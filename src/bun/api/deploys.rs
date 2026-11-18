@@ -53,10 +53,20 @@ pub(super) async fn deploy_cancel_handler(
         if let Some(council) = &state.council
             && !crate::bun::leadership::leads(council).await
         {
+            let path = match crate::cluster::http::peer_path(&[
+                "v1",
+                "deploys",
+                "operations",
+                id.as_str(),
+                "cancel",
+            ]) {
+                Ok(path) => path,
+                Err(error) => return peer_path_refusal(&error),
+            };
             return crate::bun::batch::forward_to_leader(
                 &state,
                 council,
-                &format!("/v1/deploys/operations/{id}/cancel"),
+                &path,
                 String::new(),
                 &headers,
             )
@@ -311,17 +321,26 @@ pub(super) async fn cluster_deploy_history(
     let mut answers = vec![(local_node_name(state), local)];
     let mut warnings = Vec::new();
     if !local_only {
-        let app_segment: String = url::form_urlencoded::byte_serialize(app.as_bytes()).collect();
         let namespace_value: String =
             url::form_urlencoded::byte_serialize(namespace.as_bytes()).collect();
-        let path =
-            format!("/v1/deploys/history/{app_segment}?namespace={namespace_value}&local=true");
-        let (peers, failures) = fan_out_to_peers::<crate::bun::cluster_view::ClusterDeployHistory>(
-            state,
-            &path,
-            CLUSTER_STATUS_TIMEOUT,
-        )
-        .await;
+        let (peers, failures) =
+            match crate::cluster::http::peer_path(&["v1", "deploys", "history", app]) {
+                Ok(app_path) => {
+                    let path = format!("{app_path}?namespace={namespace_value}&local=true");
+                    fan_out_to_peers::<crate::bun::cluster_view::ClusterDeployHistory>(
+                        state,
+                        &path,
+                        CLUSTER_STATUS_TIMEOUT,
+                    )
+                    .await
+                }
+                // No peer can hold history for an app whose name can't be
+                // a path segment.
+                Err(error) => (
+                    Vec::new(),
+                    vec![format!("history not asked of peers: {error}")],
+                ),
+            };
         answers.extend(peers.into_iter().map(|(node, view)| {
             let entries = view.history.into_iter().map(|entry| entry.row).collect();
             (node, entries)
@@ -357,21 +376,6 @@ pub(super) async fn deploys_history_handler(
     Json(cluster_deploy_history(&state, &app, namespace, query.local).await).into_response()
 }
 
-/// `POST /v1/rollback/{app}/{namespace}` — redeploy the app's previous
-/// successful spec (X3).
-///
-/// On a cluster, "previous" is the newest spec in the council's rollout
-/// record (#692) that differs from the current one. Without one (a single
-/// node, or an app that never finished rolling out) it is the last-but-one
-/// distinct successful deploy in the nodes' histories: the most recent
-/// completed entry is the *current* version, so rollback targets the one
-/// before it. Re-applies through the same path as
-/// `apply` (Raft in cluster mode, local deploy otherwise). The recorded
-/// spec carries the digest it ran, so the rollback runs those bytes; only
-/// a record from before binding (a bare tag) is resolved again.
-///
-/// An app GitOps manages is refused without `?force=true`: the next sync
-/// would put back what git declares (#693).
 /// The spec a rollback goes back to when the council has no released one
 /// (after a crash loop, say): the newest successful deploy in every node's
 /// history that differs from `current`. `relish rollback` and a proposed
@@ -393,6 +397,31 @@ pub(super) async fn history_rollback_target(
     crate::bun::cluster_view::rollback_target(&history, current)
 }
 
+/// How long a follower waits for the leader to start answering a
+/// forwarded rollback, as a forwarded apply does.
+const ROLLBACK_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// `POST /v1/rollback/{app}/{namespace}` — redeploy the app's previous
+/// successful spec (X3).
+///
+/// On a cluster, "previous" is the newest spec in the council's rollout
+/// record (#692) that differs from the current one. Without one (a single
+/// node, or an app that never finished rolling out) it is the last-but-one
+/// distinct successful deploy in the nodes' histories: the most recent
+/// completed entry is the *current* version, so rollback targets the one
+/// before it. Re-applies through the same path as
+/// `apply` (Raft in cluster mode, local deploy otherwise). The recorded
+/// spec carries the digest it ran, so the rollback runs those bytes; only
+/// a record from before binding (a bare tag) is resolved again.
+///
+/// A follower forwards the whole rollback to the leader before it reads
+/// anything, so the target, the owner and the GitOps check all come from
+/// the leader's state. A follower's replica can lag a deploy that has
+/// already committed, and a target picked there rolled back two versions
+/// instead of one.
+///
+/// An app GitOps manages is refused without `?force=true`: the next sync
+/// would put back what git declares (#693).
 pub(super) async fn rollback_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     binder: Option<axum::Extension<crate::pickle::binding::ImageBinder>>,
@@ -419,6 +448,19 @@ pub(super) async fn rollback_handler(
     .await
     {
         return resp;
+    }
+    if let Some(council) = &state.council
+        && !crate::bun::leadership::leads(council).await
+    {
+        return forward_rollback_to_leader(
+            &state,
+            council,
+            &app,
+            &namespace,
+            query.force,
+            &headers,
+        )
+        .await;
     }
     // Who may roll back comes before whether we can (#1125).
     if let Some(council) = &state.council
@@ -499,9 +541,9 @@ pub(super) async fn rollback_handler(
             config,
             raw,
             None,
-            // A follower forwards the re-apply as the caller, so the
-            // leader's owner rules judge it against the leader's state
-            // (the spec declares today's owner) and the caller's token
+            // Leadership can move after the check above. The re-apply
+            // then goes to the new leader as the caller, so its owner
+            // rules judge it against its own state and the caller's token
             // (#1442).
             headers,
             None,
@@ -547,4 +589,55 @@ pub(super) async fn rollback_handler(
         )
     });
     Sse::new(stream).into_response()
+}
+
+/// Send a rollback on to the leader as the caller, and stream its answer
+/// back. The leader picks the target from its own state, so a rollback
+/// never goes back further than the caller meant because this node's
+/// replica hadn't applied the latest deploy yet.
+async fn forward_rollback_to_leader(
+    state: &ApiState,
+    council: &crate::council::CouncilNode,
+    app: &str,
+    namespace: &str,
+    force: bool,
+    caller_headers: &HeaderMap,
+) -> Response {
+    let leader_url = match leader_api_url(state, council, caller_headers).await {
+        Ok(url) => url,
+        Err(refusal) => return refusal.into_response(),
+    };
+    let force = if force { "?force=true" } else { "" };
+    let request = copy_forwarded_auth(
+        mark_leader_forwarded(
+            state
+                .cluster_http
+                .client()
+                .post(format!("{leader_url}/v1/rollback/{app}/{namespace}{force}")),
+        ),
+        caller_headers,
+    );
+    match tokio::time::timeout(ROLLBACK_FORWARD_TIMEOUT, request.send()).await {
+        Ok(Ok(response)) => {
+            let mut builder = Response::builder().status(response.status());
+            if let Some(content_type) = response.headers().get(axum::http::header::CONTENT_TYPE) {
+                builder = builder.header(axum::http::header::CONTENT_TYPE, content_type);
+            }
+            builder
+                .body(axum::body::Body::from_stream(response.bytes_stream()))
+                .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+        }
+        Ok(Err(error)) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": format!("failed to forward rollback to the leader: {error}")
+            })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({"error": "leader rollback request timed out"})),
+        )
+            .into_response(),
+    }
 }

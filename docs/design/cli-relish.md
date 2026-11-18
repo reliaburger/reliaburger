@@ -29,7 +29,7 @@ Relish is a pure client-side binary. It doesn't run any server processes, doesn'
 
 Every Relish command that interacts with the cluster communicates through the Reliaburger cluster API, exposed on port 9117 (mTLS) on every node. The API follows the request routing described in the whitepaper:
 
-- **Read-only requests** (status, apps, nodes, inspect, logs, top, resolve, routes, history, wtf) are served by any council member from its local Raft state replica. The receiving node forwards to the nearest council member if it isn't one itself.
+- **Read-only requests** (status, apps, nodes, inspect, logs, top, resolve, routes, history, wtf) have no nearest-council-member routing. Some answer from the receiving node's own replica of council state, which can lag the leader; others are forwarded to the confirmed leader.
 - **Write requests** (apply, deploy, rollback, secret encrypt, snapshot create, fault inject) are forwarded to the leader, which commits via Raft before responding.
 
 Relish can target any node in the cluster. It doesn't need to know which node is the leader.
@@ -167,10 +167,10 @@ The API client is a thin wrapper around `reqwest` configured with:
 
 - **HTTP or HTTPS** to the Bun agent. With `--ca-cert` (or `RELIABURGER_CA_CERT`) the client trusts the cluster root CA and uses HTTPS; otherwise it talks plaintext HTTP to the local agent. There is no client-certificate file on disk.
 - **Token authentication** via a `Bearer <token>` header from `--token` or `RELIABURGER_TOKEN`.
-- **Fixed local endpoint** by default (`http[s]://127.0.0.1:9117`), overridable with `--endpoint` / `RELIABURGER_ENDPOINT`. There is no automatic multi-node endpoint discovery.
-- **WebSocket upgrade** for streaming endpoints (logs, exec).
-- **Retry with backoff** for transient failures (connection refused, 503). Maximum 3 retries with 1s/2s/4s backoff.
-- **Request timeout:** 30s default, configurable per-command. Streaming connections have no timeout.
+- **Endpoint:** `--endpoint` / `RELIABURGER_ENDPOINT` first, then the laptop cluster's saved context, then `http://127.0.0.1:9117` (manual 13). There is no automatic multi-node endpoint discovery.
+- **Plain HTTP for streams:** `relish logs -f` reads a streamed HTTP response, and `exec` is a plain `POST /v1/exec/{app}/{namespace}`.
+- **No automatic retries** on ordinary requests. A few calls retry a specific answer themselves (a fault clear retries a 504 within a budget, for example), and write calls that take an `Idempotency-Key` are safe for the caller to repeat.
+- **Timeouts:** a connect timeout, and a 300-second total timeout on every request from the shared client. Today that total covers streamed bodies too, so a `relish logs -f` or a long `apply` stream ends after five minutes.
 
 ### Output Formatting
 
@@ -626,7 +626,7 @@ relish --help                       # Print help and exit
 # Core operations
 relish status                       # The whole cluster on one screen: a verdict, then one line per part
 relish status --quick               # The same without wtf's checks (otherwise run with a 2 s budget)
-relish status --check               # Exit 1 on DEGRADED, 2 on DOWN
+relish status --check               # Exit 1 on DEGRADED, 2 on DOWN; no answer: 3, 4 or 5
 relish apps                         # One row per app (state, ready, restarts, nodes, age), problems first
 relish apps <app>                   # That app's instances (node, state, PID, restarts, age) and why any isn't running
 relish apps --instances             # Every instance of every app
@@ -919,7 +919,12 @@ ends in `; partial (2 of 3 nodes)`, one that couldn't be read says
 `not visible to a scoped token`.
 
 It exits 0 whenever it got an answer. `--check` exits 1 on `DEGRADED` and 2
-on `DOWN`. `-o json` prints the agent envelope (`relish.agent/v1`, command
+on `DOWN`. With no answer, with `--check` or without it and in every output
+format, it exits with the agent envelope's code: 3 when it couldn't reach or
+authenticate to the cluster (refused connection, DNS, TLS, timeout, 401), 4
+when it was refused (403), 5 for anything else (a 500, an answer it couldn't
+parse). Human output says why on stderr; `-o json` and `-o yaml` print a
+failed envelope (#2013). `-o json` prints the agent envelope (`relish.agent/v1`, command
 `status`): `data.verdict`, `data.problems`, `data.lines`, `data.wtf` and
 `data.summary` (the summary endpoint's answer), with `next` steps.
 
@@ -1227,7 +1232,10 @@ The authenticated `GET /v1/diagnostics` endpoint supplies local evidence that
 doesn't belong in the general metrics summary. It samples cgroup v2
 `throttled_usec` twice over a bounded 1–10 second window, attributes configured
 data, image, log, metric and volume paths to their containing filesystems, and
-returns public X.509 identity, issuer, serial and expiry metadata. Host paths,
+returns public X.509 identity, issuer, serial and expiry metadata, and the
+node's council backup loop state (`backup`: `not_configured`, `disabled` with a
+reason, or `running` with the interval, start, last success and last failure;
+#2016). Host paths,
 certificate bodies and key material never cross the API. A partial inventory
 uses `degraded`, carrying both the safe facts and the reason they can't support
 an OK verdict. Node leaves currently require a Bun restart to reload, so

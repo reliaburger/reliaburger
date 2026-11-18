@@ -268,6 +268,7 @@ pub(super) async fn token_revoke_handler(
     match council
         .write(crate::council::RaftRequest::RevokeApiToken {
             name: req.name.clone(),
+            now_unix_ms: crate::sesame::token::unix_millis(std::time::SystemTime::now()),
         })
         .await
     {

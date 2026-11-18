@@ -263,9 +263,7 @@ The alert state machine is simple: Inactive → Pending → Firing. A metric bre
 
 ## Ketchup: where the logs go
 
-Every line that a container writes to stdout or stderr ends up in Ketchup's append-only log files. One file per app per day, stored under `{logs_dir}/{namespace}/{app}/{date}.log`.
-
-Each log line is prefixed with a timestamp and stream indicator:
+Every line that a container writes to stdout or stderr ends up in Ketchup. The first design gave each app one plain-text file per day, `{logs_dir}/{namespace}/{app}/{date}.log`, with every line prefixed by a timestamp and an `O` or `E` for the stream:
 
 ```
 1704067200 O starting up
@@ -273,11 +271,9 @@ Each log line is prefixed with a timestamp and stream indicator:
 1704067202 O listening on :8080
 ```
 
-`O` for stdout, `E` for stderr. Simple, grep-friendly, human-readable.
+A sparse timestamp index was to sit beside each file, one `(byte_offset, timestamp)` entry every 4 KB, so a query could binary-search to its start time and scan forward. And Ketchup would sniff the first ten lines for JSON and mark the stream as structured.
 
-A sparse timestamp index sits alongside each log file. Every 4KB of log data, we record `(byte_offset, timestamp)`. To find logs from the last hour, binary search the index for the start timestamp, seek to that offset, and scan forward. No need to read the entire file.
-
-JSON auto-detection examines the first 10 lines. If they parse as JSON objects, the stream is marked as structured, enabling field-level queries:
+We never shipped that. Ketchup buffers lines in memory and flushes them to flat Parquet files in the logs directory, `logs_000000.parquet`, `logs_000001.parquet` and so on (`src/ketchup/log_store.rs`), with the stream as a column instead of a prefix. The next section explains why. There's no per-line index and no JSON detection on the node: `relish logs api --json-field level=error` parses each line as JSON on the client and keeps the ones whose field matches:
 
 ```bash
 relish logs api --json-field level=error
@@ -434,22 +430,6 @@ let new_state = match (&prev_state, value) {
 The `since` field is set when the alert enters Pending and preserved when it moves to Firing, so you know when the breach *started*, not when it was confirmed. The `if rule.operator.eval(...)` bits are *match guards*: a `match` arm only fires when its pattern matches *and* the guard is true. Rust checks that the arms are still exhaustive with guards in place, so nothing slips through.
 
 If you're used to state machines in Go or Java, this might look too compact. Where are the separate `handleInactive()`, `handlePending()`, `handleFiring()` methods? Rust's pattern matching collapses them into one expression, and the compiler ensures you handle every combination. Add a fourth state and every `match` in the codebase that doesn't handle it becomes a compilation error.
-
-### Sparse indexing: the write path
-
-The sparse index update on log append is the kind of trick that's easy to get wrong. We only write an index entry when we cross a 4KB boundary:
-
-```rust
-let offset_after = offset_before + record.len() as u64;
-if offset_before / INDEX_INTERVAL != offset_after / INDEX_INTERVAL {
-    index.add(offset_before, timestamp);
-    index.write_to(&idx_path)?;
-}
-```
-
-Integer division does the heavy lifting. If both offsets are in the same 4KB block, the division produces the same result and we skip the index update. If they straddle a boundary, we record the offset. One comparison, no modular arithmetic, no counters to maintain.
-
-The cost: for a 100MB log file, the sparse index has about 25,000 entries (one per 4KB). Binary search finds any timestamp in ~15 comparisons. Sequential scan from there covers at most 4KB of log data. The combination gives us O(log n) time-range queries without maintaining a full index.
 
 ## Hardening the metrics path
 
@@ -1095,28 +1075,30 @@ instances with the same files on disk, because this time the scheduling fell
 the other way. The bug arrived with the offsets change a few days earlier,
 and it needs a capture this big on the node being killed.
 
-The fix has two halves. `push` now walks the buffer once, remembering where
-the current line starts, and drains the finished lines in one go at the end:
+The fix has two halves. `push` now searches only the bytes it was just
+given, and copies each of them at most once:
 
 ```rust
-let mut search_from = self.partial.len();
-self.partial.extend_from_slice(bytes);
-let mut line_start = 0;
-while let Some(found) = self.partial[search_from..]
-    .iter()
-    .position(|byte| *byte == b'\n')
-{
-    let newline = search_from + found;
-    // ... hand back `self.partial[line_start..newline]` ...
-    line_start = newline + 1;
-    search_from = line_start;
+let mut rest = bytes;
+loop {
+    // ... skip to the next newline while `discarding` ...
+    let room = MAX_CAPTURED_LINE_BYTES.saturating_sub(self.partial.len());
+    let Some(newline) = rest.iter().position(|byte| *byte == b'\n') else {
+        // ... keep `rest` for the next chunk, up to `room` bytes ...
+        return lines;
+    };
+    let kept = newline.min(room);
+    self.partial.extend_from_slice(&rest[..kept]);
+    lines.push(self.take_line(newline - kept + 1));
+    rest = &rest[newline + 1..];
 }
-self.partial.drain(..line_start);
 ```
 
-`self.partial[search_from..]` is a slice, a borrowed view into the vector
-with no copy, like a Go slice expression. Starting the search at the old
-length is safe because bytes already waiting are, by definition, the part
+`rest[newline + 1..]` is a slice, a borrowed view into the caller's buffer
+with no copy, like a Go slice expression. Moving `rest` forward costs
+nothing; only the bytes of a line get copied, once, into `partial`, which
+`take_line` clears without giving back its memory. Searching only the new
+bytes is safe because bytes already waiting are, by definition, the part
 of a line with no newline yet.
 
 The second half matters more: no forwarder reads a whole file any more.
@@ -1140,6 +1122,16 @@ for 5.5 s in one go, the new one for a few milliseconds at most. The runc versio
 real container print 200,000 lines and follows it from a fresh runtime
 handle, as a restarted Bun would. `a_backlog_of_short_lines_splits_in_linear_time`
 pins `push` itself.
+
+What's `room` for? A line has to end somewhere. Output with no newline, a
+`\r` progress bar or a binary dump, would otherwise sit in `partial` in full
+until the newline finally came. So a line stops growing at `MAX_CAPTURED_LINE_BYTES` (64 KiB).
+The reader hands on that prefix as the line and sets `discarding`, the flag
+it already used to skip the rest of a line whose start was reclaimed, so the
+remainder is counted and dropped up to the next newline. Counting matters:
+the capture offset keeps moving, so the log store can still reclaim the
+file. `a_stream_with_no_newline_stays_within_the_line_cap` pushes 100 MiB
+with no newline in 64 KiB chunks and checks the buffer after every one.
 
 Should one stuck instance be able to stop a node at all? Adoption is
 fail-closed by design: an instance Bun can't prove it owns stops startup,

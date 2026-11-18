@@ -729,6 +729,12 @@ impl Evidence {
             bytes: size,
             why: why.to_string(),
         };
+        // First, before any parsing: a `.log` file is a log whatever it
+        // holds, and an app that logs JSON writes one that parses.
+        let is_log = path.extension().is_some_and(|extension| extension == "log");
+        if is_log && !include_logs {
+            return Ok(left_out("a log file; pass --include-logs to add it"));
+        }
         if size > MAX_EVIDENCE_BYTES {
             return Ok(left_out(&format!("over {MAX_EVIDENCE_BYTES} bytes")));
         }
@@ -750,10 +756,6 @@ impl Evidence {
                 name,
                 value: Value::Array(lines.clone()),
             });
-        }
-        let is_log = path.extension().is_some_and(|extension| extension == "log");
-        if is_log && !include_logs {
-            return Ok(left_out("a log file; pass --include-logs to add it"));
         }
         Ok(Evidence::Text { name, text })
     }

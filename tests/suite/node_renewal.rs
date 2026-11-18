@@ -199,6 +199,65 @@ async fn a_member_certificate_and_only_that_gets_the_master_key() {
     assert_eq!(status, StatusCode::FORBIDDEN, "a revoked certificate");
 }
 
+/// A node that forwards or relays a person's request presents its own
+/// certificate, so the node-only routes must tell such a request from the
+/// node's own: they refuse anything marked as forwarded for a person, even
+/// with a valid member certificate and, for renewal, the service token.
+#[tokio::test]
+async fn a_request_forwarded_for_a_person_is_refused_by_node_only_routes() {
+    const FORWARDED_FOR_USER: &str = "x-reliaburger-forwarded-for-user";
+    let hierarchy = ca::generate_ca_hierarchy("master-key-forwarded", &IKM).unwrap();
+    let council = council(&hierarchy, true).await;
+
+    let response = router(council.clone(), Some(peer(&hierarchy, 10)))
+        .oneshot(
+            Request::get("/v1/cluster/master-key")
+                .header(FORWARDED_FOR_USER, "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(!body.contains(&hex::encode(IKM)), "{body}");
+
+    let (renewal, _) = request("node");
+    let response = router(council.clone(), Some(peer(&hierarchy, 10)))
+        .oneshot(
+            Request::post("/v1/cluster/renew")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer internal-token")
+                .header(FORWARDED_FOR_USER, "1")
+                .body(Body::from(serde_json::to_vec(&renewal).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert_eq!(status, StatusCode::FORBIDDEN, "renewal: {body}");
+    // Renewal has other 403s (no certificate, a bad identity); this one must
+    // be the node-only refusal.
+    assert!(
+        body.contains("this route answers nodes only"),
+        "renewal: {body}"
+    );
+
+    // The node's own request, unmarked, still gets the key.
+    let (status, body) = get_master_key(router(council.clone(), Some(peer(&hierarchy, 10)))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["master_key"], hex::encode(IKM));
+    council.shutdown().await.unwrap();
+}
+
 /// G1: a retired node's certificate gets no master key, even one that was
 /// never revoked. Retirement is by node id, so this is what stops a node
 /// that was decommissioned, but kept a valid leaf, fetching the key again.
@@ -1036,11 +1095,11 @@ async fn worker_renews_a_short_override_leaf_at_its_midpoint() {
     let mut fixture =
         WorkerFixture::with_leader_lifetime(&hierarchy, false, Some(override_lifetime)).await;
     // Exactly the window a 600 s override signs (600 s plus the 300 s
-    // backdate), issued long enough ago that its midpoint is 3 s away.
+    // backdate), issued long enough ago that its midpoint is 8 s away.
     fixture
         .live
         .replace(
-            windowed_identity(&hierarchy, 20, -447, 453),
+            windowed_identity(&hierarchy, 20, -442, 458),
             &reliaburger::sesame::trust::TrustSet::from_state(
                 &fixture.council.security_state().await,
             )
@@ -1049,14 +1108,37 @@ async fn worker_renews_a_short_override_leaf_at_its_midpoint() {
         .await
         .unwrap();
     let monitor = fixture.start_with_ceiling(Some(override_lifetime));
+    // The midpoint the worker computes, from the leaf as signed: X.509
+    // keeps whole seconds, so it isn't exactly 8 s after the call above.
+    let installed = fixture.live.snapshot();
+    let midpoint = installed.not_before
+        + installed
+            .not_after
+            .duration_since(installed.not_before)
+            .unwrap()
+            / 2;
     wait_for_condition(|| monitor.state() == RenewalState::Valid).await;
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    assert_eq!(
-        fixture.calls.load(Ordering::SeqCst),
-        0,
-        "renewed before the midpoint"
+    // Watch the worker up to the midpoint. The worker reads its clock
+    // before it counts a call, so a call counted before our clock read
+    // was decided before the midpoint too. Only those samples are checked:
+    // a loaded host that spends the margin on setup shortens the watch
+    // instead of passing for an early renewal (#2008).
+    let mut checked = 0;
+    loop {
+        let calls = fixture.calls.load(Ordering::SeqCst);
+        let serial = fixture.live.snapshot().serial;
+        if std::time::SystemTime::now() >= midpoint {
+            break;
+        }
+        assert_eq!(calls, 0, "renewed before the midpoint");
+        assert_eq!(serial, SerialNumber(20));
+        checked += 1;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        checked > 0,
+        "setup ran past the leaf's midpoint before the worker could be watched"
     );
-    assert_eq!(fixture.live.snapshot().serial, SerialNumber(20));
     wait_for_condition(|| {
         fixture.live.snapshot().serial.0 >= 100 && monitor.state() == RenewalState::Valid
     })

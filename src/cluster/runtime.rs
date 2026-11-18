@@ -85,6 +85,9 @@ pub struct ClusterRuntime {
     /// This node's gossip counters: updates received and the last
     /// membership change, read by `GET /v1/cluster/summary`.
     pub gossip_stats: crate::mustard::stats::GossipStats,
+    /// This node's council backup loop state (#2016), served by
+    /// `GET /v1/diagnostics` for `relish wtf`.
+    pub backup_rx: watch::Receiver<crate::council::backup::BackupStatus>,
 }
 
 /// Configuration for starting the cluster runtime, derived from node config.
@@ -611,23 +614,31 @@ pub async fn start(
     );
 
     // Encrypted external council backup (12b.2 D21/CP12): a leader-only export
-    // loop, only when a destination is configured and a master key is present
-    // to seal with. Without the master key there is nothing to derive the seal
-    // key from, so we skip it loudly rather than shipping plaintext state.
-    if params.backup.enabled() {
-        match params.wrapping_ikm {
-            Some(master_key) => {
-                tokio::spawn(crate::council::backup::run_backup_loop(
-                    Arc::clone(&council),
-                    master_key,
-                    params.backup.clone(),
-                    shutdown.clone(),
-                ));
-            }
-            None => eprintln!(
-                "cluster: council backup configured but no master key available; backups disabled"
-            ),
-        }
+    // loop, only when a destination is configured, the store opens, and a
+    // master key is present to seal with. Without the master key there is
+    // nothing to derive the seal key from, so we skip it rather than ship
+    // plaintext state. Either way the status reaches `relish wtf` (#2016).
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let (backup_status, backup_store) = crate::council::backup::prepare_backup(
+        &params.backup,
+        params.wrapping_ikm.is_some(),
+        started_at,
+    );
+    if let crate::council::backup::BackupStatus::Disabled { reason } = &backup_status {
+        eprintln!("cluster: council backup configured but disabled: {reason}");
+    }
+    let (backup_tx, backup_rx) = watch::channel(backup_status);
+    if let (Some(store), Some(master_key)) = (backup_store, params.wrapping_ikm) {
+        tokio::spawn(crate::council::backup::run_backup_loop(
+            Arc::clone(&council),
+            master_key,
+            params.backup.clone(),
+            store,
+            backup_tx,
+            shutdown.clone(),
+        ));
     }
 
     // --- Reporting tree (flat star: every node reports to the leader) ---
@@ -773,6 +784,7 @@ pub async fn start(
             directory_rx,
             roster_rx,
             gossip_stats,
+            backup_rx,
         },
     ))
 }
@@ -875,12 +887,15 @@ fn spawn_leader_hint_publisher(
     let self_id = identity::raft_id_from_name(&node_id.0);
     spawn_supervised("cluster:leader-hint", supervision, async move {
         loop {
+            // Read the fence before the metrics borrow, so the two watch
+            // borrows are never held together (#1273, #1433).
+            let recovery_epoch = fence.snapshot().epoch;
             let hint = {
                 let m = metrics_rx.borrow();
                 (m.current_leader == Some(self_id)).then(|| LeaderHint {
                     node_id: node_id.clone(),
                     term: m.current_term,
-                    recovery_epoch: fence.snapshot().epoch,
+                    recovery_epoch,
                     api_address,
                     reporting_address,
                 })
@@ -970,6 +985,8 @@ fn spawn_leader_target_maintainer(
 ) {
     let shutdown = supervision.shutdown.clone();
     spawn_supervised("cluster:leader-target", supervision, async move {
+        // The `(recovery_epoch, term)` last published as the epoch.
+        let mut published = None;
         loop {
             let view = crate::cluster::directory::resolve_leader(
                 &metrics_rx,
@@ -989,16 +1006,21 @@ fn spawn_leader_target_maintainer(
                         }
                     });
                 }
-                // Terms only grow; ignoring lower values keeps a lagging
-                // gossip hint from briefly rolling the epoch back.
-                epoch_tx.send_if_modified(|epoch| {
-                    if view.term > *epoch {
-                        *epoch = view.term;
-                        true
-                    } else {
-                        false
-                    }
-                });
+                // This node's own Raft term always sets the epoch; a gossip
+                // hint only moves it forward, by recovery epoch then term
+                // (#1997).
+                if let Some(key) = crate::cluster::directory::next_reporting_epoch(published, &view)
+                {
+                    published = Some(key);
+                    epoch_tx.send_if_modified(|epoch| {
+                        if *epoch != view.term {
+                            *epoch = view.term;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                }
             }
             tokio::select! {
                 _ = shutdown.cancelled() => break,

@@ -783,7 +783,7 @@ When an image reference includes a registry hostname (e.g., `docker.io/redis:7-a
    their own registry, because a mirror could answer a mutable tag with a
    different image. Loopback mirrors use plain HTTP.
 
-4. **Tag re-resolution.** For mutable tags (e.g., `redis:7-alpine`), Pickle periodically re-checks the upstream registry for manifest changes (configurable interval, default 1 hour). If the upstream digest has changed, the new manifest and any new layers are pulled and cached. Since F03 U1 this matters less: an apply binds each tag to a digest (`redis:7-alpine@sha256:…`), so pulls ask for the digest and a moved tag changes nothing until the next apply. A fresh fill of a bound reference also records the image under the tag it carries, so an apply while upstream is down can bind the tag from the cache.
+4. **Tag re-resolution.** For mutable tags (e.g., `redis:7-alpine`), Pickle re-checks the upstream registry lazily: there's no background task. When a pull hits a cached tag older than `[images] cache_recheck_secs` (default 3600), Pickle asks upstream for the tag's digest; if it has changed, the new manifest and any new layers are pulled and cached. If upstream can't be reached, the stale copy is served. Since F03 U1 this matters less: an apply binds each tag to a digest (`redis:7-alpine@sha256:…`), so pulls ask for the digest and a moved tag changes nothing until the next apply. A fresh fill of a bound reference also records the image under the tag it carries, so an apply while upstream is down can bind the tag from the cache.
 
 5. **Binding at apply.** The node that handles `POST /v1/apply` (the leader, on a cluster), the GitOps runner, and a standalone node's apply resolve each tag through `pickle::binding::ImageBinder`: Pickle's catalogue for a Pickle image, otherwise a manifest `HEAD` upstream (20 s), otherwise the cached tag. With none of those the apply fails rather than store an unbound tag. A reference that already carries a digest is left alone, which is why a rollback restores the digest that ran. Bun attaches a binder only when its runtime pulls images. ProcessGrill pulls none: it refuses image apps (#914), so there's nothing to bind.
 
@@ -1278,9 +1278,9 @@ include peer replication (which the heal loop does afterwards).
 | 5 MB (small app layer) | < 1s | Local store + Raft commit |
 | 50 MB (typical app) | ~1s | Upload/store bandwidth to the receiving node |
 | 200 MB (large app with deps) | 1-2s | Upload/store bandwidth |
-| 1 GB+ (ML model, large base) | seconds | Bounded by client→node upload bandwidth |
+| 1 GB+ (ML model, large base) | seconds | Only in chunks: see below |
 
-Push latency is dominated by the client→receiving-node upload and local disk write. The Raft commit for the manifest is small (< 10KB) and adds negligible latency (typically < 50ms). Replicating to peers happens later, on the heal loop, and does not count against the push.
+Each upload request carries at most 512 MiB and must finish within 5 minutes (`MAX_REQUEST_BYTES` and `UPLOAD_TIMEOUT` in `src/pickle/api.rs`); a bigger body is refused with 413 and a slower one with 408. A layer over 512 MiB therefore has to arrive in several `PATCH` chunks, and a client that streams it in one request fails. Within those bounds, push latency is dominated by the client→receiving-node upload and local disk write. The Raft commit for the manifest is small (< 10KB) and adds negligible latency (typically < 50ms). Replicating to peers happens later, on the heal loop, and does not count against the push.
 
 ### 9.2 Fan-Out Speed
 
@@ -1301,7 +1301,7 @@ Per-node pull throughput depends on the number of available sources:
 
 - **Single source:** Limited by the source node's upload bandwidth (typically 1-10 Gbps).
 - **Multiple sources (common case):** Each layer is fetched from a different peer concurrently. A 200MB image with 4 layers can be pulled in the time it takes to download the single largest layer.
-- **Range-split large layers:** For layers > 100MB, Pickle can split the download across multiple peers using byte-range requests, further reducing pull time.
+- **Range-split large layers: planned -- not yet implemented.** Each layer comes whole from one peer; there are no byte-range requests across peers. A single peer transfer is capped at 2 GiB (`src/pickle/pull.rs`).
 
 ### 9.4 Storage Overhead
 

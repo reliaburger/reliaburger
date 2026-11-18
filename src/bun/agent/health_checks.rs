@@ -210,6 +210,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
         let transition = self.supervisor.process_health_result(&instance_id, status);
 
+        if let Ok(Some(ContainerState::Stopping)) = transition {
+            self.record_never_healthy(&instance_id).await;
+        }
         if let Ok(Some(ContainerState::Unhealthy)) = transition
             && let Some(instance) = self.supervisor.get_instance(&instance_id)
         {
@@ -292,6 +295,37 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             )
             .await;
         }
+    }
+
+    /// Record that `instance_id` never passed its health check during its
+    /// startup grace, so the node is stopping it and will mark it failed
+    /// without restarting it.
+    async fn record_never_healthy(&self, instance_id: &InstanceId) {
+        let Some(instance) = self.supervisor.get_instance(instance_id) else {
+            return;
+        };
+        let mut decision = crate::bun::decisions::Decision::new("restart.never_healthy")
+            .with("instance", &instance_id.0);
+        for (key, value) in health_evidence(instance)
+            .into_iter()
+            .filter(|(key, _)| *key != "threshold")
+        {
+            decision = decision.with(key, value);
+        }
+        let failures = instance.health_counters.consecutive_unhealthy;
+        self.record_decision(
+            crate::bun::events::EventKind::Health,
+            crate::bun::events::EventSeverity::Warning,
+            Some(instance.app_name.clone()),
+            Some(instance.namespace.clone()),
+            format!(
+                "instance {} never passed its health check ({failures} probes failed in a \
+                 row); stopping it and marking it failed",
+                instance_id.0
+            ),
+            decision,
+        )
+        .await;
     }
 
     /// Confirm health publication before routing changes or automatic restart.
@@ -417,8 +451,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
-    /// A running app's process has exited, which a health check catches
-    /// only if the app has one. Mark it Stopped and route it through the
+    /// A started app's process has exited, running or still waiting for its
+    /// first healthy probe, which a health check would catch late or never.
+    /// Mark it Stopped and route it through the
     /// restart path. `retry_restart` records the `restart` event when it
     /// restarts the instance at once; an exit inside the backoff keeps
     /// `retry_pending`, and the later retry records it instead (#1652).

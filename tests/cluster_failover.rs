@@ -973,6 +973,116 @@ async fn eight_plus_node_cluster_reconciles_and_reports_through_leader_failover(
     tokio::time::sleep(Duration::from_millis(500)).await;
 }
 
+/// #1996: a node past the council cap never joins Raft, so its own term stays
+/// 0. It used to take a gossip leader hint only up to term 10, so once the
+/// cluster had had more elections than that, the workers lost the leader:
+/// they stopped reporting and stopped polling for placements.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
+async fn workers_outside_raft_keep_the_leader_after_many_elections() {
+    assert!(
+        cluster_tests_enabled(),
+        "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
+    );
+    let target_term = reliaburger::cluster::directory::MAX_LEADER_HINT_TERM_LEAD + 5;
+
+    let mut fixture = Fixture::new();
+    let all: Vec<usize> = (0..NODE_COUNT).collect();
+    let mut nodes = Vec::with_capacity(NODE_COUNT);
+    nodes.push(fixture.start_node(0, vec![], true, None).await);
+    for index in 1..NODE_COUNT {
+        let seed = fixture.gossip(0);
+        nodes.push(fixture.start_node(index, vec![seed], true, None).await);
+    }
+    wait_until(
+        "seven voters",
+        Duration::from_secs(60),
+        async || match leader_of(&nodes, &all).await {
+            Some(leader) => nodes[leader].voter_count() == 7,
+            None => false,
+        },
+    )
+    .await;
+    let leader = wait_for_leader(&nodes, &all, Duration::from_secs(30)).await;
+    let voter_ids = nodes[leader].voter_ids();
+    let (voters, workers): (Vec<usize>, Vec<usize>) = all
+        .iter()
+        .copied()
+        .partition(|&index| voter_ids.contains(&nodes[index].raft_id));
+    assert_eq!(workers.len(), 2, "expected exactly two non-voter workers");
+
+    // Force elections until the term is well past the old bound. Each
+    // campaign from a follower raises its term above the leader's, which
+    // makes the leader step down and a new election run.
+    let mut next = 0;
+    loop {
+        let leader = wait_for_leader(&nodes, &voters, Duration::from_secs(60)).await;
+        let term = nodes[leader].metrics_rx.borrow().current_term;
+        if term > target_term {
+            break;
+        }
+        let candidate = voters[next % voters.len()];
+        next += 1;
+        if candidate == leader {
+            continue;
+        }
+        let _ = nodes[candidate].council.raft().trigger().elect().await;
+        wait_until(
+            &format!("a leader at a term above {term}"),
+            Duration::from_secs(60),
+            async || match leader_of(&nodes, &voters).await {
+                Some(leader) => nodes[leader].metrics_rx.borrow().current_term > term,
+                None => false,
+            },
+        )
+        .await;
+    }
+    for &worker in &workers {
+        assert_eq!(
+            nodes[worker].metrics_rx.borrow().current_term,
+            0,
+            "{} learned a Raft term, so it doesn't test a node outside Raft",
+            nodes[worker].name
+        );
+    }
+
+    // Every node reports in the current epoch, the workers included.
+    wait_until(
+        "all 9 nodes reporting to the leader after the elections",
+        Duration::from_secs(60),
+        async || {
+            leader_state(&nodes, &all)
+                .await
+                .is_some_and(|state| state.reports.len() == NODE_COUNT)
+        },
+    )
+    .await;
+
+    // And the workers still poll for placements: a daemon set lands on all 9.
+    write_through_leader(
+        &nodes,
+        &all,
+        RaftRequest::AppSpec {
+            app_id: AppId::new("web", "default"),
+            spec: Box::new(daemonset_spec(600)),
+        },
+    )
+    .await;
+    wait_until(
+        "web running on all 9 nodes after the elections",
+        Duration::from_secs(90),
+        async || {
+            leader_state(&nodes, &all)
+                .await
+                .is_some_and(|state| nodes_reporting_app(&state, "web") == NODE_COUNT)
+        },
+    )
+    .await;
+
+    fixture.root.cancel();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+}
+
 /// Ownership survives a real leader change even when the worker's local
 /// placement journal is missing and it has missed the deletion entirely.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

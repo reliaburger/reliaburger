@@ -1925,6 +1925,14 @@ refuses. The mock runtime can now answer one inventory read from before a
 change, which makes that test exact: it failed with the error from the VM
 before the fix. The host and runc tests race many forgets against a reader
 and failed every run or most runs before.
+The runc one does real durable work to get there: 128 generations claimed,
+published, retired and forgotten, about nine full syncs each. On macOS every
+`sync_all` is an `F_FULLFSYNC`, which waits for the drive's whole cache, so
+the test takes about 3 s alone and 32 s beside twelve processes doing the
+same. Inside a `make ci` on a busy Mac Studio it once ran out of nextest's
+60 s ([#2009](https://github.com/reliaburger/reliaburger/issues/2009)). Its
+verdict is an error, not a time, so `.config/nextest.toml` gives it 180 s as a
+hang guard rather than fewer rounds.
 
 The test now waits for the real end state while the nodes still run: no
 launch in the inventory and no route files left. The lost leader's pool went

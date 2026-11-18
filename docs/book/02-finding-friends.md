@@ -224,9 +224,9 @@ One subtlety: when we receive a gossip update about a node we've never seen, we 
 
 ### Piggyback dissemination
 
-SWIM doesn't use dedicated broadcast messages. Instead, membership updates piggyback on the PING/ACK messages that are already flowing. Each message carries up to `MAX_PIGGYBACK_UPDATES` (8) updates, or fewer when they don't fit in the datagram (we'll get to that budget shortly), and each update is broadcast `ceil(log2(cluster_size))` times before it expires.
+SWIM doesn't use dedicated broadcast messages. Instead, membership updates piggyback on the PING/ACK messages that are already flowing. Each message carries up to `MAX_PIGGYBACK_UPDATES` (8) updates, or fewer when they don't fit in the datagram (we'll get to that budget shortly), and each update is broadcast `3 * ceil(log2(cluster_size))` times, and at least 6, before it expires.
 
-Why `ceil(log2(N))`? Because SWIM's mathematical properties guarantee that an update will reach every node within O(log N) protocol periods with high probability. For a 10,000-node cluster, that's about 14 broadcasts per update. Spread across 500ms protocol intervals, that's 7 seconds for full convergence. Not bad.
+Why `ceil(log2(N))`? Because SWIM's mathematical properties guarantee that an update will reach every node within O(log N) protocol periods with high probability. The 3 is the SWIM paper's λ: every round spends a broadcast on both the PING and the ACK, and not every broadcast lands on a node that hasn't heard yet, so we pay a constant factor for headroom. The floor of 6 keeps an update alive while a young cluster is still tiny. For a 10,000-node cluster, `ceil(log2(N))` is 14, so each update goes out 42 times. Convergence still takes O(log N) rounds of 500 ms, a few seconds.
 
 The dissemination queue prioritises failure-related updates:
 
@@ -1405,7 +1405,7 @@ The algorithm evaluates candidates on four things, in priority order.
 
 **Resource availability.** A council member runs the Raft engine, stores the log, applies entries to the state machine. That's not free. If a node is already at 95% CPU, adding council duties might push it over the edge. So `select_council_candidates` skips a node whose `ResourceSummary` shows CPU above 90% or memory above 85%. The catch is that gossip doesn't carry a `ResourceSummary` yet. Outside tests every member's `resources` is `None`, and selection treats a node that reported nothing as eligible, so today this check never refuses anyone. It's ready for the day nodes gossip their resources, which is a feature of its own.
 
-What about nodes that haven't reported resources yet? They're excluded. No data means no guarantee they're not overloaded. A node has to have reported at least once to be eligible.
+What about nodes that haven't reported resources yet? They're eligible. We'd rather have a council than wait for numbers gossip doesn't carry, so a missing report counts as "no objection", and the thresholds apply only once a node reports.
 
 **Zone diversity.** If all your council members are in the same rack and that rack loses power, your entire consensus layer dies. The algorithm collects the zones already represented in the current council (from the `"zone"` label in each node's labels map), then ranks candidates from *unrepresented* zones higher. A candidate in zone-c when the council already has members in zone-a and zone-b is more valuable than another zone-a candidate.
 
@@ -1591,6 +1591,8 @@ The reporting tree is hierarchical. Each worker node is assigned to exactly one 
 
 With a council of 5 and 10,000 nodes, each council member aggregates reports from about 2,000 workers. That's 2,000 reports of 1-10 KB each, every 5 seconds. Plenty manageable.
 
+That's the design, and the `src/reporting/` module below can build it. It isn't what a running cluster does, though. When `bun --cluster` wires the worker up, it hands the `ReportWorker` a council list with exactly one entry: the current Raft leader (`spawn_leader_target_maintainer` in `src/cluster/runtime.rs`). So production is a flat star. Every worker, voters included, reports straight to the leader, and only the leader's aggregator ever receives anything. The two-level tree is planned ([#364](https://github.com/reliaburger/reliaburger/issues/364)). Until it lands, the leader's report listener is the limit on cluster size: it refuses report connections from about 500 nodes up ([#1411](https://github.com/reliaburger/reliaburger/issues/1411)).
+
 ### Parent assignment
 
 Parent assignment is deterministic. Given the same worker ID and the same council member list, every node in the cluster computes the same parent independently. No coordination needed.
@@ -1715,7 +1717,7 @@ Two more honesty rules landed in the same pass. Entries now get evicted, not jus
 
 ### Failover
 
-When a council member departs, workers need to re-hash and connect to a surviving member. The `ReportWorker` watches the council membership via a `watch::Receiver<Vec<(NodeId, SocketAddr)>>`. When the membership changes, the worker calls `assign_parent()` again and updates its `parent_address`, and sends a report immediately rather than waiting out the interval, so a fresh leader's view fills fast.
+When a council member departs, workers need to re-hash and connect to a surviving member. The `ReportWorker` watches the council membership via a `watch::Receiver<Vec<(NodeId, SocketAddr)>>`. When the membership changes, the worker calls `assign_parent()` again and updates its `parent_address`, and sends a report immediately rather than waiting out the interval, so a fresh leader's view fills fast. In a running cluster that list holds only the leader, so "the council changed" means "the leader changed", and every worker moves to the new leader together.
 
 The new parent receives a full `StateReport` from each reassigned worker on the next reporting cycle. No explicit "handoff" protocol is needed. The new parent simply starts accumulating reports.
 
@@ -1735,6 +1737,8 @@ stale_report_timeout_secs = 30
 ```
 
 The defaults are sensible for most clusters. Smaller clusters might lower the interval; very large clusters might raise it to reduce load on council members.
+
+The two numbers also have to agree with each other, and Bun checks that at startup. A zero interval would panic the worker on its first tick, because `tokio::time::interval` refuses a zero period. A stale timeout at or below the interval marks every node stale between two of its own reports. And a stale timeout near `u64::MAX` seconds overflowed when the worker multiplied it by `BUSY_LOOP_STALE_WINDOWS`: `Duration * u32` panics on overflow, just as `Instant + Duration` does. So validation refuses all three, and caps the timeout at a day. The worker also uses `Duration::saturating_mul`, the version that stops at `Duration::MAX` instead of panicking.
 
 ## The node directory: growing past the council
 
@@ -1760,6 +1764,7 @@ pub struct DirectoryExtension {
 pub struct LeaderHint {
     pub node_id: NodeId,
     pub term: u64,
+    pub recovery_epoch: u64,
     pub api_address: SocketAddr,
     pub reporting_address: SocketAddr,
 }
@@ -1770,6 +1775,44 @@ The endpoints are the sender's own, straight from its config. No more "the API i
 The leader hint is the interesting part. Only the actual leader *originates* a hint: the cluster runtime watches the local Raft metrics and, while this node leads, publishes `Some(LeaderHint { me, my term, my endpoints })` into the gossip node. Everyone else just relays the highest-term hint they've seen. Raft terms only ever grow, so failover resolves itself: the new leader's hint carries a higher term and displaces the old one everywhere within a few gossip rounds, and a deposed leader's stale hint (or a replayed datagram) always loses the comparison. There's no retraction protocol, no invalidation message. Just max-by-term, the same trick incarnation numbers pull in SWIM.
 
 On the receiving side, every node folds extensions into a `NodeDirectory` (a map of node to endpoints plus the best hint) and publishes it on a `watch` channel. The reporting worker's leader-target maintainer and the placement reconciler now resolve the leader through one shared function: Raft metrics stay authoritative when they know a leader (voters, same term or newer), and the gossip directory answers for everyone else. A worker outside the council learns the leader from its very first gossip exchange with anyone who knows.
+
+### Whose term is it?
+
+"Raft metrics stay authoritative, the hint answers for everyone else" hides a question: how far do you trust a hint? A hint claiming term `u64::MAX` would, if a voter believed it, carry that voter's reporting epoch to a number no real election will ever reach. So since July a node took a hint only if its term was at most ten above the node's own Raft term (`MAX_LEADER_HINT_TERM_LEAD`). An election bumps the term by one, so ten absorbs gossip outrunning Raft and still refuses nonsense.
+
+Now ask what "the node's own Raft term" is on the eighth node, the one this whole section exists for. It never joins Raft. It never hears an AppendEntries. Its metrics say term 0, today and forever. The check reads `hint.term <= 0 + 10`, which holds until the cluster's eleventh election. Failovers, rolling upgrades, handovers, a voter deposed for a full disk: a long-lived cluster gets there. From then on every worker past the council cap finds no leader, stops polling for placements and stops reporting, and the leader, hearing nothing, places their replicas a second time while the old ones still run. The unit test passed a local term of 5, which no real non-member ever has, so it never saw this ([#1996](https://github.com/reliaburger/reliaburger/issues/1996)).
+
+The fix is to admit that a non-member has no term to judge by. `raft_leader` now reports the local term only when this node sits in the Raft membership (voters and learners both do), and `resolve_leader_view` takes it as an `Option<u64>`:
+
+```rust
+let hint_plausible = |hint: &LeaderHint| {
+    hint.recovery_epoch != local_epoch
+        || local_term.is_none_or(|local| {
+            hint.term <= local.saturating_add(MAX_LEADER_HINT_TERM_LEAD)
+        })
+};
+```
+
+`Option::is_none_or(f)` is `true` for `None` and `f(value)` for `Some(value)`: no term, no bound. A member keeps the bound, because its term is real, but only for hints from its own recovery epoch (more on epochs in a moment). A voter that a recovery has fenced still holds the old council's term, and comparing that with the new council's fresh term line would make it refuse the new leader for no reason. A non-member takes the newest hint gossip has shown it. Isn't that the forged-term problem again? Not really. Forging a hint takes the cluster's gossip key, since every extension carries an HMAC, and the reporting epoch a hint can move only gates anything on the leader, which is a member and judges hints by its own term.
+
+The same review found a second way for a hint to lie about its term. `relish council recover` builds a new council at a new *recovery epoch*, and its terms start again from the bottom. For a while, surviving workers still relay the old council's last hint: epoch 0, term 9, say, against the recovered leader's epoch 1, term 3. The directory ordered hints by `(recovery_epoch, term)`, but `resolve_leader_view` compared terms alone, so 9 beat 3 and the recovered leader's reporting epoch jumped to 9. The maintainer only ever let that epoch grow, and the scheduler skips every pass while the epoch differs from the leader's own term. Nothing would ever bring it back down ([#1997](https://github.com/reliaburger/reliaburger/issues/1997)).
+
+Two changes close it. The gossip directory now holds a *recovery floor*, the newest epoch the node's own recovery fence knows. `observe_hint` refuses a hint from below the floor, and `raise_recovery_floor` drops one already held when the floor rises, so a node never resolves the old council at all. And the reporting epoch is keyed on the pair, not the term:
+
+```rust
+pub fn next_reporting_epoch(last: Option<(u64, u64)>, view: &LeaderView) -> Option<(u64, u64)> {
+    let key = (view.recovery_epoch, view.term);
+    let publish = match view.source {
+        LeaderSource::Raft => last != Some(key),
+        LeaderSource::Gossip => last.is_none_or(|last| key > last),
+    };
+    publish.then_some(key)
+}
+```
+
+Tuples compare field by field, so a newer recovery epoch wins whatever the terms. The new `LeaderSource` enum records where a view came from. A node's own Raft metrics are the truth about its own term, so they always set the epoch, even downwards; a gossip hint may only move it forward. That's the half that rescues a node whose epoch an old hint has already raised.
+
+While we were here, we also fixed three places that held two `watch` borrows at once, the pattern behind the deadlocks in Chapter 14. The leader-hint publisher read the recovery fence inside its metrics borrow. The fenced metrics filter borrowed both channels in one expression. And the handover hold read the metrics inside `send_if_modified`, which holds the hold's write lock. None of them had a partner taking the locks the other way round yet. Each now copies one value out before it takes the next lock.
 
 ### Keeping the extension out of the message body
 
@@ -2438,9 +2481,9 @@ address) plus the provisioned master-key and identity paths.
 
 1. **Bind ports.** Same as before, different host or different port numbers.
 2. **Create MustardNode with seed.** Node 2 adds the seed address to its membership table and starts the gossip protocol. On its first cycle, it pings `10.0.1.5:9443`.
-3. **Gossip discovery.** Node 1 receives the PING, learns about Node 2, and piggybacks this on its next outgoing messages. Node 2 receives Node 1's ACK with its membership list. Within one or two gossip periods (200ms each by default), both nodes know about each other.
+3. **Gossip discovery.** Node 1 receives the PING, learns about Node 2, and piggybacks this on its next outgoing messages. Node 2 receives Node 1's ACK with its membership list. Within one or two gossip periods (500 ms each by default), both nodes know about each other.
 4. **No council yet.** Node 2 starts as a non-council worker. It doesn't run Raft.
-5. **Start ReportWorker.** Node 2 computes its parent via `assign_parent()`: with one council member, every worker reports to Node 1. It starts sending `StateReport` messages to Node 1 every 5 seconds.
+5. **Start ReportWorker.** Node 2 reports to the leader, which is Node 1. It starts sending `StateReport` messages to Node 1 every 5 seconds.
 6. **Leader notices.** On Node 1, the leader checks whether the council should grow. With `min_council_size = 3`, it wants at least 3 council members. It only has 1 (itself), and Node 2 just appeared. The cluster runtime sets `min_node_age` to zero, so Node 2 is eligible straight away, and the reconciler starts walking it in on its next two-second tick.
 
 Two nodes. One is the council, the other is a worker. Apps can be scheduled on both.
@@ -2457,7 +2500,7 @@ The leader promotes them:
 2. **Wait for catch-up.** The learners replay the existing log entries to build their `DesiredState`. For a fresh cluster this is fast: there might be only a few entries.
 3. **Change membership.** `council.change_membership({1, 2, 3})`. All three nodes are now voters. Raft requires a quorum of 2 for writes. The cluster can now survive the loss of any single node.
 
-Once promoted, Nodes 2 and 3 start their own `ReportAggregator` instances. Workers re-hash their parent assignments: with 3 council members, each gets roughly a third of the workers. The reporting tree rebalances automatically.
+Every node runs a `ReportAggregator`, but only the leader's receives reports, because every worker reports to the leader (the flat star from "The reporting tree" above). Promoting Nodes 2 and 3 doesn't move anyone's reports; a change of leader does, and the workers follow it on their next report.
 
 You now have a proper 3-node council. If the leader dies, Raft elects a new one within 1–2 seconds. If a council member dies, the leader promotes a replacement from the worker pool.
 
@@ -2530,7 +2573,7 @@ The leader calls this function periodically (every gossip cycle, since it's chea
 
 ### What happens to running apps during a council change?
 
-Nothing. Council changes affect the control plane only. Running workloads are managed by the Bun agent on each node, which doesn't care about Raft membership. Apps keep serving traffic. Health checks keep running. The gossip protocol keeps probing. The only visible effect is that the reporting tree rebalances: workers re-hash their parent assignments when the council membership changes, and the new parent starts receiving reports on the next cycle.
+Nothing. Council changes affect the control plane only. Running workloads are managed by the Bun agent on each node, which doesn't care about Raft membership. Apps keep serving traffic. Health checks keep running. The gossip protocol keeps probing. If the leader changes, workers point their reports at the new leader and send one straight away, so its view fills within a cycle.
 
 ## Healing the council
 
@@ -2746,6 +2789,22 @@ retain = 24
 ```
 
 Off by default. If you don't set `url`, the loop never starts and you pay nothing.
+
+Here's a trap we built for ourselves, though. "The loop never starts" also happened when you *did* set `url`: with no master key on the node, or a URL the object store couldn't open, Bun printed one line to stderr and carried on. Nothing else noticed. You'd find out on the day you needed a restore and the bucket was empty (#2016). A backup you can't see is a backup you don't have, so each node now keeps its loop's state in a `tokio::sync::watch` channel and serves it from `GET /v1/diagnostics`:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum BackupStatus {
+    NotConfigured,
+    Disabled { reason: String },
+    Running(BackupProgress),
+}
+```
+
+`#[serde(tag = "state")]` makes the JSON an object with a `"state"` field naming the variant, `{"state": "disabled", "reason": "..."}`, rather than serde's default of wrapping it in an object keyed by the variant name. `BackupProgress` holds the interval, when the loop started, the last successful export and the last failure. `prepare_backup` decides the starting state (and opens the store, so a bad URL is caught before the loop exists), and the loop calls `record_export` after each attempt. Both are plain functions, so the tests feed them a missing key, a bad URL and a failing store without a council in sight.
+
+`relish wtf` reads every node's status. Configured but disabled is critical, since there'll be nothing to restore from. The leader's last export failing, or no export by *any* node for three intervals, is a warning; counting any node means a fresh leader that hasn't ticked yet isn't flagged while its predecessor's backup is still recent. One voter without `[cluster.backup]` while the others have it is a warning too, because whichever voter leads is the one that exports, and `[cluster.backup]` is per-node config. No voter configured at all is *not* a warning, though. Every fresh cluster starts that way, the bare-metal appliance included, and a status row that turns yellow on day one teaches people to ignore yellow. So that case is an OK row that says backups aren't configured and points at the manual. And when wtf can't see a leader, it says nothing about backups rather than claim the leader is exporting them.
 
 "Each backend's standard credentials" was, for a while, a promise the code didn't keep. `object_store::parse_url` builds an S3 store with `AmazonS3Builder::new()`, which reads no environment at all, so `AWS_REGION` and friends were ignored and S3 quietly fell back to the instance's metadata credentials in `us-east-1` (#695). Chapter 15 has the fix in `object_storage::open`; the short version is that we now hand each builder its own `AWS_*` or `GOOGLE_*` variables.
 

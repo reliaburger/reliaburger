@@ -122,7 +122,7 @@ You’ll need two or more x86\_64 or arm64 machines with UEFI network boot, a su
 
 **Where it stands**
 
-Good enough for home labs and dev clusters. Not for production until 1.0.0, expected in January 2027. Until then, an upgrade can mean starting a fresh cluster. [What’s ready, feature by feature](https://reliaburger.com/features).
+Good enough for home labs and dev clusters. Not for production until 1.0.0, which has no date yet. Until then, an upgrade can mean starting a fresh cluster. [What’s ready, feature by feature](https://reliaburger.com/features).
 
 [Roadmap](https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md)
 
@@ -683,15 +683,9 @@ Four open models ran the agent gym in Ollama on our Mac Studio, at an 8K window,
 
 ## What’s next
 
-**0.2.8: Agents you can trust, built faster**
-
-In progress, with its scope still being settled. Agent changes as proposals you review and can undo, trying a change on a copy of production, and a record of why an agent did what it did. Alongside them, a faster loop for building and releasing Reliaburger itself.
-
-[Milestone](https://github.com/reliaburger/reliaburger/milestone/30)
-
 **0.3.0: Bare metal in an hour**
 
-After 0.2.8. An appliance OS, netbooting and claiming machines over the LAN, and signed A/B OS updates. The exit test: Dell Wyse thin clients from power-on to a cluster.
+Next, after 0.2.8. An appliance OS, netbooting and claiming machines over the LAN, and signed A/B OS updates. The exit test: Dell Wyse thin clients from power-on to a cluster.
 
 [Milestone](https://github.com/reliaburger/reliaburger/milestone/6)
 

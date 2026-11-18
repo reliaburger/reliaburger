@@ -409,7 +409,7 @@ pub fn tokens_to_sweep(tokens: &[ApiToken], now_unix_ms: u64) -> Vec<String> {
 }
 
 /// Milliseconds since the Unix epoch; zero for a time before it.
-fn unix_millis(at: SystemTime) -> u64 {
+pub fn unix_millis(at: SystemTime) -> u64 {
     at.duration_since(SystemTime::UNIX_EPOCH)
         .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)

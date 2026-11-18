@@ -465,3 +465,57 @@ async fn ingress_serves_https_with_self_signed_cert() {
 
     test_app.shutdown();
 }
+
+/// HTTP/2 carries the host in the `:authority` pseudo-header, not in a
+/// `Host` header. Browsers and curl negotiate h2 by ALPN on the HTTPS
+/// listener, so the proxy must route on the authority when no `Host`
+/// header is present.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ingress_routes_http2_requests_by_authority() {
+    let test_app = TestApp::start(TestAppMode::Healthy).await.unwrap();
+    let harness = IngressHarness::start_reaching(test_app.port()).await;
+
+    let config = Config::parse(&format!(
+        r#"
+        [app.secure]
+        script = "exec sleep 86400"
+        port = {}
+
+        [app.secure.ingress]
+        host = "secure.test"
+    "#,
+        test_app.port()
+    ))
+    .unwrap();
+    harness.client.apply(&config).await.unwrap();
+
+    // The host goes in the URL, never in a header: over HTTP/2 the client
+    // sends it only as `:authority`. Resolve the name to the local listener.
+    let http_client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .http2_prior_knowledge()
+        .resolve(
+            "secure.test",
+            SocketAddr::from(([127, 0, 0, 1], harness.https_addr.port())),
+        )
+        .build()
+        .unwrap();
+    let url = format!("https://secure.test:{}/healthz", harness.https_addr.port());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut last = None;
+    while tokio::time::Instant::now() < deadline {
+        match http_client.get(&url).send().await {
+            Ok(response) if response.status().as_u16() == 200 => {
+                assert_eq!(response.version(), reqwest::Version::HTTP_2);
+                test_app.shutdown();
+                return;
+            }
+            Ok(response) => {
+                last = Some(format!("{:?} {}", response.version(), response.status()));
+            }
+            Err(error) => last = Some(error.to_string()),
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("an HTTP/2 request for secure.test never reached the route; last saw {last:?}");
+}

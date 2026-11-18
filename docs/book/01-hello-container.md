@@ -743,7 +743,7 @@ Ten states. Each one means something specific:
 - **Unhealthy**: health checks are failing. Removed from the service map, no new traffic.
 - **Stopping**: graceful shutdown in progress, draining existing connections.
 - **Stopped**: process has exited, resources cleaned up.
-- **Failed**: permanent failure. Exceeded restart limits, or an init container crashed.
+- **Failed**: permanent failure. Exceeded restart limits, an init container crashed, or it never passed its startup health check.
 
 The key insight is that not all transitions are valid. You can't go from `Pending` directly to `Running`: you have to prepare first, start, and pass health checks. You can't go from `Failed` to `Running`: you have to start over from `Pending`. The state machine enforces this:
 
@@ -866,6 +866,8 @@ pub fn cgroup_path(namespace: &str, app_name: &str, instance: u32) -> PathBuf {
 ```
 
 `format!()` is Rust's string interpolation macro, similar to Python's f-strings or Go's `fmt.Sprintf`. But unlike `Sprintf`, the compiler checks the format string at compile time. If you reference a variable that doesn't exist, or use the wrong format specifier, you get a compilation error, not a runtime panic.
+
+That's where the chapter started, and `cgroup_path` still exists. A live instance uses `instance_cgroup_path` instead, whose leaf is `g{generation}-{ordinal}` (`/sys/fs/cgroup/reliaburger/default/web/g3-0`, say) rather than a bare ordinal. During a rolling deploy the old `web-0` and its successor exist side by side, and with a bare `0` they'd share one directory: retiring the old container would delete the new one's cgroup. Putting the deployment generation in the name gives each its own. The function also refuses an instance id whose shape doesn't match its namespace and app, so a confused caller can't point it somewhere else.
 
 CPU limits use two parameters. `cpu.max` is a hard limit: "this container can use at most X microseconds of CPU time per Y-microsecond period." `cpu.weight` is proportional sharing: "when the CPU is contended, give this container this share relative to others."
 
@@ -1124,7 +1126,7 @@ pub struct WorkloadInstance {
 }
 ```
 
-Two fields at the bottom deserve a note. `is_job` distinguishes run-to-completion tasks from long-running apps. We could have modelled this as an enum (`WorkloadKind::App` vs `WorkloadKind::Job`) instead of a boolean, and for a system with more workload types that would be the right call. For now, a boolean is honest about the two cases we actually have.
+Two fields at the bottom deserve a note. `is_job` distinguishes run-to-completion tasks from long-running apps. We could have modelled this as an enum (`WorkloadKind::App` vs `WorkloadKind::Job`) instead of a boolean, and for a system with more workload types that would be the right call. For now, a boolean is honest about the two cases we actually have. (That held until 0.2.0. Jobs then moved to their own task-array lifecycle, the supervisor went back to apps only, and `is_job` is gone; see the note under "Deploying a job".)
 
 `oci_spec` stores the OCI spec that was used to create this instance. Why keep it around? Because when an instance fails and gets restarted, the agent needs to call `grill.create()` again with the same spec. Without storing it, we'd need to regenerate it from the original `AppSpec` or `JobSpec`, which means the agent would need to keep the config around and know which spec belongs to which instance. Storing the OCI spec directly is simpler and self-contained.
 
@@ -1274,6 +1276,8 @@ fn test_supervisor() -> WorkloadSupervisor<MockGrill> {
 The compiler generates a `WorkloadSupervisor<MockGrill>` that calls `MockGrill` methods directly. In production, we'll create a `WorkloadSupervisor<ContainerdGrill>` that calls the real runtime. Same code, different concrete type, zero runtime overhead.
 
 ### Deploying a job
+
+> **Later replaced.** This section and "Monitoring jobs" below describe the job path Phase 1 built, and it no longer exists. `deploy_job`, `is_job` and `check_jobs` were removed in 0.2.0, when every job (a TOML `[job.*]`, a cron fire, a `run_before` hook) became a one-task array on the leader-driven task-array lifecycle. A TOML job now gets four attempts by default, and a hook one attempt with a 600 s deadline (`JobDefinition::from_spec` in `src/meat/job.rs`). Chapter 17, "A Million Jobs", tells that story. We've kept the original here because the reasoning (no port, no health check, a bounded retry budget) still holds; only the machinery changed.
 
 Apps run forever (or until someone stops them). Jobs run to completion. A database migration, a batch data export, a cleanup script. You start it, it does its thing, it exits. If it fails, you retry a few times. If it keeps failing, you give up.
 
@@ -1451,7 +1455,7 @@ Every method on `HealthChecker` that deals with time takes a `now: Instant` para
 
 ```rust
 pub fn register(&mut self, instance_id: InstanceId, config: HealthCheckConfig, now: Instant) {
-    let deadline = now + config.initial_delay;
+    let deadline = deadline_after(now, config.initial_delay);
     // ...
 }
 ```
@@ -1459,6 +1463,8 @@ pub fn register(&mut self, instance_id: InstanceId, config: HealthCheckConfig, n
 This makes tests completely deterministic. You create an `Instant`, advance it by known amounts, and assert on the results. No flaky tests from timing races. No need for time-mocking libraries. Just pass the time you want.
 
 This is a general pattern worth adopting for any code that depends on the clock: make time a parameter, not a hidden dependency.
+
+Why `deadline_after` and not plain `now + config.initial_delay`? Because `Instant + Duration` panics when the sum doesn't fit in the clock. In C that would be silent wraparound; Rust's standard library chooses a loud failure instead. Rust gives you the quiet version too, `checked_add`, which returns an `Option<Instant>`: `None` means overflow, and you decide what happens. A review found that `initial_delay = 9223372036854775807` sailed through validation and then took the whole agent loop down on the first `register`. Now validation refuses any `interval` or `initial_delay` over a day, and `deadline_after` cuts the delay to that day and uses `checked_add`, so even a config that skipped validation can't panic the loop.
 
 ### evaluate_result: a pure function
 
@@ -1476,6 +1482,11 @@ pub fn evaluate_result(
             if counters.consecutive_healthy >= config.threshold_healthy =>
         {
             Some(ContainerState::Running)
+        }
+        (ContainerState::HealthWait, false)
+            if counters.consecutive_unhealthy >= STARTUP_FAILURE_LIMIT =>
+        {
+            Some(ContainerState::Stopping)
         }
         (ContainerState::Running, false)
             if counters.consecutive_unhealthy >= config.threshold_unhealthy =>
@@ -1497,6 +1508,32 @@ It takes all its inputs as parameters, does a `match`, and returns `Option<Conta
 The `match` uses Rust's pattern matching with guards (the `if` clauses). The tuple pattern `(current_state, status.is_healthy())` lets us branch on both values simultaneously. The `_` arm catches everything else: states where health check results don't drive transitions (`Pending`, `Preparing`, `Stopping`, etc.).
 
 Making this a free function rather than a method on `HealthChecker` or `WorkloadInstance` is a deliberate choice. It has no hidden state, no side effects, and it's trivially testable. You can write a dozen test cases for it without setting up a supervisor, a mock runtime, or an instance. Just call the function with different inputs and check the output.
+
+### Dying before the first healthy probe
+
+The second arm is the startup grace. A new instance that fails 60 probes in a row (`STARTUP_FAILURE_LIMIT`, about ten minutes at the default 10-second interval) is given up, so it doesn't sit in `HealthWait` for ever. It used to go straight to `Failed`, and a comment said `Failed` "flows into the restart path". It didn't. `maybe_restart` only restarts from `Unhealthy` or `Stopped`, so a `Failed` instance stayed `Failed`, and nothing recorded why. A review in November 2026 traced two ways that hurt (#1999).
+
+The first was a crash during startup, the classic crash loop. The agent notices an app's process exiting with a *state sweep*: every tick it asks the runtime for the state of each instance and routes an exit through `observe_app_exit`, which stops the instance and restarts it with backoff. But the sweep only asked about `Running` instances. A health-checked app is in `HealthWait` until its first passing probe, so an app that died on startup was never asked about. Its probes were refused for ten minutes, then it went `Failed` with no `restart` event, so `relish wtf` never saw the crash loop. In a cluster the leader eventually noticed the missing replica and redeployed it, ten minutes late and with no record of why.
+
+The second was a process that stays up but never answers its probe, because the `path` or `port` is wrong. It went `Failed` with its process still running. Anything that reads `Failed` as "not running" is then wrong about it: a volume snapshot restore checks for running instances that way, and would swap the volume under a live writer.
+
+The fix has two halves. The sweep now asks about every instance whose exit it watches, through one small function in `src/bun/agent/state_sweep.rs`:
+
+```rust
+pub(super) fn watches_exit(state: ContainerState) -> bool {
+    matches!(state, ContainerState::HealthWait | ContainerState::Running)
+}
+```
+
+`matches!` is a macro from the standard library that returns `true` when its first argument fits the pattern, here either of two variants. The planner uses it to choose which instances to read, and the loop uses it again when the answer comes back, because the instance may have moved on while the read was in flight. Keeping both checks in one function means they can't disagree.
+
+The other half is the grace itself. It now returns `Stopping`, not `Failed`, and `process_health_result` marks the instance `retry_pending` with the cause `RestartCause::NeverHealthy`. That's the same cleanup path a failed restart takes: the agent kills the process off the loop and confirms it's gone, then calls `maybe_restart`. There, a `Stopped` instance whose cause is `NeverHealthy` goes to `Failed` instead of `Pending`. It isn't restarted, because the same probe would fail the same way, and the agent records a `restart.never_healthy` decision with the probe and the failures in a row, so `relish agent explain` can say what happened.
+
+Adding a variant to `RestartCause` had a cost we could see straight away: `retry_restart` matches on the cause to name the rule it records, and Rust's `match` must cover every variant, so the code stopped compiling until we said what a `NeverHealthy` restart means. It means nothing, since `maybe_restart` never restarts one, and the arm says so and returns. In C or Go a new enum value falls through a `switch` silently; here the compiler made us decide.
+
+Review of the fix found one more way to leave something running. A sidecar restarts on its own when it crashes, in a task off the loop, and `HealthWait` counts as a state whose sidecars should run. If the grace ran out while a sidecar's restart was in flight, the cleanup killed the sidecars it knew about, and then the restart task finished and started its sidecar again, beside an instance now `Failed`. `observe_app_exit` already cancels those restarts; the cleanup path didn't. Now `begin_restart_cleanup` cancels them too, and a cancelled restart kills whatever it started. `a_sidecar_restarting_when_its_instance_is_given_up_does_not_survive` in `src/bun/agent/tests/sidecars.rs` slows the restart's create down so it lands after the cleanup, and checks that the proxy's last operation is a kill.
+
+Two agent tests pin the main fix, in `src/bun/agent/tests/restart_ownership.rs`. `an_exit_before_the_first_healthy_probe_restarts_and_is_recorded` deploys a health-checked app, makes the mock runtime report its process gone while it's still in `HealthWait`, and checks that one sweep restarts it and records `restart.process_exited`. `a_never_healthy_instance_is_stopped_before_it_is_failed` feeds refused probes until the grace runs out, and checks that the instance goes to `Stopping`, the runtime gets a kill, and only then is the instance `Failed`, with no restart and one `restart.never_healthy` decision.
 
 ### A default that depends on another field
 
@@ -2377,6 +2414,8 @@ _ = health_interval.tick() => {
 
 ### Monitoring jobs
 
+> **Later replaced.** `check_jobs` went with the rest of Phase 1's job path in 0.2.0 (see "Deploying a job" above). Task attempts are now watched by the task-array executors, which report completions to the leader; Chapter 17 covers them. The init-container and restart sections below still describe how apps work.
+
 Apps run forever. Jobs exit. The agent needs to notice when a job process has stopped and decide what to do about it. That's `check_jobs`:
 
 ```rust
@@ -2582,7 +2621,7 @@ The filter logic is specific: only instances that are Pending *and* have been re
 
 This is called the "collect-then-process" pattern. We gather everything we need to act on (releasing the borrow on the supervisor), then iterate and mutate. The alternative would be indexing into the instances map by position, which is both less readable and fragile if the map changes size during iteration.
 
-Everything in this section runs on the event loop, and every `.await` in it holds every other command until it returns. On one container that's fine. On a busy node, a few slow runc calls in a row made the whole node look dead, and Chapter 15 tells that story. Today the tick only *starts* this work: the state reads in `check_jobs` (and its sibling for apps, `check_apps`) run as one parallel sweep in a spawned task, and each restart's kill, create and start run in tasks of their own, reporting back to the loop between steps.
+Everything in this section runs on the event loop, and every `.await` in it holds every other command until it returns. On one container that's fine. On a busy node, a few slow runc calls in a row made the whole node look dead, and Chapter 15 tells that story. Today the tick only *starts* this work: the state reads in `check_apps` run as one parallel sweep in a spawned task, and each restart's kill, create and start run in tasks of their own, reporting back to the loop between steps.
 
 ## A local API
 
@@ -2797,9 +2836,9 @@ Here's what the integration tests cover:
 
 **`relish_status_returns_expected_output`**: deploy via the command channel directly (not HTTP), verify the status API reflects the expected app name.
 
-**`job_runs_to_completion`**: deploy a job with `command = ["echo", "migration complete"]`. Wait a few seconds for the process to exit, then verify the instance reaches Stopped state. This tests the full job pipeline: deploy, `drive_job_startup`, process exit detection in `check_jobs`, and the success path.
+**`job_runs_to_completion`**: deploy a job with `command = ["echo", "migration complete"]`. Wait a few seconds for the process to exit, then verify the instance reaches Stopped state. When we wrote it, this exercised Phase 1's job pipeline: deploy, `drive_job_startup`, process exit detection in `check_jobs`, and the success path. The test still exists in `tests/integration.rs`, and now drives the same TOML job through the task-array path instead.
 
-**`job_failed_retries_then_fails`**: deploy a job with `command = ["false"]`. The `false` command exits immediately with code 1. Wait for all retries to exhaust (3 retries with exponential backoff takes about 12 seconds), then verify the instance reaches Failed state and `restart_count > 0`.
+**`job_failed_retries_then_fails`**: deploy a job with `command = ["false"]`. The `false` command exits immediately with code 1. Wait for all attempts to run out (four by default today, with backoff between them; Phase 1 gave three retries), then verify the instance reaches Failed state and `restart_count > 0`.
 
 **`init_container_success_allows_app_start`**: deploy an app with an init container that runs `echo "init done"`. Verify the deploy succeeds and the app reaches Running. Tests the Preparing → Initialising → Starting path.
 
@@ -2906,6 +2945,33 @@ OCI images use a convention called *whiteout files* to handle deletions between 
 - `.wh..wh..opq` means "this entire directory is opaque — ignore everything from lower layers"
 
 The unpacker watches for these markers and removes the corresponding files before continuing with the rest of the layer.
+
+That sounds like two calls to `std::fs::remove_dir_all`, and it used to be. Two details make it harder.
+
+The first is symlinks. Ordinary tar entries go through the `tar` crate's `unpack_in`, which checks that each entry's parent directory really sits inside the rootfs. Whiteouts never reach that code: we resolve them ourselves. A lower layer can make `x` a symlink to `/etc`, and a path call on `rootfs/x/.wh.passwd` follows that symlink like any other. Checking the *name* (no `..`, no leading `/`) doesn't help, because the name is fine; the filesystem is what points elsewhere. Bun unpacks images as root, so the removal has to be unable to leave the rootfs.
+
+The fix lives in `src/grill/whiteout.rs`. It opens the rootfs as a directory descriptor and walks to the whiteout's parent one component at a time with `openat` and `O_NOFOLLOW | O_DIRECTORY`. If any component is a symlink, the kernel refuses to open it (`ELOOP` or `ENOTDIR`), and the whiteout has nothing to remove. Below that point every call is relative to a descriptor: `fstatat` with `AT_SYMLINK_NOFOLLOW` to see what an entry is, `openat` to descend, `unlinkat` to remove. A symlink inside a removed directory is unlinked as a link, so its target is never touched. This is the same pattern `chown_tree` in `src/grill/volume.rs` uses for volumes (chapter 5), and it comes from the `nix` crate we already depend on, so no new crate was needed. Linux's `openat2` with `RESOLVE_BENEATH` would do the walk in one call, but it isn't on macOS, where these unit tests also run.
+
+The first version opened every directory on the way with `O_RDONLY`, and review caught a regression in it. Opening a directory for reading needs its read bit, but walking through it on a path only needs the search (`x`) bit. Root doesn't care, but a rootless Bun unpacks as an ordinary user, and an image whose lower directory was `0311` would have failed to pull. On Linux the walk now uses `O_PATH`, a descriptor that's good for `*at` calls and nothing else, which asks only for the search bit. A directory is opened for reading only when we have to list it. The same rootless Bun can't remove anything from a `0555` directory either. There we chose to keep the entry, log a warning and carry on: the leftover is still inside the rootfs, and failing would refuse an image every other runtime runs. Any other error, such as a full disk, still fails the pull.
+
+Refusing every symlink has one visible effect. containerd follows symlinks that stay inside the root, so if an image has `lib -> usr/lib`, a whiteout written as `lib/.wh.foo` removes `usr/lib/foo` there and nothing here. We accept that. Builders take whiteouts from the overlay snapshot's upper directory, where the kernel has already resolved the link, so they write `usr/lib/.wh.foo`, the real path.
+
+The second is order. The OCI image spec says a whiteout hides only *lower* layers. Builders put whiteouts before their siblings, but nothing forces them to, and a layer listing `d/new.txt` and then `d/.wh..wh..opq` would lose its own `new.txt` if we applied the marker blindly. So the unpacker records each path the current layer has written in a `LayerEntries` set, and a whiteout skips those (and keeps any directory with something from this layer inside it). containerd's applier makes the same choice. The alternative, reading each layer twice so whiteouts can run first, would decompress every layer twice.
+
+`LayerEntries` wraps a `BTreeSet<PathBuf>`, and the "anything beneath this path?" question uses the set's ordering. `PathBuf` compares component by component, so everything under `a/b` sorts directly after `a/b` itself (and `a/b/c` sorts before `a/bc`). One range query answers it:
+
+```rust
+self.paths
+    .range::<Path, _>((Bound::Included(path), Bound::Unbounded))
+    .next()
+    .is_some_and(|first| first.starts_with(path))
+```
+
+`range::<Path, _>` is a *turbofish*: it names the generic type parameter by hand, here "look this up by `&Path`, not `PathBuf`". A `BTreeSet<PathBuf>` can be searched by `&Path` because `PathBuf` implements `Borrow<Path>`, the same trick that lets a `HashMap<String, _>` take a `&str` key. The tuple of `Bound`s is used instead of the shorter `path..` because the standard library's `RangeFrom<&T>` only works for sized `T`, and `Path` is unsized.
+
+Removing a directory tree uses an explicit stack, not recursion, so a deeply nested image fails with an error instead of overflowing the thread's stack. Each pending name holds an `Rc<Dir>` of its parent: `Rc` is a reference-counted pointer, so siblings share one open descriptor, which closes when the last of them is done.
+
+The tests `whiteouts_under_a_symlinked_parent_stay_inside_the_rootfs` and `whiteout_after_its_siblings_keeps_the_same_layer_entries` pin both rules. Each failed against the old path-based code.
 
 ### Content-addressed caching
 

@@ -238,15 +238,20 @@ impl CouncilNode {
     pub fn with_recovery_fence(mut self, fence: RecoveryFence) -> Self {
         let mut raw = self.raft.metrics();
         let mut fence_rx = fence.subscribe();
-        let (filtered_tx, filtered_rx) =
-            watch::channel(fenced_view(raw.borrow().clone(), &fence_rx.borrow()));
+        // Each borrow is copied out in its own statement, so the metrics
+        // and fence borrows are never held together (#1273, #1433).
+        let metrics = raw.borrow().clone();
+        let snapshot = *fence_rx.borrow();
+        let (filtered_tx, filtered_rx) = watch::channel(fenced_view(metrics, &snapshot));
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     changed = raw.changed() => if changed.is_err() { break },
                     changed = fence_rx.changed() => if changed.is_err() { break },
                 }
-                let view = fenced_view(raw.borrow().clone(), &fence_rx.borrow());
+                let metrics = raw.borrow().clone();
+                let snapshot = *fence_rx.borrow();
+                let view = fenced_view(metrics, &snapshot);
                 if filtered_tx.send(view).is_err() {
                     break;
                 }
@@ -1389,7 +1394,10 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(60));
 
         nodes[0]
-            .write(RaftRequest::RevokeApiToken { name: "ci".into() })
+            .write(RaftRequest::RevokeApiToken {
+                name: "ci".into(),
+                now_unix_ms: 0,
+            })
             .await
             .unwrap();
         assert!(

@@ -14,12 +14,18 @@ app inside 15 minutes; Bun records one for every restart, so `relish events`
 shows the same history `wtf` read. A high lifetime restart count in
 `relish apps` on its own isn't one.
 
-You only need to reach one node. `wtf`, `inspect` and `path` send every
-per-node request through the node you're connected to (`/v1/nodes/<node>/relay/...`), carrying
-your own credential, so they work from a laptop whose VMs sit behind Lima's
-private network. The relay forwards only the handful of read-only diagnostic
-calls these commands make, plus the path probe itself, and each target
-repeats every authentication and authorisation check.
+You only need to reach one node. `wtf`, `inspect`, `path`, `test` and `exec`
+send every per-node request through the node you're connected to
+(`/v1/nodes/<node>/relay/...`), carrying your own credential, so they work
+from a laptop whose VMs sit behind Lima's private network. The relay forwards
+only the handful of read-only diagnostic calls these commands make, plus two
+`POST`s: the path probe (`POST /v1/path`) and `relish exec` into an instance
+on another node (`POST /v1/exec/<app>/<namespace>`). Each target repeats every
+authentication and authorisation check, so an exec through the relay needs
+the same Deployer role and `exec` permission as one sent straight to the
+node. The relay builds the target's path one segment at a time and refuses a
+path that would need any percent-encoding, and a node-only route on the
+target refuses a relayed request.
 
 ```sh
 relish wtf                       # diagnose the whole cluster
@@ -70,6 +76,17 @@ that can't unseal the cluster's GitOps credentials (no master key) gets a
 `gitops-config-unreadable` warning, since as leader it couldn't sync. With none
 of these, the `gitops` OK row says so. See
 [GitOps](12_operations.md#gitops).
+
+`wtf` asks every node what its council backup loop is doing. A node with
+`[cluster.backup]` set whose loop can't run (no master key, or a destination
+the object store can't open) is a critical `backup-disabled` finding with the
+reason. The leader's last export failing, or no node having exported for three
+intervals, is a `backup-failing` warning. One council member without
+`[cluster.backup]` while others have it is a `backup-not-configured` warning.
+With no member configured, the `backups` OK row says backups aren't
+configured; otherwise it says the leader is exporting. With no leader
+observed, there's no `backups` row. See
+[Backing up the council](12_operations.md#backing-up-the-council).
 
 `wtf` also asks every node for its own view of the council, because a split
 brain looks healthy from either half. It reports CRITICAL when a node is
@@ -156,6 +173,9 @@ means, the numbers that decide it and the line of code that does (see
 | `gitops-plaintext-secret` | warning | A secret is plaintext in the GitOps repository |
 | `gitops-local-config` | warning | A node's own `[gitops]` is ignored |
 | `gitops-config-unreadable` | warning | A node can't unseal the GitOps credentials |
+| `backup-disabled` | critical | A node has `[cluster.backup]` but its backup loop can't run |
+| `backup-not-configured` | warning | One council member lacks `[cluster.backup]` while others have it |
+| `backup-failing` | warning | The leader's last backup failed, or none for 3 intervals |
 | `policy-broken` | warning | A policy in force can't be evaluated |
 | `policy-would-deny` | warning | A committed app or job breaks a deny policy |
 | `policy-audit` | warning | A committed app or job breaks an audit policy |
@@ -229,6 +249,7 @@ far back the records reach: unknown, not "it didn't happen".
 | `restart.start_failed` | The runtime couldn't start the instance, so the node cleaned up and tried again |
 | `restart.health_failed` | The instance failed `threshold` health probes in a row, so the node restarted it |
 | `restart.budget_exhausted` | The instance used its whole restart budget, so the node gave up and marked it failed |
+| `restart.never_healthy` | The instance never passed its health check in its startup grace, so the node stopped it and marked it failed instead of restarting it |
 | `restart.sidecar_exited` | A sidecar exited and was restarted on its own |
 | `deploy.refused.policy` | An enforcing policy denied the apply |
 | `deploy.refused.owner` | The apply named an owner the caller can't speak for |

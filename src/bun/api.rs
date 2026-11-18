@@ -981,6 +981,7 @@ pub fn router_with_upgrade(
         .merge(auth_routes)
         .merge(protected)
         .layer(axum::middleware::map_response(ui::forbid_framing))
+        .layer(axum::middleware::from_fn(keep_node_routes_node_only))
         .layer(axum::middleware::from_fn_with_state(
             state,
             refuse_retired_tls_peer,
@@ -1422,12 +1423,24 @@ async fn known_node_api_url(
     }
 }
 
+/// Set on every request a node forwards or relays on a person's behalf.
+///
+/// Such a request goes out over the forwarding node's own TLS connection,
+/// so it presents that node's client certificate. A route that admits a
+/// node by its certificate alone would take the person for the node, so the
+/// node-only routes refuse any request that carries this header (see
+/// [`keep_node_routes_node_only`]). A client can set it too, but all it
+/// does is get the client refused.
+pub(crate) const FORWARDED_FOR_USER_HEADER: &str = "x-reliaburger-forwarded-for-user";
+
 /// Preserve the end user's credential so the target node repeats every
-/// authentication and server-policy check.
+/// authentication and server-policy check, and mark the request
+/// [`FORWARDED_FOR_USER_HEADER`] so node-only routes refuse it.
 pub(crate) fn copy_forwarded_auth(
-    mut request: reqwest::RequestBuilder,
+    request: reqwest::RequestBuilder,
     headers: &HeaderMap,
 ) -> reqwest::RequestBuilder {
+    let mut request = request.header(FORWARDED_FOR_USER_HEADER, "1");
     for name in [
         axum::http::header::AUTHORIZATION,
         axum::http::header::COOKIE,
@@ -1445,6 +1458,42 @@ pub(crate) fn copy_forwarded_auth(
         );
     }
     request
+}
+
+/// Refuse a request a node forwarded or relayed for a person when the route
+/// is node-only: one the matrix gives the system principal, or one that
+/// admits a node by its TLS certificate alone, like `/v1/cluster/master-key`.
+///
+/// The forwarding node presents its own certificate, so without this a
+/// person could borrow it. A node's own calls to these routes never carry
+/// [`FORWARDED_FOR_USER_HEADER`].
+pub(super) async fn keep_node_routes_node_only(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let node_only = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .is_some_and(|route| crate::bun::authz::is_node_only(request.method(), route.as_str()));
+    if node_only && request.headers().contains_key(FORWARDED_FOR_USER_HEADER) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "this route answers nodes only, not a request forwarded for a person"
+            })),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+/// The answer to a request whose values can't go into a peer URL.
+pub(crate) fn peer_path_refusal(error: &crate::cluster::http::PeerPathError) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": format!("can't forward this request: {error}") })),
+    )
+        .into_response()
 }
 
 /// Gather instance statuses from the agent.

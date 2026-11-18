@@ -880,6 +880,10 @@ impl Default for PortRange {
     }
 }
 
+/// The longest `[reporting_tree] stale_report_timeout_secs` validation
+/// accepts: one day. The report interval must be shorter still.
+pub const MAX_STALE_REPORT_TIMEOUT_SECS: u64 = 86_400;
+
 /// Reporting tree configuration.
 ///
 /// Controls how often worker nodes send state reports to their assigned

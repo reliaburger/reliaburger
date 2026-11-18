@@ -12,11 +12,11 @@ Design document for the Mustard gossip protocol and the Raft consensus layer in 
 
 Reliaburger coordinates a cluster of up to 10,000 homogeneous nodes without a dedicated control plane. Two protocols operate at different scales to make this work:
 
-- **Mustard** is the gossip protocol. It is based on SWIM (Scalable Weakly-consistent Infection-style Membership) and runs on every node. Mustard handles cluster membership discovery, failure detection, leader identity broadcast, node resource summaries, and catastrophic recovery candidate distribution. It carries only lightweight, fixed-size payloads and achieves O(log N) convergence with O(1) per-node network overhead.
+- **Mustard** is the gossip protocol. It is based on SWIM (Scalable Weakly-consistent Infection-style Membership) and runs on every node. Mustard handles cluster membership discovery, failure detection and leader identity broadcast. Node resource summaries and catastrophic-recovery candidate distribution are planned on top of it, not sent today (§3, §5.5). It carries only lightweight, fixed-size payloads and achieves O(log N) convergence with O(1) per-node network overhead.
 
 - **Raft** runs on a small dynamic council of 3 to 7 nodes selected from the cluster. One council member is the leader; the others are hot standbys. Raft handles leader election among council members, replication of desired state (app specs, secrets, scheduling decisions), and cluster configuration changes. Raft is explicitly not used for runtime state.
 
-- **The hierarchical reporting tree** is the third communication layer. Each worker node reports its runtime state (running containers, health, resource usage, job completions) to its assigned council member over mTLS. Council members aggregate reports for the leader. This keeps variable-size payloads off the gossip mesh, preserving SWIM's scaling properties.
+- **Reporting** is the third communication layer. Each node reports its runtime state (running containers, health, resource usage, job completions) over mTLS. Today every node reports straight to the leader; a hierarchical tree, with council members aggregating for the leader, is planned ([#364](https://github.com/reliaburger/reliaburger/issues/364)). This keeps variable-size payloads off the gossip mesh, preserving SWIM's scaling properties.
 
 **Key design decisions:**
 
@@ -150,6 +150,10 @@ The Raft consensus group operates independently from Mustard but depends on it f
 
 1. **Leader discovery.** When a new Raft leader is elected, the leader announces itself via Mustard gossip so all 10,000 nodes learn the leader identity without Raft having to communicate with them.
 2. **Council member replacement.** When a council member departs, the leader uses Mustard's membership list to find a suitable replacement.
+
+**How a node resolves the leader** (`src/cluster/directory.rs`, `resolve_leader`). The leader stamps a `LeaderHint` (its id, term, recovery epoch and endpoints) on its gossip, and every node relays the newest one it has seen, ordered by recovery epoch and then term. A Raft member (voter or learner) trusts its own metrics, and takes a hint over them only when the hint is newer and its term is at most ten above the member's own (`MAX_LEADER_HINT_TERM_LEAD`), so an absurd term can't carry a member's reporting epoch away. The bound applies only to a hint from the recovery epoch the member's own term belongs to (`NodeDirectory::local_recovery_epoch`, from its fence): a fenced voter of a replaced council still holds its old term, which says nothing about the new council's term line. A node outside the Raft membership never hears AppendEntries and stays at term 0, so that bound would lose it the leader from the cluster's eleventh election on; it takes the hint as it is ([#1996](https://github.com/reliaburger/reliaburger/issues/1996)). Gossip is HMAC-authenticated with the cluster key, and the reporting epoch only gates anything on the leader, which is a member.
+
+A recovery (`relish council recover`) starts a fresh term line at a new recovery epoch, so a term only compares within one epoch. Each node's gossip directory holds a recovery floor, the newest epoch its own recovery fence knows (`FenceSnapshot::newest_known_epoch`). It never adopts a hint from below the floor and drops one when the floor rises, so the replaced council's hint, still relayed by survivors, can't outrank the recovered leader. The leader-target maintainer keys the reporting epoch on `(recovery_epoch, term)`: the node's own Raft metrics always set it, even downwards, and a gossip hint only moves it forward. Before this, an old council's higher term could raise a recovered leader's reporting epoch for good, and the scheduler skips every pass while that epoch differs from the leader's term ([#1997](https://github.com/reliaburger/reliaburger/issues/1997)).
 
 Raft is used for:
 

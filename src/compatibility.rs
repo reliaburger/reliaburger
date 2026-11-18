@@ -254,6 +254,9 @@ pub struct Compatibility {
 /// or supersedes, and `/v1/version` carries `os_trial`.
 /// OIDC signing-key rotation (#709): `SecurityState::retiring_oidc_keys`, and
 /// the `RotateOidcSigningKey` and `RetireOidcSigningKeys` Raft requests.
+/// `RaftRequest::RevokeApiToken` carries the proposer's `now_unix_ms`, so
+/// the last-Admin guard counts only unexpired Admins (#2014); a node's
+/// `GET /v1/diagnostics` carries its council backup state (#2016).
 ///
 /// Bumping either number makes the checked-in gossip and Raft fuzz seeds
 /// stale: run `make fuzz-corpus-seed` in the same change (#1941). Keep the

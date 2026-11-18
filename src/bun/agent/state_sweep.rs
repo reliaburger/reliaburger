@@ -10,7 +10,8 @@
 //!
 //! A result can land after the instance it describes has moved on, so each
 //! read carries the instance's [`Incarnation`], and the loop applies an
-//! exit only to the same incarnation, still `Running`.
+//! exit only to the same incarnation, still in a state whose exit it
+//! watches ([`watches_exit`]).
 
 use std::time::{Duration, Instant};
 
@@ -44,6 +45,14 @@ impl Incarnation {
             restart_count: instance.restart_count,
         }
     }
+}
+
+/// Whether the sweep watches an app in `state` for its process exiting.
+/// A `HealthWait` app's process is started, so a crash before its first
+/// healthy probe is an exit like any other: no probe would notice, because
+/// a startup probe that fails only counts towards giving up.
+pub(super) fn watches_exit(state: ContainerState) -> bool {
+    matches!(state, ContainerState::HealthWait | ContainerState::Running)
 }
 
 /// One instance the sweep asks the runtime about.
@@ -99,7 +108,7 @@ async fn observe<G: Grill>(grill: &G, read: &StateRead) -> Observed {
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
-    /// The instances whose runtime state a sweep should read: running apps
+    /// The instances whose runtime state a sweep should read: started apps
     /// (to catch a crash that no health check would), filtered by `include`,
     /// and the sidecars that should be running beside a started instance
     /// (#1120), each read under its instance's incarnation.
@@ -115,7 +124,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .collect();
         let apps = instances
             .iter()
-            .filter(|instance| instance.state == ContainerState::Running)
+            .filter(|instance| state_sweep::watches_exit(instance.state))
             .map(|instance| state_sweep::StateRead {
                 id: instance.id.clone(),
                 incarnation: state_sweep::Incarnation::of(instance),
@@ -135,7 +144,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         apps.chain(sidecars).collect()
     }
 
-    /// Start a sweep of every running app's runtime state, unless
+    /// Start a sweep of every started app's runtime state, unless
     /// the last one hasn't reported yet. The reads run off the loop; the
     /// sweep's `select!` branch applies what they saw.
     pub(super) fn begin_state_sweep(&mut self) {
@@ -153,7 +162,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Apply a finished sweep: every app it saw exit goes through the
     /// restart path, if it's still the incarnation the sweep read and still
-    /// Running.
+    /// in a state whose exit the sweep watches.
     pub(super) async fn apply_state_sweep(
         &mut self,
         sweep: Result<state_sweep::StateSweep, tokio::task::JoinError>,
@@ -188,7 +197,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .supervisor
                 .get_instance(&read.id)
                 .is_some_and(|instance| {
-                    instance.state == ContainerState::Running
+                    state_sweep::watches_exit(instance.state)
                         && state_sweep::Incarnation::of(instance) == read.incarnation
                 });
             if !current {

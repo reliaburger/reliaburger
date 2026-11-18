@@ -1869,7 +1869,7 @@ async fn writes_the_leader_refuses_come_back_through_the_follower_unchanged() {
             .text()
             .await
             .unwrap()
-            .contains("last Admin token")
+            .contains("only Admin token")
     );
     assert_eq!(
         cluster

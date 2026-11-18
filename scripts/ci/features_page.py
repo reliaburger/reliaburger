@@ -400,7 +400,7 @@ def render(catalogue, repo=REPO):
     <!-- Generated from {SOURCE} by `make features-page`: edit the TOML, not this file. -->
     <main id="main" class="comparison-page features-page">
       <div class="comparison-intro"><div class="eyebrow">FEATURE STATUS · {release}</div><h1>What's ready, and what isn't.</h1><p class="lede">Every feature of Reliaburger {release}, released on {html.escape(catalogue.released)}: how far along it is, what it doesn't do yet, and the open issues against it. Search the page for the thing you need.</p></div>
-      <div class="comparison-note"><p>Before 1.0.0, all of it is for home labs and dev clusters, not production. 1.0.0 is expected in January 2027. Until then, an upgrade can mean starting a fresh cluster.</p></div>
+      <div class="comparison-note"><p>Before 1.0.0, all of it is for home labs and dev clusters, not production. 1.0.0 has no date yet. Until then, an upgrade can mean starting a fresh cluster.</p></div>
       <section id="statuses"><h2>What the statuses mean <a class="permalink" href="#statuses" aria-label="Link to what the statuses mean">#</a></h2>
         <div class="table-wrap"><table class="status-table"><thead><tr><th scope="col">Status</th><th scope="col">What it means</th></tr></thead><tbody>{meanings}</tbody></table></div>
         <p>The release gate is what every release passes before it ships: two installs from empty caches, hours of soak under faults with apps and jobs, and power cuts mid-write (<a href="{GITHUB}/blob/v{release}/docs/releasing.md#the-release-gate">how it works</a>). Unit tests alone don't make a feature Ready.</p>

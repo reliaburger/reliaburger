@@ -41,12 +41,12 @@ Wrapper is disabled by default. Operators enable it on selected nodes with `[ing
 1. Bun joins cluster (mTLS handshake via Sesame node certificate)
 2. Bun populates the service map from reporting tree state
 3. Bun starts Wrapper listener tasks
-4. Wrapper loads an operator certificate or builds its in-memory Ingress CA resolver
+4. Wrapper loads the operator certificate, if configured, and builds its in-memory Ingress CA resolver, if it can; each serves its own routes
 5. Wrapper binds ports 80 and 443
 6. Wrapper begins accepting connections
 ```
 
-Wrapper doesn't accept connections until at least one routing table entry exists. If no ingress routes are configured in any app spec, Wrapper binds the ports but returns `503 Service Unavailable` for all requests (with a human-readable body indicating no ingress routes are configured).
+If no ingress routes are configured in any app spec, Wrapper still binds its ports and accepts connections, but every request finds no route and gets `404 Not Found` with an empty body (`src/wrapper/proxy.rs`).
 
 ---
 
@@ -67,7 +67,7 @@ http_port = 80
 https_port = 443
 ```
 
-Each listener spawns a tokio task per accepted connection. Connections are tracked in a `DashMap<ConnectionId, ConnectionState>` for drain coordination.
+Each listener spawns a tokio task per accepted connection. Drain coordination doesn't track connections. It counts requests per backend instance: `SharedDrains` (`src/wrapper/draining.rs`) is a drain tracker behind an `Arc<Mutex<_>>`, and each request captures its backend's count under the routing table's read lock, so a drain started under the write lock can't miss it.
 
 Every accepted connection gets the deadlines in `sesame::connection::ConnectionTimeouts::PRODUCTION`, shared with Bun's API and registry listeners: a 10 s TLS handshake (`tls_handshake_timeout`), 75 s for the first request byte and for each HTTP/1 request head (which also closes idle keep-alive connections), HTTP/2 pings every 30 s with a 20 s ack deadline, a 300 s write-stall limit for responses and WebSockets nobody reads, and TCP keepalive (60 s idle, 15 s probes). A streaming response or a quiet WebSocket is never closed for being idle; only a stalled write ends it. TLS connections still retire after one hour. The stream wrappers that enforce the first-byte, write-stall and lifetime limits forward the socket's vectored writes (`is_write_vectored`, `poll_write_vectored`): without them Hyper copies every response body into a per-connection write buffer that it never shrinks, so each idle keep-alive connection kept the capacity of its largest answer (#892).
 
@@ -131,6 +131,26 @@ Wrapper manages TLS certificates per ingress route. Each route specifies a TLS m
 `relish apply` and `relish lint`. A route that reaches a node anyway is
 skipped rather than guessed at or served in plaintext.
 
+**Choosing per SNI (#2011):** one HTTPS listener serves every route on a node,
+so the listener's resolver (`wrapper::tls::RouteCertResolver`) picks the
+certificate per handshake from the SNI host's routes:
+
+| SNI host | Node has the source | Certificate served |
+|---|---|---|
+| `explicit` route | operator pair | the `[ingress]` `tls_cert`/`tls_key` pair |
+| `cluster` route | Ingress CA resolver | an Ingress CA leaf for that host |
+| `explicit` or `cluster` route | no | the self-signed development certificate, with one warning per host on stderr; never the other mode's certificate |
+| plain-HTTP route, unknown host, or no SNI | — | the operator pair if the node has one, else the self-signed certificate |
+| any SNI while a rebuild holds the routing table | — | the self-signed certificate for that handshake, since the host's mode is unknown |
+
+SNI names a host, not a path, so routes on one host share a certificate. When
+they disagree, `explicit` wins over `cluster`, and either wins over plain HTTP
+(`RoutingTable::certificate_mode`). Before 0.3.0 the listener made one choice
+for every route (disk pair if present, else the Ingress CA), so the mode only
+decided the plain-HTTP redirect. A cluster-mode node with no disk pair also
+minted an Ingress CA leaf for plain routes' hosts; now only `cluster` hosts get
+one, and plain hosts get the self-signed certificate.
+
 **Cluster CA flow (current):**
 
 ```
@@ -151,8 +171,8 @@ unconfigured host can never obtain a trusted cluster certificate. The cache is
 additionally capped as defence in depth.
 
 This currently requires the ingress node to have council state and the
-wrapping key material. If it doesn't, the listener uses its self-signed
-development certificate. Operators must not treat that fallback as a
+wrapping key material. If it doesn't, `cluster` hosts get the listener's
+self-signed development certificate, never the operator pair. Operators must not treat that fallback as a
 cluster-issued production certificate.
 
 **Explicit flow (current):**
@@ -160,7 +180,8 @@ cluster-issued production certificate.
 ```
 1. The operator sets both `tls_cert` and `tls_key` in `[ingress]`
 2. Wrapper reads the PEM files during startup
-3. Routes marked `tls = "explicit"` use that listener certificate
+3. Hosts with a `tls = "explicit"` route are served that pair; a node
+   without one serves those hosts the self-signed certificate and warns
 ```
 
 **Certificate storage:**
@@ -172,11 +193,15 @@ rotation process.
 
 **Certificate renewal:**
 
-Automatic renewal and hot reload aren't implemented. The current in-memory
-resolver also doesn't replace a cached cluster leaf at expiry. Production
-acceptance therefore needs renewal before the cluster mode can be called
-hands-off; until then, restart Wrapper before expiry or use externally rotated
-operator material.
+Both kinds renew without a restart. The cluster resolver
+(`IngressCertResolver` in `src/wrapper/tls.rs`) issues a new leaf for a
+hostname on the first handshake after the cached leaf passes the midpoint of
+its validity. If signing fails, it keeps serving the old leaf, but only until
+that leaf expires. Operator files are re-read once a second
+(`FileCertResolver::run`): a changed, valid pair replaces the served one on the
+next handshake, and a pair that won't load is logged once and ignored, so the
+last good pair stays in service until its own expiry. Expiry telemetry is still
+missing (§5.4).
 
 ### 3.5 Connection Draining During Deploys
 
@@ -465,14 +490,18 @@ Every inbound HTTPS request follows this path:
     - A cluster leaf is minted/served only for a configured ingress host;
       an unknown SNI (or none) is served the self-signed default, which a
       hostname-validating client rejects
-3.  HTTP/1.1 or HTTP/2 request parsed (via hyper's auto builder). NOTE: Wrapper's rustls config does not set `alpn_protocols`, so it does **not** advertise `h2` over TLS — HTTP/2-over-TLS/ALPN negotiation is planned, not shipped. (hyper's auto builder can still speak h2 on cleartext prior-knowledge.)
-4.  Host header extracted (falls back to SNI hostname)
+3.  HTTP/1.1 or HTTP/2 request parsed (via hyper's auto builder). Wrapper's rustls config advertises ALPN `h2, http/1.1`, so browsers and curl negotiate HTTP/2 over TLS. (hyper's auto builder also speaks h2 on cleartext prior-knowledge.)
+4.  Host taken from the `Host` header; when there is none (HTTP/2 sends the
+    host as the `:authority` pseudo-header, which hyper puts in the request
+    URI), from the URI's authority. The SNI hostname is not used.
 5.  Routing table lookup:
     a. Exact match on Host → Vec<PathRoute>
     b. Longest path prefix match → PathRoute
     c. If no match: respond 404 Not Found
 6.  Rate limit check:
-    a. Extract client IP (from X-Forwarded-For if trusted proxy, else peer IP)
+    a. Client IP is always the TCP peer address. There is no trusted-proxy
+       setting and Wrapper never reads X-Forwarded-For, so behind an HTTP load
+       balancer every client shares the balancer's bucket
     b. Check token bucket for (client_ip, route)
     c. If rate limited: respond 429 Too Many Requests with Retry-After header
 7.  Backend selection from BackendPool:
@@ -500,8 +529,9 @@ locally. There is no network CSR round-trip in the current implementation.
 **Mode: `explicit`**
 
 Used with `tls_cert` and `tls_key` in the node's `[ingress]` configuration.
-This is the public-certificate path in v1. The same listener certificate serves
-all explicit routes on that node, so its SANs must cover every advertised host.
+This is the public-certificate path in v1. The same pair serves all explicit
+routes on that node, so its SANs must cover every advertised host. `cluster`
+hosts on the same listener keep their Ingress CA leaves.
 
 **Mode: omitted / `none` / `off` / `disabled`**
 
@@ -526,11 +556,12 @@ credential boundaries exist would repeat the same documentation mistake.
 
 ### 5.4 Certificate Renewal (required follow-up)
 
-The v1 cluster resolver caches a generated leaf for the life of the Bun process
-and doesn't inspect its expiry. Operator certificates load at startup and don't
-hot-reload. A production implementation must renew or reload before expiry,
-retain the last valid certificate while rotation runs, expose expiry telemetry,
-and fail acceptance when a required certificate can't be refreshed.
+Renewal and reload ship (§3.4): the cluster resolver renews a leaf at the
+midpoint of its validity, operator files are re-read every second, and both
+keep the last valid certificate, never past its expiry, while a refresh fails.
+What's still missing is expiry telemetry and a check that fails loudly when a
+required certificate can't be refreshed. Today a refused file reload logs one
+line on stderr, and a failed cluster renewal logs nothing.
 
 ### 5.5 Connection Draining
 

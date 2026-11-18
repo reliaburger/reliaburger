@@ -542,6 +542,8 @@ The rule that took the most thought is what the sweep must *not* remove. Remembe
 
 So the sweep keeps the last Admin, even an expired one (the one that expired most recently, if there are several), and it never empties the store, even if there's no Admin left at all. The token it keeps can't authenticate anyone, but its presence keeps the store non-empty, and a non-empty store means the API stays closed. A test pins that from the other side: a store whose every token has expired still answers an anonymous request with `401`.
 
+The revoke guard had the opposite gap for a while (#2014). It counted every Admin, expired or not, so with one live Admin and one expired one, revoking the live one passed: two Admins, after all. What was left was a store with one Admin token that couldn't authenticate anyone, and nobody could mint a new one. The guard now asks the question that matters, "would a usable Admin be left?", so it counts only Admins that haven't expired and aren't scoped: a namespace-scoped Admin can't create or revoke tokens (`require_unscoped`), so it can't replace root either. And it gets "now" the same way the sweep does: `RevokeApiToken { name, now_unix_ms }` carries the clock of the node that proposed it, so every replica judges expiry at the same instant. An expired Admin can still be revoked while a live one remains, and the only Admin in the store still can't be, expired or not, for the bootstrap-window reason above. The tests `revoke_refuses_to_remove_the_last_unexpired_admin_token` and `revoke_refuses_to_remove_the_last_unscoped_admin_token` set up exactly those pairs, and the refusal says which rule it hit, so an operator with one expired Admin isn't told it's "the last unexpired" one.
+
 Each removal is audited like a revoke. The leader records a `token.expired_swept` event per token, with principal `system`, since no person asked for it.
 
 ### Rotating a token without an outage
@@ -1012,7 +1014,65 @@ The matrix rows changed to match (`App(DEPLOY)` on the snapshot routes, `Body(FA
 
 Reads had a version of the same problem. Every container gets a JWT, and the manual calls it confined to the workload's own app and namespace. But `/v1/resolve`, `/v1/routes`, `/v1/fault` and `/v1/build/{id}` took no auth context at all, so one compromised container could list every service VIP, every ingress route and every fault in the cluster. They now filter like `/v1/status` does, with `authorize_scoped(...).is_ok()` in a `filter`. That needed a namespace on two wire types that only carried an app name (`RouteInfo` and `FaultSummary`), and a destination repository on each build record. `GET /v1/fault?cluster=true` refuses a scoped caller outright, as the events listing does, because node faults belong to no tenant. The legacy batch status branch got the scope check its task-array neighbour already had.
 
-Three smaller holes went in the same change. The node relay forwards only an allowlist of paths, but it built a URL from the path, and a URL resolves `..` away: `v1/exec/../apply` matched the exec rule and left as `POST /v1/apply`. The target re-authorised, so it wasn't an escalation, but an allowlist you can walk around isn't one. The relay now refuses any `.` or `..` segment, percent-encoded or not. The session cookie gets `Secure` when the API serves TLS, which the handler learns from the `TlsTransport` extension the TLS listener puts on every request. And the registry, which used to fall back to plaintext when its TLS configuration failed to build, now fails to start, as the API always did.
+Three smaller holes went in the same change. The node relay forwards only an allowlist of paths, but it built a URL from the path, and a URL resolves `..` away: `v1/exec/../apply` matched the exec rule and left as `POST /v1/apply`. The target re-authorised, so it wasn't an escalation, but an allowlist you can walk around isn't one. The relay first refused any `.` or `..` segment, percent-encoded or not, and that turned out to be checking the wrong thing; the next section says why. The session cookie gets `Secure` when the API serves TLS, which the handler learns from the `TlsTransport` extension the TLS listener puts on every request. And the registry, which used to fall back to plaintext when its TLS configuration failed to build, now fails to start, as the API always did.
+
+### Build the path the peer will see
+
+That dot-segment check looked at the string the relay was handed. What the peer answers is the path in the URL the relay builds, and a URL parser does more to a string than resolve `..`. The [WHATWG URL Standard](https://url.spec.whatwg.org/#path-state), which the [`url`](https://docs.rs/url) crate under reqwest follows, reads `\` as `/` in an `http` or `https` URL, and it drops every tab and newline before it parses at all. So a segment written `..%5C..%5Cstatus` decodes to one segment, `..\..\status`, which matches no dot rule, and the URL turns it into three levels, two of them `..`. A segment `.%09.` decodes to `.`, a tab, `.`, and the parser hands back `..`. Checking a string and then letting a parser reshape it isn't a check on what gets sent.
+
+Two changes close the gap, and they go further than the relay, because every node that forwards a request formats the caller's values into a peer URL: the lease id in a test-lease read, an app and namespace in a stop, a policy name in a delete.
+
+First, a peer path is never formatted any more. `cluster::http::peer_path` takes the path's segments and encodes each one on its own:
+
+```rust
+pub fn peer_path<S: AsRef<str>>(segments: &[S]) -> Result<String, PeerPathError> {
+    for segment in segments {
+        let segment = segment.as_ref();
+        if segment.is_empty() {
+            return Err(PeerPathError::EmptySegment);
+        }
+        if segment == "." || segment == ".." {
+            return Err(PeerPathError::DotSegment(segment.to_string()));
+        }
+        if segment.chars().any(char::is_control) {
+            return Err(PeerPathError::ControlCharacter(segment.to_string()));
+        }
+    }
+    let mut url = url::Url::parse(ENCODING_BASE).map_err(|_| PeerPathError::Encoder)?;
+    url.path_segments_mut()
+        .map_err(|()| PeerPathError::Encoder)?
+        .pop_if_empty()
+        .extend(segments);
+    Ok(url.path().to_string())
+}
+```
+
+`S: AsRef<str>` is a generic bound: `S` can be any type that lends out a `&str`, so one function takes `["v1", "test", "leases", id]` whether `id` is a `&str` or a `String`. `path_segments_mut()` is the `url` crate's way to add segments to an existing URL: it percent-encodes `/`, `\`, `%`, `?` and `#` inside each one, so a segment stays one segment. It does two things quietly that we can't allow, though. It skips a `.` or `..` segment instead of adding it, and the parser underneath drops tabs and newlines. Skipping a segment changes the path as surely as resolving one, so `peer_path` refuses dot segments and every control character before the encoder sees them. The `Encoder` variant is there because `Url::parse` and `path_segments_mut` both return a `Result`, and the project doesn't `unwrap` in library code; a constant `http://` base never fails either.
+
+Every forward that carries a caller's value now goes through it: the lease reads, renewals and releases, app stops and deletes, job disables, deploy cancels, policy deletes, the cross-node log follow, the deploy-history fan-out and the snapshot forward. A value that can't be a segment gets a 400 at the first node, and nothing is sent.
+
+Second, the relay checks its allowlist against the path it built, not the one it was given. `relay_peer_path` splits the decoded path on `/`, runs the segments through `peer_path`, and passes only a path that came back unchanged: one that needed no encoding at all. App names, namespaces and the allowlisted routes are plain text, so nothing the relay serves needs a `%`, and a path that would need one is refused rather than rewritten. `Option::then_some` keeps the end tidy: `allowed.then_some(peer_path)` is `Some(peer_path)` when `allowed` is true and `None` otherwise.
+
+The tests come in three layers. `peer_path`'s own unit tests feed it backslashes, slashes, percent signs, tabs, newlines, NUL and a C1 control character, and one parses the result again with the scheme and authority to show the segment count survives. `relay_refuses_backslashes_in_a_segment` and its neighbours hold the allowlist to the built path. And `the_relay_refuses_encoded_backslashes_tabs_and_newlines` sends the encoded forms through a real entry node to a real peer, and checks the ordinary `v1/status` relay still answers beside them.
+
+### Node-only routes stay node-only
+
+A forwarded request has a second property that matters. The node sends it over its own TLS connection, which presents its own client certificate. Most routes don't care: they authorise the bearer token the request carries, and a forwarded request carries the person's. But a few routes admit a *node*, and one of them, `GET /v1/cluster/master-key`, admits a node by its certificate alone, because a node that has just joined has no service token yet. The service token is derived from the master key it's asking for.
+
+So a forwarded request now says what it is. `copy_forwarded_auth`, which every relay and leader forward already used to pass on the person's credential, also sets `x-reliaburger-forwarded-for-user`, and the lease forwarder, which copies the credential itself, sets it too. A middleware on the API router refuses any request that carries it when the matched route is node-only:
+
+```rust
+let node_only = request
+    .extensions()
+    .get::<axum::extract::MatchedPath>()
+    .is_some_and(|route| crate::bun::authz::is_node_only(request.method(), route.as_str()));
+```
+
+`MatchedPath` is the route pattern axum matched, like `/v1/placements/{node_id}`, rather than the concrete path, so the check reads the same table as the rest of the authorisation code. A route is node-only when its matrix row names the `System` principal, or when it's in `CERTIFICATE_ONLY_ROUTES`, a one-row list for the master-key handout. A middleware added with `Router::layer` runs after routing, which is why `MatchedPath` is there to read.
+
+The alternative was to make every node-only route demand the service token as well. Renewal and the other `System` routes already do. The master-key route can't, for the reason above, and a marker that the forwarding node adds is something no forwarded request can leave out. A client can set the header itself, but all that gets it is a 403.
+
+A static test, `every_route_that_reads_the_tls_peer_is_node_only`, reads every mounted handler's source, and any handler that takes a `TlsPeerCertificate` must sit on a node-only route. A suite test, `a_request_forwarded_for_a_person_is_refused_by_node_only_routes`, presents a valid member certificate with the marker and gets a 403 from the master-key route and from renewal, then drops the marker and gets the key.
 
 ### Don't hash under a lock
 

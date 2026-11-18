@@ -141,7 +141,14 @@ own ingress CA, which renew themselves; your clients need to trust that CA.
 `examples/phase-1/container-tls-ingress.toml` serves podinfo this way.
 `explicit` uses the `tls_cert` and `tls_key` PEM files from this node's
 `[ingress]` section, reloaded when they change; Bun rejects a half-configured
-pair. There's no ACME: `relish apply` and `relish lint` refuse `auto` and
+pair. Both kinds of route can share a node: the ingress picks the certificate
+by the hostname the client asks for. Routes on one host share a certificate,
+and `explicit` wins if they disagree. A node missing what a route's mode needs
+(no pair for `explicit`, no cluster CA for `cluster`) serves that host the
+self-signed fallback and logs a warning, rather than the other mode's
+certificate. A host whose routes are all plain HTTP, reached over HTTPS, gets
+the node's `tls_cert` pair if it has one and the self-signed fallback if not;
+it never gets a cluster certificate. There's no ACME: `relish apply` and `relish lint` refuse `auto` and
 `acme`, as they do any other unknown mode. The listener's self-signed fallback
 is for development, not a substitute for either mode.
 

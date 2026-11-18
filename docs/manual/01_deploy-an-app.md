@@ -91,10 +91,18 @@ initial_delay = 0         # seconds before the first probe (default 0)
 
 `health.port` works without an app `port`, so an app can probe a separate
 admin listener. `relish apply` refuses a health check with neither, a zero
-interval, timeout or threshold, and a `timeout` longer than the
-`interval`. Leave `timeout` out and it's 5 seconds or the interval,
-whichever is shorter, so `interval = 2` on its own is fine. A new instance that never passes is given up after 60 failed
-probes (about ten minutes at the default interval) and restarted.
+interval, timeout or threshold, an `interval` or `initial_delay` over a day
+(86400 seconds), and a `timeout` longer than the `interval`. Leave `timeout` out and it's 5 seconds or the interval,
+whichever is shorter, so `interval = 2` on its own is fine.
+
+A new instance that crashes before its first passing probe is restarted at
+once, with the usual backoff, and records a `restart` event, so `relish wtf`
+sees a crash loop. One whose process stays up but never passes (a wrong
+`path` or `port`, say) is given up after 60 failed probes in a row (about ten
+minutes at the default interval). The node stops its process and marks it
+`failed` instead of restarting it, and records why under
+`restart.never_healthy`. Restarting wouldn't help: the same probe fails the
+same way. Fix the check and apply again.
 
 ## Init containers
 
@@ -649,7 +657,10 @@ Each node keeps its last 50 deploys per app.
 
 In a cluster, `relish rollback` takes its target from the council, which keeps
 the last ten versions of each app that rolled out healthy on every node, so it
-works from whichever node you ask and after every node has restarted. The
+works from whichever node you ask and after every node has restarted. A
+follower sends the rollback on to the leader, which picks the target from its
+own state, so a deploy that has just committed counts even on a node that
+hasn't caught up with it yet. The
 previous version is the newest one there that differs from what the app runs
 now. Without one (a single node, or an app that never finished a rollout) it
 falls back to the cluster-wide history. A rollback changes the version and

@@ -31,20 +31,21 @@ Reading the cluster:
 | `status` | the agent envelope (`relish.agent/v1`): `data.verdict`, `data.problems`, `data.lines`, `data.wtf` and `data.summary` (the `GET /v1/cluster/summary` answer), with `next` steps |
 | `apps` | one row per app: `namespace`, `app`, `state`, `desired`, `running`, `restarts`, `nodes`, `age_seconds`, `reason` |
 | `apps NAME`, `apps --instances` | one record per instance: `node`, `id`, `app_name`, `namespace`, `state`, `pid`, `restart_count`, `age_seconds`, `reason` |
-| `nodes` | one record per node: its gossip state and address, `version`, `cpu_percent`, `memory_percent`, `disk_percent`, `allocated`, `cordoned`, `disk_pressure` and `unanswered` |
-| `logs` | one object per line (JSON Lines): `at`, `node`, `instance`, `stream`, `text` |
+| `nodes` | one record per node: its gossip state and address, `version`, `cpu_percent`, `memory_percent`, `disk_percent`, `allocated`, `cordoned`, `disk_pressure` and `unanswered`; an empty list on a standalone node |
+| `logs` | one object per line (JSON Lines): `at`, `node`, `instance`, `stream`, and the line in `text`, an `untrusted` object |
+| `events` | `events`, each with its `message` in an `untrusted` object, and `warnings` for the members that didn't answer |
 | `inspect` | `desired` (or `desired_error`), then each node's `answer`: its `instances`, or the `reason` it's missing |
 | `routes` | the list of routes |
 | `logs-search` | the rows, as one list |
 | `batch watch` | one summary per line (JSON Lines), once a second until the run ends |
-| `batch logs` | `run`, `index` and the task's kept `output` |
+| `batch logs` | `run`, `index` and the task's kept `output`, an `untrusted` object |
 | `snapshot list`, `snapshot create` | the node's snapshot records |
 | `upgrade check` | `running`, `latest`, each node's `platform`, a `verdict` (`up_to_date`, `available`, `needs_fresh_cluster`, `no_artefact_for_node`, `no_artefacts`), the `reason` behind a verdict that blocks, and the `command` to run when one is available |
 | `upgrade plan` | the `stages` in order, with `estimated_secs` |
 | `upgrade status` | `scope` (`cluster` or `node`) and the run record as the node keeps it, under `state` |
 | `verify` | the `verdict` (`verified`, `mismatch`, `unknown`), the `reasons`, each node's and `relish`'s `sha256`, `published_sha256`, `hash` and `signature` checks, the `metadata` sources and the `trusted_keys` |
 | `secret pubkey` | `public_key`, and the `namespace` it belongs to |
-| `exec` | `exit_code` and the command's `output`; relish still exits with that code |
+| `exec` | `exit_code` and the command's `output`, an `untrusted` object; relish still exits with that code |
 
 Changing it:
 
@@ -52,7 +53,7 @@ Changing it:
 |---|---|
 | `stop`, `delete`, `release` | `action` (`stop_requested`, `delete_requested`, `released`), `app`, `namespace`, `forced` |
 | `rollback` | the `app`, its `namespace`, and whether it was `forced` |
-| `apply --rerun-jobs`, `batch`, `run` | the node's answer: `created` and `instances`, or `batch_id` and its counts |
+| `apply`, `apply --rerun-jobs`, `batch`, `run` | the node's answer: `created` and `instances`, or `batch_id` and its counts; `apply --dry-run` prints the plan |
 | `batch replay`, `batch cancel` | `run` and the `change` (`replay_acknowledged`, `cancelled`) |
 | `fault <type>` | the fault, with any it created on other nodes under `routed` |
 | `fault list`, `fault clear` | `faults` and `warnings`; the node's `message` |
@@ -65,6 +66,9 @@ Changing it:
 | `policy delete` | the policy `deleted` |
 | `secret rotate`, `token revoke` | the node's `message` |
 | `token create`, `token rotate`, `join-token create` | the new `token`, with its name, role, scope and expiry |
+| `join-token list` | `join_tokens`: each one's `id`, `node_id`, `expires_at` and whether it was `consumed`, never the token |
+| `join-token revoke` | the `node_id` and how many tokens were `revoked` |
+| `identity rotate-signing-key` | the new `key_id`, the `retiring_key_id` and when it stops verifying, `retire_after` |
 | `ca rotate` | the `role`, the `stage` (`begun`, `finalised`) and the council's `message` |
 | `upgrade start` | `scope`, `target_version`, `upgrade_id`, and `already_running` with its `detail` |
 | `upgrade rollback`, `resume`, `abort` | the `change`, and the version or upgrade it was about |
@@ -273,7 +277,7 @@ is a field the node can't honour; nothing is silently dropped.
 | `env` | Environment variables: plain, encrypted (`ENC[AGE:...]`) or from a secret provider (`PROVIDER[name:path]`, see `security`) |
 | `namespace` | Namespace; `default` when omitted |
 | `owner` | The name of the API token of the controller that manages the app. Only that token or an admin may set it; `relish apply` and GitOps then leave the app alone, and `relish release` hands it back (see `writing-a-controller`) |
-| `health` | `path`, `port` (default: the app's `port`), `protocol` (`http` or `https`), `interval` (10 s), `timeout` (5 s or `interval`, whichever is shorter; at most `interval`), `threshold_unhealthy` (3), `threshold_healthy` (1), `initial_delay` (0 s). No zeros |
+| `health` | `path`, `port` (default: the app's `port`), `protocol` (`http` or `https`), `interval` (10 s), `timeout` (5 s or `interval`, whichever is shorter; at most `interval`), `threshold_unhealthy` (3), `threshold_healthy` (1), `initial_delay` (0 s). No zeros; `interval` and `initial_delay` at most 86400 s |
 | `[[init]]` | `image` (default: the app's), `command` and `env` (on top of the app's; plain or `PROVIDER[name:path]`, no encrypted values); runs before the app with its env and mounts |
 | `[[sidecar]]` | `name` (a DNS label), `image` (default: the app's), `command`, `args`, `env` (on top of the app's; no encrypted values), `cpu` and `memory`. Runs beside each instance in its network namespace, after the init containers and before the app, and stops after it. Restarts on its own with a backoff up to a minute. Its requests add to the app's. Needs rootful runc; refused on `exec` and `script` apps and alongside an `egress` allowlist |
 | `[[config_file]]` | `path` and exactly one of `content` (a per-instance read-only copy) or `source` (a node file, allowlisted); not on `exec` or `script` apps |
@@ -381,10 +385,10 @@ startup instead of being ignored.
 | `[images]` | registry, pull-through cache, mirrors, trust policy and upstream rules (see `security`), builds (`build_timeout_secs`, `max_context_bytes`, `build_cache_max_bytes`: 100 GiB, 2 GiB on a quickstart; see `images-and-volumes`) |
 | `[metrics]`, `[logs]`, `[alerts]` | observability (see `observability`) |
 | `[gitops]`, `[upgrades]` | see `operations` |
-| `[smoker]`, `[testing]` | fault durations and the fault and test policy (see `chaos`) |
+| `[smoker]`, `[testing]` | fault durations, `default_duration_secs` (600) and `max_duration_secs` (3600), where `0 < default <= max <= 86400`, and the fault and test policy (see `chaos`) |
 | `[process_workloads]` | `allowed_binaries` for `exec` workloads (empty: none; a `script` needs `/bin/sh`), which the scheduler also places by; host commands inherit only `PATH`, `HOME`, `LANG`, `LANGUAGE`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR` and `LC_*` from Bun |
 | `[secret_providers.NAME]` | `binary` (absolute), `timeout_secs` (5, at most 60), `max_output_bytes` (64 KiB, at most 1 MiB), `env`: the exec secret providers this node runs for `PROVIDER[NAME:path]` values, which the scheduler also places by (see `security`) |
-| `[reporting_tree]` | `report_interval_secs` (5), `stale_report_timeout_secs` (30), `stale_node_grace_secs` (300: how long a live node whose reports stopped keeps its replicas before they move; see `deploy-an-app`) |
+| `[reporting_tree]` | `report_interval_secs` (5, not 0), `stale_report_timeout_secs` (30: more than `report_interval_secs`, at most 86400), `stale_node_grace_secs` (300, not 0: how long a live node whose reports stopped keeps its replicas before they move; see `deploy-an-app`) |
 | `[runtime]` | `stop_confirmation_timeout_secs`; `allowed_capabilities`, `allowed_sysctls` and `allowed_devices`, the runtime knobs apps may use here, which the scheduler also places by (empty: none; see `security`) |
 
 ### Shorter certificates for soak runs
@@ -431,13 +435,22 @@ incomplete evidence. Before
 `relish status` exits `0` whenever it got an answer, whatever the verdict.
 With `--check` it exits `1` on `DEGRADED` and `2` on `DOWN`, for a script or
 a monitor. A usage error exits `2` as well, so try the command once by hand
-before you wire it in.
+before you wire it in. When the cluster doesn't answer, `status` exits with
+the agent codes below, with `--check` or without it and in every output
+format: `3` when it couldn't reach or authenticate to the cluster, `4` when
+it was refused, `5` for anything else. Human output says why on stderr;
+`-o json` and `-o yaml` print a failed envelope.
 
 `relish agent` commands use their own codes, which say only whether the
 command answered: `0` answered, `2` usage, `3` couldn't reach or authenticate
 to the cluster, `4` refused, `5` anything else. A usage error there is a JSON
 envelope on stdout, not text on stderr. See
 [Working with an AI agent](16_working-with-an-ai-agent.md#exit-codes).
+
+With `-o json` or `-o yaml`, `apply` and `deploy` against an agent that
+doesn't answer still print the plan of what they would have done, as data,
+then exit `1` with `nothing was deployed` on stderr. The JSON parses either
+way, so check the exit code before you trust it.
 
 `relish exec` exits with the remote command's own exit code, so
 `relish exec web ls /ready` works in a shell `if`. It exits `1` when it

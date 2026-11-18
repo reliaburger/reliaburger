@@ -299,7 +299,16 @@ pub(super) async fn cluster_app_change(
         } else {
             ""
         };
-        let url = format!("{leader_url}/v1/{}/{app}/{namespace}{force}", change.verb());
+        let path = match crate::cluster::http::peer_path(&[
+            "v1",
+            change.verb(),
+            app.as_str(),
+            namespace.as_str(),
+        ]) {
+            Ok(path) => path,
+            Err(error) => return peer_path_refusal(&error),
+        };
+        let url = format!("{leader_url}{path}{force}");
         let request = copy_forwarded_auth(
             mark_leader_forwarded(state.cluster_http.client().post(url)),
             caller_headers,

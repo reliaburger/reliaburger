@@ -47,6 +47,7 @@ pub mod state;
 pub mod stop;
 pub mod userns;
 pub mod volume;
+mod whiteout;
 
 use std::fmt;
 use std::path::PathBuf;

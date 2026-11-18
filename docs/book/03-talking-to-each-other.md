@@ -487,7 +487,7 @@ Everything above describes what happens on a single node. But a 10-node cluster 
 
 For a long time that was the actual behaviour, and the honest answer was "cross-node service discovery doesn't work yet." Fixing it is what the **endpoint catalogue** does. The idea is small: the leader already knows what's running where, so let it build one cluster-wide map of every service's backends and replicate it to every node.
 
-Where does the leader's knowledge come from? The reporting tree from Chapter 2. Every node reports its running instances — namespace, app name, host port, health — to its council parent every reporting interval; the council aggregates for the leader. The leader's scheduling loop already reads that aggregate. So building the catalogue is a walk over those reports:
+Where does the leader's knowledge come from? The reporting tree from Chapter 2. Every node reports its running instances — namespace, app name, host port, health — straight to the leader every reporting interval (a flat star today; Chapter 2's two-level tree is planned, [#364](https://github.com/reliaburger/reliaburger/issues/364)), and the leader's aggregator collects them. The leader's scheduling loop already reads that aggregate. So building the catalogue is a walk over those reports:
 
 ```rust
 for (node_id, report) in &reports.reports {
@@ -946,6 +946,8 @@ The prefix match has a sharp edge that's easy to get wrong. If `/api` is a route
 
 One more subtlety in the lookup: stripping the port off the `Host` header. `myapp.com:8080` should look up `myapp.com`. The obvious `host.split(':').next()` works — right up until someone sends an IPv6 literal like `[::1]:8080`, where splitting on the first colon gives you `[`. You have to notice the bracket and keep everything up to the closing `]`. IPv6 punishes every parser that assumes a colon means "port".
 
+And where does the host come from in the first place? Over HTTP/1.1 it's the `Host` header. HTTP/2 moved it into a pseudo-header, `:authority`, and Hyper hands that to us as part of the request URI, not as a header. Most HTTP/2 clients send no `Host` header at all. Wrapper advertises `h2` in the TLS handshake, so every browser and every `curl https://...` speaks HTTP/2 to it. For a while our proxy read only the `Host` header, found an empty string and answered every one of those requests with a 404. No test caught it, because every test client was built HTTP/1-only. So `request_host` takes the `Host` header when there is one and the URI's authority when there isn't, and `ingress_routes_http2_requests_by_authority` in `tests/suite/ingress.rs` sends a real HTTP/2 request with the host only in the URL.
+
 ### What happens when things go wrong
 
 Three error codes tell the client exactly what happened:
@@ -1140,6 +1142,37 @@ pub fn generate_self_signed_cert()
 Operators can also provide their own cert and key via config (`tls_cert_path`, `tls_key_path`) for environments where a real certificate is available outside of Reliaburger's control.
 
 Sesame later added cluster-CA certificates, and operators can load a certificate and key from disk. Automatic ACME/Let's Encrypt provisioning didn't make the v1 cut. `auto` and `acme` therefore fail route validation instead of falling back to either plaintext or a self-signed certificate.
+
+### One listener, a certificate per route
+
+Each route picks its certificate with `tls`: `cluster` for a leaf from the cluster's Ingress CA, `explicit` for the operator's pair. But a node has one HTTPS listener for every route, and until 0.3.0 that listener made one choice for all of them: the disk pair if the node had one, the Ingress CA if it didn't. So a `cluster` route on a node with a disk pair got the operator's certificate, and an `explicit` route on a node without one quietly got a cluster leaf (#2011). The route's mode only decided whether plain HTTP redirected.
+
+The fix uses the one thing a TLS client tells us before we must answer: the hostname in its SNI (Server Name Indication, the name the client puts in its first handshake message). rustls asks a `ResolvesServerCert` for the certificate on every handshake, and `RouteCertResolver` answers by looking the host up in the routing table:
+
+```rust
+match (mode, server_name) {
+    (Some(TlsMode::Explicit), _) if self.operator.is_some() => CertificateSource::Operator,
+    (Some(TlsMode::Cluster), _) if self.cluster.is_some() => CertificateSource::Cluster,
+    (Some(TlsMode::Explicit), Some(host)) => {
+        self.warn_once(host, "explicit", "no tls_cert/tls_key pair in [ingress]");
+        CertificateSource::SelfSigned
+    }
+    (Some(TlsMode::Cluster), Some(host)) => {
+        self.warn_once(host, "cluster", "no Ingress CA (council state is missing)");
+        CertificateSource::SelfSigned
+    }
+    _ if self.operator.is_some() => CertificateSource::Operator,
+    _ => CertificateSource::SelfSigned,
+}
+```
+
+A `match` arm can carry a guard (`if ...`) that must also hold for the arm to win, so the first two arms say "this mode, and the node has what it needs". When it doesn't, the host gets the self-signed certificate and one warning, never the other mode's certificate. A client that checks names rejects the self-signed one, which is the honest answer from a misconfigured node. Everything else (a plain-HTTP route reached over HTTPS, an unknown host, a handshake with no SNI) gets the operator pair when there is one, and the self-signed certificate when there isn't. That last part is a change: a cluster-mode node with no disk pair used to mint an Ingress CA leaf for any routed host, plain routes included. Now only a `tls = "cluster"` host gets one, which is what the mode says.
+
+The resolver holds the two sources as `Option<Arc<FileCertResolver>>` and `Option<Arc<dyn ResolvesServerCert>>`. The second is a trait object: Bun wraps the Ingress CA resolver in a `ReloadableCertResolver` so a CA rotation can swap it, and the listener doesn't need to know which concrete type it got. `resolve` is a synchronous callback on the handshake path, so it reads the routing table with `try_read()` rather than `.await`. While a rebuild holds the table, we can't know the host's mode, so that one handshake gets the self-signed certificate. Falling back to the operator pair there would hand a `cluster` host the other mode's certificate, the very thing the fix is meant to prevent.
+
+SNI names a host, not a path, so two routes on one host share a certificate. When they disagree, `explicit` wins over `cluster`, since the operator chose that certificate for that name on purpose. `RoutingTable::certificate_mode` makes that call, and its test pins it.
+
+The tests that caught the old behaviour run real handshakes against one listener with both kinds of route and check which leaf comes back: the operator's for `explicit`, one the Ingress CA signed for `cluster` (`tests/suite/ingress_route_tls.rs`). Two older tests had passed a plain certificate as the "cluster" resolver to get a known leaf on every host. That leaned on the listener-wide behaviour, so they now load an operator pair instead.
 
 ## What we learned
 

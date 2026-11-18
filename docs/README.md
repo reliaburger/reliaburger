@@ -1055,7 +1055,9 @@ size on any cluster: a `HEALTHY`, `DEGRADED` or `DOWN` verdict, then one line
 per part of the cluster from `GET /v1/cluster/summary` plus `relish wtf`'s
 checks (2 s budget, `--quick` skips them), each line that needs attention
 ending in the command to run next. It exits 0 when it got an answer;
-`--check` exits 1 on `DEGRADED` and 2 on `DOWN`. `-o json` prints the agent
+`--check` exits 1 on `DEGRADED` and 2 on `DOWN`. With no answer it exits
+3 when it couldn't reach or authenticate to the cluster, 4 when it was
+refused and 5 for anything else, in every output format. `-o json` prints the agent
 envelope. The lists live in `relish apps` (one row per app, problems first;
 `relish apps NAME` or `--instances` for instances) and `relish nodes`
 (version, usage and allocation per node); both filter with `--unhealthy`.
@@ -1824,7 +1826,7 @@ and jobs the cluster's policies would now refuse (`relish policy audit` lists
 the same). Use `--app <name>` for application scope or `--watch` for a
 human refresh every 30 seconds (`--interval <secs>` changes the period). JSON and YAML use schema version 1. Exit status 0 means
 all selected evidence was observed and healthy, 1 means a critical finding,
-and 2 means warnings or unknown evidence. Bounded in-memory restart and deploy
+and 3 means warnings or unknown evidence (2 is a usage error). Bounded in-memory restart and deploy
 history is deliberately reported as degraded, not silently accepted as a
 complete historical record.
 

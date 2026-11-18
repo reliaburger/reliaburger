@@ -259,6 +259,12 @@
   },
   {
     "source": "tests/cluster_failover.rs",
+    "function": "workers_outside_raft_keep_the_leader_after_many_elections",
+    "binary": "reliaburger::cluster_failover",
+    "test": "workers_outside_raft_keep_the_leader_after_many_elections"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
     "function": "invalid_ingress_on_one_app_leaves_discovery_working_cluster_wide",
     "binary": "reliaburger::cluster_failover",
     "test": "invalid_ingress_on_one_app_leaves_discovery_working_cluster_wide"

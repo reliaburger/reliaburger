@@ -1573,6 +1573,22 @@ record ([the 28 October review](../qualification/2026-10-28-dependency-exception
 `main` took 0.13.5 in [#1409](https://github.com/reliaburger/reliaburger/pull/1409). An
 advisory is where the review starts, not the verdict.
 
+The night before 0.3.0's candidate was due, RustSec marked three crates unmaintained at
+once: `chrono`, `chrono-tz` and `humantime`. Their maintainer had wound the project down and
+pointed users at `jiff`, and from that evening every pull request's audit failed. None of
+the three is ours. Our code keeps time with `std::time`, but Arrow, Parquet, DataFusion,
+`object_store`, `openraft`, the OCI client, the MCP server crate and the Prometheus parser
+all use chrono, and DataFusion asks Arrow for `chrono-tz` itself. An unmaintained advisory
+has no fixed version to move to, and the newest release of every one of those crates,
+Arrow 60 included, still uses chrono, so the only fix was replacing a dozen other projects'
+code. The three got dated exceptions
+([the 17 November review](../qualification/2026-11-17-dependency-exceptions.md)) and a test
+with two jobs: it fails if Reliaburger itself starts depending on one of them, so the
+exception can't become cover for new code, and it fails if an exception outlives its crate
+in the lockfile. [#2036](https://github.com/reliaburger/reliaburger/issues/2036) removes
+them as upstream moves. Unmaintained means nobody will fix the next bug, not that a bug is
+known, and that's what a dated exception is for.
+
 Sometimes the next major version isn't there to take. bincode's list said 1→3, and bincode
 3.0.0 turned out to be a crate whose only code is a `compile_error!`, published when its
 maintainers stopped. No version clears its unmaintained advisory, so "bump it" became
@@ -2432,7 +2448,9 @@ expects.
 
 `relish logs -o json` is JSON Lines, one object per log line with `at`,
 `node`, `instance`, `stream` and `text`, so an agent can filter on fields
-instead of on the `[instance]` labels people see. The client used to turn the
+instead of on the `[instance]` labels people see. `text` is an `untrusted`
+object, because the app wrote the line ([Chapter
+19](19-built-for-agents.md#their-words-not-ours)). The client used to turn the
 store's entries into text before anyone could ask for anything else; it now
 returns a `LogLines` enum, `Stored` entries with their metadata or `Captured`
 plain lines from the agent's own fallback, and rendering happens last. A
@@ -2776,6 +2794,13 @@ That's two numbers, and they belong in config:
 default_duration_secs = 600   # applied when a fault names no duration
 max_duration_secs = 3600      # a fault asking for longer is rejected
 ```
+
+Two numbers can disagree, though. Set `max_duration_secs = 300` and leave the
+default alone, and every fault without `--duration` is refused, because the
+600 s default is over the limit. Set the maximum to two days, and the 24-hour
+backstop quietly cuts every fault to one day anyway. So Bun checks
+`0 < default <= max <= 86400` at startup and refuses the node config with the
+field named, instead of leaving you to find out at the first injection.
 
 The decision worth dwelling on is *where* to enforce them. The CLI already
 defaulted a missing `--duration` to ten minutes, so it would have been easy to

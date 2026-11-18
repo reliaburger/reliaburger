@@ -14,10 +14,11 @@ Before=boot-complete.target
 Type=oneshot
 RemainAfterExit=yes
 StandardOutput=journal+console
-# The script's test override (image/tests/test_boot_check.py): never take
-# it from the manager's environment, or a node could decide its boots were
-# never counted and a bad update would never fall back.
-UnsetEnvironment=BOOT_CHECK_EFIVARS
+# The script's test overrides (image/tests/test_boot_check.py): never take
+# them from the manager's environment, or a node could decide its boots were
+# never counted and a bad update would never fall back, or read a frozen
+# uptime and never finish.
+UnsetEnvironment=BOOT_CHECK_EFIVARS BOOT_CHECK_UPTIME
 ExecStart=/usr/lib/reliaburger/boot-check
 
 [Install]

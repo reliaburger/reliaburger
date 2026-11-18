@@ -226,6 +226,7 @@ pub(super) struct DiagnosticsQuery {
 pub(super) async fn diagnostics_handler(
     live_identity: Option<axum::Extension<crate::sesame::credentials::LiveNodeIdentity>>,
     renewal: Option<axum::Extension<crate::sesame::renewal_worker::RenewalMonitor>>,
+    backup: Option<axum::Extension<crate::council::backup::BackupMonitor>>,
     State(state): State<ApiState>,
     Query(query): Query<DiagnosticsQuery>,
 ) -> Json<crate::bun::diagnostics::LocalDiagnosticSnapshot> {
@@ -317,6 +318,17 @@ pub(super) async fn diagnostics_handler(
         },
     };
 
+    // Copied out of the watch borrow in one statement (CLAUDE.md).
+    let backup = match backup {
+        Some(axum::Extension(monitor)) => DiagnosticSource::Available {
+            observed_at,
+            value: monitor.0.borrow().clone(),
+        },
+        None => DiagnosticSource::Unsupported {
+            reason: "a standalone node has no council to back up".to_string(),
+        },
+    };
+
     Json(LocalDiagnosticSnapshot {
         schema_version: crate::bun::diagnostics::LOCAL_DIAGNOSTIC_SCHEMA_VERSION,
         node_id: state.static_capabilities.node_id.clone(),
@@ -324,6 +336,7 @@ pub(super) async fn diagnostics_handler(
         disks,
         cpu_throttling,
         certificates,
+        backup,
     })
 }
 

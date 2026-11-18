@@ -544,7 +544,7 @@ max_storage_mb = 200    # prune exported metrics files when exceeding 200 MB
 export_path = "/mnt/backup/metrics/"
 ```
 
-Setting `max_storage_mb = 0` (the default) disables size-based pruning. Retention-based pruning (via `retention_days`) still applies. You can use both: retention handles the steady state, max_storage handles spikes.
+The caps are on by default: 2,048 MB for logs and 1,024 MB for metrics. Setting `max_storage_mb = 0` turns size-based pruning off. Retention-based pruning (via `retention_days`) still applies. You can use both: retention handles the steady state, max_storage handles spikes.
 
 ## Upgrading Brioche: from meta-refresh to HTMX
 
@@ -809,7 +809,7 @@ A new background task in `bun.rs` runs every 30 seconds (configurable via `alert
 3. Calls `evaluator.evaluate(latest_values)`, which now returns a `Vec<AlertTransition>`
 4. For each transition, spawns a fire-and-forget webhook delivery task
 
-That last point matters. If a webhook endpoint is slow or down, the retry loop (1s → 5s → 25s) takes 31 seconds total. We can't block the next evaluation tick waiting for that. So each dispatch runs in its own `tokio::spawn`. The evaluation loop moves on immediately.
+That last point matters. If a webhook endpoint is slow or down, the retry loop (three attempts with a 10-second timeout each, and waits of 1 s and 5 s between them) can take 36 seconds. We can't block the next evaluation tick waiting for that. So each dispatch runs in its own `tokio::spawn`. The evaluation loop moves on immediately.
 
 ### Detecting transitions
 
@@ -865,7 +865,7 @@ This is the same pattern we use in `lettuce/webhook.rs` for verifying incoming G
 
 ### Retry with backoff
 
-Failed deliveries get three attempts: 1 second, 5 seconds, 25 seconds. After three failures, the notification is dropped and logged. We considered a queue with persistent retries, but that adds complexity for diminishing returns. Notifications are transition-driven: an alert that stays firing does not generate a new transition on the next evaluation. Exhausted delivery retries therefore remain a limitation; operators must inspect delivery errors and the active alert list.
+Failed deliveries get three attempts, 1 second and then 5 seconds apart. (The code lists a third delay of 25 seconds, but nothing comes after the third attempt, so it never waits it.) After three failures, the notification is dropped and logged. We considered a queue with persistent retries, but that adds complexity for diminishing returns. Notifications are transition-driven: an alert that stays firing does not generate a new transition on the next evaluation. Exhausted delivery retries therefore remain a limitation; operators must inspect delivery errors and the active alert list.
 
 ### Configuration
 
@@ -893,7 +893,7 @@ Empty `severity` means all alerts. Each destination can filter independently. Pa
 
 **Export as the format you already have.** The original plan was `jsonl.gz`. But the LogStore already flushes Parquet every 60 seconds, so exporting became "copy the bytes" instead of "build a serialise-and-gzip pipeline", and DataFusion queries the archives in place. When you find yourself about to convert data, check whether you can just move it.
 
-**Fire-and-forget, or the loop stalls.** A webhook retry chain runs up to 31 seconds. The alert evaluator ticks every 30. Block on delivery and the next evaluation is already late. Each dispatch gets its own `tokio::spawn`, and the loop moves on. Anything slow and external belongs off the critical path.
+**Fire-and-forget, or the loop stalls.** A webhook retry chain runs up to 36 seconds. The alert evaluator ticks every 30. Block on delivery and the next evaluation is already late. Each dispatch gets its own `tokio::spawn`, and the loop moves on. Anything slow and external belongs off the critical path.
 
 **The whole design exists to bound fan-out.** Hierarchical aggregation isn't there because partial aggregates are elegant. It's there so a cluster-wide query costs council-size requests (3–7) instead of N (thousands). When a feature's shape looks elaborate, check whether it's buying you a complexity bound — here it turns O(N) into O(1).
 

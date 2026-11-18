@@ -368,12 +368,18 @@ impl std::fmt::Display for CaRotation {
 }
 
 /// `relish identity rotate-signing-key`: sign workload JWTs with a new key,
-/// and say which key keeps verifying until when (#709).
-pub async fn identity_rotate_signing_key() -> Result<(), RelishError> {
+/// and say which key keeps verifying until when (#709). Under `-o json` or
+/// `-o yaml` it prints the council's answer: `key_id`, `retiring_key_id`
+/// and `retire_after` (#2012).
+pub async fn identity_rotate_signing_key(output: OutputFormat) -> Result<(), RelishError> {
     let client = super::client::BunClient::default_local();
     let rotated = client.identity_rotate_signing_key().await?;
-    println!("{}", rotation_message(&rotated));
-    Ok(())
+    if output == OutputFormat::Human {
+        println!("{}", rotation_message(&rotated));
+        return Ok(());
+    }
+    let answer = serde_json::to_value(&rotated).map_err(RelishError::SerialiseJson)?;
+    print_output(&answer, output)
 }
 
 /// What `relish identity rotate-signing-key` prints for `rotated`.

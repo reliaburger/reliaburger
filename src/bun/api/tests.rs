@@ -1760,8 +1760,8 @@ async fn lease_reads_forward_user_authority_and_refuse_an_isolated_leader() {
     }
 }
 
-/// One request the fake leader received: path, bearer, whether it carried
-/// the leader-forwarded marker, body.
+/// One request the fake leader received: path with its query, bearer,
+/// whether it carried the leader-forwarded marker, body.
 pub(super) type SeenAtLeader = (String, Option<String>, bool, String);
 
 /// Serve a fake leader API on `listener` that accepts every request and
@@ -1774,7 +1774,12 @@ pub(super) fn serve_recording_leader(
     let leader = axum::Router::new().fallback(move |request: axum::extract::Request| {
         let recorder = recorder.clone();
         async move {
-            let path = request.uri().path().to_string();
+            // The query too: a forward that drops `?force=true` changes
+            // what the leader does.
+            let path = request
+                .uri()
+                .path_and_query()
+                .map_or_else(|| request.uri().path().to_string(), |path| path.to_string());
             let bearer = request
                 .headers()
                 .get("authorization")
@@ -2112,16 +2117,93 @@ async fn a_follower_forwards_app_changes_to_the_leader_with_the_callers_token() 
     }
 }
 
-/// #1310: a rollback re-applies the previous spec through `cluster_apply`,
-/// so a follower forwards it as an apply. It goes as the caller, bearer and
-/// all, so the leader audits it under the caller's token name and a policy
-/// sees the caller's role, not the follower's service identity.
+/// A follower forwards a lease read with the lease id as one encoded path
+/// segment. An id holding `\` and `..` reaches the leader as a lease read,
+/// never as another route, and one holding a tab or newline, which a URL
+/// parser would drop, is refused before anything is sent.
 #[tokio::test]
-async fn a_follower_forwards_a_rollback_to_the_leader_with_the_callers_token() {
+async fn a_follower_forwards_a_lease_id_as_one_path_segment() {
     let (deployer, deployer_key) = a_user_token(crate::sesame::types::ApiRole::Deployer);
-    // No spec in Raft and no gossip peers, so the follower's own records
-    // choose the target: the newest is the current version, the one before
-    // it is what the rollback re-applies.
+    let (follower, seen, nodes) = follower_of_a_recording_leader(deployer).await;
+
+    let (status, body) = get_authenticated(
+        follower.clone(),
+        "/v1/test/leases/..%5C..%5Ctoken%5Clist",
+        &deployer_key,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let paths: Vec<String> = seen
+        .lock()
+        .await
+        .iter()
+        .map(|(path, ..)| path.clone())
+        .collect();
+    assert_eq!(paths, ["/v1/test/leases/..%5C..%5Ctoken%5Clist"]);
+
+    for path in [
+        "/v1/test/leases/.%09.",
+        "/v1/test/leases/.%0A.",
+        "/v1/test/leases/lease%0D",
+    ] {
+        let (status, body) = get_authenticated(follower.clone(), path, &deployer_key).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{path}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    assert_eq!(seen.lock().await.len(), 1, "a refused id reaches no leader");
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// Every request a node forwards or relays for a person carries the
+/// person's credential and the forwarded-for-user mark, which node-only
+/// routes refuse.
+#[test]
+fn a_forwarded_request_carries_the_callers_credential_and_the_mark() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_static("Bearer rbrg_person"),
+    );
+    let client = crate::cluster::ClusterHttp::plaintext();
+    let request = copy_forwarded_auth(
+        client.client().get("http://127.0.0.1:1/v1/status"),
+        &headers,
+    )
+    .build()
+    .unwrap();
+    assert_eq!(
+        request.headers().get(FORWARDED_FOR_USER_HEADER).unwrap(),
+        "1"
+    );
+    assert_eq!(
+        request.headers().get("authorization").unwrap(),
+        "Bearer rbrg_person"
+    );
+}
+
+/// A follower forwards a rollback to the leader whole, before it reads
+/// anything, and the leader picks the target from its own state. The
+/// follower's replica can lag a deploy that has committed: a target picked
+/// there went back two versions instead of one. It goes as the caller,
+/// bearer and all, so the leader audits it under the caller's token name
+/// and a policy sees the caller's role, not the follower's service
+/// identity (#1310).
+#[tokio::test]
+async fn a_follower_forwards_a_rollback_to_the_leader_before_choosing_its_target() {
+    let (deployer, deployer_key) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+    // The follower's own records would choose nginx:1.26. It must not
+    // choose at all.
     let deployed = |id: u64, image: &str| DeployHistoryEntry {
         id: crate::meat::deploy_types::DeployId(id),
         created_at: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(id),
@@ -2137,35 +2219,37 @@ async fn a_follower_forwards_a_rollback_to_the_leader_with_the_callers_token() {
     let (follower, seen, nodes) =
         follower_with_history_of_a_recording_leader(deployer, Some(history)).await;
 
-    let (status, reply) = send_bounded(
-        follower,
-        "POST",
+    for path in [
         "/v1/rollback/web/default",
-        &deployer_key,
-        "",
-        &[],
-    )
-    .await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{reply}");
-    assert!(reply.contains("recorded by the leader"), "{reply}");
+        "/v1/rollback/web/default?force=true",
+    ] {
+        let (status, reply) =
+            send_bounded(follower.clone(), "POST", path, &deployer_key, "", &[]).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{path}: {reply}");
+        assert!(reply.contains("recorded by the leader"), "{reply}");
+    }
 
     let seen = seen.lock().await.clone();
-    let [(path, bearer, marked, body)] = seen.as_slice() else {
-        panic!("one forward to the leader: {seen:?}");
-    };
-    assert_eq!(path, "/v1/apply");
     assert_eq!(
-        bearer.as_deref(),
-        Some(format!("Bearer {deployer_key}").as_str()),
-        "the leader must see the caller's token"
+        seen.iter()
+            .map(|(path, ..)| path.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "/v1/rollback/web/default",
+            "/v1/rollback/web/default?force=true"
+        ],
+        "the leader resolves the rollback itself, not an apply of the follower's \
+         pick, and `force` reaches it"
     );
-    assert!(marked, "a forwarded rollback carries the forwarded mark");
-    let config: Config = toml::from_str(body).unwrap();
-    assert_eq!(
-        config.app.get("web").and_then(|spec| spec.image.as_deref()),
-        Some("nginx:1.26"),
-        "the forward re-applies the previous version: {body}"
-    );
+    for (_, bearer, marked, body) in &seen {
+        assert_eq!(
+            bearer.as_deref(),
+            Some(format!("Bearer {deployer_key}").as_str()),
+            "the leader must see the caller's token"
+        );
+        assert!(marked, "a forwarded rollback carries the forwarded mark");
+        assert!(body.is_empty(), "the follower chose no spec: {body}");
+    }
     for node in nodes {
         node.shutdown().await.unwrap();
     }
@@ -2545,9 +2629,11 @@ async fn a_follower_without_the_run_forwards_cancel_results_and_logs_to_the_lead
         assert!(reply.contains("recorded by the leader"), "{path}: {reply}");
     }
     let seen = seen.lock().await.clone();
+    // The results forward adds its own paging query; the route is what
+    // this test is about.
     assert_eq!(
         seen.iter()
-            .map(|(path, ..)| path.as_str())
+            .map(|(path, ..)| path.split('?').next().unwrap_or(path))
             .collect::<Vec<_>>(),
         RUN_CALLS.iter().map(|(_, path)| *path).collect::<Vec<_>>()
     );

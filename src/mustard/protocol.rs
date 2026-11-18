@@ -386,12 +386,31 @@ impl<T: MustardTransport> MustardNode<T> {
 
     /// Wire this node's recovery fence (#424): every outgoing extension then
     /// advertises the epoch it claims, so restarted voters can tell whether a
-    /// recovery replaced their council before they serve Raft.
+    /// recovery replaced their council before they serve Raft. The directory
+    /// also stops taking leader hints from an older epoch (#1997).
     pub fn set_recovery_fence_watch(
         &mut self,
         rx: watch::Receiver<crate::council::fence::FenceSnapshot>,
     ) {
         self.recovery_fence_rx = Some(rx);
+        if self.refresh_recovery_floor() {
+            self.publish_directory();
+        }
+    }
+
+    /// Copy this node's recovery epochs from its fence into the directory:
+    /// the floor (the newest epoch the fence knows) and the epoch its own
+    /// Raft term belongs to. Returns `true` if the directory changed.
+    fn refresh_recovery_floor(&mut self) -> bool {
+        // Copied out in one statement, so the fence borrow ends here.
+        let Some(fence) = self.recovery_fence_rx.as_ref().map(|rx| *rx.borrow()) else {
+            return false;
+        };
+        let floor = self
+            .directory
+            .raise_recovery_floor(fence.newest_known_epoch());
+        let local = self.directory.set_local_recovery_epoch(fence.epoch);
+        floor || local
     }
 
     /// Wire the live council roles (voter set + leader by name) the cluster
@@ -566,7 +585,10 @@ impl<T: MustardTransport> MustardNode<T> {
     /// membership record, so a membership snapshot carries them for the
     /// scheduler (a `MembershipUpdate` never has).
     fn ingest_extension(&mut self, extension: &DirectoryExtension) {
-        let changed = self.directory.observe(extension);
+        // The fence may have learned a newer epoch since the last datagram:
+        // raise the floor first, so a stale hint here is refused.
+        let mut changed = self.refresh_recovery_floor();
+        changed |= self.directory.observe(extension);
         if let Some(member) = self.membership.get_mut(&extension.node_id)
             && member.labels != extension.labels
         {
@@ -2615,6 +2637,61 @@ mod tests {
         msg.extension = Some(ext("peer-c", &old));
         node.handle_message(addr(4), msg).await;
         assert_eq!(node.directory().leader, Some(new));
+    }
+
+    /// #1997: after `council recover`, survivors still relay the replaced
+    /// council's hint for a while, with a term from the old term line. A
+    /// node whose fence holds the new epoch must not adopt it, or a
+    /// recovered leader would follow the fenced one.
+    #[tokio::test]
+    async fn a_leader_hint_from_an_older_recovery_epoch_is_ignored() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("survivor"), addr(1), fast_config(), t1);
+        let fence = crate::council::fence::RecoveryFence::serving(1);
+        node.set_recovery_fence_watch(fence.subscribe());
+        assert_eq!(
+            (
+                node.directory().recovery_floor,
+                node.directory().local_recovery_epoch
+            ),
+            (1, 1)
+        );
+        let with_hint = |sender: &str, recovery_epoch: u64, term: u64| {
+            let mut message = ping_from(sender);
+            message.extension = Some(DirectoryExtension {
+                node_id: NodeId::new(sender),
+                api_address: addr(9117),
+                reporting_address: addr(9445),
+                leader: Some(LeaderHint {
+                    node_id: NodeId::new("leader"),
+                    term,
+                    recovery_epoch,
+                    api_address: addr(9217),
+                    reporting_address: addr(9545),
+                }),
+                labels: BTreeMap::new(),
+                disk_pressured: false,
+                recovery_epoch: None,
+                recovery_id: None,
+                jobs: None,
+                hmac: [0u8; 32],
+            });
+            message
+        };
+
+        node.handle_message(addr(2), with_hint("old-worker", 0, 9))
+            .await;
+        assert_eq!(
+            node.directory().leader,
+            None,
+            "a hint from the replaced council was adopted"
+        );
+
+        node.handle_message(addr(3), with_hint("new-voter", 1, 3))
+            .await;
+        let leader = node.directory().leader.clone().expect("the new hint");
+        assert_eq!((leader.recovery_epoch, leader.term), (1, 3));
     }
 
     #[tokio::test]
