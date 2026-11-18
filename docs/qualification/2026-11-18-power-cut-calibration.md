@@ -98,9 +98,10 @@ only what the `fsync` records show: flushed writes survive. A surviving
 between its write and the cut, and nothing in this run recorded that.
 
 `calibrate.sh --raw` is the experiment that does. It gives the VM a second,
-1 GiB virtual disk with no filesystem
-([`calibrate-vm.yaml`](../../scripts/release/power_cut/calibrate-vm.yaml)'s
-`additionalDisks`), and `calibrate.py write-raw` writes `O_DIRECT` records to
+1 GiB virtual disk with no filesystem (`limactl disk create --format raw`,
+attached with `limactl start --set .additionalDisks` and `format: false`;
+only a `--raw` run gets it, so every other run boots the VM the cuts above
+used), and `calibrate.py write-raw` writes `O_DIRECT` records to
 it alone, reading the disk's completed-flush count from
 `/sys/block/<disk>/stat` before each write and printing it with the ACK, and
 again after. A record is *uncovered* when the count before its write equals
@@ -112,6 +113,28 @@ and the verdict are unit-tested; the mode has **not yet run** on a VM, so it
 still needs its first run to confirm Lima attaches the disk as the script
 expects. Until it runs, the stop and kill rows above say model 2 or gentler,
 not model 1.
+
+The scan also records the raw disk's `/sys/block/<disk>/queue/write_cache`,
+and the tally lists every value seen. The counting assumes `write back`: the
+guest sends that disk flushes when asked. If it reads `write through`, the
+guest believes the disk has no volatile cache and never sends it a flush, so
+every record counts as uncovered, and a lost record would mean something
+else: the virtual disk dropped a write it had reported as on stable storage,
+model 3 behaviour rather than model 2. Read the losses in that light.
+
+The first `--raw` run has to confirm four things the unit tests can't, and a
+one-cut `calibrate.sh --raw --kind sysrq --cuts 1` smoke on a quiet host
+settles all of them before the 50-cut runs:
+
+- [ ] `limactl start --set '.additionalDisks = […]'` applies to a template
+  path (`calibrate-vm.yaml`), not just to an instance name.
+- [ ] `format: false` keeps Lima from formatting and mounting the disk: no
+  filesystem on it, nothing in `/proc/mounts`.
+- [ ] VZ accepts the disk `limactl disk create --format raw` made, and the
+  guest sees it as a virtio disk.
+- [ ] `find_raw_device` finds exactly one unpartitioned, unmounted vdX of
+  2097152 sectors (`scan-raw`'s `disk` field names it), with
+  `write_cache` = `write back`.
 
 ### The dm-log-writes proof
 

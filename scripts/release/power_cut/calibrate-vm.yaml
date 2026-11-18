@@ -9,11 +9,11 @@
 # own virtual disk, and provisioning is a no-op: Lima runs provision scripts
 # on every boot, and every cut boots the VM again.
 #
-# The second disk is the raw disk for `calibrate.sh --raw`: attached with no
-# filesystem, so only calibrate.py's raw writer touches it and nothing else
-# in the guest sends it a flush. calibrate.sh creates a 1 GiB raw-format disk
-# per VM (`limactl disk create <vm>-raw`) and sets this name to it with
-# `--set`; the name here is a placeholder.
+# `calibrate.sh --raw` adds a second disk with `--set .additionalDisks`: a
+# 1 GiB raw-format disk per VM (`limactl disk create <vm>-raw`), attached with
+# `format: false` so it has no filesystem and only calibrate.py's raw writer
+# touches it. It isn't listed here, so every other run boots the same VM as
+# the published cuts.
 images:
 - location: "https://cloud-images.ubuntu.com/releases/resolute/release-20260927/ubuntu-26.04-server-cloudimg-arm64.img"
   arch: "aarch64"
@@ -26,6 +26,3 @@ mounts: []
 containerd:
   system: false
   user: false
-additionalDisks:
-- name: "pc-cal-raw"
-  format: false

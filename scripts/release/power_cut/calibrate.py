@@ -46,6 +46,13 @@ with no uncovered record says nothing and isn't counted. The time between
 the last reading and the cut itself (a few milliseconds) isn't observed;
 nothing in the guest sends that disk a flush unless asked.
 
+scan-raw also reports the disk's /sys/block/<disk>/queue/write_cache. With
+"write back" the guest sends flushes and the counting above means what it
+says. With "write through" the guest believes the disk has no volatile cache
+and never sends it a flush, so every record counts as uncovered, and a lost
+one means the virtual disk dropped a write it reported as on stable storage:
+fault model 3 behaviour, not model 2.
+
 Each record carries the run id, its sequence number, its mode and a CRC over
 the block, so a scan tells a record of this run from a stale one (absent) and
 from a half-written one (torn). Record N lives in block N - 1, so a scan needs
@@ -280,7 +287,7 @@ def read_raw_acks_text(text):
     return info
 
 
-def raw_result(info, survived):
+def raw_result(info, survived, write_cache="unknown"):
     """One raw-disk cut: what was acknowledged, what no flush covered, and what of each was lost."""
     acked = max((seq for seq, _ in info["acks"]), default=0)
     final = info["final_flushes"]
@@ -291,6 +298,8 @@ def raw_result(info, survived):
         "lost_acked": max(0, acked - survived["prefix"]),
         "beyond_ack": max(0, survived["highest"] - acked),
         "flushes_final": final,
+        # The raw disk's queue/write_cache as the guest saw it after the cut.
+        "write_cache": write_cache,
         "uncovered": len(uncovered),
         "lost_uncovered": sum(1 for seq in uncovered if seq > survived["prefix"]),
         # Only a cut that left some acknowledged record uncovered says
@@ -330,7 +339,7 @@ def record(kind, cut, acks_path, scan_path, detail):
         raise RecordError(f"cut {cut}: the guest never rebooted (boot id {boot} before and after)")
     modes = {}
     if RAW in scan["modes"]:
-        modes[RAW] = raw_result(read_raw_acks_text(text), scan["modes"][RAW])
+        modes[RAW] = raw_result(read_raw_acks_text(text), scan["modes"][RAW], scan.get("write_cache", "unknown"))
     for mode in MODES:
         if mode not in scan["modes"]:
             continue
@@ -372,6 +381,8 @@ def tally(lines):
             if "counted" in result:
                 row.setdefault("not_counted", 0)
                 row.setdefault("uncovered_total", 0)
+                caches = set(row.get("write_cache", [])) | {result.get("write_cache", "unknown")}
+                row["write_cache"] = sorted(caches)
                 if not result["counted"]:
                     row["not_counted"] += 1
                     continue
@@ -443,7 +454,10 @@ def run_command(arguments):
     elif arguments.command == "scan-raw":
         disk = raw_device()
         modes = {RAW: scan_file(f"/dev/{disk}", arguments.run, RAW)}
-        print(json.dumps({"run": arguments.run, "boot": boot_id(), "disk": disk, "modes": modes}))
+        with open(f"/sys/block/{disk}/queue/write_cache") as file:
+            write_cache = file.read().strip()
+        print(json.dumps({"run": arguments.run, "boot": boot_id(), "disk": disk, "write_cache": write_cache,
+                          "modes": modes}))
     elif arguments.command == "record":
         print(json.dumps(record(arguments.kind, arguments.cut, arguments.acks, arguments.scan,
                                 json.loads(arguments.detail))))

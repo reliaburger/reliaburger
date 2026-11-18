@@ -116,7 +116,7 @@ if grep -qx -- "$vm" <<< "$existing"; then
     fail "VM $vm already exists; delete it (limactl delete --force $vm) or name another with --vm"
 fi
 disk_name=$vm-raw
-if [[ -e $lima_home/_disks/$disk_name ]]; then
+if [[ $raw == yes && -e $lima_home/_disks/$disk_name ]]; then
     fail "disk $disk_name already exists; delete it (limactl disk delete $disk_name) or name another VM with --vm"
 fi
 
@@ -138,15 +138,21 @@ cleanup() {
 trap cleanup EXIT
 
 say "creating $vm"
-# The raw disk: 1 GiB (calibrate.py's RAW_SECTORS finds it by that size),
-# raw format for VZ, attached unformatted by calibrate-vm.yaml under this VM's
-# own name so two calibration VMs never share one.
-limactl disk create "$disk_name" --size 1GiB --format raw > "$evidence/disk.log" 2>&1 \
-    || fail "creating disk $disk_name failed; see $evidence/disk.log"
-made_disk=yes
+# Only a --raw run gets the second disk, so every other run's VM is the one
+# the published cuts used. The raw disk: 1 GiB (calibrate.py's RAW_SECTORS
+# finds it by that size), raw format for VZ, named after this VM so two
+# calibration VMs never share one, and attached with format: false so Lima
+# neither formats nor mounts it.
+start_options=()
+if [[ $raw == yes ]]; then
+    limactl disk create "$disk_name" --size 1GiB --format raw > "$evidence/disk.log" 2>&1 \
+        || fail "creating disk $disk_name failed; see $evidence/disk.log"
+    made_disk=yes
+    start_options=(--set ".additionalDisks = [{\"name\": \"$disk_name\", \"format\": false}]")
+fi
 # Only a VM this run created is ever deleted, so made_vm flips only once the
 # start has worked; a failed start may leave a half-made $vm to delete by hand.
-limactl start --tty=false --name "$vm" --set ".additionalDisks[0].name = \"$disk_name\"" \
+limactl start --tty=false --name "$vm" ${start_options[@]+"${start_options[@]}"} \
     "$here/calibrate-vm.yaml" > "$evidence/create.log" 2>&1 \
     || fail "creating $vm failed; see $evidence/create.log (delete any half-made VM with: limactl delete --force $vm)"
 made_vm=yes
