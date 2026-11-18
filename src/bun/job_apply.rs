@@ -277,6 +277,7 @@ pub(crate) async fn apply(
             Event::default().data(serde_json::to_string(&event).unwrap_or_default()),
         )
     }))
+    .keep_alive(axum::response::sse::KeepAlive::default())
     .into_response()
 }
 

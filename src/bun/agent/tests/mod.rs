@@ -5800,7 +5800,6 @@ fn allow_host_workloads<G: Grill + Clone + 'static>(
         .set_process_config(crate::config::process_workloads::ProcessWorkloadsConfig {
             allowed_binaries,
             mount_isolation: false,
-            ..Default::default()
         });
 }
 

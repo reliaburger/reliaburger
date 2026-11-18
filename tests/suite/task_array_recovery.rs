@@ -31,7 +31,6 @@ fn node(root: &Path, delay: Duration, concurrency: u32) -> TaskArrayNode {
             policy: ProcessWorkloadsConfig {
                 allowed_binaries: vec!["/review/task".into()],
                 mount_isolation: false,
-                ..Default::default()
             },
             default_concurrency: concurrency,
             backoff: (Duration::from_millis(1), Duration::from_millis(2)),
@@ -340,7 +339,6 @@ async fn output_storage_failure_refuses_work_and_never_acknowledges_the_chunk() 
             policy: ProcessWorkloadsConfig {
                 allowed_binaries: vec!["/review/task".into()],
                 mount_isolation: false,
-                ..Default::default()
             },
             default_concurrency: 1,
             backoff: (Duration::ZERO, Duration::ZERO),

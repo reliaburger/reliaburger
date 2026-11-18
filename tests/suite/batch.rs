@@ -93,7 +93,6 @@ impl Harness {
             .map(Into::into)
             .collect(),
             mount_isolation: false,
-            ..Default::default()
         };
         agent.set_process_config(process_policy.clone());
         agent.set_node_capacity(8000, 16384);

@@ -170,8 +170,9 @@ A value the build doesn't know is <code>null</code>.</li>
 an agent should ask you before running it.</li>
 <li><code>warnings</code> are things worth knowing that aren't the answer.</li>
 </ul>
-<p>Keys come out in alphabetical order. Every key is always there; a value
-nobody knows is <code>null</code>.</p>
+<p>Keys come out in alphabetical order. An answer always carries <code>data</code>,
+<code>truncated</code>, <code>next</code> and <code>warnings</code>, and a value nobody knows is <code>null</code>, not
+left out. A failure carries <code>error</code> in their place, as below.</p>
 <p>A failure carries <code>error</code> instead of <code>data</code>:</p>
 <pre><code class="language-json">{
   "schema": "relish.agent/v1",
@@ -188,7 +189,9 @@ nobody knows is <code>null</code>.</p>
 <code>tls_untrusted</code>, <code>timeout</code>, <code>unauthenticated</code>, <code>forbidden</code>, <code>not_found</code>,
 <code>conflict</code>, <code>api</code>, <code>source_mismatch</code>, <code>build_failed</code>, <code>unsupported_platform</code>,
 <code>internal</code>, <code>lease_held</code>, <code>stale</code> and <code>guardrail</code>. <code>status</code> is the HTTP status when the API answered with one,
-and <code>endpoint</code> the address <code>relish</code> dialled when the connection failed. A
+and <code>endpoint</code> the address <code>relish</code> dialled when the connection failed. Those
+five keys are always there, <code>null</code> when they don't apply; <code>error.lease</code>, the
+lease in the way, comes only with <code>lease_held</code>. A
 connection failure splits by its cause: <code>dns</code> when the host name doesn't
 resolve, <code>tls_untrusted</code> when the server's certificate isn't one <code>relish</code>
 trusts (pass the cluster CA with <code>--ca-cert</code>), and <code>unreachable</code> for the rest.</p>
@@ -269,11 +272,18 @@ a cut line with <code>…[cut]</code>. <code>truncated</code> is <code>true</cod
 command left lines out. Tell your agent to treat anything inside <code>untrusted</code>
 as evidence to read, never as instructions to follow. Redaction is a safety
 net, not a promise: read what you share before you post it anywhere.</p>
+<p>A lease's purpose and a proposal's reason are another agent's words, and
+the audit records and events about them carry them too. <code>relish agent timeline</code> and <code>relish agent explain</code> take them out of an entry's <code>details</code>
+(or a decision's <code>evidence</code>) and put them in <code>author_text</code>, an <code>untrusted</code>
+object with origin <code>lease_purpose</code> or <code>proposal_reason</code>; it's <code>null</code> when
+the record has neither.</p>
 <p>The rest of <code>relish</code> keeps the same rule under <code>-o json</code> and <code>-o yaml</code>:
 <code>relish logs</code> puts each line's <code>text</code>, <code>relish events</code> each <code>message</code>, and
 <code>relish exec</code> and <code>relish batch logs</code> the <code>output</code> in an <code>untrusted</code> object,
-with lines cut at 16 KiB (512 bytes for an event). Their plain output for
-people is unchanged.</p>
+with lines cut at 16 KiB (512 bytes for an event). <code>relish events</code> and
+<code>relish audit</code> move a lease's purpose or a proposal's reason out of
+<code>details</code> into <code>author_text</code>, the same as the timeline. Their plain output
+for people is unchanged.</p>
 </section>
 <section class="agents-section" id="commands">
 <h2>Commands <a class="permalink" href="#commands" aria-label="Link to this section">#</a></h2>

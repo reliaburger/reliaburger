@@ -272,7 +272,7 @@ pub struct TimelineEntry {
 
 /// Run `relish agent context`.
 pub async fn run(args: &ContextArgs, max_bytes: usize, rerun: &str) -> Rendered {
-    let client = BunClient::default_local();
+    let client = BunClient::local().await;
     let (collected, summary, events, leases, proposals) = tokio::join!(
         wtf::collect(&client, None),
         tokio::time::timeout(SUMMARY_TIMEOUT, client.cluster_summary()),

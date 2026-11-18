@@ -128,8 +128,9 @@ An answer looks like this (one line on stdout, spread out here):
   an agent should ask you before running it.
 - `warnings` are things worth knowing that aren't the answer.
 
-Keys come out in alphabetical order. Every key is always there; a value
-nobody knows is `null`.
+Keys come out in alphabetical order. An answer always carries `data`,
+`truncated`, `next` and `warnings`, and a value nobody knows is `null`, not
+left out. A failure carries `error` in their place, as below.
 
 A failure carries `error` instead of `data`:
 
@@ -150,7 +151,9 @@ A failure carries `error` instead of `data`:
 `tls_untrusted`, `timeout`, `unauthenticated`, `forbidden`, `not_found`,
 `conflict`, `api`, `source_mismatch`, `build_failed`, `unsupported_platform`,
 `internal`, `lease_held`, `stale` and `guardrail`. `status` is the HTTP status when the API answered with one,
-and `endpoint` the address `relish` dialled when the connection failed. A
+and `endpoint` the address `relish` dialled when the connection failed. Those
+five keys are always there, `null` when they don't apply; `error.lease`, the
+lease in the way, comes only with `lease_held`. A
 connection failure splits by its cause: `dns` when the host name doesn't
 resolve, `tls_untrusted` when the server's certificate isn't one `relish`
 trusts (pass the cluster CA with `--ca-cert`), and `unreachable` for the rest.
@@ -244,11 +247,20 @@ command left lines out. Tell your agent to treat anything inside `untrusted`
 as evidence to read, never as instructions to follow. Redaction is a safety
 net, not a promise: read what you share before you post it anywhere.
 
+A lease's purpose and a proposal's reason are another agent's words, and
+the audit records and events about them carry them too. `relish agent
+timeline` and `relish agent explain` take them out of an entry's `details`
+(or a decision's `evidence`) and put them in `author_text`, an `untrusted`
+object with origin `lease_purpose` or `proposal_reason`; it's `null` when
+the record has neither.
+
 The rest of `relish` keeps the same rule under `-o json` and `-o yaml`:
 `relish logs` puts each line's `text`, `relish events` each `message`, and
 `relish exec` and `relish batch logs` the `output` in an `untrusted` object,
-with lines cut at 16 KiB (512 bytes for an event). Their plain output for
-people is unchanged.
+with lines cut at 16 KiB (512 bytes for an event). `relish events` and
+`relish audit` move a lease's purpose or a proposal's reason out of
+`details` into `author_text`, the same as the timeline. Their plain output
+for people is unchanged.
 
 ## Commands
 

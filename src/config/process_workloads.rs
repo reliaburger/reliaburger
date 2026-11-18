@@ -30,13 +30,6 @@ pub struct ProcessWorkloadsConfig {
     /// Linux, so a node that runs them sets it to `false`.
     #[serde(skip_serializing_if = "is_default_mount_isolation")]
     pub mount_isolation: bool,
-
-    /// Directory for temporary script files.
-    ///
-    /// Inline scripts are written here, made executable, and cleaned up
-    /// after execution. Must not be inside any workload-visible path.
-    #[serde(skip_serializing_if = "is_default_script_dir")]
-    pub script_dir: PathBuf,
 }
 
 // Both defaults depend on the machine that reads the file. When relish on a
@@ -47,16 +40,14 @@ fn is_default_mount_isolation(value: &bool) -> bool {
     *value == ProcessWorkloadsConfig::default().mount_isolation
 }
 
-fn is_default_script_dir(value: &std::path::Path) -> bool {
-    value == ProcessWorkloadsConfig::default().script_dir
-}
-
+// Not derived: `mount_isolation` defaults to true on Linux, which clippy on
+// another platform can't see.
+#[allow(clippy::derivable_impls)]
 impl Default for ProcessWorkloadsConfig {
     fn default() -> Self {
         Self {
             allowed_binaries: Vec::new(),
             mount_isolation: cfg!(target_os = "linux"),
-            script_dir: std::env::temp_dir().join("reliaburger-scripts"),
         }
     }
 }
@@ -115,12 +106,10 @@ mod tests {
         let toml_str = r#"
             allowed_binaries = ["/usr/bin/python3", "/usr/local/bin/node"]
             mount_isolation = true
-            script_dir = "/tmp/scripts"
         "#;
         let config: ProcessWorkloadsConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.allowed_binaries.len(), 2);
         assert!(config.mount_isolation);
-        assert_eq!(config.script_dir, PathBuf::from("/tmp/scripts"));
     }
 
     #[test]
@@ -132,27 +121,13 @@ mod tests {
     #[test]
     fn host_dependent_defaults_are_left_for_the_reading_node() {
         let written = toml::to_string(&ProcessWorkloadsConfig::default()).unwrap();
-        assert!(!written.contains("script_dir"), "{written}");
         assert!(!written.contains("mount_isolation"), "{written}");
         let explicit = ProcessWorkloadsConfig {
-            script_dir: PathBuf::from("/srv/scripts"),
             mount_isolation: !ProcessWorkloadsConfig::default().mount_isolation,
             ..Default::default()
         };
         let written = toml::to_string(&explicit).unwrap();
         let back: ProcessWorkloadsConfig = toml::from_str(&written).unwrap();
-        assert_eq!(back.script_dir, PathBuf::from("/srv/scripts"));
         assert_eq!(back.mount_isolation, explicit.mount_isolation);
-    }
-
-    #[test]
-    fn default_script_dir_is_temp() {
-        let config = ProcessWorkloadsConfig::default();
-        assert!(
-            config
-                .script_dir
-                .to_string_lossy()
-                .contains("reliaburger-scripts")
-        );
     }
 }

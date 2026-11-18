@@ -381,7 +381,7 @@ HealthChecker (periodic per workload)
 - Attaching to container stdio streams for log capture
 - Reconnecting to running containers after Bun restart
 
-**ProcessManager** handles non-container workloads. Today (the `process` Grill backend, `src/grill/process.rs`) it validates the binary against the allowlist and then starts the host process through a durable owner and activation gate, in its own process group, with the spec's environment and stdout/stderr captured for Ketchup. Auxiliary exec commands have child owners, and application retirement waits for their confirmed cleanup too. Writing inline scripts to temporary files and marking them executable is real. The namespace/seccomp/user-drop machinery below is the **planned** design, not current behaviour:
+**ProcessManager** handles non-container workloads. Today (the `process` Grill backend, `src/grill/process.rs`) it validates the binary against the allowlist and then starts the host process through a durable owner and activation gate, in its own process group, with the spec's environment and stdout/stderr captured for Ketchup. Auxiliary exec commands have child owners, and application retirement waits for their confirmed cleanup too. An inline script runs as `/bin/sh -c <script>`; no file is written. The namespace/seccomp/user-drop machinery below is the **planned** design, not current behaviour:
 
 - Validating binaries against the allowlist in `node.toml` *(shipped)*
 - Writing inline scripts to temporary files and marking them executable *(shipped)*
@@ -1920,7 +1920,6 @@ Unit tests cover individual components in isolation using mocked dependencies.
 
 - Binary allowlist validation (exact match, glob match, glob rejection when `allow_globs = false`)
 - Mount namespace construction (default visible paths, blocked paths, `allow_paths` with `:rw` suffix)
-- Script temp file creation and hash computation
 - Isolation config derivation from `AppSpec`
 
 **HealthChecker unit tests:**

@@ -1807,7 +1807,6 @@ mod tests {
         ProcessWorkloadsConfig {
             allowed_binaries: allowed.iter().map(PathBuf::from).collect(),
             mount_isolation,
-            ..ProcessWorkloadsConfig::default()
         }
     }
 

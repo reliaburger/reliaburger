@@ -45,8 +45,8 @@ struct Cli {
     listen: String,
 
     /// Runtime to use: auto, process, runc or mixed (Linux).
-    #[arg(long, default_value = "auto")]
-    runtime: String,
+    #[arg(long, value_enum, default_value_t = RuntimeChoice::Auto)]
+    runtime: RuntimeChoice,
 
     /// Join/form a cluster using the `[cluster]` config (gossip membership).
     /// Without this flag, bun runs as a single node, as before.
@@ -59,6 +59,36 @@ struct Cli {
 }
 
 /// Subcommands `bun` answers to besides running as an agent.
+/// The runtime `--runtime` names. Clap refuses any other value before Bun
+/// does anything, so a typo can't leave a state marker behind.
+// For the Rust reader: `ValueEnum` lets clap parse the flag straight into
+// this enum, listing the variants (in kebab-case) in `--help`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum RuntimeChoice {
+    /// runc when it's installed (Linux), with host processes; else process.
+    Auto,
+    /// Host processes only.
+    Process,
+    /// runc containers only (Linux).
+    Runc,
+    /// runc containers and host processes (Linux).
+    Mixed,
+    /// Apple Container directly: refused, with what to run instead.
+    Apple,
+}
+
+impl std::fmt::Display for RuntimeChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RuntimeChoice::Auto => "auto",
+            RuntimeChoice::Process => "process",
+            RuntimeChoice::Runc => "runc",
+            RuntimeChoice::Mixed => "mixed",
+            RuntimeChoice::Apple => "apple",
+        })
+    }
+}
+
 #[derive(clap::Subcommand)]
 enum Command {
     /// Internal foreground-process owner; runs before Tokio starts.
@@ -1044,9 +1074,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     if cli.cluster {
         let rootless = reliaburger::grill::rootless::is_rootless();
         let runc_installed = rootless
-            && cli.runtime == "auto"
+            && cli.runtime == RuntimeChoice::Auto
             && matches!(detect_runtime().await, DetectedRuntime::Runc { .. });
-        refuse_rootless_cluster(&cli.runtime, rootless, runc_installed)?;
+        refuse_rootless_cluster(cli.runtime, rootless, runc_installed)?;
     }
 
     // Load node config
@@ -1228,7 +1258,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
     // Select runtime
     let runtime = select_runtime(
-        &cli.runtime,
+        cli.runtime,
         &instances_dir,
         &pickle_dir,
         &config.images.mirrors,
@@ -4122,14 +4152,14 @@ const ROOTLESS_CLUSTER_UNSUPPORTED: &str = "rootless runc clusters are unsupport
 /// host, so the refusal can come before Bun touches any state (#813).
 #[cfg(target_os = "linux")]
 fn refuse_rootless_cluster(
-    selection: &str,
+    selection: RuntimeChoice,
     rootless: bool,
     runc_installed: bool,
 ) -> anyhow::Result<()> {
     let selects_runc = match selection {
-        "runc" | "mixed" => true,
-        "auto" => runc_installed,
-        _ => false,
+        RuntimeChoice::Runc | RuntimeChoice::Mixed => true,
+        RuntimeChoice::Auto => runc_installed,
+        RuntimeChoice::Process | RuntimeChoice::Apple => false,
     };
     if rootless && selects_runc {
         anyhow::bail!(ROOTLESS_CLUSTER_UNSUPPORTED);
@@ -4138,7 +4168,7 @@ fn refuse_rootless_cluster(
 }
 
 async fn select_runtime(
-    name: &str,
+    name: RuntimeChoice,
     instances_dir: &std::path::Path,
     image_directory: &std::path::Path,
     mirrors: &reliaburger::grill::ImageMirrors,
@@ -4146,7 +4176,7 @@ async fn select_runtime(
     #[cfg(not(target_os = "linux"))]
     let _ = (image_directory, mirrors);
     match name {
-        "auto" => {
+        RuntimeChoice::Auto => {
             // Both runtimes use durable owners, so launches remain
             // discoverable even before agent adoption is recorded.
             let runtime = match detect_runtime().await {
@@ -4173,7 +4203,7 @@ async fn select_runtime(
             println!("bun: auto-detected runtime: {kind}");
             Ok(runtime)
         }
-        "process" => {
+        RuntimeChoice::Process => {
             println!("bun: using process runtime");
             Ok(AnyGrill::Process(ProcessGrill::with_owner(
                 instances_dir.to_path_buf(),
@@ -4181,12 +4211,12 @@ async fn select_runtime(
             )))
         }
         #[cfg(target_os = "linux")]
-        "runc" | "mixed" => {
+        RuntimeChoice::Runc | RuntimeChoice::Mixed => {
             let is_rootless = reliaburger::grill::rootless::is_rootless();
             let mode = if is_rootless { "rootless" } else { "root" };
             println!("bun: using {name} runtime ({mode})");
             let grill = create_runc_runtime(instances_dir, image_directory, is_rootless, mirrors)?;
-            if name == "mixed" {
+            if name == RuntimeChoice::Mixed {
                 Ok(AnyGrill::with_host_processes(
                     grill,
                     instances_dir,
@@ -4196,8 +4226,11 @@ async fn select_runtime(
                 Ok(AnyGrill::Runc(grill))
             }
         }
-        "apple" => anyhow::bail!(APPLE_RUNTIME_DEFERRED),
-        other => anyhow::bail!("unknown runtime: {other}"),
+        RuntimeChoice::Apple => anyhow::bail!(APPLE_RUNTIME_DEFERRED),
+        #[cfg(not(target_os = "linux"))]
+        RuntimeChoice::Runc | RuntimeChoice::Mixed => {
+            anyhow::bail!("the {name} runtime needs Linux; use --runtime process here")
+        }
     }
 }
 
@@ -4515,13 +4548,31 @@ mod tests {
         assert!(socket.reuseaddr().unwrap());
     }
 
+    /// A misspelt runtime is refused by clap, before Bun does any work.
+    #[test]
+    fn an_unknown_runtime_is_refused_while_parsing_the_flags() {
+        let error = Cli::try_parse_from(["bun", "--runtime", "rnuc"])
+            .err()
+            .expect("rnuc isn't a runtime");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+        let cli = Cli::try_parse_from(["bun", "--runtime", "mixed"]).unwrap();
+        assert_eq!(cli.runtime, RuntimeChoice::Mixed);
+        let cli = Cli::try_parse_from(["bun"]).unwrap();
+        assert_eq!(cli.runtime, RuntimeChoice::Auto);
+    }
+
     #[tokio::test]
     async fn apple_selection_explains_the_linux_vm_release_profile() {
         let root = tempfile::tempdir().unwrap();
-        let error = select_runtime("apple", root.path(), root.path(), &Default::default())
-            .await
-            .err()
-            .expect("direct Apple Container must be unavailable for 0.1.0");
+        let error = select_runtime(
+            RuntimeChoice::Apple,
+            root.path(),
+            root.path(),
+            &Default::default(),
+        )
+        .await
+        .err()
+        .expect("direct Apple Container must be unavailable for 0.1.0");
         let message = error.to_string();
         assert!(message.contains("0.1.0"), "{message}");
         assert!(message.contains("managed Linux VM"), "{message}");
@@ -4531,7 +4582,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn rootless_cluster_is_refused_for_every_selection_that_picks_runc() {
-        for (selection, runc_installed) in [("runc", false), ("mixed", false), ("auto", true)] {
+        for (selection, runc_installed) in [
+            (RuntimeChoice::Runc, false),
+            (RuntimeChoice::Mixed, false),
+            (RuntimeChoice::Auto, true),
+        ] {
             let error = refuse_rootless_cluster(selection, true, runc_installed)
                 .expect_err("rootless runc cannot join a cluster");
             assert_eq!(
@@ -4546,14 +4601,14 @@ mod tests {
     #[test]
     fn rootless_cluster_is_allowed_when_no_rootless_runc_is_selected() {
         // Rootful runc, the process runtime, and `auto` without runc all
-        // cluster; unknown names fail later with their own message.
+        // cluster; Apple fails later with its own message.
         for (selection, rootless, runc_installed) in [
-            ("runc", false, true),
-            ("mixed", false, true),
-            ("auto", false, true),
-            ("process", true, true),
-            ("auto", true, false),
-            ("apple", true, true),
+            (RuntimeChoice::Runc, false, true),
+            (RuntimeChoice::Mixed, false, true),
+            (RuntimeChoice::Auto, false, true),
+            (RuntimeChoice::Process, true, true),
+            (RuntimeChoice::Auto, true, false),
+            (RuntimeChoice::Apple, true, true),
         ] {
             refuse_rootless_cluster(selection, rootless, runc_installed).unwrap();
         }
@@ -4564,10 +4619,10 @@ mod tests {
     async fn explicit_runc_disables_host_execution_and_mixed_enables_both() {
         use reliaburger::grill::{Grill, records::RuntimeKind};
         let root = tempfile::tempdir().unwrap();
-        for (mode, host) in [("runc", false), ("mixed", true)] {
+        for (mode, host) in [(RuntimeChoice::Runc, false), (RuntimeChoice::Mixed, true)] {
             let runtime = select_runtime(
                 mode,
-                &root.path().join(mode),
+                &root.path().join(mode.to_string()),
                 &root.path().join("images"),
                 &Default::default(),
             )
@@ -4582,7 +4637,6 @@ mod tests {
             let policy = reliaburger::config::process_workloads::ProcessWorkloadsConfig {
                 allowed_binaries: vec!["/bin/true".into()],
                 mount_isolation: false,
-                ..Default::default()
             };
             let name = if host { "runc+process" } else { "runc" };
             assert_eq!(host_workloads_enabled(name, &policy), host);
@@ -4595,7 +4649,7 @@ mod tests {
     async fn runc_selection_uses_the_nodes_private_image_storage() {
         let root = tempfile::tempdir().unwrap();
         let runtime = select_runtime(
-            "runc",
+            RuntimeChoice::Runc,
             &root.path().join("instances"),
             &root.path().join("custom-images"),
             &Default::default(),
@@ -4685,7 +4739,6 @@ mod tests {
         let mut policy = reliaburger::config::process_workloads::ProcessWorkloadsConfig {
             allowed_binaries: vec!["/bin/true".into()],
             mount_isolation: false,
-            ..Default::default()
         };
         assert!(host_workloads_enabled("process", &policy));
         policy.mount_isolation = true;

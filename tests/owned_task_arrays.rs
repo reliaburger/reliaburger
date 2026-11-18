@@ -1248,7 +1248,6 @@ async fn runc_common_job_api_runs_encrypted_singletons_and_gates_hooks_on_accept
     let host_policy = reliaburger::config::process_workloads::ProcessWorkloadsConfig {
         allowed_binaries: vec!["/usr/bin/printf".into()],
         mount_isolation: false,
-        ..Default::default()
     };
     let network = InMemoryRaftRouter::new();
     let council = Arc::new(
@@ -3345,7 +3344,6 @@ async fn cgroup_host_arrays_advertise_running_commands_not_queued_callers() {
         ProcessWorkloadsConfig {
             allowed_binaries: vec!["/bin/sh".into()],
             mount_isolation: false,
-            script_dir: root.path().join("scripts"),
         },
     );
     config.default_concurrency = 32;
@@ -3693,7 +3691,6 @@ async fn runc_shared_profile_reports_cgroup_cpu_and_memory() {
             ProcessWorkloadsConfig {
                 allowed_binaries: Vec::new(),
                 mount_isolation: false,
-                script_dir: root.path().join("scripts"),
             },
         ),
         NodeRunner::Owned(Box::new(
@@ -4021,7 +4018,6 @@ async fn leader_loss_mid_array(template: serde_json::Value) {
                 policy: ProcessWorkloadsConfig {
                     allowed_binaries: vec!["/bin/sh".into()],
                     mount_isolation: false,
-                    ..Default::default()
                 },
                 default_concurrency: 4,
                 backoff: (Duration::from_millis(1), Duration::from_millis(5)),

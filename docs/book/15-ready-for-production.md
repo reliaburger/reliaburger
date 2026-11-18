@@ -2539,13 +2539,17 @@ one-binary scratch image won't even start under runc.
 The way out was already sitting on every node. `testapp` is a subcommand of
 `bun` (`bun testapp --mode healthy --port 8080` runs the identical server), and
 `bun` is installed at `/usr/local/bin/bun` on every dev node. So instead of an
-image, the harness deploys a **process workload** — a plain command — and lets
-the node run its own `bun`:
+image, the harness deploys a **process workload** — a host binary named by
+`exec`, with `command` as its arguments — and lets the node run its own `bun`:
 
 ```toml
 [app.web]
-command = ["/usr/local/bin/bun", "testapp", "--mode", "healthy", "--port", "40817"]
+exec = "/usr/local/bin/bun"
+command = ["testapp", "--mode", "healthy", "--port", "40817"]
 ```
+
+(A `command` with no `exec`, `script` or `image` has nothing to run it in, and
+since 0.3.0 `relish lint` refuses it.)
 
 That needs the cluster to run the *process* runtime rather than runc, so
 `relish dev create` grew a `--runtime` flag (`runc` still the default). This is

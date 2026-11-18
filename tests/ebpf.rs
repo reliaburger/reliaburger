@@ -1938,7 +1938,6 @@ async fn exec_workload_is_held_to_its_namespace() {
         reliaburger::config::process_workloads::ProcessWorkloadsConfig {
             allowed_binaries: vec!["/bin/bash".into()],
             mount_isolation: false,
-            ..Default::default()
         },
     );
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
@@ -3361,7 +3360,6 @@ fn test_agent<G: reliaburger::grill::Grill + Clone + 'static>(
         reliaburger::config::process_workloads::ProcessWorkloadsConfig {
             allowed_binaries: vec!["/bin/sh".into()],
             mount_isolation: false,
-            ..Default::default()
         },
     );
     agent

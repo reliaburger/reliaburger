@@ -241,12 +241,34 @@ pub enum RelishError {
     #[error("invalid --{flag} value: {reason}")]
     InvalidFlag { flag: String, reason: String },
 
+    /// An app or namespace name the cluster couldn't hold, refused before it
+    /// goes into a request's path.
+    #[error(
+        "invalid {kind} name {name:?}: a name is a lowercase DNS label of 1–63 bytes, with letters or digits at both ends and only letters, digits or hyphens within"
+    )]
+    InvalidName {
+        /// Whether it names an app or a namespace.
+        kind: client::NameKind,
+        /// The name as given.
+        name: String,
+    },
+
     /// `relish upgrade plan` couldn't see the live cluster, so it won't
     /// guess its shape (#1568).
     #[error(
         "can't plan an upgrade for a cluster relish couldn't see ({0}); fix that, or pass --cluster-size N to plan for a cluster of N nodes"
     )]
     UnseenCluster(Box<RelishError>),
+
+    /// `relish apply` or `rollback` followed a deploy's progress for its
+    /// whole deadline without the deploy finishing.
+    #[error(
+        "stopped following the deploy after {seconds} s; it may still be running on the agent (see relish status)"
+    )]
+    DeployStreamDeadline {
+        /// The deadline, in seconds.
+        seconds: u64,
+    },
 
     /// A request to the agent timed out. The operation may still be running.
     #[error("request timed out (the operation may still be running on the agent)")]

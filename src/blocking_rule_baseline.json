@@ -451,12 +451,6 @@
   },
   {
     "path": "src/relish/mcp/credentials.rs",
-    "function": "obtain",
-    "call": "StoredToken::load",
-    "count": 2
-  },
-  {
-    "path": "src/relish/mcp/credentials.rs",
     "function": "remove",
     "call": "StoredToken::load",
     "count": 1

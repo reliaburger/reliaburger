@@ -170,7 +170,7 @@ The API client is a thin wrapper around `reqwest` configured with:
 - **Endpoint:** `--endpoint` / `RELIABURGER_ENDPOINT` first, then the laptop cluster's saved context, then `http://127.0.0.1:9117` (manual 13). There is no automatic multi-node endpoint discovery.
 - **Plain HTTP for streams:** `relish logs -f` reads a streamed HTTP response, and `exec` is a plain `POST /v1/exec/{app}/{namespace}`.
 - **No automatic retries** on ordinary requests. A few calls retry a specific answer themselves (a fault clear retries a 504 within a budget, for example), and write calls that take an `Idempotency-Key` are safe for the caller to repeat.
-- **Timeouts:** a connect timeout, and a 300-second total timeout on every request from the shared client. Today that total covers streamed bodies too, so a `relish logs -f` or a long `apply` stream ends after five minutes.
+- **Request timeout:** 300 s for a request that answers in one go, and for the wait until a streaming response starts. Once it streams (`relish logs -f`, the apply and rollback progress streams), a response ends after 60 s of silence, and the agent sends an SSE keep-alive comment every 15 s. A deploy's progress stream also stops after 30 minutes, with an error saying the deploy may still be running.
 
 ### Output Formatting
 

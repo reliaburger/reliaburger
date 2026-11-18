@@ -625,6 +625,34 @@ end anywhere, including halfway through a multi-byte UTF-8 character, so the
 decoder buffers bytes and only decodes a block once it has seen the blank line
 that ends it.
 
+A follow has no natural end, which the CLI's HTTP client didn't know until
+0.3.0. `BunClient` gave every request a 300-second deadline with reqwest's
+`ClientBuilder::timeout`, and that deadline covers reading the body, not
+only waiting for the headers. So `relish logs web -f` on a quiet app died
+after five minutes with "request timed out", and so did `relish apply` when
+a rolling deploy's progress stream ran longer. The client now carries two
+reqwest clients. Ordinary requests keep the 300-second total. Streaming ones
+(`logs -f`, the apply and rollback streams) go through a client with no
+deadline of its own, and the code applies three. The wait for the headers
+gets the ordinary 300 seconds, because the agent binds images before it
+starts an apply's stream. After that, a small `StreamBody` type reads one
+chunk at a time inside `tokio::time::timeout`, so 60 seconds of silence ends
+the command. Silence alone can't mean "dead", since a quiet app writes
+nothing for hours, so every SSE route now sends axum's
+`KeepAlive::default()`, a comment line (`:`) every 15 seconds that SSE
+parsers skip.
+
+Keep-alives cut the other way too: a deploy wedged on the agent would now
+hold `relish apply` open for ever, and a soak script with it. So an apply's
+or rollback's stream also has a 30-minute deadline, after which the command
+says it stopped following and the deploy may still be running. A followed
+log has no such deadline; following is what you asked for. Why not reqwest's
+own `read_timeout` for the silence? Because it also covers the wait for the
+headers, where 60 seconds is too short. The tests use a client with
+millisecond deadlines: `a_stream_that_keeps_talking_outlives_the_request_timeout`,
+`a_silent_stream_times_out`, `the_wait_for_a_stream_to_start_gets_the_request_timeout`
+and `a_deploy_stream_stops_at_its_deadline`.
+
 `relish top` had the same blind spot and a subtler trap. The dashboard already
 charted `process_cpu_percent` and `process_memory_bytes`, labelled by app and
 PID. Why not have the CLI query those metrics and match them to instances by

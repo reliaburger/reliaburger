@@ -1,20 +1,18 @@
 //! ProcessManager — process workloads with isolation.
 //!
-//! Wraps `ProcessGrill` with binary allowlist validation, script temp
-//! file lifecycle, and (on Linux) mount namespace isolation. The Grill
-//! trait stays clean — ProcessManager adds isolation on top.
+//! Wraps `ProcessGrill` with binary allowlist validation. The Grill trait
+//! stays clean — ProcessManager adds the policy on top. An inline script
+//! runs as `/bin/sh -c` through the same allowlist, with no file written.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::config::process_workloads::ProcessWorkloadsConfig;
 
 /// Manages the lifecycle of process workloads (exec/script).
 ///
-/// Validates binaries against the allowlist, creates temp files for
-/// inline scripts, and configures isolation. Does not implement `Grill`
-/// directly — the supervisor calls `prepare_exec` or `prepare_script`
-/// to get a command + args, then passes them to ProcessGrill.
+/// Validates binaries against the allowlist. Does not implement `Grill`
+/// directly — the supervisor calls `prepare_exec` to get a command + args,
+/// then passes them to ProcessGrill.
 #[derive(Debug, Clone)]
 pub struct ProcessManager {
     config: ProcessWorkloadsConfig,
@@ -32,8 +30,6 @@ pub struct PreparedWorkload {
     pub binary: PathBuf,
     /// Arguments to pass.
     pub args: Vec<String>,
-    /// Temp file to clean up after execution (for scripts).
-    pub temp_file: Option<PathBuf>,
 }
 
 /// Errors from process workload operations.
@@ -44,15 +40,6 @@ pub enum ProcessWorkloadError {
 
     #[error("binary {path:?} not found")]
     BinaryNotFound { path: PathBuf },
-
-    #[error("failed to create script temp file: {0}")]
-    ScriptCreateFailed(std::io::Error),
-
-    #[error("failed to clean up script temp file {path:?}: {source}")]
-    ScriptCleanupFailed {
-        path: PathBuf,
-        source: std::io::Error,
-    },
 }
 
 impl ProcessManager {
@@ -76,91 +63,15 @@ impl ProcessManager {
         Ok(PreparedWorkload {
             binary: binary.to_path_buf(),
             args: Vec::new(),
-            temp_file: None,
         })
     }
 
     /// Whether inline scripts may run on this node: true only when the
     /// interpreter (`/bin/sh`) is in the allowlist. Lets the supervisor
-    /// refuse a script deploy up front without writing a temp file.
+    /// refuse a script deploy up front.
     pub fn is_script_allowed(&self) -> bool {
         self.config
             .is_binary_allowed(std::path::Path::new(SCRIPT_INTERPRETER))
-    }
-
-    fn ensure_script_allowed(&self) -> Result<(), ProcessWorkloadError> {
-        if self.is_script_allowed() {
-            Ok(())
-        } else {
-            Err(ProcessWorkloadError::BinaryNotAllowed {
-                path: PathBuf::from(SCRIPT_INTERPRETER),
-            })
-        }
-    }
-
-    /// Prepare a script workload (inline script content).
-    ///
-    /// Writes the script to a temp file in the configured script dir,
-    /// makes it executable, and returns a `PreparedWorkload` that
-    /// executes it via `/bin/sh`. The temp file path is returned in
-    /// `PreparedWorkload.temp_file` for cleanup after execution.
-    pub fn prepare_script(
-        &self,
-        script_content: &str,
-        name: &str,
-    ) -> Result<PreparedWorkload, ProcessWorkloadError> {
-        // A script is host execution of the interpreter, so it is subject to
-        // the same deny-by-default allowlist. The operator opts into scripts
-        // by naming `/bin/sh` in `node.toml`.
-        self.ensure_script_allowed()?;
-
-        // Ensure script directory exists
-        std::fs::create_dir_all(&self.config.script_dir)
-            .map_err(ProcessWorkloadError::ScriptCreateFailed)?;
-
-        // Create temp file with a predictable name for debugging
-        let script_path = self
-            .config
-            .script_dir
-            .join(format!("reliaburger-{name}-{}.sh", std::process::id()));
-
-        // Write script content
-        let mut file = std::fs::File::create(&script_path)
-            .map_err(ProcessWorkloadError::ScriptCreateFailed)?;
-        file.write_all(script_content.as_bytes())
-            .map_err(ProcessWorkloadError::ScriptCreateFailed)?;
-
-        // Make executable
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o700);
-            std::fs::set_permissions(&script_path, perms)
-                .map_err(ProcessWorkloadError::ScriptCreateFailed)?;
-        }
-
-        Ok(PreparedWorkload {
-            binary: PathBuf::from("/bin/sh"),
-            args: vec!["-c".to_string(), script_path.to_string_lossy().to_string()],
-            temp_file: Some(script_path),
-        })
-    }
-
-    /// Clean up a prepared workload's temp files.
-    ///
-    /// Call after the workload completes (success or failure).
-    pub fn cleanup(&self, workload: &PreparedWorkload) -> Result<(), ProcessWorkloadError> {
-        if let Some(ref temp_file) = workload.temp_file
-            && temp_file.exists()
-        {
-            std::fs::remove_file(temp_file).map_err(|e| {
-                ProcessWorkloadError::ScriptCleanupFailed {
-                    path: temp_file.clone(),
-                    source: e,
-                }
-            })?;
-        }
-        Ok(())
     }
 
     /// Get the process workloads config.
@@ -177,7 +88,6 @@ mod tests {
         ProcessManager::new(ProcessWorkloadsConfig {
             allowed_binaries: binaries,
             mount_isolation: false,
-            script_dir: std::env::temp_dir().join("reliaburger-test-scripts"),
         })
     }
 
@@ -186,7 +96,7 @@ mod tests {
         let mgr = manager_with_allowlist(vec![PathBuf::from("/usr/bin/python3")]);
         let workload = mgr.prepare_exec(Path::new("/usr/bin/python3")).unwrap();
         assert_eq!(workload.binary, PathBuf::from("/usr/bin/python3"));
-        assert!(workload.temp_file.is_none());
+        assert!(workload.args.is_empty());
     }
 
     #[test]
@@ -208,76 +118,5 @@ mod tests {
             result,
             Err(ProcessWorkloadError::BinaryNotAllowed { .. })
         ));
-    }
-
-    #[test]
-    fn prepare_script_denied_without_interpreter_allowlisted() {
-        // A script is host execution of /bin/sh, so deny-by-default applies.
-        let mgr = manager_with_allowlist(vec![]);
-        let result = mgr.prepare_script("echo hi", "test-app");
-        assert!(matches!(
-            result,
-            Err(ProcessWorkloadError::BinaryNotAllowed { .. })
-        ));
-    }
-
-    #[test]
-    fn prepare_script_creates_temp_file() {
-        let mgr = manager_with_allowlist(vec![PathBuf::from(SCRIPT_INTERPRETER)]);
-        let workload = mgr.prepare_script("echo hello world", "test-app").unwrap();
-
-        assert_eq!(workload.binary, PathBuf::from("/bin/sh"));
-        assert_eq!(workload.args[0], "-c");
-        assert!(workload.temp_file.is_some());
-
-        let temp_path = workload.temp_file.as_ref().unwrap();
-        assert!(temp_path.exists());
-        let content = std::fs::read_to_string(temp_path).unwrap();
-        assert_eq!(content, "echo hello world");
-
-        // Cleanup
-        mgr.cleanup(&workload).unwrap();
-        assert!(!temp_path.exists());
-    }
-
-    #[test]
-    fn prepare_script_temp_file_is_executable() {
-        let mgr = manager_with_allowlist(vec![PathBuf::from(SCRIPT_INTERPRETER)]);
-        let workload = mgr
-            .prepare_script("#!/bin/sh\necho ok", "exec-test")
-            .unwrap();
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let temp_path = workload.temp_file.as_ref().unwrap();
-            let perms = std::fs::metadata(temp_path).unwrap().permissions();
-            assert_eq!(perms.mode() & 0o700, 0o700);
-        }
-
-        mgr.cleanup(&workload).unwrap();
-    }
-
-    #[test]
-    fn cleanup_nonexistent_file_succeeds() {
-        let mgr = manager_with_allowlist(vec![]);
-        let workload = PreparedWorkload {
-            binary: PathBuf::from("/bin/sh"),
-            args: vec![],
-            temp_file: Some(PathBuf::from("/tmp/nonexistent-reliaburger-script")),
-        };
-        // Should succeed — file doesn't exist, nothing to clean up
-        mgr.cleanup(&workload).unwrap();
-    }
-
-    #[test]
-    fn cleanup_no_temp_file_succeeds() {
-        let mgr = manager_with_allowlist(vec![]);
-        let workload = PreparedWorkload {
-            binary: PathBuf::from("/usr/bin/python3"),
-            args: vec![],
-            temp_file: None,
-        };
-        mgr.cleanup(&workload).unwrap();
     }
 }

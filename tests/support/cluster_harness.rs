@@ -74,7 +74,6 @@ impl TestHarness {
             reliaburger::config::process_workloads::ProcessWorkloadsConfig {
                 allowed_binaries: vec!["/bin/sh".into()],
                 mount_isolation: false,
-                ..Default::default()
             },
         );
         // Tests mount host paths from their own temp directories; the
@@ -100,7 +99,6 @@ impl TestHarness {
                         .map(Into::into)
                         .collect(),
                     mount_isolation: false,
-                    ..Default::default()
                 },
                 default_concurrency: 8,
                 backoff: (Duration::from_millis(1), Duration::from_millis(5)),

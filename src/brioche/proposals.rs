@@ -458,11 +458,21 @@ fn render_actions(view: &ProposalView, actions: &Actions) -> String {
         }
     }
     if !offered && (view.state == "pending" || view.state == "applied") {
-        html.push_str(
-            "<p class=\"empty\">Your token can't make this decision here: deciding takes a \
-             person's token, deployer or above, covering every app it touches, and never the \
-             author's own.</p>\n",
-        );
+        if csrf.is_none() {
+            // No browser session, as through `relish dashboard`'s proxy,
+            // which forwards no writes: what the token may do doesn't
+            // matter here.
+            html.push_str(
+                "<p class=\"empty\">This view is read-only: it has no browser session to \
+                 post from. Use the command above.</p>\n",
+            );
+        } else {
+            html.push_str(
+                "<p class=\"empty\">Your token can't make this decision here: deciding takes a \
+                 person's token, deployer or above, covering every app it touches, and never \
+                 the author's own.</p>\n",
+            );
+        }
     }
     if view.state != "pending" && view.state != "applied" {
         html.push_str("<p class=\"empty\">Decided; nothing left to do.</p>\n");
@@ -754,7 +764,12 @@ mod tests {
 
     #[test]
     fn a_viewer_who_may_not_decide_sees_no_forms_only_the_commands() {
-        let html = render_proposal(&row(view(17, "pending")), NOW, &Actions::default(), None);
+        let may_not = Actions {
+            decide: false,
+            undo: false,
+            ..decider()
+        };
+        let html = render_proposal(&row(view(17, "pending")), NOW, &may_not, None);
         assert!(!html.contains("<form"), "{html}");
         assert!(!html.contains("<button"), "{html}");
         assert!(html.contains("<code>relish proposal approve 17</code>"));
@@ -766,6 +781,25 @@ mod tests {
         };
         let html = render_proposal(&row(view(17, "pending")), NOW, &bearer, None);
         assert!(!html.contains("<form"), "{html}");
+    }
+
+    /// `relish dashboard` sends a bearer token and no session, so its view
+    /// posts nothing whoever is looking. The page says that, not that the
+    /// viewer's token falls short: an admin's doesn't.
+    #[test]
+    fn a_view_without_a_session_says_it_is_read_only() {
+        for (state, command) in [
+            ("pending", "relish proposal approve 17"),
+            ("applied", "relish undo 17"),
+        ] {
+            let mut proposal = view(17, state);
+            proposal.undo.command = Some("relish undo 17".to_string());
+            let html = render_proposal(&row(proposal), NOW, &Actions::default(), None);
+            assert!(!html.contains("<form"), "{html}");
+            assert!(!html.contains("Your token can't"), "{html}");
+            assert!(html.contains("This view is read-only"), "{html}");
+            assert!(html.contains(command), "{html}");
+        }
     }
 
     #[test]

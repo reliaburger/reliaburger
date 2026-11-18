@@ -270,8 +270,10 @@ pub struct LeaseGrant {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[serde(tag = "refusal", rename_all = "snake_case")]
 pub enum LeaseRefusal {
-    /// Someone else holds the target, or a lease that overlaps it.
-    #[error("{} is held by {} until {} ({})", lease.target, lease.holder.name, lease.expires_at_unix_ms, lease.purpose)]
+    /// Someone else holds the target, or a lease that overlaps it. The
+    /// sentence leaves out the holder's purpose, which is the holder's own
+    /// words: it travels as the lease's field, which readers wrap.
+    #[error("{} is held by {} until {}", lease.target, lease.holder.name, lease.expires_at_unix_ms)]
     Held { lease: Box<AgentLease> },
     /// There's no lease on the target.
     #[error("there's no lease on {target}")]
@@ -788,14 +790,32 @@ mod tests {
         assert_eq!(lease.holder.name, "holmes");
         assert_eq!(lease.expires_at_unix_ms, NOW + DEFAULT_LEASE_TTL_MS);
         assert_eq!(lease.purpose, "holmes is investigating");
+        let lease = Box::new(lease);
         let message = LeaseRefusal::Held {
-            lease: Box::new(lease),
+            lease: lease.clone(),
         }
         .to_string();
         assert!(
             message.contains("app:shop/web is held by holmes"),
             "{message}"
         );
+        // The purpose is the holder's own words: it travels only as the
+        // lease's field, which readers wrap, never inside a sentence.
+        let quoted = [
+            message,
+            crate::proposal::ProposalRefusal::LeaseHeld {
+                lease: lease.clone(),
+            }
+            .to_string(),
+            crate::proposal::FailedReason::Lease {
+                lease: lease.clone(),
+            }
+            .to_string(),
+            crate::bun::lease_fence::held_message(&lease, NOW),
+        ];
+        for sentence in quoted {
+            assert!(!sentence.contains("investigating"), "{sentence}");
+        }
         assert_eq!(leases.generation, 1, "a refusal changes nothing");
     }
 
