@@ -1626,6 +1626,22 @@ macOS (runc only runs on Linux, where `WEXITED` means exits), and runc
 reports a stopped process as running. The Apple runtime never names a pid, so
 Smoker can't pause an Apple container at all.
 
+Runc shared the last case, though, the one about deleting a paused instance,
+and the 0.3.0 review caught it ([#2041](https://github.com/reliaburger/reliaburger/issues/2041)).
+Its stop ran `runc kill <id> SIGTERM` and nothing after. Writing the test
+showed the bug was two bugs. The pid runc reports, and so the pid Smoker
+pauses, is the `runc run` launcher, not the container. SIGSTOP can't be
+caught, so runc can't pass it on: the container keeps running, takes its
+SIGTERM and exits, but the frozen launcher never notices, and the stop still
+waits out its whole grace (27 seconds of a 20-second grace in the test). A
+pause that freezes the container's own init is the case the review described:
+the SIGTERM stays pending and the workload never runs its handler. So a runc
+stop now follows the signal with SIGCONT to both, the launcher's pid and
+`runc kill <id> SIGCONT`, and two tests in `tests/owned_runc.rs` pause one
+each and require the stop to finish well inside its grace. That a pause of a
+runc app freezes the launcher rather than the workload is a gap of its own
+([#2079](https://github.com/reliaburger/reliaburger/issues/2079)).
+
 The lesson is an old one with a new face. A status the kernel hands back is
 only what you asked for if you check that it is. And a supervisor that's the
 only thing allowed to stop a workload must never block, because when it does,

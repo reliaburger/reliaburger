@@ -1100,7 +1100,7 @@ fn job_retirement_writes(
         .deployments()
         .filter(|(_, record)| {
             !record.completed
-                && !record.cancelled
+                && !record.cancelled()
                 && record.config.job.get(&job_id.name).is_some_and(|spec| {
                     spec.namespace.as_deref().unwrap_or("default") == job_id.namespace
                 })
@@ -1680,7 +1680,7 @@ mod tests {
         let arrays = crate::bun::task_array_leader::read_standalone(&service).await;
         assert!(arrays.jobs().definition(&namespace, "cron").is_none());
         let (_, deployment) = arrays.deployments().next().unwrap();
-        assert!(deployment.cancelled);
+        assert!(deployment.cancelled());
     }
 
     /// Without the task arrays a job lease can't prove its jobs stopped, so

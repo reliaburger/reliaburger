@@ -471,27 +471,20 @@ async fn proxy_handler(
 ) -> Response {
     // Count the request and mark it in flight. Mayo reads these process-global
     // counters to emit `ingress_requests_total`; Wrapper only produces them.
+    // `counted` takes the request out of flight even when hyper drops this
+    // future before it answers (#2044).
     let metrics = super::metrics::global_ingress_metrics();
-    metrics.record_request();
-    metrics.inc_in_flight();
-
-    // Hold a connection permit for the whole request. `try_acquire_owned`
-    // returns immediately when full, so a flood gets 503 instead of queueing.
-    // The permit lives in `_permit` and is released on every return path; for
-    // a WebSocket it is moved into the splice task so it outlives the 101.
-    let permit = match Arc::clone(&state.connection_limit).try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            metrics.record_response(StatusCode::SERVICE_UNAVAILABLE);
-            metrics.dec_in_flight();
+    super::metrics::counted(metrics, async move {
+        // Hold a connection permit for the whole request. `try_acquire_owned`
+        // returns immediately when full, so a flood gets 503 instead of
+        // queueing. The permit is released on every return path; for a
+        // WebSocket it is moved into the splice task so it outlives the 101.
+        let Ok(permit) = Arc::clone(&state.connection_limit).try_acquire_owned() else {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
-    };
-
-    let response = do_proxy(&state, remote, over_tls, req, permit).await;
-    metrics.record_response(response.status());
-    metrics.dec_in_flight();
-    response
+        };
+        do_proxy(&state, remote, over_tls, req, permit).await
+    })
+    .await
 }
 
 /// Generate a fresh request identifier.
@@ -1033,13 +1026,15 @@ const HOP_BY_HOP: [&str; 8] = [
 ];
 
 /// Whether a header name is hop-by-hop (case-insensitive).
-fn is_hop_by_hop(name: &str) -> bool {
+pub(super) fn is_hop_by_hop(name: &str) -> bool {
     HOP_BY_HOP.iter().any(|h| name.eq_ignore_ascii_case(h))
 }
 
 /// The set of header names listed in a message's `Connection` header. Those
 /// are themselves hop-by-hop for this leg and must also be dropped.
-fn connection_tokens(headers: &axum::http::HeaderMap) -> std::collections::HashSet<String> {
+pub(super) fn connection_tokens(
+    headers: &axum::http::HeaderMap,
+) -> std::collections::HashSet<String> {
     let mut set = std::collections::HashSet::new();
     for value in headers.get_all(axum::http::header::CONNECTION) {
         if let Ok(v) = value.to_str() {

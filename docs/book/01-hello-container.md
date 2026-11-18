@@ -874,13 +874,23 @@ CPU limits use two parameters. `cpu.max` is a hard limit: "this container can us
 The conversion from millicores (what users write in config) to microseconds (what the kernel expects) is straightforward:
 
 ```rust
+pub(crate) fn cpu_quota_us(millicores: u64) -> Option<u64> {
+    millicores
+        .checked_mul(CGROUP_PERIOD_US)
+        .map(|product| product / 1000)
+}
+
 pub fn cpu_max_from_millicores(millicores: u64) -> String {
-    let quota_us = millicores * CGROUP_PERIOD_US / 1000;
-    format!("{quota_us} {CGROUP_PERIOD_US}")
+    match cpu_quota_us(millicores) {
+        Some(quota_us) => format!("{quota_us} {CGROUP_PERIOD_US}"),
+        None => format!("max {CGROUP_PERIOD_US}"),
+    }
 }
 ```
 
 500 millicores means "half a CPU." With a 100ms (100,000 microsecond) period, that's 50,000 microseconds of quota: `"50000 100000"`. 1000 millicores is a full CPU: `"100000 100000"`. 2000 millicores is two CPUs: `"200000 100000"`. The kernel allows quota larger than the period.
+
+The first version multiplied with a plain `*`, and the 0.3.0 review found the hole in that ([#2042](https://github.com/reliaburger/reliaburger/issues/2042)). Parsing bounded a CPU limit only by `u64`, so `cpu = "1-200000000000000"` passed, and multiplying it by 100,000 overflows. What happens then depends on the build: a debug build panics, and a release build wraps around silently, which here meant a garbage quota, or a negative one once the OCI spec cast it to `i64`. `checked_mul` is the standard library's way of saying "multiply, or tell me it didn't fit": it returns `Option<u64>`, `None` on overflow. There are siblings for other policies, `wrapping_mul` and `saturating_mul`, and choosing one says in the code what overflow should mean. Here it means no limit (`max`). It can't happen through config any more, though, because `ResourceRange::parse_cpu` now refuses a limit above `MAX_CPU_LIMIT_MILLICORES`, 65,536 cores. Linux builds for at most 8,192 CPUs, so no real node is anywhere near it.
 
 For `cpu.weight`, we convert millicores to the kernel's 1-10000 range using `.clamp()`:
 

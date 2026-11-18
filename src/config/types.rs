@@ -119,6 +119,14 @@ fn parse_num(num_str: &str, multiplier: u64, original: &str) -> Result<u64, Conf
 // ResourceRange
 // ---------------------------------------------------------------------------
 
+/// The largest CPU limit an app, job or sidecar may declare: 65,536 cores,
+/// in millicores.
+///
+/// Linux builds for at most 8,192 CPUs, so no node has more. The ceiling
+/// keeps the CFS quota the runtime computes from the limit (millicores times
+/// the 100 ms period) far from overflowing.
+pub const MAX_CPU_LIMIT_MILLICORES: u64 = 65_536_000;
+
 /// A request-limit pair for CPU or memory resources.
 ///
 /// Parsed from strings like `"128Mi-512Mi"` (request 128Mi, limit 512Mi)
@@ -134,8 +142,20 @@ pub struct ResourceRange {
 
 impl ResourceRange {
     /// Parse a CPU range such as `"0.5-2"` or `"100m-500m"` into millicores.
+    ///
+    /// Refuses a limit above [`MAX_CPU_LIMIT_MILLICORES`].
     pub fn parse_cpu(s: &str) -> Result<Self, ConfigError> {
-        Self::parse_with(s, parse_cpu_millicores)
+        let range = Self::parse_with(s, parse_cpu_millicores)?;
+        if range.limit > MAX_CPU_LIMIT_MILLICORES {
+            return Err(ConfigError::InvalidResourceRange {
+                value: s.to_string(),
+                reason: format!(
+                    "a CPU limit can't exceed {} cores",
+                    MAX_CPU_LIMIT_MILLICORES / 1000
+                ),
+            });
+        }
+        Ok(range)
     }
 
     /// Parse a memory range such as `"128Mi-512Mi"` into bytes.
@@ -668,6 +688,17 @@ mod tests {
     fn parse_resource_range_request_exceeds_limit_rejected() {
         assert!(ResourceRange::parse_cpu("500m-100m").is_err());
         assert!(ResourceRange::parse_cpu("2-1").is_err());
+    }
+
+    /// A CPU limit no node could have is refused when it's parsed, before
+    /// the runtime multiplies it into a CFS quota and overflows (#2042).
+    #[test]
+    fn parse_resource_range_refuses_a_cpu_limit_above_the_ceiling() {
+        assert!(ResourceRange::parse_cpu("1-200000000000000").is_err());
+        assert!(ResourceRange::parse_cpu("65537").is_err());
+        assert!(ResourceRange::parse_cpu("1-65537").is_err());
+        let ceiling = ResourceRange::parse_cpu("1-65536").unwrap();
+        assert_eq!(ceiling.limit, MAX_CPU_LIMIT_MILLICORES);
     }
 
     #[test]

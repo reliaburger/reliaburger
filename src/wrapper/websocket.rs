@@ -244,9 +244,17 @@ fn build_upgrade_request(
 
     let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {backend}\r\n");
 
+    // Hop-by-hop headers and the ones the client's `Connection` names belong
+    // to the client's leg, as on the plain HTTP path: `Proxy-Authorization`
+    // is the proxy's credential, not the backend's (#2046). This leg's own
+    // `Connection` and `Upgrade` are set explicitly below.
+    let connection_tokens = super::proxy::connection_tokens(req.headers());
     for (name, value) in req.headers() {
         if name == header::HOST {
             continue; // Already set above
+        }
+        if super::proxy::is_hop_by_hop(name.as_str()) || connection_tokens.contains(name.as_str()) {
+            continue;
         }
         if super::proxy::is_forwarded_header(name.as_str())
             || name.as_str().eq_ignore_ascii_case("x-real-ip")
@@ -266,6 +274,13 @@ fn build_upgrade_request(
         }
         request.push_str(&format!("{}: {v}\r\n", name.as_str()));
     }
+    // `is_websocket_upgrade` admitted the request, so it names a protocol.
+    let upgrade = req
+        .headers()
+        .get(header::UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("websocket");
+    request.push_str(&format!("connection: upgrade\r\nupgrade: {upgrade}\r\n"));
     for (name, value) in super::proxy::forwarded_headers(remote, over_tls) {
         request.push_str(&format!("{name}: {value}\r\n"));
     }
@@ -394,6 +409,51 @@ mod tests {
         assert!(raw.contains("upgrade: websocket\r\n"));
         assert!(raw.contains("sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n"));
         assert!(raw.ends_with("\r\n\r\n"));
+    }
+
+    /// The upgrade drops what the plain HTTP path drops: the hop-by-hop
+    /// set, the proxy's own credentials, and every header the client's
+    /// `Connection` names. It keeps one `Connection: upgrade` and the
+    /// client's `Upgrade` (#2046).
+    #[test]
+    fn build_upgrade_request_strips_hop_by_hop_headers_and_proxy_credentials() {
+        let req = Request::builder()
+            .uri("/ws")
+            .header(header::CONNECTION, "keep-alive, Upgrade, X-Leg-Secret")
+            .header(header::UPGRADE, "websocket")
+            .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("Proxy-Authorization", "Basic cHJveHk6c2VjcmV0")
+            .header("Keep-Alive", "timeout=5")
+            .header("TE", "trailers")
+            .header("Trailer", "Expires")
+            .header("Transfer-Encoding", "chunked")
+            .header("X-Leg-Secret", "for-the-proxy")
+            .header("X-End-To-End", "kept")
+            .body(Body::empty())
+            .unwrap();
+        let backend: SocketAddr = "10.0.2.2:8080".parse().unwrap();
+        let remote: SocketAddr = "203.0.113.7:5000".parse().unwrap();
+        let raw = build_upgrade_request(&req, backend, remote, false).to_lowercase();
+
+        for dropped in [
+            "\r\nproxy-authorization:",
+            "\r\nkeep-alive:",
+            "\r\nte:",
+            "\r\ntrailer:",
+            "\r\ntransfer-encoding:",
+            "\r\nx-leg-secret:",
+            "cHJveHk6c2VjcmV0",
+        ] {
+            assert!(
+                !raw.contains(&dropped.to_lowercase()),
+                "{dropped} reached the backend: {raw}"
+            );
+        }
+        assert_eq!(raw.matches("connection:").count(), 1, "{raw}");
+        assert!(raw.contains("connection: upgrade\r\n"), "{raw}");
+        assert_eq!(raw.matches("upgrade: websocket\r\n").count(), 1, "{raw}");
+        assert!(raw.contains("x-end-to-end: kept\r\n"), "{raw}");
+        assert!(raw.contains("sec-websocket-key: dghlihnhbxbszsbub25jzq==\r\n"));
     }
 
     /// M9: a WebSocket client cannot spoof `X-Forwarded-For`. The client's

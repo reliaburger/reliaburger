@@ -263,6 +263,8 @@ pub struct Compatibility {
 /// The council membership check on the Raft port: the `CouncilVoters` Raft
 /// RPC and its answer, which an earlier 0.3.0 build can't decode, and a
 /// server that refuses Raft RPCs from nodes outside its council.
+/// A deployment record keeps when its cancel was requested
+/// (`DeploymentRecord::cancelled_at` replaces `cancelled`, #2047).
 ///
 /// Bumping either number makes the checked-in gossip and Raft fuzz seeds
 /// stale: run `make fuzz-corpus-seed` in the same change (#1941). Keep the

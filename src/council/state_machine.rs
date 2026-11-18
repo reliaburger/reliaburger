@@ -496,7 +496,7 @@ impl StateMachineInner {
                         reason: "unknown deployment".into(),
                     });
                 };
-                if record.cancelled {
+                if record.cancelled() {
                     return Some(CouncilResponse::Refused {
                         reason: "deployment was cancelled".into(),
                     });

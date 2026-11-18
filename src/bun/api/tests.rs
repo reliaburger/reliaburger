@@ -1489,7 +1489,7 @@ async fn leased_apply_with_jobs_uses_the_common_job_lifecycle() {
         desired
             .task_arrays
             .deployments()
-            .all(|(_, record)| record.cancelled || record.completed),
+            .all(|(_, record)| record.cancelled() || record.completed),
         "cleanup cancels the leased deployment"
     );
     assert!(
@@ -1578,7 +1578,7 @@ schedule = "* * * * *"
     assert!(
         after
             .deployments()
-            .all(|(_, record)| record.cancelled || record.completed)
+            .all(|(_, record)| record.cancelled() || record.completed)
     );
     for name in ["batch", "scheduled"] {
         assert!(after.jobs().definition(&lease.namespace, name).is_none());
@@ -10735,7 +10735,7 @@ async fn assert_stalled_settlement_is_bounded(settlement: StalledSettlement) {
     let run = seed_finished_hook(&council, failed).await;
     let before = council.desired_state().await;
     let record = before.task_arrays.deployment(HUNG_DEPLOYMENT_ID).unwrap();
-    assert!(!record.apps_committed && !record.cancelled && !record.completed);
+    assert!(!record.apps_committed && !record.cancelled() && !record.completed);
     assert_eq!(
         before.task_arrays.get(run).unwrap().state.status(),
         if failed {

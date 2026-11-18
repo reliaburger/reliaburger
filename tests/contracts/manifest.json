@@ -3589,6 +3589,60 @@
       ]
     },
     {
+      "id": "issue-2041-legacy-oci-owned_runc-runc_container_paused_by_smoker_takes_its_stop_signal_at_once",
+      "issue": 2041,
+      "promise": "Complete the exact retained legacy OCI case through its finite owned driver.",
+      "supported_paths": [
+        "Exact original ignored test identity and declared Make owner."
+      ],
+      "refused_paths": [
+        "No generic aliases or success from another test or owner."
+      ],
+      "boundaries": [
+        "Source binding only; real isolated Linux OCI execution and current receipt are required."
+      ],
+      "cases": [
+        {
+          "id": "legacy-oci-owned_runc-runc_container_paused_by_smoker_takes_its_stop_signal_at_once",
+          "binary": "reliaburger::owned_runc",
+          "test": "runc_container_paused_by_smoker_takes_its_stop_signal_at_once",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/owned_runc.rs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "issue-2041-legacy-oci-owned_runc-runc_container_with_a_paused_init_takes_its_stop_signal_at_once",
+      "issue": 2041,
+      "promise": "Complete the exact retained legacy OCI case through its finite owned driver.",
+      "supported_paths": [
+        "Exact original ignored test identity and declared Make owner."
+      ],
+      "refused_paths": [
+        "No generic aliases or success from another test or owner."
+      ],
+      "boundaries": [
+        "Source binding only; real isolated Linux OCI execution and current receipt are required."
+      ],
+      "cases": [
+        {
+          "id": "legacy-oci-owned_runc-runc_container_with_a_paused_init_takes_its_stop_signal_at_once",
+          "binary": "reliaburger::owned_runc",
+          "test": "runc_container_with_a_paused_init_takes_its_stop_signal_at_once",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/owned_runc.rs"
+          ]
+        }
+      ]
+    },
+    {
       "id": "issue-555-legacy-oci-owned_runc-recovered_source_identity_belongs_to_the_container_not_its_launcher",
       "issue": 555,
       "promise": "Complete the exact retained legacy OCI case through its finite owned driver.",

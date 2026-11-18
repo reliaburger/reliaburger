@@ -2788,6 +2788,31 @@ doesn't count until the task cgroup is really gone, and setup creates it with
 test plants a killed cgroup at the next executor's path and checks the command
 runs in a fresh directory. A mocked launch would never have found any of this.
 
+### Two numbers read at the wrong moment
+
+The 0.3.0 review found two values taken from the right place at the wrong
+time. The shared-runc and host executor pools sized themselves from the
+node's slots the first time a shared task arrived, and they counted the
+*free* slots ([#2043](https://github.com/reliaburger/reliaburger/issues/2043)).
+The pool lives in a `OnceLock`, a cell the standard library fills once and
+then only reads, so a first task that arrived while fresh runc attempts held
+nearly all 256 slots built a pool of one executor, and it stayed that size
+until Bun restarted. `OwnedRunner` now keeps `slot_total`, the number of
+slots it was configured with, and `executor_pool_size` sizes the pool from
+that (still at most 32 executors). Its test takes seven of eight slots before
+asking.
+
+The other was a timestamp. A deployment operation's
+`cancellation_requested_at` was filled with its *submission* time, because
+`DeploymentRecord` kept a `cancelled: bool` and nothing else, even though
+the `DeployCancel` write carries the leader's clock
+([#2047](https://github.com/reliaburger/reliaburger/issues/2047)). The flag is
+now `cancelled_at: Option<u64>`, and `cancelled()` is a method that asks
+whether it's set. A bool and a time side by side could disagree; one
+`Option` can't. A second cancel keeps the first time: `get_or_insert` only
+writes when the `Option` is `None`. The record is council state, so this
+changes the durable format, which 0.3.0's compatibility bump already covers.
+
 ### Room for runc to start
 
 The helper's cgroup had an 8 MiB `memory.max`, and for months that was
