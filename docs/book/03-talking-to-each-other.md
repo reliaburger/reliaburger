@@ -1205,7 +1205,20 @@ match (mode, server_name) {
 
 A `match` arm can carry a guard (`if ...`) that must also hold for the arm to win, so the first two arms say "this mode, and the node has what it needs". When it doesn't, the host gets the self-signed certificate and one warning, never the other mode's certificate. A client that checks names rejects the self-signed one, which is the honest answer from a misconfigured node. Everything else (a plain-HTTP route reached over HTTPS, an unknown host, a handshake with no SNI) gets the operator pair when there is one, and the self-signed certificate when there isn't. That last part is a change: a cluster-mode node with no disk pair used to mint an Ingress CA leaf for any routed host, plain routes included. Now only a `tls = "cluster"` host gets one, which is what the mode says.
 
-The resolver holds the two sources as `Option<Arc<FileCertResolver>>` and `Option<Arc<dyn ResolvesServerCert>>`. The second is a trait object: Bun wraps the Ingress CA resolver in a `ReloadableCertResolver` so a CA rotation can swap it, and the listener doesn't need to know which concrete type it got. `resolve` is a synchronous callback on the handshake path, so it reads the routing table with `try_read()` rather than `.await`. While a rebuild holds the table, we can't know the host's mode, so that one handshake gets the self-signed certificate. Falling back to the operator pair there would hand a `cluster` host the other mode's certificate, the very thing the fix is meant to prevent.
+The resolver holds the two sources as `Option<Arc<FileCertResolver>>` and `Option<Arc<dyn ResolvesServerCert>>`. The second is a trait object: Bun wraps the Ingress CA resolver in a `ReloadableCertResolver` so a CA rotation can swap it, and the listener doesn't need to know which concrete type it got. `resolve` is a synchronous callback on the handshake path, so it can't `.await` the routing table's tokio lock. Our first version used `try_read()` and served self-signed when that failed. Review caught the hole: tokio's `RwLock` is fair, so `try_read()` fails not only while a rebuild holds the write lock but also while one is merely waiting for it, and a proxy handler can hold a read lock across an `.await`. Every `explicit` host then got a certificate a validating client rejects, for as long as that lasted.
+
+So the table publishes a snapshot instead. `CertificateModes` holds an `Arc<HashMap<String, TlsMode>>` behind a `std::sync::RwLock`, and every `rebuild` ends by building a fresh map and swapping it in. The resolvers read the last one:
+
+```rust
+pub fn get(&self, host: &str) -> Option<TlsMode> {
+    let current = Arc::clone(&self.current.read().unwrap_or_else(|p| p.into_inner()));
+    current.get(&normalise_host(host)).copied()
+}
+```
+
+This is the one place a std lock beats tokio's. It's held only long enough to clone an `Arc` (a reference-count bump), never across an `.await`, and the code reading it is synchronous anyway. Writers build the whole map first and swap the pointer, so a reader sees either the old map or the new one, never half of each. `unwrap_or_else(|p| p.into_inner())` recovers a poisoned lock: Rust marks a lock poisoned when a thread panics holding it, but a panic mid-swap can't leave a torn `Arc`.
+
+The resolver takes the `Arc<CertificateModes>` once, when the listener binds. That only works if the table keeps the same one for life, and the agent sometimes swaps in a whole new table (`*table = candidate`), which would leave the resolver watching an orphan. `RoutingTable::replace` takes the new routes but keeps its own handle and publishes to it, and the agent's three swap sites use it.
 
 SNI names a host, not a path, so two routes on one host share a certificate. When they disagree, `explicit` wins over `cluster`, since the operator chose that certificate for that name on purpose. `RoutingTable::certificate_mode` makes that call, and its test pins it.
 

@@ -141,11 +141,16 @@ certificate per handshake from the SNI host's routes:
 | `cluster` route | Ingress CA resolver | an Ingress CA leaf for that host |
 | `explicit` or `cluster` route | no | the self-signed development certificate, with one warning per host on stderr; never the other mode's certificate |
 | plain-HTTP route, unknown host, or no SNI | — | the operator pair if the node has one, else the self-signed certificate |
-| any SNI while a rebuild holds the routing table | — | the self-signed certificate for that handshake, since the host's mode is unknown |
 
 SNI names a host, not a path, so routes on one host share a certificate. When
 they disagree, `explicit` wins over `cluster`, and either wins over plain HTTP
-(`RoutingTable::certificate_mode`). Before 0.3.0 the listener made one choice
+(`RoutingTable::certificate_mode`). The resolver reads each host's mode from
+`CertificateModes`, a snapshot every rebuild or `RoutingTable::replace`
+publishes, not from the table itself: rustls's callback is synchronous, and a
+`try_read` on the fair tokio lock fails whenever a writer holds or waits for
+it. A rebuild therefore never changes which certificate a host gets until the
+new table is published. The Ingress CA resolver mints only for hosts whose
+published mode is `cluster`. Before 0.3.0 the listener made one choice
 for every route (disk pair if present, else the Ingress CA), so the mode only
 decided the plain-HTTP redirect. A cluster-mode node with no disk pair also
 minted an Ingress CA leaf for plain routes' hosts; now only `cluster` hosts get
@@ -162,7 +167,7 @@ one, and plain hosts get the self-signed certificate.
 ```
 
 The resolver mints and caches a cluster leaf **only for a hostname that
-currently has an ingress route**. That host allowlist is a security boundary:
+currently has a `tls = "cluster"` ingress route**. That host allowlist is a security boundary:
 without it, an attacker-chosen SNI would drive unbounded Ingress-CA signing and
 grow the in-memory cache without limit. An SNI for any other host — and a
 handshake with no SNI at all — is served the self-signed development

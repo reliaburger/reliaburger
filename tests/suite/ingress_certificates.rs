@@ -39,7 +39,7 @@ fn server_config(
         hierarchy.ingress.certificate_params,
         rustls::pki_types::CertificateDer::from(hierarchy.ingress.ca.certificate_der),
         lifetime,
-        Arc::new(tokio::sync::RwLock::new(routes)),
+        routes.certificate_modes(),
         vec![default_certificate],
         default_key,
     )

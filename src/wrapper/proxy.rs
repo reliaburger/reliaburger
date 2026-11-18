@@ -286,8 +286,9 @@ pub async fn bind_proxy_with_tls(
     };
     let (self_signed_cert, self_signed_key) = super::tls::generate_self_signed_cert()
         .map_err(|e| WrapperError::ProxyFailed(format!("failed to self-sign: {e}")))?;
+    let certificate_modes = state.routing_table.read().await.certificate_modes();
     let resolver = super::tls::RouteCertResolver::new(
-        Arc::clone(&state.routing_table),
+        certificate_modes,
         file_cert_resolver.clone(),
         cert_resolver,
         vec![self_signed_cert],
