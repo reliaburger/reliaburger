@@ -269,10 +269,12 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
-    # About 25 minutes, but 35 to 41 on a slow runner (#1421), before the
-    # doctests and two report passes left it (#1723). nextest's per-test
-    # timeouts catch a hung test, so this only catches a stuck runner.
-    timeout-minutes: 62
+    # About 19 minutes at four build jobs (run 44311598552), 8 of them
+    # building. One job at a time (docs/flakes.md) tripled the build in the
+    # Lima VM, so about 35 minutes, and up to 55 on a slow runner (#1421).
+    # nextest's per-test timeouts catch a hung test, so this only catches a
+    # stuck runner.
+    timeout-minutes: 85
     steps:
       - uses: actions/checkout@v4
       - name: Free the runner's disk
@@ -313,10 +315,10 @@ jobs:
       - name: Give the build swap
         # Tops up to 8 GiB on a separate /mnt scratch disk, so the lib
         # tests' peak pages out instead of filling memory. Never on /: the
-        # coverage run needs that disk, and the watcher found memory fine
-        # (lowest 1.4 GiB, no OOM, run 44293229949) while a 5 GB swap file
-        # there helped fill /. The 24.04 image's /mnt is on /, so there the
-        # image's own 3 GiB swap file is all there is.
+        # coverage run needs that disk, and a 5 GB swap file there helped
+        # fill it. The 24.04 image's /mnt is on /, so there the image's own
+        # 3 GiB swap file is all there is. Swap is a cushion, not a budget:
+        # a host paging hard stalls the runner (docs/flakes.md).
         run: |
           have=$(awk '/^SwapTotal/ {print $2}' /proc/meminfo)
           if ! mountpoint -q /mnt; then
@@ -331,15 +333,24 @@ jobs:
           swapon --show
           df -h / /mnt 2>/dev/null || df -h /
       - name: Watch disk and memory during the coverage run
-        # Under 2 GiB free, the watcher stops nextest: a failed step with a
-        # log beats a runner lost to a full disk.
+        # Under 2 GiB free disk, or under 512 MiB of available memory for a
+        # minute with swap in use, the watcher stops the build and the
+        # tests: a failed step with a log beats a runner lost to a full disk
+        # or to a host thrashing on swap, which the runner, shielded from
+        # the OOM killer, doesn't survive.
         run: |
-          WATCH_DISK_FLOOR_KB=2097152 WATCH_STOP=cargo-nextest nohup scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids" > "$RUNNER_TEMP/portable-linux-resources.log" 2>&1 < /dev/null &
+          WATCH_DISK_FLOOR_KB=2097152 WATCH_MEM_FLOOR_KB=524288 WATCH_MEM_FLOOR_SECONDS=60 WATCH_STOP="cargo-llvm-cov cargo-nextest cargo rustc" nohup scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids" > "$RUNNER_TEMP/portable-linux-resources.log" 2>&1 < /dev/null &
           echo $! > "$RUNNER_TEMP/portable-linux-resources.pid"
       - name: Portable tests with line coverage
         id: portable_linux
         # Each test has a nextest slow-timeout with terminate-after (the
         # `ci` profile). `choom` undoes the -1000 inherited from the runner.
+        # One crate at a time: the instrumented lib tests' rustc peaks at
+        # 12 GB and the lib's at 7 GB, and any parallel build runs the two
+        # at once, which swapped a runner's 14 GiB and 3 GiB of swap full in
+        # the Lima VM (docs/flakes.md). Alone, the peak is 12 GB.
+        env:
+          CARGO_BUILD_JOBS: "1"
         run: |
           choom -n 0 -- python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate portable-linux --host linux --directory target/contracts/linux/portable-linux --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
       - name: Report the coverage run's headroom

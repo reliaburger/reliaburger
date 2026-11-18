@@ -7,7 +7,9 @@
 # disk stops talking to GitHub, so no log survived. A passing run bottomed out
 # at 5.1 GiB. This fails the job when the low-water mark is under MIN_DISK_KB,
 # or when the watcher had to stop the run at its own floor, so a shrinking
-# margin shows as a red step with numbers instead of a lost runner.
+# margin shows as a red step with numbers instead of a lost runner. It
+# also fails when the watcher stopped the run at its memory floor, and prints
+# the most swap in use and the worst memory stall, the signs of thrashing.
 #
 # Usage: assert-headroom LOG MIN_DISK_KB
 set -uo pipefail
@@ -43,7 +45,31 @@ fi
 echo "lowest free disk: $(gib "$disk") at $disk_at"
 echo "lowest free memory: $(gib "$memory") at $memory_at"
 
-stop=$(grep -m1 '^disk_floor: ' "$log" 2>/dev/null)
+# The highest value of a named field (swap_kb, psi_full) and its time, if
+# the watcher logged it.
+highest() {
+    awk -v name="$1" '
+        $2 ~ /^disk_kb=[0-9]+$/ {
+            for (i = 3; i <= NF; i++) {
+                if (index($i, name "=") != 1) continue
+                value = substr($i, length(name) + 2)
+                if (value !~ /^[0-9.]+$/) continue
+                if (best == "" || value + 0 > best + 0) { best = value; at = $1 }
+            }
+        }
+        END { if (best != "") print best, at }
+    ' "$log" 2>/dev/null
+}
+read -r swap swap_at <<< "$(highest swap_kb)"
+if [ -n "${swap:-}" ]; then
+    echo "most swap in use: $(gib "$swap") at $swap_at"
+fi
+read -r stall stall_at <<< "$(highest psi_full)"
+if [ -n "${stall:-}" ]; then
+    echo "worst full memory stall (avg10): $stall% at $stall_at"
+fi
+
+stop=$(grep -m1 -E '^(disk|mem)_floor: ' "$log" 2>/dev/null)
 if [ -n "$stop" ]; then
     echo "::error::the watcher stopped the run: $stop"
     status=1

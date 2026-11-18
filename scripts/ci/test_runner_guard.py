@@ -29,6 +29,11 @@ class FakeHost:
         self.write_tool("sudo", 'if [ "$1" = -n ]; then shift; fi\nexec "$@"\n')
         self.write_tool("dmesg", f'cat "{self.kernel_log}"\n')
 
+    def meminfo(self, available, swap_total, swap_free):
+        (self.proc / "meminfo").write_text(
+            f"MemTotal: 16000000 kB\nMemAvailable: {available} kB\n"
+            f"SwapTotal: {swap_total} kB\nSwapFree: {swap_free} kB\n")
+
     def write_tool(self, name, body):
         tool = self.bin / name
         tool.write_text("#!/bin/sh\n" + body)
@@ -191,6 +196,69 @@ cat "{host.kernel_log}"
             self.assertFalse((host.root / "pkill-calls").exists())
             self.assertNotIn("disk_floor", result.stdout)
 
+    def test_each_line_also_says_how_much_swap_is_in_use_and_the_memory_stall(self):
+        # A lost run thrashes before it goes: swap in use and the kernel's
+        # "full" memory pressure (every task stalled on memory) say so.
+        with tempfile.TemporaryDirectory() as directory:
+            host = FakeHost(directory)
+            host.meminfo(available=4096, swap_total=3145728, swap_free=1048576)
+            (host.proc / "pressure").mkdir()
+            (host.proc / "pressure" / "memory").write_text(
+                "some avg10=40.00 avg60=20.00 avg300=5.00 total=1\n"
+                "full avg10=31.50 avg60=12.00 avg300=3.00 total=1\n")
+            lines = self.watch(host, 1)
+            self.assertIn(" swap_kb=2097152 ", lines[0])
+            self.assertIn(" psi_full=31.50 ", lines[0])
+
+    def memory_floor(self, host, rounds, **extra):
+        host.write_tool("pkill", f'echo "$*" >> "{host.root}/pkill-calls"\n')
+        host.write_tool("pgrep", 'echo 4242\n')
+        pids = host.root / "runner-pids"
+        pids.write_text("")
+        settings = dict(WATCH_INTERVAL="0", WATCH_ROUNDS=str(rounds),
+                        WATCH_MEM_FLOOR_KB="524288", WATCH_MEM_FLOOR_SECONDS="0",
+                        WATCH_STOP="cargo-nextest cargo rustc")
+        settings.update(extra)
+        result = host.run(WATCH, str(pids), **settings)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = host.root / "pkill-calls"
+        return result.stdout, calls.read_text() if calls.exists() else ""
+
+    def test_memory_held_under_the_floor_with_swap_in_use_stops_the_build_once(self):
+        # On a 16 GB runner the instrumented build's rustc peaks can push the
+        # host into swap. The runner is shielded from the OOM killer, so
+        # nothing dies: its heartbeat stalls and GitHub drops it with no log
+        # (18 Nov 2026). Stopping the build first leaves a failed step.
+        with tempfile.TemporaryDirectory() as directory:
+            host = FakeHost(directory)
+            host.meminfo(available=400000, swap_total=3145728, swap_free=1048576)
+            output, calls = self.memory_floor(host, 3)
+            self.assertEqual(calls, "-TERM -x cargo-nextest\n-TERM -x cargo\n-TERM -x rustc\n")
+            floor = [line for line in output.splitlines() if line.startswith("mem_floor: ")]
+            self.assertEqual(len(floor), 1, output)
+            # The window is 0 s; a second can tick over inside the round.
+            self.assertRegex(floor[0], r"^mem_floor: 400000 kB available is under 524288 kB for [01] s "
+                                       r"with 2097152 kB swap in use: stopping cargo-nextest cargo rustc "
+                                       r"\(3 processes\)$")
+
+    def test_a_dip_shorter_than_the_window_stops_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            host = FakeHost(directory)
+            host.meminfo(available=400000, swap_total=3145728, swap_free=1048576)
+            output, calls = self.memory_floor(host, 3, WATCH_MEM_FLOOR_SECONDS="3600")
+            self.assertEqual(calls, "")
+            self.assertNotIn("mem_floor", output)
+
+    def test_low_memory_without_swap_in_use_is_left_to_the_oom_killer(self):
+        # With no swap in use the host can't thrash: the kernel kills the
+        # biggest rustc, which fails the step with a log.
+        with tempfile.TemporaryDirectory() as directory:
+            host = FakeHost(directory)
+            host.meminfo(available=400000, swap_total=3145728, swap_free=3145728)
+            output, calls = self.memory_floor(host, 3)
+            self.assertEqual(calls, "")
+            self.assertNotIn("mem_floor", output)
+
 
 class AssertHeadroomTests(unittest.TestCase):
     """The report step fails while there is still disk left to say so."""
@@ -228,6 +296,24 @@ class AssertHeadroomTests(unittest.TestCase):
         result = self.check(log, 5 * 1024 * 1024)
         self.assertEqual(result.returncode, 1)
         self.assertIn("::error::the watcher stopped the run: disk_floor: 1500000 kB", result.stdout)
+
+    def test_a_memory_floor_stop_fails_the_report(self):
+        log = self.LOG + ("mem_floor: 400000 kB available is under 524288 kB for 120 s with 2097152 kB "
+                          "swap in use: stopping cargo-nextest cargo rustc (5 processes)\n")
+        result = self.check(log, 5 * 1024 * 1024)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("::error::the watcher stopped the run: mem_floor: 400000 kB available", result.stdout)
+
+    def test_it_reports_the_most_swap_in_use_and_the_worst_memory_stall(self):
+        log = (
+            "12:04:19 disk_kb=76792508 mem_kb=14801980 load=1.41 swap_kb=0 psi_full=0.00 runners=none\n"
+            "12:06:15 disk_kb=75917720 mem_kb=1505772 load=3.68 swap_kb=2621440 psi_full=12.25 runners=none\n"
+            "12:07:15 disk_kb=75917720 mem_kb=1605772 load=3.68 swap_kb=1048576 psi_full=40.10 runners=none\n"
+        )
+        result = self.check(log, 5 * 1024 * 1024)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("most swap in use: 2.5 GiB at 12:06:15", result.stdout)
+        self.assertIn("worst full memory stall (avg10): 40.10% at 12:07:15", result.stdout)
 
     def test_no_samples_is_a_failure_not_a_pass(self):
         result = self.check("", 1)

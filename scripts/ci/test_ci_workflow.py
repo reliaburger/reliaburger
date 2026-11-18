@@ -610,12 +610,13 @@ class TrainAndQueueTests(unittest.TestCase):
         self.assertIn("save-if: false", job)
 
     def test_the_portable_suite_finishes_on_a_slow_runner_with_headroom(self):
-        # About 25 minutes normally and 35 to 41 on a slow runner (#1421).
-        # nextest's per-test timeouts catch a hung test, so the job limit
-        # only has to outlast a slow runner by half again.
+        # 35 to 41 minutes on a slow runner (#1421), then up to 55 once the
+        # coverage build ran one job at a time, which tripled the build in
+        # the Lima VM. nextest's per-test timeouts catch a hung test, so the
+        # job limit only has to outlast a slow runner by half again.
         limit = re.search(r"\n    timeout-minutes: (\d+)\n", self.jobs["portable"])
         self.assertIsNotNone(limit)
-        self.assertGreaterEqual(int(limit.group(1)), 41 * 3 // 2)
+        self.assertGreaterEqual(int(limit.group(1)), 55 * 3 // 2)
 
     def test_the_nightly_signing_build_s_own_key_test_runs(self):
         # The nightly build trusts the nightly key instead of every release
@@ -907,7 +908,14 @@ class PortableLinuxRunnerTests(unittest.TestCase):
     The watcher then named the real cause: memory was fine, but free disk
     on / fell to 5.1 GiB in a passing run, so a slower one fills it. The job
     now frees the image's unused SDKs first, keeps swap files off /, stops
-    nextest under 2 GiB and fails its report under 10 GiB."""
+    nextest under 2 GiB and fails its report under 10 GiB.
+
+    Then #2101's queue run lost its runner with 27 GB of disk freed, and
+    memory came back: two passing runs had bottomed out at 0.8 and 1.4 GiB.
+    Under a runner's memory in the Lima VM, every parallel build compiled
+    the lib (7 GB) beside its lib tests (12 GB) and swapped. The build now
+    runs one job at a time, and the watcher stops it if memory stays short
+    while swap is in use."""
 
     def setUp(self):
         self.job = jobs((WORKFLOWS / "ci.yml").read_text())["portable"]
@@ -936,9 +944,9 @@ class PortableLinuxRunnerTests(unittest.TestCase):
         self.assertNotIn("if: always()", self.steps[swap])
         self.assertIn("SwapTotal", self.steps[swap])
         self.assertIn("8388608", self.steps[swap])
-        # The watcher ruled memory out (lowest 1.4 GiB, no OOM lines in run
-        # 44293229949), and a swap file on / spent 5 GB of the disk that ran
-        # out. On 24.04 /mnt is on /dev/root, so the step adds nothing there.
+        # A swap file on / spent 5 GB of the disk that ran out (run
+        # 44293229949). On 24.04 /mnt is on /dev/root, so the step adds
+        # nothing there.
         self.assertIn("if ! mountpoint -q /mnt; then", self.steps[swap])
         self.assertNotIn("dir=/\n", self.steps[swap])
         self.assertIn('"/mnt/ci-swapfile"', self.steps[swap])
@@ -974,7 +982,27 @@ class PortableLinuxRunnerTests(unittest.TestCase):
     def test_the_watcher_stops_the_tests_before_a_full_disk_takes_the_runner(self):
         watch = self.steps[self.step('scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids"')]
         self.assertIn("WATCH_DISK_FLOOR_KB=2097152", watch)
-        self.assertIn("WATCH_STOP=cargo-nextest", watch)
+        self.assertIn('WATCH_STOP="cargo-llvm-cov cargo-nextest cargo rustc"', watch)
+
+    # #2101's queue run (44317623404) lost its runner with 27 GB of disk
+    # freed, so disk wasn't the only cause. In the Lima VM, under a runner's
+    # memory and 4 CPUs, CI's coverage build at four jobs compiles the
+    # crate's lib and its lib tests at once, two rustc processes of 7 and
+    # 8 GB, and filled the swap until the kernel killed one.
+    def test_the_watcher_stops_the_build_when_memory_stays_short_with_swap_in_use(self):
+        watch = self.steps[self.step('scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids"')]
+        self.assertIn("WATCH_MEM_FLOOR_KB=524288", watch)
+        self.assertIn("WATCH_MEM_FLOOR_SECONDS=60", watch)
+        # The build has no nextest yet: the floor must reach rustc and cargo.
+        for name in ("cargo-llvm-cov", "cargo", "rustc"):
+            self.assertIn(name, watch.split("WATCH_STOP=", 1)[1].split('"')[1].split())
+
+    def test_the_coverage_build_compiles_one_crate_at_a_time(self):
+        producer = self.steps[self.producer()]
+        self.assertIn('CARGO_BUILD_JOBS: "1"', producer)
+        # Only this job: the others don't build the instrumented lib tests.
+        text = (WORKFLOWS / "ci.yml").read_text()
+        self.assertEqual(text.count("CARGO_BUILD_JOBS:"), 1)
 
     def test_the_report_fails_when_the_low_water_mark_is_under_ten_gibibytes(self):
         report = self.steps[self.step('kill "$(cat "$RUNNER_TEMP/portable-linux-resources.pid")"')]
