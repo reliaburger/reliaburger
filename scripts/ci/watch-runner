@@ -47,7 +47,8 @@ while :; do
     echo "$(date -u +%T) disk_kb=$disk mem_kb=$memory load=$load runners=${runners:-none}"
     if [ -n "$floor" ] && [ -n "$stop" ] && [ "$stopped" = no ] \
         && [ -n "$disk" ] && [ "$disk" -lt "$floor" ]; then
-        echo "disk_floor: $disk kB free on / is under $floor kB: stopping $stop"
+        matched=$(pgrep -x "$stop" | grep -c '')
+        echo "disk_floor: $disk kB free on / is under $floor kB: stopping $stop ($matched processes)"
         pkill -TERM -x "$stop"
         stopped=yes
     fi

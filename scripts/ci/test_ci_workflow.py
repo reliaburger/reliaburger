@@ -906,8 +906,8 @@ class PortableLinuxRunnerTests(unittest.TestCase):
 
     The watcher then named the real cause: memory was fine, but free disk
     on / fell to 5.1 GiB in a passing run, so a slower one fills it. The job
-    now frees the image's unused SDKs first, stops nextest under 2 GiB and
-    fails its report under 10 GiB."""
+    now frees the image's unused SDKs first, keeps swap files off /, stops
+    nextest under 2 GiB and fails its report under 10 GiB."""
 
     def setUp(self):
         self.job = jobs((WORKFLOWS / "ci.yml").read_text())["portable"]
@@ -930,14 +930,18 @@ class PortableLinuxRunnerTests(unittest.TestCase):
         command = " ".join(re.sub(r"\\\n", " ", self.steps[self.producer()].split("run: |", 1)[1]).split())
         self.assertTrue(command.startswith("choom -n 0 -- python3 scripts/ci/workflow_adapter.py produce "), command)
 
-    def test_the_build_gets_eight_gigabytes_of_swap_whatever_the_image_has(self):
+    def test_swap_is_topped_up_only_on_a_separate_scratch_disk_never_on_root(self):
         swap = self.step("sudo swapon")
         self.assertLess(swap, self.producer())
         self.assertNotIn("if: always()", self.steps[swap])
-        # The 24.04 image may already have a small swap file, so the step
-        # tops up to 8 GiB rather than skipping when any swap exists.
         self.assertIn("SwapTotal", self.steps[swap])
         self.assertIn("8388608", self.steps[swap])
+        # The watcher ruled memory out (lowest 1.4 GiB, no OOM lines in run
+        # 44293229949), and a swap file on / spent 5 GB of the disk that ran
+        # out. On 24.04 /mnt is on /dev/root, so the step adds nothing there.
+        self.assertIn("if ! mountpoint -q /mnt; then", self.steps[swap])
+        self.assertNotIn("dir=/\n", self.steps[swap])
+        self.assertIn('"/mnt/ci-swapfile"', self.steps[swap])
 
     def test_headroom_is_watched_from_before_the_run_and_reported_and_kept_after_it(self):
         watch = self.step('scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids"')

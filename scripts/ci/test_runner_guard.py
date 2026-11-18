@@ -153,6 +153,7 @@ cat "{host.kernel_log}"
             host = FakeHost(directory)
             host.write_tool("df", 'printf "Avail\\n1500000\\n"\n')
             host.write_tool("pkill", f'echo "$*" >> "{host.root}/pkill-calls"\n')
+            host.write_tool("pgrep", 'echo 4242\necho 4243\n')
             pids = host.root / "runner-pids"
             pids.write_text("")
             result = host.run(WATCH, str(pids), WATCH_INTERVAL="0", WATCH_ROUNDS="3",
@@ -161,7 +162,22 @@ cat "{host.kernel_log}"
             self.assertEqual((host.root / "pkill-calls").read_text(), "-TERM -x cargo-nextest\n")
             floor = [line for line in result.stdout.splitlines() if line.startswith("disk_floor: ")]
             self.assertEqual(len(floor), 1, result.stdout)
-            self.assertIn("1500000 kB free on / is under 2097152 kB: stopping cargo-nextest", floor[0])
+            # The count shows whether the name matched anything at all.
+            self.assertIn("1500000 kB free on / is under 2097152 kB: stopping cargo-nextest (2 processes)",
+                          floor[0])
+
+    def test_a_stop_name_that_matches_nothing_says_zero_processes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            host = FakeHost(directory)
+            host.write_tool("df", 'printf "Avail\\n1500000\\n"\n')
+            host.write_tool("pkill", "exit 1\n")
+            host.write_tool("pgrep", "exit 1\n")
+            pids = host.root / "runner-pids"
+            pids.write_text("")
+            result = host.run(WATCH, str(pids), WATCH_INTERVAL="0", WATCH_ROUNDS="1",
+                              WATCH_DISK_FLOOR_KB="2097152", WATCH_STOP="cargo-nextest")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("stopping cargo-nextest (0 processes)", result.stdout)
 
     def test_without_a_floor_it_never_stops_anything(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -311,19 +311,21 @@ jobs:
         # run takes back the default with `choom`.
         run: scripts/ci/protect-runner "$RUNNER_TEMP/runner-pids"
       - name: Give the build swap
-        # Tops up to 8 GiB, so the lib tests' peak pages out instead of
-        # filling memory. The image's own swap file may be smaller, so this
-        # doesn't skip just because some swap exists. /mnt is the larger
-        # scratch disk where the image has one.
+        # Tops up to 8 GiB on a separate /mnt scratch disk, so the lib
+        # tests' peak pages out instead of filling memory. Never on /: the
+        # coverage run needs that disk, and the watcher found memory fine
+        # (lowest 1.4 GiB, no OOM, run 44293229949) while a 5 GB swap file
+        # there helped fill /. The 24.04 image's /mnt is on /, so there the
+        # image's own 3 GiB swap file is all there is.
         run: |
           have=$(awk '/^SwapTotal/ {print $2}' /proc/meminfo)
-          if [ "$have" -lt 8388608 ]; then
-            dir=/
-            if mountpoint -q /mnt; then dir=/mnt; fi
-            sudo fallocate -l "$((8388608 - have))K" "$dir/ci-swapfile"
-            sudo chmod 600 "$dir/ci-swapfile"
-            sudo mkswap "$dir/ci-swapfile" > /dev/null
-            sudo swapon "$dir/ci-swapfile"
+          if ! mountpoint -q /mnt; then
+            echo "no separate /mnt: keeping the image's swap, sparing /"
+          elif [ "$have" -lt 8388608 ]; then
+            sudo fallocate -l "$((8388608 - have))K" "/mnt/ci-swapfile"
+            sudo chmod 600 "/mnt/ci-swapfile"
+            sudo mkswap "/mnt/ci-swapfile" > /dev/null
+            sudo swapon "/mnt/ci-swapfile"
           fi
           free -h
           swapon --show
