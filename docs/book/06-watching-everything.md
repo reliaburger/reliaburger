@@ -1253,7 +1253,9 @@ pub fn reclaim_ingested(
 ) -> io::Result<u64> {
     // ... open for writing, refuse a symlink, check the identity ...
     let block = metadata.blksize().max(1);
-    let end = ingested_through.min(metadata.len().saturating_sub(RETAINED_CAPTURE_BYTES));
+    let end = ingested_through
+        .saturating_sub(1)
+        .min(metadata.len().saturating_sub(RETAINED_CAPTURE_BYTES));
     let end = end - end % block;
     let start = data_start(&file, 0)?;
     let start = start - start % block;
@@ -1270,6 +1272,16 @@ ingested (`ingested_through`). It keeps the last mebibyte
 reads, so `relish logs -f` still starts from real lines. And it only frees
 whole filesystem blocks: a punch that ends mid-block zeroes the partial block
 without freeing it, which would only cost a write.
+
+The `saturating_sub(1)` is there for a checkpoint that lands exactly on a
+block boundary. A store that restarts resumes at its checkpoint and reads the
+byte before it: a newline means the checkpoint starts a line, anything else
+means it's partway through one, and the reader skips to the next newline. A
+hole reads as zeros, so a punch that ended exactly at the checkpoint would
+turn that newline into a zero, and the resume would throw away a whole line
+it never stored. Rounding down from one byte earlier keeps the byte before
+any checkpoint on disk. `a_resume_at_a_block_aligned_checkpoint_after_reclaiming_keeps_its_first_line`
+reclaims up to a checkpoint at 4 MiB and resumes there.
 
 Who calls it, and when? Not the forwarder: a line it has read may still be
 sitting in the store's memory buffer, and a crash would lose it. The store's

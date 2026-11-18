@@ -226,7 +226,8 @@ pub const RETAINED_CAPTURE_BYTES: u64 = 1024 * 1024;
 /// blocks back to the filesystem while the file keeps its length: offsets
 /// still name the same lines, and the writer's `O_APPEND` writes carry on at
 /// the end. The last [`RETAINED_CAPTURE_BYTES`] stay for tail snapshots, and
-/// nothing past `ingested_through` is ever touched.
+/// neither the byte before `ingested_through` nor anything after it is ever
+/// touched, so a resume can still see whether its checkpoint starts a line.
 ///
 /// Returns where the reclaimed prefix ends; everything before it reads as
 /// zeros. Nothing is freed when `path` has gone or is no longer the file
@@ -252,7 +253,12 @@ pub fn reclaim_ingested(
         return Ok(0);
     }
     let block = metadata.blksize().max(1);
-    let end = ingested_through.min(metadata.len().saturating_sub(RETAINED_CAPTURE_BYTES));
+    // Stop short of `ingested_through` itself: the byte before a checkpoint
+    // must stay real data, because a resume reads it to tell a line start
+    // from mid-line, and a zero there would drop a whole line.
+    let end = ingested_through
+        .saturating_sub(1)
+        .min(metadata.len().saturating_sub(RETAINED_CAPTURE_BYTES));
     let end = end - end % block;
     let start = data_start(&file, 0)?;
     let start = start - start % block;
@@ -1558,6 +1564,43 @@ mod tests {
         assert!(lines.iter().all(|line| !line.line.contains('\0')));
         assert_eq!(lines.len() as u64, (contents.len() as u64 - end) / 32 + 1);
         assert_eq!(reader.read_offset(), contents.len() as u64);
+    }
+
+    /// A checkpoint on a block boundary: the hole must stop short of it, so
+    /// the byte before the checkpoint is still the newline that ends the last
+    /// ingested line. If the hole ran right up to it, that byte would read 0
+    /// and a resume would take the checkpoint for mid-line and drop a whole
+    /// line it never stored.
+    #[tokio::test]
+    async fn a_resume_at_a_block_aligned_checkpoint_after_reclaiming_keeps_its_first_line() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("spammer.stdout");
+        let contents = numbered_capture(&path, 256 * 1024);
+        let identity = identity_of(&path);
+        let block = std::fs::metadata(&path).unwrap().blksize();
+        // 32-byte lines, so a block boundary is also a line boundary.
+        let checkpoint = 4 * 1024 * 1024;
+        assert_eq!(checkpoint % block, 0);
+        assert_eq!(contents[checkpoint as usize - 1], b'\n');
+
+        let reclaimed = reclaim_ingested(&path, identity, checkpoint).unwrap();
+
+        assert!(reclaimed > 0, "nothing was reclaimed");
+        assert!(reclaimed < checkpoint, "the hole reached the checkpoint");
+        let offsets = CaptureOffsets(
+            [(path.clone(), checkpoint)].into_iter().collect(),
+            [(path.clone(), identity)].into_iter().collect(),
+        );
+        let mut reader = CaptureReader::resume(LogStream::Stdout, path.clone(), &offsets).await;
+        let chunk = read_capture_chunk(&path, reader.read_offset())
+            .await
+            .unwrap();
+        let lines = reader.push(&chunk);
+        assert_eq!(
+            lines[0].line,
+            format!("spam {:09} quick brown fox.", checkpoint / 32)
+        );
     }
 
     #[test]
