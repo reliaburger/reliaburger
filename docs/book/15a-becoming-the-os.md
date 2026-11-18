@@ -93,6 +93,8 @@ Virtio for VMs, NVMe and AHCI for mini PCs, MMC for the Wyse's eMMC, USB sticks,
 
 CI builds both architectures natively, x86_64 on `ubuntu-24.04` and aarch64 on `ubuntu-24.04-arm`, and neither needs root. mkosi builds in a user namespace and assembles the disk image with `systemd-repart` offline, without loop devices. The runner's own systemd is too old for the tools we need, so `ToolsTree=yes` has mkosi build its own pinned tools image first (1.6 to 1.7 GB, about a minute, and deliberately not cached to respect the repo's storage budget). Each run signs its `SHA256SUMS` with a throwaway Ed25519 key it generates on the spot. The real OS signing key comes after the spike, in its own protected environment.
 
+"Pinned" is truer of mkosi than of its tools. On a Ubuntu runner the tools tree comes from Debian testing, which moves every day. On 18 November 2026 Debian's release team removed dnf5 from testing, and every appliance build failed with `Unable to locate package dnf5` before it reached our image. The dnf5 came from mkosi's `package-manager` profile, which adds dnf5, zypper and pacman so one tools tree can build Fedora, openSUSE or Arch images too. We build only Ubuntu, so `ToolsTreeProfiles=misc,runtime` leaves that profile out. From it we keep one package, `ubuntu-keyring`, which apt needs to check resolute's signed `Release` file, and `ToolsTreePackages=` names it. The general lesson: when a dependency you don't control can change under you, ask only for what you use, so less of it can break your build.
+
 ### The disk, partition by partition
 
 Here's where the appliance stops looking like a normal Linux install. This is the layout of a freshly booted node on the 8 GiB disk CI used at the time:
