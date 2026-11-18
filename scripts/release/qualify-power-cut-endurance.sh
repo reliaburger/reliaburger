@@ -22,8 +22,10 @@
 # and stops between cuts (powering the cluster off cleanly), when
 # power_cut/quiet.py says a release gate holds the host; --resume picks the
 # run up again. Any other early exit (a harness error, a failed install, an
-# interrupt) powers the VM off, marks the run aborted and prints where the
-# cluster and the evidence are; an aborted run doesn't resume.
+# interrupt) marks the run aborted and prints where the cluster and the
+# evidence are. Between cuts it stops the cluster cleanly, and --resume
+# carries on; mid-cut (a cut made but not recorded) it forces the VM off and
+# the run can't resume.
 #
 # Usage:
 #   scripts/release/qualify-power-cut-endurance.sh (--release X.Y.Z | --base-url URL --qualified-digest SHA) [options]
@@ -149,12 +151,13 @@ else
 fi
 mkdir -p "$evidence/cuts" "$evidence/logs"
 reason=$(quiet) || fail "not starting: $reason"
-# A key from run.json, or nothing when it isn't there (a stored 0 prints 0).
+# A key from run.json, or nothing when it isn't there (a stored 0 prints 0,
+# a boolean true or false).
 run_get() {
     python3 -c '
 import json, sys
 value = json.load(open(sys.argv[1])).get(sys.argv[2])
-print("" if value is None else value)' "$evidence/run.json" "$1"
+print("" if value is None else json.dumps(value) if isinstance(value, bool) else value)' "$evidence/run.json" "$1"
 }
 run_set() {
     python3 - "$evidence/run.json" "$1" "$2" <<'PY'
@@ -247,7 +250,7 @@ take_baseline() {
     done
     deadline=$(( $(now) + 120 ))
     until read_acked writer > /dev/null && read_acked redis > /dev/null; do
-        [ "$(now)" -lt "$deadline" ] || abort_run 'the writer or the Redis client acknowledged nothing in 120 s'
+        [ "$(now)" -lt "$deadline" ] || abort_run "no usable ACK and INCR after 120 s: $(acked_problems)"
         sleep 5
     done
     read_resumes writer "$evidence/logs/resumes-writer.txt"
@@ -275,29 +278,45 @@ starts_in() {
         | python3 -c 'import json,sys; r = json.load(sys.stdin); print(r["starts"] if r["pass"] else "")' || true
 }
 
-# The highest ACK (writer) or INCR (redis) in the app's recent log. Fails
-# when the log can't be read, holds none, or is below the last value read
-# (run.json's writer_acked or redis_acked).
+# The highest ACK (writer) or INCR (redis) in the app's recent log. Fails,
+# saying why on standard error, when the log can't be read, holds none, or is
+# below the last value read (run.json's writer_acked or redis_acked).
 acked_now() {
     local app=soak-writer previous
     [ "$1" = writer ] || app=soak-redis-client
     previous=$(run_get "$1_acked")
-    rel logs "$app" --tail 50 > "$evidence/logs/acked-$1.txt" 2>&1 || return 1
+    rel logs "$app" --tail 50 > "$evidence/logs/acked-$1.txt" 2>&1 \
+        || { echo "power-cut: couldn't read $app's log" >&2; return 1; }
     endurance acked "$1" "$evidence/logs/acked-$1.txt" ${previous:+--previous "$previous"}
 }
 
 # acked_now, three tries 5 s apart; prints the value and keeps it in run.json.
+# On failure the last try's reason is in logs/acked-KIND.problem and on
+# standard error.
 read_acked() {
-    local value attempt
+    local value attempt problem=$evidence/logs/acked-$1.problem
     for attempt in 1 2 3; do
-        if value=$(acked_now "$1" 2> /dev/null); then
+        if value=$(acked_now "$1" 2> "$problem"); then
+            rm -f "$problem"
             run_set "$1_acked" "$value"
             echo "$value"
             return 0
         fi
         [ "$attempt" -eq 3 ] || sleep 5
     done
+    cat "$problem" >&2
     return 1
+}
+
+# Why the last read_acked calls failed: "writer: ...; redis: ...".
+acked_problems() {
+    local kind reasons=()
+    for kind in writer redis; do
+        [ ! -s "$evidence/logs/acked-$kind.problem" ] \
+            || reasons+=("$kind: $(sed 's/^power-cut: //' "$evidence/logs/acked-$kind.problem" | paste -sd ' ' -)")
+    done
+    local IFS=';'
+    echo "${reasons[*]:-no reason recorded}"
 }
 
 # --- power (sustained/power.sh) ---------------------------------------------------
@@ -383,7 +402,7 @@ one_cut() {
     # With no last ACK and INCR, I1 and I2 would hold whatever the cut did,
     # while the cut still counted towards the bound: don't make it.
     writer_acked=$(read_acked writer) && redis_acked=$(read_acked redis) \
-        || abort_run "cut $cut wasn't made: no last ACK or INCR to hold it to (see $evidence/logs/acked-*.txt)"
+        || abort_run "cut $cut wasn't made: no last ACK or INCR to hold it to ($(acked_problems))"
     cut_at=$(now)
     run_set cuts_started "$cut"
     power_off 1
@@ -419,7 +438,10 @@ print(json.dumps({"topology": "1", "kind": "site", "cut_at": int(sys.argv[1]), "
 
 # A finished run tears the cluster down (unless --keep). A violation and a
 # pause keep it as it is (stopping=keep-off). Any other exit once there is a
-# cluster powers the VM off, marks the run aborted and says where things are.
+# cluster marks the run aborted and says where things are. Between cuts
+# (every cut made has its line) it stops the cluster cleanly, so --resume can
+# carry on: a forced stop there would be a cut nobody recorded. Mid-cut, or
+# when the clean stop fails, it forces the VM off and the run can't resume.
 cleanup() {
     local status=$?
     [ "${stopping:-}" = keep-off ] && return "$status"
@@ -432,21 +454,50 @@ cleanup() {
         return "$status"
     fi
     [ -n "${home:-}" ] || return "$status"
-    if [ -n "${limactl:-}" ] && [ -n "${vm[1]:-}" ]; then
-        with_timeout 120 "$limactl" stop --force "${vm[1]}" > "$evidence/logs/abort-stop.log" 2>&1 || true
+    local between=false log=$evidence/logs/abort-stop.log
+    [ ! -f "$evidence/run.json" ] || [ "$(run_get cuts_started)" != "$(cuts_done)" ] || between=true
+    if [ "$between" = true ] && [ -n "${relish:-}" ]; then
+        with_timeout 300 "$relish" local stop --yes > "$log" 2>&1 || between=false
+    elif [ "$between" = true ]; then
+        between=false
+    fi
+    if [ "$between" = false ] && [ -n "${limactl:-}" ] && [ -n "${vm[1]:-}" ]; then
+        with_timeout 120 "$limactl" stop --force "${vm[1]}" >> "$log" 2>&1 || true
     fi
     if [ -f "$evidence/run.json" ]; then
         [ -n "$(run_get aborted)" ] || run_set aborted "the harness exited early with status $status"
+        run_set aborted_between_cuts "$between"
         run_set ended "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         endurance summary --evidence "$evidence" > /dev/null 2>&1 || true
     fi
-    say "stopped early (status $status) with the VM powered off; cluster home: $home; evidence: $evidence" >&2
+    if [ "$between" = true ]; then
+        say "stopped between cuts (status $status) with the cluster stopped cleanly; cluster home: $home;" \
+            "evidence: $evidence; carry on with --resume --evidence $evidence" >&2
+    else
+        say "stopped early (status $status) with the VM powered off; cluster home: $home; evidence: $evidence" >&2
+    fi
     return "$status"
 }
 trap cleanup EXIT
 
+# The lines in cuts.jsonl: the cuts recorded.
+cuts_done() {
+    if [ -f "$evidence/cuts.jsonl" ]; then grep -c . "$evidence/cuts.jsonl" || true; else echo 0; fi
+}
+
 if [ "$resume" = true ]; then
-    [ -z "$(run_get aborted)" ] || fail "this run was aborted ($(run_get aborted)); start a new one"
+    if [ -n "$(run_get aborted)" ]; then
+        [ "$(run_get aborted_between_cuts)" = true ] \
+            || fail "this run was aborted mid-cut ($(run_get aborted)); start a new one"
+    fi
+    cuts_started=$(run_get cuts_started)
+    [ "${cuts_started:-0}" = "$(cuts_done)" ] \
+        || fail "cut $cuts_started was made but never recorded ($(cuts_done) in cuts.jsonl); start a new run"
+    if [ -n "$(run_get aborted)" ]; then
+        say "carrying on after an abort between cuts: $(run_get aborted)"
+        run_set aborted ''
+        run_set aborted_between_cuts false
+    fi
     seed=$(run_get seed)
     duration_seconds=$(run_get duration_seconds)
     work_min=$(run_get work_min); work_max=$(run_get work_max)
@@ -484,7 +535,6 @@ else
 fi
 say "evidence: $evidence; seed $seed; $(( duration_seconds / 60 )) minutes of cuts"
 
-cuts_done() { [ -f "$evidence/cuts.jsonl" ] && grep -c . "$evidence/cuts.jsonl" || echo 0; }
 elapsed() { python3 -c '
 import json, sys
 total = 0

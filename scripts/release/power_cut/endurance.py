@@ -83,7 +83,7 @@ def acked_problem(kind, value, previous):
     if value == 0:
         return f"no {word} in the log"
     if previous is not None and value < previous:
-        return f"the last {word} read, {value}, is below the {previous} read before"
+        return f"below the last {word} read ({value} < {previous})"
     return None
 
 

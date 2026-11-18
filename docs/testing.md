@@ -1028,10 +1028,13 @@ scripts/release/qualify-power-cut-endurance.sh --release 0.2.8 --tier quick
 (schema `reliaburger.power-cut-endurance/1`) holding the cuts, violations,
 recovery percentiles and the rule-of-three bound. A violation powers the VM
 off and keeps everything for diagnosis. Any other early exit (a harness
-error, a failed install, an interrupt) powers the VM off too, prints where
-the cluster and the evidence are, and leaves `summary.json` saying
-`aborted`, as it also does when a cut that was made has no line in
-`cuts.jsonl`; an aborted run doesn't resume. It never touches `reliaburger-test`
+error, a failed install, an interrupt) prints where the cluster and the
+evidence are and leaves `summary.json` saying `aborted`, as it also does when
+a cut that was made has no line in `cuts.jsonl`. Between cuts, such as when
+the last `ACK` couldn't be read three times running, it stops the cluster
+cleanly with `relish local stop` and `--resume` carries on: forcing the VM
+off there would be a cut nobody recorded. Mid-cut, or if the clean stop
+fails, it forces the VM off and the run can't resume. It never touches `reliaburger-test`
 or your own `~/.reliaburger`, and when a release gate holds the host it
 powers the cluster off cleanly and exits 75; `--resume --evidence DIR`
 carries on. [`test_power_cut_endurance.py`](../scripts/release/test_power_cut_endurance.py)

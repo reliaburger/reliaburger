@@ -68,7 +68,8 @@ class Acked(unittest.TestCase):
         # hold for anything while the cut still counted towards the bound.
         self.assertIn("no ACK", endurance.acked_problem("writer", 0, None))
         self.assertIn("no INCR", endurance.acked_problem("redis", 0, 40))
-        self.assertIn("below the 50 read before", endurance.acked_problem("writer", 49, 50))
+        self.assertEqual(endurance.acked_problem("writer", 49, 50), "below the last ACK read (49 < 50)")
+        self.assertEqual(endurance.acked_problem("redis", 3, 8), "below the last INCR read (3 < 8)")
         self.assertIsNone(endurance.acked_problem("writer", 50, 50))
         self.assertIsNone(endurance.acked_problem("redis", 7, None))
 
@@ -501,11 +502,34 @@ class HarnessRefusals(unittest.TestCase):
         self.assertEqual(first.stdout, again.stdout)
         self.assertRegex(first.stdout, r"^cut 1: after \d+ s of work")
 
-    def test_resume_refuses_an_aborted_run(self):
+    @staticmethod
+    def aborted_run(evidence, cuts_started, lines, between):
+        Path(evidence, "run.json").write_text(json.dumps({
+            "seed": 1, "home": "/tmp/rbpc.gone", "cuts_started": cuts_started,
+            "aborted": "cut 3 wasn't made", "aborted_between_cuts": between}))
+        Path(evidence, "cuts.jsonl").write_text("".join('{"cut": %d}\n' % n for n in range(1, lines + 1)))
+
+    def test_resume_refuses_a_run_aborted_mid_cut(self):
+        with tempfile.TemporaryDirectory() as evidence:
+            self.aborted_run(evidence, 3, 2, False)
+            self.assert_refused(self.run_harness("--resume", "--evidence", evidence), "this run was aborted")
+
+    def test_resume_refuses_a_cut_made_but_never_recorded(self):
+        # Even when nothing marked the run aborted (a kill -9, a host crash).
         with tempfile.TemporaryDirectory() as evidence:
             Path(evidence, "run.json").write_text(json.dumps({"seed": 1, "home": "/tmp/rbpc.gone",
-                                                              "aborted": "cut 3 wasn't made"}))
-            self.assert_refused(self.run_harness("--resume", "--evidence", evidence), "this run was aborted")
+                                                              "cuts_started": 3}))
+            Path(evidence, "cuts.jsonl").write_text('{"cut": 1}\n{"cut": 2}\n')
+            self.assert_refused(self.run_harness("--resume", "--evidence", evidence),
+                                "cut 3 was made but never recorded")
+
+    def test_resume_carries_on_after_an_abort_between_cuts(self):
+        with tempfile.TemporaryDirectory() as evidence:
+            self.aborted_run(evidence, 2, 2, True)
+            result = self.run_harness("--resume", "--evidence", evidence)
+            # It gets past the abort check to adopting the cluster, which isn't there.
+            self.assert_refused(result, "no quickstart cluster in /tmp/rbpc.gone")
+            self.assertNotIn("aborted", result.stderr)
 
     def test_resume_refuses_an_adopted_home_it_did_not_make(self):
         with tempfile.TemporaryDirectory() as evidence:
@@ -553,8 +577,8 @@ class HarnessShell(unittest.TestCase):
     """
 
     FUNCTIONS = ("with_timeout", "now", "endurance", "run_get", "run_set", "rel", "read_resumes", "starts_in",
-                 "acked_now", "read_acked", "abort_run", "take_baseline", "power_back", "verify", "one_cut",
-                 "cleanup")
+                 "acked_now", "read_acked", "acked_problems", "abort_run", "take_baseline", "power_back", "verify", "one_cut",
+                 "cuts_done", "cleanup")
 
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -586,6 +610,7 @@ class HarnessShell(unittest.TestCase):
                 "exec soak-writer cat /data/resumes") answer resumes-writer ;;
                 "exec soak-redis redis-cli GET soak:counter") answer counter ;;
                 "exec soak-redis redis-cli LRANGE soak:starts 0 -1") answer resumes-redis ;;
+                "local stop --yes") answer local-stop ;;
                 *) exit 1 ;;
             esac
             """)
@@ -601,9 +626,12 @@ class HarnessShell(unittest.TestCase):
     def run_json(self):
         return json.loads((self.evidence / "run.json").read_text())
 
-    def run_shell(self, script, run=None):
+    def run_shell(self, script, run=None, cuts=0, fast_clock=False):
         if run is not None:
             (self.evidence / "run.json").write_text(json.dumps(run))
+        if cuts:
+            (self.evidence / "cuts.jsonl").write_text("".join(json.dumps({"cut": n, "violations": []}) + "\n"
+                                                              for n in range(1, cuts + 1)))
         functions = "".join(shell_function(HARNESS, name) for name in self.FUNCTIONS)
         prelude = textwrap.dedent(f"""
             set -uo pipefail
@@ -616,6 +644,10 @@ class HarnessShell(unittest.TestCase):
             sleep() {{ :; }}
             gsh() {{ printf '%s\\n' '2026-11-18T10:00:01+00:00 n systemd[1]: Started reliaburger.service - x.'; }}
             """)
+        # A clock that moves 100 s at every reading, so deadlines pass at once.
+        clock = 'now() { local t; t=$(( $(cat "$FAKE/clock" 2>/dev/null || echo 0) + 100 )); echo "$t" > "$FAKE/clock"; echo "$t"; }\n'
+        if fast_clock:
+            functions += clock
         return subprocess.run(["bash", "-c", prelude + functions + textwrap.dedent(script)], stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, text=True, timeout=60)
 
@@ -680,6 +712,7 @@ class HarnessShell(unittest.TestCase):
         self.assertEqual(result.stdout.split(), ["42", "kept", "42"], result.stderr)
         result = self.run_shell("read_acked writer || echo refused\n", run={"writer_acked": 50})
         self.assertEqual(result.stdout.split(), ["refused"])
+        self.assertIn("below the last ACK read (42 < 50)", result.stderr)
         self.assertEqual(self.run_json()["writer_acked"], 50)
         (self.path / "log-writer").unlink()
         result = self.run_shell("read_acked writer || echo refused\n", run={})
@@ -737,6 +770,19 @@ class HarnessShell(unittest.TestCase):
         self.assertEqual((run["writer_starts"], run["redis_starts"], run["writer_acked"], run["redis_acked"]),
                          (1, 2, 7, 3))
 
+    def test_a_baseline_below_the_last_ack_says_so(self):
+        # After a resume the writer's log tail read below the ACK kept before
+        # the pause: that's a regression, not "nothing acknowledged".
+        self.answer("instances", json.dumps([{"app_name": app, "state": "running"} for app in
+                                             ("soak-writer", "soak-redis", "soak-redis-client")]))
+        self.answer("log-writer", "ACK 40\n")
+        self.answer("log-redis", "INCR 9\n")
+        result = self.run_shell("take_baseline\n", run={"writer_acked": 50, "redis_acked": 8}, fast_clock=True)
+        self.assertNotEqual(result.returncode, 0)
+        aborted = self.run_json()["aborted"]
+        self.assertIn("below the last ACK read (40 < 50)", aborted)
+        self.assertNotIn("acknowledged nothing", aborted)
+
     def test_a_baseline_without_resume_records_aborts(self):
         self.answer("instances", json.dumps([{"app_name": app, "state": "running"} for app in
                                              ("soak-writer", "soak-redis", "soak-redis-client")]))
@@ -748,18 +794,48 @@ class HarnessShell(unittest.TestCase):
 
     # Stopping early (finding 5)
 
-    def test_an_unfinished_exit_powers_the_vm_off_and_says_where_everything_is(self):
+    def test_an_exit_mid_cut_forces_the_vm_off_and_says_where_everything_is(self):
+        # Cut 3 was made and never recorded: the run can't resume, so a forced stop costs nothing.
+        self.answer("local-stop", "")
         result = self.run_shell("""
             home=/tmp/rbpc.test keep=false
             trap cleanup EXIT
             fail 'something broke'
-            """, run={"cuts_started": 0})
+            """, run={"cuts_started": 3}, cuts=2)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("limactl stop --force node-a", self.calls_made())
+        self.assertNotIn("relish local stop --yes", self.calls_made())
+        self.assertFalse(self.run_json()["aborted_between_cuts"])
         self.assertIn("/tmp/rbpc.test", result.stderr)
         self.assertIn(str(self.evidence), result.stderr)
         self.assertIn("status 1", self.run_json()["aborted"])
         self.assertEqual(json.loads((self.evidence / "summary.json").read_text())["verdict"], "aborted")
+
+    def test_an_exit_between_cuts_stops_the_cluster_cleanly_and_can_resume(self):
+        # A forced stop here would itself be a cut nobody recorded.
+        self.answer("local-stop", "")
+        result = self.run_shell("""
+            home=/tmp/rbpc.test keep=false
+            trap cleanup EXIT
+            abort_run "cut 3 wasn't made: no ACK in the log"
+            """, run={"cuts_started": 2}, cuts=2)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("relish local stop --yes", self.calls_made())
+        self.assertNotIn("limactl stop --force node-a", self.calls_made())
+        run = self.run_json()
+        self.assertTrue(run["aborted_between_cuts"])
+        self.assertIn("--resume", result.stderr)
+
+    def test_a_clean_stop_that_fails_falls_back_to_the_forced_one_and_cannot_resume(self):
+        result = self.run_shell("""
+            home=/tmp/rbpc.test keep=false
+            trap cleanup EXIT
+            fail 'interrupted'
+            """, run={"cuts_started": 2}, cuts=2)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual([call for call in self.calls_made() if "stop" in call],
+                         ["relish local stop --yes", "limactl stop --force node-a"])
+        self.assertFalse(self.run_json()["aborted_between_cuts"])
 
     def test_a_violation_or_a_pause_keeps_the_cluster_as_it_is(self):
         result = self.run_shell("""
