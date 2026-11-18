@@ -961,6 +961,39 @@ and a rule-of-three summary, and deletes the VM. It never touches
 `reliaburger-test`. [`test_power_cut_reboot.py`](../scripts/release/test_power_cut_reboot.py)
 (in `make test-ci-scripts`) checks its decisions against a fake `limactl`.
 
+### What a forced-off VM loses
+
+A hypervisor cut isn't the harshest power cut, and the
+[calibration record](qualification/2026-11-18-power-cut-calibration.md) says
+by how much. On Lima's VZ driver on macOS, `limactl stop --force`, a `SIGKILL`
+of the VM's process and an in-guest `sysrq b` all lose the guest's page cache
+and keep every write a flush covered. A `sysrq b` also keeps every write the
+virtual disk completed, flushed or not, since the VM process outlives it:
+a disk with no volatile write cache (fault model 1 in the
+[power-cut endurance plan](plans/2026-11-18-plan-power-cut-endurance.md)).
+Whether a stop or a kill keeps completed but unflushed writes is untested:
+the first run's `O_DIRECT` records nearly always had another thread's flush
+after them. So a store that forgot an `fsync` can still pass every lane
+above. The plan's write-cache cut, built on `dm-log-writes` in the guest, is
+what tests the stronger model, and the record shows the guest kernel can
+build it (proved with a mark written at the cut; reading past the log's entry
+count without one is unit-tested only).
+
+To measure it again on your host (each kind takes about 20 minutes for 50
+cuts and needs 2 GiB of memory for its VM):
+
+```sh
+scripts/release/power_cut/calibrate.sh --kind stop --cuts 50 --evidence /tmp/cal-stop
+scripts/release/power_cut/calibrate.sh --logwrites --evidence /tmp/cal-logwrites
+```
+
+`--kind` also takes `kill` and `sysrq`. Add `--raw` to settle the open
+question: the writer then puts `O_DIRECT` records alone on a second virtual
+disk with no filesystem, records the disk's flush count with each one, and
+counts only cuts that left a record no flush covered (not yet run). The
+script creates its own VM and disk, named `pc-cal-*`, never touches
+`reliaburger-test`, and stops when a release gate holds the host.
+
 ## Hollow nodes
 
 Our biggest real cluster is three VMs. To see what a council does with

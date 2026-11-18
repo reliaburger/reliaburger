@@ -1,0 +1,49 @@
+{
+  "kernel": "7.0.0-34-generic",
+  "module": "loaded",
+  "entries": 149,
+  "unflushed_bytes_on_data_device": "yes",
+  "at-cut": {
+    "log": "log-at-cut.img",
+    "to": "end",
+    "replay": {
+      "entries": 132,
+      "replayed": 132,
+      "writes": 124,
+      "durable_point": 130
+    },
+    "unflushed_bytes": "no",
+    "mounted": "yes",
+    "flushed_file": "intact",
+    "fsck": "clean"
+  },
+  "after-sync": {
+    "log": "log-after-sync.img",
+    "to": "end",
+    "replay": {
+      "entries": 149,
+      "replayed": 149,
+      "writes": 139,
+      "durable_point": 148
+    },
+    "unflushed_bytes": "yes",
+    "mounted": "yes",
+    "flushed_file": "intact",
+    "fsck": "clean"
+  },
+  "before-sync": {
+    "log": "log-after-sync.img",
+    "to": "mark:cut",
+    "replay": {
+      "entries": 149,
+      "replayed": 132,
+      "writes": 124,
+      "durable_point": 148
+    },
+    "unflushed_bytes": "no",
+    "mounted": "yes",
+    "flushed_file": "intact",
+    "fsck": "clean"
+  },
+  "pass": true
+}

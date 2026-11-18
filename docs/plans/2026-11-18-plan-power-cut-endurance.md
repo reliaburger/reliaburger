@@ -38,7 +38,8 @@ honest and weak.
 Three fault models, in increasing strength:
 
 1. **Lose the page cache.** Everything that reached the virtual disk survives.
-   A hypervisor kill gives this on our hosts: the guest's page cache dies, but
+   An in-guest `sysrq b` gives this on our hosts, and a hypervisor kill
+   should, though step 0 couldn't yet show it: the guest's page cache dies, but
    what the VZ process handed to the host kernel sits in the host's page cache,
    which never loses power. That's a disk with no volatile write cache.
 2. **Lose the disk's write cache too.** Everything after the last flush may be
@@ -47,13 +48,16 @@ Three fault models, in increasing strength:
 3. **The hardware lies.** Flushed data lost or torn. Only real hardware with a
    real power cut shows it.
 
-Step 0 measured model 1 rather than assuming it, since nobody had checked
-whether VZ holds writes in its own process before the host sees them. It
-doesn't: on Lima VZ, `limactl stop --force`, a `SIGKILL` of the VZ process
-and an in-guest `sysrq b` each kept every write the virtual disk completed,
-flushed or not, and lost only the guest's page cache, in 50 cuts each
+Step 0 set out to measure model 1 rather than assume it, since nobody had
+checked whether VZ holds writes in its own process before the host sees
+them. On Lima VZ, `limactl stop --force`, a `SIGKILL` of the VZ process and
+an in-guest `sysrq b` each lost the guest's page cache and kept every write a
+flush covered, in 50 cuts each
 ([calibration record](../qualification/2026-11-18-power-cut-calibration.md)).
-`sysrq b` reboots the guest in place; the VM keeps running.
+`sysrq b` reboots the guest in place; the VM keeps running, so it's model 1.
+For a stop or a kill, whether VZ keeps completed but unflushed writes is
+still open: the first run's unflushed records nearly always had another
+thread's flush after them. `calibrate.sh --raw` tests it and hasn't run yet.
 
 The invariants each cut must pass (numbered as in #2067's design):
 
@@ -228,7 +232,7 @@ run; 4–7 make it strong.
 | **1. Harness skeleton, 1 node, kills only** | `sustained/power.sh` shared with the soak (soak unchanged); `qualify-power-cut-endurance.sh` creating a 1-node cluster with the soak's writer and Redis, whole-site kills at random 2–10 minute intervals, I1, I2, I4, I6 and I7 after each cut, resumable state and the summary JSON | `test_power_cut_endurance.py`: the schedule from a seed, the invariant checks on good and bad fixtures, summary arithmetic and bounds, refusal paths, the quiet-host check | A 1-hour quick run on the Studio passes and writes a summary |
 | **2. Three and five nodes; full invariants; driver** | Multi-topology (fix quickstart if it can't run three clusters side by side); the operation driver and change ledger; I3, I5, I8–I13; the read-only checker token; staggered returns and brownouts; charts | A unit test per new checker subcommand on good and bad fixtures | A day run on 1, 3 and 5 nodes passes (needs the maintainer's yes on memory) |
 | **3. Timed cuts** | `guest-watcher.sh` firing `sysrq b` 0–500 ms into a named operation (Raft snapshot, backup, image unpack, volume snapshot, rollout, job ledger write, self-upgrade) | Watcher logic on a fake file system tree; the checker counts each operation's minimum | Every operation reached its minimum in a day run |
-| **4. Write-cache cut** | Extra Lima disks, an LVM thin pool, `dm-log-writes` under Bun's data, a boot unit that rebuilds the data volume from the epoch's snapshot. Step 0 found that `dm-log-writes` logs a plain write only once a later flush completes (a FUA write at once), so a copy of the log taken at the cut is already "the disk as of the last flush" (model 2): the unit replays that whole copy, with no search for the last flush. Prefix states come from the batch the last flush logged: replay up to a random entry inside it, a cache that wrote back in order and lost power partway. Step 4's first question is how to take that copy at the cut: the log's super block counts its entries only at a mark or a FUA write, so the log device as a hypervisor kill leaves it may undercount, and `logwrites.py` may need to read entries past the count until they stop parsing. `mkfs.ext4` needs `-E lazy_itable_init=0,lazy_journal_init=0`, or background zeroing flushes on its own | A gated test that writes, marks, flushes, writes more, copies the log, replays it and finds exactly the flushed data (step 0's `logwrites-proof.sh` is the shape) | 100 write-cache cuts pass on 1 node, or a bug is found and fixed with its own failing test |
+| **4. Write-cache cut** | Extra Lima disks, an LVM thin pool, `dm-log-writes` under Bun's data, a boot unit that rebuilds the data volume from the epoch's snapshot. Step 0 found that `dm-log-writes` logs a plain write only once a later flush completes (a FUA write at once), so a copy of the log taken at the cut is already "the disk as of the last flush" (model 2): the unit replays that whole copy, with no search for the last flush. Prefix states come from the batch the last flush logged: replay up to a random entry inside it, a cache that wrote back in order and lost power partway. Step 4's first question is how to take that copy at the cut: the log's super block counts its entries only at a mark or a FUA write, so the log device as a hypervisor kill leaves it may undercount; `logwrites.py --walk` now reads entries past the count until they stop parsing (unit-tested on fixtures, not yet against a live log). `mkfs.ext4` needs `-E lazy_itable_init=0,lazy_journal_init=0`, or background zeroing flushes on its own | A gated test that writes, marks, flushes, writes more, copies the log, replays it and finds exactly the flushed data (step 0's `logwrites-proof.sh` is the shape) | 100 write-cache cuts pass on 1 node, or a bug is found and fixed with its own failing test |
 | **5. Quiet lock and continuous mode (the main path, D-1)** | The lock taken by the gate, `nightly-qualify.sh` and the soak scripts; the pause protocol; `--tier continuous` with rolling records | Lock protocol tests in each script's Python tests; the pause path in the fake-limactl tests | The run pauses under a nightly, resumes, and verifies the long-outage cut |
 | **6. Crash-state enumeration lane** | `qualify-crash-states.sh`: one operation per store recorded under `dm-log-writes`, every flush point and sampled prefixes replayed, each opened and checked | Unit tests for the replay-point generator | Every store passes; joins step 5 of the gate as a sixth lane (D-10) |
 | **7a. Hardware tier (D-2)** | Three of the lab's ten or so Wyse 3040s, each on a smart plug. First find plugs with a local HTTP API and no cloud dependency (Shelly Gen2+ and Tasmota-flashed plugs are the candidates to check). A plug driver (`--hardware fleet.json`); the netboot and claim flow resetting the three units to a clean install between runs; the same loop at one cut every 10–20 minutes, the same invariants, and the same `cuts.jsonl` and summary format, with the ACK ledgers kept on the Mac, not the devices | Fake-plug tests for the driver; the reset flow against a fake netboot server | A week on the three Wyses with a record; the only evidence for flash that lies (model 3) |
