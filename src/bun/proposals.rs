@@ -413,16 +413,56 @@ pub async fn auto_approve_pending(
         let Some(name) = verdict.approve else {
             continue;
         };
-        let outcome = approve(
-            council,
-            proposal.id,
-            Approval::Policy { name: name.clone() },
-        )
-        .await?;
+        let approval = Approval::Policy { name: name.clone() };
+        // A `clear_fault` keeps its own path: there, the action is clearing
+        // the fault, and a policy never does that.
+        let outcome = if proposal.kind == crate::proposal::ProposalKind::ClearFault {
+            approve(council, proposal.id, approval).await?
+        } else {
+            let check = || ingress_hosts_as_author(council, &proposal);
+            approve_with(council, proposal.id, approval, Some(check)).await?
+        };
         let principal = format!("policy:{name}");
         record(events, policy_outcome_events(&outcome, &principal, node)).await;
     }
     Ok(())
+}
+
+/// The ingress-host rule for a proposal a policy approves, judged as its
+/// author against the cluster as it stands now: the host may have been
+/// taken since the author proposed. A refusal fails the proposal with the
+/// reason, and nothing is written. An author whose token is gone can't be
+/// judged, so a proposal of theirs that routes a host fails too.
+async fn ingress_hosts_as_author(council: &CouncilNode, proposal: &Proposal) -> ActionResult {
+    let routes = proposal.changes.iter().any(|change| {
+        change
+            .after
+            .spec
+            .as_ref()
+            .is_some_and(|spec| spec.ingress.is_some())
+    });
+    if !routes {
+        return None;
+    }
+    let tokens = council.security_state().await.api_tokens;
+    let Some(author) =
+        crate::sesame::auth::context_for_principal(&proposal.author.principal_id, &tokens)
+    else {
+        return Some(FailedReason::Refused {
+            reason: format!(
+                "the author's token ({}) is gone, so the ingress hosts this proposal routes \
+                 can't be checked against its scope",
+                proposal.author.name
+            ),
+        });
+    };
+    let desired = council.desired_state().await;
+    let specs = proposal
+        .changes
+        .iter()
+        .filter_map(|change| Some((change.app.clone(), change.after.spec.as_deref()?)));
+    crate::bun::api::apply::ingress_host_conflict(Some(&author), specs, &desired)
+        .map(|reason| FailedReason::Refused { reason })
 }
 
 /// The audit records a policy's approval writes: the proposal's own, and,

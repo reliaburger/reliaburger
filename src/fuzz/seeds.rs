@@ -13,7 +13,8 @@ use std::path::Path;
 use crate::council::network::{RaftRpc, RaftRpcEnvelope};
 use crate::meat::NodeId;
 use crate::mustard::message::{
-    DirectoryExtension, GossipMessage, GossipPayload, LeaderHint, MembershipUpdate, encode_datagram,
+    DirectoryExtension, GossipMessage, GossipPayload, LeaderHint, MembershipUpdate, SequenceFloor,
+    encode_datagram,
 };
 use crate::mustard::state::NodeState;
 
@@ -86,7 +87,18 @@ fn gossip() -> Vec<Seed> {
     });
     let sync = message(GossipPayload::Sync {
         entries: vec![update("a", NodeState::Alive), update("b", NodeState::Left)],
+        floors: vec![SequenceFloor {
+            node_id: NodeId::new("departed"),
+            incarnation: 2,
+            sequence: 41,
+            expires_in_secs: 3600,
+        }],
         wants_reply: true,
+    });
+    let stale = message(GossipPayload::Stale {
+        held_incarnation: 4,
+        held_sequence: 40,
+        updates: vec![update("c", NodeState::Suspect)],
     });
     let mut with_directory = message(GossipPayload::Ping { updates: vec![] });
     with_directory.extension = Some(DirectoryExtension {
@@ -112,6 +124,7 @@ fn gossip() -> Vec<Seed> {
         ("ping-req", ping_req),
         ("ack", ack),
         ("sync", sync),
+        ("stale", stale),
         ("ping-with-directory", with_directory),
     ]
     .into_iter()
@@ -177,6 +190,7 @@ fn raft() -> Vec<Seed> {
             "install-snapshot",
             envelope(RaftRpc::InstallSnapshot(snapshot)),
         ),
+        seed("council-voters", envelope(RaftRpc::CouncilVoters)),
     ]
 }
 

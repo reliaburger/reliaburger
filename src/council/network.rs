@@ -17,6 +17,7 @@ use openraft::raft::{
 use openraft::{Raft, RaftNetwork, RaftNetworkFactory};
 use tokio::sync::Mutex;
 
+use super::admission::{CouncilVoters, PeerIdentity, RaftAdmission, Standing};
 use super::connection_pool::{
     PeerKey, RaftConnection, RaftConnectionPool, ReuseCheck, SERVER_CONNECTION_MAX_AGE,
     SERVER_IDLE_TIMEOUT,
@@ -253,6 +254,11 @@ pub enum RaftRpc {
     AppendEntries(AppendEntriesRequest<TypeConfig>),
     Vote(VoteRequest<u64>),
     InstallSnapshot(InstallSnapshotRequest<TypeConfig>),
+    /// Which nodes are voters in your council? A member whose view of the
+    /// membership is behind asks this of the voters it knows before it
+    /// admits a leader it has never heard of (see [`super::admission`]).
+    /// It reaches no Raft state and never moves the recovery fence.
+    CouncilVoters,
 }
 
 /// A Raft RPC stamped with the sender's recovery epoch (C5, #424).
@@ -284,17 +290,25 @@ pub struct RaftRpcEnvelope {
 /// Returns `None` (drop the connection) for a malformed or incompatible
 /// frame, and otherwise the fence's verdict with the inner RPC. Kept free of
 /// I/O so the fence is unit-tested without a `Raft` instance.
+#[cfg(any(test, feature = "fuzzing"))]
 pub(crate) fn decode_and_admit(
     payload: &[u8],
     fence: &RecoveryFence,
 ) -> Option<(Admission, RaftRpc)> {
+    let (claim, rpc) = decode_envelope(payload)?;
+    Some((fence.admit(claim), rpc))
+}
+
+/// Decode a stamped Raft RPC frame into the sender's recovery claim and the
+/// RPC. `None` for a malformed or incompatible frame.
+fn decode_envelope(payload: &[u8]) -> Option<(RecoveryClaim, RaftRpc)> {
     let envelope = serde_json::from_slice::<RaftRpcEnvelope>(payload).ok()?;
     envelope.compatibility.require_current().ok()?;
-    let sender = RecoveryClaim {
+    let claim = RecoveryClaim {
         epoch: envelope.sender_recovery_epoch,
         id: envelope.sender_recovery_id,
     };
-    Some((fence.admit(sender), envelope.rpc))
+    Some((claim, envelope.rpc))
 }
 
 /// Raft RPC response envelope, serialised over TCP.
@@ -311,6 +325,9 @@ pub enum RaftRpcResponse {
         recovery_epoch: u64,
         recovery_id: Option<RecoveryId>,
     },
+    /// The voters of the answering node's council (committed and effective
+    /// membership together), by Raft id, with their node names.
+    CouncilVoters(CouncilVoters),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -387,6 +404,7 @@ pub async fn serve_raft_rpc(
         crate::smoker::node_fault::NodeTransportGate::new(),
         None,
         RaftBlocklist::default(),
+        RaftAdmission::without_vouching(),
     )
     .await
 }
@@ -416,6 +434,38 @@ pub async fn serve_raft_rpc_with_node_gate(
     crl: Option<crate::sesame::mtls::CrlHandle>,
     blocklist: RaftBlocklist,
 ) {
+    serve_raft_rpc_with_admission(
+        listener,
+        raft,
+        contact,
+        shutdown,
+        tls,
+        fence,
+        node_gate,
+        crl,
+        blocklist,
+        RaftAdmission::without_vouching(),
+    )
+    .await
+}
+
+/// [`serve_raft_rpc_with_node_gate`] with the council membership check's
+/// vouching: a member whose view of the membership is behind asks the
+/// voters it knows about a leader it has never heard of, instead of
+/// refusing it until the leadership moves (see [`super::admission`]).
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_raft_rpc_with_admission(
+    listener: tokio::net::TcpListener,
+    raft: Raft<TypeConfig>,
+    contact: LeaderContact,
+    shutdown: tokio_util::sync::CancellationToken,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    fence: RecoveryFence,
+    node_gate: crate::smoker::node_fault::NodeTransportGate,
+    crl: Option<crate::sesame::mtls::CrlHandle>,
+    blocklist: RaftBlocklist,
+    admission: RaftAdmission,
+) {
     serve_raft_rpc_with_limit_and_node_gate(
         listener,
         raft,
@@ -427,6 +477,7 @@ pub async fn serve_raft_rpc_with_node_gate(
         node_gate,
         crl,
         blocklist,
+        admission,
     )
     .await
 }
@@ -452,6 +503,7 @@ pub async fn serve_raft_rpc_with_limit(
         crate::smoker::node_fault::NodeTransportGate::new(),
         None,
         RaftBlocklist::default(),
+        RaftAdmission::without_vouching(),
     )
     .await
 }
@@ -470,6 +522,7 @@ pub async fn serve_raft_rpc_with_limit_and_node_gate(
     node_gate: crate::smoker::node_fault::NodeTransportGate,
     crl: Option<crate::sesame::mtls::CrlHandle>,
     blocklist: RaftBlocklist,
+    admission: RaftAdmission,
 ) {
     // O6: hold a permit for the whole lifetime of a connection. Acquiring
     // *before* accepting means excess peers queue in the kernel's backlog
@@ -506,6 +559,7 @@ pub async fn serve_raft_rpc_with_limit_and_node_gate(
                         let fence = fence.clone();
                         let connection_gate = node_gate.clone();
                         let connection_blocklist = blocklist.clone();
+                        let admission = admission.clone();
                         match tls.clone() {
                             Some(acceptor) => {
                                 let crl = crl.clone();
@@ -522,6 +576,12 @@ pub async fn serve_raft_rpc_with_limit_and_node_gate(
                                     else {
                                         return;
                                     };
+                                    // Who the certificate says is talking:
+                                    // the council membership check holds
+                                    // every RPC on this connection to it.
+                                    let peer = PeerIdentity::from_certificates(
+                                        tls_stream.get_ref().1.peer_certificates(),
+                                    );
                                     // The handshake checked the peer's chain
                                     // against the CRL once; re-check it
                                     // before every later request (#928).
@@ -538,11 +598,15 @@ pub async fn serve_raft_rpc_with_limit_and_node_gate(
                                         };
                                     serve_connection(
                                         tls_stream,
-                                        raft,
-                                        contact,
-                                        fence,
+                                        Connection {
+                                            raft,
+                                            contact,
+                                            fence,
+                                            blocklist: connection_blocklist,
+                                            admission,
+                                            identity: peer,
+                                        },
                                         connection_gate,
-                                        connection_blocklist,
                                         still_admitted,
                                     )
                                     .await;
@@ -553,11 +617,15 @@ pub async fn serve_raft_rpc_with_limit_and_node_gate(
                                     let _permit = permit;
                                     serve_connection(
                                         stream,
-                                        raft,
-                                        contact,
-                                        fence,
+                                        Connection {
+                                            raft,
+                                            contact,
+                                            fence,
+                                            blocklist: connection_blocklist,
+                                            admission,
+                                            identity: PeerIdentity::Plaintext,
+                                        },
                                         connection_gate,
-                                        connection_blocklist,
                                         |_| true,
                                     )
                                     .await;
@@ -591,12 +659,7 @@ async fn sent_by_blocked_peer(
     if blocklist.read().await.is_empty() {
         return false;
     }
-    let vote = match rpc {
-        RaftRpc::AppendEntries(request) => &request.vote,
-        RaftRpc::Vote(request) => &request.vote,
-        RaftRpc::InstallSnapshot(request) => &request.vote,
-    };
-    let Some(sender) = vote.leader_id().voted_for() else {
+    let Some(sender) = rpc.sender() else {
         return false;
     };
     // Copy the address out in one statement: the borrow holds the metrics
@@ -628,11 +691,8 @@ async fn sent_by_blocked_peer(
 /// path passes `|_| true`.
 async fn serve_connection<S, F>(
     mut stream: S,
-    raft: Raft<TypeConfig>,
-    contact: LeaderContact,
-    fence: RecoveryFence,
+    connection: Connection,
     node_gate: crate::smoker::node_fault::NodeTransportGate,
-    blocklist: RaftBlocklist,
     admitted: F,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -650,7 +710,7 @@ async fn serve_connection<S, F>(
         }
         let served = tokio::time::timeout(
             RAFT_ACCEPT_DEADLINE,
-            handle_raft_frame(&mut stream, &payload, &raft, &contact, &fence, &blocklist),
+            handle_raft_frame(&mut stream, &payload, &connection),
         )
         .await;
         if !matches!(served, Ok(true)) || opened.elapsed() >= SERVER_CONNECTION_MAX_AGE {
@@ -659,16 +719,32 @@ async fn serve_connection<S, F>(
     }
 }
 
+/// What serving one connection needs: this node's Raft, the state each
+/// request consults, and who the connection's certificate says is talking.
+struct Connection {
+    raft: Raft<TypeConfig>,
+    contact: LeaderContact,
+    fence: RecoveryFence,
+    blocklist: RaftBlocklist,
+    admission: RaftAdmission,
+    identity: PeerIdentity,
+}
+
 /// Serve one request frame and write its response. Returns whether the
 /// connection may carry another request.
 async fn handle_raft_frame<S: AsyncWrite + Unpin>(
     stream: &mut S,
     payload: &[u8],
-    raft: &Raft<TypeConfig>,
-    contact: &LeaderContact,
-    fence: &RecoveryFence,
-    blocklist: &RaftBlocklist,
+    connection: &Connection,
 ) -> bool {
+    let Connection {
+        raft,
+        contact,
+        fence,
+        blocklist,
+        admission,
+        identity,
+    } = connection;
     // JSON, not a binary format: AppendEntries carries log entries whose
     // `AppSpec` payload uses `deserialize_any` config types (see
     // durable_log). A positional format like postcard (or the bincode it
@@ -676,17 +752,55 @@ async fn handle_raft_frame<S: AsyncWrite + Unpin>(
     // so a replicated AppSpec entry would never deserialise on the
     // follower and the write would hang forever.
     //
-    // The frame is a `RaftRpcEnvelope`; the recovery fence (C5, #424) decides
-    // whether it reaches Raft at all.
-    let Some((admission, rpc)) = decode_and_admit(payload, fence) else {
+    // The frame is a `RaftRpcEnvelope`; the council membership check and
+    // the recovery fence (C5, #424) decide whether it reaches Raft at all.
+    let Some((claim, rpc)) = decode_envelope(payload) else {
         return false;
     };
+    if matches!(rpc, RaftRpc::CouncilVoters) {
+        return answer_council_voters(stream, raft, fence, claim).await;
+    }
     // A partitioned peer gets no answer at all, as if the packets were lost:
     // closing the connection makes its client report the peer unreachable.
     if sent_by_blocked_peer(&rpc, raft, blocklist).await {
         return false;
     }
-    match admission {
+    let sender = rpc.sender();
+    let admission_verdict = match admission.standing(raft, sender, identity).await {
+        // Only a council member's epoch may move the fence.
+        Standing::Member => fence.admit(claim),
+        // A node with no council serves whoever replicates to it, and adopts
+        // that council's epoch while it holds none. One that already holds
+        // an epoch (a recovered survivor before it re-forms its council, a
+        // joiner between its first contact and its first membership) serves
+        // its own epoch but can't be fenced by a stranger.
+        Standing::NoCouncil => match fence.admit_if_unclaimed(claim) {
+            Some(verdict) => verdict,
+            None if fence.peek(claim) == Admission::Serve => Admission::Serve,
+            None => match fence.refusal_for_outsider(claim) {
+                Some(newest) => Admission::Refuse { newest },
+                None => return false,
+            },
+        },
+        Standing::Stranger => {
+            // A leader or candidate this node has never heard of may be a
+            // voter that joined while this node was away: ask the voters it
+            // knows. Copy the index out of the metrics in one statement.
+            let our_last_index = raft.metrics().borrow().last_log_index;
+            if let Some(sender) = sender
+                && rpc.worth_vouching_for(our_last_index)
+            {
+                admission.ask_for_vouch(raft, sender, identity);
+            }
+            // Tell an old voter about a newer epoch, but never learn one
+            // from a stranger. Anything else is closed without an answer.
+            match fence.refusal_for_outsider(claim) {
+                Some(newest) => Admission::Refuse { newest },
+                None => return false,
+            }
+        }
+    };
+    match admission_verdict {
         Admission::Serve => {}
         Admission::Adopted => {
             // A fresh node joining a council: make the adopted epoch durable
@@ -729,9 +843,42 @@ async fn handle_raft_frame<S: AsyncWrite + Unpin>(
             Ok(resp) => RaftRpcResponse::InstallSnapshot(resp),
             Err(_) => return false,
         },
+        // Answered before the membership check.
+        RaftRpc::CouncilVoters => return false,
     };
 
     write_response(stream, response).await
+}
+
+/// Answer a [`RaftRpc::CouncilVoters`] question with this node's council.
+///
+/// Only a node serving Raft at the asker's own epoch answers: a probing or
+/// fenced node's membership may be a replaced council's. An asker on an
+/// older epoch is told the newer one, as any outsider is. The answer reaches
+/// no Raft state and never moves the fence.
+async fn answer_council_voters<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    raft: &Raft<TypeConfig>,
+    fence: &RecoveryFence,
+    claim: RecoveryClaim,
+) -> bool {
+    if fence.peek(claim) != Admission::Serve {
+        if let Some(newest) = fence.refusal_for_outsider(claim) {
+            write_response(
+                stream,
+                RaftRpcResponse::Fenced {
+                    recovery_epoch: newest.epoch,
+                    recovery_id: newest.id,
+                },
+            )
+            .await;
+        }
+        return false;
+    }
+    let Some(voters) = super::admission::council_voters(raft).await else {
+        return false;
+    };
+    write_response(stream, RaftRpcResponse::CouncilVoters(voters)).await
 }
 
 /// Write one enveloped response frame. Returns whether it was written; a
@@ -1000,6 +1147,17 @@ impl TcpRaftNetwork {
             ))));
         }
         Ok(response)
+    }
+
+    /// Ask this peer which nodes are voters in its council (see
+    /// [`super::admission`]).
+    pub(crate) async fn council_voters(&self) -> Result<CouncilVoters, Unreachable> {
+        match self.rpc(RaftRpc::CouncilVoters).await? {
+            RaftRpcResponse::CouncilVoters(voters) => Ok(voters),
+            _ => Err(Unreachable::new(&RouterError(
+                "unexpected response type".into(),
+            ))),
+        }
     }
 
     /// Inner RPC implementation (called within a timeout).

@@ -38,6 +38,7 @@ fn runtime(directory: &Path) -> ProcessGrill {
 
 fn workload(script: &str, stop: StopPolicy) -> OciSpec {
     OciSpec {
+        managed_volumes: Vec::new(),
         reusable_executor: false,
         host_process: true,
         initialiser: false,

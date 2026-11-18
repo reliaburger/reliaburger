@@ -89,7 +89,9 @@ operations need cluster-wide authority, so only an *unscoped* admin can manage
 tokens and join tokens, rotate secrets, sign images, decommission nodes, clear
 every fault, or apply `[namespace]` and `[permission]` declarations. A
 `deployer` scoped to one namespace is what a controller runs with
-(`writing-a-controller`).
+(`writing-a-controller`). It can't take an ingress host that another
+namespace's app serves (see `networking`), and it clears faults by naming a
+service and a namespace in its scope.
 
 `create` prints the plaintext token once, on stdout, and the cluster keeps
 only a hash, so `TOKEN="$(relish token create ...)"` captures it. Its expiry
@@ -244,8 +246,13 @@ anyone, so it needs `deploy` granted the same way, and a build that sets
 one app still shows that app's charts on its dashboard page, but the dashboard
 leaves out the alert panel, and `relish top` shows only that app's rows.
 
-A browser session keeps its token's permissions, and it's read-only: a
-cookie can read the dashboard but never change anything. The Proposals page
+A browser session keeps its token's permissions and scope, and it's
+read-only: a cookie can read the dashboard but never change anything. A
+session made from a scoped token sees only its apps and namespaces on every
+dashboard page, the overview, the apps table and each node's page included,
+as `/v1/status` shows it. The alert panel, like `/v1/alerts`, shows it only
+alerts on its own apps; an alert on a node's own metrics names no namespace,
+so only an unscoped token sees it. The Proposals page
 lets a person approve, reject or undo an agent's proposal, but the cookie
 can't do that on its own. These are the browser path's defences:
 
@@ -1308,13 +1315,18 @@ Rotating the root itself isn't supported yet.
 Every container gets a SPIFFE identity, `spiffe://CLUSTER/ns/NAMESPACE/app/NAME`
 (or `/job/NAME`), and its credentials appear read-only in
 `/run/reliaburger/identity/`: `cert.pem`, `key.pem`, `ca.pem`, `bundle.pem`,
-and `token`, an OIDC JWT. Use the certificate for mTLS between your services.
+`token`, an OIDC JWT, and `api-token`, a second JWT for the Reliaburger API
+alone. Use the certificate for mTLS between your services.
 `ca.pem` is a bundle: every Workload CA the cluster trusts, then the root.
 Usually that's one of each, but while a Workload CA rotation is in progress it
 holds the old CA and the new one, so verify peers against the whole file, not
 just its first certificate.
-The JWT also works as a bearer token against the Reliaburger API, as a
-read-only credential confined to the workload's own app and namespace. With it
+`token` carries the audience `spiffe://CLUSTER`, and it's the one to hand to
+your services and to cloud workload identity federation. The API refuses it.
+`api-token` carries the audience `reliaburger-api:CLUSTER`, and it works as a
+bearer token against the Reliaburger API, as a read-only credential confined
+to the workload's own app and namespace. Keep it inside the workload: a party
+you hand `token` to can't log in to the API with it. With `api-token`
 a workload can read its own status, logs, metrics, snapshots, batches and
 builds. The cluster-wide lists filter themselves to that app: `/v1/resolve`
 shows only its own service, `/v1/routes` only its own ingress routes, and

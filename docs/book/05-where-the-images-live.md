@@ -216,6 +216,37 @@ A mount is kernel state, though, and kernel state doesn't survive a reboot. We o
 
 The same soak found a smaller trap in a new loop volume. `mkfs.ext4` leaves `lost+found` behind, so the app never sees an empty directory. The official Redis entrypoint only takes over its data directory when it holds nothing but `*.rdb` files and `appendonlydir`; anything else and it prints a notice, drops to the `redis` user and fails with "Permission denied". Postgres's `initdb` flatly refuses a non-empty directory. We remove `lost+found` right after mounting, so a new volume looks exactly like a Docker volume does. `e2fsck` makes a fresh one if it ever needs it.
 
+The record beside each volume, `data.volume.json`, turned out to carry more weight than it looked. It's how provisioning knows a volume already exists, so it's also the only thing standing between a loop image full of data and `mkfs.ext4 -F`. Three things were loose ([#2000](https://github.com/reliaburger/reliaburger/issues/2000)). The record was written to a temporary file and renamed, with no `fsync`, so a power cut soon after could leave it empty. Reading it turned *every* failure into "no record", and no record meant "new volume". And `setup_loop_mount` never asked whether the image was already there: `fallocate` keeps an existing file, and `-F` tells `mkfs` to format it without asking.
+
+Each gets its own fix. The record now goes through the same durable write as the node's identity files: write a temporary file, `sync_all` it, rename it, then sync the directory so the rename itself survives. Reading it returns a `Result<Option<VolumeSidecar>, VolumeError>`, and the three states mean three different things:
+
+```rust
+fn read_sidecar(host_path: &Path) -> Result<Option<VolumeSidecar>, VolumeError> {
+    let path = VolumeManager::sidecar_path(host_path);
+    crate::durable::read_json_if_exists(&path, SIDECAR_LIMIT, crate::durable::Access::Regular)
+        .map_err(|error| VolumeError::UnreadableRecord {
+            path: path.display().to_string(),
+            reason: error.to_string(),
+        })
+}
+```
+
+`Ok(Some(_))` is a provisioned volume, `Ok(None)` is no record at all, and `Err(_)` is a record we can't trust, which stops the start with a message naming the file. The old `Option` had only two states, so "missing" and "damaged" had to share one, and they shared the dangerous one. A type with a slot for each answer makes the caller say what it does with each; `?` passes the error up, and nothing formats anything.
+
+Last, the image is created with `OpenOptions::new().create_new(true)`, Rust's spelling of `O_CREAT | O_EXCL`: it fails with `AlreadyExists` instead of opening a file that's already there. An image with no record is either the leftover of a crash between formatting and recording, or a populated volume whose record was lost. Bun can't tell which, so it refuses and leaves the call to the operator. Just before `mkfs.ext4 -F` runs, a second check reads the image's first megabyte and refuses if any byte isn't zero, so `-F` only ever formats a blank file. Both helpers carry `#[cfg_attr(not(target_os = "linux"), allow(dead_code))]`: only the Linux build calls them outside tests, and the attribute applies `allow(dead_code)` on every other target, so macOS builds don't warn about them. The gated regression provisions a 16 MiB loop volume, writes to it, unmounts it, deletes its record and provisions again: the second call fails, and the data is still in the image.
+
+Refusing an existing image has a cost the first version missed, and review caught it. If `mkfs` or `mount` fails on a volume's very first start, the image this call just claimed stays behind with no record, maybe still mounted, and every retry refuses it for good. So the claim now comes with an undo. `setup_loop_mount` claims the image, then runs everything else in a helper, and on any error it unmounts the image if it got that far and deletes it:
+
+```rust
+claim_loop_image(&img_path)?;
+if let Err(error) = self.format_and_mount(path, &img_path, size_bytes) {
+    self.abandon_loop(path);
+    return Err(error);
+}
+```
+
+That's safe because nothing has used the image yet: the record that would let a container mount it is written last, and a failure there runs the same undo. Splitting the steps into a helper keeps the cleanup in one place. Inside `format_and_mount`, `?` returns at the first failure, and the single `if let Err` above sees it, whichever step failed. A crash can still land between the claim and `mkfs`, where no cleanup runs. That leaves an image that is still all zeros, so `claim_loop_image` takes back a blank image instead of refusing it. Blank means no filesystem, so there's no data to lose. The test needs failures that a real system won't produce on demand, so `VolumeManager` grows a test-only hook, `loop_fault: Option<fn(LoopStep) -> bool>`, behind `#[cfg(test)]`. It doesn't exist in a release build at all. The gated test fails the first start before formatting, after mounting and before recording, and checks each time that nothing is left mounted, the image is gone, and the next start provisions the volume.
+
 On macOS, there's no loop mount. Reliaburger creates a plain directory and logs a warning. Size limits are soft-only on macOS. This is a development convenience, not a production limitation — production clusters run Linux.
 
 ## Whose volume is it?
@@ -259,6 +290,25 @@ fn chown_tree(
 Host-path volumes (`source = "/srv/import"`) get none of this. They're the operator's directories, and silently chowning `/srv/import` to uid 2,000,000,999 is exactly the kind of surprise an orchestrator shouldn't spring. Bun checks the mode bits instead and, if the container's user plainly can't write, logs which host uid to `chown` the directory to. It still starts the container, because plenty of host mounts are only ever read.
 
 The proof is a gated test that runs the real Redis image with `--appendonly yes` over a managed volume: first as uid 999 directly (so no entrypoint `chown` can paper over a missing hand-over), writes a key, restarts, reads it back, then restarts as image root and reads it again.
+
+### Which directories are Bun's?
+
+Two questions decide whether a directory gets chowned: is it a managed volume, and is the path to it the path we think it is? Bun used to answer both by looking at the disk. A bind source with a `<name>.volume.json` beside it counted as managed, wherever it was, host paths included. And a volume's path was built by `join`ing its mount path onto the volumes directory and handing the result to `create_dir_all`, which follows symlinks like any other path lookup.
+
+The second answer is the subtle one. Everything inside a managed volume belongs to its container, symlinks included. A new volume whose mount path runs through an older volume of the same app (`/data/cache` after `/data`) is resolved through whatever that older container left there. The overlap check from earlier in this chapter doesn't see it: it compares the volumes of one spec, and this layout spans two deploys.
+
+Now each question gets an answer that doesn't depend on what a container wrote. Which mounts are managed is recorded when the OCI spec is built: `build_mounts` returns the mounts *and* a `Vec<ManagedVolumeMount>` naming the volumes directory and source of each managed volume, and `OciSpec::managed_volumes` carries that list to Runc. Runc hands over exactly those. Every other bind source is a host path, whatever sits beside it. The field isn't part of the OCI runtime spec, like `port_mapping` before it, and `#[serde(default, skip_serializing_if = "Vec::is_empty")]` keeps a spec with no managed volumes byte-for-byte what it was.
+
+The path is resolved one component at a time, from the volumes directory down:
+
+```rust
+let relative = managed_relative_path(namespace, app_name, mount_path)?;
+let host_path = resolve_volume_path(&self.volumes_dir, &relative, PathWalk::Create)?;
+```
+
+`managed_relative_path` refuses anything but plain names, and `resolve_volume_path` walks them with `symlink_metadata`, which describes a symlink rather than its target. It refuses a component that is a symlink, isn't a directory, or is itself a volume (it has a record beside it) or a snapshot restore's copy of one. It makes missing parents with `create_dir`, one name at a time, never `create_dir_all`. A new volume over a directory that already holds an older one is refused too, since the new container would mount the older volume, record and all. The hand-over runs the same walk in `PathWalk::Check` mode before it chowns anything.
+
+Checking a path and using it a moment later is normally a race. Here it isn't one, and the reason is the rule itself: every directory the walk accepts is outside every volume, so no container can write to it, and no container can swap one for a symlink between the check and the use. The rule that stops a path through a volume is also what makes the check safe to trust. The tests set up each layout: a symlink inside an older volume, a plain directory inside one, an older volume inside the new path, a symlinked namespace, parent or leaf, and a record copied beside a host directory. Each must leave the host directory exactly as it was.
 
 ### A host path is a tenant boundary
 

@@ -75,6 +75,21 @@ pub struct OciSpec {
     /// refuses a spec that carries them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_knobs: Option<super::knobs::RuntimeKnobs>,
+    /// The managed volumes among [`Self::mounts`], recorded when the spec
+    /// is built. Not part of the OCI runtime spec: rootful runc hands
+    /// exactly these to the container user, and every other bind source
+    /// is the operator's and is never chowned, whatever files sit beside it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub managed_volumes: Vec<ManagedVolumeMount>,
+}
+
+/// A managed volume a spec mounts, as the spec builder named it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ManagedVolumeMount {
+    /// The node's volumes directory, which the source lies below.
+    pub volumes_dir: PathBuf,
+    /// The host directory bind-mounted read-write into the container.
+    pub source: PathBuf,
 }
 
 impl OciSpec {
@@ -456,7 +471,7 @@ pub fn generate_oci_spec_with_decryptor(
     let env = build_env_with_decryptor(spec, decryptor)?;
     let provider_env = declared_provider_env(&spec.env);
     let args = build_args(app_name, spec);
-    let mounts = build_mounts(
+    let (mounts, managed_volumes) = build_mounts(
         spec,
         host_port,
         app_name,
@@ -470,6 +485,7 @@ pub fn generate_oci_spec_with_decryptor(
     let resources = build_resources(spec);
 
     Ok(OciSpec {
+        managed_volumes,
         reusable_executor: false,
         host_process: spec.exec.is_some() || spec.script.is_some(),
         initialiser: false,
@@ -666,7 +682,7 @@ fn build_mounts(
     namespace: &str,
     instance_id: &str,
     volumes_dir: Option<&Path>,
-) -> Vec<OciMount> {
+) -> (Vec<OciMount>, Vec<ManagedVolumeMount>) {
     let mut mounts = standard_mounts();
 
     // Config files: read-only bind mounts.
@@ -703,6 +719,7 @@ fn build_mounts(
     }
 
     // Volumes: read-write bind mounts
+    let mut managed = Vec::new();
     for vol in &spec.volumes {
         let host_path = if let Some(source) = &vol.source {
             // HostPath mode: use the explicit host path
@@ -712,9 +729,15 @@ fn build_mounts(
             let base = volumes_dir
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| PathBuf::from("/var/lib/reliaburger/volumes"));
-            base.join(namespace)
+            let host_path = base
+                .join(namespace)
                 .join(app_name)
-                .join(vol.path.strip_prefix("/").unwrap_or(&vol.path))
+                .join(vol.path.strip_prefix("/").unwrap_or(&vol.path));
+            managed.push(ManagedVolumeMount {
+                volumes_dir: base,
+                source: host_path.clone(),
+            });
+            host_path
         };
 
         mounts.push(OciMount {
@@ -726,8 +749,8 @@ fn build_mounts(
     }
 
     // Workload identity mount — populated by Bun after CSR signing.
-    // Starts empty; cert.pem, key.pem, ca.pem, bundle.pem, token, and
-    // meta.json appear once the council signs the workload's CSR. The
+    // Starts empty; cert.pem, key.pem, ca.pem, bundle.pem, token,
+    // api-token and meta.json appear once the council signs the workload's CSR. The
     // source is per-INSTANCE (PKI7): replicas of the same app must not
     // share (or overwrite) each other's private key. Bun prepares the
     // directory (tmpfs-backed on Linux root) before create; the
@@ -746,7 +769,7 @@ fn build_mounts(
         options: vec!["bind".to_string(), "ro".to_string()],
     });
 
-    mounts
+    (mounts, managed)
 }
 
 /// Standard Linux namespaces for container isolation.
@@ -959,6 +982,7 @@ pub fn generate_job_oci_spec(
     }
 
     OciSpec {
+        managed_volumes: Vec::new(),
         reusable_executor: false,
         host_process: spec.is_host(),
         initialiser: false,
@@ -1060,6 +1084,7 @@ pub fn generate_init_oci_spec(
     // the app; a bare root filesystem has no config to read.
     let from_image = init.image.is_some() || app.process.overrides.is_some();
     OciSpec {
+        managed_volumes: Vec::new(),
         reusable_executor: false,
         // A host app's init that names no image runs on the host like its
         // app, so the mixed runtime routes it there too (#935).
@@ -1151,6 +1176,7 @@ pub fn generate_sidecar_oci_spec(
         }),
     }
     OciSpec {
+        managed_volumes: Vec::new(),
         reusable_executor: false,
         host_process: false,
         // A sidecar borrows the app's volumes as an init does, so a runtime
@@ -2249,6 +2275,15 @@ mod tests {
             .find(|m| m.destination == std::path::Path::new("/logs"));
         assert!(data_mount.is_some());
         assert!(logs_mount.is_some());
+        // Only the managed volume is recorded as one: runc hands exactly
+        // these to the container user and never touches the host path.
+        assert_eq!(
+            oci.managed_volumes,
+            vec![ManagedVolumeMount {
+                volumes_dir: PathBuf::from("/var/lib/reliaburger/volumes"),
+                source: PathBuf::from("/var/lib/reliaburger/volumes/default/web/logs"),
+            }]
+        );
     }
 
     #[test]

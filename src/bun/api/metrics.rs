@@ -159,6 +159,8 @@ pub(super) async fn metrics_summary_handler(
 ///
 /// Alerts are rules evaluated over the whole metric store, so a principal
 /// with a `[permission]` spec needs `metrics` across the cluster (B18).
+/// A scoped caller gets only the alerts on apps its scope covers
+/// ([`super::ui::alert_visible`]).
 pub(super) async fn alerts_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
@@ -176,10 +178,11 @@ pub(super) async fn alerts_handler(
         return Json(crate::mayo::alert::AlertsResponse { alerts: Vec::new() }).into_response();
     };
     let evaluator = alerts.read().await;
-    Json(crate::mayo::alert::AlertsResponse {
-        alerts: evaluator.all_statuses(),
-    })
-    .into_response()
+    // A scoped caller sees the alerts on its own apps, as the dashboard
+    // shows them.
+    let mut statuses = evaluator.all_statuses();
+    statuses.retain(|status| super::ui::alert_visible(auth.as_deref(), &status.labels));
+    Json(crate::mayo::alert::AlertsResponse { alerts: statuses }).into_response()
 }
 
 /// `GET /v1/metrics/keys` — list all distinct metric names.

@@ -962,6 +962,7 @@ mod tests {
     fn spec() -> OciSpec {
         use super::super::oci::{OciLinux, OciProcess, OciRoot, OciUser};
         OciSpec {
+            managed_volumes: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,

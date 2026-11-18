@@ -425,6 +425,26 @@ one). A bigger `cpu` or `memory` request doesn't move it, even when its node is
 now short of room. A host-path volume is never chowned: make it readable (or writable) by
 the container's mapped user yourself.
 
+Two managed volumes of one app can't nest: an app that asks for both `/data`
+and `/data/sub` is refused at deploy time.
+
+Everything inside a managed volume belongs to the app, so a new volume can't
+live inside an older one. A deploy that asks for `/data/cache` while the node
+still holds the app's `/data` volume (or the reverse) fails, naming the path.
+Pick a mount path beside the old one instead, such as `/cache`. A volume path
+that runs through a symlink below the volumes directory is refused the same
+way. The volumes directory itself, and the directories above it, are yours:
+Bun follows a symlink there, so you can point it at another disk.
+
+Bun keeps a small record beside each managed volume
+(`<volumes>/<namespace>/<app>/data.volume.json` for `/data`) and syncs it to
+disk on every write. If that record is damaged, the app fails to start with a
+message naming it, and Bun leaves the volume alone: it never treats a volume
+with a damaged record as new, and never formats a loop image that already
+holds data. If a sized volume's first set-up fails part-way, Bun removes the
+image it made, so the next start tries again from scratch. Restore the record from a backup, or delete the volume and its record
+if they hold nothing you need.
+
 `size` is a hard limit. A node running as root enforces it with a Btrfs quota
 when the volumes directory is on Btrfs, or a loop-mounted ext4 file elsewhere.
 A node that can do neither (rootless, or macOS) refuses a sized volume and

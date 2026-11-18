@@ -485,6 +485,8 @@ fn refute(&mut self) {
 
 Bump incarnation, then broadcast "I'm alive at a higher incarnation." Since higher incarnations always win in conflict resolution, this overrides the Suspect update across the entire cluster. Today the refutation goes through `enqueue_refutation`, so it rides the very next outgoing message whatever else is queued. (The listing above is the first version, which used plain `enqueue` and, as we saw in the dissemination section, could queue the refutation behind a backlog of other nodes' failures.)
 
+A node only refutes a claim at or above its own incarnation. A `Suspect` at a lower one has already lost to the node's own record, since the higher incarnation wins, so refuting it would raise the incarnation and spread an `Alive` for nothing; a delayed or repeated rumour used to do exactly that. `a_claim_below_our_incarnation_is_not_refuted` checks `Suspect`, `Dead` and `Left` below the incarnation, and a `Suspect` at it.
+
 ### Three holes in the probe cycle
 
 An audit of the gossip layer in 0.2.1 found three ways a healthy node could still be declared dead, all under exactly the conditions where a cluster is already busy.
@@ -522,7 +524,61 @@ fn next_sequence() -> u64 {
 
 `AtomicU64` is a `u64` that several threads can update without a lock; `fetch_add` adds one and returns the old value as a single indivisible step, so two callers can never get the same number. `Ordering::Relaxed` says we only need that atomicity, not any ordering guarantee about *other* memory, which is all a counter needs. (It's `std::sync::atomic::Ordering`, not the `cmp::Ordering` from the dissemination queue: same name, different job.) `OnceLock`, which we met in Chapter 1, runs the initialiser the first time anyone asks. Seeding from wall-clock microseconds is what makes the counter rise across restarts: a node sends a few dozen datagrams a second, nowhere near a million, so a restarted process always starts above everything its previous run sent.
 
-Why a counter and not just a timestamp in each message? Because a timestamp check needs the receiver's clock to agree with the sender's, and so it needs a tolerance window for skew. Anything captured inside that window replays fine. A counter needs no clock agreement at all: the only question is "is this newer than the last thing *you* sent me?", and only the sender can answer yes. The wall clock appears only once, as a seed, and the worst it can do is step backwards across a restart; then peers ignore the node until they reap its old record, which drops the remembered sequence too. The price of strict ordering is that a datagram UDP delivers out of order behind a newer one is dropped. Gossip already treats loss as normal, so that's one lost datagram, not an error.
+Why a counter and not just a timestamp in each message? Because a timestamp check needs the receiver's clock to agree with the sender's, and so it needs a tolerance window for skew. Anything captured inside that window replays fine. A counter needs no clock agreement at all: the only question is "is this newer than the last thing *you* sent me?", and only the sender can answer yes. The wall clock appears only once, as a seed, and the worst it can do is step backwards across a restart; we'll come back to that below. The price of strict ordering is that a datagram UDP delivers out of order behind a newer one is dropped. Gossip already treats loss as normal, so that's one lost datagram, not an error.
+
+A review of the 0.3.0 train tightened the check in two places. The first was the reap. Sixty seconds after a member goes Dead or Left, `run_one_cycle` removes it from the table, and the first version removed its remembered sequence with it, so that a restarted node would be heard again. But a sender with no remembered sequence is admitted at *any* sequence, so after the reap the departed node's old datagrams counted as fresh again. Freshness shouldn't reset because we tidied up the table. Now the reap moves the sequence into a second map, `sequence_floors`, for 24 hours:
+
+```rust
+for node in &reaped {
+    if let Some(sequence) = self.sequences.remove(node) {
+        self.retain_floor(node.clone(), sequence, now + SEQUENCE_FLOOR_RETENTION);
+    }
+}
+```
+
+`HashMap::remove` hands back the value it removed as an `Option`, so moving an entry from one map to the other is one call, with no separate lookup. `admit_sequence` checks the floor before the per-sender sequence. A datagram at or below it is dropped; one above it is the node itself coming back (its counter carries on, or restarts from the wall clock, above anything it sent before), so the floor is removed and the sender is tracked as usual.
+
+A floor only helps a node that heard the member before it left. One that joined, or restarted, after the reap has nothing to compare with. So floors travel in anti-entropy: after its membership entries, each side of a push-pull sends up to 16 floors in `Sync` datagrams of their own, as `SequenceFloor { node_id, incarnation, sequence, expires_in_secs }`. The expiry goes as *time remaining*, not a fresh 24 hours, so a floor handed from node to node never outlives the one that recorded it; otherwise two nodes could keep a floor alive forever by passing it back and forth. There's a subtlety in *whose* highest sequence the floor holds. The counter is per sender, not per receiver, so the last datagram a node sent to `b` has a higher sequence than its last one to `a`, and `a`'s floor alone wouldn't cover it. So members that are down but not yet reaped go into the exchange as well, and a node raises its remembered sequence for such a member to the highest any peer reports. The reap is a minute away, which leaves several push-pulls for the cluster to agree; `peers_agree_on_a_departing_members_floor_before_the_reap` checks it. Converting the remaining `Duration` to a `u32` uses `u32::try_from(secs).unwrap_or(u32::MAX)`: `try_from` is the checked conversion, returning a `Result` instead of silently truncating the way C's cast or Go's `uint32(x)` would, and `unwrap_or` picks the value to use when it doesn't fit. The table holds at most 1,024 floors, and the one closest to expiry makes room for a new one.
+
+The first version of the floor had a cost we didn't want to ship. It turned the clock problem from earlier into a longer one: a node whose clock stepped backwards across a restart now wasn't heard until the floor expired, up to 24 hours, where before it was heard after the reap. That needs a large clock step at the wrong moment, but the 0.3.0 lab's thin-client appliances boot with exactly that, a wrong clock until NTP settles. So freshness now has two parts, compared in order:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Freshness {
+    incarnation: u64,
+    sequence: u64,
+}
+```
+
+Deriving `PartialOrd` and `Ord` on a struct compares it field by field in declaration order, like comparing tuples in Python, so a higher incarnation wins whatever the sequence. (Go has nothing like this; you'd write the comparison by hand.) The receiver keeps a `Freshness` per sender and per floor, and `fresh <= *last` is the whole check.
+
+That alone doesn't help: every run starts at incarnation 1, and the incarnation only rises when the node refutes a claim about itself. We could have persisted a boot counter in the data directory, but a reimaged node starts with an empty one and would be stuck exactly the same way. The node needs telling instead. When a receiver drops a datagram as stale, it answers the sender, at most once a second per sender, with a new payload, `Stale { held_incarnation, held_sequence }`: the freshest datagram it holds from it. The restarted node treats that like a `Suspect` about itself and refutes past it, so its next datagram is fresher, and it's heard after one round trip, whatever its clock says. A recording can't do the same: the answer goes back to whoever sent the old datagram, and the old datagram carries the old incarnation however often it's sent.
+
+The first version of `Stale` carried only the incarnation, and refuted whenever it was at least the node's own. A review caught what that did to a *live* node. For a live sender, what the peer holds is the sender's current incarnation, so a UDP duplicate drew a `Stale` answer that made a healthy node bump its incarnation and spread a refutation, and resending one of its datagrams from its own address could do that once a second per peer. The answer has to say *how* fresh, not just which incarnation, and the node has to compare it with what it has actually sent:
+
+```rust
+fn behind(&self, held: Freshness) -> bool {
+    let ours = Freshness {
+        incarnation: self.incarnation,
+        sequence: self.highest_sent,
+    };
+    ours < held
+}
+```
+
+`send` records the highest sequence it has sent. A duplicate or a reordered datagram is at most that, so `behind` is false and nothing happens. Only a datagram from an earlier run is fresher than anything this run has sent. The comparison is strict: a duplicate of the node's newest datagram is exactly equal to what the peer holds. `a_duplicated_datagram_from_a_live_node_does_not_raise_its_incarnation` pins it, and `a_restart_recovers_when_peers_hold_different_incarnations` covers an old run that peers last heard at different incarnations. The node refutes past each answer in turn, and in between, a recording at the higher incarnation is fresher than the node at the peer it refuted for. That reopens the window for one `Stale` round trip, and only after a restart.
+
+The second was smaller. `handle_message` skipped the sequence check when a datagram's `sender` was the receiving node itself, because a node keeps no sequence for itself, and then processed it like any other: it could move the node's own recorded address and roll its own directory entry back. Nothing in a datagram from yourself can be news, so the fix is one guard at the top, before anything is applied:
+
+```rust
+if message.sender == self.node_id {
+    return false;
+}
+```
+
+The only legitimate way to get one is a seed list that names the node's own address, and a reply from yourself tells you nothing. With the guard in place, the three `message.sender != self.node_id` checks further down had nothing left to do and went.
+
+Each case has a test in `protocol.rs`. `a_departed_members_recorded_datagrams_do_not_bring_it_back_after_the_reap` and `a_node_that_never_heard_the_departed_member_learns_its_floor_in_push_pull` replay old datagrams after the reap, at a node that heard them and at one that didn't. `a_datagram_in_this_nodes_own_name_is_dropped` sends a node its own PING twice and checks its address, labels and directory entry stay put and nothing is answered. The others make sure the floors don't get in the way: `a_restart_with_its_clock_set_back_is_heard_after_its_reap` and its `_before_its_reap` twin restart a node whose sequences start below its old run's, check that it's heard after one `Stale` answer, and check that the old run's datagrams are still refused; `a_restart_recovers_at_a_peer_that_learned_its_floor_in_push_pull` does the same at a node that only has the floor from anti-entropy; `stale_answers_are_rate_limited` and `a_stale_answer_only_raises_our_incarnation_when_it_has_to` pin the answer down; `a_reaped_member_that_really_comes_back_is_heard` admits a newer datagram at a new incarnation, `a_restarted_node_rejoins_after_its_reap` runs two real nodes through a crash, a reap and a rejoin, and `a_shared_floor_keeps_its_original_expiry` and `the_floor_table_is_bounded_and_drops_the_soonest_to_expire` pin the expiry and the bound.
 
 One wrinkle forced a wire change. A relay used to forward the target's ACK with `sender` set to the *target*, so the requester's `wait_for_ack` would recognise it. That datagram was physically stamped by the relay, with the relay's counter, under someone else's name: there's no way to give it a sequence that means anything. So a relay now sends the ACK in its own name and says whom it vouches for, `Ack { relayed_for: Some(target) }`. Every message has exactly one stamping node, a receiver ignores a directory extension that names anyone but the sender, and the M13 rule (never record the target at the relay's socket) falls out for free, because the only address a relayed ACK can teach is the relay's own.
 
@@ -3105,6 +3161,50 @@ A voter that is still a member hears from the leader within a heartbeat, so its 
 The return hold shares `ElectionHold` with the handover hold from the next section, because both switch the same openraft setting. An `AtomicBool` records whether the return hold is still on. Each release switches elections back on only when the other hold isn't running, and both releases do it under the same `watch` write lock, so one can't switch elections on just as the other starts. `Ordering::SeqCst` on the atomic asks for the strongest ordering, which is the right default when you aren't measuring for speed.
 
 The reproducer changed with the fix. It now checks that the returning node's term doesn't move in the two seconds it spends outside the others' gossip, which is longer than it used to take to campaign. It then checks that leadership and the leader's term stay put once it's added back, and that the leader's replication ended the hold. It passed six runs out of six, and it runs in `make test-cluster` again.
+
+### Who may speak on the Raft port
+
+mTLS answers "who are you?", and on the Raft port the answer was always good enough: a node certificate signed by the Node CA. Every node has one, though, workers included, and the listener stopped there. So a worker could send a Raft RPC that names any leader it liked, and a follower would take it on the strength of the vote inside. It could also stamp a newer recovery epoch on the envelope and fence the voter it reached. A code review found it in November 2026. What the listener was missing was the second question: are you someone this council lets drive Raft?
+
+Start with who sends what. openraft has three RPCs. A leader sends `AppendEntries` and `InstallSnapshot`; a candidate sends `Vote`. Leaders and candidates are always voters, because openraft never lets a learner campaign. Learners only receive. So the check belongs on the *sender*, and it's the same for all three: the node the RPC's vote names (`voted_for`) must be a voter in this node's council, and it must be the node the connection's certificate names. The second half stops one node speaking for another.
+
+The direction matters for learners. A leader dials a learner to replicate to it, so the learner is the receiver and the check runs against the leader. Adding a learner needs nothing new.
+
+"This node's council" needs care too, because openraft keeps two memberships. The effective one is the newest entry in the log, committed or not; the committed one is the newest that has committed. A follower that has appended the entry removing the leader no longer has the leader in its effective membership. But the leader keeps sending until that very entry commits, and refusing it would stall the removal. So the council is the union of both memberships' voters, read from openraft's own state:
+
+```rust
+raft.with_raft_state(|state| {
+    let committed = state.membership_state.committed().membership();
+    let effective = state.membership_state.effective().membership();
+    if committed.nodes().next().is_none() && effective.nodes().next().is_none() {
+        return None;
+    }
+    let mut voters = CouncilVoters::new();
+    add_voters(&mut voters, committed);
+    add_voters(&mut voters, effective);
+    Some(voters)
+})
+.await
+```
+
+`with_raft_state` sends the closure to the Raft core's own task and waits for the answer. The closure gets a reference to the core's state for the length of the call and can't keep it, so its signature asks for an `FnOnce` that is `'static`: it owns everything it captures. That's how openraft lets you look at state it never hands out. It costs a trip through the core, so the server tries the metrics channel's effective membership first and only asks the core when that doesn't settle it.
+
+Two kinds of node had to keep working, and the tests were written for them before the check. A fresh node has no membership at all, and the first leader that replicates to it is how it joins, so a node with no council serves any certificate, as before. It holds nothing worth protecting yet. The other is a member whose view is behind. Take the replaced voter from the last section. If the leader is a node that joined while it was down, its old membership has never heard of that leader, and a strict check would refuse it until leadership happened to move. Its vote counts as much as its log. Say the council swaps voter 3 for node 4 while voter 2 lags, and then the leader dies. Node 4 can't win without node 2's vote, and node 2 has never heard of node 4. The review of the first version of this check found exactly that: the council sat leaderless until the old leader came back. So a member that refuses replication from a stranger, or a vote from one whose log reaches at least as far as its own, asks the voters it *does* know, with a fourth RPC, `CouncilVoters`, dialled over the same node-id-bound mTLS as everything else. If one of them names the stranger, under the certificate's node name, the member admits it for 60 seconds, long enough to catch up and read the membership from its own log. One voucher is enough: a voter in the member's own view can already drive its Raft, so its word adds nothing it couldn't do anyway.
+
+Vouching needs at least one live voter the member knows, and that leaves one gap we chose to keep. Suppose voter 3 is swapped out while node 2 lags, then voter 3 dies, then the leader dies. Node 2 knows only voters 1 and 3, both gone, so nobody can vouch for node 4, and node 4 needs node 2's vote. We tried serving a stranger's vote when nobody answers. Node 4 won the election and then couldn't replicate to node 2, so the council still couldn't commit anything. Making it work would have meant taking a stranger's log entries on trust, which is the very thing the check exists to stop. So the council waits until node 1 or node 3 comes back, and the manual tells an operator who can't wait to run `relish council recover` or re-enrol node 2. `a_lagging_voter_that_lost_every_voter_it_knows_waits_for_one_to_return` pins that behaviour down: no leader while they're gone, and a leader once node 1 returns.
+
+The fence changed shape to match. Before, every RPC went through `fence.admit`, which could move the fence. Now only a member's RPC does. A stranger never moves it, but one on an *older* epoch still gets the `Fenced` reply, because that's how an old voter knocking on a recovered council learns it has been replaced. `refusal_for_outsider` is the read-only half:
+
+```rust
+pub fn refusal_for_outsider(&self, sender: RecoveryClaim) -> Option<RecoveryClaim> {
+    let snapshot = self.snapshot();
+    (sender.epoch < snapshot.newest_known_epoch()).then(|| snapshot.refusal_claim())
+}
+```
+
+`bool::then` turns a condition into an `Option`: `Some` of the closure's result when it's true, `None` when it's false. It reads like Python's `x if cond else None`, and the closure only runs when it's needed.
+
+What doesn't this cover? A fresh node still trusts whoever reaches it first, gossip carries epochs too, and every node still holds the master key, so the check doesn't make a worker harmless. It makes the Raft port mean what the security design always said it meant: changing the log takes the council. The tests in `tests/suite/council_tcp.rs` send each RPC kind from a certificate outside the council and from one speaking for a member, check that a newer epoch from outside leaves the fence alone, and run a council through adding a learner, promoting it and removing its own leader over mTLS. One more gives a member a view that's one voter behind, and checks it admits the leader its voters name and nobody else.
 
 ### Resigning under disk pressure
 

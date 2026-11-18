@@ -158,6 +158,7 @@ Worker Node (Bun)                     Council Node (nearest parent)
      |       key.pem                             |
      |       ca.pem                              |
      |       token (OIDC JWT)                    |
+     |       api-token (OIDC JWT, API audience)  |
      |       bundle.pem                          |
      |                                          |
      |  8. Schedule next rotation                |
@@ -691,7 +692,8 @@ pub struct WorkloadJwtClaims {
     /// Subject: the workload's SPIFFE URI.
     pub sub: String,
 
-    /// Audience. Today this is exactly `["spiffe://CLUSTER"]`; per-app
+    /// Audience. `token` carries exactly `["spiffe://CLUSTER"]`, and
+    /// `api-token` exactly `["reliaburger-api:CLUSTER"]` (§5.3); per-app
     /// audiences are planned but not yet appended (§6.6).
     pub aud: Vec<String>,
 
@@ -853,6 +855,32 @@ so the API listener permits an absent client certificate and authorises those
 requests with bearer tokens or session cookies. Gossip is UDP and uses the
 cluster-master-key-derived HMAC instead of TLS.
 
+A node certificate gets a peer through the Raft handshake, but every node
+holds one, workers included, so the Raft listener also checks council
+membership on every RPC (`council::admission`). An `AppendEntries` or
+`InstallSnapshot` comes from a leader and a `Vote` from a candidate, and both
+are voters, so the node the RPC names as its leader or candidate must be a
+voter in the receiver's council (the voters of its committed and effective
+Raft membership, never gossip) and must be the node named in the
+connection's certificate. Anything else is closed without reaching Raft, and
+its recovery epoch never moves the receiver's fence; a sender on an older
+epoch is still told the newer one. Two cases keep legitimate members in:
+
+- A fresh node with no membership serves whoever replicates to it, because
+  that is how a learner joins. It holds no Raft state yet.
+- A member whose membership is behind (the leader or a candidate joined
+  while it was away) asks the voters it knows, over node-id-bound mTLS,
+  whether the sender is a voter in their councils. It asks about replication
+  and about a vote whose log is at least as long as its own, since a council
+  that lost its leader may need that vote. If one names it, under the same node name, the
+  member admits it for 60 seconds while it catches up from the log.
+
+A fresh node's first contact is therefore trusted on first use, and a node
+that still counts a former voter as a voter admits that node's RPCs until
+its own log catches up. Plaintext clusters have no certificate to bind, so
+there the RPC's claimed sender must still be a voter but is not
+authenticated.
+
 **Output to admin:**
 
 ```
@@ -916,7 +944,7 @@ Bun on each worker node maintains a rotation schedule for every running workload
 1. **Initial issuance.** When Bun starts a workload, it immediately generates a keypair and sends a CSR to its nearest council parent.
 2. **Validation.** The council member checks that the requesting node (identified by its mTLS node certificate CN) is scheduled to run the workload (verified against Meat's scheduling state).
 3. **Signing.** The council member signs the certificate with the Workload CA, sets a 1-hour lifetime, and returns it.
-4. **Writing.** Bun writes `cert.pem`, `key.pem`, `ca.pem`, `bundle.pem`, and `token` (OIDC JWT) to the workload's tmpfs mount at `/var/run/reliaburger/identity/`.
+4. **Writing.** Bun writes `cert.pem`, `key.pem`, `ca.pem`, `bundle.pem`, `token` (OIDC JWT) and `api-token` (the same JWT with the API's audience, §5.3) to the workload's tmpfs mount at `/var/run/reliaburger/identity/`.
 5. **Rotation timer.** Bun schedules the next rotation for 30 minutes later (half the certificate lifetime).
 6. **Pre-fetch.** At the 30-minute mark, Bun generates a new keypair, sends a new CSR, receives the new certificate, and atomically writes the new files to the tmpfs mount.
 7. **Grace period.** If the CSR fails because the council is unreachable, Bun keeps the current certificate and extends its local validity window by up to 4 additional hours (configurable). The extension is logged as a security event, `relish wtf` warns about it, and an alert fires.
@@ -929,8 +957,11 @@ Bun on each worker node maintains a rotation schedule for every running workload
 
 **OIDC JWT minting** happens at the same time as certificate issuance. The council member constructs the JWT with the workload's SPIFFE URI as the `sub` claim, the cluster's OIDC issuer as `iss`, and a single audience `spiffe://CLUSTER`. The JWT is signed with the Ed25519 OIDC signing key and returned alongside the signed X.509 certificate.
 
+**Token audience.** It mints a second JWT with the same claims and the audience `reliaburger-api:CLUSTER` (`sesame::oidc::api_audience`). Bun writes the first as `token`, the one a workload hands to its peers and to cloud federation, and the second as `api-token`. The API's `WorkloadJwtVerifier` accepts only the second audience (`JwtConstraints::for_api`), so a party that receives `token` can't present it as an API login, and `api-token` isn't valid where `spiffe://CLUSTER` is expected. Both are owner-only files with the same one-hour lifetime and rotation.
+
 > **Two claim details differ from the aspirational model.** (1) The `aud` claim
-> is exactly `["spiffe://<cluster>"]` today — **per-app audiences from
+> is exactly `["spiffe://<cluster>"]` today (`["reliaburger-api:<cluster>"]` on
+> `api-token`) — **per-app audiences from
 > `[app.NAME.identity]` are not appended** (that is planned, §6.6). (2) The
 > `reliaburger.dev/node` claim is currently the **literal string `"local"`**,
 > not the issuing node's id — the CSR-signing path passes `"local"` as the node
@@ -1035,8 +1066,40 @@ carries the route's namespace), `GET /v1/fault` only workload faults on
 in-scope apps (`FaultSummary` carries the fault's namespace), and
 `GET /v1/build/{id}` answers only for a build whose destination repository
 (`BuildRecord::repository`) is in scope. `GET /v1/fault?cluster=true` refuses a
-scoped caller, since node faults belong to no tenant. A workload's JWT is a
+scoped caller, since node faults belong to no tenant, and so does
+`DELETE /v1/fault` without `service` (clear every workload fault) or with
+`service` and no `namespace`: a scoped token clears faults one in-scope
+service and namespace at a time. A workload's `api-token` JWT is a
 scoped read-only token, so these are the rules a compromised container meets.
+
+The dashboard follows the same scope, cookie or bearer. `GET /`,
+`/ui/fragment/apps` and `/ui/fragment/nodes` list and count only in-scope
+apps, and `/ui/node/{name}` lists only in-scope instances, trimming the peer's
+answer (fetched under the service token) as `/v1/status?cluster=true` does.
+The alert panel (`GET /` and `/ui/fragment/alerts`) and `GET /v1/alerts`
+keep only alerts whose series names an in-scope app (`app` is
+`<namespace>/<app>`, or a bare `app` beside a `namespace` label); an alert on
+a series that names no app, such as a node's, is unscoped-only
+(`ui::alert_visible`). These routes name no app, so the `{app}` source check
+can't see them; `namespace_scoped_token_sees_only_its_namespace_on_the_dashboard`
+and `namespace_scoped_token_sees_only_its_namespaces_alerts` cover them.
+
+**Ingress hosts.** Wrapper routes a host's requests by longest path prefix
+across every app on that host, so an app on a host can take requests meant for
+another. Wherever app specs are written for a caller, a scoped token may put
+an app on an ingress host only if every app already serving that host is in
+its scope (`authorize_ingress_hosts`, `authorize_ingress_apps`): the leader's
+apply path (`cluster_apply`), a manifest with jobs (`job_apply::apply`), and a
+proposal when it's created (as the author), approved (as the approver) and
+undone (the `before` specs, as the undoer). When the reaper approves a pending
+proposal under a policy, it checks again as the author, whose scope it reads
+from the stored token (`sesame::auth::context_for_principal`), against the
+cluster at that moment. A conflict, or an author whose token is gone, fails
+the proposal with the reason (`FailedReason::Refused`) and writes nothing. GitOps syncs only a repository an
+unscoped admin configured, so it carries that authority and isn't checked. An app that already serves the host
+keeps it through later applies, so an unscoped token can share a host across
+namespaces on purpose. Unscoped tokens aren't checked: they may change any of
+those apps anyway.
 
 **Permission specs (shipped):** A `[permission.<token-name>]` block
 (`config::PermissionSpec`, replicated as `DesiredState.permissions`) is an
@@ -1885,7 +1948,7 @@ The threat model assumes:
 - Forge certificates for arbitrary workloads — **not yet guaranteed:** CA private keys are currently derivable on every node.
 - Decrypt secrets for other namespaces — **not yet guaranteed:** a namespace with `secret_key = true` has its own age key (§5.5), but every node can still unwrap every namespace's key until the master key is split (F03b).
 - Access the age private key, CA private keys, or OIDC signing key — **not yet guaranteed** (see the note above).
-- Modify the Raft log or cluster state (requires council consensus — this *is* enforced).
+- Modify the Raft log or cluster state through Raft (requires council consensus — this *is* enforced: the Raft listener serves only RPCs that a council voter sends under its own certificate, so a compromised non-member node can neither append entries, collect votes nor move the recovery epoch fence over Raft; see the transport contract in §5.1 and `council::admission`). It still holds the master key and the bootstrap state, so this doesn't stop it reading or decrypting what those protect, and a fresh node joining the council trusts the first node that replicates to it.
 - Bypass nftables perimeter rules on other nodes.
 
 **Response:**

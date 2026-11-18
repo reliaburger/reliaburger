@@ -66,7 +66,9 @@ pub const SYSTEM_PRINCIPAL: &str = "__system";
 /// OIDC key); this is the consumer that lets a workload authenticate to the API
 /// as itself. Verification is the constrained path — algorithm, key id, issuer,
 /// audience, and `iat` are all checked — so a token minted for another cluster
-/// or purpose is refused.
+/// or purpose is refused. The audience is the API's own
+/// ([`super::oidc::api_audience`]): the `spiffe://<cluster>` token a workload
+/// hands to cloud federation or its peers is not an API login.
 ///
 /// The keys it accepts follow the council: [`refresh`](Self::refresh) takes
 /// the active signing key and every retiring one still inside its window,
@@ -83,7 +85,7 @@ impl WorkloadJwtVerifier {
     /// Build a verifier from the cluster's OIDC config and trust-domain name,
     /// accepting that config's key until the first refresh.
     pub fn new(config: super::types::OidcSigningConfig, cluster_name: &str) -> Self {
-        let constraints = super::oidc::JwtConstraints::for_config(&config, cluster_name);
+        let constraints = super::oidc::JwtConstraints::for_api(&config, cluster_name);
         let keys = vec![super::oidc::OidcVerifyingKey::from(&config)];
         Self {
             keys: Arc::new(tokio::sync::watch::Sender::new(keys)),
@@ -280,6 +282,25 @@ fn token_context(stored: &ApiToken, principal_id: String) -> AuthContext {
         scoped_apps: stored.scope.apps.clone(),
         scoped_namespaces: stored.scope.namespaces.clone(),
     }
+}
+
+/// The context the stored token behind `principal_id` authenticates as,
+/// its current secret or one still in its rotation grace, with its role and
+/// scope as they stand in `tokens`. `None` when no stored token has that
+/// principal id any more. The proposal reaper judges a policy approval as
+/// its author through this, since no request carries the author's token.
+pub(crate) fn context_for_principal(
+    principal_id: &str,
+    tokens: &[ApiToken],
+) -> Option<AuthContext> {
+    tokens.iter().find_map(|stored| {
+        let current = token_principal_id(stored) == principal_id;
+        let previous = stored
+            .previous_secret
+            .as_ref()
+            .is_some_and(|previous| principal_for_hash(&previous.token_hash) == principal_id);
+        (current || previous).then(|| token_context(stored, principal_id.to_string()))
+    })
 }
 
 /// The context of the token a browser session was made from, with that
@@ -1581,6 +1602,14 @@ mod tests {
         app: &str,
         namespace: &str,
     ) -> (String, super::super::types::OidcSigningConfig) {
+        mint_test_workload_jwt_for(app, namespace, &super::super::oidc::api_audience("test"))
+    }
+
+    fn mint_test_workload_jwt_for(
+        app: &str,
+        namespace: &str,
+        audience: &str,
+    ) -> (String, super::super::types::OidcSigningConfig) {
         let ikm = b"test-oidc-wrapping-material-32b!".to_vec();
         let config =
             super::super::oidc::generate_oidc_keypair("https://test.reliaburger.dev", &ikm)
@@ -1592,7 +1621,7 @@ mod tests {
         let claims = super::super::types::WorkloadJwtClaims {
             iss: "https://test.reliaburger.dev".to_string(),
             sub: format!("spiffe://test/ns/{namespace}/app/{app}"),
-            aud: vec!["spiffe://test".to_string()],
+            aud: vec![audience.to_string()],
             exp: now + 3600,
             iat: now,
             namespace: namespace.to_string(),
@@ -1676,6 +1705,17 @@ mod tests {
         assert!(authorize_scoped(Some(&ctx), "api", "team-a").is_ok());
         assert!(authorize_scoped(Some(&ctx), "api", "team-b").is_err());
         assert!(require_unscoped(Some(&ctx)).is_err());
+    }
+
+    /// The workload's `token` carries `spiffe://<cluster>`, the audience
+    /// cloud federation and the workload's peers check. Whoever it is handed
+    /// to could replay it to the API for its hour, so the API takes only the
+    /// `api-token` audience.
+    #[test]
+    fn a_workload_jwt_for_federation_is_not_an_api_login() {
+        let (jwt, config) = mint_test_workload_jwt_for("api", "team-a", "spiffe://test");
+        let verifier = WorkloadJwtVerifier::new(config, "test");
+        assert!(verifier.verify(&jwt).is_none());
     }
 
     #[test]

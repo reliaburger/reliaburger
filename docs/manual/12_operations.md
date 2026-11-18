@@ -784,3 +784,22 @@ they can reach each other but never the recovered side.** Wipe them with
 recovered council. If two of them do come back cut off from it, they form a
 council of their own; `relish council status` and `relish wtf` show it as two
 recovery epochs and two leaders.
+
+### A voter that missed a swap
+
+The Raft port only takes RPCs from voters a node knows, or from a node one
+of those voters names. That leaves one combination where a council can't
+elect a leader on its own. A voter (node 2, say) lags while the council
+swaps another voter out (node 3 for node 4), so node 2's membership still
+lists the old voters. If node 3 and then the leader both stop, node 2 can
+reach none of the voters it knows. Nobody can tell it that node 4 is a
+voter, so it won't vote for node 4, and if node 4 needs that vote the
+council has no leader. `relish council status` shows `NO LEADER`, and node
+2 logs `none of the voters asked ... names it`.
+
+Bring back the old leader or the swapped-out voter if you can: once node 2
+reaches one of them, it learns of node 4 and the council elects a leader.
+Otherwise recover the council with `relish council recover`, as above, or
+stop node 2, wipe its Raft state with `relish council re-enrol --data-dir
+/var/lib/reliaburger/data --force` and start it again, so it joins as a
+fresh member.

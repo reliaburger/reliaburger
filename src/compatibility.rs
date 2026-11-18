@@ -257,6 +257,12 @@ pub struct Compatibility {
 /// `RaftRequest::RevokeApiToken` carries the proposer's `now_unix_ms`, so
 /// the last-Admin guard counts only unexpired Admins (#2014); a node's
 /// `GET /v1/diagnostics` carries its council backup state (#2016).
+/// Gossip `Sync` datagrams carry `floors`, the (incarnation, sequence)
+/// floors a node keeps for reaped members, and a dropped datagram draws the
+/// new `GossipPayload::Stale` answer, so a 0.2.8 node can't decode either.
+/// The council membership check on the Raft port: the `CouncilVoters` Raft
+/// RPC and its answer, which an earlier 0.3.0 build can't decode, and a
+/// server that refuses Raft RPCs from nodes outside its council.
 ///
 /// Bumping either number makes the checked-in gossip and Raft fuzz seeds
 /// stale: run `make fuzz-corpus-seed` in the same change (#1941). Keep the
