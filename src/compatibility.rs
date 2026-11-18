@@ -266,13 +266,27 @@ pub struct Compatibility {
 /// A deployment record keeps when its cancel was requested
 /// (`DeploymentRecord::cancelled_at` replaces `cancelled`, #2047).
 ///
+/// 0.3.0 again (60/76): one more bump at the end of the train, because the
+/// changes above landed under 59/75 after the train's first bump, so builds
+/// made in between (`nightly-v0.3.0-*`, lab image 2026.47.202) spoke 59/75
+/// with another wire and state. With the bump they are refused cleanly
+/// instead of half-understood. Covered: gossip's `Stale` answer and the
+/// sequence floors in `Sync`; the `CouncilVoters` Raft RPC;
+/// `RaftRequest::RevokeApiToken::now_unix_ms`;
+/// `DeploymentRecord::cancelled_at`; the apply-time checks that refuse a
+/// join token whose name's Raft id collides with another node's (#2050),
+/// which a 59/75 replica would apply differently; `export_holds` in
+/// `GET /v1/diagnostics` (`LocalDiagnosticSnapshot` refuses unknown
+/// fields, #2062); and the API token's separate audience
+/// (`reliaburger-api:CLUSTER`, the `api-token` file beside `token`).
+///
 /// Bumping either number makes the checked-in gossip and Raft fuzz seeds
 /// stale: run `make fuzz-corpus-seed` in the same change (#1941). Keep the
 /// two fields directly inside the braces: the release scripts read them with
 /// a regex.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 59,
-    state: 75,
+    protocol: 60,
+    state: 76,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.
