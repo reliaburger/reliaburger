@@ -897,11 +897,12 @@ class PortableLinuxRunnerTests(unittest.TestCase):
     On 18 Nov 2026 it lost its runner three times, each after about 50
     minutes with the test step still in progress and no log kept (runs
     44265273054, 44265366690 and 44276663421). That step compiles the lib
-    tests, whose one rustc already peaked above 12 GB and grew with the
-    17 Nov review fixes, on a 16 GB runner with nothing protecting the
-    runner's own processes. It is #1943's failure, so it gets #1943's
-    guards: the runner out of the OOM killer's reach, swap for the peak,
-    and the headroom watched and kept."""
+    tests, whose one rustc peaks at about 14 GB (batch 1 moved it only
+    0.2 GB, so why the losses start now is open), on a 16 GB runner with
+    nothing protecting the runner's own processes. That is #1943's
+    mechanism, unverified here, so it gets #1943's guards: the runner out
+    of the OOM killer's reach, swap for the peak, and the headroom watched
+    and kept."""
 
     def setUp(self):
         self.job = jobs((WORKFLOWS / "ci.yml").read_text())["portable"]
