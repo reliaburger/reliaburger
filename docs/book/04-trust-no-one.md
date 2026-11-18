@@ -267,11 +267,20 @@ again and checked:
 ```rust
 BackupDestination::FreshIdentity { path, identity } => {
     let key = age::x25519::Identity::generate();
-    // ...write the identity, owner-only, then the sealed backup...
+    // ...write the sealed backup, then the identity, owner-only...
     let written = read_back(path)?;
     check_opens(&written, &BackupOpener::Identity(key), backup, path, now)
 }
 ```
+
+The order of the two writes matters more than it looks. Both open with
+`create_new`, which refuses to replace a file that's already there, so a
+failed attempt must not leave anything behind that blocks the retry. The
+first version wrote the identity first: a backup directory that didn't exist
+left an identity with no backup beside it, and the operator's second try
+failed on that file. Now the backup goes first, and if the identity can't be
+written the backup is removed again. A test makes each of the two writes fail
+in turn and checks that nothing is left over.
 
 `relish init` writes the backup *before* the master key, the state or the
 config, so if the backup can't be written, there's no half-made cluster

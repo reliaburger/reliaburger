@@ -575,7 +575,10 @@ pub async fn write_log_pending(pending: LogPendingFlush) -> Result<(), KetchupEr
             if test_dir_sync_failure.load(Ordering::Acquire) {
                 return Err(std::io::Error::other("injected log directory sync failure"));
             }
-            std::fs::File::open(path.parent().unwrap())?.sync_all()
+            let directory = path
+                .parent()
+                .ok_or_else(|| std::io::Error::other("log file path has no directory"))?;
+            std::fs::File::open(directory)?.sync_all()
         })();
         // A visible rename alone is not acknowledgement of durable publication.
         directory_sync?;
@@ -998,10 +1001,12 @@ impl LogStore {
             let sequence = pending
                 .batch
                 .column_by_name("sequence")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .unwrap();
+                .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+                .ok_or_else(|| {
+                    KetchupError::Io(std::io::Error::other(
+                        "pending log batch has no u64 sequence column",
+                    ))
+                })?;
             format!(
                 "SELECT * FROM logs_disk WHERE sequence < {} OR sequence > {}",
                 sequence.value(0),

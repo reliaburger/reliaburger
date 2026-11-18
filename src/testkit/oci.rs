@@ -27,6 +27,10 @@ pub fn sha256_digest(data: &[u8]) -> String {
 }
 
 /// One gzipped tar layer carrying a single marker file.
+///
+/// The `expect`s here and in [`build_synthetic_image`] can't fire: the tar
+/// and gzip write to a `Vec`, which never fails, the path is a short literal,
+/// and JSON built with `json!` always serialises.
 fn build_layer() -> Vec<u8> {
     let content = b"reliaburger testkit fixture\n";
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());

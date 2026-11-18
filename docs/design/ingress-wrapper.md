@@ -1045,7 +1045,7 @@ HTTP/3 (over QUIC) provides benefits including 0-RTT connection establishment, m
 
 ### 13.2 gRPC Proxying
 
-gRPC uses HTTP/2 with specific framing conventions (trailers, streaming, content-type `application/grpc`). Wrapper's current HTTP/2 proxying may work for unary gRPC calls, but streaming gRPC (server-streaming, client-streaming, bidirectional) hasn't been validated.
+gRPC uses HTTP/2 with specific framing conventions (trailers, streaming, content-type `application/grpc`). Wrapper doesn't proxy gRPC today, not even unary calls. It accepts HTTP/2 from clients, but its upstream client is HTTP/1.1 only (`http_client::builder` sets `http1_only`, and both of the proxy's clients in `bind_proxy_with_tls` start there), and gRPC needs HTTP/2 end to end.
 
 Known concerns:
 
@@ -1054,7 +1054,7 @@ Known concerns:
 - gRPC health checking protocol (`grpc.health.v1.Health`) is different from HTTP health checking.
 - Long-lived gRPC streams interact with connection draining (similar to WebSocket, but using HTTP/2 GOAWAY instead of WebSocket Close).
 
-**Decision status:** Needs investigation and testing. gRPC proxying should work with Wrapper's HTTP/2 support, but requires a dedicated test suite before being documented as supported.
+**Decision status:** Not supported. gRPC needs an HTTP/2 upstream client first, then a dedicated test suite (unary and each kind of streaming) before it can be documented as supported.
 
 ### 13.3 Custom Middleware / Header Injection
 
