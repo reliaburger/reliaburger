@@ -278,6 +278,11 @@ pub const CURRENT: Compatibility = Compatibility {
 /// Name of the durable format stamp at the root of a node's data directory.
 pub const STATE_STAMP: &str = "state-format.json";
 
+/// Prefix of the temporary file the stamp is written through. A crash before
+/// the rename leaves one behind; the next start removes it rather than
+/// mistaking it for unversioned state.
+const STAMP_TEMPORARY_PREFIX: &str = ".state-format-";
+
 /// Where the compatibility policy every refusal points to lives.
 pub const POLICY_URL: &str = "https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#compatibility-before-100";
 
@@ -408,13 +413,26 @@ pub fn ensure_state_compatible(directory: &Path) -> Result<(), CompatibilityErro
     }
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
-        if entry.file_name() != "identity" || !entry.file_type()?.is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_file()
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(STAMP_TEMPORARY_PREFIX))
+        {
+            // A stamp a crash interrupted before its rename (#2053).
+            std::fs::remove_file(entry.path())?;
+            continue;
+        }
+        if entry.file_name() != "identity" || !file_type.is_dir() {
             return Err(CompatibilityError::DevelopmentState(
                 directory.to_path_buf(),
             ));
         }
     }
-    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(STAMP_TEMPORARY_PREFIX)
+        .tempfile_in(directory)?;
     let bytes = serde_json::to_vec(&StateStamp {
         format: CURRENT.state,
     })
@@ -432,6 +450,36 @@ pub fn ensure_state_compatible(directory: &Path) -> Result<(), CompatibilityErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A crash between creating the stamp's temporary file and renaming it
+    /// leaves the temporary file behind. The next start must still see a
+    /// fresh directory, stamp it and clear the leftover.
+    #[test]
+    fn a_stamp_left_half_written_by_a_crash_does_not_block_the_next_start() {
+        let directory = tempfile::tempdir().unwrap();
+        let leftover = tempfile::Builder::new()
+            .prefix(STAMP_TEMPORARY_PREFIX)
+            .tempfile_in(directory.path())
+            .unwrap();
+        let (_, leftover_path) = leftover.keep().unwrap();
+
+        ensure_state_compatible(directory.path()).unwrap();
+
+        assert!(directory.path().join(STATE_STAMP).is_file());
+        assert!(!leftover_path.exists());
+    }
+
+    /// Only the stamp's own leftovers are ignored: any other file still
+    /// means unversioned state.
+    #[test]
+    fn a_foreign_file_still_counts_as_unversioned_state() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join(".tmpabc123"), b"x").unwrap();
+        assert!(matches!(
+            ensure_state_compatible(directory.path()),
+            Err(CompatibilityError::DevelopmentState(_))
+        ));
+    }
 
     #[test]
     fn fresh_state_gets_a_durable_stamp_that_allows_restart() {

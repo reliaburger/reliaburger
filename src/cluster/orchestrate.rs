@@ -1598,6 +1598,9 @@ impl VolumeHome<'_> {
             .map(|p| crate::meat::scheduler::parse_label_list(&p.required))
             .unwrap_or_default();
         let mut homes = Vec::new();
+        // What this app already asks of each home: two replicas can share a
+        // node, and each fitting alone doesn't mean both fit (#2052).
+        let mut demand: HashMap<&NodeId, Resources> = HashMap::new();
         // The leader records an app's nodes in ordinal order, so each home
         // gets back the ordinal its replica had (#398).
         for (ordinal, node_id) in (0u32..).zip(last_nodes.iter().take(want)) {
@@ -1623,7 +1626,9 @@ impl VolumeHome<'_> {
             if !node_can_run(node, spec, self.dns_required) {
                 return wait(HomeWait::NotReady);
             }
-            if !node.can_fit(&resources) {
+            let asked = demand.entry(node_id).or_default();
+            *asked = asked.saturating_add(&resources);
+            if !node.can_fit(asked) {
                 return wait(HomeWait::NoRoom);
             }
             homes.push(crate::meat::types::Placement {
@@ -2031,23 +2036,43 @@ pub fn spawn_autoscaler(
                     // and thus started the cooldown — before the Raft write,
                     // so a failed write would suppress the next real attempt
                     // for a whole cooldown while nothing actually scaled.
-                    match council
+                    let written = council
                         .write(RaftRequest::AutoscaleOverride {
                             app_id: app_id.clone(),
                             replicas: decision.to,
                             reason: decision.reason.clone(),
                         })
-                        .await
-                    {
-                        Ok(_) => tracker.apply_decision(&decision, now),
-                        Err(e) => {
-                            eprintln!("autoscaler: failed to commit override for {app_id}: {e}")
-                        }
-                    }
+                        .await;
+                    record_autoscale_write(&mut tracker, &decision, now, written);
                 }
             }
         }
     });
+}
+
+/// Start the autoscaler's cooldown for `decision` once its override write
+/// has come back. The state machine refuses an override for an app that
+/// stopped autoscaling between the read and the write; that refusal is an
+/// answer, not a scale, so only `Applied` starts the cooldown.
+fn record_autoscale_write(
+    tracker: &mut crate::meat::autoscaler::AutoscaleTracker,
+    decision: &crate::meat::autoscaler::AutoscaleDecision,
+    now: std::time::Instant,
+    written: Result<CouncilResponse, crate::council::CouncilError>,
+) {
+    let app_id = &decision.app_id;
+    match written {
+        Ok(CouncilResponse::Applied { .. }) => tracker.apply_decision(decision, now),
+        Ok(CouncilResponse::Refused { reason }) => {
+            eprintln!("autoscaler: council refused the override for {app_id}: {reason}")
+        }
+        Ok(other) => {
+            eprintln!(
+                "autoscaler: unexpected council answer to the override for {app_id}: {other:?}"
+            )
+        }
+        Err(e) => eprintln!("autoscaler: failed to commit override for {app_id}: {e}"),
+    }
 }
 
 /// Average utilisation of the app's resource request over the app's
@@ -6678,6 +6703,70 @@ image = "busybox:latest"
             plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
 
         assert!(decisions.is_empty(), "{decisions:?}");
+    }
+
+    /// Two replicas whose volumes both live on one node that now has room
+    /// for only one: each fits alone, but not together. Placing both would
+    /// over-commit the node, which then refuses one replica for good. The
+    /// app waits for room instead.
+    #[test]
+    fn a_volume_app_with_two_replicas_on_one_home_waits_until_both_fit() {
+        let mut spec = app_with_volume(100);
+        spec.replicas = Replicas::Fixed(2);
+        let (mut desired, mut cache) = stopped_and_applied_again(spec);
+        desired.last_placed_nodes.insert(
+            AppId::new("db", "default"),
+            vec![NodeId::new("home"), NodeId::new("home")],
+        );
+        let mut tight = sched_node("home", 4000, BTreeMap::new());
+        tight.allocated = Resources::new(3850, 0, 0);
+        cache.set_node(tight);
+        let alive = HashSet::from([NodeId::new("busy"), NodeId::new("home")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert!(decisions.is_empty(), "{decisions:?}");
+    }
+
+    /// A deploy that drops `[autoscale]` between the autoscaler's read and
+    /// its write makes the council refuse the override. Nothing scaled, so
+    /// the tracker must not start a cooldown or record the new count.
+    #[test]
+    fn a_refused_autoscale_override_starts_no_cooldown() {
+        use crate::meat::autoscaler::{AutoscaleDecision, AutoscaleTracker};
+        let app = AppId::new("web", "default");
+        let mut tracker = AutoscaleTracker::default();
+        tracker.get_or_insert(&app, 2);
+        let decision = AutoscaleDecision {
+            app_id: app.clone(),
+            from: 2,
+            to: 4,
+            reason: "cpu".into(),
+        };
+        let now = std::time::Instant::now();
+
+        record_autoscale_write(
+            &mut tracker,
+            &decision,
+            now,
+            Ok(CouncilResponse::Refused {
+                reason: "app web doesn't autoscale".into(),
+            }),
+        );
+        let state = tracker.get_or_insert(&app, 2);
+        assert_eq!(state.current_replicas, 2);
+        assert_eq!(state.last_scale_event, None);
+
+        record_autoscale_write(
+            &mut tracker,
+            &decision,
+            now,
+            Ok(CouncilResponse::Applied { log_index: 9 }),
+        );
+        let state = tracker.get_or_insert(&app, 2);
+        assert_eq!(state.current_replicas, 4);
+        assert_eq!(state.last_scale_event, Some(now));
     }
 
     /// Retire `node` the way `relish decommission-node` does.
