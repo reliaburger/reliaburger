@@ -891,6 +891,64 @@ class LinuxNextTests(unittest.TestCase):
         self.assertIn("sort -t '=' -k3 -n", self.job)
 
 
+class PortableLinuxRunnerTests(unittest.TestCase):
+    """The portable Linux job keeps its runner through the coverage build.
+
+    On 18 Nov 2026 it lost its runner three times, each after about 50
+    minutes with the test step still in progress and no log kept (runs
+    44265273054, 44265366690 and 44276663421). That step compiles the lib
+    tests, whose one rustc already peaked above 12 GB and grew with the
+    17 Nov review fixes, on a 16 GB runner with nothing protecting the
+    runner's own processes. It is #1943's failure, so it gets #1943's
+    guards: the runner out of the OOM killer's reach, swap for the peak,
+    and the headroom watched and kept."""
+
+    def setUp(self):
+        self.job = jobs((WORKFLOWS / "ci.yml").read_text())["portable"]
+        self.steps = steps(self.job)
+
+    def step(self, text):
+        found = [index for index, step in enumerate(self.steps) if text in step]
+        self.assertEqual(len(found), 1, text)
+        return found[0]
+
+    def producer(self):
+        return self.step("--gate portable-linux ")
+
+    def test_the_runner_is_shielded_before_the_coverage_run_and_the_run_is_not(self):
+        shield = self.step('scripts/ci/protect-runner "$RUNNER_TEMP/runner-pids"')
+        self.assertLess(shield, self.producer())
+        self.assertNotIn("if: always()", self.steps[shield])
+        # Children inherit the runner's -1000. Left there, rustc could never
+        # be killed, and a full memory would hang the host instead.
+        command = " ".join(re.sub(r"\\\n", " ", self.steps[self.producer()].split("run: |", 1)[1]).split())
+        self.assertTrue(command.startswith("choom -n 0 -- python3 scripts/ci/workflow_adapter.py produce "), command)
+
+    def test_the_build_gets_eight_gigabytes_of_swap_whatever_the_image_has(self):
+        swap = self.step("sudo swapon")
+        self.assertLess(swap, self.producer())
+        self.assertNotIn("if: always()", self.steps[swap])
+        # The 24.04 image may already have a small swap file, so the step
+        # tops up to 8 GiB rather than skipping when any swap exists.
+        self.assertIn("SwapTotal", self.steps[swap])
+        self.assertIn("8388608", self.steps[swap])
+
+    def test_headroom_is_watched_from_before_the_run_and_reported_and_kept_after_it(self):
+        watch = self.step('scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids"')
+        self.assertLess(self.step("scripts/ci/protect-runner"), watch)
+        self.assertLess(watch, self.producer())
+        self.assertIn('> "$RUNNER_TEMP/portable-linux-resources.log"', self.steps[watch])
+        report = self.step('kill "$(cat "$RUNNER_TEMP/portable-linux-resources.pid")"')
+        self.assertGreater(report, self.producer())
+        self.assertIn("if: always()", self.steps[report])
+        self.assertIn("sort -t '=' -k3 -n", self.steps[report])
+        self.assertIn("'oom|killed process'", self.steps[report])
+        keep = self.step("name: portable-linux-resources\n")
+        self.assertGreater(keep, report)
+        self.assertIn("if: always()", self.steps[keep])
+        self.assertIn("portable-linux-resources.log", self.steps[keep])
+
+
 class ArtifactDownloadTests(unittest.TestCase):
     """A stalled artefact download fails fast and is retried once (#977).
 

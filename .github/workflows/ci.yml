@@ -295,10 +295,59 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get remove -y -qq buildah
           sudo apt-get install -y -qq clang libbpf-dev llvm
+      - name: Shield the runner from the OOM killer
+        # On 18 Nov 2026 this job lost its runner three times, the test
+        # step "in progress" and no log kept: #1943's signature. The step
+        # compiles the instrumented lib tests, one rustc of 12 GB and more
+        # on a 16 GB runner. -1000 keeps Runner.Worker alive; the coverage
+        # run takes back the default with `choom`.
+        run: scripts/ci/protect-runner "$RUNNER_TEMP/runner-pids"
+      - name: Give the build swap
+        # Tops up to 8 GiB, so the lib tests' peak pages out instead of
+        # filling memory. The image's own swap file may be smaller, so this
+        # doesn't skip just because some swap exists. /mnt is the larger
+        # scratch disk where the image has one.
+        run: |
+          have=$(awk '/^SwapTotal/ {print $2}' /proc/meminfo)
+          if [ "$have" -lt 8388608 ]; then
+            dir=/
+            if mountpoint -q /mnt; then dir=/mnt; fi
+            sudo fallocate -l "$((8388608 - have))K" "$dir/ci-swapfile"
+            sudo chmod 600 "$dir/ci-swapfile"
+            sudo mkswap "$dir/ci-swapfile" > /dev/null
+            sudo swapon "$dir/ci-swapfile"
+          fi
+          free -h
+          swapon --show
+          df -h / /mnt 2>/dev/null || df -h /
+      - name: Watch disk and memory during the coverage run
+        run: |
+          nohup scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids" > "$RUNNER_TEMP/portable-linux-resources.log" 2>&1 < /dev/null &
+          echo $! > "$RUNNER_TEMP/portable-linux-resources.pid"
       - name: Portable tests with line coverage
         id: portable_linux
+        # Each test has a nextest slow-timeout with terminate-after (the
+        # `ci` profile). `choom` undoes the -1000 inherited from the runner.
         run: |
-          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate portable-linux --host linux --directory target/contracts/linux/portable-linux --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
+          choom -n 0 -- python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate portable-linux --host linux --directory target/contracts/linux/portable-linux --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
+      - name: Report the coverage run's headroom
+        if: always()
+        timeout-minutes: 3
+        run: |
+          kill "$(cat "$RUNNER_TEMP/portable-linux-resources.pid")" 2>/dev/null || true
+          echo "Lowest free disk and memory during the coverage run:"
+          grep ' disk_kb=' "$RUNNER_TEMP/portable-linux-resources.log" | sort -t '=' -k2 -n | head -1 || true
+          grep ' disk_kb=' "$RUNNER_TEMP/portable-linux-resources.log" | sort -t '=' -k3 -n | head -1 || true
+          echo "Kernel OOM lines:"
+          sudo dmesg -T | grep -iE 'oom|killed process' || echo "none"
+      - name: Keep the coverage run's resource log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: portable-linux-resources
+          path: ${{ runner.temp }}/portable-linux-resources.log
+          if-no-files-found: warn
+          retention-days: 14
       - name: Retain portable-linux current execution envelope
         if: always()
         uses: actions/upload-artifact@v4
