@@ -1892,7 +1892,10 @@ mod tests {
             .unwrap();
         grill.start(&id).await.unwrap();
 
-        let descendant_pid = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        // Three process starts and a rename take milliseconds idle and ran
+        // past 2 s at load 20 during parallel builds (#2086). Both windows
+        // only guard a hang.
+        let descendant_pid = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 if let Ok(pid) = std::fs::read_to_string(&pid_file)
                     .map_err(|_| ())
@@ -1908,7 +1911,7 @@ mod tests {
 
         grill.stop(&id).await.unwrap();
         wait_for_state(&grill, &id, ContainerState::Stopped).await;
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
             while records::process_start_time(descendant_pid).is_some() {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
