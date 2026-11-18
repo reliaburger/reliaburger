@@ -1291,6 +1291,50 @@ impl NodeConfig {
             reason,
         })
     }
+
+    /// Refuse a port this node serves on (the API port Bun actually bound,
+    /// the cluster ports, the registry, and ingress and DNS when they run)
+    /// that falls inside `[network] port_range`.
+    ///
+    /// The perimeter drops connections to every port in the range, end
+    /// included, from anyone but cluster members, before it looks at
+    /// operator CIDRs or anything else, so a service port there would answer
+    /// members only. Bun checks this at startup when it applies the
+    /// perimeter. It isn't part of [`NodeConfig::validate`]: on a node
+    /// without the perimeter (rootless, macOS, ProcessGrill demos) a service
+    /// port inside the range is harmless, since the allocator skips ports
+    /// already in use.
+    pub fn check_service_ports_outside_port_range(&self, api_port: u16) -> Result<(), ConfigError> {
+        let range = &self.network.port_range;
+        let mut ports = vec![
+            ("API port", api_port),
+            ("cluster.gossip_port", self.cluster.gossip_port),
+            ("cluster.raft_port", self.cluster.raft_port),
+            ("cluster.reporting_port", self.cluster.reporting_port),
+            ("images.registry_port", self.images.registry_port),
+        ];
+        if self.ingress.enabled {
+            ports.push(("ingress.http_port", self.ingress.http_port));
+            ports.push(("ingress.https_port", self.ingress.https_port));
+        }
+        if self.dns.enabled
+            && let Ok(listen) = self.dns.listen.parse::<std::net::SocketAddr>()
+        {
+            ports.push(("dns.listen", listen.port()));
+        }
+        for (name, port) in ports {
+            if port != 0 && (range.start..=range.end).contains(&port) {
+                return Err(ConfigError::InvalidPortRange {
+                    value: format!("{}-{}", range.start, range.end),
+                    reason: format!(
+                        "it includes the {name} {port}; the perimeter answers ports in this \
+                         range for cluster members only, so move the range or the port"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -2181,6 +2225,83 @@ mod tests {
         assert!(error.contains("upload_timeout_secs"), "{error}");
         nc.storage.snapshots.upload_timeout_secs = 60;
         assert!(nc.validate().is_ok());
+    }
+
+    /// The perimeter drops connections to every port in `port_range` from
+    /// anyone but cluster members, ahead of its other allowances, so a
+    /// service port of the node's own there would shut operators and clients
+    /// out of it.
+    #[test]
+    fn a_service_port_inside_the_host_port_range_is_refused() {
+        assert!(
+            NodeConfig::default()
+                .check_service_ports_outside_port_range(9117)
+                .is_ok()
+        );
+
+        let mut nc = NodeConfig::default();
+        nc.network.port_range.start = 9000;
+        nc.network.port_range.end = 50000;
+        let error = nc
+            .check_service_ports_outside_port_range(9117)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("9000-50000"), "{error}");
+        assert!(error.contains("API port 9117"), "{error}");
+
+        // The perimeter drops the range's end too.
+        let mut nc = NodeConfig::default();
+        nc.network.port_range.start = 9000;
+        nc.network.port_range.end = 9117;
+        assert!(nc.check_service_ports_outside_port_range(9117).is_err());
+
+        type MovePort = fn(&mut NodeConfig);
+        let cases: [(&str, MovePort); 4] = [
+            ("cluster.gossip_port", |nc| nc.cluster.gossip_port = 20000),
+            ("cluster.raft_port", |nc| nc.cluster.raft_port = 20000),
+            ("cluster.reporting_port", |nc| {
+                nc.cluster.reporting_port = 20000
+            }),
+            ("images.registry_port", |nc| nc.images.registry_port = 20000),
+        ];
+        for (field, set) in cases {
+            let mut nc = NodeConfig::default();
+            set(&mut nc);
+            let error = nc
+                .check_service_ports_outside_port_range(9117)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(field), "{field}: {error}");
+        }
+
+        // Ingress and DNS ports count only when those listeners run.
+        let mut nc = NodeConfig::default();
+        nc.ingress.http_port = 20000;
+        nc.dns.listen = "0.0.0.0:20053".into();
+        assert!(nc.check_service_ports_outside_port_range(9117).is_ok());
+        nc.ingress.enabled = true;
+        let error = nc
+            .check_service_ports_outside_port_range(9117)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ingress.http_port"), "{error}");
+        nc.ingress.enabled = false;
+        nc.dns.enabled = true;
+        let error = nc
+            .check_service_ports_outside_port_range(9117)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("dns.listen"), "{error}");
+
+        // Port 0 asks the OS for a port; it names no port in the range.
+        let mut nc = NodeConfig::default();
+        nc.network.port_range.start = 1;
+        nc.network.port_range.end = 8000;
+        nc.images.registry_port = 0;
+        nc.ingress.enabled = true;
+        nc.ingress.http_port = 0;
+        nc.ingress.https_port = 0;
+        assert!(nc.check_service_ports_outside_port_range(9117).is_ok());
     }
 
     #[test]

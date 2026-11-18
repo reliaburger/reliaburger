@@ -516,3 +516,269 @@ fn operator_cidr_reaches_the_api_port_but_not_cluster_ports() {
         "(operator→API, operator→Raft, outsider→API)"
     );
 }
+
+/// Connect from `source` to `server:port` and read the one byte the far end
+/// writes on accept, which says which listener answered. `None` when the
+/// connection or the read doesn't complete within a short deadline.
+fn greeting_from(source: std::net::Ipv4Addr, server: std::net::Ipv4Addr, port: u16) -> Option<u8> {
+    use std::io::Read;
+    use std::net::SocketAddrV4;
+    use std::os::fd::AsRawFd;
+
+    use nix::sys::socket::{
+        AddressFamily, SockFlag, SockType, SockaddrIn, bind, connect, setsockopt, socket, sockopt,
+    };
+    use nix::sys::time::{TimeVal, TimeValLike};
+
+    let fd = socket(
+        AddressFamily::Inet,
+        SockType::Stream,
+        SockFlag::SOCK_CLOEXEC,
+        None,
+    )
+    .unwrap();
+    bind(
+        fd.as_raw_fd(),
+        &SockaddrIn::from(SocketAddrV4::new(source, 0)),
+    )
+    .unwrap();
+    setsockopt(&fd, sockopt::SendTimeout, &TimeVal::milliseconds(1500)).unwrap();
+    connect(
+        fd.as_raw_fd(),
+        &SockaddrIn::from(SocketAddrV4::new(server, port)),
+    )
+    .ok()?;
+    let mut stream = std::net::TcpStream::from(fd);
+    stream
+        .set_read_timeout(Some(Duration::from_millis(1500)))
+        .unwrap();
+    let mut byte = [0u8];
+    stream.read_exact(&mut byte).ok()?;
+    Some(byte[0])
+}
+
+/// Bind `address:port` inside `namespace` and answer every connection with
+/// `greeting`, on a thread that lives as long as the test process.
+fn greeter(namespace: &str, address: std::net::Ipv4Addr, port: u16, greeting: u8) {
+    use std::io::Write;
+
+    let listener = in_namespace(namespace, move || {
+        std::net::TcpListener::bind((address, port)).unwrap()
+    });
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let _ = stream.write_all(&[greeting]);
+        }
+    });
+}
+
+fn nft_in(namespace: &str, args: &[String]) {
+    let status = std::process::Command::new("ip")
+        .args(["netns", "exec", namespace, "nft"])
+        .args(args)
+        .status()
+        .unwrap();
+    assert!(status.success(), "nft {args:?} failed in {namespace}");
+}
+
+/// A published host port answers cluster members and nobody else, and the
+/// port map rewrites only connections addressed to this node. Built from the
+/// real port map rule and perimeter ruleset inside throwaway namespaces: a
+/// node, one container behind a `veth-…` link, and a network holding a
+/// cluster member (which also listens on the same port number) and an
+/// outsider.
+#[test]
+#[ignore = "requires root, ip and nft; applies the port map and perimeter inside isolated namespaces; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
+fn published_ports_answer_members_only_and_rewrite_only_local_destinations() {
+    use reliaburger::firewall::rules::{ClusterNodes, PerimeterConfig, generate_ruleset};
+    use reliaburger::grill::portmap;
+    use std::io::Write;
+    use std::net::Ipv4Addr;
+
+    assert!(nix::unistd::geteuid().is_root());
+    let pid = std::process::id();
+    let node_ns = format!("rbpm-node-{pid}");
+    let network_ns = format!("rbpm-net-{pid}");
+    let container_ns = format!("rbpm-ctr-{pid}");
+    let _cleanup = NamespaceCleanup(vec![
+        node_ns.clone(),
+        network_ns.clone(),
+        container_ns.clone(),
+    ]);
+    let uplink = format!("rbpmu{pid}");
+    let peer = format!("rbpmp{pid}");
+    let host_veth = format!("veth-{pid}");
+    let container_veth = format!("rbpmc{pid}");
+
+    for namespace in [&node_ns, &network_ns, &container_ns] {
+        ip(&["netns", "add", namespace]);
+        ip(&["-n", namespace, "link", "set", "lo", "up"]);
+    }
+    ip(&[
+        "link",
+        "add",
+        &uplink,
+        "netns",
+        &node_ns,
+        "type",
+        "veth",
+        "peer",
+        "name",
+        &peer,
+        "netns",
+        &network_ns,
+    ]);
+    ip(&[
+        "link",
+        "add",
+        &host_veth,
+        "netns",
+        &node_ns,
+        "type",
+        "veth",
+        "peer",
+        "name",
+        &container_veth,
+        "netns",
+        &container_ns,
+    ]);
+    ip(&[
+        "-n",
+        &node_ns,
+        "addr",
+        "add",
+        "198.18.78.1/24",
+        "dev",
+        &uplink,
+    ]);
+    ip(&[
+        "-n",
+        &node_ns,
+        "addr",
+        "add",
+        "10.98.0.1/24",
+        "dev",
+        &host_veth,
+    ]);
+    ip(&[
+        "-n",
+        &network_ns,
+        "addr",
+        "add",
+        "198.18.78.2/24",
+        "dev",
+        &peer,
+    ]);
+    ip(&[
+        "-n",
+        &network_ns,
+        "addr",
+        "add",
+        "198.18.78.3/24",
+        "dev",
+        &peer,
+    ]);
+    ip(&[
+        "-n",
+        &container_ns,
+        "addr",
+        "add",
+        "10.98.0.2/24",
+        "dev",
+        &container_veth,
+    ]);
+    ip(&["-n", &node_ns, "link", "set", &uplink, "up"]);
+    ip(&["-n", &node_ns, "link", "set", &host_veth, "up"]);
+    ip(&["-n", &network_ns, "link", "set", &peer, "up"]);
+    ip(&["-n", &container_ns, "link", "set", &container_veth, "up"]);
+    ip(&[
+        "-n",
+        &container_ns,
+        "route",
+        "add",
+        "default",
+        "via",
+        "10.98.0.1",
+    ]);
+    let forwarding = std::process::Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &node_ns,
+            "sysctl",
+            "-qw",
+            "net.ipv4.ip_forward=1",
+        ])
+        .status()
+        .unwrap();
+    assert!(forwarding.success());
+
+    // The node's `reliaburger` table as `grill::netns` builds it.
+    let words = |text: &str| text.split(' ').map(String::from).collect::<Vec<_>>();
+    nft_in(&node_ns, &words("add table ip reliaburger"));
+    for (chain, priority) in [("prerouting", -100), ("postrouting", 100)] {
+        nft_in(
+            &node_ns,
+            &[
+                "add".into(),
+                "chain".into(),
+                "ip".into(),
+                "reliaburger".into(),
+                chain.into(),
+                format!("{{ type nat hook {chain} priority {priority} ; }}"),
+            ],
+        );
+    }
+    nft_in(
+        &node_ns,
+        &words("add rule ip reliaburger postrouting ip saddr 10.0.0.0/8 masquerade"),
+    );
+    nft_in(&node_ns, &portmap::portmap_definition());
+    nft_in(&node_ns, &portmap::map_rule());
+    nft_in(
+        &node_ns,
+        &portmap::element_add(&portmap::PortMapEntry {
+            host_port: 21000,
+            container_ip: Ipv4Addr::new(10, 98, 0, 2),
+            container_port: 8080,
+        }),
+    );
+
+    let node = Ipv4Addr::new(198, 18, 78, 1);
+    let member = Ipv4Addr::new(198, 18, 78, 2);
+    let outsider = Ipv4Addr::new(198, 18, 78, 3);
+    let container = Ipv4Addr::new(10, 98, 0, 2);
+    let nodes: ClusterNodes = [std::net::IpAddr::V4(member)].into();
+    let ruleset = generate_ruleset(&PerimeterConfig::default(), &nodes).unwrap();
+    let mut nft = std::process::Command::new("ip")
+        .args(["netns", "exec", &node_ns, "nft", "-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    nft.stdin
+        .take()
+        .unwrap()
+        .write_all(ruleset.as_bytes())
+        .unwrap();
+    assert!(nft.wait().unwrap().success(), "nft rejected:\n{ruleset}");
+
+    // The local container behind host port 21000, and the member's own
+    // service on the same port number.
+    greeter(&container_ns, container, 8080, b'L');
+    greeter(&network_ns, member, 21000, b'R');
+
+    let (member_reached, outsider_reached) = in_namespace(&network_ns, move || {
+        (
+            greeting_from(member, node, 21000),
+            greeting_from(outsider, node, 21000),
+        )
+    });
+    let container_reached = in_namespace(&container_ns, move || {
+        greeting_from(container, member, 21000)
+    });
+    assert_eq!(
+        (member_reached, outsider_reached, container_reached),
+        (Some(b'L'), None, Some(b'R')),
+        "(member→published port, outsider→published port, container→member's port)"
+    );
+}
