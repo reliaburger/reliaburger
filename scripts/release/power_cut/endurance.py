@@ -6,7 +6,8 @@ rule it applies is here and tested (scripts/release/test_power_cut_endurance.py)
 
   hold --seed S --cut N --what W --min A --max B   a seeded random whole number
   plan --seed S --duration D --min A --max B       the cut schedule a run would follow
-  acked writer|redis FILE                          the highest ACK or INCR in a log
+  acked writer|redis FILE [--previous P]          the highest ACK or INCR in a log; fails
+                                                   on none, or on less than P (the last read)
   seq FILE --acked N [--resumes F --starts S]      I1 from the writer's sequence check
                                                    and where it resumed (/data/resumes)
   counter FILE --acked N [--previous P] [--resumes F --starts S]
@@ -15,7 +16,8 @@ rule it applies is here and tested (scripts/release/test_power_cut_endurance.py)
   journal FILE                                     I4 from Bun's journal since boot
   instances FILE --want APP=N[,APP=N]              I7 from `relish apps --instances`
   record --evidence DIR --cut N --detail JSON      judge one cut, append it to cuts.jsonl
-  summary --evidence DIR                           summary.json from run.json and cuts.jsonl
+  summary --evidence DIR                           summary.json from run.json and cuts.jsonl;
+                                                   "aborted" unless every cut made was recorded
 
 Every invariant check prints a JSON object with a `pass` field. The numbering
 (I1, I2, I4, I6, I7) is the plan's,
@@ -69,6 +71,22 @@ def acked(kind, text):
     return max(values) if values else 0
 
 
+def acked_problem(kind, value, previous):
+    """Why VALUE can't be the last acknowledged value before a cut, or None when it can.
+
+    Zero means the log couldn't be read or held no ACK (INCR) at all, and a
+    value below PREVIOUS, the last one read, means the log was cut short or
+    came from somewhere else. Either would make I1 or I2 hold whatever the cut
+    did, so the harness mustn't cut on it.
+    """
+    word = "ACK" if kind == "writer" else "INCR"
+    if value == 0:
+        return f"no {word} in the log"
+    if previous is not None and value < previous:
+        return f"the last {word} read, {value}, is below the {previous} read before"
+    return None
+
+
 def seq_check(text, acked_value):
     """I1: the writer's awk summary says /data/seq is 1..N with N at least the last ACK.
 
@@ -109,14 +127,16 @@ def counter_check(text, acked_value, previous):
 
 
 def resume_check(text, acked_value, previous_starts):
-    """Where the writer (or the Redis client) resumed after its last start.
+    """Where the writer (or the Redis client) resumed at each start since the previous check.
 
     TEXT is one number per start, oldest first: the last whole line the
     writer found in /data/seq, or the counter the client read before its
-    first INCR. The last must be at least ACKED_VALUE, and there must be a
-    start since the previous check (PREVIOUS_STARTS starts), or nothing
-    restarted and the check proves nothing. PREVIOUS_STARTS is None for the
-    baseline before the first cut.
+    first INCR. There must be a start since the previous check
+    (PREVIOUS_STARTS starts), or nothing restarted and the check proves
+    nothing, and every one of those new starts must be at least ACKED_VALUE:
+    a start during the settle that resumed higher doesn't make up for the
+    cut's own start losing writes. PREVIOUS_STARTS is None for the baseline
+    before the first cut, when every start is new.
 
     The file and counter checks alone can't see a loss: by the time the
     cluster settles, the writer has appended hundreds of lines past the lost
@@ -134,12 +154,15 @@ def resume_check(text, acked_value, previous_starts):
     if not values:
         return {**result, "pass": False, "reason": "no start recorded"}
     result["resumed_at"] = values[-1]
+    first_new = previous_starts or 0
+    result["new_starts"] = values[first_new:]
     if previous_starts is not None and len(values) <= previous_starts:
         return {**result, "pass": False,
                 "reason": f"no new start since the last check ({len(values)} starts, {previous_starts} before)"}
-    if values[-1] < acked_value:
-        return {**result, "pass": False,
-                "reason": f"resumed at {values[-1]}, below the acknowledged {acked_value}"}
+    for number, value in enumerate(values[first_new:], first_new + 1):
+        if value < acked_value:
+            return {**result, "pass": False,
+                    "reason": f"start {number} resumed at {value}, below the acknowledged {acked_value}"}
     return {**result, "pass": True}
 
 
@@ -251,8 +274,14 @@ def percentile(values, fraction):
     return ordered[max(0, math.ceil(fraction * len(ordered)) - 1)]
 
 
-def summarise(run, lines):
-    """summary.json: per topology and pooled counts and bounds, recovery times and the verdict."""
+def summarise(run, lines, unreadable=0):
+    """summary.json: per topology and pooled counts and bounds, recovery times and the verdict.
+
+    The run is aborted, not passed, when the harness stopped early (run.json's
+    `aborted`), when a cut it made (`cuts_started`) has no line in cuts.jsonl,
+    or when UNREADABLE lines of it couldn't be parsed. A violation still
+    fails it.
+    """
     topologies = {}
     retries = 0
     for line in lines:
@@ -285,8 +314,15 @@ def summarise(run, lines):
         }
     cuts = sum(t["cuts"] for t in result.values())
     violations = sum(t["violations"] for t in result.values())
+    aborted = run.get("aborted") or None
+    if aborted is None and unreadable:
+        aborted = f"{unreadable} unreadable lines in cuts.jsonl"
+    if aborted is None and run.get("cuts_started", 0) != cuts:
+        aborted = f"{run.get('cuts_started', 0)} cuts made, {cuts} recorded"
     if violations:
         verdict = "fail"
+    elif aborted:
+        verdict = "aborted"
     elif cuts == 0:
         verdict = "no cuts"
     else:
@@ -296,17 +332,41 @@ def summarise(run, lines):
         **{key: run.get(key) for key in ("release", "relish", "bun", "host", "hypervisor", "tier", "seed",
                                          "started", "ended", "paused_seconds")},
         "topologies": result,
-        "pooled": {"cuts": cuts, "violations": violations, "bound95": bound95(cuts) if violations == 0 else None},
+        "pooled": {"cuts": cuts, "violations": violations,
+                   "bound95": bound95(cuts) if violations == 0 and not aborted else None},
         "environment_events": {"vz_start_retries": retries},
+        "aborted": aborted,
         "verdict": verdict,
     }
 
 
 def read_lines(path):
+    """cuts.jsonl's lines, and how many of them couldn't be parsed."""
     if not os.path.exists(path):
-        return []
+        return [], 0
+    lines, unreadable = [], 0
     with open(path) as file:
-        return [json.loads(line) for line in file if line.strip()]
+        for text in file:
+            if not text.strip():
+                continue
+            try:
+                lines.append(json.loads(text))
+            except json.JSONDecodeError:
+                unreadable += 1
+    return lines, unreadable
+
+
+def read_json(path, default):
+    """The JSON in PATH; DEFAULT for a missing file, and a failing check for an unreadable one."""
+    if not os.path.exists(path):
+        return default
+    try:
+        value = json.loads(read_text(path))
+    except (OSError, json.JSONDecodeError) as error:
+        return {"pass": False, "reason": f"unreadable check output: {error}"}
+    if not isinstance(value, dict):
+        return {"pass": False, "reason": f"unreadable check output: {value!r}"}
+    return value
 
 
 def read_text(path):
@@ -342,6 +402,7 @@ def main(argv):
     command = commands.add_parser("acked")
     command.add_argument("kind", choices=("writer", "redis"))
     command.add_argument("file")
+    command.add_argument("--previous", type=int, help="the value read before this one")
     command = commands.add_parser("seq")
     command.add_argument("file")
     command.add_argument("--acked", type=int, required=True)
@@ -378,7 +439,12 @@ def main(argv):
             print(f"cut {cut}: after {seconds} s of work, about minute {minute}")
         return 0
     if arguments.command == "acked":
-        print(acked(arguments.kind, read_text(arguments.file)))
+        value = acked(arguments.kind, read_text(arguments.file))
+        print(value)
+        problem = acked_problem(arguments.kind, value, arguments.previous)
+        if problem:
+            print(f"power-cut: {problem}", file=sys.stderr)
+            return 1
         return 0
     if arguments.command == "seq":
         result = seq_check(read_text(arguments.file), arguments.acked)
@@ -404,12 +470,18 @@ def main(argv):
         return emit(instances_check(instances, parse_want(arguments.want)))
     if arguments.command == "record":
         cut_directory = os.path.join(arguments.evidence, "cuts", f"{arguments.cut:05d}")
-        invariants = {}
-        for name in ("I1", "I2", "I4", "I7"):
-            path = os.path.join(cut_directory, f"{name}.json")
-            invariants[name] = (json.loads(read_text(path)) if os.path.exists(path)
-                                else {"pass": False, "reason": "not checked"})
-        line = judge(arguments.cut, json.loads(arguments.detail), invariants)
+        # Nothing here may stop the line reaching cuts.jsonl: an input that
+        # can't be read is a failing check, not a crash.
+        invariants = {name: read_json(os.path.join(cut_directory, f"{name}.json"),
+                                      {"pass": False, "reason": "not checked"})
+                      for name in ("I1", "I2", "I4", "I7")}
+        try:
+            detail = json.loads(arguments.detail)
+            if not isinstance(detail, dict):
+                raise ValueError(f"not an object: {detail!r}")
+        except ValueError as error:
+            detail = {"detail_error": f"unreadable --detail: {error}"}
+        line = judge(arguments.cut, detail, invariants)
         with open(os.path.join(arguments.evidence, "cuts.jsonl"), "a") as file:
             file.write(json.dumps(line) + "\n")
             file.flush()
@@ -419,7 +491,8 @@ def main(argv):
     if arguments.command == "summary":
         with open(os.path.join(arguments.evidence, "run.json")) as file:
             run = json.load(file)
-        summary = summarise(run, read_lines(os.path.join(arguments.evidence, "cuts.jsonl")))
+        lines, unreadable = read_lines(os.path.join(arguments.evidence, "cuts.jsonl"))
+        summary = summarise(run, lines, unreadable)
         with open(os.path.join(arguments.evidence, "summary.json"), "w") as file:
             json.dump(summary, file, indent=2)
             file.write("\n")

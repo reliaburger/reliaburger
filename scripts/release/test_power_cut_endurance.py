@@ -63,6 +63,15 @@ class Acked(unittest.TestCase):
         self.assertEqual(endurance.acked("writer", "RESUME 0 after 0 lines\n"), 0)
         self.assertEqual(endurance.acked("writer", "BACK 9\nACK x\n"), 0)
 
+    def test_zero_or_a_value_below_the_last_one_read_is_a_harness_error(self):
+        # A log that couldn't be read, or held no ACK, would make I1 and I2
+        # hold for anything while the cut still counted towards the bound.
+        self.assertIn("no ACK", endurance.acked_problem("writer", 0, None))
+        self.assertIn("no INCR", endurance.acked_problem("redis", 0, 40))
+        self.assertIn("below the 50 read before", endurance.acked_problem("writer", 49, 50))
+        self.assertIsNone(endurance.acked_problem("writer", 50, 50))
+        self.assertIsNone(endurance.acked_problem("redis", 7, None))
+
 
 class SeqCheck(unittest.TestCase):
     def test_a_whole_sequence_past_the_ack_passes(self):
@@ -114,6 +123,24 @@ class ResumeCheck(unittest.TestCase):
 
     def test_an_unreadable_record_fails(self):
         self.assertFalse(endurance.resume_check("cat: /data/resumes: No such file or directory\n", 1, 0)["pass"])
+
+    def test_every_start_since_the_last_check_must_be_at_or_past_the_ack(self):
+        # The cut's own start lost writes (90 < 100); a second start during
+        # the settle, at 400, must not hide it.
+        result = endurance.resume_check("0\n90\n400\n", 100, 1)
+        self.assertFalse(result["pass"])
+        self.assertIn("start 2 resumed at 90, below the acknowledged 100", result["reason"])
+        self.assertEqual(result["new_starts"], [90, 400])
+
+    def test_several_new_starts_all_past_the_ack_pass(self):
+        result = endurance.resume_check("0\n120\n400\n", 100, 1)
+        self.assertTrue(result["pass"], result)
+        self.assertEqual(result["new_starts"], [120, 400])
+
+    def test_starts_before_the_last_check_are_not_judged_again(self):
+        # A start below this cut's ACK that came before the previous check
+        # belongs to an earlier cut, which judged it then.
+        self.assertTrue(endurance.resume_check("0\n50\n120\n", 100, 2)["pass"])
 
     def test_the_baseline_before_the_first_cut_has_no_previous(self):
         result = endurance.resume_check("0\n", 0, None)
@@ -245,13 +272,16 @@ class Summary(unittest.TestCase):
     RUN = {"release": "0.2.8", "seed": 5, "tier": "quick", "host": "macOS", "started": "s", "ended": "e",
            "paused_seconds": 0}
 
+    def run_with(self, cuts, **extra):
+        return {**self.RUN, "cuts_started": cuts, **extra}
+
     @staticmethod
     def line(cut, violations=(), api=40, settled=60, retries=0):
         return {"cut": cut, "topology": "1", "kind": "site", "violations": list(violations),
                 "recovery": {"api_seconds": api, "settled_seconds": settled, "start_retries": retries}}
 
     def test_no_violations_in_n_cuts_bounds_the_rate_by_the_rule_of_three(self):
-        summary = endurance.summarise(self.RUN, [self.line(n) for n in range(1, 13)])
+        summary = endurance.summarise(self.run_with(12), [self.line(n) for n in range(1, 13)])
         topology = summary["topologies"]["1"]
         self.assertEqual(topology["cuts"], 12)
         self.assertAlmostEqual(topology["bound95"], 1 - 0.05 ** (1 / 12))
@@ -265,19 +295,36 @@ class Summary(unittest.TestCase):
         self.assertIsNone(endurance.bound95(0))
 
     def test_a_violation_fails_the_run_and_drops_the_bound(self):
-        summary = endurance.summarise(self.RUN, [self.line(1), self.line(2, ["I1"])])
+        summary = endurance.summarise(self.run_with(2), [self.line(1), self.line(2, ["I1"])])
         self.assertEqual(summary["verdict"], "fail")
         self.assertIsNone(summary["topologies"]["1"]["bound95"])
         self.assertEqual(summary["topologies"]["1"]["violated_cuts"], [{"cut": 2, "violations": ["I1"]}])
 
     def test_recovery_percentiles_and_retries(self):
         lines = [self.line(n, settled=s, retries=r) for n, (s, r) in enumerate([(10, 0), (20, 1), (30, 0), (100, 1)], 1)]
-        summary = endurance.summarise(self.RUN, lines)
+        summary = endurance.summarise(self.run_with(4), lines)
         self.assertEqual(summary["topologies"]["1"]["recovery_seconds"], {"p50": 20, "p95": 100, "max": 100})
         self.assertEqual(summary["environment_events"]["vz_start_retries"], 2)
 
     def test_no_cuts_is_not_a_pass(self):
-        self.assertEqual(endurance.summarise(self.RUN, [])["verdict"], "no cuts")
+        self.assertEqual(endurance.summarise(self.run_with(0), [])["verdict"], "no cuts")
+
+    def test_a_cut_made_but_not_recorded_aborts_the_run(self):
+        # Three cuts made, two lines: the third's record never reached cuts.jsonl.
+        summary = endurance.summarise(self.run_with(3), [self.line(1), self.line(2)])
+        self.assertEqual(summary["verdict"], "aborted")
+        self.assertIn("3 cuts made, 2 recorded", summary["aborted"])
+        self.assertIsNone(summary["pooled"]["bound95"])
+
+    def test_a_run_that_stopped_early_is_aborted_not_passed(self):
+        summary = endurance.summarise(self.run_with(2, aborted="could not read the last ACK"),
+                                      [self.line(1), self.line(2)])
+        self.assertEqual(summary["verdict"], "aborted")
+        self.assertEqual(summary["aborted"], "could not read the last ACK")
+
+    def test_a_violation_still_fails_an_aborted_run(self):
+        summary = endurance.summarise(self.run_with(2, aborted="x"), [self.line(1), self.line(2, ["I4"])])
+        self.assertEqual(summary["verdict"], "fail")
 
 
 class RecordAndSummaryCommands(unittest.TestCase):
@@ -298,10 +345,50 @@ class RecordAndSummaryCommands(unittest.TestCase):
             line = json.loads(Path(evidence, "cuts.jsonl").read_text())
             self.assertEqual(line["violations"], ["I7"])
             self.assertEqual(line["invariants"]["I7"]["reason"], "not checked")
-            Path(evidence, "run.json").write_text(json.dumps({"seed": 1}))
+            Path(evidence, "run.json").write_text(json.dumps({"seed": 1, "cuts_started": 1}))
             result = self.run_endurance("summary", "--evidence", evidence)
             self.assertEqual(result.returncode, 1)
             self.assertEqual(json.loads(Path(evidence, "summary.json").read_text())["verdict"], "fail")
+
+    def test_record_turns_unreadable_inputs_into_failures_and_still_appends(self):
+        with tempfile.TemporaryDirectory() as evidence:
+            cut = Path(evidence, "cuts", "00001")
+            cut.mkdir(parents=True)
+            for name in ("I1", "I2", "I4", "I7"):
+                (cut / f"{name}.json").write_text(json.dumps({"pass": True}))
+            (cut / "I2.json").write_text("")
+            result = self.run_endurance("record", "--evidence", evidence, "--cut", "1", "--detail", "")
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            line = json.loads(Path(evidence, "cuts.jsonl").read_text())
+            self.assertEqual(line["violations"], ["I2", "I6"])
+            self.assertIn("unreadable", line["invariants"]["I2"]["reason"])
+            self.assertIn("detail_error", line)
+            Path(evidence, "run.json").write_text(json.dumps({"seed": 1, "cuts_started": 1}))
+            result = self.run_endurance("summary", "--evidence", evidence)
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(json.loads(Path(evidence, "summary.json").read_text())["verdict"], "fail")
+
+    def test_summary_of_a_torn_cuts_file_is_aborted(self):
+        with tempfile.TemporaryDirectory() as evidence:
+            Path(evidence, "run.json").write_text(json.dumps({"seed": 1, "cuts_started": 1}))
+            Path(evidence, "cuts.jsonl").write_text('{"cut": 1, "violations": []')
+            result = self.run_endurance("summary", "--evidence", evidence)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            summary = json.loads(Path(evidence, "summary.json").read_text())
+            self.assertEqual(summary["verdict"], "aborted")
+            self.assertIn("unreadable", summary["aborted"])
+
+    def test_acked_exits_non_zero_on_nothing_or_a_regression(self):
+        with tempfile.NamedTemporaryFile("w") as file:
+            file.write("error: no running instance of soak-writer\n")
+            file.flush()
+            result = self.run_endurance("acked", "writer", file.name)
+            self.assertEqual((result.returncode, result.stdout.strip()), (1, "0"))
+            file.write("ACK 40\n")
+            file.flush()
+            self.assertEqual(self.run_endurance("acked", "writer", file.name).returncode, 0)
+            self.assertEqual(self.run_endurance("acked", "writer", file.name, "--previous", "41").returncode, 1)
 
     def test_an_invariant_command_exits_non_zero_on_failure(self):
         with tempfile.NamedTemporaryFile("w") as file:
