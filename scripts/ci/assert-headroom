@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Report a job's lowest free disk and memory from watch-runner's log, and fail
+# while there's still disk left to say so.
+#
+# On 18 Nov 2026 the portable Linux job lost its runner three times: free disk
+# on / ran out during the instrumented tests, and a hosted runner with a full
+# disk stops talking to GitHub, so no log survived. A passing run bottomed out
+# at 5.1 GiB. This fails the job when the low-water mark is under MIN_DISK_KB,
+# or when the watcher had to stop the run at its own floor, so a shrinking
+# margin shows as a red step with numbers instead of a lost runner.
+#
+# Usage: assert-headroom LOG MIN_DISK_KB
+set -uo pipefail
+if [ $# -ne 2 ]; then
+    echo "usage: assert-headroom LOG MIN_DISK_KB" >&2
+    exit 2
+fi
+log=$1
+minimum=$2
+status=0
+
+gib() {
+    awk -v kb="$1" 'BEGIN { printf "%.1f GiB", kb / 1048576 }'
+}
+
+# Each sample is "HH:MM:SS disk_kb=N mem_kb=N load=N runners=...".
+lowest() {
+    awk -v field="$1" '
+        $2 ~ /^disk_kb=[0-9]+$/ && $3 ~ /^mem_kb=[0-9]+$/ {
+            split($field, kv, "=")
+            if (best == "" || kv[2] + 0 < best + 0) { best = kv[2]; at = $1 }
+        }
+        END { if (best != "") print best, at }
+    ' "$log" 2>/dev/null
+}
+
+read -r disk disk_at <<< "$(lowest 2)"
+read -r memory memory_at <<< "$(lowest 3)"
+if [ -z "${disk:-}" ]; then
+    echo "::error::no disk samples in $log: the watcher didn't run, so this job's headroom is unknown"
+    exit 1
+fi
+echo "lowest free disk: $(gib "$disk") at $disk_at"
+echo "lowest free memory: $(gib "$memory") at $memory_at"
+
+stop=$(grep -m1 '^disk_floor: ' "$log" 2>/dev/null)
+if [ -n "$stop" ]; then
+    echo "::error::the watcher stopped the run: $stop"
+    status=1
+fi
+if [ "$disk" -lt "$minimum" ]; then
+    echo "::error::free disk on / fell to $(gib "$disk") at $disk_at, under the $(gib "$minimum") floor; the runner is lost when / fills (docs/flakes.md)"
+    status=1
+fi
+exit "$status"

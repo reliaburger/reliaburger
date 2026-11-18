@@ -275,6 +275,14 @@ jobs:
     timeout-minutes: 62
     steps:
       - uses: actions/checkout@v4
+      - name: Free the runner's disk
+        # The coverage run needs about 70 GB of the image's 74 GB free: 24 GB
+        # of instrumented build, then one .profraw per test process, 46 GB
+        # in all. On 18 Nov 2026 a full / lost the runner three times. This
+        # frees 25 GB or more of SDKs nothing here uses, in the
+        # background beside the cache restore and the build.
+        run: |
+          nohup scripts/ci/free-runner-disk > "$RUNNER_TEMP/free-runner-disk.log" 2>&1 < /dev/null &
       - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: llvm-tools-preview
@@ -295,10 +303,65 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get remove -y -qq buildah
           sudo apt-get install -y -qq clang libbpf-dev llvm
+      - name: Shield the runner from the OOM killer
+        # On 18 Nov 2026 this job lost its runner three times, the test
+        # step "in progress" and no log kept: #1943's signature. The step
+        # compiles the instrumented lib tests, one rustc of 12 GB and more
+        # on a 16 GB runner. -1000 keeps Runner.Worker alive; the coverage
+        # run takes back the default with `choom`.
+        run: scripts/ci/protect-runner "$RUNNER_TEMP/runner-pids"
+      - name: Give the build swap
+        # Tops up to 8 GiB on a separate /mnt scratch disk, so the lib
+        # tests' peak pages out instead of filling memory. Never on /: the
+        # coverage run needs that disk, and the watcher found memory fine
+        # (lowest 1.4 GiB, no OOM, run 44293229949) while a 5 GB swap file
+        # there helped fill /. The 24.04 image's /mnt is on /, so there the
+        # image's own 3 GiB swap file is all there is.
+        run: |
+          have=$(awk '/^SwapTotal/ {print $2}' /proc/meminfo)
+          if ! mountpoint -q /mnt; then
+            echo "no separate /mnt: keeping the image's swap, sparing /"
+          elif [ "$have" -lt 8388608 ]; then
+            sudo fallocate -l "$((8388608 - have))K" "/mnt/ci-swapfile"
+            sudo chmod 600 "/mnt/ci-swapfile"
+            sudo mkswap "/mnt/ci-swapfile" > /dev/null
+            sudo swapon "/mnt/ci-swapfile"
+          fi
+          free -h
+          swapon --show
+          df -h / /mnt 2>/dev/null || df -h /
+      - name: Watch disk and memory during the coverage run
+        # Under 2 GiB free, the watcher stops nextest: a failed step with a
+        # log beats a runner lost to a full disk.
+        run: |
+          WATCH_DISK_FLOOR_KB=2097152 WATCH_STOP=cargo-nextest nohup scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids" > "$RUNNER_TEMP/portable-linux-resources.log" 2>&1 < /dev/null &
+          echo $! > "$RUNNER_TEMP/portable-linux-resources.pid"
       - name: Portable tests with line coverage
         id: portable_linux
+        # Each test has a nextest slow-timeout with terminate-after (the
+        # `ci` profile). `choom` undoes the -1000 inherited from the runner.
         run: |
-          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate portable-linux --host linux --directory target/contracts/linux/portable-linux --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
+          choom -n 0 -- python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate portable-linux --host linux --directory target/contracts/linux/portable-linux --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
+      - name: Report the coverage run's headroom
+        # Fails under 10 GiB at the low point, while the margin shrinks and
+        # the runner still answers, rather than when it's gone.
+        if: always()
+        timeout-minutes: 3
+        run: |
+          kill "$(cat "$RUNNER_TEMP/portable-linux-resources.pid")" 2>/dev/null || true
+          echo "Disk freed before the build:"
+          cat "$RUNNER_TEMP/free-runner-disk.log" || true
+          echo "Kernel OOM lines:"
+          sudo dmesg -T | grep -iE 'oom|killed process' || echo "none"
+          scripts/ci/assert-headroom "$RUNNER_TEMP/portable-linux-resources.log" 10485760
+      - name: Keep the coverage run's resource log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: portable-linux-resources
+          path: ${{ runner.temp }}/portable-linux-resources.log
+          if-no-files-found: warn
+          retention-days: 14
       - name: Retain portable-linux current execution envelope
         if: always()
         uses: actions/upload-artifact@v4

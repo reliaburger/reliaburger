@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Delete preinstalled toolchains that no step of the job uses, for disk.
+#
+# The ubuntu-24.04 image leaves about 74 GB free on /. The portable Linux
+# job's instrumented build takes about 24 GB and its tests write one
+# .profraw per test process, about 46 GB more, and a full / loses the
+# runner (18 Nov 2026). These directories are SDKs, browsers and cloud
+# CLIs that nothing our build or tests runs: Android, .NET, Haskell,
+# CodeQL, Swift, PowerShell, Java, Go, PyPy, Ruby, Chrome, Edge, Chromium,
+# vcpkg, Miniconda, Google Cloud and Azure. The system python3 in /usr/bin
+# and the Rust toolchain in the home directory stay.
+# Best effort: a path the image lacks is skipped.
+#
+# FREE_ROOT (prefixed to every path) exists for the tests.
+set -uo pipefail
+root=${FREE_ROOT:-}
+echo "before:"
+df -h /
+for path in \
+    /usr/local/lib/android \
+    /usr/share/dotnet \
+    /opt/ghc \
+    /usr/local/.ghcup \
+    /opt/hostedtoolcache/CodeQL \
+    /usr/share/swift \
+    /usr/local/share/powershell \
+    /usr/lib/jvm \
+    /opt/hostedtoolcache/go \
+    /opt/hostedtoolcache/PyPy \
+    /opt/hostedtoolcache/Ruby \
+    /opt/google \
+    /opt/microsoft \
+    /usr/local/share/chromium \
+    /usr/local/share/vcpkg \
+    /usr/share/miniconda \
+    /usr/lib/google-cloud-sdk \
+    /opt/az; do
+    if [ -e "$root$path" ]; then
+        sudo rm -rf -- "$root$path" && echo "removed $path" || echo "could not remove $path"
+    else
+        echo "absent $path"
+    fi
+done
+echo "after:"
+df -h /
