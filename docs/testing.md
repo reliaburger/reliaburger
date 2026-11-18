@@ -994,6 +994,60 @@ counts only cuts that left a record no flush covered (not yet run). The
 script creates its own VM and disk, named `pc-cal-*`, never touches
 `reliaburger-test`, and stops when a release gate holds the host.
 
+### Power-cut endurance
+
+[`qualify-power-cut-endurance.sh`](../scripts/release/qualify-power-cut-endurance.sh)
+is the start of the long run the
+[power-cut endurance plan](plans/2026-11-18-plan-power-cut-endurance.md)
+describes (step 1 of it). It installs a published release with the website's
+`curl | sh` into a private home under `/tmp`, builds a one-node quickstart
+cluster (2 vCPU, 2 GiB), runs the soak's volume writer and Redis on it, and
+then, until the time is up, works for a random 2–10 minutes, cuts the power
+with `limactl stop --force`, waits 5–60 s and powers it back on with
+`limactl start`. After each cut it only reads, and checks:
+
+| # | Invariant | Pass means |
+|---|---|---|
+| I1 | Acknowledged volume writes | `/data/seq` holds 1..N with no gap or duplicate, and the writer started again, and at every start since the previous check resumed at or past the last `ACK` read before the cut |
+| I2 | Redis counter | Never goes backwards, and the client started again, and at every start since the previous check found it at or past the last `INCR` read before the cut |
+| I4 | Stores open cleanly | Bun started once since boot, never exited, and logged no panic or store error |
+| I6 | Recovery in time | Bun answered an API read within 120 s of power-on, and every workload ran within 300 s |
+| I7 | Desired = running | Each workload runs exactly once |
+
+I1 and I2 check where each workload *resumed*, not just what the file or
+counter holds. By the time a cluster has settled, a writer that lost
+acknowledged lines has appended hundreds more after them and its file is
+whole again; so each start records its resume point durably before doing
+anything else, in `/data/resumes` and the Redis list `soak:starts`. Every
+start since the previous check counts, not just the latest: a second start
+during the settle that resumed higher mustn't hide the cut's own start losing
+writes. If the harness can't read a last `ACK` and `INCR` before a cut (the
+log is unreadable, holds none, or went below the last one read), it doesn't
+make the cut: I1 and I2 would hold whatever happened.
+
+```sh
+scripts/release/qualify-power-cut-endurance.sh --release 0.2.8 --tier quick
+```
+
+`--tier quick` cuts for an hour; `--duration 6h` sets any other length.
+`--plan` prints the seeded schedule and exits. Each cut writes a line to
+`cuts.jsonl` and a directory of evidence; the run ends with `summary.json`
+(schema `reliaburger.power-cut-endurance/1`) holding the cuts, violations,
+recovery percentiles and the rule-of-three bound. A violation powers the VM
+off and keeps everything for diagnosis. Any other early exit (a harness
+error, a failed install, an interrupt) prints where the cluster and the
+evidence are and leaves `summary.json` saying `aborted`, as it also does when
+a cut that was made has no line in `cuts.jsonl`. Between cuts, such as when
+the last `ACK` couldn't be read three times running, it stops the cluster
+cleanly with `relish local stop` and `--resume` carries on: forcing the VM
+off there would be a cut nobody recorded. Mid-cut, or if the clean stop
+fails, it forces the VM off and the run can't resume. It never touches `reliaburger-test`
+or your own `~/.reliaburger`, and when a release gate holds the host it
+powers the cluster off cleanly and exits 75; `--resume --evidence DIR`
+carries on. [`test_power_cut_endurance.py`](../scripts/release/test_power_cut_endurance.py)
+(in `make test-ci-scripts`) covers its decisions. It runs outside the release
+gate, and the cuts it makes are fault model 1 (above).
+
 ## Hollow nodes
 
 Our biggest real cluster is three VMs. To see what a council does with
