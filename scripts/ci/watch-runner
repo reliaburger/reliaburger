@@ -11,6 +11,12 @@
 # workloads on purpose. Only a killed `Runner.` process or `runners=...:gone`
 # means the runner died.
 #
+# With WATCH_DISK_FLOOR_KB and WATCH_STOP set, the first time free disk on /
+# falls under the floor it logs a "disk_floor: " line and sends SIGTERM to
+# every process named WATCH_STOP. A full / takes a hosted runner with it and
+# no log survives; stopping the tests first leaves a failed step that says
+# why, and assert-headroom fails on that line.
+#
 # Usage: watch-runner PIDFILE
 # WATCH_INTERVAL (seconds, default 5), WATCH_ROUNDS (default 0, forever) and
 # PROC_ROOT (standing in for /proc) exist for the tests.
@@ -23,6 +29,9 @@ pidfile=$1
 proc=${PROC_ROOT:-/proc}
 interval=${WATCH_INTERVAL:-5}
 rounds=${WATCH_ROUNDS:-0}
+floor=${WATCH_DISK_FLOOR_KB:-}
+stop=${WATCH_STOP:-}
+stopped=no
 seen=0
 round=0
 while :; do
@@ -36,6 +45,13 @@ while :; do
     memory=$(awk '/^MemAvailable/ {print $2}' "$proc/meminfo" 2>/dev/null)
     load=$(cut -d" " -f1 "$proc/loadavg" 2>/dev/null)
     echo "$(date -u +%T) disk_kb=$disk mem_kb=$memory load=$load runners=${runners:-none}"
+    if [ -n "$floor" ] && [ -n "$stop" ] && [ "$stopped" = no ] \
+        && [ -n "$disk" ] && [ "$disk" -lt "$floor" ]; then
+        matched=$(pgrep -x "$stop" | grep -c '')
+        echo "disk_floor: $disk kB free on / is under $floor kB: stopping $stop ($matched processes)"
+        pkill -TERM -x "$stop"
+        stopped=yes
+    fi
 
     # The kernel log needs root on Ubuntu (kernel.dmesg_restrict).
     hits=$(sudo -n dmesg -T 2>/dev/null | grep -iE 'oom|killed process')

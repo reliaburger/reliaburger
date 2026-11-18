@@ -891,6 +891,101 @@ class LinuxNextTests(unittest.TestCase):
         self.assertIn("sort -t '=' -k3 -n", self.job)
 
 
+class PortableLinuxRunnerTests(unittest.TestCase):
+    """The portable Linux job keeps its runner through the coverage build.
+
+    On 18 Nov 2026 it lost its runner three times, each after about 50
+    minutes with the test step still in progress and no log kept (runs
+    44265273054, 44265366690 and 44276663421). That step compiles the lib
+    tests, whose one rustc peaks at about 14 GB (batch 1 moved it only
+    0.2 GB, so why the losses start now is open), on a 16 GB runner with
+    nothing protecting the runner's own processes. That is #1943's
+    mechanism, unverified here, so it gets #1943's guards: the runner out
+    of the OOM killer's reach, swap for the peak, and the headroom watched
+    and kept.
+
+    The watcher then named the real cause: memory was fine, but free disk
+    on / fell to 5.1 GiB in a passing run, so a slower one fills it. The job
+    now frees the image's unused SDKs first, keeps swap files off /, stops
+    nextest under 2 GiB and fails its report under 10 GiB."""
+
+    def setUp(self):
+        self.job = jobs((WORKFLOWS / "ci.yml").read_text())["portable"]
+        self.steps = steps(self.job)
+
+    def step(self, text):
+        found = [index for index, step in enumerate(self.steps) if text in step]
+        self.assertEqual(len(found), 1, text)
+        return found[0]
+
+    def producer(self):
+        return self.step("--gate portable-linux ")
+
+    def test_the_runner_is_shielded_before_the_coverage_run_and_the_run_is_not(self):
+        shield = self.step('scripts/ci/protect-runner "$RUNNER_TEMP/runner-pids"')
+        self.assertLess(shield, self.producer())
+        self.assertNotIn("if: always()", self.steps[shield])
+        # Children inherit the runner's -1000. Left there, rustc could never
+        # be killed, and a full memory would hang the host instead.
+        command = " ".join(re.sub(r"\\\n", " ", self.steps[self.producer()].split("run: |", 1)[1]).split())
+        self.assertTrue(command.startswith("choom -n 0 -- python3 scripts/ci/workflow_adapter.py produce "), command)
+
+    def test_swap_is_topped_up_only_on_a_separate_scratch_disk_never_on_root(self):
+        swap = self.step("sudo swapon")
+        self.assertLess(swap, self.producer())
+        self.assertNotIn("if: always()", self.steps[swap])
+        self.assertIn("SwapTotal", self.steps[swap])
+        self.assertIn("8388608", self.steps[swap])
+        # The watcher ruled memory out (lowest 1.4 GiB, no OOM lines in run
+        # 44293229949), and a swap file on / spent 5 GB of the disk that ran
+        # out. On 24.04 /mnt is on /dev/root, so the step adds nothing there.
+        self.assertIn("if ! mountpoint -q /mnt; then", self.steps[swap])
+        self.assertNotIn("dir=/\n", self.steps[swap])
+        self.assertIn('"/mnt/ci-swapfile"', self.steps[swap])
+
+    def test_headroom_is_watched_from_before_the_run_and_reported_and_kept_after_it(self):
+        watch = self.step('scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids"')
+        self.assertLess(self.step("scripts/ci/protect-runner"), watch)
+        self.assertLess(watch, self.producer())
+        self.assertIn('> "$RUNNER_TEMP/portable-linux-resources.log"', self.steps[watch])
+        report = self.step('kill "$(cat "$RUNNER_TEMP/portable-linux-resources.pid")"')
+        self.assertGreater(report, self.producer())
+        self.assertIn("if: always()", self.steps[report])
+        self.assertIn("'oom|killed process'", self.steps[report])
+        keep = self.step("name: portable-linux-resources\n")
+        self.assertGreater(keep, report)
+        self.assertIn("if: always()", self.steps[keep])
+        self.assertIn("portable-linux-resources.log", self.steps[keep])
+
+    # On 18 Nov 2026 the passing run of #2100 (44293229949) showed why the
+    # runner went: free disk on / fell from 74 GB to 5.1 GiB, 24 GB in the
+    # instrumented build and 46 GB in the tests' one .profraw per process.
+    def test_unused_preinstalled_toolchains_are_deleted_before_the_build(self):
+        free = self.step("scripts/ci/free-runner-disk")
+        self.assertLess(free, self.producer())
+        self.assertLess(free, self.step("Swatinem/rust-cache"))
+        self.assertNotIn("if: always()", self.steps[free])
+        # In the background, beside the cache restore and the build, so it
+        # costs the critical path nothing; the report prints what it freed.
+        self.assertIn('nohup scripts/ci/free-runner-disk > "$RUNNER_TEMP/free-runner-disk.log"', self.steps[free])
+        report = self.steps[self.step('kill "$(cat "$RUNNER_TEMP/portable-linux-resources.pid")"')]
+        self.assertIn('cat "$RUNNER_TEMP/free-runner-disk.log"', report)
+
+    def test_the_watcher_stops_the_tests_before_a_full_disk_takes_the_runner(self):
+        watch = self.steps[self.step('scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids"')]
+        self.assertIn("WATCH_DISK_FLOOR_KB=2097152", watch)
+        self.assertIn("WATCH_STOP=cargo-nextest", watch)
+
+    def test_the_report_fails_when_the_low_water_mark_is_under_ten_gibibytes(self):
+        report = self.steps[self.step('kill "$(cat "$RUNNER_TEMP/portable-linux-resources.pid")"')]
+        check = 'scripts/ci/assert-headroom "$RUNNER_TEMP/portable-linux-resources.log" 10485760'
+        self.assertIn(check, report)
+        # The check is the step's last command, so the kernel lines print
+        # whatever it decides and its exit status is the step's.
+        self.assertTrue(report.rstrip().endswith(check), report)
+        self.assertNotIn(check + " ||", report)
+
+
 class ArtifactDownloadTests(unittest.TestCase):
     """A stalled artefact download fails fast and is retried once (#977).
 
