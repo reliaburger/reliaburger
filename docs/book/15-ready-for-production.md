@@ -487,6 +487,52 @@ at 30 s. That's six times Kubernetes's 5 s, but it isn't the same measurement: t
 leaves out the image pull and stops at "running", while ours waits for the health check,
 on three small VMs sharing one laptop. Now all five latencies can fail a release.
 
+### The soak's own blind spot
+
+The power-cut endurance work ([#2067](https://github.com/reliaburger/reliaburger/issues/2067))
+borrowed the soak's volume writer, and in doing so found that the soak's data-loss check
+couldn't see most losses. The writer appends 1, 2, 3, ... to `/data/seq`, `sync`s, and only
+then logs `ACK n`. Every five minutes the soak checks that the file runs 1..N with N at
+least the highest `ACK` it has seen. Now suppose a power cut loses lines 901 to 1000. The
+writer comes back, drops a torn last line, finds 900 and appends 901, 902, ... at ten a
+second. A minute later the file runs unbroken past 1000, and the check passes. It can only
+fail for a loss bigger than the writes made between the cut and the next look, and a
+settle takes minutes. The Redis counter had the same hole: the client just counts on.
+
+The fix looks at the restart instead of the state long after it, the way the endurance
+harness does. Each writer start appends the number it resumed from to `/data/resumes` and
+syncs it before its first `ACK`; each Redis client start pushes the counter it found onto
+the list `soak:starts` before its first `INCR`. The checker then holds every start to the
+highest value acknowledged before it. "Before it" needs care, because the checks run every
+30 seconds and a start can land between any two reads. Each check reads the log tails first
+and the records second, so any start the records don't show yet came after every `ACK` in
+those tails. The harness takes one more look just before each power cut, so the bar is the
+last `ACK` before the cut, not the last check's. A cut of the writer's node must also be
+followed by a new start once the fault window closes, or the check proved nothing.
+
+The soak has one case the endurance run doesn't. Its Redis client usually runs on another
+node from Redis, so a cut of Redis's node loses writes under a client that never restarts.
+So the client remembers its last answer, and when an `INCR` answers no more than the one
+before, it pushes both numbers onto `soak:regressions`. Redis is back by then, so that push
+is durable, and any entry fails the soak. The unit test that matters is the scenario above:
+a file whole to 1,500, `ACK 1000` before the cut and a resume point of 900. The old check
+passes it and the new one fails it, both in the same test.
+
+The same work found a second bug in the harness. `with_timeout` bounded each `limactl`
+and `relish` call with `perl -e 'alarm shift; exec @ARGV'`: arm a timer, then replace perl
+with the command, so `SIGALRM` lands on the command itself. A C program dies of it, since
+that's the default action. Go's runtime catches every signal and turns `SIGALRM` into
+nothing unless the program asked for it, and `limactl` is a Go program, so a
+`limactl shell` into a guest that went away hung for good. The new helper forks instead.
+The child calls `setpgrp` to lead its own process group, then `exec`s the command; the
+parent waits, and when the alarm fires it sends `SIGKILL` to the negative pid, which means
+the whole group. That takes the `ssh` that `limactl` started too, which would otherwise
+hold the caller's pipe open. A process group that isn't the terminal's foreground group
+stops if it reads the terminal, so the child swaps a terminal standard input for
+`/dev/null`; a piped one still gets through, which `gsh_in` needs to hand the guest its
+script. The test runs a shell that ignores `SIGALRM` and `SIGTERM` and leaves a grandchild
+holding standard output, and expects status 124 within the deadline.
+
 
 Here's a bug that a passing test hid for a while. Bun can run a workload as a plain host
 process, not just a container. You tell it a binary path and it runs it. Obviously you don't
