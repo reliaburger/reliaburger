@@ -508,7 +508,12 @@ highest value acknowledged before it. "Before it" needs care, because the checks
 and the records second, so any start the records don't show yet came after every `ACK` in
 those tails. The harness takes one more look just before each power cut, so the bar is the
 last `ACK` before the cut, not the last check's. A cut of the writer's node must also be
-followed by a new start once the fault window closes, or the check proved nothing.
+followed by a new start, or the check proved nothing. The settle checks don't wait for the
+writer, so it gets two minutes after the fault window closes to record one. And the records
+are read with `relish exec`, so whatever the command prints is what the checker gets: Redis
+replaying its append-only file after a power cut answers `LOADING Redis is loading the
+dataset in memory` with exit status 0. A record with any line that isn't a number (or, for
+regressions, two) is a warning that judges nothing, never a loss.
 
 The soak has one case the endurance run doesn't. Its Redis client usually runs on another
 node from Redis, so a cut of Redis's node loses writes under a client that never restarts.
