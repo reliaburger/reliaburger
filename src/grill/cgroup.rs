@@ -12,7 +12,7 @@ use crate::config::types::ResourceRange;
 pub(crate) const CGROUP_ROOT: &str = "/sys/fs/cgroup/reliaburger";
 
 /// The default cgroup CPU period in microseconds.
-const CGROUP_PERIOD_US: u64 = 100_000;
+pub(crate) const CGROUP_PERIOD_US: u64 = 100_000;
 
 /// Computed cgroup v2 parameters for a workload instance.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,13 +76,26 @@ pub fn instance_cgroup_path(
         .join(canonical))
 }
 
-/// Convert millicores to a `cpu.max` string.
+/// The CFS quota, in microseconds per [`CGROUP_PERIOD_US`], for a CPU limit
+/// in millicores, or `None` when it's too large to compute.
 ///
 /// 500 millicores means 50ms of CPU time per 100ms period.
 /// The formula is: quota_us = millicores * period_us / 1000.
+pub(crate) fn cpu_quota_us(millicores: u64) -> Option<u64> {
+    millicores
+        .checked_mul(CGROUP_PERIOD_US)
+        .map(|product| product / 1000)
+}
+
+/// Convert millicores to a `cpu.max` string.
+///
+/// A limit too large to compute is no limit (`max`). Config parsing refuses
+/// one that large, so this only guards the arithmetic.
 pub fn cpu_max_from_millicores(millicores: u64) -> String {
-    let quota_us = millicores * CGROUP_PERIOD_US / 1000;
-    format!("{quota_us} {CGROUP_PERIOD_US}")
+    match cpu_quota_us(millicores) {
+        Some(quota_us) => format!("{quota_us} {CGROUP_PERIOD_US}"),
+        None => format!("max {CGROUP_PERIOD_US}"),
+    }
 }
 
 /// Convert a CPU request in millicores to a `cpu.weight` value.
@@ -169,6 +182,12 @@ mod tests {
     #[test]
     fn cpu_max_from_2000m() {
         assert_eq!(cpu_max_from_millicores(2000), "200000 100000");
+    }
+
+    /// A quota too large to compute is no limit, never a wrapped value (#2042).
+    #[test]
+    fn cpu_max_that_overflows_is_unlimited() {
+        assert_eq!(cpu_max_from_millicores(u64::MAX), "max 100000");
     }
 
     // -- cpu_weight_from_millicores -------------------------------------------

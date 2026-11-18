@@ -141,11 +141,16 @@ certificate per handshake from the SNI host's routes:
 | `cluster` route | Ingress CA resolver | an Ingress CA leaf for that host |
 | `explicit` or `cluster` route | no | the self-signed development certificate, with one warning per host on stderr; never the other mode's certificate |
 | plain-HTTP route, unknown host, or no SNI | — | the operator pair if the node has one, else the self-signed certificate |
-| any SNI while a rebuild holds the routing table | — | the self-signed certificate for that handshake, since the host's mode is unknown |
 
 SNI names a host, not a path, so routes on one host share a certificate. When
 they disagree, `explicit` wins over `cluster`, and either wins over plain HTTP
-(`RoutingTable::certificate_mode`). Before 0.3.0 the listener made one choice
+(`RoutingTable::certificate_mode`). The resolver reads each host's mode from
+`CertificateModes`, a snapshot every rebuild or `RoutingTable::replace`
+publishes, not from the table itself: rustls's callback is synchronous, and a
+`try_read` on the fair tokio lock fails whenever a writer holds or waits for
+it. A rebuild therefore never changes which certificate a host gets until the
+new table is published. The Ingress CA resolver mints only for hosts whose
+published mode is `cluster`. Before 0.3.0 the listener made one choice
 for every route (disk pair if present, else the Ingress CA), so the mode only
 decided the plain-HTTP redirect. A cluster-mode node with no disk pair also
 minted an Ingress CA leaf for plain routes' hosts; now only `cluster` hosts get
@@ -162,7 +167,7 @@ one, and plain hosts get the self-signed certificate.
 ```
 
 The resolver mints and caches a cluster leaf **only for a hostname that
-currently has an ingress route**. That host allowlist is a security boundary:
+currently has a `tls = "cluster"` ingress route**. That host allowlist is a security boundary:
 without it, an attacker-chosen SNI would drive unbounded Ingress-CA signing and
 grow the in-memory cache without limit. An SNI for any other host — and a
 handshake with no SNI at all — is served the self-signed development
@@ -491,9 +496,15 @@ Every inbound HTTPS request follows this path:
       an unknown SNI (or none) is served the self-signed default, which a
       hostname-validating client rejects
 3.  HTTP/1.1 or HTTP/2 request parsed (via hyper's auto builder). Wrapper's rustls config advertises ALPN `h2, http/1.1`, so browsers and curl negotiate HTTP/2 over TLS. (hyper's auto builder also speaks h2 on cleartext prior-knowledge.)
-4.  Host taken from the `Host` header; when there is none (HTTP/2 sends the
-    host as the `:authority` pseudo-header, which hyper puts in the request
-    URI), from the URI's authority. The SNI hostname is not used.
+4.  Host extracted. HTTP/2 uses the `:authority` pseudo-header, which hyper
+    puts in the request URI (RFC 9113 §8.3.1); a request whose `Host` header
+    names a different host or port is malformed and gets 400. Hosts compare
+    case-insensitively, and a missing port means the scheme's default (443
+    for https, 80 for http). When the authority is an IP literal (v4 or v6,
+    with or without a port) a `Host` header decides instead, so
+    `curl -k https://<node-ip>/ -H 'Host: app.example'` routes. HTTP/1.1 uses
+    the `Host` header, falling back to the URI's authority. The SNI hostname
+    is not used.
 5.  Routing table lookup:
     a. Exact match on Host → Vec<PathRoute>
     b. Longest path prefix match → PathRoute
@@ -1045,7 +1056,7 @@ HTTP/3 (over QUIC) provides benefits including 0-RTT connection establishment, m
 
 ### 13.2 gRPC Proxying
 
-gRPC uses HTTP/2 with specific framing conventions (trailers, streaming, content-type `application/grpc`). Wrapper's current HTTP/2 proxying may work for unary gRPC calls, but streaming gRPC (server-streaming, client-streaming, bidirectional) hasn't been validated.
+gRPC uses HTTP/2 with specific framing conventions (trailers, streaming, content-type `application/grpc`). Wrapper doesn't proxy gRPC today, not even unary calls. It accepts HTTP/2 from clients, but its upstream client is HTTP/1.1 only (`http_client::builder` sets `http1_only`, and both of the proxy's clients in `bind_proxy_with_tls` start there), and gRPC needs HTTP/2 end to end.
 
 Known concerns:
 
@@ -1054,7 +1065,7 @@ Known concerns:
 - gRPC health checking protocol (`grpc.health.v1.Health`) is different from HTTP health checking.
 - Long-lived gRPC streams interact with connection draining (similar to WebSocket, but using HTTP/2 GOAWAY instead of WebSocket Close).
 
-**Decision status:** Needs investigation and testing. gRPC proxying should work with Wrapper's HTTP/2 support, but requires a dedicated test suite before being documented as supported.
+**Decision status:** Not supported. gRPC needs an HTTP/2 upstream client first, then a dedicated test suite (unary and each kind of streaming) before it can be documented as supported.
 
 ### 13.3 Custom Middleware / Header Injection
 

@@ -999,19 +999,30 @@ async fn blob_head(state: &PickleState, _name: &str, digest_str: &str) -> Respon
 
     if state.store.has_blob(&digest) {
         let size = state.store.blob_size(&digest).unwrap_or(0);
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "content-length",
-            size.to_string().parse().expect("ASCII header value"),
-        );
-        headers.insert(
-            "docker-content-digest",
-            digest.as_str().parse().expect("ASCII header value"),
-        );
+        let mut headers = match registry_headers(&[("docker-content-digest", digest.as_str())]) {
+            Ok(headers) => headers,
+            Err(status) => return status.into_response(),
+        };
+        headers.insert(axum::http::header::CONTENT_LENGTH, size.into());
         (StatusCode::OK, headers).into_response()
     } else {
         StatusCode::NOT_FOUND.into_response()
     }
+}
+
+/// Response headers from name and value pairs.
+///
+/// A value that can't go in a header, such as a repository name from the
+/// request path with a control character in it, is the client's fault: it
+/// gets a 400 instead of a panic in the handler.
+fn registry_headers(pairs: &[(&'static str, &str)]) -> Result<HeaderMap, StatusCode> {
+    let mut headers = HeaderMap::new();
+    for (name, value) in pairs {
+        let value =
+            axum::http::HeaderValue::from_str(value).map_err(|_| StatusCode::BAD_REQUEST)?;
+        headers.insert(*name, value);
+    }
+    Ok(headers)
 }
 
 /// How much of a blob a GET reads from disk at a time (#892).
@@ -1037,18 +1048,14 @@ async fn blob_get(state: &PickleState, _name: &str, digest_str: &str) -> Respons
         Ok(_) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    let mut headers = HeaderMap::new();
+    let mut headers = match registry_headers(&[
+        ("docker-content-digest", digest.as_str()),
+        ("content-type", "application/octet-stream"),
+    ]) {
+        Ok(headers) => headers,
+        Err(status) => return status.into_response(),
+    };
     headers.insert(axum::http::header::CONTENT_LENGTH, length.into());
-    headers.insert(
-        "docker-content-digest",
-        digest.as_str().parse().expect("ASCII header value"),
-    );
-    headers.insert(
-        "content-type",
-        "application/octet-stream"
-            .parse()
-            .expect("ASCII header value"),
-    );
     let pieces = tokio_util::io::ReaderStream::with_capacity(file, BLOB_READ_CHUNK_BYTES);
     (
         StatusCode::OK,
@@ -1126,14 +1133,14 @@ async fn blob_upload_initiate(
     {
         Ok(upload_id) => {
             let location = format!("/v2/{name}/blobs/uploads/{upload_id}");
-            let mut headers = HeaderMap::new();
-            headers.insert("location", location.parse().expect("ASCII header value"));
-            headers.insert("range", "0-0".parse().expect("ASCII header value"));
-            headers.insert(
-                "docker-upload-uuid",
-                upload_id.parse().expect("ASCII header value"),
-            );
-            (StatusCode::ACCEPTED, headers).into_response()
+            match registry_headers(&[
+                ("location", &location),
+                ("range", "0-0"),
+                ("docker-upload-uuid", &upload_id),
+            ]) {
+                Ok(headers) => (StatusCode::ACCEPTED, headers).into_response(),
+                Err(status) => status.into_response(),
+            }
         }
         Err(error) => registry_write_error(error),
     }
@@ -1191,29 +1198,21 @@ async fn blob_upload_patch(
     let _repository_writer = access;
     match stream_upload(state, upload_id, body).await {
         Ok(total) => {
-            let mut headers = HeaderMap::new();
             // The OCI distribution spec requires a Location on every
             // chunk response — the URL for the next chunk or final PUT.
             // containers/image 5.29+ (buildah 1.33) reads it strictly:
             // without it, `buildah push` dies with "determining upload
             // URL: http: no Location header in response" (12b.2).
-            headers.insert(
-                "location",
-                format!("/v2/{name}/blobs/uploads/{upload_id}")
-                    .parse()
-                    .expect("ASCII header value"),
-            );
-            headers.insert(
-                "docker-upload-uuid",
-                upload_id.parse().expect("ASCII header value"),
-            );
-            headers.insert(
-                "range",
-                format!("0-{}", total.saturating_sub(1))
-                    .parse()
-                    .expect("ASCII header value"),
-            );
-            (StatusCode::ACCEPTED, headers).into_response()
+            let location = format!("/v2/{name}/blobs/uploads/{upload_id}");
+            let range = format!("0-{}", total.saturating_sub(1));
+            match registry_headers(&[
+                ("location", &location),
+                ("docker-upload-uuid", upload_id),
+                ("range", &range),
+            ]) {
+                Ok(headers) => (StatusCode::ACCEPTED, headers).into_response(),
+                Err(status) => status.into_response(),
+            }
         }
         Err(response) => response,
     }
@@ -1361,19 +1360,15 @@ async fn blob_upload_complete(
     }
     match result {
         Ok(()) => {
-            let mut headers = HeaderMap::new();
             // Location of the created blob (OCI distribution spec).
-            headers.insert(
-                "location",
-                format!("/v2/{name}/blobs/{}", digest.as_str())
-                    .parse()
-                    .expect("ASCII header value"),
-            );
-            headers.insert(
-                "docker-content-digest",
-                digest.as_str().parse().expect("ASCII header value"),
-            );
-            (StatusCode::CREATED, headers).into_response()
+            let location = format!("/v2/{name}/blobs/{}", digest.as_str());
+            match registry_headers(&[
+                ("location", &location),
+                ("docker-content-digest", digest.as_str()),
+            ]) {
+                Ok(headers) => (StatusCode::CREATED, headers).into_response(),
+                Err(status) => status.into_response(),
+            }
         }
         Err(super::types::PickleError::DigestMismatch { expected, actual }) => (
             StatusCode::BAD_REQUEST,
@@ -1847,14 +1842,11 @@ async fn manifest_put(
         return registry_write_error(error);
     }
 
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        "docker-content-digest",
-        manifest_digest
-            .as_str()
-            .parse()
-            .expect("ASCII header value"),
-    );
+    let mut headers = match registry_headers(&[("docker-content-digest", manifest_digest.as_str())])
+    {
+        Ok(headers) => headers,
+        Err(status) => return status.into_response(),
+    };
     // Cluster metadata is committed. Blob redundancy still converges through
     // the heal loop, so acceptance must not claim that replication has finished.
     headers.insert(

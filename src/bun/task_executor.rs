@@ -869,6 +869,8 @@ impl<R: TaskRunner> TaskPool<R> {
                 });
                 continue;
             };
+            // `pending` is this function's own semaphore and nothing closes
+            // it, so acquiring can't fail.
             let pending_permit = Arc::clone(&pending)
                 .acquire_owned()
                 .await

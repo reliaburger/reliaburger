@@ -100,6 +100,9 @@ impl Drop for AttemptListing<'_> {
     }
 }
 
+/// How many executor slots a node has unless configured otherwise.
+const DEFAULT_SLOTS: u32 = 256;
+
 /// Owned execution backend; host execution retains its separate admission policy.
 pub struct OwnedRunner<G: Grill + Clone> {
     runtime: G,
@@ -111,6 +114,9 @@ pub struct OwnedRunner<G: Grill + Clone> {
     host_runtime: Option<crate::grill::ProcessGrill>,
     budget: Mutex<std::sync::Arc<super::execution_budget::ExecutionBudget>>,
     slots: Mutex<VecDeque<u32>>,
+    /// How many executor slots this node has, free or not: what the shared
+    /// pools are sized from.
+    slot_total: u32,
     prefix: String,
     /// Where the kernel keeps workload cgroups: the startup sweep looks for
     /// executor slot groups a previous Bun left behind under it.
@@ -151,7 +157,8 @@ impl<G: Grill + Clone> OwnedRunner<G> {
             budget: Mutex::new(super::execution_budget::ExecutionBudget::new(
                 crate::meat::Resources::new(256_000, u64::MAX, 0),
             )),
-            slots: Mutex::new((0..256).collect()),
+            slots: Mutex::new((0..DEFAULT_SLOTS).collect()),
+            slot_total: DEFAULT_SLOTS,
             prefix,
             cgroup_root: crate::grill::cgroup::CGROUP_ROOT.into(),
             singletons: Mutex::new(BTreeMap::new()),
@@ -327,13 +334,22 @@ impl<G: Grill + Clone> OwnedRunner<G> {
     }
     /// A smaller executor pool for constrained nodes and real-runtime tests.
     pub fn with_slot_count(runtime: G, slots: u32) -> Self {
-        let runner = Self::new(runtime);
+        let mut runner = Self::new(runtime);
+        runner.slot_total = slots.clamp(1, DEFAULT_SLOTS);
         *runner
             .slots
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            (0..slots.clamp(1, 256)).collect();
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = (0..runner.slot_total).collect();
         runner
+    }
+    /// How many executors a shared-runc or host pool gets: one per slot,
+    /// up to 32. It counts every slot, not just the free ones, so a pool
+    /// first built while fresh attempts hold most slots isn't stuck small
+    /// until Bun restarts (#2043).
+    // Only Linux builds pools; the unit test checks the size everywhere.
+    #[cfg(any(target_os = "linux", test))]
+    fn executor_pool_size(&self) -> usize {
+        (self.slot_total as usize).clamp(1, 32)
     }
     /// Persist a private executor identity so each namespace reuses its bounded
     /// slot identities across restarts. Historical namespace journals still need
@@ -747,12 +763,7 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
         {
             #[cfg(target_os = "linux")]
             if let Some(pool) = {
-                let count = self
-                    .slots
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .len()
-                    .clamp(1, 32);
+                let count = self.executor_pool_size();
                 let budget = self
                     .budget
                     .lock()
@@ -1648,6 +1659,21 @@ mod tests {
         };
         assert!(String::from_utf8_lossy(&result.output.head).contains(&reason));
         assert_eq!(runner.slots.lock().unwrap().len(), 256);
+    }
+
+    /// The shared pools are sized from every slot the node has, not the
+    /// ones free when the first shared task arrives (#2043).
+    #[tokio::test]
+    async fn the_executor_pool_is_sized_from_every_slot_not_the_free_ones() {
+        let runner = OwnedRunner::with_slot_count(crate::grill::mock::MockGrill::new(), 8);
+        let cancel = CancellationToken::new();
+        for _ in 0..7 {
+            runner.slot(&cancel).await.unwrap();
+        }
+        assert_eq!(runner.slots.lock().unwrap().len(), 1);
+        assert_eq!(runner.executor_pool_size(), 8);
+        let full = OwnedRunner::new(crate::grill::mock::MockGrill::new());
+        assert_eq!(full.executor_pool_size(), 32);
     }
 
     async fn launch_with_image_error(error: fn() -> crate::grill::image::ImageError) -> Attempt {

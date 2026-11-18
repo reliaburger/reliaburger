@@ -76,7 +76,7 @@ fn cluster_resolver(
         hierarchy.ingress.certificate_params,
         CertificateDer::from(hierarchy.ingress.ca.certificate_der),
         Duration::from_secs(3600),
-        table,
+        table.try_read().unwrap().certificate_modes(),
         vec![default_cert],
         default_key,
     )
@@ -310,4 +310,37 @@ async fn a_cluster_route_without_the_ingress_ca_never_gets_the_operator_pair() {
         "a cluster route on a node with no Ingress CA must not be served the \
          operator's pair"
     );
+}
+
+/// A rebuild holds the routing table's write lock, and tokio's fair lock
+/// refuses readers while a writer waits. Handshakes in that window must still
+/// get each host's own certificate, not a fallback a validating client rejects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn certificates_follow_the_route_mode_while_a_rebuild_holds_the_table() {
+    let directory = tempfile::tempdir().unwrap();
+    let (cert_path, key_path, operator_leaf) = operator_pair(directory.path(), EXPLICIT_HOST);
+    let table = routes(&[(CLUSTER_HOST, "cluster"), (EXPLICIT_HOST, "explicit")]);
+    let (cluster, ingress_ca) = cluster_resolver(Arc::clone(&table));
+    let (address, _tasks) = start(
+        WrapperConfig {
+            tls_cert_path: Some(cert_path),
+            tls_key_path: Some(key_path),
+            ..WrapperConfig::default()
+        },
+        Arc::clone(&table),
+        Some(cluster),
+    )
+    .await;
+
+    let rebuilding = table.write().await;
+    assert_eq!(
+        leaf_for(address, EXPLICIT_HOST).await,
+        operator_leaf,
+        "an explicit host keeps the operator's pair during a rebuild"
+    );
+    assert!(
+        signed_by(&leaf_for(address, CLUSTER_HOST).await, &ingress_ca),
+        "a cluster host keeps its Ingress CA leaf during a rebuild"
+    );
+    drop(rebuilding);
 }

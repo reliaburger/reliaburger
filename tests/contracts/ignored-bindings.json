@@ -1212,6 +1212,12 @@
     "test": "operator_cidr_reaches_the_api_port_but_not_cluster_ports"
   },
   {
+    "source": "tests/owned_network.rs",
+    "function": "published_ports_answer_members_only_and_rewrite_only_local_destinations",
+    "binary": "reliaburger::owned_network",
+    "test": "published_ports_answer_members_only_and_rewrite_only_local_destinations"
+  },
+  {
     "source": "tests/owned_rootless.rs",
     "function": "rootless_cluster_refuses_before_ownership_recovery_for_every_selection",
     "binary": "reliaburger::owned_rootless",
@@ -1318,6 +1324,18 @@
     "function": "a_memory_request_smaller_than_runc_init_does_not_hold_the_start",
     "binary": "reliaburger::owned_runc",
     "test": "a_memory_request_smaller_than_runc_init_does_not_hold_the_start"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_container_paused_by_smoker_takes_its_stop_signal_at_once",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_container_paused_by_smoker_takes_its_stop_signal_at_once"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_container_with_a_paused_init_takes_its_stop_signal_at_once",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_container_with_a_paused_init_takes_its_stop_signal_at_once"
   },
   {
     "source": "tests/owned_runc.rs",

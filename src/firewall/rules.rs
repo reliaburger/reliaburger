@@ -28,8 +28,10 @@ pub struct PerimeterConfig {
     /// configured `[network] port_range` (the same range the port allocator
     /// draws from), so the ports dropped for outsiders exactly match the host
     /// ports Bun hands out. The default mirrors that config default. External
-    /// access to these ports is blocked — traffic reaches containers via
-    /// Wrapper on the ingress ports instead.
+    /// access to these ports is blocked on the input hook. Ports published to
+    /// containers are held to the same policy on the forward hook, after the
+    /// port map's rewrite. Traffic reaches containers via Wrapper on the
+    /// ingress ports instead.
     pub host_port_range: (u16, u16),
     /// Cluster communication ports (gossip, Raft, reporting).
     /// Only accessible from cluster node IPs.
@@ -45,6 +47,12 @@ pub struct PerimeterConfig {
     /// before gossip discovers them. Does not open container host ports.
     #[serde(default)]
     pub bootstrap_peers: Vec<String>,
+    /// Ports Bun itself serves on (`NodeConfig::service_ports` and the API
+    /// port). One inside `host_port_range` keeps the policy it would have
+    /// outside it: ingress, the registry and DNS answer everyone, while the
+    /// API and cluster ports keep their own operator and member rules.
+    #[serde(default)]
+    pub service_ports: Vec<u16>,
 }
 
 impl Default for PerimeterConfig {
@@ -56,6 +64,7 @@ impl Default for PerimeterConfig {
             operator_cidrs: Vec::new(),
             management_port: 9117,
             bootstrap_peers: Vec::new(),
+            service_ports: Vec::new(),
         }
     }
 }
@@ -313,6 +322,26 @@ fn render_family_table(
         rules.push('\n');
     }
 
+    // Bun's own public listeners (ingress, registry, DNS) inside the range
+    // answer as they would outside it. The API and cluster ports are left
+    // out: their own drops below keep them to operators and members.
+    let open_service_ports: BTreeSet<u16> = config
+        .service_ports
+        .iter()
+        .copied()
+        .filter(|port| *port != config.management_port && !config.cluster_ports.contains(port))
+        .collect();
+    if !open_service_ports.is_empty() {
+        let ports = open_service_ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        rules.push_str("    # Bun's own listeners keep their usual policy inside the range\n");
+        rules.push_str(&format!("    tcp dport {{ {ports} }} accept\n"));
+        rules.push('\n');
+    }
+
     // Block external access to container host port range
     let (port_start, port_end) = config.host_port_range;
     rules.push_str("    # Block external access to container host ports\n");
@@ -336,9 +365,45 @@ fn render_family_table(
     // Everything else passes through (policy accept)
     rules.push_str("    # Everything else: accept (SSH, operator services, etc.)\n");
     rules.push_str("  }\n");
+    rules.push_str(&render_forward_chain(saddr_keyword, node_ips));
     rules.push_str("}\n");
 
     rules
+}
+
+/// Render the chain that holds published host ports to the input chain's
+/// source policy.
+///
+/// The `reliaburger` table's nat prerouting rule rewrites a published port's
+/// destination to the container's address, so that traffic takes the forward
+/// path and never meets the input chain. This filter chain on the forward
+/// hook drops what the input chain would: a connection the port map rewrote
+/// (`ct status dnat`) towards one of this node's containers (`veth-…`) from
+/// anything but this node's own containers or a cluster member. Replies pass.
+///
+/// It matches the rewrite, not a port number. Only ports in `@portmap` are
+/// rewritten, so a port Bun itself serves on (the API, ingress, the
+/// registry) is never touched here, even inside the host-port range.
+fn render_forward_chain(saddr_keyword: &str, node_ips: &[IpAddr]) -> String {
+    let mut chain = String::new();
+    chain.push_str("  chain forward {\n");
+    chain.push_str("    type filter hook forward priority -10; policy accept;\n");
+    chain.push_str("    # Published host ports, after the port map rewrote them\n");
+    chain.push_str("    ct direction reply ct state established,related accept\n");
+    chain.push_str("    iifname \"veth-*\" accept\n");
+    if !node_ips.is_empty() {
+        let ip_set = node_ips
+            .iter()
+            .map(IpAddr::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        chain.push_str(&format!(
+            "    {saddr_keyword} saddr {{ {ip_set} }} accept\n"
+        ));
+    }
+    chain.push_str("    ct status dnat oifname \"veth-*\" drop\n");
+    chain.push_str("  }\n");
+    chain
 }
 
 /// Generate the nftables ruleset for the perimeter firewall — one
@@ -459,6 +524,87 @@ pub async fn apply_ruleset(_ruleset: &str) -> Result<(), FirewallError> {
 
 #[cfg(test)]
 mod tests {
+    /// The forward chain of each family's table, from its header to the end
+    /// of the chain.
+    fn forward_chains(rules: &str) -> Vec<&str> {
+        rules
+            .split("  chain forward {\n")
+            .skip(1)
+            .map(|rest| &rest[..rest.find("\n  }\n").unwrap()])
+            .collect()
+    }
+
+    /// A published port is rewritten to a container address before the input
+    /// hook, so its traffic never meets the input chain's drop. The same
+    /// source policy holds on the forward path, for exactly the connections
+    /// the port map rewrote: by matching the rewrite rather than a port
+    /// range, a port Bun itself serves inside the range is never touched.
+    #[test]
+    fn published_ports_obey_the_source_policy_after_the_port_map_rewrite() {
+        let config = PerimeterConfig {
+            operator_cidrs: vec!["192.168.0.0/24".to_string()],
+            bootstrap_peers: vec!["192.168.9.9".to_string()],
+            ..PerimeterConfig::default()
+        };
+        let rules =
+            generate_ruleset(&config, &cluster_with_nodes(&["10.0.1.1", "fd00::1"])).unwrap();
+        assert!(!rules.contains("chain prerouting"), "{rules}");
+        let chains = forward_chains(&rules);
+        assert_eq!(chains.len(), 2, "one per family:\n{rules}");
+        for (chain, members) in chains
+            .iter()
+            .zip(["ip saddr { 10.0.1.1 }", "ip6 saddr { fd00::1 }"])
+        {
+            assert!(chain.contains("type filter hook forward priority -10; policy accept;"));
+            let drop = chain
+                .find("ct status dnat oifname \"veth-*\" drop")
+                .unwrap_or_else(|| panic!("no drop in:\n{chain}"));
+            for allowed in [
+                "ct direction reply ct state established,related accept",
+                "iifname \"veth-*\" accept",
+                &format!("{members} accept"),
+            ] {
+                let at = chain
+                    .find(allowed)
+                    .unwrap_or_else(|| panic!("no {allowed} in:\n{chain}"));
+                assert!(at < drop, "{allowed} must come before the drop");
+            }
+            // Operators and bootstrap peers never reach container host ports.
+            assert!(!chain.contains("192.168."), "{chain}");
+            // Only rewritten connections: no port, so no service port.
+            assert!(!chain.contains("dport"), "{chain}");
+            assert_eq!(chain.matches("drop").count(), 1, "{chain}");
+        }
+    }
+
+    /// Ingress or the registry on a port inside the host-port range answers
+    /// as it would outside it. The API and cluster ports keep their own
+    /// operator and member rules even when listed.
+    #[test]
+    fn service_ports_inside_the_range_keep_their_usual_policy() {
+        let config = PerimeterConfig {
+            service_ports: vec![28080, 25050, 9117, 9443, 28080],
+            ..PerimeterConfig::default()
+        };
+        let rules = generate_ruleset(&config, &ClusterNodes::new()).unwrap();
+        for table in rules.split("chain input").skip(1) {
+            let accept = table
+                .find("    tcp dport { 25050, 28080 } accept\n")
+                .unwrap_or_else(|| panic!("no service-port accept in:\n{table}"));
+            let drop = table.find("tcp dport 10000-32767 drop").unwrap();
+            assert!(accept < drop, "the accept must precede the range drop");
+            // The API and cluster ports still answer only operators and
+            // members.
+            assert!(table.contains("tcp dport 9117 drop"));
+            assert!(table.contains("tcp dport 9443 drop"));
+        }
+        // No service ports, no accept line.
+        let rules = generate_ruleset(&PerimeterConfig::default(), &ClusterNodes::new()).unwrap();
+        let input = rules.split("chain input").nth(1).unwrap();
+        let input = &input[..input.find("chain forward").unwrap()];
+        assert!(!input.contains("tcp dport {"), "{input}");
+    }
+
     #[test]
     fn outbound_replies_are_allowed_before_container_port_drops() {
         let rules = generate_ruleset(&PerimeterConfig::default(), &ClusterNodes::new()).unwrap();

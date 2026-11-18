@@ -356,9 +356,15 @@ pub fn write_backup(
                 backup.fingerprint,
                 key.to_string().expose_secret()
             );
-            write_new_private(identity, identity_file.as_bytes())?;
+            // The backup goes first. An identity with no backup beside it
+            // opens nothing, yet it would block a retry (`create_new`), so
+            // an identity that can't be written takes its backup with it.
             let sealed = backup.seal(&BackupSeal::Recipient(recipient))?;
             write_new_private(path, &sealed)?;
+            if let Err(error) = write_new_private(identity, identity_file.as_bytes()) {
+                let _ = std::fs::remove_file(path);
+                return Err(error);
+            }
             let written = read_back(path)?;
             check_opens(&written, &BackupOpener::Identity(key), backup, path, now)
         }
@@ -384,6 +390,20 @@ fn check_opens(
 }
 
 fn write_new_private(path: &Path, bytes: &[u8]) -> Result<(), RootBackupError> {
+    create_private_with(path, |file| {
+        file.write_all(bytes)?;
+        file.sync_all()
+    })
+}
+
+/// Create `path` owner-only (it must not exist yet) and fill it with `write`.
+///
+/// A file that fails part-way is removed: left behind, it would make the
+/// retry fail on `create_new`.
+fn create_private_with(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<(), RootBackupError> {
     let failed = |e: std::io::Error| RootBackupError::WriteFailed {
         path: path.display().to_string(),
         reason: e.to_string(),
@@ -396,8 +416,11 @@ fn write_new_private(path: &Path, bytes: &[u8]) -> Result<(), RootBackupError> {
         options.mode(0o600);
     }
     let mut file = options.open(path).map_err(failed)?;
-    file.write_all(bytes).map_err(failed)?;
-    file.sync_all().map_err(failed)
+    write(&mut file).map_err(|error| {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        failed(error)
+    })
 }
 
 fn read_back(path: &Path) -> Result<Vec<u8>, RootBackupError> {
@@ -769,6 +792,53 @@ mod tests {
         );
         let other = age::x25519::Identity::generate();
         assert!(RootBackup::open(&sealed, &BackupOpener::Identity(other)).is_err());
+    }
+
+    #[test]
+    fn a_write_that_fails_after_the_file_is_created_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("root.age");
+        let err =
+            create_private_with(&path, |_| Err(std::io::Error::other("disk full"))).unwrap_err();
+        assert!(matches!(err, RootBackupError::WriteFailed { .. }), "{err}");
+        assert!(!path.exists(), "a partial file blocks the retry");
+        write_new_private(&path, b"second try").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second try");
+    }
+
+    #[test]
+    fn a_fresh_identity_is_not_left_behind_when_its_backup_cannot_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing").join("root.age");
+        let identity_path = dir.path().join("root.key");
+        let err = write_backup(
+            &root_backup("prod"),
+            &BackupDestination::FreshIdentity {
+                path: &path,
+                identity: &identity_path,
+            },
+            SystemTime::now(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, RootBackupError::WriteFailed { .. }), "{err}");
+        assert!(!identity_path.exists(), "an identity without its backup");
+    }
+
+    #[test]
+    fn a_backup_is_removed_when_its_fresh_identity_cannot_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("root.age");
+        let identity_path = dir.path().join("missing").join("root.key");
+        let destination = BackupDestination::FreshIdentity {
+            path: &path,
+            identity: &identity_path,
+        };
+        let err = write_backup(&root_backup("prod"), &destination, SystemTime::now()).unwrap_err();
+        assert!(matches!(err, RootBackupError::WriteFailed { .. }), "{err}");
+        assert!(!path.exists(), "a backup nobody can open");
+        // Once the operator fixes the directory, the same command works.
+        std::fs::create_dir(dir.path().join("missing")).unwrap();
+        write_backup(&root_backup("prod"), &destination, SystemTime::now()).unwrap();
     }
 
     #[test]

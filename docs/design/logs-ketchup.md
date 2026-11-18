@@ -75,7 +75,7 @@ The capture task is spawned when Bun starts a workload and cancelled when it sto
 └── ...
 ```
 
-Each file is one flush of the in-memory buffer. File names come from a counter seeded one past the highest existing `logs_NNNNNN.parquet`, so a restart resumes numbering instead of clobbering. Files are written with ZSTD column compression and small (8192-row) row groups, plus bloom filters on the `app` and `namespace` columns so archive reads can skip row groups that hold no matching rows.
+Each file is one flush of the in-memory buffer. Bun flushes every 60 seconds, and sooner when the buffer reaches 100,000 rows or 32 MiB, so a burst from a chatty app reaches Parquet well before the buffer's caps (1,000,000 rows or 256 MiB, counting a flush still being written) shed anything. File names come from a counter seeded one past the highest existing `logs_NNNNNN.parquet`, so a restart resumes numbering instead of clobbering. Files are written with ZSTD column compression and small (8192-row) row groups, plus bloom filters on the `app` and `namespace` columns so archive reads can skip row groups that hold no matching rows.
 
 Every file carries the schema:
 
@@ -281,6 +281,10 @@ Retention is the same Parquet-file model as Mayo (`src/bun/disk_pressure.rs`, `c
 1. If `export_path` is set, un-exported Parquet files are shipped to the destination first; only files whose exact bytes are recorded in the export checkpoint become eligible for deletion.
 2. Files are pruned **oldest-first by mtime** when past `retention_days` or when total size exceeds `max_storage_mb` (2048 MB by default; `0` is an explicit "unlimited", so only the retention cutoff applies).
 
+**A failing export holds retention.** With `export_path` set, a tick whose export fails returns before pruning anything, so neither `max_storage_mb` nor `retention_days` applies until an export succeeds: expired credentials or a missing bucket let the store grow until the disk fills. That is deliberate (deleting the only copy of unexported data is worse), so Bun makes it visible: it logs each failure, and `relish wtf` reports an `export-failing` warning for the node and store while it lasts. A hard floor that prunes unexported files when free space runs out is not implemented.
+
+**Hashing.** Each durable id needs the file's SHA-256. The exporter hashes a file once and caches the result by path, size, modification time, device and inode, all read from the open file, so the five-minute disk-pressure tick re-reads nothing it has seen. Reading and hashing run on the blocking pool.
+
 **Status of the compression lifecycle: planned -- not yet implemented.** There is no `.log`→`.log.zst` compression step (Parquet is already ZSTD-compressed at write time), no separate `compressed_retention_days`, no per-app byte counter, no `log.storage_exhausted` alert, and no `relish events --type log-retention` stream. Pruning deletes whole Parquet files.
 
 ### 5.6 Cross-Node Log Aggregation
@@ -353,7 +357,9 @@ Timestamps are wall-clock seconds stamped at `append`. A backward clock jump can
 
 ### 7.5 High-Volume Log Flood
 
-Backpressure flows through the bounded `mpsc` channel from the forwarder into the store, and through the runtime's own buffering upstream of that. A `logs.drop_policy` knob is **planned -- not yet implemented** (see Open Questions).
+Backpressure flows through the bounded `mpsc` channel from the forwarder into the store, and through the runtime's own buffering upstream of that. The store asks for an early flush at 100,000 buffered rows or 32 MiB (`LogStore::flush_wanted`), and the flush task runs on that signal as well as on its 60-second tick.
+
+If flushing can't keep up for long (a failing disk, or a burst bigger than the early flush absorbs), the buffer drops its oldest rows once it passes 1,000,000 rows or 256 MiB. A dropped line is a counted loss, not a silent one and not a replay: the checkpoint moves on as usual, so a restart doesn't store anything twice and the capture reclaim carries on. Instead the log that lost lines gets a marker line on stderr where the gap is ("N log lines dropped: the log store fell behind"), one per log per flush; markers are never dropped themselves. Bun counts the lines in `ketchup_log_lines_dropped_total` (a node metric) and `LogStore::dropped_lines`, and logs the number at the next flush. An earlier fix held the capture's checkpoint at the first dropped line so a restart would re-read it; that pinned the checkpoint for the rest of Bun's life, which stopped the reclaim and stored every later line twice after a restart, so it was replaced. A `logs.drop_policy` knob is **planned -- not yet implemented** (see Open Questions).
 
 ---
 

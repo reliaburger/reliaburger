@@ -307,6 +307,18 @@ The new lint works the other way round from the first. A second test in `src/bun
 
 A review found that both lints had been skipping code. Each stops reading a file at its inline test module, which it recognised as `#[cfg(test)]` followed by a line starting with `mod `. That also matches `mod tests;`, which only declares a test module kept in another file, and `src/bun/api.rs`, `src/bun/agent.rs`, `src/lib.rs` and the MCP and fuzz modules all have one partway down. Everything below it went unscanned. The scan now stops only when the `mod` line ends in `{`. A unit test writes a small file with one of each and checks that the scan reports the call after `mod tests;` but not the one inside `mod inline {`. Reading the skipped code found nothing new, but it does get read now.
 
+#### A forward needs a deadline too
+
+Forwarding fixed who answers, but not how long the follower waits for the answer ([#2055](https://github.com/reliaburger/reliaburger/issues/2055)). `forward_to_leader` called `send()` and then read the body with no timeout, and the cluster's HTTP client has no default one. A leader that accepts the connection and never answers, because its process has stalled or its replies are dropped, held every forwarded request for as long as the TCP connection lived. That's 17 call sites: job apply, the batch and array submissions, job runs, deploy cancel and the identity token routes. An app's stop, delete and release had their own copy of the same code, and so did the build runner's tracking request.
+
+They now share one exchange in `src/bun/batch.rs`. `relay_leader_answer` sends the request and reads the leader's whole answer inside one `tokio::time::timeout`. Past `LEADER_FORWARD_TIMEOUT` it answers 504 and says the outcome is unknown, because the leader may still finish the request. The deadline is 60 seconds. That sounds long, but the leader's own work has to fit inside it. A job apply can bind images against an upstream registry, which gives up only after 20 seconds, and then make a council write, which gives up after 10. A merely slow leader should still get its real answer through.
+
+A job apply is the exception. Its answer is an event stream that runs until the deployment settles, which can take minutes. Bounding the whole exchange would cut every long deployment off at 60 seconds. So `relay_leader_stream` bounds only `send()`, which resolves when the leader's status line and headers arrive. The body then streams through untouched. The app apply forward in `cluster_apply` already worked this way, with 5 seconds for the headers.
+
+Even the headers can take a while. Before the leader starts the stream, it binds every image in the manifest against its upstream registry, one after another, and each bind can take 20 seconds. Then it proves it leads and writes the deployment to the council. Three slow registries put the headers past 60 seconds, so the follower would answer 504 while the leader went on and committed the apply. A review caught this before the change merged. Sending the headers before the binding would have turned every binding refusal (a bad reference, a registry that refuses) from a 400 or a 502 into an event inside a 200 stream, which changes what every client sees. So the follower budgets for the work instead. `job_apply_header_deadline` counts the manifest's distinct images, allows 20 seconds for each, adds the leadership proof and two council writes, and caps the total at 280 seconds, just under the five minutes `relish` itself waits. `a_forwarded_job_apply_waits_for_the_leader_to_bind_each_image` gives a fake leader three binds and a write to sit through before it answers, which is 70 seconds, and the follower has to wait for it.
+
+`a_follower_answers_504_when_the_leader_never_answers`, in `src/bun/api/tests.rs`, binds a listener and never accepts from it. The kernel completes the TCP handshake and holds the request, so the follower's request goes out and nothing ever comes back. A batch submission, a job apply, a batch read and an app stop each have to answer 504. `a_forwarded_job_apply_streams_past_the_forward_timeout` is the other half. Its fake leader sends one event at once and the next one only after twice the forward timeout, and the follower has to relay both. Both tests run on a paused clock, so the 60 seconds cost nothing. And the leader forwards that already had deadlines kept them: upgrades, GitOps webhooks, test leases, node faults, summaries and the join-token routes.
+
 ### Definitions, runs and durable trigger identities
 
 A template and a count describe work, but not why it runs. A manually submitted
@@ -2788,6 +2800,31 @@ doesn't count until the task cgroup is really gone, and setup creates it with
 test plants a killed cgroup at the next executor's path and checks the command
 runs in a fresh directory. A mocked launch would never have found any of this.
 
+### Two numbers read at the wrong moment
+
+The 0.3.0 review found two values taken from the right place at the wrong
+time. The shared-runc and host executor pools sized themselves from the
+node's slots the first time a shared task arrived, and they counted the
+*free* slots ([#2043](https://github.com/reliaburger/reliaburger/issues/2043)).
+The pool lives in a `OnceLock`, a cell the standard library fills once and
+then only reads, so a first task that arrived while fresh runc attempts held
+nearly all 256 slots built a pool of one executor, and it stayed that size
+until Bun restarted. `OwnedRunner` now keeps `slot_total`, the number of
+slots it was configured with, and `executor_pool_size` sizes the pool from
+that (still at most 32 executors). Its test takes seven of eight slots before
+asking.
+
+The other was a timestamp. A deployment operation's
+`cancellation_requested_at` was filled with its *submission* time, because
+`DeploymentRecord` kept a `cancelled: bool` and nothing else, even though
+the `DeployCancel` write carries the leader's clock
+([#2047](https://github.com/reliaburger/reliaburger/issues/2047)). The flag is
+now `cancelled_at: Option<u64>`, and `cancelled()` is a method that asks
+whether it's set. A bool and a time side by side could disagree; one
+`Option` can't. A second cancel keeps the first time: `get_or_insert` only
+writes when the `Option` is `None`. The record is council state, so this
+changes the durable format, which 0.3.0's compatibility bump already covers.
+
 ### Room for runc to start
 
 The helper's cgroup had an 8 MiB `memory.max`, and for months that was
@@ -4506,6 +4543,16 @@ attempt counts but not reasons (22 bytes a record, and #678 is busy shrinking
 that), so a chunk resumed after a restart reports the retries it can't explain
 as exactly that. The node only counts a cause once the next attempt has really
 started, which keeps the sum equal to `attempts - 1` on every early return.
+
+The duration buckets get the same treatment. The state's decoder refuses any
+array whose buckets hold more samples than tasks that ran, so a report that
+broke that rule would be applied live and then fail on the next snapshot
+install, and no new follower could load the state. `complete` now sums the
+report's buckets with `checked_add` and refuses the report, before it changes
+anything, when the total exceeds `succeeded + failed_count`. The live apply
+and the decoder now enforce one invariant, not two, and
+`accepted_duration_counts_survive_a_snapshot_round_trip` checks that what one
+accepts the other can read.
 
 The other was start lag. The reusable pools already time the command itself,
 so the gap between the pool taking an attempt and the command starting falls

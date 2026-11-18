@@ -417,23 +417,25 @@ impl rustls::server::ResolvesServerCert for ReloadableCertResolver {
 /// Per-SNI ingress certificate resolver backed by the cluster Ingress CA (M8).
 ///
 /// On each TLS handshake it looks at the client's SNI hostname. A cluster-CA
-/// certificate is minted (and cached) **only for a host that currently has an
-/// ingress route**; every other SNI — unknown host, no SNI, or a routing table
-/// momentarily locked for a rebuild — is served the self-signed default. That
+/// certificate is minted (and cached) **only for a host that currently has a
+/// `tls = "cluster"` ingress route**; every other SNI (unknown host, another
+/// mode's host, no SNI) is served the self-signed default. That
 /// allowlist is the security boundary: without it, an attacker's arbitrary SNI
 /// would drive unbounded CA signing and grow the cache without limit.
 ///
 /// `rustls`'s `resolve` is a synchronous trait method called on the handshake
-/// path, so the cache uses `std::sync::Mutex` (not the tokio one) and the
-/// routing table is read with `try_read()`: neither lock is held across an
-/// `.await`, and a contended rebuild simply falls back to the default cert.
+/// path, so the cache uses `std::sync::Mutex` (not the tokio one) and the host
+/// allowlist is the table's lock-free [`CertificateModes`] snapshot, so a
+/// rebuild holding the table never turns a configured host away.
+///
+/// [`CertificateModes`]: super::routing::CertificateModes
 pub struct IngressCertResolver {
     ca_keypair: rcgen::KeyPair,
     ca_params: rcgen::CertificateParams,
     issuer_certificate: CertificateDer<'static>,
     lifetime: std::time::Duration,
     default_key: Arc<rustls::sign::CertifiedKey>,
-    routes: Arc<tokio::sync::RwLock<super::routing::RoutingTable>>,
+    modes: Arc<super::routing::CertificateModes>,
     cache: std::sync::Mutex<std::collections::HashMap<String, CachedCertificate>>,
 }
 
@@ -445,8 +447,8 @@ impl std::fmt::Debug for IngressCertResolver {
 }
 
 impl IngressCertResolver {
-    /// Build a resolver from the Ingress CA material, the live ingress routing
-    /// table (the host allowlist), and a self-signed fallback cert/key (served
+    /// Build a resolver from the Ingress CA material, the routing table's
+    /// certificate modes (the host allowlist), and a self-signed fallback cert/key (served
     /// for any SNI that isn't a configured route, and when a handshake carries
     /// no SNI).
     pub fn new(
@@ -454,7 +456,7 @@ impl IngressCertResolver {
         ca_params: rcgen::CertificateParams,
         issuer_certificate: CertificateDer<'static>,
         lifetime: std::time::Duration,
-        routes: Arc<tokio::sync::RwLock<super::routing::RoutingTable>>,
+        modes: Arc<super::routing::CertificateModes>,
         default_cert: Vec<CertificateDer<'static>>,
         default_key: PrivateKeyDer<'static>,
     ) -> Result<Self, TlsError> {
@@ -464,7 +466,7 @@ impl IngressCertResolver {
             issuer_certificate,
             lifetime,
             default_key: certified_key(default_cert, default_key)?,
-            routes,
+            modes,
             cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
@@ -532,14 +534,10 @@ impl IngressCertResolver {
         Some(certified)
     }
 
-    /// Whether `hostname` currently has an ingress route, read without blocking
-    /// the synchronous handshake path. A rebuild write briefly makes this
-    /// `false`; that only means the default cert is served for one handshake.
+    /// Whether `hostname` has a `tls = "cluster"` route in the last
+    /// published routing table.
     fn is_configured_host(&self, hostname: &str) -> bool {
-        self.routes
-            .try_read()
-            .map(|table| table.contains_host(hostname))
-            .unwrap_or(false)
+        self.modes.get(hostname) == Some(TlsMode::Cluster)
     }
 
     /// The certificate to serve for a handshake's SNI (`None` = no SNI). A
@@ -597,7 +595,7 @@ enum CertificateSource {
 /// validating client rejects, and one warning on stderr. It never gets the
 /// other mode's certificate.
 pub(super) struct RouteCertResolver {
-    routes: Arc<tokio::sync::RwLock<super::routing::RoutingTable>>,
+    modes: Arc<super::routing::CertificateModes>,
     operator: Option<Arc<FileCertResolver>>,
     cluster: Option<Arc<dyn rustls::server::ResolvesServerCert>>,
     self_signed: Arc<rustls::sign::CertifiedKey>,
@@ -613,18 +611,19 @@ impl std::fmt::Debug for RouteCertResolver {
 }
 
 impl RouteCertResolver {
-    /// Build the listener's resolver from the routes, the node's operator
+    /// Build the listener's resolver from the routing table's certificate
+    /// modes, the node's operator
     /// pair and Ingress CA resolver (either may be absent), and a self-signed
     /// certificate for everything neither covers.
     pub(super) fn new(
-        routes: Arc<tokio::sync::RwLock<super::routing::RoutingTable>>,
+        modes: Arc<super::routing::CertificateModes>,
         operator: Option<Arc<FileCertResolver>>,
         cluster: Option<Arc<dyn rustls::server::ResolvesServerCert>>,
         self_signed_cert: Vec<CertificateDer<'static>>,
         self_signed_key: PrivateKeyDer<'static>,
     ) -> Result<Self, TlsError> {
         Ok(Self {
-            routes,
+            modes,
             operator,
             cluster,
             self_signed: certified_key(self_signed_cert, self_signed_key)?,
@@ -635,15 +634,9 @@ impl RouteCertResolver {
     /// The source for a handshake's SNI (`None` = no SNI). Split out from
     /// `resolve` so the choice is testable without a `ClientHello`.
     fn source_for(&self, server_name: Option<&str>) -> CertificateSource {
-        let mode = match server_name {
-            None => None,
-            Some(name) => match self.routes.try_read() {
-                Ok(table) => table.certificate_mode(name),
-                // A rebuild holds the table, so this host's mode is unknown.
-                // The operator pair might be the other mode's certificate.
-                Err(_) => return CertificateSource::SelfSigned,
-            },
-        };
+        // The last published modes, so a rebuild holding the table never
+        // leaves a host's mode unknown.
+        let mode = server_name.and_then(|name| self.modes.get(name));
         match (mode, server_name) {
             (Some(TlsMode::Explicit), _) if self.operator.is_some() => CertificateSource::Operator,
             (Some(TlsMode::Cluster), _) if self.cluster.is_some() => CertificateSource::Cluster,
@@ -930,7 +923,7 @@ mod tests {
             hierarchy.ingress.certificate_params,
             CertificateDer::from(hierarchy.ingress.ca.certificate_der),
             std::time::Duration::from_secs(90 * 24 * 3600),
-            empty_routes(),
+            modes_of(&empty_routes()),
             vec![default_cert],
             default_key,
         )
@@ -1046,6 +1039,12 @@ mod tests {
         ))
     }
 
+    fn modes_of(
+        routes: &tokio::sync::RwLock<super::super::routing::RoutingTable>,
+    ) -> Arc<super::super::routing::CertificateModes> {
+        routes.try_read().unwrap().certificate_modes()
+    }
+
     fn resolver_with(
         routes: Arc<tokio::sync::RwLock<super::super::routing::RoutingTable>>,
     ) -> IngressCertResolver {
@@ -1057,7 +1056,7 @@ mod tests {
             hierarchy.ingress.certificate_params,
             CertificateDer::from(hierarchy.ingress.ca.certificate_der),
             std::time::Duration::from_secs(3600),
-            routes,
+            modes_of(&routes),
             vec![default_cert],
             default_key,
         )
@@ -1135,7 +1134,7 @@ mod tests {
             |operator: Option<Arc<FileCertResolver>>,
              cluster: Option<Arc<dyn rustls::server::ResolvesServerCert>>| {
                 let (cert, key) = generate_self_signed_cert().unwrap();
-                RouteCertResolver::new(Arc::clone(&routes), operator, cluster, vec![cert], key)
+                RouteCertResolver::new(modes_of(&routes), operator, cluster, vec![cert], key)
                     .unwrap()
             };
         use CertificateSource::{Cluster, Operator, SelfSigned};
@@ -1173,18 +1172,19 @@ mod tests {
         // route's host: only `tls = "cluster"` hosts get one.
         assert_eq!(cluster_only.source_for(Some("plain.example")), SelfSigned);
 
-        // While a rebuild holds the table, the host's mode is unknown. It
-        // must get self-signed, not the operator pair: the host might be a
-        // `cluster` one. A handshake with no SNI never reads the table.
+        // A rebuild holds the table's write lock, and tokio's fair lock turns
+        // readers away while a writer waits. The resolvers read the last
+        // published modes instead, so every host keeps its own certificate.
+        let minting = resolver_with(Arc::clone(&routes));
         let rebuilding = routes.try_write().unwrap();
-        assert_eq!(both.source_for(Some("cluster.example")), SelfSigned);
-        assert_eq!(
-            operator_only.source_for(Some("unknown.example")),
-            SelfSigned
-        );
-        assert_eq!(both.source_for(None), Operator);
-        drop(rebuilding);
+        assert_eq!(both.source_for(Some("explicit.example")), Operator);
         assert_eq!(both.source_for(Some("cluster.example")), Cluster);
+        assert_eq!(both.source_for(Some("unknown.example")), Operator);
+        assert!(!Arc::ptr_eq(
+            &minting.certificate_for(Some("cluster.example")),
+            &minting.default_key
+        ));
+        drop(rebuilding);
     }
 
     /// A configured ingress host still gets a real cluster-CA cert, cached.

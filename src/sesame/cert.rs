@@ -252,11 +252,11 @@ pub fn validate_chain_at(
     root_der: &[u8],
     at: SystemTime,
 ) -> Result<(), CertError> {
-    if chain.is_empty() {
+    let Some(last) = chain.last() else {
         return Err(CertError::ChainInvalid(
             "empty certificate chain".to_string(),
         ));
-    }
+    };
 
     // Verify every adjacent link inside the presented chain.
     for pair in chain.windows(2) {
@@ -267,7 +267,6 @@ pub fn validate_chain_at(
     // The last presented cert must chain to the trust anchor. When the caller
     // includes the root as the final element it self-chains, so only check
     // the link to the anchor when they differ.
-    let last = chain.last().expect("chain is non-empty");
     if last.as_slice() != root_der {
         verify_signature(last, root_der)?;
         check_issuer_binding(last, root_der)?;

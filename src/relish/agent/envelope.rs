@@ -440,7 +440,9 @@ impl From<&RelishError> for AgentError {
                 agent_error
             }
             RelishError::AgentRequired { .. } => AgentError::new(ErrorCode::NoEndpoint, message),
-            RelishError::RequestTimeout => AgentError::new(ErrorCode::Timeout, message),
+            RelishError::RequestTimeout | RelishError::DeployStreamDeadline { .. } => {
+                AgentError::new(ErrorCode::Timeout, message)
+            }
             RelishError::ApiError { status, .. } => {
                 let code = match status {
                     401 => ErrorCode::Unauthenticated,
@@ -460,9 +462,9 @@ impl From<&RelishError> for AgentError {
                 agent_error
             }
             RelishError::PolicyDenied { .. } => AgentError::new(ErrorCode::Forbidden, message),
-            RelishError::InvalidFlag { .. } | RelishError::InvalidImageTag { .. } => {
-                AgentError::new(ErrorCode::Usage, message)
-            }
+            RelishError::InvalidFlag { .. }
+            | RelishError::InvalidName { .. }
+            | RelishError::InvalidImageTag { .. } => AgentError::new(ErrorCode::Usage, message),
             RelishError::Manual(_)
             | RelishError::DevClusterNotFound { .. }
             | RelishError::ImageNotInRegistry { .. } => {

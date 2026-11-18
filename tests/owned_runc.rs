@@ -1231,6 +1231,97 @@ async fn actual_host_reboot_preserves_holds_and_retires_original_execution() {
     }
 }
 
+/// Which process a pause freezes.
+#[derive(Debug, Clone, Copy)]
+enum Paused {
+    /// The pid the runtime reports, which is the one Smoker's pause signals.
+    ReportedPid,
+    /// The container's own init, as `runc state` names it.
+    ContainerInit,
+}
+
+/// Start a container that handles SIGTERM, freeze `paused`, and stop it with
+/// a 20 s grace. A paused instance must take its stop signal at once: Bun
+/// follows the signal with SIGCONT (#2041), as ProcessGrill does, instead of
+/// letting the frozen process sit out its grace and die by SIGKILL.
+async fn paused_container_takes_its_stop_signal_at_once(paused: Paused) {
+    use reliaburger::bun::agent::{InstanceStop, stop_runtime_instance};
+    assert!(nix::unistd::geteuid().is_root());
+    let root = tempfile::tempdir().unwrap();
+    let id = instance(root.path());
+    let runtime = runtime(root.path());
+    runtime
+        .create(
+            &id,
+            &spec(
+                root.path(),
+                "trap '/bin/busybox touch /work/term; exit 0' TERM; \
+                 /bin/busybox touch /work/ready; \
+                 while :; do /bin/busybox sleep 0.05; done",
+            ),
+        )
+        .await
+        .unwrap();
+    install_fixture(root.path(), &id);
+    runtime.start(&id).await.unwrap();
+    wait_file(&root.path().join("shared/ready")).await;
+    let pid = match paused {
+        Paused::ReportedPid => runtime.pid(&id).await.unwrap().expect("a reported pid"),
+        Paused::ContainerInit => container_init(root.path(), &id).expect("a container init"),
+    };
+    reliaburger::smoker::process::pause_process(pid as i32).unwrap();
+
+    let grace = Duration::from_secs(20);
+    let begun = std::time::Instant::now();
+    let stopped = tokio::time::timeout(
+        Duration::from_secs(60),
+        stop_runtime_instance(
+            &runtime,
+            &id,
+            &InstanceStop::for_policy(None, grace),
+            Duration::from_secs(10),
+        ),
+    )
+    .await;
+    let took = begun.elapsed();
+    let handled = root.path().join("shared/term").exists();
+    let _ = reliaburger::smoker::process::resume_process(pid as i32);
+    runtime.kill(&id).await.unwrap();
+    assert_absent(root.path(), &id);
+    stopped.expect("the stop never finished").unwrap();
+    assert!(
+        handled,
+        "the paused container never handled its stop signal"
+    );
+    assert!(took < grace, "the stop waited out its grace: {took:?}");
+}
+
+/// The container's init pid as `runc state` reports it.
+fn container_init(root: &Path, id: &InstanceId) -> Option<u32> {
+    let output = std::process::Command::new("runc")
+        .arg("--root")
+        .arg(root.join("state"))
+        .args(["state", &id.0])
+        .output()
+        .ok()?;
+    let state: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    state["pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+}
+
+#[tokio::test]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
+async fn runc_container_paused_by_smoker_takes_its_stop_signal_at_once() {
+    paused_container_takes_its_stop_signal_at_once(Paused::ReportedPid).await;
+}
+
+#[tokio::test]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
+async fn runc_container_with_a_paused_init_takes_its_stop_signal_at_once() {
+    paused_container_takes_its_stop_signal_at_once(Paused::ContainerInit).await;
+}
+
 /// Kill every process in a stand-in for Bun's systemd unit cgroup the way
 /// `KillMode=control-group` does: SIGTERM, a grace period, then SIGKILL.
 async fn stop_unit_cgroup(unit: &Path) {

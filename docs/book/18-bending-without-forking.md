@@ -2698,6 +2698,18 @@ UTF-8, and slicing one in the middle of a multi-byte character panics. So the
 scanner steps over whole characters, never single bytes, and a template full
 of emoji still scans.
 
+The closing arms had one TOML subtlety we first got wrong. A multi-line
+string may end with up to two quotes of its own before the closing three,
+so `x = '''a''''` is the string `a'`. Matching exactly three quotes closed
+it early and read the fourth as the start of a one-line literal string,
+which then ran on past the newline, so a `"${p}"` on the next line was taken
+to be in a literal string and its value went in unescaped. The arms for
+`MultiLiteral` and `MultiBasic` now consume the whole run of quotes, up to
+five, and a one-line `Basic` or `Literal` context ends at a newline, as
+TOML's do, so a mistake can't leak into the next line. The test feeds three,
+four and five quotes of each kind and checks the slot of the placeholder
+that follows.
+
 A placeholder records its `Slot`, which is the context with the comment case
 taken away: placeholders in comments never become pieces at all. `render`
 then decides, per slot, what the value may be:

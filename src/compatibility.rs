@@ -263,18 +263,39 @@ pub struct Compatibility {
 /// The council membership check on the Raft port: the `CouncilVoters` Raft
 /// RPC and its answer, which an earlier 0.3.0 build can't decode, and a
 /// server that refuses Raft RPCs from nodes outside its council.
+/// A deployment record keeps when its cancel was requested
+/// (`DeploymentRecord::cancelled_at` replaces `cancelled`, #2047).
+///
+/// 0.3.0 again (60/76): one more bump at the end of the train, because the
+/// changes above landed under 59/75 after the train's first bump, so builds
+/// made in between (`nightly-v0.3.0-*`, lab image 2026.47.202) spoke 59/75
+/// with another wire and state. With the bump they are refused cleanly
+/// instead of half-understood. Covered: gossip's `Stale` answer and the
+/// sequence floors in `Sync`; the `CouncilVoters` Raft RPC;
+/// `RaftRequest::RevokeApiToken::now_unix_ms`;
+/// `DeploymentRecord::cancelled_at`; the apply-time checks that refuse a
+/// join token whose name's Raft id collides with another node's (#2050),
+/// which a 59/75 replica would apply differently; `export_holds` in
+/// `GET /v1/diagnostics` (`LocalDiagnosticSnapshot` refuses unknown
+/// fields, #2062); and the API token's separate audience
+/// (`reliaburger-api:CLUSTER`, the `api-token` file beside `token`).
 ///
 /// Bumping either number makes the checked-in gossip and Raft fuzz seeds
 /// stale: run `make fuzz-corpus-seed` in the same change (#1941). Keep the
 /// two fields directly inside the braces: the release scripts read them with
 /// a regex.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 59,
-    state: 75,
+    protocol: 60,
+    state: 76,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.
 pub const STATE_STAMP: &str = "state-format.json";
+
+/// Prefix of the temporary file the stamp is written through. A crash before
+/// the rename leaves one behind; the next start removes it rather than
+/// mistaking it for unversioned state.
+const STAMP_TEMPORARY_PREFIX: &str = ".state-format-";
 
 /// Where the compatibility policy every refusal points to lives.
 pub const POLICY_URL: &str = "https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#compatibility-before-100";
@@ -406,13 +427,26 @@ pub fn ensure_state_compatible(directory: &Path) -> Result<(), CompatibilityErro
     }
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
-        if entry.file_name() != "identity" || !entry.file_type()?.is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_file()
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(STAMP_TEMPORARY_PREFIX))
+        {
+            // A stamp a crash interrupted before its rename (#2053).
+            std::fs::remove_file(entry.path())?;
+            continue;
+        }
+        if entry.file_name() != "identity" || !file_type.is_dir() {
             return Err(CompatibilityError::DevelopmentState(
                 directory.to_path_buf(),
             ));
         }
     }
-    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(STAMP_TEMPORARY_PREFIX)
+        .tempfile_in(directory)?;
     let bytes = serde_json::to_vec(&StateStamp {
         format: CURRENT.state,
     })
@@ -430,6 +464,36 @@ pub fn ensure_state_compatible(directory: &Path) -> Result<(), CompatibilityErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A crash between creating the stamp's temporary file and renaming it
+    /// leaves the temporary file behind. The next start must still see a
+    /// fresh directory, stamp it and clear the leftover.
+    #[test]
+    fn a_stamp_left_half_written_by_a_crash_does_not_block_the_next_start() {
+        let directory = tempfile::tempdir().unwrap();
+        let leftover = tempfile::Builder::new()
+            .prefix(STAMP_TEMPORARY_PREFIX)
+            .tempfile_in(directory.path())
+            .unwrap();
+        let (_, leftover_path) = leftover.keep().unwrap();
+
+        ensure_state_compatible(directory.path()).unwrap();
+
+        assert!(directory.path().join(STATE_STAMP).is_file());
+        assert!(!leftover_path.exists());
+    }
+
+    /// Only the stamp's own leftovers are ignored: any other file still
+    /// means unversioned state.
+    #[test]
+    fn a_foreign_file_still_counts_as_unversioned_state() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join(".tmpabc123"), b"x").unwrap();
+        assert!(matches!(
+            ensure_state_compatible(directory.path()),
+            Err(CompatibilityError::DevelopmentState(_))
+        ));
+    }
 
     #[test]
     fn fresh_state_gets_a_durable_stamp_that_allows_restart() {

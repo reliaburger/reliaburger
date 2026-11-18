@@ -343,8 +343,20 @@ pub(crate) fn validate_app_spec(name: &str, app: &super::app::AppSpec) -> Result
 }
 
 fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError> {
-    // An app needs at least one of: image, command, exec, or script
-    if app.image.is_none() && app.command.is_empty() && app.exec.is_none() && app.script.is_none() {
+    // An app needs something to run: an image, or a host `exec` or
+    // `script`. A `command` alone has neither a root filesystem nor a host
+    // binary policy to run under, so no runtime could start it.
+    if app.image.is_none() && app.exec.is_none() && app.script.is_none() {
+        if !app.command.is_empty() {
+            return Err(ConfigError::Validation {
+                field: "command".to_string(),
+                context: format!("app {name:?}"),
+                reason: "a command needs something to run it in: add `image` for a container, \
+                         or use `exec` (with `command` as its arguments) or `script` for a host \
+                         process"
+                    .to_string(),
+            });
+        }
         return Err(ConfigError::MissingImage {
             name: name.to_string(),
         });
@@ -626,7 +638,7 @@ fn validate_app_inits(name: &str, app: &super::app::AppSpec) -> Result<(), Confi
 
 /// Refuse sidecars that can't run as declared (#1120): a name that isn't a
 /// DNS label or appears twice, a host app (whose network is the node's, so
-/// there's no namespace to share), no image to run, an encrypted value in a
+/// there's no namespace to share), an encrypted value in a
 /// sidecar's own `env`, and an app with an egress allowlist, which would
 /// hold the app to it but not its sidecars.
 fn validate_app_sidecars(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError> {
@@ -662,12 +674,6 @@ fn validate_app_sidecars(name: &str, app: &super::app::AppSpec) -> Result<(), Co
         validate_label(&sidecar.name, &context, "sidecar.name")?;
         if !seen.insert(sidecar.name.as_str()) {
             return Err(refuse(format!("two sidecars are named {:?}", sidecar.name)));
-        }
-        if sidecar.image.is_none() && app.image.is_none() {
-            return Err(refuse(format!(
-                "sidecar {:?} names no image, and the app has none to lend it",
-                sidecar.name
-            )));
         }
         if let Some(variable) = sidecar
             .env
@@ -1291,6 +1297,29 @@ impl NodeConfig {
             reason,
         })
     }
+
+    /// The ports this node serves on from its config: the cluster ports, the
+    /// registry, and ingress and DNS when they run. Port 0 (ask the OS) is
+    /// left out. Bun keeps the host-port allocator off these, together with
+    /// the API port from `--listen`, so a workload is never published on one.
+    pub fn service_ports(&self) -> Vec<u16> {
+        let mut ports = vec![
+            self.cluster.gossip_port,
+            self.cluster.raft_port,
+            self.cluster.reporting_port,
+            self.images.registry_port,
+        ];
+        if self.ingress.enabled {
+            ports.extend([self.ingress.http_port, self.ingress.https_port]);
+        }
+        if self.dns.enabled
+            && let Ok(listen) = self.dns.listen.parse::<std::net::SocketAddr>()
+        {
+            ports.push(listen.port());
+        }
+        ports.retain(|port| *port != 0);
+        ports
+    }
 }
 
 #[cfg(test)]
@@ -1684,6 +1713,22 @@ mod tests {
         );
     }
 
+    /// No runtime can start a `command` with no image, exec or script, so
+    /// lint refuses it instead of every launch failing.
+    #[test]
+    fn an_app_with_only_a_command_is_refused() {
+        let app: AppSpec = toml::from_str("command = [\"/bin/true\"]").unwrap();
+        let config = config_with_app("x", app);
+        let error = config.validate().unwrap_err();
+        assert!(
+            matches!(&error, ConfigError::Validation { field, .. } if field == "command"),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("image"), "{message}");
+        assert!(message.contains("exec"), "{message}");
+    }
+
     #[test]
     fn validate_config_file_both_content_and_source_rejected() {
         let mut app = minimal_app();
@@ -1917,15 +1962,6 @@ mod tests {
         .unwrap();
         assert_eq!(field, "sidecar");
         assert!(reason.contains("two sidecars"), "{reason}");
-    }
-
-    #[test]
-    fn a_sidecar_needs_an_image_of_its_own_or_the_apps() {
-        let (_, reason) = sidecar_refusal(
-            "command = [\"/app/run\"]\n[[sidecar]]\nname = \"p\"\ncommand = [\"x\"]\n",
-        )
-        .unwrap();
-        assert!(reason.contains("no image"), "{reason}");
     }
 
     #[test]
@@ -2181,6 +2217,25 @@ mod tests {
         assert!(error.contains("upload_timeout_secs"), "{error}");
         nc.storage.snapshots.upload_timeout_secs = 60;
         assert!(nc.validate().is_ok());
+    }
+
+    #[test]
+    fn service_ports_are_the_ports_the_node_listens_on() {
+        let mut nc = NodeConfig::default();
+        nc.cluster.gossip_port = 29443;
+        nc.images.registry_port = 25050;
+        nc.ingress.http_port = 28080;
+        nc.ingress.https_port = 0;
+        nc.dns.listen = "0.0.0.0:20053".into();
+        // Ingress and DNS count only when those listeners run.
+        assert_eq!(nc.service_ports(), vec![29443, 9444, 9445, 25050]);
+        nc.ingress.enabled = true;
+        nc.dns.enabled = true;
+        // Port 0 asks the OS for a port and names none.
+        assert_eq!(
+            nc.service_ports(),
+            vec![29443, 9444, 9445, 25050, 28080, 20053]
+        );
     }
 
     #[test]

@@ -82,6 +82,12 @@ relish join --token <TOKEN> --node-id node-02 \
   --ca-fingerprint sha256:<ROOT_CA_FINGERPRINT> https://<LEADER>:9117
 ```
 
+Pick node names that differ by more than their last two characters. Raft
+numbers each member from a hash of its name, and a few short names collide
+(`worker-c0` and `worker-ar`, for instance). The council refuses a join token,
+and a join, whose name collides with a node that has joined before or been
+decommissioned, and the error names that node: choose another name.
+
 `relish join-token list` shows the tokens the council holds (node id, and
 whether each is used, expired or still valid, never the token itself), and
 `relish join-token revoke node-02` makes node-02's unused tokens worthless.

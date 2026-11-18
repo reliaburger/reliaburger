@@ -267,11 +267,20 @@ again and checked:
 ```rust
 BackupDestination::FreshIdentity { path, identity } => {
     let key = age::x25519::Identity::generate();
-    // ...write the identity, owner-only, then the sealed backup...
+    // ...write the sealed backup, then the identity, owner-only...
     let written = read_back(path)?;
     check_opens(&written, &BackupOpener::Identity(key), backup, path, now)
 }
 ```
+
+The order of the two writes matters more than it looks. Both open with
+`create_new`, which refuses to replace a file that's already there, so a
+failed attempt must not leave anything behind that blocks the retry. The
+first version wrote the identity first: a backup directory that didn't exist
+left an identity with no backup beside it, and the operator's second try
+failed on that file. Now the backup goes first, and if the identity can't be
+written the backup is removed again. A test makes each of the two writes fail
+in turn and checks that nothing is left over.
 
 `relish init` writes the backup *before* the master key, the state or the
 config, so if the backup can't be written, there's no half-made cluster
@@ -429,6 +438,8 @@ in the joining node's `[cluster].join` configuration; pointing the HTTPS client
 at it can't work.
 
 The token is a 256-bit random value, SHA-256 hashed for storage. The cluster never stores the plaintext — only the hash goes into Raft. When a new node presents a token, the council hashes it and compares against stored hashes. If it matches, isn't expired, hasn't been consumed, and names the very node id in the request, the council marks it as consumed and issues a node certificate.
+
+One more check sits in front of that (#2050). Raft numbers its members with a `u64`, and we derive it from the node name with djb2 so every node can compute every peer's id. djb2 mixes short names badly: for any shared prefix, a name ending `c0` and one ending `ar` hash the same (33 × 99 + 48 = 33 × 97 + 114). Two nodes under one Raft id merge in the council directory, so if voter `worker-c0` died, a healthy `worker-ar` would fill its slot and the council would never replace the dead voter. A join is therefore refused when its Raft id matches a different node that has held a certificate or been retired, and the error names the node it clashes with. The pre-check in `check_join_token` gives the quick answer; the state machine repeats it when it consumes the token, so two joins racing each other can't both win, and again whenever it allocates a serial for a node leaf. Widening the hash would fix the cause, but every node derives every id, so that's a protocol change for another release.
 
 There's a subtlety in *who* issues the certificate. A brand-new node has nothing: no CA, no replicated state, no way to validate anyone. So it can't issue its own cert. Instead it asks an existing member. `relish join` POSTs to that member's `/v1/cluster/join` endpoint, which validates the token and signs the joiner a certificate, returning a bundle with the new cert plus the Node CA and Root CA certificates the joiner needs to verify future peers. The joiner writes all of that into its identity directory (the same `sesame::identity_store` layout the bootstrap node uses) and restarts. On the way back up it loads the identity and its listeners come up speaking mTLS.
 

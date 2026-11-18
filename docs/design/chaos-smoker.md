@@ -270,7 +270,7 @@ Resource faults operate entirely in userspace through Bun's existing cgroup and 
 
 **Disk I/O throttle.** Bun writes to the `blkio` cgroup controller for the target container, setting read/write bandwidth limits using `blkio.throttle.read_bps_device` and `blkio.throttle.write_bps_device`. This is the kernel's native I/O throttling mechanism.
 
-**Process faults.** Bun sends signals directly to the container's main process (PID 1 inside the container namespace). `kill` sends SIGKILL (immediate termination). `pause` sends SIGSTOP (freeze the process). `--resume` sends SIGCONT (unfreeze).
+**Process faults.** Bun sends signals directly to the container's main process (PID 1 inside the container namespace). `kill` sends SIGKILL (immediate termination). `pause` sends SIGSTOP (freeze the process). `--resume` sends SIGCONT (unfreeze). Stopping or deleting a paused instance doesn't need a resume first: every runtime follows the stop signal with SIGCONT. On runc that goes to both the `runc run` launcher and, through `runc kill <id> SIGCONT`, the container's init (#2041). The pid the runc runtime reports, and so the one `pause` signals, is the launcher, not the container; [#2079](https://github.com/reliaburger/reliaburger/issues/2079) tracks pausing the workload itself.
 
 ### 3.3 Request Flow
 

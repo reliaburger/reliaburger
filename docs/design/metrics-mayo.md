@@ -83,7 +83,7 @@ Each node stores its own metrics locally. There is no central metrics database. 
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-Inserts land in an in-memory buffer. On flush the buffer becomes an Arrow `RecordBatch`, is written to a new `metrics_NNNNNN.parquet` file, and dropped from memory. Queries see the Parquet files plus the unflushed buffer as a DataFusion `metrics` table (columns `timestamp UInt64`, `metric_name Utf8`, `labels Utf8` (a JSON object), `value Float64`) and run SQL over the union, streamed as §3.1.1 describes. A corrupt or truncated Parquet file is skipped with a log rather than failing the whole query.
+Inserts land in an in-memory buffer. On flush the buffer becomes an Arrow `RecordBatch`, is written to a new `metrics_NNNNNN.parquet` file, and dropped from memory. The write goes to a `.mayo-pending-*` temporary file, which is synced and renamed into place; `MayoStore::new` deletes any such file a crash left behind, since nothing else would (the size cap doesn't count it). Rollup files are written the same way. A rollup flush whose directory sync fails removes the file it just renamed, reports the failure and keeps its rows for the next flush: a rename that isn't synced can vanish in a power cut, and a file left in place would count those rows twice until the retry. A filesystem that can't sync directories at all (`EINVAL`, `ENOTSUP`, `ENOSYS`) isn't a failure. Queries see the Parquet files plus the unflushed buffer as a DataFusion `metrics` table (columns `timestamp UInt64`, `metric_name Utf8`, `labels Utf8` (a JSON object), `value Float64`) and run SQL over the union, streamed as §3.1.1 describes. A corrupt or truncated Parquet file is skipped with a log rather than failing the whole query.
 
 #### 3.1.1 Streamed queries
 
@@ -105,7 +105,7 @@ Every read path streams (#377): `/v1/metrics` by name or `*`, `/v1/metrics/app/�
 Retention is a single `retention_days` value (default **7**). Two paths prune Parquet files:
 
 - `MayoStore::prune(before)` deletes any file whose **newest datapoint** is older than the cutoff. The newest timestamp is read from the file's Parquet row-group statistics, not the file's mtime, so a touched/copied file with old data is still pruned and a file with recent data is kept regardless of mtime.
-- The disk-pressure task (`src/bun/disk_pressure.rs`) prunes oldest-first by file **mtime** when either `retention_days` has elapsed or `max_storage_mb` is exceeded (see §7.1). When an export destination is configured it exports a file before pruning it.
+- The disk-pressure task (`src/bun/disk_pressure.rs`) prunes oldest-first by file **mtime** when either `retention_days` has elapsed or `max_storage_mb` is exceeded (see §7.1). When an export destination is configured it exports a file before pruning it, and a tick whose export fails prunes nothing at all, so a broken destination holds both the cap and `retention_days` until an export succeeds. `relish wtf` reports that as `export-failing`.
 
 ### 3.3 Rollup Push to Council Members
 
@@ -296,6 +296,8 @@ An executor's cgroup holds its helper as well as its task groups, so the sample 
 **GPU metrics: none.** There is no `nvidia-smi` collection; no `*_gpu_*` metric is emitted.
 
 **Ingress metrics: implemented (counters), planned (durations).** The Wrapper proxy maintains a process-global `IngressMetrics` and Bun's collection loop emits `ingress_requests_total`, `ingress_responses_1xx`..`5xx`, and `ingress_requests_in_flight`. Per-route breakdowns and `ingress_request_duration_seconds` histograms remain **planned -- not yet implemented**.
+
+**Log store drops: implemented.** Bun's collection loop emits `ketchup_log_lines_dropped_total`, the log lines the node's log store dropped since Bun started because its buffer was full (#2057). It's zero unless the store fell behind.
 
 **Agent loop turns: implemented.** Bun times every turn of its agent loop by the `select!` branch that ran it (`snapshot`, `stop_wait`, `identity_signing`, `restart_step`, `state_sweep`, `follow_up`, `deploy_op`, `command`, `health_tick`) and its collection loop emits the histogram `bun_agent_loop_turn_seconds` as `_bucket{branch,le}` (bounds from 1 ms to 10 s, plus `+Inf`), `_sum{branch}` and `_count{branch}`. A branch that hasn't run yet emits nothing. The turn budget is 1 s (`src/bun/loop_meter.rs`, #351): `le="1"` against `le="+Inf"` is the share of turns within it. The V02 soak reads the histogram from `/v1/metrics` and fails a tier on any turn over the budget (`agent-loop-turn`, [releasing](../releasing.md)).
 
