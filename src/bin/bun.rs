@@ -2425,11 +2425,22 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
     // Drain container log lines from the agent into the LogStore. The store
     // skips lines it already holds, which a forwarder re-reads after a restart.
+    // A busy buffer wakes the flush task early (#2057), so a burst reaches
+    // Parquet long before the buffer's caps shed anything.
+    let log_flush_now = Arc::new(tokio::sync::Notify::new());
     {
         let drain_store = Arc::clone(&log_store);
+        let flush_now = Arc::clone(&log_flush_now);
         feeder_handles.push(tokio::spawn(async move {
             while let Some(rec) = log_rx.recv().await {
-                drain_store.write().await.ingest(&rec);
+                let flush_wanted = {
+                    let mut store = drain_store.write().await;
+                    store.ingest(&rec);
+                    store.flush_wanted()
+                };
+                if flush_wanted {
+                    flush_now.notify_one();
+                }
             }
         }));
     }
@@ -2449,6 +2460,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // measures) and `relish top` (which reads the latest usage).
     let job_telemetry = Arc::new(reliaburger::mayo::job_metrics::JobTelemetry::default());
     let collection_jobs = Arc::clone(&job_telemetry);
+    let collection_logs = Arc::clone(&log_store);
     feeder_handles.push(tokio::spawn(async move {
         // Off the runtime: the first refresh reads every process on the host.
         let Ok(mut collector) = tokio::task::spawn_blocking(SystemCollector::new).await else {
@@ -2516,6 +2528,15 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             value: value as f64,
                         });
                     }
+
+                    // Log lines the log store dropped because its buffer
+                    // was full (#2057): zero unless it fell behind.
+                    samples.push(reliaburger::mayo::collector::CollectedMetric {
+                        key: reliaburger::mayo::types::MetricKey::simple(
+                            "ketchup_log_lines_dropped_total",
+                        ),
+                        value: collection_logs.read().await.dropped_lines() as f64,
+                    });
 
                     // How long the agent loop's turns take, by branch. A long
                     // turn holds every caller, so this is the loop's health.
@@ -2631,25 +2652,31 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         });
     }
 
-    // Spawn log store flush task (every 60s)
+    // Spawn log store flush task: every 60s, and whenever the buffer asks.
+    // After a failed flush only the tick retries, so a full disk doesn't
+    // turn every ingested line into another failing flush.
     let log_flush_store = Arc::clone(&log_store);
     let log_flush_shutdown = shutdown.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut flush_failing = false;
         loop {
             tokio::select! {
                 _ = log_flush_shutdown.cancelled() => break,
-                _ = tick.tick() => {
-                    // Drain under the lock, write off it (M7): the sync Parquet
-                    // encode + fsync no longer runs while the write lock is held,
-                    // so log appends and queries aren't starved during a flush.
-                    if let Err(e) =
-                        reliaburger::ketchup::log_store::flush_shared(&log_flush_store).await
-                    {
-                        eprintln!("bun: log flush error: {e}");
-                    }
-                }
+                _ = tick.tick() => {}
+                _ = log_flush_now.notified(), if !flush_failing => {}
             }
+            // Drain under the lock, write off it (M7): the sync Parquet
+            // encode + fsync no longer runs while the write lock is held,
+            // so log appends and queries aren't starved during a flush.
+            flush_failing =
+                match reliaburger::ketchup::log_store::flush_shared(&log_flush_store).await {
+                    Ok(_) => false,
+                    Err(e) => {
+                        eprintln!("bun: log flush error: {e}");
+                        true
+                    }
+                };
         }
     });
 
@@ -2763,7 +2790,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
     // Spawn disk pressure check task (every 5 minutes)
     // Exports un-exported files before pruning, so data is never lost.
+    // A failing export holds that store's retention; `relish wtf` reports
+    // it from these holds (#2062).
+    let export_holds = reliaburger::bun::diagnostics::ExportHolds::default();
     {
+        let dp_export_holds = export_holds.clone();
         let dp_log_store = Arc::clone(&log_store);
         let dp_mayo_store = Arc::clone(&mayo_store);
         let dp_shutdown = shutdown.clone();
@@ -2822,8 +2853,16 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             log_retention_days,
                         )
                         .await;
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        dp_export_holds.record("logs", log_result.export_error.is_some(), now);
                         if let Some(error) = &log_result.export_error {
-                            eprintln!("bun: log export failed during disk pressure: {error}");
+                            eprintln!(
+                                "bun: log export failed during disk pressure: {error}; \
+                                 no log files are pruned until an export works"
+                            );
                         }
                         if log_result.files_pruned > 0 {
                             println!(
@@ -2842,8 +2881,16 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             metrics_retention_days,
                         )
                         .await;
+                        dp_export_holds.record(
+                            "metrics",
+                            metrics_result.export_error.is_some(),
+                            now,
+                        );
                         if let Some(error) = &metrics_result.export_error {
-                            eprintln!("bun: metrics export failed during disk pressure: {error}");
+                            eprintln!(
+                                "bun: metrics export failed during disk pressure: {error}; \
+                                 no metrics files are pruned until an export works"
+                            );
                         }
                         if metrics_result.files_pruned > 0 {
                             println!(
@@ -3175,6 +3222,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         diagnostics: reliaburger::bun::diagnostics::DiagnosticStaticEvidence {
             storage_paths: diagnostic_storage_paths,
             node_certificate: None,
+            export_holds: export_holds.clone(),
         },
         test_policy: config.testing.clone(),
         token_lifetime: config.security.token_lifetime(),

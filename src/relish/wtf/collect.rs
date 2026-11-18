@@ -18,10 +18,11 @@ use crate::relish::council_view::CouncilNodeObservation;
 use super::{
     AlertObservation, ApplicationEvidence, BackupObservation, BuildObservation,
     CertificateObservation, ClusterEvidence, CouncilObservation, CpuThrottleObservation,
-    DeployObservation, DiskObservation, Evidence, FaultObservation, GitOpsObservation,
-    IsolationObservation, LaunchFailureObservation, LogObservation, NodeGitOpsDifference,
-    NodeGitOpsUnreadable, NodeIsolation, NodeObservation, RegistryObservation, ReplicaObservation,
-    RestartObservation, ServiceObservation, TokenObservation, WtfInputs,
+    DeployObservation, DiskObservation, Evidence, ExportHoldObservation, FaultObservation,
+    GitOpsObservation, IsolationObservation, LaunchFailureObservation, LogObservation,
+    NodeGitOpsDifference, NodeGitOpsUnreadable, NodeIsolation, NodeObservation,
+    RegistryObservation, ReplicaObservation, RestartObservation, ServiceObservation,
+    TokenObservation, WtfInputs,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -49,6 +50,7 @@ struct NodeCollection {
 
 struct LocalEvidenceSet {
     disks: Evidence<Vec<DiskObservation>>,
+    export_holds: Evidence<Vec<ExportHoldObservation>>,
     cpu_throttling: Evidence<Vec<CpuThrottleObservation>>,
     certificates: Evidence<Vec<CertificateObservation>>,
 }
@@ -269,6 +271,7 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
             council,
             faults,
             disks: local.disks,
+            export_holds: local.export_holds,
             certificates: local.certificates,
             registry,
             tokens,
@@ -809,6 +812,7 @@ fn collect_alerts(
 
 fn collect_local_diagnostics(collected: &[NodeCollection], observed_at: u64) -> LocalEvidenceSet {
     let mut disks = EvidenceBuilder::default();
+    let mut export_holds = EvidenceBuilder::default();
     let mut cpu = EvidenceBuilder::default();
     let mut certificates = EvidenceBuilder::default();
     for node in collected {
@@ -817,6 +821,7 @@ fn collect_local_diagnostics(collected: &[NodeCollection], observed_at: u64) -> 
             Err(error) => {
                 let reason = format!("node {}: {error}", node.node_id);
                 disks.unavailable(reason.clone());
+                export_holds.unavailable(reason.clone());
                 cpu.unavailable(reason.clone());
                 certificates.unavailable(reason);
                 continue;
@@ -832,6 +837,18 @@ fn collect_local_diagnostics(collected: &[NodeCollection], observed_at: u64) -> 
                 used_percent: disk.used_percent,
             }
         });
+        export_holds
+            .values
+            .extend(
+                snapshot
+                    .export_holds
+                    .iter()
+                    .map(|hold| ExportHoldObservation {
+                        node_id: node.node_id.clone(),
+                        storage_domain: hold.storage_domain.clone(),
+                        failing_since: hold.failing_since,
+                    }),
+            );
         append_diagnostic_source(&snapshot.cpu_throttling, &node.node_id, &mut cpu, |item| {
             CpuThrottleObservation {
                 app: item.app.clone(),
@@ -858,6 +875,7 @@ fn collect_local_diagnostics(collected: &[NodeCollection], observed_at: u64) -> 
     coalesce_disk_filesystems(&mut disks.values);
     LocalEvidenceSet {
         disks: disks.finish(observed_at),
+        export_holds: export_holds.finish(observed_at),
         cpu_throttling: cpu.finish(observed_at),
         certificates: certificates.finish(observed_at),
     }
@@ -1398,6 +1416,10 @@ mod tests {
             backup: DiagnosticSource::Unsupported {
                 reason: "fixture".to_string(),
             },
+            export_holds: vec![crate::bun::diagnostics::ExportHoldEvidence {
+                storage_domain: "logs".to_string(),
+                failing_since: 7,
+            }],
         };
         let collected = vec![NodeCollection {
             node_id: "node-1".to_string(),
@@ -1414,6 +1436,14 @@ mod tests {
 
         let evidence = collect_local_diagnostics(&collected, 10);
 
+        assert_eq!(
+            evidence.export_holds.value().unwrap(),
+            &[ExportHoldObservation {
+                node_id: "node-1".to_string(),
+                storage_domain: "logs".to_string(),
+                failing_since: 7,
+            }]
+        );
         assert!(matches!(evidence.disks, Evidence::Degraded { .. }));
         assert_eq!(evidence.disks.value().unwrap().len(), 1);
         assert_eq!(evidence.disks.value().unwrap()[0].used_percent, 95.0);

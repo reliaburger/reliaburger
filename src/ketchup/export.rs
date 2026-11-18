@@ -32,6 +32,11 @@ use sha2::{Digest, Sha256};
 use super::types::KetchupError;
 use crate::file_lock::{FileLock, FileLockError};
 
+/// How many files' contents have been hashed, for tests that check an
+/// unchanged file isn't hashed again.
+#[cfg(test)]
+static FILES_HASHED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// The checkpoint filename both Bun tasks and `relish logs-export` use, so
 /// there is exactly one authoritative record of what has been exported.
 pub const CHECKPOINT_FILENAME: &str = "_export_checkpoint.json";
@@ -93,8 +98,8 @@ pub fn file_durable_id(path: &Path) -> Result<String, KetchupError> {
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| KetchupError::Io(std::io::Error::other("path has no filename")))?;
-    let contents = std::fs::read(path)?;
-    Ok(durable_id(filename, &contents))
+    let (_, hash) = file_sha256(path)?;
+    Ok(durable_id(filename, &hash))
 }
 
 /// Result of an export operation.
@@ -111,9 +116,131 @@ pub struct ExportResult {
 /// Two files sharing a name but not contents (a name reused after
 /// retention pruning) get different ids, so the checkpoint never skips
 /// genuinely new bytes.
-fn durable_id(filename: &str, contents: &[u8]) -> String {
-    let hash = hex::encode(Sha256::digest(contents));
-    format!("{filename}@{hash}")
+fn durable_id(filename: &str, sha256: &str) -> String {
+    format!("{filename}@{sha256}")
+}
+
+/// What tells one version of a file from another without reading it: its
+/// length, modification time, device and inode, all from one `fstat` of the
+/// open file. Flushes publish by renaming a new file into place, so a
+/// rewritten name is a new inode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    device: u64,
+    inode: u64,
+}
+
+impl FileStamp {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
+/// The SHA-256 of every store file hashed so far, by path, with the stamp
+/// it was taken at (#2058). Store files never change once written, so the
+/// five-minute disk-pressure tick would otherwise re-read and re-hash the
+/// whole store for nothing.
+///
+/// A std mutex, not a tokio one: it's only locked for a map lookup or
+/// insert, in synchronous code, and never held across an `.await`.
+static HASHES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (FileStamp, String)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn cached_hash(path: &Path, stamp: FileStamp) -> Option<String> {
+    let hashes = HASHES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    hashes
+        .get(path)
+        .filter(|(cached, _)| *cached == stamp)
+        .map(|(_, hash)| hash.clone())
+}
+
+fn remember_hash(path: &Path, stamp: FileStamp, hash: &str) {
+    HASHES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(path.to_path_buf(), (stamp, hash.to_string()));
+}
+
+/// Forget the hashes of files in `directory` that are no longer there, so
+/// the cache only holds what a store holds.
+fn forget_hashes_except(directory: &Path, names: &[String]) {
+    HASHES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|path, _| {
+            path.parent() != Some(directory)
+                || path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| names.iter().any(|kept| kept == name))
+        });
+}
+
+/// Hash what `reader` yields, in pieces: a store file can be larger than
+/// we'd want in memory at once. Returns the byte count and the hex digest.
+fn sha256_of(reader: &mut impl std::io::Read) -> std::io::Result<(u64, String)> {
+    #[cfg(test)]
+    FILES_HASHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0_u8; 256 * 1024];
+    let mut size = 0_u64;
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            return Ok((size, hex::encode(hash.finalize())));
+        }
+        size += count as u64;
+        hash.update(&buffer[..count]);
+    }
+}
+
+/// The size and hex SHA-256 of the file at `path`, from the cache when the
+/// file hasn't changed since it was last hashed. Blocking: run it on the
+/// blocking pool.
+fn file_sha256(path: &Path) -> std::io::Result<(u64, String)> {
+    let mut file = std::fs::File::open(path)?;
+    let stamp = FileStamp::of(&file.metadata()?);
+    if let Some(hash) = cached_hash(path, stamp) {
+        return Ok((stamp.len, hash));
+    }
+    let (size, hash) = sha256_of(&mut file)?;
+    // A file still being written isn't the one the stamp describes.
+    if size == stamp.len {
+        remember_hash(path, stamp, &hash);
+    }
+    Ok((size, hash))
+}
+
+/// Read a file to upload it, with its hex SHA-256. The hash comes from the
+/// cache when the file is the one last hashed, so a file is hashed once,
+/// not once to decide and again to upload. Blocking.
+fn read_for_upload(path: &Path) -> std::io::Result<(String, Vec<u8>)> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let stamp = FileStamp::of(&file.metadata()?);
+    let mut contents = Vec::with_capacity(usize::try_from(stamp.len).unwrap_or(0));
+    file.read_to_end(&mut contents)?;
+    let complete = contents.len() as u64 == stamp.len;
+    if complete && let Some(hash) = cached_hash(path, stamp) {
+        return Ok((hash, contents));
+    }
+    let (_, hash) = sha256_of(&mut contents.as_slice())?;
+    if complete {
+        remember_hash(path, stamp, &hash);
+    }
+    Ok((hash, contents))
 }
 
 /// Build the object store and key prefix for a destination.
@@ -292,34 +419,48 @@ async fn export_logs_locked(
         candidates.push(name);
     }
     candidates.sort();
+    forget_hashes_except(source_dir, &candidates);
 
     let mut result = ExportResult::default();
     let mut live_ids = HashSet::new();
     for filename in candidates {
         let source_path = source_dir.join(&filename);
-        let contents = match tokio::fs::read(&source_path).await {
-            Ok(bytes) => bytes,
+        // Reading and hashing are blocking work: off the runtime (#2058).
+        let path = source_path.clone();
+        let hashed = tokio::task::spawn_blocking(move || file_sha256(&path))
+            .await
+            .map_err(|error| KetchupError::Io(std::io::Error::other(error.to_string())))?;
+        let hash = match hashed {
+            Ok((_, hash)) => hash,
             // Retention may remove an immutable source between enumeration and read.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(KetchupError::Io(std::io::Error::new(
-                    error.kind(),
-                    format!("read export source {}: {error}", source_path.display()),
-                )));
-            }
+            Err(error) => return Err(read_source_error(&source_path, error)),
         };
-        let id = durable_id(&filename, &contents);
+        let id = durable_id(&filename, &hash);
         live_ids.insert(id.clone());
         if checkpoint.exported_files.contains(&id) {
             continue;
         }
 
+        let path = source_path.clone();
+        let read = tokio::task::spawn_blocking(move || read_for_upload(&path))
+            .await
+            .map_err(|error| KetchupError::Io(std::io::Error::other(error.to_string())))?;
+        let (hash, contents) = match read {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(read_source_error(&source_path, error)),
+        };
+        // The bytes uploaded name the object, even if the file changed
+        // since it was hashed above.
+        let id = durable_id(&filename, &hash);
+        live_ids.insert(id.clone());
+
         // Include the generation in the object key, not only the checkpoint.
         // Keep the Parquet extension so archive queries discover every generation.
-        let key = node_prefix.clone().join(archive_object_name(
-            &hex::encode(Sha256::digest(&contents)),
-            &filename,
-        ));
+        let key = node_prefix
+            .clone()
+            .join(archive_object_name(&hash, &filename));
         let len = contents.len() as u64;
         store
             .put(&key, object_store::PutPayload::from(contents))
@@ -335,6 +476,13 @@ async fn export_logs_locked(
     // can be forgotten: immutable destination keys make a later retry safe.
     checkpoint.exported_files.retain(|id| live_ids.contains(id));
     Ok(result)
+}
+
+fn read_source_error(path: &Path, error: std::io::Error) -> KetchupError {
+    KetchupError::Io(std::io::Error::new(
+        error.kind(),
+        format!("read export source {}: {error}", path.display()),
+    ))
 }
 
 /// One Parquet file in a node's log store, as `GET /v1/logs/archive` lists it.
@@ -415,23 +563,9 @@ pub async fn list_archive(
     })
 }
 
-/// The size and hex SHA-256 of a file, read in pieces: a store can hold more
-/// than we'd want in memory at once.
+/// The size and hex SHA-256 of a store file, hashed once and cached.
 fn hash_archive_file(path: &Path) -> std::io::Result<(u64, String)> {
-    use std::io::Read;
-
-    let mut file = std::fs::File::open(path)?;
-    let mut hash = Sha256::new();
-    let mut buffer = vec![0_u8; 256 * 1024];
-    let mut size = 0_u64;
-    loop {
-        let count = file.read(&mut buffer)?;
-        if count == 0 {
-            return Ok((size, hex::encode(hash.finalize())));
-        }
-        size += count as u64;
-        hash.update(&buffer[..count]);
-    }
+    file_sha256(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -441,6 +575,47 @@ fn hash_archive_file(path: &Path) -> std::io::Result<(u64, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The durable id of a file holding `contents`.
+    fn content_id(filename: &str, contents: &[u8]) -> String {
+        durable_id(filename, &hex::encode(Sha256::digest(contents)))
+    }
+
+    /// The disk-pressure tick exported every five minutes, and each pass
+    /// read and hashed every file in the store twice, then the pruner hashed
+    /// each once more: gigabytes of SHA-256 per tick for files that never
+    /// change. An unchanged file is now hashed once.
+    #[tokio::test]
+    async fn an_unchanged_file_is_hashed_once_across_exports_and_prunes() {
+        let source = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let destination = dest.path().to_str().unwrap();
+        for n in 0..3 {
+            std::fs::write(
+                source.path().join(format!("logs_{n:06}.parquet")),
+                format!("log data {n}"),
+            )
+            .unwrap();
+        }
+        let mut checkpoint = ExportCheckpoint::default();
+        let before = FILES_HASHED.load(std::sync::atomic::Ordering::Relaxed);
+
+        let first = export_logs(source.path(), destination, "node-1", &mut checkpoint)
+            .await
+            .unwrap();
+        assert_eq!(first.files_exported, 3);
+        let second = export_logs(source.path(), destination, "node-1", &mut checkpoint)
+            .await
+            .unwrap();
+        assert_eq!(second.files_exported, 0);
+        for n in 0..3 {
+            let path = source.path().join(format!("logs_{n:06}.parquet"));
+            assert!(checkpoint.contains_file(&path, destination, "node-1"));
+        }
+
+        let hashed = FILES_HASHED.load(std::sync::atomic::Ordering::Relaxed) - before;
+        assert_eq!(hashed, 3, "each unchanged file should be hashed once");
+    }
 
     #[test]
     fn archive_file_names_are_one_parquet_path_component() {
@@ -499,7 +674,7 @@ mod tests {
     #[test]
     fn durable_id_is_the_name_and_known_content_digest() {
         assert_eq!(
-            durable_id("metrics.parquet", b"abc"),
+            content_id("metrics.parquet", b"abc"),
             "metrics.parquet@ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
     }
@@ -601,7 +776,7 @@ mod tests {
         // Pre-record the durable id of the first file.
         checkpoint
             .exported_files
-            .insert(durable_id("logs_000000.parquet", b"data1"));
+            .insert(content_id("logs_000000.parquet", b"data1"));
         checkpoint
             .save(&source.path().join(CHECKPOINT_FILENAME))
             .unwrap();
@@ -785,10 +960,10 @@ mod tests {
         let mut checkpoint = ExportCheckpoint::default();
         checkpoint
             .exported_files
-            .insert(durable_id("logs_000000.parquet", b"a"));
+            .insert(content_id("logs_000000.parquet", b"a"));
         checkpoint
             .exported_files
-            .insert(durable_id("logs_000001.parquet", b"b"));
+            .insert(content_id("logs_000001.parquet", b"b"));
         checkpoint.save(&path).unwrap();
 
         let loaded = ExportCheckpoint::load(&path);
@@ -893,8 +1068,8 @@ mod tests {
 
     #[test]
     fn durable_id_differs_for_same_name_different_bytes() {
-        let a = durable_id("logs_000000.parquet", b"first");
-        let b = durable_id("logs_000000.parquet", b"second");
+        let a = content_id("logs_000000.parquet", b"first");
+        let b = content_id("logs_000000.parquet", b"second");
         assert_ne!(a, b);
     }
 

@@ -33,8 +33,10 @@ impl GitRepo {
     /// (someone repointed `[gitops] repo` or `branch`, or a stale clone
     /// survived a failover) triggers a fresh clone rather than silently
     /// syncing the wrong repo (GIT4). A fresh clone is fetched into a
-    /// temporary sibling directory and swapped in, so a mid-clone crash
-    /// never leaves a half-populated repo in place.
+    /// temporary sibling directory and renamed into place, so a mid-clone
+    /// crash never leaves a half-populated repo at `path`. Whatever was at
+    /// `path` (a drifted clone, or a directory without HEAD) is replaced
+    /// only once the new clone is complete (#2061).
     pub fn clone_or_open(url: &str, path: &Path, branch: &str) -> Result<Self, LettuceError> {
         Self::clone_or_open_with_budget(url, path, branch, CommandBudget::default())
     }
@@ -47,38 +49,72 @@ impl GitRepo {
         branch: &str,
         budget: CommandBudget,
     ) -> Result<Self, LettuceError> {
-        if path.join("HEAD").exists() {
-            match reused_clone_matches(path, url, branch, &budget) {
-                Ok(true) => {
-                    return Ok(Self {
-                        path: path.to_path_buf(),
-                        url: url.to_string(),
-                        branch: branch.to_string(),
-                        budget,
-                    });
-                }
-                // Drift or an unreadable clone: discard and re-clone.
-                Ok(false) | Err(_) => {
-                    std::fs::remove_dir_all(path).map_err(|e| {
-                        LettuceError::GitFailed(format!(
-                            "failed to remove drifted clone at {}: {e}",
-                            path.display()
-                        ))
-                    })?;
-                }
-            }
+        // A drifted or unreadable clone falls through to a fresh clone; the
+        // old one stays until the new one is complete.
+        if path.join("HEAD").exists()
+            && matches!(reused_clone_matches(path, url, branch, &budget), Ok(true))
+        {
+            return Ok(Self {
+                path: path.to_path_buf(),
+                url: url.to_string(),
+                branch: branch.to_string(),
+                budget,
+            });
         }
-
+        // Whatever is at `path` now (a drifted clone, or a HEAD-less
+        // directory an interrupted clone left) is replaced once the new
+        // clone succeeds.
         Self::fresh_clone(url, path, branch, budget)
     }
 
-    /// Perform a fresh bare clone at `path`.
+    /// Perform a fresh bare clone, published at `path` only once it is
+    /// complete.
+    ///
+    /// The clone goes into a `.<name>.cloning` sibling and is renamed into
+    /// place, so a clone killed by its deadline leaves nothing at `path`.
+    /// The staging name is fixed rather than random, so the next attempt
+    /// removes what a killed one left.
     fn fresh_clone(
         url: &str,
         path: &Path,
         branch: &str,
         budget: CommandBudget,
     ) -> Result<Self, LettuceError> {
+        let staging = staging_path(path)?;
+        if staging.exists() {
+            remove_clone(&staging, "interrupted clone")?;
+        }
+        let cloned = Self::clone_into(url, &staging, branch, &budget);
+        if let Err(error) = cloned {
+            // A failed clone may have written part of the staging directory.
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+        if path.exists() {
+            remove_clone(path, "replaced clone")?;
+        }
+        std::fs::rename(&staging, path).map_err(|e| {
+            let _ = std::fs::remove_dir_all(&staging);
+            LettuceError::GitFailed(format!(
+                "failed to move the new clone into {}: {e}",
+                path.display()
+            ))
+        })?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            url: url.to_string(),
+            branch: branch.to_string(),
+            budget,
+        })
+    }
+
+    /// Run `git clone --bare` into `path`.
+    fn clone_into(
+        url: &str,
+        path: &Path,
+        branch: &str,
+        budget: &CommandBudget,
+    ) -> Result<(), LettuceError> {
         // M27: keep the secret out of argv (world-readable via /proc) and out
         // of the clone's `.git/config` (where it would outlive the process).
         // The sanitised URL is what git stores as the remote; `fetch` supplies
@@ -94,7 +130,7 @@ impl GitRepo {
             .arg("--")
             .arg(&safe_url)
             .arg(path);
-        let output = run_bounded(command, &budget, "git clone")?;
+        let output = run_bounded(command, budget, "git clone")?;
 
         if !output.status.success() {
             return Err(LettuceError::GitFailed(format!(
@@ -102,13 +138,7 @@ impl GitRepo {
                 redact_git_output(&output.stderr, url)
             )));
         }
-
-        Ok(Self {
-            path: path.to_path_buf(),
-            url: url.to_string(),
-            branch: branch.to_string(),
-            budget,
-        })
+        Ok(())
     }
 
     /// A `git` command that runs in the clone.
@@ -450,6 +480,27 @@ pub(crate) fn redact_url_credentials(text: &str) -> String {
         out.push_str(trailing_ws);
     }
     out
+}
+
+/// The sibling a fresh clone of `path` is staged in.
+fn staging_path(path: &Path) -> Result<std::path::PathBuf, LettuceError> {
+    let name = path.file_name().ok_or_else(|| {
+        LettuceError::GitFailed(format!("clone path {} has no name", path.display()))
+    })?;
+    let mut staging = std::ffi::OsString::from(".");
+    staging.push(name);
+    staging.push(".cloning");
+    Ok(path.with_file_name(staging))
+}
+
+/// Remove a clone directory that can't be used, saying which kind.
+fn remove_clone(path: &Path, what: &str) -> Result<(), LettuceError> {
+    std::fs::remove_dir_all(path).map_err(|e| {
+        LettuceError::GitFailed(format!(
+            "failed to remove {what} at {}: {e}",
+            path.display()
+        ))
+    })
 }
 
 /// Does the clone already at `path` still track `url` on `branch`?
@@ -1033,5 +1084,63 @@ mod tests {
         assert_eq!(current, url_b);
 
         drop(dir_b);
+    }
+
+    /// A clone killed before it wrote HEAD left a non-empty directory with no
+    /// HEAD at the path, and every later `git clone` failed with "destination
+    /// path already exists" until someone removed it by hand.
+    #[test]
+    fn a_half_written_clone_without_head_is_replaced() {
+        let (dir, repo_path) = create_test_repo();
+        let clone_path = dir.path().join("clone");
+        std::fs::create_dir_all(clone_path.join("objects/pack")).unwrap();
+        std::fs::write(clone_path.join("objects/pack/partial.pack"), b"x").unwrap();
+        let url = format!("file://{}", repo_path.display());
+
+        let repo = GitRepo::clone_or_open(&url, &clone_path, "main").unwrap();
+
+        assert!(clone_path.join("HEAD").exists());
+        assert!(repo.head_sha().is_ok());
+    }
+
+    /// A failed clone leaves nothing at the path or beside it.
+    #[test]
+    fn a_failed_clone_leaves_nothing_behind() {
+        let dir = TempDir::new().unwrap();
+        let clone_path = dir.path().join("clone");
+        let url = format!("file://{}", dir.path().join("missing").display());
+
+        assert!(GitRepo::clone_or_open(&url, &clone_path, "main").is_err());
+
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(left.is_empty(), "a failed clone left {left:?}");
+    }
+
+    /// A drifted clone was deleted before the new one was fetched, so a
+    /// fetch that failed left no clone at all. It is now replaced only once
+    /// the new clone is complete.
+    #[test]
+    fn a_failed_reclone_keeps_the_drifted_clone() {
+        let (dir, repo_path) = create_test_repo();
+        let clone_path = dir.path().join("clone");
+        let url = format!("file://{}", repo_path.display());
+        GitRepo::clone_or_open(&url, &clone_path, "main").unwrap();
+        let missing = format!("file://{}", dir.path().join("missing").display());
+
+        assert!(GitRepo::clone_or_open(&missing, &clone_path, "main").is_err());
+
+        assert!(
+            clone_path.join("HEAD").exists(),
+            "the old clone was deleted"
+        );
+        let origin = Command::new("git")
+            .args(["config", "--", "remote.origin.url"])
+            .current_dir(&clone_path)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&origin.stdout).trim(), url);
     }
 }

@@ -456,6 +456,8 @@ if !self.seen_windows.insert(key) {
 
 `HashSet::insert` returns `false` if the key was already present, which is exactly the "have I seen this?" question we need in one call.
 
+**Temp files that outlived a crash, and a sync nobody checked.** A metrics flush writes a randomly named `.mayo-pending-*` file and renames it into place. A crash between the two left the temp file for good: nothing deleted it and the size cap didn't count it (#2059). `MayoStore::new` now deletes them, which is safe because one Bun owns the directory. The rollup writer had the opposite slip. It renamed its file and then synced the directory, but threw away a failed sync and returned `Ok`, so the caller cleared its buffer while the rename could still vanish in a power cut (#2060). The error now propagates and the rows wait for the next flush. That alone left a second bug, which review caught: the renamed file stayed in place while the rows waited, so queries counted them twice until the retry. So the writer removes the file before it reports the failure. A filesystem that can't sync a directory at all answers `EINVAL`, `ENOTSUP` or `ENOSYS`, and that isn't a failed flush: the bytes are synced and there's nothing to retry. The test takes read permission off the directory (`0o300`: write and search only), so creating and renaming the file still work and only opening the directory to sync it fails.
+
 **Rollups that vanished on restart.** The rollup store kept its flushed data in an in-memory `Vec<RecordBatch>` and named every Parquet file with a counter that reset to zero on start. So a restart both lost all history *and* overwrote `rollup_000000.parquet` with new data. We fixed both by making the rollup store read its history back from the Parquet directory (like the metrics store already did) and by seeding the flush counter one past the highest file on disk. Restart now recovers everything and appends rather than clobbering.
 
 **Per-app metrics that were never collected.** Production only collected node-level metrics (CPU, memory for the whole box). The autoscaler and the per-app dashboards had nothing to read. The collector already knew how to scrape a single process; it just wasn't being called. The collection loop now asks the agent for its running instances and collects per-process CPU and memory for each one, labelled `namespace/app`. (Even then the autoscaler kept asking for a series called `cpu` that nobody records. Chapter 9 tells that story. The per-process memory series is what memory autoscaling reads; Chapter 9 also shows it driving a real scale-up on runc.)
@@ -1278,6 +1280,89 @@ make an app block when Bun is slow. The issue also asked about the soak's own
 export directory, which grows about 600 MiB a day on each node. That's the
 harness's to bound, and it stays open in #1418.
 
+### Dropped, and saying so
+
+The buffer in front of all this had a cap from the first hardening pass: a
+million rows, after which the oldest go. It was meant for a disk that keeps
+failing. The 16 November review found it bit a healthy disk too. Flushes ran
+once a minute and nothing flushed sooner, so an app printing more than about
+17,000 lines a second lost lines (#2057). Nothing said so. `ingest` moves the
+capture offset forward when a line arrives, before it's stored, so the next
+checkpoint skipped the lost lines, and the reclaim from "Giving the disk
+back" then punched holes over the capture's copy. And the cap counted rows,
+not bytes: a million 4 KiB lines is 4 GiB.
+
+The first two changes make dropping rare. The store says when it wants
+flushing, and the task that feeds it wakes the flush task:
+
+```rust
+let flush_wanted = {
+    let mut store = drain_store.write().await;
+    store.ingest(&rec);
+    store.flush_wanted()
+};
+if flush_wanted {
+    flush_now.notify_one();
+}
+```
+
+The block computes a value and drops the write lock at its closing brace, so
+the notification goes out with no lock held. `tokio::sync::Notify` is a
+wake-up with no payload. If nobody is waiting, `notify_one` stores a single
+permit, so a burst of calls while a flush is running becomes one more flush,
+not a queue of them. The flush task waits on `notified()` beside its minute
+tick, as a `tokio::select!` branch written `_ = log_flush_now.notified(), if
+!flush_failing => {}`. The `, if` is the macro's precondition: while the last
+flush failed, that branch is switched off and only the tick retries, so a full
+disk doesn't turn every ingested line into another failing flush. At 100,000 rows
+or 32 MiB the store asks; the caps are now 1,000,000 rows *or* 256 MiB,
+counting a flush still being written.
+
+The third change decides what a drop means. Our first answer was replay:
+each buffered line remembered where in its capture it started, and no
+checkpoint saved an offset past the first dropped line, so a restart would
+read the lost lines again. Review found two problems with it, both visible
+in our own test. Capture files don't rotate, so the hold lasted for the rest
+of Bun's life: the reclaim never got past it, and a chatty instance's capture
+grew without bound, the disk fill of #1418 back again. And a restart re-read
+everything from the hold onwards, including the lines already in Parquet, so
+the store's promise never to store a line twice was broken.
+
+So a drop is now an honest, counted loss. The checkpoint moves on as usual.
+Each log that lost lines gets one marker line, on stderr, where the gap is:
+
+```rust
+for entry in self.buffer.drain(0..overflow) {
+    let owner = (entry.app, entry.namespace, entry.instance);
+    let marker = self.drop_markers.entry(owner).or_insert(DropMarker {
+        count: 0,
+        timestamp: entry.timestamp,
+        sequence: entry.sequence,
+    });
+    marker.count += 1;
+    marker.timestamp = entry.timestamp;
+    marker.sequence = entry.sequence;
+}
+```
+
+`drain(0..overflow)` removes that range from the vector and hands each
+element over by value, so the loop can move the strings into the map key
+instead of copying them. The marker takes the last dropped line's sequence,
+so a query sorts it into the gap. Markers live beside the buffer, not in it,
+so they're never dropped themselves; the next flush writes them as ordinary
+rows reading "3 log lines dropped: the log store fell behind". The store also
+counts the lines in `dropped_lines`, which Bun's collection loop reports as
+the metric `ketchup_log_lines_dropped_total`, and Bun's log says how many
+went at each flush.
+
+`shed_lines_are_counted_and_marked_in_the_instance_log` caps the buffer at
+two rows, drops three of seven lines and expects the marker between the
+survivors. `a_restart_after_a_shed_stores_nothing_twice` reopens the store
+and replays the whole capture into it: nothing is stored again.
+`the_capture_is_reclaimed_after_a_shed` follows a 4 MiB capture into a store
+capped at 1,000 rows and checks the flush still frees all but the retained
+tail. With the replay version it freed nothing.
+
 ### The tail that stopped
 
 `relish logs soak-redis-client --tail 20` answered `INCR 1628` on 30 October
@@ -1444,6 +1529,45 @@ The regression writes a log file, configures an unsupported export destination,
 and sets the pressure threshold below the file's size. It asserts both that the
 failure is reported and that the local file survives. Reporting a failed backup
 mustn't turn it into permission to delete the only copy.
+
+A failed export still holds every file, and that means it holds retention
+too: with an `export_path` set, a tick whose export fails prunes nothing, by
+size or by age, until an export works again. That's the right call (deleting
+the only copy of what we couldn't ship is the bug the checkpoint exists to
+prevent), but an operator only found out from a log line every five minutes
+while the disk filled (#2062). Bun now records which store's export is
+failing and since when, the diagnostics endpoint reports it, and `relish wtf`
+turns it into an `export-failing` warning that says retention is on hold. The
+record carries no error text, because the diagnostics payload never carries
+host paths, and an object store's error can name one; the warning points at
+Bun's log for the reason.
+
+### Hash once
+
+The disk-pressure tick exports before it prunes, and each export read every
+Parquet file in the store and hashed it twice: once for the durable id, once
+more for the object key. Then the pruner hashed each file a third time to
+check it had shipped. With the default caps that's about 3 GiB of SHA-256
+every five minutes, inline on a runtime worker, for files that never change
+once written (#2058). Now one function does the hashing, `file_sha256`, on
+the blocking pool, and it remembers each result:
+
+```rust
+static HASHES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (FileStamp, String)>>,
+> = std::sync::LazyLock::new(Default::default);
+```
+
+A `static` in Rust has to be built at compile time, and a `HashMap`
+allocates, so it can't be. `LazyLock` builds it on first use and then hands
+out the same one forever, like a function-local `static` in C that's
+initialised once. The `Mutex` is the `std` one, not tokio's, because it's
+only ever locked for a lookup or an insert, in synchronous code, never across
+an `.await`. `FileStamp` is the length, modification time, device and inode,
+all taken from one `fstat` of the open file. A flush publishes by renaming a
+new file over the name, so a reused name is a new inode and misses the cache.
+`an_unchanged_file_is_hashed_once_across_exports_and_prunes` exports three
+files twice and asks the pruner about each: before, nine hashes; now, three.
 
 ### Offline exports must report partial success
 
