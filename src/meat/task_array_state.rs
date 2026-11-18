@@ -211,6 +211,8 @@ pub enum TaskArrayError {
         retried: u64,
         causes: u64,
     },
+    #[error("chunk {chunk} report has more duration samples than tasks that ran")]
+    DurationCountMismatch { chunk: u32 },
 }
 
 /// Aggregate progress of one array, computed without touching tasks.
@@ -594,6 +596,15 @@ impl TaskArrayState {
                 causes,
             });
         }
+        // The snapshot decoder holds the whole array to this bound, so a
+        // report past it would be applied live and then fail to decode.
+        let samples = result
+            .duration_counts
+            .iter()
+            .try_fold(0u64, |total, count| total.checked_add(*count));
+        if samples.is_none_or(|samples| samples > u64::from(result.succeeded) + failed) {
+            return Err(TaskArrayError::DurationCountMismatch { chunk });
+        }
 
         self.release(node, chunk);
         self.attempts.remove(&chunk);
@@ -606,16 +617,21 @@ impl TaskArrayState {
             .insert(chunk);
         self.fold_accepted_when_full();
         for (total, count) in self.duration_counts.iter_mut().zip(result.duration_counts) {
-            *total += count;
+            *total = total.saturating_add(count);
         }
         for (recent, count) in self
             .recent_duration_counts
             .iter_mut()
             .zip(result.duration_counts)
         {
-            *recent += count;
+            *recent = recent.saturating_add(count);
         }
-        while self.recent_duration_counts.iter().sum::<u64>() > RECENT_DURATION_SAMPLES {
+        while self
+            .recent_duration_counts
+            .iter()
+            .fold(0u64, |total, count| total.saturating_add(*count))
+            > RECENT_DURATION_SAMPLES
+        {
             for recent in &mut self.recent_duration_counts {
                 *recent /= 2;
             }
@@ -1652,6 +1668,40 @@ mod tests {
             })
         );
         assert_eq!(state, before);
+    }
+
+    #[test]
+    fn a_report_with_more_durations_than_executed_tasks_is_refused() {
+        for (bucket, count) in [(0, 100), (3, u64::MAX)] {
+            let mut state = TaskArrayState::new(spec(1000, 100), 1).unwrap();
+            state.grant(&node("n1"), &chunks(0..=0)).unwrap();
+            let mut result = all_ok(&state, 0);
+            result.duration_counts[bucket] = count;
+            result.duration_counts[15] = 1;
+            let before = state.clone();
+            assert_eq!(
+                state.complete(&node("n1"), &result),
+                Err(TaskArrayError::DurationCountMismatch { chunk: 0 })
+            );
+            assert_eq!(state, before);
+        }
+    }
+
+    #[test]
+    fn accepted_duration_counts_survive_a_snapshot_round_trip() {
+        let mut state = TaskArrayState::new(spec(1000, 100), 1).unwrap();
+        state.grant(&node("n1"), &chunks(0..=1)).unwrap();
+        let mut result = all_ok(&state, 0);
+        result.duration_counts[2] = 100;
+        state.complete(&node("n1"), &result).unwrap();
+        let mut result = all_ok(&state, 1);
+        result.succeeded = 60;
+        result.not_run = 40;
+        result.duration_counts[5] = 60;
+        state.complete(&node("n1"), &result).unwrap();
+        let reopened: TaskArrayState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(reopened, state);
     }
 
     #[test]
