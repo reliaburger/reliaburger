@@ -1550,6 +1550,22 @@ record ([the 28 October review](../qualification/2026-10-28-dependency-exception
 `main` took 0.13.5 in [#1409](https://github.com/reliaburger/reliaburger/pull/1409). An
 advisory is where the review starts, not the verdict.
 
+The night before 0.3.0's candidate was due, RustSec marked three crates unmaintained at
+once: `chrono`, `chrono-tz` and `humantime`. Their maintainer had wound the project down and
+pointed users at `jiff`, and from that evening every pull request's audit failed. None of
+the three is ours. Our code keeps time with `std::time`, but Arrow, Parquet, DataFusion,
+`object_store`, `openraft`, the OCI client, the MCP server crate and the Prometheus parser
+all use chrono, and DataFusion asks Arrow for `chrono-tz` itself. An unmaintained advisory
+has no fixed version to move to, and the newest release of every one of those crates,
+Arrow 60 included, still uses chrono, so the only fix was replacing a dozen other projects'
+code. The three got dated exceptions
+([the 17 November review](../qualification/2026-11-17-dependency-exceptions.md)) and a test
+with two jobs: it fails if Reliaburger itself starts depending on one of them, so the
+exception can't become cover for new code, and it fails if an exception outlives its crate
+in the lockfile. [#2036](https://github.com/reliaburger/reliaburger/issues/2036) removes
+them as upstream moves. Unmaintained means nobody will fix the next bug, not that a bug is
+known, and that's what a dated exception is for.
+
 Sometimes the next major version isn't there to take. bincode's list said 1→3, and bincode
 3.0.0 turned out to be a crate whose only code is a `compile_error!`, published when its
 maintainers stopped. No version clears its unmaintained advisory, so "bump it" became
