@@ -1158,10 +1158,48 @@ What's `room` for? A line has to end somewhere. Output with no newline, a
 until the newline finally came. So a line stops growing at `MAX_CAPTURED_LINE_BYTES` (64 KiB).
 The reader hands on that prefix as the line and sets `discarding`, the flag
 it already used to skip the rest of a line whose start was reclaimed, so the
-remainder is counted and dropped up to the next newline. Counting matters:
-the capture offset keeps moving, so the log store can still reclaim the
-file. `a_stream_with_no_newline_stays_within_the_line_cap` pushes 100 MiB
-with no newline in 64 KiB chunks and checks the buffer after every one.
+remainder is counted and dropped up to the next newline.
+
+Counting isn't enough on its own, though. The log store learns how far a
+capture has been read only from the positions on the lines it ingests, and
+it only reclaims a capture's disk up to that offset. Skipped bytes have no
+line, so a progress bar that never printed a newline kept its whole capture
+file on disk, growing forever, while memory stayed flat. So every
+`SKIPPED_REPORT_BYTES` (1 MiB) of skipping, the reader hands on a small line
+of its own, `[skipped 1048576 more bytes of a cut line]`, carrying the
+position it has reached. The store needs no new idea: it ingests a line,
+moves the offset and reclaims behind it, exactly as before. Why not a
+record with a position and no line? We considered it. The store saves its
+offsets only when it flushes rows, so an offset with no row would wait
+for some other line to come along, and on a quiet node that might never
+happen. The marker costs one short row per megabyte, and it also tells you
+the line went on. `a_capture_with_no_newline_is_reclaimed_once_flushed`
+follows an 8 MiB capture with no newline into a real `LogStore`, flushes it
+and checks that the file's disk allocation drops to the retained tail.
+`a_stream_with_no_newline_stays_within_the_line_cap` pushes 100 MiB with no
+newline in 64 KiB chunks and checks the buffer after every one.
+
+Those markers have a side effect a reviewer caught. They checkpoint an offset
+in the middle of a line, and a reader resumed after a Bun restart always
+assumed its offset started a line. So the rest of a never-ending line came
+out looking like a fresh one. `resume` now looks at the byte before the
+offset. If it isn't a newline (a reclaimed hole reads as zeros, which count
+as mid-line too), the reader starts out skipping, just as it would have
+without the restart. `resume_inside_a_skipped_line_keeps_skipping_it` and
+`resume_after_a_zeroed_byte_keeps_skipping` pin both cases.
+
+A cut line has to say so, or a reader takes 64 KiB for the whole line. So
+it ends with ` [line cut at 64 KiB]`. And the cut must not land inside a
+character. Rust's `String` is always valid UTF-8, so `from_utf8_lossy`
+turns half an "é" into U+FFFD, the replacement character, and the line
+would end in garbage the workload never wrote. UTF-8 makes the fix cheap:
+every byte after the first one of a multi-byte character starts with the
+bits `10`. If the first byte left out is one of those, the character
+began inside the kept part, so `character_boundary` steps back to the
+byte that starts it, at most three bytes. In Go you'd reach for
+`utf8.RuneStart`; in Rust it's one mask, `byte & 0b1100_0000 ==
+0b1000_0000`. `a_line_is_cut_at_a_character_boundary` puts the cap in the
+middle of an "é" and checks that the kept text is a clean prefix.
 
 Should one stuck instance be able to stop a node at all? Adoption is
 fail-closed by design: an instance Bun can't prove it owns stops startup,

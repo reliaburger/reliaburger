@@ -499,23 +499,68 @@ pub(super) fn generate_request_id() -> String {
 
 /// The host a request is for, as the routing table matches it.
 ///
-/// HTTP/1.1 names the host in the `Host` header. HTTP/2 names it in the
-/// `:authority` pseudo-header, which hyper puts in the request URI, and a
-/// client usually sends no `Host` header at all. Browsers and curl negotiate
-/// HTTP/2 on the HTTPS listener, so the URI's authority is the fallback.
-/// An empty string matches no route.
-fn request_host(req: &Request<Body>) -> String {
-    if let Some(host) = req
+/// HTTP/1.1 names the host in the `Host` header, with the URI's authority
+/// as the fallback. HTTP/2 names it in the `:authority` pseudo-header, which
+/// hyper puts in the request URI, and a client usually sends no `Host`
+/// header at all. RFC 9113 §8.3.1 makes `:authority` win there, and calls a
+/// request whose `Host` disagrees with it malformed: that one is refused
+/// with 400 rather than routed by either.
+///
+/// One exception: an authority that is an IP literal names no host, so a
+/// `Host` header beside it decides. That's `curl -k https://<node-ip>/ -H
+/// 'Host: app.example'`, the usual way to test an ingress before DNS points
+/// at it. An empty string matches no route.
+fn request_host(req: &Request<Body>) -> Result<String, StatusCode> {
+    let header = req
         .headers()
         .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.to_str().ok());
+    let authority = req.uri().authority();
+    if req.version() == axum::http::Version::HTTP_2
+        && let Some(authority) = authority
     {
-        return host.to_string();
+        let Some(host) = header else {
+            return Ok(authority.host().to_string());
+        };
+        if is_ip_literal(authority.host()) {
+            return Ok(host.to_string());
+        }
+        let default_port = if req.uri().scheme_str() == Some("http") {
+            80
+        } else {
+            443
+        };
+        if !same_authority(host, authority, default_port) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        return Ok(authority.host().to_string());
     }
-    req.uri()
-        .authority()
+    if let Some(host) = header {
+        return Ok(host.to_string());
+    }
+    Ok(authority
         .map(|authority| authority.host().to_string())
-        .unwrap_or_default()
+        .unwrap_or_default())
+}
+
+/// Whether a URI host is an IPv4 or IPv6 literal (IPv6 comes bracketed).
+fn is_ip_literal(host: &str) -> bool {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok()
+}
+
+/// Whether a `Host` header names the same host and port as `authority`.
+/// Hosts compare case-insensitively, and a side that gives no port means
+/// the scheme's `default_port`. A `Host` that doesn't parse agrees with
+/// nothing.
+fn same_authority(host: &str, authority: &axum::http::uri::Authority, default_port: u16) -> bool {
+    let Ok(header) = host.parse::<axum::http::uri::Authority>() else {
+        return false;
+    };
+    header.host().eq_ignore_ascii_case(authority.host())
+        && header.port_u16().unwrap_or(default_port) == authority.port_u16().unwrap_or(default_port)
 }
 
 /// Route and proxy a single request.
@@ -529,7 +574,10 @@ async fn do_proxy(
     // Check for WebSocket upgrade before anything else
     let is_ws = super::websocket::is_websocket_upgrade(&req);
 
-    let host = request_host(&req);
+    let host = match request_host(&req) {
+        Ok(host) => host,
+        Err(status) => return status.into_response(),
+    };
 
     let path = req.uri().path().to_string();
 
@@ -1137,6 +1185,53 @@ mod tests {
         assert!(is_forwarded_header("Forwarded"));
         assert!(!is_forwarded_header("x-real-ip"));
         assert!(!is_forwarded_header("content-type"));
+    }
+
+    fn http2_request(uri: &str, host: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .version(axum::http::Version::HTTP_2)
+            .uri(uri);
+        if let Some(host) = host {
+            builder = builder.header(axum::http::header::HOST, host);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    #[test]
+    fn an_http2_ip_authority_routes_by_the_host_header() {
+        for uri in [
+            "https://10.0.0.7/",
+            "https://10.0.0.7:8443/",
+            "https://[fd00::7]/",
+            "https://[fd00::7]:8443/",
+        ] {
+            let request = http2_request(uri, Some("app.example"));
+            assert_eq!(request_host(&request), Ok("app.example".into()), "{uri}");
+        }
+        // With no Host header, the IP literal is all there is.
+        let request = http2_request("https://10.0.0.7:8443/", None);
+        assert_eq!(request_host(&request), Ok("10.0.0.7".into()));
+    }
+
+    #[test]
+    fn an_http2_hostname_authority_wins_and_a_disagreeing_host_is_refused() {
+        let request = http2_request("https://app.example/", None);
+        assert_eq!(request_host(&request), Ok("app.example".into()));
+        let request = http2_request("https://app.example:8443/", Some("APP.example:8443"));
+        assert_eq!(request_host(&request), Ok("app.example".into()));
+        let request = http2_request("https://app.example/", Some("other.example"));
+        assert_eq!(request_host(&request), Err(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn an_http2_host_and_authority_agree_when_a_missing_port_is_the_default() {
+        let agrees = |uri: &str, host: &str| request_host(&http2_request(uri, Some(host))).is_ok();
+        assert!(agrees("https://a.test:443/", "a.test"));
+        assert!(agrees("https://a.test/", "a.test:443"));
+        assert!(agrees("http://a.test:80/", "a.test"));
+        assert!(!agrees("https://a.test:8443/", "a.test:9443"));
+        assert!(!agrees("https://a.test:8443/", "a.test"));
+        assert!(!agrees("http://a.test/", "a.test:443"));
     }
 
     #[test]

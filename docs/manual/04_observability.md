@@ -6,7 +6,10 @@ Nothing to deploy, nothing to scrape-config.
 ## Logs
 
 Captured stdout/stderr per app, on the node that ran it, one entry per line.
-A line longer than 64 KiB is kept to its first 64 KiB. You ask any node and
+A line longer than 64 KiB is kept to its first 64 KiB, ending at a whole
+character, followed by ` [line cut at 64 KiB]`. If it goes on, an entry
+`[skipped N more bytes of a cut line]` follows for every 1 MiB more. You
+ask any node and
 it gathers from every node that runs the app:
 
 ```sh
