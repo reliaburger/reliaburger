@@ -650,6 +650,19 @@ of tests' coverage. So the job makes room instead. It deletes the runner image's
 2 GiB, and fails its report when the low point is under 10 GiB. A shrinking margin now turns a
 step red with a number on it, long before it costs us a runner.
 
+That wasn't the end of it. The next run freed 27 GB, kept 48 GB to spare, and still lost its
+runner. Memory was the other half. The crate's lib tests compile in one rustc that peaks at
+12 GB, and the lib on its own takes another 7 GB. Both need only the dependencies, so any
+parallel build starts them together. In the Lima VM, under a runner's 14 GiB and 3 GiB of
+swap, four jobs and three jobs ran out and the kernel killed the lib tests' rustc. Two jobs
+didn't help: the same pair still overlapped, filled the swap and stalled for minutes. On the
+runner nobody dies. We'd shielded it from the OOM killer, so the host pages instead, the
+runner's heartbeat stops, and GitHub gives up on it. So the coverage build now runs one job
+at a time: the peak is 12 GB and nothing swaps. It costs time, about three times as long to
+build in the VM. The watcher also logs swap and the kernel's memory-stall figure, and stops
+the build if available memory stays under 512 MiB for a minute while swap is in use. Paging
+hard is now a failed step with a log, not a vanished runner.
+
 Coverage finds unvisited code. It does not tell us whether an assertion is useful, whether a
 webhook test accidentally exercised startup, or whether a five-second performance limit is
 portable. The audit found all three in a suite with lots of coverage. Read the uncovered
