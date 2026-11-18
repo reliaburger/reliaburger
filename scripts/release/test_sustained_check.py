@@ -264,9 +264,10 @@ class ResumePoints(Evidence):
         with contextlib.redirect_stdout(io.StringIO()):
             checker.main(arguments)
 
-    def window(self, action, label="power-off"):
+    def window(self, action, label="power-off", at=NOW):
         with contextlib.redirect_stdout(io.StringIO()):
-            checker.main(["window", str(self.evidence), action] + ([label] if action == "open" else []))
+            checker.main(["window", str(self.evidence), action] + ([label] if action == "open" else [])
+                         + ["--at", str(at)])
 
     def mark(self, **files):
         directory = self.snapshot(**files)
@@ -332,12 +333,42 @@ class ResumePoints(Evidence):
         # Inside the window the writer may not be back yet.
         _, verdict = self.evaluate(self.snapshot(**{"writer__resumes_txt": "0\n"}))
         self.assertEqual(self.failures(verdict), [])
-        self.window("settled")
-        # Nothing restarted it, so nothing acknowledged past ACK 1000 either.
-        _, verdict = self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1000\n", "writer__resumes_txt": "0\n"}))
+        self.window("settled", at=NOW)
+        # Nothing restarted it, so nothing acknowledged past ACK 1000 either;
+        # past the grace period that's a start that never came.
+        _, verdict = self.evaluate(self.snapshot(ts=NOW + checker.RESTART_GRACE, **{
+            "writer__log_txt": "ACK 1000\n", "writer__resumes_txt": "0\n"}))
         self.assertIn("writer-restart", self.failures(verdict))
-        _, verdict = self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1200\n", "writer__resumes_txt": "0\n1000\n"}))
+        _, verdict = self.evaluate(self.snapshot(ts=NOW + 200, **{
+            "writer__log_txt": "ACK 1200\n", "writer__resumes_txt": "0\n1000\n"}))
         self.assertEqual(self.failures(verdict), [])
+
+    def test_a_start_late_after_the_window_closes_is_within_the_grace_period(self):
+        # The settle checks don't wait for the writer, so it may come back
+        # after the window closes; 120 s later it must have.
+        self.assertEqual(checker.RESTART_GRACE, 120)
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1000\n", "writer__resumes_txt": "0\n"}))
+        self.window("open")
+        self.power_cut("writer")
+        self.window("settled", at=NOW + 300)
+        _, verdict = self.evaluate(self.snapshot(ts=NOW + 330, **{"writer__resumes_txt": "0\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        _, verdict = self.evaluate(self.snapshot(ts=NOW + 419, **{"writer__resumes_txt": "0\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        _, verdict = self.evaluate(self.snapshot(ts=NOW + 330 + 120, **{"writer__resumes_txt": "0\n1000\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        # A start that came late still had to resume at or past ACK 1000.
+        self.assertEqual(checker.load_state(self.evidence)["resumes"]["writer"]["seen"], 2)
+
+    def test_a_redis_client_that_never_restarts_fails_after_the_grace_period(self):
+        self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 42\n", "redis__starts_txt": "0\n"}))
+        self.window("open")
+        self.power_cut("redis")
+        self.window("close", at=NOW + 100)
+        _, verdict = self.evaluate(self.snapshot(ts=NOW + 130, **{"redis__starts_txt": "0\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        _, verdict = self.evaluate(self.snapshot(ts=NOW + 230, **{"redis__starts_txt": "0\n"}))
+        self.assertIn("redis-restart", self.failures(verdict))
 
     def test_a_cut_elsewhere_needs_no_new_start(self):
         self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1000\n", "writer__resumes_txt": "0\n"}))
@@ -360,6 +391,25 @@ class ResumePoints(Evidence):
         self.assertIn("from 42 to 38", detail)
         _, verdict = self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 91\n", "redis__regressions_txt": "42 38\n"}))
         self.assertEqual(self.failures(verdict), [])
+
+    def test_redis_loading_its_aof_is_an_unreadable_record_not_a_regression(self):
+        # Just after node 3 powers on, Redis replays its AOF and redis-cli
+        # prints this with exit status 0.
+        self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 42\n", "redis__regressions_txt": ""}))
+        _, verdict = self.evaluate(self.snapshot(**{
+            "redis__regressions_txt": "LOADING Redis is loading the dataset in memory\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        warnings = [item for item in verdict["findings"] if item["check"] == "redis-regression"]
+        self.assertEqual([item["severity"] for item in warnings], ["warn"])
+        self.assertIn("unreadable", warnings[0]["detail"])
+        self.assertEqual(checker.load_state(self.evidence)["resumes"]["redis"]["regressions"], 0)
+        # A mixed answer is unreadable too, and judges nothing.
+        _, verdict = self.evaluate(self.snapshot(**{"redis__regressions_txt": "42 38\nLOADING\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        self.assertEqual(checker.load_state(self.evidence)["resumes"]["redis"]["regressions"], 0)
+        # Once Redis answers, the entry is judged.
+        _, verdict = self.evaluate(self.snapshot(**{"redis__regressions_txt": "42 38\n"}))
+        self.assertEqual(self.failures(verdict), ["redis-regression"])
 
     def test_an_unreadable_record_warns_and_judges_nothing(self):
         self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1000\n", "writer__resumes_txt": "0\n"}))

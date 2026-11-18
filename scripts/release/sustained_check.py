@@ -353,6 +353,11 @@ def writer_file_findings(text, highest_ack):
 # check the writer has appended past the lost lines and the client has
 # counted past them. So every start must resume at or past the highest value
 # acknowledged before it.
+# The settle checks don't wait for the writer or the Redis client, so either
+# may record its new start after a fault window closes; a start still missing
+# this long after the close never came.
+RESTART_GRACE = 120
+
 RESUME_RECORDS = (
     # kind, snapshot file, log tail, its prefix, the state key of its highest value
     ("writer", "writer-resumes.txt", "writer-log.txt", "ACK", "writer-ack"),
@@ -382,7 +387,7 @@ def resume_mark(record, values):
         record.setdefault("marks", []).append([len(values), record.get("highest", 0)])
 
 
-def resume_findings(record, text, fault_window, kind, prefix):
+def resume_findings(record, text, fault_window, kind, prefix, since_close=None):
     """Judge the starts in a resume record that no earlier check judged.
 
     RECORD is this kind's state: `seen` starts judged so far, `highest` the
@@ -390,9 +395,9 @@ def resume_findings(record, text, fault_window, kind, prefix):
     `[starts, highest]` as one read found them. A start numbered N must
     resume at or past the highest of the last mark with fewer than N starts:
     those tails were read before its record was, so before it started.
-    `expect` is the count at a power cut that stopped this workload; once the
-    fault window closes a record still at that count is a start that never
-    came."""
+    `expect` is the count at a power cut that stopped this workload; a record
+    still at that count RESTART_GRACE seconds after the fault window closed
+    (SINCE_CLOSE seconds ago; None when unknown) is a start that never came."""
     check = f"{kind}-resume"
     values = parse_record(text)
     if values is None:
@@ -413,7 +418,7 @@ def resume_findings(record, text, fault_window, kind, prefix):
     expect = record.get("expect")
     if expect is not None and len(values) > expect:
         record.pop("expect")
-    elif expect is not None and not fault_window:
+    elif expect is not None and not fault_window and (since_close is None or since_close >= RESTART_GRACE):
         findings.append(finding(f"{kind}-restart", "fail",
                                 f"no new start recorded since a power cut stopped it ({len(values)} starts)"))
         record.pop("expect")
@@ -424,12 +429,13 @@ def regression_findings(record, text):
     """`LAST NOW` entries the Redis client pushed when an INCR answered no
     more than the one before; each new one is a loss."""
     entries = [line.strip() for line in text.splitlines() if line.strip()]
+    if not all(re.fullmatch(r"\d+ \d+", entry) for entry in entries):
+        # Redis replaying its AOF answers `LOADING ...` with exit status 0.
+        return [finding("redis-regression", "warn", f"unreadable regression record: {text.strip()[:80]!r}")]
     findings = []
     for entry in entries[record.get("regressions", 0):]:
-        parts = entry.split()
-        detail = (f"the client saw the counter go back from {parts[0]} to {parts[1]}"
-                  if len(parts) == 2 and all(part.isdigit() for part in parts) else f"regression record {entry!r}")
-        findings.append(finding("redis-regression", "fail", detail))
+        before, after = entry.split()
+        findings.append(finding("redis-regression", "fail", f"the client saw the counter go back from {before} to {after}"))
     record["regressions"] = len(entries)
     return findings
 
@@ -1021,11 +1027,13 @@ def evaluate(evidence, snapshot):
 
     # The records are read after the tails, so every value those tails showed
     # was acknowledged before any start the records don't hold yet.
+    closed_at = state.get("window_closed_at")
+    since_close = now - closed_at if closed_at is not None else None
     for kind, name, _, prefix, key in RESUME_RECORDS:
         record = raise_highest(state, kind, state.get(key))
         text = read(snapshot, name)
         if text is not None:
-            findings += resume_findings(record, text, fault_window, kind, prefix)
+            findings += resume_findings(record, text, fault_window, kind, prefix, since_close)
     regressions = read(snapshot, "redis-regressions.txt")
     if regressions is not None:
         findings += regression_findings(raise_highest(state, "redis", None), regressions)
@@ -2463,6 +2471,7 @@ def main(argv=None):
     window.add_argument("label", nargs="?")
     window.add_argument("--down", type=int, default=0)
     window.add_argument("--node", help="the node a node fault targets")
+    window.add_argument("--at", type=int, help="when, in Unix seconds (default: now)")
     for name in ("baseline", "evaluate"):
         sub = commands.add_parser(name)
         sub.add_argument("evidence")
@@ -2585,6 +2594,7 @@ def main(argv=None):
             state.pop("window", None)
             state.pop("window_node", None)
             state["nodes_down"] = 0
+            state["window_closed_at"] = args.at if args.at is not None else int(time.time())
             if args.action == "settled":
                 state["last_settled"] = int(time.time())
         save_state(args.evidence, state)
