@@ -26,11 +26,17 @@ package. The on-disk format, from drivers/md/dm-log-writes.c:
                     then nr_sectors blocks of data (none for a discard)
 
 `sector` and `nr_sectors` count blocks of `sectorsize` bytes, the data
-device's logical block size. The super's nr_entries is updated at each FUA
-write and each mark, so write a mark before reading a live log.
+device's logical block size. The super's nr_entries is updated only at each
+FUA write and each mark, so a log copied at a cut nobody announced can hold
+entries past the count. Write a mark at the cut when you can (the calibration
+proof did). When you can't, `--walk` reads on past the count while the
+entries still look like entries: a header with known flags, a mark name that
+fits its block, and data that's all there. The format has no checksum, so a
+walk trusts the log device's tail: zero the log device before logging, or a
+stale entry from an earlier session reads as a real one.
 
-  logwrites.py list LOG
-  logwrites.py replay LOG --target FILE --to end|last-flush|mark:NAME|entry:N
+  logwrites.py list LOG [--walk]
+  logwrites.py replay LOG --target FILE --to end|last-flush|mark:NAME|entry:N [--walk]
 """
 import argparse
 import json
@@ -42,6 +48,7 @@ SUPER = struct.Struct("<QQQI")
 ENTRY = struct.Struct("<QQQQ")
 FLUSH, FUA, DISCARD, MARK, METADATA = 1, 2, 4, 8, 16
 FLAG_NAMES = ((FLUSH, "flush"), (FUA, "fua"), (DISCARD, "discard"), (MARK, "mark"), (METADATA, "metadata"))
+KNOWN_FLAGS = FLUSH | FUA | DISCARD | MARK | METADATA
 
 
 class LogError(Exception):
@@ -63,25 +70,56 @@ def read_super(log):
     return entries, sectorsize
 
 
-def entries(log):
-    """Every entry the super block counts, as dicts with the data's offset in the log."""
+def plausible(header, sectorsize, data_available):
+    """Does a block past the counted entries look like an entry the kernel wrote?
+
+    The kernel never logs an empty plain write, so an all-zero header (a
+    zeroed log device's tail) isn't one; nor is a header with flags it doesn't
+    set, a mark name longer than its block, or a write whose data isn't all
+    in the log yet.
+    """
+    if len(header) < sectorsize:
+        return False
+    _, sectors, flags, data_length = ENTRY.unpack(header[:ENTRY.size])
+    if flags & ~KNOWN_FLAGS or (flags == 0 and sectors == 0):
+        return False
+    if flags & MARK:
+        return data_length <= sectorsize - ENTRY.size
+    if data_length != 0:
+        return False
+    return flags & DISCARD or sectors * sectorsize <= data_available
+
+
+def entries(log, walk=False):
+    """The entries in the log, as dicts with the data's offset in the log.
+
+    Without WALK, exactly the entries the super block counts. With WALK, those
+    and then every further entry until one isn't `plausible`; each entry's
+    `counted` says which side of the count it's on.
+    """
     count, sectorsize = read_super(log)
+    log.seek(0, 2)
+    size = log.tell()
     offset = sectorsize
     found = []
-    for index in range(count):
+    index = 0
+    while index < count or walk:
         log.seek(offset)
         header = log.read(sectorsize)
+        if index >= count and not plausible(header, sectorsize, size - offset - sectorsize):
+            break
         if len(header) < ENTRY.size:
             raise LogError(f"entry {index} is cut short")
         sector, sectors, flags, data_length = ENTRY.unpack(header[:ENTRY.size])
         entry = {"index": index, "sector": sector, "sectors": sectors, "flags": flags,
-                 "data_offset": offset + sectorsize, "sectorsize": sectorsize}
+                 "data_offset": offset + sectorsize, "sectorsize": sectorsize, "counted": index < count}
         if flags & MARK:
             entry["mark"] = header[ENTRY.size:ENTRY.size + data_length].split(b"\0")[0].decode(errors="replace")
         found.append(entry)
         offset += sectorsize
         if not flags & DISCARD:
             offset += sectors * sectorsize
+        index += 1
     return found
 
 
@@ -126,10 +164,10 @@ def resolve(found, to):
     raise LogError(f"don't know how to replay to {to!r}")
 
 
-def replay(log, target, point):
+def replay(log, target, point, walk=False):
     """Write the first POINT entries onto TARGET; discards become zeros."""
     written = 0
-    for entry in entries(log)[:point]:
+    for entry in entries(log, walk)[:point]:
         size = entry["sectors"] * entry["sectorsize"]
         if size == 0 or entry["flags"] & MARK:
             continue
@@ -151,25 +189,29 @@ def main(argv):
     commands = parser.add_subparsers(dest="command", required=True)
     command = commands.add_parser("list")
     command.add_argument("log")
+    command.add_argument("--walk", action="store_true", help="read on past the super block's entry count")
     command = commands.add_parser("replay")
     command.add_argument("log")
     command.add_argument("--target", required=True)
     command.add_argument("--to", required=True)
+    command.add_argument("--walk", action="store_true", help="read on past the super block's entry count")
     arguments = parser.parse_args(argv)
     try:
         with open(arguments.log, "rb") as log:
-            found = entries(log)
+            found = entries(log, arguments.walk)
             if arguments.command == "list":
                 for entry in found:
                     print(json.dumps({"index": entry["index"], "sector": entry["sector"],
                                       "sectors": entry["sectors"], "flags": flag_names(entry["flags"]),
+                                      "counted": entry["counted"],
                                       **({"mark": entry["mark"]} if "mark" in entry else {})}))
                 return 0
             point = resolve(found, arguments.to)
             with open(arguments.target, "r+b") as target:
-                written = replay(log, target, point)
+                written = replay(log, target, point, arguments.walk)
                 target.flush()
-        print(json.dumps({"entries": len(found), "replayed": point, "writes": written,
+        counted = sum(1 for entry in found if entry["counted"])
+        print(json.dumps({"entries": len(found), "counted": counted, "replayed": point, "writes": written,
                           "durable_point": durable_point(found)}))
         return 0
     except LogError as error:

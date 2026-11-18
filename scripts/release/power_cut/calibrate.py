@@ -7,6 +7,9 @@ One file, two sides. In the guest (copied there by calibrate.sh, run as root):
   calibrate.py write --dir DIR --run ID    write numbered 4 KiB records to them,
                                            printing an ACK line as each one completes
   calibrate.py scan --dir DIR --run ID     after the cut, report what survived
+  calibrate.py write-raw --run ID          the raw-disk mode: O_DIRECT records on the
+                                           guest's second disk, alone (see below)
+  calibrate.py scan-raw --run ID           after the cut, what survived on it
 
 On the host:
 
@@ -22,6 +25,26 @@ The three modes differ only in how far a record has gone when its ACK prints:
   direct    O_DIRECT pwrite, no flush: the virtual disk completed the write,
             but nobody asked it to make the write durable
   buffered  buffered pwrite, no sync: only in the guest's page cache
+
+The three run at once on one filesystem, so a direct record's ACK is almost
+always followed by another thread's fdatasync (a flush of the whole virtual
+disk) or ext4's journal commit before the cut. A surviving direct record
+therefore shows that writes covered by a flush survive, not that a completed,
+unflushed write does. The raw-disk mode answers that: it writes direct
+records alone to a second virtual disk with no filesystem on it
+(calibrate-vm.yaml's raw disk, found by its size), reads the disk's
+completed-flush count from /sys/block/<disk>/stat before each write, and
+prints it with the ACK:
+
+  BOOT <id>
+  ACK raw <n> <flushes before record n was written>
+  FLUSHES <flushes after the ACK>
+
+Record n is uncovered when its count equals the last FLUSHES reading the
+host saw after the last ACK: no flush completed after it was written. A cut
+with no uncovered record says nothing and isn't counted. The time between
+the last reading and the cut itself (a few milliseconds) isn't observed;
+nothing in the guest sends that disk a flush unless asked.
 
 Each record carries the run id, its sequence number, its mode and a CRC over
 the block, so a scan tells a record of this run from a stale one (absent) and
@@ -44,6 +67,17 @@ MODES = ("fsync", "direct", "buffered")
 # 128 MiB per file: enough for a 20-second run of the fastest mode.
 BLOCKS = 32768
 HEADER = struct.Struct("<8s16sQ8s")
+RAW = "raw"
+# The raw disk's size in 512-byte sectors, as /sys/block/<disk>/size gives
+# it: 1 GiB, as calibrate.sh creates it. Nothing else in the guest has it.
+RAW_SECTORS = 2097152
+# /sys/block/<disk>/stat: "flush I/Os" is the 16th field
+# (https://docs.kernel.org/block/stat.html).
+STAT_FLUSHES = 15
+
+
+class RecordError(Exception):
+    """A cut whose evidence can't be trusted, so it mustn't be tallied."""
 
 
 def file_for(directory, mode):
@@ -165,6 +199,106 @@ def write(directory, run, seconds, pause):
         thread.join()
 
 
+def flushes_from_stat(text):
+    """The completed-flush count in a /sys/block/<disk>/stat line, or None on a kernel without it."""
+    fields = text.split()
+    return int(fields[STAT_FLUSHES]) if len(fields) > STAT_FLUSHES else None
+
+
+def find_raw_device(sys_block, sectors, mounts):
+    """The name of the one disk of SECTORS with no partitions and nothing mounted.
+
+    SYS_BLOCK is /sys/block; MOUNTS the text of /proc/mounts. Loop and other
+    virtual devices are skipped: the raw disk is a virtio disk, vdX.
+    """
+    found = []
+    for disk in sorted(os.listdir(sys_block)):
+        if not disk.startswith("vd"):
+            continue
+        path = os.path.join(sys_block, disk)
+        with open(os.path.join(path, "size")) as file:
+            if int(file.read().strip() or 0) != sectors:
+                continue
+        if any(child.startswith(disk) for child in os.listdir(path)):
+            continue
+        if any(line.split()[0].startswith(f"/dev/{disk}") for line in mounts.splitlines() if line.strip()):
+            continue
+        found.append(disk)
+    if not found:
+        raise RecordError(f"no unpartitioned, unmounted disk of {sectors} sectors")
+    if len(found) > 1:
+        raise RecordError(f"more than one candidate raw disk: {', '.join(found)}")
+    return found[0]
+
+
+def raw_device():
+    with open("/proc/mounts") as file:
+        return find_raw_device("/sys/block", RAW_SECTORS, file.read())
+
+
+def read_flushes(disk):
+    with open(f"/sys/block/{disk}/stat") as file:
+        count = flushes_from_stat(file.read())
+    if count is None:
+        raise RecordError(f"/sys/block/{disk}/stat has no flush count")
+    return count
+
+
+def write_raw(run, seconds, pause):
+    """Write direct records alone to the raw disk, with the flush count before each."""
+    disk = raw_device()
+    descriptor = os.open(f"/dev/{disk}", os.O_WRONLY | os.O_DIRECT)
+    buffer = mmap.mmap(-1, BLOCK)
+    print(f"BOOT {boot_id()}", flush=True)
+    deadline = time.monotonic() + seconds
+    for seq in range(1, BLOCKS + 1):
+        if time.monotonic() > deadline:
+            break
+        before = read_flushes(disk)
+        buffer.seek(0)
+        buffer.write(encode(run, seq, RAW))
+        os.pwrite(descriptor, buffer, (seq - 1) * BLOCK)
+        print(f"ACK {RAW} {seq} {before}", flush=True)
+        print(f"FLUSHES {read_flushes(disk)}", flush=True)
+        time.sleep(pause)
+    print(f"DONE {RAW}", flush=True)
+    os.close(descriptor)
+
+
+def read_raw_acks_text(text):
+    """The raw writer's output: its boot id, (n, flushes before n) per ACK, and the last reading after the last ACK."""
+    info = {"boot": None, "acks": [], "final_flushes": None}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == "BOOT":
+            info["boot"] = parts[1]
+        elif len(parts) == 4 and parts[:2] == ["ACK", RAW] and parts[2].isdigit() and parts[3].isdigit():
+            info["acks"].append((int(parts[2]), int(parts[3])))
+            info["final_flushes"] = None
+        elif len(parts) == 2 and parts[0] == "FLUSHES" and parts[1].isdigit():
+            info["final_flushes"] = int(parts[1])
+    return info
+
+
+def raw_result(info, survived):
+    """One raw-disk cut: what was acknowledged, what no flush covered, and what of each was lost."""
+    acked = max((seq for seq, _ in info["acks"]), default=0)
+    final = info["final_flushes"]
+    uncovered = [seq for seq, before in info["acks"] if final is not None and before == final]
+    return {
+        "acked": acked,
+        **survived,
+        "lost_acked": max(0, acked - survived["prefix"]),
+        "beyond_ack": max(0, survived["highest"] - acked),
+        "flushes_final": final,
+        "uncovered": len(uncovered),
+        "lost_uncovered": sum(1 for seq in uncovered if seq > survived["prefix"]),
+        # Only a cut that left some acknowledged record uncovered says
+        # anything about completed, unflushed writes.
+        "counted": bool(uncovered),
+    }
+
+
 def read_acks_text(text):
     """The highest ACK the host saw per mode, and the boot id the writer reported."""
     acks = {mode: 0 for mode in MODES}
@@ -179,13 +313,27 @@ def read_acks_text(text):
 
 
 def record(kind, cut, acks_path, scan_path, detail):
-    """One cut: per mode, what the host saw acknowledged and what survived."""
+    """One cut: per mode, what the host saw acknowledged and what survived.
+
+    Raises RecordError when the cut can't be shown to have happened: the
+    writer reported no boot id, or the guest's boot id didn't change. A cut
+    that never fired loses nothing and would tally as clean.
+    """
     with open(acks_path, errors="replace") as file:
-        acks, boot = read_acks_text(file.read())
+        text = file.read()
+    acks, boot = read_acks_text(text)
     with open(scan_path) as file:
         scan = json.load(file)
+    if boot is None:
+        raise RecordError(f"cut {cut}: the writer reported no boot id, so the cut can't be shown to have fired")
+    if boot == scan.get("boot"):
+        raise RecordError(f"cut {cut}: the guest never rebooted (boot id {boot} before and after)")
     modes = {}
+    if RAW in scan["modes"]:
+        modes[RAW] = raw_result(read_raw_acks_text(text), scan["modes"][RAW])
     for mode in MODES:
+        if mode not in scan["modes"]:
+            continue
         survived = scan["modes"][mode]
         acknowledged = acks[mode]
         modes[mode] = {
@@ -197,17 +345,22 @@ def record(kind, cut, acks_path, scan_path, detail):
             "beyond_ack": max(0, survived["highest"] - acknowledged),
         }
     return {"cut": cut, "kind": kind, "boot_before": boot, "boot_after": scan.get("boot"),
-            "rebooted": boot is not None and boot != scan.get("boot"), "modes": modes, **detail}
+            "rebooted": True, "modes": modes, **detail}
 
 
 def tally(lines):
     """Per kind and mode: cuts, cuts that lost acknowledged records, and how much.
 
     A cut whose writer never acknowledged anything in a mode says nothing about
-    that mode, so it's left out of that mode's count.
+    that mode, so it's left out of that mode's count; so is a raw-disk cut
+    that left no record uncovered (`not_counted`). A line that doesn't show
+    the guest rebooted raises RecordError.
     """
     kinds = {}
     for entry in lines:
+        if entry.get("rebooted") is not True or not entry.get("boot_before"):
+            raise RecordError(f"cut {entry.get('cut', '?')} of {entry.get('kind', '?')}: "
+                              "no boot id before the cut, or the guest never rebooted")
         kind = kinds.setdefault(entry["kind"], {"cuts": 0, "rebooted": 0, "modes": {}})
         kind["cuts"] += 1
         kind["rebooted"] += 1 if entry.get("rebooted") else 0
@@ -216,6 +369,13 @@ def tally(lines):
                                                   "lost_acked_max": 0, "torn": 0, "holes": 0, "acked_total": 0})
             if result["acked"] == 0:
                 continue
+            if "counted" in result:
+                row.setdefault("not_counted", 0)
+                row.setdefault("uncovered_total", 0)
+                if not result["counted"]:
+                    row["not_counted"] += 1
+                    continue
+                row["uncovered_total"] += result["uncovered"]
             row["cuts"] += 1
             row["acked_total"] += result["acked"]
             row["cuts_losing_acked"] += 1 if result["lost_acked"] else 0
@@ -248,8 +408,11 @@ def main(argv):
         command.add_argument("--dir", required=True)
         if name != "prepare":
             command.add_argument("--run", required=True)
-    commands.choices["write"].add_argument("--seconds", type=float, default=60)
-    commands.choices["write"].add_argument("--pause", type=float, default=0.002)
+    for name in ("write-raw", "scan-raw"):
+        commands.add_parser(name).add_argument("--run", required=True)
+    for name in ("write", "write-raw"):
+        commands.choices[name].add_argument("--seconds", type=float, default=60)
+        commands.choices[name].add_argument("--pause", type=float, default=0.002)
     command = commands.add_parser("record")
     command.add_argument("--kind", required=True)
     command.add_argument("--cut", type=int, required=True)
@@ -259,7 +422,15 @@ def main(argv):
     command = commands.add_parser("tally")
     command.add_argument("cuts")
     arguments = parser.parse_args(argv)
+    try:
+        run_command(arguments)
+    except RecordError as error:
+        print(f"calibrate: {error}", file=sys.stderr)
+        return 1
+    return 0
 
+
+def run_command(arguments):
     if arguments.command == "prepare":
         prepare(arguments.dir)
     elif arguments.command == "write":
@@ -267,13 +438,18 @@ def main(argv):
     elif arguments.command == "scan":
         modes = {mode: scan_file(file_for(arguments.dir, mode), arguments.run, mode) for mode in MODES}
         print(json.dumps({"run": arguments.run, "boot": boot_id(), "modes": modes}))
+    elif arguments.command == "write-raw":
+        write_raw(arguments.run, arguments.seconds, arguments.pause)
+    elif arguments.command == "scan-raw":
+        disk = raw_device()
+        modes = {RAW: scan_file(f"/dev/{disk}", arguments.run, RAW)}
+        print(json.dumps({"run": arguments.run, "boot": boot_id(), "disk": disk, "modes": modes}))
     elif arguments.command == "record":
         print(json.dumps(record(arguments.kind, arguments.cut, arguments.acks, arguments.scan,
                                 json.loads(arguments.detail))))
     elif arguments.command == "tally":
         with open(arguments.cuts) as file:
             print(json.dumps(tally(json.loads(line) for line in file if line.strip()), indent=2))
-    return 0
 
 
 if __name__ == "__main__":

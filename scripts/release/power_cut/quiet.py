@@ -28,13 +28,17 @@ DEFAULT_CHAINS = os.path.join(os.path.expanduser("~"), "github", "rb-wt", "gate-
 
 
 def lock_held(path):
-    """True when another process holds an flock on PATH. A missing file isn't held."""
+    """True when another process holds an flock on PATH, shared or exclusive. A missing file isn't held.
+
+    It asks for an exclusive lock: a shared request would be granted beside
+    a shared holder and miss it.
+    """
     try:
         descriptor = os.open(path, os.O_RDONLY)
     except FileNotFoundError:
         return False
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         return True
     finally:

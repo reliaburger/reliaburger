@@ -8974,16 +8974,37 @@ Virtualization.framework process that holds the disk, and `echo b >
 /proc/sysrq-trigger` inside the guest, which reboots the kernel on the spot
 with no sync.
 
-The answer was the same for all three. Every `fsync` record and every
+The answer looked the same for all three. Every `fsync` record and every
 `O_DIRECT` record survived every cut, and every buffered record the cut
-caught was gone. So the line falls between the guest's page cache and the
-virtual disk, not at the flush: whatever the guest handed to the disk is
-safe, flushed or not, because the macOS host keeps it in its own page cache,
-and the host never loses power. That's a disk without a volatile write cache,
-or one with power-loss protection. It's fair for a good SSD and generous for
-an SD card, which is exactly what an edge site runs on. A store that forgot an
-`fsync` and wrote with `O_DIRECT` would pass every cut we can make with a
-hypervisor.
+caught was gone. Our first reading was that the line falls between the
+guest's page cache and the virtual disk, not at the flush: whatever the guest
+handed to the disk is safe, flushed or not. A review caught the hole in that.
+The three threads wrote to the same disk at once, and every `fdatasync` sends
+the disk a flush that covers *every* write it has completed, whichever thread
+made it. With about 85 of those a second, plus ext4's own journal commits, an
+`O_DIRECT` record almost never went into a cut without someone else's flush
+behind it. Its surviving proved only what the `fsync` records proved: flushed
+writes survive.
+
+What we can say is narrower. All three cuts lose the guest's page cache and
+keep what a flush covered. `sysrq b` goes further by construction: the VM's
+process lives through it, so nothing the virtual disk completed can be lost,
+flushed or not. That's a disk without a volatile write cache, fault model 1:
+fair for a good SSD, generous for an SD card, which is exactly what an edge
+site runs on. Whether a forced stop or a killed VZ process keeps a completed,
+unflushed write, or whether VZ holds it somewhere a kill loses, is still
+open. The experiment that settles it is written and waiting for a quiet
+host: `calibrate.sh --raw` gives the VM a second disk with no filesystem, so
+the only writer on it is ours, reads the disk's flush counter from
+`/sys/block/<disk>/stat` before every record, and counts a cut only if some
+acknowledged record had no flush after it. Either way, a store that forgot
+an `fsync` and wrote with `O_DIRECT` can pass a hypervisor cut, so the cuts
+we've run can't vouch for it.
+
+There's a second loose end in the numbers: in 27 of the 150 cuts,
+`fdatasync` ran at over a thousand a second, which a flush that really waits
+for a disk shouldn't. We haven't found out why, and the record says so
+rather than calling it occasional.
 
 `sysrq b` had one surprise: the VM doesn't stop. Virtualization.framework
 treats the guest's reset as a reboot, so the VM stays running and the guest is
@@ -9004,7 +9025,7 @@ the log and replay up to it. We don't: the log has already done it.
 
 The proof runs in the same guest. It puts ext4 on a `dm-log-writes` device,
 writes one file and syncs it, writes a second with `O_DIRECT` and no flush,
-and copies the log. Replayed, that copy has the first file and not the
+writes a mark, and copies the log. Replayed, that copy has the first file and not the
 second's bytes, though the real device has both, and `e2fsck` calls it clean.
 A copy taken after one more `sync` has both. Ubuntu doesn't package
 xfstests' `replay-log`, so `logwrites.py` reads the log format straight from
@@ -9014,6 +9035,16 @@ background, after the mount, and those writes bring their own flushes. Any
 one of them can legitimately make the "unflushed" file durable halfway
 through the proof. `-E lazy_itable_init=0,lazy_journal_init=0` does the
 zeroing up front instead.
+
+The mark matters more than it looks. The log's first block counts its
+entries, and the kernel only rewrites that count at a mark or a FUA write. A
+real cut doesn't announce itself, so a copy taken then can hold entries the
+count doesn't include, and a reader that trusts the count drops them.
+`logwrites.py --walk` reads on past the count while each block still looks
+like an entry the kernel would write: flags it knows, a mark name that fits,
+and all of its data present. The format has no checksum, so the walk only
+works on a log device that started zeroed. It's tested against hand-built
+logs; the proof against a live log used the mark.
 
 The [calibration record](../qualification/2026-11-18-power-cut-calibration.md)
 has the numbers. What it changes is the wording of every power-cut record we

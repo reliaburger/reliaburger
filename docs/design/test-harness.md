@@ -124,13 +124,16 @@ are `#[ignore]`d with a reason naming the target or script that runs them:
 
 One more script cuts power without a Rust test behind it.
 `scripts/release/power_cut/calibrate.sh` measures what each way of cutting a
-Lima VM's power loses (`--kind stop|kill|sysrq --cuts N`), and whether the guest
+Lima VM's power loses (`--kind stop|kill|sysrq --cuts N`, with `--raw` for
+unflushed writes alone on a second, unformatted disk), and whether the guest
 kernel can record and replay a `dm-log-writes` log (`--logwrites`), on a
-disposable VM it creates and deletes. Its decisions (the record scan, the tally,
-the log parser and replay) are tested against fixtures in
-`scripts/release/test_power_cut_calibrate.py`, part of `make test-ci-scripts`.
-The [calibration record](../qualification/2026-11-18-power-cut-calibration.md)
-says which fault model each cut gives.
+disposable VM it creates and deletes. Its decisions (the record scan, the
+refusal of a cut that never rebooted the guest, the raw-disk flush counting,
+the tally, the log parser, its walk past the entry count, and the replay) are
+tested against fixtures in `scripts/release/test_power_cut_calibrate.py`, part
+of `make test-ci-scripts`, along with `quiet.py`'s gate check. The
+[calibration record](../qualification/2026-11-18-power-cut-calibration.md)
+says what each cut was shown to lose and what's still untested.
 `scripts/release/qualify-power-cut-endurance.sh` cuts a one-node quickstart
 cluster's power again and again and checks invariants I1, I2, I4, I6 and I7
 after each cut ([testing guide](../testing.md#power-cut-endurance)); its
