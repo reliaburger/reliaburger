@@ -533,7 +533,7 @@ migration and no feature gate
   [move plan](plans/2026-10-09-plan-container-migration.md)). Take a node down
   without taking its apps down: one cordon record ([#2106](https://github.com/reliaburger/reliaburger/issues/2106)), `relish cordon`,
   `drain` and `uncordon` ([#656](https://github.com/reliaburger/reliaburger/issues/656)), cold moves that carry volumes
-  ([#657](https://github.com/reliaburger/reliaburger/issues/657)), a retirement deadline that follows a long stop ([#1309](https://github.com/reliaburger/reliaburger/issues/1309)), drains and
+  ([#657](https://github.com/reliaburger/reliaburger/issues/657)) and explicit volume retirement ([#2121](https://github.com/reliaburger/reliaburger/issues/2121)), a retirement deadline that follows a long stop ([#1309](https://github.com/reliaburger/reliaburger/issues/1309)), drains and
   moves as proposals ([#2107](https://github.com/reliaburger/reliaburger/issues/2107)), and 0.3.0's rolling OS update waiting on a
   real drain ([#661](https://github.com/reliaburger/reliaburger/issues/661)). Alongside: one cluster-wide rollout budget
   ([#1776](https://github.com/reliaburger/reliaburger/issues/1776)), apps first on node memory ([#1967](https://github.com/reliaburger/reliaburger/issues/1967)), and an export and import
@@ -577,8 +577,7 @@ migration and no feature gate
   an app to `runtime = "vm"` and it runs as a Linux VM on Cloud Hypervisor,
   from the same OCI image, scheduled on the same hosts as containers. 0.4.4
   ships VM apps, with service discovery, logs, exec, secrets and volumes
-  working as they do for runc; the research also brings back the Apple
-  runtime here (F10, [#367](https://github.com/reliaburger/reliaburger/issues/367)). 0.4.5 moves VMs through the 0.4.0 move plan,
+  working as they do for runc. 0.4.5 moves VMs through the 0.4.0 move plan,
   cold and by snapshot, which is how an app keeps its memory across a move,
   and enforces egress policy for them. Five spikes come first. Exit test for
   0.4.4: one Redis config switches from runc to vm on the quickstart and
@@ -656,7 +655,7 @@ migration and no feature gate
   [#364](https://github.com/reliaburger/reliaburger/issues/364)); bandwidth
   faults (F09, [#366](https://github.com/reliaburger/reliaburger/issues/366));
   the remaining Kubernetes translations (F11,
-  [#368](https://github.com/reliaburger/reliaburger/issues/368)); container checkpoint moves by CRIU ([#658](https://github.com/reliaburger/reliaburger/issues/658), [#663](https://github.com/reliaburger/reliaburger/issues/663)), parked
+  [#368](https://github.com/reliaburger/reliaburger/issues/368)); the Apple runtime's return (F10, [#367](https://github.com/reliaburger/reliaburger/issues/367)); container checkpoint moves by CRIU ([#658](https://github.com/reliaburger/reliaburger/issues/658), [#663](https://github.com/reliaburger/reliaburger/issues/663)), parked
   unless VM snapshots fail their spike; cloud images, UEFI and ISOs for VM
   apps ([#1179](https://github.com/reliaburger/reliaburger/issues/1179)–[#1184](https://github.com/reliaburger/reliaburger/issues/1184)); gVisor for
   hosts without KVM ([#1186](https://github.com/reliaburger/reliaburger/issues/1186));
@@ -694,9 +693,10 @@ what's shipped and what's scheduled.
   [0.1.6](https://github.com/reliaburger/reliaburger/milestone/12) (F03a,
   F04 R1–R4, F05 I3–I4, landed),
   [0.3.0](https://github.com/reliaburger/reliaburger/milestone/6) (F08),
-  [0.4.4](https://github.com/reliaburger/reliaburger/milestone/20) (F10) and
+  [0.4.0](https://github.com/reliaburger/reliaburger/milestone/7) (F10's
+  volume retirement, [#2121](https://github.com/reliaburger/reliaburger/issues/2121)) and
   [Later](https://github.com/reliaburger/reliaburger/milestone/9) (F02,
-  F06, F09, F11, and the rest of F03–F05). F01
+  F06, F09, F11, the rest of F03–F05, and F10's Apple runtime). F01
   ([#359](https://github.com/reliaburger/reliaburger/issues/359)) moves to
   [0.6.0](https://github.com/reliaburger/reliaburger/milestone/23).
 - **Whitepaper design ahead of the binary.** The [whitepaper](whitepaper.md)

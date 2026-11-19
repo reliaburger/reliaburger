@@ -685,7 +685,7 @@ summary = "Cold moves that carry an app's volumes to another node."
 restrictions = "Today an app with a managed volume moves only when its node is decommissioned, and then starts on an empty volume."
 issues = [657]
 docs = ["docs/manual/11_images-and-volumes.md#volumes"]
-evidence = "#657 in 0.4.0; managed-volume retirement is F10 (#367, 0.4.4)."
+evidence = "#657 in 0.4.0; managed-volume retirement is #2121, also 0.4.0."
 
 # --- Registry and images -----------------------------------------------------
 
@@ -1262,12 +1262,12 @@ evidence = "docs/README 'ProcessGrill (built-in fallback)'; manual 00 says keep 
 [[group.feature]]
 name = "Apple Container"
 status = "planned"
-milestone = "0.4.4"
+milestone = "Later"
 summary = "Native containers on macOS through Apple's container runtime."
 restrictions = "Disabled in 0.2.7: macOS runs containers in Linux VMs instead."
 issues = [367]
 docs = ["docs/README.md#scope-and-limits"]
-evidence = "F10 #367 in 0.4.4; manual 00 'Apple Container isn't supported in 0.2.7'. The code and `make test-apple` exist; selection is disabled."
+evidence = "F10 #367 in Later since the 0.4.x review of 19 November 2026; manual 00 'Apple Container isn't supported in 0.2.7'. The code and `make test-apple` exist; selection is disabled."
 
 [[group.feature]]
 name = "gVisor and Windows guests"
