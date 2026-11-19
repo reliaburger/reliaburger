@@ -4,7 +4,9 @@ One paragraph per release: when it shipped, how long qualifying it took, and
 what the soaks found on the way. It's the track record behind the
 [release gate](releasing.md#staging-a-candidate); the evidence is in the
 [qualification records](qualification/) each paragraph links, and what each
-release contains is in the [roadmap](roadmap.md#releases-after-010). A new
+release contains is in the [roadmap](roadmap.md#releases-after-010). What
+changed for you in each release, and whether a cluster can roll onto it, is
+in the [changelog](../CHANGELOG.md). A new
 paragraph goes at the top when a release is promoted
 ([release gate, step 9](releasing.md#staging-a-candidate)).
 
