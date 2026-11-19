@@ -383,8 +383,11 @@ migration and no feature gate
   turned out to be glibc keeping free memory after log queries, levelling off
   in the 0.2.8 day run
   ([record](qualification/2026-11-14-v0.2.8-memory-run.md)); its full disk
-  ([#1418](https://github.com/reliaburger/reliaburger/issues/1418), 0.3.1)
-  is still open. It ships
+  ([#1418](https://github.com/reliaburger/reliaburger/issues/1418)) was
+  capture files the log store had already saved, reclaimed since 0.2.4
+  ([#1479](https://github.com/reliaburger/reliaburger/pull/1479)), and from
+  0.3.0 every soak with the job campaign fails a node whose instance storage
+  passes 64 MiB ([#2048](https://github.com/reliaburger/reliaburger/pull/2048)). It ships
   with the `zstd` 0.13 advisories under a reviewed exception
   ([#1367](https://github.com/reliaburger/reliaburger/pull/1367)). 0.2.3 keeps
   0.2.2's formats, the first release to do so, and a 0.2.2 cluster rolled onto
@@ -611,8 +614,9 @@ migration and no feature gate
 - [ ] **0.7.1: GPU dev environments**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/25),
   [research](plans/2026-10-11-research-llm-workloads.md#071-gpu-dev-environments)).
-  `relish dev`: a GPU container over SSH or VS Code with a persistent home and
-  an idle timeout.
+  A GPU container over SSH or VS Code with a persistent home and an idle
+  timeout. It needs a command name other than `relish dev`: `relish dev start`
+  already restarts a stopped contributor dev cluster.
 - [ ] **0.8.0: "Groups"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/26),
   [research](plans/2026-10-11-research-llm-workloads.md#080-groups)).

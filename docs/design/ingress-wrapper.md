@@ -408,10 +408,14 @@ pub struct RateLimitConfig {
     pub retry_after_header: bool,
 }
 
-/// Per-client-IP rate limiter state (token bucket).
-pub struct RateLimiterState {
-    /// Map of client IP → token bucket.
-    pub buckets: dashmap::DashMap<std::net::IpAddr, TokenBucket>,
+// Shipped shape (src/wrapper/rate_limit.rs): no DashMap. A
+// ShardedRateLimiter holds 16 RateLimiters, each a plain HashMap behind a
+// tokio Mutex, and a request locks only the shard its (route, client IP)
+// key hashes to.
+/// Per-(route, client IP) rate limiter state (token bucket).
+pub struct RateLimiter {
+    /// Map of (route, client IP) → token bucket.
+    pub buckets: HashMap<BucketKey, TokenBucket>,
     /// Last time expired buckets were garbage-collected.
     pub last_gc: Instant,
 }
@@ -419,7 +423,8 @@ pub struct RateLimiterState {
 pub struct TokenBucket {
     pub tokens: f64,
     pub last_refill: Instant,
-    pub config: RateLimitConfig,
+    /// Garbage collection drops a bucket idle for 5 minutes.
+    pub last_used: Instant,
 }
 
 /// Header manipulation rule.
@@ -880,7 +885,7 @@ Wrapper adds latency at two points:
 | TLS handshake (resumption) | 0.1-0.5 ms | Session tickets (TLS 1.3 PSK) are enabled by default. |
 | HTTP parsing + routing | 10-50 us | In-memory routing table lookup. Negligible for typical route counts (<1000). |
 | Proxy overhead (per request) | 50-200 us | Memory copies between client and backend sockets. hyper's zero-copy streaming minimizes this. |
-| Rate limit check | 1-5 us | DashMap lookup + token bucket arithmetic. |
+| Rate limit check | 1-5 us | One shard's lock, a `HashMap` lookup and token bucket arithmetic. |
 
 **Total added latency per request (steady state, keep-alive connection):** 60-250 microseconds. This is well below the typical application response time (1-100 ms) and isn't a practical bottleneck.
 
