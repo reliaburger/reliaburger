@@ -24,6 +24,9 @@ relish fault node-pressure node-03 --cpu 80% --memory 90% --acknowledge
 Workload faults take `--namespace` (default `default`), `--instance` to hit
 one instance, `--duration` and `--reason`, which is recorded with the fault.
 
+On runc a pause freezes every process in the container. Kill signals the
+instance's pid, as `relish apps NAME` shows it.
+
 A paused instance still reports its pid in `relish apps NAME`, and you can stop
 or delete it without clearing the pause first. Bun follows the stop signal
 with SIGCONT, on the process runtime and on runc alike, so the instance gets
