@@ -42,9 +42,9 @@ reviewed = "10 November 2026"
 "0.4.0" = 7
 "0.4.1" = 13
 "0.4.2" = 18
-"0.4.3" = 20
-"0.4.4" = 21
-"0.4.5" = 22
+"0.4.3" = 22
+"0.4.4" = 20
+"0.4.5" = 21
 "0.5.0" = 14
 "0.6.0" = 23
 "0.7.0" = 24
@@ -282,30 +282,30 @@ name = "Run a command in an instance"
 status = "beta"
 since = "0.1.0"
 summary = "`relish exec` runs one command inside a running instance and exits with its exit code."
-restrictions = "Not interactive: no stdin and no terminal. Interactive exec is planned for 0.4.0."
+restrictions = "Not interactive: no stdin and no terminal. Interactive exec is planned for 0.4.1."
 issues = [710]
 docs = ["docs/manual/01_deploy-an-app.md#the-everyday-loop"]
-evidence = "README command list; #710 in 0.4.0. Not used by the release gate."
+evidence = "README command list; #710 in 0.4.1. Not used by the release gate."
 
 [[group.feature]]
 name = "Cordon, drain and moving workloads"
 status = "planned"
 milestone = "0.4.0"
-summary = "Cordon, drain and uncordon, cold moves that carry volumes, and checkpoint moves that keep memory."
-restrictions = "Today a managed-volume app stays with its node."
-issues = [656, 657, 658, 659]
+summary = "Cordon, drain and uncordon, and cold moves that carry volumes."
+restrictions = "Today a managed-volume app stays with its node. Keeping memory across a move is planned for VM apps only (0.4.5); container checkpoints by CRIU are in Later (#658)."
+issues = [2106, 656, 657, 659]
 docs = ["docs/roadmap.md#releases-after-010"]
-evidence = "Roadmap 0.4.0 and 0.4.1; issues in milestone 0.4.0."
+evidence = "Roadmap 0.4.0; issues in milestone 0.4.0."
 
 [[group.feature]]
 name = "Apps as virtual machines"
 status = "planned"
-milestone = "0.4.3"
+milestone = "0.4.4"
 summary = "`runtime = \"vm\"` runs an app as a Linux VM on Cloud Hypervisor, from the same OCI image."
 restrictions = "Needs KVM on the host."
 issues = [1156, 1158]
 docs = ["docs/roadmap.md#releases-after-010"]
-evidence = "Roadmap 0.4.3 to 0.4.5; milestone 0.4.3."
+evidence = "Roadmap 0.4.4 and 0.4.5; milestone 0.4.4."
 
 # --- Batch jobs --------------------------------------------------------------
 
@@ -499,13 +499,13 @@ evidence = "F08 #369 in 0.3.0; the fix (b0de7b66) is on the 0.3.0 train."
 [[group.feature]]
 name = "ACME certificates"
 status = "planned"
-milestone = "0.4.0"
+milestone = "0.4.1"
 summary = "Certificates obtained and renewed automatically for ingress hosts."
 restrictions = ""
 issues = [1667]
 docs = ["docs/roadmap.md#releases-after-010"]
-evidence = "#1667 is in milestone 0.4.0; README 'Limits in 0.2.7'."
-needs_maintainer = "The roadmap's 0.3.0 entry and the whitepaper still promise ACME under F08 (#369), but #1667 sits in 0.4.0. Which is it?"
+evidence = "#1667 is in milestone 0.4.1; README 'Limits in 0.2.7'."
+needs_maintainer = "The roadmap's 0.3.0 entry and the whitepaper still promise ACME under F08 (#369), but #1667 sits in 0.4.1. Which is it?"
 
 # --- Security and identity ---------------------------------------------------
 
@@ -685,7 +685,7 @@ summary = "Cold moves that carry an app's volumes to another node."
 restrictions = "Today an app with a managed volume moves only when its node is decommissioned, and then starts on an empty volume."
 issues = [657]
 docs = ["docs/manual/11_images-and-volumes.md#volumes"]
-evidence = "#657 in 0.4.0; managed-volume retirement is F10 (#367, 0.4.3)."
+evidence = "#657 in 0.4.0; managed-volume retirement is #2121, also 0.4.0."
 
 # --- Registry and images -----------------------------------------------------
 
@@ -774,7 +774,7 @@ name = "Alerts and webhooks"
 status = "beta"
 since = "0.1.0"
 summary = "Five built-in rules on CPU, memory and disk, plus a critical alert for every failed job run, delivered to webhooks, optionally HMAC-signed."
-restrictions = "You can't define your own alert rules yet (#1773, planned for 0.4.0)."
+restrictions = "You can't define your own alert rules yet (#1773, planned for 0.4.2)."
 issues = [1773]
 docs = ["docs/manual/04_observability.md#alerts"]
 evidence = "Manual 04 'Alerts': 'You can't define your own rules yet.' Job failure alerts since 0.2.0. The README's 'Alert rules evaluate in the agent' and the 'Prometheus, Alertmanager' row of 'What you don't install' read as if you could."
@@ -1262,12 +1262,12 @@ evidence = "docs/README 'ProcessGrill (built-in fallback)'; manual 00 says keep 
 [[group.feature]]
 name = "Apple Container"
 status = "planned"
-milestone = "0.4.3"
+milestone = "Later"
 summary = "Native containers on macOS through Apple's container runtime."
 restrictions = "Disabled in 0.2.7: macOS runs containers in Linux VMs instead."
 issues = [367]
 docs = ["docs/README.md#scope-and-limits"]
-evidence = "F10 #367 in 0.4.3; manual 00 'Apple Container isn't supported in 0.2.7'. The code and `make test-apple` exist; selection is disabled."
+evidence = "F10 #367 in Later since the 0.4.x review of 19 November 2026; manual 00 'Apple Container isn't supported in 0.2.7'. The code and `make test-apple` exist; selection is disabled."
 
 [[group.feature]]
 name = "gVisor and Windows guests"

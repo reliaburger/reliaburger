@@ -97,7 +97,7 @@ So we don't ask you to trust Reliaburger because many people run it. Few do yet.
 
 There's a large and growing market of teams who need more than Docker Compose (which doesn't do multi-node or rolling deploys) but far less than Kubernetes. These teams typically have 2-200 nodes, run web applications and APIs behind load balancers, and want their containers running reliably without dedicating a full-time platform engineering team to the task.
 
-Reliaburger is built for these teams. It's one node agent (`bun`) and one CLI (`relish`), and the agent includes everything you need to run containers: scheduling, networking, ingress with built-in TLS (from the cluster's own CA or your certificate; automatic ACME certificates are planned for 0.4.0, [#1667](https://github.com/reliaburger/reliaburger/issues/1667)), service discovery, a container image registry, log collection, metrics and dashboards, GitOps, and a web UI. No plugins. No ecosystem to assemble. No YAML to wrestle. Until 1.0.0, though, it's good enough for home labs and dev clusters, not production.
+Reliaburger is built for these teams. It's one node agent (`bun`) and one CLI (`relish`), and the agent includes everything you need to run containers: scheduling, networking, ingress with built-in TLS (from the cluster's own CA or your certificate; automatic ACME certificates are planned for 0.4.1, [#1667](https://github.com/reliaburger/reliaburger/issues/1667)), service discovery, a container image registry, log collection, metrics and dashboards, GitOps, and a web UI. No plugins. No ecosystem to assemble. No YAML to wrestle. Until 1.0.0, though, it's good enough for home labs and dev clusters, not production.
 
 The architecture is designed for 10,000 nodes to provide headroom, but the primary audience is teams with 2-200 nodes who benefit from a single, well-tested architecture rather than separate solutions for small and large clusters. Those are design targets, not measurements: every release is soaked on three nodes, and the [hollow-node record](qualification/2026-10-28-hollow-nodes.md) found limits at 500 and 1,000 nodes ([#1411](https://github.com/reliaburger/reliaburger/issues/1411), [#1412](https://github.com/reliaburger/reliaburger/issues/1412), [#1413](https://github.com/reliaburger/reliaburger/issues/1413)).
 
@@ -177,7 +177,7 @@ The unit of deployment is an **App**, not a Pod/Deployment/Service triple. At it
 
 ### 3.3 Convention Over Configuration
 
-Sensible defaults everywhere, with security-sensitive choices left explicit. An ingress route is plain HTTP unless it selects `tls = "cluster"` (the cluster's Ingress CA) or `tls = "explicit"` (an operator-supplied certificate and key). Automatic public certificate provisioning is planned for 0.4.0 ([#1667](https://github.com/reliaburger/reliaburger/issues/1667)): until then `auto` and `acme` are rejected rather than quietly weakening the route. Health checks use sane timeouts. Rolling deploys are the default strategy. Log collection is on by default. Reliaburger collects metrics automatically. Configuration is for overriding defaults, not for bootstrapping basic functionality.
+Sensible defaults everywhere, with security-sensitive choices left explicit. An ingress route is plain HTTP unless it selects `tls = "cluster"` (the cluster's Ingress CA) or `tls = "explicit"` (an operator-supplied certificate and key). Automatic public certificate provisioning is planned for 0.4.1 ([#1667](https://github.com/reliaburger/reliaburger/issues/1667)): until then `auto` and `acme` are rejected rather than quietly weakening the route. Health checks use sane timeouts. Rolling deploys are the default strategy. Log collection is on by default. Reliaburger collects metrics automatically. Configuration is for overriding defaults, not for bootstrapping basic functionality.
 
 ### 3.4 Homogeneous Nodes
 
@@ -1072,7 +1072,7 @@ Every concept an agent must learn is a cost, so a test counts them: on the 0.3.0
 
 ### 17.8 What's Planned
 
-0.2.8 brought forward part of the AI SRE milestone: agent tokens, proposals approved by a person or a policy, and the first half of the incident timeline. The rest stays in 0.4.2, "Let it help" (all *planned*): the timeline's second half, with a `/v1/timeline` endpoint, GitOps and log-pattern sources and a durable decision log (#1084), log patterns (#1087) and webhooks (#1089). Later come OpenTelemetry export (#1091) and a remote MCP endpoint with its own authentication (#1092).
+0.2.8 brought forward part of the AI SRE milestone: agent tokens, proposals approved by a person or a policy, and the first half of the incident timeline. The rest stays in 0.4.2, "Plug into what you have" (all *planned*): the timeline's second half, with a `/v1/timeline` endpoint, GitOps and log-pattern sources and a durable decision log (#1084), log patterns (#1087), webhooks (#1089), OpenTelemetry export (#1091) and a remote MCP endpoint with its own authentication (#1092).
 
 > For the implementation, the tests and the reasoning behind each choice, see the book chapter [Built for Humans and Their Agents](book/19-built-for-agents.md) and the manual chapter [Working with an AI agent](manual/16_working-with-an-ai-agent.md).
 
