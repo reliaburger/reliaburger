@@ -21,16 +21,48 @@ This file is the short version. The longer records are:
 - The root CA is offline. `relish init` writes the root's private key only into the backup you name with `--root-backup`, and without a terminal it needs `--passphrase-file` or `--recipient` too ([#709](https://github.com/reliaburger/reliaburger/issues/709)).
 - `relish ca backup` now only re-seals such a backup (`--from`). Keep the backup off the cluster: it's the only copy of the root's key ([#709](https://github.com/reliaburger/reliaburger/issues/709)).
 
+- Appliance clusters start with five council voters, and spare nodes join as Raft learners up to the council cap ([#496](https://github.com/reliaburger/reliaburger/pull/496), [#1469](https://github.com/reliaburger/reliaburger/pull/1469)).
+- A memory request no longer sets `memory.high`, and runc refuses a memory limit below runc init's footprint (about 16 MiB on runc 1.4) with a message saying why ([#1955](https://github.com/reliaburger/reliaburger/issues/1955), [#1959](https://github.com/reliaburger/reliaburger/issues/1959)).
+
 ### Added
 
-- The appliance OS, our own image on Ubuntu 26.04, with signed OS builds and A/B updates.
-- `relish netboot`, and claiming machines over the LAN.
-- OIDC signing-key rotation ([#709](https://github.com/reliaburger/reliaburger/issues/709)).
-- WebSocket drain parity for the ingress ([#369](https://github.com/reliaburger/reliaburger/issues/369)).
+- The appliance OS: our own image on Ubuntu 26.04 with no SSH server, built weekly, signed, and published on an OS channel ([#401](https://github.com/reliaburger/reliaburger/issues/401)). Its A/B updates boot the new version on trial and fall back to the old one by themselves if it doesn't come up ([#406](https://github.com/reliaburger/reliaburger/issues/406)).
+- `relish os` rolls an OS version across the cluster one node at a time, workers first and the leader last, moving each node's workloads off before it reboots. `relish os status`, `resume` and `abort` follow and steer it ([#406](https://github.com/reliaburger/reliaburger/issues/406)).
+- `relish image download`, `write` and `seed`, and `relish cluster create --bare-metal`, which makes a cluster from blank appliances and confirms the root CA backup before it keeps anything ([#403](https://github.com/reliaburger/reliaburger/issues/403)).
+- `relish netboot` installs appliances over the network: ProxyDHCP, TFTP and HTTP from a laptop, macOS included, asking before it wipes a disk that's in use. `--reinstall` reinstalls a machine that already runs Reliaburger ([#404](https://github.com/reliaburger/reliaburger/issues/404)).
+- `relish machines` lists unclaimed appliances on the LAN, and `relish machines claim` compares each one's claim key with its console, then sends it a seed ([#405](https://github.com/reliaburger/reliaburger/issues/405)).
+- Bun's appliance seed mode (`bun --appliance`) ([#402](https://github.com/reliaburger/reliaburger/issues/402)).
+- `relish join-token list` and `revoke` ([#1918](https://github.com/reliaburger/reliaburger/pull/1918), [#1977](https://github.com/reliaburger/reliaburger/pull/1977)).
+- JSON and YAML output for every appliance command, and `-o json` everywhere else too ([#1709](https://github.com/reliaburger/reliaburger/issues/1709), [#2025](https://github.com/reliaburger/reliaburger/pull/2025)).
+- OIDC signing-key rotation, with an overlap window for workload tokens ([#709](https://github.com/reliaburger/reliaburger/issues/709)).
+- Ingress: a route's TLS mode picks its certificate per SNI host, and a drained WebSocket closes with 1001 and carries the HTTP proxy's headers ([#2028](https://github.com/reliaburger/reliaburger/pull/2028), [#369](https://github.com/reliaburger/reliaburger/issues/369)).
+- `relish wtf` reports the council's backups, and the last usable admin token can't be revoked ([#2030](https://github.com/reliaburger/reliaburger/pull/2030)).
+- The soak gates its API read, API write, rolling-update and app-start SLOs, and checks that every task-array chunk completes exactly once ([#1405](https://github.com/reliaburger/reliaburger/issues/1405), [#1415](https://github.com/reliaburger/reliaburger/issues/1415)).
 
 ### Changed
 
 - The quickstart guest moves to Ubuntu 26.04.
+- `relish status` exits 3 when the cluster doesn't answer ([#2025](https://github.com/reliaburger/reliaburger/pull/2025)).
+- The API takes tokens issued for its own audience only ([#2022](https://github.com/reliaburger/reliaburger/pull/2022)).
+- Published ports are held to the cluster's perimeter, and the port map covers local destinations only ([#2026](https://github.com/reliaburger/reliaburger/pull/2026)).
+- On boot, Bun waits up to 30 s for the clock before it starts ([#2037](https://github.com/reliaburger/reliaburger/pull/2037)).
+
+### Fixed
+
+- A disk-pressured voter on a full council is replaced, and a replaced voter coming back no longer forces an election ([#1523](https://github.com/reliaburger/reliaburger/issues/1523), [#1524](https://github.com/reliaburger/reliaburger/issues/1524)).
+- A stopping Bun no longer launches new job attempts ([#1965](https://github.com/reliaburger/reliaburger/issues/1965)).
+- Shared-runc executors start on Ubuntu 26.04: runc 1.4's init was OOM-killed in the helper's 8 MiB ([#1957](https://github.com/reliaburger/reliaburger/issues/1957)).
+- A half-written instance record from a power cut no longer fails the node's startup ([#1852](https://github.com/reliaburger/reliaburger/issues/1852)).
+- Secret providers are asked again after a brief outage, and only typed references are resolved ([#1308](https://github.com/reliaburger/reliaburger/issues/1308)).
+- A join seed sent again gets a fresh join token ([#2002](https://github.com/reliaburger/reliaburger/issues/2002)).
+- About 60 fixes from the 16 and 17 November codebase review: council and Raft durability, gossip freshness, council membership on the Raft port, leader forwards with deadlines, layer whiteouts and volume paths resolved by descriptor, ingress HTTP/2 authority, and relish's handling of untrusted text. Each is in the [release's pull requests](https://github.com/reliaburger/reliaburger/pull/490).
+
+### Known issues
+
+- The Raft snapshot, `snapshot.redb`, is stored in plaintext. Only the Raft log is encrypted at rest ([#1775](https://github.com/reliaburger/reliaburger/issues/1775)).
+- Node shutdown, which every OS update goes through, skips each app's `pre_stop` hook and gives it 5 s instead of its `stop_grace` ([#2118](https://github.com/reliaburger/reliaburger/issues/2118)).
+- An OS rollout moves apps that keep data in a host path away from it, and `relish status` and `relish nodes` don't show its cordons ([#2120](https://github.com/reliaburger/reliaburger/issues/2120), [#2119](https://github.com/reliaburger/reliaburger/issues/2119)).
+- A Smoker `pause` of a runc app stops its launcher, not the app ([#2079](https://github.com/reliaburger/reliaburger/issues/2079)).
 
 ## [0.2.8] - 2026-11-12
 
