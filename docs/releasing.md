@@ -127,10 +127,16 @@ make up for that:
   cuts both ways: "close", "closes", "fix", "fixes", "resolve" or
   "resolves" before `#N` closes the issue wherever it stands in the
   message, even after "doesn't", so write "`#N` stays open" instead.
-- **The gate PR names every issue.** Before the gate PR merges into `main`,
-  rebuild its body with a `Fixes #N` line for every issue the train
-  resolves: list the train's merged PRs and commits, collect their lines,
-  check each issue on GitHub, and keep the list in
+- **The gate PR names every issue.** The gate PR is the only PR into the
+  default branch, so its body is where GitHub reads the keywords. It lists
+  `Fixes #N` for every issue that any PR merged into the train fixes, and
+  the line goes in as each PR merges, not in a sweep at the end. Then every
+  fixed issue closes the moment the gate PR merges. An issue that closes by
+  hand after a manual record, such as a hardware exit test, is named in the
+  body as well, without the keyword, with the record it waits for. Before
+  the gate PR merges into `main`, check the body against the train: list the
+  train's merged PRs and commits, collect their lines, check each issue on
+  GitHub, and keep the list in
   `docs/qualification/DATE-vX.Y.Z-freeze-fixes.txt` with the issues that
   stay open and why
   ([0.2.8's](qualification/2026-11-09-v0.2.8-freeze-fixes.txt)).
