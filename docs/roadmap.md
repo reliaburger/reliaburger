@@ -533,7 +533,7 @@ migration and no feature gate
   [move plan](plans/2026-10-09-plan-container-migration.md)). Take a node down
   without taking its apps down: one cordon record ([#2106](https://github.com/reliaburger/reliaburger/issues/2106)), `relish cordon`,
   `drain` and `uncordon` ([#656](https://github.com/reliaburger/reliaburger/issues/656)), cold moves that carry volumes
-  ([#657](https://github.com/reliaburger/reliaburger/issues/657)), stop hooks honoured on a node shutdown ([#1309](https://github.com/reliaburger/reliaburger/issues/1309)), drains and
+  ([#657](https://github.com/reliaburger/reliaburger/issues/657)), a retirement deadline that follows a long stop ([#1309](https://github.com/reliaburger/reliaburger/issues/1309)), drains and
   moves as proposals ([#2107](https://github.com/reliaburger/reliaburger/issues/2107)), and 0.3.0's rolling OS update waiting on a
   real drain ([#661](https://github.com/reliaburger/reliaburger/issues/661)). Alongside: one cluster-wide rollout budget
   ([#1776](https://github.com/reliaburger/reliaburger/issues/1776)), apps first on node memory ([#1967](https://github.com/reliaburger/reliaburger/issues/1967)), and an export and import
