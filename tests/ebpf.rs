@@ -5909,19 +5909,24 @@ async fn check_backend_retirement(
                 if restart_original {
                     let original = runtime.network_reference(&id).await?.ok_or_else(|| anyhow::anyhow!("original address hold missing"))?;
                     runtime.kill(&id).await?;
+                    let started = std::time::Instant::now();
+                    let mut last = String::from("nothing observed");
                     let replacement = tokio::time::timeout(std::time::Duration::from_secs(30), async {
                         loop {
-                            let published = services.borrow().resolve(&ServiceId::new("default", name)).is_some_and(|entry| entry.backends.iter().any(|backend| backend.instance_id == id.0 && backend.healthy));
-                            if let Some(reference) = runtime.network_reference(&id).await?
-                                && reference.generation != original.generation
-                                && published
-                                && runtime.state(&id).await? == reliaburger::grill::ContainerState::Running
-                            {
+                            let backends = services.borrow().resolve(&ServiceId::new("default", name)).map(|entry| entry.backends.iter().map(|backend| (backend.instance_id.clone(), backend.healthy)).collect::<Vec<_>>());
+                            let published = backends.as_ref().is_some_and(|backends| backends.iter().any(|(instance, healthy)| *instance == id.0 && *healthy));
+                            let reference = runtime.network_reference(&id).await?;
+                            let state = runtime.state(&id).await;
+                            let new_generation = reference.as_ref().is_some_and(|reference| reference.generation != original.generation);
+                            let running = matches!(state, Ok(reliaburger::grill::ContainerState::Running));
+                            last = format!("at {:?}: new generation {new_generation} ({:?} -> {:?}), published {published} ({backends:?}), state {state:?}", started.elapsed(), original.generation, reference.as_ref().map(|reference| reference.generation.clone()));
+                            if let Some(reference) = reference && new_generation && published && running {
                                 break Ok::<_, anyhow::Error>(reference);
                             }
                             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                         }
-                    }).await??;
+                    }).await.map_err(|_| anyhow::anyhow!("restart did not finish in 30 s; last seen {last}"))??;
+                    eprintln!("restart finished in {:?}", started.elapsed());
                     let checkpoint: serde_json::Value = serde_json::from_slice(&std::fs::read(root.path().join("discovery/discovery.json"))?)?;
                     let inventory: reliaburger::bun::discovery_owners::DiscoveryInventory = serde_json::from_value(checkpoint["inventory"].clone())?;
                     anyhow::ensure!(inventory.references.len() == 1 && inventory.references[0].reference == replacement && inventory.references[0].phase == reliaburger::bun::discovery_owners::ReferencePhase::Held, "restart did not replace its original durable hold");
