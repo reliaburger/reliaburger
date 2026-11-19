@@ -822,7 +822,14 @@ through the same cargo-fuzz targets
 ([guide](https://google.github.io/oss-fuzz/getting-started/new-project-guide/rust-lang/)).
 Applying needs a `projects/reliaburger/` directory in the OSS-Fuzz repository
 (a `project.yaml`, a Dockerfile and a `build.sh` that runs `cargo fuzz build -O`),
-once the targets have run clean nightly for a while.
+once the targets have run clean nightly for a while. A draft of all three is
+in [`fuzz/oss-fuzz/`](../fuzz/oss-fuzz): `build.sh` builds every target
+`cargo fuzz list` names, with the same 64 codegen units as `make fuzz-build`,
+and ships each target's `fuzz/corpus/` seeds as its seed corpus. The
+maintainer fills in `project.yaml`'s contacts and opens the pull request
+against [google/oss-fuzz](https://github.com/google/oss-fuzz)
+([#1414](https://github.com/reliaburger/reliaburger/issues/1414)). Nothing in
+this repository runs the draft.
 
 ## Mutation testing
 
