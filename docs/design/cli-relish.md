@@ -1282,7 +1282,7 @@ command ends (D34). `POST /v1/exec/{app}/{namespace}` answers `200` with
 `{"output", "exit_code"}` whatever the code, and relish exits with that code.
 Only failing to run the command is an HTTP error: `404` when no instance is
 running, `504` when it outlives the five-minute limit, `500` otherwise.
-Interactive, streaming exec is #710 (0.4.0).
+Interactive, streaming exec is #710 (0.4.1).
 
 The `--debug`, `--privileged` and `--node` variants are **Status: planned — not
 yet implemented.** `exec` runs a command in the app's own container only; there

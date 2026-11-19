@@ -689,9 +689,9 @@ Next, after 0.2.8. An appliance OS, netbooting and claiming machines over the LA
 
 [Milestone](https://github.com/reliaburger/reliaburger/milestone/6)
 
-**0.4.0: Full container migration**
+**0.4.0: Planned maintenance**
 
-Planned. Cordon, drain and uncordon, cold moves that carry volumes, and checkpoint moves that keep memory while connections reconnect.
+Planned. Cordon, drain and uncordon, cold moves that carry volumes, and weekly OS updates that drain each node first.
 
 [Milestone](https://github.com/reliaburger/reliaburger/milestone/7)
 

@@ -10,6 +10,14 @@ design live in
 [Research: moving a running container between nodes](2026-09-28-research-container-migration.md),
 which we cite as "the research" below. Nothing here is implemented yet.
 
+**Revised on 19 November 2026** by the
+[0.4.x review](2026-11-19-review-0.4.x.md), which this plan hasn't been
+rewritten for yet. 0.4.0 ships drain and cold moves alone. Checkpoint moves
+by CRIU, and every spike that serves them, are parked in Later; VM apps keep
+their memory by snapshot in 0.4.5, and 0.5.0's live moves target VMs only.
+0.3.0 already ships the rolling OS update this plan describes as future work.
+The review's section 2 lists fifteen places where the code has moved on.
+
 ## Who this is for
 
 Picture a team of three running a dozen apps on four machines in a cupboard, or
