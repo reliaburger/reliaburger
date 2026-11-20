@@ -249,10 +249,10 @@ exporter, list fixed URLs as `[[metrics.scrape_targets]]` with a `job` and a
 
 ### Alerts
 
-Each node evaluates five built-in rules against its own metrics every 30
+Each node evaluates four built-in rules against its own metrics every 30
 seconds: CPU above 90% for 5 minutes and memory above 85% for 2 minutes
-(critical); memory above 70% for 10 minutes, disk above 80% for 5 minutes and
-CPU below 5% for 30 minutes (warning). You can't define your own rules yet ([#1773](https://github.com/reliaburger/reliaburger/issues/1773)).
+(critical); memory above 70% for 10 minutes and disk above 80% for 5 minutes
+(warning). An idle node raises nothing: low CPU is spare capacity, not a fault. You can't define your own rules yet ([#1773](https://github.com/reliaburger/reliaburger/issues/1773)).
 Webhooks deliver them, optionally signed with HMAC-SHA256:
 
 ```toml

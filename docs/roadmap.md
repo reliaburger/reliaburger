@@ -712,7 +712,7 @@ what's shipped and what's scheduled.
   ([#1776](https://github.com/reliaburger/reliaburger/issues/1776)), static builds
   ([#1774](https://github.com/reliaburger/reliaburger/issues/1774)) and Raft
   snapshot encryption ([#1775](https://github.com/reliaburger/reliaburger/issues/1775)).
-- **Custom alert rules.** Each node evaluates five built-in rules; you can't
+- **Custom alert rules.** Each node evaluates four built-in rules; you can't
   define your own yet ([#1773](https://github.com/reliaburger/reliaburger/issues/1773), planned for 0.4.2).
 - **Scale beyond three nodes.** Every release is soaked on three nodes. The
   [hollow-node record](qualification/2026-10-28-hollow-nodes.md) found limits
