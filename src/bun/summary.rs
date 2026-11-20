@@ -230,8 +230,15 @@ pub struct NodesSection {
     pub dead: u32,
     /// Nodes that left the cluster.
     pub left: u32,
-    /// Alive nodes cordoned by an upgrade, which take no new work.
+    /// Alive nodes cordoned by a bun upgrade or an OS rollout, which take
+    /// no new work.
     pub cordoned: u32,
+    /// Of those, the ones a bun upgrade cordoned.
+    #[serde(default)]
+    pub cordoned_by_upgrade: u32,
+    /// Of those, the ones an OS rollout cordoned (#2119).
+    #[serde(default)]
+    pub cordoned_by_os_rollout: u32,
     /// Nodes with a data path at or above
     /// [`DISK_PRESSURE_PERCENT`] full, among those whose usage sample
     /// arrived.
@@ -634,8 +641,49 @@ pub struct NodeCapacity {
     pub gpu_allocated: u32,
     /// GPUs the node detected, when `[resources] gpu_enabled` is set.
     pub gpu_total: u32,
-    /// Whether a cluster upgrade has cordoned it: it takes no new work.
+    /// Whether a bun upgrade or an OS rollout has cordoned it: it takes no
+    /// new work.
     pub cordoned: bool,
+    /// Which of the two cordoned it, when one has.
+    #[serde(default)]
+    pub cordoned_by: Option<Cordon>,
+}
+
+/// What cordoned a node: the cluster's own rollouts, each of which keeps
+/// new work off a node while it restarts it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Cordon {
+    /// A rolling bun upgrade (`relish upgrade`).
+    Upgrade,
+    /// An OS rollout on appliance nodes (`relish os upgrade`).
+    OsRollout,
+}
+
+impl Cordon {
+    /// The cordon a node is under, if any: a bun upgrade and an OS rollout
+    /// never run at once, but if both claimed a node the upgrade is named.
+    pub fn of_node(
+        node: &str,
+        upgrade: Option<&crate::upgrade::types::ClusterUpgradeState>,
+        os_rollout: Option<&crate::os::rollout::OsRollout>,
+    ) -> Option<Self> {
+        if upgrade.is_some_and(|upgrade| upgrade.is_node_cordoned(node)) {
+            Some(Self::Upgrade)
+        } else if os_rollout.is_some_and(|rollout| rollout.is_node_cordoned(node)) {
+            Some(Self::OsRollout)
+        } else {
+            None
+        }
+    }
+
+    /// What cordoned the node, in words, and the command that says more.
+    pub fn describe(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Upgrade => ("the bun upgrade", "relish upgrade status"),
+            Self::OsRollout => ("the OS rollout", "relish os status"),
+        }
+    }
 }
 
 impl CapacitySection {
@@ -963,16 +1011,21 @@ fn nodes_section(
     leader: Option<&LeaderView>,
 ) -> NodesSection {
     let state = |name: &str| count(members.iter().filter(|m| m.state == name).count());
+    let cordoned = |matches: fn(&NodeCapacity) -> bool| {
+        leader
+            .and_then(|view| view.capacity.as_ref())
+            .map_or(0, |capacity| {
+                count(capacity.nodes.iter().filter(|n| matches(n)).count())
+            })
+    };
     NodesSection {
         alive: state("alive"),
         suspect: state("suspect"),
         dead: state("dead"),
         left: state("left"),
-        cordoned: leader
-            .and_then(|view| view.capacity.as_ref())
-            .map_or(0, |capacity| {
-                count(capacity.nodes.iter().filter(|n| n.cordoned).count())
-            }),
+        cordoned: cordoned(|node| node.cordoned),
+        cordoned_by_upgrade: cordoned(|node| node.cordoned_by == Some(Cordon::Upgrade)),
+        cordoned_by_os_rollout: cordoned(|node| node.cordoned_by == Some(Cordon::OsRollout)),
         disk_pressure: count(
             shares
                 .iter()
@@ -1528,6 +1581,7 @@ mod tests {
             gpu_allocated,
             gpu_total,
             cordoned: false,
+            cordoned_by: None,
         };
         let section = CapacitySection::from_nodes(&[node("node-1", 2, 4), node("node-2", 0, 4)]);
         assert_eq!(section.nodes_reporting, 2);
@@ -1664,6 +1718,7 @@ mod tests {
             gpu_allocated: 1,
             gpu_total: 2,
             cordoned: false,
+            cordoned_by: None,
         }
     }
 
@@ -1913,7 +1968,9 @@ mod tests {
         ]);
         inputs.shares[0].data_disk_percent = Some(91.0);
         if let Ok(view) = &mut inputs.leader {
-            view.capacity.as_mut().unwrap().nodes[1].cordoned = true;
+            let node = &mut view.capacity.as_mut().unwrap().nodes[1];
+            node.cordoned = true;
+            node.cordoned_by = Some(Cordon::Upgrade);
         }
         let nodes = assemble(&inputs).nodes.value.unwrap();
         assert_eq!(
@@ -1924,8 +1981,67 @@ mod tests {
                 dead: 1,
                 left: 0,
                 cordoned: 1,
+                cordoned_by_upgrade: 1,
+                cordoned_by_os_rollout: 0,
                 disk_pressure: 1,
             }
+        );
+    }
+
+    /// #2119: a node the OS rollout cordoned is counted as cordoned, and
+    /// as the OS rollout's, so `relish status` can say why it takes no work.
+    #[test]
+    fn nodes_count_os_rollout_cordons_apart_from_upgrade_ones() {
+        let mut inputs = healthy();
+        if let Ok(view) = &mut inputs.leader {
+            let node = &mut view.capacity.as_mut().unwrap().nodes[2];
+            node.cordoned = true;
+            node.cordoned_by = Some(Cordon::OsRollout);
+        }
+        let nodes = assemble(&inputs).nodes.value.unwrap();
+        assert_eq!(
+            (
+                nodes.cordoned,
+                nodes.cordoned_by_upgrade,
+                nodes.cordoned_by_os_rollout
+            ),
+            (1, 0, 1)
+        );
+    }
+
+    #[test]
+    fn a_node_is_cordoned_by_whichever_rollout_is_working_on_it() {
+        let mut rollout = crate::os::rollout::plan(
+            "r1",
+            "2026.42.0",
+            "https://example/os-channel.json",
+            "node-1",
+            vec![
+                (
+                    "node-2".into(),
+                    "10.0.0.2:9117".into(),
+                    false,
+                    "2026.41.0".into(),
+                ),
+                (
+                    "node-3".into(),
+                    "10.0.0.3:9117".into(),
+                    false,
+                    "2026.41.0".into(),
+                ),
+            ],
+            0,
+        );
+        rollout.nodes[0].phase = crate::os::rollout::OsNodePhase::Draining;
+        assert_eq!(
+            Cordon::of_node("node-2", None, Some(&rollout)),
+            Some(Cordon::OsRollout)
+        );
+        assert_eq!(Cordon::of_node("node-3", None, Some(&rollout)), None);
+        assert_eq!(Cordon::of_node("node-2", None, None), None);
+        assert_eq!(
+            serde_json::to_value(Cordon::OsRollout).unwrap(),
+            serde_json::json!("os_rollout")
         );
     }
 

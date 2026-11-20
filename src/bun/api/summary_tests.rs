@@ -375,3 +375,76 @@ async fn a_live_node_without_a_fresh_report_makes_capacity_partial() {
     );
     shutdown.cancel();
 }
+
+/// #2119: the node an OS rollout is draining is cordoned in the capacity
+/// both `relish nodes` and `relish status` read, and named as the rollout's.
+#[tokio::test]
+async fn a_node_the_os_rollout_is_draining_is_cordoned_by_it() {
+    use crate::bun::summary::Cordon;
+    use crate::council::types::RaftRequest;
+
+    let shutdown = CancellationToken::new();
+    let council = super::tests::seeded_council("summary-os-cordon").await;
+    let mut rollout = crate::os::rollout::plan(
+        "os-1",
+        "2026.42.0",
+        "https://example/os-channel.json",
+        "node-1",
+        vec![
+            (
+                "node-1".into(),
+                "127.0.0.1:9117".into(),
+                true,
+                "2026.41.0".into(),
+            ),
+            (
+                "node-2".into(),
+                "127.0.0.1:9".into(),
+                false,
+                "2026.41.0".into(),
+            ),
+        ],
+        0,
+    );
+    rollout.nodes[0].phase = crate::os::rollout::OsNodePhase::Draining;
+    assert_eq!(rollout.nodes[0].node_id, "node-2", "workers go first");
+    council
+        .write(RaftRequest::OsRolloutStart {
+            rollout: Box::new(rollout),
+            replaces: None,
+        })
+        .await
+        .unwrap();
+    let (app, _dirs) = router(
+        Fixture {
+            council: Some(council),
+            membership: vec![
+                member("node-1", "127.0.0.1:9117"),
+                member("node-2", "127.0.0.1:9"),
+            ],
+            aggregated: Some(fresh(vec![report("node-1", 0, 0), report("node-2", 0, 0)])),
+            ..Fixture::default()
+        },
+        &shutdown,
+    );
+
+    let (status, body) = get(&app, "/v1/cluster/capacity", None).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let capacity: ClusterCapacity = serde_json::from_slice(&body).unwrap();
+    let cordons: Vec<(&str, bool, Option<Cordon>)> = capacity
+        .nodes
+        .iter()
+        .map(|node| (node.node.as_str(), node.cordoned, node.cordoned_by))
+        .collect();
+    assert_eq!(
+        cordons,
+        [
+            ("node-1", false, None),
+            ("node-2", true, Some(Cordon::OsRollout))
+        ]
+    );
+
+    let nodes = summary(&app, None).await.nodes.value.unwrap();
+    assert_eq!((nodes.cordoned, nodes.cordoned_by_os_rollout), (1, 1));
+    shutdown.cancel();
+}

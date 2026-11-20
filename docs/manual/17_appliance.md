@@ -690,7 +690,8 @@ own image carries and every file against the release's `SHA256SUMS`, writes
 it into the spare slot and reboots. Once it's healthy on the new version, the
 leader moves on. Apps with a managed volume or a host-path mount (a volume
 with a `source`) stay with their data and are back when the node is, a minute
-or two later.
+or two later. While a node drains and updates it takes no new work, and
+`relish nodes` and `relish status` say it's cordoned by the OS rollout.
 
 If a node comes back on its old version, because the new one failed its boot
 checks three times, or doesn't come back within 45 minutes, the rollout
