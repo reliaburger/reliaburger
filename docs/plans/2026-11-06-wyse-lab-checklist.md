@@ -262,7 +262,11 @@ This run counts for the v0.3.0 tag. No shortcuts. About a day, plus 24 hours of 
   cd ~/github/rb-wt/wyse && caffeinate -i image/lab/fleet-measure.sh ~/wyse 300 288
   ```
 
-- [ ] **2.6 Update the OS, then test the fallback.** Only once the 24 hours are over. Serve `next/` as in 1.7, then roll out the next version: the two followers first, the leader last.
+- [ ] **2.6 The other 0.3.0 gates on the cluster.** Only once the 24 hours are over:
+  - [#286](https://github.com/reliaburger/reliaburger/issues/286): the live `relish test` catalogue against the three nodes;
+  - [#287](https://github.com/reliaburger/reliaburger/issues/287): Btrfs power cuts on one node.
+
+- [ ] **2.7 Update the OS across the cluster, last.** Serve `next/` as in 1.7, then roll out the next version: the two followers first, the leader last. Keep `relish council` open in another terminal, to check the cluster keeps quorum throughout, and note how long each node took.
 
   ```sh
   channel=http://<lab-ip>:8000/releases/download/os-channel/os-channel.json
@@ -271,9 +275,9 @@ This run counts for the v0.3.0 tag. No shortcuts. About a day, plus 24 hours of 
   $R os status
   ```
 
-  Then repeat the fallback from 1.7 on a voter that isn't the leader, with that node's address in the `S` function. `relish council` names the leader, which may have moved during the update. The node should come back on the *next* version. **T3 − T2 must be 10 minutes or less.** Keep `relish council` open in another terminal, to check the cluster keeps quorum throughout.
+  The fallback isn't repeated here. 1.7's single-unit result stands for the go/no-go (maintainer decision, 20 November 2026).
 
-- [ ] **2.7 Record the results.** Collect the relish netboot log, T0 to T3, the BIOS notes, the measure CSVs and anything that went wrong. They go into `docs/qualification/<date>-wyse-3040.md`, with the go/no-go below. A failed step is still a result: write down what happened and stop.
+- [ ] **2.8 Record the results.** Collect the relish netboot log, T0 to T3, the BIOS notes, the measure CSVs and anything that went wrong. They go into `docs/qualification/<date>-wyse-3040.md`, with the go/no-go below. A failed step is still a result: write down what happened and stop.
 
 ## Go/no-go
 
@@ -285,4 +289,6 @@ All five must hold (maintainer decisions of 7 October 2026, in the [Wyse lab pla
 | Power-on to a working cluster | ≤ 60 min | T1 − T0 |
 | `MemAvailable` on every node under the workload | ≥ 1.0 GB | first 12 h of 2.5 |
 | eMMC life at the measured write rate, worst node | ≥ 5 years (about 1.3 GB a day) | 24 h of 2.5 |
-| A broken update falls back by itself | ≤ 10 min | T3 − T2 in 2.6 |
+| A broken update falls back by itself | ≤ 10 min | T3 − T2 in 1.7 |
+
+On 20 November 2026, the fallback took 10 min 28 s on one unit (1.7). The maintainer accepted it pending [#2143](https://github.com/reliaburger/reliaburger/issues/2143), which cuts boot-check's 120 s per try to 90 s in 0.3.2.
