@@ -4374,6 +4374,78 @@ reached node 2 and ran there; the request was slow on the far side, not lost
 on a dead pooled connection. The earlier candidates were lucky: the loop was
 as unfair then, and the case passes whenever the coin tosses go its way.
 
+### An exec that ate the case
+
+A 0.3.0 soak pulse failed `deploy_from_cluster_registry` with nothing but
+"case exceeded its deadline" after 300 s ([#2128](https://github.com/reliaburger/reliaburger/issues/2128)).
+The app had been committed, the status polls were bounded at 5 s each, and
+the reason carried no note from a wait that was still polling. What was left
+was the step after them: a `busybox wget` run inside the container through
+`exec_in_workload`. Forty attempts to reproduce it passed, so we still don't
+know that the exec hung. We do know that if it had, nobody could have said
+so, because every layer an exec crosses allowed exactly 300 s: the `relish`
+client, the agent, Bun's wait on the process owner's socket, and the owner's
+own deadline. The case's budget was 300 s too. A wedged exec spent all of
+it, and whichever timer fired first threw away the others' explanations.
+
+Two timeouts that are equal aren't nested; they race. The fix gives each
+layer a different length, in the order the error should come out:
+
+| Layer | Limit | Why that length |
+|-------|-------|-----------------|
+| agent (`exec_deadline.rs`) | the request's `timeout_seconds`, at most 300 s | the one that answers `504` naming the app |
+| Bun's owner-socket wait | 310 s | a backstop in the same future; mustn't beat the agent |
+| the exec owner | 320 s | retires a command whose caller stopped asking |
+| `relish` client | requested + 30 s (330 s by default) | hears the agent's answer instead of timing out blind |
+
+`relish exec` sends no timeout, so a person waiting on a long command keeps
+the five minutes they always had. The test kit asks for less. It waits at
+most 60 s, never past a second before the case's own deadline, and asks the
+agent for 5 s less than that, so the agent's `504` arrives while the test kit
+is still listening:
+
+```rust
+let wait = WORKLOAD_EXEC_BOUND.min(
+    self.deadline
+        .remaining()
+        .saturating_sub(EXEC_DEADLINE_RESERVE),
+);
+let asked = wait
+    .saturating_sub(EXEC_ANSWER_MARGIN)
+    .max(Duration::from_secs(1));
+```
+
+`saturating_sub` stops at zero instead of wrapping round or panicking, as
+`Duration` subtraction would with plain `-` when the right side is larger.
+Either way the case fails with `inspect workload contents: exec in
+rbtest-…/registry-web timed out on node rb-…-1`, followed by the agent's
+answer or "no answer within 60 s", with most of its budget unspent. If the
+wedge happens again, that line confirms or rules out the exec reading.
+
+One layer sits outside the table. When the test kit can't reach a peer
+directly it goes through the entry node's relay, and the relay gives any
+forwarded request 30 s. A relayed exec that wedges gets the relay's `504`,
+"node … did not answer within 30s", under the same heading. That's still a
+named timeout, so we left the relay alone.
+
+The request field is optional, `#[serde(default)] timeout_seconds:
+Option<u64>`, and the handler holds it between 1 s and the cap, so a caller
+can't ask an agent to keep a command running for a day. Old clients send no
+field and get the cap, so nothing about the cluster's wire format changed and
+`CURRENT` keeps its numbers.
+
+The tests check each piece. `a_hanging_exec_fails_with_a_named_timeout` runs
+`run_exec_within` on a future that never finishes, under Tokio's paused clock,
+and checks the error names the app and fires at exactly 60 s;
+`exec_deadlines_nest_inside_the_clients_wait` checks the table's order, so a
+later edit to one constant can't make two layers race again. In the test kit,
+`a_wedged_exec_fails_naming_the_app_node_and_timeout` serves a node whose exec
+never answers and a case with 3 s left, and checks the named error comes back
+before the case deadline; `an_exec_the_agent_timed_out_names_the_app_and_node`
+answers `504` and checks the timeout the test kit asked for. All four failed
+before the change: the first two because every layer was 300 s, the test kit
+pair because the case deadline fired first with nothing to say.
+
 ### Busy isn't dead
 
 `biased;` bought fairness for commands, and the final tier of the soak on

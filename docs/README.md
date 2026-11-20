@@ -1692,7 +1692,7 @@ The bun agent exposes a local HTTP API on port 9117:
 | `POST` | `/v1/stop/{app}/{namespace}` | Stop an app. In a cluster it answers `202 Accepted` with `{"status":"stopping"}` once the council records the stop; poll `/v1/status` for the instances to go. A standalone node answers `200` with `stopped` after the local stop completes |
 | `POST` | `/v1/delete/{app}/{namespace}` | Remove an app. In a cluster it answers `202 Accepted` with `{"status":"deleting"}`; cleanup on the workers follows asynchronously |
 | `GET` | `/v1/logs/{app}/{namespace}` | Captured stdout/stderr (`?tail=N&follow=true`) |
-| `POST` | `/v1/exec/{app}/{namespace}` | Execute a command (JSON body: `{"command":["..."]}`) |
+| `POST` | `/v1/exec/{app}/{namespace}` | Execute a command (JSON body: `{"command":["..."]}`, optional `"timeout_seconds"`, at most 300) |
 | `GET` | `/v1/cluster/nodes` | List cluster nodes (gossip membership, dead members included with state `dead`) |
 | `GET` | `/v1/cluster/summary` | The whole cluster at a glance: counts per section (nodes, council, gossip, versions, capacity, usage, apps, instances, jobs, logs, faults, alerts, certs, GitOps, agents: leases held and proposals waiting), each marked `complete`, `partial` or `missing` with the nodes that answered. A scoped token sees its own apps and jobs; the cluster-wide sections come back `missing` |
 | `GET` | `/v1/cluster/capacity` | Requested CPU, memory and GPUs against schedulable capacity per node, from the leader's state reports; unscoped tokens only |
