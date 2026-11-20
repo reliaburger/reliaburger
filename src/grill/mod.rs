@@ -32,6 +32,9 @@ pub mod port;
 pub mod portmap;
 pub mod process;
 mod process_control;
+// Only the exec-deadline nesting test reads it from outside.
+#[cfg(test)]
+pub(crate) use process_control::OWNER_SOCKET_EXEC_TIMEOUT;
 pub mod process_owner;
 pub mod process_workload;
 pub mod records;

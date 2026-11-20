@@ -91,6 +91,7 @@ mod discovery_ownership;
 mod discovery_recovery;
 mod egress_ownership;
 mod egress_resolution;
+mod exec_deadline;
 mod fault_coverage;
 mod faults;
 mod follow_ups;
@@ -126,6 +127,7 @@ pub use consumer::ConsumerUpdate;
 use deploy_ops::{DeployOp, DeployOps, PreparedInstance, RollingInstance};
 use deploy_worker::DeployWorker;
 use discovery_ownership::{DiscoveryOwnership, JournalReference};
+pub use exec_deadline::{MAX_EXEC_TIMEOUT, client_exec_wait, exec_timeout};
 use faults::{InstalledNetworkFaults, NodeFaultFence};
 use health_checks::wait_instance_healthy;
 pub use identity::workload_spiffe_uri;
@@ -139,11 +141,6 @@ pub use status_snapshot::{StatusReader, StatusUnavailable};
 use trace::MAX_CONCURRENT_TRACES;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use trace::backend_addresses;
-
-/// Deadline for an `exec` run off the command loop (H3). Bounds an orphaned
-/// task if the caller disconnects; the exec no longer blocks the loop, so this
-/// is generous — it only stops a truly runaway command from lingering forever.
-const EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Maximum time an init container may run before the deploy fails. Bounds the
 /// init wait so a hung init can't wedge the agent event loop indefinitely.

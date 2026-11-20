@@ -1281,7 +1281,10 @@ It is one-shot: no stdin and no terminal, and the output comes back when the
 command ends (D34). `POST /v1/exec/{app}/{namespace}` answers `200` with
 `{"output", "exit_code"}` whatever the code, and relish exits with that code.
 Only failing to run the command is an HTTP error: `404` when no instance is
-running, `504` when it outlives the five-minute limit, `500` otherwise.
+running, `504` when it outlives its limit, `500` otherwise. The limit is the
+body's optional `timeout_seconds`, held between 1 s and five minutes; without
+one it's five minutes, which is what `relish exec` gets. `relish test` asks
+for at most 55 s (#2128).
 Interactive, streaming exec is #710 (0.4.1).
 
 The `--debug`, `--privileged` and `--node` variants are **Status: planned — not
