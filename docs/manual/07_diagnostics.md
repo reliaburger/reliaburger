@@ -103,7 +103,10 @@ the same comparison as a table.
 For the image registry, `wtf` warns (`registry-redundancy`) when a node's
 registry isn't listening, peers can't reach it, or some layers have fewer live
 copies than `[images] redundancy` asks for. Heal fixes the last on its own
-within a minute or two. A *lost* image is worse: some layer it needs has no
+within a minute or two. A one-node cluster can't hold a second copy of
+anything, so there `wtf` says so under OK instead (`one node: Pickle keeps one
+copy of each layer; add a node for redundancy`), and `relish status` doesn't
+count it as a problem. A *lost* image is worse: some layer it needs has no
 live copy anywhere, so nothing can pull it. That's a CRITICAL
 `registry-lost-images` finding listing each `repository:tag`, and the only fix
 is to push the image again (or bring back the node that held it). `relish
