@@ -7,7 +7,7 @@
 //! enrol with the join token, then fetch the master key with the new
 //! certificate. It writes `node.toml` last, so a node is either fully
 //! prepared or not at all, and each step that already happened is skipped
-//! on the next boot. See docs/plans/2026-10-01-plan-appliance-product.md, W2.
+//! on the next boot. See docs/plans/archive/2026-10-01-plan-appliance-product.md, W2.
 
 pub mod address;
 pub mod claim;

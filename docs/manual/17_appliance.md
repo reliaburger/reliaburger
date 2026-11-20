@@ -18,8 +18,8 @@ Four commands do it all:
 CI runs them against QEMU VMs on every change to the image. On x86_64 it
 runs the lot: netboot installs, claimed and seeded clusters, an OS update
 and a broken update falling back. On aarch64 it runs the boot test only. The hardware it's built for is the Dell Wyse 3040,
-netbooted from a Mac, and the release isn't tagged until three of them go
-from power-on to a working cluster. Other firmware may still have surprises;
+netbooted from a Mac, and 0.3.0's exit test takes three of them from
+power-on to a working cluster. Other firmware may still have surprises;
 "What's missing" lists the ones we know of.
 
 ## What you need
