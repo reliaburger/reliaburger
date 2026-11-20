@@ -1121,6 +1121,10 @@ pub enum PickleError {
     DigestMismatch { expected: Digest, actual: Digest },
     #[error("replication failed: {0}")]
     ReplicationFailed(String),
+    /// The upstream registry answered that it has no such image, or won't
+    /// show it to this node (401, 403 or 404): asking again won't help.
+    #[error("{0}")]
+    UpstreamImageMissing(String),
     /// The cluster runs plaintext transports, and the registry leader's
     /// propose and query endpoints accept only mTLS node certificates
     /// (#792), so this node can't forward or replicate registry state.
