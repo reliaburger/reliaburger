@@ -1035,6 +1035,18 @@ class PortableLinuxRunnerTests(unittest.TestCase):
         text = (WORKFLOWS / "ci.yml").read_text()
         self.assertEqual(text.count("CARGO_BUILD_JOBS:"), 1)
 
+    def test_train_pushes_save_the_dependency_cache_that_train_prs_restore(self):
+        # The cache key carries the toolchain and the lock file, which a
+        # train changes, so train PRs never matched main's cache and built
+        # every dependency one job at a time: about ten of a run's 37
+        # minutes (run 44721359618, "No cache found"). A PR restores its
+        # base branch's caches, so the train's own pushes save one (#1723).
+        # Pull request and merge-queue refs still never save.
+        cache = self.steps[self.step("uses: Swatinem/rust-cache@")]
+        self.assertIn("shared-key: portable", cache)
+        self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' || "
+                      "startsWith(github.ref, 'refs/heads/release-') }}", cache)
+
     def test_the_report_fails_when_the_low_water_mark_is_under_ten_gibibytes(self):
         report = self.steps[self.step('kill "$(cat "$RUNNER_TEMP/portable-linux-resources.pid")"')]
         check = 'scripts/ci/assert-headroom "$RUNNER_TEMP/portable-linux-resources.log" 10485760'

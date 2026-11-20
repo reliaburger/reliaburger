@@ -1261,6 +1261,17 @@ request is closed, whose branch is gone, or which a newer cache of the same fami
 same ref has replaced. The rule is a pure function, `stale(caches, open_pulls, branches)`,
 tested on fixtures, with the `gh` calls kept at the edges so it can be tested without network access.
 
+Then November's runner losses pushed portable Linux back up. With the coverage build at one
+job at a time, portable Linux went from a median of 22.7 minutes over 13 green train PRs to 34.8 over
+the next 14. Part of that was avoidable. `Swatinem/rust-cache` keys its cache on the
+toolchain and `Cargo.lock`, and only `main` saved one. So the cache that paragraph protects,
+`main`'s, wasn't one a train PR could use: a train changes the lock file, and no train PR
+ever restored a cache. Run 44721359618 says "No cache found" and then builds every
+dependency, one crate at a time, for about ten minutes. GitHub lets a pull request restore
+caches saved on its base branch, so now the train's own pushes save that cache too. Pull
+request and merge-queue refs still never save one, so nothing a PR builds ends up in a cache
+another run trusts.
+
 ### A release gate that fits in a week
 
 Pull requests were quick by 0.2.3. The release wasn't. From code freeze to ready-to-tag took

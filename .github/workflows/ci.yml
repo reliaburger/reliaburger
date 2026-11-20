@@ -291,10 +291,15 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.151,cargo-llvm-cov@0.9.1
+      # A train's pushes save the dependency cache too: its key carries the
+      # toolchain and Cargo.lock, which a train changes, so its PRs never
+      # matched main's and built every dependency one job at a time, about
+      # ten minutes of each run (#1723). A pull request restores its base
+      # branch's caches; pull request and merge-queue refs never save.
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: portable
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release-') }}
           cache-on-failure: true
       # Cache cleanup may retain empty generated directories. Clear old
       # envelopes once; each fresh owner remains exclusive within this job.
