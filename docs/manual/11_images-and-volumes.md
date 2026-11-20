@@ -81,6 +81,15 @@ mirror, `mirrors` now covers every image you apply.
   not answer`). The registry gets 20 seconds to answer.
 - **Pickle images** bind to the digest the cluster's registry holds for the
   tag, without asking anyone else.
+- **Not built yet?** A name with no registry (`burger:v1`) that Pickle doesn't
+  hold falls through to Docker Hub. When Docker Hub hasn't got it either, the
+  apply fails with `burger:v1 isn't in this cluster's registry (Pickle); build
+  it with relish build <file> or push it, or name the registry that has it`.
+  Run `relish build` (or push the image) and apply again. An image whose own
+  registry says it doesn't exist (`ghcr.io/acme/burger:v1`) fails with
+  `doesn't exist or isn't visible to this node`: check the name, the tag and
+  the node's registry credentials. Neither is worth retrying, so a standalone
+  node answers `404`, not the `502` of a registry that's down.
 - **Where you see it:** `relish history` shows the bound reference in its
   `IMAGE` column, one row per version. `relish rollback`
   restores the bound reference of the version before, so it runs the bytes
