@@ -59,7 +59,7 @@ BURGER_URL="https://reliaburger.com/demo/burger.tar.gz"
 BURGER_FETCH="curl -fsSL ${BURGER_URL} | tar xz"
 # The example policies, from the release's tag: the demo archive is
 # built from the tag too, so the tour never needs a file the release lacks.
-PLATFORM_FETCH="curl -fsSLO https://raw.githubusercontent.com/reliaburger/reliaburger/v0.2.8/examples/policies/platform.toml"
+PLATFORM_FETCH="curl -fsSLO https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/examples/policies/platform.toml"
 POLICY_TEST="relish policy test -f platform.toml -f burger/burger.toml"
 AGENT_TOKEN='AGENT=$(relish token create --name burger-agent --agent --role deployer --namespaces default --ttl 1h)'
 PROPOSE='relish agent propose scale patty --replicas 2 --reason "a double is plenty" --token "$AGENT"'
@@ -769,4 +769,6 @@ done 3< <(tour_commands)
 resource_summary
 say "That's the tour. \`relish local destroy --yes\` removes the cluster,"
 say "and \`relish uninstall\` removes relish itself."
+say "New in 0.3.0: the same cluster on real machines. \`sudo relish netboot\` installs our"
+say "appliance OS on them over the network; https://reliaburger.com/#netboot shows how."
 sleep 2

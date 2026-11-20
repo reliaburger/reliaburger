@@ -1,5 +1,5 @@
 //! `relish machines`: find unclaimed appliances on the LAN and claim them
-//! (docs/plans/2026-10-01-plan-appliance-product.md, W5).
+//! (docs/plans/archive/2026-10-01-plan-appliance-product.md, W5).
 //!
 //! An unclaimed machine announces itself over mDNS and serves its claim API
 //! with a self-signed key (`crate::appliance::claim`). relish never trusts
