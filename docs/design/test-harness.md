@@ -122,6 +122,28 @@ are `#[ignore]`d with a reason naming the target or script that runs them:
 | `power_cut::actual_power_cut_*` | A disposable Linux VM whose power can be cut while workers write | `scripts/release/qualify-storage-power-cut.sh --vm VM --fixture exporter\|leases\|backups --iterations N` |
 | All of the above, for a release candidate | Lima on the host; it creates and deletes the VM | `scripts/release/qualify-power-cut-reboot.sh --commit SHA --iterations N --record-dir DIR` |
 
+One more script cuts power without a Rust test behind it.
+`scripts/release/power_cut/calibrate.sh` measures what each way of cutting a
+Lima VM's power loses (`--kind stop|kill|sysrq --cuts N`, with `--raw` for
+unflushed writes alone on a second, unformatted disk), and whether the guest
+kernel can record and replay a `dm-log-writes` log (`--logwrites`), on a
+disposable VM it creates and deletes. Its decisions (the record scan, the
+refusal of a cut that never rebooted the guest, the raw-disk flush counting,
+the tally, the log parser, its walk past the entry count, and the replay) are
+tested against fixtures in `scripts/release/test_power_cut_calibrate.py`, part
+of `make test-ci-scripts`, along with `quiet.py`'s gate check. The
+[calibration record](../qualification/2026-11-18-power-cut-calibration.md)
+says what each cut was shown to lose and what's still untested.
+`scripts/release/qualify-power-cut-endurance.sh` cuts a one-node quickstart
+cluster's power again and again and checks invariants I1, I2, I4, I6 and I7
+after each cut ([testing guide](../testing.md#power-cut-endurance)); its
+decisions live in `scripts/release/power_cut/endurance.py`, tested by
+`scripts/release/test_power_cut_endurance.py`, which also runs its shell
+functions (powering back on, the start bookkeeping, stopping early) against a
+fake `limactl` and `relish`. It shares `power_off` and `settle` with the soak
+through `scripts/release/sustained/power.sh`, but powers back on with
+`limactl start` alone.
+
 `.github/workflows/v02-loops.yml` is the other long-running lane. It runs only when
 someone pushes the `v02-loops` branch or dispatches it by hand, and loops the upgrade,
 council, lease-recovery and exporter-lock suites for hours on Linux x86-64, Linux

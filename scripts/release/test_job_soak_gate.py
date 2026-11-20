@@ -1047,7 +1047,12 @@ class CurrentPairExpectations(unittest.TestCase):
 
     def test_power_on_and_the_all_off_special_push_through_the_helper(self):
         bodies=self.functions()
-        for name in ("power_on","special_all_off"):
+        # power_on lives in sustained/power.sh, shared with the power-cut
+        # endurance harness; the soak's push is its power_after_on hook.
+        shared=(Path(__file__).parent/"sustained"/"power.sh").read_text()
+        on=shared[shared.index("\npower_on() {"):]
+        self.assertIn('power_after_on "$node"',on[:on.index("\n}\n")])
+        for name in ("power_after_on","special_all_off"):
             with self.subTest(function=name):
                 self.assertIn("push_current_pair",bodies[name])
                 self.assertNotIn('push_pair "$node" "$tls/current/',bodies[name])
