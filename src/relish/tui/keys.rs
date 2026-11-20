@@ -21,6 +21,12 @@ pub const KEYBINDINGS: &[(&str, &str, &str)] = &[
     ("/", "logs, metrics", "search; Esc clears it"),
     ("→ or Tab", "app detail", "next tab"),
     ("← or Shift-Tab", "app detail", "previous tab"),
+    ("↑/↓", "instances", "select an instance"),
+    (
+        "k or Ctrl-K",
+        "instances",
+        "kill the selected instance (asks first)",
+    ),
     ("f", "logs", "toggle follow"),
     ("PgUp/PgDn", "streams", "scroll"),
 ];
@@ -50,6 +56,7 @@ pub enum KeyAction {
     ToggleFollow,
     NextTab,
     PreviousTab,
+    Kill,
 }
 
 /// Translate a key event into a reducer action.
@@ -74,8 +81,36 @@ pub fn key_to_action(key: KeyEvent) -> Option<KeyAction> {
         KeyCode::Char('/') => Some(KeyAction::Filter),
         KeyCode::Char('r') => Some(KeyAction::Refresh),
         KeyCode::Char('f') => Some(KeyAction::ToggleFollow),
+        // Ctrl-K too: `KeyCode` ignores the modifiers, so it lands here.
+        KeyCode::Char('k') => Some(KeyAction::Kill),
         KeyCode::Tab | KeyCode::Right => Some(KeyAction::NextTab),
         KeyCode::BackTab | KeyCode::Left => Some(KeyAction::PreviousTab),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::KeyModifiers;
+
+    use super::*;
+
+    #[test]
+    fn k_and_ctrl_k_both_kill() {
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::CONTROL] {
+            assert_eq!(
+                key_to_action(KeyEvent::new(KeyCode::Char('k'), modifiers)),
+                Some(KeyAction::Kill)
+            );
+        }
+    }
+
+    #[test]
+    fn the_help_lists_the_kill_key() {
+        assert!(
+            KEYBINDINGS
+                .iter()
+                .any(|(key, context, _)| key.contains("Ctrl-K") && *context == "instances")
+        );
     }
 }

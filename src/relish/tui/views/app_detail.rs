@@ -17,6 +17,7 @@ fn tab_hint(tab: DetailTab) -> &'static str {
     match tab {
         DetailTab::Logs => "←/→ or Tab: switch tabs · /: search · f: follow",
         DetailTab::Metrics => "←/→ or Tab: switch tabs · /: search",
+        DetailTab::Instances => "←/→ or Tab: switch tabs · ↑/↓: select · k: kill",
         _ => "←/→ or Tab: switch tabs",
     }
 }
@@ -130,25 +131,29 @@ pub fn lines(app: &TuiApp, height: usize) -> Vec<Line<'static>> {
             if instances.is_empty() {
                 lines.push(Line::raw("no instances"));
             }
-            for instance in instances {
-                lines.push(Line::raw(format!(
-                    "{:<12} {:<24} {:<13} {:>8}  {:>9}  {:<8} {}",
-                    instance.node,
-                    instance.instance.id,
-                    instance.instance.state,
-                    instance.instance.restart_count,
-                    instance
-                        .instance
-                        .host_port
-                        .map(|port| port.to_string())
-                        .unwrap_or_else(|| "-".into()),
-                    instance
-                        .instance
-                        .pid
-                        .map(|pid| pid.to_string())
-                        .unwrap_or_else(|| "-".into()),
-                    instance.instance.image.as_deref().unwrap_or("-")
-                )));
+            let selected = app.instances_cursor.min(instances.len().saturating_sub(1));
+            for (index, instance) in instances.into_iter().enumerate() {
+                lines.push(widgets::row(
+                    format!(
+                        "{:<12} {:<24} {:<13} {:>8}  {:>9}  {:<8} {}",
+                        instance.node,
+                        instance.instance.id,
+                        instance.instance.state,
+                        instance.instance.restart_count,
+                        instance
+                            .instance
+                            .host_port
+                            .map(|port| port.to_string())
+                            .unwrap_or_else(|| "-".into()),
+                        instance
+                            .instance
+                            .pid
+                            .map(|pid| pid.to_string())
+                            .unwrap_or_else(|| "-".into()),
+                        instance.instance.image.as_deref().unwrap_or("-")
+                    ),
+                    index == selected,
+                ));
             }
         }
         DetailTab::Logs => logs::push_log_body(app, &mut lines, height),

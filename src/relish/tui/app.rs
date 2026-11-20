@@ -94,7 +94,34 @@ impl TuiApp {
                 }
                 Err(error) => self.mark_disconnected(error.to_string()),
             },
+            DataUpdate::InstanceKilled { target, result } => self.killed(target, result),
         }
+    }
+
+    /// Say how a kill went. A refusal isn't a lost connection: the API
+    /// answered, so its words go in the status line as they are.
+    fn killed(
+        &mut self,
+        target: InstanceTarget,
+        result: Result<crate::smoker::types::FaultSummary, super::data::ProviderError>,
+    ) {
+        use super::data::ProviderError;
+        self.status_message = Some(match result {
+            Ok(fault) => {
+                self.pending.push(Effect::RefreshAll);
+                (
+                    format!(
+                        "killed {} on {} (fault {}); the scheduler starts a replacement",
+                        target.instance, target.node, fault.id
+                    ),
+                    Level::Info,
+                )
+            }
+            Err(ProviderError::Api { body, .. }) => {
+                (format!("kill refused: {}", body.trim()), Level::Error)
+            }
+            Err(error) => (format!("kill failed: {error}"), Level::Error),
+        });
     }
 
     fn push_log_line(&mut self, line: LogLine) {
@@ -518,6 +545,154 @@ mod tests {
         assert_eq!(visible, ["ERROR: disk full", "retrying after error"]);
         app.filter = Some("panic".into());
         assert!(app.visible_log_lines().is_empty());
+    }
+
+    fn web_1_on_node_2() -> InstanceTarget {
+        InstanceTarget {
+            app: "web".into(),
+            namespace: "default".into(),
+            instance: "web-1".into(),
+            node: "node-2".into(),
+        }
+    }
+
+    fn kills(app: &TuiApp) -> Vec<&Effect> {
+        app.pending
+            .iter()
+            .filter(|effect| matches!(effect, Effect::KillInstance(_)))
+            .collect()
+    }
+
+    // `k` asks first, and anything but `y` sends nothing (#2175).
+    #[test]
+    fn k_without_confirming_does_nothing() {
+        for answer in [
+            KeyCode::Char('n'),
+            KeyCode::Char('N'),
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Char('q'),
+            KeyCode::Char('k'),
+        ] {
+            let mut app = app_detail(DetailTab::Instances);
+            app.update(key(KeyCode::Char('k')));
+            assert!(app.confirm_kill.is_some(), "k asks before it kills");
+            assert!(kills(&app).is_empty(), "k alone sent a kill");
+            app.update(key(answer));
+            assert_eq!(app.confirm_kill, None, "{answer:?} left the prompt open");
+            assert!(kills(&app).is_empty(), "{answer:?} sent a kill");
+            assert!(!app.should_quit, "{answer:?} quit instead of cancelling");
+            assert!(matches!(
+                app.view(),
+                View::AppDetail {
+                    tab: DetailTab::Instances,
+                    ..
+                }
+            ));
+            assert_eq!(
+                app.status_message,
+                Some(("kill cancelled".into(), Level::Info))
+            );
+        }
+    }
+
+    #[test]
+    fn y_kills_the_selected_instance_on_its_node() {
+        let mut app = app_detail(DetailTab::Instances);
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Char('k')));
+        assert_eq!(app.confirm_kill, Some(web_1_on_node_2()));
+        app.update(key(KeyCode::Char('y')));
+        assert_eq!(app.confirm_kill, None);
+        assert_eq!(kills(&app), [&Effect::KillInstance(web_1_on_node_2())]);
+    }
+
+    #[test]
+    fn ctrl_k_asks_as_k_does() {
+        let mut app = app_detail(DetailTab::Instances);
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('k'),
+            KeyModifiers::CONTROL,
+        )));
+        assert_eq!(
+            app.confirm_kill
+                .as_ref()
+                .map(|target| target.instance.as_str()),
+            Some("web-0")
+        );
+    }
+
+    #[test]
+    fn up_and_down_select_an_instance_and_stop_at_either_end() {
+        let mut app = app_detail(DetailTab::Instances);
+        assert_eq!(app.instances_cursor, 0);
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Down));
+        assert_eq!(app.instances_cursor, 1, "web has two instances");
+        app.update(key(KeyCode::Up));
+        app.update(key(KeyCode::Up));
+        assert_eq!(app.instances_cursor, 0);
+    }
+
+    #[test]
+    fn k_outside_the_instances_tab_does_nothing() {
+        for tab in [DetailTab::Overview, DetailTab::Logs, DetailTab::Metrics] {
+            let mut app = app_detail(tab);
+            app.update(key(KeyCode::Char('k')));
+            assert_eq!(app.confirm_kill, None, "{tab:?}");
+        }
+        let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);
+        app.view_stack.push(View::Apps);
+        app.update(key(KeyCode::Char('k')));
+        assert_eq!(app.confirm_kill, None);
+    }
+
+    #[test]
+    fn a_kill_says_what_it_did_and_refreshes() {
+        let mut app = app_detail(DetailTab::Instances);
+        app.update(Msg::Data(DataUpdate::InstanceKilled {
+            target: web_1_on_node_2(),
+            result: Ok(crate::smoker::types::FaultSummary {
+                id: 7,
+                fault_type: "kill".into(),
+                target_service: "web".into(),
+                namespace: Some("default".into()),
+                target_instance: Some("web-1".into()),
+                task_index: None,
+                target_node: Some("node-2".into()),
+                remaining_secs: 0,
+                injected_by: "admin".into(),
+                node: Some("node-2".into()),
+                routed: Vec::new(),
+            }),
+        }));
+        let (message, level) = app.status_message.clone().unwrap();
+        assert_eq!(level, Level::Info);
+        assert!(message.contains("killed web-1 on node-2"), "{message}");
+        assert!(message.contains("fault 7"), "{message}");
+        assert_eq!(app.pending.last(), Some(&Effect::RefreshAll));
+    }
+
+    // A refusal (a scoped token, a safety rail) shows the API's own words.
+    #[test]
+    fn a_refused_kill_shows_the_refusal() {
+        let mut app = app_detail(DetailTab::Instances);
+        app.update(Msg::Data(DataUpdate::InstanceKilled {
+            target: web_1_on_node_2(),
+            result: Err(ProviderError::Api {
+                status: 403,
+                body: "token scope does not cover namespace default\n".into(),
+            }),
+        }));
+        assert_eq!(
+            app.status_message,
+            Some((
+                "kill refused: token scope does not cover namespace default".into(),
+                Level::Error
+            ))
+        );
+        assert!(matches!(app.connection, Connection::Connected));
+        assert!(app.pending.is_empty());
     }
 
     #[test]

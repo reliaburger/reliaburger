@@ -41,6 +41,7 @@ impl TuiApp {
             KeyAction::ToggleFollow => self.log_follow = !self.log_follow,
             KeyAction::NextTab => self.cycle_tab(1),
             KeyAction::PreviousTab => self.cycle_tab(-1),
+            KeyAction::Kill => self.confirm_kill = self.selected_instance(),
         }
     }
 
@@ -48,6 +49,7 @@ impl TuiApp {
         if self.view() != &view {
             self.view_stack.push(view);
             self.clear_filter();
+            self.instances_cursor = 0;
         }
     }
 
@@ -183,6 +185,14 @@ impl TuiApp {
             View::Jobs => self.jobs_cursor = moved(self.jobs_cursor, self.data.jobs.len(), delta),
             View::Routes => {
                 self.routes_cursor = moved(self.routes_cursor, self.data.routes.len(), delta)
+            }
+            View::AppDetail {
+                app,
+                namespace,
+                tab: DetailTab::Instances,
+            } => {
+                let count = self.app_instances(app, namespace).len();
+                self.instances_cursor = moved(self.instances_cursor, count, delta)
             }
             View::Help => {
                 self.events_scroll =

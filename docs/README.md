@@ -1162,6 +1162,7 @@ TUI keys:
 | ←/→, Tab, Shift-Tab | Cycle app-detail tabs |
 | `/` | Filter the current list; search the logs or the Logs and Metrics tabs, matches in red and bold |
 | Escape (with a filter or search) | Clear it |
+| `k`, Ctrl-K | Kill the selected instance in the Instances tab, after a `[y/N]` prompt; it's an audited Smoker kill fault |
 | `f` | Toggle log following |
 | Escape, `q` | Go back; quit from the dashboard |
 

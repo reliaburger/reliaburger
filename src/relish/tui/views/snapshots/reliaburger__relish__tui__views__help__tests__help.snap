@@ -23,10 +23,10 @@ expression: "render_to_string(&app, 120, 40)"
 │/               logs, metrics search; Esc clears it                                                                   │
 │→ or Tab        app detail    next tab                                                                                │
 │← or Shift-Tab  app detail    previous tab                                                                            │
+│↑/↓             instances     select an instance                                                                      │
+│k or Ctrl-K     instances     kill the selected instance (asks first)                                                 │
 │f               logs          toggle follow                                                                           │
 │PgUp/PgDn       streams       scroll                                                                                  │
-│                                                                                                                      │
-│                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │

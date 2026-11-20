@@ -334,6 +334,49 @@ mod tests {
         insta::assert_snapshot!("app_detail_metrics_search_none", output);
     }
 
+    // The Instances tab asks before it kills (#2175).
+    #[test]
+    fn kill_confirmation_snapshot() {
+        let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);
+        app.view_stack.push(View::AppDetail {
+            app: "web".into(),
+            namespace: "default".into(),
+            tab: DetailTab::Instances,
+        });
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('k'),
+            KeyModifiers::NONE,
+        )));
+        let output = render_to_string(&app, 120, 40);
+        assert!(
+            output.contains(
+                "Kill instance web-1 on node-2? The scheduler starts a replacement. [y/N]"
+            ),
+            "{output}"
+        );
+        insta::assert_snapshot!("app_detail_instances_confirm_kill", output);
+    }
+
+    #[test]
+    fn the_selected_instance_is_highlighted() {
+        let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);
+        app.view_stack.push(View::AppDetail {
+            app: "web".into(),
+            namespace: "default".into(),
+            tab: DetailTab::Instances,
+        });
+        app.instances_cursor = 1;
+        assert_eq!(
+            styled_cell(&app, "node-2       web-1").bg,
+            crate::relish::tui::theme::selected().bg
+        );
+        assert_ne!(
+            styled_cell(&app, "node-1       web-0").bg,
+            crate::relish::tui::theme::selected().bg
+        );
+    }
+
     #[test]
     fn help_lists_keybindings() {
         let mut app = TuiApp::with_test_data(TestScenario::Empty);

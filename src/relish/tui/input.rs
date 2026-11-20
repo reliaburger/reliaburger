@@ -8,7 +8,9 @@ use super::state::{DetailTab, Effect, Level, SearchHit, TuiApp, View};
 
 impl TuiApp {
     pub(super) fn handle_key(&mut self, key: KeyEvent) {
-        if self.palette.is_some() {
+        if self.confirm_kill.is_some() {
+            self.handle_confirm_kill_key(key);
+        } else if self.palette.is_some() {
             self.handle_palette_key(key);
         } else if matches!(self.view(), View::Search) {
             self.handle_search_key(key);
@@ -34,6 +36,23 @@ impl TuiApp {
                 action
             };
             self.handle_action(action);
+        }
+    }
+
+    /// The `[y/N]` prompt: `y` sends the kill, and every other key,
+    /// Enter included, cancels it.
+    fn handle_confirm_kill_key(&mut self, key: KeyEvent) {
+        let Some(target) = self.confirm_kill.take() else {
+            return;
+        };
+        if matches!(key.code, KeyCode::Char('y' | 'Y')) {
+            self.status_message = Some((
+                format!("killing {} on {}…", target.instance, target.node),
+                Level::Info,
+            ));
+            self.pending.push(Effect::KillInstance(target));
+        } else {
+            self.status_message = Some(("kill cancelled".into(), Level::Info));
         }
     }
 

@@ -48,6 +48,11 @@ pub enum DataUpdate {
         result: Result<ClusterDeployHistory, ProviderError>,
     },
     AppMetrics(Result<MetricsQueryResult, ProviderError>),
+    /// The answer to a kill from the Instances tab.
+    InstanceKilled {
+        target: super::state::InstanceTarget,
+        result: Result<crate::smoker::types::FaultSummary, ProviderError>,
+    },
 }
 
 /// Live stream identifiers used in connection banners.

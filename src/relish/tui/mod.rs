@@ -150,6 +150,16 @@ async fn event_loop<P: DataProvider, B: Backend>(
                             .await;
                     });
                 }
+                Effect::KillInstance(target) => {
+                    let provider = Arc::clone(&provider);
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let result = provider.kill_instance(&target).await;
+                        let _ = tx
+                            .send(Msg::Data(DataUpdate::InstanceKilled { target, result }))
+                            .await;
+                    });
+                }
                 Effect::FetchAppMetrics { app, namespace } => {
                     let provider = Arc::clone(&provider);
                     let tx = tx.clone();
