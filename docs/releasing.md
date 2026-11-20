@@ -1562,7 +1562,15 @@ the real `curl … | sh` install against it on every host we advertise.
    The verifier binds each private VM address on TCP 8189 with a separate token.
    Drain begins once the last cycle, its special and any quiet tail are over
    (#1338); tier and recovery budgets stay unchanged. Missing support or incomplete coverage fails instead of skipping
-   a mode. A local smoke check is not staged fast/final acceptance, and global
+   a mode. Each mode needs a run active on the node as each gated kind of
+   fault strikes it, so the harness holds every power-off, Bun kill and node
+   fault for up to 90 seconds (`OVERLAP_WAIT_SECS` in `job_soak.py`) until a
+   run of every mode is active on that node. Whether one is running at the
+   instant of the fault is chance, and 0.3.0 candidate 4's fast tier failed
+   on it with nothing wrong in the product
+   ([#2105](https://github.com/reliaburger/reliaburger/issues/2105)). A wait
+   that runs out is a `job-overlap` event, and the fault goes ahead.
+   A local smoke check is not staged fast/final acceptance, and global
    storage bounds remain #668.
 
    **The 0.2.0 job gate (decision D18-C).** A release that claims sustained

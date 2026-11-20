@@ -527,6 +527,34 @@ class HarnessResumeWiring(unittest.TestCase):
         self.assertIn('check power-cut "$evidence" ${restarts[@]+"${restarts[@]}"}', body)
 
 
+class FaultOverlapWiring(unittest.TestCase):
+    """#2105: the harness holds each gated fault for a run of every mode on
+    its node, right before it strikes, and records a wait that runs out."""
+
+    functions = HarnessResumeWiring.functions
+
+    def test_the_mark_before_each_gated_fault_waits(self):
+        bodies = self.functions()
+        self.assertIn('job_mark_fault "$node" "${current_slot:-power-off}" wait', bodies["power_off"])
+        self.assertLess(bodies["power_off"].index("job_mark_fault"), bodies["power_off"].index("limactl\" stop"))
+        self.assertIn('job_mark_fault "$node" "${current_slot:-agent-kill}" wait', bodies["kill_bun"])
+        self.assertLess(bodies["kill_bun"].index("job_mark_fault"), bodies["kill_bun"].index("kill -9"))
+        node_fault = bodies["slot_node_fault"]
+        first = node_fault.index('job_mark_fault "$node" "${current_slot%%:*}:$kind" wait')
+        self.assertLess(first, node_fault.index('node_fault_script "$kind" start'))
+        # The marks through the hold only record; they never hold the fault.
+        self.assertEqual(node_fault.count(" wait\n"), 1)
+
+    def test_a_wait_passes_the_flag_and_a_missed_overlap_is_an_event(self):
+        body = self.functions()["job_mark_fault"]
+        self.assertIn('${3:+--wait}', body)
+        self.assertIn("3) event --phase job-overlap", body)
+
+    def test_the_wait_fits_the_compressed_slot(self):
+        import job_soak
+        self.assertLess(job_soak.OVERLAP_WAIT_SECS, 600 // 6)
+
+
 class BoundedCommands(unittest.TestCase):
     """with_timeout must stop a command that ignores SIGALRM, as Go's limactl
     does: `perl -e 'alarm; exec'` left a `limactl shell` to a guest that went

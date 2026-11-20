@@ -514,7 +514,7 @@ api_get() {
 }
 kill_bun() {
     local node=$1
-    job_mark_fault "$node" "${current_slot:-agent-kill}"
+    job_mark_fault "$node" "${current_slot:-agent-kill}" wait
     check expect "$evidence" restart "${vm[node]}"
     gsh "$node" 'kill -9 "$(systemctl show -p MainPID --value reliaburger.service)"'
 }
@@ -1166,9 +1166,22 @@ wait_for_job_drain() {
     local until=$(( $(date +%s) + 150 ))
     while [ ! -s "$evidence/jobs/exit-status" ] && [ "$(date +%s)" -lt "$until" ]; do sleep 2; done
 }
+# job_mark_fault NODE LABEL [wait]: record the job runs active on NODE as a
+# fault strikes it. With `wait`, a fault of a kind the coverage gate owes
+# (power-off, either bun kill, a node fault) is held, up to the controller's
+# OVERLAP_WAIT_SECS, until a run of every mode is active on NODE (#2105):
+# whether one is at the instant of the fault is chance, and 0.3.0 candidate
+# 4's fast tier failed on it. A wait that runs out is recorded, and the fault
+# goes ahead.
 job_mark_fault() {
     [ -n "${jobs_pid:-}" ] || return 0
-    python3 "$job_controller" mark "$evidence/jobs" "${vm[$1]}" "$2" || event --phase harness-error --target jobs --detail 'could not record active fault overlap'
+    local result=0 missing
+    missing=$(python3 "$job_controller" mark "$evidence/jobs" "${vm[$1]}" "$2" ${3:+--wait}) || result=$?
+    case $result in
+        0) ;;
+        3) event --phase job-overlap --target "${vm[$1]}" --verdict missing --detail "$2: no active run of $missing" ;;
+        *) event --phase harness-error --target jobs --detail 'could not record active fault overlap' ;;
+    esac
 }
 
 # --- evidence collection ---------------------------------------------------------
@@ -1606,7 +1619,9 @@ slot_deploy_kill() {
 power_offs=0
 power_off() {
     local node=$1
-    job_mark_fault "$node" "${current_slot:-power-off}"
+    # The wait comes after resume_cut_mark, so it can loosen that mark by as
+    # long as it lasts; that mark is a lower bound, so it stays true.
+    job_mark_fault "$node" "${current_slot:-power-off}" wait
     keep_host_logs power-off "$node"
     down[node]=1
     # The cut stops whatever runs on the node; the writer is pinned to node 2,
@@ -1681,7 +1696,7 @@ slot_node_fault() {
     # The checker excuses slow turns only on the node the fault throttles (#972).
     open_window "node-$kind" 0 "${vm[node]}"
     avoid=$node
-    job_mark_fault "$node" "${current_slot%%:*}:$kind"
+    job_mark_fault "$node" "${current_slot%%:*}:$kind" wait
     gsh "$node" "PEER=${address[peer]}; $(node_fault_script "$kind" start)" > "$log" 2>&1 || result=$?
     event --phase "fault:node-$kind" --target "${vm[node]}" --exit "$result" --command "$kind" --detail "held $hold s"
     [ "$result" -eq 0 ] || record_failure "node-$kind" "could not inject $kind on ${vm[node]}; see ${log##*/}"
