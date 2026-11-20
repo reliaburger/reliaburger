@@ -961,6 +961,13 @@ heals.
 - Leases and safety rails: [`src/testkit/lease.rs`](../src/testkit/lease.rs), [`src/testkit/safety.rs`](../src/testkit/safety.rs)
 - Proven against a real cluster: [`tests/relish_test_catalogue.rs`](../tests/relish_test_catalogue.rs)
 
+A case that fails or times out keeps its evidence: before its lease is
+released, the runner records the step it was in, its instances and their
+states, its deployments and recent events, as `failure_state` in the case's
+`-o json` entry. The plain-text report prints the first few lines of it under
+the case. The soak harness keeps the same capture in each failure bundle
+([evidence before cleanup](design/test-harness.md#evidence-before-cleanup)).
+
 ## Pulling the plug
 
 Killing a process isn't a power cut: page-cache writes survive one and not the

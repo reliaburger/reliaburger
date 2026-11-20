@@ -30,6 +30,8 @@ Subcommands:
                                         keep Lima's host-agent logs before a stop truncates them
   curl-reason CODE                      name a curl exit code (refused, timeout, TLS...)
   test-failures REPORT [STDERR]         each failing case's reason from a `relish --output json test` report
+  test-states REPORT OUT                write the failing cases' state captured before cleanup to OUT;
+                                        prints "NAME SINCE" for the failure bundle, or nothing
   seed EVIDENCE [--seed N]              start (or resume) the run's fault and node choices; prints the seed
   choose EVIDENCE WHAT LOW HIGH         the run's next choice between LOW and HIGH, logged as an event
   render EVIDENCE RECORD                write the Markdown record (refuses to overwrite)
@@ -764,6 +766,45 @@ def test_failure_reasons(report_text, stderr_text=""):
         if tail:
             return tail
     return "no output"
+
+
+def test_failure_states(report_text):
+    """Each case that did not pass, with the state `relish test` captured
+    before its cleanup (#2131): the step it was in, its instances, recent
+    events. Cases without a capture are left out; an unreadable report gives
+    an empty list."""
+    try:
+        results = json.loads(report_text)["results"]
+    except (ValueError, KeyError, TypeError):
+        return []
+    return [{key: result.get(key) for key in ("name", "group", "started_at", "finished_at", "outcome", "cleanup",
+                                               "failure_state")}
+            for result in results
+            if result.get("outcome", {}).get("status") != "pass" and result.get("failure_state")]
+
+
+def write_test_states(report_path, out_path):
+    """Write the captured states of a report's failing cases to `out_path`.
+
+    Returns "NAME SINCE" for the bundle: the file's name and a journalctl
+    `--since` reaching back to one minute before the earliest failing case
+    started, and never less than the usual 15 minutes, or "" when no case
+    carried a capture."""
+    report = Path(report_path)
+    states = test_failure_states(report.read_text(errors="replace")) if report.exists() else []
+    if not states:
+        return ""
+    out = Path(out_path)
+    out.write_text(json.dumps(states, indent=1) + "\n")
+    starts = []
+    for state in states:
+        try:
+            starts.append(calendar.timegm(time.strptime(state.get("started_at") or "", "%Y-%m-%dT%H:%M:%SZ")))
+        except ValueError:
+            pass
+    fifteen_minutes_ago = int(time.time()) - 900
+    since = f"@{min(min(starts) - 60, fifteen_minutes_ago)}" if starts else "-15min"
+    return f"{out.name} {since}"
 
 
 def curl_reason(code):
@@ -2337,6 +2378,9 @@ def render(evidence, record):
         for row in failures:
             seen = time.strftime("%H:%M:%S", time.gmtime(row.get("ts", started)))
             symptom = str(row.get("detail", "")).replace("|", "\\|").replace("\n", " ")[:300]
+            if row.get("captured"):
+                # The state the check saw before anything cleaned up (#2131).
+                symptom += f" (state at failure: `failures/{row['number']}/{row['captured']}`)"
             lines.append(f"| {row['number']} | {seen} | {row.get('check', '')} | {symptom} | {row.get('class', 'unclassified')} | "
                          f"{row.get('cause', 'open')} | {row.get('action', 'open')} |")
     else:
@@ -2526,6 +2570,9 @@ def main(argv=None):
     failures = commands.add_parser("test-failures", help="why a relish test JSON run failed (#1068)")
     failures.add_argument("report")
     failures.add_argument("stderr", nargs="?")
+    states = commands.add_parser("test-states", help="keep a relish test report's captured failure states (#2131)")
+    states.add_argument("report")
+    states.add_argument("out")
     seed = commands.add_parser("seed", help="start or resume the run's seeded choices (#1062)")
     seed.add_argument("evidence")
     seed.add_argument("--seed", type=int)
@@ -2663,6 +2710,9 @@ def main(argv=None):
         blocks = loop_stalls.extract(Path(args.journal).read_text(errors="replace"))
         if blocks:
             print("\n\n".join(blocks))
+        return 0
+    if args.command == "test-states":
+        print(write_test_states(args.report, args.out))
         return 0
     if args.command == "test-failures":
         stderr_text = Path(args.stderr).read_text(errors="replace") if args.stderr and Path(args.stderr).exists() else ""

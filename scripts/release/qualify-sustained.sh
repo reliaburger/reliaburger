@@ -1454,8 +1454,15 @@ registry() {
 }
 
 failure_count=0
+# record_failure CHECK DETAIL [SNAPSHOT] [KEY] [TEST_REPORT]
+# Bundle the evidence for a failed check, straight away: every caller runs
+# it before its own cleanup (fault clear, settle). A `relish test` cleans up
+# its cases inside the run, so TEST_REPORT names its JSON report, whose
+# failing cases carry the state captured before their leases were released;
+# the bundle keeps that state and its journals reach back to the case's
+# start rather than 15 minutes before the run ended (#2131).
 record_failure() {
-    local check_name=$1 detail=$2 snapshot=${3:-} key=${4:-} directory node
+    local check_name=$1 detail=$2 snapshot=${3:-} key=${4:-} report=${5:-} directory node captured= since=-15min
     # A keyed failure that keeps recurring gets one bundle per half hour.
     if [ -n "$key" ] && check seen "$evidence" "$key"; then
         event --phase failure --target "$check_name" --verdict repeat --detail "$detail"
@@ -1464,17 +1471,24 @@ record_failure() {
     failure_count=$(( $(find "$evidence/failures" -mindepth 1 -maxdepth 1 -type d | wc -l) + 1 ))
     directory=$evidence/failures/$failure_count
     mkdir -p "$directory"
-    python3 - "$directory/summary.json" "$check_name" "$detail" "${current_slot:-}" "${snapshot:-}" <<'PY'
+    if [ -n "$report" ]; then
+        cp "$report" "$directory/test-report.json" 2>/dev/null || true
+        read -r captured since <<<"$(check test-states "$report" "$directory/captured-state.json" 2>/dev/null)" || true
+        since=${since:--15min}
+    fi
+    python3 - "$directory/summary.json" "$check_name" "$detail" "${current_slot:-}" "${snapshot:-}" "$captured" <<'PY'
 import json, sys, time
-path, check, detail, slot, snapshot = sys.argv[1:]
-json.dump({"ts": int(time.time()), "check": check, "detail": detail, "slot": slot, "snapshot": snapshot,
-           "class": "unclassified", "cause": "open", "action": "open", "disposition": "open"},
-          open(path, "w"), indent=1)
+path, check, detail, slot, snapshot, captured = sys.argv[1:]
+summary = {"ts": int(time.time()), "check": check, "detail": detail, "slot": slot, "snapshot": snapshot,
+           "class": "unclassified", "cause": "open", "action": "open", "disposition": "open"}
+if captured:
+    summary["captured"] = captured
+json.dump(summary, open(path, "w"), indent=1)
 PY
     [ -z "$snapshot" ] || cp -R "$snapshot" "$directory/snapshot"
     for node in 1 2 3; do
         [ "${down[node]}" = 0 ] || continue
-        gsh "$node" 'journalctl -u reliaburger --since "-15min" --no-pager' > "$directory/journal-${vm[node]}.txt" 2>&1 || true
+        gsh "$node" "journalctl -u reliaburger --since '$since' --no-pager" > "$directory/journal-${vm[node]}.txt" 2>&1 || true
         # The stall watchdog's thread snapshots, cut out of that journal (#1707).
         check loop-stalls "$directory/journal-${vm[node]}.txt" > "$directory/loop-stalls-${vm[node]}.txt" 2>/dev/null || true
         [ -s "$directory/loop-stalls-${vm[node]}.txt" ] || rm -f "$directory/loop-stalls-${vm[node]}.txt"
@@ -1486,7 +1500,7 @@ PY
     cp "$evidence/state.json" "$directory/state.json" 2>/dev/null || true
     printf 'slot %s\nwindow %s\ndown %s %s %s\n' "${current_slot:-}" "${window_label:-}" "${down[1]}" "${down[2]}" "${down[3]}" > "$directory/context.txt"
     event --phase failure --target "$check_name" --verdict fail --detail "$detail"
-    say "FAILURE $failure_count: $check_name: $detail"
+    say "FAILURE $failure_count: $check_name: $detail${captured:+; state at failure: failures/$failure_count/$captured}"
 }
 
 # A cluster that can't be set up can't be soaked: bundle the evidence and stop.
@@ -1754,7 +1768,7 @@ chaos_one() {
         # A JSON report's last lines are only closing brackets: name the
         # failing case and its reason instead (#1068).
         if [ "$kind" = scenario ]; then
-            record_failure "chaos-$kind" "$(check test-failures "$output" "$output.err")"
+            record_failure "chaos-$kind" "$(check test-failures "$output" "$output.err")" '' '' "$output"
         else
             record_failure "chaos-$kind" "$(tail -n 3 "$output" | tr '\n' ' ')"
         fi
@@ -1774,7 +1788,8 @@ catalogue_pulse() {
     rel_budget=1800 rel --output json test --profile full-runc --filter volumes,image-registry,workload-identity,ingress,deployments \
         --timeout 300s > "$output" 2>"$output.err" || result=$?
     event --phase pulse --exit "$result" --verdict "$([ "$result" -eq 0 ] && echo ok || echo fail)" --detail "${output##*/}"
-    [ "$result" -eq 0 ] || record_failure pulse "relish test exited $result; see ${output##*/}"
+    [ "$result" -eq 0 ] || record_failure pulse \
+        "relish test exited $result: $(check test-failures "$output" "$output.err"); see ${output##*/}" '' '' "$output"
     settle pulse:settle 300 || true
 }
 

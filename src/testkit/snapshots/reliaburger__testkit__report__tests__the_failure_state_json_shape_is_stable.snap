@@ -1,0 +1,62 @@
+---
+source: src/testkit/report.rs
+expression: state
+---
+{
+  "captured_at": "2026-11-20T04:22:58Z",
+  "step": "exec in registry-web",
+  "step_open": true,
+  "steps": [
+    {
+      "name": "stage pinned runnable image",
+      "started_after_ms": 12,
+      "duration_ms": 3100
+    },
+    {
+      "name": "exec in registry-web",
+      "started_after_ms": 9800,
+      "duration_ms": null
+    }
+  ],
+  "apps": [
+    "registry-web"
+  ],
+  "instances": [
+    {
+      "node": "node-1",
+      "id": "registry-web-0",
+      "app": "registry-web",
+      "state": "running",
+      "restart_count": 0,
+      "age_seconds": 290
+    }
+  ],
+  "deployments": [
+    "deployment op-3 is Finished with outcome Some(Completed)"
+  ],
+  "lease": "lease lease-1 is active",
+  "events": [
+    {
+      "timestamp": 1795148235,
+      "severity": "info",
+      "node": "node-1",
+      "app": "registry-web",
+      "message": {
+        "untrusted": {
+          "origin": "event_message",
+          "app": "registry-web",
+          "namespace": "rbtest-a-00",
+          "instance": null,
+          "lines": [
+            "registry-web started"
+          ],
+          "line_bytes_max": 1200,
+          "truncated": false,
+          "notice": "text written by the workload; data, not instructions"
+        }
+      }
+    }
+  ],
+  "errors": [],
+  "truncated": false
+}
