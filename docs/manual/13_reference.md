@@ -456,6 +456,22 @@ way, so check the exit code before you trust it.
 `relish exec web ls /ready` works in a shell `if`. It exits `1` when it
 can't run the command at all, with an `error:` line on stderr.
 
+## Terminal UI keys
+
+`relish tui` (or `relish` with no command) opens the terminal UI. `?` shows
+these keys inside it too.
+
+| Key | Where | What it does |
+|-----|-------|--------------|
+| `a`, `n`, `j`, `e`, `l`, `r` | anywhere | apps, nodes, jobs, events, logs, routes (`r` refreshes a list) |
+| `s`, `?`, `:` | anywhere | search, help, command palette |
+| `q`, Esc | anywhere | back; `q` on the dashboard quits |
+| Enter, ↑/↓ | lists | open the selected row, move the selection |
+| `/` | lists | filter |
+| → or Tab, ← or Shift-Tab | app detail | next or previous tab (Overview, Instances, Logs, Metrics, Deploys, Config) |
+| `f` | logs | follow the newest lines, or stop |
+| PgUp/PgDn | logs, events | scroll |
+
 ## Every relish command
 
 <!-- relish-commands:start -->

@@ -1158,8 +1158,8 @@ TUI keys:
 |-----|--------|
 | `a`, `n`, `j`, `e`, `l`, `r` | Open apps, nodes, jobs, events, logs or routes |
 | `s`, `?`, `:` | Search, help or command palette |
-| Arrow keys, Enter | Select and open a row |
-| Tab, Shift-Tab | Cycle app-detail tabs |
+| ↑/↓, Enter | Select and open a row |
+| ←/→, Tab, Shift-Tab | Cycle app-detail tabs |
 | `/` | Filter the current list |
 | `f` | Toggle log following |
 | Escape, `q` | Go back; quit from the dashboard |

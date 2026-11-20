@@ -18,8 +18,8 @@ pub const KEYBINDINGS: &[(&str, &str, &str)] = &[
     ("Enter", "lists", "open selection"),
     ("↑/↓", "lists", "move selection"),
     ("/", "lists", "filter"),
-    ("Tab", "app detail", "next tab"),
-    ("Shift-Tab", "app detail", "previous tab"),
+    ("→ or Tab", "app detail", "next tab"),
+    ("← or Shift-Tab", "app detail", "previous tab"),
     ("f", "logs", "toggle follow"),
     ("PgUp/PgDn", "streams", "scroll"),
 ];
@@ -73,8 +73,8 @@ pub fn key_to_action(key: KeyEvent) -> Option<KeyAction> {
         KeyCode::Char('/') => Some(KeyAction::Filter),
         KeyCode::Char('r') => Some(KeyAction::Refresh),
         KeyCode::Char('f') => Some(KeyAction::ToggleFollow),
-        KeyCode::Tab => Some(KeyAction::NextTab),
-        KeyCode::BackTab => Some(KeyAction::PreviousTab),
+        KeyCode::Tab | KeyCode::Right => Some(KeyAction::NextTab),
+        KeyCode::BackTab | KeyCode::Left => Some(KeyAction::PreviousTab),
         _ => None,
     }
 }

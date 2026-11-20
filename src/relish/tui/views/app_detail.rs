@@ -9,6 +9,9 @@ use crate::relish::tui::app::{DetailTab, TuiApp, View};
 
 use super::widgets;
 
+/// How to switch tabs, shown under the tab bar.
+const TAB_HINT: &str = "←/→ or Tab: switch tabs";
+
 /// The image an app's instances run, as the Overview tab shows it: one
 /// reference, every distinct one mid-rollout, or `unknown` when no instance
 /// reports one (a process workload, or an older node).
@@ -46,6 +49,8 @@ pub fn lines(app: &TuiApp, height: usize) -> Vec<Line<'static>> {
     let mut lines = vec![
         widgets::heading(format!("{name} · {namespace}")),
         Line::raw(tabs),
+        // The tabs looked stuck without it (#2169).
+        Line::raw(TAB_HINT),
         Line::raw(""),
     ];
     let instances: Vec<_> = app
