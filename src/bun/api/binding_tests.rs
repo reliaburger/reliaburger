@@ -211,6 +211,23 @@ async fn a_standalone_apply_fails_before_deploying_when_the_registry_is_down() {
     shutdown.cancel();
 }
 
+/// #2145: an image nobody built is the caller's mistake, not a registry
+/// outage: a 404 that names Pickle and `relish build`.
+#[tokio::test]
+async fn a_standalone_apply_of_an_image_nobody_built_is_a_404_naming_pickle() {
+    let binder = ImageBinder::with_upstream(Arc::new(crate::pickle::binding::MissingUpstream));
+    let (app, shutdown) = router_with(None, None, Some(binder));
+
+    let (status, body) = post(app, "/v1/apply", "[app.web]\nimage = \"burger:v1\"\n").await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(
+        body.contains("burger:v1 isn't in this cluster's registry (Pickle)"),
+        "{body}"
+    );
+    shutdown.cancel();
+}
+
 /// `[images.trust_policy.upstream_default] allow = false` with one rule
 /// for Docker Hub's official images.
 fn allow_list() -> crate::config::node::TrustPolicySection {

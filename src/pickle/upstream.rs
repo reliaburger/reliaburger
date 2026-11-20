@@ -269,6 +269,32 @@ impl OciUpstream {
     }
 }
 
+/// Whether a registry's answer means it has no such image (or won't show
+/// it), rather than that it's in trouble. Docker Hub answers 401, not 404,
+/// for a repository it doesn't have, so 401 and 403 count too.
+fn registry_lacks_image(error: &oci_client::errors::OciDistributionError) -> bool {
+    use oci_client::errors::{OciDistributionError, OciErrorCode};
+    match error {
+        OciDistributionError::UnauthorizedError { .. }
+        | OciDistributionError::ImageManifestNotFoundError(_) => true,
+        OciDistributionError::RegistryError { envelope, .. } => {
+            !envelope.errors.is_empty()
+                && envelope.errors.iter().all(|error| {
+                    matches!(
+                        error.code,
+                        OciErrorCode::ManifestUnknown
+                            | OciErrorCode::NameUnknown
+                            | OciErrorCode::NotFound
+                            | OciErrorCode::Unauthorized
+                            | OciErrorCode::Denied
+                    )
+                })
+        }
+        OciDistributionError::ServerError { code, .. } => matches!(code, 401 | 403 | 404),
+        _ => false,
+    }
+}
+
 impl UpstreamRegistry for OciUpstream {
     fn head_manifest_digest<'a>(&'a self, image: &'a ImageReference) -> UpstreamFuture<'a, Digest> {
         Box::pin(async move {
@@ -280,10 +306,18 @@ impl UpstreamRegistry for OciUpstream {
             })
             .await
             .map_err(|e| {
-                PickleError::ReplicationFailed(format!(
-                    "upstream HEAD {} failed: {e}",
-                    image.full_reference()
-                ))
+                if registry_lacks_image(&e) {
+                    PickleError::UpstreamImageMissing(format!(
+                        "{} has no {}, or won't show it to this node ({e})",
+                        image.registry,
+                        image.full_reference()
+                    ))
+                } else {
+                    PickleError::ReplicationFailed(format!(
+                        "upstream HEAD {} failed: {e}",
+                        image.full_reference()
+                    ))
+                }
             })?;
             Digest::new(&digest)
                 .map_err(|e| PickleError::ReplicationFailed(format!("upstream digest: {e}")))
@@ -654,6 +688,75 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(decision, CacheDecision::Refetch);
+    }
+
+    /// A plain-HTTP registry on loopback whose every manifest read
+    /// answers `status` with `body`, standing in for Docker Hub asked about
+    /// a repository it doesn't have.
+    async fn registry_answering(status: u16, body: &'static str) -> String {
+        use axum::{Router, http::StatusCode, routing::get};
+        let status = StatusCode::from_u16(status).unwrap();
+        let app = Router::new()
+            .route("/v2/", get(|| async { "{}" }))
+            .fallback(move || async move {
+                (
+                    status,
+                    [("content-type", "application/json")],
+                    body.to_string(),
+                )
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        address.to_string()
+    }
+
+    /// #2145: Docker Hub answers 401 for a repository it doesn't have, and
+    /// a registry answers 404 for a tag it doesn't have. Both mean "no such
+    /// image", which the apply reports as the caller's mistake rather than a
+    /// registry that's down.
+    #[tokio::test]
+    async fn a_registry_that_refuses_or_lacks_the_image_says_it_is_missing() {
+        let upstream = OciUpstream::insecure_http(HashMap::new());
+        let cases = [
+            (
+                401,
+                r#"{"errors":[{"code":"UNAUTHORIZED","message":"no"}]}"#,
+            ),
+            (
+                404,
+                r#"{"errors":[{"code":"MANIFEST_UNKNOWN","message":"no"}]}"#,
+            ),
+            (
+                404,
+                r#"{"errors":[{"code":"NAME_UNKNOWN","message":"no"}]}"#,
+            ),
+            (404, "not json"),
+        ];
+        for (status, body) in cases {
+            let address = registry_answering(status, body).await;
+            let image = ImageReference::parse(&format!("{address}/burger:v1")).unwrap();
+            let error = upstream.head_manifest_digest(&image).await.unwrap_err();
+            assert!(
+                matches!(error, PickleError::UpstreamImageMissing(_)),
+                "{status} {body}: {error:?}"
+            );
+        }
+    }
+
+    /// A registry in trouble isn't a missing image: the apply may still
+    /// bind from the cache, and the error says to try again.
+    #[tokio::test]
+    async fn a_registry_error_that_is_not_about_the_image_is_not_missing() {
+        let upstream = OciUpstream::insecure_http(HashMap::new());
+        let address =
+            registry_answering(400, r#"{"errors":[{"code":"UNSUPPORTED","message":"no"}]}"#).await;
+        let image = ImageReference::parse(&format!("{address}/burger:v1")).unwrap();
+        let error = upstream.head_manifest_digest(&image).await.unwrap_err();
+        assert!(
+            matches!(error, PickleError::ReplicationFailed(_)),
+            "{error:?}"
+        );
     }
 
     #[test]
