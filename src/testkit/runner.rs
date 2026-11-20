@@ -1118,6 +1118,7 @@ mod tests {
             .as_ref()
             .expect("a timed-out case carries its state");
         assert_eq!(state.step.as_deref(), Some("exec in registry-web"));
+        assert!(state.step_open);
         let steps: Vec<_> = state
             .steps
             .iter()
@@ -1130,6 +1131,34 @@ mod tests {
                 ("exec in registry-web", false)
             ]
         );
+    }
+
+    /// A timeout outside any step must not name a step that already
+    /// finished as the one the case was stuck in.
+    #[tokio::test]
+    async fn a_timeout_outside_any_step_names_only_the_last_finished_one() {
+        async fn stuck(ctx: TestContext) -> Result<(), String> {
+            ctx.step("stage pinned runnable image", async {}).await?;
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+        let mut cfg = config(dead_client(), full_capabilities(), 1);
+        cfg.timeout = Duration::from_millis(300);
+
+        let report = run(vec![case("stuck", &[], testkit_case!(stuck))], cfg)
+            .await
+            .unwrap();
+
+        let result = &report.results[0];
+        match &result.outcome {
+            TestOutcome::Unknown { reason, .. } => {
+                assert!(!reason.contains("during step"), "{reason}")
+            }
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+        let state = result.failure_state.as_ref().unwrap();
+        assert_eq!(state.step.as_deref(), Some("stage pinned runnable image"));
+        assert!(!state.step_open);
     }
 
     /// The state a failing case leaves must be read before its lease is
@@ -1163,8 +1192,8 @@ mod tests {
         assert_eq!(state.instances.len(), 1, "{state:?}");
         assert_eq!(state.instances[0].state, "pending");
         assert_eq!(state.instances[0].reason.as_deref(), Some("pulling image"));
-        let messages: Vec<_> = state.events.iter().map(|e| e.message.as_str()).collect();
-        assert_eq!(messages, ["pull started for registry-web"]);
+        let messages: Vec<_> = state.events.iter().map(|e| e.message.lines()).collect();
+        assert_eq!(messages, [["pull started for registry-web"]]);
         // The mock has no deployment listing: the capture says so rather
         // than reporting an empty one.
         assert!(
@@ -1185,6 +1214,12 @@ mod tests {
             .position(|entry| entry == "events")
             .expect("events read");
         assert!(first_capture < release, "{order:?}");
+        // The lease is read before the events, which take the longest.
+        let lease = order
+            .iter()
+            .position(|entry| entry == "lease")
+            .expect("lease read");
+        assert!(lease < first_capture, "{order:?}");
     }
 
     #[tokio::test]
@@ -1434,9 +1469,16 @@ mod tests {
                 "warnings": []
             }))
         }
+        async fn read_lease(State(state): State<LeaseMockState>) -> StatusCode {
+            state.records.lock().await.push("lease".to_string());
+            StatusCode::NOT_FOUND
+        }
         let app = Router::new()
             .route("/v1/test/leases", post(create_mock_lease))
-            .route("/v1/test/leases/{id}", delete(release_mock_lease))
+            .route(
+                "/v1/test/leases/{id}",
+                delete(release_mock_lease).get(read_lease),
+            )
             .route("/v1/cluster/nodes", get(empty_mock_list))
             .route("/v1/status", get(status))
             .route("/v1/events", get(events))

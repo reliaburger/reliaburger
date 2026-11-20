@@ -787,8 +787,9 @@ def write_test_states(report_path, out_path):
     """Write the captured states of a report's failing cases to `out_path`.
 
     Returns "NAME SINCE" for the bundle: the file's name and a journalctl
-    `--since` (one minute before the earliest failing case started), or ""
-    when no case carried a capture."""
+    `--since` reaching back to one minute before the earliest failing case
+    started, and never less than the usual 15 minutes, or "" when no case
+    carried a capture."""
     report = Path(report_path)
     states = test_failure_states(report.read_text(errors="replace")) if report.exists() else []
     if not states:
@@ -801,7 +802,8 @@ def write_test_states(report_path, out_path):
             starts.append(calendar.timegm(time.strptime(state.get("started_at") or "", "%Y-%m-%dT%H:%M:%SZ")))
         except ValueError:
             pass
-    since = f"@{min(starts) - 60}" if starts else "-15min"
+    fifteen_minutes_ago = int(time.time()) - 900
+    since = f"@{min(min(starts) - 60, fifteen_minutes_ago)}" if starts else "-15min"
     return f"{out.name} {since}"
 
 

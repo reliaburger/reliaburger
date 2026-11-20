@@ -252,8 +252,14 @@ const HUMAN_CAPTURE_LINES: usize = 3;
 fn render_failure_state(out: &mut String, state: &crate::testkit::FailureState) {
     use std::fmt::Write;
 
-    if let Some(step) = &state.step {
-        let _ = writeln!(out, "        step: {step}");
+    match (&state.step, state.step_open) {
+        (Some(step), true) => {
+            let _ = writeln!(out, "        step: {step}");
+        }
+        (Some(step), false) => {
+            let _ = writeln!(out, "        last finished step: {step}");
+        }
+        (None, _) => {}
     }
     if state.instances.is_empty() && !state.apps.is_empty() {
         let _ = writeln!(out, "        no instances of {}", state.apps.join(", "));
@@ -272,7 +278,7 @@ fn render_failure_state(out: &mut String, state: &crate::testkit::FailureState) 
     }
     let skip = state.events.len().saturating_sub(HUMAN_CAPTURE_LINES);
     for event in state.events.iter().skip(skip) {
-        let _ = writeln!(out, "        event: {}", event.message);
+        let _ = writeln!(out, "        event: {}", event.message.lines().join(" "));
     }
     for error in &state.errors {
         let _ = writeln!(out, "        not captured: {error}");
@@ -327,6 +333,7 @@ mod tests {
         crate::testkit::FailureState {
             captured_at: "2026-07-26T12:02:00Z".to_string(),
             step: Some("wait for hang to reach unhealthy".to_string()),
+            step_open: true,
             apps: vec!["hang".to_string()],
             instances: vec![crate::testkit::CapturedInstance {
                 node: "node-2".to_string(),
@@ -338,15 +345,29 @@ mod tests {
                 reason: None,
                 age_seconds: Some(118),
             }],
-            events: vec![crate::testkit::CapturedEvent {
-                timestamp: 1_785_067_200,
-                severity: crate::bun::events::EventSeverity::Info,
-                node: Some("node-2".to_string()),
-                app: Some("hang".to_string()),
-                message: "hang deployed".to_string(),
-            }],
+            events: vec![crate::testkit::CapturedEvent::new(
+                1_785_067_200,
+                crate::bun::events::EventSeverity::Info,
+                Some("node-2"),
+                Some("hang"),
+                Some("rbtest-a-00"),
+                "hang deployed",
+            )],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_failure_outside_any_step_names_the_last_finished_one_as_finished() {
+        let state = crate::testkit::FailureState {
+            step: Some("apply web".to_string()),
+            step_open: false,
+            ..Default::default()
+        };
+        let mut out = String::new();
+        render_failure_state(&mut out, &state);
+        assert!(out.contains("last finished step: apply web"), "{out}");
+        assert!(!out.contains("        step:"), "{out}");
     }
 
     fn sample_report() -> TestReport {

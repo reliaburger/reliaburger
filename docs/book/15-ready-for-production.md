@@ -4034,7 +4034,14 @@ honest:
   and a capture mustn't turn one into a megabyte.
 - **Missing isn't empty.** A read that fails goes into `errors`. An empty
   `instances` list then means the cluster said there were none, not that we
-  couldn't ask.
+  couldn't ask. Each node's status is its own read, and they run together
+  through `futures_util::future::join_all`, which polls a list of futures at
+  once and returns their outputs in order. The first version asked the nodes
+  one after another inside a single read, so one partitioned node cost the
+  capture every node's instances. That's exactly when you want them.
+- **App text stays marked.** An event's message can quote what an app said,
+  so it's wrapped as untrusted text, the same wrapper `relish events -o json`
+  uses, before it reaches a report an agent might read.
 - **It can't wedge teardown.** Each read gets three seconds, the whole
   capture 15, and the case's lease is 15 seconds longer to cover it.
 
@@ -4043,8 +4050,8 @@ already ran before its own cleanup for most checks, but `relish test` cleans
 up inside the run, minutes before the harness gets to look. Now the pulse and
 the chaos scenario hand their JSON report to `record_failure`, which copies
 each failing case's capture into `failures/<n>/captured-state.json`, takes
-the journals from a minute before the case started rather than the last 15
-minutes, and links the capture from the failure line, so the next reader
+the journals from a minute before the case started (or the last 15 minutes,
+whichever reaches further back), and links the capture from the failure line, so the next reader
 starts from it.
 
 The registry cases failed faster: "blob upload POST failed … https://127.0.0.1:5050".

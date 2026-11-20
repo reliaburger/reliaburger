@@ -962,30 +962,45 @@ impl TestContext {
         let mut state = FailureState {
             captured_at: crate::testkit::runner::now_rfc3339(),
             step: trace.step,
+            step_open: trace.step_open,
             steps: trace.steps,
             ..FailureState::default()
         };
         let mut apps = trace.apps;
 
-        match bounded_read(deadline, self.namespace_instances_by_node()).await {
-            Ok(instances) => {
-                for (node, instance) in instances {
-                    if !apps.contains(&instance.app_name) {
-                        apps.push(instance.app_name.clone());
+        // The lease first: it's one quick read, and whether it had expired
+        // decides how to read everything after it.
+        if let Some(lease_id) = &self.lease_id {
+            state.lease = Some(
+                match bounded_read(deadline, async {
+                    Ok(self.client.test_lease(lease_id).await)
+                })
+                .await
+                {
+                    Ok(result) => {
+                        lease_note(lease_id, result, crate::testkit::lease::now_unix_millis())
                     }
-                    state.instances.push(CapturedInstance {
-                        node,
-                        id: instance.id,
-                        app: instance.app_name,
-                        state: instance.state,
-                        restart_count: instance.restart_count,
-                        exit_code: instance.exit_code,
-                        reason: instance.reason,
-                        age_seconds: instance.age_seconds,
-                    });
-                }
+                    Err(error) => format!("lease {lease_id} unreadable: {error}"),
+                },
+            );
+        }
+
+        let (instances, node_errors) = self.namespace_instances_by_node(deadline).await;
+        state.errors.extend(node_errors);
+        for (node, instance) in instances {
+            if !apps.contains(&instance.app_name) {
+                apps.push(instance.app_name.clone());
             }
-            Err(error) => state.errors.push(format!("instances unreadable: {error}")),
+            state.instances.push(CapturedInstance {
+                node,
+                id: instance.id,
+                app: instance.app_name,
+                state: instance.state,
+                restart_count: instance.restart_count,
+                exit_code: instance.exit_code,
+                reason: instance.reason,
+                age_seconds: instance.age_seconds,
+            });
         }
         let asked: Vec<String> = apps.iter().take(MAX_CAPTURED_APPS).cloned().collect();
         state.truncated |= apps.len() > asked.len();
@@ -1025,12 +1040,26 @@ impl TestContext {
             })
             .await;
             match read {
-                Ok(view) => events.extend(view.events.into_iter().filter(|event| {
-                    event
-                        .namespace
-                        .as_deref()
-                        .is_none_or(|namespace| namespace == self.namespace)
-                })),
+                Ok(view) => {
+                    // The server's limit counts every namespace's events
+                    // about this app name, so another namespace's can push
+                    // this case's out of the page. Say so.
+                    let returned = view.events.len();
+                    let before = events.len();
+                    events.extend(view.events.into_iter().filter(|event| {
+                        event
+                            .namespace
+                            .as_deref()
+                            .is_none_or(|namespace| namespace == self.namespace)
+                    }));
+                    let left_out = returned - (events.len() - before);
+                    if left_out > 0 {
+                        state.errors.push(format!(
+                            "events for {app}: left out {left_out} of {returned} from other \
+                             namespaces, so older events of this case's may be missing"
+                        ));
+                    }
+                }
                 Err(error) => state
                     .errors
                     .push(format!("events for {app} unreadable: {error}")),
@@ -1039,51 +1068,57 @@ impl TestContext {
         events.sort_by_key(|event| (event.timestamp, event.sequence));
         state.events = events
             .into_iter()
-            .map(|event| CapturedEvent {
-                timestamp: event.timestamp,
-                severity: event.severity,
-                node: event.node,
-                app: event.app,
-                message: event.message,
+            .map(|event| {
+                CapturedEvent::new(
+                    event.timestamp,
+                    event.severity,
+                    event.node.as_deref(),
+                    event.app.as_deref(),
+                    event.namespace.as_deref(),
+                    &event.message,
+                )
             })
             .collect();
-
-        if let Some(lease_id) = &self.lease_id {
-            state.lease = Some(
-                match bounded_read(deadline, async {
-                    Ok(self.client.test_lease(lease_id).await)
-                })
-                .await
-                {
-                    Ok(result) => {
-                        lease_note(lease_id, result, crate::testkit::lease::now_unix_millis())
-                    }
-                    Err(error) => format!("lease {lease_id} unreadable: {error}"),
-                },
-            );
-        }
         state.bound();
         state
     }
 
-    /// Every unfinished instance in this namespace, with the node that runs it.
-    async fn namespace_instances_by_node(&self) -> Result<Vec<(String, InstanceStatus)>, String> {
+    /// Every unfinished instance in this namespace, with the node that runs
+    /// it, and one error per node that didn't answer.
+    ///
+    /// Each node gets its own bounded read and they all run at once, so a
+    /// partitioned node costs its own instances, not everyone's.
+    async fn namespace_instances_by_node(
+        &self,
+        deadline: Deadline,
+    ) -> (Vec<(String, InstanceStatus)>, Vec<String>) {
+        let nodes = match bounded_read(deadline, self.node_clients()).await {
+            Ok(nodes) => nodes,
+            Err(error) => return (Vec::new(), vec![format!("instances unreadable: {error}")]),
+        };
+        let reads = nodes.into_iter().map(|(node, client)| async move {
+            let read = bounded_read(deadline, async {
+                client.status().await.map_err(|error| error.to_string())
+            })
+            .await;
+            (node, read)
+        });
         let mut all = Vec::new();
-        for (node, client) in self.node_clients().await? {
-            let statuses = client
-                .status()
-                .await
-                .map_err(|error| format!("could not inspect node {node}: {error}"))?;
-            all.extend(
-                statuses
-                    .into_iter()
-                    .filter(|instance| {
-                        instance.namespace == self.namespace && !Self::is_finished_run(instance)
-                    })
-                    .map(|instance| (node.clone(), instance)),
-            );
+        let mut errors = Vec::new();
+        for (node, read) in futures_util::future::join_all(reads).await {
+            match read {
+                Ok(statuses) => all.extend(
+                    statuses
+                        .into_iter()
+                        .filter(|instance| {
+                            instance.namespace == self.namespace && !Self::is_finished_run(instance)
+                        })
+                        .map(|instance| (node.clone(), instance)),
+                ),
+                Err(error) => errors.push(format!("instances on node {node} unreadable: {error}")),
+            }
         }
-        Ok(all)
+        (all, errors)
     }
 
     /// Attempt reversal of owned faults and leased resources, then report evidence.
@@ -1636,6 +1671,114 @@ mod tests {
             ]
         );
         assert!(snapshot.step_open);
+    }
+
+    /// One partitioned node must not cost the capture every other node's
+    /// instances: each node gets its own bounded read, and the one that
+    /// didn't answer is named.
+    #[tokio::test]
+    async fn a_capture_keeps_the_nodes_that_answer_and_names_the_one_that_did_not() {
+        use axum::routing::get;
+        let slow_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let slow_address = slow_listener.local_addr().unwrap();
+        let slow = tokio::spawn(async move {
+            let router = axum::Router::new().route(
+                "/v1/status",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    axum::Json(Vec::<InstanceStatus>::new())
+                }),
+            );
+            axum::serve(slow_listener, router).await.unwrap()
+        });
+        let fast_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fast_address = fast_listener.local_addr().unwrap();
+        let nodes = serde_json::json!([
+            {"node_id":"one", "address":"127.0.0.1:7946", "api_address": fast_address.to_string(),
+             "state":"alive", "incarnation":1, "is_council":true, "is_leader":true, "labels":{}},
+            {"node_id":"two", "address":"127.0.0.1:7947", "api_address": slow_address.to_string(),
+             "state":"alive", "incarnation":1, "is_council":true, "is_leader":false, "labels":{}}
+        ]);
+        let fast = tokio::spawn(async move {
+            let router = axum::Router::new()
+                .route(
+                    "/v1/cluster/nodes",
+                    get(move || {
+                        let nodes = nodes.clone();
+                        async move { axum::Json(nodes) }
+                    }),
+                )
+                .route(
+                    "/v1/status",
+                    get(|| async {
+                        axum::Json(serde_json::json!([
+                            {"id":"web-0", "app_name":"web", "namespace":"rbtest-nodes-00",
+                             "state":"running", "restart_count":0, "host_port":null, "pid":null}
+                        ]))
+                    }),
+                );
+            axum::serve(fast_listener, router).await.unwrap()
+        });
+        let mut ctx = context("rbtest-nodes-00");
+        ctx.client = BunClient::new(&format!("http://{fast_address}"));
+
+        let started = std::time::Instant::now();
+        let state = ctx
+            .capture_failure_state(Deadline::after(Duration::from_secs(15)).unwrap())
+            .await;
+        fast.abort();
+        slow.abort();
+
+        assert_eq!(state.instances.len(), 1, "{state:?}");
+        assert_eq!(state.instances[0].node, "one");
+        let errors = state.errors.join("\n");
+        assert!(errors.contains("node two"), "{errors}");
+        assert!(!errors.contains("node one"), "{errors}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The server's event limit counts every namespace's events about an app
+    /// name, so other namespaces' events can push this case's out. Say so
+    /// rather than drop them silently.
+    #[tokio::test]
+    async fn a_capture_says_when_other_namespaces_crowded_out_events() {
+        use axum::routing::get;
+        let router = axum::Router::new().route(
+            "/v1/events",
+            get(|| async {
+                axum::Json(serde_json::json!({
+                    "events": [
+                        {"sequence": 1, "timestamp": 10, "kind": "deploy", "severity": "info",
+                         "app": "web", "namespace": "rbtest-crowd-00", "node": "one",
+                         "message": "ours"},
+                        {"sequence": 2, "timestamp": 11, "kind": "deploy", "severity": "info",
+                         "app": "web", "namespace": "operator", "node": "one",
+                         "message": "theirs"}
+                    ],
+                    "warnings": []
+                }))
+            }),
+        );
+        let (base, server) = serve(router).await;
+        let mut ctx = context("rbtest-crowd-00");
+        ctx.client = BunClient::new(&base);
+        ctx.trace.note_app("web").await;
+
+        let state = ctx
+            .capture_failure_state(Deadline::after(Duration::from_secs(10)).unwrap())
+            .await;
+        server.abort();
+
+        assert_eq!(state.events.len(), 1);
+        let errors = state.errors.join("\n");
+        assert!(
+            errors.contains("events for web: left out 1 of 2 from other namespaces"),
+            "{errors}"
+        );
     }
 
     /// Against nothing at all, a capture still returns: each unreadable

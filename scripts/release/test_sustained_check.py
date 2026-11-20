@@ -2351,6 +2351,15 @@ class CapturedState(Evidence):
         self.assertEqual(checker.write_test_states(report, out), f"captured-state.json @{started - 60}")
         self.assertEqual(json.loads(out.read_text())[0]["failure_state"], self.STATE)
 
+    def test_the_journal_window_never_shrinks_below_fifteen_minutes(self):
+        report = self.evidence / "pulse.json"
+        recent = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 120))
+        report.write_text(self.report().replace("2026-11-20T04:17:43Z", recent))
+        before = int(time.time())
+        name, since = checker.write_test_states(report, self.evidence / "captured-state.json").split()
+        self.assertEqual(name, "captured-state.json")
+        self.assertLessEqual(int(since.lstrip("@")), before - 900 + 5)
+
     def test_a_report_without_captures_writes_nothing(self):
         report = self.evidence / "pulse.json"
         report.write_text(json.dumps({"results": [{"name": "x", "outcome": {"status": "pass"}}]}))

@@ -404,8 +404,13 @@ and before anything cleans up.
   in the case's report entry as `failure_state`, so `-o json` and the soak's
   pulse snapshots carry it. Every list and text field is bounded (16 steps,
   8 apps, 32 instances, 20 events, 300 characters each), and a read that
-  fails is listed in `errors` rather than left out. The capture gets 15 s,
-  3 s per read, and the case's lease is that much longer.
+  fails is listed in `errors` rather than left out: each node's status is
+  its own read, so a partitioned node costs only its own instances, and
+  events another namespace crowded out of the server's page are noted too.
+  Event messages are wrapped as untrusted text, as `relish events -o json`
+  wraps them, because they can quote an app. `step_open` says whether the
+  named step was still running or the case failed after finishing it. The
+  capture gets 15 s, 3 s per read, and the case's lease is that much longer.
 - **Named steps.** Cases run their waits through `TestContext::step` or a
   wait helper, which opens a named step and closes it when it ends. A step
   the runner cancelled at its deadline stays open, so a timeout reads
@@ -415,8 +420,8 @@ and before anything cleans up.
   cleanup (fault clear, settle). A `relish test` check passes its JSON
   report too: the bundle keeps it as `test-report.json`, writes the failing
   cases' captured states to `captured-state.json`, and takes the journals
-  from a minute before the earliest failing case started, not the last 15
-  minutes. The failure line in the log and in the rendered record links
+  from a minute before the earliest failing case started, or the last 15
+  minutes if that reaches further back. The failure line in the log and in the rendered record links
   `failures/<n>/captured-state.json`.
 
 ## Adding a test
