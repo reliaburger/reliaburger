@@ -1,7 +1,11 @@
 """The fuzzing workflow runs every target nightly and on decoder changes (#1398)."""
 from fnmatch import fnmatch
 from pathlib import Path
+import os
 import re
+import subprocess
+import tempfile
+import tomllib
 import unittest
 
 REPO = Path(__file__).resolve().parents[2]
@@ -140,12 +144,141 @@ class FuzzWorkflowTests(unittest.TestCase):
         cache = cache[:cache.index("\n      - ")]
         self.assertIn("save-if: ${{ github.event_name != 'pull_request' }}", cache)
 
+    def test_the_summary_reports_each_targets_coverage_counters(self):
+        # The counter count is how a reader of the job sees that only the
+        # decoder crates are instrumented (#1953).
+        report = self.text[self.text.index("name: Report executions and coverage"):]
+        report = report[:report.index("\n      - ")]
+        self.assertIn("inline 8-bit counters", report)
+
     def test_the_fuzz_crate_is_outside_the_root_workspace(self):
         manifest = (REPO / "fuzz" / "Cargo.toml").read_text()
         self.assertRegex(manifest, r"(?m)^\[workspace\]$")
         self.assertIn('features = ["fuzzing"]', manifest)
         root = (REPO / "Cargo.toml").read_text()
         self.assertNotRegex(root, r'(?m)^members = .*"fuzz"')
+
+
+# Coverage instrumentation only on the crates the decoders run through
+# (#1953). libFuzzer scans every counter after every input: with the whole
+# dependency tree instrumented that was about 15.3 million counters.
+WRAPPER = REPO / "fuzz" / "rustc-coverage.sh"
+
+# The crates each decoder hands bytes to, as rustc names them. Losing one of
+# these would blind libFuzzer inside the parser it's meant to be exploring.
+DECODER_CRATES = {
+    "reliaburger",
+    "serde",
+    "serde_json",
+    "postcard",
+    "toml",
+    "hickory_proto",
+    "x509_parser",
+    "rcgen",
+    "oci_client",
+    "oci_spec",
+}
+
+# What cargo-fuzz 0.13 puts in RUSTFLAGS, among what cargo adds per crate.
+CARGO_FUZZ_FLAGS = [
+    "-Cpasses=sancov-module",
+    "-Cllvm-args=-sanitizer-coverage-level=4",
+    "-Cllvm-args=-sanitizer-coverage-inline-8bit-counters",
+    "-Cllvm-args=-sanitizer-coverage-pc-table",
+    "-Cllvm-args=-sanitizer-coverage-trace-compares",
+    "-Zsanitizer=address",
+    "--cfg", "fuzzing",
+]
+
+# A stand-in rustc that prints each argument it gets on its own line.
+FAKE_RUSTC = '#!/bin/sh\nfor arg in "$@"; do printf \'%s\\n\' "$arg"; done\n'
+
+
+def kept_crates():
+    """The crate names in the wrapper's COVERAGE_CRATES list."""
+    block = re.search(r'(?ms)^COVERAGE_CRATES="\n(.*?)^"', WRAPPER.read_text())
+    return block.group(1).split() if block else []
+
+
+def locked_crates():
+    """Every package in fuzz/Cargo.lock, as rustc names its crate."""
+    with open(REPO / "fuzz" / "Cargo.lock", "rb") as lock:
+        return {package["name"].replace("-", "_") for package in tomllib.load(lock)["package"]}
+
+
+class FuzzInstrumentationTests(unittest.TestCase):
+    def rustc_sees(self, *args):
+        """Run the wrapper over the stand-in rustc; return what rustc got."""
+        with tempfile.TemporaryDirectory() as scratch:
+            fake = Path(scratch) / "rustc"
+            fake.write_text(FAKE_RUSTC)
+            fake.chmod(0o755)
+            out = subprocess.run([str(WRAPPER), str(fake), *args],
+                                 capture_output=True, text=True, check=True)
+        return out.stdout.splitlines()
+
+    def test_a_dependency_is_built_without_the_coverage_pass(self):
+        args = ["--crate-name", "tokio", "--edition=2021", "src/lib.rs", *CARGO_FUZZ_FLAGS]
+        seen = self.rustc_sees(*args)
+        self.assertNotIn("-Cpasses=sancov-module", seen)
+        # AddressSanitizer stays on, and nothing else changes.
+        self.assertIn("-Zsanitizer=address", seen)
+        self.assertEqual(seen, [arg for arg in args if arg != "-Cpasses=sancov-module"])
+
+    def test_the_decoder_crates_keep_every_flag(self):
+        for crate in sorted(DECODER_CRATES):
+            with self.subTest(crate=crate):
+                args = ["--crate-name", crate, "src/lib.rs", *CARGO_FUZZ_FLAGS]
+                self.assertEqual(self.rustc_sees(*args), args)
+
+    def test_a_call_that_names_no_crate_passes_through(self):
+        self.assertEqual(self.rustc_sees("-vV"), ["-vV"])
+
+    def test_an_argument_with_spaces_survives(self):
+        args = ["--crate-name", "tokio", "--cfg", 'feature="a b"', "-Cpasses=sancov-module"]
+        self.assertEqual(self.rustc_sees(*args), args[:-1])
+
+    def test_the_decoder_crates_are_on_the_list(self):
+        missing = DECODER_CRATES - set(kept_crates())
+        self.assertFalse(missing, f"not instrumented: {sorted(missing)}")
+
+    def test_every_kept_crate_is_one_the_fuzz_build_uses(self):
+        # A misspelt or since-dropped name would silently instrument nothing.
+        locked = locked_crates()
+        for crate in kept_crates():
+            with self.subTest(crate=crate):
+                self.assertIn(crate, locked)
+
+    def test_make_builds_and_runs_through_the_wrapper(self):
+        makefile = (REPO / "Makefile").read_text()
+        self.assertRegex(makefile, r"(?m)^FUZZ_RUSTC_WRAPPER \?= \$\(CURDIR\)/fuzz/rustc-coverage\.sh$")
+        self.assertRegex(makefile, r"(?m)^FUZZ = RUSTC_WRAPPER=\$\(FUZZ_RUSTC_WRAPPER\) ")
+        self.assertTrue(os.access(WRAPPER, os.X_OK), "the wrapper is executable")
+
+    def test_a_fuzz_run_never_rebuilds_the_crate(self):
+        # A release build embeds the source bundle and watches its allowlist,
+        # fuzz/ included, by modification time. Every log and corpus file a
+        # run wrote under fuzz/target/ rebuilt reliaburger, twice a target:
+        # the 16 Nov nightly spent 25 minutes a target and hit its timeout.
+        build = (REPO / "build.rs").read_text()
+        embed = build[build.index("fn embed_source()"):]
+        embed = embed[:embed.index("\n}\n")]
+        skip = embed.find('std::env::var_os("CARGO_FEATURE_FUZZING").is_some()')
+        self.assertNotEqual(skip, -1, "embed_source skips the fuzzing build")
+        self.assertLess(skip, embed.index("rerun-if-changed"))
+
+    def test_a_change_to_the_list_rebuilds_every_crate(self):
+        # Cargo doesn't fingerprint a RUSTC_WRAPPER: a cached build, or one
+        # from before the wrapper, kept its old instrumentation (the first
+        # narrowed build here reused all 600 dependencies as they were). A
+        # cfg named after the wrapper's checksum puts it in RUSTFLAGS, which
+        # Cargo does fingerprint.
+        makefile = (REPO / "Makefile").read_text()
+        self.assertRegex(makefile, r"(?m)^FUZZ_COVERAGE_ID = .*cksum < \$\(FUZZ_RUSTC_WRAPPER\)")
+        fuzz = re.search(r"(?ms)^FUZZ = (.*?)fuzz$", makefile).group(1)
+        self.assertIn('RUSTFLAGS="$$RUSTFLAGS --cfg=$(FUZZ_COVERAGE_CFG) '
+                      '--check-cfg=cfg($(FUZZ_COVERAGE_CFG))"', fuzz)
+        self.assertIn("$(FUZZ_COVERAGE_ID)", makefile[makefile.index("FUZZ_COVERAGE_CFG ="):])
 
 
 if __name__ == "__main__":
