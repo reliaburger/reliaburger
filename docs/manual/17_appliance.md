@@ -688,8 +688,9 @@ moves the workloads it can elsewhere, then tells the node to update. The node
 downloads the release from GitHub, checks its signature against the key its
 own image carries and every file against the release's `SHA256SUMS`, writes
 it into the spare slot and reboots. Once it's healthy on the new version, the
-leader moves on. Apps with a managed volume stay with their data and are back
-when the node is, a minute or two later.
+leader moves on. Apps with a managed volume or a host-path mount (a volume
+with a `source`) stay with their data and are back when the node is, a minute
+or two later.
 
 If a node comes back on its old version, because the new one failed its boot
 checks three times, or doesn't come back within 45 minutes, the rollout
