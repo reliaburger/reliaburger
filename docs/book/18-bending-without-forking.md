@@ -1906,6 +1906,66 @@ one stop, with the caller's own grace wherever the app names none. That
 keeps the old behaviour exactly: a deploy still gives an old instance its
 `drain_timeout`, and any other stop still gives it 10 s.
 
+#### A node shutdown takes the same path
+
+Almost every stop. Bun's own shutdown, when systemd stops the unit or the
+OS rollout reboots the node, kept its old loop until 0.3.1: SIGTERM to
+everything, a fixed 5 s, then SIGKILL. No pre-stop, and no `stop_grace`.
+That was harmless until the rollout. It drains the apps it can move before
+it reboots a node, so the ones left for shutdown are exactly the ones with a
+managed volume, the databases. Every weekly OS update gave a database five
+seconds and no checkpoint (#2118).
+
+Now `shutdown_all` builds each instance's `InstanceStop` the way an
+operator stop does and hands the lot to `stop_round`:
+
+```rust
+let graceful = futures_util::future::join_all(stops.iter().map(|(id, stop)| async move {
+    // One that has already gone needs no pre-stop and no signal.
+    match tokio::time::timeout(confirmation_timeout, grill.state(id)).await {
+        Ok(Ok(ContainerState::Stopped))
+        | Ok(Err(crate::grill::GrillError::NotFound { .. })) => return,
+        _ => {}
+    }
+    if let Err(error) = stop_instance_alone(grill, id, stop, confirmation_timeout).await {
+        eprintln!("bun: {id}: shutdown stop not confirmed: {error}");
+    }
+}));
+let left = deadline.saturating_duration_since(Instant::now());
+if tokio::time::timeout(left, graceful).await.is_err() {
+    eprintln!("bun: shutdown budget spent; killing what still runs");
+}
+```
+
+`join_all`, which chapter 7 met in the ordinary stop, runs every instance's
+four steps side by side, so a database with a two-minute grace doesn't
+spend the web server's time as well as its own. Each `async move` block
+moves in copies of references, to the runtime (`grill`) and to one
+`(id, stop)` pair, not the values themselves. That's fine here, unlike on the
+spawned stop wait in chapter 7, because these futures never outlive the
+function that borrows them.
+
+What it can't do is wait for ever. systemd gives Bun the unit's
+`TimeoutStopSec`, 30 s in every unit we ship, and then kills it. With
+`KillMode=process` it kills only Bun, so whatever Bun hadn't stopped keeps
+running without anyone watching it. So the whole shutdown shares one budget,
+`SHUTDOWN_STOP_BUDGET`, 20 s counted from the moment shutdown starts.
+`tokio::time::timeout` drops the joined future when the budget runs out,
+which cancels every stop still in its pre-stop or grace, and a short kill
+round (`SHUTDOWN_KILL_BOUND`, 2 s) takes whatever is left. Sidecars still go
+after their apps, in a second round, with up to 5 s of the budget kept back
+for them. 20 s, two kill rounds and a few seconds for Bun's own exit fit in
+30, and a test reads every unit file to keep it that way.
+
+That's a real limit, and we chose to state it rather than hide it. An app
+that asks for `stop_grace = "2m"` gets its two minutes from `relish stop` and
+from a deploy, but at most about 20 s when its node shuts down. Why not raise
+`TimeoutStopSec`? Because the unit's timeout is also how long a stuck Bun
+holds up a reboot, and a node that takes minutes to reboot makes every OS
+rollout slower. Moving the app off the node first is the better answer for
+anything that needs longer, and it's what the rollout does for every app it
+can move.
+
 ### Sidecars
 
 A sidecar is three promises: it shares its app's network, it's up before the
@@ -3376,7 +3436,19 @@ signal, so only these tests prove the owner reads the spec.
 The wiring tests use the mock runtime and read its call log: an operator
 stop calls `exec` before `stop`, an app with no `pre_stop` never calls
 `exec`, and a rolling deploy runs the *old* instance's pre-stop before it
-signals it, even though the new spec has none. The parsing tests in
+signals it, even though the new spec has none. Three more do the same for a node
+shutdown (#2118), on a mock runtime whose workloads ignore their signal:
+`a_node_shutdown_runs_pre_stop_and_gives_the_app_its_own_grace` checks the
+order is `exec`, `stop`, `kill` and that the kill came after the app's own
+2 s, not the old fixed 5 s;
+`a_node_shutdown_stops_every_instance_at_once` stops two apps with a 2 s
+grace each and wants it done in well under 4 s; and
+`a_node_shutdown_ends_within_its_budget_whatever_the_app_asks_for` gives an
+app an hour of grace and a pre-stop that never returns, then checks a 1 s
+budget still ends in a kill. `the_shutdown_budget_fits_inside_every_units_stop_timeout`
+reads `TimeoutStopSec` from the quickstart's unit, the appliance image's unit
+and the units in `docs/linux-servers.md`, and fails if the budget outgrows
+any of them. The parsing tests in
 `grill::stop` and `config::validate` cover each refusal, and
 `stop_hooks_survive_an_export_and_import_round_trip` sends an app through
 `relish export` and back in. To check the tests check something, we put

@@ -4645,7 +4645,7 @@ async fn shutdown_escalates_to_kill_when_stop_is_ignored() {
     let port_allocator = PortAllocator::new(30000, 31000);
     let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown);
     // Escalation is under test, not the length of the production grace.
-    agent.set_shutdown_grace(std::time::Duration::from_millis(200));
+    agent.set_shutdown_budget(std::time::Duration::from_millis(200));
 
     let (ev_tx, mut ev_rx) = mpsc::channel(64);
     agent.deploy(basic_config(), &ev_tx).await;
@@ -7033,7 +7033,7 @@ fn stubborn_agent() -> (
     agent.set_volumes_dir(volumes.path().to_path_buf());
     allow_host_workloads(&mut agent, &[]);
     agent.set_stop_grace(STUBBORN_GRACE);
-    agent.set_shutdown_grace(std::time::Duration::from_millis(200));
+    agent.set_shutdown_budget(std::time::Duration::from_millis(200));
     let handle = tokio::spawn(async move { agent.run().await });
     (tx, shutdown, handle, grill_handle, volumes)
 }
@@ -7392,7 +7392,7 @@ async fn deploy_is_refused_while_the_workload_is_stopping() {
 async fn shutdown_reports_pending_stops_unconfirmed() {
     let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
     agent.set_stop_grace(std::time::Duration::from_secs(60));
-    agent.set_shutdown_grace(std::time::Duration::from_millis(200));
+    agent.set_shutdown_budget(std::time::Duration::from_millis(200));
     expect_complete(&drain_deploy(&mut agent, basic_config()).await);
     grill.set_ignore_stop(true);
     grill.set_state(

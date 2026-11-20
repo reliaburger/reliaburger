@@ -171,8 +171,26 @@ const HEALTH_TICK_STARVATION_BOUND: std::time::Duration = std::time::Duration::f
 /// two-second exit wait plus its cgroup removal, with room to spare.
 const SHUTDOWN_PRESSURE_CLEAR: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Grace period between SIGTERM and SIGKILL during shutdown.
-const SHUTDOWN_GRACE_SECS: u64 = 5;
+/// How long node shutdown may spend stopping instances gracefully, all told
+/// (#2118). Each instance stops as an ordinary stop would (its pre-stop
+/// command, its signal, its own `stop_grace`), every one at once, and
+/// whatever still runs when this runs out is killed. Counted from the start
+/// of shutdown, so it also covers reversing faults first.
+///
+/// Every systemd unit we ship gives Bun `TimeoutStopSec=30` before it is
+/// killed itself (`KillMode=process`, so its workloads would be orphaned).
+/// This budget plus two rounds of [`SHUTDOWN_KILL_BOUND`] leaves Bun 6 s of
+/// that for the rest of its exit. A test checks every unit against it.
+const SHUTDOWN_STOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long shutdown waits for its force-kills once a round's graceful time
+/// is up. There are two rounds: apps, then their sidecars.
+const SHUTDOWN_KILL_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The most of the shutdown budget the sidecars' round keeps back for
+/// itself when there are sidecars, so an app with a long grace can't leave
+/// its log shipper no time at all. The old fixed shutdown grace.
+const SHUTDOWN_SIDECAR_SHARE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long an ordinary stop waits for a container to exit after SIGTERM
 /// before it escalates to SIGKILL (DEP6).
@@ -927,8 +945,9 @@ pub struct BunAgent<G: Grill> {
     /// How long an ordinary stop waits after SIGTERM before SIGKILL.
     /// `STOP_GRACE_SECS` unless a test shortens it with `set_stop_grace`.
     stop_grace: std::time::Duration,
-    /// The same wait for node shutdown: `SHUTDOWN_GRACE_SECS` by default.
-    shutdown_grace: std::time::Duration,
+    /// How long node shutdown may spend stopping instances gracefully:
+    /// `SHUTDOWN_STOP_BUDGET` unless a test shortens it.
+    shutdown_budget: std::time::Duration,
     /// Operator stops and retirements whose exit is still being awaited.
     pending_stops: PendingStops,
     /// Their exit waits, off the command loop so a workload that ignores
@@ -1158,7 +1177,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             health_inflight: std::collections::HashSet::new(),
             drains: new_shared_drains(),
             stop_grace: std::time::Duration::from_secs(STOP_GRACE_SECS),
-            shutdown_grace: std::time::Duration::from_secs(SHUTDOWN_GRACE_SECS),
+            shutdown_budget: SHUTDOWN_STOP_BUDGET,
             pending_stops: PendingStops::new(),
             stop_waits: tokio::task::JoinSet::new(),
             restart_rotation: RestartRotation::default(),
@@ -1330,7 +1349,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             health_inflight: std::collections::HashSet::new(),
             drains: new_shared_drains(),
             stop_grace: std::time::Duration::from_secs(STOP_GRACE_SECS),
-            shutdown_grace: std::time::Duration::from_secs(SHUTDOWN_GRACE_SECS),
+            shutdown_budget: SHUTDOWN_STOP_BUDGET,
             pending_stops: PendingStops::new(),
             stop_waits: tokio::task::JoinSet::new(),
             restart_rotation: RestartRotation::default(),
@@ -1676,10 +1695,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.stop_grace = grace;
     }
 
-    /// Override how long node shutdown waits after SIGTERM before SIGKILL.
-    /// Production keeps `SHUTDOWN_GRACE_SECS`, as with `set_stop_grace`.
-    pub fn set_shutdown_grace(&mut self, grace: std::time::Duration) {
-        self.shutdown_grace = grace;
+    /// Override how long node shutdown may spend stopping instances
+    /// gracefully before it kills what still runs. Production keeps
+    /// `SHUTDOWN_STOP_BUDGET`, as with `set_stop_grace`.
+    pub fn set_shutdown_budget(&mut self, budget: std::time::Duration) {
+        self.shutdown_budget = budget;
     }
 
     /// The loop's turn meter, for the metrics collector to export.

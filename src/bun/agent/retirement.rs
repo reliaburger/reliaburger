@@ -477,8 +477,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.supervisor.health_checker_mut().unregister(old_id);
     }
 
-    /// Gracefully stop all instances.
+    /// Gracefully stop all instances, within the shutdown budget.
     pub(super) async fn shutdown_all(&mut self) {
+        // One budget for the whole shutdown, so Bun is done before systemd's
+        // `TimeoutStopSec` runs out and kills it with its workloads still up.
+        let deadline = Instant::now() + self.shutdown_budget;
         // Reverse every owned fault before the process goes away. The
         // node-pressure helper also has PR_SET_PDEATHSIG and startup sweeping
         // for crash recovery, but graceful shutdown should leave no helper or
@@ -521,54 +524,77 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
 
         // Sidecars outlive their apps here too (#1120): they get their own
-        // round once every app has exited.
+        // round once every app has exited, with a share of the budget kept
+        // back for it.
         let sidecars = self.sidecars.all();
         for id in &ids {
             self.sidecars.cancel_relaunches(id);
         }
-        self.stop_or_kill_all(&ids).await;
-        self.stop_or_kill_all(&sidecars).await;
+        let apps_deadline = if sidecars.is_empty() {
+            deadline
+        } else {
+            let share = SHUTDOWN_SIDECAR_SHARE.min(self.shutdown_budget / 4);
+            deadline.checked_sub(share).unwrap_or(deadline)
+        };
+        // Each app stops as an ordinary stop would (#2118): its pre-stop
+        // command, its own signal, then its own grace.
+        let app_stops: Vec<(InstanceId, InstanceStop)> = ids
+            .into_iter()
+            .map(|id| {
+                let stop = InstanceStop {
+                    sidecars: Vec::new(),
+                    ..self.instance_stop(&id, self.stop_grace)
+                };
+                (id, stop)
+            })
+            .collect();
+        // LOOP-INLINE: shutdown's last turn; nothing is queued behind it
+        self.stop_round(&app_stops, apps_deadline).await;
+        let sidecar_stops: Vec<(InstanceId, InstanceStop)> = sidecars
+            .into_iter()
+            .map(|id| (id, InstanceStop::for_policy(None, self.stop_grace)))
+            .collect();
+        // LOOP-INLINE: shutdown's last turn; nothing is queued behind it
+        self.stop_round(&sidecar_stops, deadline).await;
     }
 
-    /// Ask everything in `ids` to stop (SIGTERM), wait (up to the shutdown
-    /// grace, but no longer than needed) for it to exit, then force-kill
-    /// (SIGKILL) whatever is still running so nothing is orphaned.
-    async fn stop_or_kill_all(&self, ids: &[InstanceId]) {
-        if ids.is_empty() {
+    /// Stop every instance in `stops` at once, each its own way, until
+    /// `deadline`; then force-kill whatever still runs so nothing is
+    /// orphaned. Running them side by side means one app's long grace costs
+    /// the others nothing.
+    async fn stop_round(&self, stops: &[(InstanceId, InstanceStop)], deadline: Instant) {
+        if stops.is_empty() {
             return;
         }
-        for id in ids {
-            // LOOP-INLINE: shutdown's last turn; nothing is queued behind it
-            let _ = self.supervisor.grill().stop(id).await;
+        let grill = self.supervisor.grill();
+        let confirmation_timeout = self.stop_confirmation_timeout;
+        let graceful = futures_util::future::join_all(stops.iter().map(|(id, stop)| async move {
+            // One that has already gone needs no pre-stop and no signal.
+            match tokio::time::timeout(confirmation_timeout, grill.state(id)).await {
+                Ok(Ok(ContainerState::Stopped))
+                | Ok(Err(crate::grill::GrillError::NotFound { .. })) => return,
+                _ => {}
+            }
+            if let Err(error) = stop_instance_alone(grill, id, stop, confirmation_timeout).await {
+                eprintln!("bun: {id}: shutdown stop not confirmed: {error}");
+            }
+        }));
+        let left = deadline.saturating_duration_since(Instant::now());
+        // LOOP-INLINE: shutdown's last turn; bounded by the shutdown budget
+        if tokio::time::timeout(left, graceful).await.is_err() {
+            eprintln!("bun: shutdown budget spent; killing what still runs");
         }
-        let deadline = Instant::now() + self.shutdown_grace;
-        loop {
-            let mut all_stopped = true;
-            for id in ids {
-                // LOOP-INLINE: shutdown's last turn; nothing is queued behind it
-                if !matches!(
-                    self.supervisor.grill().state(id).await,
-                    Ok(ContainerState::Stopped)
-                ) {
-                    all_stopped = false;
-                    break;
-                }
+        let kills = futures_util::future::join_all(stops.iter().map(|(id, _)| async move {
+            if !matches!(grill.state(id).await, Ok(ContainerState::Stopped)) {
+                let _ = grill.kill(id).await;
             }
-            if all_stopped || Instant::now() >= deadline {
-                break;
-            }
-            // LOOP-INLINE: shutdown's last turn; nothing is queued behind it
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        for id in ids {
-            // LOOP-INLINE: shutdown's last turn; nothing is queued behind it
-            if !matches!(
-                self.supervisor.grill().state(id).await,
-                Ok(ContainerState::Stopped)
-            ) {
-                // LOOP-INLINE: shutdown's last turn; nothing is queued behind it
-                let _ = self.supervisor.grill().kill(id).await;
-            }
+        }));
+        // LOOP-INLINE: shutdown's last turn; bounded by SHUTDOWN_KILL_BOUND
+        if tokio::time::timeout(SHUTDOWN_KILL_BOUND, kills)
+            .await
+            .is_err()
+        {
+            eprintln!("bun: shutdown kills not all answered; leaving the rest");
         }
     }
 }

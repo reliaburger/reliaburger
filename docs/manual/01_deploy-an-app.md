@@ -797,9 +797,13 @@ A stop then runs four steps, each with its own limit:
 
 Without `stop_grace`, a deploy gives each old instance its `drain_timeout`,
 and any other stop (`relish stop`, or the leader moving a replica off a node)
-gives it 10 s, as before. The signal travels with the instance, so when Bun
-itself shuts down and stops its workloads they get it too, though with Bun's
-own 5 s grace and no `pre_stop`.
+gives it 10 s, as before. When Bun itself shuts down (`systemctl stop`, or
+the OS rollout rebooting the node) it stops every instance on the node the
+same way, all at once, but within 20 s in total: the systemd units give Bun
+30 s before they kill it. Whatever hasn't exited by then gets SIGKILL. A
+database with a managed volume meets this on every rolling OS update, which
+can't move it off its node first, so make sure it can stop cleanly in well
+under 20 s.
 
 The longest a stop can now take is `pre_stop_timeout` plus `stop_grace` plus
 a few seconds for the runtime. That can outlast the placement loop's deadline
