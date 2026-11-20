@@ -9526,7 +9526,14 @@ per target (about two million inputs across the nine) found nothing else.
 
 The next step is OSS-Fuzz, which runs the same cargo-fuzz targets on
 Google's machines around the clock. That wants targets that have run clean
-nightly for a while first, so it's a follow-up.
+nightly for a while first, so it's a follow-up. The application itself is
+three small files in OSS-Fuzz's own repository: a `project.yaml` with the
+contacts that get crash reports, a Dockerfile that clones the code onto
+Google's Rust build image, and a `build.sh` that runs `cargo fuzz build -O`
+and copies each target and its seeds out. Drafts of all three wait in
+`fuzz/oss-fuzz/`. The script asks `cargo fuzz list` for the targets rather
+than naming them, so a thirteenth target won't need a second pull request
+to Google.
 
 Three decoders missed the first cut, and they have targets now
 ([#1414](https://github.com/reliaburger/reliaburger/issues/1414)). They are the task-array

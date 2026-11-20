@@ -1,0 +1,17 @@
+# Draft of projects/reliaburger/project.yaml for the OSS-Fuzz repository
+# (#1414). Copy this directory there to apply; see docs/testing.md, "Fuzzing".
+#
+# OSS-Fuzz sends crash reports to primary_contact and auto_ccs, and each must
+# be an address with a Google account. The maintainer fills them in when
+# applying.
+homepage: "https://reliaburger.com"
+language: rust
+primary_contact: ""
+auto_ccs: []
+main_repo: "https://github.com/reliaburger/reliaburger"
+# The targets already run under AddressSanitizer in fuzz.yml. cargo-fuzz
+# builds Rust with libFuzzer only.
+sanitizers:
+  - address
+fuzzing_engines:
+  - libfuzzer
