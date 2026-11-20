@@ -1,0 +1,52 @@
+---
+source: src/relish/nodes_cmd.rs
+expression: "yaml_serde::to_string(&rows).unwrap()"
+---
+- node_id: node-2
+  address: 10.0.0.2:7946
+  state: alive
+  incarnation: 1
+  is_council: true
+  is_leader: false
+  labels: {}
+  version: 0.2.8
+  cpu_percent: 12.0
+  memory_percent: 25.0
+  disk_percent: 20.0
+  allocated:
+    node: node-2
+    cpu_allocated_millicores: 3000
+    cpu_total_millicores: 4000
+    memory_allocated_mb: 2048
+    memory_total_mb: 8192
+    gpu_allocated: 0
+    gpu_total: 0
+    cordoned: true
+    cordoned_by: os_rollout
+  cordoned: true
+  cordoned_by: os_rollout
+  disk_pressure: false
+- node_id: node-1
+  address: 10.0.0.1:7946
+  state: alive
+  incarnation: 1
+  is_council: true
+  is_leader: true
+  labels: {}
+  version: 0.2.8
+  cpu_percent: 34.0
+  memory_percent: 25.0
+  disk_percent: 40.0
+  allocated:
+    node: node-1
+    cpu_allocated_millicores: 3000
+    cpu_total_millicores: 4000
+    memory_allocated_mb: 2048
+    memory_total_mb: 8192
+    gpu_allocated: 0
+    gpu_total: 0
+    cordoned: false
+    cordoned_by: null
+  cordoned: false
+  cordoned_by: null
+  disk_pressure: false

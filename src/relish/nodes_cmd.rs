@@ -13,7 +13,9 @@ use super::apps_cmd::ask_each_node;
 use super::client::BunClient;
 use super::{OutputFormat, RelishError};
 use crate::bun::agent::NodeStatus;
-use crate::bun::summary::{ClusterCapacity, DISK_PRESSURE_PERCENT, NodeCapacity, NodeSummary};
+use crate::bun::summary::{
+    ClusterCapacity, Cordon, DISK_PRESSURE_PERCENT, NodeCapacity, NodeSummary,
+};
 
 /// One node, as `relish nodes` lists it.
 #[derive(Debug, Clone, Serialize)]
@@ -31,8 +33,10 @@ pub struct NodeRow {
     pub disk_percent: Option<f64>,
     /// What the scheduler has committed on it, when the leader said.
     pub allocated: Option<NodeCapacity>,
-    /// Whether an upgrade has cordoned it.
+    /// Whether a bun upgrade or an OS rollout has cordoned it.
     pub cordoned: bool,
+    /// Which of the two cordoned it, when one has.
+    pub cordoned_by: Option<Cordon>,
     /// Whether a data path is at or above the disk-pressure threshold.
     pub disk_pressure: bool,
     /// Why the node's own answer is missing, when it is.
@@ -137,6 +141,7 @@ pub fn node_rows(
                     .and_then(|u| ratio(u.memory_used_bytes, u.memory_total_bytes)),
                 disk_percent,
                 cordoned: allocated.as_ref().is_some_and(|a| a.cordoned),
+                cordoned_by: allocated.as_ref().and_then(|a| a.cordoned_by),
                 disk_pressure: disk_percent.is_some_and(|p| p >= DISK_PRESSURE_PERCENT),
                 allocated,
                 unanswered,
@@ -196,7 +201,8 @@ fn state_cell(row: &NodeRow) -> String {
     state
 }
 
-/// The `relish nodes` table, then a line for each node that didn't answer.
+/// The `relish nodes` table, then a line for each node a rollout cordoned
+/// and each node that didn't answer.
 pub fn render_nodes(rows: &[NodeRow]) -> String {
     if rows.is_empty() {
         return "no nodes match\n".to_string();
@@ -229,6 +235,21 @@ pub fn render_nodes(rows: &[NodeRow]) -> String {
             percent(row.disk_percent),
             allocated_cell(row.allocated.as_ref()),
         );
+    }
+    let cordons: Vec<(&NodeRow, Cordon)> = rows
+        .iter()
+        .filter_map(|row| row.cordoned_by.map(|cordon| (row, cordon)))
+        .collect();
+    if !cordons.is_empty() {
+        out.push('\n');
+        for (row, cordon) in cordons {
+            let (what, more) = cordon.describe();
+            let _ = writeln!(
+                out,
+                "{} is cordoned by {what}: it takes no new work ({more})",
+                row.status.node_id
+            );
+        }
     }
     let silent: Vec<&NodeRow> = rows.iter().filter(|r| r.unanswered.is_some()).collect();
     if !silent.is_empty() {
@@ -285,7 +306,7 @@ mod tests {
         }
     }
 
-    fn capacity(name: &str, cordoned: bool) -> NodeCapacity {
+    fn capacity(name: &str, cordoned_by: Option<Cordon>) -> NodeCapacity {
         NodeCapacity {
             node: name.to_string(),
             cpu_allocated_millicores: 3_000,
@@ -294,7 +315,8 @@ mod tests {
             memory_total_mb: 8_192,
             gpu_allocated: 0,
             gpu_total: 0,
-            cordoned,
+            cordoned: cordoned_by.is_some(),
+            cordoned_by,
         }
     }
 
@@ -314,9 +336,9 @@ mod tests {
             &[("node-3".to_string(), "no answer in 3 s".to_string())],
             Some(&ClusterCapacity {
                 nodes: vec![
-                    capacity("node-1", false),
-                    capacity("node-2", false),
-                    capacity("node-4", true),
+                    capacity("node-1", None),
+                    capacity("node-2", None),
+                    capacity("node-4", Some(Cordon::Upgrade)),
                 ],
                 not_reporting: vec!["node-3".to_string()],
             }),
@@ -351,6 +373,46 @@ mod tests {
         assert_eq!(value[0]["disk_pressure"], true);
         assert_eq!(value[0]["memory_percent"], 25.0);
         assert_eq!(value[1]["unanswered"], "no answer in 3 s");
+    }
+
+    /// #2119: a node an OS rollout is draining says so, in the table and
+    /// in what a script reads.
+    fn os_rollout_fixture() -> Vec<NodeRow> {
+        node_rows(
+            vec![
+                member("node-1", "alive", true),
+                member("node-2", "alive", false),
+            ],
+            &[share("node-1", 34.0, 40.0), share("node-2", 12.0, 20.0)],
+            &[],
+            Some(&ClusterCapacity {
+                nodes: vec![
+                    capacity("node-1", None),
+                    capacity("node-2", Some(Cordon::OsRollout)),
+                ],
+                not_reporting: Vec::new(),
+            }),
+        )
+    }
+
+    #[test]
+    fn a_node_the_os_rollout_cordoned_says_so() {
+        let rows = os_rollout_fixture();
+        assert!(rows[0].is_unhealthy(), "a cordoned node needs looking at");
+        assert_eq!(rows[0].cordoned_by, Some(Cordon::OsRollout));
+        insta::assert_snapshot!(render_nodes(&rows));
+    }
+
+    #[test]
+    fn json_and_yaml_name_the_os_rollout_cordon() {
+        let rows = os_rollout_fixture();
+        let value = serde_json::to_value(&rows).unwrap();
+        assert_eq!(value[0]["node_id"], "node-2");
+        assert_eq!(value[0]["cordoned"], true);
+        assert_eq!(value[0]["cordoned_by"], "os_rollout");
+        assert_eq!(value[0]["allocated"]["cordoned_by"], "os_rollout");
+        assert_eq!(value[1]["cordoned_by"], serde_json::Value::Null);
+        insta::assert_snapshot!(yaml_serde::to_string(&rows).unwrap());
     }
 
     #[tokio::test]

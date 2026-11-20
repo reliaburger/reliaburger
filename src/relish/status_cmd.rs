@@ -617,10 +617,30 @@ mod tests {
             ],
             upgrade_in_progress: true,
         });
-        summary.nodes.value.as_mut().unwrap().cordoned = 1;
+        let nodes = summary.nodes.value.as_mut().unwrap();
+        nodes.cordoned = 1;
+        nodes.cordoned_by_upgrade = 1;
         let data = status_data(summary, checked(0, 0));
         assert_eq!(data.verdict, Verdict::Healthy);
         insta::assert_snapshot!(render(&data, false));
+    }
+
+    /// #2119: a node the OS rollout is draining is named as the rollout's,
+    /// so the operator knows why it takes no new work.
+    #[test]
+    fn an_os_rollout_cordon_is_named_as_the_rollouts() {
+        let mut summary = healthy();
+        let nodes = summary.nodes.value.as_mut().unwrap();
+        nodes.cordoned = 1;
+        nodes.cordoned_by_os_rollout = 1;
+        let data = status_data(summary, checked(0, 0));
+        assert_eq!(data.verdict, Verdict::Healthy);
+        insta::assert_snapshot!(render(&data, false));
+        let json = serde_json::to_value(&data).unwrap();
+        assert_eq!(
+            json["summary"]["nodes"]["value"]["cordoned_by_os_rollout"],
+            1
+        );
     }
 
     #[test]
