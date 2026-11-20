@@ -20,8 +20,8 @@ expression: "render_to_string(&app, 120, 40)"
 │Enter           lists         open selection                                                                          │
 │↑/↓             lists         move selection                                                                          │
 │/               lists         filter                                                                                  │
-│Tab             app detail    next tab                                                                                │
-│Shift-Tab       app detail    previous tab                                                                            │
+│→ or Tab        app detail    next tab                                                                                │
+│← or Shift-Tab  app detail    previous tab                                                                            │
 │f               logs          toggle follow                                                                           │
 │PgUp/PgDn       streams       scroll                                                                                  │
 │                                                                                                                      │

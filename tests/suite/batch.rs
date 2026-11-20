@@ -593,6 +593,7 @@ async fn a_previous_named_run_cannot_complete_a_new_batch_before_dispatch_acknow
                         runtime_unknown: false,
                         status_age_ms: None,
                         age_seconds: None,
+                        image: None,
                         reason: None,
                     }]);
                     let _ = observed_tx.send(()).await;

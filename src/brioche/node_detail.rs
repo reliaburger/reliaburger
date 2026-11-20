@@ -104,6 +104,7 @@ mod tests {
                     runtime_unknown: false,
                     status_age_ms: None,
                     age_seconds: None,
+                    image: None,
                     reason: None,
                 },
                 InstanceStatus {
@@ -118,6 +119,7 @@ mod tests {
                     runtime_unknown: false,
                     status_age_ms: None,
                     age_seconds: None,
+                    image: None,
                     reason: None,
                 },
             ],

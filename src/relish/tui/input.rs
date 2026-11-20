@@ -151,7 +151,7 @@ impl TuiApp {
                     });
                 }
             }
-            for node in &self.data.nodes {
+            for node in self.data.nodes.iter().map(|row| &row.status) {
                 if node.node_id.to_lowercase().contains(&query) {
                     hits.push(SearchHit {
                         kind: "node".into(),

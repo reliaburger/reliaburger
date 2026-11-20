@@ -121,6 +121,8 @@ An enum models a closed set of alternatives. Rust requires an exhaustive `match`
 
 `DetailTab` is another enum with six variants. It derives `Copy` because it is a small value with no owned data. Cycling a tab computes the next variant and queues any effect that the new tab needs.
 
+Tab and Shift-Tab cycled the tabs from day one. In the Wyse lab, though, the first thing people pressed was →, and nothing happened, so the tabs looked stuck. Now ← and → map to the same `KeyAction::PreviousTab` and `NextTab`, which is one `|` in a `match` arm (`KeyCode::Tab | KeyCode::Right`): a pattern that matches either value, like stacking two `case` labels in C or Go. A line under the tab bar says `←/→ or Tab: switch tabs`, and the help view lists both keys, since it renders the `KEYBINDINGS` table in `keys.rs`, next to the `match` that maps the keys. The arrows were free in this view: ↑ and ↓ move a list's selection, and nothing used ← or →.
+
 ## What just happened?
 
 Before this phase Bun had logs, deploy history and metrics, but no honest cluster event feed. The TUI needed one, so we added the smallest useful store.
@@ -276,6 +278,66 @@ incomplete, the UI keeps its last good data and shows the error rather than a
 shorter list. Logs and deployment history still said plainly that they covered
 the connected node only; one cluster-wide view doesn't make the others
 cluster-wide.
+
+### Which image is it running?
+
+For months the app detail's Overview tab ended with `image          unknown`,
+for every app. It wasn't a bug in the lookup. There was no lookup: the line
+was a string literal, because `InstanceStatus` had no image to show. The node
+knew, of course. It pulled the image and started the instance from it, and
+`WorkloadInstance` keeps the reference (bound to its digest when apply pinned
+one, as in `nginx:1.27@sha256:…`). It just never said.
+
+So `InstanceStatus` grew one more field:
+
+```rust
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub image: Option<String>,
+```
+
+A process workload has no image, so it's `None` there rather than an empty
+string. The two serde attributes matter more than usual. `InstanceStatus`
+doesn't only travel from Bun to `relish`: for cluster status a node fans out
+to its peers' `/v1/status` and parses their answers into the same type. A
+0.3.0 node asking a 0.3.1 peer gets a field it doesn't know, and serde skips
+unknown fields unless a type says `#[serde(deny_unknown_fields)]`, which this
+one doesn't. A 0.3.1 node asking an older peer finds no `image` key, and
+`default` makes that `None`. Neither side refuses the other, so the change
+needs no bump of the cluster's protocol version.
+
+The Overview shows the distinct images across the app's instances. That's
+usually one. Mid-rollout it's two, and the tab lists both rather than picking
+the first and hiding the rollout. The Instances tab gets an IMAGE column, so
+you can see which replica runs which. With no image from any instance (a
+process app, or every node older than the field), it still says `unknown`,
+which is now true.
+
+### One table, two screens
+
+The nodes view had the same problem in a different shape. `relish nodes`
+grew VERSION, CPU, MEM, DISK and ALLOCATED columns months ago, built from
+three answers: gossip's member list, each node's own summary through the
+relay, and the leader's allocations. The TUI's nodes view still showed what
+the first version of `relish nodes` did: gossip's word and the labels.
+
+Copying the columns would have fixed it until the next one. Instead the TUI
+asks `nodes_cmd::fetch_rows` for the very `NodeRow`s the command prints, and
+both turn a row into cells with `nodes_cmd::row_cells`, which returns
+`[String; 10]`, an array whose length is part of its type. A new column means
+changing that `10`, and the compiler then points at every place that lays
+the cells out. The two screens differ only in layout. The command pads to
+fixed widths, which suits a pipe into `grep`. The TUI sizes each column to
+its widest cell, so the table fits a 120-column terminal, and leaves the
+SWIM incarnation number to the node's own page.
+
+Sharing the fetch turned up a compile error worth knowing about. The TUI's
+data provider promises futures that are `Send`, and `ask_each_node` built its
+per-node requests as a lazy `filter(...).map(...)` over borrowed nodes. The
+compiler couldn't prove that iterator `Send` "for any two lifetimes", a
+known limit of how Rust checks closures inside `async fn`s. Collecting the
+requests into a `Vec` before streaming them fixed it, as it had for the
+status snapshot reader. Nothing changed at runtime: the requests were
+always going to be built.
 
 ### Every view, not just one
 

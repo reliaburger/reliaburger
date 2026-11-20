@@ -213,6 +213,7 @@ mod tests {
                 runtime_unknown: false,
                 status_age_ms: None,
                 age_seconds: None,
+                image: None,
                 reason: None,
             },
         });
@@ -320,6 +321,32 @@ mod tests {
         ));
         app.update(key(KeyCode::Esc));
         assert_eq!(app.view(), &View::Apps);
+    }
+
+    // The arrow keys switch the app detail tabs, as Tab and Shift-Tab do
+    // (#2169).
+    #[test]
+    fn left_and_right_switch_app_detail_tabs() {
+        let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);
+        app.view_stack.push(View::AppDetail {
+            app: "web".into(),
+            namespace: "default".into(),
+            tab: DetailTab::Overview,
+        });
+        let tab = |app: &TuiApp| match app.view() {
+            View::AppDetail { tab, .. } => *tab,
+            other => panic!("left the app detail view for {other:?}"),
+        };
+        app.update(key(KeyCode::Right));
+        assert_eq!(tab(&app), DetailTab::Instances);
+        app.update(key(KeyCode::Right));
+        assert_eq!(tab(&app), DetailTab::Logs);
+        app.update(key(KeyCode::Left));
+        assert_eq!(tab(&app), DetailTab::Instances);
+        app.update(key(KeyCode::Left));
+        app.update(key(KeyCode::Left));
+        // Wraps round, as Shift-Tab does.
+        assert_eq!(tab(&app), DetailTab::Config);
     }
 
     #[test]

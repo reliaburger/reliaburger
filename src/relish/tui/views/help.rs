@@ -159,6 +159,46 @@ mod tests {
         );
     }
 
+    // Mid-rollout an app's instances run different images; the Overview
+    // names each one instead of picking one (#2167).
+    #[test]
+    fn app_detail_overview_lists_every_image_mid_rollout() {
+        let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);
+        let second = app
+            .data
+            .instances
+            .iter_mut()
+            .find(|row| row.instance.id == "web-1")
+            .unwrap();
+        second.instance.image = Some("registry.example/web:v2".into());
+        app.view_stack.push(View::AppDetail {
+            app: "web".into(),
+            namespace: "default".into(),
+            tab: DetailTab::Overview,
+        });
+        let output = render_to_string(&app, 120, 40);
+        assert!(
+            output.contains("image          registry.example/web:v1, registry.example/web:v2"),
+            "{output}"
+        );
+    }
+
+    // An older node, or a process workload, reports no image.
+    #[test]
+    fn app_detail_overview_says_unknown_without_an_image() {
+        let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);
+        for row in &mut app.data.instances {
+            row.instance.image = None;
+        }
+        app.view_stack.push(View::AppDetail {
+            app: "web".into(),
+            namespace: "default".into(),
+            tab: DetailTab::Overview,
+        });
+        let output = render_to_string(&app, 120, 40);
+        assert!(output.contains("image          unknown"), "{output}");
+    }
+
     #[test]
     fn help_lists_keybindings() {
         let mut app = TuiApp::with_test_data(TestScenario::Empty);

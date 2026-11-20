@@ -6,11 +6,12 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::bun::agent::{ClusterInstanceStatus, CouncilStatus, NodeStatus};
+use crate::bun::agent::{ClusterInstanceStatus, CouncilStatus};
 use crate::bun::cluster_view::{ClusterDeployHistory, ClusterEvents, ClusterJobs};
 use crate::bun::summary::ClusterSummary;
 use crate::mayo::rollup::MetricsQueryResult;
 use crate::relish::client::BunClient;
+use crate::relish::nodes_cmd::NodeRow;
 use crate::wrapper::types::RouteInfo;
 
 use super::fixtures::TestScenario;
@@ -43,7 +44,8 @@ pub trait DataProvider: Send + Sync + 'static {
     fn status(
         &self,
     ) -> impl Future<Output = Result<Vec<ClusterInstanceStatus>, ProviderError>> + Send;
-    fn nodes(&self) -> impl Future<Output = Result<Vec<NodeStatus>, ProviderError>> + Send;
+    /// Every node's `relish nodes` row.
+    fn nodes(&self) -> impl Future<Output = Result<Vec<NodeRow>, ProviderError>> + Send;
     fn council(&self) -> impl Future<Output = Result<CouncilStatus, ProviderError>> + Send;
     fn alerts(
         &self,
@@ -91,8 +93,11 @@ impl DataProvider for HttpDataProvider {
     async fn status(&self) -> Result<Vec<ClusterInstanceStatus>, ProviderError> {
         self.client.cluster_status().await.map_err(Into::into)
     }
-    async fn nodes(&self) -> Result<Vec<NodeStatus>, ProviderError> {
-        self.client.nodes().await.map_err(Into::into)
+    async fn nodes(&self) -> Result<Vec<NodeRow>, ProviderError> {
+        // A missing allocation answer leaves `-` in the ALLOCATED column;
+        // the TUI has no stderr to warn on.
+        let (rows, _allocations_error) = crate::relish::nodes_cmd::fetch_rows(&self.client).await?;
+        Ok(rows)
     }
     async fn council(&self) -> Result<CouncilStatus, ProviderError> {
         self.client.council().await.map_err(Into::into)
@@ -161,7 +166,7 @@ impl DataProvider for MockDataProvider {
     async fn status(&self) -> Result<Vec<ClusterInstanceStatus>, ProviderError> {
         Ok(self.scenario.data().instances)
     }
-    async fn nodes(&self) -> Result<Vec<NodeStatus>, ProviderError> {
+    async fn nodes(&self) -> Result<Vec<NodeRow>, ProviderError> {
         Ok(self.scenario.data().nodes)
     }
     async fn council(&self) -> Result<CouncilStatus, ProviderError> {

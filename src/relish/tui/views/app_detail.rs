@@ -1,9 +1,30 @@
+use std::collections::BTreeSet;
+
 use ratatui::text::Line;
+
+use crate::bun::agent::ClusterInstanceStatus;
 
 use crate::relish::output::sparkline;
 use crate::relish::tui::app::{DetailTab, TuiApp, View};
 
 use super::widgets;
+
+/// How to switch tabs, shown under the tab bar.
+const TAB_HINT: &str = "←/→ or Tab: switch tabs";
+
+/// The image an app's instances run, as the Overview tab shows it: one
+/// reference, every distinct one mid-rollout, or `unknown` when no instance
+/// reports one (a process workload, or an older node).
+fn overview_image(instances: &[&ClusterInstanceStatus]) -> String {
+    let images: BTreeSet<&str> = instances
+        .iter()
+        .filter_map(|instance| instance.instance.image.as_deref())
+        .collect();
+    if images.is_empty() {
+        return "unknown".into();
+    }
+    images.into_iter().collect::<Vec<_>>().join(", ")
+}
 
 pub fn lines(app: &TuiApp, height: usize) -> Vec<Line<'static>> {
     let View::AppDetail {
@@ -28,6 +49,8 @@ pub fn lines(app: &TuiApp, height: usize) -> Vec<Line<'static>> {
     let mut lines = vec![
         widgets::heading(format!("{name} · {namespace}")),
         Line::raw(tabs),
+        // The tabs looked stuck without it (#2169).
+        Line::raw(TAB_HINT),
         Line::raw(""),
     ];
     let instances: Vec<_> = app
@@ -51,19 +74,19 @@ pub fn lines(app: &TuiApp, height: usize) -> Vec<Line<'static>> {
             lines.extend([
                 Line::raw(format!("ready          {ready}/{}", instances.len())),
                 Line::raw(format!("restarts       {restarts}")),
-                Line::raw("image          unknown"),
+                Line::raw(format!("image          {}", overview_image(&instances))),
             ]);
         }
         DetailTab::Instances => {
             lines.push(widgets::heading(
-                "NODE         ID                       STATE         RESTARTS  HOST PORT  PID",
+                "NODE         ID                       STATE         RESTARTS  HOST PORT  PID      IMAGE",
             ));
             if instances.is_empty() {
                 lines.push(Line::raw("no instances"));
             }
             for instance in instances {
                 lines.push(Line::raw(format!(
-                    "{:<12} {:<24} {:<13} {:>8}  {:>9}  {}",
+                    "{:<12} {:<24} {:<13} {:>8}  {:>9}  {:<8} {}",
                     instance.node,
                     instance.instance.id,
                     instance.instance.state,
@@ -77,7 +100,8 @@ pub fn lines(app: &TuiApp, height: usize) -> Vec<Line<'static>> {
                         .instance
                         .pid
                         .map(|pid| pid.to_string())
-                        .unwrap_or_else(|| "-".into())
+                        .unwrap_or_else(|| "-".into()),
+                    instance.instance.image.as_deref().unwrap_or("-")
                 )));
             }
         }
