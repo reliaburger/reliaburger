@@ -93,10 +93,19 @@ jobs:
       # serves the nightly run and pull requests, and only the nightly (or a
       # run by hand) saves it: a PR's saved cache counts against the 10 GB
       # quota ci.yml keeps for main (#1442).
+      #
+      # The key also names the coverage wrapper, since Cargo doesn't
+      # fingerprint a RUSTC_WRAPPER. From 17 Nov 2026, main's nightly saved
+      # crates built through fuzz/rustc-coverage.sh, and pull requests into a
+      # train that didn't have the wrapper yet restored them. Each rebuilt
+      # the whole crate (33 minutes instead of 11) and then took about 20
+      # minutes per 30-second target, so every one hit the job's limit
+      # (#2125).
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz -> target
           shared-key: fuzz
+          key: coverage-${{ hashFiles('fuzz/rustc-coverage.sh') }}
           save-if: ${{ github.event_name != 'pull_request' }}
           cache-on-failure: true
           # reliaburger is a path dependency here, which rust-cache would
