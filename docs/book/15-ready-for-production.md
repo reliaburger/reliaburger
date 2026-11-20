@@ -1078,7 +1078,7 @@ floor. Portable Linux does all of that in about 15 minutes. macOS, the privilege
 suites, upgrades and benchmarks still have to pass, but on what lands, not on every draft of
 it. `select-jobs.sh` now gives a pull request into `release-*` a fourth output, `macos=false`,
 along with `heavy=false`. The full set runs in GitHub's merge queue, on the batch merged onto
-the train before any of it lands, and again on the push to the train. A `full-ci` label still
+the train before any of it lands (and, until November, again on the push to the train). A `full-ci` label still
 buys the whole set on the pull request, and the gate PR into `main` (its head is a train) gets
 it too.
 
@@ -1152,7 +1152,7 @@ to do with macOS ([#1443](https://github.com/reliaburger/reliaburger/issues/1443
 The rule now is that macOS runs where it can find something Linux can't. Every push, to a
 train or to `main`, and the nightly still run all three shards, so no commit lands without
 them, and the candidate build demands them. The gate PR gets the light set on each push,
-because the push to the train has just run everything; at code freeze the maintainer labels
+because the train's commit has just passed everything; at code freeze the maintainer labels
 it `release-gate`, and from then on it runs everything and the evidence gate refuses it
 without every owner. Any other pull request gets macOS only if it touches macOS-specific
 code, or someone labels it `macos`. "macOS-specific" is a list of paths (the Apple runtime,
@@ -1271,6 +1271,88 @@ dependency, one crate at a time, for about ten minutes. GitHub lets a pull reque
 caches saved on its base branch, so now the train's own pushes save that cache too. Pull
 request and merge-queue refs still never save one, so nothing a PR builds ends up in a cache
 another run trusts.
+
+That fixed the build. It didn't fix the wait. On the evening of 20 November the 0.3.1 train
+had five groups in the merge queue, and jobs sat for up to 96 minutes before a runner picked
+them up. A train PR whose own jobs took 30 minutes took 70 to 110 to go green. The account
+runs a fixed number of hosted jobs at once, so the question wasn't how fast a job ran. It was
+who else wanted a runner.
+
+So we counted. Over the 194 `ci.yml` runs from 18 to 20 November, 22,120 runner-minutes, a
+queue group starts 20 jobs and burns about 280 runner-minutes, and the queue builds up to
+eight groups at once. Three kinds of run were waste.
+
+The biggest was the push to the train. The merge queue pushes exactly the commit its group
+tested, and the run IDs prove it: in 15 of the window's 18 train pushes, a merge-group run with the
+same `head_sha` had already passed every job. The push then ran all 20 again, about 4,100
+runner-minutes for answers we already had. We already had a function that decides whether one
+run can stand in for another: the candidate build's `ci_reuse.py`, which demands the exact
+commit, the first attempt and every job green. It gained one option, `--event merge_group`,
+and select jobs calls it on a train push. When it finds the queue's run, the push runs only CI
+policy and the gate, and `every_job.py` accepts a push that skipped the code jobs only when
+select jobs names the run it rests on, in a `tested_by` output. Anything doubtful, an API error
+or a re-run that went green, runs everything, as before.
+
+One thing that push still did was save the dependency cache from the paragraph above. So
+when the train's `Cargo.lock`, `Cargo.toml` or `.cargo/config.toml` differs from `main`'s,
+the push still runs portable Linux alone, for its cache. That's one job instead of twenty.
+
+The second was groups the queue had already thrown away. When an entry fails, the queue
+re-forms: it drops the groups behind the failure, deletes their `gh-readonly-queue/...`
+branches and starts new ones. It doesn't cancel the dropped groups' runs. Our `concurrency`
+block couldn't either: a merge-group run's group is its own run ID. Could a better key fix
+it? A dropped group and its replacement share the PR number, but the number lives inside the
+branch name, and workflow expressions have no way to cut a string. The base SHA in the name
+changes with every re-formation. So five superseded runs kept 78 jobs and about 1,100
+runner-minutes going after the queue stopped caring, two of them for over an hour.
+
+The branch is the signal. If `gh-readonly-queue/release-1-3-1/pr-2154-09de86c7...` is gone, the
+queue will never read that run's checks. `queue_sweep.py` lists the unfinished merge-group
+runs and cancels each whose branch has gone. Like the cache trimmer, the rule is a pure
+function over API rows and a lookup, tested on fixtures taken from that evening:
+
+```python
+def superseded(runs, branch_exists, now):
+    found = []
+    for run in runs:
+        branch = run.get("head_branch") or ""
+        if run.get("event") != "merge_group" or not branch.startswith(QUEUE_PREFIX):
+            continue
+        if run.get("status") == FINISHED:
+            continue
+        if now - parse_time(run["created_at"]) < GRACE:
+            continue
+        if branch_exists(branch) is False:
+            found.append(run)
+    return found
+```
+
+`branch_exists` answers `True`, `False` or `None`, and only a definite `False` cancels: a 502
+from the API keeps the run. A finished run is skipped because a group that merged loses its
+branch too.
+
+When should it run? Every re-formation either starts a new group, a `merge_group` event, or
+merges one, a push to the train, so a small workflow listening to both catches each dropped
+run within a minute or so. It's its own workflow, `queue-sweep.yml`, for the same reason the
+cache trimmer is: cancelling a run needs `actions: write`, and `ci.yml` is also called by
+`build.yml` and `ci-retarget.yml`, which grant it `actions: read`. GitHub refuses a called
+workflow that asks for more than its caller grants, whatever the job's `if` says.
+
+The third was small jobs. The dependency audit and the demo app's Go tests each take under a
+minute, but a job is a job: each waited for its own runner, and the gate waits for the last.
+That evening `demo app` waited 96 minutes to run for 30 seconds. They're steps of `CI policy`
+now, which runs on every change anyway, so a train PR asks for 9 runners instead of 11 and a
+queue group for 18 instead of 20. A queue group that changes only documentation now skips the
+code jobs as a pull request does, since its code is the code of the group in front of it.
+Two of the window's 32 groups would have.
+
+Together that's about a quarter of the window's runner-minutes, 5,700 of 22,120, that no
+longer compete with the PRs an author is waiting for. What we didn't do matters as much.
+Portable Linux still builds one crate at a time, 13 of its 25 to 31 minutes, because two
+instrumented compiles at once ran a 16 GB runner out of memory; that's the floor of every
+train PR until the build itself changes. Portable macOS, 52 to 57 minutes with a warm cache,
+still sets the length of every queue group. And the queue builds up to eight groups at once,
+160 jobs, a setting in the repository ruleset that only the maintainer can change.
 
 ### A release gate that fits in a week
 

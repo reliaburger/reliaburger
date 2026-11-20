@@ -79,8 +79,9 @@ version (`release-0-2-1`), and one gate PR takes the train into `main`. CI
 treats the three kinds of run differently ([which jobs run](testing.md#which-jobs-a-pull-request-runs)):
 
 - **A PR into the train** gets the light set: lint and format, minimum Rust,
-  portable Linux with the coverage floor, the demo app, the source bundle
-  build and the optimised contract boundaries, in about 25 minutes. A
+  portable Linux with the coverage floor, CI policy (with the dependency
+  audit and the demo app), the source bundle build and the optimised
+  contract boundaries, in about 30 minutes of running. A
   `full-ci` label adds everything except portable macOS: privileged
   Linux (on Ubuntu 24.04 and 26.04), cluster, acceptance,
   upgrades and benchmarks. Portable macOS runs on the PR only when it
@@ -88,10 +89,17 @@ treats the three kinds of run differently ([which jobs run](testing.md#which-job
 - **The merge queue** runs every job, portable macOS and the heavy suites
   included, on the batch merged onto the train, before any of it lands. The
   queue requires the single check `ignored-test evidence`, which waits for
-  every other job and demands every evidence owner.
-- **The push to the train** runs everything on the result, macOS included.
+  every other job and demands every evidence owner. A group that changes
+  only documentation runs no code job: its code is its base's. When the
+  queue drops a group, `queue-sweep.yml` cancels its run
+  ([what a merge costs](testing.md#what-a-merge-costs-in-runners)).
+- **The push to the train** runs nothing but CI policy when the queue's run
+  on that exact commit passed every job at its first attempt, and everything
+  when it didn't (a direct push, say). When the train's dependencies differ
+  from `main`'s it still runs portable Linux, to save the cache its PRs
+  restore.
 - **The gate PR** into `main` gets the light set on each push, because the
-  push to the train has just run everything on the same code
+  merge queue has just run everything on the same code
   ([#1443](https://github.com/reliaburger/reliaburger/issues/1443)). At code
   freeze, label it `release-gate`: from then on it runs everything, and the
   evidence gate refuses it without every owner, macOS included. Merging it
