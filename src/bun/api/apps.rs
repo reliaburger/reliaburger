@@ -299,26 +299,25 @@ pub(super) async fn cluster_app_change(
         } else {
             ""
         };
-        let url = format!("{leader_url}/v1/{}/{app}/{namespace}{force}", change.verb());
+        let path = match crate::cluster::http::peer_path(&[
+            "v1",
+            change.verb(),
+            app.as_str(),
+            namespace.as_str(),
+        ]) {
+            Ok(path) => path,
+            Err(error) => return peer_path_refusal(&error),
+        };
+        let url = format!("{leader_url}{path}{force}");
         let request = copy_forwarded_auth(
             mark_leader_forwarded(state.cluster_http.client().post(url)),
             caller_headers,
         );
-        return match request.send().await {
-            Ok(response) => {
-                let status = StatusCode::from_u16(response.status().as_u16())
-                    .unwrap_or(StatusCode::BAD_GATEWAY);
-                let body = response.bytes().await.unwrap_or_default();
-                (status, body).into_response()
-            }
-            Err(e) => (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({
-                    "error": format!("failed to forward {} to the leader: {e}", change.verb())
-                })),
-            )
-                .into_response(),
-        };
+        return crate::bun::batch::relay_leader_answer(
+            request,
+            crate::bun::batch::LEADER_FORWARD_TIMEOUT,
+        )
+        .await;
     }
 
     // Only the owner's token or an admin changes an owned app (#1125),
@@ -393,13 +392,22 @@ pub(super) async fn cluster_app_change(
             )
                 .into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("failed to update desired state: {e}")
-            })),
-        )
-            .into_response(),
+        // A council that can't commit in time is unavailable, not broken.
+        Err(e) => {
+            let status = match e {
+                crate::council::CouncilError::WriteTimedOut { .. } => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (
+                status,
+                Json(serde_json::json!({
+                    "error": format!("failed to update desired state: {e}")
+                })),
+            )
+                .into_response()
+        }
     }
 }
 

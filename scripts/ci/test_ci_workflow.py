@@ -1,4 +1,5 @@
 """The CI workflow keeps evidence for every suite, and its triggers and gates say what they do."""
+import os
 from pathlib import Path
 import re
 import shlex
@@ -609,12 +610,13 @@ class TrainAndQueueTests(unittest.TestCase):
         self.assertIn("save-if: false", job)
 
     def test_the_portable_suite_finishes_on_a_slow_runner_with_headroom(self):
-        # About 25 minutes normally and 35 to 41 on a slow runner (#1421).
-        # nextest's per-test timeouts catch a hung test, so the job limit
-        # only has to outlast a slow runner by half again.
+        # 35 to 41 minutes on a slow runner (#1421), then up to 55 once the
+        # coverage build ran one job at a time, which tripled the build in
+        # the Lima VM. nextest's per-test timeouts catch a hung test, so the
+        # job limit only has to outlast a slow runner by half again.
         limit = re.search(r"\n    timeout-minutes: (\d+)\n", self.jobs["portable"])
         self.assertIsNotNone(limit)
-        self.assertGreaterEqual(int(limit.group(1)), 41 * 3 // 2)
+        self.assertGreaterEqual(int(limit.group(1)), 55 * 3 // 2)
 
     def test_the_nightly_signing_build_s_own_key_test_runs(self):
         # The nightly build trusts the nightly key instead of every release
@@ -890,6 +892,128 @@ class LinuxNextTests(unittest.TestCase):
         self.assertIn("sort -t '=' -k3 -n", self.job)
 
 
+class PortableLinuxRunnerTests(unittest.TestCase):
+    """The portable Linux job keeps its runner through the coverage build.
+
+    On 18 Nov 2026 it lost its runner three times, each after about 50
+    minutes with the test step still in progress and no log kept (runs
+    44265273054, 44265366690 and 44276663421). That step compiles the lib
+    tests, whose one rustc peaks at about 14 GB (batch 1 moved it only
+    0.2 GB, so why the losses start now is open), on a 16 GB runner with
+    nothing protecting the runner's own processes. That is #1943's
+    mechanism, unverified here, so it gets #1943's guards: the runner out
+    of the OOM killer's reach, swap for the peak, and the headroom watched
+    and kept.
+
+    The watcher then named the real cause: memory was fine, but free disk
+    on / fell to 5.1 GiB in a passing run, so a slower one fills it. The job
+    now frees the image's unused SDKs first, keeps swap files off /, stops
+    nextest under 2 GiB and fails its report under 10 GiB.
+
+    Then #2101's queue run lost its runner with 27 GB of disk freed, and
+    memory came back: two passing runs had bottomed out at 0.8 and 1.4 GiB.
+    Under a runner's memory in the Lima VM, every parallel build compiled
+    the lib (7 GB) beside its lib tests (12 GB) and swapped. The build now
+    runs one job at a time, and the watcher stops it if memory stays short
+    while swap is in use."""
+
+    def setUp(self):
+        self.job = jobs((WORKFLOWS / "ci.yml").read_text())["portable"]
+        self.steps = steps(self.job)
+
+    def step(self, text):
+        found = [index for index, step in enumerate(self.steps) if text in step]
+        self.assertEqual(len(found), 1, text)
+        return found[0]
+
+    def producer(self):
+        return self.step("--gate portable-linux ")
+
+    def test_the_runner_is_shielded_before_the_coverage_run_and_the_run_is_not(self):
+        shield = self.step('scripts/ci/protect-runner "$RUNNER_TEMP/runner-pids"')
+        self.assertLess(shield, self.producer())
+        self.assertNotIn("if: always()", self.steps[shield])
+        # Children inherit the runner's -1000. Left there, rustc could never
+        # be killed, and a full memory would hang the host instead.
+        command = " ".join(re.sub(r"\\\n", " ", self.steps[self.producer()].split("run: |", 1)[1]).split())
+        self.assertTrue(command.startswith("choom -n 0 -- python3 scripts/ci/workflow_adapter.py produce "), command)
+
+    def test_swap_is_topped_up_only_on_a_separate_scratch_disk_never_on_root(self):
+        swap = self.step("sudo swapon")
+        self.assertLess(swap, self.producer())
+        self.assertNotIn("if: always()", self.steps[swap])
+        self.assertIn("SwapTotal", self.steps[swap])
+        self.assertIn("8388608", self.steps[swap])
+        # A swap file on / spent 5 GB of the disk that ran out (run
+        # 44293229949). On 24.04 /mnt is on /dev/root, so the step adds
+        # nothing there.
+        self.assertIn("if ! mountpoint -q /mnt; then", self.steps[swap])
+        self.assertNotIn("dir=/\n", self.steps[swap])
+        self.assertIn('"/mnt/ci-swapfile"', self.steps[swap])
+
+    def test_headroom_is_watched_from_before_the_run_and_reported_and_kept_after_it(self):
+        watch = self.step('scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids"')
+        self.assertLess(self.step("scripts/ci/protect-runner"), watch)
+        self.assertLess(watch, self.producer())
+        self.assertIn('> "$RUNNER_TEMP/portable-linux-resources.log"', self.steps[watch])
+        report = self.step('kill "$(cat "$RUNNER_TEMP/portable-linux-resources.pid")"')
+        self.assertGreater(report, self.producer())
+        self.assertIn("if: always()", self.steps[report])
+        self.assertIn("'oom|killed process'", self.steps[report])
+        keep = self.step("name: portable-linux-resources\n")
+        self.assertGreater(keep, report)
+        self.assertIn("if: always()", self.steps[keep])
+        self.assertIn("portable-linux-resources.log", self.steps[keep])
+
+    # On 18 Nov 2026 the passing run of #2100 (44293229949) showed why the
+    # runner went: free disk on / fell from 74 GB to 5.1 GiB, 24 GB in the
+    # instrumented build and 46 GB in the tests' one .profraw per process.
+    def test_unused_preinstalled_toolchains_are_deleted_before_the_build(self):
+        free = self.step("scripts/ci/free-runner-disk")
+        self.assertLess(free, self.producer())
+        self.assertLess(free, self.step("Swatinem/rust-cache"))
+        self.assertNotIn("if: always()", self.steps[free])
+        # In the background, beside the cache restore and the build, so it
+        # costs the critical path nothing; the report prints what it freed.
+        self.assertIn('nohup scripts/ci/free-runner-disk > "$RUNNER_TEMP/free-runner-disk.log"', self.steps[free])
+        report = self.steps[self.step('kill "$(cat "$RUNNER_TEMP/portable-linux-resources.pid")"')]
+        self.assertIn('cat "$RUNNER_TEMP/free-runner-disk.log"', report)
+
+    def test_the_watcher_stops_the_tests_before_a_full_disk_takes_the_runner(self):
+        watch = self.steps[self.step('scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids"')]
+        self.assertIn("WATCH_DISK_FLOOR_KB=2097152", watch)
+        self.assertIn('WATCH_STOP="cargo-llvm-cov cargo-nextest cargo rustc"', watch)
+
+    # #2101's queue run (44317623404) lost its runner with 27 GB of disk
+    # freed, so disk wasn't the only cause. In the Lima VM, under a runner's
+    # memory and 4 CPUs, CI's coverage build at four jobs compiles the
+    # crate's lib and its lib tests at once, two rustc processes of 7 and
+    # 8 GB, and filled the swap until the kernel killed one.
+    def test_the_watcher_stops_the_build_when_memory_stays_short_with_swap_in_use(self):
+        watch = self.steps[self.step('scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids"')]
+        self.assertIn("WATCH_MEM_FLOOR_KB=524288", watch)
+        self.assertIn("WATCH_MEM_FLOOR_SECONDS=60", watch)
+        # The build has no nextest yet: the floor must reach rustc and cargo.
+        for name in ("cargo-llvm-cov", "cargo", "rustc"):
+            self.assertIn(name, watch.split("WATCH_STOP=", 1)[1].split('"')[1].split())
+
+    def test_the_coverage_build_compiles_one_crate_at_a_time(self):
+        producer = self.steps[self.producer()]
+        self.assertIn('CARGO_BUILD_JOBS: "1"', producer)
+        # Only this job: the others don't build the instrumented lib tests.
+        text = (WORKFLOWS / "ci.yml").read_text()
+        self.assertEqual(text.count("CARGO_BUILD_JOBS:"), 1)
+
+    def test_the_report_fails_when_the_low_water_mark_is_under_ten_gibibytes(self):
+        report = self.steps[self.step('kill "$(cat "$RUNNER_TEMP/portable-linux-resources.pid")"')]
+        check = 'scripts/ci/assert-headroom "$RUNNER_TEMP/portable-linux-resources.log" 10485760'
+        self.assertIn(check, report)
+        # The check is the step's last command, so the kernel lines print
+        # whatever it decides and its exit status is the step's.
+        self.assertTrue(report.rstrip().endswith(check), report)
+        self.assertNotIn(check + " ||", report)
+
+
 class ArtifactDownloadTests(unittest.TestCase):
     """A stalled artefact download fails fast and is retried once (#977).
 
@@ -1149,6 +1273,311 @@ class RetargetTests(unittest.TestCase):
         # two runs land in different concurrency groups.
         group = re.search(r"concurrency:\n\s+group: (.*)", self.ci).group(1)
         self.assertIn("github.workflow", group)
+
+
+class V02LoopArchiveTests(unittest.TestCase):
+    """The V02 loops archive only the test binaries the loops run.
+
+    Archiving every test binary took more than the build job's 60 minutes
+    on macos-15 from a cold cache, and the ubuntu-24.04-arm runner was shut
+    down mid-compile in two of four attempts (runs 36114785981 and
+    43174277022). One failed platform skips every loop, since they all need
+    the build job.
+    """
+
+    # A cold macos-15 build of the archived binaries, with room to spare.
+    MIN_BUILD_MINUTES = 90
+
+    def setUp(self):
+        self.text = (WORKFLOWS / "v02-loops.yml").read_text()
+        self.loops = jobs(self.text)
+
+    @staticmethod
+    def make_targets(workflow_jobs):
+        """The make targets the upgrade loop's matrix runs."""
+        matrix = re.search(r"\n        target: \[([^\]]*)\]", workflow_jobs["upgrade"])
+        return [target.strip() for target in matrix.group(1).split(",")]
+
+    def selected_binaries(self, workflow_jobs):
+        """Every test binary a loop's nextest filter names."""
+        text = "\n".join(workflow_jobs[name] for name in ("upgrade", "council", "leases"))
+        names = set(re.findall(r"binary\(([\w-]+)\)", text))
+        matrix = re.search(r"\n        binary: \[([^\]]*)\]", workflow_jobs["council"])
+        names.update(binary.strip() for binary in matrix.group(1).split(","))
+        for target in self.make_targets(workflow_jobs):
+            _, recipe = dry_run(target)
+            names.update(re.findall(r"binary\(([\w-]+)\)", "\n".join(recipe)))
+        names.discard("${{ matrix.binary }}")
+        return names
+
+    def assert_archives_what_the_loops_run(self, workflow_jobs):
+        """No subTest here: the detection test expects the first failure to raise."""
+        build = workflow_jobs["build-tests"]
+        archive = next(step for step in steps(build) if "nextest archive" in step)
+        archived = set(re.findall(r"--test ([\w-]+)", archive))
+        self.assertTrue(archived, "the archive names the test binaries it builds")
+        self.assertEqual(archived, self.selected_binaries(workflow_jobs))
+        self.assertNotIn("--workspace", archive)
+        self.assertNotIn("--lib", archive, "the loops run no library unit tests")
+        limit = re.search(r"\n    timeout-minutes: (\d+)\n", build + "\n")
+        self.assertIsNotNone(limit)
+        self.assertGreaterEqual(int(limit.group(1)), self.MIN_BUILD_MINUTES)
+
+    def test_the_archive_builds_exactly_the_binaries_the_loops_select(self):
+        self.assert_archives_what_the_loops_run(self.loops)
+
+    def test_the_selection_covers_every_loop(self):
+        self.assertEqual(
+            self.selected_binaries(self.loops),
+            {"self_upgrade", "self_upgrade_cluster", "council_disaster_recovery",
+             "cluster_failover", "registry_recovery", "suite",
+             "test_storage"},
+        )
+
+    @staticmethod
+    def named_tests(workflow_jobs):
+        """(binary, test path) for every exact test a lease loop's filter names."""
+        found = []
+        for line in workflow_jobs["leases"].splitlines():
+            filter_line = re.search(r"filter: (.*)$", line)
+            if not filter_line:
+                continue
+            binary = re.search(r"binary\(([\w-]+)\)", filter_line.group(1)).group(1)
+            for test in re.findall(r"test\(=([\w:]+)\)", filter_line.group(1)):
+                found.append((binary, test))
+        return found
+
+    @staticmethod
+    def defines(binary, test):
+        """Whether the binary's source defines the test function."""
+        *modules, function = test.split("::")
+        if binary == "suite":
+            source = REPO / "tests" / "suite" / ("/".join(modules) + ".rs")
+        else:
+            source = REPO / "tests" / f"{binary}.rs"
+        if not source.is_file():
+            return False
+        return re.search(rf"\bfn {re.escape(function)}\s*\(", source.read_text()) is not None
+
+    def test_every_test_a_lease_loop_names_exists(self):
+        # Run 43183887759's job-lease loop selected nothing on every platform:
+        # its test went when node-local jobs were retired (2560765c).
+        named = self.named_tests(self.loops)
+        self.assertTrue(named)
+        for binary, test in named:
+            with self.subTest(binary=binary, test=test):
+                self.assertTrue(self.defines(binary, test), f"{binary} has no test {test}")
+
+    def test_a_filter_naming_a_removed_test_is_detected(self):
+        self.assertFalse(self.defines(
+            "job_recovery", "node_job_lease_reaps_a_surviving_process_after_bun_is_killed"))
+        self.assertFalse(self.defines("suite", "log_export::no_such_test"))
+        self.assertTrue(self.defines(
+            "suite", "log_export::export_persists_and_reloads_the_authoritative_checkpoint"))
+
+    def test_a_missing_extra_or_whole_workspace_archive_is_detected(self):
+        build = self.loops["build-tests"]
+        archive = next(step for step in steps(build) if "nextest archive" in step)
+        changes = [
+            archive.replace(" --test registry_recovery", ""),
+            archive.replace(" --test suite", " --test suite --test oci_crash"),
+            re.sub(r"( --test [\w-]+)+", " --workspace", archive),
+            archive.replace(" --test suite", " --test suite --lib"),
+        ]
+        for changed in changes:
+            altered = dict(self.loops, **{"build-tests": build.replace(archive, changed)})
+            with self.subTest(change=changed), self.assertRaises(AssertionError):
+                self.assert_archives_what_the_loops_run(altered)
+        short = dict(self.loops, **{"build-tests": re.sub(
+            r"\n    timeout-minutes: \d+", "\n    timeout-minutes: 60", build)})
+        with self.assertRaises(AssertionError):
+            self.assert_archives_what_the_loops_run(short)
+
+
+class ApplianceTests(unittest.TestCase):
+    """appliance.yml: lab builds carry a next version and a lab channel for
+    the Wyse lab, without loosening how a published build is signed."""
+
+    def setUp(self):
+        self.text = (WORKFLOWS / "appliance.yml").read_text()
+        self.jobs = jobs(self.text)
+        self.image = steps(self.jobs["image"])
+
+    def step(self, name):
+        found = [s for s in self.image if f"- name: {name}" in s]
+        self.assertEqual(len(found), 1, name)
+        return found[0]
+
+    def test_nothing_publishes_on_a_schedule_until_v0_3_0_is_promoted(self):
+        # Maintainer, 7 October 2026: the weekly publish stays off until
+        # v0.3.0 is promoted, so the train landing on main publishes nothing
+        # by itself. A dispatch with `publish` is the only way to publish.
+        triggers = self.text.split("\njobs:", 1)[0]
+        self.assertNotRegex(triggers, r"(?m)^\s+schedule:")
+        self.assertNotRegex(triggers, r"(?m)^\s+- cron:")
+
+    def test_a_pull_request_changing_appliance_code_builds_and_tests_the_image(self):
+        # src/os (the node's half of an OS update), src/appliance (prepare,
+        # claim, the console) and src/relish/netboot run only in the image's
+        # QEMU tests, and a PR run builds bun from source, so a change there
+        # has to trigger them.
+        triggers = self.text.split("\njobs:", 1)[0]
+        pull_request = triggers.split("\n  pull_request:", 1)[1]
+        paths = re.findall(r'(?m)^      - "([^"]+)"$', pull_request)
+        for path in (
+            "image/**",
+            ".github/workflows/appliance.yml",
+            "src/os/**",
+            "src/appliance/**",
+            "src/relish/netboot/**",
+        ):
+            with self.subTest(path=path):
+                self.assertIn(path, paths)
+
+    def test_every_build_checks_its_manifest_for_an_ssh_server_before_uploading(self):
+        # #401: a published image has no SSH server. The check reads the
+        # built image's manifest, so it must run after the build and before
+        # anything uploads the image for signing.
+        check = self.step("No SSH server in a published image")
+        self.assertIn("image/tests/no_ssh_server.py manifest", check)
+        self.assertIn('[ "$PUBLISH" = true ] || lab=(--lab)', check)
+        position = self.image.index(check)
+        self.assertGreater(position, self.image.index(self.step("Build the image")))
+        uploads = [i for i, s in enumerate(self.image) if "actions/upload-artifact" in s]
+        self.assertTrue(uploads)
+        self.assertTrue(all(position < i for i in uploads), uploads)
+
+    def test_only_main_publishes(self):
+        plan = self.jobs["plan"]
+        self.assertIn('if [ "$GITHUB_REF" = refs/heads/main ]', plan)
+        self.assertIn("needs.plan.outputs.publish == 'true'", self.jobs["sign"])
+
+    def test_the_release_key_stays_in_the_sign_job_which_runs_only_first_party_actions(self):
+        for name, job in self.jobs.items():
+            with self.subTest(job=name):
+                if name == "sign":
+                    self.assertEqual(job.count("secrets.RELIABURGER_RELEASE_KEY"), 1)
+                else:
+                    self.assertNotIn("RELIABURGER_RELEASE_KEY", job)
+        # The key is a secret of the `release` environment only, so a job
+        # without it reads an empty key and the publish fails.
+        self.assertRegex(self.jobs["sign"], r"(?m)^    environment: release$")
+        actions = re.findall(r"uses: ([^@\s]+)@", self.jobs["sign"])
+        self.assertTrue(actions)
+        for action in actions:
+            self.assertTrue(action.startswith("actions/"), action)
+
+    def test_lab_builds_sign_a_lab_channel_for_the_next_version_with_the_runs_key(self):
+        sign = self.step("Sign (throwaway key)")
+        self.assertIn("if: env.PUBLISH != 'true'", sign)
+        self.assertRegex(sign, r"scripts/release/os_release\.py\"? lab-channel")
+        self.assertIn('--version "$NEXT_VERSION"', sign)
+        # The channel is checked with the run's public key, and the private
+        # key is gone before any test runs.
+        self.assertIn("os-channel.json.sig", sign)
+        self.assertLess(sign.index("lab-channel"), sign.index('rm -f "$RUNNER_TEMP/spike.key"'))
+        self.assertIn('"$RUNNER_TEMP/spike.der"', sign.split("rm -f", 1)[1])
+
+    def test_the_next_version_is_built_for_every_x86_64_lab_build(self):
+        build = self.step("Build the next version (x86-64 lab builds)")
+        self.assertIn("env.PUBLISH != 'true'", build)
+        # Not only when relish was built from source: a dispatch naming a
+        # bun release gets a next version too.
+        self.assertNotIn("source-bin", build.split("run:")[0])
+
+    def test_the_next_version_is_uploaded_as_a_release_tree(self):
+        upload = self.step("Upload the next version")
+        self.assertIn("name: appliance-x86_64-next", upload)
+        self.assertIn("lab-release", upload)
+        self.assertIn("if: env.NEXT_VERSION != ''", upload)
+        self.assertIn("lab-release.sh", self.step("Lay out the next version as a release"))
+
+    def test_dispatched_lab_builds_keep_their_artefacts_a_week(self):
+        for name in ["Upload the image", "Upload the next version"]:
+            with self.subTest(step=name):
+                self.assertIn("github.event_name == 'workflow_dispatch' && 7",
+                              self.step(name))
+        # A published build's artefacts still last three days: they go into
+        # its releases within the run.
+        self.assertIn("env.PUBLISH == 'true' && 3", self.step("Upload the image"))
+
+    def test_every_x86_64_lab_build_makes_a_broken_version_signed_with_the_runs_key(self):
+        # #406: the fallback test, and the Wyse lab's, need a broken version
+        # the run's own images trust, sorting above the next version.
+        build = self.step("Build a broken version (x86-64 lab builds)")
+        self.assertIn("if: env.NEXT_VERSION != ''", build)
+        self.assertIn("+ 2 ))", build)
+        self.assertIn('--extra-tree "$GITHUB_WORKSPACE/image/tests/broken-bun"', build)
+        self.assertIn('"$RUNNER_TEMP"/broken/*.SHA256SUMS', self.step("Sign (throwaway key)"))
+        lay_out = self.step("Lay out the next version as a release")
+        self.assertIn('"$RUNNER_TEMP/broken" "$BROKEN_VERSION"', lay_out)
+
+    def test_both_kinds_of_broken_build_break_bun_the_same_way(self):
+        # A real broken binary, newer than any release, rather than a unit
+        # override: the launcher must install it, as it would a bad release,
+        # so the fallback test proves the older OS gets its own bun back.
+        self.assertIn("image/tests/broken-bun/", self.step("Break bun on purpose (spike S4)"))
+        broken = REPO / "image/tests/broken-bun/usr/lib/reliaburger/bin/bun"
+        self.assertTrue(os.access(broken, os.X_OK), "the broken bun must be executable")
+        version = subprocess.run([broken, "--version"], capture_output=True, text=True)
+        self.assertEqual(version.stdout.split()[:2], ["bun", "999.0.0-broken"])
+        self.assertFalse((REPO / "image/tests/broken-bun/usr/lib/systemd").exists(),
+                         "no unit override: the launcher has to run the broken bun")
+
+    def test_the_fallback_test_runs_on_every_x86_64_lab_build(self):
+        # Every pull request run, so the release train and its gate run it.
+        fallback = self.step("OS fallback (x86-64, KVM)")
+        condition = fallback.split("if:", 1)[1].split("\n", 1)[0]
+        self.assertIn("env.BROKEN_VERSION != ''", condition)
+        self.assertNotIn("event_name", condition)
+        self.assertIn('"$BROKEN_VERSION" source-bin/relish-linux-x86_64 --fallback', fallback)
+        self.assertIn("timeout-minutes:", fallback)
+        branches = re.search(r"pull_request:\n(?:\s+#.*\n)*\s+branches: (\[.*\])", self.text)
+        self.assertIn('"release-*"', branches.group(1))
+
+    def test_the_boot_test_uses_the_wyse_sized_disk(self):
+        boot = self.step("Boot test")
+        self.assertIn(". image/tests/disk.sh", boot)
+        self.assertIn("disk_from_image", boot)
+
+
+class ReleaseKeyEnvironmentTests(unittest.TestCase):
+    """RELIABURGER_RELEASE_KEY is a secret of the `release` environment and
+    nowhere else, so a job that reads it without naming that environment
+    gets an empty key and fails."""
+
+    # A job's environment: `release` itself, or main's `release` against a
+    # train's `nightly` (build.yml signs on main only, with the release key).
+    RELEASE = re.compile(
+        r"(?m)^    environment: (?:release|\$\{\{ github\.ref == 'refs/heads/main' "
+        r"&& 'release' \|\| 'nightly' \}\})$")
+
+    def test_every_job_reading_the_release_key_runs_in_the_release_environment(self):
+        readers = []
+        for path in sorted(WORKFLOWS.glob("*.yml")):
+            for name, job in jobs(path.read_text()).items():
+                if "secrets.RELIABURGER_RELEASE_KEY" not in job:
+                    continue
+                readers.append(f"{path.name}:{name}")
+                with self.subTest(job=f"{path.name}:{name}"):
+                    self.assertRegex(job, self.RELEASE)
+        # appliance.yml's sign job and build.yml's candidate job.
+        self.assertIn("appliance.yml:sign", readers)
+        self.assertGreaterEqual(len(readers), 2, readers)
+
+    def test_a_job_reading_the_key_without_the_environment_is_detected(self):
+        job = "    runs-on: ubuntu-24.04\n    env:\n      K: ${{ secrets.RELIABURGER_RELEASE_KEY }}"
+        self.assertNotRegex(job, self.RELEASE)
+        self.assertNotRegex(job.replace("runs-on", "environment: nightly\n    runs-on"), self.RELEASE)
+
+
+class DeadTriggerTests(unittest.TestCase):
+    """No workflow triggers on a branch pattern no branch uses."""
+
+    def test_no_workflow_triggers_on_feat_appliance_branches(self):
+        for path in sorted(WORKFLOWS.glob("*.yml")):
+            with self.subTest(workflow=path.name):
+                self.assertNotIn("feat/appliance-", path.read_text())
 
 
 if __name__ == "__main__":

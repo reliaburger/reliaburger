@@ -263,9 +263,7 @@ The alert state machine is simple: Inactive → Pending → Firing. A metric bre
 
 ## Ketchup: where the logs go
 
-Every line that a container writes to stdout or stderr ends up in Ketchup's append-only log files. One file per app per day, stored under `{logs_dir}/{namespace}/{app}/{date}.log`.
-
-Each log line is prefixed with a timestamp and stream indicator:
+Every line that a container writes to stdout or stderr ends up in Ketchup. The first design gave each app one plain-text file per day, `{logs_dir}/{namespace}/{app}/{date}.log`, with every line prefixed by a timestamp and an `O` or `E` for the stream:
 
 ```
 1704067200 O starting up
@@ -273,11 +271,9 @@ Each log line is prefixed with a timestamp and stream indicator:
 1704067202 O listening on :8080
 ```
 
-`O` for stdout, `E` for stderr. Simple, grep-friendly, human-readable.
+A sparse timestamp index was to sit beside each file, one `(byte_offset, timestamp)` entry every 4 KB, so a query could binary-search to its start time and scan forward. And Ketchup would sniff the first ten lines for JSON and mark the stream as structured.
 
-A sparse timestamp index sits alongside each log file. Every 4KB of log data, we record `(byte_offset, timestamp)`. To find logs from the last hour, binary search the index for the start timestamp, seek to that offset, and scan forward. No need to read the entire file.
-
-JSON auto-detection examines the first 10 lines. If they parse as JSON objects, the stream is marked as structured, enabling field-level queries:
+We never shipped that. Ketchup buffers lines in memory and flushes them to flat Parquet files in the logs directory, `logs_000000.parquet`, `logs_000001.parquet` and so on (`src/ketchup/log_store.rs`), with the stream as a column instead of a prefix. The next section explains why. There's no per-line index and no JSON detection on the node: `relish logs api --json-field level=error` parses each line as JSON on the client and keeps the ones whose field matches:
 
 ```bash
 relish logs api --json-field level=error
@@ -435,22 +431,6 @@ The `since` field is set when the alert enters Pending and preserved when it mov
 
 If you're used to state machines in Go or Java, this might look too compact. Where are the separate `handleInactive()`, `handlePending()`, `handleFiring()` methods? Rust's pattern matching collapses them into one expression, and the compiler ensures you handle every combination. Add a fourth state and every `match` in the codebase that doesn't handle it becomes a compilation error.
 
-### Sparse indexing: the write path
-
-The sparse index update on log append is the kind of trick that's easy to get wrong. We only write an index entry when we cross a 4KB boundary:
-
-```rust
-let offset_after = offset_before + record.len() as u64;
-if offset_before / INDEX_INTERVAL != offset_after / INDEX_INTERVAL {
-    index.add(offset_before, timestamp);
-    index.write_to(&idx_path)?;
-}
-```
-
-Integer division does the heavy lifting. If both offsets are in the same 4KB block, the division produces the same result and we skip the index update. If they straddle a boundary, we record the offset. One comparison, no modular arithmetic, no counters to maintain.
-
-The cost: for a 100MB log file, the sparse index has about 25,000 entries (one per 4KB). Binary search finds any timestamp in ~15 comparisons. Sequential scan from there covers at most 4KB of log data. The combination gives us O(log n) time-range queries without maintaining a full index.
-
 ## Hardening the metrics path
 
 The first cut of Mayo worked in the demo and passed its tests. A later review found five sharp edges that only bite in production, not in a thirty-second demo, and a long soak found a sixth. They're worth walking through, because each one is a small change that fixes a whole class of failure.
@@ -475,6 +455,8 @@ if !self.seen_windows.insert(key) {
 ```
 
 `HashSet::insert` returns `false` if the key was already present, which is exactly the "have I seen this?" question we need in one call.
+
+**Temp files that outlived a crash, and a sync nobody checked.** A metrics flush writes a randomly named `.mayo-pending-*` file and renames it into place. A crash between the two left the temp file for good: nothing deleted it and the size cap didn't count it (#2059). `MayoStore::new` now deletes them, which is safe because one Bun owns the directory. The rollup writer had the opposite slip. It renamed its file and then synced the directory, but threw away a failed sync and returned `Ok`, so the caller cleared its buffer while the rename could still vanish in a power cut (#2060). The error now propagates and the rows wait for the next flush. That alone left a second bug, which review caught: the renamed file stayed in place while the rows waited, so queries counted them twice until the retry. So the writer removes the file before it reports the failure. A filesystem that can't sync a directory at all answers `EINVAL`, `ENOTSUP` or `ENOSYS`, and that isn't a failed flush: the bytes are synced and there's nothing to retry. The test takes read permission off the directory (`0o300`: write and search only), so creating and renaming the file still work and only opening the directory to sync it fails.
 
 **Rollups that vanished on restart.** The rollup store kept its flushed data in an in-memory `Vec<RecordBatch>` and named every Parquet file with a counter that reset to zero on start. So a restart both lost all history *and* overwrote `rollup_000000.parquet` with new data. We fixed both by making the rollup store read its history back from the Parquet directory (like the metrics store already did) and by seeding the flush counter one past the highest file on disk. Restart now recovers everything and appends rather than clobbering.
 
@@ -642,6 +624,34 @@ Both ends of that pipe parse SSE, so the parsing lives in one small type,
 end anywhere, including halfway through a multi-byte UTF-8 character, so the
 decoder buffers bytes and only decodes a block once it has seen the blank line
 that ends it.
+
+A follow has no natural end, which the CLI's HTTP client didn't know until
+0.3.0. `BunClient` gave every request a 300-second deadline with reqwest's
+`ClientBuilder::timeout`, and that deadline covers reading the body, not
+only waiting for the headers. So `relish logs web -f` on a quiet app died
+after five minutes with "request timed out", and so did `relish apply` when
+a rolling deploy's progress stream ran longer. The client now carries two
+reqwest clients. Ordinary requests keep the 300-second total. Streaming ones
+(`logs -f`, the apply and rollback streams) go through a client with no
+deadline of its own, and the code applies three. The wait for the headers
+gets the ordinary 300 seconds, because the agent binds images before it
+starts an apply's stream. After that, a small `StreamBody` type reads one
+chunk at a time inside `tokio::time::timeout`, so 60 seconds of silence ends
+the command. Silence alone can't mean "dead", since a quiet app writes
+nothing for hours, so every SSE route now sends axum's
+`KeepAlive::default()`, a comment line (`:`) every 15 seconds that SSE
+parsers skip.
+
+Keep-alives cut the other way too: a deploy wedged on the agent would now
+hold `relish apply` open for ever, and a soak script with it. So an apply's
+or rollback's stream also has a 30-minute deadline, after which the command
+says it stopped following and the deploy may still be running. A followed
+log has no such deadline; following is what you asked for. Why not reqwest's
+own `read_timeout` for the silence? Because it also covers the wait for the
+headers, where 60 seconds is too short. The tests use a client with
+millisecond deadlines: `a_stream_that_keeps_talking_outlives_the_request_timeout`,
+`a_silent_stream_times_out`, `the_wait_for_a_stream_to_start_gets_the_request_timeout`
+and `a_deploy_stream_stops_at_its_deadline`.
 
 `relish top` had the same blind spot and a subtler trap. The dashboard already
 charted `process_cpu_percent` and `process_memory_bytes`, labelled by app and
@@ -1095,28 +1105,30 @@ instances with the same files on disk, because this time the scheduling fell
 the other way. The bug arrived with the offsets change a few days earlier,
 and it needs a capture this big on the node being killed.
 
-The fix has two halves. `push` now walks the buffer once, remembering where
-the current line starts, and drains the finished lines in one go at the end:
+The fix has two halves. `push` now searches only the bytes it was just
+given, and copies each of them at most once:
 
 ```rust
-let mut search_from = self.partial.len();
-self.partial.extend_from_slice(bytes);
-let mut line_start = 0;
-while let Some(found) = self.partial[search_from..]
-    .iter()
-    .position(|byte| *byte == b'\n')
-{
-    let newline = search_from + found;
-    // ... hand back `self.partial[line_start..newline]` ...
-    line_start = newline + 1;
-    search_from = line_start;
+let mut rest = bytes;
+loop {
+    // ... skip to the next newline while `discarding` ...
+    let room = MAX_CAPTURED_LINE_BYTES.saturating_sub(self.partial.len());
+    let Some(newline) = rest.iter().position(|byte| *byte == b'\n') else {
+        // ... keep `rest` for the next chunk, up to `room` bytes ...
+        return lines;
+    };
+    let kept = newline.min(room);
+    self.partial.extend_from_slice(&rest[..kept]);
+    lines.push(self.take_line(newline - kept + 1));
+    rest = &rest[newline + 1..];
 }
-self.partial.drain(..line_start);
 ```
 
-`self.partial[search_from..]` is a slice, a borrowed view into the vector
-with no copy, like a Go slice expression. Starting the search at the old
-length is safe because bytes already waiting are, by definition, the part
+`rest[newline + 1..]` is a slice, a borrowed view into the caller's buffer
+with no copy, like a Go slice expression. Moving `rest` forward costs
+nothing; only the bytes of a line get copied, once, into `partial`, which
+`take_line` clears without giving back its memory. Searching only the new
+bytes is safe because bytes already waiting are, by definition, the part
 of a line with no newline yet.
 
 The second half matters more: no forwarder reads a whole file any more.
@@ -1140,6 +1152,54 @@ for 5.5 s in one go, the new one for a few milliseconds at most. The runc versio
 real container print 200,000 lines and follows it from a fresh runtime
 handle, as a restarted Bun would. `a_backlog_of_short_lines_splits_in_linear_time`
 pins `push` itself.
+
+What's `room` for? A line has to end somewhere. Output with no newline, a
+`\r` progress bar or a binary dump, would otherwise sit in `partial` in full
+until the newline finally came. So a line stops growing at `MAX_CAPTURED_LINE_BYTES` (64 KiB).
+The reader hands on that prefix as the line and sets `discarding`, the flag
+it already used to skip the rest of a line whose start was reclaimed, so the
+remainder is counted and dropped up to the next newline.
+
+Counting isn't enough on its own, though. The log store learns how far a
+capture has been read only from the positions on the lines it ingests, and
+it only reclaims a capture's disk up to that offset. Skipped bytes have no
+line, so a progress bar that never printed a newline kept its whole capture
+file on disk, growing forever, while memory stayed flat. So every
+`SKIPPED_REPORT_BYTES` (1 MiB) of skipping, the reader hands on a small line
+of its own, `[skipped 1048576 more bytes of a cut line]`, carrying the
+position it has reached. The store needs no new idea: it ingests a line,
+moves the offset and reclaims behind it, exactly as before. Why not a
+record with a position and no line? We considered it. The store saves its
+offsets only when it flushes rows, so an offset with no row would wait
+for some other line to come along, and on a quiet node that might never
+happen. The marker costs one short row per megabyte, and it also tells you
+the line went on. `a_capture_with_no_newline_is_reclaimed_once_flushed`
+follows an 8 MiB capture with no newline into a real `LogStore`, flushes it
+and checks that the file's disk allocation drops to the retained tail.
+`a_stream_with_no_newline_stays_within_the_line_cap` pushes 100 MiB with no
+newline in 64 KiB chunks and checks the buffer after every one.
+
+Those markers have a side effect a reviewer caught. They checkpoint an offset
+in the middle of a line, and a reader resumed after a Bun restart always
+assumed its offset started a line. So the rest of a never-ending line came
+out looking like a fresh one. `resume` now looks at the byte before the
+offset. If it isn't a newline (a reclaimed hole reads as zeros, which count
+as mid-line too), the reader starts out skipping, just as it would have
+without the restart. `resume_inside_a_skipped_line_keeps_skipping_it` and
+`resume_after_a_zeroed_byte_keeps_skipping` pin both cases.
+
+A cut line has to say so, or a reader takes 64 KiB for the whole line. So
+it ends with ` [line cut at 64 KiB]`. And the cut must not land inside a
+character. Rust's `String` is always valid UTF-8, so `from_utf8_lossy`
+turns half an "é" into U+FFFD, the replacement character, and the line
+would end in garbage the workload never wrote. UTF-8 makes the fix cheap:
+every byte after the first one of a multi-byte character starts with the
+bits `10`. If the first byte left out is one of those, the character
+began inside the kept part, so `character_boundary` steps back to the
+byte that starts it, at most three bytes. In Go you'd reach for
+`utf8.RuneStart`; in Rust it's one mask, `byte & 0b1100_0000 ==
+0b1000_0000`. `a_line_is_cut_at_a_character_boundary` puts the cap in the
+middle of an "é" and checks that the kept text is a clean prefix.
 
 Should one stuck instance be able to stop a node at all? Adoption is
 fail-closed by design: an instance Bun can't prove it owns stops startup,
@@ -1193,7 +1253,9 @@ pub fn reclaim_ingested(
 ) -> io::Result<u64> {
     // ... open for writing, refuse a symlink, check the identity ...
     let block = metadata.blksize().max(1);
-    let end = ingested_through.min(metadata.len().saturating_sub(RETAINED_CAPTURE_BYTES));
+    let end = ingested_through
+        .saturating_sub(1)
+        .min(metadata.len().saturating_sub(RETAINED_CAPTURE_BYTES));
     let end = end - end % block;
     let start = data_start(&file, 0)?;
     let start = start - start % block;
@@ -1210,6 +1272,16 @@ ingested (`ingested_through`). It keeps the last mebibyte
 reads, so `relish logs -f` still starts from real lines. And it only frees
 whole filesystem blocks: a punch that ends mid-block zeroes the partial block
 without freeing it, which would only cost a write.
+
+The `saturating_sub(1)` is there for a checkpoint that lands exactly on a
+block boundary. A store that restarts resumes at its checkpoint and reads the
+byte before it: a newline means the checkpoint starts a line, anything else
+means it's partway through one, and the reader skips to the next newline. A
+hole reads as zeros, so a punch that ended exactly at the checkpoint would
+turn that newline into a zero, and the resume would throw away a whole line
+it never stored. Rounding down from one byte earlier keeps the byte before
+any checkpoint on disk. `a_resume_at_a_block_aligned_checkpoint_after_reclaiming_keeps_its_first_line`
+reclaims up to a checkpoint at 4 MiB and resumes there.
 
 Who calls it, and when? Not the forwarder: a line it has read may still be
 sitting in the store's memory buffer, and a crash would lose it. The store's
@@ -1285,6 +1357,89 @@ rotate at will but put Bun in the path of every byte every app writes, and
 make an app block when Bun is slow. The issue also asked about the soak's own
 export directory, which grows about 600 MiB a day on each node. That's the
 harness's to bound, and it stays open in #1418.
+
+### Dropped, and saying so
+
+The buffer in front of all this had a cap from the first hardening pass: a
+million rows, after which the oldest go. It was meant for a disk that keeps
+failing. The 16 November review found it bit a healthy disk too. Flushes ran
+once a minute and nothing flushed sooner, so an app printing more than about
+17,000 lines a second lost lines (#2057). Nothing said so. `ingest` moves the
+capture offset forward when a line arrives, before it's stored, so the next
+checkpoint skipped the lost lines, and the reclaim from "Giving the disk
+back" then punched holes over the capture's copy. And the cap counted rows,
+not bytes: a million 4 KiB lines is 4 GiB.
+
+The first two changes make dropping rare. The store says when it wants
+flushing, and the task that feeds it wakes the flush task:
+
+```rust
+let flush_wanted = {
+    let mut store = drain_store.write().await;
+    store.ingest(&rec);
+    store.flush_wanted()
+};
+if flush_wanted {
+    flush_now.notify_one();
+}
+```
+
+The block computes a value and drops the write lock at its closing brace, so
+the notification goes out with no lock held. `tokio::sync::Notify` is a
+wake-up with no payload. If nobody is waiting, `notify_one` stores a single
+permit, so a burst of calls while a flush is running becomes one more flush,
+not a queue of them. The flush task waits on `notified()` beside its minute
+tick, as a `tokio::select!` branch written `_ = log_flush_now.notified(), if
+!flush_failing => {}`. The `, if` is the macro's precondition: while the last
+flush failed, that branch is switched off and only the tick retries, so a full
+disk doesn't turn every ingested line into another failing flush. At 100,000 rows
+or 32 MiB the store asks; the caps are now 1,000,000 rows *or* 256 MiB,
+counting a flush still being written.
+
+The third change decides what a drop means. Our first answer was replay:
+each buffered line remembered where in its capture it started, and no
+checkpoint saved an offset past the first dropped line, so a restart would
+read the lost lines again. Review found two problems with it, both visible
+in our own test. Capture files don't rotate, so the hold lasted for the rest
+of Bun's life: the reclaim never got past it, and a chatty instance's capture
+grew without bound, the disk fill of #1418 back again. And a restart re-read
+everything from the hold onwards, including the lines already in Parquet, so
+the store's promise never to store a line twice was broken.
+
+So a drop is now an honest, counted loss. The checkpoint moves on as usual.
+Each log that lost lines gets one marker line, on stderr, where the gap is:
+
+```rust
+for entry in self.buffer.drain(0..overflow) {
+    let owner = (entry.app, entry.namespace, entry.instance);
+    let marker = self.drop_markers.entry(owner).or_insert(DropMarker {
+        count: 0,
+        timestamp: entry.timestamp,
+        sequence: entry.sequence,
+    });
+    marker.count += 1;
+    marker.timestamp = entry.timestamp;
+    marker.sequence = entry.sequence;
+}
+```
+
+`drain(0..overflow)` removes that range from the vector and hands each
+element over by value, so the loop can move the strings into the map key
+instead of copying them. The marker takes the last dropped line's sequence,
+so a query sorts it into the gap. Markers live beside the buffer, not in it,
+so they're never dropped themselves; the next flush writes them as ordinary
+rows reading "3 log lines dropped: the log store fell behind". The store also
+counts the lines in `dropped_lines`, which Bun's collection loop reports as
+the metric `ketchup_log_lines_dropped_total`, and Bun's log says how many
+went at each flush.
+
+`shed_lines_are_counted_and_marked_in_the_instance_log` caps the buffer at
+two rows, drops three of seven lines and expects the marker between the
+survivors. `a_restart_after_a_shed_stores_nothing_twice` reopens the store
+and replays the whole capture into it: nothing is stored again.
+`the_capture_is_reclaimed_after_a_shed` follows a 4 MiB capture into a store
+capped at 1,000 rows and checks the flush still frees all but the retained
+tail. With the replay version it freed nothing.
 
 ### The tail that stopped
 
@@ -1452,6 +1607,45 @@ The regression writes a log file, configures an unsupported export destination,
 and sets the pressure threshold below the file's size. It asserts both that the
 failure is reported and that the local file survives. Reporting a failed backup
 mustn't turn it into permission to delete the only copy.
+
+A failed export still holds every file, and that means it holds retention
+too: with an `export_path` set, a tick whose export fails prunes nothing, by
+size or by age, until an export works again. That's the right call (deleting
+the only copy of what we couldn't ship is the bug the checkpoint exists to
+prevent), but an operator only found out from a log line every five minutes
+while the disk filled (#2062). Bun now records which store's export is
+failing and since when, the diagnostics endpoint reports it, and `relish wtf`
+turns it into an `export-failing` warning that says retention is on hold. The
+record carries no error text, because the diagnostics payload never carries
+host paths, and an object store's error can name one; the warning points at
+Bun's log for the reason.
+
+### Hash once
+
+The disk-pressure tick exports before it prunes, and each export read every
+Parquet file in the store and hashed it twice: once for the durable id, once
+more for the object key. Then the pruner hashed each file a third time to
+check it had shipped. With the default caps that's about 3 GiB of SHA-256
+every five minutes, inline on a runtime worker, for files that never change
+once written (#2058). Now one function does the hashing, `file_sha256`, on
+the blocking pool, and it remembers each result:
+
+```rust
+static HASHES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (FileStamp, String)>>,
+> = std::sync::LazyLock::new(Default::default);
+```
+
+A `static` in Rust has to be built at compile time, and a `HashMap`
+allocates, so it can't be. `LazyLock` builds it on first use and then hands
+out the same one forever, like a function-local `static` in C that's
+initialised once. The `Mutex` is the `std` one, not tokio's, because it's
+only ever locked for a lookup or an insert, in synchronous code, never across
+an `.await`. `FileStamp` is the length, modification time, device and inode,
+all taken from one `fstat` of the open file. A flush publishes by renaming a
+new file over the name, so a reused name is a new inode and misses the cache.
+`an_unchanged_file_is_hashed_once_across_exports_and_prunes` exports three
+files twice and asks the pruner about each: before, nine hashes; now, three.
 
 ### Offline exports must report partial success
 

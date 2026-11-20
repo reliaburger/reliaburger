@@ -90,6 +90,14 @@ class Admission(unittest.TestCase):
             self.assertEqual(ra["template"]["runtime"],mode)
             self.assertEqual("image" in ra["template"],mode!="process")
             self.assertEqual("exec" in ra["template"],mode=="process")
+    def test_limit_fixture_leaves_room_for_runc_init(self):
+        # #1957: a fresh runc job's limit covers runc init too, and Ubuntu
+        # 26.04's runc 1.4 init peaks at 12.7 MiB. At 8 MiB the container
+        # never started, so the fixture never ran into its own limit.
+        c=self.campaign()
+        for mode in jobs.MODES:
+            template=c.body(c.prepare(mode,"short","limit",100))["definition"]["template"]
+            self.assertGreaterEqual(int(template["memory"][:-2]),32,mode)
     def test_resume_rejects_different_cluster_or_audit_identity(self):
         c=self.campaign(); c.prepare("runc","short","work",100)
         with self.assertRaises(jobs.InvalidEvidence):
@@ -130,6 +138,94 @@ class Audit(unittest.TestCase):
         self.assertEqual(result,{"effects":3,"attempts":5,"repeated_attempts":2})
         for ledgers in ([[[0,1],[1,1]]],[[[0,1],[1,1],[2,1],[3,1]]]):
             with self.assertRaises(jobs.InvalidEvidence): jobs.audit_effects(3,ledgers)
+
+
+def rows(start, end, grant=1, attempts=1):
+    return [dict(index=i, grant_attempt=grant, attempts=attempts, succeeded=True) for i in range(start, end)]
+
+
+class ChunkHistory(unittest.TestCase):
+    """#1415: every task-array chunk completes exactly once, from one grant."""
+    def test_the_sample_always_holds_the_first_and_last_chunk_and_is_seeded(self):
+        picked=jobs.sampled_chunks(262144,64,"run-7")
+        self.assertEqual(len(picked),jobs.CHUNK_SAMPLE+2)
+        self.assertEqual((picked[0],picked[-1]),(0,4095))
+        self.assertEqual(picked,jobs.sampled_chunks(262144,64,"run-7"))
+        self.assertNotEqual(picked,jobs.sampled_chunks(262144,64,"run-8"))
+    def test_a_small_run_is_read_whole(self):
+        self.assertEqual(jobs.sampled_chunks(8,1,"audit"),list(range(8)))
+        self.assertEqual(jobs.sampled_chunks(130,64,"short"),[0,1,2])
+    def test_a_chunk_completed_once_from_one_grant_passes(self):
+        self.assertEqual(jobs.check_chunk(1,64,130,rows(64,128,grant=3)),3)
+        self.assertEqual(jobs.check_chunk(2,64,130,rows(128,130)),1)
+    def test_a_missing_repeated_or_foreign_task_fails(self):
+        for bad in (rows(64,127), rows(64,128)+rows(127,128), rows(65,129), rows(64,128)[::-1]):
+            with self.subTest(n=len(bad)), self.assertRaisesRegex(jobs.InvalidEvidence,"exactly once"):
+                jobs.check_chunk(1,64,130,bad)
+    def test_a_chunk_accepted_from_two_grants_fails(self):
+        mixed=rows(64,96,grant=1)+rows(96,128,grant=2)
+        with self.assertRaisesRegex(jobs.InvalidEvidence,"more than one grant"):
+            jobs.check_chunk(1,64,130,mixed)
+        for grant in (0,None,True):
+            with self.subTest(grant=grant), self.assertRaises(jobs.InvalidEvidence):
+                jobs.check_chunk(0,2,2,rows(0,2,grant=grant))
+    def test_extra_runs_need_a_regrant(self):
+        # Index 0's chunk was granted once and accepted after 2 attempts; a
+        # third execution happened that no accepted attempt explains.
+        once=rows(0,1,grant=1,attempts=2)
+        jobs.explain_effects(once,[[[0,2]]])
+        jobs.explain_effects(once,[[[0,1]]])
+        with self.assertRaisesRegex(jobs.InvalidEvidence,"ran 3 times"):
+            jobs.explain_effects(once,[[[0,2]],[[0,1]]])
+        jobs.explain_effects(rows(0,1,grant=2,attempts=1),[[[0,3]]])
+
+    def drain_audit(self, results, receipts=None, polls=(100,101)):
+        """Drain one audit run whose /results answers come from `results(start, limit)`."""
+        class API(FakeAPI):
+            def request(self,method,path,body=None,raw=False):
+                if path=="/v1/jobs/runs": return super().request(method,path,body)
+                if "/results?" in path:
+                    query=dict(p.split("=") for p in path.split("?")[1].split("&"))
+                    return results(int(query.get("after",-1))+1,int(query["limit"]))
+                identity=int(path.split("/")[3])
+                request=next(v for v in self.posts if self.runs[(v["name"],v["request_id"])]==identity)
+                count=request["definition"]["tasks"]["count"]; template=request["definition"]["template"]
+                value=summary(identity,total=count,succeeded=count,done=True,name=request["name"])
+                value.update(runtime=template["runtime"],cpu_request_millicores=25,
+                             memory_request_bytes=int(template["memory"][:-2])<<20)
+                return value
+        directory=tempfile.mkdtemp(); self.addCleanup(lambda: __import__("shutil").rmtree(directory))
+        # Every runtime's short profile starts with an audit run, and its long
+        # profile with a 512-task work run of one-task chunks.
+        c=jobs.Campaign(directory,API(),[],"token",ledger_reader=lambda name: receipts or [[[i,1] for i in range(8)]])
+        for now in polls: c.step(now)
+        return c,Path(directory)
+    def test_a_drained_audit_run_checks_every_chunk_and_keeps_the_evidence(self):
+        c,directory=self.drain_audit(lambda start,limit: dict(rows=rows(start,start+limit)))
+        self.assertEqual(c.state["errors"],[])
+        self.assertNotIn("process:short",c.state["active"])
+        lines=[json.loads(line) for line in (directory/"chunk-history.jsonl").read_text().splitlines()]
+        self.assertEqual(c.state["totals"]["chunks_checked"],len(lines))
+        self.assertEqual(c.state["totals"]["chunks_regranted"],0)
+        audit=[line["chunk"] for line in lines if line["purpose"]=="audit" and line["mode"]=="process"]
+        self.assertEqual(audit,list(range(8)))
+        work=[line for line in lines if line["purpose"]=="work" and line["mode"]=="process"]
+        self.assertEqual([line["chunk"] for line in work],jobs.sampled_chunks(512,1,work[0]["run"]))
+    def test_a_chunk_accepted_twice_is_a_campaign_error(self):
+        c,_=self.drain_audit(lambda start,limit: dict(rows=rows(start,start+limit)+rows(start,start+1)))
+        self.assertTrue(any("exactly once" in error for error in c.state["errors"]))
+    def test_an_unexplained_extra_run_is_a_campaign_error(self):
+        c,_=self.drain_audit(lambda start,limit: dict(rows=rows(start,start+limit)),
+                             receipts=[[[i,2 if i==3 else 1] for i in range(8)]])
+        self.assertTrue(any("task 3 ran 2 times" in error for error in c.state["errors"]))
+    def test_an_unreachable_chunk_waits_for_the_grace_then_fails(self):
+        c,_=self.drain_audit(lambda start,limit: dict(rows=[],unreachable=["rb-a-2"]),
+                             polls=(100,101,100+jobs.RESULT_UNREACHABLE_GRACE))
+        # Unreachable since the first poll of the drained run, at 101.
+        self.assertEqual(c.state["errors"],[])
+        self.assertIn("process:short",c.state["active"])
+        c.step(101+jobs.RESULT_UNREACHABLE_GRACE)
+        self.assertTrue(any("rb-a-2" in error for error in c.state["errors"]))
 
 
 class Gate(unittest.TestCase):
@@ -455,6 +551,14 @@ class TargetLoad(unittest.TestCase):
         self.path=Path(self.temp.name)/"jobs"; self.api=FakeAPI()
     def campaign(self, load="target", rate=jobs.DEFAULT_TARGET_RATE):
         return jobs.Campaign(self.path,self.api,[],"token",load=load,target_rate=rate)
+
+    def test_target_executors_leave_the_quickstart_apps_room_to_recover(self):
+        # #1958 made a shared-runc executor reserve 32 + 24 MiB, not 40. At
+        # 8 a node the jobs fast tier's executors took every MiB of a node's
+        # 1,438 after quorum loss, and redis couldn't be re-placed for 600 s
+        # (15 Nov rehearsal). Keep shared-runc's reservation at 0.2.8's
+        # 8 x 40 MiB, which left the apps about 100 MiB to recover in.
+        self.assertLessEqual(jobs.TARGET_CAPS["shared-runc"]*(32+24), 8*40)
 
     def test_target_load_turns_fast_short_runs_into_million_task_arrays(self):
         c=self.campaign()

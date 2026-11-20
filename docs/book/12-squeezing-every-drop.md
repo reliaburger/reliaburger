@@ -113,10 +113,10 @@ We've already solved this shape of problem once. Chapter 3's eBPF service discov
 
 ```
 nft add map ip reliaburger portmap '{ type inet_service : ipv4_addr . inet_service ; }'
-nft add rule ip reliaburger prerouting dnat ip addr . port to tcp dport map @portmap
+nft add rule ip reliaburger prerouting fib daddr type local dnat ip addr . port to tcp dport map @portmap
 ```
 
-The first line declares a typed map: service port in, "address . port" pair out (the `.` builds a concatenation, nftables' way of saying tuple). The second line is the only rule the chain needs, ever. It says: take the packet's TCP destination port, look it up in `@portmap`, and DNAT to whatever the map returns. Adding a container is no longer "append a rule"; it's "insert an element":
+The first line declares a typed map: service port in, "address . port" pair out (the `.` builds a concatenation, nftables' way of saying tuple). The second line is the only rule the chain needs, ever. It says: if the packet is addressed to this node, take its TCP destination port, look it up in `@portmap`, and DNAT to whatever the map returns. (The "addressed to this node" part, `fib daddr type local`, came later; the end of this section explains why it matters.) Adding a container is no longer "append a rule"; it's "insert an element":
 
 ```
 nft add element ip reliaburger portmap '{ 30017 : 10.0.2.5 . 8080 }'
@@ -195,6 +195,18 @@ One smaller note from the switchover. `ensure_nft_table` lists the chain once be
 And the C4 rule still stands: everything here lives in the `reliaburger` table, and nothing touches `reliaburger_fw`. The perimeter firewall reconcile deletes *its own* table wholesale; the day those two tables were one, a firewall refresh silently wiped every container's NAT. The guard test that keeps them separate stays green.
 
 What the map deliberately doesn't fix: DNAT in `prerouting` only rewrites traffic *arriving at the node from outside*. A connection made from the node itself (or from a local container) to `container_ip:host_port` never traverses prerouting, and the cross-node story for container IPs is part of a bigger, known control-plane gap tracked in the July discrepancy register. This section made published ports genuinely reachable from outside the node, in O(1). It did not redesign the dataplane. And saying which is which out loud is half the value of a register like that.
+
+### Whose port is it?
+
+The first version of the map rule matched on the destination port alone. Read it again: `dnat ip addr . port to tcp dport map @portmap`. Nothing in it asks *which address* the packet was going to.
+
+That's fine for a packet arriving from outside, which can only be addressed to this node. But prerouting also sees every packet a local container sends on its way out. Host ports are allocated per node, at random, so node A's 21000 and node B's 21000 belong to different apps. When a container on A called a service whose backend was `B_ip:21000`, the packet entered A's prerouting, matched port 21000 and was rewritten to A's *own* local container on that port. The same went for anything outside the cluster that happened to sit on a port in the range: a container's connection to a MongoDB on 27017 would land on whatever local app held 27017.
+
+The fix is four words in the rule: `fib daddr type local`. `fib` asks the kernel's routing table (the forwarding information base) about the packet, and `daddr type local` is true only when the destination is one of this node's own addresses. Everything else leaves the node as sent. The rule's argv test pins the new text, and a namespace test in `tests/owned_network.rs` builds a node, a container and a peer that listens on the same port number, then checks that the container's call reaches the peer and not itself.
+
+One wrinkle: the kernel keeps nftables state across a Bun upgrade, so an upgraded node could still hold the old rule. The probe that guards `add rule` against duplicates now checks for the current rule exactly, via `portmap::prerouting_is_current`, and if the chain holds anything else it flushes the chain and writes the rule again. The chain holds nothing but this one rule and the elements live in the map, so the flush loses no mapping.
+
+The flush and the add go to nft as one command line, `flush chain ip reliaburger prerouting ; add rule …`, and that detail matters. nft applies everything in one invocation as a single transaction. Run them as two invocations and there's a moment when the chain is empty, and a failed add leaves it empty for good: every published port on the node stops answering until the next setup. With one transaction, the kernel sees either the old rule or the new one, never neither.
 
 ## Deleting data without losing it
 
@@ -622,6 +634,26 @@ impl Drop for ScopedDir {
 ```
 
 This is RAII (Resource Acquisition Is Initialisation, the same idiom C++ uses), and in Rust it's the *default* way to manage a resource, not a pattern you reach for. The directory also gets a random suffix now (`<build_id>-<random>`), because the old path was derived from the context digest, so two concurrent builds of the same context fought over one directory. Distinct directories, cleaned on every path: two bugs closed by one type.
+
+That `Drop` had a cost we didn't see at first ([#1871](https://github.com/reliaburger/reliaburger/issues/1871)). The build runs in an `async fn`, so the value is dropped on a tokio worker thread, and `remove_dir_all` on a context with thousands of files can take most of a second. For that time every other task on the worker waits. The lint that catches blocking file calls in async code (`src/blocking_rule.rs`) can't see this one, because nothing calls `drop` by name: the compiler inserts the call. `Drop` can't be `async` either, so the fix hands the delete to tokio's blocking pool, a set of threads kept for exactly this kind of work:
+
+```rust
+fn drop(&mut self) {
+    let path = std::mem::take(&mut self.path);
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => {
+            runtime.spawn_blocking(move || {
+                let _ = std::fs::remove_dir_all(path);
+            });
+        }
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+```
+
+`Handle::try_current` asks whether this thread is running inside a tokio runtime. If it isn't, as in a plain `#[test]`, there's no worker to stall, so the delete runs inline. `std::mem::take` swaps an empty `PathBuf` into the field and hands back the old one. We need that because `drop` only gets `&mut self`, and the closure must own the path: `spawn_blocking` may run it after the `ScopedDir` is gone, so it can't borrow from it. `move` makes the closure take ownership of `path`. The first test dropped a 10,000-file directory on a single-threaded runtime while another task ticked every 5 ms, and failed if the ticker ever stalled past 200 ms. It timed out on busy hosts ([#1978](https://github.com/reliaburger/reliaburger/issues/1978)). Under load the drop never stalled the ticker for more than 11 ms, but creating and deleting the 10,000 files took several seconds on a disk shared with other builds. Fewer files wouldn't do: even 10,000 stalled the old inline delete for only about 280 ms on the Mac, close to the limit, and 1,000 for only 27 ms. A stopwatch measured the disk, not where the delete ran. So the test now asks that question directly, with the `off_runtime::assert_runs_on_blocking_pool` helper from Chapter 15. That helper holds the runtime's only blocking thread, then polls an async block that drops the directory and waits for it to disappear. A delete sent to the pool queues behind the held thread, so on the first poll the directory is still there and the block is `Pending`. An inline delete has already finished by then, so the block is `Ready` and the helper fails. Ten files are enough, and the answer doesn't depend on the clock.
 
 ### One table for "who may call this?"
 

@@ -188,7 +188,7 @@ fn parse_wait(value: &str) -> Result<Duration, String> {
 
 /// Run one `relish agent lease` command.
 pub async fn run(options: &LeaseOptions, max_bytes: usize, rerun: &str) -> Rendered {
-    let client = BunClient::default_local();
+    let client = BunClient::local().await;
     let command = options.command.name();
     let result = match &options.command {
         LeaseCommand::Take(args) => take(&client, args).await,

@@ -71,8 +71,8 @@ Ensure the following ports are open:
 | `80`, `443` | TCP | Ingress HTTP/HTTPS proxy (Wrapper) | External |
 
 Bun manages its own nftables perimeter on top of that: once it's running, only
-cluster members (and the `bootstrap_peers` you list in `node.toml`) can reach
-the API, cluster and container host ports. Your laptop gets in to the API port,
+cluster members can reach the container host ports, and only they and the
+`bootstrap_peers` you list in `node.toml` can reach the API and cluster ports. Your laptop gets in to the API port,
 and only that port, through `operator_cidrs` (see §5.3). Your host firewall
 still has to let that traffic in. With UFW, run this on every node:
 
@@ -92,6 +92,17 @@ chain's policy to `DROP`. Bun enables IPv4 forwarding but doesn't override
 another firewall's rules, so a node can reach its containers while
 container-to-container traffic is still dropped. The
 [runc notes](README.md#runc-linux) cover what to check.
+
+Bun's own check for published container ports is a forward-hook chain at
+priority -10 in its `reliaburger_fw` table. nftables runs every table's chain
+on a hook independently: an `accept` in one only hands the packet to the next,
+while a `drop` anywhere is final. So on a host that also runs Docker or UFW,
+Docker's rules can't let an outsider past Bun's chain to a published port, and
+Bun's chain can't override a drop in theirs (that's the `FORWARD` trap above).
+It touches only connections Bun's port map rewrote to its own containers
+(`ct status dnat`, out through a `veth-…` link), never Docker's. To see every
+forward chain and its priority, run `sudo nft list ruleset | grep -B1 'hook
+forward'`; `sudo nft list chain ip reliaburger_fw forward` shows Bun's.
 
 ---
 
@@ -167,23 +178,28 @@ the initial security bootstrap state, and its own node identity.
 On **Node 1 (`192.168.0.101`)**, run:
 
 ```sh
-sudo relish init /etc/reliaburger --cluster-name prod --node-id node-01
+sudo relish init /etc/reliaburger --cluster-name prod --node-id node-01 \
+    --root-backup /media/usb/prod-root-backup.age
 ```
+
+It asks for a passphrase twice: the root CA's private key goes only into
+`--root-backup`, sealed to it, and no node keeps a copy. Point it at
+removable media or anywhere off this node. In a script, add
+`--passphrase-file FILE` or `--recipient age1...` (your age public key);
+without a terminal, `relish init` refuses to run without them.
 
 This writes the following files under `/etc/reliaburger`:
 - `prod-master.key`: Master secret key (used to encrypt CA and secrets).
 - `prod-security-bootstrap.json`: Initial cluster security state.
-- `prod-root-ca.age`: The sealed root CA key.
 - `reliaburger.toml`: Sample cluster node config file.
 - `app.toml`: Sample application manifest file.
 - `identity/`: Node 1's mTLS certificates (`node.crt`, `node.key`, `root-ca.crt`, etc.).
 
 > **Important**: `relish init` prints two `Root CA:` lines to stderr. Copy the
 > one that starts with `sha256:`; that's the root CA fingerprint the joining
-> nodes pin in §4. Back up `prod-master.key` and `prod-root-ca.age` together,
-> and make a copy of the root that only you can open with
-> `sudo relish ca backup --out prod-root-backup.age --dir /etc/reliaburger`
-> (see the manual's security chapter).
+> nodes pin in §4. Back up `prod-master.key`, and keep the root CA backup
+> offline and apart from it; `relish ca verify` checks the backup against
+> that fingerprint (see the manual's security chapter).
 
 ### 3.2 Write the Node 1 configuration
 

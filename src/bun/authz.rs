@@ -145,6 +145,8 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/ui/static/{*path}", Public),
     route(Post, "/v1/cluster/join", Public),
     route(Get, "/v1/cluster/ca", Public),
+    // No bearer token: the handler requires a member's TLS client certificate.
+    route(Get, "/v1/cluster/master-key", Public),
     route(Get, "/ui/login", Public),
     route(Post, "/ui/session", Public),
     route(Post, "/ui/logout", Public),
@@ -259,6 +261,13 @@ pub const ROUTE_MATRIX: &[Route] = &[
     gated(Post, "/v1/upgrade/resume", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/upgrade/abort", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/upgrade/cluster-rollback", Admin, Cluster(ADMIN)),
+    // Appliance OS updates: the leader stages on each node as the system
+    // principal; operators start and steer the rollout.
+    gated(Post, "/v1/os/stage", Admin, Cluster(ADMIN)),
+    route(Get, "/v1/os/rollout", AnyToken),
+    gated(Post, "/v1/os/rollout/start", Admin, Cluster(ADMIN)),
+    gated(Post, "/v1/os/rollout/resume", Admin, Cluster(ADMIN)),
+    gated(Post, "/v1/os/rollout/abort", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/cluster/elect", Admin, Cluster(ADMIN)),
     // GitOps: anyone may read the status (it never carries credentials);
     // changing the cluster's configuration is an Admin operation (#693).
@@ -413,6 +422,9 @@ pub const ROUTE_MATRIX: &[Route] = &[
     gated(Post, "/v1/token/revoke", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/token/rotate", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/join-token/create", Admin, Cluster(ADMIN)),
+    gated(Get, "/v1/join-token/list", Admin, Cluster(ADMIN)),
+    gated(Post, "/v1/join-token/revoke", Admin, Cluster(ADMIN)),
+    gated(Post, "/v1/perimeter/admit", Admin, Cluster(ADMIN)),
     route(Get, "/v1/secret/public-key", AnyToken),
     gated(Post, "/v1/secret/rotate", Admin, Cluster(SECRET_WRITE)),
     // Rotating an intermediate CA (F04 R4): the operator's root signs, so
@@ -420,7 +432,36 @@ pub const ROUTE_MATRIX: &[Route] = &[
     gated(Post, "/v1/ca/rotation/prepare", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/ca/rotation/begin", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/ca/rotation/finalize", Admin, Cluster(ADMIN)),
+    gated(
+        Post,
+        "/v1/identity/signing-key/rotate",
+        Admin,
+        Cluster(ADMIN),
+    ),
 ];
+
+/// Routes that admit a node by its TLS client certificate alone, with no
+/// bearer token: a node that just joined has nothing else to present. The
+/// matrix lists them as `Public`, since the bearer layer lets them through.
+pub const CERTIFICATE_ONLY_ROUTES: &[(Method, &str)] = &[(Get, "/v1/cluster/master-key")];
+
+/// Whether the route `(method, path)` answers nodes only: a `System` row, or
+/// one of [`CERTIFICATE_ONLY_ROUTES`]. `path` is the axum pattern. A request
+/// a node forwards or relays for a person must never reach one, because it
+/// arrives with the forwarding node's certificate.
+pub fn is_node_only(method: &axum::http::Method, path: &str) -> bool {
+    let method = match *method {
+        // axum answers HEAD with the GET handler, so it is the same route.
+        axum::http::Method::GET | axum::http::Method::HEAD => Get,
+        axum::http::Method::POST => Post,
+        axum::http::Method::DELETE => Delete,
+        _ => return false,
+    };
+    CERTIFICATE_ONLY_ROUTES
+        .iter()
+        .any(|&(only_method, only_path)| only_method == method && only_path == path)
+        || required_principal(method, path) == Some(RoutePrincipal::System)
+}
 
 /// Look up the principal a `(method, path)` requires, if the matrix
 /// knows it. `path` is the axum pattern, not a concrete request path.
@@ -487,6 +528,67 @@ mod tests {
             required_principal(Method::Get, "/v1/cluster/security-view"),
             Some(RoutePrincipal::System),
             "the security view must be a node-to-node route"
+        );
+    }
+
+    #[test]
+    fn certificate_only_and_system_routes_are_node_only() {
+        let get = axum::http::Method::GET;
+        let post = axum::http::Method::POST;
+        assert!(is_node_only(&get, "/v1/cluster/master-key"));
+        assert!(is_node_only(&post, "/v1/cluster/renew"));
+        assert!(is_node_only(&get, "/v1/placements/{node_id}"));
+        assert!(!is_node_only(&post, "/v1/cluster/master-key"));
+        assert!(!is_node_only(&get, "/v1/status"));
+        assert!(!is_node_only(&post, "/v1/exec/{app}/{namespace}"));
+        assert!(!is_node_only(&get, "/v1/cluster/ca"));
+    }
+
+    /// axum serves HEAD with a route's GET handler, so HEAD on a node-only
+    /// GET route is node-only too.
+    #[test]
+    fn head_on_a_node_only_get_route_is_node_only() {
+        let head = axum::http::Method::HEAD;
+        assert!(is_node_only(&head, "/v1/cluster/master-key"));
+        assert!(is_node_only(&head, "/v1/placements/{node_id}"));
+        assert!(!is_node_only(&head, "/v1/status"));
+        assert!(!is_node_only(
+            &axum::http::Method::PUT,
+            "/v1/cluster/master-key"
+        ));
+    }
+
+    /// A handler that reads the caller's TLS certificate trusts it to name
+    /// a node, so its route must be node-only: a request forwarded for a
+    /// person carries the forwarding node's certificate, not the person's.
+    #[test]
+    fn every_route_that_reads_the_tls_peer_is_node_only() {
+        let source = include_str!("api.rs");
+        let mut open = Vec::new();
+        let mut checked = 0;
+        for (path, handlers) in mounted_route_method_handlers(source) {
+            for (method, handler) in handlers {
+                let Some(body) = mounted_handler_body(source, &handler) else {
+                    continue;
+                };
+                if !body.contains("TlsPeerCertificate") {
+                    continue;
+                }
+                checked += 1;
+                let http_method = match method {
+                    Method::Get => axum::http::Method::GET,
+                    Method::Post => axum::http::Method::POST,
+                    Method::Delete => axum::http::Method::DELETE,
+                };
+                if !is_node_only(&http_method, &path) {
+                    open.push(format!("{method:?} {path} → {handler}"));
+                }
+            }
+        }
+        assert!(checked >= 5, "only found {checked} TLS-peer handlers");
+        assert!(
+            open.is_empty(),
+            "routes that trust the TLS peer but aren't node-only: {open:?}"
         );
     }
 
@@ -705,6 +807,7 @@ mod tests {
         include_str!("api/metrics.rs"),
         include_str!("api/node_info.rs"),
         include_str!("api/nodes.rs"),
+        include_str!("api/os.rs"),
         include_str!("api/policies.rs"),
         include_str!("api/registry.rs"),
         include_str!("api/secrets.rs"),
@@ -1121,6 +1224,10 @@ mod tests {
             "upgrade_abort_handler",
             "upgrade_cluster_rollback_handler",
             "cluster_elect_handler",
+            "os_stage_handler",
+            "os_rollout_start_handler",
+            "os_rollout_resume_handler",
+            "os_rollout_abort_handler",
         ] {
             let body = mounted_handler_body(source, handler).expect(handler);
             assert!(

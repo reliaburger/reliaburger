@@ -160,7 +160,14 @@ impl CaptureTasks {
     }
 
     fn abort(&self) {
-        for reader in self.readers.lock().unwrap().iter().flatten() {
+        // A poisoned lock still holds valid abort handles: aborting is all we do.
+        for reader in self
+            .readers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .flatten()
+        {
             reader.abort();
         }
     }
@@ -865,6 +872,9 @@ impl super::Grill for ProcessGrill {
 
         // File-backed mode: append to log files that outlive this process
         // (they must survive a self-upgrade exec). In-memory mode: pipes.
+        // Pipes and their capture are decided together: a pipe nobody reads
+        // would block the child once it fills.
+        let capture = log_files.is_none().then(|| CaptureTasks::new(instance));
         if let Some((stdout_file, stderr_file)) = log_files {
             cmd.stdout(std::process::Stdio::from(stdout_file));
             cmd.stderr(std::process::Stdio::from(stderr_file));
@@ -895,18 +905,16 @@ impl super::Grill for ProcessGrill {
             }
         })?;
 
-        let capture = if self.log_dir.is_none() {
-            Some(CaptureTasks::new(instance))
-        } else {
-            None
-        };
         // Spawn tasks to capture stdout/stderr (in-memory mode only —
         // file-backed mode has no pipes to read).
         let stdout_buf = entry.stdout_buf.clone();
-        if let Some(stdout) = child.stdout.take() {
+        // `capture` is set exactly when the pipes are (see above).
+        if let Some(stdout) = child.stdout.take()
+            && let Some(capture) = capture.as_ref()
+        {
             #[cfg(test)]
             let gate = self.capture_gate.clone();
-            let capture = capture.as_ref().unwrap().clone();
+            let capture = capture.clone();
             let completion = CaptureCompletion {
                 capture: capture.clone(),
                 index: 0,
@@ -936,14 +944,20 @@ impl super::Grill for ProcessGrill {
                     }
                 }
             });
-            capture.readers.lock().unwrap()[0] = Some(reader_task.abort_handle());
+            capture
+                .readers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)[0] =
+                Some(reader_task.abort_handle());
         }
 
         let stderr_buf = entry.stderr_buf.clone();
-        if let Some(stderr) = child.stderr.take() {
+        if let Some(stderr) = child.stderr.take()
+            && let Some(capture) = capture.as_ref()
+        {
             #[cfg(test)]
             let gate = self.capture_gate.clone();
-            let capture = capture.as_ref().unwrap().clone();
+            let capture = capture.clone();
             let completion = CaptureCompletion {
                 capture: capture.clone(),
                 index: 1,
@@ -973,7 +987,11 @@ impl super::Grill for ProcessGrill {
                     }
                 }
             });
-            capture.readers.lock().unwrap()[1] = Some(reader_task.abort_handle());
+            capture
+                .readers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)[1] =
+                Some(reader_task.abort_handle());
         }
 
         entry.capture = capture;
@@ -1578,6 +1596,7 @@ mod tests {
     /// A host workload's spec: the only kind the process runtime runs.
     fn spec_with_args(args: Vec<String>) -> OciSpec {
         OciSpec {
+            managed_volumes: Vec::new(),
             reusable_executor: false,
             host_process: true,
             initialiser: false,
@@ -1873,7 +1892,10 @@ mod tests {
             .unwrap();
         grill.start(&id).await.unwrap();
 
-        let descendant_pid = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        // Three process starts and a rename take milliseconds idle and ran
+        // past 2 s at load 20 during parallel builds (#2086). Both windows
+        // only guard a hang.
+        let descendant_pid = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 if let Ok(pid) = std::fs::read_to_string(&pid_file)
                     .map_err(|_| ())
@@ -1889,7 +1911,7 @@ mod tests {
 
         grill.stop(&id).await.unwrap();
         wait_for_state(&grill, &id, ContainerState::Stopped).await;
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
             while records::process_start_time(descendant_pid).is_some() {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }

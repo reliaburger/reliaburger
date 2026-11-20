@@ -1378,7 +1378,8 @@ async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
     let root = tempfile::tempdir().unwrap().keep();
     let _cleanup = RootCleanup(root.clone());
     durable_fixture(&root);
-    reliaburger::relish::commands::init(&root, "activation", "activation-node").unwrap();
+    reliaburger::relish::commands::init_with_throwaway_root(&root, "activation", "activation-node")
+        .unwrap();
     let base = NodeConfig::from_file(&root.join("node.toml")).unwrap();
     let mut config = NodeConfig::from_file(&root.join("reliaburger.toml")).unwrap();
     config.storage = base.storage;
@@ -1601,7 +1602,7 @@ async fn enrolled_upgrade_fixture(
         config.cluster.join = vec![format!("127.0.0.1:{}", config.cluster.gossip_port)];
         config
     } else {
-        reliaburger::relish::commands::init(root, "activation", name).unwrap();
+        reliaburger::relish::commands::init_with_throwaway_root(root, "activation", name).unwrap();
         let admin = reliaburger::sesame::token::create_token(
             "qualification-operator",
             reliaburger::sesame::types::ApiRole::Admin,

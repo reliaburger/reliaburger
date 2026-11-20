@@ -1,0 +1,9 @@
+enable reliaburger.service
+enable reliaburger-seed.service
+enable reliaburger-console.service
+enable reliaburger-boot-check.service
+enable systemd-networkd.service
+enable systemd-resolved.service
+enable systemd-timesyncd.service
+disable systemd-sysupdate.timer
+disable systemd-sysupdate-reboot.timer

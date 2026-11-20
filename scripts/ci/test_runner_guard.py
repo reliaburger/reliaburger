@@ -9,6 +9,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 PROTECT = HERE / "protect-runner"
 WATCH = HERE / "watch-runner"
+HEADROOM = HERE / "assert-headroom"
+FREE_DISK = HERE / "free-runner-disk"
 
 
 class FakeHost:
@@ -26,6 +28,11 @@ class FakeHost:
         self.kernel_log.write_text("")
         self.write_tool("sudo", 'if [ "$1" = -n ]; then shift; fi\nexec "$@"\n')
         self.write_tool("dmesg", f'cat "{self.kernel_log}"\n')
+
+    def meminfo(self, available, swap_total, swap_free):
+        (self.proc / "meminfo").write_text(
+            f"MemTotal: 16000000 kB\nMemAvailable: {available} kB\n"
+            f"SwapTotal: {swap_total} kB\nSwapFree: {swap_free} kB\n")
 
     def write_tool(self, name, body):
         tool = self.bin / name
@@ -143,6 +150,214 @@ cat "{host.kernel_log}"
                 "kernel: [Sat Nov 14 19:00:05 2026] Out of memory: Killed process 4242 (Runner.Worker)",
             ])
             self.assertEqual(len([line for line in lines if " disk_kb=" in line]), 3)
+
+    def test_under_the_disk_floor_it_stops_the_named_process_once_and_says_so(self):
+        # A full / takes the hosted runner with it and no log survives (18
+        # Nov 2026). Stopping the tests first leaves a failed step instead.
+        with tempfile.TemporaryDirectory() as directory:
+            host = FakeHost(directory)
+            host.write_tool("df", 'printf "Avail\\n1500000\\n"\n')
+            host.write_tool("pkill", f'echo "$*" >> "{host.root}/pkill-calls"\n')
+            host.write_tool("pgrep", 'echo 4242\necho 4243\n')
+            pids = host.root / "runner-pids"
+            pids.write_text("")
+            result = host.run(WATCH, str(pids), WATCH_INTERVAL="0", WATCH_ROUNDS="3",
+                              WATCH_DISK_FLOOR_KB="2097152", WATCH_STOP="cargo-nextest")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((host.root / "pkill-calls").read_text(), "-TERM -x cargo-nextest\n")
+            floor = [line for line in result.stdout.splitlines() if line.startswith("disk_floor: ")]
+            self.assertEqual(len(floor), 1, result.stdout)
+            # The count shows whether the name matched anything at all.
+            self.assertIn("1500000 kB free on / is under 2097152 kB: stopping cargo-nextest (2 processes)",
+                          floor[0])
+
+    def test_a_stop_name_that_matches_nothing_says_zero_processes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            host = FakeHost(directory)
+            host.write_tool("df", 'printf "Avail\\n1500000\\n"\n')
+            host.write_tool("pkill", "exit 1\n")
+            host.write_tool("pgrep", "exit 1\n")
+            pids = host.root / "runner-pids"
+            pids.write_text("")
+            result = host.run(WATCH, str(pids), WATCH_INTERVAL="0", WATCH_ROUNDS="1",
+                              WATCH_DISK_FLOOR_KB="2097152", WATCH_STOP="cargo-nextest")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("stopping cargo-nextest (0 processes)", result.stdout)
+
+    def test_without_a_floor_it_never_stops_anything(self):
+        with tempfile.TemporaryDirectory() as directory:
+            host = FakeHost(directory)
+            host.write_tool("df", 'printf "Avail\\n1500000\\n"\n')
+            host.write_tool("pkill", f'echo "$*" >> "{host.root}/pkill-calls"\n')
+            pids = host.root / "runner-pids"
+            pids.write_text("")
+            result = host.run(WATCH, str(pids), WATCH_INTERVAL="0", WATCH_ROUNDS="2")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((host.root / "pkill-calls").exists())
+            self.assertNotIn("disk_floor", result.stdout)
+
+    def test_each_line_also_says_how_much_swap_is_in_use_and_the_memory_stall(self):
+        # A lost run thrashes before it goes: swap in use and the kernel's
+        # "full" memory pressure (every task stalled on memory) say so.
+        with tempfile.TemporaryDirectory() as directory:
+            host = FakeHost(directory)
+            host.meminfo(available=4096, swap_total=3145728, swap_free=1048576)
+            (host.proc / "pressure").mkdir()
+            (host.proc / "pressure" / "memory").write_text(
+                "some avg10=40.00 avg60=20.00 avg300=5.00 total=1\n"
+                "full avg10=31.50 avg60=12.00 avg300=3.00 total=1\n")
+            lines = self.watch(host, 1)
+            self.assertIn(" swap_kb=2097152 ", lines[0])
+            self.assertIn(" psi_full=31.50 ", lines[0])
+
+    def memory_floor(self, host, rounds, **extra):
+        host.write_tool("pkill", f'echo "$*" >> "{host.root}/pkill-calls"\n')
+        host.write_tool("pgrep", 'echo 4242\n')
+        pids = host.root / "runner-pids"
+        pids.write_text("")
+        settings = dict(WATCH_INTERVAL="0", WATCH_ROUNDS=str(rounds),
+                        WATCH_MEM_FLOOR_KB="524288", WATCH_MEM_FLOOR_SECONDS="0",
+                        WATCH_STOP="cargo-nextest cargo rustc")
+        settings.update(extra)
+        result = host.run(WATCH, str(pids), **settings)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = host.root / "pkill-calls"
+        return result.stdout, calls.read_text() if calls.exists() else ""
+
+    def test_memory_held_under_the_floor_with_swap_in_use_stops_the_build_once(self):
+        # On a 16 GB runner the instrumented build's rustc peaks can push the
+        # host into swap. The runner is shielded from the OOM killer, so
+        # nothing dies: its heartbeat stalls and GitHub drops it with no log
+        # (18 Nov 2026). Stopping the build first leaves a failed step.
+        with tempfile.TemporaryDirectory() as directory:
+            host = FakeHost(directory)
+            host.meminfo(available=400000, swap_total=3145728, swap_free=1048576)
+            output, calls = self.memory_floor(host, 3)
+            self.assertEqual(calls, "-TERM -x cargo-nextest\n-TERM -x cargo\n-TERM -x rustc\n")
+            floor = [line for line in output.splitlines() if line.startswith("mem_floor: ")]
+            self.assertEqual(len(floor), 1, output)
+            # The window is 0 s; a second can tick over inside the round.
+            self.assertRegex(floor[0], r"^mem_floor: 400000 kB available is under 524288 kB for [01] s "
+                                       r"with 2097152 kB swap in use: stopping cargo-nextest cargo rustc "
+                                       r"\(3 processes\)$")
+
+    def test_a_dip_shorter_than_the_window_stops_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            host = FakeHost(directory)
+            host.meminfo(available=400000, swap_total=3145728, swap_free=1048576)
+            output, calls = self.memory_floor(host, 3, WATCH_MEM_FLOOR_SECONDS="3600")
+            self.assertEqual(calls, "")
+            self.assertNotIn("mem_floor", output)
+
+    def test_low_memory_without_swap_in_use_is_left_to_the_oom_killer(self):
+        # With no swap in use the host can't thrash: the kernel kills the
+        # biggest rustc, which fails the step with a log.
+        with tempfile.TemporaryDirectory() as directory:
+            host = FakeHost(directory)
+            host.meminfo(available=400000, swap_total=3145728, swap_free=3145728)
+            output, calls = self.memory_floor(host, 3)
+            self.assertEqual(calls, "")
+            self.assertNotIn("mem_floor", output)
+
+
+class AssertHeadroomTests(unittest.TestCase):
+    """The report step fails while there is still disk left to say so."""
+
+    LOG = (
+        "12:04:19 disk_kb=76792508 mem_kb=14801980 load=1.41 runners=Runner.Worker:2012:up\n"
+        "12:06:15 disk_kb=75917720 mem_kb=1505772 load=3.68 runners=Runner.Worker:2012:up\n"
+        "kernel: [Wed Nov 18 12:10:00 2026] eth0: oom test line\n"
+        "12:30:34 disk_kb=5321696 mem_kb=15133296 load=3.96 runners=Runner.Worker:2012:up\n"
+    )
+
+    def check(self, text, minimum_kb):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "resources.log"
+            log.write_text(text)
+            return subprocess.run([str(HEADROOM), str(log), str(minimum_kb)],
+                                  capture_output=True, text=True, timeout=30)
+
+    def test_it_prints_the_lowest_disk_and_memory_samples_and_passes_above_the_floor(self):
+        result = self.check(self.LOG, 5 * 1024 * 1024)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("lowest free disk: 5.1 GiB at 12:30:34", result.stdout)
+        self.assertIn("lowest free memory: 1.4 GiB at 12:06:15", result.stdout)
+        self.assertEqual(result.stderr, "")
+
+    def test_a_low_water_mark_under_the_floor_fails_with_an_annotation(self):
+        # The passing run of #2100 (44293229949) bottomed out at 5.1 GiB.
+        result = self.check(self.LOG, 10 * 1024 * 1024)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("::error::free disk on / fell to 5.1 GiB at 12:30:34, under the 10.0 GiB floor",
+                      result.stdout)
+
+    def test_a_watcher_stop_is_reported_even_if_disk_came_back(self):
+        log = self.LOG + "disk_floor: 1500000 kB free on / is under 2097152 kB: stopping cargo-nextest\n"
+        result = self.check(log, 5 * 1024 * 1024)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("::error::the watcher stopped the run: disk_floor: 1500000 kB", result.stdout)
+
+    def test_a_memory_floor_stop_fails_the_report(self):
+        log = self.LOG + ("mem_floor: 400000 kB available is under 524288 kB for 120 s with 2097152 kB "
+                          "swap in use: stopping cargo-nextest cargo rustc (5 processes)\n")
+        result = self.check(log, 5 * 1024 * 1024)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("::error::the watcher stopped the run: mem_floor: 400000 kB available", result.stdout)
+
+    def test_it_reports_the_most_swap_in_use_and_the_worst_memory_stall(self):
+        log = (
+            "12:04:19 disk_kb=76792508 mem_kb=14801980 load=1.41 swap_kb=0 psi_full=0.00 runners=none\n"
+            "12:06:15 disk_kb=75917720 mem_kb=1505772 load=3.68 swap_kb=2621440 psi_full=12.25 runners=none\n"
+            "12:07:15 disk_kb=75917720 mem_kb=1605772 load=3.68 swap_kb=1048576 psi_full=40.10 runners=none\n"
+        )
+        result = self.check(log, 5 * 1024 * 1024)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("most swap in use: 2.5 GiB at 12:06:15", result.stdout)
+        self.assertIn("worst full memory stall (avg10): 40.10% at 12:07:15", result.stdout)
+
+    def test_no_samples_is_a_failure_not_a_pass(self):
+        result = self.check("", 1)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("::error::no disk samples", result.stdout)
+
+    def test_it_refuses_to_run_without_its_arguments(self):
+        result = subprocess.run([str(HEADROOM)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("usage", result.stderr)
+
+
+class FreeRunnerDiskTests(unittest.TestCase):
+    """The preinstalled toolchains no job of ours uses go; everything else stays."""
+
+    def test_it_removes_the_unused_toolchains_and_keeps_the_rest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            host = FakeHost(directory)
+            root = host.root / "image"
+            doomed = ["usr/local/lib/android", "usr/share/dotnet", "opt/ghc", "usr/local/.ghcup",
+                      "opt/hostedtoolcache/CodeQL", "usr/share/swift", "usr/local/share/powershell"]
+            kept = ["opt/hostedtoolcache/Python", "usr/bin", "home/runner/.cargo"]
+            for path in doomed + kept:
+                (root / path).mkdir(parents=True)
+                (root / path / "file").write_text("x")
+            host.write_tool("df", 'echo "df $*"\n')
+            result = host.run(FREE_DISK, FREE_ROOT=str(root))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for path in doomed:
+                self.assertFalse((root / path).exists(), path)
+            for path in kept:
+                self.assertTrue((root / path / "file").exists(), path)
+            self.assertIn("removed /usr/local/lib/android", result.stdout)
+            self.assertEqual(result.stdout.count("df -h /"), 2, result.stdout)
+
+    def test_a_path_the_image_lacks_is_skipped_never_fatal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            host = FakeHost(directory)
+            root = host.root / "image"
+            root.mkdir()
+            host.write_tool("df", "true\n")
+            result = host.run(FREE_DISK, FREE_ROOT=str(root))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("absent /opt/ghc", result.stdout)
 
 
 if __name__ == "__main__":

@@ -306,45 +306,50 @@ impl RecoveryFence {
 
     /// Decide what to do with an inbound RPC from a sender claiming
     /// `sender`, moving the fence if the sender reveals something new.
+    ///
+    /// Only an RPC from a member of this node's council may move the fence;
+    /// the Raft server checks that first (see [`super::admission`]).
     pub fn admit(&self, sender: RecoveryClaim) -> Admission {
         let mut admission = Admission::Serve;
         self.state.send_if_modified(|current| {
             let before = *current;
-            admission = match current.state {
-                // A council older than one gossip has already shown us is a
-                // replaced one: joining it would hand it a vote (#428).
-                FenceState::Unclaimed if sender.epoch < current.epoch => Admission::Refuse {
-                    newest: current.refusal_claim(),
-                },
-                FenceState::Unclaimed => {
-                    *current = FenceSnapshot {
-                        epoch: sender.epoch,
-                        recovery_id: sender.id,
-                        state: FenceState::Serving,
-                    };
-                    Admission::Adopted
-                }
-                FenceState::Serving
-                    if current.claim().is_some_and(|own| {
-                        own.epoch == sender.epoch && !own.conflicts_with(&sender)
-                    }) =>
-                {
-                    Admission::Serve
-                }
-                FenceState::Serving
-                | FenceState::Probing
-                | FenceState::Fenced { .. }
-                | FenceState::Split { .. } => {
-                    fence_if_newer(current, sender.epoch);
-                    split_if_conflicting(current, sender);
-                    Admission::Refuse {
-                        newest: current.refusal_claim(),
-                    }
-                }
-            };
+            admission = decide(current, sender);
             *current != before
         });
         admission
+    }
+
+    /// [`Self::admit`], but only while this node holds no epoch: a fresh
+    /// node adopts the epoch of the first council that reaches it. Returns
+    /// `None`, and leaves the fence alone, once the node holds one.
+    pub fn admit_if_unclaimed(&self, sender: RecoveryClaim) -> Option<Admission> {
+        let mut admission = None;
+        self.state.send_if_modified(|current| {
+            if current.state != FenceState::Unclaimed {
+                return false;
+            }
+            let before = *current;
+            admission = Some(decide(current, sender));
+            *current != before
+        });
+        admission
+    }
+
+    /// What [`Self::admit`] would decide for `sender`, without moving the
+    /// fence.
+    pub fn peek(&self, sender: RecoveryClaim) -> Admission {
+        let mut copy = self.snapshot();
+        decide(&mut copy, sender)
+    }
+
+    /// What to tell a sender from outside this node's council: the newest
+    /// epoch this node knows, when the sender's is older, so an old voter
+    /// talking to a recovered council still learns it was replaced. `None`
+    /// when the sender isn't behind. Never moves the fence: news of a newer
+    /// epoch counts only from a council member or from gossip.
+    pub fn refusal_for_outsider(&self, sender: RecoveryClaim) -> Option<RecoveryClaim> {
+        let snapshot = self.snapshot();
+        (sender.epoch < snapshot.newest_known_epoch()).then(|| snapshot.refusal_claim())
     }
 
     /// A peer (in a Raft reply or over gossip) holds `peer`. A node holding
@@ -412,6 +417,43 @@ impl RecoveryFence {
             tokio::fs::File::open(directory).await?.sync_all().await?;
         }
         Ok(())
+    }
+}
+
+/// The fence's verdict on one inbound RPC from a sender claiming `sender`,
+/// moving `current` if the sender reveals something new.
+fn decide(current: &mut FenceSnapshot, sender: RecoveryClaim) -> Admission {
+    match current.state {
+        // A council older than one gossip has already shown us is a
+        // replaced one: joining it would hand it a vote (#428).
+        FenceState::Unclaimed if sender.epoch < current.epoch => Admission::Refuse {
+            newest: current.refusal_claim(),
+        },
+        FenceState::Unclaimed => {
+            *current = FenceSnapshot {
+                epoch: sender.epoch,
+                recovery_id: sender.id,
+                state: FenceState::Serving,
+            };
+            Admission::Adopted
+        }
+        FenceState::Serving
+            if current
+                .claim()
+                .is_some_and(|own| own.epoch == sender.epoch && !own.conflicts_with(&sender)) =>
+        {
+            Admission::Serve
+        }
+        FenceState::Serving
+        | FenceState::Probing
+        | FenceState::Fenced { .. }
+        | FenceState::Split { .. } => {
+            fence_if_newer(current, sender.epoch);
+            split_if_conflicting(current, sender);
+            Admission::Refuse {
+                newest: current.refusal_claim(),
+            }
+        }
     }
 }
 
@@ -728,5 +770,52 @@ mod tests {
         std::fs::create_dir_all(&raft).unwrap();
         fence.persist().await.unwrap();
         assert_eq!(fence.persist_failure(), None);
+    }
+
+    // -- the council membership check's helpers -----------------------------
+
+    #[test]
+    fn peek_reports_the_verdict_without_moving_the_fence() {
+        let serving = fence(0, FenceState::Serving);
+        assert_eq!(
+            serving.peek(at(1)),
+            Admission::Refuse { newest: at(1) },
+            "a newer epoch would fence it"
+        );
+        assert!(!serving.is_fenced());
+        assert_eq!(serving.peek(at(0)), Admission::Serve);
+
+        let unclaimed = fence(0, FenceState::Unclaimed);
+        assert_eq!(unclaimed.peek(at(3)), Admission::Adopted);
+        assert_eq!(unclaimed.snapshot().claimed_epoch(), None);
+    }
+
+    #[test]
+    fn admit_if_unclaimed_adopts_only_on_a_fresh_node() {
+        let joiner = fence(0, FenceState::Unclaimed);
+        assert_eq!(joiner.admit_if_unclaimed(at(2)), Some(Admission::Adopted));
+        assert_eq!(joiner.snapshot().claimed_epoch(), Some(2));
+
+        // Once it holds an epoch, a newer one can't move it this way.
+        assert_eq!(joiner.admit_if_unclaimed(at(3)), None);
+        assert!(!joiner.is_fenced());
+        assert_eq!(joiner.snapshot().claimed_epoch(), Some(2));
+    }
+
+    #[test]
+    fn an_outsider_is_told_only_a_newer_epoch_and_the_fence_stays() {
+        let recovered = fence(1, FenceState::Serving);
+        assert_eq!(recovered.refusal_for_outsider(at(0)), Some(at(1)));
+        assert_eq!(recovered.refusal_for_outsider(at(1)), None);
+        assert_eq!(recovered.refusal_for_outsider(at(2)), None);
+        assert!(!recovered.is_fenced());
+        assert_eq!(recovered.snapshot().claimed_epoch(), Some(1));
+
+        // A fenced node passes on the epoch that fenced it.
+        let fenced = fence(0, FenceState::Fenced { newer_epoch: 2 });
+        assert_eq!(
+            fenced.refusal_for_outsider(at(0)),
+            Some(RecoveryClaim { epoch: 2, id: None })
+        );
     }
 }

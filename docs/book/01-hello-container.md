@@ -743,7 +743,7 @@ Ten states. Each one means something specific:
 - **Unhealthy**: health checks are failing. Removed from the service map, no new traffic.
 - **Stopping**: graceful shutdown in progress, draining existing connections.
 - **Stopped**: process has exited, resources cleaned up.
-- **Failed**: permanent failure. Exceeded restart limits, or an init container crashed.
+- **Failed**: permanent failure. Exceeded restart limits, an init container crashed, or it never passed its startup health check.
 
 The key insight is that not all transitions are valid. You can't go from `Pending` directly to `Running`: you have to prepare first, start, and pass health checks. You can't go from `Failed` to `Running`: you have to start over from `Pending`. The state machine enforces this:
 
@@ -867,18 +867,30 @@ pub fn cgroup_path(namespace: &str, app_name: &str, instance: u32) -> PathBuf {
 
 `format!()` is Rust's string interpolation macro, similar to Python's f-strings or Go's `fmt.Sprintf`. But unlike `Sprintf`, the compiler checks the format string at compile time. If you reference a variable that doesn't exist, or use the wrong format specifier, you get a compilation error, not a runtime panic.
 
+That's where the chapter started, and `cgroup_path` still exists. A live instance uses `instance_cgroup_path` instead, whose leaf is `g{generation}-{ordinal}` (`/sys/fs/cgroup/reliaburger/default/web/g3-0`, say) rather than a bare ordinal. During a rolling deploy the old `web-0` and its successor exist side by side, and with a bare `0` they'd share one directory: retiring the old container would delete the new one's cgroup. Putting the deployment generation in the name gives each its own. The function also refuses an instance id whose shape doesn't match its namespace and app, so a confused caller can't point it somewhere else.
+
 CPU limits use two parameters. `cpu.max` is a hard limit: "this container can use at most X microseconds of CPU time per Y-microsecond period." `cpu.weight` is proportional sharing: "when the CPU is contended, give this container this share relative to others."
 
 The conversion from millicores (what users write in config) to microseconds (what the kernel expects) is straightforward:
 
 ```rust
+pub(crate) fn cpu_quota_us(millicores: u64) -> Option<u64> {
+    millicores
+        .checked_mul(CGROUP_PERIOD_US)
+        .map(|product| product / 1000)
+}
+
 pub fn cpu_max_from_millicores(millicores: u64) -> String {
-    let quota_us = millicores * CGROUP_PERIOD_US / 1000;
-    format!("{quota_us} {CGROUP_PERIOD_US}")
+    match cpu_quota_us(millicores) {
+        Some(quota_us) => format!("{quota_us} {CGROUP_PERIOD_US}"),
+        None => format!("max {CGROUP_PERIOD_US}"),
+    }
 }
 ```
 
 500 millicores means "half a CPU." With a 100ms (100,000 microsecond) period, that's 50,000 microseconds of quota: `"50000 100000"`. 1000 millicores is a full CPU: `"100000 100000"`. 2000 millicores is two CPUs: `"200000 100000"`. The kernel allows quota larger than the period.
+
+The first version multiplied with a plain `*`, and the 0.3.0 review found the hole in that ([#2042](https://github.com/reliaburger/reliaburger/issues/2042)). Parsing bounded a CPU limit only by `u64`, so `cpu = "1-200000000000000"` passed, and multiplying it by 100,000 overflows. What happens then depends on the build: a debug build panics, and a release build wraps around silently, which here meant a garbage quota, or a negative one once the OCI spec cast it to `i64`. `checked_mul` is the standard library's way of saying "multiply, or tell me it didn't fit": it returns `Option<u64>`, `None` on overflow. There are siblings for other policies, `wrapping_mul` and `saturating_mul`, and choosing one says in the code what overflow should mean. Here it means no limit (`max`). It can't happen through config any more, though, because `ResourceRange::parse_cpu` now refuses a limit above `MAX_CPU_LIMIT_MILLICORES`, 65,536 cores. Linux builds for at most 8,192 CPUs, so no real node is anywhere near it.
 
 For `cpu.weight`, we convert millicores to the kernel's 1-10000 range using `.clamp()`:
 
@@ -891,7 +903,56 @@ pub fn cpu_weight_from_millicores(millicores: u64) -> u32 {
 
 `.clamp(min, max)` is a standard library method on numeric types that bounds a value: if it's below `min`, return `min`; if it's above `max`, return `max`; otherwise return it unchanged.
 
-Memory limits are simpler. `memory.max` is the hard limit in bytes: exceed it and the kernel OOM-kills your process. `memory.high` is a soft limit: exceed it and the kernel starts reclaiming memory aggressively, slowing your process down but not killing it. We set `memory.max` to the configured limit and `memory.high` to the request. This gives containers breathing room between "the kernel starts pushing back" and "the kernel kills you."
+Memory limits are simpler. `memory.max` is the hard limit in bytes: exceed it and the kernel OOM-kills your process. We set it to the configured limit, and that's the only memory knob the container's cgroup gets. The request isn't a cgroup setting at all. It's a reservation: the scheduler adds it up so it never puts more requested memory on a node than the node has.
+
+We used to write the request to `memory.high` as well. `memory.high` is a soft limit: cross it and the kernel reclaims the cgroup's memory and, if it can't get below the line, puts the process to sleep each time it returns from a system call. The idea was breathing room between "the kernel starts pushing back" and "the kernel kills you." It took the 0.3.0 rehearsal gate to show what it really did ([#1955](https://github.com/reliaburger/reliaburger/issues/1955)).
+
+The quickstart's burger demo asks for `memory = "8Mi-32Mi"`. When its containers started on node 1, every one failed with `runc startup timed out`, about 11 seconds apart. The kernel told us why. The stuck `runc init` was in state `D`, and its wait channel was `__mem_cgroup_handle_over_high`. Before runc hands the cgroup to your program, its own `runc init` runs in it, and the runc 1.4 in the Ubuntu 26.04 guest holds about 10 MiB of anonymous memory there. That's more than 8 MiB. The guest has no swap, so the kernel can't reclaim anonymous pages; it can only keep throttling. By hand on the same node, `runc run -d` of that bundle took 13 ms with no `memory.high`, 12 ms with 12 MiB, and 20 to 35 seconds with 8 MiB, past Bun's 10-second start deadline. Node 2 took 4 seconds with the same 8 MiB, which is why the same image "worked" there: how hard the throttle bites depends on the node, so a soft limit just under the runtime's own footprint is a coin toss.
+
+So a request no longer touches the cgroup. Couldn't we use `memory.low`, the kernel's protection floor, instead? Not here: a cgroup's `memory.low` only counts up to its parents' protection, and our `/reliaburger/{namespace}/{app}` parents have none, so it would be a setting that does nothing. Kubernetes reached the same answer by default: a pod's memory request schedules it and nothing else, unless you opt into the alpha Memory QoS feature. Even that derives `memory.high` from the *limit*, never the request, and turns the request into `memory.min`, which it also writes on every parent cgroup so the protection is real ([Kubernetes Memory QoS](https://kubernetes.io/blog/2023/05/05/qos-memory-resources/)). A workload that grows past its request now runs until its limit, and the limit is where the kernel says no.
+
+### A floor under the limit
+
+That fixed the request. The limit has the same problem in a blunter form ([#1959](https://github.com/reliaburger/reliaburger/issues/1959)). `runc init` still runs in the container's cgroup, and `memory.max` is a hard ceiling, so a limit below its footprint doesn't throttle it: the kernel kills it. On a soak node, runc 1.4's init peaked at 10.9 to 13.3 MB, and `runc create` failed at 8, 10 and 12 MiB with `container init was OOM-killed (memory limit too low?)`. runc 1.5 needs about 4 MiB, but a node can run either. Before this change, all you saw was a start failure, with runc's question mark buried in a log.
+
+So the floor gets a name and a home next to the code that writes `memory.max`, in `src/grill/oci.rs`:
+
+```rust
+pub const RUNC_INIT_MEMORY_BYTES: u64 = 16 << 20;
+
+// The highest memory.peak measured for runc init: lowering the room below it
+// fails the build.
+const _: () = assert!(RUNC_INIT_MEMORY_BYTES >= 13_266_944);
+```
+
+The name says what the number measures, runc init's footprint, not one of the rules that use it. Chapter 17's shared-runc helper hit the same footprint the same week and first got its own 16 MiB constant ([#1957](https://github.com/reliaburger/reliaburger/issues/1957)). Two constants for one measurement drift apart the day someone updates one, so the helper's cap now adds this one.
+
+`16 << 20` is 16 shifted left by 20 bits, which is 16 × 2²⁰, or 16 MiB. The second line is a compile-time assertion. A `const` item is evaluated by the compiler, and `assert!` inside one runs then, not when the program does. If someone lowers the floor below the measured peak, the crate doesn't build. Naming the constant `_` means we never refer to it; it exists only to be checked. C has `_Static_assert` for this; Go has nothing built in.
+
+Should `relish apply` warn about a small limit, or refuse it? We refuse. A warning makes sense when the config might work: here it can't, on the runc a node ships today. A warning scrolls past, the apply succeeds, and the user gets a start failure a minute later on some node, which is exactly what we set out to remove. Refusing fails fast, at the desk, with a message that says what to change:
+
+```
+memory in "app \"tiny\"": memory limit 8Mi is below the 16Mi a container needs to start: runc init runs inside the container's cgroup first and is OOM-killed under it
+```
+
+The check, `runc_memory_floor_refusal` in `src/config/validate.rs`, looks only at the limit. A request of 4 MiB under a 16 MiB limit is still fine, because after #1955 the request touches no cgroup file. It only applies where runc init really runs in the workload's cgroup: an app with an `image` and its sidecars, a fresh `runc` job and a task array's `runc` template. A host app or `process` job has no runc, and a `shared-runc` task is cloned straight into its task cgroup with `CLONE_INTO_CGROUP`, so runc init never runs there (Chapter 17 has the details).
+
+The function returns `Option<String>`: `None` means "fine", `Some(reason)` means "refuse, and here's why". Its body is three lines:
+
+```rust
+let limit = memory?.limit;
+(limit < RUNC_INIT_MEMORY_BYTES).then(|| format!(/* ... */))
+```
+
+The `?` works on `Option` as well as `Result`: if `memory` is `None` (no limit set), the function returns `None` right there. `bool::then` turns a condition into an `Option`, running the closure only when the condition is true. Go would write the same thing as an `if` and two returns; it's a matter of taste, and here the short form reads like the rule it states.
+
+Validation can't catch everything. A cluster can hold an app applied before this check existed, or a node can run a runc that needs even more. So Grill gets the second half. When `runc run` exits non-zero before the container ever ran, `owned_start` in `src/grill/runc/owned.rs` reads what runc wrote to stderr and hands it to `explain_runc_init_oom`. If runc said `OOM-killed`, the start fails with a `StartFailed` error that names the limit and the floor, instead of a bare exit:
+
+```
+runc init was OOM-killed before the workload started: it runs inside the container's cgroup and the memory limit of 8Mi is too small for it; give the app or job a memory limit of at least 16Mi
+```
+
+We match runc's text, which is fragile in principle: a future runc could reword it. The cost of that is small, though. If the match misses, we're back to the old generic failure, not a wrong answer. The pure function is tested on its own with runc's real message, and it works on any platform, like the cgroup helpers above.
 
 Notice that none of these functions touch the filesystem. They compute values and return them. The actual writing to `/sys/fs/cgroup` happens elsewhere, when we're running on Linux with the right permissions. This separation is deliberate. These functions are pure: same input, same output, no side effects. That makes them testable on any platform: your CI server, your macOS laptop, anywhere. We test the computation now and test the filesystem operations in integration tests on Linux later.
 
@@ -1075,7 +1136,7 @@ pub struct WorkloadInstance {
 }
 ```
 
-Two fields at the bottom deserve a note. `is_job` distinguishes run-to-completion tasks from long-running apps. We could have modelled this as an enum (`WorkloadKind::App` vs `WorkloadKind::Job`) instead of a boolean, and for a system with more workload types that would be the right call. For now, a boolean is honest about the two cases we actually have.
+Two fields at the bottom deserve a note. `is_job` distinguishes run-to-completion tasks from long-running apps. We could have modelled this as an enum (`WorkloadKind::App` vs `WorkloadKind::Job`) instead of a boolean, and for a system with more workload types that would be the right call. For now, a boolean is honest about the two cases we actually have. (That held until 0.2.0. Jobs then moved to their own task-array lifecycle, the supervisor went back to apps only, and `is_job` is gone; see the note under "Deploying a job".)
 
 `oci_spec` stores the OCI spec that was used to create this instance. Why keep it around? Because when an instance fails and gets restarted, the agent needs to call `grill.create()` again with the same spec. Without storing it, we'd need to regenerate it from the original `AppSpec` or `JobSpec`, which means the agent would need to keep the config around and know which spec belongs to which instance. Storing the OCI spec directly is simpler and self-contained.
 
@@ -1225,6 +1286,8 @@ fn test_supervisor() -> WorkloadSupervisor<MockGrill> {
 The compiler generates a `WorkloadSupervisor<MockGrill>` that calls `MockGrill` methods directly. In production, we'll create a `WorkloadSupervisor<ContainerdGrill>` that calls the real runtime. Same code, different concrete type, zero runtime overhead.
 
 ### Deploying a job
+
+> **Later replaced.** This section and "Monitoring jobs" below describe the job path Phase 1 built, and it no longer exists. `deploy_job`, `is_job` and `check_jobs` were removed in 0.2.0, when every job (a TOML `[job.*]`, a cron fire, a `run_before` hook) became a one-task array on the leader-driven task-array lifecycle. A TOML job now gets four attempts by default, and a hook one attempt with a 600 s deadline (`JobDefinition::from_spec` in `src/meat/job.rs`). Chapter 17, "A Million Jobs", tells that story. We've kept the original here because the reasoning (no port, no health check, a bounded retry budget) still holds; only the machinery changed.
 
 Apps run forever (or until someone stops them). Jobs run to completion. A database migration, a batch data export, a cleanup script. You start it, it does its thing, it exits. If it fails, you retry a few times. If it keeps failing, you give up.
 
@@ -1402,7 +1465,7 @@ Every method on `HealthChecker` that deals with time takes a `now: Instant` para
 
 ```rust
 pub fn register(&mut self, instance_id: InstanceId, config: HealthCheckConfig, now: Instant) {
-    let deadline = now + config.initial_delay;
+    let deadline = deadline_after(now, config.initial_delay);
     // ...
 }
 ```
@@ -1410,6 +1473,8 @@ pub fn register(&mut self, instance_id: InstanceId, config: HealthCheckConfig, n
 This makes tests completely deterministic. You create an `Instant`, advance it by known amounts, and assert on the results. No flaky tests from timing races. No need for time-mocking libraries. Just pass the time you want.
 
 This is a general pattern worth adopting for any code that depends on the clock: make time a parameter, not a hidden dependency.
+
+Why `deadline_after` and not plain `now + config.initial_delay`? Because `Instant + Duration` panics when the sum doesn't fit in the clock. In C that would be silent wraparound; Rust's standard library chooses a loud failure instead. Rust gives you the quiet version too, `checked_add`, which returns an `Option<Instant>`: `None` means overflow, and you decide what happens. A review found that `initial_delay = 9223372036854775807` sailed through validation and then took the whole agent loop down on the first `register`. Now validation refuses any `interval` or `initial_delay` over a day, and `deadline_after` cuts the delay to that day and uses `checked_add`, so even a config that skipped validation can't panic the loop.
 
 ### evaluate_result: a pure function
 
@@ -1427,6 +1492,11 @@ pub fn evaluate_result(
             if counters.consecutive_healthy >= config.threshold_healthy =>
         {
             Some(ContainerState::Running)
+        }
+        (ContainerState::HealthWait, false)
+            if counters.consecutive_unhealthy >= STARTUP_FAILURE_LIMIT =>
+        {
+            Some(ContainerState::Stopping)
         }
         (ContainerState::Running, false)
             if counters.consecutive_unhealthy >= config.threshold_unhealthy =>
@@ -1448,6 +1518,32 @@ It takes all its inputs as parameters, does a `match`, and returns `Option<Conta
 The `match` uses Rust's pattern matching with guards (the `if` clauses). The tuple pattern `(current_state, status.is_healthy())` lets us branch on both values simultaneously. The `_` arm catches everything else: states where health check results don't drive transitions (`Pending`, `Preparing`, `Stopping`, etc.).
 
 Making this a free function rather than a method on `HealthChecker` or `WorkloadInstance` is a deliberate choice. It has no hidden state, no side effects, and it's trivially testable. You can write a dozen test cases for it without setting up a supervisor, a mock runtime, or an instance. Just call the function with different inputs and check the output.
+
+### Dying before the first healthy probe
+
+The second arm is the startup grace. A new instance that fails 60 probes in a row (`STARTUP_FAILURE_LIMIT`, about ten minutes at the default 10-second interval) is given up, so it doesn't sit in `HealthWait` for ever. It used to go straight to `Failed`, and a comment said `Failed` "flows into the restart path". It didn't. `maybe_restart` only restarts from `Unhealthy` or `Stopped`, so a `Failed` instance stayed `Failed`, and nothing recorded why. A review in November 2026 traced two ways that hurt (#1999).
+
+The first was a crash during startup, the classic crash loop. The agent notices an app's process exiting with a *state sweep*: every tick it asks the runtime for the state of each instance and routes an exit through `observe_app_exit`, which stops the instance and restarts it with backoff. But the sweep only asked about `Running` instances. A health-checked app is in `HealthWait` until its first passing probe, so an app that died on startup was never asked about. Its probes were refused for ten minutes, then it went `Failed` with no `restart` event, so `relish wtf` never saw the crash loop. In a cluster the leader eventually noticed the missing replica and redeployed it, ten minutes late and with no record of why.
+
+The second was a process that stays up but never answers its probe, because the `path` or `port` is wrong. It went `Failed` with its process still running. Anything that reads `Failed` as "not running" is then wrong about it: a volume snapshot restore checks for running instances that way, and would swap the volume under a live writer.
+
+The fix has two halves. The sweep now asks about every instance whose exit it watches, through one small function in `src/bun/agent/state_sweep.rs`:
+
+```rust
+pub(super) fn watches_exit(state: ContainerState) -> bool {
+    matches!(state, ContainerState::HealthWait | ContainerState::Running)
+}
+```
+
+`matches!` is a macro from the standard library that returns `true` when its first argument fits the pattern, here either of two variants. The planner uses it to choose which instances to read, and the loop uses it again when the answer comes back, because the instance may have moved on while the read was in flight. Keeping both checks in one function means they can't disagree.
+
+The other half is the grace itself. It now returns `Stopping`, not `Failed`, and `process_health_result` marks the instance `retry_pending` with the cause `RestartCause::NeverHealthy`. That's the same cleanup path a failed restart takes: the agent kills the process off the loop and confirms it's gone, then calls `maybe_restart`. There, a `Stopped` instance whose cause is `NeverHealthy` goes to `Failed` instead of `Pending`. It isn't restarted, because the same probe would fail the same way, and the agent records a `restart.never_healthy` decision with the probe and the failures in a row, so `relish agent explain` can say what happened.
+
+Adding a variant to `RestartCause` had a cost we could see straight away: `retry_restart` matches on the cause to name the rule it records, and Rust's `match` must cover every variant, so the code stopped compiling until we said what a `NeverHealthy` restart means. It means nothing, since `maybe_restart` never restarts one, and the arm says so and returns. In C or Go a new enum value falls through a `switch` silently; here the compiler made us decide.
+
+Review of the fix found one more way to leave something running. A sidecar restarts on its own when it crashes, in a task off the loop, and `HealthWait` counts as a state whose sidecars should run. If the grace ran out while a sidecar's restart was in flight, the cleanup killed the sidecars it knew about, and then the restart task finished and started its sidecar again, beside an instance now `Failed`. `observe_app_exit` already cancels those restarts; the cleanup path didn't. Now `begin_restart_cleanup` cancels them too, and a cancelled restart kills whatever it started. `a_sidecar_restarting_when_its_instance_is_given_up_does_not_survive` in `src/bun/agent/tests/sidecars.rs` slows the restart's create down so it lands after the cleanup, and checks that the proxy's last operation is a kill.
+
+Two agent tests pin the main fix, in `src/bun/agent/tests/restart_ownership.rs`. `an_exit_before_the_first_healthy_probe_restarts_and_is_recorded` deploys a health-checked app, makes the mock runtime report its process gone while it's still in `HealthWait`, and checks that one sweep restarts it and records `restart.process_exited`. `a_never_healthy_instance_is_stopped_before_it_is_failed` feeds refused probes until the grace runs out, and checks that the instance goes to `Stopping`, the runtime gets a kill, and only then is the instance `Failed`, with no restart and one `restart.never_healthy` decision.
 
 ### A default that depends on another field
 
@@ -1680,7 +1776,7 @@ pub enum OutputFormat {
 }
 ```
 
-`#[derive(clap::ValueEnum)]` teaches clap how to parse this enum from command-line text. `--output human`, `--output json`, and `--output yaml` all just work. Anything else gets a clear error message. No string matching, no `if output == "json"` scattered through your code.
+`#[derive(clap::ValueEnum)]` teaches clap how to parse this enum from command-line text. `--output human`, `--output json`, and `--output yaml` all just work. Anything else gets a clear error message. No string matching, no `if output == "json"` scattered through your code. Bun's `--runtime` flag was a `String` until 0.3.0, matched against `"auto"`, `"process"`, `"runc"` and `"mixed"` deep in start-up, so `bun --runtime rnuc` loaded its config and set up storage before saying "unknown runtime". It's now a `RuntimeChoice` enum with the same derive, and clap refuses the typo before `main` does anything.
 
 The `#[default]` attribute on `Human` means you don't even need to specify `--output`: it defaults to human-readable text. This is a Rust enum feature that works with the `Default` trait. In Go you'd check for an empty string; in Python you'd pass `default=` to `argparse`. Here the default is part of the type definition itself.
 
@@ -2328,6 +2424,8 @@ _ = health_interval.tick() => {
 
 ### Monitoring jobs
 
+> **Later replaced.** `check_jobs` went with the rest of Phase 1's job path in 0.2.0 (see "Deploying a job" above). Task attempts are now watched by the task-array executors, which report completions to the leader; Chapter 17 covers them. The init-container and restart sections below still describe how apps work.
+
 Apps run forever. Jobs exit. The agent needs to notice when a job process has stopped and decide what to do about it. That's `check_jobs`:
 
 ```rust
@@ -2533,7 +2631,7 @@ The filter logic is specific: only instances that are Pending *and* have been re
 
 This is called the "collect-then-process" pattern. We gather everything we need to act on (releasing the borrow on the supervisor), then iterate and mutate. The alternative would be indexing into the instances map by position, which is both less readable and fragile if the map changes size during iteration.
 
-Everything in this section runs on the event loop, and every `.await` in it holds every other command until it returns. On one container that's fine. On a busy node, a few slow runc calls in a row made the whole node look dead, and Chapter 15 tells that story. Today the tick only *starts* this work: the state reads in `check_jobs` (and its sibling for apps, `check_apps`) run as one parallel sweep in a spawned task, and each restart's kill, create and start run in tasks of their own, reporting back to the loop between steps.
+Everything in this section runs on the event loop, and every `.await` in it holds every other command until it returns. On one container that's fine. On a busy node, a few slow runc calls in a row made the whole node look dead, and Chapter 15 tells that story. Today the tick only *starts* this work: the state reads in `check_apps` run as one parallel sweep in a spawned task, and each restart's kill, create and start run in tasks of their own, reporting back to the loop between steps.
 
 ## A local API
 
@@ -2748,9 +2846,9 @@ Here's what the integration tests cover:
 
 **`relish_status_returns_expected_output`**: deploy via the command channel directly (not HTTP), verify the status API reflects the expected app name.
 
-**`job_runs_to_completion`**: deploy a job with `command = ["echo", "migration complete"]`. Wait a few seconds for the process to exit, then verify the instance reaches Stopped state. This tests the full job pipeline: deploy, `drive_job_startup`, process exit detection in `check_jobs`, and the success path.
+**`job_runs_to_completion`**: deploy a job with `command = ["echo", "migration complete"]`. Wait a few seconds for the process to exit, then verify the instance reaches Stopped state. When we wrote it, this exercised Phase 1's job pipeline: deploy, `drive_job_startup`, process exit detection in `check_jobs`, and the success path. The test still exists in `tests/integration.rs`, and now drives the same TOML job through the task-array path instead.
 
-**`job_failed_retries_then_fails`**: deploy a job with `command = ["false"]`. The `false` command exits immediately with code 1. Wait for all retries to exhaust (3 retries with exponential backoff takes about 12 seconds), then verify the instance reaches Failed state and `restart_count > 0`.
+**`job_failed_retries_then_fails`**: deploy a job with `command = ["false"]`. The `false` command exits immediately with code 1. Wait for all attempts to run out (four by default today, with backoff between them; Phase 1 gave three retries), then verify the instance reaches Failed state and `restart_count > 0`.
 
 **`init_container_success_allows_app_start`**: deploy an app with an init container that runs `echo "init done"`. Verify the deploy succeeds and the app reaches Running. Tests the Preparing → Initialising → Starting path.
 
@@ -2857,6 +2955,33 @@ OCI images use a convention called *whiteout files* to handle deletions between 
 - `.wh..wh..opq` means "this entire directory is opaque — ignore everything from lower layers"
 
 The unpacker watches for these markers and removes the corresponding files before continuing with the rest of the layer.
+
+That sounds like two calls to `std::fs::remove_dir_all`, and it used to be. Two details make it harder.
+
+The first is symlinks. Ordinary tar entries go through the `tar` crate's `unpack_in`, which checks that each entry's parent directory really sits inside the rootfs. Whiteouts never reach that code: we resolve them ourselves. A lower layer can make `x` a symlink to `/etc`, and a path call on `rootfs/x/.wh.passwd` follows that symlink like any other. Checking the *name* (no `..`, no leading `/`) doesn't help, because the name is fine; the filesystem is what points elsewhere. Bun unpacks images as root, so the removal has to be unable to leave the rootfs.
+
+The fix lives in `src/grill/whiteout.rs`. It opens the rootfs as a directory descriptor and walks to the whiteout's parent one component at a time with `openat` and `O_NOFOLLOW | O_DIRECTORY`. If any component is a symlink, the kernel refuses to open it (`ELOOP` or `ENOTDIR`), and the whiteout has nothing to remove. Below that point every call is relative to a descriptor: `fstatat` with `AT_SYMLINK_NOFOLLOW` to see what an entry is, `openat` to descend, `unlinkat` to remove. A symlink inside a removed directory is unlinked as a link, so its target is never touched. This is the same pattern `chown_tree` in `src/grill/volume.rs` uses for volumes (chapter 5), and it comes from the `nix` crate we already depend on, so no new crate was needed. Linux's `openat2` with `RESOLVE_BENEATH` would do the walk in one call, but it isn't on macOS, where these unit tests also run.
+
+The first version opened every directory on the way with `O_RDONLY`, and review caught a regression in it. Opening a directory for reading needs its read bit, but walking through it on a path only needs the search (`x`) bit. Root doesn't care, but a rootless Bun unpacks as an ordinary user, and an image whose lower directory was `0311` would have failed to pull. On Linux the walk now uses `O_PATH`, a descriptor that's good for `*at` calls and nothing else, which asks only for the search bit. A directory is opened for reading only when we have to list it. The same rootless Bun can't remove anything from a `0555` directory either. There we chose to keep the entry, log a warning and carry on: the leftover is still inside the rootfs, and failing would refuse an image every other runtime runs. Any other error, such as a full disk, still fails the pull.
+
+Refusing every symlink has one visible effect. containerd follows symlinks that stay inside the root, so if an image has `lib -> usr/lib`, a whiteout written as `lib/.wh.foo` removes `usr/lib/foo` there and nothing here. We accept that. Builders take whiteouts from the overlay snapshot's upper directory, where the kernel has already resolved the link, so they write `usr/lib/.wh.foo`, the real path.
+
+The second is order. The OCI image spec says a whiteout hides only *lower* layers. Builders put whiteouts before their siblings, but nothing forces them to, and a layer listing `d/new.txt` and then `d/.wh..wh..opq` would lose its own `new.txt` if we applied the marker blindly. So the unpacker records each path the current layer has written in a `LayerEntries` set, and a whiteout skips those (and keeps any directory with something from this layer inside it). containerd's applier makes the same choice. The alternative, reading each layer twice so whiteouts can run first, would decompress every layer twice.
+
+`LayerEntries` wraps a `BTreeSet<PathBuf>`, and the "anything beneath this path?" question uses the set's ordering. `PathBuf` compares component by component, so everything under `a/b` sorts directly after `a/b` itself (and `a/b/c` sorts before `a/bc`). One range query answers it:
+
+```rust
+self.paths
+    .range::<Path, _>((Bound::Included(path), Bound::Unbounded))
+    .next()
+    .is_some_and(|first| first.starts_with(path))
+```
+
+`range::<Path, _>` is a *turbofish*: it names the generic type parameter by hand, here "look this up by `&Path`, not `PathBuf`". A `BTreeSet<PathBuf>` can be searched by `&Path` because `PathBuf` implements `Borrow<Path>`, the same trick that lets a `HashMap<String, _>` take a `&str` key. The tuple of `Bound`s is used instead of the shorter `path..` because the standard library's `RangeFrom<&T>` only works for sized `T`, and `Path` is unsized.
+
+Removing a directory tree uses an explicit stack, not recursion, so a deeply nested image fails with an error instead of overflowing the thread's stack. Each pending name holds an `Rc<Dir>` of its parent: `Rc` is a reference-counted pointer, so siblings share one open descriptor, which closes when the last of them is done.
+
+The tests `whiteouts_under_a_symlinked_parent_stay_inside_the_rootfs` and `whiteout_after_its_siblings_keeps_the_same_layer_entries` pin both rules. Each failed against the old path-based code.
 
 ### Content-addressed caching
 
@@ -3107,6 +3232,8 @@ The same incident fixed what happens on a mismatch. The check used to return an 
 
 The 0.2.8 release gate found the same mistake in the next check down ([#1849](https://github.com/reliaburger/reliaburger/issues/1849)). Besides the PID, the adoption record names the launcher's log files, and adoption compared that with the log stem bound in the generation. A mismatch returned an error. In the soak, Bun was SIGKILLed one second into a rollout, came back and adopted everything, and a minute later the node lost power for 25 seconds. The record and the launcher binding are written at different moments, and the page cache that held one of them was lost. Every Bun after that exited at startup with "adoption log identity conflicts with runtime generation", over 500 times, and the node never rejoined. Either way round the record is stale: if it names logs the generation never bound, the record is newer, and if it names none, or another launch's, the generation is newer. So adoption treats it like a record that names another process. It retires the generation, says so on stderr and returns `Ok(false)`, and the instance is rescheduled. It also checks for a `Retired` or `Retiring` generation before comparing logs, because a sealed generation's logs don't matter. `a_record_and_generation_split_by_a_power_cut_retire_and_others_still_adopt` builds both orders on disk, beside a healthy instance that must still adopt, and the reboot qualification (`scripts/release/qualify-oci-reboot.sh`) now carries a split record across a real power cycle. On the old code the first fails with the exact error from the gate. The rule we keep relearning: on startup, a record that disagrees with the runtime's own evidence describes the past, and the cure is to retire it, never to stop the node.
 
+Two checks one level up, in Bun's startup preflight, still stopped the node ([#1852](https://github.com/reliaburger/reliaburger/issues/1852)). Before adopting anything, `reconcile_runtime_launches` in `src/bun/agent/records.rs` pairs each adoption record with the runtime's list of launches. A record with no launch, or one whose spec conflicts with its launch, returned an error, so one half-written record cost the whole node rather than one instance. A spec conflict now gets the treatment a launch with no record already got: the launch is what the runtime actually runs, so it's fenced (killed if it's still running) and retired, and the record goes with it. A record with no launch needs more care. Nothing in the runtime owns its process, so Bun can't kill it by generation. That's only safe to retire when the record's boot ID differs from the current one, which proves the process died with the old boot (see below). Within the same boot the check still refuses startup, because a process might be running with nothing tracking it. `reconcile_runtime_launches` now returns the set of records it retired, and the adoption loop skips them. That's a `HashSet<String>`, Rust's hash set; `contains` is the membership test. The tests, `a_record_from_an_earlier_boot_with_no_runtime_launch_is_retired`, `a_record_from_this_boot_with_no_runtime_launch_still_refuses_startup` and `a_record_conflicting_with_its_runtime_launch_is_retired_and_the_launch_fenced`, each put the broken record next to a healthy one that must still adopt.
+
 One question remains: did the *machine* restart? Kill Bun and the container can keep running. Reboot Linux and it can't. Every intent and owner record stores the kernel's boot ID from `/proc/sys/kernel/random/boot_id`, a random UUID that changes on every boot. A different boot ID proves that every process from the old record is dead, so recovery records the execution as interrupted with no exit code and removes the stale runc state directly. It never passes the old PID to `runc delete --force`; that number might belong to something else by now.
 
 All this paperwork has to go somewhere when an instance goes for good. A retired generation keeps its intent record, its owner directory and, on a node that mixes containers with host processes, a small route file saying which runtime ran it. That's deliberate: the record is the proof that nothing still runs. But for a long time nothing ever deleted it. Delete an app, scale it down or roll it to a new version, and each retired instance left its files behind, forever. `Grill::forget_retired` deletes them, and it refuses to delete anything while the generation could still own a process or an address. Batch executors learned to call it in [Chapter 17](17-a-million-jobs.md). App instances didn't, until [#738](https://github.com/reliaburger/reliaburger/issues/738). The agent now calls it once the supervisor has let an instance go, which happens when its app is deleted, when a scale-down or a rollout retires it, and when startup retires a launch it won't adopt. A `relish stop` doesn't count, because its stopped replicas stay owned until the next apply rolls over them, and an adopted instance keeps its files.
@@ -3122,6 +3249,8 @@ Testing the same thing against the real process runtime turned up a second race,
 "Runs in its own task" had one more consequence, and it took a CI flake to find it ([#877](https://github.com/reliaburger/reliaburger/issues/877)). Startup adoption walks the node's records one by one. When it retires a launch it won't adopt, it spawns the forget and moves on to the next record, and on a cluster node that next record starts by reading the runtime's whole inventory. The inventory lists the `records` directory, then reads each entry it found. If the forget renames an entry away between those two steps, the inventory used to find a name with nothing behind it, call that corruption, and refuse. Bun refuses to start on any adoption error, so a node in the middle of an upgrade exited instead of coming back. On CI it took down one node of the three-node upgrade-and-rollback qualification test, which then waited a minute for an upgrade that never settled.
 
 The forget isn't wrong to run there, and the inventory isn't wrong to be strict about corruption. It just had the wrong idea of what a vanished record means. Only a forget removes a published record, it only does that to a retired generation, and it renames the whole directory away in one step. So a record that disappears mid-read owned nothing, and the inventory now leaves it out, exactly as it would have a moment later. A directory that's still there but has no readable intent in it is still corruption, and still refuses. The process runtime's owner inventory had the same gap and got the same fix. `record_forgotten_after_enumeration_is_absent_from_the_inventory` and its process twin list a retired record, forget it, then read what they listed.
+
+The single-instance status read had it too, and another flake found it ([#2032](https://github.com/reliaburger/reliaburger/issues/2032)). `ProcessControl::status_if_present` checks that the owner's directory exists and then reads its journal. A reader in another process, such as a test's own `ProcessGrill` looking at the same data directory while a restarted Bun forgets the initialiser it just retired, could pass the first check and then lose the journal with the directory, and the read failed with "No such file or directory". It now treats that the way the inventory does: if the journal is missing because the whole directory has gone, the owner was forgotten and the answer is "not found"; if the directory is still there without its journal, that's corruption and it refuses. `optional_status_reads_a_generation_forgotten_under_it_as_absent` runs three readers against a forget a hundred times; before the fix it failed within the first thirty.
 
 For a while this owned path was opt-in, and rootful Runc without eBPF quietly took the old spawn-and-record path with all of the crash windows above still open. Nothing had been released, so nobody depended on it, and we deleted it (about 1,900 lines). `RuncGrill::new` now takes the owner executable as a plain argument:
 

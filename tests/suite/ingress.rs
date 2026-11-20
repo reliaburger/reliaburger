@@ -67,7 +67,6 @@ impl IngressHarness {
             reliaburger::config::process_workloads::ProcessWorkloadsConfig {
                 allowed_binaries: vec!["/bin/sh".into()],
                 mount_isolation: false,
-                ..Default::default()
             },
         );
 
@@ -462,6 +461,172 @@ async fn ingress_serves_https_with_self_signed_cert() {
     )
     .await;
     assert_eq!(response.status().as_u16(), 200);
+
+    test_app.shutdown();
+}
+
+/// HTTP/2 carries the host in the `:authority` pseudo-header, not in a
+/// `Host` header. Browsers and curl negotiate h2 by ALPN on the HTTPS
+/// listener, so the proxy must route on the authority when no `Host`
+/// header is present.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ingress_routes_http2_requests_by_authority() {
+    let test_app = TestApp::start(TestAppMode::Healthy).await.unwrap();
+    let harness = IngressHarness::start_reaching(test_app.port()).await;
+
+    let config = Config::parse(&format!(
+        r#"
+        [app.secure]
+        script = "exec sleep 86400"
+        port = {}
+
+        [app.secure.ingress]
+        host = "secure.test"
+    "#,
+        test_app.port()
+    ))
+    .unwrap();
+    harness.client.apply(&config).await.unwrap();
+
+    // The host goes in the URL, never in a header: over HTTP/2 the client
+    // sends it only as `:authority`. Resolve the name to the local listener.
+    let http_client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .http2_prior_knowledge()
+        .resolve(
+            "secure.test",
+            SocketAddr::from(([127, 0, 0, 1], harness.https_addr.port())),
+        )
+        .build()
+        .unwrap();
+    let url = format!("https://secure.test:{}/healthz", harness.https_addr.port());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut last = None;
+    while tokio::time::Instant::now() < deadline {
+        match http_client.get(&url).send().await {
+            Ok(response) if response.status().as_u16() == 200 => {
+                assert_eq!(response.version(), reqwest::Version::HTTP_2);
+                test_app.shutdown();
+                return;
+            }
+            Ok(response) => {
+                last = Some(format!("{:?} {}", response.version(), response.status()));
+            }
+            Err(error) => last = Some(error.to_string()),
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("an HTTP/2 request for secure.test never reached the route; last saw {last:?}");
+}
+
+/// Deploy `secure.test` behind a healthy test app and wait until the plain
+/// listener routes it.
+async fn harness_with_secure_route() -> (TestApp, IngressHarness) {
+    let test_app = TestApp::start(TestAppMode::Healthy).await.unwrap();
+    let harness = IngressHarness::start_reaching(test_app.port()).await;
+    let config = Config::parse(&format!(
+        r#"
+        [app.secure]
+        script = "exec sleep 86400"
+        port = {}
+
+        [app.secure.ingress]
+        host = "secure.test"
+    "#,
+        test_app.port()
+    ))
+    .unwrap();
+    harness.client.apply(&config).await.unwrap();
+    wait_for_status(
+        &reqwest::Client::new(),
+        &harness.http_url("/healthz"),
+        "secure.test",
+        200,
+    )
+    .await;
+    (test_app, harness)
+}
+
+/// RFC 9113 §8.3.1: over HTTP/2 the `:authority` names the target, and a
+/// request whose `Host` header disagrees with it is malformed. Letting
+/// `Host` win would route by a header the client's TLS session never named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ingress_refuses_http2_requests_whose_host_disagrees_with_the_authority() {
+    let (test_app, harness) = harness_with_secure_route().await;
+    let http_client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .http2_prior_knowledge()
+        .resolve(
+            "secure.test",
+            SocketAddr::from(([127, 0, 0, 1], harness.https_addr.port())),
+        )
+        .build()
+        .unwrap();
+    let url = format!("https://secure.test:{}/healthz", harness.https_addr.port());
+
+    let response = http_client
+        .get(&url)
+        .header("host", "other.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.version(), reqwest::Version::HTTP_2);
+    assert_eq!(response.status().as_u16(), 400);
+
+    // A Host header that agrees with the authority is fine.
+    let agreeing = format!("secure.test:{}", harness.https_addr.port());
+    let response = http_client
+        .get(&url)
+        .header("host", agreeing)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+
+    test_app.shutdown();
+}
+
+/// `curl -k https://<node-ip>/ -H 'Host: app.example'` is how people test an
+/// ingress before DNS points at it, and curl and reqwest speak HTTP/2 to do
+/// it. An IP literal names no host, so over HTTP/2 a `Host` header next to
+/// one still routes. (The listener is IPv4 only; the IPv6 and portless
+/// forms are unit tests of `request_host` in `src/wrapper/proxy.rs`.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ingress_routes_http2_requests_by_host_when_the_authority_is_an_ip() {
+    let (test_app, harness) = harness_with_secure_route().await;
+    let http_client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+    let response = http_client
+        .get(harness.https_url("/healthz"))
+        .header("host", "secure.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.version(), reqwest::Version::HTTP_2);
+    assert_eq!(response.status().as_u16(), 200);
+
+    test_app.shutdown();
+}
+
+/// HTTP/1.1 keeps routing by the `Host` header, even when an absolute-form
+/// request target names another host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ingress_routes_http1_requests_by_host_when_the_target_disagrees() {
+    let (test_app, harness) = harness_with_secure_route().await;
+    let mut stream = TcpStream::connect(("127.0.0.1", harness.http_addr.port()))
+        .await
+        .unwrap();
+    stream
+        .write_all(
+            b"GET http://other.test/healthz HTTP/1.1\r\nHost: secure.test\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let (head, _) = read_head(&mut stream).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
 
     test_app.shutdown();
 }

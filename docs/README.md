@@ -14,7 +14,8 @@ release follows the same [build, staging and promotion procedure](releasing.md#m
 From 0.2.7, every release file also carries a build provenance
 attestation that anyone can check with `gh attestation verify`, and the macOS `relish` can be
 notarised ([checks a stranger can run](releasing.md#checks-a-stranger-can-run)).
-The limits below are the ones 0.2.8 ships with; the [roadmap](roadmap.md) tracks
+The limits below are the ones 0.2.8 ships with; the [changelog](../CHANGELOG.md)
+says what changed in each release, and the [roadmap](roadmap.md) tracks
 what comes after it. The [feature status page](https://reliaburger.com/features)
 rates every feature Ready, Beta, Alpha or Planned, with its restrictions and open
 issues; its source is [features.toml](features.toml).
@@ -41,8 +42,8 @@ metrics, logs, GitOps, jobs and fault injection are compiled into that agent,
 so there's no control plane to assemble and no add-ons to install. A Linux node
 needs a few distribution packages (`runc`, `nftables`, `iproute2` and friends,
 listed in the [Linux servers guide](linux-servers.md)), and releases are glibc
-builds; static builds are planned for 0.3.0
-([#401](https://github.com/reliaburger/reliaburger/issues/401)). Every
+builds; static builds are planned
+([#1774](https://github.com/reliaburger/reliaburger/issues/1774)). Every
 command is listed in the manual's
 [reference](manual/13_reference.md#every-relish-command).
 
@@ -876,7 +877,8 @@ lease ownership must also be unscoped, for both inspection and cleanup.
 configuration; no security switch needs hand-editing:
 
 ```sh
-sudo target/debug/relish init cluster --cluster-name prod --node-id node-01
+sudo target/debug/relish init cluster --cluster-name prod --node-id node-01 \
+  --root-backup ~/prod-root-backup.age
 sudo target/debug/bun --cluster --runtime runc --config cluster/reliaburger.toml
 ```
 
@@ -897,17 +899,17 @@ target/debug/relish --ca-cert cluster/identity/root-ca.crt apply cluster/app.tom
 target/debug/relish --ca-cert cluster/identity/root-ca.crt status
 ```
 
-Then keep a copy of the root CA that only you can open, sealed to a passphrase
-(or `--recipient` for your age key), and check it offline against the
-fingerprint `init` printed:
+`init` asked for a passphrase and sealed the root CA's private key into
+`--root-backup`, its only copy (`--passphrase-file` or `--recipient` for your
+age key, in a script). Check it offline against the fingerprint `init`
+printed, and keep it off the cluster:
 
 ```sh
-target/debug/relish ca backup --out prod-root-backup.age --dir cluster
-target/debug/relish ca verify prod-root-backup.age --fingerprint sha256:...
+target/debug/relish ca verify ~/prod-root-backup.age --fingerprint sha256:...
 ```
 
 The same file is what replaces an intermediate CA later:
-`relish ca rotate --role node --root-backup prod-root-backup.age` signs the
+`relish ca rotate --role node --root-backup ~/prod-root-backup.age` signs the
 cluster's new Node CA on your machine, and `--finalize` retires the old one
 once every node has moved (see the manual's security chapter).
 
@@ -945,6 +947,9 @@ does not commit or disclose a usable token.
 For the whole walkthrough on three Linux VMs or bare-metal servers you
 already run, from packages and firewall rules to systemd units, see
 [Running Reliaburger on your own Linux servers](linux-servers.md).
+To turn spare mini PCs or thin clients into appliance nodes over the network
+instead, with no distro to install, see
+[Bare metal: the appliance and netboot](manual/17_appliance.md).
 
 Keep `[cluster].name` identical on every node. `relish init`, `relish setup`
 and `relish dev create` write it for you; Bun validates it as a DNS-style SPIFFE trust domain.
@@ -1051,7 +1056,9 @@ size on any cluster: a `HEALTHY`, `DEGRADED` or `DOWN` verdict, then one line
 per part of the cluster from `GET /v1/cluster/summary` plus `relish wtf`'s
 checks (2 s budget, `--quick` skips them), each line that needs attention
 ending in the command to run next. It exits 0 when it got an answer;
-`--check` exits 1 on `DEGRADED` and 2 on `DOWN`. `-o json` prints the agent
+`--check` exits 1 on `DEGRADED` and 2 on `DOWN`. With no answer it exits
+3 when it couldn't reach or authenticate to the cluster, 4 when it was
+refused and 5 for anything else, in every output format. `-o json` prints the agent
 envelope. The lists live in `relish apps` (one row per app, problems first;
 `relish apps NAME` or `--instances` for instances) and `relish nodes`
 (version, usage and allocation per node); both filter with `--unhealthy`.
@@ -1820,7 +1827,7 @@ and jobs the cluster's policies would now refuse (`relish policy audit` lists
 the same). Use `--app <name>` for application scope or `--watch` for a
 human refresh every 30 seconds (`--interval <secs>` changes the period). JSON and YAML use schema version 1. Exit status 0 means
 all selected evidence was observed and healthy, 1 means a critical finding,
-and 2 means warnings or unknown evidence. Bounded in-memory restart and deploy
+and 3 means warnings or unknown evidence (2 is a usage error). Bounded in-memory restart and deploy
 history is deliberately reported as degraded, not silently accepted as a
 complete historical record.
 
@@ -1843,9 +1850,9 @@ that gossip reports dead is named rather than silently left out.
 (`--app`, `--severity`, `--limit`). `relish exec <app> <cmd>` runs a command
 once, without stdin or a terminal, and exits with its exit code. `relish
 resolve <name> --namespace <ns>` picks a service whose name exists in several
-namespaces. `-o json` works on every command except the six interactive
+namespaces. `-o json` works on every command except the eight interactive
 ones (`tui`, `dashboard`, `manual`, `source`, the guided `setup`, `dev
-shell`), which refuse it with exit 2; `setup --quickstart` and `setup --ssh`
+shell`, `machines claim`, `netboot`), which refuse it with exit 2; `setup --quickstart` and `setup --ssh`
 print what they built, for an agent to quote; `logs` and `batch watch` print one object per line,
 and a command that changes something reports what it did (manual chapter
 13). `relish fmt` keeps comments.

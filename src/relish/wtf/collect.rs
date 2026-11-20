@@ -16,12 +16,13 @@ use crate::relish::client::BunClient;
 use crate::relish::council_view::CouncilNodeObservation;
 
 use super::{
-    AlertObservation, ApplicationEvidence, BuildObservation, CertificateObservation,
-    ClusterEvidence, CouncilObservation, CpuThrottleObservation, DeployObservation,
-    DiskObservation, Evidence, FaultObservation, GitOpsObservation, IsolationObservation,
-    LaunchFailureObservation, LogObservation, NodeGitOpsDifference, NodeGitOpsUnreadable,
-    NodeIsolation, NodeObservation, RegistryObservation, ReplicaObservation, RestartObservation,
-    ServiceObservation, TokenObservation, WtfInputs,
+    AlertObservation, ApplicationEvidence, BackupObservation, BuildObservation,
+    CertificateObservation, ClusterEvidence, CouncilObservation, CpuThrottleObservation,
+    DeployObservation, DiskObservation, Evidence, ExportHoldObservation, FaultObservation,
+    GitOpsObservation, IsolationObservation, LaunchFailureObservation, LogObservation,
+    NodeGitOpsDifference, NodeGitOpsUnreadable, NodeIsolation, NodeObservation,
+    RegistryObservation, ReplicaObservation, RestartObservation, ServiceObservation,
+    TokenObservation, WtfInputs,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -49,6 +50,7 @@ struct NodeCollection {
 
 struct LocalEvidenceSet {
     disks: Evidence<Vec<DiskObservation>>,
+    export_holds: Evidence<Vec<ExportHoldObservation>>,
     cpu_throttling: Evidence<Vec<CpuThrottleObservation>>,
     certificates: Evidence<Vec<CertificateObservation>>,
 }
@@ -252,6 +254,12 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
         Evidence::available(collected_at, Default::default())
     };
     let recent_logs = collect_logs(client, app, &restarts, collected_at).await;
+    let backups = if cluster_enabled {
+        collect_backups(&endpoints, &collected, collected_at)
+    } else {
+        // A standalone node has no council to back up.
+        Evidence::available(collected_at, Vec::new())
+    };
 
     Ok(WtfInputs {
         cluster_name,
@@ -263,12 +271,14 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
             council,
             faults,
             disks: local.disks,
+            export_holds: local.export_holds,
             certificates: local.certificates,
             registry,
             tokens,
             isolation,
             gitops,
             policies,
+            backups,
         },
         applications: ApplicationEvidence {
             restarts,
@@ -437,6 +447,8 @@ fn collect_builds(
                 version: version.version.clone(),
                 commit: version.commit.clone(),
                 binary_sha256: version.binary_sha256.clone(),
+                os_version: version.os_version.clone(),
+                os_update: version.os_update.clone(),
             }),
             Err(error) => builder.unavailable(format!("node {}: {error}", node.node_id)),
         }
@@ -800,6 +812,7 @@ fn collect_alerts(
 
 fn collect_local_diagnostics(collected: &[NodeCollection], observed_at: u64) -> LocalEvidenceSet {
     let mut disks = EvidenceBuilder::default();
+    let mut export_holds = EvidenceBuilder::default();
     let mut cpu = EvidenceBuilder::default();
     let mut certificates = EvidenceBuilder::default();
     for node in collected {
@@ -808,6 +821,7 @@ fn collect_local_diagnostics(collected: &[NodeCollection], observed_at: u64) -> 
             Err(error) => {
                 let reason = format!("node {}: {error}", node.node_id);
                 disks.unavailable(reason.clone());
+                export_holds.unavailable(reason.clone());
                 cpu.unavailable(reason.clone());
                 certificates.unavailable(reason);
                 continue;
@@ -823,6 +837,18 @@ fn collect_local_diagnostics(collected: &[NodeCollection], observed_at: u64) -> 
                 used_percent: disk.used_percent,
             }
         });
+        export_holds
+            .values
+            .extend(
+                snapshot
+                    .export_holds
+                    .iter()
+                    .map(|hold| ExportHoldObservation {
+                        node_id: node.node_id.clone(),
+                        storage_domain: hold.storage_domain.clone(),
+                        failing_since: hold.failing_since,
+                    }),
+            );
         append_diagnostic_source(&snapshot.cpu_throttling, &node.node_id, &mut cpu, |item| {
             CpuThrottleObservation {
                 app: item.app.clone(),
@@ -849,6 +875,7 @@ fn collect_local_diagnostics(collected: &[NodeCollection], observed_at: u64) -> 
     coalesce_disk_filesystems(&mut disks.values);
     LocalEvidenceSet {
         disks: disks.finish(observed_at),
+        export_holds: export_holds.finish(observed_at),
         cpu_throttling: cpu.finish(observed_at),
         certificates: certificates.finish(observed_at),
     }
@@ -912,6 +939,42 @@ fn append_diagnostic_source<T, U, F>(
             builder.unsupported(format!("node {node_id}: {reason}"));
         }
     }
+}
+
+/// Each node's council backup loop, from its diagnostics (#2016). `endpoints`
+/// and `collected` are parallel: the endpoint says whether the node votes
+/// and leads.
+fn collect_backups(
+    endpoints: &[NodeEndpoint],
+    collected: &[NodeCollection],
+    observed_at: u64,
+) -> Evidence<Vec<BackupObservation>> {
+    let mut builder = EvidenceBuilder::default();
+    for (endpoint, node) in endpoints.iter().zip(collected) {
+        let snapshot = match &node.diagnostics {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                builder.unavailable(format!("node {}: {error}", node.node_id));
+                continue;
+            }
+        };
+        match &snapshot.backup {
+            DiagnosticSource::Available { value, .. }
+            | DiagnosticSource::Degraded { value, .. } => builder.values.push(BackupObservation {
+                node_id: node.node_id.clone(),
+                is_council: endpoint.status.is_council,
+                is_leader: endpoint.status.is_leader,
+                status: value.clone(),
+            }),
+            DiagnosticSource::Unavailable { reason } => {
+                builder.unavailable(format!("node {}: {reason}", node.node_id))
+            }
+            DiagnosticSource::Unsupported { reason } => {
+                builder.unsupported(format!("node {}: {reason}", node.node_id))
+            }
+        }
+    }
+    builder.finish(observed_at)
 }
 
 /// Token lifetimes from `GET /v1/token/list`. Only an unscoped Admin may
@@ -1350,6 +1413,13 @@ mod tests {
                 }],
                 reason: "workload inventory unavailable".to_string(),
             },
+            backup: DiagnosticSource::Unsupported {
+                reason: "fixture".to_string(),
+            },
+            export_holds: vec![crate::bun::diagnostics::ExportHoldEvidence {
+                storage_domain: "logs".to_string(),
+                failing_since: 7,
+            }],
         };
         let collected = vec![NodeCollection {
             node_id: "node-1".to_string(),
@@ -1366,6 +1436,14 @@ mod tests {
 
         let evidence = collect_local_diagnostics(&collected, 10);
 
+        assert_eq!(
+            evidence.export_holds.value().unwrap(),
+            &[ExportHoldObservation {
+                node_id: "node-1".to_string(),
+                storage_domain: "logs".to_string(),
+                failing_since: 7,
+            }]
+        );
         assert!(matches!(evidence.disks, Evidence::Degraded { .. }));
         assert_eq!(evidence.disks.value().unwrap().len(), 1);
         assert_eq!(evidence.disks.value().unwrap()[0].used_percent, 95.0);
@@ -1553,6 +1631,7 @@ mod tests {
                 "disks":{"state":"available","observed_at":10,"value":disks},
                 "cpu_throttling":{"state":"unsupported","reason":"fixture"},
                 "certificates":{"state":"unsupported","reason":"fixture"},
+                "backup":{"state":"unsupported","reason":"fixture"},
             });
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
@@ -1662,6 +1741,8 @@ mod tests {
             version: "v0.1.1".into(),
             commit: Some("3fcb1fd".into()),
             binary_sha256: Some("aaaa".into()),
+            os_version: None,
+            os_update: Default::default(),
             platform: None,
             compatibility: None,
         };

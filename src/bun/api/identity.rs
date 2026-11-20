@@ -3,7 +3,8 @@
 
 use super::*;
 
-/// JWKS endpoint — publishes the OIDC Ed25519 public key for JWT verification.
+/// JWKS endpoint: publishes the OIDC Ed25519 public keys for JWT
+/// verification, the active one and any a rotation is retiring (#709).
 pub(super) async fn identity_jwks_handler(State(state): State<ApiState>) -> Response {
     let Some(ref council) = state.council else {
         return (
@@ -14,15 +15,21 @@ pub(super) async fn identity_jwks_handler(State(state): State<ApiState>) -> Resp
     };
 
     let security_state = council.security_state().await;
-    let Some(ref oidc_config) = security_state.oidc_signing_config else {
-        return (
+    match crate::sesame::oidc::jwks_for_state(&security_state, unix_now_secs()) {
+        Some(jwks) => Json(jwks).into_response(),
+        None => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({ "error": "no OIDC signing config" })),
         )
-            .into_response();
-    };
+            .into_response(),
+    }
+}
 
-    Json(crate::sesame::oidc::jwks_response(oidc_config)).into_response()
+/// Seconds since the Unix epoch, zero for a clock before it.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
 }
 
 /// Attach an operator's detached image signature (from `relish sign`) to a
@@ -261,6 +268,7 @@ pub(super) async fn token_revoke_handler(
     match council
         .write(crate::council::RaftRequest::RevokeApiToken {
             name: req.name.clone(),
+            now_unix_ms: crate::sesame::token::unix_millis(std::time::SystemTime::now()),
         })
         .await
     {
@@ -619,8 +627,11 @@ pub(super) async fn token_create_handler(
 }
 
 /// How long a follower waits for the leader to answer a forwarded token or
-/// join-token write. Longer than the 5 s the apply path allows, because the
-/// leader may spend 3 s proving it leads before it even writes.
+/// join-token write. Longer than everything the leader may spend on it: 3 s
+/// proving it leads, up to 10 s for the council write
+/// ([`crate::council::node::WRITE_TIMEOUT`]) and 2 s waiting for its own
+/// replica ([`TOKEN_REPLICATION_WAIT`]), so a slow but healthy leader's
+/// answer, and the secret in it, gets through.
 ///
 /// It's only a backstop, because the write may have committed anyway and
 /// what that costs depends on the route, which is why each caller of
@@ -629,7 +640,7 @@ pub(super) async fn token_create_handler(
 /// - a create or a rotation loses the only copy of the new secret;
 /// - a revoke loses nothing: it's safe to repeat;
 /// - a join token leaves a hash nobody has the plaintext for, which expires.
-const LEADER_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(super) const LEADER_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// How long the answering node waits for its own replica to apply a write the
 /// leader committed. Replication takes a few heartbeats. The write has
@@ -640,7 +651,7 @@ const LEADER_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// - the old secret of a rotation without grace keeps working here;
 /// - a revoked token is out of the store, but a refresh from the lagging
 ///   replica can bring it back, so the answer says the node is behind.
-const TOKEN_REPLICATION_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+pub(super) const TOKEN_REPLICATION_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Forward a token or join-token write to the leader with the caller's own
 /// credential, so the leader repeats every check and forwarding grants
@@ -663,6 +674,19 @@ async fn forward_token_write(
         )
             .into_response(),
     }
+}
+
+/// Label a successful answer the leader gave to a forwarded join-token
+/// request as JSON. The proxy passes the leader's body through but not its
+/// headers, and a client reading the answer expects JSON.
+fn with_json_content_type(mut answer: Response) -> Response {
+    if answer.status() == StatusCode::OK {
+        answer.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+    }
+    answer
 }
 
 /// Take a committed revoke's token out of this node's auth store now, instead
@@ -962,6 +986,166 @@ pub(super) async fn token_rotate_handler(
     .into_response()
 }
 
+/// List the join tokens the council holds: their node id, expiry and
+/// whether they've been used, never the token.
+///
+/// The leader answers. A follower forwards the request with the caller's
+/// own credential, because its replica can lag and miss a token the leader
+/// just committed.
+pub(super) async fn join_token_list_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
+    {
+        return resp;
+    }
+    if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return response;
+    }
+    if let Err(response) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Admin,
+    )
+    .await
+    {
+        return response;
+    }
+    let Some(ref council) = state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no council available" })),
+        )
+            .into_response();
+    };
+    if let Some(council) = crate::bun::leadership::council_to_forward_to(&state).await {
+        let forward = crate::bun::batch::forward_get_to_leader(
+            &state,
+            council,
+            "/v1/join-token/list",
+            &headers,
+        );
+        return match tokio::time::timeout(LEADER_FORWARD_TIMEOUT, forward).await {
+            Ok(answer) => with_json_content_type(answer),
+            Err(_) => (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "error": "the leader didn't answer in time; listing again is safe"
+                })),
+            )
+                .into_response(),
+        };
+    }
+    let security = council.security_state().await;
+    Json(serde_json::json!({
+        "join_tokens": crate::sesame::join::summarise_join_tokens(&security),
+    }))
+    .into_response()
+}
+
+/// Revoke every unused join token for a node id: each is marked consumed
+/// through Raft, so none of them can enrol that node any more.
+///
+/// Only the leader writes, and only its state machine is sure to hold every
+/// token, so a follower forwards the request with the caller's own
+/// credential and the leader repeats every check, as for a create.
+pub(super) async fn join_token_revoke_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
+    {
+        return resp;
+    }
+    if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return response;
+    }
+    if let Err(response) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Admin,
+    )
+    .await
+    {
+        return response;
+    }
+    #[derive(serde::Deserialize)]
+    struct RevokeRequest {
+        node_id: String,
+    }
+    let req: RevokeRequest = match serde_json::from_str(&body) {
+        Ok(request) => request,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid JSON: {e}") })),
+            )
+                .into_response();
+        }
+    };
+    let Some(ref council) = state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no council available" })),
+        )
+            .into_response();
+    };
+    if let Some(council) = crate::bun::leadership::council_to_forward_to(&state).await {
+        let answer = forward_token_write(
+            &state,
+            council,
+            "/v1/join-token/revoke",
+            body,
+            &headers,
+            "the leader didn't answer in time, so the revoke may or may not have committed; \
+             revoking again is safe",
+        )
+        .await;
+        return with_json_content_type(answer);
+    }
+    let security = council.security_state().await;
+    let hashes = crate::sesame::join::join_tokens_to_revoke(&security, &req.node_id);
+    for token_hash in &hashes {
+        if let Err(e) = council
+            .write(crate::council::RaftRequest::ConsumeJoinToken {
+                token_hash: *token_hash,
+            })
+            .await
+        {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": format!("failed to revoke join tokens (try the cluster leader): {e}")
+                })),
+            )
+                .into_response();
+        }
+    }
+    record_caller_audit(
+        &state,
+        auth.as_deref(),
+        crate::bun::events::EventKind::Token,
+        "join_token.revoked",
+        std::collections::BTreeMap::from([
+            ("node_id".to_string(), req.node_id.clone()),
+            ("revoked".to_string(), hashes.len().to_string()),
+        ]),
+        format!(
+            "{} join token(s) revoked for node {}",
+            hashes.len(),
+            req.node_id
+        ),
+    )
+    .await;
+    Json(serde_json::json!({ "node_id": req.node_id, "revoked": hashes.len() })).into_response()
+}
+
 /// Create a short-lived, single-use node join token and persist its hash.
 ///
 /// This is deliberately separate from API bearer-token management. The
@@ -1007,6 +1191,10 @@ pub(super) async fn join_token_create_handler(
         /// exactly one node id so it cannot be replayed to impersonate another.
         #[serde(default)]
         node_id: String,
+        /// A token for a seed (`relish image seed`): it may wait on a USB
+        /// stick for days, so it may last up to a week (G6).
+        #[serde(default)]
+        seed: bool,
     }
 
     let req: CreateRequest = match serde_json::from_str(&body) {
@@ -1029,7 +1217,7 @@ pub(super) async fn join_token_create_handler(
     };
 
     if let Some(council) = crate::bun::leadership::council_to_forward_to(&state).await {
-        let mut answer = forward_token_write(
+        let answer = forward_token_write(
             &state,
             council,
             "/v1/join-token/create",
@@ -1039,17 +1227,16 @@ pub(super) async fn join_token_create_handler(
              secret is lost, so nobody can use it and it expires by itself: create another",
         )
         .await;
-        if answer.status() == StatusCode::OK {
-            answer.headers_mut().insert(
-                axum::http::header::CONTENT_TYPE,
-                axum::http::HeaderValue::from_static("application/json"),
-            );
-        }
-        return answer;
+        return with_json_content_type(answer);
     }
 
     let ttl = std::time::Duration::from_secs(req.ttl_seconds);
-    let (plaintext, join_token) = match crate::sesame::join::create_join_token(ttl, &req.node_id) {
+    let created = if req.seed {
+        crate::sesame::join::create_seed_join_token(ttl, &req.node_id)
+    } else {
+        crate::sesame::join::create_join_token(ttl, &req.node_id)
+    };
+    let (plaintext, join_token) = match created {
         Ok(created) => created,
         Err(crate::sesame::join::JoinError::EmptyNodeId) => {
             return (
@@ -1065,7 +1252,12 @@ pub(super) async fn join_token_create_handler(
                     "error": format!(
                         "ttl_seconds must be between {} and {}",
                         crate::sesame::join::MIN_JOIN_TOKEN_TTL.as_secs(),
-                        crate::sesame::join::MAX_JOIN_TOKEN_TTL.as_secs(),
+                        if req.seed {
+                            crate::sesame::join::MAX_SEED_JOIN_TOKEN_TTL
+                        } else {
+                            crate::sesame::join::MAX_JOIN_TOKEN_TTL
+                        }
+                        .as_secs(),
                     )
                 })),
             )
@@ -1121,6 +1313,71 @@ pub(super) async fn join_token_create_handler(
             })),
         )
             .into_response(),
+    }
+}
+
+/// `POST /v1/perimeter/admit {"address", "minutes"}`: open a join window
+/// (G2), letting one address through this node's perimeter firewall for up
+/// to an hour so a machine being claimed can enrol. Enrolment still needs
+/// its join token; this only lets the packets in.
+pub(super) async fn perimeter_admit_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    body: String,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
+    {
+        return resp;
+    }
+    if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return response;
+    }
+    if let Err(response) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Admin,
+    )
+    .await
+    {
+        return response;
+    }
+    #[derive(serde::Deserialize)]
+    struct AdmitRequest {
+        address: std::net::IpAddr,
+        minutes: u64,
+    }
+    let request: AdmitRequest = match serde_json::from_str(&body) {
+        Ok(request) => request,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("invalid JSON: {e}") })),
+            )
+                .into_response();
+        }
+    };
+    let duration = std::time::Duration::from_secs(request.minutes.saturating_mul(60));
+    if duration.is_zero() || duration > crate::firewall::rules::JoinWindows::MAX {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "minutes must be between 1 and 60" })),
+        )
+            .into_response();
+    }
+    match ask_agent(&state.cmd_tx, |response| AgentCommand::OpenJoinWindow {
+        address: request.address,
+        duration,
+        response,
+    })
+    .await
+    {
+        Ok(()) => Json(serde_json::json!({
+            "address": request.address,
+            "minutes": request.minutes,
+        }))
+        .into_response(),
+        Err(response) => response,
     }
 }
 

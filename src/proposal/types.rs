@@ -364,11 +364,9 @@ impl std::fmt::Display for FailedReason {
             FailedReason::Stale { app, .. } => {
                 write!(f, "{app} changed after the proposal was made")
             }
-            FailedReason::Lease { lease } => write!(
-                f,
-                "{} is held by {} ({})",
-                lease.target, lease.holder.name, lease.purpose
-            ),
+            FailedReason::Lease { lease } => {
+                write!(f, "{} is held by {}", lease.target, lease.holder.name)
+            }
             FailedReason::Guardrail { rule, message } => write!(f, "{rule}: {message}"),
             FailedReason::BlastRadiusGrew { what } => write!(f, "{what}"),
             FailedReason::Fault { reason } => write!(f, "{reason}"),
@@ -612,7 +610,8 @@ pub enum ProposalRefusal {
     #[error("proposal {proposal} is already pending on {app}; withdraw it, or wait for it")]
     Conflict { app: String, proposal: ProposalId },
     /// Someone else holds a lease on a touched app.
-    #[error("{} is held by {} ({})", lease.target, lease.holder.name, lease.purpose)]
+    // No purpose: it's the holder's own words (see `LeaseRefusal::Held`).
+    #[error("{} is held by {}", lease.target, lease.holder.name)]
     LeaseHeld { lease: Box<AgentLease> },
     /// An app moved since the proposal (or its undo) saw it.
     #[error("{app} changed {what}")]

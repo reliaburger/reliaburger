@@ -29,7 +29,7 @@ Relish is a pure client-side binary. It doesn't run any server processes, doesn'
 
 Every Relish command that interacts with the cluster communicates through the Reliaburger cluster API, exposed on port 9117 (mTLS) on every node. The API follows the request routing described in the whitepaper:
 
-- **Read-only requests** (status, apps, nodes, inspect, logs, top, resolve, routes, history, wtf) are served by any council member from its local Raft state replica. The receiving node forwards to the nearest council member if it isn't one itself.
+- **Read-only requests** (status, apps, nodes, inspect, logs, top, resolve, routes, history, wtf) have no nearest-council-member routing. Some answer from the receiving node's own replica of council state, which can lag the leader; others are forwarded to the confirmed leader.
 - **Write requests** (apply, deploy, rollback, secret encrypt, snapshot create, fault inject) are forwarded to the leader, which commits via Raft before responding.
 
 Relish can target any node in the cluster. It doesn't need to know which node is the leader.
@@ -68,7 +68,7 @@ The `relish routes` command queries the Wrapper ingress proxy for the current ro
 
 ### Sesame (security)
 
-`relish init`, `relish join`, `relish join-token`, `relish token`, `relish secret` and `relish sign` drive the Sesame security subsystem (PKI, identities, tokens, secret encryption, image signing). `relish ca` backs up the root CA (`relish ca backup`), checks a backup offline (`relish ca verify`) and rotates an intermediate (`relish ca rotate`). CA status and revocation are planned (#362). There is no workload-identity command: `relish identity` *(planned)*.
+`relish init`, `relish join`, `relish join-token`, `relish token`, `relish secret` and `relish sign` drive the Sesame security subsystem (PKI, identities, tokens, secret encryption, image signing). `relish ca` re-seals the root CA backup `relish init` wrote (`relish ca backup`), checks a backup offline (`relish ca verify`) and rotates an intermediate (`relish ca rotate`). CA status and revocation are planned (#362). `relish identity rotate-signing-key` replaces the key that signs workload JWTs, keeping the old one verifying until its tokens expire (#709).
 
 ---
 
@@ -167,10 +167,10 @@ The API client is a thin wrapper around `reqwest` configured with:
 
 - **HTTP or HTTPS** to the Bun agent. With `--ca-cert` (or `RELIABURGER_CA_CERT`) the client trusts the cluster root CA and uses HTTPS; otherwise it talks plaintext HTTP to the local agent. There is no client-certificate file on disk.
 - **Token authentication** via a `Bearer <token>` header from `--token` or `RELIABURGER_TOKEN`.
-- **Fixed local endpoint** by default (`http[s]://127.0.0.1:9117`), overridable with `--endpoint` / `RELIABURGER_ENDPOINT`. There is no automatic multi-node endpoint discovery.
-- **WebSocket upgrade** for streaming endpoints (logs, exec).
-- **Retry with backoff** for transient failures (connection refused, 503). Maximum 3 retries with 1s/2s/4s backoff.
-- **Request timeout:** 30s default, configurable per-command. Streaming connections have no timeout.
+- **Endpoint:** `--endpoint` / `RELIABURGER_ENDPOINT` first, then the laptop cluster's saved context, then `http://127.0.0.1:9117` (manual 13). There is no automatic multi-node endpoint discovery.
+- **Plain HTTP for streams:** `relish logs -f` reads a streamed HTTP response, and `exec` is a plain `POST /v1/exec/{app}/{namespace}`.
+- **No automatic retries** on ordinary requests. A few calls retry a specific answer themselves (a fault clear retries a 504 within a budget, for example), and write calls that take an `Idempotency-Key` are safe for the caller to repeat.
+- **Request timeout:** 300 s for a request that answers in one go, and for the wait until a streaming response starts. Once it streams (`relish logs -f`, the apply and rollback progress streams), a response ends after 60 s of silence, and the agent sends an SSE keep-alive comment every 15 s. A deploy's progress stream also stops after 30 minutes, with an error saying the deploy may still be running.
 
 ### Output Formatting
 
@@ -626,7 +626,7 @@ relish --help                       # Print help and exit
 # Core operations
 relish status                       # The whole cluster on one screen: a verdict, then one line per part
 relish status --quick               # The same without wtf's checks (otherwise run with a 2 s budget)
-relish status --check               # Exit 1 on DEGRADED, 2 on DOWN
+relish status --check               # Exit 1 on DEGRADED, 2 on DOWN; no answer: 3, 4 or 5
 relish apps                         # One row per app (state, ready, restarts, nodes, age), problems first
 relish apps <app>                   # That app's instances (node, state, PID, restarts, age) and why any isn't running
 relish apps --instances             # Every instance of every app
@@ -680,7 +680,7 @@ relish exec <app> <cmd...>          # Run a command once inside a running instan
 relish exec <app> --namespace <ns> <cmd...>  # Scope to a namespace
 
 # Cluster lifecycle
-relish init [dir] --cluster-name <name> --node-id <id> # Generate config + PKI
+relish init [dir] --cluster-name <name> --node-id <id> --root-backup <file> [--passphrase-file <path> | --recipient <age1...>] # Generate config + PKI; the root key goes only into the backup
 relish init [dir] --development-plaintext              # Local-only plaintext transports (explicit opt-in; no cluster registry)
 relish nodes                        # Gossip state, council seat, version, usage and allocation, problems first
 relish nodes --unhealthy            # Only nodes not alive, cordoned, under disk pressure or not answering
@@ -700,7 +700,7 @@ relish secret pubkey --namespace <ns>               # A namespace's own key (sec
 relish secret rotate [--finalize] --namespace <ns>  # Rotate one namespace's key (unscoped Admin)
 
 # Root CA backup (offline) and intermediate rotation
-relish ca backup --out <file> [--dir <init-dir>] [--cluster-name <name>] [--recipient <age1...> | --passphrase-file <path>]
+relish ca backup --from <backup> --out <file> [--passphrase-file <path> | --identity <file>] [--recipient <age1...> | --new-passphrase-file <path>]
 relish ca verify <file> --fingerprint sha256:... [--passphrase-file <path> | --identity <path>]
 relish ca rotate --role <node|workload|ingress> --root-backup <file> [--passphrase-file <path> | --identity <path>]
 relish ca rotate --role <node|workload|ingress> --finalize   # Retire the old CA once nothing depends on it
@@ -919,7 +919,12 @@ ends in `; partial (2 of 3 nodes)`, one that couldn't be read says
 `not visible to a scoped token`.
 
 It exits 0 whenever it got an answer. `--check` exits 1 on `DEGRADED` and 2
-on `DOWN`. `-o json` prints the agent envelope (`relish.agent/v1`, command
+on `DOWN`. With no answer, with `--check` or without it and in every output
+format, it exits with the agent envelope's code: 3 when it couldn't reach or
+authenticate to the cluster (refused connection, DNS, TLS, timeout, 401), 4
+when it was refused (403), 5 for anything else (a 500, an answer it couldn't
+parse). Human output says why on stderr; `-o json` and `-o yaml` print a
+failed envelope (#2013). `-o json` prints the agent envelope (`relish.agent/v1`, command
 `status`): `data.verdict`, `data.problems`, `data.lines`, `data.wtf` and
 `data.summary` (the summary endpoint's answer), with `next` steps.
 
@@ -1227,7 +1232,10 @@ The authenticated `GET /v1/diagnostics` endpoint supplies local evidence that
 doesn't belong in the general metrics summary. It samples cgroup v2
 `throttled_usec` twice over a bounded 1–10 second window, attributes configured
 data, image, log, metric and volume paths to their containing filesystems, and
-returns public X.509 identity, issuer, serial and expiry metadata. Host paths,
+returns public X.509 identity, issuer, serial and expiry metadata, and the
+node's council backup loop state (`backup`: `not_configured`, `disabled` with a
+reason, or `running` with the interval, start, last success and last failure;
+#2016). Host paths,
 certificate bodies and key material never cross the API. A partial inventory
 uses `degraded`, carrying both the safe facts and the reason they can't support
 an OK verdict. Node leaves currently require a Bun restart to reload, so
@@ -1274,7 +1282,7 @@ command ends (D34). `POST /v1/exec/{app}/{namespace}` answers `200` with
 `{"output", "exit_code"}` whatever the code, and relish exits with that code.
 Only failing to run the command is an HTTP error: `404` when no instance is
 running, `504` when it outlives the five-minute limit, `500` otherwise.
-Interactive, streaming exec is #710 (0.4.0).
+Interactive, streaming exec is #710 (0.4.1).
 
 The `--debug`, `--privileged` and `--node` variants are **Status: planned — not
 yet implemented.** `exec` runs a command in the app's own container only; there
@@ -1379,12 +1387,15 @@ Navigation:
 
 #### Cluster Lifecycle Commands
 
-**`relish init [dir] --cluster-name <name> --node-id <id>`**
+**`relish init [dir] --cluster-name <name> --node-id <id> --root-backup <file>`**
 
-Creates the output directory and writes `reliaburger.toml`, a sample
-`app.toml`, the CA hierarchy, sealed root backup, master key, initial security
-state and the first node's identity. It prints the one-use join token and root
-CA fingerprint. It does **not** start Bun. The operator starts the first node
+Writes the root CA backup to `--root-backup` first, sealed to a passphrase
+(asked twice at a terminal, or `--passphrase-file`) or to `--recipient`, and
+checks it; that's the root key's only copy (#709). Without a terminal it
+refuses unless both are given, and it never picks a default file. Then it
+creates the output directory and writes `reliaburger.toml`, a sample
+`app.toml`, the master key, initial security state and the first node's
+identity. It prints the root CA fingerprint. It does **not** start Bun. The operator starts the first node
 explicitly with `bun --cluster --config <dir>/reliaburger.toml`; the generated
 config requires mTLS unless `--development-plaintext` was explicitly used.
 `require_mtls` also defaults to `true` when a config omits it, so a hand-written
@@ -1819,7 +1830,7 @@ These events are visible in `relish history` and in the TUI/web events view. Sec
 
 Target: under 50ms from invocation to first API request.
 
-Relish is a single Rust binary. Linux release builds link glibc (`*-linux-gnu`); static musl builds are planned with 0.3.0 (#401). Startup consists of: argument parsing (clap, <1ms), config file loading (TOML parse, <2ms), API client construction (TLS context, <10ms), and the first HTTP request.
+Relish is a single Rust binary. Linux release builds link glibc (`*-linux-gnu`); static musl builds are planned ([#1774](https://github.com/reliaburger/reliaburger/issues/1774)). Startup consists of: argument parsing (clap, <1ms), config file loading (TOML parse, <2ms), API client construction (TLS context, <10ms), and the first HTTP request.
 
 For commands that don't contact the cluster (`compile`, `lint`, `fmt`, `diff`, `--version`), total execution time is typically under 20ms.
 
@@ -2048,7 +2059,7 @@ Relish is implemented in Rust. The following crates are used:
 | `rustls` | 0.23.x | TLS implementation (used by reqwest) for mTLS client certs |
 | `insta` | 1.x | Snapshot testing for TUI rendering (dev dependency) |
 
-Release builds pin every dependency in `Cargo.lock`. Linux builds link glibc dynamically; a static musl build is planned with 0.3.0 (#401).
+Release builds pin every dependency in `Cargo.lock`. Linux builds link glibc dynamically; a static musl build is planned ([#1774](https://github.com/reliaburger/reliaburger/issues/1774)).
 
 ---
 

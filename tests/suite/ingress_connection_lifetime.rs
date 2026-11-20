@@ -6,7 +6,7 @@ use std::time::Duration;
 use reliaburger::config::app::IngressSpec;
 use reliaburger::onion::{service_id::ServiceId, service_map::ServiceMap, types::BackendInstance};
 use reliaburger::wrapper::{
-    proxy::bind_proxy_with_tls, routing::RoutingTable, tls, types::WrapperConfig,
+    proxy::bind_proxy_with_tls, routing::RoutingTable, types::WrapperConfig,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
@@ -63,18 +63,27 @@ async fn upgraded_ingress_connection_retires_and_a_new_connection_still_works() 
             )]),
         )
         .unwrap();
-    let (certificate, key) = tls::generate_self_signed_cert().unwrap();
-    let config = tls::build_tls_config(vec![certificate.clone()], key).unwrap();
+    // The listener serves a host with no `cluster` route the node's operator
+    // pair (#2011), so the client can pin that certificate.
+    let generated = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let certificate = generated.cert.der().clone();
+    let pem = tempfile::tempdir().unwrap();
+    let cert_path = pem.path().join("cert.pem");
+    let key_path = pem.path().join("key.pem");
+    std::fs::write(&cert_path, generated.cert.pem()).unwrap();
+    std::fs::write(&key_path, generated.signing_key.serialize_pem()).unwrap();
     let shutdown = CancellationToken::new();
     let proxy = bind_proxy_with_tls(
         WrapperConfig {
             http_port: 0,
             https_port: 0,
+            tls_cert_path: Some(cert_path),
+            tls_key_path: Some(key_path),
             ..Default::default()
         },
         Arc::new(tokio::sync::RwLock::new(routes)),
         None,
-        Some(config.cert_resolver.clone()),
+        None,
         None,
         shutdown.clone(),
     )

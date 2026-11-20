@@ -178,6 +178,74 @@ fn every_tour_command_parses_with_the_real_cli() {
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
 
+/// The text of every `<code data-netboot>` element: the netboot section's
+/// commands, with any leading `sudo` dropped.
+fn netboot_commands() -> Vec<String> {
+    let page = read("docs/website/index.html");
+    let mut commands = Vec::new();
+    let mut rest = page.as_str();
+    while let Some(start) = rest.find("<code data-netboot>") {
+        rest = &rest[start + "<code data-netboot>".len()..];
+        let end = rest.find("</code>").expect("unterminated netboot command");
+        let command = decode(&strip_tags(&rest[..end]));
+        commands.push(
+            command
+                .strip_prefix("sudo ")
+                .unwrap_or(&command)
+                .to_string(),
+        );
+        rest = &rest[end..];
+    }
+    commands
+}
+
+#[test]
+fn every_netboot_command_parses_with_the_real_cli() {
+    let commands = netboot_commands();
+    assert!(
+        commands.len() >= 5,
+        "found only {commands:?}; did the markup change?"
+    );
+    let failures: Vec<String> = commands
+        .iter()
+        .filter_map(|command| {
+            parses(command)
+                .err()
+                .map(|error| format!("{command}\n{error}"))
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// The netboot recording is on show, like the tour's, its file is on the
+/// site, and only the commands fold.
+#[test]
+fn the_netboot_recording_is_always_visible_and_only_its_commands_fold() {
+    let page = read("docs/website/index.html");
+    let figure = page
+        .find("id=\"netboot-recording\"")
+        .expect("no netboot recording");
+    assert!(
+        !details_ranges(&page)
+            .iter()
+            .any(|range| range.contains(&figure)),
+        "the netboot recording sits inside a <details>"
+    );
+    let fold = page
+        .find("id=\"netboot-commands\"")
+        .expect("no netboot commands");
+    assert!(
+        fold > figure,
+        "the netboot commands come after the recording"
+    );
+    assert!(
+        repository()
+            .join("docs/website/assets/netboot.cast")
+            .is_file(),
+        "docs/website/assets/netboot.cast is missing"
+    );
+}
+
 #[test]
 fn homepage_and_manual_show_the_same_tour() {
     let homepage = homepage_commands();
@@ -660,6 +728,7 @@ fn every_section_can_be_linked_to() {
         "why",
         "install",
         "tour",
+        "netboot",
         "debug",
         "act",
         "start",
@@ -684,10 +753,10 @@ fn every_section_can_be_linked_to() {
     );
 }
 
-/// The page sets expectations before anyone installs, and the date it gives
-/// for 1.0.0 is the one the roadmap gives.
+/// The page sets expectations before anyone installs, and, like the roadmap,
+/// gives 1.0.0 no date.
 #[test]
-fn the_status_box_says_who_it_is_for_and_when_1_0_0_is_due() {
+fn the_status_box_says_who_it_is_for_and_that_1_0_0_has_no_date() {
     let page = read("docs/website/index.html");
     let start = page
         .find("<aside class=\"status status-note\"")
@@ -699,8 +768,11 @@ fn the_status_box_says_who_it_is_for_and_when_1_0_0_is_due() {
     for phrase in ["home labs", "dev clusters", "production until 1.0.0"] {
         assert!(text.contains(phrase), "the status box lacks {phrase:?}");
     }
-    assert!(text.contains("January 2027"));
-    assert!(read("docs/roadmap.md").contains("January 2027"));
+    // Releases go out when they're ready, with no target dates before 1.0
+    // (maintainer decision, 6 November 2026).
+    assert!(text.contains("1.0.0, which has no date yet"));
+    assert!(read("docs/roadmap.md").contains("no target dates before 1.0.0"));
+    assert!(!page.contains("January 2027"));
 }
 
 /// The day run is the page's headline claim, so its memory chart stays beside
@@ -1952,6 +2024,72 @@ fn the_install_section_offers_homebrew_after_the_one_line_install() {
     assert!(brew < quickstart, "install the CLI, then build the cluster");
     let style = read("docs/website/style.css");
     assert!(style.contains("#install-homebrew:checked ~ .install-panel-homebrew"));
+}
+
+/// A fourth tab installs on real machines (#407): the four appliance
+/// commands, each parsed by the netboot test, the warning that the installer
+/// erases a disk, and links down to the netboot section and to the manual's
+/// appliance chapter. It comes after the other three, and says which release
+/// adds it.
+#[test]
+fn the_install_section_offers_real_hardware_last() {
+    let page = read("docs/website/index.html");
+    let section = &page[page.find("<section id=\"install\"").unwrap()..];
+    let section = &section[..section.find("</section>").unwrap()];
+    let homebrew = section.find(">Homebrew</label>").unwrap();
+    let hardware = section
+        .find(">Real hardware</label>")
+        .expect("no Real hardware tab");
+    assert!(homebrew < hardware, "real hardware is the last tab");
+    let panel = &section[section.find("install-panel-hardware").unwrap()..];
+    let commands = marked_commands(panel, "data-netboot");
+    for expected in [
+        "relish image download",
+        "sudo relish netboot",
+        "relish machines",
+        "relish machines claim",
+    ] {
+        assert!(
+            commands.iter().any(|command| command.starts_with(expected)),
+            "the panel lacks `{expected}`: {commands:?}"
+        );
+    }
+    let text = decode(&strip_tags(panel));
+    for needed in [
+        "erases the largest built-in disk",
+        "2 GiB",
+        "8 GB",
+        &unreleased_label(),
+    ] {
+        assert!(text.contains(needed), "the panel doesn't say {needed:?}");
+    }
+    assert!(panel.contains("href=\"#netboot\""));
+    assert!(panel.contains("docs/manual/17_appliance.md"));
+    let style = read("docs/website/style.css");
+    assert!(style.contains("#install-hardware:checked ~ .install-panel-hardware"));
+}
+
+/// The netboot section says what hardware works: the machine it's tested on,
+/// the network cards the installer drives, that Secure Boot must be off, and
+/// that Raspberry Pis aren't supported yet (#1971).
+#[test]
+fn the_netboot_section_says_what_hardware_works() {
+    let page = read("docs/website/index.html");
+    let section = &page[page.find("<section id=\"netboot\"").unwrap()..];
+    let section = &section[..section.find("</section>").unwrap()];
+    let text = decode(&strip_tags(section));
+    for needed in [
+        "Dell Wyse 3040",
+        "RTL8111",
+        "I219",
+        "tg3",
+        "USB Ethernet",
+        "Secure Boot",
+        "Raspberry Pi",
+    ] {
+        assert!(text.contains(needed), "the section doesn't say {needed:?}");
+    }
+    assert!(section.contains("https://github.com/reliaburger/reliaburger/issues/1971"));
 }
 
 // --- Built for humans and their agents (#1578) -----------------------------

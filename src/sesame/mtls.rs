@@ -340,7 +340,7 @@ impl PinnedChainServerVerifier {
 }
 
 /// Extract the node id from a leaf certificate's node-id URI SAN, if present.
-fn node_id_from_leaf(der: &CertificateDer<'_>) -> Option<String> {
+pub(crate) fn node_id_from_leaf(der: &CertificateDer<'_>) -> Option<String> {
     use x509_parser::prelude::*;
     let (_, cert) = X509Certificate::from_der(der).ok()?;
     let san = cert.subject_alternative_name().ok().flatten()?;
@@ -762,6 +762,8 @@ pub mod gossip_hmac {
 
         let mut key_bytes = [0u8; 32];
         let info = [b"gossip-hmac" as &[u8]];
+        // HKDF-SHA256 expands to at most 255 * 32 bytes, and `fill` gets the
+        // 32 that `HkdfLen` declares, so neither call can fail.
         let okm = prk.expand(&info, HkdfLen).expect("HKDF expand");
         okm.fill(&mut key_bytes).expect("HKDF fill");
 

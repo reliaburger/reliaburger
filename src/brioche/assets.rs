@@ -4,7 +4,7 @@
 //! and compiled into the binary at build time. No filesystem
 //! dependency at runtime.
 
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use rust_embed::Embed;
 
@@ -22,10 +22,14 @@ pub async fn static_asset_handler(
         Some(content) => {
             let mime = mime_guess::from_path(&path).first_or_octet_stream();
             let mut headers = HeaderMap::new();
-            headers.insert(header::CONTENT_TYPE, mime.as_ref().parse().unwrap());
+            // A MIME type is ASCII, so this only falls back if mime_guess
+            // ever returned something that isn't.
+            let content_type = HeaderValue::from_str(mime.as_ref())
+                .unwrap_or(HeaderValue::from_static("application/octet-stream"));
+            headers.insert(header::CONTENT_TYPE, content_type);
             headers.insert(
                 header::CACHE_CONTROL,
-                "public, max-age=86400".parse().unwrap(),
+                HeaderValue::from_static("public, max-age=86400"),
             );
             (StatusCode::OK, headers, content.data.to_vec()).into_response()
         }

@@ -180,13 +180,60 @@ impl PathRoute {
     }
 }
 
+/// The certificate mode of every routed host, readable without the routing
+/// table's lock (#2011).
+///
+/// The TLS resolver runs inside rustls's synchronous handshake callback, so it
+/// can't `.await` the table's tokio lock, and `try_read` fails whenever a
+/// writer holds or waits for it (tokio's lock is fair). The table publishes a
+/// fresh snapshot here at the end of every rebuild or replacement, and the
+/// resolver reads the last one, so a handshake never sees "unknown" mid-rebuild.
+pub struct CertificateModes {
+    // A std lock is fine: it's held only to clone or swap the `Arc`, never
+    // across an `.await`, and the synchronous rustls callback can't use tokio's.
+    current: std::sync::RwLock<Arc<HashMap<String, TlsMode>>>,
+}
+
+impl std::fmt::Debug for CertificateModes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CertificateModes").finish_non_exhaustive()
+    }
+}
+
+impl CertificateModes {
+    fn new() -> Self {
+        Self {
+            current: std::sync::RwLock::new(Arc::new(HashMap::new())),
+        }
+    }
+
+    /// The mode that chooses `host`'s certificate in the last published
+    /// table, or `None` when it had no route. See
+    /// [`RoutingTable::certificate_mode`].
+    pub fn get(&self, host: &str) -> Option<TlsMode> {
+        // A poisoned lock means a writer panicked mid-swap of one `Arc`; the
+        // value itself is intact.
+        let current = Arc::clone(&self.current.read().unwrap_or_else(|p| p.into_inner()));
+        current.get(&normalise_host(host)).copied()
+    }
+
+    fn publish(&self, modes: HashMap<String, TlsMode>) {
+        *self.current.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(modes);
+    }
+}
+
 /// The routing table: hostname → sorted list of path routes.
 ///
 /// Path routes are sorted by path length descending (longest prefix
 /// match). The table is behind `Arc<RwLock<RoutingTable>>` — reads
 /// are fast, writes happen only on deploy/health events.
+///
+/// Swap a whole new table in with [`replace`](Self::replace), not `*table =
+/// new`: `replace` keeps this table's [`CertificateModes`], which the TLS
+/// resolver already holds, and publishes the new modes to it.
 pub struct RoutingTable {
     routes: HashMap<String, Vec<PathRoute>>,
+    certificate_modes: Arc<CertificateModes>,
 }
 
 impl RoutingTable {
@@ -194,7 +241,30 @@ impl RoutingTable {
     pub fn new() -> Self {
         Self {
             routes: HashMap::new(),
+            certificate_modes: Arc::new(CertificateModes::new()),
         }
+    }
+
+    /// The lock-free view of each host's certificate mode, kept current by
+    /// [`rebuild`](Self::rebuild) and [`replace`](Self::replace).
+    pub fn certificate_modes(&self) -> Arc<CertificateModes> {
+        Arc::clone(&self.certificate_modes)
+    }
+
+    /// Take `other`'s routes, keeping this table's [`CertificateModes`] and
+    /// publishing the new modes to it.
+    pub fn replace(&mut self, other: RoutingTable) {
+        self.routes = other.routes;
+        self.publish_certificate_modes();
+    }
+
+    fn publish_certificate_modes(&self) {
+        let modes = self
+            .routes
+            .iter()
+            .map(|(host, routes)| (host.clone(), mode_for(routes)))
+            .collect();
+        self.certificate_modes.publish(modes);
     }
 
     /// Rebuild the routing table from the ServiceMap and app ingress configs.
@@ -216,6 +286,7 @@ impl RoutingTable {
     ) -> Result<(), RoutingError> {
         let previous = RoutingTable {
             routes: std::mem::take(&mut self.routes),
+            certificate_modes: Arc::new(CertificateModes::new()),
         };
         let mut rejected = Vec::new();
 
@@ -256,6 +327,7 @@ impl RoutingTable {
                     .then_with(|| a.app_name.cmp(&b.app_name))
             });
         }
+        self.publish_certificate_modes();
 
         if rejected.is_empty() {
             Ok(())
@@ -308,6 +380,19 @@ impl RoutingTable {
     /// grow the certificate cache.
     pub fn contains_host(&self, host: &str) -> bool {
         self.routes.contains_key(&normalise_host(host))
+    }
+
+    /// The TLS mode that chooses the certificate for `host`, or `None` when
+    /// `host` has no route.
+    ///
+    /// A TLS client names a host, not a path, so every route on one host
+    /// shares one certificate. When the routes on a host disagree,
+    /// `explicit` beats `cluster` (the operator chose that certificate for
+    /// this name on purpose), and either beats a plain-HTTP route.
+    pub fn certificate_mode(&self, host: &str) -> Option<TlsMode> {
+        self.routes
+            .get(&normalise_host(host))
+            .map(|routes| mode_for(routes))
     }
 
     /// Total number of routes across all hosts.
@@ -501,6 +586,19 @@ fn build_path_route(
 ///
 /// Config validation calls this so `relish apply` and `relish lint` refuse a
 /// route every node would skip. Returns the reason the route is invalid.
+/// The certificate mode for one host's routes: `explicit` beats `cluster`,
+/// and either beats plain HTTP.
+fn mode_for(routes: &[PathRoute]) -> TlsMode {
+    let modes = || routes.iter().map(|route| route.tls_mode);
+    if modes().any(|mode| mode == TlsMode::Explicit) {
+        TlsMode::Explicit
+    } else if modes().any(|mode| mode == TlsMode::Cluster) {
+        TlsMode::Cluster
+    } else {
+        TlsMode::Disabled
+    }
+}
+
 pub fn validate_ingress(ingress: &IngressSpec) -> Result<(), String> {
     TlsMode::parse(ingress.tls.as_deref()).map_err(|e| e.to_string())?;
     build_rate_limit(ingress.rate_limit_rps, ingress.rate_limit_burst)?;
@@ -1310,6 +1408,74 @@ mod tests {
         assert!(route.tls_mode.requires_tls());
     }
 
+    /// #2011: SNI names a host, so one host's routes share a certificate.
+    /// An `explicit` route on the host wins over `cluster`, and either wins
+    /// over a plain-HTTP route.
+    #[test]
+    fn certificate_mode_is_chosen_per_host() {
+        let mut map = ServiceMap::new();
+        let mut configs = HashMap::new();
+        for (app, host, path, tls) in [
+            ("plain", "plain.com", "/", None),
+            ("cluster-root", "mixed.com", "/", Some("cluster")),
+            ("explicit-api", "mixed.com", "/api", Some("explicit")),
+            ("cluster-only", "cluster.com", "/", Some("cluster")),
+            ("cluster-api", "partly.com", "/api", Some("cluster")),
+            ("plain-root", "partly.com", "/", None),
+        ] {
+            map.register_app(app, "default", 8080, None).unwrap();
+            configs.insert(
+                ns_key("default", app),
+                IngressSpec {
+                    tls: tls.map(str::to_string),
+                    ..spec_with_path(host, path)
+                },
+            );
+        }
+        let mut table = RoutingTable::new();
+        table.rebuild(&map, &configs).unwrap();
+
+        assert_eq!(table.certificate_mode("plain.com"), Some(TlsMode::Disabled));
+        assert_eq!(table.certificate_mode("mixed.com"), Some(TlsMode::Explicit));
+        assert_eq!(
+            table.certificate_mode("Cluster.COM:443"),
+            Some(TlsMode::Cluster)
+        );
+        assert_eq!(table.certificate_mode("partly.com"), Some(TlsMode::Cluster));
+        assert_eq!(table.certificate_mode("unknown.com"), None);
+    }
+
+    /// The TLS resolver keeps the handle it took at bind time, so a rebuild
+    /// and a wholesale `replace` must both publish to that same handle.
+    #[test]
+    fn certificate_modes_follow_rebuilds_and_replacements() {
+        let mut map = ServiceMap::new();
+        map.register_app("web", "default", 8080, None).unwrap();
+        let spec = |tls: &str| {
+            HashMap::from([(
+                ns_key("default", "web"),
+                IngressSpec {
+                    tls: Some(tls.to_string()),
+                    ..spec_with_path("web.com", "/")
+                },
+            )])
+        };
+        let mut table = RoutingTable::new();
+        let modes = table.certificate_modes();
+        assert_eq!(modes.get("web.com"), None);
+
+        table.rebuild(&map, &spec("cluster")).unwrap();
+        assert_eq!(modes.get("Web.COM:443"), Some(TlsMode::Cluster));
+
+        let mut candidate = RoutingTable::new();
+        candidate.rebuild(&map, &spec("explicit")).unwrap();
+        table.replace(candidate);
+        assert_eq!(modes.get("web.com"), Some(TlsMode::Explicit));
+
+        table.replace(RoutingTable::new());
+        assert_eq!(modes.get("web.com"), None);
+    }
+
     #[test]
     fn equal_length_routes_sort_deterministically() {
         // Two same-length prefixes on one host must resolve in a stable
@@ -1515,7 +1681,7 @@ mod tests {
         .unwrap();
         let mut replacement = RoutingTable::new();
         replacement.rebuild(&map, &configs).unwrap();
-        *table.write().await = replacement;
+        table.write().await.replace(replacement);
         let count = requests.load(Ordering::SeqCst);
         tokio::time::timeout(Duration::from_secs(2), async {
             while requests.load(Ordering::SeqCst) < count + 3 {

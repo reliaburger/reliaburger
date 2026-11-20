@@ -2,19 +2,19 @@
   "packages": ["runc", "uidmap", "btrfs-progs", "nftables", "iptables", "iproute2", "buildah"],
   "images": {
     "aarch64": {
-      "asset": "reliaburger-guest-ubuntu-24.04-20260911-aarch64.qcow2",
+      "asset": "reliaburger-guest-ubuntu-26.04-20260927-aarch64.qcow2",
       "source": {
-        "file": "ubuntu-24.04-20260911-aarch64.img",
-        "url": "https://cloud-images.ubuntu.com/releases/noble/release-20260911/ubuntu-24.04-server-cloudimg-arm64.img",
-        "sha256": "7b682958a67ff5de068e36de6af8b75fa645d296af5a70d6500527f6a33781db"
+        "file": "ubuntu-26.04-20260927-aarch64.img",
+        "url": "https://cloud-images.ubuntu.com/releases/resolute/release-20260927/ubuntu-26.04-server-cloudimg-arm64.img",
+        "sha256": "63a93bd5a8d76e33b15ceb5daa3657bd79be804748051ab178e643b0f5da22e7"
       }
     },
     "x86_64": {
-      "asset": "reliaburger-guest-ubuntu-24.04-20260911-x86_64.qcow2",
+      "asset": "reliaburger-guest-ubuntu-26.04-20260927-x86_64.qcow2",
       "source": {
-        "file": "ubuntu-24.04-20260911-x86_64.img",
-        "url": "https://cloud-images.ubuntu.com/releases/noble/release-20260911/ubuntu-24.04-server-cloudimg-amd64.img",
-        "sha256": "612b2c0cc1bc413a6cb8c38fd611794caf0f2b436c50013d8b3794db12ad7354"
+        "file": "ubuntu-26.04-20260927-x86_64.img",
+        "url": "https://cloud-images.ubuntu.com/releases/resolute/release-20260927/ubuntu-26.04-server-cloudimg-amd64.img",
+        "sha256": "8800651811af9a85465ad1d552add729947bb16488dddb4a9b5305a3d97332b2"
       }
     }
   }

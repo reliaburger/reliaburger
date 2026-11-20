@@ -1,0 +1,25 @@
+# Prepare this node from its seed before the agent starts: install the
+# bootstrap material of the node that creates the cluster, or enrol with a
+# join token and fetch the master key (`bun appliance prepare`). The seed is
+# the reliaburger.seed credential or seeds/<mac>.seed on a USB stick labelled
+# RBSEED. Without one, it waits to be claimed over the LAN (W5), serving
+# the claim API on port 9119, so this unit stays activating until then.
+[Unit]
+Description=Reliaburger seed
+After=network-online.target
+Wants=network-online.target
+Before=reliaburger.service
+ConditionPathExists=!/etc/reliaburger/node.toml
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ImportCredential=reliaburger.seed
+# A joiner waits for its first member to come up, which can take a while
+# when a whole fleet powers on together.
+TimeoutStartSec=infinity
+StandardOutput=journal+console
+ExecStart=/usr/lib/reliaburger/start prepare
+
+[Install]
+WantedBy=multi-user.target

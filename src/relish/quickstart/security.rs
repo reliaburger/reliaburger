@@ -15,6 +15,57 @@ pub struct Bootstrap {
     pub directory: PathBuf,
     /// Pinned root fingerprint used when enrolling additional nodes.
     pub root_fingerprint: String,
+    /// The root CA backup and the identity that opens it, once written.
+    pub root_backup: Option<RootBackupFiles>,
+}
+
+/// The only copy of the root CA's key, on the operator's machine, and the
+/// age identity that opens it, kept in another directory (#709). No node
+/// ever gets either.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RootBackupFiles {
+    /// The sealed backup, in the cluster's bootstrap directory.
+    pub backup: PathBuf,
+    /// The age identity that opens it.
+    pub identity: PathBuf,
+}
+
+/// The backup's name inside a bootstrap directory.
+pub const ROOT_BACKUP_FILE: &str = "root-ca-backup.age";
+
+/// Where the identities that open root backups go, under relish's state
+/// root (`~/.reliaburger`): apart from every cluster's bootstrap directory.
+pub fn root_backup_keys_in(state_root: &Path) -> PathBuf {
+    state_root.join("root-backup-keys")
+}
+
+/// Where a cluster's root backup and its identity go: the backup as
+/// `backup` in `directory`, the identity in `keys`, named after the root.
+pub(crate) fn root_backup_files_named(
+    directory: &Path,
+    backup: &str,
+    keys: &Path,
+    fingerprint: &str,
+) -> RootBackupFiles {
+    let hex = fingerprint.trim_start_matches("sha256:");
+    RootBackupFiles {
+        backup: directory.join(backup),
+        identity: keys.join(format!("root-{}.age-identity", &hex[..hex.len().min(16)])),
+    }
+}
+
+fn root_backup_files(directory: &Path, keys: &Path, fingerprint: &str) -> RootBackupFiles {
+    root_backup_files_named(directory, ROOT_BACKUP_FILE, keys, fingerprint)
+}
+
+/// The keys directory for an operation in `<root>/clusters/<name>`.
+fn operation_keys(operation: &Operation) -> Result<PathBuf, RelishError> {
+    operation
+        .directory
+        .parent()
+        .and_then(Path::parent)
+        .map(root_backup_keys_in)
+        .ok_or_else(|| failed("cluster directory has no state root"))
 }
 
 impl Bootstrap {
@@ -33,6 +84,7 @@ pub fn existing(operation: &Operation) -> Result<Bootstrap, RelishError> {
     load(
         &operation.directory.join("security"),
         first_node(operation)?,
+        &operation_keys(operation)?,
     )
 }
 
@@ -48,6 +100,7 @@ pub fn prepare(operation: &Operation) -> Result<Bootstrap, RelishError> {
         &operation.state.spec.name,
         first_node(operation)?,
         QUICKSTART_ADMINISTRATOR,
+        &operation_keys(operation)?,
     )
 }
 
@@ -70,14 +123,19 @@ fn first_node(operation: &Operation) -> Result<&str, RelishError> {
 /// `relish dev create` both build their clusters from it. `directory` must
 /// not exist yet or must hold a complete bundle for `first_node`; its parent
 /// must exist.
+///
+/// The root CA's key goes only into `root-ca-backup.age` in the bundle,
+/// sealed to a fresh age identity written into `keys` (#709). No node gets
+/// either: [`node_security_files`] never names them.
 pub fn prepare_in(
     directory: &Path,
     cluster: &str,
     first_node: &str,
     administrator: &str,
+    keys: &Path,
 ) -> Result<Bootstrap, RelishError> {
     if directory.exists() {
-        return load(directory, first_node);
+        return load(directory, first_node, keys);
     }
     let parent = directory
         .parent()
@@ -90,8 +148,18 @@ pub fn prepare_in(
         builder.permissions(std::fs::Permissions::from_mode(0o700));
     }
     let staging = builder.tempdir_in(parent)?;
-    let mut init = crate::sesame::init::initialize_cluster(cluster, first_node, staging.path())
+    let mut init = crate::sesame::init::initialize_cluster(cluster, first_node)
         .map_err(|error| failed(&format!("failed to generate bootstrap identity: {error}")))?;
+    create_private_dir(keys)?;
+    let files = root_backup_files(directory, keys, &init.root_backup.fingerprint);
+    crate::sesame::root_backup::write_backup(
+        &init.root_backup,
+        &crate::sesame::root_backup::BackupDestination::FreshIdentity {
+            path: &staging.path().join(ROOT_BACKUP_FILE),
+            identity: &files.identity,
+        },
+        std::time::SystemTime::now(),
+    )?;
     let administrator = crate::sesame::token::create_token(
         administrator,
         ApiRole::Admin,
@@ -114,14 +182,23 @@ pub fn prepare_in(
     let identity = crate::relish::commands::node_identity_from_init(&init)?;
     crate::sesame::identity_store::save(&staging.path().join("identity"), &identity)
         .map_err(|error| failed(&format!("failed to persist bootstrap identity: {error}")))?;
-    std::fs::File::open(&init.sealed_root_ca_path)?.sync_all()?;
     #[cfg(unix)]
     std::fs::File::open(staging.path())?.sync_all()?;
     std::fs::rename(staging.path(), directory)?;
     let _ = staging.keep();
     #[cfg(unix)]
     std::fs::File::open(parent)?.sync_all()?;
-    load(directory, first_node)
+    load(directory, first_node, keys)
+}
+
+pub(crate) fn create_private_dir(path: &Path) -> Result<(), RelishError> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 /// The identity files of a bootstrap bundle, in install order: the commit
@@ -160,7 +237,7 @@ pub fn node_security_files(directory: &Path, index: usize) -> Vec<(PathBuf, Stri
     files
 }
 
-fn load(directory: &Path, first_node: &str) -> Result<Bootstrap, RelishError> {
+fn load(directory: &Path, first_node: &str, keys: &Path) -> Result<Bootstrap, RelishError> {
     let identity =
         crate::sesame::identity_store::load(&directory.join("identity")).map_err(|error| {
             failed(&format!(
@@ -211,9 +288,13 @@ fn load(directory: &Path, first_node: &str) -> Result<Bootstrap, RelishError> {
     if principal.role != ApiRole::Admin {
         return Err(failed("bootstrap token is not an administrator"));
     }
+    let root_fingerprint =
+        crate::sesame::identity_store::root_ca_fingerprint(&identity.root_ca_der);
+    let files = root_backup_files(directory, keys, &root_fingerprint);
     Ok(Bootstrap {
         directory: directory.to_path_buf(),
-        root_fingerprint: crate::sesame::identity_store::root_ca_fingerprint(&identity.root_ca_der),
+        root_backup: files.backup.exists().then_some(files),
+        root_fingerprint,
     })
 }
 
@@ -286,6 +367,49 @@ mod tests {
         );
     }
 
+    /// #709: the root key is only in the backup on this machine, which the
+    /// identity in the keys directory opens, and no node is sent either.
+    #[test]
+    fn the_root_backup_stays_on_the_operators_machine_and_opens_with_its_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let operation = operation(root.path());
+        let bootstrap = prepare(&operation).unwrap();
+        let files = bootstrap.root_backup.clone().expect("a root backup");
+        assert!(files.backup.starts_with(&bootstrap.directory));
+        let state_root = operation.directory.parent().unwrap().parent().unwrap();
+        assert!(
+            files
+                .identity
+                .starts_with(state_root.join("root-backup-keys"))
+        );
+        assert!(!files.identity.starts_with(&bootstrap.directory));
+
+        let identity = std::fs::read_to_string(&files.identity).unwrap();
+        let identity: age::x25519::Identity = identity
+            .lines()
+            .find(|line| line.starts_with("AGE-SECRET-KEY-"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let backup = crate::sesame::root_backup::RootBackup::open(
+            &std::fs::read(&files.backup).unwrap(),
+            &crate::sesame::root_backup::BackupOpener::Identity(identity),
+        )
+        .unwrap();
+        backup
+            .verify(&bootstrap.root_fingerprint, std::time::SystemTime::now())
+            .unwrap();
+
+        for index in 0..3 {
+            for (source, _) in node_security_files(&bootstrap.directory, index) {
+                assert_ne!(source, files.backup);
+                assert_ne!(source, files.identity);
+            }
+        }
+        // A retry finds the same backup.
+        assert_eq!(prepare(&operation).unwrap().root_backup, Some(files));
+    }
+
     #[test]
     fn an_incomplete_existing_identity_is_refused_instead_of_regenerated() {
         let root = tempfile::tempdir().unwrap();
@@ -354,7 +478,14 @@ mod tests {
     fn the_caller_names_the_administrator_token() {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("security");
-        let bootstrap = prepare_in(&directory, "lab", "lab-1", "dev-lab-admin").unwrap();
+        let bootstrap = prepare_in(
+            &directory,
+            "lab",
+            "lab-1",
+            "dev-lab-admin",
+            &root.path().join("keys"),
+        )
+        .unwrap();
         assert_eq!(token_names(&bootstrap), vec!["dev-lab-admin"]);
     }
 }

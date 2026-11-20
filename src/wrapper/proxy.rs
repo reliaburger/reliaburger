@@ -200,9 +200,10 @@ pub struct BoundProxy {
 
 /// Bind the Wrapper HTTP and HTTPS listeners.
 ///
-/// TLS uses the certificate and key from `config.tls_cert_path` /
-/// `config.tls_key_path` when both are set, and a self-signed
-/// certificate generated at startup otherwise.
+/// TLS serves the certificate and key from `config.tls_cert_path` /
+/// `config.tls_key_path` when both are set, and a self-signed certificate
+/// generated at startup otherwise. With no Ingress CA, a `tls = "cluster"`
+/// host gets the self-signed certificate; see [`bind_proxy_with_tls`].
 pub async fn bind_proxy(
     config: WrapperConfig,
     routing_table: Arc<RwLock<RoutingTable>>,
@@ -225,13 +226,15 @@ pub async fn bind_proxy_with_drains(
     bind_proxy_with_tls(config, routing_table, drains, None, None, shutdown).await
 }
 
-/// Bind the listeners, optionally resolving TLS certificates per SNI from the
-/// cluster Ingress CA (M8).
+/// Bind the listeners, choosing each TLS host's certificate by its route's
+/// `tls` mode (M8, #2011).
 ///
-/// When `cert_resolver` is `Some`, `tls = "cluster"` routes are served a
-/// certificate issued from the Ingress CA for the requested host, so a client
-/// trusting the cluster root trusts the ingress. When `None`, TLS falls back to
-/// the operator disk cert or a self-signed `localhost` cert, exactly as before.
+/// `cert_resolver` is the cluster Ingress CA resolver: with it, `tls =
+/// "cluster"` hosts are served a leaf issued for the requested host, so a
+/// client trusting the cluster root trusts the ingress. `tls = "explicit"`
+/// hosts are served the operator pair from `config.tls_cert_path` /
+/// `config.tls_key_path`. A host whose mode names a certificate this node
+/// lacks gets the self-signed `localhost` cert, never the other mode's.
 pub async fn bind_proxy_with_tls(
     config: WrapperConfig,
     routing_table: Arc<RwLock<RoutingTable>>,
@@ -271,39 +274,29 @@ pub async fn bind_proxy_with_tls(
     let http_listener = bind(config.http_port).await?;
     let http_addr = local_addr(&http_listener)?;
 
-    // An operator disk cert always wins. Otherwise, if the cluster Ingress CA
-    // resolver is wired, serve per-SNI cluster-signed certs; failing both, a
-    // self-signed `localhost` cert (dev / no-cluster).
-    let mut file_cert_resolver = None;
-    let tls_config = match (&config.tls_cert_path, &config.tls_key_path) {
-        (Some(cert), Some(key)) => {
-            let resolver = Arc::new(
-                super::tls::FileCertResolver::load(cert, key)
-                    .await
-                    .map_err(|e| {
-                        WrapperError::ProxyFailed(format!("failed to load TLS files: {e}"))
-                    })?,
-            );
-            file_cert_resolver = Some(Arc::clone(&resolver));
-            super::tls::build_tls_config_with_resolver(resolver).map_err(|e| {
-                WrapperError::ProxyFailed(format!("failed to build TLS config: {e}"))
-            })?
-        }
-        _ => match cert_resolver {
-            Some(resolver) => {
-                super::tls::build_tls_config_with_resolver(resolver).map_err(|e| {
-                    WrapperError::ProxyFailed(format!("failed to build ingress TLS resolver: {e}"))
-                })?
-            }
-            None => {
-                let (cert, key) = super::tls::generate_self_signed_cert()
-                    .map_err(|e| WrapperError::ProxyFailed(format!("failed to self-sign: {e}")))?;
-                super::tls::build_tls_config(vec![cert], key).map_err(|e| {
-                    WrapperError::ProxyFailed(format!("failed to build TLS config: {e}"))
-                })?
-            }
-        },
+    // The route's `tls` mode picks the certificate per SNI host (#2011): the
+    // operator pair for `explicit`, an Ingress CA leaf for `cluster`.
+    let file_cert_resolver = match (&config.tls_cert_path, &config.tls_key_path) {
+        (Some(cert), Some(key)) => Some(Arc::new(
+            super::tls::FileCertResolver::load(cert, key)
+                .await
+                .map_err(|e| WrapperError::ProxyFailed(format!("failed to load TLS files: {e}")))?,
+        )),
+        _ => None,
     };
+    let (self_signed_cert, self_signed_key) = super::tls::generate_self_signed_cert()
+        .map_err(|e| WrapperError::ProxyFailed(format!("failed to self-sign: {e}")))?;
+    let certificate_modes = state.routing_table.read().await.certificate_modes();
+    let resolver = super::tls::RouteCertResolver::new(
+        certificate_modes,
+        file_cert_resolver.clone(),
+        cert_resolver,
+        vec![self_signed_cert],
+        self_signed_key,
+    )
+    .map_err(|e| WrapperError::ProxyFailed(format!("failed to build TLS resolver: {e}")))?;
+    let tls_config = super::tls::build_tls_config_with_resolver(Arc::new(resolver))
+        .map_err(|e| WrapperError::ProxyFailed(format!("failed to build TLS config: {e}")))?;
     let tls_acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
 
     let https_listener = bind(config.https_port).await?;
@@ -479,27 +472,20 @@ async fn proxy_handler(
 ) -> Response {
     // Count the request and mark it in flight. Mayo reads these process-global
     // counters to emit `ingress_requests_total`; Wrapper only produces them.
+    // `counted` takes the request out of flight even when hyper drops this
+    // future before it answers (#2044).
     let metrics = super::metrics::global_ingress_metrics();
-    metrics.record_request();
-    metrics.inc_in_flight();
-
-    // Hold a connection permit for the whole request. `try_acquire_owned`
-    // returns immediately when full, so a flood gets 503 instead of queueing.
-    // The permit lives in `_permit` and is released on every return path; for
-    // a WebSocket it is moved into the splice task so it outlives the 101.
-    let permit = match Arc::clone(&state.connection_limit).try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            metrics.record_response(StatusCode::SERVICE_UNAVAILABLE);
-            metrics.dec_in_flight();
+    super::metrics::counted(metrics, async move {
+        // Hold a connection permit for the whole request. `try_acquire_owned`
+        // returns immediately when full, so a flood gets 503 instead of
+        // queueing. The permit is released on every return path; for a
+        // WebSocket it is moved into the splice task so it outlives the 101.
+        let Ok(permit) = Arc::clone(&state.connection_limit).try_acquire_owned() else {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
-    };
-
-    let response = do_proxy(&state, remote, over_tls, req, permit).await;
-    metrics.record_response(response.status());
-    metrics.dec_in_flight();
-    response
+        };
+        do_proxy(&state, remote, over_tls, req, permit).await
+    })
+    .await
 }
 
 /// Generate a fresh request identifier.
@@ -507,8 +493,74 @@ async fn proxy_handler(
 /// A 128-bit random value, hex-encoded — unique enough to correlate a request
 /// across the proxy hop without pulling in a UUID dependency. Only used when
 /// the client didn't already supply an `X-Request-ID`.
-fn generate_request_id() -> String {
+pub(super) fn generate_request_id() -> String {
     format!("{:032x}", rand::random::<u128>())
+}
+
+/// The host a request is for, as the routing table matches it.
+///
+/// HTTP/1.1 names the host in the `Host` header, with the URI's authority
+/// as the fallback. HTTP/2 names it in the `:authority` pseudo-header, which
+/// hyper puts in the request URI, and a client usually sends no `Host`
+/// header at all. RFC 9113 §8.3.1 makes `:authority` win there, and calls a
+/// request whose `Host` disagrees with it malformed: that one is refused
+/// with 400 rather than routed by either.
+///
+/// One exception: an authority that is an IP literal names no host, so a
+/// `Host` header beside it decides. That's `curl -k https://<node-ip>/ -H
+/// 'Host: app.example'`, the usual way to test an ingress before DNS points
+/// at it. An empty string matches no route.
+fn request_host(req: &Request<Body>) -> Result<String, StatusCode> {
+    let header = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok());
+    let authority = req.uri().authority();
+    if req.version() == axum::http::Version::HTTP_2
+        && let Some(authority) = authority
+    {
+        let Some(host) = header else {
+            return Ok(authority.host().to_string());
+        };
+        if is_ip_literal(authority.host()) {
+            return Ok(host.to_string());
+        }
+        let default_port = if req.uri().scheme_str() == Some("http") {
+            80
+        } else {
+            443
+        };
+        if !same_authority(host, authority, default_port) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        return Ok(authority.host().to_string());
+    }
+    if let Some(host) = header {
+        return Ok(host.to_string());
+    }
+    Ok(authority
+        .map(|authority| authority.host().to_string())
+        .unwrap_or_default())
+}
+
+/// Whether a URI host is an IPv4 or IPv6 literal (IPv6 comes bracketed).
+fn is_ip_literal(host: &str) -> bool {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok()
+}
+
+/// Whether a `Host` header names the same host and port as `authority`.
+/// Hosts compare case-insensitively, and a side that gives no port means
+/// the scheme's `default_port`. A `Host` that doesn't parse agrees with
+/// nothing.
+fn same_authority(host: &str, authority: &axum::http::uri::Authority, default_port: u16) -> bool {
+    let Ok(header) = host.parse::<axum::http::uri::Authority>() else {
+        return false;
+    };
+    header.host().eq_ignore_ascii_case(authority.host())
+        && header.port_u16().unwrap_or(default_port) == authority.port_u16().unwrap_or(default_port)
 }
 
 /// Route and proxy a single request.
@@ -522,13 +574,10 @@ async fn do_proxy(
     // Check for WebSocket upgrade before anything else
     let is_ws = super::websocket::is_websocket_upgrade(&req);
 
-    // Extract host from the Host header
-    let host = req
-        .headers()
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let host = match request_host(&req) {
+        Ok(host) => host,
+        Err(status) => return status.into_response(),
+    };
 
     let path = req.uri().path().to_string();
 
@@ -1026,13 +1075,15 @@ const HOP_BY_HOP: [&str; 8] = [
 ];
 
 /// Whether a header name is hop-by-hop (case-insensitive).
-fn is_hop_by_hop(name: &str) -> bool {
+pub(super) fn is_hop_by_hop(name: &str) -> bool {
     HOP_BY_HOP.iter().any(|h| name.eq_ignore_ascii_case(h))
 }
 
 /// The set of header names listed in a message's `Connection` header. Those
 /// are themselves hop-by-hop for this leg and must also be dropped.
-fn connection_tokens(headers: &axum::http::HeaderMap) -> std::collections::HashSet<String> {
+pub(super) fn connection_tokens(
+    headers: &axum::http::HeaderMap,
+) -> std::collections::HashSet<String> {
     let mut set = std::collections::HashSet::new();
     for value in headers.get_all(axum::http::header::CONNECTION) {
         if let Ok(v) = value.to_str() {
@@ -1134,6 +1185,53 @@ mod tests {
         assert!(is_forwarded_header("Forwarded"));
         assert!(!is_forwarded_header("x-real-ip"));
         assert!(!is_forwarded_header("content-type"));
+    }
+
+    fn http2_request(uri: &str, host: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .version(axum::http::Version::HTTP_2)
+            .uri(uri);
+        if let Some(host) = host {
+            builder = builder.header(axum::http::header::HOST, host);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    #[test]
+    fn an_http2_ip_authority_routes_by_the_host_header() {
+        for uri in [
+            "https://10.0.0.7/",
+            "https://10.0.0.7:8443/",
+            "https://[fd00::7]/",
+            "https://[fd00::7]:8443/",
+        ] {
+            let request = http2_request(uri, Some("app.example"));
+            assert_eq!(request_host(&request), Ok("app.example".into()), "{uri}");
+        }
+        // With no Host header, the IP literal is all there is.
+        let request = http2_request("https://10.0.0.7:8443/", None);
+        assert_eq!(request_host(&request), Ok("10.0.0.7".into()));
+    }
+
+    #[test]
+    fn an_http2_hostname_authority_wins_and_a_disagreeing_host_is_refused() {
+        let request = http2_request("https://app.example/", None);
+        assert_eq!(request_host(&request), Ok("app.example".into()));
+        let request = http2_request("https://app.example:8443/", Some("APP.example:8443"));
+        assert_eq!(request_host(&request), Ok("app.example".into()));
+        let request = http2_request("https://app.example/", Some("other.example"));
+        assert_eq!(request_host(&request), Err(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn an_http2_host_and_authority_agree_when_a_missing_port_is_the_default() {
+        let agrees = |uri: &str, host: &str| request_host(&http2_request(uri, Some(host))).is_ok();
+        assert!(agrees("https://a.test:443/", "a.test"));
+        assert!(agrees("https://a.test/", "a.test:443"));
+        assert!(agrees("http://a.test:80/", "a.test"));
+        assert!(!agrees("https://a.test:8443/", "a.test:9443"));
+        assert!(!agrees("https://a.test:8443/", "a.test"));
+        assert!(!agrees("http://a.test/", "a.test:443"));
     }
 
     #[test]
@@ -2323,12 +2421,17 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(2), drains.wait_drained("default__ws-0"))
                 .await
                 .expect("WebSocket did not release its captured backend after cancellation");
-            let closed = tokio::time::timeout(Duration::from_secs(2), ws.read(&mut buf))
+            // F08: the client hears why before the connection goes: a Close
+            // frame with 1001 Going Away, then end of stream.
+            let mut received = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), ws.read_to_end(&mut received))
                 .await
-                .unwrap();
-            assert!(
-                matches!(closed, Ok(0) | Err(_)),
-                "WebSocket stayed open after drain completion"
+                .expect("WebSocket stayed open after drain completion")
+                .ok();
+            assert_eq!(
+                received,
+                super::super::websocket::build_close_frame(1001),
+                "the client got no Close 1001 before the connection closed"
             );
         }
 

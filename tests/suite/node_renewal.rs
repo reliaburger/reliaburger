@@ -31,7 +31,7 @@ use tower::ServiceExt;
 
 use crate::bun_process;
 use bun_process::{
-    BunProcess, WAIT, assert_success, reserve_address, reserve_ports, run_relish,
+    BunProcess, WAIT, assert_success, reserve_address, reserve_ports, run_relish_init,
     spawn_bun_with_port_retry, wait_for_relish,
 };
 
@@ -56,7 +56,7 @@ async fn council(hierarchy: &ca::CaHierarchy, initialise: bool) -> Arc<CouncilNo
         .await
         .unwrap(),
     );
-    network.register(1, node.raft().clone()).await;
+    network.register(1, &node).await;
     if initialise {
         node.initialize(BTreeMap::from([(
             1,
@@ -145,6 +145,339 @@ async fn post(
         )
         .await
         .unwrap()
+}
+
+async fn get_master_key(router: Router) -> (StatusCode, serde_json::Value) {
+    let response = router
+        .oneshot(
+            Request::get("/v1/cluster/master-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&body).unwrap_or_default())
+}
+
+/// G1: a node that just joined fetches the master key with its certificate
+/// alone, and nothing else gets it.
+#[tokio::test]
+async fn a_member_certificate_and_only_that_gets_the_master_key() {
+    let hierarchy = ca::generate_ca_hierarchy("master-key", &IKM).unwrap();
+    let council = council(&hierarchy, true).await;
+
+    let (status, body) = get_master_key(router(council.clone(), Some(peer(&hierarchy, 10)))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["master_key"], hex::encode(IKM));
+
+    let (status, _) = get_master_key(router(council.clone(), None)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "no client certificate");
+
+    let foreign = peer(&ca::generate_ca_hierarchy("foreign", &IKM).unwrap(), 10);
+    let (status, _) = get_master_key(router(council.clone(), Some(foreign))).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "another cluster's certificate"
+    );
+
+    council
+        .write(RaftRequest::RevokeCertificate(CrlEntry {
+            serial: SerialNumber(10),
+            issuer: CaRole::Node,
+            revoked_at: SystemTime::now(),
+            reason: "lost stick".into(),
+            expires_at: None,
+        }))
+        .await
+        .unwrap();
+    let (status, _) = get_master_key(router(council.clone(), Some(peer(&hierarchy, 10)))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a revoked certificate");
+}
+
+/// A node that forwards or relays a person's request presents its own
+/// certificate, so the node-only routes must tell such a request from the
+/// node's own: they refuse anything marked as forwarded for a person, even
+/// with a valid member certificate and, for renewal, the service token.
+#[tokio::test]
+async fn a_request_forwarded_for_a_person_is_refused_by_node_only_routes() {
+    const FORWARDED_FOR_USER: &str = "x-reliaburger-forwarded-for-user";
+    let hierarchy = ca::generate_ca_hierarchy("master-key-forwarded", &IKM).unwrap();
+    let council = council(&hierarchy, true).await;
+
+    let response = router(council.clone(), Some(peer(&hierarchy, 10)))
+        .oneshot(
+            Request::get("/v1/cluster/master-key")
+                .header(FORWARDED_FOR_USER, "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(!body.contains(&hex::encode(IKM)), "{body}");
+
+    let (renewal, _) = request("node");
+    let response = router(council.clone(), Some(peer(&hierarchy, 10)))
+        .oneshot(
+            Request::post("/v1/cluster/renew")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer internal-token")
+                .header(FORWARDED_FOR_USER, "1")
+                .body(Body::from(serde_json::to_vec(&renewal).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert_eq!(status, StatusCode::FORBIDDEN, "renewal: {body}");
+    // Renewal has other 403s (no certificate, a bad identity); this one must
+    // be the node-only refusal.
+    assert!(
+        body.contains("this route answers nodes only"),
+        "renewal: {body}"
+    );
+
+    // The node's own request, unmarked, still gets the key.
+    let (status, body) = get_master_key(router(council.clone(), Some(peer(&hierarchy, 10)))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["master_key"], hex::encode(IKM));
+    council.shutdown().await.unwrap();
+}
+
+/// G1: a retired node's certificate gets no master key, even one that was
+/// never revoked. Retirement is by node id, so this is what stops a node
+/// that was decommissioned, but kept a valid leaf, fetching the key again.
+#[tokio::test]
+async fn a_retired_node_gets_no_master_key_even_with_an_unrevoked_certificate() {
+    use reliaburger::council::CouncilResponse;
+
+    let hierarchy = ca::generate_ca_hierarchy("master-key-retired", &IKM).unwrap();
+    let council = council(&hierarchy, true).await;
+    // A worker, not the council's own voter, which can't be retired.
+    let worker = |serial| {
+        let (leaf, _, _) = ca::issue_node_cert(
+            "old-worker",
+            SerialNumber(serial),
+            &hierarchy.node.signing_keypair,
+            &hierarchy.node.certificate_params,
+        )
+        .unwrap();
+        TlsPeerCertificate(leaf.into())
+    };
+    let (status, _) = get_master_key(router(council.clone(), Some(worker(10)))).await;
+    assert_eq!(status, StatusCode::OK, "before retirement");
+
+    let membership_log_id = *council.metrics().borrow().membership_config.log_id();
+    assert!(matches!(
+        council
+            .write(RaftRequest::DecommissionNode {
+                node_id: "old-worker".into(),
+                retired_by: "operator".into(),
+                reason: "replaced".into(),
+                retired_at_unix_ms: 30,
+                membership_log_id
+            })
+            .await
+            .unwrap(),
+        CouncilResponse::NodeDecommissioned { .. }
+    ));
+
+    // Serial 11 was never issued before, let alone revoked: only the
+    // retirement can refuse it.
+    let security = council.security_state().await;
+    assert!(
+        security
+            .crl
+            .entries
+            .iter()
+            .all(|entry| entry.serial != SerialNumber(11))
+    );
+    for serial in [10, 11] {
+        // The router's retired-peer layer refuses before the handler's own
+        // check, in plain text, so read the body as it comes.
+        let response = router(council.clone(), Some(worker(serial)))
+            .oneshot(
+                Request::get("/v1/cluster/master-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::FORBIDDEN, "serial {serial}: {body}");
+        assert!(
+            body.contains("node identity is retired"),
+            "serial {serial}: {body}"
+        );
+        assert!(!body.contains(&hex::encode(IKM)), "serial {serial}: {body}");
+    }
+    council.shutdown().await.unwrap();
+}
+
+/// Three voters holding the master key, with `hierarchy` as their CA, once
+/// one of them leads and every member has applied the security state.
+/// Returns the members, the router that carries their Raft traffic and the
+/// leader's index.
+async fn three_members(
+    hierarchy: &ca::CaHierarchy,
+) -> (Vec<Arc<CouncilNode>>, InMemoryRaftRouter, usize) {
+    let network = InMemoryRaftRouter::new();
+    let mut members = Vec::new();
+    let mut infos = BTreeMap::new();
+    for id in 1..=3u64 {
+        let node = Arc::new(
+            CouncilNode::new(
+                id,
+                CouncilConfig {
+                    heartbeat_interval_ms: 50,
+                    election_timeout_min_ms: 150,
+                    election_timeout_max_ms: 300,
+                    ..Default::default()
+                },
+                InMemoryRaftNetworkFactory::new(id, network.clone()),
+                MemLogStore::new(),
+                CouncilStateMachine::new(),
+                Some(IKM),
+            )
+            .await
+            .unwrap(),
+        );
+        network.register(id, &node).await;
+        infos.insert(
+            id,
+            CouncilNodeInfo::new(
+                format!("127.0.0.1:{}", 9000 + id).parse().unwrap(),
+                format!("member-{id}"),
+            ),
+        );
+        members.push(node);
+    }
+    members[0].initialize(infos).await.unwrap();
+    let leader = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            for (index, member) in members.iter().enumerate() {
+                if member.is_leader().await {
+                    return index;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("no member was elected");
+    members[leader]
+        .write(RaftRequest::SecurityStateInit(Box::new(SecurityState {
+            certificate_authorities: vec![hierarchy.root.ca.clone(), hierarchy.node.ca.clone()],
+            next_serial: 100,
+            ..Default::default()
+        })))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for member in &members {
+            while member
+                .security_state()
+                .await
+                .certificate_authorities
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    })
+    .await
+    .expect("a member never applied the security state");
+    (members, network, leader)
+}
+
+/// The master-key handout checks the caller against the confirmed security
+/// state, as renewal does. A member whose replica hasn't caught up can't
+/// confirm it, so it refuses even a certificate its own replica would still
+/// accept. Only the leader answers, and it applies every revocation it has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_master_key_is_handed_out_only_against_the_confirmed_security_state() {
+    let hierarchy = ca::generate_ca_hierarchy("master-key-confirmed", &IKM).unwrap();
+    let (members, network, leader) = three_members(&hierarchy).await;
+    let behind = (0..3).find(|index| *index != leader).unwrap();
+    let behind_id = behind as u64 + 1;
+
+    // The normal join path: the leader hands a member's certificate the key.
+    let (status, body) =
+        get_master_key(router(members[leader].clone(), Some(peer(&hierarchy, 10)))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["master_key"], hex::encode(IKM));
+
+    // Cut one member off from replication, then revoke the certificate. The
+    // other two are still a quorum, so the revocation commits without it.
+    for other in (1..=3u64).filter(|other| *other != behind_id) {
+        network.partition(behind_id, other).await;
+    }
+    members[leader]
+        .write(RaftRequest::RevokeCertificate(CrlEntry {
+            serial: SerialNumber(10),
+            issuer: CaRole::Node,
+            revoked_at: SystemTime::now(),
+            reason: "lost stick".into(),
+            expires_at: None,
+        }))
+        .await
+        .unwrap();
+    // So the cut-off member's own replica would still accept the certificate.
+    assert!(
+        members[behind]
+            .security_state()
+            .await
+            .crl
+            .entries
+            .is_empty(),
+        "the cut-off member mustn't have seen the revocation"
+    );
+
+    let (status, body) =
+        get_master_key(router(members[behind].clone(), Some(peer(&hierarchy, 10)))).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a member that can't confirm the security state refuses: {body}"
+    );
+    assert_ne!(body["master_key"], hex::encode(IKM));
+
+    let (status, body) =
+        get_master_key(router(members[leader].clone(), Some(peer(&hierarchy, 10)))).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the leader applies it: {body}"
+    );
+
+    // Another member's certificate still gets the key from the leader.
+    let (status, body) =
+        get_master_key(router(members[leader].clone(), Some(peer(&hierarchy, 11)))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["master_key"], hex::encode(IKM));
+
+    network.heal().await;
+    for member in members {
+        member.shutdown().await.unwrap();
+    }
 }
 
 /// #1508: the renewed leaf names the address the request came from, as an
@@ -762,11 +1095,11 @@ async fn worker_renews_a_short_override_leaf_at_its_midpoint() {
     let mut fixture =
         WorkerFixture::with_leader_lifetime(&hierarchy, false, Some(override_lifetime)).await;
     // Exactly the window a 600 s override signs (600 s plus the 300 s
-    // backdate), issued long enough ago that its midpoint is 3 s away.
+    // backdate), issued long enough ago that its midpoint is 8 s away.
     fixture
         .live
         .replace(
-            windowed_identity(&hierarchy, 20, -447, 453),
+            windowed_identity(&hierarchy, 20, -442, 458),
             &reliaburger::sesame::trust::TrustSet::from_state(
                 &fixture.council.security_state().await,
             )
@@ -775,14 +1108,37 @@ async fn worker_renews_a_short_override_leaf_at_its_midpoint() {
         .await
         .unwrap();
     let monitor = fixture.start_with_ceiling(Some(override_lifetime));
+    // The midpoint the worker computes, from the leaf as signed: X.509
+    // keeps whole seconds, so it isn't exactly 8 s after the call above.
+    let installed = fixture.live.snapshot();
+    let midpoint = installed.not_before
+        + installed
+            .not_after
+            .duration_since(installed.not_before)
+            .unwrap()
+            / 2;
     wait_for_condition(|| monitor.state() == RenewalState::Valid).await;
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    assert_eq!(
-        fixture.calls.load(Ordering::SeqCst),
-        0,
-        "renewed before the midpoint"
+    // Watch the worker up to the midpoint. The worker reads its clock
+    // before it counts a call, so a call counted before our clock read
+    // was decided before the midpoint too. Only those samples are checked:
+    // a loaded host that spends the margin on setup shortens the watch
+    // instead of passing for an early renewal (#2008).
+    let mut checked = 0;
+    loop {
+        let calls = fixture.calls.load(Ordering::SeqCst);
+        let serial = fixture.live.snapshot().serial;
+        if std::time::SystemTime::now() >= midpoint {
+            break;
+        }
+        assert_eq!(calls, 0, "renewed before the midpoint");
+        assert_eq!(serial, SerialNumber(20));
+        checked += 1;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        checked > 0,
+        "setup ran past the leaf's midpoint before the worker could be watched"
     );
-    assert_eq!(fixture.live.snapshot().serial, SerialNumber(20));
     wait_for_condition(|| {
         fixture.live.snapshot().serial.0 >= 100 && monitor.state() == RenewalState::Valid
     })
@@ -1090,14 +1446,7 @@ fn secure_bun_renews_a_due_node_leaf_and_reuses_it_after_restart() {
     let root = tempfile::tempdir().unwrap();
     let cluster_dir = root.path().join("cluster");
     assert_success(
-        &run_relish(&[
-            "init",
-            cluster_dir.to_str().unwrap(),
-            "--cluster-name",
-            "renewal-startup",
-            "--node-id",
-            "node-01",
-        ]),
+        &run_relish_init(&cluster_dir, "renewal-startup", "node-01"),
         "initialise renewal fixture",
     );
     let node_path = cluster_dir.join("reliaburger.toml");

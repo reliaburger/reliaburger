@@ -1325,3 +1325,237 @@ async fn verify_finds_a_drifted_node_offline() {
     server.abort();
     let _ = server.await;
 }
+
+/// A Bun that answers the commands #2012 found printing prose under
+/// `-o json`: `apply`, `join-token list`, `join-token revoke`,
+/// `identity rotate-signing-key`, and `nodes` on a standalone node.
+async fn stub_bun_for_change_commands() -> (String, tokio::task::JoinHandle<()>) {
+    use axum::{
+        Router,
+        routing::{get, post},
+    };
+    let app = Router::new()
+        .route(
+            "/v1/health",
+            get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
+        )
+        .route(
+            "/v1/apply",
+            post(|| async {
+                let complete = serde_json::json!({
+                    "type": "Complete", "created": 1, "instances": ["default__web-0"],
+                });
+                (
+                    [("content-type", "text/event-stream")],
+                    format!("data: {complete}\n\n"),
+                )
+            }),
+        )
+        .route(
+            "/v1/cluster/nodes",
+            get(|| async { axum::Json(serde_json::json!([])) }),
+        )
+        .route(
+            "/v1/join-token/list",
+            get(|| async {
+                axum::Json(serde_json::json!({"join_tokens": [{
+                    "id": "a1b2c3d4", "node_id": "node-02",
+                    "expires_at": 4_102_444_800u64, "consumed": false,
+                }]}))
+            }),
+        )
+        .route(
+            "/v1/join-token/revoke",
+            post(|| async { axum::Json(serde_json::json!({"revoked": 2})) }),
+        )
+        .route(
+            "/v1/identity/signing-key/rotate",
+            post(|| async {
+                axum::Json(serde_json::json!({
+                    "key_id": "k2", "retiring_key_id": "k1", "retire_after": 4_102_444_800u64,
+                }))
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (endpoint, server)
+}
+
+/// #2012: every command that accepts `-o json` prints data, not prose. These
+/// four used to print their human line whatever `-o` said, and `nodes` on a
+/// standalone node said "no cluster nodes" instead of an empty list.
+#[tokio::test]
+async fn change_commands_print_data_under_output_json_and_yaml() {
+    let (endpoint, server) = stub_bun_for_change_commands().await;
+    let directory = tempfile::tempdir().unwrap();
+    let manifest = directory.path().join("app.toml");
+    std::fs::write(&manifest, "[app.web]\nscript = \"exec true\"\n").unwrap();
+    let manifest = manifest.to_str().unwrap();
+
+    let commands: [(&[&str], &str, serde_json::Value); 4] = [
+        (&["apply", manifest], "created", serde_json::json!(1)),
+        (
+            &["join-token", "list"],
+            "join_tokens",
+            serde_json::json!([{
+                "id": "a1b2c3d4", "node_id": "node-02",
+                "expires_at": 4_102_444_800u64, "consumed": false,
+            }]),
+        ),
+        (
+            &["join-token", "revoke", "node-02"],
+            "revoked",
+            serde_json::json!(2),
+        ),
+        (
+            &["identity", "rotate-signing-key"],
+            "key_id",
+            serde_json::json!("k2"),
+        ),
+    ];
+    for (command, field, expected) in commands {
+        for format in ["json", "yaml"] {
+            let mut args = vec!["-o", format];
+            args.extend_from_slice(command);
+            let output = run_against(&endpoint, &args).await;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "relish {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let data: serde_json::Value = match format {
+                "json" => serde_json::from_str(&stdout)
+                    .unwrap_or_else(|e| panic!("relish {args:?} printed {stdout:?}: {e}")),
+                _ => yaml_serde::from_str(&stdout)
+                    .unwrap_or_else(|e| panic!("relish {args:?} printed {stdout:?}: {e}")),
+            };
+            assert_eq!(data[field], expected, "relish {args:?}: {data}");
+        }
+    }
+    for format in ["json", "yaml"] {
+        let output = run_against(&endpoint, &["-o", format, "nodes"]).await;
+        assert!(output.status.success(), "relish -o {format} nodes");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let rows: Vec<serde_json::Value> = match format {
+            "json" => serde_json::from_str(&stdout),
+            _ => yaml_serde::from_str(&stdout).map_err(serde::de::Error::custom),
+        }
+        .unwrap_or_else(|e| panic!("relish -o {format} nodes printed {stdout:?}: {e}"));
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+    server.abort();
+    let _ = server.await;
+}
+
+/// #2013: a cluster that doesn't answer is neither `DEGRADED` (1) nor
+/// `DOWN` (2). `relish status` exits 3, "couldn't reach the cluster", in
+/// every output format, with `--check` or without it.
+#[tokio::test]
+async fn status_exits_three_in_every_format_when_the_cluster_does_not_answer() {
+    // Nothing listens on port 1.
+    let endpoint = "http://127.0.0.1:1";
+    for check in [false, true] {
+        for format in ["human", "json", "yaml"] {
+            let mut args = vec!["-o", format, "status", "--quick"];
+            if check {
+                args.push("--check");
+            }
+            let output = run_against(endpoint, &args).await;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.code(),
+                Some(3),
+                "relish {args:?}: stdout {stdout:?} stderr {stderr:?}"
+            );
+            match format {
+                "human" => assert!(stderr.contains("error:"), "{stderr}"),
+                "json" => {
+                    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+                    assert_eq!(envelope["ok"], false);
+                    assert_eq!(envelope["error"]["code"], "unreachable");
+                }
+                _ => {
+                    let envelope: serde_json::Value = yaml_serde::from_str(&stdout)
+                        .unwrap_or_else(|e| panic!("relish {args:?} printed {stdout:?}: {e}"));
+                    assert_eq!(envelope["ok"], false);
+                    assert_eq!(envelope["error"]["code"], "unreachable");
+                }
+            }
+        }
+    }
+}
+
+/// A Bun whose summary endpoint and apply both answer `status`.
+async fn stub_bun_answering(status: u16) -> (String, tokio::task::JoinHandle<()>) {
+    use axum::{
+        Router,
+        http::StatusCode,
+        routing::{get, post},
+    };
+    let code = StatusCode::from_u16(status).unwrap();
+    let app = Router::new()
+        .route(
+            "/v1/health",
+            get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
+        )
+        .route(
+            "/v1/cluster/summary",
+            get(move || async move { (code, "no") }),
+        )
+        .route("/v1/apply", post(move || async move { (code, "no") }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (endpoint, server)
+}
+
+/// #2013: a summary the cluster refuses to give exits with the agent
+/// envelope's code in every format: 3 for 401 (couldn't authenticate), 4
+/// for 403 (refused), 5 for a 500 (anything else). Never 1 or 2, which
+/// `--check` keeps for DEGRADED and DOWN.
+#[tokio::test]
+async fn status_without_a_summary_exits_with_the_envelope_code() {
+    for (status, exit) in [(401, 3), (403, 4), (500, 5)] {
+        let (endpoint, server) = stub_bun_answering(status).await;
+        for format in ["human", "json", "yaml"] {
+            let args = ["-o", format, "status", "--quick", "--check"];
+            let output = run_against(&endpoint, &args).await;
+            assert_eq!(
+                output.status.code(),
+                Some(exit),
+                "HTTP {status}, relish {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        server.abort();
+        let _ = server.await;
+    }
+}
+
+/// #2012: an apply the node fails prints nothing on stdout under `-o json`
+/// (the error goes to stderr) and exits non-zero, so a script never mistakes
+/// it for an answer.
+#[tokio::test]
+async fn a_failed_apply_under_output_json_exits_non_zero_with_empty_stdout() {
+    let (endpoint, server) = stub_bun_answering(500).await;
+    let directory = tempfile::tempdir().unwrap();
+    let manifest = directory.path().join("app.toml");
+    std::fs::write(&manifest, "[app.web]\nscript = \"exec true\"\n").unwrap();
+    let output = run_against(
+        &endpoint,
+        &["-o", "json", "apply", manifest.to_str().unwrap()],
+    )
+    .await;
+    server.abort();
+    let _ = server.await;
+    assert!(!output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("error:"));
+}

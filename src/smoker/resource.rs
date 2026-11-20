@@ -282,7 +282,8 @@ pub fn recorded_cpu_max(resources: Option<&OciResources>) -> String {
 }
 
 /// The `memory.high` a workload's runtime gives it from its recorded
-/// resources: its memory request, or unlimited when it declares none.
+/// resources: unlimited, unless the recorded specification sets one. Grill
+/// never derives it from a memory request (#1955).
 pub fn recorded_memory_high(resources: Option<&OciResources>) -> String {
     resources
         .and_then(|resources| resources.unified.get("memory.high"))

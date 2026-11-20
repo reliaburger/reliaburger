@@ -1010,9 +1010,13 @@ async fn restarting_bun_on_a_volume_apps_node_never_moves_the_app() {
     assert_eq!(home.len(), 1, "db runs once: {home:?}");
     let home_index = ports.iter().position(|(n, _)| *n == home[0]).unwrap();
     let (home_name, home_port) = ports[home_index];
-    let marker = volume_root(home_name, home_port, "db")
-        .join("data")
-        .join("marker");
+    let volume = volume_root(home_name, home_port, "db").join("data");
+    // `apply_until_live` counts a pending instance, which is listed before
+    // the off-loop provisioning has created its volume; on a loaded host
+    // that can take more than a turn (#2024).
+    let provisioned = wait_until(Duration::from_secs(45), || volume.is_dir()).await;
+    assert!(provisioned, "{home_name} never provisioned db's volume");
+    let marker = volume.join("marker");
     std::fs::write(&marker, b"written before the restart").unwrap();
     let observer_index = if home_index == 0 { 1 } else { 0 };
 
@@ -1751,6 +1755,24 @@ async fn partition_isolates_a_node_for_real() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
+    // Hold the partition until q3 no longer lists its blocked peers either.
+    // A heal that looked those peers up in q3's live membership then found
+    // nobody to unblock, so q3 stayed cut off and the cluster never released
+    // the fault's reservation (#1820, #1835). Healing as soon as q1 noticed
+    // only hit that when a loaded host made detection slow.
+    let isolated = wait_until(Duration::from_secs(60), || {
+        ["q1", "q2"]
+            .iter()
+            .all(|peer| peer_state(&n3, peer).is_none())
+    })
+    .await;
+    assert!(
+        isolated,
+        "q3 still lists its blocked peers; saw q1 {:?}, q2 {:?}",
+        peer_state(&n3, "q1"),
+        peer_state(&n3, "q2")
+    );
+
     // Heal: clear q3's blocklists and it should rejoin and be Alive again.
     n3.client
         .clear_fault(fault.id, Some("q3"), true)
@@ -1976,12 +1998,18 @@ async fn start_spread_web_cluster(
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         let mut last_apply: Option<tokio::time::Instant> = None;
         loop {
-            if live_web_instances(&nodes).await == 3 && nodes_running_web(&nodes).await == 3 {
+            // Wait for a running replica with a pid on every node, not just a
+            // live status: callers read `web_process` straight away, and a
+            // replica can be live (say, `starting`) before it runs (#1961).
+            if live_web_instances(&nodes).await == 3
+                && nodes_running_web(&nodes).await == 3
+                && every_node_runs_a_web_process(&nodes).await
+            {
                 break;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "web never spread one replica per node"
+                "web never spread one running replica per node"
             );
             if last_apply.is_none_or(|t| t.elapsed() >= Duration::from_secs(8)) {
                 let _ =
@@ -2320,6 +2348,16 @@ async fn web_process(node: &Node) -> Option<(u32, u32)> {
         .into_iter()
         .find(|status| status.app_name == "web" && status.state == "running")
         .and_then(|status| Some((status.pid?, status.restart_count)))
+}
+
+/// Whether every node in `nodes` has a running `web` replica with a pid.
+async fn every_node_runs_a_web_process(nodes: &[&Node]) -> bool {
+    for node in nodes {
+        if web_process(node).await.is_none() {
+            return false;
+        }
+    }
+    true
 }
 
 /// Z2.1: a workload fault sent to one node kills the replica that runs on
@@ -2802,6 +2840,48 @@ async fn wtf_and_path_reach_every_node_through_the_entry_node() {
         inputs.cluster.council.value().is_some(),
         "the leader's council view came through the relay: {:?}",
         inputs.cluster.council
+    );
+    // Every node reports its council backup loop (#2016); this cluster
+    // configures none, which wtf's OK row says.
+    let backups = inputs
+        .cluster
+        .backups
+        .value()
+        .expect("backup evidence is available")
+        .clone();
+    let mut reported: Vec<_> = backups
+        .iter()
+        .map(|node| (node.node_id.clone(), node.status.clone()))
+        .collect();
+    reported.sort_by(|a, b| a.0.cmp(&b.0));
+    let expected: Vec<_> = names
+        .iter()
+        .map(|name| {
+            (
+                name.clone(),
+                reliaburger::council::backup::BackupStatus::NotConfigured,
+            )
+        })
+        .collect();
+    assert_eq!(reported, expected);
+    let cluster_wide = reliaburger::relish::wtf::WtfInputs {
+        app: None,
+        ..inputs.clone()
+    };
+    let report = reliaburger::relish::wtf::diagnose(&cluster_wide);
+    assert!(
+        report
+            .ok
+            .iter()
+            .any(|ok| ok.id == "backups" && ok.description.contains("aren't configured")),
+        "{report:?}"
+    );
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|finding| finding.id.starts_with("backup-")),
+        "{report:?}"
     );
 
     let result = reliaburger::relish::path_cmd::probe_path(

@@ -1,0 +1,15 @@
+#!/bin/sh
+# A broken build's bun: it starts, and never gets healthy. It says it's newer
+# than any release, so bun's launcher (/usr/lib/reliaburger/start) installs it
+# as it would a bad release's bun. Every counted boot of this version then
+# fails its boot check, and after the third try systemd-boot falls back to
+# the version before it, whose launcher must put that OS's own bun back.
+# appliance.yml adds this tree to the broken version it builds for the
+# fallback test (image/tests/os-update.sh), and to the whole build when
+# dispatched with broken_bun. Never in a published image.
+case "${1:-}" in
+    --version) echo "bun 999.0.0-broken"; exit 0 ;;
+    appliance) exit 0 ;;
+esac
+echo "bun: broken on purpose (image/tests/broken-bun); never healthy" >&2
+exec sleep infinity

@@ -23,6 +23,10 @@ const MAX_HANDSHAKE_HEAD: usize = 16 * 1024;
 /// so it can't pin the handler, its permit, and the drain guard forever (M16).
 const WS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long a drained WebSocket's client gets to take its Close frame
+/// before the connection is dropped anyway.
+const CLOSE_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Check whether a request is a WebSocket upgrade.
 ///
 /// A valid WebSocket upgrade has both `Connection: Upgrade` (or
@@ -124,20 +128,37 @@ pub async fn handle_websocket_upgrade(
         // Bind the guards so they live for the whole splice, then release.
         let _permit = permit;
         let _drain_guard = drain_guard;
-        tokio::select! {
+        let upgraded = tokio::select! {
             biased;
-            _ = super::draining::wait_for_termination(&terminate) => {},
-            _ = async {
-                let upgraded = match client_upgrade.await {
-                    Ok(u) => u,
-                    Err(_) => return,
-                };
-                let mut client_io = TokioIo::new(upgraded);
-                if !leftover.is_empty() && client_io.write_all(&leftover).await.is_err() {
-                    return;
-                }
-                let _ = tokio::io::copy_bidirectional(&mut client_io, &mut backend_stream).await;
-            } => {},
+            _ = super::draining::wait_for_termination(&terminate) => return,
+            upgraded = client_upgrade => match upgraded {
+                Ok(upgraded) => upgraded,
+                Err(_) => return,
+            },
+        };
+        let mut client_io = TokioIo::new(upgraded);
+        if !leftover.is_empty() && client_io.write_all(&leftover).await.is_err() {
+            return;
+        }
+        // Decide first, act after: the copy borrows both streams, and the
+        // borrow has to end before the Close frame can be written.
+        let terminated = tokio::select! {
+            biased;
+            _ = super::draining::wait_for_termination(&terminate) => true,
+            _ = tokio::io::copy_bidirectional(&mut client_io, &mut backend_stream) => false,
+        };
+        if terminated {
+            // F08: a drain deadline ends the connection, so tell the client
+            // why: Close with 1001 Going Away, so it reconnects rather than
+            // reporting an error. The splice copies bytes, not frames, so if
+            // the deadline fell in the middle of a backend frame the client
+            // sees a protocol error instead. Either way it's bounded.
+            let close = build_close_frame(1001);
+            let _ = tokio::time::timeout(CLOSE_FRAME_TIMEOUT, async {
+                client_io.write_all(&close).await?;
+                client_io.shutdown().await
+            })
+            .await;
         }
     });
 
@@ -223,11 +244,22 @@ fn build_upgrade_request(
 
     let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {backend}\r\n");
 
+    // Hop-by-hop headers and the ones the client's `Connection` names belong
+    // to the client's leg, as on the plain HTTP path: `Proxy-Authorization`
+    // is the proxy's credential, not the backend's (#2046). This leg's own
+    // `Connection` and `Upgrade` are set explicitly below.
+    let connection_tokens = super::proxy::connection_tokens(req.headers());
     for (name, value) in req.headers() {
         if name == header::HOST {
             continue; // Already set above
         }
-        if super::proxy::is_forwarded_header(name.as_str()) {
+        if super::proxy::is_hop_by_hop(name.as_str()) || connection_tokens.contains(name.as_str()) {
+            continue;
+        }
+        if super::proxy::is_forwarded_header(name.as_str())
+            || name.as_str().eq_ignore_ascii_case("x-real-ip")
+            || name.as_str().eq_ignore_ascii_case("x-request-id")
+        {
             continue; // Replaced with the proxy's own view below.
         }
         let Ok(v) = value.to_str() else {
@@ -242,9 +274,26 @@ fn build_upgrade_request(
         }
         request.push_str(&format!("{}: {v}\r\n", name.as_str()));
     }
+    // `is_websocket_upgrade` admitted the request, so it names a protocol.
+    let upgrade = req
+        .headers()
+        .get(header::UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("websocket");
+    request.push_str(&format!("connection: upgrade\r\nupgrade: {upgrade}\r\n"));
     for (name, value) in super::proxy::forwarded_headers(remote, over_tls) {
         request.push_str(&format!("{name}: {value}\r\n"));
     }
+    // The same proxy-owned headers as a plain request (F08): the client's
+    // address as the proxy saw it, and the client's request id or a new one.
+    let request_id = req
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map_or_else(super::proxy::generate_request_id, str::to_string);
+    request.push_str(&format!("x-real-ip: {}\r\n", remote.ip()));
+    request.push_str(&format!("x-request-id: {request_id}\r\n"));
     request.push_str("\r\n");
     request
 }
@@ -362,6 +411,51 @@ mod tests {
         assert!(raw.ends_with("\r\n\r\n"));
     }
 
+    /// The upgrade drops what the plain HTTP path drops: the hop-by-hop
+    /// set, the proxy's own credentials, and every header the client's
+    /// `Connection` names. It keeps one `Connection: upgrade` and the
+    /// client's `Upgrade` (#2046).
+    #[test]
+    fn build_upgrade_request_strips_hop_by_hop_headers_and_proxy_credentials() {
+        let req = Request::builder()
+            .uri("/ws")
+            .header(header::CONNECTION, "keep-alive, Upgrade, X-Leg-Secret")
+            .header(header::UPGRADE, "websocket")
+            .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("Proxy-Authorization", "Basic cHJveHk6c2VjcmV0")
+            .header("Keep-Alive", "timeout=5")
+            .header("TE", "trailers")
+            .header("Trailer", "Expires")
+            .header("Transfer-Encoding", "chunked")
+            .header("X-Leg-Secret", "for-the-proxy")
+            .header("X-End-To-End", "kept")
+            .body(Body::empty())
+            .unwrap();
+        let backend: SocketAddr = "10.0.2.2:8080".parse().unwrap();
+        let remote: SocketAddr = "203.0.113.7:5000".parse().unwrap();
+        let raw = build_upgrade_request(&req, backend, remote, false).to_lowercase();
+
+        for dropped in [
+            "\r\nproxy-authorization:",
+            "\r\nkeep-alive:",
+            "\r\nte:",
+            "\r\ntrailer:",
+            "\r\ntransfer-encoding:",
+            "\r\nx-leg-secret:",
+            "cHJveHk6c2VjcmV0",
+        ] {
+            assert!(
+                !raw.contains(&dropped.to_lowercase()),
+                "{dropped} reached the backend: {raw}"
+            );
+        }
+        assert_eq!(raw.matches("connection:").count(), 1, "{raw}");
+        assert!(raw.contains("connection: upgrade\r\n"), "{raw}");
+        assert_eq!(raw.matches("upgrade: websocket\r\n").count(), 1, "{raw}");
+        assert!(raw.contains("x-end-to-end: kept\r\n"), "{raw}");
+        assert!(raw.contains("sec-websocket-key: dghlihnhbxbszsbub25jzq==\r\n"));
+    }
+
     /// M9: a WebSocket client cannot spoof `X-Forwarded-For`. The client's
     /// forwarded headers are dropped and the proxy sets its own from the real
     /// peer address, exactly like the non-WS forward path.
@@ -390,6 +484,54 @@ mod tests {
         assert!(raw.contains("x-forwarded-proto: https\r\n"));
         // Exactly one x-forwarded-for line (no duplicate from the client).
         assert_eq!(raw.matches("x-forwarded-for:").count(), 1);
+    }
+
+    /// F08: the upgrade carries the same proxy-owned headers as a plain
+    /// request. `X-Real-IP` is the proxy's view of the client, never the
+    /// client's own claim, and a request id is minted when the client sent
+    /// none, so a backend can correlate the connection across the hop.
+    #[test]
+    fn build_upgrade_request_sets_real_ip_and_mints_a_request_id() {
+        let req = Request::builder()
+            .uri("/ws")
+            .header(header::CONNECTION, "Upgrade")
+            .header(header::UPGRADE, "websocket")
+            .header("X-Real-IP", "1.2.3.4")
+            .body(Body::empty())
+            .unwrap();
+        let backend: SocketAddr = "10.0.2.2:8080".parse().unwrap();
+        let remote: SocketAddr = "203.0.113.7:5000".parse().unwrap();
+        let raw = build_upgrade_request(&req, backend, remote, false).to_lowercase();
+
+        assert!(!raw.contains("1.2.3.4"), "client x-real-ip leaked: {raw}");
+        assert!(raw.contains("x-real-ip: 203.0.113.7\r\n"), "{raw}");
+        assert_eq!(raw.matches("x-real-ip:").count(), 1);
+        let ids: Vec<&str> = raw
+            .lines()
+            .filter_map(|line| line.strip_prefix("x-request-id: "))
+            .collect();
+        assert_eq!(ids.len(), 1, "{raw}");
+        assert_eq!(ids[0].len(), 32, "{raw}");
+        assert!(ids[0].chars().all(|c| c.is_ascii_hexdigit()), "{raw}");
+    }
+
+    #[test]
+    fn build_upgrade_request_keeps_a_client_request_id() {
+        let req = Request::builder()
+            .uri("/ws")
+            .header(header::CONNECTION, "Upgrade")
+            .header(header::UPGRADE, "websocket")
+            .header("X-Request-ID", "client-supplied-id-123")
+            .body(Body::empty())
+            .unwrap();
+        let backend: SocketAddr = "10.0.2.2:8080".parse().unwrap();
+        let remote: SocketAddr = "203.0.113.7:5000".parse().unwrap();
+        let raw = build_upgrade_request(&req, backend, remote, false).to_lowercase();
+        assert!(
+            raw.contains("x-request-id: client-supplied-id-123\r\n"),
+            "{raw}"
+        );
+        assert_eq!(raw.matches("x-request-id:").count(), 1, "{raw}");
     }
 
     #[test]

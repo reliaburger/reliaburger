@@ -230,6 +230,7 @@ pub async fn start_hollow_node(spec: HollowSpec) -> std::io::Result<HollowNode> 
             seeds,
             wrapping_ikm: None,
             bootstrap_security_state: None,
+            bootstrap_council_size: None,
             data_dir: data_dir.clone(),
             mayo: None,
             rollup_interval: std::time::Duration::from_secs(60),

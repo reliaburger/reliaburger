@@ -25,6 +25,7 @@ fn runtime(directory: &Path) -> ProcessGrill {
 /// A host workload: the only kind the process runtime runs (#914).
 fn spec(script: &str) -> OciSpec {
     OciSpec {
+        managed_volumes: Vec::new(),
         reusable_executor: false,
         host_process: true,
         initialiser: false,
@@ -1358,7 +1359,6 @@ fn running_agent(
         reliaburger::config::process_workloads::ProcessWorkloadsConfig {
             allowed_binaries,
             mount_isolation: false,
-            ..Default::default()
         },
     );
     let task = tokio::spawn(async move { agent.run().await });

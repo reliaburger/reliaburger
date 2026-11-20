@@ -58,7 +58,15 @@ path = "/data"            # a managed volume; see `images-and-volumes`
 CPU follows Kubernetes: a bare number is cores (`cpu = "2"`, `cpu = "0.5-2"`)
 and the `m` suffix is millicores (`"250m"` is a quarter of a core). Memory takes
 `Ki`/`Mi`/`Gi`/`Ti`, and a bare number is bytes. A single value sets the request
-and the limit to the same thing.
+and the limit to the same thing. A CPU limit can't be more than 65,536 cores.
+
+The request only reserves memory on a node; the limit is the container's
+ceiling. An app with an `image`, and each of its sidecars, needs a memory limit
+of at least 16 MiB. runc starts every container with its own `runc init`
+process inside the container's cgroup, and runc 1.4 needs up to 13 MB for it,
+so `relish apply` refuses `memory = "8Mi"` instead of letting the start fail.
+The request can still be smaller (`memory = "4Mi-16Mi"`). Host apps (`exec` or
+`script`) have no floor.
 
 Names (apps, jobs, namespaces) are lowercase DNS labels. Secrets go in `env`
 encrypted; see `security`. Ingress, firewall and egress rules are in
@@ -83,10 +91,18 @@ initial_delay = 0         # seconds before the first probe (default 0)
 
 `health.port` works without an app `port`, so an app can probe a separate
 admin listener. `relish apply` refuses a health check with neither, a zero
-interval, timeout or threshold, and a `timeout` longer than the
-`interval`. Leave `timeout` out and it's 5 seconds or the interval,
-whichever is shorter, so `interval = 2` on its own is fine. A new instance that never passes is given up after 60 failed
-probes (about ten minutes at the default interval) and restarted.
+interval, timeout or threshold, an `interval` or `initial_delay` over a day
+(86400 seconds), and a `timeout` longer than the `interval`. Leave `timeout` out and it's 5 seconds or the interval,
+whichever is shorter, so `interval = 2` on its own is fine.
+
+A new instance that crashes before its first passing probe is restarted at
+once, with the usual backoff, and records a `restart` event, so `relish wtf`
+sees a crash loop. One whose process stays up but never passes (a wrong
+`path` or `port`, say) is given up after 60 failed probes in a row (about ten
+minutes at the default interval). The node stops its process and marks it
+`failed` instead of restarting it, and records why under
+`restart.never_healthy`. Restarting wouldn't help: the same probe fails the
+same way. Fix the check and apply again.
 
 ## Init containers
 
@@ -641,7 +657,10 @@ Each node keeps its last 50 deploys per app.
 
 In a cluster, `relish rollback` takes its target from the council, which keeps
 the last ten versions of each app that rolled out healthy on every node, so it
-works from whichever node you ask and after every node has restarted. The
+works from whichever node you ask and after every node has restarted. A
+follower sends the rollback on to the leader, which picks the target from its
+own state, so a deploy that has just committed counts even on a node that
+hasn't caught up with it yet. The
 previous version is the newest one there that differs from what the app runs
 now. Without one (a single node, or an app that never finished a rollout) it
 falls back to the cluster-wide history. A rollback changes the version and

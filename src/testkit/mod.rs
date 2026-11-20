@@ -12,8 +12,10 @@
 //! - [`runner`] — parallelism, timeouts and teardown around a selection.
 //! - [`cases`] — the integration catalogue.
 //! - [`chaos`] — the chaos scenarios, selected by `--chaos`.
+//! - [`bun_binary`] — the Bun binary the runtime tests run as their owner.
 
 pub mod bench;
+pub mod bun_binary;
 pub mod cases;
 pub mod chaos;
 pub mod context;

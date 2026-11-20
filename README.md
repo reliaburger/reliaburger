@@ -139,6 +139,7 @@ feature Ready, Beta, Alpha or Planned.
 - [The whitepaper](docs/whitepaper.md) for the architecture and its trade-offs, and the [design docs](docs/design/) for each subsystem.
 - [The comparisons](https://reliaburger.com/compare/) with Kubernetes, Nomad, k3s, Docker Compose, Coolify and Uncloud.
 - [The roadmap](docs/roadmap.md) for what's next and the known gaps.
+- [The changelog](CHANGELOG.md) for what changed in each release, and whether your cluster can roll onto it.
 
 ## Contributing
 

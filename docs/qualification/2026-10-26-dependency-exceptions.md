@@ -53,6 +53,15 @@ zstd-safe 7.3.0 and 7.2.4 respectively.
 lockfile's SHA-256 is
 `e21a2d1742e79d5e86b75a990785f1a112f74aac4953dd051c0aa770aee34da0`.
 
+## Update, 7 November 2026
+
+[include-flate-compress 0.3.5](https://crates.io/crates/include-flate-compress/0.3.5),
+published on 27 October, requires zstd `^0.14.0`. The 0.3.0 train locks it,
+with `include-flate` and `include-flate-codegen` 0.3.5, so zstd 0.13 is now
+reached only through arrow and DataFusion. The exceptions stay:
+[DataFusion 55.2.0](https://crates.io/crates/datafusion/55.2.0) is still the
+newest release, and it still requires arrow `^59.2`.
+
 ## Reproduce the review
 
 ```sh

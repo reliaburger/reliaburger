@@ -6,6 +6,7 @@ checks what can be checked without a cluster, on every CI run.
 import pathlib
 import re
 import subprocess
+import tempfile
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -102,6 +103,48 @@ class DemoScripts(unittest.TestCase):
             with self.subTest(script=name):
                 self.assertIn(f'run_demo("{name}")', live)
                 self.assertIn(f'scripts/demo/{name}', testing)
+
+    def test_the_gitops_demo_rewrites_each_port_once_whatever_the_port_base(self):
+        # #2068: with port base 28078, 8081 became 28082 and the next rule
+        # turned that into 228083. Run point_at_demo as the demo defines it.
+        script = (DEMO / 'gitops.sh').read_text()
+        function = re.search(r'(?ms)^point_at_demo\(\) \{.*?^\}', script).group(0)
+        for base in [28078, 28076, 28077, 30000, 8074, 8076]:
+            with self.subTest(base=base), tempfile.TemporaryDirectory() as tmp:
+                source = pathlib.Path(tmp) / 'in.toml'
+                target = pathlib.Path(tmp) / 'out.toml'
+                source.write_text(
+                    'exec = "target/debug/testapp"\n'
+                    'command = ["--port", "8080"]\n'
+                    'port = 8081\n'
+                    'port = 8082\n'
+                    'ports = [8080, 8081, 8082]\n'
+                    'image = "app:v18081"\n'
+                    'pairs = 8080,8080,8080,8080 8081:8082\n'
+                )
+                subprocess.run(
+                    ['bash', '-c', f'set -euo pipefail\n{function}\npoint_at_demo "$1" "$2"',
+                     'bash', str(source), str(target)],
+                    check=True,
+                    env={
+                        'PATH': '/usr/bin:/bin',
+                        'TESTAPP': '/opt/testapp',
+                        'DEMO_APP_PORT': str(base + 4),
+                        'DEMO_SECOND_APP_PORT': str(base + 5),
+                        'DEMO_THIRD_APP_PORT': str(base + 6),
+                    },
+                )
+                self.assertEqual(
+                    target.read_text(),
+                    'exec = "/opt/testapp"\n'
+                    f'command = ["--port", "{base + 6}"]\n'
+                    f'port = {base + 4}\n'
+                    f'port = {base + 5}\n'
+                    f'ports = [{base + 6}, {base + 4}, {base + 5}]\n'
+                    'image = "app:v18081"\n'
+                    f'pairs = {base + 6},{base + 6},{base + 6},{base + 6} '
+                    f'{base + 4}:{base + 5}\n',
+                )
 
 
 if __name__ == '__main__':

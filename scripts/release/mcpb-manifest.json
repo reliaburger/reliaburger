@@ -11,7 +11,7 @@
   },
   "description": "Read-only Reliaburger cluster diagnosis: the relish agent commands as MCP tools.",
   "display_name": "Reliaburger relish",
-  "documentation": "https://github.com/reliaburger/reliaburger/blob/v0.2.8/docs/manual/16_working-with-an-ai-agent.md",
+  "documentation": "https://github.com/reliaburger/reliaburger/blob/v0.3.0/docs/manual/16_working-with-an-ai-agent.md",
   "homepage": "https://reliaburger.com/agents",
   "keywords": [
     "reliaburger",
@@ -118,5 +118,5 @@
       "type": "string"
     }
   },
-  "version": "0.2.8"
+  "version": "0.3.0"
 }

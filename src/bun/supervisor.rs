@@ -934,6 +934,13 @@ impl<G: Grill> WorkloadSupervisor<G> {
 
         if let Some(new_state) = transition {
             instance.state = instance.state.transition_to(new_state)?;
+            // Only a startup that never passed a probe goes to Stopping.
+            // The agent's cleanup kills it, and `maybe_restart` then marks
+            // it Failed instead of restarting it.
+            if new_state == ContainerState::Stopping {
+                instance.retry_pending = true;
+                instance.restart_cause = Some(crate::bun::restart::RestartCause::NeverHealthy);
+            }
             Ok(Some(new_state))
         } else {
             Ok(None)
@@ -944,7 +951,8 @@ impl<G: Grill> WorkloadSupervisor<G> {
     /// transition it back to Pending.
     ///
     /// Returns `true` if the restart was initiated, `false` if the
-    /// instance isn't eligible (not in a restartable state).
+    /// instance isn't eligible (not in a restartable state, inside its
+    /// backoff, or never healthy, which marks it `Failed`).
     pub async fn maybe_restart(
         &mut self,
         instance_id: &InstanceId,
@@ -962,6 +970,17 @@ impl<G: Grill> WorkloadSupervisor<G> {
             instance.state,
             ContainerState::Unhealthy | ContainerState::Stopped
         ) {
+            return Ok(false);
+        }
+
+        // A stopped instance that never passed its startup health check is
+        // given up, not restarted.
+        if instance.state == ContainerState::Stopped
+            && instance.restart_cause == Some(crate::bun::restart::RestartCause::NeverHealthy)
+        {
+            instance.state = instance.state.transition_to(ContainerState::Failed)?;
+            instance.retry_pending = false;
+            instance.restart_cause = None;
             return Ok(false);
         }
 
@@ -1081,7 +1100,6 @@ mod tests {
             crate::config::process_workloads::ProcessWorkloadsConfig {
                 allowed_binaries: binaries,
                 mount_isolation: false,
-                script_dir: std::env::temp_dir().join("reliaburger-sup-test-scripts"),
             },
         )
     }
@@ -1169,13 +1187,8 @@ mod tests {
             "set RELIABURGER_RUNC_TESTS=1 after installing runc"
         );
         let root = tempfile::tempdir().unwrap();
-        let owner = std::env::var_os("RELIABURGER_BUN_BINARY")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                // Unit tests run from target/<profile>/deps; Bun is built beside it.
-                let executable = std::env::current_exe().unwrap();
-                executable.parent().unwrap().parent().unwrap().join("bun")
-            });
+        let owner =
+            crate::testkit::bun_binary::bun_binary().unwrap_or_else(|error| panic!("{error}"));
         let grill = crate::grill::runc::RuncGrill::new(
             root.path().join("bundles"),
             crate::grill::ImageStore::new(root.path().join("images")),
@@ -1638,6 +1651,42 @@ mod tests {
         assert_eq!(result, None);
     }
 
+    /// A startup that never passes a probe is stopped, with cleanup owed,
+    /// and once stopped it is marked Failed rather than restarted. Its
+    /// process may still be running, so marking it Failed at once left a
+    /// live process the node counted as stopped.
+    #[tokio::test]
+    async fn a_never_healthy_startup_is_stopped_then_failed_not_restarted() {
+        let mut sup = test_supervisor();
+        let now = Instant::now();
+        let spec = app_spec_with_health(8080);
+        let ids = sup.deploy_app("web", "default", &spec, now).await.unwrap();
+        sup.get_instance_mut(&ids[0]).unwrap().state = ContainerState::HealthWait;
+
+        let mut last = None;
+        while last.is_none() {
+            last = sup
+                .process_health_result(&ids[0], HealthStatus::ConnectionRefused)
+                .unwrap();
+        }
+        assert_eq!(last, Some(ContainerState::Stopping));
+        let instance = sup.get_instance(&ids[0]).unwrap();
+        assert!(instance.retry_pending, "the stop must be owed cleanup");
+        assert_eq!(
+            instance.restart_cause,
+            Some(crate::bun::restart::RestartCause::NeverHealthy)
+        );
+
+        // The agent's cleanup confirmed the process is gone.
+        let instance = sup.get_instance_mut(&ids[0]).unwrap();
+        instance.state = ContainerState::Stopped;
+        assert!(!sup.maybe_restart(&ids[0], Instant::now()).await.unwrap());
+        let instance = sup.get_instance(&ids[0]).unwrap();
+        assert_eq!(instance.state, ContainerState::Failed);
+        assert!(!instance.retry_pending);
+        assert_eq!(instance.restart_count, 0);
+    }
+
     #[tokio::test]
     async fn health_result_unknown_instance_errors() {
         let mut sup = test_supervisor();
@@ -1792,7 +1841,6 @@ mod tests {
             crate::config::process_workloads::ProcessWorkloadsConfig {
                 allowed_binaries: vec![std::path::PathBuf::from("/usr/bin/python3")],
                 mount_isolation: true,
-                script_dir: std::env::temp_dir().join("reliaburger-sup-iso-test"),
             },
         );
         let spec = exec_app_spec("/usr/bin/python3");
@@ -2159,7 +2207,6 @@ mod tests {
         sup.set_process_config(crate::config::process_workloads::ProcessWorkloadsConfig {
             allowed_binaries: vec!["/bin/sh".into()],
             mount_isolation: false,
-            script_dir: root.path().join("scripts"),
         });
         sup.admit_app("host", &host).unwrap();
         host.memory = Some(crate::config::types::ResourceRange::parse_memory("64Mi").unwrap());
@@ -2216,7 +2263,6 @@ mod tests {
             crate::config::process_workloads::ProcessWorkloadsConfig {
                 allowed_binaries: vec!["/bin/sh".into()],
                 mount_isolation: false,
-                script_dir: root.path().join("scripts"),
             },
         );
         let host = |init: &str| {
@@ -2262,7 +2308,6 @@ mod tests {
             crate::config::process_workloads::ProcessWorkloadsConfig {
                 allowed_binaries: vec!["/bin/sh".into()],
                 mount_isolation: false,
-                script_dir: root.path().join("scripts"),
             },
         );
         sup.set_capabilities(PlatformCapabilities {

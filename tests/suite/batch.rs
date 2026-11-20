@@ -93,7 +93,6 @@ impl Harness {
             .map(Into::into)
             .collect(),
             mount_isolation: false,
-            ..Default::default()
         };
         agent.set_process_config(process_policy.clone());
         agent.set_node_capacity(8000, 16384);
@@ -319,7 +318,7 @@ async fn single_node_leader() -> Arc<CouncilNode> {
     )
     .await
     .unwrap();
-    router.register(1, node.raft().clone()).await;
+    router.register(1, &node).await;
     let mut members = BTreeMap::new();
     members.insert(
         1u64,
@@ -1148,7 +1147,7 @@ async fn follower_forwarding_cannot_bypass_a_failed_cluster_prerequisite() {
             .await
             .unwrap(),
         );
-        network.register(id, node.raft().clone()).await;
+        network.register(id, &node).await;
         councils.push(node);
     }
     councils[0]
@@ -1275,7 +1274,7 @@ async fn assert_handover_keeps_an_uncertain_prerequisite_claim(mode: &str) {
             .await
             .unwrap(),
         );
-        network.register(id, node.raft().clone()).await;
+        network.register(id, &node).await;
         councils.push(node);
     }
     councils[0]
@@ -1618,7 +1617,7 @@ async fn cancelling_a_running_cluster_migration_never_publishes_its_app_revision
                 break;
             }
             assert!(
-                record.cancelled,
+                record.cancelled(),
                 "cancellation intent disappeared before cleanup"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1655,7 +1654,7 @@ async fn cancelling_a_running_cluster_migration_never_publishes_its_app_revision
         .find(|(id, _)| *id == claim_id)
         .unwrap()
         .1;
-    assert!(receipt.cancelled && receipt.completed);
+    assert!(receipt.cancelled() && receipt.completed);
     assert!(!receipt.apps_committed);
     assert_eq!(
         receipt.outcome,

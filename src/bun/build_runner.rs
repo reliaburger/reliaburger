@@ -345,20 +345,31 @@ async fn forward_track_to_leader(
     if let Some(token) = &state.service_token {
         proxied = proxied.bearer_auth(token);
     }
-    let response = proxied
-        .send()
+    let exchange = async {
+        let response = proxied
+            .send()
+            .await
+            .map_err(|e| format!("leader forward failed: {e}"))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("leader refused the tracking op ({status}): {body}"));
+        }
+        let value: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| format!("leader track response unreadable: {e}"))?;
+        Ok(value["build_id"].as_u64())
+    };
+    let deadline = super::batch::LEADER_FORWARD_TIMEOUT;
+    tokio::time::timeout(deadline, exchange)
         .await
-        .map_err(|e| format!("leader forward failed: {e}"))?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("leader refused the tracking op ({status}): {body}"));
-    }
-    let value: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("leader track response unreadable: {e}"))?;
-    Ok(value["build_id"].as_u64())
+        .map_err(|_| {
+            format!(
+                "the leader didn't answer the tracking op within {}s",
+                deadline.as_secs()
+            )
+        })?
 }
 
 // ---------------------------------------------------------------------------
@@ -661,8 +672,22 @@ impl ScopedDir {
 }
 
 impl Drop for ScopedDir {
+    /// A build context can hold thousands of files, and the value is
+    /// dropped in async code, so inside a runtime the delete goes to the
+    /// blocking pool rather than stalling the worker it was dropped on
+    /// (#1871). Outside one there's no worker to stall.
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        let path = std::mem::take(&mut self.path);
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn_blocking(move || {
+                    let _ = std::fs::remove_dir_all(path);
+                });
+            }
+            Err(_) => {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+        }
     }
 }
 
@@ -1975,7 +2000,7 @@ mod tests {
         )
         .await
         .unwrap();
-        router.register(1, node.raft().clone()).await;
+        router.register(1, &node).await;
         let members = std::collections::BTreeMap::from([(
             1u64,
             CouncilNodeInfo::new("127.0.0.1:9001".parse().unwrap(), "node-1".to_string()),
@@ -2010,6 +2035,7 @@ mod tests {
             join_tokens: vec![],
             next_serial: 10,
             oidc_signing_config: Some(oidc_config),
+            retiring_oidc_keys: Vec::new(),
             crl: crate::sesame::types::Crl::default(),
             secret_seals: std::collections::BTreeMap::new(),
             node_leaves: std::collections::BTreeMap::new(),
@@ -2137,7 +2163,7 @@ mod tests {
         )
         .await
         .unwrap();
-        router.register(1, node.raft().clone()).await;
+        router.register(1, &node).await;
         let members = std::collections::BTreeMap::from([(
             1u64,
             CouncilNodeInfo::new("127.0.0.1:9002".parse().unwrap(), "node-1".to_string()),
@@ -2232,6 +2258,36 @@ mod tests {
             path
         };
         assert!(!path.exists(), "ScopedDir should delete itself on drop");
+    }
+
+    /// #1871: dropping a build directory in async code mustn't stall the
+    /// worker it runs on while thousands of files are deleted, so the
+    /// delete goes to the blocking pool. The check is structural, not a
+    /// stopwatch (#1978): with the pool's only thread held, a delete sent
+    /// there can't have happened by the end of the first poll, while an
+    /// inline one has, whatever the tree's size or the disk's speed.
+    #[test]
+    fn dropping_a_scoped_dir_in_async_code_never_blocks_the_runtime() {
+        let base = std::env::temp_dir().join("reliaburger-build-test");
+        let dir = ScopedDir::new(&base, 1871).unwrap();
+        let path = dir.path().to_path_buf();
+        let sub = path.join("layer");
+        std::fs::create_dir(&sub).unwrap();
+        for f in 0..10 {
+            std::fs::write(sub.join(format!("f{f}")), b"x").unwrap();
+        }
+
+        let deleted = crate::off_runtime::assert_runs_on_blocking_pool(async move {
+            drop(dir);
+            for _ in 0..3000 {
+                if !path.exists() {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            false
+        });
+        assert!(deleted, "the dropped build directory was never deleted");
     }
 
     #[test]

@@ -27,6 +27,8 @@ pub const CERTIFICATE_WARNING_SECONDS: u64 = 14 * 24 * 60 * 60;
 pub const DISK_WARNING_PERCENT: u64 = 85;
 /// `disk-high`: critical from this percentage full.
 pub const DISK_CRITICAL_PERCENT: u64 = 95;
+/// `backup-failing`: no council backup exported for this many intervals.
+pub const BACKUP_STALE_INTERVALS: u64 = 3;
 
 /// How bad a finding is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
@@ -97,6 +99,18 @@ pub const FINDINGS: &[FindingKind] = &[
         id: "version-skew",
         severities: WARNING,
         meaning: "the nodes run different bun builds (version and commit, or the binary's SHA-256 when the commit is unknown)",
+        thresholds: &[],
+    },
+    FindingKind {
+        id: "os-update-failed",
+        severities: WARNING,
+        meaning: "an appliance couldn't update its OS during `relish os upgrade`; the rollout stops at that node until `relish os resume`",
+        thresholds: &[],
+    },
+    FindingKind {
+        id: "os-skew",
+        severities: WARNING,
+        meaning: "the appliances run different Reliaburger OS versions, as they do partway through a rollout",
         thresholds: &[],
     },
     FindingKind {
@@ -184,6 +198,12 @@ pub const FINDINGS: &[FindingKind] = &[
         ],
     },
     FindingKind {
+        id: "export-failing",
+        severities: WARNING,
+        meaning: "a node can't export its logs or metrics; it prunes only what it has exported, so the store's size cap and retention are on hold until an export works",
+        thresholds: &[],
+    },
+    FindingKind {
         id: "cert-expired",
         severities: CRITICAL,
         meaning: "a node or workload certificate is past its not-after time",
@@ -269,6 +289,29 @@ pub const FINDINGS: &[FindingKind] = &[
         severities: WARNING,
         meaning: "a node can't unseal the cluster's GitOps credentials, so as leader it couldn't sync",
         thresholds: &[],
+    },
+    FindingKind {
+        id: "backup-disabled",
+        severities: CRITICAL,
+        meaning: "a node has [cluster.backup] set but its backup loop can't run: no master key to seal with, or a destination the object store can't open",
+        thresholds: &[],
+    },
+    FindingKind {
+        id: "backup-not-configured",
+        severities: WARNING,
+        meaning: "some council members have [cluster.backup] but this one doesn't, so as leader it would export nothing (a cluster with none configured gets an OK row that says so)",
+        thresholds: &[],
+    },
+    FindingKind {
+        id: "backup-failing",
+        severities: WARNING,
+        meaning: "the leader's last council backup export failed, or no node has exported one for several intervals",
+        thresholds: &[Threshold {
+            constant: "BACKUP_STALE_INTERVALS",
+            value: BACKUP_STALE_INTERVALS,
+            unit: Unit::Count,
+            meaning: "backup intervals without an export before the warning",
+        }],
     },
     FindingKind {
         id: "policy-broken",

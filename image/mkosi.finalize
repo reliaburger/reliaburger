@@ -1,0 +1,18 @@
+#!/bin/sh
+# Ship a pristine copy of this image's /etc in /usr/share/factory/etc.
+#
+# /etc lives on the data partition, so an OS update (which replaces only
+# /usr) would otherwise never change it: new CA certificates, linker paths,
+# alternatives or unit symlinks from a later image wouldn't reach installed
+# nodes. reliaburger-etc-sync.service compares this copy with the node's /etc
+# on the first boot of each new /usr and updates what the node never changed
+# (mkosi.extra/usr/lib/reliaburger/etc-sync).
+#
+# A finalize script: it runs after the presets and every other step that
+# writes /etc. Only the main image has it; the installer doesn't need one.
+set -eu
+factory="$BUILDROOT/usr/share/factory/etc"
+rm -rf "$factory"
+mkdir -p "$factory"
+cp -a "$BUILDROOT/etc/." "$factory/"
+echo "factory /etc: $(find "$factory" ! -type d | wc -l) entries, $(du -sh "$factory" | cut -f1)"

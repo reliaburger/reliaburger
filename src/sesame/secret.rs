@@ -497,9 +497,8 @@ mod tests {
     }
 
     // Values sealed by an age 0.10 build (Reliaburger 0.2.1 and earlier),
-    // checked in as fixtures. App configs carry `ENC[AGE:...]` values and
-    // every node keeps `<cluster>-root-ca.age`, so later age releases have
-    // to keep opening both (#1026).
+    // checked in as fixtures. App configs carry `ENC[AGE:...]` values for
+    // years, so later age releases have to keep opening them (#1026).
     const AGE_0_10_IDENTITY: &str = include_str!("../../tests/fixtures/age/identity.txt");
 
     fn fixture_identity() -> age::x25519::Identity {

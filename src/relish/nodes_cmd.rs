@@ -63,9 +63,14 @@ pub async fn run_with_client(
     client: &BunClient,
 ) -> Result<(), RelishError> {
     let nodes = client.nodes().await?;
+    // A standalone node has no cluster nodes: say so to a person, and hand
+    // a script the empty list it can parse (#2012).
     if nodes.is_empty() {
-        println!("no cluster nodes (single-node mode)");
-        return Ok(());
+        if output == OutputFormat::Human {
+            println!("no cluster nodes (single-node mode)");
+            return Ok(());
+        }
+        return print_rows(&[], output);
     }
     let (capacity, (shares, unanswered)) = tokio::join!(
         client.cluster_capacity(),
@@ -87,15 +92,19 @@ pub async fn run_with_client(
     if unhealthy {
         rows.retain(NodeRow::is_unhealthy);
     }
+    print_rows(&rows, output)
+}
+
+fn print_rows(rows: &[NodeRow], output: OutputFormat) -> Result<(), RelishError> {
     match output {
-        OutputFormat::Human => print!("{}", render_nodes(&rows)),
+        OutputFormat::Human => print!("{}", render_nodes(rows)),
         OutputFormat::Json => println!(
             "{}",
-            serde_json::to_string_pretty(&rows).map_err(RelishError::SerialiseJson)?
+            serde_json::to_string_pretty(rows).map_err(RelishError::SerialiseJson)?
         ),
         OutputFormat::Yaml => print!(
             "{}",
-            yaml_serde::to_string(&rows).map_err(RelishError::SerialiseYaml)?
+            yaml_serde::to_string(rows).map_err(RelishError::SerialiseYaml)?
         ),
     }
     Ok(())

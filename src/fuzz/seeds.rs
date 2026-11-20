@@ -13,7 +13,8 @@ use std::path::Path;
 use crate::council::network::{RaftRpc, RaftRpcEnvelope};
 use crate::meat::NodeId;
 use crate::mustard::message::{
-    DirectoryExtension, GossipMessage, GossipPayload, LeaderHint, MembershipUpdate, encode_datagram,
+    DirectoryExtension, GossipMessage, GossipPayload, LeaderHint, MembershipUpdate, SequenceFloor,
+    encode_datagram,
 };
 use crate::mustard::state::NodeState;
 
@@ -44,6 +45,9 @@ pub(super) fn for_target(target: &str) -> Vec<Seed> {
         "join_csr" => csrs(),
         "app_config" => config_files(&["phase-1", "phase-8", "templates", "policies"]),
         "node_config" => config_files(&["node"]),
+        "task_manifest" => task_manifests(),
+        "chaos_scenario" => scenario_files(),
+        "council_backup_state" => council_states(),
         other => panic!("no seeds for fuzz target {other}"),
     }
 }
@@ -83,7 +87,18 @@ fn gossip() -> Vec<Seed> {
     });
     let sync = message(GossipPayload::Sync {
         entries: vec![update("a", NodeState::Alive), update("b", NodeState::Left)],
+        floors: vec![SequenceFloor {
+            node_id: NodeId::new("departed"),
+            incarnation: 2,
+            sequence: 41,
+            expires_in_secs: 3600,
+        }],
         wants_reply: true,
+    });
+    let stale = message(GossipPayload::Stale {
+        held_incarnation: 4,
+        held_sequence: 40,
+        updates: vec![update("c", NodeState::Suspect)],
     });
     let mut with_directory = message(GossipPayload::Ping { updates: vec![] });
     with_directory.extension = Some(DirectoryExtension {
@@ -109,6 +124,7 @@ fn gossip() -> Vec<Seed> {
         ("ping-req", ping_req),
         ("ack", ack),
         ("sync", sync),
+        ("stale", stale),
         ("ping-with-directory", with_directory),
     ]
     .into_iter()
@@ -174,6 +190,7 @@ fn raft() -> Vec<Seed> {
             "install-snapshot",
             envelope(RaftRpc::InstallSnapshot(snapshot)),
         ),
+        seed("council-voters", envelope(RaftRpc::CouncilVoters)),
     ]
 }
 
@@ -356,4 +373,54 @@ fn config_files(directories: &[&str]) -> Vec<Seed> {
         }
     }
     seeds
+}
+
+fn task_manifests() -> Vec<Seed> {
+    let cohort = |name: &str, count: u32| {
+        serde_json::json!({
+            "name": name,
+            "count": count,
+            "template": {"runtime": "process", "exec": "/bin/true"},
+        })
+    };
+    vec![
+        seed(
+            "one-cohort",
+            json(serde_json::json!({"name": "mixed", "cohort": [cohort("small", 1)]})),
+        ),
+        seed(
+            "two-cohorts",
+            json(serde_json::json!({
+                "name": "render",
+                "namespace": "media",
+                "cohort": [cohort("thumbnails", 100), cohort("posters", 3)],
+            })),
+        ),
+    ]
+}
+
+fn scenario_files() -> Vec<Seed> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/phase-8/container-chaos-scenario.toml");
+    vec![seed(
+        "container-chaos-scenario",
+        std::fs::read(&path).expect("the example scenario reads"),
+    )]
+}
+
+fn council_states() -> Vec<Seed> {
+    use crate::council::types::DesiredState;
+
+    let empty = DesiredState::default();
+    let mut configured = DesiredState::default();
+    configured.config.insert("heartbeat".into(), "1".into());
+    [("empty", empty), ("with-config", configured)]
+        .into_iter()
+        .map(|(name, state)| {
+            seed(
+                name,
+                serde_json::to_vec(&state).expect("seed state encodes"),
+            )
+        })
+        .collect()
 }

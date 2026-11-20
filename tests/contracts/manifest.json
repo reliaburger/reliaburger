@@ -233,6 +233,45 @@
       ]
     },
     {
+      "id": "issue-2000",
+      "issue": 2000,
+      "promise": "A loop volume whose provisioning record is lost or unreadable keeps its data: provisioning refuses rather than formatting its image.",
+      "supported_paths": [
+        "A provisioned loop volume with an intact record mounts again with its data.",
+        "A first provisioning that fails part-way removes its own image, so the next start provisions the volume."
+      ],
+      "refused_paths": [
+        "A loop image with no readable record is never claimed or formatted again."
+      ],
+      "boundaries": [
+        "Actual loop-backed ext4 formatting requires the provisioned Linux root gate; the portable record and image checks cannot substitute for it."
+      ],
+      "cases": [
+        {
+          "id": "issue-2000-a_loop_image_without_its_record_is_never_formatted",
+          "binary": "reliaburger",
+          "test": "grill::volume::tests::a_loop_image_without_its_record_is_never_formatted",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/grill/volume.rs"
+          ]
+        },
+        {
+          "id": "issue-2000-a_failed_first_loop_provisioning_can_be_retried",
+          "binary": "reliaburger",
+          "test": "grill::volume::tests::a_failed_first_loop_provisioning_can_be_retried",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/grill/volume.rs"
+          ]
+        }
+      ]
+    },
+    {
       "id": "issue-529",
       "issue": 529,
       "promise": "Artifact signing credentials remain useful beyond the ordinary short-lived TLS leaf window.",
@@ -3280,6 +3319,33 @@
       ]
     },
     {
+      "id": "issue-555-legacy-oci-owned_network-published_ports_answer_members_only_and_rewrite_only_local_destinations",
+      "issue": 555,
+      "promise": "Complete the exact retained legacy OCI case through its finite owned driver.",
+      "supported_paths": [
+        "Exact original ignored test identity and declared Make owner."
+      ],
+      "refused_paths": [
+        "No generic aliases or success from another test or owner."
+      ],
+      "boundaries": [
+        "Source binding only; real isolated Linux OCI execution and current receipt are required."
+      ],
+      "cases": [
+        {
+          "id": "legacy-oci-owned_network-published_ports_answer_members_only_and_rewrite_only_local_destinations",
+          "binary": "reliaburger::owned_network",
+          "test": "published_ports_answer_members_only_and_rewrite_only_local_destinations",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/owned_network.rs"
+          ]
+        }
+      ]
+    },
+    {
       "id": "issue-555-legacy-oci-owned_runc-runc_owned_preparation_recovers_original_intent_and_retires_without_adoption",
       "issue": 555,
       "promise": "Complete the exact retained legacy OCI case through its finite owned driver.",
@@ -3486,6 +3552,87 @@
           "id": "legacy-oci-owned_runc-generated_cgroup_path_matches_the_actual_container_before_its_first_instruction",
           "binary": "reliaburger::owned_runc",
           "test": "generated_cgroup_path_matches_the_actual_container_before_its_first_instruction",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/owned_runc.rs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "issue-1955-legacy-oci-owned_runc-a_memory_request_smaller_than_runc_init_does_not_hold_the_start",
+      "issue": 1955,
+      "promise": "Complete the exact retained legacy OCI case through its finite owned driver.",
+      "supported_paths": [
+        "Exact original ignored test identity and declared Make owner."
+      ],
+      "refused_paths": [
+        "No generic aliases or success from another test or owner."
+      ],
+      "boundaries": [
+        "Source binding only; real isolated Linux OCI execution and current receipt are required."
+      ],
+      "cases": [
+        {
+          "id": "legacy-oci-owned_runc-a_memory_request_smaller_than_runc_init_does_not_hold_the_start",
+          "binary": "reliaburger::owned_runc",
+          "test": "a_memory_request_smaller_than_runc_init_does_not_hold_the_start",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/owned_runc.rs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "issue-2041-legacy-oci-owned_runc-runc_container_paused_by_smoker_takes_its_stop_signal_at_once",
+      "issue": 2041,
+      "promise": "Complete the exact retained legacy OCI case through its finite owned driver.",
+      "supported_paths": [
+        "Exact original ignored test identity and declared Make owner."
+      ],
+      "refused_paths": [
+        "No generic aliases or success from another test or owner."
+      ],
+      "boundaries": [
+        "Source binding only; real isolated Linux OCI execution and current receipt are required."
+      ],
+      "cases": [
+        {
+          "id": "legacy-oci-owned_runc-runc_container_paused_by_smoker_takes_its_stop_signal_at_once",
+          "binary": "reliaburger::owned_runc",
+          "test": "runc_container_paused_by_smoker_takes_its_stop_signal_at_once",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/owned_runc.rs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "issue-2041-legacy-oci-owned_runc-runc_container_with_a_paused_init_takes_its_stop_signal_at_once",
+      "issue": 2041,
+      "promise": "Complete the exact retained legacy OCI case through its finite owned driver.",
+      "supported_paths": [
+        "Exact original ignored test identity and declared Make owner."
+      ],
+      "refused_paths": [
+        "No generic aliases or success from another test or owner."
+      ],
+      "boundaries": [
+        "Source binding only; real isolated Linux OCI execution and current receipt are required."
+      ],
+      "cases": [
+        {
+          "id": "legacy-oci-owned_runc-runc_container_with_a_paused_init_takes_its_stop_signal_at_once",
+          "binary": "reliaburger::owned_runc",
+          "test": "runc_container_with_a_paused_init_takes_its_stop_signal_at_once",
           "requires": [
             "oci-interruptions"
           ],
@@ -4118,6 +4265,17 @@
           ],
           "sources": [
             "tests/build.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-ebpf-onion_objects_use_only_the_original_bpf_instruction_set",
+          "binary": "reliaburger::ebpf",
+          "test": "onion_objects_use_only_the_original_bpf_instruction_set",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
           ]
         },
         {
@@ -5303,6 +5461,17 @@
           ]
         },
         {
+          "id": "legacy-ci-reliaburger-cluster_failover-workers_outside_raft_keep_the_leader_after_many_elections",
+          "binary": "reliaburger::cluster_failover",
+          "test": "workers_outside_raft_keep_the_leader_after_many_elections",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
+          ]
+        },
+        {
           "id": "legacy-ci-reliaburger-cluster_failover-lease_retirement_waits_for_paused_worker_across_leader_change",
           "binary": "reliaburger::cluster_failover",
           "test": "lease_retirement_waits_for_paused_worker_across_leader_change",
@@ -5856,6 +6025,17 @@
           "id": "legacy-ci-reliaburger-cluster_failover-a_lease_history_through_a_leader_kill_is_linearizable",
           "binary": "reliaburger::cluster_failover",
           "test": "a_lease_history_through_a_leader_kill_is_linearizable",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-cluster_failover-a_lease_history_through_a_leader_partition_is_linearizable",
+          "binary": "reliaburger::cluster_failover",
+          "test": "a_lease_history_through_a_leader_partition_is_linearizable",
           "requires": [
             "cluster-tests"
           ],
@@ -7253,6 +7433,33 @@
       ],
       "boundaries": [
         "Old voters that can reach only each other, never a node on the newer epoch, still can't learn of the recovery."
+      ]
+    },
+    {
+      "id": "issue-1524-returning-voter-hold",
+      "issue": 1524,
+      "promise": "A voter replaced while it was down and then restarted on its old Raft state holds its elections until it hears from a leader, so rejoining as a learner never deposes the leader or raises its term.",
+      "supported_paths": [
+        "In-process clusters on the real cluster runtime and the in-memory Raft router"
+      ],
+      "refused_paths": [
+        "A returning node's election campaign while a leader it can reach is live"
+      ],
+      "boundaries": [
+        "After the grace with no live leader in gossip, or at the cap, the hold ends and the node may campaign, as a whole-cluster restart needs."
+      ],
+      "cases": [
+        {
+          "id": "returning-voter-a_replaced_voter_coming_back_joins_as_a_learner_without_an_election",
+          "binary": "reliaburger::council_self_healing",
+          "test": "a_replaced_voter_coming_back_joins_as_a_learner_without_an_election",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/council_self_healing.rs"
+          ]
+        }
       ]
     },
     {

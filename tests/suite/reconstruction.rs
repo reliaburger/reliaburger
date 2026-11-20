@@ -65,7 +65,7 @@ async fn create_cluster(n: u64) -> (Vec<CouncilNode>, InMemoryRaftRouter) {
         )
         .await
         .unwrap();
-        router.register(id, node.raft().clone()).await;
+        router.register(id, &node).await;
         nodes.push(node);
     }
     (nodes, router)

@@ -180,7 +180,10 @@ def make_selection(root, target, *, archived=False, partition=None):
     c.require('$(NEXTEST)' not in suffix, 'multiple nextest invocations')
     mirror = '$(WITH_TEST_IMAGES)' in prefix
     c.require(prefix.count('$(WITH_TEST_IMAGES)') <= 1, 'duplicate image mirror')
-    prefix = prefix.replace('$(WITH_TEST_IMAGES)', '').replace('$(CURDIR)', str(root))
+    # The job extracts its archive with `--target-dir-remap target`, so in CI
+    # cargo's target directory is target/ in the checkout (#1859).
+    prefix = (prefix.replace('$(WITH_TEST_IMAGES)', '').replace('$(CURDIR)', str(root))
+              .replace('$(TARGET_DIR)', str(root / 'target')))
     suffix = suffix.replace('$(LINUX_EXCLUDE)', LINUX_EXCLUDE if target == 'test-linux' else '')
     c.require('$' not in prefix + suffix, 'unknown Make expansion requires review')
     environment = {}

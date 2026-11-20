@@ -315,7 +315,9 @@ https_port = {https}
     assert!(home.contains("\"hostname\""), "{home}");
 
     // The frontend forwards /api/echo to --backend-url=http://backend:9898,
-    // and answers with the list of backend responses.
+    // and answers with the list of backend responses. While the backend is
+    // still starting, that list holds podinfo's error instead (Onion refuses
+    // a dial to a service with no backends yet), so keep asking (#2126).
     let echoed = eventually(Duration::from_secs(60), || async {
         let outcome = get_text(
             http.post(format!("{base}/api/echo"))
@@ -324,17 +326,16 @@ https_port = {https}
         .await;
         let body = remember(&last, outcome)?;
         let parsed: serde_json::Value = serde_json::from_str(&body).ok()?;
-        parsed.is_array().then_some(body)
+        (parsed.is_array() && body.contains("reliaburger-demo")).then_some(body)
     })
     .await;
-    let Some(echoed) = echoed else {
+    if echoed.is_none() {
         let last = last.borrow().clone();
         panic!(
             "frontend never reached the backend by name\n{}",
             diagnostics(&root, api, &last).await
         );
-    };
-    assert!(echoed.contains("reliaburger-demo"), "{echoed}");
+    }
 
     let demo = Demo {
         root,

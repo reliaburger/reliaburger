@@ -911,7 +911,7 @@ pub fn live_quorum_headroom_ok(configured_voters: usize, live_voters: usize) -> 
 /// not appear in its own gossip snapshot to be alive.
 ///
 /// Returns `(configured_voters, live_voters)`.
-fn count_live_voters(
+pub(crate) fn count_live_voters(
     council: &crate::council::CouncilNode,
     membership: &[crate::mustard::membership::MembershipSnapshot],
     self_id: u64,
@@ -996,16 +996,17 @@ pub async fn run_orchestrator(
 
         // Count live voters against the current gossip snapshot: an upgrade
         // that would drop the vote keeping quorum is refused (UPG1).
-        let (configured_voters, live_voters, gossip_alive_ids) = {
-            let membership = membership_rx.borrow();
-            let (configured, live) = count_live_voters(&council, &membership, self_raft_id);
-            let alive: std::collections::BTreeSet<String> = membership
-                .iter()
-                .filter(|m| m.state == crate::mustard::state::NodeState::Alive)
-                .map(|m| m.node_id.0.clone())
-                .collect();
-            (configured, live, alive)
-        };
+        // Copy the membership out before `count_live_voters` borrows the
+        // council's metrics: two watch borrows held at once can deadlock
+        // (#1273, #1433).
+        let membership = membership_rx.borrow().clone();
+        let (configured_voters, live_voters) =
+            count_live_voters(&council, &membership, self_raft_id);
+        let gossip_alive_ids: std::collections::BTreeSet<String> = membership
+            .iter()
+            .filter(|m| m.state == crate::mustard::state::NodeState::Alive)
+            .map(|m| m.node_id.0.clone())
+            .collect();
         let quorum_ok = live_quorum_headroom_ok(configured_voters, live_voters);
         let voter_phase = matches!(
             upgrade.phase,
@@ -1038,11 +1039,16 @@ pub async fn run_orchestrator(
             // Persist the FINAL state before clearing, so the archived
             // history entry shows the completed walk (every node Healthy),
             // not whatever mid-walk snapshot Raft last saw.
-            let _ = council
+            // A refusal means the run was cleared while this step ran;
+            // there's nothing left to archive.
+            if let Ok(crate::council::CouncilResponse::Refused { .. }) | Err(_) = council
                 .write(RaftRequest::UpgradeUpdate {
                     state: Box::new(next.clone()),
                 })
-                .await;
+                .await
+            {
+                continue;
+            }
             let _ = council
                 .write(RaftRequest::UpgradeClear {
                     upgrade_id: next.upgrade_id.clone(),
@@ -1052,15 +1058,22 @@ pub async fn run_orchestrator(
             if let ClusterUpgradePhase::Paused { reason } = &next.phase {
                 eprintln!("bun: cluster upgrade {} paused: {reason}", next.upgrade_id);
             }
-            if let Err(e) = council
+            let upgrade_id = next.upgrade_id.clone();
+            match council
                 .write(RaftRequest::UpgradeUpdate {
                     state: Box::new(next),
                 })
                 .await
             {
+                // It ended while this step ran (an abort, say): the state
+                // machine keeps what the operator decided.
+                Ok(crate::council::CouncilResponse::Refused { reason }) => {
+                    eprintln!("bun: cluster upgrade {upgrade_id}: dropping this step: {reason}");
+                }
+                Ok(_) => {}
                 // A lost phase-transition write (e.g. a node newly marked
                 // Failed) was invisible to operators; surface it (M17).
-                eprintln!("bun: cluster upgrade phase update failed to commit: {e}");
+                Err(e) => eprintln!("bun: cluster upgrade phase update failed to commit: {e}"),
             }
         }
     }

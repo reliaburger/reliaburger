@@ -36,6 +36,11 @@ checks formatting before it restores a cache. `make ci-bench` is `make ci` follo
 runs a privileged, cluster or upgrade suite; those have their own targets
 below, because they need root, a provisioned host or a lot of wall time.
 
+Test threads get an 8 MiB stack (`RUST_MIN_STACK` in
+[`.cargo/config.toml`](../.cargo/config.toml)), not std's 2 MiB. An
+unoptimised build of clap's derived `relish` parser needs more than 2 MiB, so
+without it every test that parses the CLI overflows its stack.
+
 `make test` first runs `make warm-executables`: it builds the suite with
 `cargo test --no-run`, which builds the `[[bin]]` targets (`bun`, `relish`,
 `testapp`) as the tests use them, and, on macOS, runs each binary once with
@@ -60,13 +65,23 @@ disclaims responsibility (`posix_spawn` with
 [Chapter 14](book/14-changing-the-tyres.md#the-deadline-was-timing-macos-not-the-candidate).
 
 The same rule holds for every target that builds before its tests. `make
-test-linux` needs `target/debug/bun` with the `ebpf` feature
+test-linux` needs `debug/bun` with the `ebpf` feature
 (`RELIABURGER_BUN_BINARY` names it), so it first runs `cargo test --no-run
 --features ebpf`, the build nextest's `--features ebpf` will ask for. It used
 to run `cargo build --features ebpf --bin bun`, so on a fresh target nextest
 compiled the library, every proc macro and `bun` a second time, and replaced
 the `bun` the step had built. On a Mac the two builds took 710 s; now they take 327 s
 ([#904](https://github.com/reliaburger/reliaburger/issues/904)).
+
+That `bun` is in cargo's target directory: `$CARGO_TARGET_DIR` if it's set,
+otherwise `target/` in the checkout. The Makefile's `TARGET_DIR` says so, and
+the demo scripts do the same. `make test-linux` used to name
+`target/debug/bun` in the checkout. Under an out-of-tree `CARGO_TARGET_DIR`
+that file doesn't exist, every runtime command failed with ENOENT in about
+30 ms, and the run looked like a burst of flaky runc failures. Now a test whose
+`RELIABURGER_BUN_BINARY` names a missing file fails at once, naming the path
+(`testkit::bun_binary`,
+[#1859](https://github.com/reliaburger/reliaburger/issues/1859)).
 A pre-build is `cargo test --no-run` with exactly the build flags of the test
 run that follows it (`--features`, `--release` and the like); selection flags
 such as `-E` don't matter, since nextest builds every test target anyway.
@@ -752,6 +767,9 @@ plan: [`plans/2026-10-28-research-kubernetes-release-testing.md`](plans/2026-10-
 | `join_csr` | `sesame::ca::sign_node_csr` | a joining node |
 | `app_config` | `config::Config::parse` | `relish apply` or a GitOps repository |
 | `node_config` | `config::node::NodeConfig::parse` | a node's config file |
+| `task_manifest` | `TaskManifestRequest` and `validate_submission` (`bun::task_array_api`) | `relish batch submit` or `POST /v1/batch/manifest` |
+| `chaos_scenario` | `ScriptedScenario` and `smoker::scenario::build_timeline` | a chaos scenario file for `relish fault scenario` |
+| `council_backup_state` | `DesiredState`, then `BackupKey::for_state` and `BackupKey::parse` | the state inside an unsealed backup, during `relish council recover` |
 
 A target's body lives in [`src/fuzz/mod.rs`](../src/fuzz/mod.rs), behind the
 `fuzzing` feature, and [`fuzz/fuzz_targets/`](../fuzz/fuzz_targets) only wraps
@@ -820,15 +838,27 @@ The seed corpus in [`fuzz/corpus/`](../fuzz/corpus) comes from the decoders'
 unit-test fixtures and the `examples/` configs
 ([`src/fuzz/seeds.rs`](../src/fuzz/seeds.rs)). `make fuzz-corpus-seed`
 rewrites it; run it after a protocol or state bump, since old gossip and Raft
-seeds then stop decoding. libFuzzer writes what it finds to
+seeds then stop decoding. `fuzz::tests` runs every checked-in fixture seed
+through its target and fails if one is refused, so a bump that leaves stale
+seeds fails `make test`. libFuzzer writes what it finds to
 `fuzz/target/corpus/`, never into the checked-in seeds.
 
 OSS-Fuzz is the follow-up: Google's continuous fuzzing runs Rust projects
 through the same cargo-fuzz targets
 ([guide](https://google.github.io/oss-fuzz/getting-started/new-project-guide/rust-lang/)).
 Applying needs a `projects/reliaburger/` directory in the OSS-Fuzz repository
-(a `project.yaml`, a Dockerfile and a `build.sh` that runs `cargo fuzz build -O` with `RUSTC_WRAPPER=fuzz/rustc-coverage.sh`),
-once the targets have run clean nightly for a while.
+(a `project.yaml`, a Dockerfile and a `build.sh` that runs `cargo fuzz build -O`),
+once the targets have run clean nightly for a while. A draft of all three is
+in [`fuzz/oss-fuzz/`](../fuzz/oss-fuzz): `build.sh` builds every target
+`cargo fuzz list` names, with the same 64 codegen units as `make fuzz-build`,
+and ships each target's `fuzz/corpus/` seeds as its seed corpus. Unlike
+`make fuzz-build`, the draft doesn't set
+`RUSTC_WRAPPER=fuzz/rustc-coverage.sh`, so every crate keeps its coverage
+counters; whether OSS-Fuzz's build should narrow them too is decided when the
+pull request is opened. The maintainer fills in `project.yaml`'s contacts and
+opens the pull request against [google/oss-fuzz](https://github.com/google/oss-fuzz)
+([#1414](https://github.com/reliaburger/reliaburger/issues/1414)). Nothing in
+this repository runs the draft.
 
 ## Mutation testing
 
@@ -1287,7 +1317,15 @@ within two minutes; a fault that doesn't settle by its deadline; containers,
 namespaces, eBPF pins, file descriptors or memory leaking after settling; an
 upgrade that ends on the wrong version; a Bun panic or a restart no fault
 explains; an agent loop turn over a second; or, with jobs, a run that executes
-twice, goes missing or never drains. The full list is the soak plan's
+twice, goes missing or never drains, or a node's `data/instances` over 64 MiB
+outside a fault window. That last one counts allocated blocks on the data
+filesystem, as the job inventory does: `du -sb` also counts each container's
+mounted root filesystem and the length of capture files whose stored prefix
+Bun has punched out, so it overstates the space used several times over.
+Since 0.2.5 every record peaks at 24 to 29 MiB, the 24-hour day runs
+included; 0.2.3's and 0.2.4's day runs reached 0.9 GiB on node 1 before the
+capture reclaim
+([#1418](https://github.com/reliaburger/reliaburger/issues/1418)). The full list is the soak plan's
 [pass and fail](plans/2026-09-25-v02-sustained.md#4-pass-and-fail). Each
 failure gets a root cause; a product fix means a new candidate and every soak
 again. Before 1.0, a final run whose only failures match a documented harness
@@ -1323,10 +1361,10 @@ why we copied the idea and not the tooling.
 | SLO (p99) | What's timed | Threshold | Mode |
 |---|---|---|---|
 | Job task start | A job task's start lag on a pooled executor, from the job campaign's buckets, in runs no fault window overlapped | ≤ 256 ms | Gated in the fast and final tiers |
-| API read | `GET /v1/status?cluster=true` and `GET /v1/cluster/nodes` (what `relish status` and `relish nodes` ask) on every node, at every light check, from the host | ≤ 1,000 ms | Record only |
-| API write | `relish apply` of the soak workloads, from the call to the Raft commit | ≤ 2,000 ms | Record only |
-| App start | Each node's deploy of a new `soak-slo` instance, from its start until the instance passes its health check | ≤ 5,000 ms | Record only |
-| Rolling update | From `relish apply` returning until every node runs the new `soak-slo` | ≤ 30,000 ms | Record only |
+| API read | `GET /v1/status?cluster=true` and `GET /v1/cluster/nodes` (what `relish status` and `relish nodes` ask) on every node, at every light check, from the host | ≤ 3,000 ms | Gated in the fast and final tiers |
+| API write | `relish apply` of the soak workloads, from the call to the Raft commit | ≤ 3,000 ms | Gated in the fast and final tiers |
+| App start | Each node's deploy of a new `soak-slo` instance, from its start until the instance passes its health check | ≤ 30,000 ms | Gated in the fast and final tiers |
+| Rolling update | From `relish apply` returning until every node runs the new `soak-slo` | ≤ 100,000 ms | Gated in the fast and final tiers |
 
 **Where the gated number comes from.** The job start lag is the one latency
 earlier records already kept. Across the ten 0.2.0 to 0.2.2 soak records its
@@ -1356,15 +1394,54 @@ tail gives it millions, so a final short of 1,000 fails. 0.2.4's 8-hour
 final, the first to gate on it, measured 32 ms over 137,306,923 quiet tasks
 ([record](qualification/2026-10-30-v0.2.4-job-qualification.md)).
 
-**Record only, from 28 October 2026.** No soak before 0.2.4 timed the API,
-an app start or a rolling update, so those four start in record-only mode:
-the record shows the value and whether it's over the provisional threshold,
-and never fails on it. The provisional thresholds are Kubernetes's for reads
-and app start, and a guess with room to spare for writes and rolling updates.
-The first 0.2.4 fast and final records exist now
-([release closure](qualification/2026-10-30-v0.2.4-release-closure.md)),
-and the maintainer sets each gate from them, with margin, the same way as
-the job start.
+**The API and rollout gates, from 6 November 2026.** No soak before 0.2.4
+timed the API, an app start or a rolling update, so those four started in
+record-only mode on 28 October: the record showed the value and whether it
+was over a provisional threshold, and never failed on it. The fast and final
+records from 0.2.4 to 0.2.6 then set three of the gates
+([#1405](https://github.com/reliaburger/reliaburger/issues/1405);
+`python3 scripts/release/soak_slo.py trend docs/qualification` lists them):
+
+| SLO (p99) | Fast-tier records | Final records | Worst | Gate |
+|---|---|---|---|---|
+| API read | 100 to 150 ms | 150, 1,500, 150 ms | 1,500 ms | 3,000 ms |
+| API write | 150 to 300 ms | 500, 1,500, 1,500 ms | 1,500 ms | 3,000 ms |
+| Rolling update | 30,000 ms | 30,000, 50,000, 50,000 ms | 50,000 ms | 100,000 ms |
+
+Each gate sits two histogram buckets above the worst value. A p99 is the
+upper bound of its bucket, so one bucket of margin would fail a run that was
+only a little slower than the worst so far, and the job start's four times
+would leave the rolling update at 200 s, longer than the rollout's own
+budget. A day tier and a custom run still record these without gating them:
+the 0.2.4 day run measured a rolling update p99 of 100,000 ms at six times
+the load.
+
+**The app start gate, from 16 November 2026.** App start stayed record only
+at first. It's 1 ms in every record up to 0.2.8, because deploy history
+stamped a deploy's start at the moment it recorded the deploy's end, so
+`completed_at − created_at` measured nothing
+([#1640](https://github.com/reliaburger/reliaburger/issues/1640)). Ignore
+those records' App start column. The 0.3.0 rehearsal's soaks were the first
+to run on builds with the fix, and their 186 starts are real: each matches
+its deploy history entry, a few seconds from start to completion, and the
+three nodes' entries follow one another through the rolling update
+([#1913](https://github.com/reliaburger/reliaburger/issues/1913)):
+
+| Record | Starts | Median | Slowest | p99 bucket |
+|---|---|---|---|---|
+| V02 fast, candidates 2 and 3 | 24, 24 | 4,785, 4,663 ms | 7,346, 7,176 ms | 10,000 ms |
+| V02 fast, seeded, candidates 2 and 3 | 24, 24 | 4,439, 4,736 ms | 6,899, 6,208 ms | 7,000 ms |
+| Jobs fast, candidates 2 and 3 | 12, 18 | 5,640, 5,302 ms | 10,829, 8,789 ms | 15,000, 10,000 ms |
+| Jobs final (8 h), candidate 2 | 60 | 6,563 ms | 11,069 ms | 15,000 ms |
+
+The gate follows the same rule as the other three: two buckets above the
+worst p99, 15,000 ms, which puts it at 30,000 ms. A tier gets only twelve to
+sixty starts, two per cycle per node, so its p99 is close to its slowest
+start, and a margin of one bucket would fail a run on one slow start. The
+job tiers start apps more slowly than the V02 tiers, because the job
+campaign shares the nodes' CPU. Kubernetes's pod start-up SLO is 5 s, but it
+leaves out the image pull and the health check, and it isn't measured on
+three small VMs sharing one laptop.
 
 **How it's measured.** At every light, settle and heavy check outside a fault
 window, the harness times the two API reads on each node that is up
@@ -1465,6 +1542,14 @@ and checks the record. The gated
 `cluster_failover::a_lease_history_through_a_leader_kill_is_linearizable`
 (`make test-cluster`) runs the client against three in-process nodes while
 it kills the leader, and checks the history.
+`cluster_failover::a_lease_history_through_a_leader_partition_is_linearizable`
+runs the same client while the leader is cut off rather than killed
+([#1415](https://github.com/reliaburger/reliaburger/issues/1415)): every
+cluster transport of the old leader is quiesced, as a `node-kill` fault does,
+while its API keeps answering. The test waits for one of the other two to be
+elected, leaves the old leader cut off for ten seconds more, then heals it.
+That's the direct test for a stale read after a leader change, which a kill
+can't give, because a killed leader answers nothing.
 
 **Showing it can fail.** The bug the issue names is a follower answering a
 read from its own copy without confirming leadership: in
@@ -1499,6 +1584,11 @@ building it.
 cover lost admission replies, resumption with the same request ID, monotonic
 accounting, unknown-owner fences, independent effects, stale observations,
 exact orphan detection and failure propagation into the final V02 verdict.
+They also cover the exactly-once chunk check (#1415). A drained work or audit
+run's sampled chunks must each hold every task once, all from one grant. An
+audit task whose chunk was granted once mustn't have run more often than its
+accepted attempts. A chunk on an unreachable node waits out the same 600 s
+grace as a failure fixture's result.
 For the job qualification tiers they also parse `--plan` output (an hour-long
 fast tier whose first four cycles carry every fault kind and every special,
 node faults on every node, an 8-hour final whose cycles, quiet tail and run

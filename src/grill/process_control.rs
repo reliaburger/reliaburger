@@ -398,6 +398,11 @@ impl ProcessControl {
     }
 
     /// Absence is only an unpublished directory, never a missing journal or socket.
+    ///
+    /// A forget renames a retired owner's directory away whole, so a read
+    /// that loses its journal because the directory went with it found a
+    /// forgotten owner (#2032); a directory still there without its journal
+    /// is corrupt and refuses, as the inventory's reads do (#877).
     pub(crate) async fn status_if_present(
         &self,
         id: &InstanceId,
@@ -411,7 +416,16 @@ impl ProcessControl {
                     Err(error) => return Err(error),
                 }
             }
-            this.inspect_status(&id).map(Some)
+            match this.inspect_status(&id) {
+                Ok(record) => Ok(Some(record)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    match std::fs::symlink_metadata(&directory) {
+                        Err(missing) if missing.kind() == io::ErrorKind::NotFound => Ok(None),
+                        _ => Err(error),
+                    }
+                }
+                Err(error) => Err(error),
+            }
         })
         .await
     }
@@ -962,6 +976,7 @@ mod tests {
     fn spec() -> OciSpec {
         use super::super::oci::{OciLinux, OciProcess, OciRoot, OciUser};
         OciSpec {
+            managed_volumes: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1254,6 +1269,41 @@ mod tests {
         assert!(control.status_if_present(&id).await.is_err());
         std::fs::write(directory.join("owner.json"), b"broken").unwrap();
         assert!(control.status_if_present(&id).await.is_err());
+    }
+
+    // #2032: a reader in another process (a test's own `ProcessGrill`, a
+    // second tool on the node) races Bun forgetting a retired generation.
+    // The forget renames the directory away whole, so a read that finds it
+    // gone halfway has found a forgotten owner, not a broken one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn optional_status_reads_a_generation_forgotten_under_it_as_absent() {
+        let root = tempfile::tempdir().unwrap();
+        let control = ProcessControl::new(root.path().join("owners"), PathBuf::from("/bin/false"));
+        for round in 0..100 {
+            let id = InstanceId(format!("default__forgotten-{round}"));
+            control.prepare(&id, &spec()).await.unwrap();
+            assert!(control.cancel_unstarted(&id).await.unwrap());
+            let readers: Vec<_> = (0..3)
+                .map(|_| {
+                    let control = control.clone();
+                    let id = id.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            match control.status_if_present(&id).await {
+                                Ok(Some(_)) => tokio::task::yield_now().await,
+                                Ok(None) => return Ok(()),
+                                Err(error) => return Err(error),
+                            }
+                        }
+                    })
+                })
+                .collect();
+            control.forget_retired(&id, None).await.unwrap();
+            for reader in readers {
+                let read = reader.await.unwrap();
+                assert!(read.is_ok(), "round {round}: {read:?}");
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

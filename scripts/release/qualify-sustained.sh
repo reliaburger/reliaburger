@@ -346,8 +346,31 @@ PY
 }
 meta_get() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))' "$evidence/metadata.json" "$1" 2>/dev/null || true; }
 
-# Kill a command that outlives its budget (macOS has no timeout(1)).
-with_timeout() { perl -e 'alarm shift; exec @ARGV or die "exec: $!\n"' "$@"; }
+# with_timeout SECONDS COMMAND...: run COMMAND, killing it and everything it
+# started after SECONDS (status 124); macOS has no timeout(1). Not
+# `perl -e 'alarm; exec'`: limactl is a Go program, and Go catches SIGALRM and
+# ignores it, so a `limactl shell` to a guest that went away under it hung for
+# good (the power-cut calibration's sysrq run, 17 November 2026). The command
+# gets its own process group, so the ssh it starts dies with it and can't
+# hold a pipe open, and the harness being stopped takes the group with it.
+# A piped standard input still reaches it (gsh_in sends the guest its script
+# that way); a terminal doesn't, since a background group reading one stops.
+with_timeout() {
+    perl -e '
+        my $seconds = shift;
+        my $pid = fork() // die "fork: $!\n";
+        if ($pid == 0) {
+            setpgrp(0, 0);
+            open(STDIN, "<", "/dev/null") if -t STDIN;
+            exec(@ARGV) or die "exec: $!\n";
+        }
+        sub stop { kill("KILL", -$pid); waitpid($pid, 0); exit($_[0]); }
+        $SIG{ALRM} = sub { stop(124) };
+        $SIG{$_} = sub { stop(130) } for qw(INT TERM HUP);
+        alarm($seconds);
+        waitpid($pid, 0);
+        exit($? & 127 ? 128 + ($? & 127) : $? >> 8);' "$@"
+}
 
 # --- the operator signature -----------------------------------------------------
 
@@ -1072,6 +1095,7 @@ cat > /etc/systemd/system/reliaburger-soak-audit.service <<UNIT
 [Unit]
 Description=Independent release job effect verifier
 After=network-online.target
+Before=reliaburger.service
 [Service]
 ExecStart=/usr/bin/python3 /var/lib/reliaburger/soak-jobs/job_soak.py serve --database /var/lib/reliaburger/soak-jobs/effects.sqlite --token-file /var/lib/reliaburger/soak-jobs/.token --address $1
 Restart=on-failure
@@ -1209,6 +1233,7 @@ echo "panics $(journalctl -u reliaburger --no-pager -q --cursor-file=/var/tmp/so
 # One clock source (#608): Lima's guest agent owns the clock, and every step
 # it takes since the last report is counted.
 echo "timesyncd $(systemctl is-active systemd-timesyncd.service 2>/dev/null)"
+echo "chrony $(systemctl is-active chrony.service 2>/dev/null)"
 echo "clock_steps $(journalctl -u lima-guestagent --no-pager -q --cursor-file=/var/tmp/soak-clock.cursor 2>/dev/null | grep -c 'SyncTime: system time synchronized')"
 # The agent loop stall watchdog's snapshots since the last report (#1707);
 # the checker cuts the blocks out and keeps them in loop-stalls.jsonl.
@@ -1292,6 +1317,13 @@ collect_light() {
         "http://127.0.0.1:$ingress_port/" > "$directory/http.txt" 2>/dev/null || true
     probe_forwards "$directory"
     [ -n "$window_label" ] || slo_reads "$directory"
+    log_tails "$directory"
+    resume_records "$directory"
+}
+
+# The writer's and the Redis client's last lines: their newest ACK and INCR.
+log_tails() {
+    local directory=$1
     if [ "$tier" = day ]; then
         # `relish logs` fans out to every node, so every store would be
         # queried; the day tier asks only the node holding the lines, and
@@ -1302,6 +1334,34 @@ collect_light() {
         rel logs soak-writer --tail 20 > "$directory/writer-log.txt" 2>&1 || true
         rel logs soak-redis-client --tail 20 > "$directory/redis-log.txt" 2>&1 || true
     fi
+}
+
+# Where each writer start resumed (/data/resumes on node 2), the counter each
+# Redis client start found (soak:starts) and every step back the client saw
+# (soak:regressions), both in Redis on node 3. Always read after log_tails:
+# the checker holds a start these records don't show yet to every value the
+# tails showed, so the tails must come first.
+resume_records() {
+    local directory=$1
+    [ "${down[2]}" = 1 ] || rel_on 2 exec soak-writer cat /data/resumes \
+        > "$directory/writer-resumes.txt" 2>/dev/null || rm -f "$directory/writer-resumes.txt"
+    [ "${down[3]}" = 1 ] || rel_on 3 exec soak-redis redis-cli LRANGE soak:starts 0 -1 \
+        > "$directory/redis-starts.txt" 2>/dev/null || rm -f "$directory/redis-starts.txt"
+    [ "${down[3]}" = 1 ] || rel_on 3 exec soak-redis redis-cli LRANGE soak:regressions 0 -1 \
+        > "$directory/redis-regressions.txt" 2>/dev/null || rm -f "$directory/redis-regressions.txt"
+}
+
+# Just before a power cut, the tails and records as they stand, so a start
+# after the cut must resume at or past what was acknowledged just before it,
+# not at the last check (up to 30 s and 300 writer lines earlier). Bounded
+# tighter than other calls: it holds up the cut.
+resume_cut_mark() {
+    local directory
+    directory=$evidence/snapshots/power-cut-mark-$(date +%s)
+    mkdir -p "$directory"
+    rel_budget=30 log_tails "$directory"
+    rel_budget=30 resume_records "$directory"
+    check resume-mark "$evidence" "$directory" 2>> "$evidence/harness-errors.log" || true
 }
 
 # The last 20 lines of APP from one node's own log store, through that
@@ -1550,7 +1610,13 @@ power_before_off() {
     local node=$1
     job_mark_fault "$node" "${current_slot:-power-off}"
     keep_host_logs power-off "$node"
-    check power-cut "$evidence"
+    # The cut stops whatever runs on the node; the writer is pinned to node 2,
+    # and the day tier pins the Redis client to node 1. Each must record a new
+    # start before the checks pass again.
+    local restarts=()
+    [ "$node" != 2 ] || restarts+=(--restarts writer)
+    [ "$node" != 1 ] || [ "$tier" != day ] || restarts+=(--restarts redis)
+    check power-cut "$evidence" ${restarts[@]+"${restarts[@]}"}
 }
 power_after_on() {
     local node=$1
@@ -1564,6 +1630,7 @@ slot_power_off() {
     hold=$(random_between power-off-hold "$hold_min" "$hold_max")
     say "fault: power off ${vm[node]} for $hold s"
     open_window power-off 1
+    resume_cut_mark
     power_off "$node"
     event --phase fault:power-off --target "${vm[node]}" --command 'limactl stop --force' --detail "held $hold s"
     event --phase effect:power-off --target "${vm[node]}" \
@@ -1766,6 +1833,7 @@ special_quorum_loss() {
 special_all_off() {
     say 'special: every VM powered off at once'
     open_window all-off 3
+    resume_cut_mark
     power_off 1
     power_off 2
     power_off 3

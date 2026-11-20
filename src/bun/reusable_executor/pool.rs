@@ -1,6 +1,6 @@
 //! Bounded owned containers, with one independently limited command per slot.
 use super::timings::{Phase, TimingSnapshot, Timings};
-use super::{ExecutorError, ExecutorKey, ExecutorProfile, HELPER_MEMORY_BYTES, protocol};
+use super::{ExecutorError, ExecutorKey, ExecutorProfile, protocol};
 use crate::bun::execution_budget::{ExecutionBudget, ResourceLease};
 use crate::bun::task_executor::{Attempt, AttemptOutcome, CapturedOutput, TaskInvocation};
 use crate::config::job::JobSpec;
@@ -894,9 +894,11 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             request: super::HELPER_CPU_REQUEST,
             limit: 100,
         });
+        // runc writes this over the cgroup `prepare_cgroups` set, and its
+        // init runs inside it before the helper does (#1957).
         helper_profile.memory = Some(crate::config::types::ResourceRange {
-            request: HELPER_MEMORY_BYTES,
-            limit: HELPER_MEMORY_BYTES,
+            request: profile.helper_memory,
+            limit: profile.helper_memory,
         });
         // The job's `pids` is for its commands. runc would write it over the
         // helper's own limit, which `prepare_cgroups` already set.
@@ -1717,23 +1719,9 @@ fn prepare_cgroups(base: &Path, profile: ExecutorProfile) -> std::io::Result<()>
         Err(error) => return Err(error),
     }
     std::fs::create_dir(&task)?;
-    std::fs::write(
-        task.join("cpu.max"),
-        if profile.cpu.limit < 10 {
-            format!("{} 1000000", profile.cpu.limit * 1000)
-        } else {
-            crate::grill::cpu_max_from_millicores(profile.cpu.limit)
-        },
-    )?;
-    std::fs::write(
-        task.join("cpu.weight"),
-        crate::grill::cgroup::cpu_weight_from_millicores(profile.cpu.request).to_string(),
-    )?;
-    std::fs::write(task.join("memory.max"), profile.memory.limit.to_string())?;
-    std::fs::write(task.join("memory.swap.max"), "0")?;
-    std::fs::write(task.join("memory.high"), profile.memory.request.to_string())?;
-    std::fs::write(task.join("memory.oom.group"), "1")?;
-    std::fs::write(task.join("pids.max"), profile.pids.to_string())?;
+    for (file, value) in profile.task_cgroup_files() {
+        std::fs::write(task.join(file), value)?;
+    }
     std::fs::write(
         base.join("helper/cpu.max"),
         crate::grill::cpu_max_from_millicores(100),
@@ -1742,15 +1730,14 @@ fn prepare_cgroups(base: &Path, profile: ExecutorProfile) -> std::io::Result<()>
         base.join("helper/cpu.weight"),
         crate::grill::cgroup::cpu_weight_from_millicores(super::HELPER_CPU_REQUEST).to_string(),
     )?;
-    std::fs::write(
-        base.join("helper/memory.high"),
-        HELPER_MEMORY_BYTES.to_string(),
-    )?;
+    // No soft limit under the cap: runc init runs here first, and a
+    // memory.high would throttle it as it did app containers (#1955).
+    std::fs::write(base.join("helper/memory.high"), "max")?;
     std::fs::write(base.join("helper/memory.swap.max"), "0")?;
     std::fs::write(base.join("helper/pids.max"), super::HELPER_PIDS.to_string())?;
     std::fs::write(
         base.join("helper/memory.max"),
-        HELPER_MEMORY_BYTES.to_string(),
+        profile.helper_memory.to_string(),
     )?;
     let uid = Some(crate::grill::userns::EXECUTOR_HOST_UID);
     for path in [
@@ -2058,6 +2045,7 @@ mod tests {
     async fn running(process: &ProcessGrill, name: &str) -> InstanceId {
         let id = InstanceId(name.into());
         let spec = OciSpec {
+            managed_volumes: Vec::new(),
             reusable_executor: false,
             host_process: true,
             initialiser: false,

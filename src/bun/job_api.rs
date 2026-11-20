@@ -505,14 +505,19 @@ pub async fn disable_schedule_handler(
         return response;
     }
     if let Some(council) = super::leadership::council_to_forward_to(&state).await {
-        return super::batch::forward_to_leader(
-            &state,
-            council,
-            &format!("/v1/jobs/definitions/{name}/{namespace}/disable"),
-            String::new(),
-            &headers,
-        )
-        .await;
+        let path = match crate::cluster::http::peer_path(&[
+            "v1",
+            "jobs",
+            "definitions",
+            name.as_str(),
+            namespace.as_str(),
+            "disable",
+        ]) {
+            Ok(path) => path,
+            Err(error) => return super::api::peer_path_refusal(&error),
+        };
+        return super::batch::forward_to_leader(&state, council, &path, String::new(), &headers)
+            .await;
     }
     let arrays = read_task_arrays(&state).await;
     let Some(record) = arrays.jobs().definition(&namespace, &name) else {
@@ -549,18 +554,13 @@ pub(crate) async fn stop_definition(
     let arrays = read_task_arrays(state).await;
     arrays.jobs().definition(namespace, name)?;
     if let Some(council) = super::leadership::council_to_forward_to(state).await {
+        let verb = if forget { "delete" } else { "stop" };
+        let path = match crate::cluster::http::peer_path(&["v1", verb, name, namespace]) {
+            Ok(path) => path,
+            Err(error) => return Some(super::api::peer_path_refusal(&error)),
+        };
         return Some(
-            super::batch::forward_to_leader(
-                state,
-                council,
-                &format!(
-                    "/v1/{}/{name}/{namespace}",
-                    if forget { "delete" } else { "stop" }
-                ),
-                String::new(),
-                headers,
-            )
-            .await,
+            super::batch::forward_to_leader(state, council, &path, String::new(), headers).await,
         );
     }
     if let Err(response) = crate::sesame::auth::authorize_scoped(auth, name, namespace) {

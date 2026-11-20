@@ -1020,7 +1020,7 @@ pub async fn run(args: &VerifyArgs, max_bytes: usize, rerun: &str) -> Rendered {
         }
     };
     let executable = std::env::current_exe().unwrap_or_default();
-    let evidence = collect(args, &BunClient::default_local(), &executable, &keys).await;
+    let evidence = collect(args, &BunClient::local().await, &executable, &keys).await;
     answer(&evidence, BuildInfo::current(), max_bytes, rerun)
 }
 
@@ -1041,7 +1041,7 @@ pub async fn run_human(
 ) -> Result<CommandOutcome, RelishError> {
     let keys = compiled_keys()?;
     let executable = std::env::current_exe()?;
-    let evidence = collect(args, &BunClient::default_local(), &executable, &keys).await;
+    let evidence = collect(args, &BunClient::local().await, &executable, &keys).await;
     let (data, next) = assess(&evidence);
     let shown = HumanVerify { data, next };
     match output {

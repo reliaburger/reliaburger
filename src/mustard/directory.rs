@@ -53,6 +53,15 @@ pub struct NodeDirectory {
     pub jobs: HashMap<NodeId, JobCapabilities>,
     /// Best known leader: newest recovery epoch first, then highest term.
     pub leader: Option<LeaderHint>,
+    /// The newest recovery epoch this node knows of, from its own recovery
+    /// fence (#1997). A recovery starts a fresh term line, so a hint from an
+    /// older epoch names a council that recovery replaced, however high its
+    /// term: the directory neither adopts one nor keeps one.
+    pub recovery_floor: u64,
+    /// The recovery epoch this node's own Raft term belongs to, from its
+    /// fence. Equal to the floor on a serving member; below it on a node a
+    /// recovery has fenced, whose term is from the replaced council's line.
+    pub local_recovery_epoch: u64,
 }
 
 impl NodeDirectory {
@@ -115,7 +124,12 @@ impl NodeDirectory {
     /// epoch, or a higher term in the same epoch), or the same epoch and term
     /// with different content (a leader re-advertising moved endpoints).
     /// Returns `true` if adopted.
+    /// A hint from before [`recovery_floor`](Self::recovery_floor) is never
+    /// adopted.
     pub fn observe_hint(&mut self, hint: &LeaderHint) -> bool {
+        if hint.recovery_epoch < self.recovery_floor {
+            return false;
+        }
         let newer = match &self.leader {
             Some(current) => {
                 let order = |h: &LeaderHint| (h.recovery_epoch, h.term);
@@ -127,6 +141,33 @@ impl NodeDirectory {
             self.leader = Some(hint.clone());
         }
         newer
+    }
+
+    /// Raise [`recovery_floor`](Self::recovery_floor) to `floor`, the newest
+    /// recovery epoch this node's fence knows, and drop a leader hint from
+    /// before it. The floor never falls. Returns `true` if the directory
+    /// changed.
+    pub fn raise_recovery_floor(&mut self, floor: u64) -> bool {
+        if floor <= self.recovery_floor {
+            return false;
+        }
+        self.recovery_floor = floor;
+        if self
+            .leader
+            .as_ref()
+            .is_some_and(|hint| hint.recovery_epoch < floor)
+        {
+            self.leader = None;
+        }
+        true
+    }
+
+    /// Record the recovery epoch this node's own Raft term belongs to.
+    /// Returns `true` if it changed.
+    pub fn set_local_recovery_epoch(&mut self, epoch: u64) -> bool {
+        let changed = self.local_recovery_epoch != epoch;
+        self.local_recovery_epoch = epoch;
+        changed
     }
 
     /// Resolve a node's API endpoint, preferring the address it advertised
@@ -439,6 +480,31 @@ mod tests {
             dir.leader.as_ref().unwrap().node_id,
             NodeId::new("survivor")
         );
+    }
+
+    /// #1997: once this node's fence knows a recovery epoch, a hint from an
+    /// older one names the replaced council. Its term means nothing against
+    /// the new term line, so it must not be adopted, and one adopted before
+    /// the floor rose must go.
+    #[test]
+    fn a_hint_from_before_the_recovery_floor_is_dropped_and_never_adopted() {
+        let mut dir = NodeDirectory::default();
+        let mut stale = hint("old-leader", 9);
+        stale.recovery_epoch = 0;
+        assert!(dir.observe_hint(&stale));
+
+        assert!(dir.raise_recovery_floor(1));
+        assert_eq!(dir.leader, None, "the stale hint outlived the recovery");
+        assert!(!dir.observe_hint(&stale), "a stale hint was adopted again");
+        assert_eq!(dir.leader, None);
+
+        let mut recovered = hint("survivor", 3);
+        recovered.recovery_epoch = 1;
+        assert!(dir.observe_hint(&recovered));
+        // The floor never falls, and raising it to where it is changes nothing.
+        assert!(!dir.raise_recovery_floor(0));
+        assert!(!dir.raise_recovery_floor(1));
+        assert_eq!(dir.leader, Some(recovered));
     }
 
     #[test]

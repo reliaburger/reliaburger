@@ -10,8 +10,9 @@ use super::model::{
 // The thresholds live beside the finding ids they decide, so `relish agent
 // explain` reports the numbers these checks use.
 use super::findings::{
-    CERTIFICATE_WARNING_SECONDS, CRASHLOOP_RESTARTS, CRASHLOOP_WINDOW_SECONDS,
-    DISK_CRITICAL_PERCENT, DISK_WARNING_PERCENT, RECENT_DEPLOY_SECONDS, STUCK_DEPLOY_SECONDS,
+    BACKUP_STALE_INTERVALS, CERTIFICATE_WARNING_SECONDS, CRASHLOOP_RESTARTS,
+    CRASHLOOP_WINDOW_SECONDS, DISK_CRITICAL_PERCENT, DISK_WARNING_PERCENT, RECENT_DEPLOY_SECONDS,
+    STUCK_DEPLOY_SECONDS,
 };
 
 /// Diagnose a cluster from an immutable evidence snapshot.
@@ -36,14 +37,17 @@ pub fn diagnose(inputs: &WtfInputs) -> WtfReport {
         record_cluster_unknowns(&inputs.cluster, &mut report);
         check_nodes(inputs, &mut report);
         check_builds(inputs, &mut report);
+        check_os(inputs, &mut report);
         check_council(inputs, &mut report);
         check_faults(inputs, &mut report);
         check_disks(inputs, &mut report);
+        check_export_holds(inputs, &mut report);
         check_certificates(inputs, &mut report);
         check_registry(inputs, &mut report);
         check_tokens(inputs, &mut report);
         check_isolation(inputs, &mut report);
         check_gitops(inputs, &mut report);
+        check_backups(inputs, &mut report);
         check_policies(inputs, &mut report);
     }
     record_application_unknowns(&inputs.applications, inputs.app.as_deref(), &mut report);
@@ -85,12 +89,14 @@ fn record_cluster_unknowns(evidence: &ClusterEvidence, report: &mut WtfReport) {
     record_unknown("council", &evidence.council, "cluster", report);
     record_unknown("faults", &evidence.faults, "cluster", report);
     record_unknown("disks", &evidence.disks, "cluster", report);
+    record_unknown("export_holds", &evidence.export_holds, "cluster", report);
     record_unknown("certificates", &evidence.certificates, "cluster", report);
     record_unknown("registry", &evidence.registry, "cluster", report);
     record_unknown("tokens", &evidence.tokens, "cluster", report);
     record_unknown("isolation", &evidence.isolation, "cluster", report);
     record_unknown("gitops", &evidence.gitops, "cluster", report);
     record_unknown("policies", &evidence.policies, "cluster", report);
+    record_unknown("backups", &evidence.backups, "cluster", report);
 }
 
 fn record_application_unknowns(
@@ -278,6 +284,60 @@ fn check_builds(inputs: &WtfInputs, report: &mut WtfReport) {
         correlated_events: Vec::new(),
         affected_resource: "cluster".to_string(),
     });
+}
+
+/// Appliance OS findings (W6): a node whose OS update failed, and nodes on
+/// different OS versions. Whether a newer release exists is `relish os
+/// list`'s business: it needs the internet, and `wtf --watch` polls.
+fn check_os(inputs: &WtfInputs, report: &mut WtfReport) {
+    let Some(builds) = inputs.cluster.builds.value() else {
+        return;
+    };
+    for build in builds {
+        if let crate::os::rollout::OsUpdateState::Failed { target, reason } = &build.os_update {
+            report.warnings.push(WtfFinding {
+                id: "os-update-failed".to_string(),
+                title: format!("{} couldn't update its OS to {target}", build.node_id),
+                details: vec![reason.clone()],
+                suggestion: "see the rollout with `relish os status`; `relish os resume` \
+                             retries the node once the cause is fixed"
+                    .to_string(),
+                correlated_events: Vec::new(),
+                affected_resource: format!("node/{}", build.node_id),
+            });
+        }
+    }
+    let appliances: Vec<(&str, &str)> = builds
+        .iter()
+        .filter_map(|b| Some((b.node_id.as_str(), b.os_version.as_deref()?)))
+        .collect();
+    let versions: std::collections::BTreeSet<&str> = appliances.iter().map(|(_, v)| *v).collect();
+    match versions.len() {
+        0 => {}
+        1 => report.ok.push(WtfOk {
+            id: "os".to_string(),
+            description: match appliances.as_slice() {
+                [(node, version)] => format!("{node} runs OS {version}"),
+                [(_, version), ..] => {
+                    format!("all {} appliances run OS {version}", appliances.len())
+                }
+                [] => return,
+            },
+        }),
+        _ => report.warnings.push(WtfFinding {
+            id: "os-skew".to_string(),
+            title: "appliances run different OS versions".to_string(),
+            details: appliances
+                .iter()
+                .map(|(node, version)| format!("{node}: {version}"))
+                .collect(),
+            suggestion:
+                "`relish os upgrade <version>` brings them in line; nodes already on it are skipped"
+                    .to_string(),
+            correlated_events: Vec::new(),
+            affected_resource: "cluster".to_string(),
+        }),
+    }
 }
 
 fn check_council(inputs: &WtfInputs, report: &mut WtfReport) {
@@ -1096,6 +1156,40 @@ fn check_disks(inputs: &WtfInputs, report: &mut WtfReport) {
     }
 }
 
+/// A store whose export keeps failing prunes nothing (#2062): with an export
+/// destination set, Bun deletes only what it has shipped, so its size cap
+/// and retention wait until an export works and the disk fills meanwhile.
+fn check_export_holds(inputs: &WtfInputs, report: &mut WtfReport) {
+    let Some(holds) = inputs.cluster.export_holds.value() else {
+        return;
+    };
+    for hold in holds {
+        let failing_for = inputs.collected_at.saturating_sub(hold.failing_since);
+        report.warnings.push(WtfFinding {
+            id: "export-failing".to_string(),
+            title: format!(
+                "node {} can't export its {}, so their retention is on hold",
+                hold.node_id, hold.storage_domain
+            ),
+            details: vec![
+                format!("exports have failed for {failing_for} s"),
+                format!(
+                    "until one works, the node prunes no {} files: neither max_storage_mb \
+                     nor retention_days applies",
+                    hold.storage_domain
+                ),
+            ],
+            suggestion: format!(
+                "fix the [{}] export_path destination (credentials, bucket, path); node {}'s \
+                 Bun log says why each export failed",
+                hold.storage_domain, hold.node_id
+            ),
+            correlated_events: Vec::new(),
+            affected_resource: format!("node.{}", hold.node_id),
+        });
+    }
+}
+
 fn check_cpu_throttling(inputs: &WtfInputs, report: &mut WtfReport) {
     let Some(observations) = inputs.applications.cpu_throttling.value() else {
         return;
@@ -1490,6 +1584,152 @@ fn check_gitops(inputs: &WtfInputs, report: &mut WtfReport) {
     }
 }
 
+/// Council backups (#2016): configured but unable to run is critical, since
+/// nothing will be there to restore from. A voter without `[cluster.backup]`
+/// while others have it, a failing export, or none for
+/// [`BACKUP_STALE_INTERVALS`] intervals warn. No voter configured at all is
+/// an OK row that says so: a fresh cluster's choice, not a fault.
+///
+/// Every node reports its own loop, because `[cluster.backup]` is per-node
+/// config and whichever voter leads is the one that exports. Freshness counts
+/// the newest export by any node, so a leadership change doesn't look stale.
+fn check_backups(inputs: &WtfInputs, report: &mut WtfReport) {
+    use crate::council::backup::BackupStatus;
+    let Some(backups) = inputs.cluster.backups.value() else {
+        return;
+    };
+    // A standalone node has no council to back up.
+    if backups.is_empty() {
+        return;
+    }
+    let problems = report.critical.len() + report.warnings.len();
+    for node in backups {
+        if let BackupStatus::Disabled { reason } = &node.status {
+            report.critical.push(WtfFinding {
+                id: "backup-disabled".to_string(),
+                title: format!(
+                    "node {} has [cluster.backup] set but exports no council backups",
+                    node.node_id
+                ),
+                details: vec![reason.clone()],
+                suggestion: "give the node the cluster master key ([security] \
+                             master_key_path) and a destination it can open, then restart bun"
+                    .to_string(),
+                correlated_events: Vec::new(),
+                affected_resource: format!("node.{}", node.node_id),
+            });
+        }
+    }
+
+    // Workers never lead, so only voters' configuration matters; with no
+    // council membership known, judge every node.
+    let voters: Vec<_> = if backups.iter().any(|node| node.is_council) {
+        backups.iter().filter(|node| node.is_council).collect()
+    } else {
+        backups.iter().collect()
+    };
+    let unconfigured: Vec<_> = voters
+        .iter()
+        .filter(|node| node.status == BackupStatus::NotConfigured)
+        .collect();
+    // A fresh cluster, the appliance included, starts without backups. That's
+    // a choice, not a fault, so the row says so instead of warning.
+    if unconfigured.len() == voters.len() {
+        if report.critical.len() + report.warnings.len() == problems {
+            report.ok.push(WtfOk {
+                id: "backups".to_string(),
+                description: "council backups aren't configured; see manual 12 \
+                              (operations, \"Backing up the council\")"
+                    .to_string(),
+            });
+        }
+        return;
+    }
+    for node in unconfigured {
+        report.warnings.push(WtfFinding {
+            id: "backup-not-configured".to_string(),
+            title: format!(
+                "council member {} has no [cluster.backup]; as leader it would export nothing",
+                node.node_id
+            ),
+            details: Vec::new(),
+            suggestion: "give every council member the same [cluster.backup]".to_string(),
+            correlated_events: Vec::new(),
+            affected_resource: format!("node.{}", node.node_id),
+        });
+    }
+
+    if let Some(detail) = backup_failing(backups, inputs.collected_at) {
+        report.warnings.push(WtfFinding {
+            id: "backup-failing".to_string(),
+            title: "the council's backups are not being written".to_string(),
+            details: vec![detail],
+            suggestion: "check the destination and its credentials from the leader; \
+                         bun's stderr logs each failed export"
+                .to_string(),
+            correlated_events: Vec::new(),
+            affected_resource: "cluster".to_string(),
+        });
+    }
+
+    // With no leader observed, whether anyone exports can't be read: say
+    // nothing rather than claim it.
+    let leader_observed = backups.iter().any(|node| node.is_leader);
+    if leader_observed && report.critical.len() + report.warnings.len() == problems {
+        report.ok.push(WtfOk {
+            id: "backups".to_string(),
+            description: "council backups are configured and the leader is exporting them"
+                .to_string(),
+        });
+    }
+}
+
+/// Why the leader's backups aren't landing, if they aren't: its last export
+/// failed, or no node has exported for [`BACKUP_STALE_INTERVALS`] intervals
+/// although the leader's loop has run that long.
+fn backup_failing(backups: &[super::BackupObservation], now: u64) -> Option<String> {
+    use crate::council::backup::BackupStatus;
+    let leader = backups.iter().find_map(|node| match &node.status {
+        BackupStatus::Running(progress) if node.is_leader => Some(progress),
+        _ => None,
+    })?;
+    if let Some(failure) = &leader.last_failure
+        && leader
+            .last_success_at
+            .is_none_or(|success| failure.at > success)
+    {
+        return Some(format!(
+            "the last export failed {}s ago: {}",
+            now.saturating_sub(failure.at),
+            failure.error
+        ));
+    }
+    let newest = backups
+        .iter()
+        .filter_map(|node| match &node.status {
+            BackupStatus::Running(progress) => progress.last_success_at,
+            _ => None,
+        })
+        .max();
+    let window = BACKUP_STALE_INTERVALS.saturating_mul(leader.interval_secs.max(1));
+    // A leader whose loop only just started hasn't had its chance yet.
+    let since = newest.unwrap_or(0).max(leader.started_at);
+    if now.saturating_sub(since) <= window {
+        return None;
+    }
+    Some(match newest {
+        Some(at) => format!(
+            "the newest backup was exported {}s ago; the interval is {}s",
+            now.saturating_sub(at),
+            leader.interval_secs
+        ),
+        None => format!(
+            "no backup has been exported since the leader's loop started {}s ago",
+            now.saturating_sub(leader.started_at)
+        ),
+    })
+}
+
 /// Policy findings (#1119): committed apps and jobs the policies in force
 /// would now refuse or record, the same list `relish policy audit` prints.
 /// A new policy never touches running work, so these keep running; the
@@ -1593,12 +1833,13 @@ fn with_caveat(description: &str, caveat: Option<&str>) -> String {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use crate::council::backup::{BackupProgress, BackupStatus};
     use crate::relish::wtf::{
-        AlertObservation, CertificateObservation, CouncilObservation, CpuThrottleObservation,
-        DeployObservation, DiskObservation, FaultObservation, GitOpsObservation,
-        IsolationObservation, LaunchFailureObservation, LogObservation, NodeGitOpsDifference,
-        NodeIsolation, NodeObservation, RegistryObservation, ReplicaObservation,
-        RestartObservation, ServiceObservation, TokenObservation,
+        AlertObservation, BackupObservation, CertificateObservation, CouncilObservation,
+        CpuThrottleObservation, DeployObservation, DiskObservation, ExportHoldObservation,
+        FaultObservation, GitOpsObservation, IsolationObservation, LaunchFailureObservation,
+        LogObservation, NodeGitOpsDifference, NodeIsolation, NodeObservation, RegistryObservation,
+        ReplicaObservation, RestartObservation, ServiceObservation, TokenObservation,
     };
 
     pub(in crate::relish::wtf) const NOW: u64 = 2_000_000;
@@ -1638,6 +1879,7 @@ pub(super) mod tests {
                     total_bytes: 100,
                     used_percent: 20.0,
                 }]),
+                export_holds: available(Vec::new()),
                 certificates: available(vec![CertificateObservation {
                     certificate_kind: "node".to_string(),
                     identity: "node-1".to_string(),
@@ -1671,6 +1913,17 @@ pub(super) mod tests {
                 }),
                 gitops: available(GitOpsObservation::default()),
                 policies: available(crate::policy::audit::PolicyAudit::default()),
+                backups: available(vec![BackupObservation {
+                    node_id: "node-1".to_string(),
+                    is_council: true,
+                    is_leader: true,
+                    status: BackupStatus::Running(BackupProgress {
+                        interval_secs: 300,
+                        started_at: NOW - 10 * DAY,
+                        last_success_at: Some(NOW - 60),
+                        last_failure: None,
+                    }),
+                }]),
             },
             applications: ApplicationEvidence {
                 restarts: available(Vec::new()),
@@ -1784,6 +2037,8 @@ pub(super) mod tests {
         // Late enough for a 91-day-old token; only token findings matter here.
         let now = 100 * DAY;
         inputs.collected_at = now;
+        // The healthy fixture's last backup would look stale this late.
+        inputs.cluster.backups = available(Vec::new());
         inputs.cluster.tokens = available(vec![
             token("old-root", "admin", now - 91 * DAY, None),
             token("young-root", "admin", now - 89 * DAY, None),
@@ -1802,6 +2057,190 @@ pub(super) mod tests {
             "{:?}",
             report.warnings[0]
         );
+    }
+
+    fn backup_running(last_success_at: Option<u64>) -> BackupStatus {
+        BackupStatus::Running(BackupProgress {
+            interval_secs: 300,
+            started_at: NOW - 10 * DAY,
+            last_success_at,
+            last_failure: None,
+        })
+    }
+
+    fn backup(
+        node_id: &str,
+        is_council: bool,
+        is_leader: bool,
+        status: BackupStatus,
+    ) -> BackupObservation {
+        BackupObservation {
+            node_id: node_id.to_string(),
+            is_council,
+            is_leader,
+            status,
+        }
+    }
+
+    fn critical_ids(report: &WtfReport) -> Vec<(&str, &str)> {
+        report
+            .critical
+            .iter()
+            .map(|finding| (finding.id.as_str(), finding.affected_resource.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn healthy_backups_are_ok() {
+        let report = diagnose(&healthy_inputs());
+        assert!(report.ok.iter().any(|ok| ok.id == "backups"), "{report:?}");
+    }
+
+    /// #2016: configured, but no master key or a bad URL: nothing exports.
+    #[test]
+    fn a_configured_but_disabled_backup_is_critical() {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.backups = available(vec![backup(
+            "node-1",
+            true,
+            true,
+            BackupStatus::Disabled {
+                reason: "no master key on this node".to_string(),
+            },
+        )]);
+        let report = diagnose(&inputs);
+        assert_eq!(critical_ids(&report), [("backup-disabled", "node.node-1")]);
+        assert!(report.critical[0].details[0].contains("no master key"));
+        assert!(!report.ok.iter().any(|ok| ok.id == "backups"));
+    }
+
+    /// A fresh cluster, the appliance included, has no backups configured:
+    /// an OK row that says so, not a warning (#2016 review).
+    #[test]
+    fn a_cluster_without_backups_is_ok_with_a_caveat() {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.backups = available(vec![
+            backup("node-1", true, true, BackupStatus::NotConfigured),
+            backup("node-2", true, false, BackupStatus::NotConfigured),
+        ]);
+        let report = diagnose(&inputs);
+        assert!(warning_ids(&report).is_empty(), "{report:?}");
+        let row = report
+            .ok
+            .iter()
+            .find(|ok| ok.id == "backups")
+            .expect("a backups row");
+        assert!(row.description.contains("aren't configured"), "{row:?}");
+        assert!(row.description.contains("manual 12"), "{row:?}");
+    }
+
+    /// With no leader observed, nobody knows whether backups are exported:
+    /// no OK row claiming the leader is exporting them.
+    #[test]
+    fn no_observed_leader_gives_no_backups_ok_row() {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.backups = available(vec![backup(
+            "node-1",
+            true,
+            false,
+            backup_running(Some(NOW - 60)),
+        )]);
+        let report = diagnose(&inputs);
+        assert!(!report.ok.iter().any(|ok| ok.id == "backups"), "{report:?}");
+    }
+
+    /// The configured voters lead, but the leader lacks it: as leader it
+    /// exports nothing.
+    #[test]
+    fn a_leader_without_backups_is_warned_when_other_voters_have_them() {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.backups = available(vec![
+            backup("node-1", true, true, BackupStatus::NotConfigured),
+            backup("node-2", true, false, backup_running(Some(NOW - 60))),
+        ]);
+        let report = diagnose(&inputs);
+        assert_eq!(
+            warning_ids(&report),
+            [("backup-not-configured", "node.node-1")]
+        );
+    }
+
+    /// A voter without `[cluster.backup]` exports nothing once it leads.
+    #[test]
+    fn a_council_member_without_backups_is_warned_when_others_have_them() {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.backups = available(vec![
+            backup("node-1", true, true, backup_running(Some(NOW - 60))),
+            backup("node-2", true, false, BackupStatus::NotConfigured),
+            backup("worker", false, false, BackupStatus::NotConfigured),
+        ]);
+        let report = diagnose(&inputs);
+        assert_eq!(
+            warning_ids(&report),
+            [("backup-not-configured", "node.node-2")]
+        );
+    }
+
+    /// #2016: a store that refuses the export.
+    #[test]
+    fn a_failing_export_on_the_leader_is_warned() {
+        let mut inputs = healthy_inputs();
+        let mut status = backup_running(Some(NOW - 600));
+        status.record_export(
+            &Err(crate::council::backup::BackupError::ObjectStore(
+                "access denied".to_string(),
+            )),
+            NOW - 60,
+        );
+        inputs.cluster.backups = available(vec![backup("node-1", true, true, status)]);
+        let report = diagnose(&inputs);
+        assert_eq!(warning_ids(&report), [("backup-failing", "cluster")]);
+        assert!(
+            report.warnings[0]
+                .details
+                .iter()
+                .any(|detail| detail.contains("access denied")),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn no_export_for_several_intervals_is_warned() {
+        let mut inputs = healthy_inputs();
+        let stale = NOW - BACKUP_STALE_INTERVALS * 300 - 1;
+        inputs.cluster.backups = available(vec![
+            backup("node-1", true, true, backup_running(None)),
+            backup("node-2", true, false, backup_running(Some(stale))),
+        ]);
+        let report = diagnose(&inputs);
+        assert_eq!(warning_ids(&report), [("backup-failing", "cluster")]);
+
+        // A fresh export by any node, the former leader say, is enough.
+        inputs.cluster.backups = available(vec![
+            backup("node-1", true, true, backup_running(None)),
+            backup("node-2", true, false, backup_running(Some(NOW - 60))),
+        ]);
+        assert!(warning_ids(&diagnose(&inputs)).is_empty());
+    }
+
+    /// A leader that only just started hasn't had time to export.
+    #[test]
+    fn a_new_loop_is_not_stale() {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.backups = available(vec![backup(
+            "node-1",
+            true,
+            true,
+            BackupStatus::Running(BackupProgress {
+                interval_secs: 300,
+                started_at: NOW - 300,
+                last_success_at: None,
+                last_failure: None,
+            }),
+        )]);
+        let report = diagnose(&inputs);
+        assert!(warning_ids(&report).is_empty(), "{report:?}");
+        assert!(report.ok.iter().any(|ok| ok.id == "backups"));
     }
 
     #[test]
@@ -1877,6 +2316,38 @@ pub(super) mod tests {
         assert_eq!(report.node_count, 1);
         assert_eq!(report.summary.ok_count, report.ok.len());
         assert!(report.ok.iter().any(|ok| ok.id == "nodes"));
+    }
+
+    /// A failing export holds the store's retention, which only Bun's log
+    /// said, every five minutes, while the disk filled (#2062).
+    #[test]
+    fn a_failing_export_is_a_warning_that_retention_is_on_hold() {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.export_holds = available(vec![ExportHoldObservation {
+            node_id: "node-1".to_string(),
+            storage_domain: "logs".to_string(),
+            failing_since: NOW - 600,
+        }]);
+
+        let report = diagnose(&inputs);
+
+        let finding = report
+            .warnings
+            .iter()
+            .find(|finding| finding.id == "export-failing")
+            .expect("an export-failing warning");
+        assert_eq!(finding.affected_resource, "node.node-1");
+        assert!(
+            finding.title.contains("retention is on hold"),
+            "{}",
+            finding.title
+        );
+        assert!(
+            finding.details[0].contains("600 s"),
+            "{:?}",
+            finding.details
+        );
+        assert!(finding.suggestion.contains("[logs] export_path"));
     }
 
     #[test]
@@ -1991,6 +2462,7 @@ pub(super) mod tests {
                 name: "node-1".to_string(),
                 voter: true,
             }],
+            council_size: None,
         }
     }
 
@@ -3073,7 +3545,68 @@ pub(super) mod tests {
             version: version.to_string(),
             commit: commit.map(str::to_string),
             binary_sha256: binary_sha256.map(str::to_string),
+            os_version: None,
+            os_update: Default::default(),
         }
+    }
+
+    fn on_os(
+        node_id: &str,
+        os: &str,
+        update: crate::os::rollout::OsUpdateState,
+    ) -> BuildObservation {
+        BuildObservation {
+            os_version: Some(os.to_string()),
+            os_update: update,
+            ..build(node_id, "v0.1.1", Some(COMMIT_A), Some("aaaa"))
+        }
+    }
+
+    #[test]
+    fn appliances_on_one_os_version_are_ok() {
+        use crate::os::rollout::OsUpdateState::Idle;
+        let report = with_builds(vec![
+            on_os("home-1", "2026.42.0", Idle),
+            on_os("home-2", "2026.42.0", Idle),
+        ]);
+        assert!(
+            report
+                .ok
+                .iter()
+                .any(|ok| ok.id == "os" && ok.description == "all 2 appliances run OS 2026.42.0")
+        );
+        assert!(!report.warnings.iter().any(|w| w.id.starts_with("os")));
+    }
+
+    #[test]
+    fn a_failed_os_update_and_mixed_versions_are_warnings() {
+        use crate::os::rollout::OsUpdateState::{Failed, Idle};
+        let report = with_builds(vec![
+            on_os("home-1", "2026.42.0", Idle),
+            on_os(
+                "home-2",
+                "2026.41.0",
+                Failed {
+                    target: "2026.42.0".into(),
+                    reason: "booted 2026.41.0 instead".into(),
+                },
+            ),
+        ]);
+        let ids: Vec<&str> = report.warnings.iter().map(|w| w.id.as_str()).collect();
+        assert!(ids.contains(&"os-update-failed"), "{ids:?}");
+        assert!(ids.contains(&"os-skew"), "{ids:?}");
+        let failed = report
+            .warnings
+            .iter()
+            .find(|w| w.id == "os-update-failed")
+            .unwrap();
+        assert_eq!(failed.title, "home-2 couldn't update its OS to 2026.42.0");
+    }
+
+    #[test]
+    fn nodes_without_an_appliance_os_say_nothing_about_it() {
+        let report = with_builds(vec![build("n1", "v0.1.1", Some(COMMIT_A), Some("aaaa"))]);
+        assert!(!report.ok.iter().any(|ok| ok.id == "os"));
     }
 
     fn with_builds(builds: Vec<BuildObservation>) -> WtfReport {

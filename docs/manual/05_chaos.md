@@ -25,8 +25,9 @@ Workload faults take `--namespace` (default `default`), `--instance` to hit
 one instance, `--duration` and `--reason`, which is recorded with the fault.
 
 A paused instance still reports its pid in `relish apps NAME`, and you can stop
-or delete it without clearing the pause first: Bun follows the stop signal
-with SIGCONT, so the instance gets its usual chance to shut down cleanly.
+or delete it without clearing the pause first. Bun follows the stop signal
+with SIGCONT, on the process runtime and on runc alike, so the instance gets
+its usual chance to shut down cleanly.
 
 ### Jobs and task arrays
 

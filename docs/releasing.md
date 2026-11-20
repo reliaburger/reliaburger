@@ -25,8 +25,8 @@ requests, main and manual candidate builds:
 | `relish-linux-x86_64` | Ubuntu 22.04 x86_64 | Linux CLI |
 | `relish-linux-aarch64` | Ubuntu 22.04 arm64 | Linux CLI |
 | `relish-macos-aarch64` | macOS 15 Apple silicon | Laptop CLI |
-| `reliaburger-guest-ubuntu-24.04-…-aarch64.qcow2` | Ubuntu 24.04 arm64 | Quickstart VM image |
-| `reliaburger-guest-ubuntu-24.04-…-x86_64.qcow2` | Ubuntu 24.04 x86_64 | Quickstart VM image |
+| `reliaburger-guest-ubuntu-26.04-…-aarch64.qcow2` | Ubuntu 24.04 arm64 | Quickstart VM image (Ubuntu 26.04) |
+| `reliaburger-guest-ubuntu-26.04-…-x86_64.qcow2` | Ubuntu 24.04 x86_64 | Quickstart VM image (Ubuntu 26.04) |
 
 Pull requests build the guest images only when `build_guest_image.sh`,
 `guest-images.json` or the workflow changes.
@@ -41,6 +41,19 @@ so the profile never compiles on the bench host. Pushes and manual runs
 build it, and pull requests only when the workflow changes. Its name matches
 neither the candidate job's `binaries-*` nor `candidate-*`, so it never
 reaches `candidate.json`, staging or promotion.
+
+The appliance OS images are built separately, by
+`.github/workflows/appliance.yml`. A publishing run releases them as
+`os-<version>-<arch>` with a signed `os-channel.json`, which is what `relish
+image download` and `relish os` read. Today only a manual dispatch with
+`publish` set publishes. The weekly scheduled build (Monday 04:00 UTC,
+`cron: "0 4 * * 1"`) is switched off until v0.3.0 is promoted (maintainer,
+7 October 2026), so the 0.3.0 train reaching main publishes nothing by
+itself. **After v0.3.0 is promoted, dispatch a publish and restore the
+`schedule` trigger** in `appliance.yml`, as [step 8 of
+staging](#staging-a-candidate) says. Its plan job already treats a scheduled
+run on main as a publishing one, and a build whose packages match the last
+release publishes nothing.
 
 There's no Intel macOS build. 0.2.1 was the last release with
 `relish-macos-x86_64` (maintainer decision, 17 October 2026,
@@ -114,10 +127,16 @@ make up for that:
   cuts both ways: "close", "closes", "fix", "fixes", "resolve" or
   "resolves" before `#N` closes the issue wherever it stands in the
   message, even after "doesn't", so write "`#N` stays open" instead.
-- **The gate PR names every issue.** Before the gate PR merges into `main`,
-  rebuild its body with a `Fixes #N` line for every issue the train
-  resolves: list the train's merged PRs and commits, collect their lines,
-  check each issue on GitHub, and keep the list in
+- **The gate PR names every issue.** The gate PR is the only PR into the
+  default branch, so its body is where GitHub reads the keywords. It lists
+  `Fixes #N` for every issue that any PR merged into the train fixes, and
+  the line goes in as each PR merges, not in a sweep at the end. Then every
+  fixed issue closes the moment the gate PR merges. An issue that closes by
+  hand after a manual record, such as a hardware exit test, is named in the
+  body as well, without the keyword, with the record it waits for. Before
+  the gate PR merges into `main`, check the body against the train: list the
+  train's merged PRs and commits, collect their lines, check each issue on
+  GitHub, and keep the list in
   `docs/qualification/DATE-vX.Y.Z-freeze-fixes.txt` with the issues that
   stay open and why
   ([0.2.8's](qualification/2026-11-09-v0.2.8-freeze-fixes.txt)).
@@ -663,6 +682,30 @@ The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
 same steps and the same losses. A script that read `relish status -o json`
 as a list of instances should read `relish apps --instances -o json` instead.
 
+### Upgrading from 0.2.8
+
+0.3.0 can't roll onto a 0.2.8 cluster. The appliance OS rollout and the
+cluster-wide council size are new Raft requests and new fields in council
+state, and OIDC signing-key rotation adds two more requests and a field in
+the security state
+([#709](https://github.com/reliaburger/reliaburger/issues/709)); the full
+list is in `src/compatibility.rs`. So the protocol moved from 58 to 60 and
+the state format from 74 to 76, and a 0.2.8 leader refuses
+`relish upgrade start v0.3.0` before it records a run. The train bumped
+twice: once at its first format change (59/75) and once at its end, so a
+pre-release build made between the two is refused like any other format.
+
+The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
+same steps and the same losses, and one change to how you start it: the root
+CA is now offline
+([#709](https://github.com/reliaburger/reliaburger/issues/709)). `relish
+init` writes the root's private key only into the backup you name with
+`--root-backup`, and without a terminal it needs `--passphrase-file` or
+`--recipient` too. The setups that run on your machine write it there,
+sealed to a fresh age identity, and print both paths. `relish ca backup` now
+only re-seals such a backup (`--from`). Keep that backup somewhere safe and
+off the cluster: it's the only copy of the root's key.
+
 ## Signing identity
 
 Configure `RELIABURGER_RELEASE_KEY` as a secret of the `release` GitHub
@@ -734,7 +777,11 @@ cat ~/reliaburger-nightly-key/release.pub
 ```
 
 `relish dev keygen` names its files `release.key` and `release.pub` whatever
-they're for. The `ed25519:…` line it printed goes into
+they're for. Its key is a PKCS#8 v2 document, with the public key after the
+seed, which the runners' OpenSSL 3.0 can't read, so every train build failed
+at signing until `package.py` learnt to turn it into the v1 document of the
+same key, after checking the public key it carries matches the seed
+([#1950](https://github.com/reliaburger/reliaburger/issues/1950)). The `ed25519:…` line it printed goes into
 `NIGHTLY_SIGNING_KEYS`. With an empty list, a train's build fails at signing
 with "signing key is not trusted by the binaries it signs". The maintainers
 created the key on 27 October 2026, and the 0.2.4 train carries its public
@@ -1277,6 +1324,13 @@ installs (step 3) on the candidate, and the matching nightly's directory is
 copied into `docs/qualification/` as the soak and power-cut records. When it
 fails, run steps 4 and 5 on the candidate as before.
 
+Freeze is also when the release notes are drafted
+(`docs/qualification/DATE-vX.Y.Z-release-notes.md`). Alongside the draft,
+bring the release's section in [`CHANGELOG.md`](../CHANGELOG.md) up to date
+under `## [Unreleased] - X.Y.Z`: Upgrading first, then what it adds, changes,
+fixes and removes, one line each. `scripts/ci/test_changelog.py` fails while
+the version in `Cargo.toml` has no section.
+
 ### Performance records after the tag
 
 Benchmarks, the profile (#1358) and the day run (#1032) don't decide whether a
@@ -1744,6 +1798,40 @@ the real `curl … | sh` install against it on every host we advertise.
    `docs/qualification/DATE-vX.Y.Z-release-notes.md`, above that list:
    `gh release edit vX.Y.Z --notes-file NOTES` with the draft followed by
    the generated list ([0.2.8's draft](qualification/2026-11-09-v0.2.8-release-notes.md)).
+   In [`CHANGELOG.md`](../CHANGELOG.md), turn `## [Unreleased] - X.Y.Z` into
+   the dated `## [X.Y.Z] - YYYY-MM-DD`, add the known issues it ships with,
+   and point its link at the release page.
+
+   **Then publish the appliance OS**, from v0.3.0 on. `promote.yml` publishes
+   only `bun` and `relish`; the OS images that `relish image download` and
+   `relish os` read are published by `appliance.yml`, and only from `main`:
+
+   ```sh
+   gh workflow run appliance.yml --ref main -f publish=true
+   ```
+
+   With no `bun_release`, the image takes `bun` and `relish` from the newest
+   published `v*` release, the one you just promoted. The `sign` job runs in
+   the `release` environment, the only place `RELIABURGER_RELEASE_KEY`
+   lives, signs both architectures and the channel, and `publish` releases
+   them as `os-<version>-<arch>` and updates `os-channel.json` on the
+   `os-channel` release. A build whose packages match the last release
+   publishes nothing, so a patch release that changes no package is a no-op.
+
+   After v0.3.0's promotion, and only once, restore the weekly scheduled
+   publish the maintainer paused until then ([why](#what-the-workflow-builds)):
+   add back to `appliance.yml`'s `on:` block
+
+   ```yaml
+     schedule:
+       - cron: "0 4 * * 1"
+   ```
+
+   drop the paragraph saying it's off from the workflow's header and from
+   [What the workflow builds](#what-the-workflow-builds), and turn
+   `test_nothing_publishes_on_a_schedule_until_v0_3_0_is_promoted` in
+   `scripts/ci/test_ci_workflow.py` into a test that the schedule is there.
+   The plan job already treats a scheduled run on `main` as a publishing one.
 
 9. **Publish the performance records**, after the tag
    ([why](#performance-records-after-the-tag)). They don't block the release;
@@ -1899,6 +1987,8 @@ the real `curl … | sh` install against it on every host we advertise.
     took and how many candidates, what each soak found and what fixed it, and
     any known issue it ships with, linking the records from step 6. When the
     profile from step 9 is in, add one line from its answer.
+    `scripts/ci/test_changelog.py` fails while a release in the log has no
+    dated section in [`CHANGELOG.md`](../CHANGELOG.md) (step 8).
 
 ## Soaking a candidate in CI
 
@@ -2011,32 +2101,44 @@ need their own evidence after publication.
 ## Guest images and bootstrap installer
 
 Each quickstart VM boots from a guest image the release builds itself: the
-dated Ubuntu 24.04 cloud image named in `scripts/release/guest-images.json`
+dated Ubuntu 26.04 cloud image named in `scripts/release/guest-images.json`
 with that file's `packages` (runc, uidmap, btrfs-progs, nftables, iptables,
 iproute2, buildah) already installed. Without them baked in, every VM spent 15–40 s of
 its first boot in `apt-get update` and `install`, against Ubuntu's live mirrors
 ([measurements](qualification/2026-09-24-guest-image.md)).
 
+The guest runs the same Ubuntu release as the appliance OS (`image/mkosi.conf`),
+and its packages are the appliance's node packages plus Buildah, which only the
+guest needs. `scripts/release/test_guest_images.py` reads both files and fails
+when the two lists drift, so a package added to one is added to the other.
+
 Buildah is there so the five-minute tour can `relish build` on the cluster.
 With what it pulls in that the stock image lacks (`containers-common`, the CNI
 plugins and netavark, `fuse-overlayfs`), it adds about 75 MiB installed,
 going by Ubuntu 24.04's package sizes: 47 MiB of that is
-`containernetworking-plugins`. Expect the compressed image to grow by roughly
-25–40 MiB; record the real figure with the next image build.
+`containernetworking-plugins`. On Ubuntu 26.04 the packages need about
+270 MiB, and the aarch64 image built on 7 October 2026 was 1009 MiB, 107 MiB
+more than the stock cloud image.
 
 `scripts/release/build_guest_image.sh` builds one image, for the host's own
 architecture:
 
 ```sh
-sudo apt-get install -y qemu-utils
+sudo apt-get install -y qemu-utils cloud-guest-utils
 sudo scripts/release/build_guest_image.sh --output guest > guest-record.json
 ```
 
 It downloads the upstream image (or takes `--source FILE`) and refuses it unless
-its SHA-256 matches the pin. It converts it to a sparse raw file, loop-mounts
-the root and boot partitions, and runs `apt-get install` in a chroot, with
+its SHA-256 matches the pin. It converts it to a sparse raw file and adds 1 GiB
+to it, because Ubuntu 26.04's 2.5 GiB root filesystem has only about 160 MiB
+free. It grows the root partition and filesystem into that space
+(`growpart`, `resize2fs`), loop-mounts the root and boot partitions, and runs `apt-get install` in a chroot, with
 package indexes and downloads on a tmpfs so they never reach the image and with
-service starts blocked. Then it seals the image: an empty `/etc/machine-id`,
+service starts blocked. It disables chrony, Ubuntu 26.04's time daemon, because
+Lima's guest agent owns the guest clock (#608). It adds a systemd `.link` file
+naming the virtio NIC `eth0`: 26.04's initrd brings the NIC up as `enp0s1`,
+cloud-init can't rename an interface that's up, and without the file each new
+VM waited two minutes for an `eth0` that never appeared. Then it seals the image: an empty `/etc/machine-id`,
 `cloud-init clean`, no SSH host keys, random seed, logs or temporary files, so
 every VM still generates its own identity at first boot. `fstrim` returns freed
 blocks to the sparse file, and `qemu-img convert -c` writes a zlib-compressed
@@ -2074,7 +2176,8 @@ Update `guest-images.json` deliberately when changing the guest baseline (new
 upstream image date or package list); don't introduce an unpinned `current`
 fallback. Development runs (`--development-binaries`) have no release to take a
 built image from, so they boot the pinned upstream image and install the
-packages at first boot. The VM's provisioning script skips `apt` whenever every
+packages at first boot. The stock image has no `.link` file, so its first boot
+loses the NIC rename and setup restarts the VM once; later boots are fine. The VM's provisioning script skips `apt` whenever every
 package is already present, so both paths use the same script.
 
 Packaging generates `install.sh` with the exact native CLI checksums. The

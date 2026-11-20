@@ -646,6 +646,7 @@ pub async fn run(options: Options) -> Result<()> {
                 back_up: bootstrap.directory.clone(),
                 unreachable,
                 relish: &relish,
+                root_backup: bootstrap.root_backup.clone(),
             });
             output::print_output(&report, options.output)?;
             Ok(())

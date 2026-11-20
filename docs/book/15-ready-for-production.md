@@ -464,6 +464,80 @@ bucket bound for the same reason we picked 256 ms: the record's number is then e
 one the gate compared. `soak_slo.py trend` lists every record's values side by side, which
 is the closest we'll come to a dashboard for now.
 
+Three releases of records later, that listing set the gates
+([#1405](https://github.com/reliaburger/reliaburger/issues/1405)). The API read, the API write
+and the rolling update are now gated at two buckets above the worst fast or final value: 3 s,
+3 s and 100 s. The same listing showed something else, which a dashboard would have shown
+at a glance. App start was 1 ms in every record, on machines that take seconds to start a
+container. "A start and a completion on that node's own clock" turned out to be one clock
+reading taken twice: every deploy-history writer filled both fields with `SystemTime::now()`
+as it wrote the entry ([#1640](https://github.com/reliaburger/reliaburger/issues/1640)). A
+number that never moves deserves suspicion. App start stayed record only until its
+timestamps meant something.
+
+They did from the 0.3.0 rehearsal, the first soaks on builds with the fix
+([#1913](https://github.com/reliaburger/reliaburger/issues/1913)). Its seven records hold 186
+starts, from 2.6 s to 11.1 s, with medians of about 5 s. Before trusting them we checked a
+few against the raw deploy history the harness keeps in its evidence: each start was a few
+seconds from `created_at` to `completed_at`, and the three nodes' entries followed one
+another through the rollout, as a rolling update should. The job tiers are a second or two
+slower than the V02 tiers, because the job campaign is busy on the same CPUs. The worst p99
+was the 15 s bucket, in the jobs tiers, so by the same two-bucket rule App start is gated
+at 30 s. That's six times Kubernetes's 5 s, but it isn't the same measurement: theirs
+leaves out the image pull and stops at "running", while ours waits for the health check,
+on three small VMs sharing one laptop. Now all five latencies can fail a release.
+
+### The soak's own blind spot
+
+The power-cut endurance work ([#2067](https://github.com/reliaburger/reliaburger/issues/2067))
+borrowed the soak's volume writer, and in doing so found that the soak's data-loss check
+couldn't see most losses. The writer appends 1, 2, 3, ... to `/data/seq`, `sync`s, and only
+then logs `ACK n`. Every five minutes the soak checks that the file runs 1..N with N at
+least the highest `ACK` it has seen. Now suppose a power cut loses lines 901 to 1000. The
+writer comes back, drops a torn last line, finds 900 and appends 901, 902, ... at ten a
+second. A minute later the file runs unbroken past 1000, and the check passes. It can only
+fail for a loss bigger than the writes made between the cut and the next look, and a
+settle takes minutes. The Redis counter had the same hole: the client just counts on.
+
+The fix looks at the restart instead of the state long after it, the way the endurance
+harness does. Each writer start appends the number it resumed from to `/data/resumes` and
+syncs it before its first `ACK`; each Redis client start pushes the counter it found onto
+the list `soak:starts` before its first `INCR`. The checker then holds every start to the
+highest value acknowledged before it. "Before it" needs care, because the checks run every
+30 seconds and a start can land between any two reads. Each check reads the log tails first
+and the records second, so any start the records don't show yet came after every `ACK` in
+those tails. The harness takes one more look just before each power cut, so the bar is the
+last `ACK` before the cut, not the last check's. A cut of the writer's node must also be
+followed by a new start, or the check proved nothing. The settle checks don't wait for the
+writer, so it gets two minutes after the fault window closes to record one. And the records
+are read with `relish exec`, so whatever the command prints is what the checker gets: Redis
+replaying its append-only file after a power cut answers `LOADING Redis is loading the
+dataset in memory` with exit status 0. A record with any line that isn't a number (or, for
+regressions, two) is a warning that judges nothing, never a loss.
+
+The soak has one case the endurance run doesn't. Its Redis client usually runs on another
+node from Redis, so a cut of Redis's node loses writes under a client that never restarts.
+So the client remembers its last answer, and when an `INCR` answers no more than the one
+before, it pushes both numbers onto `soak:regressions`. Redis is back by then, so that push
+is durable, and any entry fails the soak. The unit test that matters is the scenario above:
+a file whole to 1,500, `ACK 1000` before the cut and a resume point of 900. The old check
+passes it and the new one fails it, both in the same test.
+
+The same work found a second bug in the harness. `with_timeout` bounded each `limactl`
+and `relish` call with `perl -e 'alarm shift; exec @ARGV'`: arm a timer, then replace perl
+with the command, so `SIGALRM` lands on the command itself. A C program dies of it, since
+that's the default action. Go's runtime catches every signal and turns `SIGALRM` into
+nothing unless the program asked for it, and `limactl` is a Go program, so a
+`limactl shell` into a guest that went away hung for good. The new helper forks instead.
+The child calls `setpgrp` to lead its own process group, then `exec`s the command; the
+parent waits, and when the alarm fires it sends `SIGKILL` to the negative pid, which means
+the whole group. That takes the `ssh` that `limactl` started too, which would otherwise
+hold the caller's pipe open. A process group that isn't the terminal's foreground group
+stops if it reads the terminal, so the child swaps a terminal standard input for
+`/dev/null`; a piped one still gets through, which `gsh_in` needs to hand the guest its
+script. The test runs a shell that ignores `SIGALRM` and `SIGTERM` and leaves a grandchild
+holding standard output, and expects status 124 within the deadline.
+
 
 Here's a bug that a passing test hid for a while. Bun can run a workload as a plain host
 process, not just a container. You tell it a binary path and it runs it. Obviously you don't
@@ -610,6 +684,35 @@ the whole report. The report steps now pass `--failure-mode all`, which skips an
 profile with a warning and only fails when none can be read. Skipping one killed process's
 partial counts can pull coverage down a hair. It can't push it up, so the floor still means
 what it says.
+
+Those files add up. cargo-llvm-cov names each one after the process that wrote it (`%p`, the
+pid, in LLVM's pattern), and nextest runs every test in its own process, so every test leaves
+a profile behind. The lib tests' binary is big, and each of its processes writes 5 MB of
+counters. That came to 44 GB on a hosted runner that starts with 74 GB free. On
+18 November 2026 the runner lost contact with GitHub three times, with no log. A watcher on a
+run that passed showed memory was fine, and free disk down to 5 GB. A slower runner fills it.
+
+LLVM can merge as it goes instead: drop `%p` and every process of one binary adds its counts
+into a small pool of shared files. We tried that and didn't take it. A process killed halfway
+through writing leaves the pool file truncated, and after that every later process fails to
+merge into it, so one SIGKILL from a crash-recovery test would silently throw away thousands
+of tests' coverage. So the job makes room instead. It deletes the runner image's Android,
+.NET, Haskell and other SDKs that nothing here uses, stops nextest if free disk drops under
+2 GiB, and fails its report when the low point is under 10 GiB. A shrinking margin now turns a
+step red with a number on it, long before it costs us a runner.
+
+That wasn't the end of it. The next run freed 27 GB, kept 48 GB to spare, and still lost its
+runner. Memory was the other half. The crate's lib tests compile in one rustc that peaks at
+12 GB, and the lib on its own takes another 7 GB. Both need only the dependencies, so any
+parallel build starts them together. In the Lima VM, under a runner's 14 GiB and 3 GiB of
+swap, four jobs and three jobs ran out and the kernel killed the lib tests' rustc. Two jobs
+didn't help: the same pair still overlapped, filled the swap and stalled for minutes. On the
+runner nobody dies. We'd shielded it from the OOM killer, so the host pages instead, the
+runner's heartbeat stops, and GitHub gives up on it. So the coverage build now runs one job
+at a time: the peak is 12 GB and nothing swaps. It costs time, about three times as long to
+build in the VM. The watcher also logs swap and the kernel's memory-stall figure, and stops
+the build if available memory stays under 512 MiB for a minute while swap is in use. Paging
+hard is now a failed step with a log, not a vanished runner.
 
 Coverage finds unvisited code. It does not tell us whether an assertion is useful, whether a
 webhook test accidentally exercised startup, or whether a five-second performance limit is
@@ -2370,7 +2473,8 @@ release that makes `relish` friendly to LLM agents, the maintainer's call was
 `-o json` for every command (#1566). So the answer became an enum with two
 honest answers, `Structured` and `Interactive`, and only six commands give the
 second: `tui`, `dashboard`, `manual`'s reader, `source`, `setup` and `dev
-shell`.
+shell`. 0.3.0 added two more, `machines claim`, which waits for a person to
+compare claim keys, and `netboot`, which serves installs until it's stopped.
 
 Every other command follows the pattern `status` and `events` already used: a
 small struct that derives `Serialize` for the data and implements `Display`
@@ -2424,7 +2528,9 @@ expects.
 
 `relish logs -o json` is JSON Lines, one object per log line with `at`,
 `node`, `instance`, `stream` and `text`, so an agent can filter on fields
-instead of on the `[instance]` labels people see. The client used to turn the
+instead of on the `[instance]` labels people see. `text` is an `untrusted`
+object, because the app wrote the line ([Chapter
+19](19-built-for-agents.md#their-words-not-ours)). The client used to turn the
 store's entries into text before anyone could ask for anything else; it now
 returns a `LogLines` enum, `Stored` entries with their metadata or `Captured`
 plain lines from the agent's own fallback, and rendering happens last. A
@@ -2513,13 +2619,17 @@ one-binary scratch image won't even start under runc.
 The way out was already sitting on every node. `testapp` is a subcommand of
 `bun` (`bun testapp --mode healthy --port 8080` runs the identical server), and
 `bun` is installed at `/usr/local/bin/bun` on every dev node. So instead of an
-image, the harness deploys a **process workload** — a plain command — and lets
-the node run its own `bun`:
+image, the harness deploys a **process workload** — a host binary named by
+`exec`, with `command` as its arguments — and lets the node run its own `bun`:
 
 ```toml
 [app.web]
-command = ["/usr/local/bin/bun", "testapp", "--mode", "healthy", "--port", "40817"]
+exec = "/usr/local/bin/bun"
+command = ["testapp", "--mode", "healthy", "--port", "40817"]
 ```
+
+(A `command` with no `exec`, `script` or `image` has nothing to run it in, and
+since 0.3.0 `relish lint` refuses it.)
 
 That needs the cluster to run the *process* runtime rather than runc, so
 `relish dev create` grew a `--runtime` flag (`runc` still the default). This is
@@ -2768,6 +2878,13 @@ That's two numbers, and they belong in config:
 default_duration_secs = 600   # applied when a fault names no duration
 max_duration_secs = 3600      # a fault asking for longer is rejected
 ```
+
+Two numbers can disagree, though. Set `max_duration_secs = 300` and leave the
+default alone, and every fault without `--duration` is refused, because the
+600 s default is over the limit. Set the maximum to two days, and the 24-hour
+backstop quietly cuts every fault to one day anyway. So Bun checks
+`0 < default <= max <= 86400` at startup and refuses the node config with the
+field named, instead of leaving you to find out at the first injection.
 
 The decision worth dwelling on is *where* to enforce them. The CLI already
 defaulted a missing `--duration` to ten minutes, so it would have been easy to
@@ -9526,6 +9643,16 @@ tests build, every app config in `examples/`. A unit test checks each seed is
 When the protocol version moves, the checked-in gossip and Raft seeds stop
 decoding, and `make fuzz-corpus-seed` writes fresh ones.
 
+That test checked the seeds the code builds, though, not the files on disk,
+and another test only checked that each file was there. So when the protocol
+moved from 56 to 59, every gossip seed in `fuzz/corpus/` still had a 56 in its
+first byte, the Raft seeds were just as stale, and nothing failed. The gossip
+fuzzer started from five datagrams the decoder threw out at the version check
+and reached 66 edges; fresh seeds reach about 1,300 in seventeen seconds.
+A weekend fuzzing campaign noticed in its first ten minutes. Now a third
+test runs each checked-in seed file through its target and wants it
+accepted, so a bump that leaves stale seeds fails `make ci`.
+
 `make fuzz-smoke` runs every target for ten seconds. The `fuzz.yml` workflow
 runs each one for five minutes every night, and for thirty seconds on a pull
 request that touches a decoder. A crash fails the job and uploads the input.
@@ -9621,7 +9748,27 @@ target never reads the bundle, so the build script now skips it when the
 
 The next step is OSS-Fuzz, which runs the same cargo-fuzz targets on
 Google's machines around the clock. That wants targets that have run clean
-nightly for a while first, so it's a follow-up.
+nightly for a while first, so it's a follow-up. The application itself is
+three small files in OSS-Fuzz's own repository: a `project.yaml` with the
+contacts that get crash reports, a Dockerfile that clones the code onto
+Google's Rust build image, and a `build.sh` that runs `cargo fuzz build -O`
+and copies each target and its seeds out. Drafts of all three wait in
+`fuzz/oss-fuzz/`. The script asks `cargo fuzz list` for the targets rather
+than naming them, so a thirteenth target won't need a second pull request
+to Google.
+
+Three decoders missed the first cut, and they have targets now
+([#1414](https://github.com/reliaburger/reliaburger/issues/1414)). They are the task-array
+manifest, the chaos scenario file, and the council state inside a backup. The last one
+shows why one target per file isn't enough. `council_backup` already fuzzes the backup
+file, but its bytes are sealed with the master key, and random input never unseals. So the
+JSON a restore parses once it has unsealed a backup was never reached. `council_backup_state`
+starts after the seal. It also checks the one property a restore leans on: the backup name
+worked out from a state must parse back to the same position, because `relish council
+recover` refuses a state that doesn't sit where its name says. None of the three types
+derives `PartialEq`, and `DesiredState` holds `HashMap`s that re-encode in a different order
+each time. So each round trip compares `serde_json::Value`s, whose maps are ordered, rather
+than the structs.
 
 ## Did it happen in some order?
 
@@ -9718,6 +9865,16 @@ reads every write straight back through a different node. With that, the broken 
 three runs out of three, each time on a renew that returned one expiry and a read 3 ms later,
 through another node, that returned the one before. The honest build passed every run.
 
+A kill has a blind spot, though. A killed leader answers nothing, so it can't serve a stale
+read. The dangerous leader is the one that's alive and cut off, still sure it leads, while the
+others elect someone new. The fixture's nodes already carry the switch a `node-kill` fault
+throws: a `NodeTransportGate` that makes every cluster transport behave as if the node had
+gone, while its API keeps answering. So a second test quiesces the leader's gate instead of
+killing it, waits for one of the other two to win an election, leaves the old leader cut off
+ten seconds more, and heals it (#1415). It passes. The leader-confirmation check is what makes
+it pass: the old leader can't reach a quorum, so it can't prove it leads, and it refuses or
+forwards instead of answering from its copy.
+
 The checker's first finding wasn't that bug, though. It was in our model. On the honest
 build, a read during a release saw the lease *cleaning*, and the model said that couldn't
 happen: a release was one step, held one instant and free the next. But the council releases
@@ -9738,8 +9895,34 @@ hand on every exit path; here it's the type's job. The nodes come from the fixtu
 from Chapter 1: every field we don't name comes from the default.
 
 What doesn't this cover? Only what the clients do. The soak's apps, jobs and upgrades write to
-the council too, and the history sees none of it. The next step is the same check for job
-outcomes, where "every task-array chunk completes exactly once" is an invariant today.
+the council too, and the history sees none of it.
+
+### Every chunk exactly once
+
+Jobs are the next most important thing the soak writes. The council promises that every
+task-array chunk completes exactly once
+([#1415](https://github.com/reliaburger/reliaburger/issues/1415)). The leader grants a chunk
+to a node, and the node reports it done. If the node dies first, the leader grants the chunk
+again with the next attempt number, and that number fences off a late report from the dead
+node. So a chunk can *run* twice, but it must be *counted* once.
+
+The soak can't see grants: they live only in Raft state. What it can see is the accepted
+results, through `GET /v1/batch/{id}/results`. Each row there names the grant attempt that
+produced it, and that's enough for a model with two rules:
+
+1. **Counted once.** A chunk's rows hold each of its tasks exactly once, and every row comes
+   from the same grant. Rows from two grants in one chunk mean the council accepted the chunk
+   twice.
+2. **Run again only after a re-grant.** The audit runs already post one effect per execution
+   to a ledger outside the cluster. A task whose chunk was granted once can't have run more
+   often than its accepted attempts. Extra runs need a grant attempt above 1.
+
+Reading every row of a 262,144-task run after each drain would cost hundreds of requests. So
+`job_soak.py` reads the first chunk, the last chunk and six picked at random, from a generator
+seeded with the run's name, so a rerun reads the same ones. It reads small runs whole. Each
+checked chunk's grant goes into `chunk-history.jsonl` next to the campaign state, and the
+qualification record counts the chunks checked and how many of them were re-granted. A
+re-grant isn't a failure; it's the evidence that the soak's faults exercised the fence.
 
 ## Lessons learned: audit the evidence too
 

@@ -3,7 +3,8 @@
 A Reliaburger cluster is the same `bun` binary on every node, started with
 `--cluster`. Membership spreads by SWIM gossip. A Raft council, embedded in the
 agent, holds the desired state and schedules work; it starts on the first node
-and grows as nodes join, up to seven voters.
+and grows as nodes join, up to seven voters, or to the council size the
+cluster was created with (appliance clusters default to five).
 
 The council always holds an odd number of voters: the largest odd number the
 live nodes allow, up to seven. An even council survives no more failures than
@@ -30,10 +31,13 @@ the rest of this chapter is for servers.
 ## Initialise the first node
 
 `relish init` generates the cluster PKI, the first node's identity, a sample
-`app.toml` and an mTLS-required `reliaburger.toml`:
+`app.toml` and an mTLS-required `reliaburger.toml`. The root CA's private key
+goes only into a backup you keep off the node, so say where (it asks for a
+passphrase, or see `security` for scripts):
 
 ```sh
-sudo relish init cluster --cluster-name prod --node-id node-01
+sudo relish init cluster --cluster-name prod --node-id node-01 \
+    --root-backup /media/usb/prod-root-backup.age
 ```
 
 Run as root on Linux with `runc` installed, `relish init` writes `[ebpf]` and
@@ -78,6 +82,18 @@ relish join --token <TOKEN> --node-id node-02 \
   --ca-fingerprint sha256:<ROOT_CA_FINGERPRINT> https://<LEADER>:9117
 ```
 
+Pick node names that differ by more than their last two characters. Raft
+numbers each member from a hash of its name, and a few short names collide
+(`worker-c0` and `worker-ar`, for instance). The council refuses a join token,
+and a join, whose name collides with a node that has joined before or been
+decommissioned, and the error names that node: choose another name.
+
+`relish join-token list` shows the tokens the council holds (node id, and
+whether each is used, expired or still valid, never the token itself), and
+`relish join-token revoke node-02` makes node-02's unused tokens worthless.
+Like `create`, both are answered by the council leader, whichever member
+you ask.
+
 `relish init` printed the root CA fingerprint; pinning it means a member
 offering a different CA is refused. `--token-file` reads the token from a
 private file instead of the command line. `join` only enrols the identity (into
@@ -120,9 +136,10 @@ for its own view: its role, recovery epoch, Raft term and log position. Above
 the table it prints the epoch, the leader and quorum (`3/3 voters, quorum
 ok`), and it lists any node that didn't answer. One node's answer can't show a
 split, so it compares them all and calls out fenced nodes, two epochs or two
-leaders. `--output json` gives the same report to scripts. `relish status`
-sums it up on its `council` line: the leader and its term, the voters, and
-whether quorum holds.
+leaders. A cluster created with a council size shows it on a `Size:` line
+(`up to 5 voters`). `--output json` gives the same report to scripts.
+`relish status` sums it up on its `council` line: the leader and its term,
+the voters, and whether quorum holds.
 
 The council heals itself: lose a voter and the reconciler swaps a caught-up
 node in for it, in one membership change, so the voter count stays odd. A voter whose disk is at least 95% full for ten minutes
@@ -148,18 +165,19 @@ should come in under:
 | A job task waits for a pooled executor to start it | 256 ms |
 | `relish status` or `relish nodes` answers | 1 s |
 | `relish apply` returns, its change committed | 2 s |
-| A new instance of an app passes its health check | 5 s |
+| A new instance of an app passes its health check | 10 s |
 | A rolling update reaches every node | 30 s |
 
 `relish status` answers from one summary call to the node you're connected
 to. It also runs `relish wtf`'s checks alongside, with their own 2 s budget;
 past that its `wtf` line says `not checked in time`, and `--quick` skips them.
 
-Only the first one fails a release today. The other four were first measured
-in October 2026 and are recorded, not yet enforced: treat them as targets
-until the soak records show where they really sit. Bigger clusters, real
-networks and slow image pulls add to all of them, and none of them holds
-while a node is down or a leader is being elected.
+A release fails its soak when any of them goes well past what earlier
+soaks measured. The other four were first measured in October 2026, and
+their gates sit about twice as high as the slowest soak so far, so a release
+can't quietly get much slower. Bigger clusters, real networks and slow image
+pulls add to all of them, and none of them holds while a node is down or a
+leader is being elected.
 
 ## When a node is gone for good
 

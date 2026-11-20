@@ -75,7 +75,7 @@ The core of Lettuce is a continuous sync loop running on the coordinator:
 
 **Step-by-step flow:**
 
-1. **Trigger.** The poll timer fires (every `poll_interval`, default 30s), a validated webhook arrives, a committed trigger (`relish gitops sync`, or a webhook another node accepted) is pending, or this node has just become leader. The loop watches Raft's metrics only for a new term or leader, not for every commit, and reads only `gitops_config` and the trigger generations until it knows it leads a cluster with GitOps on; the whole `DesiredState` is cloned only for a sync that will run (#1030).
+1. **Trigger.** The poll timer fires (every `poll_interval`, default 30s), a validated webhook arrives, a committed trigger (a webhook another node accepted) is pending, or this node has just become leader. The loop watches Raft's metrics only for a new term or leader, not for every commit, and reads only `gitops_config` and the trigger generations until it knows it leads a cluster with GitOps on; the whole `DesiredState` is cloned only for a sync that will run (#1030).
 2. **Git fetch.** Lettuce performs `git fetch origin <branch>` on the local bare clone. If the remote HEAD hasn't moved, the loop carries on with the current HEAD rather than stopping: every tick reconciles (B16), so a manual change to desired state is repaired without waiting for a commit. Each `git` call runs under a deadline and the shutdown token (see Section 5.3).
 3. **Commit signature verification.** If `require_signed_commits` is enabled globally, or if the commit adds, changes or removes any `script` value (auto-enforcement per Section 17, Section 5.8), the commit signature is verified against `trusted_signing_keys`. Unsigned or untrusted commits are rejected and the reason is recorded in `SyncState.last_error`. (A dedicated alert on rejection is **planned — not yet implemented**; today the rejection surfaces through sync state, not the alerting subsystem.)
 4. **TOML parse.** All `.toml` files under the configured `path` are parsed into the internal `DesiredState` representation. Parse errors are non-fatal per file -- a single malformed file doesn't block sync of other files, but the malformed file is flagged as an error in sync status.
@@ -101,7 +101,10 @@ a handover naturally resumes syncing on the new leader — rather than running a
 coordinator election (the old `select_coordinator`, which named a non-leader that never
 actually synced, is no longer called). A reused local clone is verified against the configured
 remote URL and branch and re-cloned on drift, so a stale clone left by a leadership change
-never syncs the wrong repository.
+never syncs the wrong repository. A fresh clone goes into a `.<name>.cloning` sibling first and is
+renamed into place only once `git clone` succeeds, so a clone killed by its deadline leaves
+nothing at the path. Whatever was at the path (a drifted clone, or a directory without `HEAD`
+that an interrupted clone left) is replaced only then, so a failed re-clone keeps the old clone.
 
 **Configuration in Raft (0.2.1, #693).** The `[gitops]` configuration the leader syncs is
 `DesiredState.gitops_config`, a `StoredGitOpsConfig`, not the leader's own `node.toml`. Every
@@ -528,7 +531,7 @@ The default sync mode. A tokio timer fires every `poll_interval_secs` (default 3
 5. Update `SyncState` in Raft with the result.
 6. Release the sync lock.
 
-**Back-off on failure:** If git fetch fails (network error, auth failure), Lettuce applies exponential back-off: 30s, 60s, 120s, 240s, capped at `poll_interval * 8`. The back-off resets on a successful fetch. During back-off, incoming webhooks still trigger immediate sync attempts.
+**Back-off on failure:** Any failed sync backs off, not just a failed fetch: a stored GitOps config that can't be read or decrypted, a clone or fetch that fails (network error, auth failure), a sync task that panics, a commit that fails verification or parsing, and a partial sync in which the cluster refused a change. Each counts as a consecutive failure, is recorded in `SyncState`, and makes the loop sleep `poll_interval` × 2, then × 4, then × 8 at most (`backoff_delay` in `src/lettuce/sync.rs`). A clean sync resets the count. The loop doesn't wake for a webhook while it sleeps; a webhook's sync request is durable, so the next pass after the back-off picks it up.
 
 **Jitter (planned — not yet implemented):** To avoid thundering-herd effects in multi-cluster setups where many clusters point at the same repo, Lettuce could add random jitter of +/- 10% to the poll interval. The current poll timer fires at a fixed interval with no jitter.
 
@@ -739,7 +742,7 @@ commit applies. The full rule table is in `deployments.md` §5.11.
 
 ### 6.1 Full Configuration Reference
 
-All configuration lives in the `[gitops]` section of the cluster configuration TOML (applied via `relish apply` or present in the git repo itself for bootstrapping).
+All configuration lives in a `[gitops]` section. It belongs in a node's `node.toml` (the first leader to find a cluster with no GitOps configuration adopts its own) or in a file you pass to `relish gitops set`, which writes it to Raft for the whole cluster. The workload configuration that `relish apply` reads, and the TOML files in the repo itself, have no `[gitops]` table: they refuse one as an unknown field.
 
 ```toml
 [gitops]
@@ -755,7 +758,8 @@ branch = "main"
 path = "production/"
 
 # Poll interval, in whole seconds. Default: 30.
-# Set to 0 to disable polling entirely (webhook-only mode).
+# There's no webhook-only mode: 0 is treated as 1, so Lettuce fetches every
+# second. With a webhook set up, keep the poll as a slow safety net.
 poll_interval_secs = 30
 
 # Require all commits to be signed. Default: false.
@@ -952,8 +956,7 @@ The coordinator maintains a bare clone locally. Only the initial clone transfers
 
 On coordinator failover, the new coordinator must clone fresh if it has no local cache. To mitigate this:
 
-- All council members periodically `git fetch` in the background (every 5 minutes) to keep a warm cache, even if they aren't the coordinator. This is a read-only operation with no sync side effects.
-- The failover clone is therefore typically fast (only a few seconds of objects to fetch).
+- *Planned, not implemented:* council members other than the leader would `git fetch` in the background to keep a warm cache. Today only the leader's loop touches git, so a new leader with no local clone clones the repo from scratch on its first sync.
 
 ---
 

@@ -96,6 +96,40 @@ const LOG_ROW_GROUP_SIZE: usize = 8192;
 /// RollupStore bounds itself the same way.
 const MAX_BUFFER_ROWS: usize = 1_000_000;
 
+/// The same ceiling in bytes: a million long lines would otherwise hold
+/// gigabytes before the row cap applied.
+const MAX_BUFFER_BYTES: usize = 256 * 1024 * 1024;
+
+/// A buffer this many rows long asks to be flushed now rather than at the
+/// next minute tick, so a burst from a chatty app reaches Parquet long
+/// before the caps above shed anything.
+const FLUSH_EARLY_ROWS: usize = 100_000;
+
+/// The early-flush threshold in bytes.
+const FLUSH_EARLY_BYTES: usize = 32 * 1024 * 1024;
+
+/// How large the unflushed buffer may grow, and when it asks to be flushed.
+#[derive(Debug, Clone, Copy)]
+struct BufferLimits {
+    /// Rows past this are shed, oldest first.
+    max_rows: usize,
+    /// Bytes past this are shed, oldest first.
+    max_bytes: usize,
+    /// At this many rows [`LogStore::flush_wanted`] says yes.
+    flush_rows: usize,
+    /// At this many bytes [`LogStore::flush_wanted`] says yes.
+    flush_bytes: usize,
+}
+
+impl BufferLimits {
+    const DEFAULT: Self = Self {
+        max_rows: MAX_BUFFER_ROWS,
+        max_bytes: MAX_BUFFER_BYTES,
+        flush_rows: FLUSH_EARLY_ROWS,
+        flush_bytes: FLUSH_EARLY_BYTES,
+    };
+}
+
 /// Parquet writer properties for flushed log files.
 ///
 /// Two optimisations, both of which only matter for the *archive* read
@@ -424,6 +458,9 @@ pub struct LogPendingFlush {
     data_dir: std::path::PathBuf,
     path: std::path::PathBuf,
     batch: RecordBatch,
+    /// What the batch's rows held in the buffer, counted against its cap
+    /// until the batch is on disk.
+    bytes: usize,
     /// What the store will have durably ingested once `batch` is on disk.
     checkpoint: IngestCheckpoint,
     // The store retains this batch. Each attempt holds this owned mutex guard
@@ -575,7 +612,10 @@ pub async fn write_log_pending(pending: LogPendingFlush) -> Result<(), KetchupEr
             if test_dir_sync_failure.load(Ordering::Acquire) {
                 return Err(std::io::Error::other("injected log directory sync failure"));
             }
-            std::fs::File::open(path.parent().unwrap())?.sync_all()
+            let directory = path
+                .parent()
+                .ok_or_else(|| std::io::Error::other("log file path has no directory"))?;
+            std::fs::File::open(directory)?.sync_all()
         })();
         // A visible rename alone is not acknowledgement of durable publication.
         directory_sync?;
@@ -641,6 +681,41 @@ struct BufferedLogEntry {
     line: String,
 }
 
+impl BufferedLogEntry {
+    /// Roughly the memory the entry holds: the struct and its strings.
+    fn size(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.app.len()
+            + self.namespace.len()
+            + self.instance.as_ref().map_or(0, String::len)
+            + self.line.len()
+    }
+}
+
+/// Whose log a dropped line belonged to: app, namespace and instance.
+type LogOwner = (String, String, Option<String>);
+
+/// Lines one log lost to a full buffer, stored as one marker line where
+/// they were (#2057).
+#[derive(Debug, Clone, Copy)]
+struct DropMarker {
+    /// How many lines were dropped.
+    count: u64,
+    /// The last dropped line's timestamp and sequence: the marker sorts
+    /// where the gap is.
+    timestamp: u64,
+    sequence: u64,
+}
+
+impl DropMarker {
+    fn line(&self) -> String {
+        match self.count {
+            1 => "1 log line dropped: the log store fell behind".to_string(),
+            count => format!("{count} log lines dropped: the log store fell behind"),
+        }
+    }
+}
+
 /// Arrow/DataFusion log store.
 ///
 /// Same architecture as MayoStore: buffer in memory, flush to Parquet, query
@@ -655,6 +730,16 @@ pub struct LogStore {
     flush_counter: u64,
     /// Everything ingested so far, flushed or not. Flushing saves a copy.
     ingested: IngestCheckpoint,
+    /// Bytes the rows in `buffer` hold, by [`BufferedLogEntry::size`].
+    buffer_bytes: usize,
+    limits: BufferLimits,
+    /// Per log, the lines a full buffer dropped since the last flush. Each
+    /// becomes a marker line in the next flush; markers are never shed.
+    drop_markers: std::collections::BTreeMap<LogOwner, DropMarker>,
+    /// Lines dropped since the store opened, for the node's metrics.
+    dropped_lines: u64,
+    /// Lines dropped since the last flush reported them in Bun's log.
+    dropped_unreported: u64,
 }
 
 impl LogStore {
@@ -672,7 +757,24 @@ impl LogStore {
             data_dir,
             flush_counter,
             ingested,
+            buffer_bytes: 0,
+            limits: BufferLimits::DEFAULT,
+            drop_markers: std::collections::BTreeMap::new(),
+            dropped_lines: 0,
+            dropped_unreported: 0,
         }
+    }
+
+    /// How many log lines this store has dropped since it opened, because
+    /// its buffer was full.
+    pub fn dropped_lines(&self) -> u64 {
+        self.dropped_lines
+    }
+
+    /// Whether the buffer has grown enough to flush now instead of waiting
+    /// for the next periodic flush.
+    pub fn flush_wanted(&self) -> bool {
+        self.buffer.len() >= self.limits.flush_rows || self.buffer_bytes >= self.limits.flush_bytes
     }
 
     /// Where the store has read each capture file up to, for forwarders to
@@ -791,7 +893,7 @@ impl LogStore {
         // or the clock steps back.
         let sequence = nanos.max(self.ingested.last_sequence.saturating_add(1));
         self.ingested.last_sequence = sequence;
-        self.buffer.push(BufferedLogEntry {
+        let entry = BufferedLogEntry {
             timestamp,
             sequence,
             app: app.to_string(),
@@ -799,18 +901,54 @@ impl LogStore {
             instance,
             stream,
             line: line.to_string(),
-        });
-        // Bound memory if flushing is failing (M8): drop the oldest entries
-        // rather than let a stuck flush grow the buffer until the node OOMs.
-        let buffered_limit = MAX_BUFFER_ROWS.saturating_sub(
-            self.pending
-                .as_ref()
-                .map_or(0, |pending| pending.batch.num_rows()),
-        );
-        if self.buffer.len() > buffered_limit {
-            let overflow = self.buffer.len() - buffered_limit;
-            self.buffer.drain(0..overflow);
+        };
+        self.buffer_bytes += entry.size();
+        self.buffer.push(entry);
+        self.shed_overflow();
+    }
+
+    /// Bound memory if flushing can't keep up (M8): shed the oldest entries
+    /// rather than let a stuck flush grow the buffer until the node OOMs.
+    /// A flush still being written counts against both caps.
+    ///
+    /// A shed line is a counted loss (#2057). Early flushes and the byte cap
+    /// make shedding rare, so we don't replay it: the checkpoint moves on as
+    /// usual, the line's log gets a marker saying how many lines went, and
+    /// the store counts them.
+    fn shed_overflow(&mut self) {
+        let (pending_rows, pending_bytes) = self
+            .pending
+            .as_ref()
+            .map_or((0, 0), |pending| (pending.batch.num_rows(), pending.bytes));
+        let row_limit = self.limits.max_rows.saturating_sub(pending_rows);
+        let byte_limit = self.limits.max_bytes.saturating_sub(pending_bytes);
+        let mut rows = self.buffer.len();
+        let mut bytes = self.buffer_bytes;
+        let mut overflow = 0;
+        while overflow < self.buffer.len() && (rows > row_limit || bytes > byte_limit) {
+            rows -= 1;
+            bytes -= self.buffer[overflow].size();
+            overflow += 1;
         }
+        if overflow == 0 {
+            return;
+        }
+        for entry in self.buffer.drain(0..overflow) {
+            let owner = (entry.app, entry.namespace, entry.instance);
+            // Lines arrive in sequence order, so the last one shed is where
+            // the gap ends.
+            let marker = self.drop_markers.entry(owner).or_insert(DropMarker {
+                count: 0,
+                timestamp: entry.timestamp,
+                sequence: entry.sequence,
+            });
+            marker.count += 1;
+            marker.timestamp = entry.timestamp;
+            marker.sequence = entry.sequence;
+        }
+        self.buffer_bytes = bytes;
+        self.dropped_lines += overflow as u64;
+        self.dropped_unreported += overflow as u64;
     }
 
     /// Number of unflushed entries.
@@ -840,18 +978,56 @@ impl LogStore {
 
     /// Convert the buffer to an Arrow RecordBatch.
     fn buffer_to_batch(&self) -> Result<Option<RecordBatch>, KetchupError> {
-        if self.buffer.is_empty() {
+        if self.buffer.is_empty() && self.drop_markers.is_empty() {
             return Ok(None);
         }
 
-        let timestamps: Vec<u64> = self.buffer.iter().map(|e| e.timestamp).collect();
-        let apps: Vec<&str> = self.buffer.iter().map(|e| e.app.as_str()).collect();
-        let namespaces: Vec<&str> = self.buffer.iter().map(|e| e.namespace.as_str()).collect();
-        let streams: Vec<&str> = self.buffer.iter().map(|e| e.stream.as_str()).collect();
-        let lines: Vec<&str> = self.buffer.iter().map(|e| e.line.as_str()).collect();
-        let sequences: Vec<u64> = self.buffer.iter().map(|e| e.sequence).collect();
-        let instances: Vec<Option<&str>> =
-            self.buffer.iter().map(|e| e.instance.as_deref()).collect();
+        // The buffered lines, then one marker per log that lost lines.
+        let marker_lines: Vec<String> = self.drop_markers.values().map(DropMarker::line).collect();
+        let owners = self.drop_markers.keys();
+        let markers = self.drop_markers.values();
+        let timestamps: Vec<u64> = self
+            .buffer
+            .iter()
+            .map(|e| e.timestamp)
+            .chain(markers.clone().map(|marker| marker.timestamp))
+            .collect();
+        let apps: Vec<&str> = self
+            .buffer
+            .iter()
+            .map(|e| e.app.as_str())
+            .chain(owners.clone().map(|(app, _, _)| app.as_str()))
+            .collect();
+        let namespaces: Vec<&str> = self
+            .buffer
+            .iter()
+            .map(|e| e.namespace.as_str())
+            .chain(owners.clone().map(|(_, namespace, _)| namespace.as_str()))
+            .collect();
+        let streams: Vec<&str> = self
+            .buffer
+            .iter()
+            .map(|e| e.stream.as_str())
+            .chain(markers.clone().map(|_| LogStream::Stderr.as_str()))
+            .collect();
+        let lines: Vec<&str> = self
+            .buffer
+            .iter()
+            .map(|e| e.line.as_str())
+            .chain(marker_lines.iter().map(String::as_str))
+            .collect();
+        let sequences: Vec<u64> = self
+            .buffer
+            .iter()
+            .map(|e| e.sequence)
+            .chain(markers.map(|marker| marker.sequence))
+            .collect();
+        let instances: Vec<Option<&str>> = self
+            .buffer
+            .iter()
+            .map(|e| e.instance.as_deref())
+            .chain(owners.map(|(_, _, instance)| instance.as_deref()))
+            .collect();
 
         let batch = RecordBatch::try_new(
             Arc::new(log_schema()),
@@ -884,12 +1060,22 @@ impl LogStore {
         };
         let filename = format!("logs_{:06}.parquet", self.flush_counter);
         let path = self.data_dir.join(filename);
+        if self.dropped_unreported > 0 {
+            eprintln!(
+                "ketchup: the log buffer was full and dropped {} line(s); each log that lost lines has a marker line where they were",
+                self.dropped_unreported
+            );
+            self.dropped_unreported = 0;
+        }
+        let bytes = std::mem::take(&mut self.buffer_bytes);
         self.buffer.clear();
+        self.drop_markers.clear();
         self.flush_counter += 1;
         let pending = LogPendingFlush {
             data_dir: self.data_dir.clone(),
             path,
             batch,
+            bytes,
             checkpoint: self.ingested.clone(),
             writing: Arc::new(tokio::sync::Mutex::new(())),
             completed: Arc::new(AtomicBool::new(false)),
@@ -998,10 +1184,12 @@ impl LogStore {
             let sequence = pending
                 .batch
                 .column_by_name("sequence")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .unwrap();
+                .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+                .ok_or_else(|| {
+                    KetchupError::Io(std::io::Error::other(
+                        "pending log batch has no u64 sequence column",
+                    ))
+                })?;
             format!(
                 "SELECT * FROM logs_disk WHERE sequence < {} OR sequence > {}",
                 sequence.value(0),
@@ -1582,6 +1770,168 @@ mod tests {
             .collect();
         let expected: Vec<String> = (0..200).map(|i| format!("ACK {i}")).collect();
         assert_eq!(lines, expected);
+    }
+
+    /// Small limits so a test can fill the buffer with a handful of lines.
+    fn tiny_limits() -> BufferLimits {
+        BufferLimits {
+            max_rows: 2,
+            max_bytes: usize::MAX,
+            flush_rows: 3,
+            flush_bytes: usize::MAX,
+        }
+    }
+
+    /// Flushes ran only once a minute, so a burst of more than a million
+    /// lines inside one minute overflowed the buffer on a healthy disk. A
+    /// busy buffer now asks to be flushed straight away.
+    #[tokio::test]
+    async fn a_busy_buffer_asks_for_an_early_flush() {
+        let (mut store, _dir) = test_store();
+        store.limits = BufferLimits {
+            max_rows: 100,
+            ..tiny_limits()
+        };
+        store.ingest_at(1, &record("default__web-0", "one"));
+        store.ingest_at(2, &record("default__web-0", "two"));
+        assert!(!store.flush_wanted());
+        store.ingest_at(3, &record("default__web-0", "three"));
+        assert!(store.flush_wanted());
+        store.flush().await.unwrap();
+        assert!(!store.flush_wanted());
+    }
+
+    /// The cap counted rows, so a million long lines could hold gigabytes.
+    /// It counts bytes too, and still keeps the newest lines.
+    #[test]
+    fn the_buffer_is_capped_by_bytes_as_well_as_rows() {
+        let (mut store, _dir) = test_store();
+        store.limits = BufferLimits {
+            max_rows: usize::MAX,
+            max_bytes: 64 * 1024,
+            flush_rows: usize::MAX,
+            flush_bytes: usize::MAX,
+        };
+        let long = "x".repeat(4096);
+        for n in 0..100 {
+            store.ingest_at(n, &record("default__web-0", &format!("{n} {long}")));
+        }
+        assert!(store.buffer_bytes <= 64 * 1024, "{}", store.buffer_bytes);
+        assert!(store.buffer_len() < 100);
+        assert!(store.buffer.last().unwrap().line.starts_with("99 "));
+    }
+
+    /// A burst that outruns flushing sheds the oldest buffered lines. They
+    /// are a counted loss, not a silent one (#2057): the instance's own log
+    /// says how many lines went missing where they went missing, and the
+    /// store counts them.
+    #[tokio::test]
+    async fn shed_lines_are_counted_and_marked_in_the_instance_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let capture = capture_file(&dir, "chatty.stdout");
+        let mut store = LogStore::new(dir.path().join("logs"));
+        store.limits = tiny_limits();
+        assert!(store.ingest(&writer_line(&capture, 1)));
+        assert!(store.ingest(&writer_line(&capture, 2)));
+        store.flush().await.unwrap();
+        // Lines 3, 4 and 5 are shed to keep two rows.
+        for n in 3..=7 {
+            assert!(store.ingest(&writer_line(&capture, n)));
+        }
+        store.flush().await.unwrap();
+
+        assert_eq!(
+            writer_lines(&store).await,
+            [
+                "ACK 0001",
+                "ACK 0002",
+                "3 log lines dropped: the log store fell behind",
+                "ACK 0006",
+                "ACK 0007",
+            ]
+        );
+        assert_eq!(store.dropped_lines(), 3);
+    }
+
+    /// The first fix held a capture's checkpoint at the first shed line for
+    /// the rest of Bun's life. A restart then stored every later line a
+    /// second time, and the capture was never reclaimed past that point. A
+    /// shed line is now a counted loss, and the checkpoint moves on.
+    #[tokio::test]
+    async fn a_restart_after_a_shed_stores_nothing_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        let capture = capture_file(&dir, "chatty.stdout");
+        let mut store = LogStore::new(logs.clone());
+        store.limits = tiny_limits();
+        for n in 1..=7 {
+            assert!(store.ingest(&writer_line(&capture, n)));
+        }
+        store.flush().await.unwrap();
+        let before = writer_lines(&store).await;
+        drop(store);
+
+        let mut reopened = LogStore::new(logs);
+        assert_eq!(
+            reopened.capture_offsets().0.get(&capture),
+            Some(&(7 * LINE_BYTES))
+        );
+        // A forwarder that re-reads the capture stores nothing again.
+        for n in 1..=7 {
+            assert!(!reopened.ingest(&writer_line(&capture, n)), "line {n}");
+        }
+        reopened.flush().await.unwrap();
+        assert_eq!(writer_lines(&reopened).await, before);
+    }
+
+    /// A shed must not stop the capture reclaim: the first fix pinned the
+    /// checkpoint at the first shed line, so the capture grew for good.
+    #[tokio::test]
+    async fn the_capture_is_reclaimed_after_a_shed() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::tempdir().unwrap();
+        let captures = tempfile::tempdir().unwrap();
+        let file = captures.path().join("spammer.stdout");
+        let line = "spam the quick brown fox jumps over the lazy dog\n";
+        let contents = line.repeat(4 * 1024 * 1024 / line.len());
+        std::fs::write(&file, &contents).unwrap();
+        let allocated = || std::fs::metadata(&file).unwrap().blocks() * 512;
+        let mut store = LogStore::new(directory.path().to_path_buf());
+        // Far fewer rows than the capture holds, so most of it is shed.
+        store.limits = BufferLimits {
+            max_rows: 1000,
+            ..BufferLimits::DEFAULT
+        };
+        let mut reader =
+            crate::grill::capture::CaptureReader::new(LogStream::Stdout, Some(file.clone()));
+        loop {
+            let bytes = reader.read_chunk().await.unwrap();
+            if bytes.is_empty() {
+                break;
+            }
+            for line in reader.push(&bytes) {
+                store.ingest_at(
+                    100,
+                    &crate::ketchup::types::LogRecord {
+                        app: "spammer".into(),
+                        namespace: "default".into(),
+                        instance: "spammer-0".into(),
+                        stream: line.stream,
+                        line: line.line,
+                        position: line.position,
+                    },
+                );
+            }
+        }
+        assert!(store.dropped_lines() > 0, "the test must shed");
+
+        store.flush().await.unwrap();
+
+        assert!(
+            allocated() <= crate::grill::capture::RETAINED_CAPTURE_BYTES + 256 * 1024,
+            "{} bytes of the capture are still allocated",
+            allocated()
+        );
     }
 
     #[tokio::test]

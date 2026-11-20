@@ -275,6 +275,13 @@ pub(super) async fn proposal_create_handler(
     if let Err(response) = authorise_apps(&state, auth, action, proposal.apps()).await {
         return response;
     }
+    // An app it would put on an ingress host meets the apply path's host
+    // rule, judged as the author here and as the approver on approval.
+    if let Err(response) =
+        authorise_proposal_hosts(council, auth, &proposal, |change| &change.after).await
+    {
+        return response;
+    }
     if let Some(forecast) = forecast(capacity.as_deref(), &proposal).await {
         crate::proposal::build::with_forecast(&mut proposal, forecast);
     }
@@ -432,6 +439,11 @@ pub(super) async fn proposal_approve_handler(
     let Some(council) = &state.council else {
         return standalone();
     };
+    if let Err(response) =
+        authorise_proposal_hosts(council, auth, &proposal, |change| &change.after).await
+    {
+        return response;
+    }
     let approval = Approval::Human(approver.clone());
     let outcome = match &proposal.fault {
         // The fault is cleared on its node, as the approver, with the
@@ -784,12 +796,19 @@ pub(super) async fn proposal_undo_handler(
     {
         return forwarded;
     }
-    if let Err(response) = authorise_undoer(&state, auth, id, action).await {
-        return response;
-    }
+    let proposal = match authorise_undoer(&state, auth, id, action).await {
+        Ok(proposal) => proposal,
+        Err(response) => return response,
+    };
     let Some(council) = &state.council else {
         return standalone();
     };
+    // An undo writes each app back as it was, host included.
+    if let Err(response) =
+        authorise_proposal_hosts(council, auth, &proposal, |change| &change.before).await
+    {
+        return response;
+    }
     let by = principal_of(auth);
     let outcome = match crate::bun::proposals::undo(council, id, by.clone()).await {
         Ok(outcome) => outcome,
@@ -811,6 +830,36 @@ pub(super) async fn authorise_undoer(
     let proposal = read_proposal(state, auth, id).await?;
     authorise_apps(state, auth, action, proposal.apps()).await?;
     Ok(proposal)
+}
+
+/// The apply path's ingress-host rule for the specs a proposal writes:
+/// `revision` picks them from each change, `after` on approval and
+/// `before` on undo. A scoped caller can't put an app on a host that an
+/// app outside its scope serves ([`super::apply::authorize_ingress_apps`]).
+#[allow(clippy::result_large_err)]
+async fn authorise_proposal_hosts(
+    council: &crate::council::CouncilNode,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    proposal: &Proposal,
+    revision: fn(&crate::proposal::AppChange) -> &crate::proposal::AppRevision,
+) -> Result<(), Response> {
+    let routed = |change: &crate::proposal::AppChange| {
+        revision(change)
+            .spec
+            .as_ref()
+            .is_some_and(|spec| spec.ingress.is_some())
+    };
+    if !proposal.changes.iter().any(routed) {
+        return Ok(());
+    }
+    // Read the cluster first: nothing borrowed from `proposal` is held
+    // across the await.
+    let desired = council.desired_state().await;
+    let specs = proposal
+        .changes
+        .iter()
+        .filter_map(|change| Some((change.app.clone(), revision(change).spec.as_deref()?)));
+    super::apply::authorize_ingress_apps(auth, specs, &desired)
 }
 
 /// A person who may decide proposal `id`: a human token (an agent's

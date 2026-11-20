@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use bun_process::{
-    BunProcess, assert_success, reserve_address, reserve_ports, run_relish,
+    BunProcess, assert_success, reserve_address, reserve_ports, run_relish, run_relish_init,
     spawn_bun_with_runtime_port_retry, wait_for_relish,
 };
 use reliaburger::relish::client::BunClient;
@@ -166,14 +166,7 @@ async fn runc_autoscaler_scales_up_on_real_memory_growth() {
     };
     let cluster_dir = root.path().join("cluster");
     assert_success(
-        &run_relish(&[
-            "init",
-            cluster_dir.to_str().unwrap(),
-            "--cluster-name",
-            "memory-autoscale",
-            "--node-id",
-            "node-01",
-        ]),
+        &run_relish_init(&cluster_dir, "memory-autoscale", "node-01"),
         "initialise memory autoscale fixture",
     );
     let node_path = cluster_dir.join("reliaburger.toml");

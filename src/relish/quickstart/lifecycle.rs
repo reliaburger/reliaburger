@@ -377,6 +377,34 @@ impl std::fmt::Display for LocalChanges {
     }
 }
 
+/// Remove a destroyed cluster's files: everything in its directory but the
+/// operation lock, and the identity that opened its root backup, which
+/// lives in another directory (#709). The cluster and its root go together.
+fn forget_cluster_files(
+    directory: &std::path::Path,
+    identity: Option<&std::path::Path>,
+) -> Result<()> {
+    if let Some(identity) = identity
+        && let Err(error) = std::fs::remove_file(identity)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(error.into());
+    }
+    // Preserve the lock inode so a concurrent setup can't lock a different file.
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        if entry.file_name() == "operation.lock" {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(entry.path())?;
+        } else {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 /// Run a lifecycle action on the managed cluster `name`, printing in
 /// `output`.
 pub async fn run(
@@ -399,10 +427,12 @@ pub async fn run(
     let (operation, bootstrap) = tokio::task::spawn_blocking(move || -> Result<_> {
         let operation = Operation::load(&operation_root, &name)?;
         refuse_ssh_cluster(&operation.state.spec)?;
-        let bootstrap = if matches!(action, Action::Status | Action::Start) {
-            Some(security::existing(&operation)?)
-        } else {
-            None
+        let bootstrap = match action {
+            Action::Status | Action::Start => Some(security::existing(&operation)?),
+            // The identity that opens the root backup lives outside the
+            // cluster directory; find it before the directory goes (#709).
+            Action::Destroy => security::existing(&operation).ok(),
+            _ => None,
         };
         Ok((operation, bootstrap))
     })
@@ -500,21 +530,13 @@ pub async fn run(
     }
 
     if action == Action::Destroy {
+        let identity = bootstrap
+            .as_ref()
+            .and_then(|bootstrap| bootstrap.root_backup.as_ref())
+            .map(|files| files.identity.clone());
         tokio::task::spawn_blocking(move || -> Result<()> {
             LocalContext::remove_owned(&root.join("context.json"), &operation.state.id)?;
-            // Preserve the lock inode so a concurrent setup can't lock a different file.
-            for entry in std::fs::read_dir(&operation.directory)? {
-                let entry = entry?;
-                if entry.file_name() == "operation.lock" {
-                    continue;
-                }
-                if entry.file_type()?.is_dir() {
-                    std::fs::remove_dir_all(entry.path())?;
-                } else {
-                    std::fs::remove_file(entry.path())?;
-                }
-            }
-            Ok(())
+            forget_cluster_files(&operation.directory, identity.as_deref())
         })
         .await??;
     }
@@ -888,5 +910,35 @@ fi
                 .to_string();
             assert!(error.contains("take a node"), "{error}");
         }
+    }
+
+    #[test]
+    fn destroy_forgets_the_cluster_and_the_identity_that_opens_its_root() {
+        let root = tempfile::tempdir().unwrap();
+        let cluster = root.path().join("clusters").join("laptop");
+        std::fs::create_dir_all(cluster.join("security")).unwrap();
+        std::fs::write(cluster.join("operation.lock"), "").unwrap();
+        std::fs::write(
+            cluster.join("security").join("root-ca-backup.age"),
+            "sealed",
+        )
+        .unwrap();
+        let keys = root.path().join("root-backup-keys");
+        std::fs::create_dir(&keys).unwrap();
+        let identity = keys.join("root-0123456789abcdef.age-identity");
+        let another = keys.join("root-fedcba9876543210.age-identity");
+        std::fs::write(&identity, "AGE-SECRET-KEY-1").unwrap();
+        std::fs::write(&another, "AGE-SECRET-KEY-1").unwrap();
+
+        forget_cluster_files(&cluster, Some(&identity)).unwrap();
+        assert!(!identity.exists());
+        assert!(another.exists(), "another cluster's identity was removed");
+        let left: Vec<_> = std::fs::read_dir(&cluster)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("operation.lock")]);
+        // Twice is fine: the identity is already gone.
+        forget_cluster_files(&cluster, Some(&identity)).unwrap();
     }
 }

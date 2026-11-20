@@ -228,6 +228,10 @@ cluster can roll onto it in place
 0.2.8 moves the pair to protocol 58 and state format 74, and a 0.2.7
 cluster's leader refuses it
 ([upgrading from 0.2.7](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-027)).
+0.3.0 moves the pair to protocol 60 and state format 76, and a 0.2.8
+cluster's leader refuses it; its fresh cluster also keeps the root CA
+offline
+([upgrading from 0.2.8](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-028)).
 
 A laptop cluster says the same thing when you rerun the quickstart installer
 from a newer release over it. Its saved record names the release that set it
@@ -599,6 +603,17 @@ The leader confirms it's still the leader before each export, so a deposed
 one skips it. Backups written by 0.2.0 or earlier are named by time alone;
 they're left alone and never restored.
 
+A configured backup can still be off. With no master key on the node (there's
+nothing to seal with, and plaintext state never leaves it), or a `url` the
+object store can't open, the loop never starts. `relish wtf` reports either as
+a critical `backup-disabled` finding naming the node and the reason. It warns
+`backup-failing` when the leader's last export failed, or when nothing has been
+exported for three intervals, and `backup-not-configured` when one council
+member lacks `[cluster.backup]` while others have it: as leader, that member
+would export nothing. Give every council member the same `[cluster.backup]`.
+With none configured anywhere, `wtf`'s `backups` row is OK and says backups
+aren't configured.
+
 For `s3://` and `gs://`, Bun reads the standard variables of each backend:
 `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`,
 `AWS_REGION` (or `AWS_DEFAULT_REGION`) and `AWS_ENDPOINT` for S3 and
@@ -608,8 +623,9 @@ the shell you run `relish council recover` from. With none set, S3 falls back
 to the instance's metadata credentials. Volume-snapshot upload and log and
 metrics export read the same variables. Volumes aren't in it; snapshot those separately (see
 `images-and-volumes`). Nor is the root CA's private key, which never enters the
-council: back that up yourself with `relish ca backup`, sealed to a passphrase
-or your own age key, and check it with `relish ca verify` (see `security`).
+council: its only copy is the backup `relish init` wrote for you, sealed to a
+passphrase or your own age key. Check it with `relish ca verify` (see
+`security`).
 
 If every voter is gone, stop a surviving node and recover it:
 
@@ -768,3 +784,22 @@ they can reach each other but never the recovered side.** Wipe them with
 recovered council. If two of them do come back cut off from it, they form a
 council of their own; `relish council status` and `relish wtf` show it as two
 recovery epochs and two leaders.
+
+### A voter that missed a swap
+
+The Raft port only takes RPCs from voters a node knows, or from a node one
+of those voters names. That leaves one combination where a council can't
+elect a leader on its own. A voter (node 2, say) lags while the council
+swaps another voter out (node 3 for node 4), so node 2's membership still
+lists the old voters. If node 3 and then the leader both stop, node 2 can
+reach none of the voters it knows. Nobody can tell it that node 4 is a
+voter, so it won't vote for node 4, and if node 4 needs that vote the
+council has no leader. `relish council status` shows `NO LEADER`, and node
+2 logs `none of the voters asked ... names it`.
+
+Bring back the old leader or the swapped-out voter if you can: once node 2
+reaches one of them, it learns of node 4 and the council elects a leader.
+Otherwise recover the council with `relish council recover`, as above, or
+stop node 2, wipe its Raft state with `relish council re-enrol --data-dir
+/var/lib/reliaburger/data --force` and start it again, so it joins as a
+fresh member.

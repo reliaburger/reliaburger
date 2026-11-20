@@ -45,8 +45,8 @@ struct Cli {
     listen: String,
 
     /// Runtime to use: auto, process, runc or mixed (Linux).
-    #[arg(long, default_value = "auto")]
-    runtime: String,
+    #[arg(long, value_enum, default_value_t = RuntimeChoice::Auto)]
+    runtime: RuntimeChoice,
 
     /// Join/form a cluster using the `[cluster]` config (gossip membership).
     /// Without this flag, bun runs as a single node, as before.
@@ -59,6 +59,36 @@ struct Cli {
 }
 
 /// Subcommands `bun` answers to besides running as an agent.
+/// The runtime `--runtime` names. Clap refuses any other value before Bun
+/// does anything, so a typo can't leave a state marker behind.
+// For the Rust reader: `ValueEnum` lets clap parse the flag straight into
+// this enum, listing the variants (in kebab-case) in `--help`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum RuntimeChoice {
+    /// runc when it's installed (Linux), with host processes; else process.
+    Auto,
+    /// Host processes only.
+    Process,
+    /// runc containers only (Linux).
+    Runc,
+    /// runc containers and host processes (Linux).
+    Mixed,
+    /// Apple Container directly: refused, with what to run instead.
+    Apple,
+}
+
+impl std::fmt::Display for RuntimeChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RuntimeChoice::Auto => "auto",
+            RuntimeChoice::Process => "process",
+            RuntimeChoice::Runc => "runc",
+            RuntimeChoice::Mixed => "mixed",
+            RuntimeChoice::Apple => "apple",
+        })
+    }
+}
+
 #[derive(clap::Subcommand)]
 enum Command {
     /// Internal foreground-process owner; runs before Tokio starts.
@@ -101,6 +131,9 @@ enum Command {
         #[arg(long)]
         instance: String,
     },
+    /// Appliance OS steps (`relish manual appliance`).
+    #[command(subcommand)]
+    Appliance(ApplianceCommand),
     /// Run the built-in test workload.
     ///
     /// The same server the library exposes, shipped inside `bun` so every
@@ -142,6 +175,21 @@ enum Command {
         /// Number of CPU-burning worker threads.
         #[arg(long)]
         cpu_workers: usize,
+    },
+}
+
+/// `bun appliance ...`: what an appliance runs before and beside the agent.
+#[derive(clap::Subcommand)]
+enum ApplianceCommand {
+    /// Prepare this node from its seed: install the bootstrap material, or
+    /// enrol and fetch the master key, then write node.toml. Run by
+    /// reliaburger-seed.service before the agent.
+    Prepare,
+    /// Show this node's status on a console, refreshed every five seconds.
+    Console {
+        /// The terminal to draw on.
+        #[arg(long, default_value = "/dev/tty1")]
+        tty: PathBuf,
     },
 }
 
@@ -237,6 +285,7 @@ fn cluster_params_from_config(
         seeds,
         wrapping_ikm,
         bootstrap_security_state,
+        bootstrap_council_size: config.cluster.council_size,
         data_dir: config.storage.data.clone(),
         // The MayoStore doesn't exist yet when params are built; the
         // caller sets it before starting the runtime.
@@ -716,7 +765,7 @@ async fn build_ingress_cert_resolver(
         params,
         rustls::pki_types::CertificateDer::from(ingress_ca.certificate_der.clone()),
         lifetime,
-        routing_table,
+        routing_table.read().await.certificate_modes(),
         vec![default_cert],
         default_key,
     ) {
@@ -988,6 +1037,19 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     {
         return run_testapp(mode, *port, *count, *delay, *alloc_mib).await;
     }
+    // The appliance's own steps, before (prepare) or beside (console) an agent.
+    if let Some(Command::Appliance(command)) = &cli.command {
+        let paths = reliaburger::appliance::Paths::system();
+        return match command {
+            ApplianceCommand::Prepare => reliaburger::appliance::prepare::run(&paths)
+                .await
+                .map(|_| ())
+                .map_err(|e| anyhow::anyhow!("reliaburger: {e}")),
+            ApplianceCommand::Console { tty } => reliaburger::appliance::console::run(&paths, tty)
+                .await
+                .map_err(|e| anyhow::anyhow!("console {}: {e}", tty.display())),
+        };
+    }
 
     // Resolve the running version from the real executable path (not argv[0]):
     // in debug builds a `.version` sidecar next to the binary can override it,
@@ -1012,9 +1074,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     if cli.cluster {
         let rootless = reliaburger::grill::rootless::is_rootless();
         let runc_installed = rootless
-            && cli.runtime == "auto"
+            && cli.runtime == RuntimeChoice::Auto
             && matches!(detect_runtime().await, DetectedRuntime::Runc { .. });
-        refuse_rootless_cluster(&cli.runtime, rootless, runc_installed)?;
+        refuse_rootless_cluster(cli.runtime, rootless, runc_installed)?;
     }
 
     // Load node config
@@ -1075,11 +1137,18 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         .validate_storage_caps(data_filesystem.total_bytes)
         .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
 
-    // Create port allocator from config
+    // Create port allocator from config. It never hands out a port Bun
+    // itself serves on, even one inside the range that isn't listening yet.
+    let api_listen_port = cli
+        .listen
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .filter(|port| *port != 0);
     let port_allocator = PortAllocator::new(
         config.network.port_range.start,
         config.network.port_range.end,
-    );
+    )
+    .excluding(config.service_ports().into_iter().chain(api_listen_port));
 
     // Writable base for node-local runtime state (instance records,
     // upgrade markers). Prefers the configured data dir, falls back to the
@@ -1189,7 +1258,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
     // Select runtime
     let runtime = select_runtime(
-        &cli.runtime,
+        cli.runtime,
         &instances_dir,
         &pickle_dir,
         &config.images.mirrors,
@@ -1354,6 +1423,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let mut api_known_members: Option<api::KnownMembers> = None;
     // Gossip's own counters, for `GET /v1/cluster/summary`.
     let mut api_gossip_stats: Option<reliaburger::mustard::stats::GossipStats> = None;
+    let mut api_backup_monitor: Option<reliaburger::council::backup::BackupMonitor> = None;
     // Handles the orchestration tasks need, captured before the
     // ClusterHandle moves into the agent (spawned further down, once
     // the service token exists).
@@ -1434,6 +1504,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         replication_membership = Some(handle.membership_rx.clone());
         registry_directory = Some(cluster_runtime.directory_rx.clone());
         api_gossip_stats = Some(cluster_runtime.gossip_stats.clone());
+        api_backup_monitor = Some(reliaburger::council::backup::BackupMonitor(
+            cluster_runtime.backup_rx.clone(),
+        ));
         orchestration = Some((
             handle.membership_rx.clone(),
             handle.raft_metrics_rx.clone(),
@@ -1554,6 +1627,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         api_port,
         config.security.bootstrap_peers.clone(),
         config.security.operator_cidrs.clone(),
+        // Bun's own listeners keep their usual policy inside the host-port
+        // range.
+        config.service_ports(),
     );
     agent.set_smoker_config(config.smoker.to_smoker_config());
     agent.set_node_leaf_lifetime(config.security.node_leaf_lifetime());
@@ -1910,6 +1986,32 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
+    // Appliance OS updates (W6): on an appliance, the slot this node stages
+    // updates into, and the leader's rollout loop beside the orchestrator.
+    match reliaburger::upgrade::keys::release_keys(&config.upgrades) {
+        Ok(keys) => {
+            if let Some(slot) = reliaburger::os::slot::OsSlot::detect(keys) {
+                reliaburger::os::slot::install(slot);
+            }
+        }
+        Err(error) => eprintln!("bun: OS updates disabled: {error}"),
+    }
+    if let (Some(council), Some(membership_rx)) =
+        (api_council.clone(), upgrade_membership_rx.clone())
+    {
+        let control = reliaburger::os::rollout::HttpOsControl::new(
+            cluster_http.clone(),
+            service_token.clone(),
+        );
+        tokio::spawn(reliaburger::os::rollout::run_rollout(
+            council,
+            control,
+            node_name.clone(),
+            membership_rx,
+            shutdown.clone(),
+        ));
+    }
+
     // Rolling-upgrade orchestrator: dormant unless this node is the Raft
     // leader with an active upgrade in DesiredState (Phase 14). Needs the
     // gossip membership watch to count live voters for quorum (UPG1); it
@@ -2263,7 +2365,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         // Wire the cluster Ingress CA into TLS so `tls = "cluster"` routes are
         // served a cluster-signed cert per SNI (M8), not a self-signed
         // `localhost` cert. Available only in cluster mode (a council + the
-        // wrapping IKM to unwrap the Ingress CA key). A disk cert still wins.
+        // wrapping IKM to unwrap the Ingress CA key). `tls = "explicit"`
+        // routes get the `[ingress]` disk pair instead (#2011).
         let ingress_resolver: Option<std::sync::Arc<dyn rustls::server::ResolvesServerCert>> =
             match &api_council {
                 Some(council) => {
@@ -2352,11 +2455,22 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
     // Drain container log lines from the agent into the LogStore. The store
     // skips lines it already holds, which a forwarder re-reads after a restart.
+    // A busy buffer wakes the flush task early (#2057), so a burst reaches
+    // Parquet long before the buffer's caps shed anything.
+    let log_flush_now = Arc::new(tokio::sync::Notify::new());
     {
         let drain_store = Arc::clone(&log_store);
+        let flush_now = Arc::clone(&log_flush_now);
         feeder_handles.push(tokio::spawn(async move {
             while let Some(rec) = log_rx.recv().await {
-                drain_store.write().await.ingest(&rec);
+                let flush_wanted = {
+                    let mut store = drain_store.write().await;
+                    store.ingest(&rec);
+                    store.flush_wanted()
+                };
+                if flush_wanted {
+                    flush_now.notify_one();
+                }
             }
         }));
     }
@@ -2376,6 +2490,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // measures) and `relish top` (which reads the latest usage).
     let job_telemetry = Arc::new(reliaburger::mayo::job_metrics::JobTelemetry::default());
     let collection_jobs = Arc::clone(&job_telemetry);
+    let collection_logs = Arc::clone(&log_store);
     feeder_handles.push(tokio::spawn(async move {
         // Off the runtime: the first refresh reads every process on the host.
         let Ok(mut collector) = tokio::task::spawn_blocking(SystemCollector::new).await else {
@@ -2443,6 +2558,15 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             value: value as f64,
                         });
                     }
+
+                    // Log lines the log store dropped because its buffer
+                    // was full (#2057): zero unless it fell behind.
+                    samples.push(reliaburger::mayo::collector::CollectedMetric {
+                        key: reliaburger::mayo::types::MetricKey::simple(
+                            "ketchup_log_lines_dropped_total",
+                        ),
+                        value: collection_logs.read().await.dropped_lines() as f64,
+                    });
 
                     // How long the agent loop's turns take, by branch. A long
                     // turn holds every caller, so this is the loop's health.
@@ -2558,25 +2682,31 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         });
     }
 
-    // Spawn log store flush task (every 60s)
+    // Spawn log store flush task: every 60s, and whenever the buffer asks.
+    // After a failed flush only the tick retries, so a full disk doesn't
+    // turn every ingested line into another failing flush.
     let log_flush_store = Arc::clone(&log_store);
     let log_flush_shutdown = shutdown.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut flush_failing = false;
         loop {
             tokio::select! {
                 _ = log_flush_shutdown.cancelled() => break,
-                _ = tick.tick() => {
-                    // Drain under the lock, write off it (M7): the sync Parquet
-                    // encode + fsync no longer runs while the write lock is held,
-                    // so log appends and queries aren't starved during a flush.
-                    if let Err(e) =
-                        reliaburger::ketchup::log_store::flush_shared(&log_flush_store).await
-                    {
-                        eprintln!("bun: log flush error: {e}");
-                    }
-                }
+                _ = tick.tick() => {}
+                _ = log_flush_now.notified(), if !flush_failing => {}
             }
+            // Drain under the lock, write off it (M7): the sync Parquet
+            // encode + fsync no longer runs while the write lock is held,
+            // so log appends and queries aren't starved during a flush.
+            flush_failing =
+                match reliaburger::ketchup::log_store::flush_shared(&log_flush_store).await {
+                    Ok(_) => false,
+                    Err(e) => {
+                        eprintln!("bun: log flush error: {e}");
+                        true
+                    }
+                };
         }
     });
 
@@ -2690,7 +2820,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
     // Spawn disk pressure check task (every 5 minutes)
     // Exports un-exported files before pruning, so data is never lost.
+    // A failing export holds that store's retention; `relish wtf` reports
+    // it from these holds (#2062).
+    let export_holds = reliaburger::bun::diagnostics::ExportHolds::default();
     {
+        let dp_export_holds = export_holds.clone();
         let dp_log_store = Arc::clone(&log_store);
         let dp_mayo_store = Arc::clone(&mayo_store);
         let dp_shutdown = shutdown.clone();
@@ -2749,8 +2883,16 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             log_retention_days,
                         )
                         .await;
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        dp_export_holds.record("logs", log_result.export_error.is_some(), now);
                         if let Some(error) = &log_result.export_error {
-                            eprintln!("bun: log export failed during disk pressure: {error}");
+                            eprintln!(
+                                "bun: log export failed during disk pressure: {error}; \
+                                 no log files are pruned until an export works"
+                            );
                         }
                         if log_result.files_pruned > 0 {
                             println!(
@@ -2769,8 +2911,16 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             metrics_retention_days,
                         )
                         .await;
+                        dp_export_holds.record(
+                            "metrics",
+                            metrics_result.export_error.is_some(),
+                            now,
+                        );
                         if let Some(error) = &metrics_result.export_error {
-                            eprintln!("bun: metrics export failed during disk pressure: {error}");
+                            eprintln!(
+                                "bun: metrics export failed during disk pressure: {error}; \
+                                 no metrics files are pruned until an export works"
+                            );
                         }
                         if metrics_result.files_pruned > 0 {
                             println!(
@@ -2976,7 +3126,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 reliaburger::bun::task_array_node::NodeRunner::Owned(Box::new(task_runner)),
             )
             .with_budget(execution_budget)
-            .with_telemetry(Arc::clone(&job_telemetry)),
+            .with_telemetry(Arc::clone(&job_telemetry))
+            // A stopping Bun starts no new attempts, so the stop window
+            // can't use up a task's retries (#1965). Running attempts
+            // carry on: the restart's ledger and replay cover them.
+            .with_draining(shutdown.child_token()),
         )))
         .with_job_notifier(WebhookDispatcher::new(
             reliaburger::http_client::builder()
@@ -3098,6 +3252,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         diagnostics: reliaburger::bun::diagnostics::DiagnosticStaticEvidence {
             storage_paths: diagnostic_storage_paths,
             node_certificate: None,
+            export_holds: export_holds.clone(),
         },
         test_policy: config.testing.clone(),
         token_lifetime: config.security.token_lifetime(),
@@ -3118,6 +3273,28 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             }),
         None => None,
     };
+    // The verifier's keys follow the council, on the token store's 5 s
+    // cadence: after `relish identity rotate-signing-key` the new key's
+    // tokens verify here, and the old key's stop once its window ends (#709).
+    // Clones share the keys, so refreshing this one refreshes the router's.
+    if let (Some(verifier), Some(council)) = (jwt_verifier.clone(), api_council.clone()) {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = ticker.tick() => {
+                        let state = council.security_state().await;
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |elapsed| elapsed.as_secs());
+                        verifier.refresh(&state, now);
+                    }
+                }
+            }
+        });
+    }
 
     let leader_directory = registry_directory.clone().map(api::LeaderDirectory);
     let registry_forwarder = if let Some(directory) = registry_directory {
@@ -3226,6 +3403,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     };
     let app = match api_gossip_stats {
         Some(stats) => app.layer(axum::Extension(stats)),
+        None => app,
+    };
+    let app = match api_backup_monitor {
+        Some(monitor) => app.layer(axum::Extension(monitor)),
         None => app,
     };
     let app = match leader_directory {
@@ -3971,14 +4152,14 @@ const ROOTLESS_CLUSTER_UNSUPPORTED: &str = "rootless runc clusters are unsupport
 /// host, so the refusal can come before Bun touches any state (#813).
 #[cfg(target_os = "linux")]
 fn refuse_rootless_cluster(
-    selection: &str,
+    selection: RuntimeChoice,
     rootless: bool,
     runc_installed: bool,
 ) -> anyhow::Result<()> {
     let selects_runc = match selection {
-        "runc" | "mixed" => true,
-        "auto" => runc_installed,
-        _ => false,
+        RuntimeChoice::Runc | RuntimeChoice::Mixed => true,
+        RuntimeChoice::Auto => runc_installed,
+        RuntimeChoice::Process | RuntimeChoice::Apple => false,
     };
     if rootless && selects_runc {
         anyhow::bail!(ROOTLESS_CLUSTER_UNSUPPORTED);
@@ -3987,7 +4168,7 @@ fn refuse_rootless_cluster(
 }
 
 async fn select_runtime(
-    name: &str,
+    name: RuntimeChoice,
     instances_dir: &std::path::Path,
     image_directory: &std::path::Path,
     mirrors: &reliaburger::grill::ImageMirrors,
@@ -3995,7 +4176,7 @@ async fn select_runtime(
     #[cfg(not(target_os = "linux"))]
     let _ = (image_directory, mirrors);
     match name {
-        "auto" => {
+        RuntimeChoice::Auto => {
             // Both runtimes use durable owners, so launches remain
             // discoverable even before agent adoption is recorded.
             let runtime = match detect_runtime().await {
@@ -4022,7 +4203,7 @@ async fn select_runtime(
             println!("bun: auto-detected runtime: {kind}");
             Ok(runtime)
         }
-        "process" => {
+        RuntimeChoice::Process => {
             println!("bun: using process runtime");
             Ok(AnyGrill::Process(ProcessGrill::with_owner(
                 instances_dir.to_path_buf(),
@@ -4030,12 +4211,12 @@ async fn select_runtime(
             )))
         }
         #[cfg(target_os = "linux")]
-        "runc" | "mixed" => {
+        RuntimeChoice::Runc | RuntimeChoice::Mixed => {
             let is_rootless = reliaburger::grill::rootless::is_rootless();
             let mode = if is_rootless { "rootless" } else { "root" };
             println!("bun: using {name} runtime ({mode})");
             let grill = create_runc_runtime(instances_dir, image_directory, is_rootless, mirrors)?;
-            if name == "mixed" {
+            if name == RuntimeChoice::Mixed {
                 Ok(AnyGrill::with_host_processes(
                     grill,
                     instances_dir,
@@ -4045,8 +4226,11 @@ async fn select_runtime(
                 Ok(AnyGrill::Runc(grill))
             }
         }
-        "apple" => anyhow::bail!(APPLE_RUNTIME_DEFERRED),
-        other => anyhow::bail!("unknown runtime: {other}"),
+        RuntimeChoice::Apple => anyhow::bail!(APPLE_RUNTIME_DEFERRED),
+        #[cfg(not(target_os = "linux"))]
+        RuntimeChoice::Runc | RuntimeChoice::Mixed => {
+            anyhow::bail!("the {name} runtime needs Linux; use --runtime process here")
+        }
     }
 }
 
@@ -4364,13 +4548,31 @@ mod tests {
         assert!(socket.reuseaddr().unwrap());
     }
 
+    /// A misspelt runtime is refused by clap, before Bun does any work.
+    #[test]
+    fn an_unknown_runtime_is_refused_while_parsing_the_flags() {
+        let error = Cli::try_parse_from(["bun", "--runtime", "rnuc"])
+            .err()
+            .expect("rnuc isn't a runtime");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+        let cli = Cli::try_parse_from(["bun", "--runtime", "mixed"]).unwrap();
+        assert_eq!(cli.runtime, RuntimeChoice::Mixed);
+        let cli = Cli::try_parse_from(["bun"]).unwrap();
+        assert_eq!(cli.runtime, RuntimeChoice::Auto);
+    }
+
     #[tokio::test]
     async fn apple_selection_explains_the_linux_vm_release_profile() {
         let root = tempfile::tempdir().unwrap();
-        let error = select_runtime("apple", root.path(), root.path(), &Default::default())
-            .await
-            .err()
-            .expect("direct Apple Container must be unavailable for 0.1.0");
+        let error = select_runtime(
+            RuntimeChoice::Apple,
+            root.path(),
+            root.path(),
+            &Default::default(),
+        )
+        .await
+        .err()
+        .expect("direct Apple Container must be unavailable for 0.1.0");
         let message = error.to_string();
         assert!(message.contains("0.1.0"), "{message}");
         assert!(message.contains("managed Linux VM"), "{message}");
@@ -4380,7 +4582,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn rootless_cluster_is_refused_for_every_selection_that_picks_runc() {
-        for (selection, runc_installed) in [("runc", false), ("mixed", false), ("auto", true)] {
+        for (selection, runc_installed) in [
+            (RuntimeChoice::Runc, false),
+            (RuntimeChoice::Mixed, false),
+            (RuntimeChoice::Auto, true),
+        ] {
             let error = refuse_rootless_cluster(selection, true, runc_installed)
                 .expect_err("rootless runc cannot join a cluster");
             assert_eq!(
@@ -4395,14 +4601,14 @@ mod tests {
     #[test]
     fn rootless_cluster_is_allowed_when_no_rootless_runc_is_selected() {
         // Rootful runc, the process runtime, and `auto` without runc all
-        // cluster; unknown names fail later with their own message.
+        // cluster; Apple fails later with its own message.
         for (selection, rootless, runc_installed) in [
-            ("runc", false, true),
-            ("mixed", false, true),
-            ("auto", false, true),
-            ("process", true, true),
-            ("auto", true, false),
-            ("apple", true, true),
+            (RuntimeChoice::Runc, false, true),
+            (RuntimeChoice::Mixed, false, true),
+            (RuntimeChoice::Auto, false, true),
+            (RuntimeChoice::Process, true, true),
+            (RuntimeChoice::Auto, true, false),
+            (RuntimeChoice::Apple, true, true),
         ] {
             refuse_rootless_cluster(selection, rootless, runc_installed).unwrap();
         }
@@ -4413,10 +4619,10 @@ mod tests {
     async fn explicit_runc_disables_host_execution_and_mixed_enables_both() {
         use reliaburger::grill::{Grill, records::RuntimeKind};
         let root = tempfile::tempdir().unwrap();
-        for (mode, host) in [("runc", false), ("mixed", true)] {
+        for (mode, host) in [(RuntimeChoice::Runc, false), (RuntimeChoice::Mixed, true)] {
             let runtime = select_runtime(
                 mode,
-                &root.path().join(mode),
+                &root.path().join(mode.to_string()),
                 &root.path().join("images"),
                 &Default::default(),
             )
@@ -4431,7 +4637,6 @@ mod tests {
             let policy = reliaburger::config::process_workloads::ProcessWorkloadsConfig {
                 allowed_binaries: vec!["/bin/true".into()],
                 mount_isolation: false,
-                ..Default::default()
             };
             let name = if host { "runc+process" } else { "runc" };
             assert_eq!(host_workloads_enabled(name, &policy), host);
@@ -4444,7 +4649,7 @@ mod tests {
     async fn runc_selection_uses_the_nodes_private_image_storage() {
         let root = tempfile::tempdir().unwrap();
         let runtime = select_runtime(
-            "runc",
+            RuntimeChoice::Runc,
             &root.path().join("instances"),
             &root.path().join("custom-images"),
             &Default::default(),
@@ -4534,7 +4739,6 @@ mod tests {
         let mut policy = reliaburger::config::process_workloads::ProcessWorkloadsConfig {
             allowed_binaries: vec!["/bin/true".into()],
             mount_isolation: false,
-            ..Default::default()
         };
         assert!(host_workloads_enabled("process", &policy));
         policy.mount_isolation = true;
@@ -4817,7 +5021,7 @@ mod tests {
         )
         .await
         .unwrap();
-        raft_router.register(1, council.raft().clone()).await;
+        raft_router.register(1, &council).await;
         let mut members = BTreeMap::new();
         members.insert(
             1,
@@ -4949,7 +5153,12 @@ mod tests {
     #[test]
     fn changing_a_node_name_requires_fresh_enrolment() {
         let dir = tempfile::tempdir().unwrap();
-        reliaburger::relish::commands::init(dir.path(), "secure-test", "old-worker").unwrap();
+        reliaburger::relish::commands::init_with_throwaway_root(
+            dir.path(),
+            "secure-test",
+            "old-worker",
+        )
+        .unwrap();
         let mut config = NodeConfig::from_file(&dir.path().join("reliaburger.toml")).unwrap();
         config.node.name = Some("fresh-worker".into());
         let error = cluster_params_from_config(&config)
@@ -4961,7 +5170,12 @@ mod tests {
     #[test]
     fn normal_init_config_loads_the_generated_identity_for_mtls() {
         let dir = tempfile::tempdir().unwrap();
-        reliaburger::relish::commands::init(dir.path(), "secure-test", "node-secure").unwrap();
+        reliaburger::relish::commands::init_with_throwaway_root(
+            dir.path(),
+            "secure-test",
+            "node-secure",
+        )
+        .unwrap();
         let config = NodeConfig::from_file(&dir.path().join("reliaburger.toml")).unwrap();
 
         assert!(config.security.require_mtls);
@@ -5020,11 +5234,18 @@ mod tests {
     #[test]
     fn development_plaintext_init_sets_the_insecure_cluster_ack() {
         let dir = tempfile::tempdir().unwrap();
+        let operator = age::x25519::Identity::generate();
         reliaburger::relish::commands::init_with_security(
             dir.path(),
             "dev",
             "node-01",
             reliaburger::relish::commands::InitSecurityMode::DevelopmentPlaintext,
+            &reliaburger::relish::ca_cmd::InitRootBackup {
+                path: dir.path().join("root-backup.age"),
+                target: reliaburger::relish::ca_cmd::BackupTarget::Recipient(
+                    operator.to_public().to_string(),
+                ),
+            },
             reliaburger::relish::OutputFormat::Human,
         )
         .unwrap();
@@ -5319,9 +5540,18 @@ mod tests {
     fn enrolled_metrics_archive_owner_uses_the_root_and_certificate_node_id() {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
-        reliaburger::relish::commands::init(first.path(), "first-cluster", "shared-label").unwrap();
-        reliaburger::relish::commands::init(second.path(), "second-cluster", "shared-label")
-            .unwrap();
+        reliaburger::relish::commands::init_with_throwaway_root(
+            first.path(),
+            "first-cluster",
+            "shared-label",
+        )
+        .unwrap();
+        reliaburger::relish::commands::init_with_throwaway_root(
+            second.path(),
+            "second-cluster",
+            "shared-label",
+        )
+        .unwrap();
         let config_one = NodeConfig::from_file(&first.path().join("reliaburger.toml")).unwrap();
         let config_two = NodeConfig::from_file(&second.path().join("reliaburger.toml")).unwrap();
         let one = metrics_archive_owner(&config_one, first.path()).unwrap();

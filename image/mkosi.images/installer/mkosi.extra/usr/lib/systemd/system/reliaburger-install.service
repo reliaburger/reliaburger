@@ -1,0 +1,15 @@
+# Streams the appliance onto the disk once the network is up. Its output
+# goes to the console, which is the installer's only UI.
+[Unit]
+Description=Install Reliaburger OS
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+StandardOutput=journal+console
+StandardError=journal+console
+ExecStart=/usr/lib/reliaburger/install
+
+[Install]
+WantedBy=multi-user.target

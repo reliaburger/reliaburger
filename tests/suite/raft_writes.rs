@@ -128,7 +128,7 @@ async fn leader_with_log() -> (Arc<CouncilNode>, MemLogStore) {
     )
     .await
     .unwrap();
-    network.register(1, node.raft().clone()).await;
+    network.register(1, &node).await;
     node.initialize(BTreeMap::from([(
         1,
         CouncilNodeInfo::new("127.0.0.1:9000".parse().unwrap(), "node"),

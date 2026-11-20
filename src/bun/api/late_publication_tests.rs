@@ -18,7 +18,7 @@ use tower::ServiceExt;
 
 use super::router_with_upgrade;
 use crate::bun::agent::AgentCommand;
-use crate::bun::task_array_leader::TaskArrayService;
+use crate::bun::task_array_leader::{CronClock, TaskArrayService};
 use crate::bun::task_array_node::{NodeRunner, TaskArrayNode, TaskArrayNodeConfig};
 use crate::bun::task_executor::{AttemptOutcome, FakeRunner};
 
@@ -31,6 +31,11 @@ const CALLER_DEADLINE: Duration = Duration::from_millis(200);
 /// publication that a loaded host can keep past 200 ms, which fenced the
 /// reopened node and answered the retry 503 (#1641). This only guards a hang.
 const RESTARTED_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// The minute every node's cron clock stands at. The leader loop records
+/// each new minute it sees with a durable write of its own, which on a
+/// loaded host can take longer than `CALLER_DEADLINE` by itself and fence
+/// the store before the test's own publication is held (#2033).
+const CRON_EPOCH_SECS: u64 = 1_800_000_000;
 
 /// One standalone node with durable job storage under `data`, its leader
 /// loop and a fake executor that counts every attempt in `executed`.
@@ -43,6 +48,7 @@ struct StandaloneNode {
 
 impl StandaloneNode {
     async fn start(data: &Path, executed: Arc<AtomicU64>, write_timeout: Duration) -> Self {
+        let cron_clock = CronClock::manual(CRON_EPOCH_SECS);
         let shutdown = CancellationToken::new();
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(16);
         // No agent: task arrays don't go through it. Holding the receiver
@@ -71,7 +77,6 @@ impl StandaloneNode {
                 policy: crate::config::process_workloads::ProcessWorkloadsConfig {
                     mount_isolation: false,
                     allowed_binaries: vec!["/bin/sh".into()],
-                    ..Default::default()
                 },
                 default_concurrency: 8,
                 backoff: (Duration::ZERO, Duration::ZERO),
@@ -90,6 +95,7 @@ impl StandaloneNode {
                 Duration::from_secs(30),
             )
             .with_write_timeout(write_timeout)
+            .with_cron_clock(cron_clock)
             .with_storage(data)
             .await
             .unwrap(),
@@ -169,6 +175,14 @@ impl StandaloneNode {
     }
 }
 
+/// The cron minute the store at `data` has published, read straight from
+/// disk; `None` before the first checkpoint.
+fn published_cron_minute(data: &Path) -> Option<i64> {
+    let bytes = std::fs::read(data.join("job-state").join("jobs.json")).ok()?;
+    let checkpoint: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    checkpoint["arrays"]["cron_observed_minute"].as_i64()
+}
+
 /// The run ids the store at `data` has published, read straight from disk.
 fn published_runs(data: &Path) -> Vec<u64> {
     let bytes = std::fs::read(data.join("job-state").join("jobs.json")).unwrap();
@@ -185,6 +199,22 @@ fn published_runs(data: &Path) -> Vec<u64> {
 async fn a_late_publication_after_the_caller_times_out_keeps_one_durable_run_identity() {
     let data = tempfile::tempdir().unwrap();
     let executed = Arc::new(AtomicU64::new(0));
+    // Let the leader loop record its cron minute under a hang guard first,
+    // so the node with the short deadline has no write of its own to make
+    // and the only publication it can time out on is the held one.
+    let primer =
+        StandaloneNode::start(data.path(), Arc::clone(&executed), RESTARTED_WRITE_TIMEOUT).await;
+    let minute = i64::try_from(CRON_EPOCH_SECS / 60).unwrap();
+    let deadline = tokio::time::Instant::now() + RESTARTED_WRITE_TIMEOUT;
+    while published_cron_minute(data.path()) != Some(minute) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the leader loop never recorded its cron minute"
+        );
+        tokio::time::sleep(SYNC_INTERVAL).await;
+    }
+    primer.shutdown.cancel();
+    drop(primer);
     let first = StandaloneNode::start(data.path(), Arc::clone(&executed), CALLER_DEADLINE).await;
     let writer = Arc::new(std::sync::Barrier::new(2));
     first.service.pause_next_publication(Arc::clone(&writer));

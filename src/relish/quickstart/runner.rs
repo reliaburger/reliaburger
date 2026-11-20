@@ -178,6 +178,7 @@ pub async fn run(options: Options) -> Result<()> {
                 context,
                 timings_file: timings_path,
                 relish: &relish,
+                root_backup: bootstrap.root_backup.clone(),
             });
             output::print_output(&report, options.output)?;
             Ok(())

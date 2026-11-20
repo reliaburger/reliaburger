@@ -56,7 +56,6 @@ fn service(data: &std::path::Path) -> Arc<TaskArrayService> {
             policy: ProcessWorkloadsConfig {
                 allowed_binaries: vec![PathBuf::from(BINARY)],
                 mount_isolation: false,
-                ..ProcessWorkloadsConfig::default()
             },
             default_concurrency: 16,
             backoff: (Duration::from_millis(1), Duration::from_millis(5)),
@@ -595,7 +594,6 @@ async fn start_common_node(
             policy: ProcessWorkloadsConfig {
                 allowed_binaries: vec![BINARY.into()],
                 mount_isolation: false,
-                ..Default::default()
             },
             default_concurrency: 2,
             backoff: (Duration::from_millis(1), Duration::from_millis(5)),
@@ -1160,7 +1158,6 @@ async fn start_hung_node(
             policy: ProcessWorkloadsConfig {
                 allowed_binaries: vec![PathBuf::from(BINARY)],
                 mount_isolation: false,
-                ..ProcessWorkloadsConfig::default()
             },
             default_concurrency: 16,
             backoff: (Duration::from_millis(1), Duration::from_millis(5)),
@@ -1465,7 +1462,6 @@ async fn shared_budget_node(
                     policy: ProcessWorkloadsConfig {
                         allowed_binaries: vec![BINARY.into()],
                         mount_isolation: false,
-                        ..Default::default()
                     },
                     default_concurrency: 8,
                     backoff: (Duration::from_millis(1), Duration::from_millis(5)),
@@ -1667,7 +1663,6 @@ async fn chaos_node(
                     policy: ProcessWorkloadsConfig {
                         allowed_binaries: vec!["/bin/sh".into()],
                         mount_isolation: false,
-                        ..Default::default()
                     },
                     default_concurrency: 4,
                     backoff: (Duration::from_millis(1), Duration::from_millis(5)),

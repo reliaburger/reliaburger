@@ -352,7 +352,9 @@ impl WebhookDispatcher {
         }
     }
 
-    /// Send to one destination with 3 retries (1s, 5s, 25s backoff).
+    /// Send to one destination in up to 3 attempts, waiting 1 s after the
+    /// first failure and 5 s after the second. The last delay in `delays`
+    /// never runs: nothing follows the third attempt.
     async fn send_with_retry(&self, dest: &AlertDestination, body: &[u8]) {
         let delays = [1, 5, 25];
         for (attempt, delay) in delays.iter().enumerate() {

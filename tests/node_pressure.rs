@@ -49,9 +49,12 @@ async fn node_pressure_consumes_capacity_outside_bun_and_cleans_up() {
         max_cpu_percentage: 5,
         max_memory_percentage: memory_percentage,
     };
-    let helper = std::env::var_os("RELIABURGER_BUN_BINARY")
-        .map(std::path::PathBuf::from)
-        .expect("RELIABURGER_BUN_BINARY must name the Linux bun under test");
+    assert!(
+        std::env::var_os(reliaburger::testkit::bun_binary::BUN_BINARY_ENV).is_some(),
+        "RELIABURGER_BUN_BINARY must name the Linux bun under test"
+    );
+    let helper =
+        reliaburger::testkit::bun_binary::bun_binary().unwrap_or_else(|error| panic!("{error}"));
     let mut controller = NodePressureController::default();
     assert!(
         controller.configure(limits, helper.clone()),
@@ -290,7 +293,14 @@ async fn helper_dies_with_creating_thread_or_parent_and_stale_cgroup_is_reclaime
         std::env::var("RELIABURGER_NODE_PRESSURE_TESTS").as_deref(),
         Ok("1")
     );
-    let binary = std::env::var("RELIABURGER_BUN_BINARY").unwrap();
+    assert!(
+        std::env::var_os(reliaburger::testkit::bun_binary::BUN_BINARY_ENV).is_some(),
+        "RELIABURGER_BUN_BINARY must name the Linux bun under test"
+    );
+    let binary = reliaburger::testkit::bun_binary::bun_binary()
+        .unwrap_or_else(|error| panic!("{error}"))
+        .display()
+        .to_string();
     let script = r#"
 import os, subprocess, sys, threading
 child = None

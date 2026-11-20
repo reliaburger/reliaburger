@@ -1,6 +1,7 @@
 """Synthetic trusted-workflow plan cases; no Rust or workflow qualification."""
 import copy
 import importlib
+import os
 from pathlib import Path
 import re
 import tempfile
@@ -144,6 +145,23 @@ class WorkflowAssembly(unittest.TestCase):
         self.assertEqual(selectors[-1], '(binary(owned_runc) | binary(test_storage)) & not binary(owned_runc) & not binary(owned_network)')
         self.assertIn('--features', selectors)
         self.assertEqual(environment['RELIABURGER_TEST_IMAGE_MIRROR'], '127.0.0.1:5099')
+        self.assertEqual(environment['RELIABURGER_BUN_BINARY'], str(self.root.resolve() / 'target/debug/bun'))
+
+    def test_linux_names_bun_in_the_extracted_archives_target_directory(self):
+        # The Makefile names bun in cargo's target directory (#1859). The
+        # job's archive is extracted with `--target-dir-remap target`, so in
+        # CI that is target/ in the checkout, whatever CARGO_TARGET_DIR says.
+        makefile = self.root.joinpath('Makefile')
+        makefile.write_text(MAKEFILE.replace('$(CURDIR)/target/debug/bun', '$(TARGET_DIR)/debug/bun'))
+        saved = os.environ.get('CARGO_TARGET_DIR')
+        os.environ['CARGO_TARGET_DIR'] = '/elsewhere'
+        try:
+            _, environment = self.w.make_selection(self.root, 'test-linux')
+        finally:
+            if saved is None:
+                del os.environ['CARGO_TARGET_DIR']
+            else:
+                os.environ['CARGO_TARGET_DIR'] = saved
         self.assertEqual(environment['RELIABURGER_BUN_BINARY'], str(self.root.resolve() / 'target/debug/bun'))
 
     def test_portable_implicit_selection_not_broadened(self):

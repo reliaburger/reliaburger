@@ -253,11 +253,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Reconcile launches that reached the runtime before agent adoption was durable.
+    ///
+    /// Returns the records it retired as stale, which the caller mustn't
+    /// adopt: a record from an earlier boot whose launch the runtime lost,
+    /// and a record that conflicts with the launch it names (#1852).
     pub(super) async fn reconcile_runtime_launches(
         &mut self,
         records: &[crate::grill::records::InstanceRecord],
         launches: &[crate::grill::RuntimeLaunch],
-    ) -> Result<(), BunError> {
+    ) -> Result<std::collections::HashSet<String>, BunError> {
         let inventory: std::collections::HashMap<_, _> = launches
             .iter()
             .map(|launch| (launch.instance_id.0.as_str(), launch))
@@ -267,24 +271,47 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 "duplicate runtime launch identity".into(),
             ));
         }
-        let recorded: std::collections::HashSet<_> = records
+        let mut recorded: std::collections::HashSet<_> = records
             .iter()
             .map(|record| record.instance_id.as_str())
             .collect();
-        // Validate all cross-record relationships before retiring any owner.
+        // The record and the runtime's launch intent are written at different
+        // moments, and a power cut can keep one without the other. Such a
+        // record no longer describes what runs, so it's retired and the
+        // instance reschedules, rather than one half-written record stopping
+        // the whole node (#1852). Validate every record before retiring any.
+        let mut lost_launches = Vec::new();
+        let mut stale = std::collections::HashSet::new();
         for record in records {
-            let launch = inventory.get(record.instance_id.as_str()).ok_or_else(|| {
-                BunError::AdoptionState(format!(
-                    "instance {} has no runtime launch intent",
-                    record.instance_id
-                ))
-            })?;
+            let Some(launch) = inventory.get(record.instance_id.as_str()) else {
+                // With no launch, nothing in the runtime owns the record's
+                // process. Only a reboot proves that process is gone.
+                if !from_an_earlier_boot(record) {
+                    return Err(BunError::AdoptionState(format!(
+                        "instance {} has no runtime launch intent",
+                        record.instance_id
+                    )));
+                }
+                lost_launches.push(InstanceId(record.instance_id.clone()));
+                stale.insert(record.instance_id.clone());
+                continue;
+            };
             if !launch.launched(&record.oci_spec) {
-                return Err(BunError::AdoptionState(format!(
-                    "instance {} conflicts with runtime preparation",
+                // The launch is what the runtime runs: fence and retire it
+                // below like a launch with no record at all.
+                eprintln!(
+                    "bun: {}: adoption record conflicts with its runtime launch; retiring the launch",
                     record.instance_id
-                )));
+                );
+                stale.insert(record.instance_id.clone());
             }
+        }
+        recorded.retain(|id| !stale.contains(*id));
+        for id in &lost_launches {
+            eprintln!(
+                "bun: {id}: adoption record from an earlier boot has no runtime launch; retiring it"
+            );
+            self.retire_instance_artifacts_fully(id).await?;
         }
         let mut retired = Vec::new();
         for launch in launches {
@@ -316,7 +343,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 self.retire_instance_artifacts_fully(&id).await?;
             }
         }
-        Ok(())
+        Ok(stale)
     }
 
     /// Adopt still-running workloads recorded by a previous bun process.
@@ -404,10 +431,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.restore_egress_owners(&records, launch_inventory.as_deref())
             .await?;
         self.replay_discovery_releases().await?;
-        if let Some(launches) = &launch_inventory {
-            self.reconcile_runtime_launches(&records, launches).await?;
-        }
+        let stale = match &launch_inventory {
+            Some(launches) => self.reconcile_runtime_launches(&records, launches).await?,
+            None => std::collections::HashSet::new(),
+        };
         for record in records {
+            if stale.contains(&record.instance_id) {
+                continue;
+            }
             // Startup preflight proved that runtime, record and supervisor
             // share the same identity. Never invent an alias for an old owner.
             let runtime_id = InstanceId(record.instance_id.clone());
@@ -559,5 +590,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.sweep_orphaned_identity_dirs().await;
 
         Ok(adopted_count)
+    }
+}
+
+/// Whether the record's process provably died with an earlier boot.
+fn from_an_earlier_boot(record: &crate::grill::records::InstanceRecord) -> bool {
+    match (&record.boot_id, crate::grill::records::current_boot()) {
+        (Some(recorded), Some(current)) => *recorded != current,
+        _ => false,
     }
 }

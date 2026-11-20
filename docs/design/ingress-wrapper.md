@@ -41,12 +41,12 @@ Wrapper is disabled by default. Operators enable it on selected nodes with `[ing
 1. Bun joins cluster (mTLS handshake via Sesame node certificate)
 2. Bun populates the service map from reporting tree state
 3. Bun starts Wrapper listener tasks
-4. Wrapper loads an operator certificate or builds its in-memory Ingress CA resolver
+4. Wrapper loads the operator certificate, if configured, and builds its in-memory Ingress CA resolver, if it can; each serves its own routes
 5. Wrapper binds ports 80 and 443
 6. Wrapper begins accepting connections
 ```
 
-Wrapper doesn't accept connections until at least one routing table entry exists. If no ingress routes are configured in any app spec, Wrapper binds the ports but returns `503 Service Unavailable` for all requests (with a human-readable body indicating no ingress routes are configured).
+If no ingress routes are configured in any app spec, Wrapper still binds its ports and accepts connections, but every request finds no route and gets `404 Not Found` with an empty body (`src/wrapper/proxy.rs`).
 
 ---
 
@@ -67,7 +67,7 @@ http_port = 80
 https_port = 443
 ```
 
-Each listener spawns a tokio task per accepted connection. Connections are tracked in a `DashMap<ConnectionId, ConnectionState>` for drain coordination.
+Each listener spawns a tokio task per accepted connection. Drain coordination doesn't track connections. It counts requests per backend instance: `SharedDrains` (`src/wrapper/draining.rs`) is a drain tracker behind an `Arc<Mutex<_>>`, and each request captures its backend's count under the routing table's read lock, so a drain started under the write lock can't miss it.
 
 Every accepted connection gets the deadlines in `sesame::connection::ConnectionTimeouts::PRODUCTION`, shared with Bun's API and registry listeners: a 10 s TLS handshake (`tls_handshake_timeout`), 75 s for the first request byte and for each HTTP/1 request head (which also closes idle keep-alive connections), HTTP/2 pings every 30 s with a 20 s ack deadline, a 300 s write-stall limit for responses and WebSockets nobody reads, and TCP keepalive (60 s idle, 15 s probes). A streaming response or a quiet WebSocket is never closed for being idle; only a stalled write ends it. TLS connections still retire after one hour. The stream wrappers that enforce the first-byte, write-stall and lifetime limits forward the socket's vectored writes (`is_write_vectored`, `poll_write_vectored`): without them Hyper copies every response body into a per-connection write buffer that it never shrinks, so each idle keep-alive connection kept the capacity of its largest answer (#892).
 
@@ -131,6 +131,31 @@ Wrapper manages TLS certificates per ingress route. Each route specifies a TLS m
 `relish apply` and `relish lint`. A route that reaches a node anyway is
 skipped rather than guessed at or served in plaintext.
 
+**Choosing per SNI (#2011):** one HTTPS listener serves every route on a node,
+so the listener's resolver (`wrapper::tls::RouteCertResolver`) picks the
+certificate per handshake from the SNI host's routes:
+
+| SNI host | Node has the source | Certificate served |
+|---|---|---|
+| `explicit` route | operator pair | the `[ingress]` `tls_cert`/`tls_key` pair |
+| `cluster` route | Ingress CA resolver | an Ingress CA leaf for that host |
+| `explicit` or `cluster` route | no | the self-signed development certificate, with one warning per host on stderr; never the other mode's certificate |
+| plain-HTTP route, unknown host, or no SNI | — | the operator pair if the node has one, else the self-signed certificate |
+
+SNI names a host, not a path, so routes on one host share a certificate. When
+they disagree, `explicit` wins over `cluster`, and either wins over plain HTTP
+(`RoutingTable::certificate_mode`). The resolver reads each host's mode from
+`CertificateModes`, a snapshot every rebuild or `RoutingTable::replace`
+publishes, not from the table itself: rustls's callback is synchronous, and a
+`try_read` on the fair tokio lock fails whenever a writer holds or waits for
+it. A rebuild therefore never changes which certificate a host gets until the
+new table is published. The Ingress CA resolver mints only for hosts whose
+published mode is `cluster`. Before 0.3.0 the listener made one choice
+for every route (disk pair if present, else the Ingress CA), so the mode only
+decided the plain-HTTP redirect. A cluster-mode node with no disk pair also
+minted an Ingress CA leaf for plain routes' hosts; now only `cluster` hosts get
+one, and plain hosts get the self-signed certificate.
+
 **Cluster CA flow (current):**
 
 ```
@@ -142,7 +167,7 @@ skipped rather than guessed at or served in plaintext.
 ```
 
 The resolver mints and caches a cluster leaf **only for a hostname that
-currently has an ingress route**. That host allowlist is a security boundary:
+currently has a `tls = "cluster"` ingress route**. That host allowlist is a security boundary:
 without it, an attacker-chosen SNI would drive unbounded Ingress-CA signing and
 grow the in-memory cache without limit. An SNI for any other host — and a
 handshake with no SNI at all — is served the self-signed development
@@ -151,8 +176,8 @@ unconfigured host can never obtain a trusted cluster certificate. The cache is
 additionally capped as defence in depth.
 
 This currently requires the ingress node to have council state and the
-wrapping key material. If it doesn't, the listener uses its self-signed
-development certificate. Operators must not treat that fallback as a
+wrapping key material. If it doesn't, `cluster` hosts get the listener's
+self-signed development certificate, never the operator pair. Operators must not treat that fallback as a
 cluster-issued production certificate.
 
 **Explicit flow (current):**
@@ -160,7 +185,8 @@ cluster-issued production certificate.
 ```
 1. The operator sets both `tls_cert` and `tls_key` in `[ingress]`
 2. Wrapper reads the PEM files during startup
-3. Routes marked `tls = "explicit"` use that listener certificate
+3. Hosts with a `tls = "explicit"` route are served that pair; a node
+   without one serves those hosts the self-signed certificate and warns
 ```
 
 **Certificate storage:**
@@ -172,11 +198,15 @@ rotation process.
 
 **Certificate renewal:**
 
-Automatic renewal and hot reload aren't implemented. The current in-memory
-resolver also doesn't replace a cached cluster leaf at expiry. Production
-acceptance therefore needs renewal before the cluster mode can be called
-hands-off; until then, restart Wrapper before expiry or use externally rotated
-operator material.
+Both kinds renew without a restart. The cluster resolver
+(`IngressCertResolver` in `src/wrapper/tls.rs`) issues a new leaf for a
+hostname on the first handshake after the cached leaf passes the midpoint of
+its validity. If signing fails, it keeps serving the old leaf, but only until
+that leaf expires. Operator files are re-read once a second
+(`FileCertResolver::run`): a changed, valid pair replaces the served one on the
+next handshake, and a pair that won't load is logged once and ignored, so the
+last good pair stays in service until its own expiry. Expiry telemetry is still
+missing (§5.4).
 
 ### 3.5 Connection Draining During Deploys
 
@@ -206,10 +236,10 @@ Drain coordination is event-driven: Bun publishes a `DrainBackend { app, instanc
 > stream watches the token and stops mid-stream (closing the connection) if the
 > deadline fires. A backend still inside its drain window keeps the clean
 > count-and-forward behaviour. WebSockets are torn down at the deadline too:
-> the splice watches the same token and closes both sockets when it fires.
-> **What's still a follow-up (F08):** the graceful Close-1001 frame
-> (`websocket_close_frame`) isn't sent first, so clients see the connection
-> drop rather than a Going Away close.
+> the splice watches the same token, and when it fires it sends the client a
+> Close frame with 1001 Going Away, bounded by one second, then closes both
+> sockets (F08, #369). The splice copies bytes, not frames, so a deadline that
+> lands mid-frame leaves the client a protocol error instead of a clean close.
 
 ---
 
@@ -378,10 +408,14 @@ pub struct RateLimitConfig {
     pub retry_after_header: bool,
 }
 
-/// Per-client-IP rate limiter state (token bucket).
-pub struct RateLimiterState {
-    /// Map of client IP → token bucket.
-    pub buckets: dashmap::DashMap<std::net::IpAddr, TokenBucket>,
+// Shipped shape (src/wrapper/rate_limit.rs): no DashMap. A
+// ShardedRateLimiter holds 16 RateLimiters, each a plain HashMap behind a
+// tokio Mutex, and a request locks only the shard its (route, client IP)
+// key hashes to.
+/// Per-(route, client IP) rate limiter state (token bucket).
+pub struct RateLimiter {
+    /// Map of (route, client IP) → token bucket.
+    pub buckets: HashMap<BucketKey, TokenBucket>,
     /// Last time expired buckets were garbage-collected.
     pub last_gc: Instant,
 }
@@ -389,7 +423,8 @@ pub struct RateLimiterState {
 pub struct TokenBucket {
     pub tokens: f64,
     pub last_refill: Instant,
-    pub config: RateLimitConfig,
+    /// Garbage collection drops a bucket idle for 5 minutes.
+    pub last_used: Instant,
 }
 
 /// Header manipulation rule.
@@ -465,14 +500,24 @@ Every inbound HTTPS request follows this path:
     - A cluster leaf is minted/served only for a configured ingress host;
       an unknown SNI (or none) is served the self-signed default, which a
       hostname-validating client rejects
-3.  HTTP/1.1 or HTTP/2 request parsed (via hyper's auto builder). NOTE: Wrapper's rustls config does not set `alpn_protocols`, so it does **not** advertise `h2` over TLS — HTTP/2-over-TLS/ALPN negotiation is planned, not shipped. (hyper's auto builder can still speak h2 on cleartext prior-knowledge.)
-4.  Host header extracted (falls back to SNI hostname)
+3.  HTTP/1.1 or HTTP/2 request parsed (via hyper's auto builder). Wrapper's rustls config advertises ALPN `h2, http/1.1`, so browsers and curl negotiate HTTP/2 over TLS. (hyper's auto builder also speaks h2 on cleartext prior-knowledge.)
+4.  Host extracted. HTTP/2 uses the `:authority` pseudo-header, which hyper
+    puts in the request URI (RFC 9113 §8.3.1); a request whose `Host` header
+    names a different host or port is malformed and gets 400. Hosts compare
+    case-insensitively, and a missing port means the scheme's default (443
+    for https, 80 for http). When the authority is an IP literal (v4 or v6,
+    with or without a port) a `Host` header decides instead, so
+    `curl -k https://<node-ip>/ -H 'Host: app.example'` routes. HTTP/1.1 uses
+    the `Host` header, falling back to the URI's authority. The SNI hostname
+    is not used.
 5.  Routing table lookup:
     a. Exact match on Host → Vec<PathRoute>
     b. Longest path prefix match → PathRoute
     c. If no match: respond 404 Not Found
 6.  Rate limit check:
-    a. Extract client IP (from X-Forwarded-For if trusted proxy, else peer IP)
+    a. Client IP is always the TCP peer address. There is no trusted-proxy
+       setting and Wrapper never reads X-Forwarded-For, so behind an HTTP load
+       balancer every client shares the balancer's bucket
     b. Check token bucket for (client_ip, route)
     c. If rate limited: respond 429 Too Many Requests with Retry-After header
 7.  Backend selection from BackendPool:
@@ -480,7 +525,7 @@ Every inbound HTTPS request follows this path:
     b. If pool empty: respond 502 Bad Gateway
     c. Select backend by unweighted round-robin (the only strategy implemented; no strategy setting is exposed)
 8.  Proxy the request:
-    a. Add X-Forwarded-For and X-Forwarded-Proto headers (the only headers Wrapper injects today). X-Real-IP and X-Request-ID are planned, not yet added.
+    a. Replace the client's `X-Forwarded-For`, `X-Forwarded-Proto`, `Forwarded` and `X-Real-IP` with the proxy's own view of the connection, and set `X-Request-ID` to the client's value or a new 128-bit random id. A WebSocket upgrade gets the same headers (F08, #369).
     b. Forward the request to backend_addr
     c. Stream the response back to the client
 9.  Connection accounting:
@@ -500,8 +545,9 @@ locally. There is no network CSR round-trip in the current implementation.
 **Mode: `explicit`**
 
 Used with `tls_cert` and `tls_key` in the node's `[ingress]` configuration.
-This is the public-certificate path in v1. The same listener certificate serves
-all explicit routes on that node, so its SANs must cover every advertised host.
+This is the public-certificate path in v1. The same pair serves all explicit
+routes on that node, so its SANs must cover every advertised host. `cluster`
+hosts on the same listener keep their Ingress CA leaves.
 
 **Mode: omitted / `none` / `off` / `disabled`**
 
@@ -509,6 +555,8 @@ The application route is served as plain HTTP. There is deliberately no
 implicit TLS default.
 
 ### 5.3 ACME Certificate Provisioning (deferred design)
+
+> The plan for building it is [`docs/plans/2026-11-06-plan-f08-acme.md`](../plans/2026-11-06-plan-f08-acme.md) (#369): HTTP-01 answered by every node from council state, with the leader as the one ACME client.
 
 `auto` and `acme` are reserved but rejected. A future implementation needs an
 explicit issuer model, production/staging directory selection, account-key
@@ -524,11 +572,12 @@ credential boundaries exist would repeat the same documentation mistake.
 
 ### 5.4 Certificate Renewal (required follow-up)
 
-The v1 cluster resolver caches a generated leaf for the life of the Bun process
-and doesn't inspect its expiry. Operator certificates load at startup and don't
-hot-reload. A production implementation must renew or reload before expiry,
-retain the last valid certificate while rotation runs, expose expiry telemetry,
-and fail acceptance when a required certificate can't be refreshed.
+Renewal and reload ship (§3.4): the cluster resolver renews a leaf at the
+midpoint of its validity, operator files are re-read every second, and both
+keep the last valid certificate, never past its expiry, while a refresh fails.
+What's still missing is expiry telemetry and a check that fails loudly when a
+required certificate can't be refreshed. Today a refused file reload logs one
+line on stderr, and a failed cluster renewal logs nothing.
 
 ### 5.5 Connection Draining
 
@@ -560,10 +609,11 @@ Bun (deploy coordinator)                  Wrapper
 > follow-up.** When the deadline expires with connections still open, Wrapper now
 > fires the drain entry's `terminate` token. Of the protocol below, HTTP items 2
 > and 3 ship (a new request to a terminating backend gets `503`; an in-flight
-> response stops mid-stream, closing the connection). Item 1 — the WebSocket
-> Close 1001 handshake — is not yet sent on the live WS splice path.
+> response stops mid-stream, closing the connection). Item 1 ships in a
+> shorter form: Wrapper sends the Close frame and closes, without waiting for
+> the client's half of the close handshake (F08, #369).
 >
-> 1. WebSocket connections: send a WebSocket Close frame (opcode 0x08) with status 1001 (Going Away), wait 5 seconds for the close handshake, then RST. *(follow-up)*
+> 1. WebSocket connections: send a WebSocket Close frame (opcode 0x08) with status 1001 (Going Away), within one second, then close.
 > 2. HTTP connections: send a 503 response if the request is mid-stream, then close.
 > 3. Idle keep-alive connections: closed once the backend goes away.
 
@@ -582,7 +632,7 @@ When Wrapper receives a request with `Connection: Upgrade` and `Upgrade: websock
 3. Wrapper forwards the upgrade request to the backend.
 4. If the backend responds with `101 Switching Protocols`, Wrapper enters bidirectional byte-level proxying (no HTTP framing).
 5. The connection is tracked as `is_websocket: true` in the connection tracker.
-6. WebSocket connections are long-lived. The Close-1001 drain treatment described above is a follow-up: `websocket_close_frame` exists and is unit-tested, but is not yet sent on the live WS splice — today a draining backend's WebSockets are torn down at the drain deadline via a cancellation token (see §5.5).
+6. WebSocket connections are long-lived. At a drain deadline the splice sends the client a Close 1001 (Going Away) frame, then closes both sockets (§5.5).
 
 Wrapper doesn't inspect or modify WebSocket frames. It operates as a transparent TCP proxy after the upgrade handshake.
 
@@ -754,7 +804,7 @@ Wrapper validates ingress configuration at deploy time:
 | **Invalid route** | Refused at apply and lint; a spec that predates the check is caught when a routing-table rebuild parses its TLS mode or rate limit | That one route is skipped and logged with its namespace and app; every other route and the catalogue generation install normally. | Reapply the app with `cluster`, `explicit`, or a plain-HTTP alias and a positive rate. |
 | **Backend pool empty** | All backends removed from the service map, or marked locally unhealthy by Wrapper's active probe | Route returns 502 Bad Gateway for all requests. | Automatic: backends re-appear when the service map marks them healthy or new instances are scheduled. Wrapper re-adds them within seconds. |
 | **Certificate expiry** | Currently detected by clients, not by Wrapper | Clients reject the connection. | Restart before a cluster-issued leaf expires, or rotate the configured operator files and restart. Automatic detection, telemetry and hot rotation are required follow-up work. |
-| **Slow draining** | In-flight connections exceed `drain_timeout` | Deploy step is delayed up to `drain_timeout`. On expiry Wrapper fires the drain's terminate token: new requests to that backend get `503`, in-flight HTTP responses stop mid-stream and close, and WebSockets are closed without a Close-1001 frame (§5.5). | Increase `drain_timeout` if the app has legitimately long-running requests. For WebSocket apps, set a higher timeout or implement reconnection logic in the client. |
+| **Slow draining** | In-flight connections exceed `drain_timeout` | Deploy step is delayed up to `drain_timeout`. On expiry Wrapper fires the drain's terminate token: new requests to that backend get `503`, in-flight HTTP responses stop mid-stream and close, and WebSockets get a Close 1001 frame, then close (§5.5). | Increase `drain_timeout` if the app has legitimately long-running requests. For WebSocket apps, set a higher timeout or implement reconnection logic in the client. |
 | **Ingress CA resolver unavailable at startup** | Bun can't reconstruct the Ingress CA material and logs a warning | The HTTPS listener uses its self-signed development certificate; `cluster` doesn't meet its production trust contract on that node. | Restore council/wrapping material before enabling ingress, or configure an explicit certificate pair. A future capability gate should reject placement on such a node. |
 | **Port 80/443 already in use** | `bind()` returns `EADDRINUSE` | Wrapper cannot start. Bun logs the error and retries every 30 seconds. | Operator must free the ports or reconfigure Wrapper to use alternative ports. |
 | **rustls handshake failure** | Client sends unsupported TLS version or cipher suite | Connection dropped during handshake | Client-side fix (upgrade TLS version). Wrapper logs the failure at debug level to avoid log flooding. |
@@ -835,7 +885,7 @@ Wrapper adds latency at two points:
 | TLS handshake (resumption) | 0.1-0.5 ms | Session tickets (TLS 1.3 PSK) are enabled by default. |
 | HTTP parsing + routing | 10-50 us | In-memory routing table lookup. Negligible for typical route counts (<1000). |
 | Proxy overhead (per request) | 50-200 us | Memory copies between client and backend sockets. hyper's zero-copy streaming minimizes this. |
-| Rate limit check | 1-5 us | DashMap lookup + token bucket arithmetic. |
+| Rate limit check | 1-5 us | One shard's lock, a `HashMap` lookup and token bucket arithmetic. |
 
 **Total added latency per request (steady state, keep-alive connection):** 60-250 microseconds. This is well below the typical application response time (1-100 ms) and isn't a practical bottleneck.
 
@@ -1011,7 +1061,7 @@ HTTP/3 (over QUIC) provides benefits including 0-RTT connection establishment, m
 
 ### 13.2 gRPC Proxying
 
-gRPC uses HTTP/2 with specific framing conventions (trailers, streaming, content-type `application/grpc`). Wrapper's current HTTP/2 proxying may work for unary gRPC calls, but streaming gRPC (server-streaming, client-streaming, bidirectional) hasn't been validated.
+gRPC uses HTTP/2 with specific framing conventions (trailers, streaming, content-type `application/grpc`). Wrapper doesn't proxy gRPC today, not even unary calls. It accepts HTTP/2 from clients, but its upstream client is HTTP/1.1 only (`http_client::builder` sets `http1_only`, and both of the proxy's clients in `bind_proxy_with_tls` start there), and gRPC needs HTTP/2 end to end.
 
 Known concerns:
 
@@ -1020,7 +1070,7 @@ Known concerns:
 - gRPC health checking protocol (`grpc.health.v1.Health`) is different from HTTP health checking.
 - Long-lived gRPC streams interact with connection draining (similar to WebSocket, but using HTTP/2 GOAWAY instead of WebSocket Close).
 
-**Decision status:** Needs investigation and testing. gRPC proxying should work with Wrapper's HTTP/2 support, but requires a dedicated test suite before being documented as supported.
+**Decision status:** Not supported. gRPC needs an HTTP/2 upstream client first, then a dedicated test suite (unary and each kind of streaming) before it can be documented as supported.
 
 ### 13.3 Custom Middleware / Header Injection
 

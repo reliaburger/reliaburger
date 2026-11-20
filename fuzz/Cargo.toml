@@ -84,3 +84,24 @@ path = "fuzz_targets/node_config.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "task_manifest"
+path = "fuzz_targets/task_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chaos_scenario"
+path = "fuzz_targets/chaos_scenario.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "council_backup_state"
+path = "fuzz_targets/council_backup_state.rs"
+test = false
+doc = false
+bench = false

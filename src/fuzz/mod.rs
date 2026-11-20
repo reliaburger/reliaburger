@@ -94,6 +94,21 @@ pub const TARGETS: &[Target] = &[
         decoder: "config::node::NodeConfig::parse",
         run: node_config,
     },
+    Target {
+        name: "task_manifest",
+        decoder: "bun::task_array_api::TaskManifestRequest (POST /v1/batch/manifest)",
+        run: task_manifest,
+    },
+    Target {
+        name: "chaos_scenario",
+        decoder: "smoker::types::ScriptedScenario (relish fault scenario)",
+        run: chaos_scenario,
+    },
+    Target {
+        name: "council_backup_state",
+        decoder: "council::types::DesiredState, as a restore parses an unsealed backup",
+        run: council_backup_state,
+    },
 ];
 
 /// A gossip datagram, as any host that can reach the UDP port sends it.
@@ -371,5 +386,95 @@ pub fn node_config(data: &[u8]) -> Outcome {
     let encoded = toml::to_string(&config).expect("a parsed node config re-encodes");
     let again = NodeConfig::parse(&encoded).expect("a re-encoded node config parses");
     assert_eq!(config, again, "a node config changed on its round trip");
+    Outcome::Accepted
+}
+
+/// The JSON of `value` as a `serde_json::Value`, whose maps are ordered, so
+/// two encodings compare equal whatever order a `HashMap` iterated in.
+fn as_json<T: serde::Serialize>(value: &T, what: &str) -> serde_json::Value {
+    serde_json::to_value(value)
+        .unwrap_or_else(|error| panic!("a decoded {what} re-encodes: {error}"))
+}
+
+/// A task-array manifest, as `POST /v1/batch/manifest` reads it (#1414).
+///
+/// An accepted manifest must survive a JSON round trip, and each cohort then
+/// goes through the same check the handler runs before it admits anything.
+pub fn task_manifest(data: &[u8]) -> Outcome {
+    use crate::bun::task_array_api::{
+        TaskArraySubmitRequest, TaskManifestRequest, validate_submission,
+    };
+
+    let Ok(manifest) = serde_json::from_slice::<TaskManifestRequest>(data) else {
+        return Outcome::Refused;
+    };
+    let encoded = serde_json::to_vec(&manifest).expect("a decoded manifest re-encodes");
+    let again: TaskManifestRequest =
+        serde_json::from_slice(&encoded).expect("a re-encoded manifest decodes");
+    assert_eq!(
+        as_json(&manifest, "manifest"),
+        as_json(&again, "manifest"),
+        "a manifest changed on its round trip"
+    );
+    for cohort in &manifest.cohort {
+        let mut array = TaskArraySubmitRequest {
+            name: manifest.name.clone(),
+            namespace: Some(manifest.namespace.clone()),
+            template: cohort.template.clone(),
+            spec: cohort.spec.clone(),
+        };
+        let _ = validate_submission(&mut array);
+    }
+    Outcome::Accepted
+}
+
+/// A chaos scenario file, as `relish fault scenario` reads it (#1414).
+///
+/// An accepted scenario must survive a TOML round trip, and building its
+/// timeline, which parses every duration and fault, must not panic.
+pub fn chaos_scenario(data: &[u8]) -> Outcome {
+    use crate::smoker::types::ScriptedScenario;
+
+    let Ok(text) = std::str::from_utf8(data) else {
+        return Outcome::Refused;
+    };
+    let Ok(scenario) = toml::from_str::<ScriptedScenario>(text) else {
+        return Outcome::Refused;
+    };
+    let encoded = toml::to_string(&scenario).expect("a parsed scenario re-encodes");
+    let again: ScriptedScenario = toml::from_str(&encoded).expect("a re-encoded scenario parses");
+    assert_eq!(
+        as_json(&scenario, "scenario"),
+        as_json(&again, "scenario"),
+        "a scenario changed on its round trip"
+    );
+    let _ = crate::smoker::scenario::build_timeline(&scenario, 1.0);
+    Outcome::Accepted
+}
+
+/// The council state inside a backup, as a restore parses it once the
+/// backup is unsealed (#1414). The `council_backup` target can't reach this:
+/// random bytes never unseal.
+///
+/// An accepted state must survive a JSON round trip, and the backup name
+/// worked out from it must parse back to the same position, since a restore
+/// refuses a state that doesn't sit where its name says.
+pub fn council_backup_state(data: &[u8]) -> Outcome {
+    use crate::council::backup::BackupKey;
+    use crate::council::types::DesiredState;
+
+    let Ok(state) = serde_json::from_slice::<DesiredState>(data) else {
+        return Outcome::Refused;
+    };
+    let encoded = serde_json::to_vec(&state).expect("a decoded state re-encodes");
+    let again: DesiredState = serde_json::from_slice(&encoded).expect("a re-encoded state decodes");
+    assert_eq!(
+        as_json(&state, "state"),
+        as_json(&again, "state"),
+        "a council state changed on its round trip"
+    );
+    let key = BackupKey::for_state(&state, std::time::UNIX_EPOCH);
+    let parsed = BackupKey::parse(&key.object_name()).expect("a backup's own name parses");
+    assert_eq!(parsed, key, "a backup name didn't parse back to its key");
     Outcome::Accepted
 }

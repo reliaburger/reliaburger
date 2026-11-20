@@ -1,0 +1,18 @@
+#!ipxe
+# The netboot server's boot script, fetched over TFTP by embed.ipxe.
+# Everything after it goes over HTTP from the same server: the installer UKI,
+# then (from inside the installer) the signed disk image. Serve each
+# architecture's artefacts under /<buildarch>/ with installer.efi pointing at
+# reliaburger-os-installer_<version>.efi.
+#
+# Arguments to a UKI replace its built-in command line (Secure Boot off), so
+# this passes the console too. --autofree: a failed attempt must not leave the
+# installer registered, or iPXE hands it to the next try as an initrd.
+# Our iPXE's embedded script sets ${server}; firmware with iPXE built in
+# comes here straight from DHCP, so work it out the same way.
+isset ${server} || set server ${proxydhcp/next-server}
+isset ${server} || set server ${next-server}
+iseq ${buildarch} arm64 && set console ttyAMA0 || set console ttyS0
+set base http://${server}:8080/${buildarch}
+echo reliaburger: chaining ${base}/installer.efi
+chain --autofree ${base}/installer.efi reliaburger.url=${base} console=tty0 console=${console},115200

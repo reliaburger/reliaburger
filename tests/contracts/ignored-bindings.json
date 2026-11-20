@@ -169,6 +169,18 @@
   },
   {
     "source": "src/grill/volume.rs",
+    "function": "a_loop_image_without_its_record_is_never_formatted",
+    "binary": "reliaburger",
+    "test": "grill::volume::tests::a_loop_image_without_its_record_is_never_formatted"
+  },
+  {
+    "source": "src/grill/volume.rs",
+    "function": "a_failed_first_loop_provisioning_can_be_retried",
+    "binary": "reliaburger",
+    "test": "grill::volume::tests::a_failed_first_loop_provisioning_can_be_retried"
+  },
+  {
+    "source": "src/grill/volume.rs",
     "function": "btrfs_quota_blocks_writes_beyond_limit",
     "binary": "reliaburger",
     "test": "grill::volume::tests::btrfs_quota_blocks_writes_beyond_limit"
@@ -259,6 +271,12 @@
   },
   {
     "source": "tests/cluster_failover.rs",
+    "function": "workers_outside_raft_keep_the_leader_after_many_elections",
+    "binary": "reliaburger::cluster_failover",
+    "test": "workers_outside_raft_keep_the_leader_after_many_elections"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
     "function": "invalid_ingress_on_one_app_leaves_discovery_working_cluster_wide",
     "binary": "reliaburger::cluster_failover",
     "test": "invalid_ingress_on_one_app_leaves_discovery_working_cluster_wide"
@@ -298,6 +316,12 @@
     "function": "a_lease_history_through_a_leader_kill_is_linearizable",
     "binary": "reliaburger::cluster_failover",
     "test": "a_lease_history_through_a_leader_kill_is_linearizable"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
+    "function": "a_lease_history_through_a_leader_partition_is_linearizable",
+    "binary": "reliaburger::cluster_failover",
+    "test": "a_lease_history_through_a_leader_partition_is_linearizable"
   },
   {
     "source": "tests/cluster_failover.rs",
@@ -472,6 +496,18 @@
     "function": "two_node_cluster_survives_losing_the_non_voter",
     "binary": "reliaburger::council_self_healing",
     "test": "two_node_cluster_survives_losing_the_non_voter"
+  },
+  {
+    "source": "tests/council_self_healing.rs",
+    "function": "a_replaced_voter_coming_back_joins_as_a_learner_without_an_election",
+    "binary": "reliaburger::council_self_healing",
+    "test": "a_replaced_voter_coming_back_joins_as_a_learner_without_an_election"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "onion_objects_use_only_the_original_bpf_instruction_set",
+    "binary": "reliaburger::ebpf",
+    "test": "onion_objects_use_only_the_original_bpf_instruction_set"
   },
   {
     "source": "tests/ebpf.rs",
@@ -1176,6 +1212,12 @@
     "test": "operator_cidr_reaches_the_api_port_but_not_cluster_ports"
   },
   {
+    "source": "tests/owned_network.rs",
+    "function": "published_ports_answer_members_only_and_rewrite_only_local_destinations",
+    "binary": "reliaburger::owned_network",
+    "test": "published_ports_answer_members_only_and_rewrite_only_local_destinations"
+  },
+  {
     "source": "tests/owned_rootless.rs",
     "function": "rootless_cluster_refuses_before_ownership_recovery_for_every_selection",
     "binary": "reliaburger::owned_rootless",
@@ -1276,6 +1318,24 @@
     "function": "generated_cgroup_path_matches_the_actual_container_before_its_first_instruction",
     "binary": "reliaburger::owned_runc",
     "test": "generated_cgroup_path_matches_the_actual_container_before_its_first_instruction"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "a_memory_request_smaller_than_runc_init_does_not_hold_the_start",
+    "binary": "reliaburger::owned_runc",
+    "test": "a_memory_request_smaller_than_runc_init_does_not_hold_the_start"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_container_paused_by_smoker_takes_its_stop_signal_at_once",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_container_paused_by_smoker_takes_its_stop_signal_at_once"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_container_with_a_paused_init_takes_its_stop_signal_at_once",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_container_with_a_paused_init_takes_its_stop_signal_at_once"
   },
   {
     "source": "tests/owned_runc.rs",

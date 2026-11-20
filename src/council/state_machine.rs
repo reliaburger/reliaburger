@@ -15,7 +15,9 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
-use super::types::{CouncilNodeInfo, CouncilResponse, DesiredState, RaftRequest, TypeConfig};
+use super::types::{
+    CouncilNodeInfo, CouncilResponse, DesiredState, RaftRequest, ReplacesPaused, TypeConfig,
+};
 use crate::sesame::types::AgeKeyScope;
 
 /// Persisted snapshot: `data` = JSON of `DesiredState` (which itself carries
@@ -102,6 +104,9 @@ struct StateMachineInner {
     /// state doesn't hold.
     snapshot_last_log_id: Option<LogId<u64>>,
     snapshot_membership: StoredMembership<u64, CouncilNodeInfo>,
+    /// The name `snapshot_data` goes by, made once with it by
+    /// [`snapshot_id_for`].
+    snapshot_id: String,
     /// When set, snapshots are persisted here so applied state survives a
     /// restart (the durable log replays only the post-snapshot tail).
     db: Option<Arc<Database>>,
@@ -126,6 +131,12 @@ impl std::fmt::Debug for StateMachineInner {
 /// Write the latest snapshot (data + index + version + checksum) to redb,
 /// fsyncing on commit. The version and checksum keys land in the same write
 /// transaction as the payload they describe.
+///
+/// A write whose `index` isn't newer than the stored one is skipped (#2049).
+/// openraft builds a snapshot in a spawned task while it installs one inline,
+/// so their commits can land in either order. The counter was taken under
+/// the state lock, so it orders the states, and an older snapshot committing
+/// late must not replace a newer one whose log openraft has already purged.
 // `redb::Error` is large but dictated by the crate; boxing it here buys nothing.
 #[allow(clippy::result_large_err)]
 fn persist_snapshot(db: &Database, data: &[u8], index: u64) -> Result<(), redb::Error> {
@@ -133,6 +144,15 @@ fn persist_snapshot(db: &Database, data: &[u8], index: u64) -> Result<(), redb::
     let wtx = db.begin_write()?;
     {
         let mut t = wtx.open_table(SNAPSHOT)?;
+        let stored = t
+            .get(SNAP_INDEX_KEY)?
+            .and_then(|stored| <[u8; 8]>::try_from(stored.value()).ok())
+            .map(u64::from_le_bytes);
+        if stored.is_some_and(|stored| stored >= index) {
+            drop(t);
+            wtx.abort()?;
+            return Ok(());
+        }
         t.insert(SNAP_DATA_KEY, data)?;
         t.insert(SNAP_INDEX_KEY, index.to_le_bytes().as_slice())?;
         t.insert(
@@ -160,6 +180,25 @@ async fn persist_snapshot_blocking(
         Ok(Err(e)) => Err(StorageError::from(StorageIOError::write_state_machine(&e))),
         Err(e) => Err(StorageError::from(StorageIOError::write_state_machine(&e))),
     }
+}
+
+/// Name a snapshot after the log position it covers, a random value and this
+/// node's snapshot counter (#2051). openraft keeps receiving into one stream
+/// while the id stays the same, and every node counts its own snapshots, so a
+/// counter alone let a new leader's chunks land on top of an old leader's
+/// snapshot of the same number. The random part keeps two snapshots of the
+/// same log position apart too: their JSON needn't match byte for byte.
+fn snapshot_id_for(last_log_id: Option<LogId<u64>>, counter: u64) -> String {
+    let position = last_log_id.map_or_else(
+        || "none".to_string(),
+        |log_id| {
+            format!(
+                "{}-{}-{}",
+                log_id.leader_id.term, log_id.leader_id.node_id, log_id.index
+            )
+        },
+    );
+    format!("{position}-{:016x}-{counter}", rand::random::<u64>())
 }
 
 /// SHA-256 of the snapshot payload bytes.
@@ -216,19 +255,35 @@ fn verify_snapshot_checksum(
 /// above `max` can't reach the log (validation refuses it), but the clamp
 /// mustn't panic on one.
 /// A proposal entry's answer.
+/// Why a start can't take the slot that holds `active` (its id, and
+/// whether it's paused), if it can't. An empty slot takes a start that
+/// replaces nothing; a paused run gives way only to a start that names it.
+fn refuse_replacing(
+    kind: &str,
+    active: Option<(&str, bool)>,
+    replaces: Option<&ReplacesPaused>,
+) -> Option<String> {
+    let named = replaces.map(|replaces| match replaces {
+        ReplacesPaused::Resume { id } | ReplacesPaused::Supersede { id, .. } => id.as_str(),
+    });
+    match (active, named) {
+        (None, None) => None,
+        (None, Some(named)) => Some(format!("{kind} {named} isn't paused any more")),
+        (Some((id, true)), Some(named)) if id == named => None,
+        (Some((id, true)), Some(named)) => {
+            Some(format!("{kind} {named} isn't paused any more; {id} is"))
+        }
+        (Some((id, false)), Some(_)) => Some(format!("{kind} {id} isn't paused any more")),
+        (Some((id, _)), None) => Some(format!("{kind} {id} is in progress")),
+    }
+}
+
 fn proposal_response(outcome: crate::proposal::ProposalOutcome) -> Option<CouncilResponse> {
     Some(CouncilResponse::Proposal(Box::new(outcome)))
 }
 
 fn clamp_to_bounds(replicas: u32, autoscale: &crate::config::app::AutoscaleSpec) -> u32 {
     replicas.max(autoscale.min).min(autoscale.max)
-}
-
-/// Whether `keypair` is the age key `relish init` sealed the root CA backup
-/// to: the cluster-wide key of generation 0. Nothing else seals to it, so
-/// finalising a rotation keeps it, read-only.
-fn opens_root_ca_backup(keypair: &crate::sesame::types::AgeKeypair) -> bool {
-    keypair.scope == crate::sesame::types::AgeKeyScope::ClusterWide && keypair.generation == 0
 }
 
 impl StateMachineInner {
@@ -395,6 +450,69 @@ impl StateMachineInner {
         self.apply_request_at(request, position)
     }
 
+    /// Why a new bun upgrade can't start, if it can't. Raft applies one
+    /// entry at a time, so this is where two racing starts are told apart
+    /// (M13).
+    fn refuse_upgrade_start(
+        &self,
+        start: &crate::upgrade::types::ClusterUpgradeState,
+        replaces: Option<&ReplacesPaused>,
+    ) -> Option<String> {
+        // A bun upgrade and an OS rollout both restart nodes; never start
+        // one while the other holds the fleet.
+        if let Some(rollout) = &self.state.os_rollout {
+            return Some(format!(
+                "OS rollout {} is in progress; resume or abort it first",
+                rollout.rollout_id
+            ));
+        }
+        let active = self.state.active_upgrade.as_ref().map(|active| {
+            let paused = matches!(
+                active.phase,
+                crate::upgrade::types::ClusterUpgradePhase::Paused { .. }
+            );
+            (active.upgrade_id.as_str(), paused)
+        });
+        if let Some(reason) = refuse_replacing("upgrade", active, replaces) {
+            return Some(reason);
+        }
+        self.state
+            .upgrade_history
+            .iter()
+            .any(|ended| ended.upgrade_id == start.upgrade_id)
+            .then(|| format!("upgrade {} has already run", start.upgrade_id))
+    }
+
+    /// Why a new OS rollout can't start, if it can't: the same rules as
+    /// [`Self::refuse_upgrade_start`].
+    fn refuse_os_rollout_start(
+        &self,
+        start: &crate::os::rollout::OsRollout,
+        replaces: Option<&ReplacesPaused>,
+    ) -> Option<String> {
+        if let Some(upgrade) = &self.state.active_upgrade {
+            return Some(format!(
+                "bun upgrade {} is in progress; finish or abort it first",
+                upgrade.upgrade_id
+            ));
+        }
+        let active = self.state.os_rollout.as_ref().map(|active| {
+            let paused = matches!(
+                active.phase,
+                crate::os::rollout::OsRolloutPhase::Paused { .. }
+            );
+            (active.rollout_id.as_str(), paused)
+        });
+        if let Some(reason) = refuse_replacing("OS rollout", active, replaces) {
+            return Some(reason);
+        }
+        self.state
+            .os_rollout_history
+            .iter()
+            .any(|ended| ended.rollout_id == start.rollout_id)
+            .then(|| format!("OS rollout {} has already run", start.rollout_id))
+    }
+
     fn apply_request_at(
         &mut self,
         request: &RaftRequest,
@@ -415,7 +533,7 @@ impl StateMachineInner {
                         reason: "unknown deployment".into(),
                     });
                 };
-                if record.cancelled {
+                if record.cancelled() {
                     return Some(CouncilResponse::Refused {
                         reason: "deployment was cancelled".into(),
                     });
@@ -877,6 +995,19 @@ impl StateMachineInner {
                         reason: "node identity is retired".into(),
                     });
                 }
+                // Refused at creation so the operator learns before handing
+                // the token out; the consume below checks again (#2050).
+                if let Some(existing) =
+                    crate::sesame::join::raft_id_taken_by(&self.state.security_state, &jt.node_id)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: crate::sesame::join::JoinError::RaftIdCollision {
+                            node_id: jt.node_id.clone(),
+                            existing: existing.to_string(),
+                        }
+                        .to_string(),
+                    });
+                }
                 // Prune consumed tokens and cap the list so it can't grow
                 // without bound over a long-lived cluster (O5). Pruning keys on
                 // `consumed` (replicated state) and a fixed cap, not wall-clock
@@ -936,8 +1067,32 @@ impl StateMachineInner {
                         reason: "join token already consumed".to_string(),
                     });
                 }
-                token.consumed = true;
                 let node_id = token.node_id.clone();
+                // Checked again here, not only before the write: two joins
+                // whose names collide can each pass the pre-check (#2050).
+                if let Some(existing) =
+                    crate::sesame::join::raft_id_taken_by(&self.state.security_state, &node_id)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: crate::sesame::join::JoinError::RaftIdCollision {
+                            node_id,
+                            existing: existing.to_string(),
+                        }
+                        .to_string(),
+                    });
+                }
+                let Some(token) = self
+                    .state
+                    .security_state
+                    .join_tokens
+                    .iter_mut()
+                    .find(|jt| jt.token_hash == *token_hash)
+                else {
+                    return Some(CouncilResponse::Refused {
+                        reason: "join token not found".to_string(),
+                    });
+                };
+                token.consumed = true;
                 let serial = self.state.security_state.next_serial;
                 self.state.security_state.next_serial += 1;
                 crate::sesame::ca_rotation::record_node_leaf(
@@ -962,7 +1117,7 @@ impl StateMachineInner {
                 }
                 self.state.security_state.api_tokens.push(token.clone());
             }
-            RaftRequest::RevokeApiToken { name } => {
+            RaftRequest::RevokeApiToken { name, now_unix_ms } => {
                 // Never let a revoke empty the store of Admin tokens. An empty
                 // token store reopens the middleware's bootstrap allow-all
                 // (`sesame::auth`), and the loopback-only bind guard is a
@@ -971,18 +1126,42 @@ impl StateMachineInner {
                 // sequentially, this check is race-free: two concurrent revokes
                 // of two distinct Admins become two entries, and the second one
                 // (now the last Admin) is refused.
+                //
+                // An expired Admin keeps the store from emptying but lets no
+                // one in, and a scoped Admin can't create or revoke tokens
+                // (`require_unscoped`), so neither counts as a replacement:
+                // the last unexpired, unscoped Admin can't go while only
+                // those would be left (#2014). The entry carries the
+                // proposer's clock, as the sweep's does, so every replica
+                // decides the same way.
                 use crate::sesame::types::ApiRole;
                 let tokens = &self.state.security_state.api_tokens;
-                let target_is_admin = tokens
+                let usable = |t: &crate::sesame::types::ApiToken| {
+                    t.scope.apps.is_none()
+                        && t.scope.namespaces.is_none()
+                        && t.expires_at
+                            .is_none_or(|at| crate::sesame::token::unix_millis(at) > *now_unix_ms)
+                };
+                let target = tokens
                     .iter()
-                    .any(|t| t.name == *name && t.role == ApiRole::Admin);
-                let admin_count = tokens.iter().filter(|t| t.role == ApiRole::Admin).count();
-                if target_is_admin && admin_count <= 1 {
+                    .find(|t| t.name == *name && t.role == ApiRole::Admin);
+                let admins = tokens.iter().filter(|t| t.role == ApiRole::Admin);
+                let admin_count = admins.clone().count();
+                let usable_admins = admins.filter(|t| usable(t)).count();
+                let refusal = match target {
+                    Some(_) if admin_count <= 1 => Some(
+                        "it is the only Admin token; create a replacement Admin token \
+                         before revoking this one",
+                    ),
+                    Some(target) if usable(target) && usable_admins <= 1 => Some(
+                        "it is the last unexpired, unscoped Admin token, the only kind \
+                         that can manage tokens; create a replacement before revoking this one",
+                    ),
+                    _ => None,
+                };
+                if let Some(why) = refusal {
                     return Some(CouncilResponse::Refused {
-                        reason: format!(
-                            "refusing to revoke {name:?}: it is the last Admin token; \
-                             create a replacement Admin token before revoking this one"
-                        ),
+                        reason: format!("refusing to revoke {name:?}: {why}"),
                     });
                 }
                 self.state
@@ -1139,14 +1318,12 @@ impl StateMachineInner {
                         ),
                     });
                 }
-                // The cluster-wide generation-0 key stays, read-only: `relish
-                // init` sealed the root CA's private key to it
-                // (`<cluster>-root-ca.age`), and no seal record knows that, so
-                // retiring it would leave the root backup unopenable (F04 R0).
+                // Every old key goes: the root CA backup is sealed to the
+                // operator, not to a cluster key (#709).
                 self.state
                     .security_state
                     .age_keypairs
-                    .retain(|kp| kp.scope != *scope || !kp.read_only || opens_root_ca_backup(kp));
+                    .retain(|kp| kp.scope != *scope || !kp.read_only);
             }
             RaftRequest::RevokeCertificate(entry) => {
                 self.state.security_state.crl.entries.push(entry.clone());
@@ -1252,27 +1429,41 @@ impl StateMachineInner {
                     .cloned()
                     .collect();
             }
-            RaftRequest::UpgradeUpdate { state } => {
-                // Reject starting a *different* upgrade while one is actively in
-                // progress (M13). The start/rollback handlers check
-                // `active_upgrade` then write, which is racy — two concurrent
-                // starts both passed the is_some() guard and the second
-                // clobbered the first plan mid-flight. Serialised Raft apply is
-                // the right place to enforce it.
-                //
-                // A resume legitimately renames the run to a fresh id and
-                // replaces a *Paused* upgrade, so only a different-id write
-                // against a non-paused active upgrade is the race to block; a
-                // same-id phase update, or a resume of a paused run, still
-                // applies.
-                if let Some(active) = &self.state.active_upgrade
-                    && active.upgrade_id != state.upgrade_id
-                    && !matches!(
-                        active.phase,
-                        crate::upgrade::types::ClusterUpgradePhase::Paused { .. }
-                    )
+            RaftRequest::UpgradeStart { state, replaces } => {
+                if let Some(reason) = self.refuse_upgrade_start(state, replaces.as_ref()) {
+                    return Some(CouncilResponse::Refused { reason });
+                }
+                if let Some(ReplacesPaused::Supersede { reason, .. }) = replaces
+                    && let Some(mut ended) = self.state.active_upgrade.take()
                 {
-                    return None;
+                    ended.phase = crate::upgrade::types::ClusterUpgradePhase::Aborted {
+                        reason: reason.clone(),
+                    };
+                    self.state.upgrade_history.push(ended);
+                    if self.state.upgrade_history.len() > 20 {
+                        self.state.upgrade_history.remove(0);
+                    }
+                }
+                self.state.active_upgrade = Some(*state.clone());
+            }
+            RaftRequest::UpgradeUpdate { state } => {
+                // Progress only: the run must still be the active one. The
+                // orchestrator and the abort handler each read the run,
+                // work, then write; a write computed before an abort or a
+                // completion must not bring the run back once it's ended or
+                // been cleared.
+                let current = self.state.active_upgrade.as_ref().is_some_and(|active| {
+                    active.upgrade_id == state.upgrade_id
+                        && !matches!(
+                            active.phase,
+                            crate::upgrade::types::ClusterUpgradePhase::Completed
+                                | crate::upgrade::types::ClusterUpgradePhase::Aborted { .. }
+                        )
+                });
+                if !current {
+                    return Some(CouncilResponse::Refused {
+                        reason: format!("upgrade {} isn't in progress", state.upgrade_id),
+                    });
                 }
                 self.state.active_upgrade = Some(*state.clone());
             }
@@ -1286,6 +1477,53 @@ impl StateMachineInner {
                     } else {
                         // Clear for a different id: put it back untouched.
                         self.state.active_upgrade = Some(active);
+                    }
+                }
+            }
+            RaftRequest::OsRolloutStart { rollout, replaces } => {
+                if let Some(reason) = self.refuse_os_rollout_start(rollout, replaces.as_ref()) {
+                    return Some(CouncilResponse::Refused { reason });
+                }
+                if let Some(ReplacesPaused::Supersede { reason, .. }) = replaces
+                    && let Some(mut ended) = self.state.os_rollout.take()
+                {
+                    ended.phase = crate::os::rollout::OsRolloutPhase::Aborted {
+                        reason: reason.clone(),
+                    };
+                    self.state.os_rollout_history.push(ended);
+                    if self.state.os_rollout_history.len() > 20 {
+                        self.state.os_rollout_history.remove(0);
+                    }
+                }
+                self.state.os_rollout = Some(*rollout.clone());
+            }
+            RaftRequest::OsRolloutUpdate { rollout } => {
+                // Progress only, as for a bun upgrade: the leader's loop
+                // reads the rollout, waits on the nodes for up to 30 s, then
+                // writes. `relish os abort` in between ends and clears it,
+                // and the late write must not bring it back.
+                let current = self.state.os_rollout.as_ref().is_some_and(|active| {
+                    active.rollout_id == rollout.rollout_id && !active.phase.is_terminal()
+                });
+                if !current {
+                    return Some(CouncilResponse::Refused {
+                        reason: format!("OS rollout {} isn't in progress", rollout.rollout_id),
+                    });
+                }
+                self.state.os_rollout = Some(*rollout.clone());
+            }
+            RaftRequest::CouncilSize { voters } => {
+                self.state.council_size = Some(*voters);
+            }
+            RaftRequest::OsRolloutClear { rollout_id } => {
+                if let Some(active) = self.state.os_rollout.take() {
+                    if active.rollout_id == *rollout_id {
+                        self.state.os_rollout_history.push(active);
+                        if self.state.os_rollout_history.len() > 20 {
+                            self.state.os_rollout_history.remove(0);
+                        }
+                    } else {
+                        self.state.os_rollout = Some(active);
                     }
                 }
             }
@@ -2458,6 +2696,20 @@ impl StateMachineInner {
                         reason: "node identity is retired".into(),
                     });
                 }
+                // The leaf recorded below would seat this name in
+                // `node_leaves`, so it must not share another node's Raft
+                // id any more than a join may (#2050).
+                if let Some(existing) =
+                    crate::sesame::join::raft_id_taken_by(&self.state.security_state, node_id)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: crate::sesame::join::JoinError::RaftIdCollision {
+                            node_id: node_id.clone(),
+                            existing: existing.to_string(),
+                        }
+                        .to_string(),
+                    });
+                }
                 let serial = self.state.security_state.next_serial;
                 self.state.security_state.next_serial += 1;
                 crate::sesame::ca_rotation::record_node_leaf(
@@ -2499,6 +2751,29 @@ impl StateMachineInner {
                         },
                     },
                 );
+            }
+            RaftRequest::RotateOidcSigningKey {
+                signing_key,
+                retire_after_unix_secs,
+                now_unix_secs,
+            } => {
+                return crate::sesame::oidc::rotate_signing_key(
+                    &mut self.state.security_state,
+                    signing_key.clone(),
+                    *retire_after_unix_secs,
+                    *now_unix_secs,
+                )
+                .err()
+                .map(|error| CouncilResponse::Refused {
+                    reason: error.to_string(),
+                });
+            }
+            RaftRequest::RetireOidcSigningKeys { now_unix_secs } => {
+                crate::sesame::oidc::retire_signing_keys(
+                    &mut self.state.security_state,
+                    *now_unix_secs,
+                );
+                return None;
             }
             RaftRequest::AcknowledgeNodeTrust {
                 node_id,
@@ -3517,6 +3792,7 @@ impl CouncilStateMachine {
             {
                 inner.snapshot_index = u64::from_le_bytes(le);
             }
+            inner.snapshot_id = snapshot_id_for(inner.snapshot_last_log_id, inner.snapshot_index);
         }
         inner.db = Some(db);
         Ok(Self::around(inner))
@@ -3554,6 +3830,9 @@ impl CouncilStateMachine {
     /// The write uses the same enveloped format (version + checksum) as a
     /// normal snapshot, so nothing downstream can tell a recovered snapshot
     /// from an ordinary one except by the bumped `recovery_epoch`.
+    ///
+    /// `snapshot_db` must hold no snapshot yet; a populated store is refused
+    /// with an error rather than left unchanged.
     // `redb::Error` is large but dictated by the crate; boxing it buys nothing.
     #[allow(clippy::result_large_err)]
     pub fn persist_recovered_snapshot(
@@ -3562,6 +3841,23 @@ impl CouncilStateMachine {
     ) -> Result<(), redb::Error> {
         // Serialisation of a plain struct with only owned data is infallible in
         // practice; map any error into a redb error rather than panicking.
+        // Counter 1 is only right in an empty store: `persist_snapshot`
+        // skips a write that isn't newer than what's stored (#2049), so
+        // against a populated store this would silently write nothing.
+        // Recovery always stages a fresh store; refuse anything else.
+        let populated = {
+            let rtx = snapshot_db.begin_read()?;
+            match rtx.open_table(SNAPSHOT) {
+                Ok(table) => table.get(SNAP_INDEX_KEY)?.is_some(),
+                Err(redb::TableError::TableDoesNotExist(_)) => false,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        if populated {
+            return Err(redb::Error::Io(std::io::Error::other(
+                "a recovered snapshot needs an empty snapshot store",
+            )));
+        }
         let data = serde_json::to_vec(&state)
             .map_err(|e| redb::Error::Io(std::io::Error::other(e.to_string())))?;
         persist_snapshot(snapshot_db, &data, 1)
@@ -3675,6 +3971,8 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         MemSnapshotBuilder {
             inner: Arc::clone(&self.inner),
+            #[cfg(test)]
+            lock_free_while_encoding: None,
         }
     }
 
@@ -3689,9 +3987,15 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
         meta: &SnapshotMeta<u64, CouncilNodeInfo>,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<u64>> {
+        // Decoding the whole desired state is CPU work that grows with the
+        // cluster: off the runtime, so the worker keeps serving heartbeats.
         let data = snapshot.into_inner();
-        let new_state: DesiredState = serde_json::from_slice(&data)
-            .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
+        let (new_state, data) = tokio::task::spawn_blocking(move || {
+            serde_json::from_slice::<DesiredState>(&data).map(|state| (state, data))
+        })
+        .await
+        .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?
+        .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
 
         let (db, index) = {
             let mut guard = self.inner.write().await;
@@ -3704,6 +4008,7 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
             guard.snapshot_data = Some(data.clone());
             guard.snapshot_last_log_id = meta.last_log_id;
             guard.snapshot_membership = meta.last_membership.clone();
+            guard.snapshot_id = snapshot_id_for(meta.last_log_id, guard.snapshot_index);
             (guard.db.clone(), guard.snapshot_index)
         };
 
@@ -3724,7 +4029,7 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
                 let meta = SnapshotMeta {
                     last_log_id: guard.snapshot_last_log_id,
                     last_membership: guard.snapshot_membership.clone(),
-                    snapshot_id: format!("mem-{}", guard.snapshot_index),
+                    snapshot_id: guard.snapshot_id.clone(),
                 };
                 Ok(Some(Snapshot {
                     meta,
@@ -3744,29 +4049,87 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
 #[derive(Debug)]
 pub struct MemSnapshotBuilder {
     inner: Arc<RwLock<StateMachineInner>>,
+    /// Test hook: set to whether the state lock was free just before the
+    /// encode started.
+    #[cfg(test)]
+    lock_free_while_encoding: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+/// What [`MemSnapshotBuilder::build_snapshot`] stored, and the store to
+/// persist it to (`None` when there is nothing new to persist).
+struct BuiltSnapshot {
+    data: Vec<u8>,
+    snapshot_id: String,
+    index: u64,
+    db: Option<Arc<Database>>,
+    last_log_id: Option<LogId<u64>>,
+    last_membership: StoredMembership<u64, CouncilNodeInfo>,
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for MemSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
-        let (data, index, db, last_log_id, last_membership) = {
-            let mut guard = self.inner.write().await;
-            let data = serde_json::to_vec(&guard.state)
-                .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
+        // Encoding the whole desired state is CPU work that grows with the
+        // cluster: on a slow CPU it takes seconds. It runs on a blocking
+        // thread, from a copy taken under a short read lock, and takes the
+        // write lock only to store the result, so `apply`, and every council
+        // write behind it, never waits for the encode.
+        let inner = Arc::clone(&self.inner);
+        #[cfg(test)]
+        let lock_free_while_encoding = self.lock_free_while_encoding.clone();
+        let built = tokio::task::spawn_blocking(move || {
+            let state = inner.blocking_read().state.clone();
+            #[cfg(test)]
+            if let Some(flag) = &lock_free_while_encoding {
+                flag.store(
+                    inner.try_write().is_ok(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }
+            let data = serde_json::to_vec(&state)?;
+            let mut guard = inner.blocking_write();
+            // A snapshot installed from the leader while this one encoded
+            // is newer: keep it, and hand it back instead of this one.
+            if guard.snapshot_last_log_id > state.last_applied_log
+                && let Some(newer) = &guard.snapshot_data
+            {
+                return Ok::<_, serde_json::Error>(BuiltSnapshot {
+                    data: newer.clone(),
+                    snapshot_id: guard.snapshot_id.clone(),
+                    index: guard.snapshot_index,
+                    db: None,
+                    last_log_id: guard.snapshot_last_log_id,
+                    last_membership: guard.snapshot_membership.clone(),
+                });
+            }
             guard.snapshot_index += 1;
             guard.snapshot_data = Some(data.clone());
-            guard.snapshot_last_log_id = guard.state.last_applied_log;
-            guard.snapshot_membership = guard.state.last_membership.clone();
-            (
+            guard.snapshot_last_log_id = state.last_applied_log;
+            guard.snapshot_membership = state.last_membership.clone();
+            guard.snapshot_id = snapshot_id_for(state.last_applied_log, guard.snapshot_index);
+            Ok(BuiltSnapshot {
                 data,
-                guard.snapshot_index,
-                guard.db.clone(),
-                guard.state.last_applied_log,
-                guard.state.last_membership.clone(),
-            )
-        };
+                snapshot_id: guard.snapshot_id.clone(),
+                index: guard.snapshot_index,
+                db: guard.db.clone(),
+                last_log_id: state.last_applied_log,
+                last_membership: state.last_membership,
+            })
+        })
+        .await
+        .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?
+        .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
+        let BuiltSnapshot {
+            data,
+            snapshot_id,
+            index,
+            db,
+            last_log_id,
+            last_membership,
+        } = built;
 
         // Persist so applied state survives a restart, off the async runtime
-        // (M7): the lock is released before the fsync.
+        // (M7): the lock is released before the fsync. A newer installed
+        // snapshot was persisted by its install.
         if let Some(db) = db {
             persist_snapshot_blocking(db, data.clone(), index).await?;
         }
@@ -3774,7 +4137,7 @@ impl RaftSnapshotBuilder<TypeConfig> for MemSnapshotBuilder {
         let meta = SnapshotMeta {
             last_log_id,
             last_membership,
-            snapshot_id: format!("mem-{index}"),
+            snapshot_id,
         };
 
         Ok(Snapshot {
@@ -4544,6 +4907,67 @@ mod tests {
             t.insert(key, bytes.as_slice()).unwrap();
         }
         wtx.commit().unwrap();
+    }
+
+    /// openraft builds a snapshot in a spawned task while it installs one
+    /// inline, so their two commits can land in either order. The install
+    /// (newer, counter 2) committing before the build (older, counter 1)
+    /// must leave the install on disk, or a restart finds the log purged
+    /// past the stored snapshot and refuses to start.
+    #[tokio::test]
+    async fn an_older_snapshot_committing_late_does_not_overwrite_a_newer_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("order.redb");
+        let db = Database::create(&path).unwrap();
+        let state_at = |index| {
+            let state = DesiredState {
+                last_applied_log: Some(log_id(1, index)),
+                ..DesiredState::default()
+            };
+            serde_json::to_vec(&state).unwrap()
+        };
+
+        persist_snapshot(&db, &state_at(20), 2).unwrap();
+        persist_snapshot(&db, &state_at(10), 1).unwrap();
+        drop(db);
+
+        let mut sm =
+            CouncilStateMachine::with_store(std::sync::Arc::new(Database::create(&path).unwrap()))
+                .unwrap();
+        let (last_applied, _) = sm.applied_state().await.unwrap();
+        assert_eq!(last_applied.map(|l| l.index), Some(20));
+    }
+
+    /// openraft keeps receiving into one stream while the snapshot id stays
+    /// the same. Two nodes that built the same number of snapshots must
+    /// still name theirs differently, or a leader change mid-transfer
+    /// splices the new leader's chunks into the old one's bytes.
+    #[tokio::test]
+    async fn two_nodes_with_the_same_snapshot_count_name_their_snapshots_apart() {
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let mut sm = CouncilStateMachine::new();
+            sm.apply_fixture(vec![normal_entry(
+                1,
+                1,
+                RaftRequest::AppSpec {
+                    app_id: AppId::new("web", "prod"),
+                    spec: Box::new(default_spec()),
+                },
+            )])
+            .await
+            .unwrap();
+            let built = sm
+                .get_snapshot_builder()
+                .await
+                .build_snapshot()
+                .await
+                .unwrap();
+            let current = sm.get_current_snapshot().await.unwrap().unwrap();
+            assert_eq!(built.meta.snapshot_id, current.meta.snapshot_id);
+            ids.push(built.meta.snapshot_id);
+        }
+        assert_ne!(ids[0], ids[1]);
     }
 
     #[tokio::test]
@@ -6361,6 +6785,25 @@ mod tests {
         assert!(!held.config.contains_key("after-snapshot"));
     }
 
+    /// Encoding a big desired state takes seconds on a slow CPU. If the
+    /// builder held the state lock meanwhile, every apply, and so every
+    /// council write, waited behind it, long enough to hit the write
+    /// timeout. It encodes a copy instead and locks only to store it.
+    #[tokio::test]
+    async fn a_snapshot_build_leaves_the_state_lock_free_while_it_encodes() {
+        let sm = CouncilStateMachine::new();
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut builder = MemSnapshotBuilder {
+            inner: Arc::clone(&sm.inner),
+            lock_free_while_encoding: Some(Arc::clone(&flag)),
+        };
+        builder.build_snapshot().await.unwrap();
+        assert!(
+            flag.load(std::sync::atomic::Ordering::SeqCst),
+            "the builder held the state lock while it encoded"
+        );
+    }
+
     #[tokio::test]
     async fn get_current_snapshot_returns_none_initially() {
         let mut sm = CouncilStateMachine::new();
@@ -7035,9 +7478,9 @@ mod tests {
             .iter()
             .map(|kp| (kp.generation, kp.read_only))
             .collect();
-        // Gen 1 is retired; gen 0 stays, read-only, because it opens the
-        // root CA backup `relish init` wrote (F04 R0).
-        assert_eq!(remaining, [(0, true), (2, false)]);
+        // Every old generation is retired: nothing is sealed to gen 0 any
+        // more, because the root CA backup is the operator's (#709).
+        assert_eq!(remaining, [(2, false)]);
     }
 
     /// F04 R1 through the log: a Node CA rotation begins, a second one is
@@ -7159,6 +7602,43 @@ mod tests {
             inner.state.security_state.trusted_cas(CaRole::Node).len(),
             1
         );
+    }
+
+    /// #709: a signing-key rotation through the log moves the old key to
+    /// retiring with the window the proposer chose, refuses a cluster with
+    /// no key, and a later retire drops the old key once its window ends.
+    #[test]
+    fn oidc_signing_key_rotation_and_retirement_through_the_log() {
+        let ikm = [6u8; 32];
+        let old = crate::sesame::oidc::generate_oidc_keypair("https://rotate", &ikm).unwrap();
+        let new = crate::sesame::oidc::generate_oidc_keypair("https://rotate", &ikm).unwrap();
+        let mut inner = StateMachineInner::default();
+        let rotate = RaftRequest::RotateOidcSigningKey {
+            signing_key: new.clone(),
+            retire_after_unix_secs: 2_000,
+            now_unix_secs: 1_000,
+        };
+        assert!(matches!(
+            inner.apply_request(&rotate),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        inner.state.security_state.oidc_signing_config = Some(old.clone());
+        assert_eq!(inner.apply_request(&rotate), None);
+        let security = &inner.state.security_state;
+        assert_eq!(security.oidc_signing_config.as_ref(), Some(&new));
+        assert_eq!(security.retiring_oidc_keys.len(), 1);
+        assert_eq!(security.retiring_oidc_keys[0].key_id, old.key_id);
+
+        let early = RaftRequest::RetireOidcSigningKeys {
+            now_unix_secs: 1_999,
+        };
+        assert_eq!(inner.apply_request(&early), None);
+        assert_eq!(inner.state.security_state.retiring_oidc_keys.len(), 1);
+        let due = RaftRequest::RetireOidcSigningKeys {
+            now_unix_secs: 2_000,
+        };
+        assert_eq!(inner.apply_request(&due), None);
+        assert!(inner.state.security_state.retiring_oidc_keys.is_empty());
     }
 
     /// F04 R4 through the log: prepare allocates the serial the operator's
@@ -7482,15 +7962,13 @@ mod tests {
         );
     }
 
-    /// F04 R0: `relish init` seals the root CA's private key to the cluster's
-    /// generation-0 age key, in `<cluster>-root-ca.age`. Finalising a secret
-    /// rotation used to drop that key, after which nothing the cluster holds
-    /// could open the root backup.
+    /// #709: the root CA backup is sealed to the operator, so nothing keeps
+    /// an old cluster-wide key alive. Finalising a rotation retires every
+    /// one, generation 0 included.
     #[test]
-    fn the_root_backup_still_opens_after_a_finalised_secret_rotation() {
+    fn secret_rotation_finalise_retires_the_generation_zero_key() {
         use crate::sesame::types::AgeKeyScope;
-        let dir = tempfile::tempdir().unwrap();
-        let init = crate::sesame::init::initialize_cluster("prod", "node-1", dir.path()).unwrap();
+        let init = crate::sesame::init::initialize_cluster("prod", "node-1").unwrap();
         let mut inner = StateMachineInner::default();
         inner.apply_request(&RaftRequest::SecurityStateInit(Box::new(
             init.security_state.clone(),
@@ -7513,22 +7991,15 @@ mod tests {
             !matches!(response, Some(CouncilResponse::Refused { .. })),
             "{response:?}"
         );
-
-        let sealed = std::fs::read(&init.sealed_root_ca_path).unwrap();
-        let opened = inner
+        let generations: Vec<u64> = inner
             .state
             .security_state
             .age_keypairs
             .iter()
             .filter(|kp| kp.scope == AgeKeyScope::ClusterWide)
-            .filter_map(|kp| {
-                crate::sesame::secret::unwrap_age_identity(kp, &init.master_secret).ok()
-            })
-            .find_map(|identity| crate::sesame::secret::unseal_with_age(&sealed, &identity).ok());
-        assert!(
-            opened.is_some(),
-            "no key left in the state opens the root CA backup"
-        );
+            .map(|kp| kp.generation)
+            .collect();
+        assert_eq!(generations, vec![1]);
     }
 
     #[test]
@@ -7657,9 +8128,8 @@ mod tests {
             .iter()
             .map(|kp| (kp.generation, kp.read_only))
             .collect();
-        // Gen 1 is the only active key; gen 0 stays read-only for the root
-        // CA backup (F04 R0).
-        assert_eq!(remaining, [(0, true), (1, false)]);
+        // Gen 1 is the only key left (#709).
+        assert_eq!(remaining, [(1, false)]);
     }
 
     /// PKI8: a second rotation while one is un-finalised is refused; the
@@ -7993,6 +8463,126 @@ mod tests {
         assert_eq!(inner.state.security_state.next_serial, 8);
     }
 
+    fn join_token_for(node_id: &str, hash: u8) -> crate::sesame::types::JoinToken {
+        crate::sesame::types::JoinToken {
+            token_hash: [hash; 32],
+            expires_at: std::time::SystemTime::now(),
+            consumed: false,
+            attestation_mode: crate::sesame::types::AttestationMode::None,
+            node_id: node_id.to_string(),
+        }
+    }
+
+    /// `worker-c0` and `worker-ar` hash to the same Raft id. A second node
+    /// under that id would hide the first: a dead voter would look alive
+    /// through the other node's gossip. A token for the second name is
+    /// refused when it's created.
+    #[test]
+    fn create_join_token_refuses_a_node_whose_raft_id_is_taken() {
+        let mut inner = StateMachineInner::default();
+        crate::sesame::ca_rotation::record_node_leaf(
+            &mut inner.state.security_state,
+            "worker-c0",
+            3,
+        );
+
+        let resp = inner.apply_request(&RaftRequest::CreateJoinToken(join_token_for(
+            "worker-ar",
+            0xCE,
+        )));
+
+        let Some(CouncilResponse::Refused { reason }) = resp else {
+            panic!("expected a refusal, got {resp:?}");
+        };
+        assert!(reason.contains("worker-c0"), "{reason}");
+        assert!(inner.state.security_state.join_tokens.is_empty());
+        let again = inner.apply_request(&RaftRequest::CreateJoinToken(join_token_for(
+            "worker-c0",
+            0xCF,
+        )));
+        assert_eq!(again, None, "the same name may enrol again");
+    }
+
+    /// Two tokens minted before either node joined: whichever consumes
+    /// second is refused, and spends neither its token nor a serial.
+    #[test]
+    fn consume_join_token_for_issue_refuses_a_node_whose_raft_id_is_taken() {
+        let mut inner = StateMachineInner::default();
+        inner.state.security_state.next_serial = 7;
+        inner.apply_request(&RaftRequest::CreateJoinToken(join_token_for(
+            "worker-ar",
+            0xCE,
+        )));
+        crate::sesame::ca_rotation::record_node_leaf(
+            &mut inner.state.security_state,
+            "worker-c0",
+            3,
+        );
+
+        let resp = inner.apply_request(&RaftRequest::ConsumeJoinTokenForIssue {
+            token_hash: [0xCE; 32],
+        });
+
+        let Some(CouncilResponse::Refused { reason }) = resp else {
+            panic!("expected a refusal, got {resp:?}");
+        };
+        assert!(reason.contains("worker-c0"), "{reason}");
+        assert!(!inner.state.security_state.join_tokens[0].consumed);
+        assert_eq!(inner.state.security_state.next_serial, 7);
+    }
+
+    /// A serial for a node leaf (renewal, bootstrap) records the node in
+    /// `node_leaves` too, so it refuses a name whose Raft id another node
+    /// holds, and allocates nothing (#2050). The same name renews as before.
+    #[test]
+    fn allocate_node_serial_refuses_a_node_whose_raft_id_is_taken() {
+        let mut inner = StateMachineInner::default();
+        inner.state.security_state.next_serial = 7;
+        crate::sesame::ca_rotation::record_node_leaf(
+            &mut inner.state.security_state,
+            "worker-c0",
+            3,
+        );
+
+        let resp = inner.apply_request(&RaftRequest::AllocateNodeSerial {
+            node_id: "worker-ar".into(),
+        });
+
+        let Some(CouncilResponse::Refused { reason }) = resp else {
+            panic!("expected a refusal, got {resp:?}");
+        };
+        assert!(reason.contains("worker-c0"), "{reason}");
+        assert_eq!(inner.state.security_state.next_serial, 7);
+        assert!(
+            !inner
+                .state
+                .security_state
+                .node_leaves
+                .contains_key("worker-ar")
+        );
+        let renewal = inner.apply_request(&RaftRequest::AllocateNodeSerial {
+            node_id: "worker-c0".into(),
+        });
+        assert_eq!(
+            renewal,
+            Some(CouncilResponse::SerialAllocated { serial: 7 })
+        );
+    }
+
+    /// The recovered snapshot is written with counter 1, which a store that
+    /// already holds a snapshot would skip. Recovery always stages a fresh
+    /// store, so a populated one is a caller bug and says so.
+    #[test]
+    fn a_recovered_snapshot_refuses_a_store_that_already_holds_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path().join("snapshot.redb")).unwrap();
+        persist_snapshot(&db, b"{}", 4).unwrap();
+
+        let result = CouncilStateMachine::persist_recovered_snapshot(&db, DesiredState::default());
+
+        assert!(result.is_err(), "{result:?}");
+    }
+
     #[test]
     fn consume_join_token_for_issue_refuses_an_unknown_token() {
         let mut inner = StateMachineInner::default();
@@ -8038,6 +8628,7 @@ mod tests {
 
         inner.apply_request(&RaftRequest::RevokeApiToken {
             name: "ci".to_string(),
+            now_unix_ms: 0,
         });
         assert!(inner.state.security_state.api_tokens.is_empty());
     }
@@ -8212,6 +8803,7 @@ mod tests {
         // Admin at runtime (which would reopen the bootstrap allow-all).
         let resp = inner.apply_request(&RaftRequest::RevokeApiToken {
             name: "admin-a".to_string(),
+            now_unix_ms: 0,
         });
         assert!(matches!(resp, Some(CouncilResponse::Refused { .. })));
         assert!(
@@ -8227,6 +8819,7 @@ mod tests {
         // A non-Admin token is always revocable, even as the only non-Admin.
         inner.apply_request(&RaftRequest::RevokeApiToken {
             name: "deployer".to_string(),
+            now_unix_ms: 0,
         });
         assert!(
             !inner
@@ -8244,6 +8837,7 @@ mod tests {
         )));
         inner.apply_request(&RaftRequest::RevokeApiToken {
             name: "admin-a".to_string(),
+            now_unix_ms: 0,
         });
         let admins: Vec<_> = inner
             .state
@@ -8254,6 +8848,132 @@ mod tests {
             .map(|t| t.name.clone())
             .collect();
         assert_eq!(admins, vec!["admin-b".to_string()]);
+    }
+
+    #[test]
+    fn revoke_refuses_to_remove_the_last_unexpired_admin_token() {
+        use crate::sesame::types::{ApiRole, ApiToken, TokenScope};
+        use std::time::{Duration, SystemTime};
+        const NOW_MS: u64 = 2_000_000_000_000;
+        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(NOW_MS);
+        let admin = |name: &str, expires_at: Option<SystemTime>| ApiToken {
+            name: name.to_string(),
+            token_hash: vec![1, 2, 3],
+            role: ApiRole::Admin,
+            kind: crate::sesame::types::TokenKind::Human,
+            scope: TokenScope::default(),
+            expires_at,
+            created_at: SystemTime::UNIX_EPOCH,
+            previous_secret: None,
+        };
+        let revoke = |name: &str| RaftRequest::RevokeApiToken {
+            name: name.to_string(),
+            now_unix_ms: NOW_MS,
+        };
+
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::CreateApiToken(admin("live", None)));
+        inner.apply_request(&RaftRequest::CreateApiToken(admin(
+            "expired",
+            Some(now - Duration::from_secs(60)),
+        )));
+
+        // Two Admin tokens, but only one anyone can still use: revoking it
+        // would lock every operator out (#2014).
+        let resp = inner.apply_request(&revoke("live"));
+        assert!(
+            matches!(resp, Some(CouncilResponse::Refused { .. })),
+            "revoking the last unexpired Admin must be refused, got {resp:?}"
+        );
+        assert_eq!(token_names(&inner), ["live", "expired"]);
+
+        // The expired one can go: the usable Admin stays.
+        let resp = inner.apply_request(&revoke("expired"));
+        assert!(!matches!(resp, Some(CouncilResponse::Refused { .. })));
+        assert_eq!(token_names(&inner), ["live"]);
+
+        // A token expiring later than the entry's time still counts as usable.
+        inner.apply_request(&RaftRequest::CreateApiToken(admin(
+            "later",
+            Some(now + Duration::from_secs(60)),
+        )));
+        let resp = inner.apply_request(&revoke("live"));
+        assert!(!matches!(resp, Some(CouncilResponse::Refused { .. })));
+        assert_eq!(token_names(&inner), ["later"]);
+    }
+
+    /// Token create and revoke need an unscoped token, so a namespace-scoped
+    /// Admin can't replace the root one: revoking root would lock everyone
+    /// out of token management (#2014 review).
+    #[test]
+    fn revoke_refuses_to_remove_the_last_unscoped_admin_token() {
+        use crate::sesame::types::{ApiRole, ApiToken, TokenScope};
+        let admin = |name: &str, scope: TokenScope| ApiToken {
+            name: name.to_string(),
+            token_hash: vec![1, 2, 3],
+            role: ApiRole::Admin,
+            kind: crate::sesame::types::TokenKind::Human,
+            scope,
+            expires_at: None,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            previous_secret: None,
+        };
+        let revoke = |name: &str| RaftRequest::RevokeApiToken {
+            name: name.to_string(),
+            now_unix_ms: 2_000_000_000_000,
+        };
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::CreateApiToken(admin(
+            "root",
+            TokenScope::default(),
+        )));
+        inner.apply_request(&RaftRequest::CreateApiToken(admin(
+            "team",
+            TokenScope {
+                apps: None,
+                namespaces: Some(vec!["team".to_string()]),
+            },
+        )));
+
+        let resp = inner.apply_request(&revoke("root"));
+        let Some(CouncilResponse::Refused { reason }) = resp else {
+            panic!("revoking the last unscoped Admin must be refused, got {resp:?}");
+        };
+        assert!(reason.contains("unscoped"), "{reason}");
+        assert_eq!(token_names(&inner), ["root", "team"]);
+
+        // The scoped one can go while root stays.
+        let resp = inner.apply_request(&revoke("team"));
+        assert!(!matches!(resp, Some(CouncilResponse::Refused { .. })));
+        assert_eq!(token_names(&inner), ["root"]);
+    }
+
+    #[test]
+    fn revoke_refuses_to_remove_the_only_admin_even_when_it_has_expired() {
+        use crate::sesame::types::{ApiRole, ApiToken, TokenScope};
+        use std::time::{Duration, SystemTime};
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::CreateApiToken(ApiToken {
+            name: "old".to_string(),
+            token_hash: vec![1],
+            role: ApiRole::Admin,
+            kind: crate::sesame::types::TokenKind::Human,
+            scope: TokenScope::default(),
+            expires_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+            created_at: SystemTime::UNIX_EPOCH,
+            previous_secret: None,
+        }));
+        let resp = inner.apply_request(&RaftRequest::RevokeApiToken {
+            name: "old".to_string(),
+            now_unix_ms: 2_000_000_000_000,
+        });
+        let Some(CouncilResponse::Refused { reason }) = resp else {
+            panic!("the only Admin must survive, got {resp:?}");
+        };
+        // It has expired, so "the last unexpired Admin" would be wrong.
+        assert!(reason.contains("the only Admin token"), "{reason}");
+        assert!(!reason.contains("unexpired"), "{reason}");
+        assert_eq!(token_names(&inner), ["old"]);
     }
 
     fn rotation_for(name: &str, hash: u8) -> crate::sesame::types::TokenRotation {
@@ -8379,31 +9099,234 @@ mod tests {
     #[test]
     fn upgrade_update_replaces_active_state() {
         let mut inner = StateMachineInner::default();
-        inner.apply_request(&RaftRequest::UpgradeUpdate {
+        inner.apply_request(&RaftRequest::UpgradeStart {
             state: Box::new(upgrade_state("up-1")),
+            replaces: None,
         });
         let mut advanced = upgrade_state("up-1");
         advanced.phase = crate::upgrade::types::ClusterUpgradePhase::UpgradingWorkers;
-        inner.apply_request(&RaftRequest::UpgradeUpdate {
-            state: Box::new(advanced.clone()),
-        });
+        assert_eq!(
+            inner.apply_request(&RaftRequest::UpgradeUpdate {
+                state: Box::new(advanced.clone()),
+            }),
+            None
+        );
 
         assert_eq!(inner.state.active_upgrade, Some(advanced));
         assert!(inner.state.upgrade_history.is_empty());
     }
 
+    fn os_rollout(id: &str) -> crate::os::rollout::OsRollout {
+        crate::os::rollout::plan(
+            id,
+            "2026.42.0",
+            "https://example/os-channel.json",
+            "n1",
+            vec![(
+                "n1".into(),
+                "10.0.0.1:9117".into(),
+                true,
+                "2026.41.0".into(),
+            )],
+            0,
+        )
+    }
+
+    fn is_refused(response: Option<CouncilResponse>) -> bool {
+        matches!(response, Some(CouncilResponse::Refused { .. }))
+    }
+
     #[test]
-    fn upgrade_update_ignores_a_concurrent_different_start() {
+    fn an_os_rollout_and_a_bun_upgrade_never_overlap() {
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::OsRolloutStart {
+            rollout: Box::new(os_rollout("os-1")),
+            replaces: None,
+        });
+        assert!(is_refused(inner.apply_request(
+            &RaftRequest::UpgradeStart {
+                state: Box::new(upgrade_state("up-1")),
+                replaces: None,
+            }
+        )));
+        assert!(
+            inner.state.active_upgrade.is_none(),
+            "no bun upgrade during an OS rollout"
+        );
+        assert!(is_refused(inner.apply_request(
+            &RaftRequest::OsRolloutStart {
+                rollout: Box::new(os_rollout("os-2")),
+                replaces: None,
+            }
+        )));
+        assert_eq!(inner.state.os_rollout.as_ref().unwrap().rollout_id, "os-1");
+
+        inner.apply_request(&RaftRequest::OsRolloutClear {
+            rollout_id: "os-1".into(),
+        });
+        assert!(inner.state.os_rollout.is_none());
+        assert_eq!(inner.state.os_rollout_history.len(), 1);
+
+        inner.apply_request(&RaftRequest::UpgradeStart {
+            state: Box::new(upgrade_state("up-1")),
+            replaces: None,
+        });
+        assert!(is_refused(inner.apply_request(
+            &RaftRequest::OsRolloutStart {
+                rollout: Box::new(os_rollout("os-3")),
+                replaces: None,
+            }
+        )));
+        assert!(
+            inner.state.os_rollout.is_none(),
+            "no OS rollout during a bun upgrade"
+        );
+    }
+
+    #[test]
+    fn a_paused_os_rollout_can_be_resumed_under_a_new_id() {
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::OsRolloutStart {
+            rollout: Box::new(os_rollout("os-1")),
+            replaces: None,
+        });
+        let mut paused = os_rollout("os-1");
+        paused.phase = crate::os::rollout::OsRolloutPhase::Paused {
+            reason: "n1 fell back".into(),
+        };
+        inner.apply_request(&RaftRequest::OsRolloutUpdate {
+            rollout: Box::new(paused.clone()),
+        });
+        assert_eq!(
+            inner.apply_request(&RaftRequest::OsRolloutStart {
+                rollout: Box::new(crate::os::rollout::resume(paused, 10)),
+                replaces: Some(ReplacesPaused::Resume { id: "os-1".into() }),
+            }),
+            None
+        );
+        assert_eq!(
+            inner.state.os_rollout.as_ref().unwrap().rollout_id,
+            "os-1-retry"
+        );
+    }
+
+    /// The leader's loop reads the rollout, waits on a node for up to 30 s
+    /// and writes what it learnt. `relish os abort` in that window writes
+    /// `Aborted`, then clears it; the late `Running` write must not bring
+    /// the rollout back.
+    #[test]
+    fn a_stale_os_rollout_update_after_an_abort_leaves_it_cleared() {
+        let mut inner = StateMachineInner::default();
+        let running = os_rollout("os-1");
+        inner.apply_request(&RaftRequest::OsRolloutStart {
+            rollout: Box::new(running.clone()),
+            replaces: None,
+        });
+        let mut aborted = running.clone();
+        aborted.phase = crate::os::rollout::OsRolloutPhase::Aborted {
+            reason: "aborted by the operator".into(),
+        };
+        inner.apply_request(&RaftRequest::OsRolloutUpdate {
+            rollout: Box::new(aborted),
+        });
+        inner.apply_request(&RaftRequest::OsRolloutClear {
+            rollout_id: "os-1".into(),
+        });
+
+        let mut stale = running;
+        stale.nodes[0].phase = crate::os::rollout::OsNodePhase::Draining;
+        assert!(is_refused(inner.apply_request(
+            &RaftRequest::OsRolloutUpdate {
+                rollout: Box::new(stale.clone()),
+            }
+        )));
+        assert!(inner.state.os_rollout.is_none(), "the abort stands");
+        // Nor can the same id start again.
+        assert!(is_refused(inner.apply_request(
+            &RaftRequest::OsRolloutStart {
+                rollout: Box::new(stale),
+                replaces: None,
+            }
+        )));
+        assert!(inner.state.os_rollout.is_none());
+    }
+
+    /// The same stale write landing between the abort's two writes.
+    #[test]
+    fn a_stale_os_rollout_update_between_abort_and_clear_is_refused() {
+        let mut inner = StateMachineInner::default();
+        let running = os_rollout("os-1");
+        inner.apply_request(&RaftRequest::OsRolloutStart {
+            rollout: Box::new(running.clone()),
+            replaces: None,
+        });
+        let mut aborted = running.clone();
+        aborted.phase = crate::os::rollout::OsRolloutPhase::Aborted {
+            reason: "aborted by the operator".into(),
+        };
+        inner.apply_request(&RaftRequest::OsRolloutUpdate {
+            rollout: Box::new(aborted.clone()),
+        });
+
+        assert!(is_refused(inner.apply_request(
+            &RaftRequest::OsRolloutUpdate {
+                rollout: Box::new(running),
+            }
+        )));
+        assert_eq!(inner.state.os_rollout, Some(aborted));
+        inner.apply_request(&RaftRequest::OsRolloutClear {
+            rollout_id: "os-1".into(),
+        });
+        assert!(inner.state.os_rollout.is_none());
+        assert_eq!(inner.state.os_rollout_history.len(), 1);
+    }
+
+    #[test]
+    fn an_os_rollout_update_never_starts_a_rollout() {
+        let mut inner = StateMachineInner::default();
+        assert!(is_refused(inner.apply_request(
+            &RaftRequest::OsRolloutUpdate {
+                rollout: Box::new(os_rollout("os-1")),
+            }
+        )));
+        assert!(inner.state.os_rollout.is_none());
+    }
+
+    #[test]
+    fn the_council_size_is_cluster_state_that_survives_a_snapshot() {
+        let mut inner = StateMachineInner::default();
+        assert_eq!(inner.state.council_size, None);
+        inner.apply_request(&RaftRequest::CouncilSize {
+            voters: crate::council::CouncilSize::APPLIANCE,
+        });
+        assert_eq!(
+            inner.state.council_size,
+            Some(crate::council::CouncilSize::APPLIANCE)
+        );
+        let json = serde_json::to_vec(&inner.state).unwrap();
+        let restored: DesiredState = serde_json::from_slice(&json).unwrap();
+        assert_eq!(
+            restored.council_size,
+            Some(crate::council::CouncilSize::APPLIANCE)
+        );
+    }
+
+    #[test]
+    fn upgrade_start_refuses_a_concurrent_different_start() {
         // M13: a second start with a *different* upgrade id while one is active
         // must not clobber the first plan (the racy check-then-write let two
-        // concurrent starts through). A same-id update still applies.
+        // concurrent starts through).
         let mut inner = StateMachineInner::default();
-        inner.apply_request(&RaftRequest::UpgradeUpdate {
+        inner.apply_request(&RaftRequest::UpgradeStart {
             state: Box::new(upgrade_state("up-1")),
+            replaces: None,
         });
-        inner.apply_request(&RaftRequest::UpgradeUpdate {
-            state: Box::new(upgrade_state("up-2")),
-        });
+        assert!(is_refused(inner.apply_request(
+            &RaftRequest::UpgradeStart {
+                state: Box::new(upgrade_state("up-2")),
+                replaces: None,
+            }
+        )));
         assert_eq!(
             inner.state.active_upgrade.as_ref().unwrap().upgrade_id,
             "up-1",
@@ -8412,12 +9335,16 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_update_allows_a_resume_of_a_paused_run() {
+    fn upgrade_start_allows_a_resume_of_a_paused_run() {
         // M13 regression guard: `upgrade resume` renames the run to a fresh id
         // and replaces the *paused* active upgrade. That must apply — the race
         // guard only blocks a different-id start against a *non-paused* active
         // upgrade, not a resume.
         let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::UpgradeStart {
+            state: Box::new(upgrade_state("up-1")),
+            replaces: None,
+        });
         let mut paused = upgrade_state("up-1");
         paused.phase = crate::upgrade::types::ClusterUpgradePhase::Paused {
             reason: "worker reverted".to_string(),
@@ -8426,9 +9353,13 @@ mod tests {
             state: Box::new(paused),
         });
         // Resume: a fresh id, non-paused phase.
-        inner.apply_request(&RaftRequest::UpgradeUpdate {
-            state: Box::new(upgrade_state("up-1-resume")),
-        });
+        assert_eq!(
+            inner.apply_request(&RaftRequest::UpgradeStart {
+                state: Box::new(upgrade_state("up-1-resume")),
+                replaces: Some(ReplacesPaused::Resume { id: "up-1".into() }),
+            }),
+            None
+        );
         assert_eq!(
             inner.state.active_upgrade.as_ref().unwrap().upgrade_id,
             "up-1-resume",
@@ -8436,11 +9367,57 @@ mod tests {
         );
     }
 
+    /// The bun upgrade has the OS rollout's race: the orchestrator reads
+    /// the run, steps it (HTTP to a node), then writes. A run aborted and
+    /// cleared in between must stay cleared, and so must one between the
+    /// abort's two writes.
+    #[test]
+    fn a_stale_upgrade_update_cannot_bring_back_an_aborted_run() {
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::UpgradeStart {
+            state: Box::new(upgrade_state("up-1")),
+            replaces: None,
+        });
+        let mut aborted = upgrade_state("up-1");
+        aborted.phase = crate::upgrade::types::ClusterUpgradePhase::Aborted {
+            reason: "aborted by the operator".into(),
+        };
+        inner.apply_request(&RaftRequest::UpgradeUpdate {
+            state: Box::new(aborted.clone()),
+        });
+        let mut stale = upgrade_state("up-1");
+        stale.phase = crate::upgrade::types::ClusterUpgradePhase::UpgradingWorkers;
+        assert!(is_refused(inner.apply_request(
+            &RaftRequest::UpgradeUpdate {
+                state: Box::new(stale.clone()),
+            }
+        )));
+        assert_eq!(inner.state.active_upgrade, Some(aborted));
+
+        inner.apply_request(&RaftRequest::UpgradeClear {
+            upgrade_id: "up-1".into(),
+        });
+        assert!(is_refused(inner.apply_request(
+            &RaftRequest::UpgradeUpdate {
+                state: Box::new(stale.clone()),
+            }
+        )));
+        assert!(inner.state.active_upgrade.is_none(), "the abort stands");
+        assert!(is_refused(inner.apply_request(
+            &RaftRequest::UpgradeStart {
+                state: Box::new(stale),
+                replaces: None,
+            }
+        )));
+        assert!(inner.state.active_upgrade.is_none());
+    }
+
     #[test]
     fn upgrade_clear_archives_to_history() {
         let mut inner = StateMachineInner::default();
-        inner.apply_request(&RaftRequest::UpgradeUpdate {
+        inner.apply_request(&RaftRequest::UpgradeStart {
             state: Box::new(upgrade_state("up-1")),
+            replaces: None,
         });
 
         // A clear for a DIFFERENT id must not touch the active upgrade.
@@ -8462,8 +9439,9 @@ mod tests {
         let mut inner = StateMachineInner::default();
         for i in 0..25 {
             let id = format!("up-{i}");
-            inner.apply_request(&RaftRequest::UpgradeUpdate {
+            inner.apply_request(&RaftRequest::UpgradeStart {
                 state: Box::new(upgrade_state(&id)),
+                replaces: None,
             });
             inner.apply_request(&RaftRequest::UpgradeClear { upgrade_id: id });
         }
@@ -8474,13 +9452,148 @@ mod tests {
     #[test]
     fn snapshot_with_active_upgrade_roundtrips() {
         let mut inner = StateMachineInner::default();
-        inner.apply_request(&RaftRequest::UpgradeUpdate {
+        inner.apply_request(&RaftRequest::UpgradeStart {
             state: Box::new(upgrade_state("up-1")),
+            replaces: None,
         });
 
         let json = serde_json::to_string(&inner.state).unwrap();
         let reloaded: DesiredState = serde_json::from_str(&json).unwrap();
         assert_eq!(reloaded.active_upgrade, inner.state.active_upgrade);
+    }
+
+    fn paused_upgrade(inner: &mut StateMachineInner, id: &str) {
+        inner.apply_request(&RaftRequest::UpgradeStart {
+            state: Box::new(upgrade_state(id)),
+            replaces: None,
+        });
+        let mut paused = upgrade_state(id);
+        paused.phase = crate::upgrade::types::ClusterUpgradePhase::Paused {
+            reason: "worker reverted".into(),
+        };
+        inner.apply_request(&RaftRequest::UpgradeUpdate {
+            state: Box::new(paused),
+        });
+    }
+
+    /// A start that doesn't name the paused run can't replace it: only a
+    /// resume or a rollback that saw that run may.
+    #[test]
+    fn a_paused_run_gives_way_only_to_a_start_that_names_it() {
+        let mut inner = StateMachineInner::default();
+        paused_upgrade(&mut inner, "up-1");
+        for replaces in [
+            None,
+            Some(ReplacesPaused::Resume {
+                id: "up-other".into(),
+            }),
+        ] {
+            assert!(is_refused(inner.apply_request(
+                &RaftRequest::UpgradeStart {
+                    state: Box::new(upgrade_state("up-2")),
+                    replaces,
+                }
+            )));
+            assert_eq!(
+                inner.state.active_upgrade.as_ref().unwrap().upgrade_id,
+                "up-1"
+            );
+        }
+        // Nor can a resume replace a run that isn't paused any more.
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::UpgradeStart {
+            state: Box::new(upgrade_state("up-1")),
+            replaces: None,
+        });
+        assert!(is_refused(inner.apply_request(
+            &RaftRequest::UpgradeStart {
+                state: Box::new(upgrade_state("up-1-retry")),
+                replaces: Some(ReplacesPaused::Resume { id: "up-1".into() }),
+            }
+        )));
+        // Or one that has gone.
+        let mut inner = StateMachineInner::default();
+        assert!(is_refused(inner.apply_request(
+            &RaftRequest::UpgradeStart {
+                state: Box::new(upgrade_state("up-1-retry")),
+                replaces: Some(ReplacesPaused::Resume { id: "up-1".into() }),
+            }
+        )));
+        assert!(inner.state.active_upgrade.is_none());
+    }
+
+    /// A rollback over a paused upgrade archives the paused run and starts
+    /// the rollback in one entry, so an OS rollout can't land between the
+    /// two and leave the paused run archived with nothing rolling back.
+    #[test]
+    fn a_rollback_supersedes_a_paused_run_in_one_entry() {
+        let mut inner = StateMachineInner::default();
+        paused_upgrade(&mut inner, "up-1");
+        assert_eq!(
+            inner.apply_request(&RaftRequest::UpgradeStart {
+                state: Box::new(upgrade_state("rollback-1")),
+                replaces: Some(ReplacesPaused::Supersede {
+                    id: "up-1".into(),
+                    reason: "replaced by a rollback".into(),
+                }),
+            }),
+            None
+        );
+        assert_eq!(
+            inner.state.active_upgrade.as_ref().unwrap().upgrade_id,
+            "rollback-1"
+        );
+        let archived = &inner.state.upgrade_history[0];
+        assert_eq!(archived.upgrade_id, "up-1");
+        assert_eq!(
+            archived.phase,
+            crate::upgrade::types::ClusterUpgradePhase::Aborted {
+                reason: "replaced by a rollback".into()
+            }
+        );
+
+        // Refused as a whole: the paused run stays where it was.
+        let mut inner = StateMachineInner::default();
+        paused_upgrade(&mut inner, "up-1");
+        inner.state.os_rollout = Some(os_rollout("os-1"));
+        assert!(is_refused(inner.apply_request(
+            &RaftRequest::UpgradeStart {
+                state: Box::new(upgrade_state("rollback-1")),
+                replaces: Some(ReplacesPaused::Supersede {
+                    id: "up-1".into(),
+                    reason: "replaced by a rollback".into(),
+                }),
+            }
+        )));
+        assert_eq!(
+            inner.state.active_upgrade.as_ref().unwrap().upgrade_id,
+            "up-1"
+        );
+        assert!(inner.state.upgrade_history.is_empty());
+    }
+
+    /// An OS rollout resume must name the paused rollout too.
+    #[test]
+    fn a_paused_os_rollout_gives_way_only_to_a_resume_that_names_it() {
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::OsRolloutStart {
+            rollout: Box::new(os_rollout("os-1")),
+            replaces: None,
+        });
+        let mut paused = os_rollout("os-1");
+        paused.phase = crate::os::rollout::OsRolloutPhase::Paused {
+            reason: "n1 fell back".into(),
+        };
+        inner.apply_request(&RaftRequest::OsRolloutUpdate {
+            rollout: Box::new(paused),
+        });
+        assert!(is_refused(inner.apply_request(
+            &RaftRequest::OsRolloutStart {
+                rollout: Box::new(os_rollout("os-2")),
+                replaces: None,
+            }
+        )));
+        assert_eq!(inner.state.os_rollout.as_ref().unwrap().rollout_id, "os-1");
     }
 
     // -- Batch/build durable tracking (12b.2) ---------------------------------
@@ -9436,6 +10549,7 @@ mod tests {
         );
         inner.apply_request(&RaftRequest::RevokeApiToken {
             name: leased_token().name,
+            now_unix_ms: 0,
         });
         assert!(inner.state.security_state.api_tokens.is_empty());
         assert!(matches!(

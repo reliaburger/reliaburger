@@ -43,7 +43,7 @@ async fn single_node_leader() -> Arc<CouncilNode> {
     )
     .await
     .unwrap();
-    router.register(1, node.raft().clone()).await;
+    router.register(1, &node).await;
     let mut members = BTreeMap::new();
     members.insert(
         1u64,
@@ -344,7 +344,7 @@ async fn apply_changes_on_a_node_that_is_not_leader_abandons_the_sync() {
     )
     .await
     .unwrap();
-    router.register(1, node.raft().clone()).await;
+    router.register(1, &node).await;
     let node = Arc::new(node);
     assert!(!node.is_leader().await, "node must not be leader");
 
