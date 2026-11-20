@@ -3655,9 +3655,11 @@ dependencies = [
  "defmt",
  "jiff-core",
  "jiff-static",
+ "log",
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
+ "windows-link",
 ]
 
 [[package]]
@@ -5745,6 +5747,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "insta",
+ "jiff",
  "jsonschema",
  "k8s-openapi",
  "libc",

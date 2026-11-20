@@ -455,7 +455,7 @@ Ten second-hand Dell Wyse 3040s arrived for the lab. Some had blank eMMCs. Some 
 So the decision moved to the person at the `relish netboot` terminal. Before it writes anything, the installer runs `ask-to-wipe`, which posts what `lsblk -P` sees on the disk to the URL `relish netboot` gave it on the command line (`reliaburger.ask=http://…/disk?mac=…&uuid=…`). It gets back a ticket, and polls `GET /disk/<ticket>` every two seconds. Meanwhile the operator sees:
 
 ```
-relish netboot: 6c:4b:90:12:34:56: /dev/mmcblk0, 7.8 GB, gpt, 4 partitions: vfat "EFI", ext4 "ThinOS", (no filesystem), swap — wipe? [y/N]
+21:04:17 relish netboot: 6c:4b:90:12:34:56: /dev/mmcblk0, 7.8 GB, gpt, 4 partitions: vfat "EFI", ext4 "ThinOS", (no filesystem), swap — wipe? [y/N]
 ```
 
 The whole policy is one pure function in `src/relish/netboot/wipe.rs`:
@@ -1196,6 +1196,12 @@ Before the 0.3.0 gate, four reviewers read the train against `main`, and the net
 The TFTP sender waited for each acknowledgement with `tokio::time::timeout(negotiated.timeout, socket.recv(...))`, inside the loop. That reads as "wait up to two seconds for a packet", and it is, every time round. But a packet that isn't the one we want, an old ACK repeated by a client whose clock is out of step with ours, ends the wait and starts a fresh one, so a lost DATA block could wait for ever while stale ACKs kept arriving. The fix is to wait for a *moment*, not a *duration*: `resend_at` is set when a packet goes out, and the loop waits with `tokio::time::timeout_at(resend_at, ...)`. Stray packets come and go, and the deadline stays put. The test sends a stale ACK every 100 ms and expects the lost block again within about one timeout; against the old loop it failed, as it should.
 
 The rest were one-liners with tests. A requested TFTP timeout over 30 s is declined (RFC 2349 lets a server accept the client's value or leave it out, never answer another), and at most 64 transfers run at once, after which a request is told the server is busy. A "y" typed for one machine's wipe question could land just after the next one appeared, so for a second after a question is shown, an answer is ignored and the operator asked again. `relish netboot` exited 0 when one of its four servers died, because the `select!` arm just returned a message; it now returns an error, so a script notices. And 32-bit x86 UEFI firmware, option 93 value 6, was being sent our 64-bit iPXE, which it can't run; it's now refused with a reason, like BIOS.
+
+### What time is it here?
+
+The three-Wyse lab measures intervals: from the moment `relish netboot` starts serving, how long until each machine says `ack on 4011`, finishes its download, reports `installed`. The log printed none of those times, so someone sat beside it writing them down. Now every line starts with the local time, `21:04:17 dhcp: …`. All of them pass through the one `Log` closure, so the fix is a pure function, `stamped(time, line)`, that a unit test can call with a fixed time, plus one call to read the clock.
+
+Reading the clock turned out to be the interesting part. The `time` crate was already a dependency, but it won't tell you the local offset from UTC in a process that has more than one thread. Working that out on Unix means calling C's `localtime_r`, which reads the `TZ` environment variable, and another thread changing the environment at the same moment is undefined behaviour. A library can't rule that out, so `time` refuses, and under tokio's multi-threaded runtime it would refuse every time. `jiff`, which `k8s-openapi` already pulled into our build, reads the time zone file itself and never touches the C library's state, so `jiff::Zoned::now().time()` is safe from any thread. It costs a direct dependency on a crate we were already compiling, with three of its features switched on.
 
 ### A binary that can't write next to itself
 

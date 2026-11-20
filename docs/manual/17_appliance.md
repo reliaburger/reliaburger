@@ -133,7 +133,9 @@ Before it serves anything, it checks the signature on each architecture's
 `SHA256SUMS` and the SHA-256 of every file it lists, and refuses to start if
 any of them is wrong. Then it prints what it serves and logs every boot
 request: each machine's MAC address, its firmware, and what it was told to
-boot. It stops after an hour (`--for 3h` to change that) or at Ctrl-C.
+boot. Every line it logs while serving starts with the local time, to the
+second, and so does the line that says it started serving, so you can time
+each machine's stages from the log alone. It stops after an hour (`--for 3h` to change that) or at Ctrl-C.
 
 It doesn't touch your router's DHCP. When a machine asks the network where to
 boot from, your router still hands out the address, and relish answers only
@@ -341,7 +343,7 @@ disk on its own. Before it writes anything, it reports what's on the disk to
 `relish netboot` and waits. The netboot terminal asks you:
 
 ```
-relish netboot: 6c:4b:90:12:34:56: /dev/mmcblk0, 7.8 GB, gpt, 4 partitions: vfat "EFI", ext4 "ThinOS", (no filesystem), swap — wipe? [y/N]
+21:04:17 relish netboot: 6c:4b:90:12:34:56: /dev/mmcblk0, 7.8 GB, gpt, 4 partitions: vfat "EFI", ext4 "ThinOS", (no filesystem), swap — wipe? [y/N]
 ```
 
 Type `y` and Enter to wipe it and install. Anything else, or no answer within
@@ -368,7 +370,7 @@ ask, so it wipes only the disks of `--wipe` machines and leaves every other
 used disk alone. Every decision goes into its log:
 
 ```
-http: 6c:4b:90:12:34:56: disk /dev/mmcblk0, 7.8 GB, gpt, 4 partitions: …: wiping it and installing (--wipe lists it)
+21:04:17 http: 6c:4b:90:12:34:56: disk /dev/mmcblk0, 7.8 GB, gpt, 4 partitions: …: wiping it and installing (--wipe lists it)
 ```
 
 If several machines report at once, the questions come one at a time.
