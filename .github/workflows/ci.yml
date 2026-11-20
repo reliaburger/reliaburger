@@ -317,29 +317,27 @@ jobs:
         # tests' peak pages out instead of filling memory. Never on /: the
         # coverage run needs that disk, and a 5 GB swap file there helped
         # fill it. The 24.04 image's /mnt is on /, so there the image's own
-        # 3 GiB swap file is all there is. Swap is a cushion, not a budget:
-        # a host paging hard stalls the runner (docs/flakes.md).
+        # 3 GiB swap file is all there is. Never on device-mapper either
+        # (give-swap). Swap is a cushion, not a budget: a host paging hard
+        # stalls the runner (docs/flakes.md).
         run: |
-          have=$(awk '/^SwapTotal/ {print $2}' /proc/meminfo)
           if ! mountpoint -q /mnt; then
             echo "no separate /mnt: keeping the image's swap, sparing /"
-          elif [ "$have" -lt 8388608 ]; then
-            sudo fallocate -l "$((8388608 - have))K" "/mnt/ci-swapfile"
-            sudo chmod 600 "/mnt/ci-swapfile"
-            sudo mkswap "/mnt/ci-swapfile" > /dev/null
-            sudo swapon "/mnt/ci-swapfile"
+          else
+            scripts/ci/give-swap 8388608 /mnt
           fi
           free -h
           swapon --show
           df -h / /mnt 2>/dev/null || df -h /
       - name: Watch disk and memory during the coverage run
-        # Under 2 GiB free disk, or under 512 MiB of available memory for a
-        # minute with swap in use, the watcher stops the build and the
-        # tests: a failed step with a log beats a runner lost to a full disk
-        # or to a host thrashing on swap, which the runner, shielded from
-        # the OOM killer, doesn't survive.
+        # Under 2 GiB free disk, under 512 MiB of available memory for a
+        # minute with swap in use, or with every task stalled on memory 60%
+        # of the time for 30 s (passing runs peak at 21%), the watcher stops
+        # the build and the tests: a failed step with a log beats a runner
+        # lost to a full disk or to a host thrashing, which the runner,
+        # shielded from the OOM killer, doesn't survive.
         run: |
-          WATCH_DISK_FLOOR_KB=2097152 WATCH_MEM_FLOOR_KB=524288 WATCH_MEM_FLOOR_SECONDS=60 WATCH_STOP="cargo-llvm-cov cargo-nextest cargo rustc" nohup scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids" > "$RUNNER_TEMP/portable-linux-resources.log" 2>&1 < /dev/null &
+          WATCH_DISK_FLOOR_KB=2097152 WATCH_MEM_FLOOR_KB=524288 WATCH_MEM_FLOOR_SECONDS=60 WATCH_PSI_FULL_PERCENT=60 WATCH_PSI_SECONDS=30 WATCH_STOP="cargo-llvm-cov cargo-nextest cargo rustc" nohup scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids" > "$RUNNER_TEMP/portable-linux-resources.log" 2>&1 < /dev/null &
           echo $! > "$RUNNER_TEMP/portable-linux-resources.pid"
       - name: Portable tests with line coverage
         id: portable_linux
@@ -600,14 +598,13 @@ jobs:
         # The shield turned #1943's lost runners into a visible global OOM:
         # on 15 Nov rustc, building the lib tests, reached 10.6 GB resident
         # while rust-lld linked, and the kernel killed it. Swap lets that
-        # peak page out instead; skipped if the image already has swap.
+        # peak page out instead. Some 26.04 runners come up with / on
+        # /dev/mapper/cow-root, a dm-snapshot, and no swap: a swap file
+        # there froze the host for 34 minutes on 20 Nov (run 44648854969),
+        # so give-swap adds none on device-mapper, and the Makefile's
+        # test-linux target keeps the build's peak to one big rustc.
         run: |
-          if [ -z "$(swapon --show --noheadings)" ]; then
-            sudo fallocate -l 8G /ci-swapfile
-            sudo chmod 600 /ci-swapfile
-            sudo mkswap /ci-swapfile > /dev/null
-            sudo swapon /ci-swapfile
-          fi
+          scripts/ci/give-swap 8388608 /
           free -h
           swapon --show
           df -h /
@@ -615,9 +612,12 @@ jobs:
         # As the `linux` job does for the OCI interruptions (#800): the
         # headroom every 5 s, so a run that ends badly shows whether the
         # runner was short of memory or disk, plus whether the runner's
-        # processes still live and any kernel OOM lines (#1943).
+        # processes still live and any kernel OOM lines (#1943). With the
+        # portable job's floors and memory-stall limit, it stops the build
+        # or the tests (as root, through sudo) before a full disk or a host
+        # paging hard costs the runner; passing runs peak at 49% stall.
         run: |
-          nohup scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids" > "$RUNNER_TEMP/linux-next-resources.log" 2>&1 < /dev/null &
+          WATCH_DISK_FLOOR_KB=2097152 WATCH_MEM_FLOOR_KB=524288 WATCH_MEM_FLOOR_SECONDS=60 WATCH_PSI_FULL_PERCENT=60 WATCH_PSI_SECONDS=30 WATCH_STOP="cargo-nextest cargo rustc" nohup scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids" > "$RUNNER_TEMP/linux-next-resources.log" 2>&1 < /dev/null &
           echo $! > "$RUNNER_TEMP/linux-next-resources.pid"
       - name: Run the provisioned Linux tests as root
         id: linux_next_tests
@@ -646,9 +646,8 @@ jobs:
         timeout-minutes: 3
         run: |
           kill "$(cat "$RUNNER_TEMP/linux-next-resources.pid")" 2>/dev/null || true
-          echo "Lowest free disk and memory while the privileged tests ran:"
-          grep ' disk_kb=' "$RUNNER_TEMP/linux-next-resources.log" | sort -t '=' -k2 -n | head -1 || true
-          grep ' disk_kb=' "$RUNNER_TEMP/linux-next-resources.log" | sort -t '=' -k3 -n | head -1 || true
+          status=0
+          scripts/ci/assert-headroom "$RUNNER_TEMP/linux-next-resources.log" 10485760 || status=1
           echo "Kernel OOM lines:"
           sudo dmesg -T | grep -iE 'oom|killed process' || echo "none"
           if [ "${{ steps.linux_next_tests.outcome }}" != success ]; then
@@ -662,6 +661,7 @@ jobs:
               done
             done
           fi
+          exit "$status"
       - name: Keep the privileged tests' JUnit and log
         if: always()
         uses: actions/upload-artifact@v4

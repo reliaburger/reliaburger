@@ -143,9 +143,12 @@ class MakefilePrebuilds(unittest.TestCase):
     def test_test_linux_builds_bun_as_its_ebpf_suite_does(self):
         # RELIABURGER_BUN_BINARY points at target/debug/bun; a `cargo build`
         # of it was replaced by nextest's own build of the same file.
+        # The lib tests build on their own first, so they never compile
+        # beside the lib (#1943); both builds are nextest's own.
         lines = workflow_assembly.recipe((ROOT / "Makefile").read_text(), "test-linux")
-        self.assertEqual(lines[0], "$(CARGO) test --no-run --features ebpf")
-        self.assertIn("--features ebpf", lines[1].split("$(NEXTEST)", 1)[1])
+        self.assertEqual(lines[:2], ["$(CARGO) test --no-run --features ebpf --lib",
+                                     "$(CARGO) test --no-run --features ebpf"])
+        self.assertIn("--features ebpf", lines[2].split("$(NEXTEST)", 1)[1])
 
     def test_test_linux_names_bun_in_cargos_target_directory(self):
         # target/ in the checkout doesn't exist under an out-of-tree
@@ -153,7 +156,7 @@ class MakefilePrebuilds(unittest.TestCase):
         text = (ROOT / "Makefile").read_text()
         self.assertIn("TARGET_DIR = $(or $(CARGO_TARGET_DIR),$(CURDIR)/target)", text.splitlines())
         lines = workflow_assembly.recipe(text, "test-linux")
-        self.assertIn('RELIABURGER_BUN_BINARY="$(TARGET_DIR)/debug/bun"', lines[1])
+        self.assertIn('RELIABURGER_BUN_BINARY="$(TARGET_DIR)/debug/bun"', lines[-1])
         self.assertFalse([line for line in text.splitlines() if "$(CURDIR)/target/" in line])
 
     def test_no_script_names_a_binary_in_the_checkouts_target_directory(self):

@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Top the host's swap up to TOTAL_KB with a swap file in DIRECTORY (#1943),
+# so a compile's peak pages out instead of meeting the OOM killer.
+#
+# Never on a device-mapper disk. On 20 Nov 2026 (run 44648854969) an Ubuntu
+# 26.04 runner came up with / on /dev/mapper/cow-root, a dm-snapshot, and no
+# swap, so the job put an 8 GiB swap file there. When the build began to
+# page, writeback waited on the snapshot's copy-on-write (dm_snapshot's
+# wait_for_in_progress, kcopyd), which needs memory to finish, and the whole
+# host froze for 34 minutes, the watcher included. Runners whose / is
+# /dev/root keep their 3 GiB /swapfile and never stalled. Telling a snapshot
+# from a plain linear map needs root and dmsetup; no runner we've seen has
+# any other device-mapper root, so any /dev/mapper/ or /dev/dm- source is
+# refused. Without swap, the OOM killer acts instead, and leaves a log.
+#
+# Usage: give-swap TOTAL_KB DIRECTORY
+# PROC_ROOT stands in for /proc in the tests.
+set -euo pipefail
+if [ $# -ne 2 ]; then
+    echo "usage: give-swap TOTAL_KB DIRECTORY" >&2
+    exit 2
+fi
+total=$1
+directory=$2
+proc=${PROC_ROOT:-/proc}
+
+have=$(awk '/^SwapTotal/ {print $2}' "$proc/meminfo")
+have=${have:-0}
+if [ "$have" -ge "$total" ]; then
+    echo "swap: $have kB already, at least $total kB: keeping the image's"
+    exit 0
+fi
+source=$(findmnt --noheadings --output SOURCE --target "$directory")
+case "$source" in
+/dev/mapper/* | /dev/dm-*)
+    echo "no swap file: $directory is on $source, a device-mapper device; paging through a snapshot froze a runner (#1943)"
+    exit 0
+    ;;
+esac
+file="${directory%/}/ci-swapfile"
+sudo fallocate -l "$((total - have))K" "$file"
+sudo chmod 600 "$file"
+sudo mkswap "$file" > /dev/null
+sudo swapon "$file"
+echo "swap: added $((total - have)) kB in $file on $source"
