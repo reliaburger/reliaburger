@@ -123,15 +123,16 @@ needs attention ends in the command that shows the detail, such as
 `relish nodes --unhealthy` or `relish apps --unhealthy`.
 
 `relish nodes` shows every member's gossip state: `alive`, `suspect` (missed
-its probes, not yet declared dead) or `dead`, with `cordoned` or `disk` (85%
+its probes, not yet declared dead), `dead`, or `left` (it shut down cleanly,
+which is often a reboot), with `cordoned` or `disk` (85%
 full or more) added to an alive node's state. A node is cordoned while a bun
 upgrade or an OS rollout restarts it, and a line under the table says which
 (`node-2 is cordoned by the OS rollout`). Beside it are the node's Bun
 version, its CPU, memory and disk use, and what the scheduler has allocated
-there. Nodes with a problem come first, and `--unhealthy` keeps only them. A dead node stays listed for up
-to a day after it was last heard from, so you can see what went missing. It
-drops off sooner if it comes back, leaves the cluster on purpose, or you
-retire it with `relish decommission-node`.
+there. Nodes with a problem come first, and `--unhealthy` keeps only them. A dead or left node stays listed for up
+to a day after it was last heard from, so you can see what went missing and
+whether it still holds a council seat. It drops off sooner if it comes back,
+or if you retire it with `relish decommission-node`.
 
 `relish council status` asks every node, through the one you're connected to,
 for its own view: its role, recovery epoch, Raft term and log position. Above

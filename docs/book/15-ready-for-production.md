@@ -4550,7 +4550,24 @@ means (the scheduler, the council and Pickle all treat "published" as "worth
 talking to"), gossip got a second one. `MembershipTable::roster()` returns
 every member, down ones included, until they're reaped, and
 `MustardNode::set_roster_watch` publishes it next to the old view. The
-refresher reads the roster. A `Left` entry is forgotten on sight.
+refresher reads the roster. A `Left` entry was forgotten on sight.
+
+That last rule didn't survive the Wyse lab. We rebooted one of three council
+voters with Ctrl+Alt+Del, and `relish nodes` went straight from three rows to
+two. A clean shutdown runs gossip's graceful leave, so the node was `Left`,
+and the table forgot it. Yet `relish council status` still listed it as a
+voter, still counted towards the quorum, and it came back two minutes later.
+Pulling the cord on another voter had shown it as `dead`, which is the more
+violent event and got the more honest answer. Leaving tells you the node
+meant to go. It doesn't tell you it's gone for good.
+
+So a `Left` member now stays in the table like a dead one, with the same
+24-hour limit, and keeps its `Left` state when gossip reaps it, where a
+reaped dead member stays `Dead`. `relish nodes` shows it as `left` with its
+council seat, and `relish status` counts it on the nodes line (`1 left`)
+without calling the cluster degraded. It drops off when it comes back, when
+its identity is retired, or when a day passes. Retirement is the real "gone
+for good", and the operator says so with `relish decommission-node`.
 
 A node the operator *retired* is gone for good: its identity is on the CRL,
 and Chapter 4's mTLS verifiers already refuse it. Every node keeps a

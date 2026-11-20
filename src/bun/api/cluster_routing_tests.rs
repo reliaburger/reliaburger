@@ -902,8 +902,11 @@ async fn known_members_keep_a_dead_member_after_gossip_reaps_it() {
     assert_eq!(down[0].state, Dead);
 }
 
+// A clean shutdown announces a graceful leave, but a rebooting council
+// voter still holds its seat: `relish nodes` must keep showing it, as
+// `left`, after gossip reaps it, until it comes back or is retired (#2164).
 #[tokio::test]
-async fn known_members_forget_a_member_that_left() {
+async fn known_members_keep_a_member_that_left_until_it_returns_or_is_retired() {
     use crate::mustard::state::NodeState::{Alive, Left};
     let known = KnownMembers::default();
     let none = Default::default();
@@ -912,12 +915,30 @@ async fn known_members_forget_a_member_that_left() {
     known.refresh(roster_of(&alive, Alive), &none, now).await;
     let mut roster = roster_of(&alive[..1], Alive);
     roster.extend(roster_of(&alive[1..], Left));
-    known.refresh(roster, &none, now).await;
-    // Gossip reaps the Left entry; it must not come back as dead.
+    known.refresh(roster.clone(), &none, now).await;
+    let down = known.down().await;
+    assert_eq!(down.len(), 1);
+    assert_eq!(down[0].info.node_id.0, "node-2");
+    assert_eq!(down[0].state, Left);
+
+    // Gossip reaps the Left entry; it stays left, not dead.
     known
         .refresh(roster_of(&alive[..1], Alive), &none, now)
         .await;
+    let down = known.down().await;
+    assert_eq!(down.len(), 1);
+    assert_eq!(down[0].state, Left);
 
+    // It comes back: no longer down.
+    known.refresh(roster_of(&alive, Alive), &none, now).await;
+    assert!(known.down().await.is_empty());
+
+    // It leaves again and is retired: forgotten at once.
+    known.refresh(roster, &none, now).await;
+    let retired = std::collections::BTreeSet::from(["node-2".to_string()]);
+    known
+        .refresh(roster_of(&alive[..1], Alive), &retired, now)
+        .await;
     assert_eq!(
         known_ports(&known).await,
         vec![("node-1".to_string(), 1001)]
