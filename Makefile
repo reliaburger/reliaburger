@@ -241,7 +241,21 @@ agent-docs: features-page ## Regenerate the agent-facing files from the manual's
 # checked-in seeds; crashes go to fuzz/artifacts/<target>/.
 # fuzz.yml pins a dated nightly here so its build cache stays valid.
 FUZZ_TOOLCHAIN ?= nightly
-FUZZ = $(CARGO) +$(FUZZ_TOOLCHAIN) fuzz
+# Coverage instrumentation only on reliaburger and the parsers the decoders
+# run through (#1953): the whole dependency tree was 15.3 million counters,
+# which libFuzzer scans after every input. Narrowed, each target runs about
+# 3.5 times as many inputs a second. fuzz/rustc-coverage.sh holds the list.
+# Empty instruments everything.
+FUZZ_RUSTC_WRAPPER ?= $(CURDIR)/fuzz/rustc-coverage.sh
+# Cargo doesn't fingerprint a RUSTC_WRAPPER, so a changed list (or a build
+# from before the wrapper) would reuse crates instrumented the old way. A
+# cfg named after the wrapper's checksum puts it in every crate's RUSTFLAGS,
+# which Cargo does fingerprint; nothing reads the cfg.
+FUZZ_COVERAGE_ID = $(if $(FUZZ_RUSTC_WRAPPER),$(shell cksum < $(FUZZ_RUSTC_WRAPPER) | cut -d' ' -f1),all)
+FUZZ_COVERAGE_CFG = fuzz_coverage_$(FUZZ_COVERAGE_ID)
+FUZZ = RUSTC_WRAPPER=$(FUZZ_RUSTC_WRAPPER) \
+	RUSTFLAGS="$$RUSTFLAGS --cfg=$(FUZZ_COVERAGE_CFG) --check-cfg=cfg($(FUZZ_COVERAGE_CFG))" \
+	$(CARGO) +$(FUZZ_TOOLCHAIN) fuzz
 FUZZ_SECONDS ?= 10
 # cargo-fuzz defaults --target to the triple it was built for; a prebuilt
 # musl cargo-fuzz then asks for a static CRT that AddressSanitizer refuses.

@@ -522,7 +522,8 @@ class HarnessResumeWiring(unittest.TestCase):
                 self.assertLess(bodies[name].index("resume_cut_mark"), bodies[name].index("power_off "))
 
     def test_a_cut_of_the_writers_node_expects_a_new_writer_start(self):
-        body = self.functions()["power_off"]
+        # power_off itself lives in sustained/power.sh; the soak's hook runs the check.
+        body = self.functions()["power_before_off"]
         self.assertIn('[ "$node" != 2 ] || restarts+=(--restarts writer)', body)
         self.assertIn('check power-cut "$evidence" ${restarts[@]+"${restarts[@]}"}', body)
 

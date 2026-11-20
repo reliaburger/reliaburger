@@ -1,0 +1,41 @@
+{
+  "schema": "reliaburger.power-cut-calibration/1",
+  "kinds": {
+    "stop": {
+      "cuts": 50,
+      "rebooted": 50,
+      "modes": {
+        "fsync": {
+          "cuts": 50,
+          "cuts_losing_acked": 0,
+          "lost_acked_total": 0,
+          "lost_acked_max": 0,
+          "torn": 0,
+          "holes": 0,
+          "acked_total": 174730,
+          "verdict": "kept every acknowledged record"
+        },
+        "direct": {
+          "cuts": 50,
+          "cuts_losing_acked": 0,
+          "lost_acked_total": 0,
+          "lost_acked_max": 0,
+          "torn": 0,
+          "holes": 0,
+          "acked_total": 42319,
+          "verdict": "kept every acknowledged record"
+        },
+        "buffered": {
+          "cuts": 50,
+          "cuts_losing_acked": 50,
+          "lost_acked_total": 135156,
+          "lost_acked_max": 5413,
+          "torn": 0,
+          "holes": 0,
+          "acked_total": 135156,
+          "verdict": "lost acknowledged records in every cut"
+        }
+      }
+    }
+  }
+}
