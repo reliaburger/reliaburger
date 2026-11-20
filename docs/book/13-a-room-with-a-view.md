@@ -121,7 +121,7 @@ An enum models a closed set of alternatives. Rust requires an exhaustive `match`
 
 `DetailTab` is another enum with six variants. It derives `Copy` because it is a small value with no owned data. Cycling a tab computes the next variant and queues any effect that the new tab needs.
 
-Tab and Shift-Tab cycled the tabs from day one. In the Wyse lab, though, the first thing people pressed was →, and nothing happened, so the tabs looked stuck. Now ← and → map to the same `KeyAction::PreviousTab` and `NextTab`, which is one `|` in a `match` arm (`KeyCode::Tab | KeyCode::Right`): a pattern that matches either value, like stacking two `case` labels in C or Go. A line under the tab bar says `←/→ or Tab: switch tabs`, and the help view lists both keys, since it renders the same `KEYBINDINGS` table the reducer is tested against. The arrows were free in this view: ↑ and ↓ move a list's selection, and nothing used ← or →.
+Tab and Shift-Tab cycled the tabs from day one. In the Wyse lab, though, the first thing people pressed was →, and nothing happened, so the tabs looked stuck. Now ← and → map to the same `KeyAction::PreviousTab` and `NextTab`, which is one `|` in a `match` arm (`KeyCode::Tab | KeyCode::Right`): a pattern that matches either value, like stacking two `case` labels in C or Go. A line under the tab bar says `←/→ or Tab: switch tabs`, and the help view lists both keys, since it renders the `KEYBINDINGS` table in `keys.rs`, next to the `match` that maps the keys. The arrows were free in this view: ↑ and ↓ move a list's selection, and nothing used ← or →.
 
 ## What just happened?
 
