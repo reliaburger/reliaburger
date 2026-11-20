@@ -714,6 +714,25 @@ build in the VM. The watcher also logs swap and the kernel's memory-stall figure
 the build if available memory stays under 512 MiB for a minute while swap is in use. Paging
 hard is now a failed step with a log, not a vanished runner.
 
+The Ubuntu 26.04 job had been losing runners the same way, and on 20 November one finally
+came back with a log. Its build had been compiling the lib and the lib tests together when the
+host went quiet for 34 minutes. Available memory had dipped to 1 GiB and the host had started
+to swap; then the watcher, which samples every five seconds, wrote nothing at all. When the
+step's own `timeout` ended it, the load was 41 and every task had spent 98% of the last ten
+seconds waiting on memory. The kernel stacks
+the job printed on failure gave the answer. The writeback thread was stuck in
+`dm_snapshot`'s `wait_for_in_progress`, and `df` showed `/` on `/dev/mapper/cow-root`. That
+runner had come up with its root on a device-mapper snapshot and no swap. So our "give the
+compile swap" step put an 8 GiB swap file on the snapshot. Each page swapped out was a write
+the snapshot had to copy first, and that copy needs memory, which was exactly what the host
+had run out of. All 70 passing runs from 15 to 20 November had the plain `/dev/root` and kept their
+image's 3 GiB swap file. Now `scripts/ci/give-swap` refuses to put swap on device-mapper,
+`make test-linux` builds the lib tests on their own before the lib, so the two big rustc
+processes never overlap, and the watcher gets a third trigger: a "full" memory stall of 60% or
+more, held for 30 seconds, stops the build whether swap is in use or not. Passing runs peak at
+49% for one ten-second sample. None of that helps a host that freezes outright, because the
+watcher freezes with it. That case is why the step's own `timeout` stays.
+
 Coverage finds unvisited code. It does not tell us whether an assertion is useful, whether a
 webhook test accidentally exercised startup, or whether a five-second performance limit is
 portable. The audit found all three in a suite with lots of coverage. Read the uncovered
@@ -1241,6 +1260,17 @@ that has since merged can never be restored again, but it still counts, and it c
 request is closed, whose branch is gone, or which a newer cache of the same family on the
 same ref has replaced. The rule is a pure function, `stale(caches, open_pulls, branches)`,
 tested on fixtures, with the `gh` calls kept at the edges so it can be tested without network access.
+
+Then November's runner losses pushed portable Linux back up. With the coverage build at one
+job at a time, portable Linux went from a median of 22.7 minutes over 13 green train PRs to 34.8 over
+the next 14. Part of that was avoidable. `Swatinem/rust-cache` keys its cache on the
+toolchain and `Cargo.lock`, and only `main` saved one. So the cache that paragraph protects,
+`main`'s, wasn't one a train PR could use: a train changes the lock file, and no train PR
+ever restored a cache. Run 44721359618 says "No cache found" and then builds every
+dependency, one crate at a time, for about ten minutes. GitHub lets a pull request restore
+caches saved on its base branch, so now the train's own pushes save that cache too. Pull
+request and merge-queue refs still never save one, so nothing a PR builds ends up in a cache
+another run trusts.
 
 ### A release gate that fits in a week
 
