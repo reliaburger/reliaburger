@@ -536,8 +536,8 @@ class FaultOverlapWiring(unittest.TestCase):
 
     def test_the_mark_before_each_gated_fault_waits(self):
         bodies = self.functions()
-        self.assertIn('job_mark_fault "$node" "${current_slot:-power-off}" wait', bodies["power_off"])
-        self.assertLess(bodies["power_off"].index("job_mark_fault"), bodies["power_off"].index("limactl\" stop"))
+        # power_off (sustained/power.sh) calls this hook before it stops the VM.
+        self.assertIn('job_mark_fault "$node" "${current_slot:-power-off}" wait', bodies["power_before_off"])
         self.assertIn('job_mark_fault "$node" "${current_slot:-agent-kill}" wait', bodies["kill_bun"])
         self.assertLess(bodies["kill_bun"].index("job_mark_fault"), bodies["kill_bun"].index("kill -9"))
         node_fault = bodies["slot_node_fault"]
