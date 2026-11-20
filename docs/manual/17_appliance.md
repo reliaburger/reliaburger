@@ -656,7 +656,9 @@ Each node keeps two copies of the operating system: the one it runs, and a
 spare slot for the next. An update goes into the spare slot. The node reboots
 into it with three tries, and it's only marked good once bun is healthy
 again. If bun doesn't come up, the node goes back to the previous version by
-itself after the third try.
+itself after the third try. Each try waits up to 90 seconds for bun, so on a
+Wyse 3040, which takes about a minute to boot, a broken update is back on the
+old version in about 9 minutes.
 
 bun does this across the cluster, one node at a time. See what each node runs
 and what the newest release is:
