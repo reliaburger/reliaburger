@@ -310,6 +310,33 @@ you can see which replica runs which. With no image from any instance (a
 process app, or every node older than the field), it still says `unknown`,
 which is now true.
 
+### One table, two screens
+
+The nodes view had the same problem in a different shape. `relish nodes`
+grew VERSION, CPU, MEM, DISK and ALLOCATED columns months ago, built from
+three answers: gossip's member list, each node's own summary through the
+relay, and the leader's allocations. The TUI's nodes view still showed what
+the first version of `relish nodes` did: gossip's word and the labels.
+
+Copying the columns would have fixed it until the next one. Instead the TUI
+asks `nodes_cmd::fetch_rows` for the very `NodeRow`s the command prints, and
+both turn a row into cells with `nodes_cmd::row_cells`, which returns
+`[String; 10]`, an array whose length is part of its type. A new column means
+changing that `10`, and the compiler then points at every place that lays
+the cells out. The two screens differ only in layout. The command pads to
+fixed widths, which suits a pipe into `grep`. The TUI sizes each column to
+its widest cell, so the table fits a 120-column terminal, and leaves the
+SWIM incarnation number to the node's own page.
+
+Sharing the fetch turned up a compile error worth knowing about. The TUI's
+data provider promises futures that are `Send`, and `ask_each_node` built its
+per-node requests as a lazy `filter(...).map(...)` over borrowed nodes. The
+compiler couldn't prove that iterator `Send` "for any two lifetimes", a
+known limit of how Rust checks closures inside `async fn`s. Collecting the
+requests into a `Vec` before streaming them fixed it, as it had for the
+status snapshot reader. Nothing changed at runtime: the requests were
+always going to be built.
+
 ### Every view, not just one
 
 Saying so plainly was better than lying, but it was still a gap. Deploy

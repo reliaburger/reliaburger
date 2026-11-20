@@ -118,7 +118,7 @@ impl TuiApp {
             View::Nodes => {
                 if let Some(node) = self.data.nodes.get(self.nodes_cursor) {
                     self.push(View::NodeDetail {
-                        node: node.node_id.clone(),
+                        node: node.status.node_id.clone(),
                     });
                 }
             }

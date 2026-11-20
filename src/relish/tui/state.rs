@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::bun::agent::{ClusterInstanceStatus, CouncilStatus, JobStatus, NodeStatus};
+use crate::bun::agent::{ClusterInstanceStatus, CouncilStatus, JobStatus};
 use crate::bun::cluster_view::{ClusterDeployHistory, NodeTagged};
 use crate::bun::events::ClusterEvent;
 use crate::bun::summary::ClusterSummary;
@@ -80,7 +80,9 @@ pub struct ClusterData {
     /// dashboard and the header show. `None` until the first one arrives.
     pub summary: Option<ClusterSummary>,
     pub instances: Vec<ClusterInstanceStatus>,
-    pub nodes: Vec<NodeStatus>,
+    /// Every node as `relish nodes` lists it: gossip's view, its own
+    /// usage and what the scheduler allocated there.
+    pub nodes: Vec<crate::relish::nodes_cmd::NodeRow>,
     pub council: Option<CouncilStatus>,
     pub alerts: Vec<crate::mayo::alert::AlertStatus>,
     pub routes: Vec<RouteInfo>,
