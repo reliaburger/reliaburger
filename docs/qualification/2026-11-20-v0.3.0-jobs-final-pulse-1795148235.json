@@ -1,0 +1,340 @@
+{
+  "schema_version": 2,
+  "started_at": "2026-11-20T04:17:20Z",
+  "duration_ms": 338639,
+  "cluster_nodes": 3,
+  "chaos": false,
+  "profile": "full-runc",
+  "total": 15,
+  "passed": 11,
+  "failed": 0,
+  "skipped": 3,
+  "unknown": 1,
+  "results": [
+    {
+      "name": "rolling_deploy_keeps_the_app_running",
+      "group": "deployments",
+      "required": false,
+      "started_at": "2026-11-20T04:17:20Z",
+      "finished_at": "2026-11-20T04:17:20Z",
+      "deadline_at": "2026-11-20T04:22:20Z",
+      "outcome": {
+        "status": "skipped",
+        "capability": "process_runtime",
+        "reason": "requires process_runtime"
+      },
+      "duration_ms": 0,
+      "evidence": [],
+      "cleanup": {
+        "status": "not_required"
+      }
+    },
+    {
+      "name": "failed_deploy_rolls_back_automatically",
+      "group": "deployments",
+      "required": false,
+      "started_at": "2026-11-20T04:17:20Z",
+      "finished_at": "2026-11-20T04:17:20Z",
+      "deadline_at": "2026-11-20T04:22:20Z",
+      "outcome": {
+        "status": "skipped",
+        "capability": "process_runtime",
+        "reason": "requires process_runtime"
+      },
+      "duration_ms": 0,
+      "evidence": [],
+      "cleanup": {
+        "status": "not_required"
+      }
+    },
+    {
+      "name": "deploy_history_records_each_version",
+      "group": "deployments",
+      "required": false,
+      "started_at": "2026-11-20T04:17:20Z",
+      "finished_at": "2026-11-20T04:17:20Z",
+      "deadline_at": "2026-11-20T04:22:20Z",
+      "outcome": {
+        "status": "skipped",
+        "capability": "process_runtime",
+        "reason": "requires process_runtime"
+      },
+      "duration_ms": 0,
+      "evidence": [],
+      "cleanup": {
+        "status": "not_required"
+      }
+    },
+    {
+      "name": "workload_receives_spiffe_certificate",
+      "group": "workload-identity",
+      "required": true,
+      "started_at": "2026-11-20T04:17:20Z",
+      "finished_at": "2026-11-20T04:17:30Z",
+      "deadline_at": "2026-11-20T04:22:20Z",
+      "outcome": {
+        "status": "pass"
+      },
+      "duration_ms": 10664,
+      "evidence": [
+        {
+          "kind": "observed",
+          "source": "workload_receives_spiffe_certificate",
+          "observed_at": "2026-11-20T04:17:30Z",
+          "detail": "case completed its live assertions"
+        }
+      ],
+      "cleanup": {
+        "status": "confirmed"
+      }
+    },
+    {
+      "name": "jwks_endpoint_serves_signing_keys",
+      "group": "workload-identity",
+      "required": true,
+      "started_at": "2026-11-20T04:17:20Z",
+      "finished_at": "2026-11-20T04:17:20Z",
+      "deadline_at": "2026-11-20T04:22:20Z",
+      "outcome": {
+        "status": "pass"
+      },
+      "duration_ms": 87,
+      "evidence": [
+        {
+          "kind": "observed",
+          "source": "jwks_endpoint_serves_signing_keys",
+          "observed_at": "2026-11-20T04:17:20Z",
+          "detail": "case completed its live assertions"
+        }
+      ],
+      "cleanup": {
+        "status": "confirmed"
+      }
+    },
+    {
+      "name": "namespace_scoped_token_is_rejected_elsewhere",
+      "group": "workload-identity",
+      "required": true,
+      "started_at": "2026-11-20T04:17:20Z",
+      "finished_at": "2026-11-20T04:17:20Z",
+      "deadline_at": "2026-11-20T04:22:20Z",
+      "outcome": {
+        "status": "pass"
+      },
+      "duration_ms": 339,
+      "evidence": [
+        {
+          "kind": "observed",
+          "source": "namespace_scoped_token_is_rejected_elsewhere",
+          "observed_at": "2026-11-20T04:17:20Z",
+          "detail": "case completed its live assertions"
+        }
+      ],
+      "cleanup": {
+        "status": "confirmed"
+      }
+    },
+    {
+      "name": "ingress_routes_host_header_to_app",
+      "group": "ingress",
+      "required": true,
+      "started_at": "2026-11-20T04:17:20Z",
+      "finished_at": "2026-11-20T04:17:42Z",
+      "deadline_at": "2026-11-20T04:22:20Z",
+      "outcome": {
+        "status": "pass"
+      },
+      "duration_ms": 22727,
+      "evidence": [
+        {
+          "kind": "observed",
+          "source": "ingress_routes_host_header_to_app",
+          "observed_at": "2026-11-20T04:17:42Z",
+          "detail": "case completed its live assertions"
+        }
+      ],
+      "cleanup": {
+        "status": "confirmed"
+      }
+    },
+    {
+      "name": "ingress_removes_route_after_stop",
+      "group": "ingress",
+      "required": true,
+      "started_at": "2026-11-20T04:17:20Z",
+      "finished_at": "2026-11-20T04:17:42Z",
+      "deadline_at": "2026-11-20T04:22:20Z",
+      "outcome": {
+        "status": "pass"
+      },
+      "duration_ms": 22746,
+      "evidence": [
+        {
+          "kind": "observed",
+          "source": "ingress_removes_route_after_stop",
+          "observed_at": "2026-11-20T04:17:42Z",
+          "detail": "case completed its live assertions"
+        }
+      ],
+      "cleanup": {
+        "status": "confirmed"
+      }
+    },
+    {
+      "name": "ingress_route_appears_in_routing_table",
+      "group": "ingress",
+      "required": true,
+      "started_at": "2026-11-20T04:17:20Z",
+      "finished_at": "2026-11-20T04:17:36Z",
+      "deadline_at": "2026-11-20T04:22:20Z",
+      "outcome": {
+        "status": "pass"
+      },
+      "duration_ms": 16322,
+      "evidence": [
+        {
+          "kind": "observed",
+          "source": "ingress_route_appears_in_routing_table",
+          "observed_at": "2026-11-20T04:17:36Z",
+          "detail": "case completed its live assertions"
+        }
+      ],
+      "cleanup": {
+        "status": "confirmed"
+      }
+    },
+    {
+      "name": "volume_data_survives_instance_restart",
+      "group": "volumes",
+      "required": true,
+      "started_at": "2026-11-20T04:17:30Z",
+      "finished_at": "2026-11-20T04:18:08Z",
+      "deadline_at": "2026-11-20T04:22:30Z",
+      "outcome": {
+        "status": "pass"
+      },
+      "duration_ms": 37224,
+      "evidence": [
+        {
+          "kind": "observed",
+          "source": "volume_data_survives_instance_restart",
+          "observed_at": "2026-11-20T04:18:08Z",
+          "detail": "case completed its live assertions"
+        }
+      ],
+      "cleanup": {
+        "status": "confirmed"
+      }
+    },
+    {
+      "name": "volume_is_isolated_per_app",
+      "group": "volumes",
+      "required": true,
+      "started_at": "2026-11-20T04:17:36Z",
+      "finished_at": "2026-11-20T04:17:58Z",
+      "deadline_at": "2026-11-20T04:22:36Z",
+      "outcome": {
+        "status": "pass"
+      },
+      "duration_ms": 21153,
+      "evidence": [
+        {
+          "kind": "observed",
+          "source": "volume_is_isolated_per_app",
+          "observed_at": "2026-11-20T04:17:58Z",
+          "detail": "case completed its live assertions"
+        }
+      ],
+      "cleanup": {
+        "status": "confirmed"
+      }
+    },
+    {
+      "name": "volume_size_limit_is_enforced",
+      "group": "volumes",
+      "required": true,
+      "started_at": "2026-11-20T04:17:43Z",
+      "finished_at": "2026-11-20T04:18:01Z",
+      "deadline_at": "2026-11-20T04:22:43Z",
+      "outcome": {
+        "status": "pass"
+      },
+      "duration_ms": 18003,
+      "evidence": [
+        {
+          "kind": "observed",
+          "source": "volume_size_limit_is_enforced",
+          "observed_at": "2026-11-20T04:18:01Z",
+          "detail": "case completed its live assertions"
+        }
+      ],
+      "cleanup": {
+        "status": "confirmed"
+      }
+    },
+    {
+      "name": "push_and_pull_image_roundtrip",
+      "group": "image-registry",
+      "required": true,
+      "started_at": "2026-11-20T04:17:42Z",
+      "finished_at": "2026-11-20T04:17:43Z",
+      "deadline_at": "2026-11-20T04:22:42Z",
+      "outcome": {
+        "status": "pass"
+      },
+      "duration_ms": 991,
+      "evidence": [
+        {
+          "kind": "observed",
+          "source": "push_and_pull_image_roundtrip",
+          "observed_at": "2026-11-20T04:17:43Z",
+          "detail": "case completed its live assertions"
+        }
+      ],
+      "cleanup": {
+        "status": "confirmed"
+      }
+    },
+    {
+      "name": "manifest_catalog_lists_pushed_image",
+      "group": "image-registry",
+      "required": true,
+      "started_at": "2026-11-20T04:17:42Z",
+      "finished_at": "2026-11-20T04:17:43Z",
+      "deadline_at": "2026-11-20T04:22:42Z",
+      "outcome": {
+        "status": "pass"
+      },
+      "duration_ms": 1039,
+      "evidence": [
+        {
+          "kind": "observed",
+          "source": "manifest_catalog_lists_pushed_image",
+          "observed_at": "2026-11-20T04:17:43Z",
+          "detail": "case completed its live assertions"
+        }
+      ],
+      "cleanup": {
+        "status": "confirmed"
+      }
+    },
+    {
+      "name": "deploy_from_cluster_registry",
+      "group": "image-registry",
+      "required": true,
+      "started_at": "2026-11-20T04:17:43Z",
+      "finished_at": "2026-11-20T04:22:58Z",
+      "deadline_at": "2026-11-20T04:22:43Z",
+      "outcome": {
+        "status": "unknown",
+        "kind": "timed_out",
+        "reason": "case exceeded its 300000 ms deadline"
+      },
+      "duration_ms": 314919,
+      "evidence": [],
+      "cleanup": {
+        "status": "confirmed"
+      }
+    }
+  ]
+}
