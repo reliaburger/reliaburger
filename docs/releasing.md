@@ -1324,6 +1324,13 @@ installs (step 3) on the candidate, and the matching nightly's directory is
 copied into `docs/qualification/` as the soak and power-cut records. When it
 fails, run steps 4 and 5 on the candidate as before.
 
+Freeze is also when the release notes are drafted
+(`docs/qualification/DATE-vX.Y.Z-release-notes.md`). Alongside the draft,
+bring the release's section in [`CHANGELOG.md`](../CHANGELOG.md) up to date
+under `## [Unreleased] - X.Y.Z`: Upgrading first, then what it adds, changes,
+fixes and removes, one line each. `scripts/ci/test_changelog.py` fails while
+the version in `Cargo.toml` has no section.
+
 ### Performance records after the tag
 
 Benchmarks, the profile (#1358) and the day run (#1032) don't decide whether a
@@ -1791,6 +1798,9 @@ the real `curl … | sh` install against it on every host we advertise.
    `docs/qualification/DATE-vX.Y.Z-release-notes.md`, above that list:
    `gh release edit vX.Y.Z --notes-file NOTES` with the draft followed by
    the generated list ([0.2.8's draft](qualification/2026-11-09-v0.2.8-release-notes.md)).
+   In [`CHANGELOG.md`](../CHANGELOG.md), turn `## [Unreleased] - X.Y.Z` into
+   the dated `## [X.Y.Z] - YYYY-MM-DD`, add the known issues it ships with,
+   and point its link at the release page.
 
    **Then publish the appliance OS**, from v0.3.0 on. `promote.yml` publishes
    only `bun` and `relish`; the OS images that `relish image download` and
@@ -1977,6 +1987,8 @@ the real `curl … | sh` install against it on every host we advertise.
     took and how many candidates, what each soak found and what fixed it, and
     any known issue it ships with, linking the records from step 6. When the
     profile from step 9 is in, add one line from its answer.
+    `scripts/ci/test_changelog.py` fails while a release in the log has no
+    dated section in [`CHANGELOG.md`](../CHANGELOG.md) (step 8).
 
 ## Soaking a candidate in CI
 
