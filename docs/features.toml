@@ -893,8 +893,8 @@ name = "Leader failover and agent restarts"
 status = "ready"
 since = "0.1.0"
 summary = "A new leader takes over within seconds, and a restarted `bun` adopts its running workloads instead of replacing them."
-restrictions = "A replaced voter coming back can force an unneeded election."
-issues = [1524]
+restrictions = "None known: since 0.3.0 a returning voter holds its elections until it hears from a leader (#1524)."
+issues = []
 docs = ["docs/manual/02_cluster-basics.md#watch-it"]
 evidence = "Gate: SIGKILL of the leader and of followers, six times each in the 0.2.7 V02 fast tier; no leader for over 30 s fails the release. Replicas kept on restart since 0.2.4 (#1449)."
 
