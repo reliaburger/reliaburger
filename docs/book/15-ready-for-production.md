@@ -714,6 +714,25 @@ build in the VM. The watcher also logs swap and the kernel's memory-stall figure
 the build if available memory stays under 512 MiB for a minute while swap is in use. Paging
 hard is now a failed step with a log, not a vanished runner.
 
+The Ubuntu 26.04 job had been losing runners the same way, and on 20 November one finally
+came back with a log. Its build had been compiling the lib and the lib tests together when the
+host went quiet for 34 minutes. Available memory had dipped to 1 GiB and the host had started
+to swap; then the watcher, which samples every five seconds, wrote nothing at all. When the
+step's own `timeout` ended it, the load was 41 and every task had spent 98% of the last ten
+seconds waiting on memory. The kernel stacks
+the job printed on failure gave the answer. The writeback thread was stuck in
+`dm_snapshot`'s `wait_for_in_progress`, and `df` showed `/` on `/dev/mapper/cow-root`. That
+runner had come up with its root on a device-mapper snapshot and no swap. So our "give the
+compile swap" step put an 8 GiB swap file on the snapshot. Each page swapped out was a write
+the snapshot had to copy first, and that copy needs memory, which was exactly what the host
+had run out of. All 70 passing runs from 15 to 20 November had the plain `/dev/root` and kept their
+image's 3 GiB swap file. Now `scripts/ci/give-swap` refuses to put swap on device-mapper,
+`make test-linux` builds the lib tests on their own before the lib, so the two big rustc
+processes never overlap, and the watcher gets a third trigger: a "full" memory stall of 60% or
+more, held for 30 seconds, stops the build whether swap is in use or not. Passing runs peak at
+49% for one ten-second sample. None of that helps a host that freezes outright, because the
+watcher freezes with it. That case is why the step's own `timeout` stays.
+
 Coverage finds unvisited code. It does not tell us whether an assertion is useful, whether a
 webhook test accidentally exercised startup, or whether a five-second performance limit is
 portable. The audit found all three in a suite with lots of coverage. Read the uncovered
@@ -1241,6 +1260,17 @@ that has since merged can never be restored again, but it still counts, and it c
 request is closed, whose branch is gone, or which a newer cache of the same family on the
 same ref has replaced. The rule is a pure function, `stale(caches, open_pulls, branches)`,
 tested on fixtures, with the `gh` calls kept at the edges so it can be tested without network access.
+
+Then November's runner losses pushed portable Linux back up. With the coverage build at one
+job at a time, portable Linux went from a median of 22.7 minutes over 13 green train PRs to 34.8 over
+the next 14. Part of that was avoidable. `Swatinem/rust-cache` keys its cache on the
+toolchain and `Cargo.lock`, and only `main` saved one. So the cache that paragraph protects,
+`main`'s, wasn't one a train PR could use: a train changes the lock file, and no train PR
+ever restored a cache. Run 44721359618 says "No cache found" and then builds every
+dependency, one crate at a time, for about ten minutes. GitHub lets a pull request restore
+caches saved on its base branch, so now the train's own pushes save that cache too. Pull
+request and merge-queue refs still never save one, so nothing a PR builds ends up in a cache
+another run trusts.
 
 ### A release gate that fits in a week
 
@@ -3944,27 +3974,115 @@ exceeded its 600000 ms deadline". The case's own wait knew precisely what it
 was stuck on (three running replicas, and the states it last saw), but it
 gives up on the same deadline the runner enforces, and the runner won the
 race and cancelled it before the message came back. Now each poll helper also
-leaves a note on the context as it goes, a `WaitNote`, which is a newtype
-around `Arc<tokio::sync::Mutex<Option<String>>>` so every clone of the context
-shares one note. On a timeout the runner appends it:
+leaves a note on the context as it goes. The note lives in a `CaseTrace`, a
+newtype around `Arc<tokio::sync::Mutex<TraceState>>`, so every clone of the
+context shares one trace. On a timeout the runner appends the note:
 
 ```rust
-if let (Some(note), TestOutcome::Unknown { reason, .. }) =
-    (context.wait_note.take().await, &mut outcome)
-{
+if let Some(note) = context.trace.take_wait().await {
     reason.push_str("; it was still ");
     reason.push_str(&note);
 }
 ```
 
-That `if let` matches a *tuple* of two values at once, so the body runs only
-when there's a note *and* the outcome is the `Unknown` variant. The `..` skips
-the fields we don't need, and matching on `&mut outcome` binds `reason` as a
-mutable reference into the enum, so we can extend the string in place without
-rebuilding the variant. We didn't give the body a grace period to return its
-own message instead: an existing test insists that a timed-out body stops at
-its deadline, and a case that can keep acting after it would be a worse bug
-than a terse report.
+`reason` here was bound by an earlier `if let TestOutcome::Unknown { reason, .. }
+= &mut outcome`. Matching on `&mut outcome` binds `reason` as a mutable
+reference into the enum, so we can extend the string in place without
+rebuilding the variant, and the `..` skips the fields we don't need. We didn't
+give the body a grace period to return its own message instead: an existing
+test insists that a timed-out body stops at its deadline, and a case that can
+keep acting after it would be a worse bug than a terse report.
+
+### Evidence before cleanup
+
+The note helped only while a wait helper was running. In 0.3.0 candidate 4's
+final soak, `deploy_from_cluster_registry` ran for five minutes and the report
+said "case exceeded its 300000 ms deadline", full stop (#2128). The case had
+four stretches where it could hang: staging the image into the registry, the
+apply, the wait for a running instance and the `wget` inside the container.
+Nothing said which. And by the time the soak harness bundled its evidence, the
+runner had released the case's lease, which removed the app. The journals
+showed it had been applied, and that was all. Was the instance never started,
+or did the probe inside it hang? Nobody could tell, and a five-minute stall in
+58 clean runs doesn't reproduce on demand.
+
+So a case now names its steps. `TestContext::step` runs a future under the
+case deadline, and puts its name in the trace while it runs:
+
+```rust
+pub async fn step<T, F>(&self, name: &str, future: F) -> Result<T, String>
+where
+    F: std::future::Future<Output = T>,
+{
+    let sequence = self.trace.begin_step(name).await;
+    let output = self
+        .deadline
+        .run(name, future)
+        .await
+        .map_err(|error| error.to_string())?;
+    self.trace.end_step(sequence).await;
+    Ok(output)
+}
+```
+
+`step` is generic over two types. `F` is whatever future the caller hands
+over, and the `where` clause says it must be a `Future` whose output is `T`,
+so `step` gives back exactly what the future produced, wrapped in a
+`Result`. Rust compiles a separate copy of `step` for each `F` and `T` it's
+called with (monomorphisation), so unlike a Go interface value there's no
+boxing and no dynamic dispatch. The wait
+helpers, `apply` and `exec_in_workload` open steps the same way, so most cases
+get them without asking.
+
+The interesting part is what *doesn't* happen. When the runner's deadline
+fires, it drops the case's future, and Rust drops a future by simply never
+polling it again. `end_step` never runs. That's exactly what we want: a step
+with no end is the step the case was in when it was cancelled, and the runner
+reads it from the trace and says so: `case exceeded its 300000 ms deadline
+during step "exec in registry-web"`. The `?` on the deadline does the same
+when the step runs out of time by itself. No guard object, no `Drop`
+implementation. Cancellation leaving state behind is usually a bug; here it's
+the evidence.
+
+The trace keeps at most 16 steps in a `VecDeque` (a ring buffer from the
+standard library, cheap to push at the back and pop at the front). When it's
+full it drops the oldest *finished* step first. The workload-identity case
+polls `exec_in_workload` every 100 ms inside its own "wait for workload
+certificate" step, and a plain ring would push that enclosing step out after
+a couple of seconds of polling.
+
+Then the state. After a case fails or times out, and before teardown, the
+runner calls `capture_failure_state`. It reads the case's instances on every
+reachable node, the newest deployment of each app, recent events about them
+and what the server says of the lease, and puts the lot in the case's report
+entry as `failure_state`. So `relish test -o json` and every soak pulse
+snapshot carry the app's state at the moment it failed. Three rules keep it
+honest:
+
+- **Bounded.** 16 steps, 8 apps, 32 instances, 20 events and 300 characters
+  per text field. A pulse snapshot is kept for every hour of an 8-hour soak,
+  and a capture mustn't turn one into a megabyte.
+- **Missing isn't empty.** A read that fails goes into `errors`. An empty
+  `instances` list then means the cluster said there were none, not that we
+  couldn't ask. Each node's status is its own read, and they run together
+  through `futures_util::future::join_all`, which polls a list of futures at
+  once and returns their outputs in order. The first version asked the nodes
+  one after another inside a single read, so one partitioned node cost the
+  capture every node's instances. That's exactly when you want them.
+- **App text stays marked.** An event's message can quote what an app said,
+  so it's wrapped as untrusted text, the same wrapper `relish events -o json`
+  uses, before it reaches a report an agent might read.
+- **It can't wedge teardown.** Each read gets three seconds, the whole
+  capture 15, and the case's lease is 15 seconds longer to cover it.
+
+The soak harness had the mirror image of the problem. Its `record_failure`
+already ran before its own cleanup for most checks, but `relish test` cleans
+up inside the run, minutes before the harness gets to look. Now the pulse and
+the chaos scenario hand their JSON report to `record_failure`, which copies
+each failing case's capture into `failures/<n>/captured-state.json`, takes
+the journals from a minute before the case started (or the last 15 minutes,
+whichever reaches further back), and links the capture from the failure line, so the next reader
+starts from it.
 
 The registry cases failed faster: "blob upload POST failed … https://127.0.0.1:5050".
 They push to `ctx.registry_base()`, the registry origin from the capability

@@ -267,6 +267,13 @@ heavy_every=300
 # tier gets about a dozen, a final about twenty and a day about fifty.
 slo_every=$(( cycle / 2 ))
 slo_rollout_budget=180
+# The day tier deploys once, so its deploy hooks and `after` jobs ran only in
+# the campaign's first seconds, where the task-array store's 20 newest runs a
+# namespace could prune them before the controller's first scan (#1935). It
+# applies the job fixtures again every hour instead; the tiers with a fault
+# schedule do it with every rolling deploy.
+hook_every=0
+[ "$tier" != day ] || hook_every=3600
 leaf_lifetime=3600
 
 if [ "$resume" = true ]; then
@@ -518,7 +525,7 @@ api_get() {
 }
 kill_bun() {
     local node=$1
-    job_mark_fault "$node" "${current_slot:-agent-kill}"
+    job_mark_fault "$node" "${current_slot:-agent-kill}" wait
     check expect "$evidence" restart "${vm[node]}"
     gsh "$node" 'kill -9 "$(systemctl show -p MainPID --value reliaburger.service)"'
 }
@@ -1008,6 +1015,23 @@ apply_soak_manifests() {
     rel apply -f "$evidence/workloads.toml" >> "$log" 2>&1
 }
 
+# The workloads at their current generations with the job fixtures, applied
+# again (#1935): no app changes, so nothing rolls, but every run_before hook
+# and plain job runs once more and the controller sees it finish. Not once
+# the drain is asked for or due within a minute (jobs_applied, #963).
+hook_applies=0
+hook_apply() {
+    jobs_applied || return 0
+    hook_applies=$(( hook_applies + 1 ))
+    write_workloads
+    local log=$evidence/snapshots/hook-apply-$hook_applies.log
+    if apply_soak_manifests "$log"; then
+        event --phase jobs:hook-apply --verdict ok --detail "apply $hook_applies at generation $generation"
+    else
+        event --phase jobs:hook-apply --verdict fail --detail "apply $hook_applies failed; see ${log##*/}"
+    fi
+}
+
 # Every instance in the cluster as a JSON list, one object per instance with
 # its node, id, app_name and state. From 0.2.8 `relish status` prints the
 # cluster summary instead, and the instance list moved to `relish apps
@@ -1170,9 +1194,22 @@ wait_for_job_drain() {
     local until=$(( $(date +%s) + 150 ))
     while [ ! -s "$evidence/jobs/exit-status" ] && [ "$(date +%s)" -lt "$until" ]; do sleep 2; done
 }
+# job_mark_fault NODE LABEL [wait]: record the job runs active on NODE as a
+# fault strikes it. With `wait`, a fault of a kind the coverage gate owes
+# (power-off, either bun kill, a node fault) is held, up to the controller's
+# OVERLAP_WAIT_SECS, until a run of every mode is active on NODE (#2105):
+# whether one is at the instant of the fault is chance, and 0.3.0 candidate
+# 4's fast tier failed on it. A wait that runs out is recorded, and the fault
+# goes ahead.
 job_mark_fault() {
     [ -n "${jobs_pid:-}" ] || return 0
-    python3 "$job_controller" mark "$evidence/jobs" "${vm[$1]}" "$2" || event --phase harness-error --target jobs --detail 'could not record active fault overlap'
+    local result=0 missing
+    missing=$(python3 "$job_controller" mark "$evidence/jobs" "${vm[$1]}" "$2" ${3:+--wait}) || result=$?
+    case $result in
+        0) ;;
+        3) event --phase job-overlap --target "${vm[$1]}" --verdict missing --detail "$2: no active run of $missing" ;;
+        *) event --phase harness-error --target jobs --detail 'could not record active fault overlap' ;;
+    esac
 }
 
 # --- evidence collection ---------------------------------------------------------
@@ -1454,8 +1491,15 @@ registry() {
 }
 
 failure_count=0
+# record_failure CHECK DETAIL [SNAPSHOT] [KEY] [TEST_REPORT]
+# Bundle the evidence for a failed check, straight away: every caller runs
+# it before its own cleanup (fault clear, settle). A `relish test` cleans up
+# its cases inside the run, so TEST_REPORT names its JSON report, whose
+# failing cases carry the state captured before their leases were released;
+# the bundle keeps that state and its journals reach back to the case's
+# start rather than 15 minutes before the run ended (#2131).
 record_failure() {
-    local check_name=$1 detail=$2 snapshot=${3:-} key=${4:-} directory node
+    local check_name=$1 detail=$2 snapshot=${3:-} key=${4:-} report=${5:-} directory node captured= since=-15min
     # A keyed failure that keeps recurring gets one bundle per half hour.
     if [ -n "$key" ] && check seen "$evidence" "$key"; then
         event --phase failure --target "$check_name" --verdict repeat --detail "$detail"
@@ -1464,17 +1508,24 @@ record_failure() {
     failure_count=$(( $(find "$evidence/failures" -mindepth 1 -maxdepth 1 -type d | wc -l) + 1 ))
     directory=$evidence/failures/$failure_count
     mkdir -p "$directory"
-    python3 - "$directory/summary.json" "$check_name" "$detail" "${current_slot:-}" "${snapshot:-}" <<'PY'
+    if [ -n "$report" ]; then
+        cp "$report" "$directory/test-report.json" 2>/dev/null || true
+        read -r captured since <<<"$(check test-states "$report" "$directory/captured-state.json" 2>/dev/null)" || true
+        since=${since:--15min}
+    fi
+    python3 - "$directory/summary.json" "$check_name" "$detail" "${current_slot:-}" "${snapshot:-}" "$captured" <<'PY'
 import json, sys, time
-path, check, detail, slot, snapshot = sys.argv[1:]
-json.dump({"ts": int(time.time()), "check": check, "detail": detail, "slot": slot, "snapshot": snapshot,
-           "class": "unclassified", "cause": "open", "action": "open", "disposition": "open"},
-          open(path, "w"), indent=1)
+path, check, detail, slot, snapshot, captured = sys.argv[1:]
+summary = {"ts": int(time.time()), "check": check, "detail": detail, "slot": slot, "snapshot": snapshot,
+           "class": "unclassified", "cause": "open", "action": "open", "disposition": "open"}
+if captured:
+    summary["captured"] = captured
+json.dump(summary, open(path, "w"), indent=1)
 PY
     [ -z "$snapshot" ] || cp -R "$snapshot" "$directory/snapshot"
     for node in 1 2 3; do
         [ "${down[node]}" = 0 ] || continue
-        gsh "$node" 'journalctl -u reliaburger --since "-15min" --no-pager' > "$directory/journal-${vm[node]}.txt" 2>&1 || true
+        gsh "$node" "journalctl -u reliaburger --since '$since' --no-pager" > "$directory/journal-${vm[node]}.txt" 2>&1 || true
         # The stall watchdog's thread snapshots, cut out of that journal (#1707).
         check loop-stalls "$directory/journal-${vm[node]}.txt" > "$directory/loop-stalls-${vm[node]}.txt" 2>/dev/null || true
         [ -s "$directory/loop-stalls-${vm[node]}.txt" ] || rm -f "$directory/loop-stalls-${vm[node]}.txt"
@@ -1486,7 +1537,7 @@ PY
     cp "$evidence/state.json" "$directory/state.json" 2>/dev/null || true
     printf 'slot %s\nwindow %s\ndown %s %s %s\n' "${current_slot:-}" "${window_label:-}" "${down[1]}" "${down[2]}" "${down[3]}" > "$directory/context.txt"
     event --phase failure --target "$check_name" --verdict fail --detail "$detail"
-    say "FAILURE $failure_count: $check_name: $detail"
+    say "FAILURE $failure_count: $check_name: $detail${captured:+; state at failure: failures/$failure_count/$captured}"
 }
 
 # A cluster that can't be set up can't be soaked: bundle the evidence and stop.
@@ -1518,6 +1569,7 @@ window_label=
 next_light=0
 next_heavy=$(( $(date +%s) + heavy_every ))
 next_slo=$(( $(date +%s) + slo_every ))
+next_hook=$(( $(date +%s) + hook_every ))
 next_rotation=$(( $(date +%s) + rotation ))
 open_window() { window_label=$1; check window "$evidence" open "$1" --down "${2:-0}" ${3:+--node "$3"}; }
 close_window() { check window "$evidence" "${1:-close}"; window_label=; }
@@ -1608,7 +1660,9 @@ slot_deploy_kill() {
 power_offs=0
 power_before_off() {
     local node=$1
-    job_mark_fault "$node" "${current_slot:-power-off}"
+    # The wait comes after resume_cut_mark, so it can loosen that mark by as
+    # long as it lasts; that mark is a lower bound, so it stays true.
+    job_mark_fault "$node" "${current_slot:-power-off}" wait
     keep_host_logs power-off "$node"
     # The cut stops whatever runs on the node; the writer is pinned to node 2,
     # and the day tier pins the Redis client to node 1. Each must record a new
@@ -1678,7 +1732,7 @@ slot_node_fault() {
     # The checker excuses slow turns only on the node the fault throttles (#972).
     open_window "node-$kind" 0 "${vm[node]}"
     avoid=$node
-    job_mark_fault "$node" "${current_slot%%:*}:$kind"
+    job_mark_fault "$node" "${current_slot%%:*}:$kind" wait
     gsh "$node" "PEER=${address[peer]}; $(node_fault_script "$kind" start)" > "$log" 2>&1 || result=$?
     event --phase "fault:node-$kind" --target "${vm[node]}" --exit "$result" --command "$kind" --detail "held $hold s"
     [ "$result" -eq 0 ] || record_failure "node-$kind" "could not inject $kind on ${vm[node]}; see ${log##*/}"
@@ -1754,7 +1808,7 @@ chaos_one() {
         # A JSON report's last lines are only closing brackets: name the
         # failing case and its reason instead (#1068).
         if [ "$kind" = scenario ]; then
-            record_failure "chaos-$kind" "$(check test-failures "$output" "$output.err")"
+            record_failure "chaos-$kind" "$(check test-failures "$output" "$output.err")" '' '' "$output"
         else
             record_failure "chaos-$kind" "$(tail -n 3 "$output" | tr '\n' ' ')"
         fi
@@ -1774,7 +1828,8 @@ catalogue_pulse() {
     rel_budget=1800 rel --output json test --profile full-runc --filter volumes,image-registry,workload-identity,ingress,deployments \
         --timeout 300s > "$output" 2>"$output.err" || result=$?
     event --phase pulse --exit "$result" --verdict "$([ "$result" -eq 0 ] && echo ok || echo fail)" --detail "${output##*/}"
-    [ "$result" -eq 0 ] || record_failure pulse "relish test exited $result; see ${output##*/}"
+    [ "$result" -eq 0 ] || record_failure pulse \
+        "relish test exited $result: $(check test-failures "$output" "$output.err"); see ${output##*/}" '' '' "$output"
     settle pulse:settle 300 || true
 }
 
@@ -2009,6 +2064,9 @@ wait_until() {
         elif [ "$now" -ge "$next_slo" ] && [ -z "$window_label" ]; then
             next_slo=$(( now + slo_every ))
             run_slot slo_rollout
+        elif [ "$hook_every" -gt 0 ] && [ "$now" -ge "$next_hook" ] && [ -z "$window_label" ]; then
+            next_hook=$(( now + hook_every ))
+            run_slot hook_apply
         elif [ "$now" -ge "$next_light" ]; then
             next_light=$(( now + light_every ))
             observe light || true
@@ -2231,6 +2289,7 @@ if [ "$plan" = true ]; then
     [ "$tier" != day ] || printf 'plan: host-busybox busybox-static %s %s\n' "$day_busybox_version" "$day_busybox_sha256"
     [ "$malloc_points" != true ] || printf 'plan: malloc-trim at hours 6 12 18 24 on every node (gdb: malloc_stats, malloc_trim(0))\n'
     [ "$tier" != day ] || printf 'plan: log-ab soak-quiet on node 3, never queried; tails ask only the node holding the lines\n'
+    [ "$hook_every" -eq 0 ] || printf 'plan: hook-apply every %s s: the job fixtures again at unchanged generations, so every deploy hook and after job runs while the controller watches\n' "$hook_every"
     printf 'plan: %s\n' "$job_runs"
     printf 'plan: seed %s for every fault and node choice\n' "${seed:-random}"
     [ "$tier" = day ] || printf 'plan: council-history %s clients, checked for linearizability after the soak\n' "$history_clients"
@@ -2338,6 +2397,7 @@ next_light=$(date +%s)
 next_malloc=$(date +%s)
 next_heavy=$(( $(date +%s) + heavy_every ))
 next_slo=$(( $(date +%s) + slo_every / 2 ))
+next_hook=$(( $(date +%s) + hook_every ))
 index=$first_cycle
 # A day tier runs no cycles: its whole length is the wait below.
 while [ "$schedule" != none ]; do

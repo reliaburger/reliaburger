@@ -710,6 +710,21 @@ The leader runs a loop every five seconds, and the loop calls one pure function,
 
 `Draining` is the new part. While a node is draining or updating, the scheduler's cache marks it not ready, exactly as Chapter 14's upgrade cordon does, so on its next pass the scheduler moves that node's replicas elsewhere. The leader waits until no movable replica is placed there, or five minutes, whichever comes first. Replicas of apps with a managed volume don't move: their data is on that disk, so they wait for the node, as they would through any reboot.
 
+An app that bind-mounts a host path (a volume with a `source`) waits too, though that took a bug report to get right (#2120). `undrained`, the function that tells the leader which nodes still hold movable replicas, filtered on `has_managed_volume` alone, so it counted a host-path app as movable, and the scheduler agreed: a cordoned node is not ready, and a replica on a node that isn't ready moves. The app was started on another node, away from whatever it kept under its host path. The fix has two halves that have to agree. `undrained` now asks `stays_through_os_rollout`, which is true for a managed volume or a host path, and the scheduler's `Liveness::keeps` keeps a host-path replica on any node the OS rollout is draining or updating, through the reboot as well, when the node drops out of gossip for a minute. Leave out the second half and the leader stops waiting for the app but the scheduler moves it anyway.
+
+Why only during an OS rollout, when a managed volume stays put through anything short of decommissioning? Because a managed volume is always on the node's disk, and a host path needn't be: it can be an NFS mount every node shares, and then moving the app when its node dies is exactly right. During an OS rollout we know the node is coming back in a minute or two, so waiting costs little whichever kind of path it is.
+
+The same review found the cordon was invisible (#2119). `relish nodes` and `relish status` read each node's `cordoned` flag from the leader's capacity view, and `capacity_from_reports` set it from the bun upgrade alone, so a node the OS rollout was draining looked like any other healthy node that, for no stated reason, got no new work. Now the leader asks both rollouts, and records which one holds the node:
+
+```rust
+pub enum Cordon {
+    Upgrade,
+    OsRollout,
+}
+```
+
+`NodeCapacity` keeps its `cordoned` flag and gains `cordoned_by: Option<Cordon>`, which `serde` writes as `"upgrade"`, `"os_rollout"` or `null`. `relish nodes` prints a line under its table (`node-2 is cordoned by the OS rollout: it takes no new work (relish os status)`), and `relish status` counts the two kinds apart: `1 cordoned by the OS rollout`. Why an enum and not a second `bool`, say `os_rollout_cordoned`? Two flags allow "cordoned by both", which never happens, and a third cordon would need a third flag; an `Option` of an enum holds exactly one owner or none, and a `match` on it has to handle every owner. `cordoned` stays for the scripts that already read it, always equal to `cordoned_by.is_some()`. The new fields carry `#[serde(default)]`, so a node that reads a leader's answer from before the change gets `None` and zeros rather than an error.
+
 Then the leader posts the directive, and the node takes over. It fetches the release's `SHA256SUMS` and signature from the GitHub release named after the version, checks the signature, streams each file to disk while hashing it, and hands the directory to sysupdate, exactly as `os-stage` did. Which key does it check against? The release keys compiled into bun, *and* the key in `/usr/lib/reliaburger/os-signing-key.pub.pem` in its own image. dm-verity guards that file like every other byte of `/usr`, so an image vouches for its successors. A published image carries the release key; a CI lab build carries its own throwaway key, which is what lets CI test a real update between two lab builds.
 
 Before it reboots, the node writes what it's doing to `/var/lib/reliaburger/os-update.json`: `{"state": "rebooting", "target": "2026.42.0"}`. That one file answers the hard question after the reboot. If the node comes up on 2026.42.0 and the boot gets blessed, the update worked. If it comes up on anything else, it was a fallback, and bun says so in `/v1/version`:

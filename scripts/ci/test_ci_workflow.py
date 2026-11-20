@@ -829,21 +829,38 @@ class LinuxNextTests(unittest.TestCase):
         inner = int(re.search(r"timeout --kill-after=1m (\d+)m", command).group(1))
         self.assertLessEqual(inner + 1, self.minutes(step) - 1)
 
-    def test_the_compile_gets_swap_before_the_tests_run(self):
+    def test_the_compile_gets_swap_before_the_tests_run_but_never_on_a_snapshot(self):
         # With the runner shielded, #1943 showed up as a global OOM: on
         # 15 Nov rustc reached 10.6 GB resident building the lib tests while
-        # rust-lld linked, and the kernel killed it (run 43715574887).
-        swap = self.step("sudo swapon /ci-swapfile")
+        # rust-lld linked, and the kernel killed it (run 43715574887). On
+        # 20 Nov a swap file on a dm-snapshot / froze the host for 34
+        # minutes (run 44648854969), so give-swap refuses device-mapper.
+        swap = self.step("scripts/ci/give-swap 8388608 /")
         self.assertLess(swap, self.step("make test-linux"))
-        self.assertIn("swapon --show --noheadings", self.steps[swap])
         self.assertNotIn("if: always()", self.steps[swap])
+        self.assertNotIn("fallocate", self.steps[swap])
+        self.assertIn("swapon --show", self.steps[swap])
+
+    def test_the_watcher_stops_a_build_or_test_run_that_pages_or_fills_the_disk(self):
+        # The guards the portable job has, plus the memory-stall limit, which
+        # fires with or without swap. The tests run as root, so the watcher
+        # signals through sudo (test_runner_guard.py).
+        watch = self.steps[self.step("scripts/ci/watch-runner")]
+        for setting in ("WATCH_DISK_FLOOR_KB=2097152", "WATCH_MEM_FLOOR_KB=524288",
+                        "WATCH_MEM_FLOOR_SECONDS=60", "WATCH_PSI_FULL_PERCENT=60",
+                        "WATCH_PSI_SECONDS=30"):
+            self.assertIn(setting, watch)
+        stop = watch.split("WATCH_STOP=", 1)[1].split('"')[1].split()
+        for name in ("cargo-nextest", "cargo", "rustc"):
+            self.assertIn(name, stop)
+        report = self.steps[self.step('kill "$(cat "$RUNNER_TEMP/linux-next-resources.pid")"')]
+        self.assertIn('scripts/ci/assert-headroom "$RUNNER_TEMP/linux-next-resources.log" 10485760', report)
 
     def test_the_watcher_logs_kernel_oom_kills_and_whether_the_runner_lives(self):
         watch = self.steps[self.step("scripts/ci/watch-runner")]
         self.assertIn('scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids"', watch)
         report = self.steps[self.step('kill "$(cat "$RUNNER_TEMP/linux-next-resources.pid")"')]
         # The low-water marks sort only the resource lines, not kernel lines.
-        self.assertIn("grep ' disk_kb='", report)
         self.assertIn("dmesg -T", report)
         self.assertIn("'oom|killed process'", report)
 
@@ -888,8 +905,17 @@ class LinuxNextTests(unittest.TestCase):
         # ("separator must be exactly one character long").
         text = (WORKFLOWS / "ci.yml").read_text()
         self.assertNotIn("sort -t=", text)
-        self.assertIn("sort -t '=' -k2 -n", self.job)
-        self.assertIn("sort -t '=' -k3 -n", self.job)
+
+    def test_make_test_linux_compiles_the_lib_tests_before_the_lib(self):
+        # The lib (about 7 GB) and its lib tests (10 to 12 GB) both need
+        # only the dependencies, so one parallel build compiles them at
+        # once, and on 20 Nov that pair paged the runner into a stall.
+        # Building the lib tests first, on their own, leaves them the last
+        # unit of that build; the lib follows with them already done.
+        recipe = re.search(r"(?m)^test-linux:.*\n((?:\t.*\n)+)", (REPO / "Makefile").read_text()).group(1)
+        builds = [line.strip() for line in recipe.splitlines() if "--no-run" in line]
+        self.assertEqual(builds, ["$(CARGO) test --no-run --features ebpf --lib",
+                                  "$(CARGO) test --no-run --features ebpf"])
 
 
 class PortableLinuxRunnerTests(unittest.TestCase):
@@ -939,17 +965,15 @@ class PortableLinuxRunnerTests(unittest.TestCase):
         self.assertTrue(command.startswith("choom -n 0 -- python3 scripts/ci/workflow_adapter.py produce "), command)
 
     def test_swap_is_topped_up_only_on_a_separate_scratch_disk_never_on_root(self):
-        swap = self.step("sudo swapon")
+        swap = self.step("scripts/ci/give-swap")
         self.assertLess(swap, self.producer())
         self.assertNotIn("if: always()", self.steps[swap])
-        self.assertIn("SwapTotal", self.steps[swap])
-        self.assertIn("8388608", self.steps[swap])
         # A swap file on / spent 5 GB of the disk that ran out (run
         # 44293229949). On 24.04 /mnt is on /dev/root, so the step adds
-        # nothing there.
+        # nothing there. give-swap also refuses a device-mapper disk.
         self.assertIn("if ! mountpoint -q /mnt; then", self.steps[swap])
-        self.assertNotIn("dir=/\n", self.steps[swap])
-        self.assertIn('"/mnt/ci-swapfile"', self.steps[swap])
+        self.assertIn("scripts/ci/give-swap 8388608 /mnt", self.steps[swap])
+        self.assertNotIn("give-swap 8388608 /\n", self.steps[swap])
 
     def test_headroom_is_watched_from_before_the_run_and_reported_and_kept_after_it(self):
         watch = self.step('scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids"')
@@ -997,12 +1021,31 @@ class PortableLinuxRunnerTests(unittest.TestCase):
         for name in ("cargo-llvm-cov", "cargo", "rustc"):
             self.assertIn(name, watch.split("WATCH_STOP=", 1)[1].split('"')[1].split())
 
+    def test_the_watcher_also_stops_the_build_when_every_task_stalls_on_memory(self):
+        # Passing portable runs peak at 21% (avg10); 60% held for 30 s is a
+        # host paging hard, with or without swap in use.
+        watch = self.steps[self.step('scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids"')]
+        self.assertIn("WATCH_PSI_FULL_PERCENT=60", watch)
+        self.assertIn("WATCH_PSI_SECONDS=30", watch)
+
     def test_the_coverage_build_compiles_one_crate_at_a_time(self):
         producer = self.steps[self.producer()]
         self.assertIn('CARGO_BUILD_JOBS: "1"', producer)
         # Only this job: the others don't build the instrumented lib tests.
         text = (WORKFLOWS / "ci.yml").read_text()
         self.assertEqual(text.count("CARGO_BUILD_JOBS:"), 1)
+
+    def test_train_pushes_save_the_dependency_cache_that_train_prs_restore(self):
+        # The cache key carries the toolchain and the lock file, which a
+        # train changes, so train PRs never matched main's cache and built
+        # every dependency one job at a time: about ten of a run's 37
+        # minutes (run 44721359618, "No cache found"). A PR restores its
+        # base branch's caches, so the train's own pushes save one (#1723).
+        # Pull request and merge-queue refs still never save.
+        cache = self.steps[self.step("uses: Swatinem/rust-cache@")]
+        self.assertIn("shared-key: portable", cache)
+        self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' || "
+                      "startsWith(github.ref, 'refs/heads/release-') }}", cache)
 
     def test_the_report_fails_when_the_low_water_mark_is_under_ten_gibibytes(self):
         report = self.steps[self.step('kill "$(cat "$RUNNER_TEMP/portable-linux-resources.pid")"')]

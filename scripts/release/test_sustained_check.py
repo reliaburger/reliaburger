@@ -1,4 +1,5 @@
 """The V02 soak checker judges evidence the way section 4 of the plan says."""
+import calendar
 import contextlib
 import hashlib
 import io
@@ -526,6 +527,112 @@ class HarnessResumeWiring(unittest.TestCase):
         body = self.functions()["power_before_off"]
         self.assertIn('[ "$node" != 2 ] || restarts+=(--restarts writer)', body)
         self.assertIn('check power-cut "$evidence" ${restarts[@]+"${restarts[@]}"}', body)
+
+
+class FaultOverlapWiring(unittest.TestCase):
+    """#2105: the harness holds each gated fault for a run of every mode on
+    its node, right before it strikes, and records a wait that runs out."""
+
+    functions = HarnessResumeWiring.functions
+
+    def test_the_mark_before_each_gated_fault_waits(self):
+        bodies = self.functions()
+        # power_off (sustained/power.sh) calls this hook before it stops the VM.
+        self.assertIn('job_mark_fault "$node" "${current_slot:-power-off}" wait', bodies["power_before_off"])
+        self.assertIn('job_mark_fault "$node" "${current_slot:-agent-kill}" wait', bodies["kill_bun"])
+        self.assertLess(bodies["kill_bun"].index("job_mark_fault"), bodies["kill_bun"].index("kill -9"))
+        node_fault = bodies["slot_node_fault"]
+        first = node_fault.index('job_mark_fault "$node" "${current_slot%%:*}:$kind" wait')
+        self.assertLess(first, node_fault.index('node_fault_script "$kind" start'))
+        # The marks through the hold only record; they never hold the fault.
+        self.assertEqual(node_fault.count(" wait\n"), 1)
+
+    def test_a_wait_passes_the_flag_and_a_missed_overlap_is_an_event(self):
+        body = self.functions()["job_mark_fault"]
+        self.assertIn('${3:+--wait}', body)
+        self.assertIn("3) event --phase job-overlap", body)
+
+    def test_the_wait_fits_the_compressed_slot(self):
+        import job_soak
+        self.assertLess(job_soak.OVERLAP_WAIT_SECS, 600 // 6)
+
+
+class DayHookApply(unittest.TestCase):
+    """#1935: the day tier deploys once, so it applies the job fixtures again
+    every hour, and its deploy hooks and after jobs run while the controller
+    watches rather than only in the first seconds of the campaign."""
+
+    functions = HarnessResumeWiring.functions
+    release = Path(__file__).parent
+
+    def plan(self, script, tier):
+        import subprocess
+        return subprocess.run([str(self.release / script), "--tier", tier, "--plan"], capture_output=True, text=True,
+                              check=True, env=dict(os.environ, RELIABURGER_SOAK_CAFFEINATED="1")).stdout
+
+    def test_the_day_plan_applies_the_job_fixtures_every_hour(self):
+        self.assertIn("plan: hook-apply every 3600 s", self.plan("qualify-jobs-sustained.sh", "day"))
+
+    def test_no_tier_with_a_fault_schedule_plans_one(self):
+        # Their deploy-kill slots apply the fixtures with every rolling deploy.
+        for script in ("qualify-sustained.sh", "qualify-jobs-sustained.sh"):
+            for tier in ("fast", "final"):
+                with self.subTest(script=script, tier=tier):
+                    self.assertNotIn("hook-apply", self.plan(script, tier))
+
+    def test_the_wait_applies_them_outside_any_window(self):
+        body = self.functions()["wait_until"]
+        branch = body[body.index('[ "$hook_every" -gt 0 ]'):]
+        self.assertIn('[ -z "$window_label" ]', branch[:branch.index("then")])
+        self.assertIn("run_slot hook_apply", branch[:branch.index("elif")])
+
+    def run_hook_apply(self, stop=None, stop_at=None, installed=True):
+        import subprocess
+        bodies = self.functions()
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory)
+            (evidence / "jobs").mkdir()
+            (evidence / "snapshots").mkdir()
+            if installed: (evidence / "jobs" / "installed").touch()
+            if stop: (evidence / "jobs" / "stop").touch()
+            template = evidence / "template.toml"
+            template.write_text('[app.soak-identity]\nimage = "x"\n[app.soak-identity.env]\nSOAK_GENERATION = "0"\n'
+                                'SOAK_SLO_GENERATION = "0"\n[policy.deny]\nrule = "x"\n')
+            (evidence / "day.toml").write_text('[app.soak-quiet]\nimage = "x"\n')
+            functions = "".join(f"{name}() {{\n{bodies[name]}\n}}\n" for name in
+                                ("jobs_applied", "soak_workloads", "write_workloads", "apply_soak_manifests", "hook_apply"))
+            script = f"""set -eu
+evidence={evidence}; repository={self.release.parent.parent}; workloads_template={template}
+day_workloads={evidence / "day.toml"}; tier=day; generation=4; slo_generation=7; hook_applies=0
+rel() {{ echo "rel $*" >> {evidence}/calls; }}
+event() {{ echo "event $*" >> {evidence}/calls; }}
+meta_get() {{ echo "{stop_at or ''}"; }}
+{functions}
+hook_apply
+"""
+            subprocess.run(["bash", "-c", script], check=True, capture_output=True, text=True)
+            calls = (evidence / "calls").read_text() if (evidence / "calls").exists() else ""
+            workloads = (evidence / "workloads.toml").read_text() if (evidence / "workloads.toml").exists() else ""
+            return calls, workloads
+
+    def test_a_hook_apply_applies_the_policies_then_the_workloads_with_the_fixtures(self):
+        calls, workloads = self.run_hook_apply()
+        applies = [line for line in calls.splitlines() if line.startswith("rel apply")]
+        self.assertEqual(len(applies), 2)
+        self.assertIn("policies.toml", applies[0])
+        self.assertIn("workloads.toml", applies[1])
+        for mode in ("runc", "shared-runc", "process"):
+            self.assertIn(f"[job.soak-job-hook-{mode}]", workloads)
+        # The same generations: no app rolls, only the jobs run again.
+        self.assertIn('SOAK_GENERATION = "4"', workloads)
+        self.assertIn('SOAK_SLO_GENERATION = "7"', workloads)
+        self.assertIn("event --phase jobs:hook-apply --verdict ok", calls)
+
+    def test_no_hook_apply_once_the_drain_is_asked_for_or_due_within_a_minute(self):
+        import time
+        for case in (dict(stop=True), dict(stop_at=int(time.time()) + 30), dict(installed=False)):
+            with self.subTest(**case):
+                self.assertEqual(self.run_hook_apply(**case), ("", ""))
 
 
 class BoundedCommands(unittest.TestCase):
@@ -2312,6 +2419,136 @@ class TestFailures(unittest.TestCase):
         chaos = script[script.index("chaos_one() {"):script.index("catalogue_pulse() {")]
         self.assertIn('--timeout 600s > "$output" 2> "$output.err"', chaos)
         self.assertIn('record_failure "chaos-$kind" "$(check test-failures "$output" "$output.err")"', chaos)
+
+
+class CapturedState(Evidence):
+    """#2131: a `relish test` case that timed out was bundled after its
+    cleanup, so the bundle showed neither the app's instances nor where the
+    case was stuck. The case's report entry now carries the state captured
+    before its lease was released, and the bundle keeps it."""
+
+    STATE = {"captured_at": "2026-11-20T04:22:58Z", "step": "exec in registry-web",
+             "steps": [{"name": "exec in registry-web", "started_after_ms": 9800, "duration_ms": None}],
+             "apps": ["registry-web"],
+             "instances": [{"node": "rb-a-1", "id": "registry-web-0", "app": "registry-web",
+                            "state": "running", "restart_count": 0}],
+             "deployments": [], "events": [], "errors": [], "truncated": False}
+
+    def report(self):
+        return json.dumps({"schema_version": 2, "results": [
+            {"name": "deploy_from_cluster_registry", "group": "image-registry",
+             "started_at": "2026-11-20T04:17:43Z", "finished_at": "2026-11-20T04:22:58Z",
+             "outcome": {"status": "unknown", "kind": "timed_out",
+                         "reason": 'case exceeded its 300000 ms deadline during step "exec in registry-web"'},
+             "cleanup": {"status": "confirmed"}, "failure_state": self.STATE},
+            {"name": "push_and_pull_image_roundtrip", "outcome": {"status": "pass"}, "cleanup": {"status": "confirmed"}},
+        ]})
+
+    def test_only_failing_cases_with_a_capture_are_kept(self):
+        states = checker.test_failure_states(self.report())
+        self.assertEqual([state["name"] for state in states], ["deploy_from_cluster_registry"])
+        self.assertEqual(states[0]["failure_state"]["step"], "exec in registry-web")
+        self.assertEqual(checker.test_failure_states("not json"), [])
+
+    def test_the_states_file_names_itself_and_a_journal_start_before_the_case(self):
+        report = self.evidence / "pulse.json"
+        report.write_text(self.report())
+        out = self.evidence / "captured-state.json"
+        started = calendar.timegm(time.strptime("2026-11-20T04:17:43Z", "%Y-%m-%dT%H:%M:%SZ"))
+        self.assertEqual(checker.write_test_states(report, out), f"captured-state.json @{started - 60}")
+        self.assertEqual(json.loads(out.read_text())[0]["failure_state"], self.STATE)
+
+    def test_the_journal_window_never_shrinks_below_fifteen_minutes(self):
+        report = self.evidence / "pulse.json"
+        recent = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 120))
+        report.write_text(self.report().replace("2026-11-20T04:17:43Z", recent))
+        before = int(time.time())
+        name, since = checker.write_test_states(report, self.evidence / "captured-state.json").split()
+        self.assertEqual(name, "captured-state.json")
+        self.assertLessEqual(int(since.lstrip("@")), before - 900 + 5)
+
+    def test_a_report_without_captures_writes_nothing(self):
+        report = self.evidence / "pulse.json"
+        report.write_text(json.dumps({"results": [{"name": "x", "outcome": {"status": "pass"}}]}))
+        out = self.evidence / "captured-state.json"
+        self.assertEqual(checker.write_test_states(report, out), "")
+        self.assertFalse(out.exists())
+
+    def test_the_bundle_keeps_the_state_and_reaches_back_to_the_case(self):
+        release = Path(__file__).parent
+        script = (release / "qualify-sustained.sh").read_text()
+        bundle = script[script.index("record_failure() {"):script.index("setup_fail() {")]
+        report = self.evidence / "pulse-1795148235.json"
+        report.write_text(self.report())
+        calls = self.evidence / "gsh-calls.txt"
+        said = self.evidence / "said.txt"
+        stubs = f"""
+checker={release / 'sustained_check.py'}
+check() {{ python3 "$checker" "$@"; }}
+evidence={self.evidence}
+vm=([1]=rb-a-1 [2]=rb-a-2 [3]=rb-a-3)
+down=(0 0 1 1)
+gsh() {{ printf '%s\\n' "$2" >> {calls}; }}
+api_get() {{ :; }}
+memory_report() {{ :; }}
+rel() {{ :; }}
+event() {{ :; }}
+say() {{ printf '%s\\n' "$*" >> {said}; }}
+mkdir -p "$evidence/failures"
+"""
+        subprocess.run(["bash", "-c", stubs + bundle + f"\nrecord_failure pulse 'relish test exited 1' '' '' {report}"],
+                       check=True, timeout=60, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        failure = self.evidence / "failures" / "1"
+        self.assertEqual(json.loads((failure / "summary.json").read_text())["captured"], "captured-state.json")
+        self.assertEqual(json.loads((failure / "captured-state.json").read_text())[0]["failure_state"], self.STATE)
+        self.assertTrue((failure / "test-report.json").exists())
+        started = calendar.timegm(time.strptime("2026-11-20T04:17:43Z", "%Y-%m-%dT%H:%M:%SZ"))
+        self.assertIn(f"--since '@{started - 60}'", calls.read_text())
+        self.assertIn("state at failure: failures/1/captured-state.json", said.read_text())
+
+    def test_a_bundle_without_a_report_keeps_the_last_fifteen_minutes(self):
+        release = Path(__file__).parent
+        script = (release / "qualify-sustained.sh").read_text()
+        bundle = script[script.index("record_failure() {"):script.index("setup_fail() {")]
+        calls = self.evidence / "gsh-calls.txt"
+        stubs = f"""
+checker={release / 'sustained_check.py'}
+check() {{ python3 "$checker" "$@"; }}
+evidence={self.evidence}
+vm=([1]=rb-a-1 [2]=rb-a-2 [3]=rb-a-3)
+down=(0 0 1 1)
+gsh() {{ printf '%s\\n' "$2" >> {calls}; }}
+api_get() {{ :; }}
+memory_report() {{ :; }}
+rel() {{ :; }}
+event() {{ :; }}
+say() {{ :; }}
+mkdir -p "$evidence/failures"
+"""
+        subprocess.run(["bash", "-c", stubs + bundle + "\nrecord_failure settle 'did not settle'"],
+                       check=True, timeout=60, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        summary = json.loads((self.evidence / "failures" / "1" / "summary.json").read_text())
+        self.assertNotIn("captured", summary)
+        self.assertIn("--since '-15min'", calls.read_text())
+
+    def test_the_record_links_the_captured_state_from_the_failure_line(self):
+        Record.write_run(self, failures=["pulse: relish test exited 1"])
+        summary = self.evidence / "failures" / "1" / "summary.json"
+        summary.write_text(json.dumps(dict(json.loads(summary.read_text()), captured="captured-state.json")))
+        record = self.evidence / "record.md"
+        checker.render(self.evidence, record)
+        self.assertIn("relish test exited 1 (state at failure: `failures/1/captured-state.json`)", record.read_text())
+
+    def test_every_relish_test_check_hands_its_report_to_the_bundle(self):
+        script = (Path(__file__).parent / "qualify-sustained.sh").read_text()
+        chaos = script[script.index("chaos_one() {"):script.index("catalogue_pulse() {")]
+        pulse = script[script.index("catalogue_pulse() {"):]
+        pulse = pulse[:pulse.index("\n}\n")]
+        self.assertIn('"$(check test-failures "$output" "$output.err")" \'\' \'\' "$output"', chaos)
+        self.assertIn("'' '' \"$output\"", pulse)
+        self.assertIn('check test-failures "$output" "$output.err"', pulse)
+        # The bundle is taken before the chaos slot clears its faults.
+        self.assertLess(chaos.index("record_failure"), chaos.index("rel fault clear"))
 
 
 DAY = 24 * 3600

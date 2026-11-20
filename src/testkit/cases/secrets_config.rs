@@ -57,13 +57,11 @@ async fn encrypted_environment_roundtrip(
     plaintext: &str,
 ) -> Result<(), String> {
     let key = ctx
-        .deadline
-        .run(
+        .step(
             "fetch public encryption key",
             ctx.client.secret_public_key(None),
         )
-        .await
-        .map_err(|error| error.to_string())?
+        .await?
         .map_err(|error| format!("could not fetch public encryption key: {error}"))?;
     let first = crate::sesame::secret::encrypt_secret(plaintext, &key.public_key)
         .map_err(|error| error.to_string())?;

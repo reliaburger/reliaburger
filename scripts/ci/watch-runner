@@ -27,6 +27,17 @@
 # killer, until GitHub drops it with no log (18 Nov 2026). Without swap in
 # use the host can't thrash, and the OOM killer leaves a log of its own.
 #
+# With WATCH_PSI_FULL_PERCENT and WATCH_STOP set, once the kernel's "full"
+# memory pressure over ten seconds has stayed at or over that percentage for
+# WATCH_PSI_SECONDS (default 30), it logs a "mem_stall: " line and sends the
+# same SIGTERM. That catches a host paging hard whatever MemAvailable says,
+# swap or not; passing runs peak at about 49% for ten seconds. A host that
+# freezes outright, as one with swap on a dm-snapshot did (give-swap), stops
+# this watcher too, so the step's own `timeout` is the last guard.
+#
+# The stop goes through `sudo -n` when it can, so it reaches a build or
+# tests running as root, as the 26.04 job's do.
+#
 # Usage: watch-runner PIDFILE
 # WATCH_INTERVAL (seconds, default 5), WATCH_ROUNDS (default 0, forever) and
 # PROC_ROOT (standing in for /proc) exist for the tests.
@@ -42,19 +53,25 @@ rounds=${WATCH_ROUNDS:-0}
 floor=${WATCH_DISK_FLOOR_KB:-}
 memory_floor=${WATCH_MEM_FLOOR_KB:-}
 memory_window=${WATCH_MEM_FLOOR_SECONDS:-60}
+stall_limit=${WATCH_PSI_FULL_PERCENT:-}
+stall_window=${WATCH_PSI_SECONDS:-30}
 stop=${WATCH_STOP:-}
 stopped=no
 low_since=
+stalled_since=
 
 # Send SIGTERM to every process named in WATCH_STOP; print how many matched.
 stop_all() {
-    local matched=0 name
+    local matched=0 name signal=()
     for name in $stop; do
         matched=$((matched + $(pgrep -x "$name" | grep -c '')))
     done
     echo "$matched"
+    if sudo -n true 2> /dev/null; then
+        signal=(sudo -n)
+    fi
     for name in $stop; do
-        pkill -TERM -x "$name"
+        "${signal[@]}" pkill -TERM -x "$name"
     done
 }
 seen=0
@@ -89,6 +106,19 @@ while :; do
         && [ "$held" -ge "$memory_window" ]; then
         matched=$(stop_all)
         echo "mem_floor: $memory kB available is under $memory_floor kB for $held s with $swap kB swap in use: stopping $stop ($matched processes)"
+        stopped=yes
+    fi
+    if [ -n "$stall_limit" ] && [ -n "$stall" ] \
+        && awk -v now="$stall" -v limit="$stall_limit" 'BEGIN { exit !(now + 0 >= limit + 0) }'; then
+        stalled_since=${stalled_since:-$SECONDS}
+    else
+        stalled_since=
+    fi
+    stalled=$((SECONDS - ${stalled_since:-$SECONDS}))
+    if [ -n "$stalled_since" ] && [ -n "$stop" ] && [ "$stopped" = no ] \
+        && [ "$stalled" -ge "$stall_window" ]; then
+        matched=$(stop_all)
+        echo "mem_stall: every task waited on memory $stall% of the last 10 s, at or over $stall_limit% for $stalled s: stopping $stop ($matched processes)"
         stopped=yes
     fi
 

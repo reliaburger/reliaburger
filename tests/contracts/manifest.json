@@ -3643,6 +3643,33 @@
       ]
     },
     {
+      "id": "issue-2079-legacy-oci-owned_runc-runc_pause_freezes_the_workload_not_its_launcher",
+      "issue": 2079,
+      "promise": "Complete the exact retained legacy OCI case through its finite owned driver.",
+      "supported_paths": [
+        "Exact original ignored test identity and declared Make owner."
+      ],
+      "refused_paths": [
+        "No generic aliases or success from another test or owner."
+      ],
+      "boundaries": [
+        "Source binding only; real isolated Linux OCI execution and current receipt are required."
+      ],
+      "cases": [
+        {
+          "id": "legacy-oci-owned_runc-runc_pause_freezes_the_workload_not_its_launcher",
+          "binary": "reliaburger::owned_runc",
+          "test": "runc_pause_freezes_the_workload_not_its_launcher",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/owned_runc.rs"
+          ]
+        }
+      ]
+    },
+    {
       "id": "issue-555-legacy-oci-owned_runc-recovered_source_identity_belongs_to_the_container_not_its_launcher",
       "issue": 555,
       "promise": "Complete the exact retained legacy OCI case through its finite owned driver.",

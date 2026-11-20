@@ -702,6 +702,21 @@ pub trait Grill: Send + Sync {
         std::future::ready(Ok(None))
     }
 
+    /// The processes a Smoker pause freezes and its resume thaws: the
+    /// workload's own (#2079).
+    ///
+    /// Most runtimes run the workload as the process `pid` names, so this
+    /// defaults to that one. Runc's `pid` is its `runc run` launcher, and
+    /// freezing that leaves the container running, so runc names the
+    /// container's processes instead. Empty when the instance has no
+    /// process; an error means the runtime couldn't say.
+    fn workload_pids(
+        &self,
+        instance: &InstanceId,
+    ) -> impl std::future::Future<Output = Result<Vec<u32>, GrillError>> + Send {
+        async move { Ok(self.pid(instance).await?.into_iter().collect()) }
+    }
+
     /// Get the runtime-assigned IP of a running instance's container, if any.
     ///
     /// Runtimes with per-container networking (runc netns, Apple container)
@@ -1179,6 +1194,18 @@ impl Grill for AnyGrill {
             AnyGrill::Mixed(g) => g.workload_cgroup(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.workload_cgroup(instance).await,
+        }
+    }
+
+    async fn workload_pids(&self, instance: &InstanceId) -> Result<Vec<u32>, GrillError> {
+        match self {
+            AnyGrill::Process(g) => g.workload_pids(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.workload_pids(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.workload_pids(instance).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.workload_pids(instance).await,
         }
     }
 

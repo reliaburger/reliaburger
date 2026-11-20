@@ -965,11 +965,16 @@ One row per node: `NODE ADDRESS STATE COUNCIL LEADER VERSION CPU MEM DISK
 ALLOCATED`, problems first. `STATE` is the gossip state, with `cordoned` or
 `disk` (disk pressure, 85% or more) added, as in `alive,cordoned`.
 `ALLOCATED` is what the scheduler has placed there (`cpu 75% mem 25%`). Under
-the table, a line names each node that didn't answer and why. `--unhealthy`
-keeps nodes that aren't alive, are cordoned, are under disk pressure or didn't
-answer. `-o json` adds `version`, `cpu_percent`, `memory_percent`,
-`disk_percent`, `allocated`, `cordoned`, `disk_pressure` and `unanswered` to
-each node's record.
+the table, a line names each cordoned node and what cordoned it (the bun
+upgrade or the OS rollout, with the command that shows its progress), and a
+line names each node that didn't answer and why. `--unhealthy` keeps nodes
+that aren't alive, are cordoned, are under disk pressure or didn't answer.
+`-o json` adds `version`, `cpu_percent`, `memory_percent`, `disk_percent`,
+`allocated`, `cordoned`, `cordoned_by` (`upgrade`, `os_rollout` or null),
+`disk_pressure` and `unanswered` to each node's record. `relish status`
+counts cordons on its `nodes` line by owner (`1 cordoned by the OS
+rollout`), and its JSON carries `cordoned_by_upgrade` and
+`cordoned_by_os_rollout` beside the `cordoned` total.
 
 **`relish apply <path>`**
 

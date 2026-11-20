@@ -124,7 +124,9 @@ needs attention ends in the command that shows the detail, such as
 
 `relish nodes` shows every member's gossip state: `alive`, `suspect` (missed
 its probes, not yet declared dead) or `dead`, with `cordoned` or `disk` (85%
-full or more) added to an alive node's state. Beside it are the node's Bun
+full or more) added to an alive node's state. A node is cordoned while a bun
+upgrade or an OS rollout restarts it, and a line under the table says which
+(`node-2 is cordoned by the OS rollout`). Beside it are the node's Bun
 version, its CPU, memory and disk use, and what the scheduler has allocated
 there. Nodes with a problem come first, and `--unhealthy` keeps only them. A dead node stays listed for up
 to a day after it was last heard from, so you can see what went missing. It

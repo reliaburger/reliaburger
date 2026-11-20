@@ -12145,6 +12145,32 @@ async fn resource_faults_reject_off_linux() {
     assert!(err.contains("Linux cgroups"), "unexpected reason: {err}");
 }
 
+/// A pause freezes the workload's processes, not the process the runtime
+/// names as the instance's. On runc that one is the `runc run` launcher,
+/// and freezing it left the container running (#2079). A kill still
+/// signals the instance's process.
+#[tokio::test]
+async fn a_pause_signals_the_workload_processes_and_a_kill_the_instance_process() {
+    use super::signal_faults::{Signal, SignalTarget, read_pids};
+    let grill = MockGrill::new();
+    grill.set_pid(100);
+    grill.set_workload_pids(vec![200, 201]);
+    let targets = [SignalTarget::Instance(InstanceId("default__web-0".into()))];
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    assert_eq!(
+        read_pids(&grill, &targets, Signal::Pause, deadline).await,
+        vec![200, 201]
+    );
+    assert_eq!(
+        read_pids(&grill, &targets, Signal::Resume, deadline).await,
+        vec![200, 201]
+    );
+    assert_eq!(
+        read_pids(&grill, &targets, Signal::Kill { count: 0 }, deadline).await,
+        vec![100]
+    );
+}
+
 /// Reversing a Pause fault SIGCONTs the frozen process.
 ///
 /// We freeze a real child with SIGSTOP, then drive `reverse_fault` with
