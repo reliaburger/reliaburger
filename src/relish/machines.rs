@@ -764,22 +764,55 @@ pub async fn run_claim(options: &ClaimOptions) -> Result<(), RelishError> {
         })
         .await,
     );
+    // The nodes whose seeds arrived, which the claim waits for.
+    let started: Vec<String> = deliveries
+        .iter()
+        .map(|delivery| delivery.node.name.clone())
+        .filter(|name| !failures.iter().any(|failure| failure.node.name == *name))
+        .collect();
     // The cluster is in the directory whether or not node 1 got its seed,
     // so relish points at it either way: the context is then ready when a
     // retry reaches node 1.
-    if let Some(created) = &created {
-        println!(
-            "cluster {} created in {}",
-            created.fleet.cluster,
-            options.directory.display()
-        );
-        // BLOCKING-OK: relish CLI: a one-shot step before the command does anything long-lived
-        match bare_metal::adopt(created, &options.directory) {
-            Ok(context) => print!("{context}"),
-            Err(error) if failures.is_empty() => return Err(error),
-            // The seeds that didn't arrive matter more: say what to run.
-            Err(error) => eprintln!("warning: relish doesn't point at the cluster: {error}"),
+    let client = match &created {
+        Some(created) => {
+            println!(
+                "cluster {} created in {}",
+                created.fleet.cluster,
+                options.directory.display()
+            );
+            // BLOCKING-OK: relish CLI: a one-shot step before the command does anything long-lived
+            match bare_metal::adopt(created, &options.directory) {
+                Ok(context) => {
+                    print!("{context}");
+                    // Only node 1 can answer for a new cluster.
+                    let node_one_started = created
+                        .fleet
+                        .nodes
+                        .first()
+                        .is_some_and(|node| started.contains(&node.name));
+                    // BLOCKING-OK: relish CLI: reads two small files the create step just wrote
+                    node_one_started.then(|| context_client(&context)).flatten()
+                }
+                Err(error) if failures.is_empty() => return Err(error),
+                // The seeds that didn't arrive matter more: say what to run.
+                Err(error) => {
+                    eprintln!("warning: relish doesn't point at the cluster: {error}");
+                    None
+                }
+            }
         }
+        None => Some(super::client::BunClient::default_local()),
+    };
+    if let Some(client) = client
+        && !started.is_empty()
+    {
+        wait_for_claimed_nodes(
+            &started,
+            CLAIM_READY_TIMEOUT,
+            || alive_nodes(&client),
+            std::io::stdout(),
+        )
+        .await;
     }
     if failures.is_empty() {
         Ok(())
@@ -790,6 +823,100 @@ pub async fn run_claim(options: &ClaimOptions) -> Result<(), RelishError> {
             &failures,
         ))
     }
+}
+
+/// How long `relish machines claim` waits for the claimed nodes to answer.
+/// A Wyse 3040 starts in seconds once its seed arrives; slower hardware,
+/// and machines that join through node 1, take longer.
+const CLAIM_READY_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// A client for the cluster `context` describes, whether or not relish
+/// adopted it, or `None` (with a warning) when its files can't be read.
+fn context_client(context: &bare_metal::ContextReport) -> Option<super::client::BunClient> {
+    let token = std::fs::read_to_string(&context.token_file);
+    let ca = std::fs::read(&context.ca_cert);
+    let client = match (token, ca) {
+        (Ok(token), Ok(ca)) => {
+            super::client::BunClient::new_with_ca(&context.endpoint, Some(token.trim()), &ca)
+        }
+        (Err(error), _) | (_, Err(error)) => Err(RelishError::from(error)),
+    };
+    client
+        .inspect_err(|error| eprintln!("warning: not waiting for the nodes to start: {error}"))
+        .ok()
+}
+
+/// The names of the nodes the cluster reports alive.
+async fn alive_nodes(client: &super::client::BunClient) -> Result<Vec<String>, RelishError> {
+    Ok(client
+        .nodes()
+        .await?
+        .into_iter()
+        .filter(|node| node.state == "alive")
+        .map(|node| node.node_id)
+        .collect())
+}
+
+/// Wait until `alive` reports every node in `names`, for up to `timeout`,
+/// writing a line to `output` as each comes up. Returns whether they all
+/// did. A node still starting at the end isn't an error: its seed arrived,
+/// and the line printed says how to check on it (#2146).
+async fn wait_for_claimed_nodes<F, Fut>(
+    names: &[String],
+    timeout: Duration,
+    mut alive: F,
+    mut output: impl std::io::Write,
+) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<String>, RelishError>>,
+{
+    use tokio::time::{Instant, sleep, timeout_at};
+    let deadline = Instant::now() + timeout;
+    let _ = writeln!(
+        output,
+        "waiting for {} to start (up to {} s)",
+        names.join(", "),
+        timeout.as_secs()
+    );
+    let mut waiting: Vec<&String> = names.iter().collect();
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match timeout_at(deadline, alive()).await {
+            Ok(Ok(up)) => {
+                last_error = None;
+                waiting.retain(|name| {
+                    let started = up.contains(name);
+                    if started {
+                        let _ = writeln!(output, "  {name}: up");
+                    }
+                    !started
+                });
+                if waiting.is_empty() {
+                    return true;
+                }
+            }
+            Ok(Err(error)) => last_error = Some(error),
+            Err(_) => break,
+        }
+        let _ = timeout_at(deadline, sleep(Duration::from_secs(1))).await;
+    }
+    let names: Vec<&str> = waiting.iter().map(|name| name.as_str()).collect();
+    let verb = if names.len() == 1 { "is" } else { "are" };
+    let _ = write!(
+        output,
+        "{} {verb} still starting after {} s",
+        names.join(", "),
+        timeout.as_secs()
+    );
+    if let Some(error) = last_error {
+        let _ = write!(output, " ({error})");
+    }
+    let _ = writeln!(
+        output,
+        "; `relish nodes` lists each node as alive once it's up"
+    );
+    false
 }
 
 /// How long a claimed machine has to enrol through the cluster's
@@ -1428,5 +1555,61 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(std::fs::read(&seed_path).unwrap(), seed);
+    }
+
+    /// #2146: the claim used to return the moment the seeds arrived, so the
+    /// `relish nodes` it suggests met a node whose API wasn't listening yet.
+    /// It now waits until every claimed node answers, saying so as each does.
+    #[tokio::test(start_paused = true)]
+    async fn the_claim_waits_until_every_claimed_node_answers() {
+        let answers = std::sync::Mutex::new(std::collections::VecDeque::from([
+            Err(RelishError::InitFailed("connection refused".into())),
+            Ok(vec![]),
+            Ok(vec!["home-1".to_string()]),
+            Ok(vec!["home-1".to_string(), "home-2".to_string()]),
+        ]));
+        let names = vec!["home-1".to_string(), "home-2".to_string()];
+        let mut output = Vec::new();
+        let started = tokio::time::Instant::now();
+        let ready = wait_for_claimed_nodes(
+            &names,
+            Duration::from_secs(180),
+            || {
+                let answer = answers.lock().unwrap().pop_front();
+                async move { answer.unwrap_or_else(|| panic!("asked after every node answered")) }
+            },
+            &mut output,
+        )
+        .await;
+        assert!(ready);
+        assert!(started.elapsed() < Duration::from_secs(180));
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.contains("waiting for home-1, home-2 to start"),
+            "{output}"
+        );
+        assert!(output.contains("home-1: up"), "{output}");
+        assert!(output.contains("home-2: up"), "{output}");
+        assert_eq!(output.matches("home-1: up").count(), 1, "{output}");
+    }
+
+    /// Slower hardware may take longer than the wait: the claim still
+    /// succeeds (the seeds arrived), and says which nodes are still starting
+    /// and how to check on them.
+    #[tokio::test(start_paused = true)]
+    async fn a_node_still_starting_after_the_wait_is_named_with_how_to_check() {
+        let names = vec!["home-1".to_string(), "home-2".to_string()];
+        let mut output = Vec::new();
+        let ready = wait_for_claimed_nodes(
+            &names,
+            Duration::from_secs(180),
+            || async { Ok(vec!["home-1".to_string()]) },
+            &mut output,
+        )
+        .await;
+        assert!(!ready);
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("home-2 is still starting"), "{output}");
+        assert!(output.contains("relish nodes"), "{output}");
     }
 }
