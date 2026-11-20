@@ -66,7 +66,7 @@ Packages=
         iproute2
 ```
 
-`resolute` is 26.04's codename. `Format=disk` produces a whole partitioned disk image, and `SplitArtifacts=` also writes the pieces an update needs as separate files. The boot artefact is a UKI (Unified Kernel Image): the kernel, the initrd and the kernel command line glued into one EFI executable, which systemd-boot starts like any other EFI program. `%i_%v` names it `reliaburger-os_<version>.efi`, a name that matters later. The locked root password means there's no console login at all. The last six packages match the quickstart guest's list, `scripts/release/guest-images.json`, less Buildah, which the guest needs for `relish build`. From 0.3.0 the quickstart guest runs Ubuntu 26.04 too, so the two channels install the same packages from the same archive and test the same userland. mkosi can't read a JSON file, so rather than generate one list from the other we let a test hold them together: `test_guest_images.py` parses the `Packages=` block and fails if its tail and the guest's list drift apart.
+`resolute` is 26.04's codename. `Format=disk` produces a whole partitioned disk image, and `SplitArtifacts=` also writes the pieces an update needs as separate files. The boot artefact is a UKI (Unified Kernel Image): the kernel, the initrd and the kernel command line glued into one EFI executable, which systemd-boot starts like any other EFI program. `%i_%v` names it `reliaburger-os_<version>.efi`, a name that matters later. The locked root password means there's no console login at all. The last six packages match the quickstart guest's list, `scripts/release/guest-images.json`, less Buildah, which the guest needs for `relish build`. An appliance cluster builds nothing itself: you build elsewhere and push into Pickle ("A tour that couldn't build", below). From 0.3.0 the quickstart guest runs Ubuntu 26.04 too, so the two channels install the same packages from the same archive and test the same userland. mkosi can't read a JSON file, so rather than generate one list from the other we let a test hold them together: `test_guest_images.py` parses the `Packages=` block and fails if its tail and the guest's list drift apart.
 
 The kernel package drags in the full `linux-firmware` set, hundreds of megabytes, unless something else provides it. `linux-firmware-minimal` does, and we add back only the Wyse's Realtek NIC firmware (and its Intel graphics firmware on x86-64, in `mkosi.conf.d/10-x86-64.conf`, a drop-in whose `[Match] Architecture=` line applies it to one architecture only).
 
@@ -1211,6 +1211,20 @@ exec 9>&-
 `exec 9>file` opens the file as descriptor 9 for the rest of the script, and `flock 9` waits for an exclusive lock on it. The `exec 9>&-` before starting bun matters as much as the lock. An `exec` keeps the process's open descriptors, so without it bun would hold the lock for as long as it ran, and the console's next restart would wait for ever. `test_start.py` checks both: a launcher waits while the test holds the lock, and a bun it started can take the lock itself.
 
 `test_console_unit.py` now refuses a console ordered after any of our units that can wait for ever, and the claimed-pair test in CI reads each unclaimed VM's screen before claiming it. It doesn't photograph the screen: `/dev/vcs1` holds the text on tty1, so the test reads it over the lab image's SSH and looks for the key that port 9119 serves.
+
+### A tour that couldn't build
+
+The tour's first step is `relish build burger/burger.toml`, and on the Wyse cluster it failed:
+
+```
+error: API error (status 503): {"error":"no builder available: buildah is not on this node's PATH and no peer reports the capability"}
+```
+
+That was no surprise to the image. `mkosi.conf` lists the quickstart guest's packages "less Buildah", and `test_guest_images.py` keeps it that way. It was a surprise to the docs, which sent appliance users through a tour whose first command can't work there, and to the error, which said what was missing without saying what to do.
+
+We could have added Buildah. Its cost isn't only megabytes. Every package goes into both 1.1 GB `/usr` slots, a build pulls a toolchain image and writes layers to an eMMC we're counting writes on, and a multi-platform build on a 2 GB Atom is slow at best. A build also runs whatever `RUN` steps a Dockerfile holds, on the machines that keep the cluster's state. The appliance's whole pitch is that it does one job.
+
+So the appliance stays without it, and the refusal now names the ways out. bun keeps the message in one constant, `NO_BUILDER_ERROR`, rather than inline in the handler, so a test can hold it to its promises: it says appliance nodes never have Buildah, shows `docker push <node>:5050/<name>:<tag>`, points at `relish manual images`, and suggests adding a Linux node with Buildah, since bun hands a build to any peer that reports it. A second test checks that the manual section it names exists, so a renamed heading can't leave the error pointing at nothing. Manual 17 now walks through building the burger on a laptop and pushing it into Pickle before the tour's `relish apply`.
 
 ### Reading it all again
 

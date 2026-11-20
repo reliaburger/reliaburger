@@ -45,6 +45,12 @@ On first boot `systemd-repart` grows the data partition and adds an empty
 everything a node changes lives on the data partition. That's also why an OS
 update never touches the cluster's state (§4.4).
 
+The image has no Buildah, so no appliance node can run `relish build`. bun
+refuses a build that no node can run with `NO_BUILDER_ERROR`
+(`src/bun/build_runner.rs`), which names the ways out: build elsewhere and
+push into Pickle, or add a Linux node with Buildah, which bun hands builds to
+(#2144).
+
 Lab builds add `openssh-server` for debugging. Published images don't have
 it, and `image/tests/no_ssh_server.py` checks it twice. Its unit test reads
 the mkosi configs, where only a `Profiles=lab` drop-in may name an SSH
