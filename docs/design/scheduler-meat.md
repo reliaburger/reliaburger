@@ -420,6 +420,12 @@ pub enum RunTrigger {
 
 ### Node State
 
+This is the design's shape, not the shipped one. The shipped `NodeCapacity`
+(in `meat::types`) holds the node's id, address, total, reserved and
+allocated resources, and labels. There's no `NodeStatus`: no node is ever
+`Draining` or `Cordoned` by an operator until drain ships
+([#656](https://github.com/reliaburger/reliaburger/issues/656)).
+
 ```rust
 /// A node's capacity and current utilisation, as tracked by the scheduler.
 #[derive(Clone, Debug, Serialize, Deserialize)]
