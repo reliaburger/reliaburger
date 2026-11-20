@@ -227,7 +227,11 @@ With none, the machine is unclaimed and waits to be claimed
   `3f9a-12bc-77de-0a41`.
 - **Console.** The tty1 status screen redraws every 5 seconds and shows the
   short claim key while the node has no name, with the hint to compare it in
-  `relish machines claim`.
+  `relish machines claim`. `reliaburger-console.service` is ordered after
+  none of our units: the seed unit stays activating until the claim, and a
+  console ordered after it showed nothing until the key no longer mattered
+  (#2161). It shares bun's launcher with prepare and bun, which installs
+  bun under a lock (`/var/lib/reliaburger/bin/.install.lock`).
 - **mDNS.** It announces `_rb-unclaimed._tcp.local.` (RFC 6763 caps the name
   at 15 bytes) as `reliaburger-<mac>`, with TXT `mac`, `arch` and `fp` (the
   short fingerprint). It waits up to 60 seconds for an IPv4 address before
