@@ -321,7 +321,7 @@ async fn a_sidecar_that_cannot_start_fails_its_instance_which_never_starts() {
     let message = events
         .iter()
         .find_map(|event| match event {
-            ApplyEvent::Error { message } => Some(message.clone()),
+            ApplyEvent::Error { message, .. } => Some(message.clone()),
             _ => None,
         })
         .expect("the failed sidecar produced no Error event");
@@ -347,7 +347,7 @@ async fn a_node_whose_runtime_cannot_share_a_network_refuses_sidecars_with_a_rea
     let message = events
         .iter()
         .find_map(|event| match event {
-            ApplyEvent::Error { message } => Some(message.clone()),
+            ApplyEvent::Error { message, .. } => Some(message.clone()),
             _ => None,
         })
         .expect("sidecars on a runtime that can't share a network were accepted");

@@ -3366,7 +3366,7 @@ async fn deploy_outcome(
                     reason,
                 });
             }
-            ApplyEvent::Error { message } if failure.is_none() => {
+            ApplyEvent::Error { message, .. } if failure.is_none() => {
                 failure = Some(DeployWaitError::Failed(message));
             }
             _ => {}
@@ -3803,6 +3803,7 @@ mod tests {
                     counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let _ = events
                         .send(ApplyEvent::Error {
+                            status: None,
                             message: "cluster discovery publication failed: local service \
                                       requires its committed cluster allocation"
                                 .into(),
@@ -4728,6 +4729,7 @@ command = ["false"]
                         deploys.push(std::time::Instant::now());
                         let _ = events
                             .send(ApplyEvent::Error {
+                                status: None,
                                 message: "replacement exited before its identity was recorded"
                                     .into(),
                             })
@@ -5206,6 +5208,7 @@ image = "busybox:latest"
         let message = "init container 0 failed for instance default__web-0: \
                        exited with code 1: runc run failed: container's cgroup is not empty";
         tx.send(ApplyEvent::Error {
+            status: None,
             message: message.to_string(),
         })
         .await
@@ -5234,6 +5237,7 @@ image = "busybox:latest"
         let (tx, rx) = mpsc::channel(4);
         for event in [
             ApplyEvent::Error {
+                status: None,
                 message: "default__web-g1-0 failed its health check".into(),
             },
             ApplyEvent::RolloutAborted {
@@ -5242,6 +5246,7 @@ image = "busybox:latest"
                 reason: "rolled back — old instances preserved".into(),
             },
             ApplyEvent::Error {
+                status: None,
                 message: "rolled back — old instances preserved".into(),
             },
         ] {
@@ -5263,9 +5268,11 @@ image = "busybox:latest"
         let (tx, rx) = mpsc::channel(8);
         for event in [
             ApplyEvent::Error {
+                status: None,
                 message: "node capacity cannot admit cpu=100m mem=32Mi".into(),
             },
             ApplyEvent::Error {
+                status: None,
                 message: "a later error".into(),
             },
             ApplyEvent::RolloutAborted {
@@ -5274,6 +5281,7 @@ image = "busybox:latest"
                 reason: "rolled back — old instances preserved".into(),
             },
             ApplyEvent::Error {
+                status: None,
                 message: "rolled back — old instances preserved".into(),
             },
         ] {

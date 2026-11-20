@@ -32,8 +32,16 @@ pub enum ApplyEvent {
         rolled_back: bool,
         reason: String,
     },
-    /// The deploy failed.
-    Error { message: String },
+    /// The deploy failed. `status` is the HTTP status the same failure
+    /// answers when it comes before a stream starts (404 for an image
+    /// nobody built), so a client can name it after the stream's 200. It's
+    /// `None` for a failure with no status of its own, and from a server
+    /// that predates the field (#2157).
+    Error {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
+    },
 }
 
 /// The outcome of clearing one fault on this node.
@@ -1305,5 +1313,52 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 std::process::exit(1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ApplyEvent;
+
+    #[test]
+    fn an_error_with_a_status_round_trips_through_json() {
+        let event = ApplyEvent::Error {
+            message: "burger:v1 isn't in this cluster's registry (Pickle)".into(),
+            status: Some(404),
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"Error","message":"burger:v1 isn't in this cluster's registry (Pickle)","status":404}"#
+        );
+        let ApplyEvent::Error { message, status } = serde_json::from_str(&json).unwrap() else {
+            panic!("not an error: {json}");
+        };
+        assert_eq!(status, Some(404));
+        assert!(message.starts_with("burger:v1"), "{message}");
+    }
+
+    #[test]
+    fn an_error_without_a_status_leaves_the_field_out() {
+        let event = ApplyEvent::Error {
+            message: "boom".into(),
+            status: None,
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(json, r#"{"type":"Error","message":"boom"}"#);
+    }
+
+    /// A server from before #2157 sends no status; the event still parses.
+    #[test]
+    fn an_error_from_an_older_server_parses_with_no_status() {
+        let event: ApplyEvent =
+            serde_json::from_str(r#"{"type":"Error","message":"boom"}"#).unwrap();
+
+        let ApplyEvent::Error { message, status } = event else {
+            panic!("not an error: {event:?}");
+        };
+        assert_eq!((message.as_str(), status), ("boom", None));
     }
 }

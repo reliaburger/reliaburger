@@ -706,6 +706,20 @@ sealed to a fresh age identity, and print both paths. `relish ca backup` now
 only re-seals such a backup (`--from`). Keep that backup somewhere safe and
 off the cluster: it's the only copy of the root's key.
 
+### Upgrading from 0.3.1
+
+0.3.2 can't roll onto a 0.3.0 or 0.3.1 cluster, which both speak protocol 60
+and state format 76. The apply stream's `Error` event carries the HTTP status
+of the failure it reports, so `relish apply` on a cluster names an image
+nobody built as `404` instead of `500`
+([#2157](https://github.com/reliaburger/reliaburger/issues/2157)); the full
+list is in `src/compatibility.rs`. So the protocol moved from 60 to 61; the
+state format stays at 76. A 0.3.1 leader refuses `relish upgrade start v0.3.2`
+before it records a run.
+
+The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
+same steps and the same losses.
+
 ## Signing identity
 
 Configure `RELIABURGER_RELEASE_KEY` as a secret of the `release` GitHub
