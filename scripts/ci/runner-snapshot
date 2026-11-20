@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Print one snapshot of what a CI job's host is doing (#1943).
+#
+# On 20 Nov 2026 three privileged Linux jobs ran into their limits with a
+# step still "in progress", and GitHub kept no log (runs 44729365098,
+# 44778442800 and 44783868580). When a step's own timeout fires, it kills
+# the hung processes before a report step can look at them, so watch-runner
+# runs this a few minutes before that limit (WATCH_SNAPSHOT_AFTER), and the
+# report steps run it again after a failure.
+#
+# It prints, each under a "--- " heading: memory and swap, the kernel's
+# pressure stall figures, free disk, the test processes nextest is running
+# and for how long (its progress), every process as a tree, the kernel
+# stacks of each task in uninterruptible sleep (D) and of every thread of a
+# test binary, Bun or process owner, the end of the kernel log, and the end
+# of each LOG given. Every part is best effort: a tool that fails leaves a
+# line saying so, and the exit status is always 0.
+#
+# Usage: runner-snapshot [LOG...]
+# PROC_ROOT stands in for /proc in the tests.
+set -uo pipefail
+proc=${PROC_ROOT:-/proc}
+
+# Root reads the kernel log and other users' stacks; sudo -n never prompts.
+as_root=
+if sudo -n true 2> /dev/null; then
+    as_root="sudo -n"
+fi
+
+section() {
+    printf '\n--- %s\n' "$1"
+}
+
+echo "=== runner snapshot at $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+section "load"
+cat "$proc/loadavg" 2> /dev/null || echo "no loadavg"
+
+section "memory and swap"
+grep -E '^(MemTotal|MemFree|MemAvailable|Cached|Dirty|Writeback|SwapTotal|SwapFree|Committed_AS):' \
+    "$proc/meminfo" 2> /dev/null || echo "no meminfo"
+free -m 2> /dev/null || echo "free failed"
+swapon --show 2> /dev/null || echo "swapon failed"
+
+section "pressure (the share of time tasks stalled)"
+for resource in memory io cpu; do
+    echo "$resource:"
+    cat "$proc/pressure/$resource" 2> /dev/null || echo "  none"
+done
+
+section "disk"
+df -h / 2> /dev/null || echo "df failed"
+
+# nextest runs each test as `BINARY --exact NAME ...`, so these lines name
+# the tests in progress; their elapsed seconds show which one is stuck.
+section "running test processes (elapsed seconds, command)"
+ps -eo pid=,etimes=,args= 2> /dev/null \
+    | awk '/target\/(debug|release)\/deps\/|cargo-nextest|bin\/bun |__process-owner/' \
+    || echo "ps failed"
+
+section "processes"
+ps -eo pid,ppid,pgid,stat,wchan:32,etime,rss,args --forest 2> /dev/null || echo "ps failed"
+
+section "kernel stacks of stuck and test processes"
+for pid in $(ps -eo pid=,stat=,args= 2> /dev/null \
+    | awk '$2 ~ /^D/ || /target\/debug\/(deps\/|bun)|upgrade-bin\/bun|__process-owner/ {print $1}'); do
+    for task in "$proc/$pid"/task/*; do
+        [ -d "$task" ] || continue
+        echo "== $task ($($as_root cat "$task/comm" 2> /dev/null), $($as_root cat "$task/wchan" 2> /dev/null))"
+        $as_root cat "$task/stack" 2> /dev/null || echo "(no stack)"
+    done
+done
+
+section "kernel log, last 100 lines"
+$as_root dmesg -T 2> /dev/null | tail -n 100 || echo "dmesg failed"
+
+for log in "$@"; do
+    section "last lines of $log"
+    if [ -r "$log" ]; then
+        tail -n 60 "$log"
+    else
+        echo "$log: not there"
+    fi
+done
+exit 0

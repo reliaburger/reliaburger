@@ -733,6 +733,25 @@ more, held for 30 seconds, stops the build whether swap is in use or not. Passin
 49% for one ten-second sample. None of that helps a host that freezes outright, because the
 watcher freezes with it. That case is why the step's own `timeout` stays.
 
+The same day the 24.04 job, which had none of those guards, lost two runners of its own. We
+went back through every CI run of the past week to see where. All three of its losses since
+15 November came in one step, "Prove rootless port adoption", and in no other. That step runs
+`make test-rootless-runc`, and in CI it's the job's first build, cold on a train or a pull
+request. Its recipe didn't have the split build `make test-linux` had just been given, so the
+lib and the lib tests compiled side by side again. It has the split now, and the job has the
+26.04 job's guards: the shield, swap, the watcher with its three stops, and a limit on every
+heavy step inside a longer job limit, so a hang fails one step and the rest still report.
+
+A step limit has a catch: when it fires, it kills the processes we wanted to look at. So the
+watcher now takes snapshots on a schedule. `scripts/ci/runner-snapshot` prints memory, swap,
+the pressure-stall figures, which tests nextest is running and for how long, the process
+tree, the kernel stacks of every stuck task and test binary, and the end of the kernel log.
+The 24.04 job takes one every five minutes from minute 20; the 26.04 job takes one at minute
+36, past every passing run and before its tests' own 40-minute `timeout`. Each snapshot gets
+its own file, so a later one can't overwrite the one taken before a kill, and the job's last
+step uploads them all. A host that freezes outright still keeps nothing, but a hung step now
+leaves a picture of itself from a few minutes before it died.
+
 Coverage finds unvisited code. It does not tell us whether an assertion is useful, whether a
 webhook test accidentally exercised startup, or whether a five-second performance limit is
 portable. The audit found all three in a suite with lots of coverage. Read the uncovered
