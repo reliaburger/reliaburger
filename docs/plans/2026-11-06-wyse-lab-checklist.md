@@ -91,7 +91,9 @@ The fast loop: aim for under 30 minutes a pass, and use the shortcuts freely.
   - Power Management: AC Recovery "Power On", so a unit comes back after the cord test (2.4);
   - Boot Sequence: eMMC (`default`) first, network second. The network entries appear after a save and a reboot into F2; on 1.2.3 the IPv4 one is "IP4 Realtek PCIe GBE Family Controller".
 
-  Note the BIOS version, the PXE entry's exact name, and whether the unit still holds ThinOS. The settings page locks after a save; Unlock takes the admin password.
+  Note the BIOS version, the PXE entry's exact name, and what the unit still holds: ThinOS, or another OS. Second-hand units can arrive with Windows or Ubuntu instead; the lab's had NTFS, LVM and IGEL boot entries. The settings page locks after a save; Unlock takes the admin password.
+
+  Refurbished units can have a flat CMOS coin cell (CR2032). Such a unit loses its BIOS settings and its clock whenever it's unplugged. Check its settings and set the clock after any power loss, and don't pick it for the cord test in 2.4.
 
 - [ ] **1.2 B only: make the Mac the lab's router.** Cable the adapter to the switch, with nothing else on the switch but the Wyses. Give the adapter a fixed address, NAT out through the Wi-Fi, and run dnsmasq with the reservations in a terminal of its own. The network service name (`<service>`) comes from `networksetup -listnetworkserviceorder`; with the cable in, `ifconfig <iface> | grep status` says `active`.
 
@@ -129,7 +131,7 @@ The fast loop: aim for under 30 minutes a pass, and use the shortcuts freely.
   - **B:** "this machine's DHCP server … hands out addresses", or "a DHCP server on this machine holds UDP 67";
   - **A:** "&lt;router&gt; hands out addresses on `<iface>`, and no other netboot server answers".
 
-- [ ] **1.4 Power on and watch it install.** A blank eMMC falls through to the network by itself. A unit with ThinOS boots ThinOS, so press F12 and pick the IPv4 entry ("IP4 Realtek PCIe GBE Family Controller" on 1.2.3).
+- [ ] **1.4 Power on and watch it install.** A blank eMMC falls through to the network by itself. A unit with any OS on it (ThinOS, Windows, Ubuntu) boots that OS, so press F12 and pick the IPv4 entry ("IP4 Realtek PCIe GBE Family Controller" on 1.2.3). The installer puts its own boot entry first, and the old entries are harmless once the disk is wiped.
 
   In relish's log, within a minute or so, you should see:
   1. `ack on 4011` twice (B only): once for the firmware and once for iPXE;
@@ -138,14 +140,17 @@ The fast loop: aim for under 30 minutes a pass, and use the shortcuts freely.
   4. the disk decision;
   5. `installed … in N s`.
 
-  The target must be `/dev/mmcblk0`, never a `boot0` or `boot1` partition. The monitor shows the installer's `reliaburger-install:` lines too (#1611); on a build without them, go by relish's log.
+  The target must be the eMMC itself (about 15.8 GB), never a `boot0` or `boot1` partition. Its name isn't fixed: the same unit showed up as `/dev/mmcblk0` on one boot and `/dev/mmcblk1` on another. The monitor shows the installer's `reliaburger-install:` lines too (#1611); on a build without them, go by relish's log.
+
+  - **If the screen freezes after relish logs `installed`**, with no new DHCP request in dnsmasq's log, the installer's reboot has hung (#2163). Hold the power button and power it on again. Don't press F12: relish now answers it with `exit`, and it boots the install.
+  - **The screen stops at the kernel's last lines** (an `intel-spi` or `sof-audio` probe error at about 40 s) on a working boot too. Until #2161 is fixed, an unclaimed node doesn't show its status there. Go by relish's log and `relish machines`.
 
   - **If relish logs `ack on 4011` but no `tftp:` line**, and the firmware moves on to IPv6: it didn't accept relish's reply, as the 3040 didn't before #1970. Let dnsmasq name the boot file instead (the README's "If a machine won't boot from relish's reply"), and tell the laptop session.
   - **If B stalls**, dnsmasq hands out the address but relish logs nothing: the firmware ignores option 60. Stop relish and dnsmasq, plug the switch into the home router, and repeat from 1.2 as A.
   - **If the installer can't fetch**, the monitor shows `systemd-networkd-wait-online` failing and `reliaburger-install: FAILED: can't fetch …` after about 2.5 minutes: the installer has no driver for the NIC. That was #1969; the build's "Installer drivers" step lists what it carries.
   - **If iPXE misbehaves**, hanging or losing the link after TFTP: restart relish with `--ipxe full`.
 
-- [ ] **1.5 Claim it as a one-node cluster.** After the reboot, the monitor shows its address, MAC and claim key. For the dry run, skip the questions with `--trust-lan --yes`, and add your SSH key so the lab image lets you in.
+- [ ] **1.5 Claim it as a one-node cluster.** After the reboot, `relish machines` lists its address, MAC and claim key. The monitor should too, but doesn't yet (#2161). For the dry run, skip the questions with `--trust-lan --yes`, and add your SSH key so the lab image lets you in.
 
   ```sh
   $R machines --wait 10
@@ -156,12 +161,28 @@ The fast loop: aim for under 30 minutes a pass, and use the shortcuts freely.
 
   You want one node alive, `Size: up to 5 voters`, and nothing for `wtf` to fix. If `relish machines` sees nothing, run `dns-sd -B _rb-unclaimed._tcp`, or claim by address (`<ip-1>`) instead of MAC.
 
-- [ ] **1.6 Run a workload.** The ingress is on port 80 of the node, not `localhost:18080`. Note how long the image pull took compared with the laptop quickstart.
+- [ ] **1.6 Run a workload.** The ingress is on port 80 of the node, not `localhost:18080`. Note how long the image pull took compared with the laptop quickstart. The burger demo needs `relish build` first, and the appliance has no Buildah to build with (#2144), so use an image from Docker Hub. Save this as `~/wyse-lab/nginx.toml`:
+
+  ```toml
+  [app.nginx]
+  image = "nginx:alpine"
+  port = 80
+  replicas = 1
+  memory = "16Mi-128Mi"
+
+  [app.nginx.health]
+  path = "/"
+  interval = 5
+  timeout = 3
+
+  [app.nginx.ingress]
+  host = "nginx.localhost"
+  ```
 
   ```sh
-  cd ~/wyse-lab && curl -fsSL https://reliaburger.com/demo/burger.tar.gz | tar xz
-  $R apply burger/burger.toml
-  curl -H 'Host: burger.localhost' http://<ip-1>/
+  $R apply ~/wyse-lab/nginx.toml
+  $R apps
+  curl -H 'Host: nginx.localhost' http://<ip-1>/
   ```
 
 - [ ] **1.7 Test the fallback on this one node.** This is the riskiest Wyse-specific part: whether the firmware keeps counting boot tries. Serve `next/` in a terminal of its own, stage the broken version and reboot. The node is down while it tries, which is fine for the dry run.
@@ -170,14 +191,16 @@ The fast loop: aim for under 30 minutes a pass, and use the shortcuts freely.
   cd ~/wyse-lab/next && python3 -m http.server 8000
   ```
 
+  `S` is a function, not a variable: zsh, macOS's shell, doesn't split an unquoted `$S` into words, so `S="ssh …"; $S cmd` fails with "no such file or directory".
+
   ```sh
-  S="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@<ip-1>"
-  $S /usr/lib/reliaburger/os-stage http://<lab-ip>:8000/releases/download/os-<broken>-x86_64 <broken>
-  $S 'date -u +%FT%TZ; systemctl reboot'; date -u +%FT%TZ
+  S() { ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@<ip-1> "$@"; }
+  S /usr/lib/reliaburger/os-stage http://<lab-ip>:8000/releases/download/os-<broken>-x86_64 <broken>
+  S 'date -u +%FT%TZ; systemctl reboot'; date -u +%FT%TZ
   ```
 
   ```sh
-  $S 'journalctl -b 0 -u reliaburger-boot-check -o short-iso --no-pager | grep "bun healthy"'
+  S 'journalctl -b 0 -u reliaburger-boot-check -o short-iso --no-pager | grep "bun healthy"'
   ```
 
   The reboot line prints T2 (the node's clock, then the Mac's); the `journalctl` line's timestamp is T3. It gets three tries of up to 120 s each, then boots the version it ran before, by itself. T3 − T2 must be 10 minutes or less. Count the reboots you see on the monitor.
@@ -210,9 +233,15 @@ This run counts for the v0.3.0 tag. No shortcuts. About a day, plus 24 hours of 
     --wipe <mac-1> --wipe <mac-2> --wipe <mac-3>
   ```
 
-  **T0** is when the first Wyse gets power. Power all three on together and write the time down.
+  **T0** is when the first Wyse gets power. Power all three on together and write the time down. With one monitor and keyboard, stagger them: T0 is the first unit's power-on. Press F12 on each, and move on once relish logs `ack on 4011` for its MAC. relish's log shows each install, so a unit doesn't need the monitor once it's netbooting.
 
 - [ ] **2.3 Claim, comparing every key.** No `--trust-lan` or `--yes` this time. Move the monitor from unit to unit and check each claim key matches. At the backup prompt, copy `~/wyse/secrets` off the Mac and type `yes`.
+
+  Until #2161 is fixed, the screen doesn't show the claim key, so check it afterwards instead. Once a node is claimed, its own log names the key it served, which should match the one `relish machines` listed for that address:
+
+  ```sh
+  for ip in <ip-1> <ip-2> <ip-3>; do echo "== $ip"; ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@$ip 'journalctl -u reliaburger-seed | grep "claim key"'; done
+  ```
 
   ```sh
   $R machines --wait 10
@@ -225,7 +254,7 @@ This run counts for the v0.3.0 tag. No shortcuts. About a day, plus 24 hours of 
 
   **T1** is the first time `nodes` shows three alive and `wtf` has nothing to fix. **T1 − T0 must be 60 minutes or less.** All three are voters, so note which one leads.
 
-- [ ] **2.4 Tour, then pull a cord.** Run the burger tour from 1.6 against `<ip-1>`. Then pull the power on a voter that isn't the leader, wait a minute, plug it back in, and wait for `relish nodes` to show three alive. Note how long it took to rejoin, and whether any reboot hung.
+- [ ] **2.4 Tour, then pull a cord.** Run the workload from 1.6 against `<ip-1>`. Then pull the power on a voter that isn't the leader, and not a unit with a flat coin cell, wait a minute, plug it back in, and wait for `relish nodes` to show three alive. Note how long it took to rejoin, and whether any reboot hung.
 
 - [ ] **2.5 Measure for 24 hours, with no reboots.** It samples every 5 minutes, 288 times. Leave the tour's apps running for the first 12 hours, then `relish delete` them and note the time. A reboot anywhere in the window spoils that node's eMMC figure. The CSVs land in `~/wyse/measure/`.
 
@@ -242,7 +271,7 @@ This run counts for the v0.3.0 tag. No shortcuts. About a day, plus 24 hours of 
   $R os status
   ```
 
-  Then repeat the fallback from 1.7 on a voter that isn't the leader, with that node's address in `$S`. `relish council` names the leader, which may have moved during the update. The node should come back on the *next* version. **T3 − T2 must be 10 minutes or less.** Keep `relish council` open in another terminal, to check the cluster keeps quorum throughout.
+  Then repeat the fallback from 1.7 on a voter that isn't the leader, with that node's address in the `S` function. `relish council` names the leader, which may have moved during the update. The node should come back on the *next* version. **T3 − T2 must be 10 minutes or less.** Keep `relish council` open in another terminal, to check the cluster keeps quorum throughout.
 
 - [ ] **2.7 Record the results.** Collect the relish netboot log, T0 to T3, the BIOS notes, the measure CSVs and anything that went wrong. They go into `docs/qualification/<date>-wyse-3040.md`, with the go/no-go below. A failed step is still a result: write down what happened and stop.
 
