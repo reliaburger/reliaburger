@@ -13,7 +13,10 @@ use crate::bun::agent::InstanceStatus;
 use crate::bun::capabilities::ClusterCapabilities;
 use crate::relish::client::BunClient;
 use crate::testkit::deadline::Deadline;
-use crate::testkit::report::CleanupOutcome;
+use crate::testkit::report::{
+    CapturedEvent, CapturedInstance, CaseStep, CleanupOutcome, FailureState, MAX_CAPTURED_APPS,
+    MAX_CAPTURED_EVENTS, MAX_CAPTURED_STEPS,
+};
 
 /// Prefix for every namespace the test runner creates.
 ///
@@ -126,67 +129,193 @@ pub struct TestContext {
     pub deadline: Deadline,
     /// How [`Self::node_clients`] reaches peer nodes.
     pub peer_route: PeerRoute,
-    /// What the case's current wait is waiting for, for a timeout report.
-    pub(crate) wait_note: WaitNote,
+    /// What the case is waiting for and which named steps it has run, for a
+    /// failure report.
+    pub(crate) trace: CaseTrace,
 }
 
-/// What a case's poll helper is waiting for and what it last saw.
+/// What a case has been doing, kept so a failure can say where it was.
 ///
-/// A helper gives up on the same deadline the runner enforces, so the runner
-/// usually cancels the body before the helper's own message comes back. The
-/// helper writes that message here on every poll instead, and the runner adds
-/// it to the timeout. Clones share one note.
-#[derive(Clone, Default)]
-pub(crate) struct WaitNote(std::sync::Arc<tokio::sync::Mutex<Option<String>>>);
+/// Two things live here. The wait note: a poll helper gives up on the same
+/// deadline the runner enforces, so the runner usually cancels the body
+/// before the helper's own message comes back; the helper writes that
+/// message here on every poll instead, and the runner adds it to the
+/// timeout. And the named steps (#2131): each helper and
+/// [`TestContext::step`] opens a step when it starts and closes it when it
+/// ends, so a step the runner cancelled stays open and names where the case
+/// was stuck. Clones share one trace.
+#[derive(Clone)]
+pub(crate) struct CaseTrace(std::sync::Arc<tokio::sync::Mutex<TraceState>>);
 
-impl WaitNote {
-    /// Replace the note with the current wait's state.
-    pub(crate) async fn record(&self, note: String) {
-        *self.0.lock().await = Some(note);
+struct TraceState {
+    origin: std::time::Instant,
+    wait_note: Option<String>,
+    /// Steps oldest first, each with the sequence number that closes it.
+    steps: std::collections::VecDeque<(u64, CaseStep)>,
+    next_step: u64,
+    /// Applications the case applied, in first-applied order.
+    apps: Vec<String>,
+}
+
+impl Default for CaseTrace {
+    fn default() -> Self {
+        Self(std::sync::Arc::new(tokio::sync::Mutex::new(TraceState {
+            origin: std::time::Instant::now(),
+            wait_note: None,
+            steps: std::collections::VecDeque::new(),
+            next_step: 0,
+            apps: Vec::new(),
+        })))
+    }
+}
+
+/// What a [`CaseTrace`] holds when the runner reads it after a failure.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TraceSnapshot {
+    /// The newest step still open, else the last one the case finished.
+    pub step: Option<String>,
+    /// Whether [`Self::step`] was still open, which is where a cancelled case was.
+    pub step_open: bool,
+    pub steps: Vec<CaseStep>,
+    pub apps: Vec<String>,
+}
+
+impl CaseTrace {
+    /// Replace the wait note with the current wait's state.
+    pub(crate) async fn record_wait(&self, note: String) {
+        self.0.lock().await.wait_note = Some(note);
     }
 
-    /// Forget the note once its wait is over.
-    pub(crate) async fn clear(&self) {
-        *self.0.lock().await = None;
+    /// Forget the wait note once its wait is over.
+    pub(crate) async fn clear_wait(&self) {
+        self.0.lock().await.wait_note = None;
     }
 
     /// The note left by a wait that never finished, if any.
-    pub(crate) async fn take(&self) -> Option<String> {
-        self.0.lock().await.take()
+    pub(crate) async fn take_wait(&self) -> Option<String> {
+        self.0.lock().await.wait_note.take()
     }
+
+    /// Open a named step; [`Self::end_step`] with the returned number closes it.
+    pub(crate) async fn begin_step(&self, name: &str) -> u64 {
+        let mut state = self.0.lock().await;
+        let sequence = state.next_step;
+        state.next_step += 1;
+        let started_after_ms = millis(state.origin.elapsed());
+        state.steps.push_back((
+            sequence,
+            CaseStep {
+                name: name.to_string(),
+                started_after_ms,
+                duration_ms: None,
+            },
+        ));
+        // Keep the newest steps, since the last ones are where a failure
+        // happened, and drop finished ones first: a step still open encloses
+        // the ones a polling loop keeps starting inside it.
+        while state.steps.len() > MAX_CAPTURED_STEPS {
+            let finished = state
+                .steps
+                .iter()
+                .position(|(_, step)| step.duration_ms.is_some());
+            match finished {
+                Some(index) => state.steps.remove(index),
+                None => state.steps.pop_front(),
+            };
+        }
+        sequence
+    }
+
+    /// Close the step `sequence` opened, recording how long it took.
+    pub(crate) async fn end_step(&self, sequence: u64) {
+        let mut state = self.0.lock().await;
+        let now = millis(state.origin.elapsed());
+        if let Some((_, step)) = state.steps.iter_mut().find(|(id, _)| *id == sequence) {
+            step.duration_ms = Some(now.saturating_sub(step.started_after_ms));
+        }
+    }
+
+    /// Remember that the case applied `app`.
+    pub(crate) async fn note_app(&self, app: &str) {
+        let mut state = self.0.lock().await;
+        if !state.apps.iter().any(|known| known == app) {
+            state.apps.push(app.to_string());
+        }
+    }
+
+    /// The steps and applications recorded so far.
+    pub(crate) async fn snapshot(&self) -> TraceSnapshot {
+        let state = self.0.lock().await;
+        let open = state
+            .steps
+            .iter()
+            .rev()
+            .find(|(_, step)| step.duration_ms.is_none());
+        let (step, step_open) = match open {
+            Some((_, step)) => (Some(step.name.clone()), true),
+            None => (state.steps.back().map(|(_, step)| step.name.clone()), false),
+        };
+        TraceSnapshot {
+            step,
+            step_open,
+            steps: state.steps.iter().map(|(_, step)| step.clone()).collect(),
+            apps: state.apps.clone(),
+        }
+    }
+}
+
+fn millis(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 impl TestContext {
     /// Inspect the actual owning node, since the entry node may not run this app.
     pub async fn exec_in_workload(&self, app: &str, command: &[String]) -> Result<String, String> {
-        self.deadline
-            .run("inspect workload contents", async {
-                for (node, client) in self.node_clients().await? {
-                    let instances = client
-                        .status()
+        self.step(&format!("exec in {app}"), async {
+            for (node, client) in self.node_clients().await? {
+                let instances = client
+                    .status()
+                    .await
+                    .map_err(|error| format!("could not inspect node {node}: {error}"))?;
+                if instances.iter().any(|instance| {
+                    instance.app_name == app
+                        && instance.namespace == self.namespace
+                        && instance.state == "running"
+                }) {
+                    return client
+                        .exec(app, &self.namespace, command)
                         .await
-                        .map_err(|error| format!("could not inspect node {node}: {error}"))?;
-                    if instances.iter().any(|instance| {
-                        instance.app_name == app
-                            && instance.namespace == self.namespace
-                            && instance.state == "running"
-                    }) {
-                        return client
-                            .exec(app, &self.namespace, command)
-                            .await
-                            .map(|answer| answer.output)
-                            .map_err(|error| {
-                                format!("workload inspection failed on {node}: {error}")
-                            });
-                    }
+                        .map(|answer| answer.output)
+                        .map_err(|error| format!("workload inspection failed on {node}: {error}"));
                 }
-                Err(format!(
-                    "no running instance of {}/{app} found",
-                    self.namespace
-                ))
-            })
+            }
+            Err(format!(
+                "no running instance of {}/{app} found",
+                self.namespace
+            ))
+        })
+        .await?
+    }
+
+    /// Run one named step of the case under the case deadline.
+    ///
+    /// The name stays in the case's trace while the step runs, so a case
+    /// that fails, or that the runner cancels at its deadline, inside the
+    /// step reports which one it was in (#2131). A step that runs out of
+    /// deadline itself stays open for the same reason. Name steps for what
+    /// they wait on: "stage pinned runnable image", "exec in web".
+    pub async fn step<T, F>(&self, name: &str, future: F) -> Result<T, String>
+    where
+        F: std::future::Future<Output = T>,
+    {
+        let sequence = self.trace.begin_step(name).await;
+        let output = self
+            .deadline
+            .run(name, future)
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        self.trace.end_step(sequence).await;
+        Ok(output)
     }
 
     /// Build a bounded HTTP client for workloads, without cluster credentials.
@@ -236,6 +365,21 @@ impl TestContext {
             } else {
                 config.job.is_empty() && (!config.app.is_empty() || !config.namespace.is_empty())
             };
+        let names: Vec<&String> = config.app.keys().chain(config.job.keys()).collect();
+        for name in &names {
+            self.trace.note_app(name).await;
+        }
+        let step = self
+            .trace
+            .begin_step(&format!(
+                "apply {}",
+                names
+                    .iter()
+                    .map(|name| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+            .await;
         let result = match &self.lease_id {
             Some(lease_id) if lease_compatible => {
                 self.client.apply_with_lease(&config, lease_id).await
@@ -248,6 +392,7 @@ impl TestContext {
             }
             None => self.client.apply(&config).await,
         };
+        self.trace.end_step(step).await;
         result
             .map(|_| ())
             .map_err(|error| format!("apply failed: {error}"))
@@ -536,13 +681,18 @@ impl TestContext {
     where
         F: Fn(&[InstanceStatus]) -> bool,
     {
+        let step = self
+            .trace
+            .begin_step(&format!("wait for {app} to reach {what} cluster-wide"))
+            .await;
         let mut last: Vec<InstanceStatus> = Vec::new();
         loop {
             let last_error = match self.cluster_instances(app).await {
                 Ok(instances) => {
                     last = instances;
                     if predicate(&last) {
-                        self.wait_note.clear().await;
+                        self.trace.clear_wait().await;
+                        self.trace.end_step(step).await;
                         return Ok(());
                     }
                     None
@@ -558,7 +708,7 @@ impl TestContext {
             if self.deadline.remaining().is_zero() {
                 return Err(format!("timed out after {:?} {waiting}", self.timeout));
             }
-            self.wait_note.record(waiting).await;
+            self.trace.record_wait(waiting).await;
             tokio::time::sleep(Duration::from_millis(500).min(self.deadline.remaining())).await;
         }
     }
@@ -577,6 +727,10 @@ impl TestContext {
     where
         F: Fn(&[crate::bun::agent::JobStatus]) -> bool,
     {
+        let step = self
+            .trace
+            .begin_step(&format!("wait for job {job} to reach {what}"))
+            .await;
         let mut last: Vec<crate::bun::agent::JobStatus> = Vec::new();
         loop {
             let last_error = match self.client.jobs().await {
@@ -588,7 +742,8 @@ impl TestContext {
                         .filter(|row| row.name == job && row.namespace == self.namespace)
                         .collect();
                     if predicate(&last) {
-                        self.wait_note.clear().await;
+                        self.trace.clear_wait().await;
+                        self.trace.end_step(step).await;
                         return Ok(());
                     }
                     None
@@ -612,7 +767,7 @@ impl TestContext {
             } else {
                 waiting
             };
-            self.wait_note.record(waiting).await;
+            self.trace.record_wait(waiting).await;
             tokio::time::sleep(Duration::from_millis(500).min(self.deadline.remaining())).await;
         }
     }
@@ -628,7 +783,7 @@ impl TestContext {
             Err(_) => "definitions unreadable: timed out".to_string(),
         };
         let deployment = match tokio::time::timeout(budget, self.client.deploy_operations()).await {
-            Ok(Ok(snapshot)) => job_deployment_note(&snapshot, job, &self.namespace),
+            Ok(Ok(snapshot)) => deployment_note(&snapshot, job, &self.namespace),
             Ok(Err(error)) => format!("deployments unreadable: {error}"),
             Err(_) => "deployments unreadable: timed out".to_string(),
         };
@@ -758,6 +913,10 @@ impl TestContext {
         F: Fn(&[InstanceStatus]) -> bool,
     {
         let poll = Duration::from_millis(500);
+        let step = self
+            .trace
+            .begin_step(&format!("wait for {app} to reach {what}"))
+            .await;
         let mut last: Vec<InstanceStatus> = Vec::new();
         loop {
             if let Ok(Ok(all)) = self.deadline.run("status poll", self.client.status()).await {
@@ -768,7 +927,8 @@ impl TestContext {
                     })
                     .collect();
                 if predicate(&last) {
-                    self.wait_note.clear().await;
+                    self.trace.clear_wait().await;
+                    self.trace.end_step(step).await;
                     return Ok(());
                 }
             }
@@ -783,9 +943,147 @@ impl TestContext {
             if self.deadline.remaining().is_zero() {
                 return Err(format!("timed out after {:?} {waiting}", self.timeout));
             }
-            self.wait_note.record(waiting).await;
+            self.trace.record_wait(waiting).await;
             tokio::time::sleep(poll.min(self.deadline.remaining())).await;
         }
+    }
+
+    /// Record what the cluster shows of this case's resources, for the
+    /// report of a case that failed or timed out (#2131).
+    ///
+    /// The runner calls this before teardown, while the instances are still
+    /// there: the case's named steps, its applications' instances on every
+    /// reachable node, the newest deployment of each, recent events about
+    /// them and what the server says of the lease. Each read gets at most
+    /// [`CAPTURE_READ_BUDGET`] of `deadline`; one that fails is listed in
+    /// `errors`, never dropped silently. The result is bounded.
+    pub(crate) async fn capture_failure_state(&self, deadline: Deadline) -> FailureState {
+        let trace = self.trace.snapshot().await;
+        let mut state = FailureState {
+            captured_at: crate::testkit::runner::now_rfc3339(),
+            step: trace.step,
+            steps: trace.steps,
+            ..FailureState::default()
+        };
+        let mut apps = trace.apps;
+
+        match bounded_read(deadline, self.namespace_instances_by_node()).await {
+            Ok(instances) => {
+                for (node, instance) in instances {
+                    if !apps.contains(&instance.app_name) {
+                        apps.push(instance.app_name.clone());
+                    }
+                    state.instances.push(CapturedInstance {
+                        node,
+                        id: instance.id,
+                        app: instance.app_name,
+                        state: instance.state,
+                        restart_count: instance.restart_count,
+                        exit_code: instance.exit_code,
+                        reason: instance.reason,
+                        age_seconds: instance.age_seconds,
+                    });
+                }
+            }
+            Err(error) => state.errors.push(format!("instances unreadable: {error}")),
+        }
+        let asked: Vec<String> = apps.iter().take(MAX_CAPTURED_APPS).cloned().collect();
+        state.truncated |= apps.len() > asked.len();
+        state.apps = apps;
+
+        match bounded_read(deadline, async {
+            self.client
+                .deploy_operations()
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .await
+        {
+            Ok(snapshot) => {
+                state.deployments = asked
+                    .iter()
+                    .map(|app| deployment_note(&snapshot, app, &self.namespace))
+                    .collect();
+            }
+            Err(error) => state
+                .errors
+                .push(format!("deployments unreadable: {error}")),
+        }
+
+        let mut events = Vec::new();
+        for app in &asked {
+            let filter = crate::relish::events_cmd::EventsFilter {
+                limit: MAX_CAPTURED_EVENTS,
+                app: Some(app.clone()),
+                severity: None,
+            };
+            let read = bounded_read(deadline, async {
+                self.client
+                    .events_matching(&filter)
+                    .await
+                    .map_err(|error| error.to_string())
+            })
+            .await;
+            match read {
+                Ok(view) => events.extend(view.events.into_iter().filter(|event| {
+                    event
+                        .namespace
+                        .as_deref()
+                        .is_none_or(|namespace| namespace == self.namespace)
+                })),
+                Err(error) => state
+                    .errors
+                    .push(format!("events for {app} unreadable: {error}")),
+            }
+        }
+        events.sort_by_key(|event| (event.timestamp, event.sequence));
+        state.events = events
+            .into_iter()
+            .map(|event| CapturedEvent {
+                timestamp: event.timestamp,
+                severity: event.severity,
+                node: event.node,
+                app: event.app,
+                message: event.message,
+            })
+            .collect();
+
+        if let Some(lease_id) = &self.lease_id {
+            state.lease = Some(
+                match bounded_read(deadline, async {
+                    Ok(self.client.test_lease(lease_id).await)
+                })
+                .await
+                {
+                    Ok(result) => {
+                        lease_note(lease_id, result, crate::testkit::lease::now_unix_millis())
+                    }
+                    Err(error) => format!("lease {lease_id} unreadable: {error}"),
+                },
+            );
+        }
+        state.bound();
+        state
+    }
+
+    /// Every unfinished instance in this namespace, with the node that runs it.
+    async fn namespace_instances_by_node(&self) -> Result<Vec<(String, InstanceStatus)>, String> {
+        let mut all = Vec::new();
+        for (node, client) in self.node_clients().await? {
+            let statuses = client
+                .status()
+                .await
+                .map_err(|error| format!("could not inspect node {node}: {error}"))?;
+            all.extend(
+                statuses
+                    .into_iter()
+                    .filter(|instance| {
+                        instance.namespace == self.namespace && !Self::is_finished_run(instance)
+                    })
+                    .map(|instance| (node.clone(), instance)),
+            );
+        }
+        Ok(all)
     }
 
     /// Attempt reversal of owned faults and leased resources, then report evidence.
@@ -935,6 +1233,25 @@ impl TestContext {
     }
 }
 
+/// Longest one read of a failure capture may take, so a hung node can't
+/// spend the whole capture budget.
+pub(crate) const CAPTURE_READ_BUDGET: Duration = Duration::from_secs(3);
+
+/// Run one capture read within [`CAPTURE_READ_BUDGET`] and what is left of
+/// `deadline`.
+async fn bounded_read<T, F>(deadline: Deadline, read: F) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>>,
+{
+    let budget = deadline
+        .child(CAPTURE_READ_BUDGET)
+        .map_err(|_| "the capture budget was spent".to_string())?;
+    budget
+        .run("capture read", read)
+        .await
+        .map_err(|error| error.to_string())?
+}
+
 /// Why cleanup is unknown when the lease owner was reached but the release
 /// ran out of its budget, naming the budget it actually had.
 fn unconfirmed_release_reason() -> String {
@@ -1013,7 +1330,7 @@ impl TestContext {
             timeout: Duration::from_millis(200),
             deadline: Deadline::after(Duration::from_millis(200)).unwrap(),
             peer_route: PeerRoute::Direct,
-            wait_note: Default::default(),
+            trace: Default::default(),
         }
     }
 }
@@ -1035,8 +1352,8 @@ fn job_definition_note(view: &serde_json::Value, job: &str, namespace: &str) -> 
 }
 
 /// What `GET /v1/deploys/operations` says of the newest deployment that
-/// named `namespace/job`, live or finished.
-fn job_deployment_note(
+/// named `namespace/job` (an app or a job), live or finished.
+fn deployment_note(
     snapshot: &crate::bun::deploy_operations::DeployOperationSnapshot,
     job: &str,
     namespace: &str,
@@ -1220,7 +1537,7 @@ mod tests {
                 !rows.is_empty()
             })
             .await;
-        let note = ctx.wait_note.take().await.unwrap_or_default();
+        let note = ctx.trace.take_wait().await.unwrap_or_default();
         server.abort();
         assert!(waited.is_err());
         assert!(note.contains("last saw 0 row(s)"), "{note}");
@@ -1256,6 +1573,91 @@ mod tests {
 
     fn context(namespace: &str) -> TestContext {
         TestContext::offline(namespace)
+    }
+
+    /// A polling loop starts a step on every try. Those must not push out
+    /// the step that encloses them, which is where the case really was.
+    #[tokio::test]
+    async fn a_flood_of_finished_steps_keeps_the_open_step_that_encloses_them() {
+        let trace = CaseTrace::default();
+        let outer = trace.begin_step("wait for workload certificate").await;
+        for _ in 0..100 {
+            let inner = trace.begin_step("exec in identity-app").await;
+            trace.end_step(inner).await;
+        }
+
+        let snapshot = trace.snapshot().await;
+
+        assert_eq!(snapshot.steps.len(), MAX_CAPTURED_STEPS);
+        assert_eq!(snapshot.steps[0].name, "wait for workload certificate");
+        assert_eq!(
+            snapshot.step.as_deref(),
+            Some("wait for workload certificate")
+        );
+        assert!(snapshot.step_open);
+        trace.end_step(outer).await;
+        let snapshot = trace.snapshot().await;
+        assert!(!snapshot.step_open);
+        assert_eq!(snapshot.step.as_deref(), Some("exec in identity-app"));
+    }
+
+    #[tokio::test]
+    async fn a_step_that_runs_out_of_deadline_stays_open() {
+        let ctx = context("rbtest-steps-00");
+        ctx.step("quick", async {}).await.unwrap();
+        let error = ctx
+            .step("exec in web", std::future::pending::<()>())
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("exec in web exceeded"), "{error}");
+        let snapshot = ctx.trace.snapshot().await;
+        assert_eq!(snapshot.step.as_deref(), Some("exec in web"));
+        assert!(snapshot.step_open);
+        assert!(snapshot.steps[0].duration_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_wait_names_its_step_and_apply_names_its_apps() {
+        let mut ctx = context("rbtest-steps-01");
+        // Nothing listens on port 1, so neither call reaches a cluster.
+        ctx.client = BunClient::new_with_token("http://127.0.0.1:1", None);
+        let _ = ctx.apply(&ctx.container_idle_spec("idle")).await;
+        let _ = ctx.wait_running_cluster("idle", 1).await;
+
+        let snapshot = ctx.trace.snapshot().await;
+        assert_eq!(snapshot.apps, ["idle"]);
+        let names: Vec<_> = snapshot.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "apply idle",
+                "wait for idle to reach 1 running replica(s) cluster-wide"
+            ]
+        );
+        assert!(snapshot.step_open);
+    }
+
+    /// Against nothing at all, a capture still returns: each unreadable
+    /// source is named, within the capture's budget.
+    #[tokio::test]
+    async fn a_capture_of_an_unreachable_cluster_names_what_it_could_not_read() {
+        let mut ctx = context("rbtest-steps-02");
+        ctx.client = BunClient::new_with_token("http://127.0.0.1:1", None);
+        ctx.lease_id = Some("lease-1".to_string());
+        ctx.trace.note_app("web").await;
+
+        let state = ctx
+            .capture_failure_state(Deadline::after(Duration::from_secs(10)).unwrap())
+            .await;
+
+        assert_eq!(state.apps, ["web"]);
+        assert!(state.instances.is_empty());
+        let errors = state.errors.join("\n");
+        assert!(errors.contains("instances unreadable"), "{errors}");
+        assert!(errors.contains("deployments unreadable"), "{errors}");
+        assert!(errors.contains("events for web unreadable"), "{errors}");
+        assert!(state.lease.unwrap_or_default().contains("lease-1"));
     }
 
     #[tokio::test]

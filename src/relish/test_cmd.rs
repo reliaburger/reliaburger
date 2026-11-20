@@ -229,6 +229,9 @@ fn render_human(report: &TestReport) -> String {
             "  {mark}  {}  ({} ms){detail}",
             result.name, result.duration_ms
         );
+        if let Some(state) = &result.failure_state {
+            render_failure_state(&mut out, state);
+        }
     }
 
     let seconds = report.duration_ms as f64 / 1000.0;
@@ -238,6 +241,46 @@ fn render_human(report: &TestReport) -> String {
         report.total, report.passed, report.failed, report.skipped, report.unknown, seconds
     );
     out
+}
+
+/// How many instances and events a failing case shows in the plain-text
+/// report. `-o json` carries the whole bounded capture.
+const HUMAN_CAPTURE_LINES: usize = 3;
+
+/// The few lines of a failing case's captured state worth reading first:
+/// where it was, what its instances were doing, what happened last.
+fn render_failure_state(out: &mut String, state: &crate::testkit::FailureState) {
+    use std::fmt::Write;
+
+    if let Some(step) = &state.step {
+        let _ = writeln!(out, "        step: {step}");
+    }
+    if state.instances.is_empty() && !state.apps.is_empty() {
+        let _ = writeln!(out, "        no instances of {}", state.apps.join(", "));
+    }
+    for instance in state.instances.iter().take(HUMAN_CAPTURE_LINES) {
+        let reason = instance
+            .reason
+            .as_deref()
+            .map(|reason| format!(" ({reason})"))
+            .unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "        instance {} on {}: {}{reason}",
+            instance.id, instance.node, instance.state
+        );
+    }
+    let skip = state.events.len().saturating_sub(HUMAN_CAPTURE_LINES);
+    for event in state.events.iter().skip(skip) {
+        let _ = writeln!(out, "        event: {}", event.message);
+    }
+    for error in &state.errors {
+        let _ = writeln!(out, "        not captured: {error}");
+    }
+    let hidden = state.instances.len().saturating_sub(HUMAN_CAPTURE_LINES) + skip;
+    if hidden > 0 || state.truncated {
+        let _ = writeln!(out, "        (more in -o json)");
+    }
 }
 
 #[cfg(test)]
@@ -276,6 +319,33 @@ mod tests {
             duration_ms,
             evidence,
             cleanup: CleanupOutcome::NotRequired,
+            failure_state: None,
+        }
+    }
+
+    fn sample_failure_state() -> crate::testkit::FailureState {
+        crate::testkit::FailureState {
+            captured_at: "2026-07-26T12:02:00Z".to_string(),
+            step: Some("wait for hang to reach unhealthy".to_string()),
+            apps: vec!["hang".to_string()],
+            instances: vec![crate::testkit::CapturedInstance {
+                node: "node-2".to_string(),
+                id: "hang-0".to_string(),
+                app: "hang".to_string(),
+                state: "running".to_string(),
+                restart_count: 0,
+                exit_code: None,
+                reason: None,
+                age_seconds: Some(118),
+            }],
+            events: vec![crate::testkit::CapturedEvent {
+                timestamp: 1_785_067_200,
+                severity: crate::bun::events::EventSeverity::Info,
+                node: Some("node-2".to_string()),
+                app: Some("hang".to_string()),
+                message: "hang deployed".to_string(),
+            }],
+            ..Default::default()
         }
     }
 
@@ -305,15 +375,18 @@ mod tests {
                     },
                     80,
                 ),
-                result(
-                    "hanging_health_check_marks_instance_unhealthy",
-                    TestGroup::HealthChecks,
-                    TestOutcome::Unknown {
-                        kind: UnknownKind::TimedOut,
-                        reason: "case exceeded its 120000 ms deadline".to_string(),
-                    },
-                    120_000,
-                ),
+                TestCaseResult {
+                    failure_state: Some(sample_failure_state()),
+                    ..result(
+                        "hanging_health_check_marks_instance_unhealthy",
+                        TestGroup::HealthChecks,
+                        TestOutcome::Unknown {
+                            kind: UnknownKind::TimedOut,
+                            reason: "case exceeded its 120000 ms deadline during step \"wait for hang to reach unhealthy\"".to_string(),
+                        },
+                        120_000,
+                    )
+                },
             ],
             "2026-07-26T12:00:00Z".to_string(),
             4321,

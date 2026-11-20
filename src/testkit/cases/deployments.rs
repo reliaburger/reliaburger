@@ -101,35 +101,33 @@ async fn wait_for_recorded_versions(
     app: &str,
     commands: &[Vec<String>],
 ) -> Result<(), String> {
-    ctx.deadline
-        .run("completed history for every deployed version", async {
-            loop {
-                // The entry node merges every node's records; a node that
-                // didn't answer just means another round.
-                let history = ctx
-                    .client
-                    .deploy_history(app, &ctx.namespace)
-                    .await
-                    .map_err(|error| format!("deploy history: {error}"))?
-                    .history;
-                let complete = commands.iter().all(|command| {
-                    history.iter().any(|entry| {
-                        entry.row.result == crate::meat::deploy_types::DeployResult::Completed
-                            && entry
-                                .row
-                                .spec
-                                .as_ref()
-                                .is_some_and(|spec| &spec.command == command)
-                    })
-                });
-                if complete {
-                    return Ok(());
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+    ctx.step("completed history for every deployed version", async {
+        loop {
+            // The entry node merges every node's records; a node that
+            // didn't answer just means another round.
+            let history = ctx
+                .client
+                .deploy_history(app, &ctx.namespace)
+                .await
+                .map_err(|error| format!("deploy history: {error}"))?
+                .history;
+            let complete = commands.iter().all(|command| {
+                history.iter().any(|entry| {
+                    entry.row.result == crate::meat::deploy_types::DeployResult::Completed
+                        && entry
+                            .row
+                            .spec
+                            .as_ref()
+                            .is_some_and(|spec| &spec.command == command)
+                })
+            });
+            if complete {
+                return Ok(());
             }
-        })
-        .await
-        .map_err(|error| error.to_string())?
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await?
 }
 
 pub fn cases() -> Vec<TestCase> {
@@ -236,7 +234,7 @@ mod tests {
             timeout,
             deadline: crate::testkit::deadline::Deadline::after(timeout).unwrap(),
             peer_route: crate::testkit::context::PeerRoute::Direct,
-            wait_note: Default::default(),
+            trace: Default::default(),
         };
         let case = cases()
             .into_iter()

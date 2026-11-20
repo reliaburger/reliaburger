@@ -44,6 +44,12 @@ fn teardown_timeout() -> Duration {
     crate::relish::client::lease_release_budget() + TEARDOWN_MARGIN
 }
 
+/// How long the runner spends recording a failing case's state before its
+/// teardown (#2131). Each read inside gets less (see
+/// [`CAPTURE_READ_BUDGET`](super::context::CAPTURE_READ_BUDGET)), so one hung
+/// node costs its read, not the whole capture.
+const CAPTURE_BUDGET: Duration = Duration::from_secs(15);
+
 /// How long lease creation keeps retrying a 503 "retry shortly": long enough
 /// to ride out a council leader change, which answers with exactly that while
 /// no leader is known (#510). The case deadline still bounds the whole wait.
@@ -258,6 +264,7 @@ pub async fn run(cases: Vec<TestCase>, config: RunConfig) -> Result<TestReport, 
                         cleanup: CleanupOutcome::Unknown {
                             reason: "runner task ended before cleanup evidence".to_string(),
                         },
+                        failure_state: None,
                     },
                 });
             }
@@ -312,6 +319,7 @@ async fn run_one(
                 duration_ms: 0,
                 evidence: vec![],
                 cleanup: CleanupOutcome::NotRequired,
+                failure_state: None,
             };
         }
     };
@@ -345,6 +353,7 @@ async fn run_one(
                     duration_ms: start.elapsed().as_millis() as u64,
                     evidence: Vec::new(),
                     cleanup: CleanupOutcome::NotRequired,
+                    failure_state: None,
                 };
             }
             Err(_) => {
@@ -362,6 +371,7 @@ async fn run_one(
                     duration_ms: start.elapsed().as_millis() as u64,
                     evidence: Vec::new(),
                     cleanup: CleanupOutcome::NotRequired,
+                    failure_state: None,
                 };
             }
         }
@@ -391,6 +401,7 @@ async fn run_one(
             duration_ms: start.elapsed().as_millis() as u64,
             evidence: Vec::new(),
             cleanup: CleanupOutcome::NotRequired,
+            failure_state: None,
         };
     }
     let unknown: Vec<_> = case
@@ -418,12 +429,17 @@ async fn run_one(
             duration_ms: start.elapsed().as_millis() as u64,
             evidence: Vec::new(),
             cleanup: CleanupOutcome::NotRequired,
+            failure_state: None,
         };
     }
 
     let (namespace, lease_id) = match lease_ownership {
         LeaseOwnership::Required => {
-            let lifetime = timeout.saturating_add(teardown_timeout());
+            // The lease outlives the case by the failure capture and the
+            // teardown, both of which still need its resources owned.
+            let lifetime = timeout
+                .saturating_add(CAPTURE_BUDGET)
+                .saturating_add(teardown_timeout());
             let ttl_seconds = lifetime
                 .as_secs()
                 .saturating_add(u64::from(lifetime.subsec_nanos() != 0));
@@ -445,6 +461,7 @@ async fn run_one(
                     duration_ms: start.elapsed().as_millis() as u64,
                     evidence: Vec::new(),
                     cleanup: CleanupOutcome::NotRequired,
+                    failure_state: None,
                 };
             }
             match deadline
@@ -472,6 +489,7 @@ async fn run_one(
                         cleanup: CleanupOutcome::Unknown {
                             reason: "lease creation returned no ownership evidence; the server TTL reaper must decide cleanup".to_string(),
                         },
+                        failure_state: None,
                     };
                 }
                 Err(error) => {
@@ -490,6 +508,7 @@ async fn run_one(
                                 "{error}; the server TTL reaper must decide whether a late lease was created"
                             ),
                         },
+                        failure_state: None,
                     };
                 }
             }
@@ -507,7 +526,7 @@ async fn run_one(
         timeout,
         deadline,
         peer_route,
-        wait_note: Default::default(),
+        trace: Default::default(),
     };
 
     // The case body gets its own task so a panic is data and the outer owner
@@ -531,13 +550,18 @@ async fn run_one(
             body.abort();
             let _ = body.await;
             let mut outcome = TestOutcome::timed_out("case", deadline.budget_ms());
-            // The case's own wait gives up on this same deadline, usually a
-            // moment too late to return its message. It left a note instead.
-            if let (Some(note), TestOutcome::Unknown { reason, .. }) =
-                (context.wait_note.take().await, &mut outcome)
-            {
-                reason.push_str("; it was still ");
-                reason.push_str(&note);
+            if let TestOutcome::Unknown { reason, .. } = &mut outcome {
+                // Name the step the runner cancelled the body in (#2131).
+                let trace = context.trace.snapshot().await;
+                if let (Some(step), true) = (trace.step, trace.step_open) {
+                    reason.push_str(&format!(" during step {step:?}"));
+                }
+                // The case's own wait gives up on this same deadline, usually
+                // a moment too late to return its message. It left a note.
+                if let Some(note) = context.trace.take_wait().await {
+                    reason.push_str("; it was still ");
+                    reason.push_str(&note);
+                }
             }
             outcome
         }
@@ -546,6 +570,23 @@ async fn run_one(
     if let Some(note) = host_suspension_note(wall_elapsed, start.elapsed()) {
         append_reason(&mut outcome, &note);
     }
+
+    // Take the failing case's state while its resources still exist: the
+    // lease release below removes the very instances a failure is about
+    // (#2131).
+    let failure_state = match &outcome {
+        TestOutcome::Fail { .. } | TestOutcome::Unknown { .. } => {
+            match Deadline::after(CAPTURE_BUDGET) {
+                Ok(capture_deadline) => Some(context.capture_failure_state(capture_deadline).await),
+                Err(error) => Some(super::report::FailureState {
+                    captured_at: now_rfc3339(),
+                    errors: vec![format!("could not start the capture: {error}")],
+                    ..Default::default()
+                }),
+            }
+        }
+        TestOutcome::Pass | TestOutcome::Skipped { .. } => None,
+    };
 
     // `Deadline::after` refuses only a zero or overflowing budget, and the
     // teardown budget is a constant margin on top of the lease release bound.
@@ -573,6 +614,7 @@ async fn run_one(
         duration_ms: start.elapsed().as_millis() as u64,
         evidence,
         cleanup,
+        failure_state,
     }
 }
 
@@ -1039,6 +1081,127 @@ mod tests {
         }
     }
 
+    /// #2128: a registry case hit its deadline and the report said only
+    /// "case exceeded its 300000 ms deadline", so nobody could tell whether
+    /// staging, the apply, the wait or the exec inside the workload hung. A
+    /// timeout now names the step the runner cancelled, and the report keeps
+    /// every step with how long it took.
+    #[tokio::test]
+    async fn a_timed_out_case_names_the_step_it_was_cancelled_in() {
+        async fn stuck(ctx: TestContext) -> Result<(), String> {
+            ctx.step("stage pinned runnable image", async {}).await?;
+            ctx.step("exec in registry-web", std::future::pending::<()>())
+                .await?;
+            Ok(())
+        }
+        let cases = vec![case("stuck", &[], testkit_case!(stuck))];
+        let mut cfg = config(dead_client(), full_capabilities(), 4);
+        cfg.timeout = Duration::from_millis(300);
+
+        let report = run(cases, cfg).await.unwrap();
+
+        let result = &report.results[0];
+        match &result.outcome {
+            TestOutcome::Unknown { kind, reason } => {
+                assert_eq!(*kind, UnknownKind::TimedOut);
+                assert!(
+                    reason.contains(
+                        "case exceeded its 300 ms deadline during step \"exec in registry-web\""
+                    ),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+        let state = result
+            .failure_state
+            .as_ref()
+            .expect("a timed-out case carries its state");
+        assert_eq!(state.step.as_deref(), Some("exec in registry-web"));
+        let steps: Vec<_> = state
+            .steps
+            .iter()
+            .map(|step| (step.name.as_str(), step.duration_ms.is_some()))
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                ("stage pinned runnable image", true),
+                ("exec in registry-web", false)
+            ]
+        );
+    }
+
+    /// The state a failing case leaves must be read before its lease is
+    /// released, because the release removes the instances (#2131).
+    #[tokio::test]
+    async fn a_failing_case_records_its_instances_and_events_before_its_lease_is_released() {
+        async fn fails(ctx: TestContext) -> Result<(), String> {
+            ctx.trace.note_app("registry-web").await;
+            ctx.step("wait for registry-web", async {}).await?;
+            Err("registry-web never answered".to_string())
+        }
+        let (address, records) = spawn_stuck_app_server().await;
+        let mut cfg = config(
+            BunClient::new_with_token(&address, None),
+            full_capabilities(),
+            1,
+        );
+        cfg.fixed_namespace = Some("rbtest-fixed".to_string());
+        cfg.lease_ownership = LeaseOwnership::Required;
+
+        let report = run(vec![case("fails", &[], testkit_case!(fails))], cfg)
+            .await
+            .unwrap();
+
+        let result = &report.results[0];
+        assert!(matches!(result.outcome, TestOutcome::Fail { .. }));
+        assert_eq!(result.cleanup, CleanupOutcome::Confirmed);
+        let state = result.failure_state.as_ref().expect("captured state");
+        assert_eq!(state.step.as_deref(), Some("wait for registry-web"));
+        assert_eq!(state.apps, ["registry-web"]);
+        assert_eq!(state.instances.len(), 1, "{state:?}");
+        assert_eq!(state.instances[0].state, "pending");
+        assert_eq!(state.instances[0].reason.as_deref(), Some("pulling image"));
+        let messages: Vec<_> = state.events.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(messages, ["pull started for registry-web"]);
+        // The mock has no deployment listing: the capture says so rather
+        // than reporting an empty one.
+        assert!(
+            state
+                .errors
+                .iter()
+                .any(|error| error.starts_with("deployments unreadable")),
+            "{:?}",
+            state.errors
+        );
+        let order = records.lock().await.clone();
+        let release = order
+            .iter()
+            .position(|entry| entry.starts_with("release:"))
+            .expect("lease released");
+        let first_capture = order
+            .iter()
+            .position(|entry| entry == "events")
+            .expect("events read");
+        assert!(first_capture < release, "{order:?}");
+    }
+
+    #[tokio::test]
+    async fn a_passing_case_carries_no_failure_state() {
+        async fn passes(_ctx: TestContext) -> Result<(), String> {
+            Ok(())
+        }
+        let report = run(
+            vec![case("passes", &[], testkit_case!(passes))],
+            config(dead_client(), full_capabilities(), 1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.results[0].outcome, TestOutcome::Pass);
+        assert!(report.results[0].failure_state.is_none());
+    }
+
     #[tokio::test]
     async fn a_panicking_case_becomes_unknown_and_still_reaches_cleanup() {
         async fn boom(_ctx: TestContext) -> Result<(), String> {
@@ -1234,6 +1397,56 @@ mod tests {
         (address, records)
     }
 
+    /// A lease server whose namespace holds one `pending` instance of
+    /// `registry-web` until the lease is released, and whose events name it.
+    /// Records the order of status reads, event reads and the release.
+    async fn spawn_stuck_app_server() -> (String, Arc<tokio::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let records = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let state = LeaseMockState {
+            records: Arc::clone(&records),
+            next_id: Arc::new(AtomicUsize::new(1)),
+        };
+        async fn status(State(state): State<LeaseMockState>) -> Json<Vec<InstanceStatus>> {
+            let mut records = state.records.lock().await;
+            let released = records.iter().any(|entry| entry.starts_with("release:"));
+            records.push("status".to_string());
+            if released {
+                return Json(Vec::new());
+            }
+            let mut stuck = instance("registry-web", "rbtest-fixed-00");
+            stuck.state = "pending".to_string();
+            stuck.reason = Some("pulling image".to_string());
+            Json(vec![stuck])
+        }
+        async fn events(State(state): State<LeaseMockState>) -> Json<serde_json::Value> {
+            state.records.lock().await.push("events".to_string());
+            Json(serde_json::json!({
+                "events": [
+                    {"sequence": 1, "timestamp": 1795148235, "kind": "deploy",
+                     "severity": "info", "app": "registry-web", "namespace": "rbtest-fixed-00",
+                     "node": "node-1", "message": "pull started for registry-web"},
+                    {"sequence": 2, "timestamp": 1795148236, "kind": "deploy",
+                     "severity": "info", "app": "registry-web", "namespace": "someone-else",
+                     "node": "node-1", "message": "another namespace's app"}
+                ],
+                "warnings": []
+            }))
+        }
+        let app = Router::new()
+            .route("/v1/test/leases", post(create_mock_lease))
+            .route("/v1/test/leases/{id}", delete(release_mock_lease))
+            .route("/v1/cluster/nodes", get(empty_mock_list))
+            .route("/v1/status", get(status))
+            .route("/v1/events", get(events))
+            .with_state(state);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (address, records)
+    }
+
     /// A lease server that answers the first `refusals` creations with
     /// `status` and `body`, then grants leases as [`create_mock_lease`] does.
     async fn spawn_refusing_lease_server(
@@ -1380,7 +1593,7 @@ mod tests {
         let mut observed = records.lock().await.clone();
         observed.sort();
         // The sub-second case timeout rounds the lease up by one second.
-        let ttl = teardown_timeout().as_secs() + 1;
+        let ttl = (CAPTURE_BUDGET + teardown_timeout()).as_secs() + 1;
         assert_eq!(
             observed,
             vec![

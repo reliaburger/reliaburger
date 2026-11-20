@@ -389,6 +389,36 @@ production deadlines. Subprocess readiness/capture controls should name the
 bounded phase, observe the owned child and distinguish an empty readable log
 from a log read/decode error. Never include secrets to improve a diagnostic.
 
+## Evidence before cleanup
+
+A check that fails must leave enough behind to diagnose it from the record,
+without a rerun (#2131). Cleanup is the enemy here: it removes the very
+instances a failure is about. So evidence is taken at the moment of failure
+and before anything cleans up.
+
+- **`relish test`.** The runner records a failing or timed-out case's state
+  before it releases the case's lease: the named step it was in, every step
+  with its duration, its applications and their instances on every reachable
+  node (state, restarts, exit code, reason), the newest deployment of each,
+  recent events about them and what the server says of the lease. It goes
+  in the case's report entry as `failure_state`, so `-o json` and the soak's
+  pulse snapshots carry it. Every list and text field is bounded (16 steps,
+  8 apps, 32 instances, 20 events, 300 characters each), and a read that
+  fails is listed in `errors` rather than left out. The capture gets 15 s,
+  3 s per read, and the case's lease is that much longer.
+- **Named steps.** Cases run their waits through `TestContext::step` or a
+  wait helper, which opens a named step and closes it when it ends. A step
+  the runner cancelled at its deadline stays open, so a timeout reads
+  `case exceeded its 300000 ms deadline during step "exec in registry-web"`
+  rather than just the deadline. Name a step for what it waits on.
+- **The soak harness.** `record_failure` runs before the caller's own
+  cleanup (fault clear, settle). A `relish test` check passes its JSON
+  report too: the bundle keeps it as `test-report.json`, writes the failing
+  cases' captured states to `captured-state.json`, and takes the journals
+  from a minute before the earliest failing case started, not the last 15
+  minutes. The failure line in the log and in the rendered record links
+  `failures/<n>/captured-state.json`.
+
 ## Adding a test
 
 Name the externally visible behaviour, make the failure message describe the missing

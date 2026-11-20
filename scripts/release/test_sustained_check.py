@@ -1,4 +1,5 @@
 """The V02 soak checker judges evidence the way section 4 of the plan says."""
+import calendar
 import contextlib
 import hashlib
 import io
@@ -2311,6 +2312,127 @@ class TestFailures(unittest.TestCase):
         chaos = script[script.index("chaos_one() {"):script.index("catalogue_pulse() {")]
         self.assertIn('--timeout 600s > "$output" 2> "$output.err"', chaos)
         self.assertIn('record_failure "chaos-$kind" "$(check test-failures "$output" "$output.err")"', chaos)
+
+
+class CapturedState(Evidence):
+    """#2131: a `relish test` case that timed out was bundled after its
+    cleanup, so the bundle showed neither the app's instances nor where the
+    case was stuck. The case's report entry now carries the state captured
+    before its lease was released, and the bundle keeps it."""
+
+    STATE = {"captured_at": "2026-11-20T04:22:58Z", "step": "exec in registry-web",
+             "steps": [{"name": "exec in registry-web", "started_after_ms": 9800, "duration_ms": None}],
+             "apps": ["registry-web"],
+             "instances": [{"node": "rb-a-1", "id": "registry-web-0", "app": "registry-web",
+                            "state": "running", "restart_count": 0}],
+             "deployments": [], "events": [], "errors": [], "truncated": False}
+
+    def report(self):
+        return json.dumps({"schema_version": 2, "results": [
+            {"name": "deploy_from_cluster_registry", "group": "image-registry",
+             "started_at": "2026-11-20T04:17:43Z", "finished_at": "2026-11-20T04:22:58Z",
+             "outcome": {"status": "unknown", "kind": "timed_out",
+                         "reason": 'case exceeded its 300000 ms deadline during step "exec in registry-web"'},
+             "cleanup": {"status": "confirmed"}, "failure_state": self.STATE},
+            {"name": "push_and_pull_image_roundtrip", "outcome": {"status": "pass"}, "cleanup": {"status": "confirmed"}},
+        ]})
+
+    def test_only_failing_cases_with_a_capture_are_kept(self):
+        states = checker.test_failure_states(self.report())
+        self.assertEqual([state["name"] for state in states], ["deploy_from_cluster_registry"])
+        self.assertEqual(states[0]["failure_state"]["step"], "exec in registry-web")
+        self.assertEqual(checker.test_failure_states("not json"), [])
+
+    def test_the_states_file_names_itself_and_a_journal_start_before_the_case(self):
+        report = self.evidence / "pulse.json"
+        report.write_text(self.report())
+        out = self.evidence / "captured-state.json"
+        started = calendar.timegm(time.strptime("2026-11-20T04:17:43Z", "%Y-%m-%dT%H:%M:%SZ"))
+        self.assertEqual(checker.write_test_states(report, out), f"captured-state.json @{started - 60}")
+        self.assertEqual(json.loads(out.read_text())[0]["failure_state"], self.STATE)
+
+    def test_a_report_without_captures_writes_nothing(self):
+        report = self.evidence / "pulse.json"
+        report.write_text(json.dumps({"results": [{"name": "x", "outcome": {"status": "pass"}}]}))
+        out = self.evidence / "captured-state.json"
+        self.assertEqual(checker.write_test_states(report, out), "")
+        self.assertFalse(out.exists())
+
+    def test_the_bundle_keeps_the_state_and_reaches_back_to_the_case(self):
+        release = Path(__file__).parent
+        script = (release / "qualify-sustained.sh").read_text()
+        bundle = script[script.index("record_failure() {"):script.index("setup_fail() {")]
+        report = self.evidence / "pulse-1795148235.json"
+        report.write_text(self.report())
+        calls = self.evidence / "gsh-calls.txt"
+        said = self.evidence / "said.txt"
+        stubs = f"""
+checker={release / 'sustained_check.py'}
+check() {{ python3 "$checker" "$@"; }}
+evidence={self.evidence}
+vm=([1]=rb-a-1 [2]=rb-a-2 [3]=rb-a-3)
+down=(0 0 1 1)
+gsh() {{ printf '%s\\n' "$2" >> {calls}; }}
+api_get() {{ :; }}
+memory_report() {{ :; }}
+rel() {{ :; }}
+event() {{ :; }}
+say() {{ printf '%s\\n' "$*" >> {said}; }}
+mkdir -p "$evidence/failures"
+"""
+        subprocess.run(["bash", "-c", stubs + bundle + f"\nrecord_failure pulse 'relish test exited 1' '' '' {report}"],
+                       check=True, timeout=60, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        failure = self.evidence / "failures" / "1"
+        self.assertEqual(json.loads((failure / "summary.json").read_text())["captured"], "captured-state.json")
+        self.assertEqual(json.loads((failure / "captured-state.json").read_text())[0]["failure_state"], self.STATE)
+        self.assertTrue((failure / "test-report.json").exists())
+        started = calendar.timegm(time.strptime("2026-11-20T04:17:43Z", "%Y-%m-%dT%H:%M:%SZ"))
+        self.assertIn(f"--since '@{started - 60}'", calls.read_text())
+        self.assertIn("state at failure: failures/1/captured-state.json", said.read_text())
+
+    def test_a_bundle_without_a_report_keeps_the_last_fifteen_minutes(self):
+        release = Path(__file__).parent
+        script = (release / "qualify-sustained.sh").read_text()
+        bundle = script[script.index("record_failure() {"):script.index("setup_fail() {")]
+        calls = self.evidence / "gsh-calls.txt"
+        stubs = f"""
+checker={release / 'sustained_check.py'}
+check() {{ python3 "$checker" "$@"; }}
+evidence={self.evidence}
+vm=([1]=rb-a-1 [2]=rb-a-2 [3]=rb-a-3)
+down=(0 0 1 1)
+gsh() {{ printf '%s\\n' "$2" >> {calls}; }}
+api_get() {{ :; }}
+memory_report() {{ :; }}
+rel() {{ :; }}
+event() {{ :; }}
+say() {{ :; }}
+mkdir -p "$evidence/failures"
+"""
+        subprocess.run(["bash", "-c", stubs + bundle + "\nrecord_failure settle 'did not settle'"],
+                       check=True, timeout=60, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        summary = json.loads((self.evidence / "failures" / "1" / "summary.json").read_text())
+        self.assertNotIn("captured", summary)
+        self.assertIn("--since '-15min'", calls.read_text())
+
+    def test_the_record_links_the_captured_state_from_the_failure_line(self):
+        Record.write_run(self, failures=["pulse: relish test exited 1"])
+        summary = self.evidence / "failures" / "1" / "summary.json"
+        summary.write_text(json.dumps(dict(json.loads(summary.read_text()), captured="captured-state.json")))
+        record = self.evidence / "record.md"
+        checker.render(self.evidence, record)
+        self.assertIn("relish test exited 1 (state at failure: `failures/1/captured-state.json`)", record.read_text())
+
+    def test_every_relish_test_check_hands_its_report_to_the_bundle(self):
+        script = (Path(__file__).parent / "qualify-sustained.sh").read_text()
+        chaos = script[script.index("chaos_one() {"):script.index("catalogue_pulse() {")]
+        pulse = script[script.index("catalogue_pulse() {"):]
+        pulse = pulse[:pulse.index("\n}\n")]
+        self.assertIn('"$(check test-failures "$output" "$output.err")" \'\' \'\' "$output"', chaos)
+        self.assertIn("'' '' \"$output\"", pulse)
+        self.assertIn('check test-failures "$output" "$output.err"', pulse)
+        # The bundle is taken before the chaos slot clears its faults.
+        self.assertLess(chaos.index("record_failure"), chaos.index("rel fault clear"))
 
 
 DAY = 24 * 3600

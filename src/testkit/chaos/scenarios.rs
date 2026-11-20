@@ -110,7 +110,7 @@ async fn wait_for_leader(
             && let Some(leader) = status.leader
             && different_from.is_none_or(|old| old != leader)
         {
-            context.wait_note.clear().await;
+            context.trace.clear_wait().await;
             return Ok(leader);
         }
         if context.deadline.remaining().is_zero() {
@@ -123,7 +123,7 @@ async fn wait_for_leader(
             Some(old) => format!("waiting for a council leader other than {old}"),
             None => "waiting for a council leader".to_string(),
         };
-        context.wait_note.record(waiting).await;
+        context.trace.record_wait(waiting).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
@@ -142,7 +142,7 @@ async fn wait_for_node_state(
                 .find(|node| node.node_id == node_id)
                 .map(|node| node.state.clone());
             if last.as_deref().is_some_and(|state| wanted.contains(&state)) {
-                context.wait_note.clear().await;
+                context.trace.clear_wait().await;
                 return Ok(());
             }
         }
@@ -152,8 +152,8 @@ async fn wait_for_node_state(
             ));
         }
         context
-            .wait_note
-            .record(format!(
+            .trace
+            .record_wait(format!(
                 "waiting for node {node_id} to reach one of {wanted:?}; last state was {last:?}"
             ))
             .await;
@@ -702,7 +702,7 @@ mod tests {
             timeout,
             deadline: crate::testkit::deadline::Deadline::after(timeout).unwrap(),
             peer_route: crate::testkit::context::PeerRoute::Relay,
-            wait_note: Default::default(),
+            trace: Default::default(),
         };
         let relayed_worker = context.client.via_node("worker-2").unwrap();
 
@@ -744,7 +744,7 @@ mod tests {
             timeout,
             deadline: crate::testkit::deadline::Deadline::after(timeout).unwrap(),
             peer_route: crate::testkit::context::PeerRoute::Relay,
-            wait_note: Default::default(),
+            trace: Default::default(),
         }
     }
 

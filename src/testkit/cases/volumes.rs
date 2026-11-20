@@ -247,7 +247,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             deadline: Deadline::after(Duration::from_secs(5)).unwrap(),
             peer_route: PeerRoute::Relay,
-            wait_note: Default::default(),
+            trace: Default::default(),
         };
 
         let output = exec_sh(&ctx, "vol-persist", "cat /data/marker").await;

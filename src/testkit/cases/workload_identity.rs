@@ -38,8 +38,7 @@ async fn workload_receives_spiffe_certificate(
     ctx.apply(&ctx.container_idle_spec(app)).await?;
     ctx.wait_running_cluster(app, 1).await?;
     let bundle = ctx
-        .deadline
-        .run("wait for workload certificate", async {
+        .step("wait for workload certificate", async {
             loop {
                 if let Ok(bundle) = ctx
                     .exec_in_workload(
@@ -58,8 +57,7 @@ async fn workload_receives_spiffe_certificate(
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         })
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let certificates = CertificateDer::pem_slice_iter(bundle.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("invalid workload certificate PEM: {error}"))?;
