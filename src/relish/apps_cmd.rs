@@ -502,6 +502,7 @@ mod tests {
                 runtime_unknown: false,
                 status_age_ms: None,
                 age_seconds: Some(3_600 * u64::from(index + 1)),
+                image: None,
                 reason: None,
             },
         }

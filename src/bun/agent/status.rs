@@ -68,6 +68,12 @@ pub struct InstanceStatus {
     /// `binary not found: /usr/local/bin/app` (#881).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The image reference the node started this instance from, bound to
+    /// its digest (`nginx:1.27@sha256:…`) when apply pinned one. `None` for
+    /// a process workload, which has no image, and in an answer from a node
+    /// that doesn't report it. Instances of one app can differ mid-rollout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 }
 
 /// A workload status with the node that supplied it.
@@ -675,6 +681,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         status_age_ms: None,
                         age_seconds: Some(instance.created_at.elapsed().as_secs()),
                         reason: instance.launch_failure.clone(),
+                        image: (!instance.image.is_empty()).then(|| instance.image.clone()),
                     },
                     evidence,
                 }

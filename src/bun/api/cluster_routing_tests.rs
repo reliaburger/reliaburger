@@ -82,6 +82,7 @@ fn instance(id: &str, app: &str, state: &str) -> InstanceStatus {
         runtime_unknown: false,
         status_age_ms: None,
         age_seconds: None,
+        image: None,
         reason: None,
     }
 }

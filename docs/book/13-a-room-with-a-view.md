@@ -277,6 +277,39 @@ shorter list. Logs and deployment history still said plainly that they covered
 the connected node only; one cluster-wide view doesn't make the others
 cluster-wide.
 
+### Which image is it running?
+
+For months the app detail's Overview tab ended with `image          unknown`,
+for every app. It wasn't a bug in the lookup. There was no lookup: the line
+was a string literal, because `InstanceStatus` had no image to show. The node
+knew, of course. It pulled the image and started the instance from it, and
+`WorkloadInstance` keeps the reference (bound to its digest when apply pinned
+one, as in `nginx:1.27@sha256:…`). It just never said.
+
+So `InstanceStatus` grew one more field:
+
+```rust
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub image: Option<String>,
+```
+
+A process workload has no image, so it's `None` there rather than an empty
+string. The two serde attributes matter more than usual. `InstanceStatus`
+doesn't only travel from Bun to `relish`: for cluster status a node fans out
+to its peers' `/v1/status` and parses their answers into the same type. A
+0.3.0 node asking a 0.3.1 peer gets a field it doesn't know, and serde skips
+unknown fields unless a type says `#[serde(deny_unknown_fields)]`, which this
+one doesn't. A 0.3.1 node asking an older peer finds no `image` key, and
+`default` makes that `None`. Neither side refuses the other, so the change
+needs no bump of the cluster's protocol version.
+
+The Overview shows the distinct images across the app's instances. That's
+usually one. Mid-rollout it's two, and the tab lists both rather than picking
+the first and hiding the rollout. The Instances tab gets an IMAGE column, so
+you can see which replica runs which. With no image from any instance (a
+process app, or every node older than the field), it still says `unknown`,
+which is now true.
+
 ### Every view, not just one
 
 Saying so plainly was better than lying, but it was still a gap. Deploy
