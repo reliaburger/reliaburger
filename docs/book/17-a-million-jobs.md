@@ -4204,9 +4204,22 @@ and counts a hook from either place. A failed outcome in that history fails
 the campaign, just as a failed row does (#1935). That history survives a
 re-apply, so on a cluster adopted with `--home` it can still hold the last
 campaign's runs; only outcomes that started after this campaign did, give or
-take five minutes of clock skew, count either way. One gap remains: a one-off
-`after` job has no definition, so its coverage still depends on catching its
-row before it's pruned.
+take five minutes of clock skew, count either way.
+
+That fixed what the checker could see, not what the day tier did. A day
+run still deployed once, in the campaign's first seconds, so its hooks ran
+once, and a one-off `after` job, which has no definition to keep a history,
+still had to be caught in a summary row before it was pruned. The 0.3.0
+rehearsal's day run covered both. That says the race went our way that day.
+It doesn't say it always will. So the day tier now applies the job fixtures
+again every hour, with the workloads at the generations they already run.
+No app changes, so nothing rolls, but an apply is the desired state: every
+`run_before` hook and every plain job runs once more, with the controller
+long since scanning every 30 seconds. That's 23 more chances a day instead
+of one lucky one. `hook_apply` goes through `jobs_applied` like every other
+apply, so none lands once the drain is asked for or within the minute before
+it, and `test_no_hook_apply_once_the_drain_is_asked_for_or_due_within_a_minute`
+runs the real function in bash, with `rel` stubbed out, to show it (#1935).
 
 ### Soak jobs while the apps keep running
 

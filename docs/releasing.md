@@ -1569,7 +1569,11 @@ the real `curl … | sh` install against it on every host we advertise.
    instant of the fault is chance, and 0.3.0 candidate 4's fast tier failed
    on it with nothing wrong in the product
    ([#2105](https://github.com/reliaburger/reliaburger/issues/2105)). A wait
-   that runs out is a `job-overlap` event, and the fault goes ahead.
+   that runs out is a `job-overlap` event, and the fault goes ahead. The day
+   tier deploys once, so it applies the job fixtures again every hour, at the
+   workloads' unchanged generations: no app rolls, and every deploy hook and
+   `after` job runs again while the controller watches
+   ([#1935](https://github.com/reliaburger/reliaburger/issues/1935)).
    A local smoke check is not staged fast/final acceptance, and global
    storage bounds remain #668.
 

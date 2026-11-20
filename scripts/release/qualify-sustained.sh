@@ -264,6 +264,13 @@ heavy_every=300
 # tier gets about a dozen, a final about twenty and a day about fifty.
 slo_every=$(( cycle / 2 ))
 slo_rollout_budget=180
+# The day tier deploys once, so its deploy hooks and `after` jobs ran only in
+# the campaign's first seconds, where the task-array store's 20 newest runs a
+# namespace could prune them before the controller's first scan (#1935). It
+# applies the job fixtures again every hour instead; the tiers with a fault
+# schedule do it with every rolling deploy.
+hook_every=0
+[ "$tier" != day ] || hook_every=3600
 leaf_lifetime=3600
 
 if [ "$resume" = true ]; then
@@ -1004,6 +1011,23 @@ apply_soak_manifests() {
     rel apply -f "$evidence/workloads.toml" >> "$log" 2>&1
 }
 
+# The workloads at their current generations with the job fixtures, applied
+# again (#1935): no app changes, so nothing rolls, but every run_before hook
+# and plain job runs once more and the controller sees it finish. Not once
+# the drain is asked for or due within a minute (jobs_applied, #963).
+hook_applies=0
+hook_apply() {
+    jobs_applied || return 0
+    hook_applies=$(( hook_applies + 1 ))
+    write_workloads
+    local log=$evidence/snapshots/hook-apply-$hook_applies.log
+    if apply_soak_manifests "$log"; then
+        event --phase jobs:hook-apply --verdict ok --detail "apply $hook_applies at generation $generation"
+    else
+        event --phase jobs:hook-apply --verdict fail --detail "apply $hook_applies failed; see ${log##*/}"
+    fi
+}
+
 # Every instance in the cluster as a JSON list, one object per instance with
 # its node, id, app_name and state. From 0.2.8 `relish status` prints the
 # cluster summary instead, and the instance list moved to `relish apps
@@ -1527,6 +1551,7 @@ window_label=
 next_light=0
 next_heavy=$(( $(date +%s) + heavy_every ))
 next_slo=$(( $(date +%s) + slo_every ))
+next_hook=$(( $(date +%s) + hook_every ))
 next_rotation=$(( $(date +%s) + rotation ))
 open_window() { window_label=$1; check window "$evidence" open "$1" --down "${2:-0}" ${3:+--node "$3"}; }
 close_window() { check window "$evidence" "${1:-close}"; window_label=; }
@@ -2027,6 +2052,9 @@ wait_until() {
         elif [ "$now" -ge "$next_slo" ] && [ -z "$window_label" ]; then
             next_slo=$(( now + slo_every ))
             run_slot slo_rollout
+        elif [ "$hook_every" -gt 0 ] && [ "$now" -ge "$next_hook" ] && [ -z "$window_label" ]; then
+            next_hook=$(( now + hook_every ))
+            run_slot hook_apply
         elif [ "$now" -ge "$next_light" ]; then
             next_light=$(( now + light_every ))
             observe light || true
@@ -2249,6 +2277,7 @@ if [ "$plan" = true ]; then
     [ "$tier" != day ] || printf 'plan: host-busybox busybox-static %s %s\n' "$day_busybox_version" "$day_busybox_sha256"
     [ "$malloc_points" != true ] || printf 'plan: malloc-trim at hours 6 12 18 24 on every node (gdb: malloc_stats, malloc_trim(0))\n'
     [ "$tier" != day ] || printf 'plan: log-ab soak-quiet on node 3, never queried; tails ask only the node holding the lines\n'
+    [ "$hook_every" -eq 0 ] || printf 'plan: hook-apply every %s s: the job fixtures again at unchanged generations, so every deploy hook and after job runs while the controller watches\n' "$hook_every"
     printf 'plan: %s\n' "$job_runs"
     printf 'plan: seed %s for every fault and node choice\n' "${seed:-random}"
     [ "$tier" = day ] || printf 'plan: council-history %s clients, checked for linearizability after the soak\n' "$history_clients"
@@ -2356,6 +2385,7 @@ next_light=$(date +%s)
 next_malloc=$(date +%s)
 next_heavy=$(( $(date +%s) + heavy_every ))
 next_slo=$(( $(date +%s) + slo_every / 2 ))
+next_hook=$(( $(date +%s) + hook_every ))
 index=$first_cycle
 # A day tier runs no cycles: its whole length is the wait below.
 while [ "$schedule" != none ]; do
