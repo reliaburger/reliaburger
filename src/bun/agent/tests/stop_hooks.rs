@@ -479,6 +479,11 @@ async fn a_runtime_that_cannot_inspect_the_instance_fails_the_stop_at_once() {
 // stops the way an ordinary stop would: its pre-stop command, its signal,
 // then its own grace. All at once, so one slow app costs the others nothing,
 // and all within one budget that fits inside the unit's `TimeoutStopSec`.
+//
+// The deploy runs on the real clock; the shutdown on tokio's paused one, so
+// every grace and budget below is exact, however loaded the host. Nothing
+// here spawns a task while the clock is paused: `shutdown_all` polls its
+// stops together with `join_all`, inside the call.
 
 /// Instances of `config` deployed on a mock runtime whose workloads ignore
 /// their stop signal, so only the grace running out (or the kill) ends them.
@@ -495,6 +500,8 @@ async fn stubborn_agent(config: Config) -> (TestAgent, MockGrill, Vec<InstanceId
     for id in &ids {
         grill.set_state(id, ContainerState::Running);
     }
+    // From here on, sleeps and timeouts advance virtual time only.
+    tokio::time::pause();
     (agent, grill, ids)
 }
 
@@ -515,7 +522,7 @@ async fn a_node_shutdown_runs_pre_stop_and_gives_the_app_its_own_grace() {
     let id = &ids[0];
     let from = grill.calls().len();
 
-    let begun = Instant::now();
+    let begun = tokio::time::Instant::now();
     agent.shutdown_all().await;
     let took = begun.elapsed();
 
@@ -527,9 +534,10 @@ async fn a_node_shutdown_runs_pre_stop_and_gives_the_app_its_own_grace() {
         matches!((exec, stop, kill), (Some(exec), Some(stop), Some(kill)) if exec < stop && stop < kill),
         "pre_stop, then the signal, then the kill once the grace ran out: {operations:?}"
     );
-    // The app's own 2 s, not the agent's default 10 s nor a fixed shutdown grace.
+    // The app's own 2 s, not the agent's default 10 s nor the old fixed 5 s.
+    // The clock is paused, so only the polling step (100 ms) adds to it.
     assert!(
-        took >= Duration::from_millis(1900) && took < Duration::from_millis(4500),
+        took >= Duration::from_secs(2) && took < Duration::from_millis(2500),
         "the app's stop_grace of 2s must be the wait: {took:?}"
     );
 }
@@ -553,7 +561,7 @@ async fn a_node_shutdown_stops_every_instance_at_once() {
     let (mut agent, grill, ids) = stubborn_agent(config).await;
     assert_eq!(ids.len(), 2, "{ids:?}");
 
-    let begun = Instant::now();
+    let begun = tokio::time::Instant::now();
     agent.shutdown_all().await;
     let took = begun.elapsed();
 
@@ -561,9 +569,10 @@ async fn a_node_shutdown_stops_every_instance_at_once() {
         let operations = operations_on(&grill, id, 0);
         assert!(operations.contains(&"kill".to_string()), "{operations:?}");
     }
-    // One after the other would be 4 s: two graces, not one.
+    // One after the other would be 4 s: two graces, not one. The clock is
+    // paused, so this measures the stop path, not the host's load.
     assert!(
-        took >= Duration::from_millis(1900) && took < Duration::from_millis(3500),
+        took >= Duration::from_secs(2) && took < Duration::from_millis(2500),
         "the two graces must run side by side: {took:?}"
     );
 }
@@ -586,7 +595,7 @@ async fn a_node_shutdown_ends_within_its_budget_whatever_the_app_asks_for() {
     grill.block_execs();
     agent.set_shutdown_budget(Duration::from_secs(1));
 
-    let begun = Instant::now();
+    let begun = tokio::time::Instant::now();
     agent.shutdown_all().await;
     let took = begun.elapsed();
 
@@ -596,7 +605,11 @@ async fn a_node_shutdown_ends_within_its_budget_whatever_the_app_asks_for() {
         operations.contains(&"kill".to_string()),
         "the budget ran out, so the instance is killed: {operations:?}"
     );
-    assert!(took < Duration::from_secs(3), "{took:?}");
+    // The 1 s budget, then the kill round, which answers at once here.
+    assert!(
+        took >= Duration::from_secs(1) && took < Duration::from_millis(1500),
+        "{took:?}"
+    );
 }
 
 /// Every `TimeoutStopSec` in `unit`, in seconds.

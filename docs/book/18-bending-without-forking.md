@@ -3448,7 +3448,16 @@ app an hour of grace and a pre-stop that never returns, then checks a 1 s
 budget still ends in a kill. `the_shutdown_budget_fits_inside_every_units_stop_timeout`
 reads `TimeoutStopSec` from the quickstart's unit, the appliance image's unit
 and the units in `docs/linux-servers.md`, and fails if the budget outgrows
-any of them. The parsing tests in
+any of them. The first three run the shutdown on tokio's paused clock, which
+`tokio::time::pause()` switches on once the deploy is done: every sleep and
+timeout then moves virtual time only, so "two 2 s graces took 2 s, not 4 s"
+is an exact claim, not a race against the host's load. That's safe because
+`shutdown_all` polls its stops with `join_all` inside the call and spawns
+nothing; a spawned task on a paused clock is the trap the project guide
+warns about. Against the old code, they fail. The old loop timed itself with
+`std::time::Instant`, which the paused clock doesn't move, so it spun
+through 61,503 virtual seconds waiting for five real ones.
+ The parsing tests in
 `grill::stop` and `config::validate` cover each refusal, and
 `stop_hooks_survive_an_export_and_import_round_trip` sends an app through
 `relish export` and back in. To check the tests check something, we put
