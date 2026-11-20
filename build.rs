@@ -89,6 +89,13 @@ fn embed_source() {
     if !release && std::env::var_os("CARGO_FEATURE_EMBED_SOURCE").is_none() {
         return;
     }
+    // cargo-fuzz builds with the release profile, and nothing in a fuzz
+    // target reads the bundle. Watching the allowlist (fuzz/ included) made
+    // every log and corpus file a fuzz run writes under fuzz/target/ rebuild
+    // the whole crate, twice a target (#1953).
+    if std::env::var_os("CARGO_FEATURE_FUZZING").is_some() {
+        return;
+    }
     println!("cargo:rustc-cfg=source_bundle_embedded");
 
     let root = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo manifest dir"));

@@ -9060,6 +9060,159 @@ that. The snapshot uploader still needs its own fixture: it needs Btrfs
 volumes. Its export receipts are written atomically and durably now, and an
 upload is only receipted once the destination has confirmed the archive.
 
+### What does pulling the plug on a VM actually pull?
+
+Every one of those records says "a VM forced off isn't a real power loss",
+and for a long time nobody could say exactly how it differed. When we started
+planning a run that cuts power thousands of times
+([#2067](https://github.com/reliaburger/reliaburger/issues/2067)), that
+stopped being good enough. If the cut is gentler than a real one, a thousand
+passes prove less than they seem to.
+
+So before building anything, we measured. `scripts/release/power_cut/calibrate.sh`
+creates a throwaway Ubuntu VM, the size of a quickstart node, and runs a
+writer in it with three threads. Each thread writes numbered 4 KiB records
+into its own file and prints `ACK n` once a record has gone as far as its mode
+takes it:
+
+- **fsync**: a buffered write, then `fdatasync`. As far as the guest can
+  tell, it's on stable storage.
+- **direct**: an `O_DIRECT` write and no flush. The virtual disk has the
+  record, but nobody asked it to make the write durable.
+- **buffered**: a plain write. It's in the guest's page cache and nowhere
+  else.
+
+A few seconds in, the script cuts the power, brings the VM back, and asks how
+many acknowledged records each file still holds. Every record carries the
+run's id, its number and a CRC, so a stale record from an earlier run, or one
+half written, never counts as a survivor. It does that 50 times for each of
+three ways to cut: `limactl stop --force`, a `SIGKILL` straight to the
+Virtualization.framework process that holds the disk, and `echo b >
+/proc/sysrq-trigger` inside the guest, which reboots the kernel on the spot
+with no sync.
+
+The answer looked the same for all three. Every `fsync` record and every
+`O_DIRECT` record survived every cut, and every buffered record the cut
+caught was gone. Our first reading was that the line falls between the
+guest's page cache and the virtual disk, not at the flush: whatever the guest
+handed to the disk is safe, flushed or not. A review caught the hole in that.
+The three threads wrote to the same disk at once, and every `fdatasync` sends
+the disk a flush that covers *every* write it has completed, whichever thread
+made it. With about 85 of those a second, plus ext4's own journal commits, an
+`O_DIRECT` record almost never went into a cut without someone else's flush
+behind it. Its surviving proved only what the `fsync` records proved: flushed
+writes survive.
+
+What we can say is narrower. All three cuts lose the guest's page cache and
+keep what a flush covered. `sysrq b` goes further by construction: the VM's
+process lives through it, so nothing the virtual disk completed can be lost,
+flushed or not. That's a disk without a volatile write cache, fault model 1:
+fair for a good SSD, generous for an SD card, which is exactly what an edge
+site runs on. Whether a forced stop or a killed VZ process keeps a completed,
+unflushed write, or whether VZ holds it somewhere a kill loses, is still
+open. The experiment that settles it is written and waiting for a quiet
+host: `calibrate.sh --raw` gives the VM a second disk with no filesystem, so
+the only writer on it is ours, reads the disk's flush counter from
+`/sys/block/<disk>/stat` before every record, and counts a cut only if some
+acknowledged record had no flush after it. Either way, a store that forgot
+an `fsync` and wrote with `O_DIRECT` can pass a hypervisor cut, so the cuts
+we've run can't vouch for it.
+
+There's a second loose end in the numbers: in 27 of the 150 cuts,
+`fdatasync` ran at over a thousand a second, which a flush that really waits
+for a disk shouldn't. We haven't found out why, and the record says so
+rather than calling it occasional.
+
+`sysrq b` had one surprise: the VM doesn't stop. Virtualization.framework
+treats the guest's reset as a reboot, so the VM stays running and the guest is
+back in about ten seconds. That makes it the cut to use when timing matters,
+since it fires from inside the guest within milliseconds of whatever it's
+watching for.
+
+To get the harsher cut, we need to lose what the disk hadn't flushed, and the
+kernel can already record that. `dm-log-writes` is a device-mapper target
+that passes every write through to the real device and logs it, with every
+flush and every named mark, on a second device. The detail that matters is
+*when* it logs a plain write: only once a later flush completes. Until then
+the write sits on a list in memory, just like a drive's write cache. So a
+copy of the log taken at the moment of the cut, replayed from the start onto
+the disk as it was when logging began, gives exactly the disk a drive with a
+volatile cache must have kept. We expected to need to find the last flush in
+the log and replay up to it. We don't: the log has already done it.
+
+The proof runs in the same guest. It puts ext4 on a `dm-log-writes` device,
+writes one file and syncs it, writes a second with `O_DIRECT` and no flush,
+writes a mark, and copies the log. Replayed, that copy has the first file and not the
+second's bytes, though the real device has both, and `e2fsck` calls it clean.
+A copy taken after one more `sync` has both. Ubuntu doesn't package
+xfstests' `replay-log`, so `logwrites.py` reads the log format straight from
+the kernel's `drivers/md/dm-log-writes.c` with nothing but `struct`. There
+was one false start: `mkfs.ext4` zeroes its inode tables lazily, in the
+background, after the mount, and those writes bring their own flushes. Any
+one of them can legitimately make the "unflushed" file durable halfway
+through the proof. `-E lazy_itable_init=0,lazy_journal_init=0` does the
+zeroing up front instead.
+
+The mark matters more than it looks. The log's first block counts its
+entries, and the kernel only rewrites that count at a mark or a FUA write. A
+real cut doesn't announce itself, so a copy taken then can hold entries the
+count doesn't include, and a reader that trusts the count drops them.
+`logwrites.py --walk` reads on past the count while each block still looks
+like an entry the kernel would write: flags it knows, a mark name that fits,
+and all of its data present. The format has no checksum, so the walk only
+works on a log device that started zeroed. It's tested against hand-built
+logs; the proof against a live log used the mark.
+
+The [calibration record](../qualification/2026-11-18-power-cut-calibration.md)
+has the numbers. What it changes is the wording of every power-cut record we
+publish from here on: a hypervisor cut tests "lose the page cache", and the
+write-cache cut built on `dm-log-writes` is what earns the stronger claim.
+
+### A check that can't fail isn't a check
+
+The first piece of the endurance run is deliberately small: one node, one
+kind of cut, five invariants. `qualify-power-cut-endurance.sh` installs a
+published release, starts the soak's two data-bearing workloads, and cuts the
+power every few minutes. The writer appends 1, 2, 3, ... to `/data/seq`,
+`sync`s, and only then prints `ACK n`. Just before each cut the harness reads
+the highest `ACK` from the writer's log. After the cut it waits for the
+cluster to settle and checks that the file runs 1..N with nothing missing and
+N at least that `ACK`.
+
+Our first smoke run passed five cuts out of five. Then we read the evidence.
+At the first cut the host had seen `ACK 428`; the file held 464 lines. Fine?
+Look at what the writer does when it starts: it drops a torn last line and
+carries on from the last whole one. Suppose the cut had lost lines 401 to
+428. The writer would come back, find 400, and append 401, 402, ... at ten a
+second. The cluster took 118 s to settle, and long before then the file
+would run unbroken past 428. The check would pass. It could
+*never* fail for a loss smaller than the settle time's worth of writes, and
+the Redis counter had the same blind spot.
+
+The fix is to look at the moment that matters, the restart, rather than at
+the state long after it. Each start of the writer now appends the number it
+resumed from to `/data/resumes` and syncs it before writing anything else;
+each start of the Redis client reads the counter and pushes that value onto
+a list before its first `INCR`. I1 passes only if there's a new start since
+the last cut and every start since then resumed at or past the `ACK`. Every
+one, not the latest: if the writer resumes at 90 after the cut and then
+restarts again during the settle, at 400, the second start is past the `ACK`
+and the first one still lost writes. The unit tests are the exact scenarios:
+a file that's whole to 500 and a resume point of 90 against an `ACK` of 100
+must fail, and so must resume points 90 then 400.
+
+The same review found two more ways for the run to pass without checking
+anything. If the log read before a cut failed or held no `ACK`, the harness
+took the last `ACK` as 0, which every resume point beats; now it refuses to
+make that cut and stops the run. And powering back on with `relish local
+start` counted as a failure whenever Bun took more than the command's own
+45 s to get ready, which made the harness force the VM off and start it
+again: a second power cut, mid-recovery, that the record never mentioned.
+Now the harness runs `limactl start` alone, retries only Lima's one known
+refusal (the VM never booted then), and leaves a slow Bun to I6. The lesson isn't new, but it's worth
+repeating every time you write an invariant: make it fail on purpose at least
+once, or you don't know what it checks.
+
 ## A thousand nodes that aren't there
 
 How big a cluster have we actually run? Three VMs. The whitepaper's 10,000-node
@@ -9523,6 +9676,75 @@ The fix parses the whole document before the typed parse, so a push and a
 pull read the same JSON. Two unit tests (one per spelling) failed first, and
 the input that found it now lives in the corpus. After the fix, three minutes
 per target (about two million inputs across the nine) found nothing else.
+
+### Watching less, running more
+
+The first long campaign, a weekend on the Mac Studio in November (156
+worker-hours, 472 million inputs over twelve targets), found nothing new. It
+did find out where the time went. libFuzzer learns from *coverage counters*:
+the compiler gives every branch a byte, the branch bumps it, and after each
+input libFuzzer scans the whole table for bytes that changed. cargo-fuzz puts
+its instrumentation flags in `RUSTFLAGS`, and those reach every crate in the
+build. Ours pulls in tokio, axum, rustls, datafusion and six hundred more, so
+each target carried about 15.3 million counters, nearly all of them for code
+no decoder ever reaches. Most of each execution was spent reading zeros.
+
+The fix is to instrument only what the decoders run through: reliaburger
+itself, and the parsers it hands bytes to (serde_json, postcard, toml,
+hickory-proto, x509-parser and a few more)
+([#1953](https://github.com/reliaburger/reliaburger/issues/1953)). The obvious
+tool didn't work. Nightly Cargo can set `rustflags` per package in a profile,
+and LLVM keeps the last `-sanitizer-coverage-level` it's given, so setting it to
+0 for every dependency looked like a one-line change. Cargo puts a profile's
+flags *before* `RUSTFLAGS`, though, so cargo-fuzz's level 4 came last and won.
+The build ran, and the counter count didn't move.
+
+What did work is a `RUSTC_WRAPPER`, Cargo's hook for running every `rustc`
+call through another program first (it's how sccache works).
+[`fuzz/rustc-coverage.sh`](../../fuzz/rustc-coverage.sh) reads the crate name
+from the arguments and, for anything not on its list, drops
+`-Cpasses=sancov-module`, the flag that turns on the coverage pass.
+AddressSanitizer is a separate flag and stays on everywhere, so a buffer
+overflow in a dependency still stops the run. Generic code helps here: a
+serde derive or serde_json's reader is compiled into the crate that uses it,
+so most of what a decoder runs is reliaburger's own code even when it
+started life in a dependency.
+
+One trap remained. Cargo doesn't fingerprint the wrapper, so the first
+narrowed build reused every dependency it had built before, fully
+instrumented, and again nothing changed. The Makefile now adds a `--cfg`
+named after the wrapper's checksum to `RUSTFLAGS`, which Cargo does
+fingerprint. Nothing reads it; its only job is to make a changed list rebuild.
+
+Each target now carries 4.3 million counters instead of 15.3 million, and
+reliaburger's own share didn't shrink: its compiled objects hold the same
+counters either way, and only crates such as tokio drop to none. On the same
+machine, a minute from the seed corpus ran about 3.6 times as many inputs:
+
+| Target | Inputs a second, before | After | Speed-up |
+|---|---|---|---|
+| `app_config` | 259 | 915 | 3.5× |
+| `dns_query` | 277 | 987 | 3.6× |
+| `oci_manifest_push` | 287 | 1,030 | 3.6× |
+
+Faster only matters if it finds more, so we replayed each minute's corpus
+through the *old*, fully instrumented build, which counts the same way for
+both. The narrowed runs' corpora reached more: 1,704 coverage points against
+1,253 for `dns_query`, 1,410 against 1,165 for `oci_manifest_push`, and 24,171
+against 23,631 for `app_config`. The nightly job gets the same three and a
+half times the inputs in the same five minutes a target, and the job summary
+now shows each target's counter count, so a build that's quietly instrumenting
+everything again shows up as a number in the millions.
+
+Measuring it turned up a second leak, a bigger one. The nightly job had been
+timing out: it spent 25 minutes on each five-minute target. A release build
+packs the source tree into `relish` for `relish source`, and its build script
+tells Cargo to rebuild whenever anything in that tree changes, `fuzz/`
+included. Every fuzz run writes its log and its new corpus files under
+`fuzz/target/`, so each target rebuilt the whole crate, twice: once because
+`cargo fuzz build` was writing its log, and again before the run. A fuzz
+target never reads the bundle, so the build script now skips it when the
+`fuzzing` feature is on, and a target starts in seconds.
 
 The next step is OSS-Fuzz, which runs the same cargo-fuzz targets on
 Google's machines around the clock. That wants targets that have run clean
