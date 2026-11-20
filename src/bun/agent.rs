@@ -233,6 +233,14 @@ pub fn stop_completion_bound(confirmation_timeout: std::time::Duration) -> std::
     std::time::Duration::from_secs(STOP_GRACE_SECS) * 2 + confirmation_timeout * 3
 }
 
+/// The longest Bun's own shutdown spends stopping its instances: the
+/// graceful budget, then a kill round for the apps and one for their
+/// sidecars. A harness that SIGTERMs Bun and kills it sooner cuts the
+/// shutdown short and leaves workloads behind (#2118).
+pub fn shutdown_completion_bound() -> std::time::Duration {
+    SHUTDOWN_STOP_BUDGET + SHUTDOWN_KILL_BOUND * 2
+}
+
 /// Build a shared drain tracker for a new agent. The completion channel's
 /// receiver is dropped because the retire path polls `wait_drained` rather
 /// than consuming the notification stream.

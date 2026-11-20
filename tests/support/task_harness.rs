@@ -27,9 +27,15 @@ impl Drop for TestTasks {
         for mut task in self.tasks.drain(..) {
             let completed = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
-                    tokio::time::timeout(Duration::from_secs(10), &mut task)
-                        .await
-                        .is_ok()
+                    // An agent task stops its workloads before it ends, for
+                    // up to `shutdown_completion_bound()`.
+                    tokio::time::timeout(
+                        reliaburger::bun::agent::shutdown_completion_bound()
+                            + Duration::from_secs(5),
+                        &mut task,
+                    )
+                    .await
+                    .is_ok()
                 })
             });
             if !completed {

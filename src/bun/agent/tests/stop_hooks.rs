@@ -639,7 +639,7 @@ fn the_shutdown_budget_fits_inside_every_units_stop_timeout() {
             include_str!("../../../../docs/linux-servers.md"),
         ),
     ];
-    let needed = SHUTDOWN_STOP_BUDGET + SHUTDOWN_KILL_BOUND * 2 + Duration::from_secs(5);
+    let needed = shutdown_completion_bound() + Duration::from_secs(5);
     for (name, unit) in units {
         let timeouts = stop_timeouts(unit);
         assert!(!timeouts.is_empty(), "{name} sets no TimeoutStopSec");

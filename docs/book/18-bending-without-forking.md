@@ -3457,7 +3457,13 @@ nothing; a spawned task on a paused clock is the trap the project guide
 warns about. Against the old code, they fail. The old loop timed itself with
 `std::time::Instant`, which the paused clock doesn't move, so it spun
 through 61,503 virtual seconds waiting for five real ones.
- The parsing tests in
+
+A longer shutdown has a cost elsewhere too. The test harnesses that SIGTERM
+a `bun` process, or cancel an in-process agent, used to give it 5 s and
+10 s before they killed it. That would now cut a legitimate shutdown short
+and leave its workloads running, so both now wait for
+`shutdown_completion_bound()`, the budget plus both kill rounds, and a few
+seconds more. The parsing tests in
 `grill::stop` and `config::validate` cover each refusal, and
 `stop_hooks_survive_an_export_and_import_round_trip` sends an app through
 `relish export` and back in. To check the tests check something, we put
