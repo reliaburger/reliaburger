@@ -18,8 +18,8 @@ Four commands do it all:
 CI runs them against QEMU VMs on every change to the image. On x86_64 it
 runs the lot: netboot installs, claimed and seeded clusters, an OS update
 and a broken update falling back. On aarch64 it runs the boot test only. The hardware it's built for is the Dell Wyse 3040,
-netbooted from a Mac, and the release isn't tagged until three of them go
-from power-on to a working cluster. Other firmware may still have surprises;
+netbooted from a Mac, and 0.3.0's exit test takes three of them from
+power-on to a working cluster. Other firmware may still have surprises;
 "What's missing" lists the ones we know of.
 
 ## What you need
@@ -499,7 +499,18 @@ terminal and without `--yes`, relish refuses before it makes anything. Every oth
 machine's seed holds only a join token: single-use, bound to that machine's
 name, and good for an hour (`--ttl` to change). Each machine fetches its
 certificate and the master key from the cluster itself when it joins. relish
-now points at node 1, with an admin token. Then:
+now points at node 1, with an admin token, and waits up to three minutes for
+every machine it claimed to start, printing each as it comes up:
+
+```
+waiting for home-1, home-2, home-3 to start (up to 180 s)
+  home-1: up
+  home-2: up
+  home-3: up
+```
+
+A machine that's still starting after that is named, with `relish nodes` to
+check on it; the claim itself succeeded. Then:
 
 ```sh
 relish nodes

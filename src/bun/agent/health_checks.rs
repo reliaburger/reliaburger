@@ -479,7 +479,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     pub(super) async fn check_apps(&mut self) {
         let reads = self.plan_state_reads(|_| true);
         let grill = self.supervisor.grill().clone();
-        let sweep = state_sweep::sweep_states(grill, reads).await;
+        let unfinished = std::mem::take(&mut self.unfinished_state_reads);
+        let sweep = state_sweep::sweep_states(grill, reads, unfinished).await;
         self.apply_state_sweep(Ok(sweep)).await;
     }
 }
