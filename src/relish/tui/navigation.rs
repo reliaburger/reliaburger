@@ -47,6 +47,7 @@ impl TuiApp {
     pub(super) fn push(&mut self, view: View) {
         if self.view() != &view {
             self.view_stack.push(view);
+            self.clear_filter();
         }
     }
 
@@ -58,7 +59,16 @@ impl TuiApp {
                 self.pending.push(Effect::CloseLogStream);
             }
             self.view_stack.pop();
+            self.clear_filter();
         }
+    }
+
+    /// A `/` search belongs to the screen it was typed on. Without this, a
+    /// search for `error` in the logs would come back as a filter on the
+    /// apps list.
+    fn clear_filter(&mut self) {
+        self.filter = None;
+        self.filter_editing = false;
     }
 
     fn view_is_log_stream(&self) -> bool {
@@ -83,6 +93,8 @@ impl TuiApp {
         };
         let old = *tab;
         *tab = tab.offset(delta);
+        self.filter = None;
+        self.filter_editing = false;
         if old == DetailTab::Logs {
             self.pending.push(Effect::CloseLogStream);
         }

@@ -176,6 +176,12 @@ impl TestScenario {
                         labels: "{}".into(),
                         value: 64.0,
                     },
+                    MetricsQueryRow {
+                        timestamp: FIXTURE_NOW,
+                        metric_name: "http_requests_total".into(),
+                        labels: r#"{"route":"/health"}"#.into(),
+                        value: 1520.0,
+                    },
                 ],
                 warnings: Vec::new(),
             });

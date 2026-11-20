@@ -1160,7 +1160,8 @@ TUI keys:
 | `s`, `?`, `:` | Search, help or command palette |
 | ↑/↓, Enter | Select and open a row |
 | ←/→, Tab, Shift-Tab | Cycle app-detail tabs |
-| `/` | Filter the current list |
+| `/` | Filter the current list; search the logs or the Logs and Metrics tabs, matches in red and bold |
+| Escape (with a filter or search) | Clear it |
 | `f` | Toggle log following |
 | Escape, `q` | Go back; quit from the dashboard |
 

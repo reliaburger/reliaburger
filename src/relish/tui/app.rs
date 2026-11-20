@@ -395,6 +395,131 @@ mod tests {
         );
     }
 
+    fn type_text(app: &mut TuiApp, text: &str) {
+        for character in text.chars() {
+            app.update(key(KeyCode::Char(character)));
+        }
+    }
+
+    fn app_detail(tab: DetailTab) -> TuiApp {
+        let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);
+        app.view_stack.push(View::AppDetail {
+            app: "web".into(),
+            namespace: "default".into(),
+            tab,
+        });
+        app
+    }
+
+    // `/` searches the Logs tab; Esc clears the search and stays put, and
+    // only a second Esc goes back (#2174).
+    #[test]
+    fn slash_searches_the_logs_tab_and_esc_clears_it_without_leaving() {
+        let mut app = app_detail(DetailTab::Logs);
+        app.update(key(KeyCode::Char('/')));
+        assert!(app.filter_editing);
+        type_text(&mut app, "err");
+        assert_eq!(app.filter.as_deref(), Some("err"));
+        app.update(key(KeyCode::Enter));
+        assert!(!app.filter_editing);
+        assert_eq!(app.filter.as_deref(), Some("err"));
+
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.filter, None);
+        assert!(matches!(
+            app.view(),
+            View::AppDetail {
+                tab: DetailTab::Logs,
+                ..
+            }
+        ));
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.view(), &View::Dashboard);
+    }
+
+    #[test]
+    fn esc_while_typing_a_search_clears_it() {
+        let mut app = app_detail(DetailTab::Metrics);
+        app.update(key(KeyCode::Char('/')));
+        type_text(&mut app, "cpu");
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.filter, None);
+        assert!(!app.filter_editing);
+        assert!(matches!(
+            app.view(),
+            View::AppDetail {
+                tab: DetailTab::Metrics,
+                ..
+            }
+        ));
+    }
+
+    // While the search box is open, letters are search text, not keys:
+    // `l` and `q` don't open the logs view or go back.
+    #[test]
+    fn typing_in_the_logs_view_search_box_does_not_navigate() {
+        let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);
+        app.view_stack.push(View::Logs {
+            app: Some(("web".into(), "default".into())),
+        });
+        app.update(key(KeyCode::Char('/')));
+        type_text(&mut app, "slow query");
+        assert_eq!(app.filter.as_deref(), Some("slow query"));
+        assert!(matches!(app.view(), View::Logs { app: Some(_) }));
+        app.update(key(KeyCode::Backspace));
+        assert_eq!(app.filter.as_deref(), Some("slow quer"));
+    }
+
+    // A search belongs to the screen it was typed on: another tab or view
+    // starts without it.
+    #[test]
+    fn a_search_does_not_follow_you_to_another_tab_or_view() {
+        let mut app = app_detail(DetailTab::Logs);
+        app.update(key(KeyCode::Char('/')));
+        type_text(&mut app, "err");
+        app.update(key(KeyCode::Enter));
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.filter, None);
+
+        app.update(key(KeyCode::Char('/')));
+        type_text(&mut app, "cpu");
+        app.update(key(KeyCode::Enter));
+        app.update(key(KeyCode::Char('q')));
+        assert_eq!(app.view(), &View::Dashboard);
+        assert_eq!(app.filter, None);
+
+        app.update(key(KeyCode::Char('/')));
+        type_text(&mut app, "web");
+        app.update(key(KeyCode::Enter));
+        app.update(key(KeyCode::Char('e')));
+        assert_eq!(app.filter, None);
+    }
+
+    #[test]
+    fn visible_log_lines_keep_only_matching_lines_ignoring_case() {
+        let mut app = app_detail(DetailTab::Logs);
+        for line in [
+            "GET /health 200",
+            "ERROR: disk full",
+            "retrying after error",
+        ] {
+            app.log_lines.push_back(LogLine {
+                instance: "web-0".into(),
+                line: line.into(),
+            });
+        }
+        assert_eq!(app.visible_log_lines().len(), 3);
+        app.filter = Some("error".into());
+        let visible: Vec<_> = app
+            .visible_log_lines()
+            .iter()
+            .map(|line| line.line.as_str())
+            .collect();
+        assert_eq!(visible, ["ERROR: disk full", "retrying after error"]);
+        app.filter = Some("panic".into());
+        assert!(app.visible_log_lines().is_empty());
+    }
+
     #[test]
     fn search_matches_across_cached_resources() {
         let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);

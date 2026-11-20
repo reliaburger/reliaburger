@@ -5,6 +5,7 @@ pub mod data;
 pub mod fixtures;
 mod input;
 pub mod keys;
+mod matching;
 pub mod msg;
 mod navigation;
 pub mod palette;

@@ -243,6 +243,16 @@ impl TuiApp {
         apps
     }
 
+    /// The buffered log lines the `/` search leaves, oldest first: all of
+    /// them with no search, or those containing it, ignoring case.
+    pub fn visible_log_lines(&self) -> Vec<&LogLine> {
+        let needle = self.filter.as_deref().unwrap_or_default();
+        self.log_lines
+            .iter()
+            .filter(|line| super::matching::contains(&line.line, needle))
+            .collect()
+    }
+
     pub fn filtered_apps(&self) -> Vec<(String, String)> {
         let apps = self.all_apps();
         match self.filter.as_deref() {

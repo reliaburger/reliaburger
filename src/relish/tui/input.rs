@@ -14,6 +14,10 @@ impl TuiApp {
             self.handle_search_key(key);
         } else if self.filter_editing {
             self.handle_filter_key(key);
+        } else if key.code == KeyCode::Esc && self.filter.is_some() {
+            // Esc clears a search before it goes back, so the view you
+            // searched in stays open.
+            self.filter = None;
         } else if let Some(action) = key_to_action(key) {
             let action = if action == super::keys::KeyAction::Refresh
                 && matches!(
@@ -48,6 +52,7 @@ impl TuiApp {
             _ => {}
         }
         self.apps_cursor = 0;
+        self.log_scroll = 0;
     }
 
     fn handle_palette_key(&mut self, key: KeyEvent) {

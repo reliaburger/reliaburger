@@ -467,7 +467,8 @@ these keys inside it too.
 | `s`, `?`, `:` | anywhere | search, help, command palette |
 | `q`, Esc | anywhere | back; `q` on the dashboard quits |
 | Enter, ↑/↓ | lists | open the selected row, move the selection |
-| `/` | lists | filter |
+| `/` | lists | filter; Esc clears it |
+| `/` | logs, app detail Logs and Metrics tabs | search: show only the lines (or metrics, by name and labels) containing the text, ignoring case, each match in red and bold; Enter keeps it, Esc clears it |
 | → or Tab, ← or Shift-Tab | app detail | next or previous tab (Overview, Instances, Logs, Metrics, Deploys, Config) |
 | `f` | logs | follow the newest lines, or stop |
 | PgUp/PgDn | logs, events | scroll |
