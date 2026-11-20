@@ -1035,6 +1035,31 @@ The real command hands `refresh_resent` a closure that borrows one client for ev
 
 The Wyse lab's first real claim found the last gap (#2146). `claim` printed `relish now talks to this cluster` the moment node 1 had its seed, and the very next `relish nodes` failed with "connection refused": node 1 still had to unpack the seed and start bun. A few seconds later everything answered. On a 3040 that's a few seconds; on slower hardware, or for machines that still have to join through node 1, longer. So `claim` now waits before it returns, up to three minutes, asking the cluster's `/v1/cluster/nodes` once a second until every machine whose seed arrived is listed alive, and printing `home-1: up` as each one is. A machine that's still starting at the end isn't a failure: its seed arrived. `claim` names it, says `relish nodes` will list it once it's up, and exits 0. The wait asks the new cluster with a client built from the context `create` wrote, not the one relish adopted, so it works even when another cluster's context was kept. `wait_for_claimed_nodes` takes the "which nodes are alive?" question as a closure, like `deliver_seeds`, so a test answers "connection refused", then nothing, then one node, then both, on a paused clock (`#[tokio::test(start_paused = true)]`), and three minutes pass in no time.
 
+That same lab run found the context's other trap (#2162). The Mac already had a context from an earlier cluster, and that cluster's directory had since been deleted. `claim --create` saw another cluster's context in the way, kept it, and printed three `export` lines. The next `relish nodes` said:
+
+```
+error: API error (status 0): No such file or directory (os error 2)
+```
+
+Nothing in that line is true except the last part. No API answered, and the error names neither the context nor the file. relish keeps the token inside `context.json`, but only a path to the CA certificate, and the certificate lived in the deleted directory. Building the client failed reading it. `BunClient` doesn't fail at that point: it keeps the reason and returns it from the first request, so a command that never talks to the cluster isn't stopped by a broken one. That deferred reason went out as `RelishError::ApiError { status: 0, .. }`, the variant for "the agent answered with an error".
+
+There are two fixes. The first is an honest error. A client relish couldn't set up now fails with `RelishError::ClientConfig`, which prints its reason as it is, and the reason for a missing CA is its own variant, `ContextFileMissing`, holding the context file, the cluster it was for and the missing certificate:
+
+```
+error: the relish context for bare-metal/lab can't be used: its CA certificate /Users/you/lab/root-ca.crt is gone. If that cluster is gone too, remove /Users/you/.reliaburger/context.json so relish goes back to the local default, or create a new cluster with `relish setup` or `relish machines claim --create`, which replaces it. ...
+```
+
+`relish agent` maps both to `no_endpoint`, so an agent driving relish sees a configuration problem rather than an API error with no status.
+
+The second fix stops keeping a context nothing can use. `LocalContext::missing_file` returns the CA path when it no longer exists, and `LocalContext::save` now returns `Result<Option<ReplacedContext>, RelishError>`: it still refuses to overwrite another cluster's working context, but it replaces one whose certificate is gone and hands back what it replaced. `adopt`, which `cluster create --bare-metal` and `machines claim --create` both call, checks first, so a working context is kept as before and a dead one is replaced, and the report says so:
+
+```
+relish now talks to this cluster (node 1, https://192.168.1.51:9117).
+It replaced the context for bare-metal/lab, which no longer worked: /Users/you/lab/root-ca.crt is gone.
+```
+
+`relish setup` refused a dead context too ("another cluster owns the active context"), so it got the same check. Only a *missing* file counts. A certificate relish can't read for another reason, say a permissions slip, still marks a context someone may want back, so relish keeps it and says what it couldn't read. `adopt` became a thin wrapper around `adopt_at`, which takes the context's path, because the default path comes from `RELIABURGER_HOME` and changing the environment in a test races every other test in the process. The three tests for `adopt_at` cover no context, a working one (kept) and the lab's case, a context whose cluster directory is gone (replaced, with the line above). In `local_context.rs`, `a_context_whose_ca_is_gone_says_which_context_and_file_and_what_to_do` checks the new error names the cluster, the file and `relish machines claim --create`, and never says "status 0".
+
 ## A LAN on a laptop
 
 We had no KVM machine and no spare PCs, only CI and one Apple silicon Mac without root. Everything had to run virtualised until the last step.

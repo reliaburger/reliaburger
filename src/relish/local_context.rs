@@ -60,8 +60,11 @@ impl LocalContext {
         Ok(Some(context))
     }
 
-    /// Atomically save credentials, without replacing another cluster's context.
-    pub fn save(&self, path: &Path) -> Result<(), RelishError> {
+    /// Atomically save credentials, without replacing another cluster's
+    /// working context. Another cluster's context whose files are gone is
+    /// replaced, since nothing can use it any more, and returned so the
+    /// caller can say so (#2162).
+    pub fn save(&self, path: &Path) -> Result<Option<ReplacedContext>, RelishError> {
         self.validate()?;
         let parent = path.parent().ok_or_else(|| {
             RelishError::InitFailed("context has no parent directory".to_string())
@@ -75,16 +78,33 @@ impl LocalContext {
         }
         directory.create(parent)?;
         let _lock = lock_context(path)?;
-        if let Some(existing) = Self::load(path)?
-            && existing.owner != self.owner
-        {
-            return Err(RelishError::InitFailed(
-                "another managed cluster owns the active context".to_string(),
-            ));
-        }
+        let replaced = match Self::load(path)? {
+            Some(existing) if existing.owner != self.owner => {
+                let Some(missing) = existing.missing_file() else {
+                    return Err(RelishError::InitFailed(
+                        "another managed cluster owns the active context".to_string(),
+                    ));
+                };
+                Some(ReplacedContext {
+                    owner: existing.owner.clone(),
+                    missing: missing.to_path_buf(),
+                })
+            }
+            _ => None,
+        };
         let bytes = serde_json::to_vec_pretty(self).map_err(RelishError::SerialiseJson)?;
         crate::sesame::identity::atomic_write_mode(path, &bytes, Some(0o600))?;
-        Ok(())
+        Ok(replaced)
+    }
+
+    /// The file this context needs that no longer exists, if any: its CA
+    /// certificate, which lives in the cluster's directory and goes when
+    /// that directory is deleted. The token is in the context itself.
+    pub fn missing_file(&self) -> Option<&Path> {
+        match std::fs::metadata(&self.ca_cert) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(&self.ca_cert),
+            _ => None,
+        }
     }
 
     /// Remove the active credentials only when they belong to this operation.
@@ -108,7 +128,15 @@ impl LocalContext {
         ca_cert: Option<&Path>,
     ) -> Result<super::client::BunClient, RelishError> {
         self.validate()?;
-        let ca = std::fs::read(ca_cert.unwrap_or(&self.ca_cert))?;
+        let ca = match ca_cert {
+            Some(path) => std::fs::read(path).map_err(|error| {
+                RelishError::ClientConfig(format!(
+                    "can't read the CA certificate {}: {error}",
+                    path.display()
+                ))
+            })?,
+            None => self.read_ca()?,
+        };
         super::client::BunClient::new_with_ca(
             &self.endpoint,
             Some(token.unwrap_or(&self.token)),
@@ -137,6 +165,27 @@ impl LocalContext {
         (context_ca_pem == connection_ca_pem).then(|| self.service_endpoints.clone())
     }
 
+    /// This context's own CA certificate, or an error that names the
+    /// context and the missing file and says what to do about it.
+    fn read_ca(&self) -> Result<Vec<u8>, RelishError> {
+        std::fs::read(&self.ca_cert).map_err(|error| {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return RelishError::ClientConfig(format!(
+                    "can't read the CA certificate {} that the relish context for {} trusts: {error}",
+                    self.ca_cert.display(),
+                    self.owner
+                ));
+            }
+            RelishError::ContextFileMissing {
+                // The path only goes into the message; every caller loaded
+                // this context from the default path.
+                context: default_path().unwrap_or_else(|_| PathBuf::from("context.json")),
+                owner: self.owner.clone(),
+                missing: self.ca_cert.clone(),
+            }
+        })
+    }
+
     fn validate(&self) -> Result<(), RelishError> {
         if self.schema != 1
             || self.owner.is_empty()
@@ -157,6 +206,16 @@ impl LocalContext {
         }
         Ok(())
     }
+}
+
+/// Another cluster's context that [`LocalContext::save`] replaced because a
+/// file it needs is gone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReplacedContext {
+    /// The cluster the old context was for.
+    pub owner: String,
+    /// The file it needed that no longer exists.
+    pub missing: PathBuf,
 }
 
 /// The default managed context path, separate from user shell configuration.
@@ -342,7 +401,12 @@ mod tests {
         assert!(still_linked(&fresh, &lock_path).unwrap());
     }
 
+    /// A context for `owner` whose CA certificate exists in `root`.
     fn context(root: &std::path::Path, owner: &str) -> LocalContext {
+        let ca_cert = root.join("root-ca.crt");
+        if !ca_cert.exists() {
+            std::fs::write(&ca_cert, b"cluster ca").unwrap();
+        }
         LocalContext {
             schema: 1,
             owner: owner.to_string(),
@@ -394,6 +458,87 @@ mod tests {
             LocalContext::load(&path).unwrap().unwrap().owner,
             "cluster-a"
         );
+    }
+
+    #[test]
+    fn a_context_whose_ca_is_gone_is_replaced_and_reported() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("context.json");
+        let old_cluster = tempfile::tempdir().unwrap();
+        context(old_cluster.path(), "cluster-a")
+            .save(&path)
+            .unwrap();
+        let missing = old_cluster.path().join("root-ca.crt");
+        drop(old_cluster);
+
+        let replaced = context(root.path(), "cluster-b").save(&path).unwrap();
+
+        assert_eq!(
+            replaced,
+            Some(ReplacedContext {
+                owner: "cluster-a".to_string(),
+                missing,
+            })
+        );
+        assert_eq!(
+            LocalContext::load(&path).unwrap().unwrap().owner,
+            "cluster-b"
+        );
+    }
+
+    #[test]
+    fn saving_over_a_working_context_of_the_same_cluster_replaces_nothing_else() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("context.json");
+        assert_eq!(context(root.path(), "cluster-a").save(&path).unwrap(), None);
+        assert_eq!(context(root.path(), "cluster-a").save(&path).unwrap(), None);
+    }
+
+    #[test]
+    fn a_context_whose_ca_is_gone_says_which_context_and_file_and_what_to_do() {
+        let root = tempfile::tempdir().unwrap();
+        let mut stale = context(root.path(), "bare-metal/lab");
+        stale.ca_cert = root.path().join("deleted-cluster/root-ca.crt");
+
+        let error = stale.client(None, None).err().unwrap();
+
+        assert!(matches!(error, RelishError::ContextFileMissing { .. }));
+        let message = error.to_string();
+        assert!(message.contains("bare-metal/lab"), "{message}");
+        assert!(
+            message.contains(&stale.ca_cert.display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("context.json"), "{message}");
+        assert!(
+            message.contains("relish machines claim --create"),
+            "{message}"
+        );
+        assert!(!message.contains("status 0"), "{message}");
+    }
+
+    #[test]
+    fn a_missing_ca_given_on_the_command_line_is_named() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("elsewhere.crt");
+        let error = context(root.path(), "cluster-a")
+            .client(None, Some(&missing))
+            .err()
+            .unwrap();
+        assert!(matches!(error, RelishError::ClientConfig(_)));
+        assert!(
+            error.to_string().contains(&missing.display().to_string()),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn missing_file_names_only_a_ca_that_is_gone() {
+        let root = tempfile::tempdir().unwrap();
+        let mut live = context(root.path(), "cluster-a");
+        assert_eq!(live.missing_file(), None);
+        live.ca_cert = root.path().join("gone.crt");
+        assert_eq!(live.missing_file(), Some(live.ca_cert.as_path()));
     }
 
     #[test]

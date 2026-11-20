@@ -190,7 +190,7 @@ pub async fn run(options: Options) -> Result<()> {
     }
 }
 
-/// Lock an operation, refuse another cluster's context, and prepare credentials
+/// Lock an operation, refuse another cluster's working context, and prepare credentials
 /// once. The returned lock keeps a second setup out of this state directory.
 pub(super) async fn open_operation(
     root: &Path,
@@ -210,9 +210,11 @@ pub(super) async fn open_operation(
             lock_options.open(operation_root.join("setup.lock"))?,
         )
         .context("another managed setup is using this state directory")?;
-        if LocalContext::load(&operation_root.join("context.json"))?
-            .is_some_and(|context| context.owner != operation.state.id)
-        {
+        // A context whose files are gone is replaced when setup saves its
+        // own; only a working one belongs to someone (#2162).
+        if LocalContext::load(&operation_root.join("context.json"))?.is_some_and(|context| {
+            context.owner != operation.state.id && context.missing_file().is_none()
+        }) {
             bail!("another cluster owns the active context; use a separate RELIABURGER_HOME for a second cluster");
         }
         let bootstrap = security::prepare(&operation)?;
@@ -502,8 +504,20 @@ async fn build_cluster(
             ingress_https: None,
         },
     };
-    let path = root.join("context.json");
-    tokio::task::spawn_blocking(move || context.save(&path)).await??;
+    save_context(context, root.join("context.json")).await
+}
+
+/// Save setup's context at `path`, and say so if it replaced another
+/// cluster's context whose files were gone (#2162).
+pub(super) async fn save_context(context: LocalContext, path: PathBuf) -> Result<()> {
+    let replaced = tokio::task::spawn_blocking(move || context.save(&path)).await??;
+    if let Some(replaced) = replaced {
+        eprintln!(
+            "replaced the relish context for {}, which no longer worked: {} is gone",
+            replaced.owner,
+            replaced.missing.display()
+        );
+    }
     Ok(())
 }
 
@@ -966,6 +980,54 @@ pub(super) async fn probe_demo(port: u16, host: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::bun::agent::{CouncilMemberInfo, CouncilStatus};
+
+    fn spec() -> ClusterSpec {
+        ClusterSpec {
+            name: "lab".into(),
+            nodes: 1,
+            version: env!("CARGO_PKG_VERSION").parse().unwrap(),
+            api_port: 19117,
+            ingress_port: 18080,
+            registry_port: 15050,
+            ssh: Vec::new(),
+        }
+    }
+
+    /// Save a context for another cluster in `root`, trusting `ca_cert`.
+    fn save_other_context(root: &Path, ca_cert: PathBuf) {
+        LocalContext {
+            schema: 1,
+            owner: "bare-metal/old".into(),
+            endpoint: "https://192.168.1.99:9117".into(),
+            token: "rbrg_old".into(),
+            ca_cert,
+            service_endpoints: Default::default(),
+        }
+        .save(&root.join("context.json"))
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn setup_refuses_a_working_context_for_another_cluster() {
+        let root = tempfile::tempdir().unwrap();
+        let ca_cert = root.path().join("old-ca.crt");
+        std::fs::write(&ca_cert, b"old cluster ca").unwrap();
+        save_other_context(root.path(), ca_cert);
+        let refused = open_operation(root.path(), spec()).await.err().unwrap();
+        assert!(
+            refused.to_string().contains("another cluster owns"),
+            "{refused}"
+        );
+    }
+
+    /// The old cluster's directory was deleted, so its context can't work
+    /// and setup takes its place (#2162).
+    #[tokio::test]
+    async fn setup_goes_ahead_over_a_context_whose_files_are_gone() {
+        let root = tempfile::tempdir().unwrap();
+        save_other_context(root.path(), root.path().join("deleted/root-ca.crt"));
+        assert!(open_operation(root.path(), spec()).await.is_ok());
+    }
 
     #[test]
     fn a_dev_version_without_development_binaries_is_refused() {

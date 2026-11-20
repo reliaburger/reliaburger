@@ -441,6 +441,12 @@ and each cause has its own fix:
   laptop cluster's `~/.reliaburger/context.json`, then
   `http://127.0.0.1:9117`. An explicit endpoint doesn't borrow the saved
   context's credentials: pass `--token` and `--ca-cert` too.
+- "the relish context for … can't be used: its CA certificate … is gone"
+  means `context.json` still points at a cluster whose directory was
+  deleted. Remove `~/.reliaburger/context.json` if that cluster is gone,
+  or create a new cluster with `relish setup` or
+  `relish machines claim --create`, which replaces it. To reach another
+  cluster meanwhile, pass `--endpoint`, `--ca-cert` and `--token`.
 - Plain `http://` works only to a loopback address. Anything remote needs
   HTTPS and the cluster CA (`--ca-cert` or `RELIABURGER_CA_CERT`).
 - On a laptop cluster, `relish local status` checks every VM and its API. Node

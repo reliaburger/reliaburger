@@ -932,15 +932,19 @@ impl BunClient {
     /// Create a client with an explicit token (or none). Used by tests; `new`
     /// resolves the token from the flag/env instead.
     pub fn new_with_token(base_url: &str, token: Option<&str>) -> Self {
-        let ca_pem = match resolve_ca_cert().map(std::fs::read).transpose() {
-            Ok(pem) => pem,
-            Err(error) => {
-                return Self::unusable(
-                    base_url,
-                    token,
-                    format!("failed to read cluster CA: {error}"),
-                );
-            }
+        let ca_pem = match resolve_ca_cert() {
+            None => None,
+            // BLOCKING-OK: relish CLI: a one-shot read of the `--ca-cert` file before the command does anything long-lived, as the old `map(std::fs::read)` was
+            Some(path) => match std::fs::read(&path) {
+                Ok(pem) => Some(pem),
+                Err(error) => {
+                    return Self::unusable(
+                        base_url,
+                        token,
+                        format!("can't read the CA certificate {}: {error}", path.display()),
+                    );
+                }
+            },
         };
         Self::build(base_url, token, ca_pem.as_deref())
     }
@@ -1168,10 +1172,7 @@ impl BunClient {
     pub fn http(&self) -> Result<&reqwest::Client, RelishError> {
         self.client
             .as_ref()
-            .map_err(|reason| RelishError::ApiError {
-                status: 0,
-                body: reason.clone(),
-            })
+            .map_err(|reason| RelishError::ClientConfig(reason.clone()))
     }
 
     /// The HTTP client for a response that streams for as long as the work
@@ -1181,10 +1182,7 @@ impl BunClient {
     fn streaming_http(&self) -> Result<&reqwest::Client, RelishError> {
         self.stream_client
             .as_ref()
-            .map_err(|reason| RelishError::ApiError {
-                status: 0,
-                body: reason.clone(),
-            })
+            .map_err(|reason| RelishError::ClientConfig(reason.clone()))
     }
 
     /// Send a request whose answer streams. The work before the first byte
@@ -4001,6 +3999,23 @@ mod tests {
     use futures_util::StreamExt;
     use std::sync::{Arc, Mutex};
 
+    /// A client relish couldn't set up says why, not "API error (status
+    /// 0)", which reads as if the cluster answered (#2162).
+    #[tokio::test]
+    async fn an_unusable_client_reports_its_reason_not_an_api_error() {
+        let client = BunClient::unusable(
+            "https://127.0.0.1:9",
+            None,
+            "the relish context for lab can't be used".to_string(),
+        );
+        let error = client.nodes().await.unwrap_err();
+        assert!(matches!(error, RelishError::ClientConfig(_)), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            "the relish context for lab can't be used"
+        );
+    }
+
     #[test]
     fn the_audit_query_carries_the_app_filter() {
         let filter = crate::bun::audit::AuditFilter {
@@ -4319,7 +4334,7 @@ mod tests {
     async fn malformed_bearer_is_an_error_instead_of_an_anonymous_request() {
         let client = BunClient::new_with_token("http://127.0.0.1:9", Some("bad\nheader"));
         let error = client.health().await.unwrap_err();
-        assert!(matches!(error, RelishError::ApiError { body, .. } if body.contains("bearer")));
+        assert!(matches!(error, RelishError::ClientConfig(reason) if reason.contains("bearer")));
     }
 
     #[tokio::test]
