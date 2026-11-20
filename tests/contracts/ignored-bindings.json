@@ -1339,6 +1339,12 @@
   },
   {
     "source": "tests/owned_runc.rs",
+    "function": "runc_pause_freezes_the_workload_not_its_launcher",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_pause_freezes_the_workload_not_its_launcher"
+  },
+  {
+    "source": "tests/owned_runc.rs",
     "function": "recovered_source_identity_belongs_to_the_container_not_its_launcher",
     "binary": "reliaburger::owned_runc",
     "test": "recovered_source_identity_belongs_to_the_container_not_its_launcher"
