@@ -481,7 +481,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     pub(super) async fn shutdown_all(&mut self) {
         // One budget for the whole shutdown, so Bun is done before systemd's
         // `TimeoutStopSec` runs out and kills it with its workloads still up.
-        let deadline = Instant::now() + self.shutdown_budget;
+        let deadline = tokio::time::Instant::now() + self.shutdown_budget;
         // Reverse every owned fault before the process goes away. The
         // node-pressure helper also has PR_SET_PDEATHSIG and startup sweeping
         // for crash recovery, but graceful shutdown should leave no helper or
@@ -562,7 +562,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// `deadline`; then force-kill whatever still runs so nothing is
     /// orphaned. Running them side by side means one app's long grace costs
     /// the others nothing.
-    async fn stop_round(&self, stops: &[(InstanceId, InstanceStop)], deadline: Instant) {
+    async fn stop_round(
+        &self,
+        stops: &[(InstanceId, InstanceStop)],
+        deadline: tokio::time::Instant,
+    ) {
         if stops.is_empty() {
             return;
         }
@@ -579,7 +583,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 eprintln!("bun: {id}: shutdown stop not confirmed: {error}");
             }
         }));
-        let left = deadline.saturating_duration_since(Instant::now());
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         // LOOP-INLINE: shutdown's last turn; bounded by the shutdown budget
         if tokio::time::timeout(left, graceful).await.is_err() {
             eprintln!("bun: shutdown budget spent; killing what still runs");
