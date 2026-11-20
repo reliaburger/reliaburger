@@ -1628,18 +1628,23 @@ fn the_release_testing_section_shows_the_installed_release_s_soak_charts() {
         );
         shown.push(format!("{directory}/{file}"));
     }
-    for (kind, chart) in [("app soak", "sustained"), ("job soak", "job-qualification")] {
+    // A job soak's record is `…-job-qualification` up to 0.2.8 and
+    // `…-jobs-final` (or `…-jobs-fast` for a patch release) from 0.3.0.
+    let job_soak = |s: &str| s.contains("job-qualification") || s.contains("-jobs-");
+    let app_soak = |s: &str| s.contains("sustained");
+    for (kind, is_kind) in [
+        ("app soak", &app_soak as &dyn Fn(&str) -> bool),
+        ("job soak", &job_soak),
+    ] {
         for file in ["rss.svg", "fds.svg", "cpu.svg"] {
             assert!(
-                shown.iter().any(|s| s.contains(chart) && s.ends_with(file)),
+                shown.iter().any(|s| is_kind(s) && s.ends_with(file)),
                 "the release-testing section shows no {file} from the {kind}"
             );
         }
     }
     assert!(
-        shown
-            .iter()
-            .any(|s| s.contains("job-qualification") && s.ends_with("jobs.svg")),
+        shown.iter().any(|s| job_soak(s) && s.ends_with("jobs.svg")),
         "the release-testing section shows no job-rate chart from the job soak"
     );
     let mut on_disk = Vec::new();
@@ -2030,7 +2035,7 @@ fn the_install_section_offers_homebrew_after_the_one_line_install() {
 /// commands, each parsed by the netboot test, the warning that the installer
 /// erases a disk, and links down to the netboot section and to the manual's
 /// appliance chapter. It comes after the other three, and says which release
-/// adds it.
+/// added it.
 #[test]
 fn the_install_section_offers_real_hardware_last() {
     let page = read("docs/website/index.html");
@@ -2059,7 +2064,7 @@ fn the_install_section_offers_real_hardware_last() {
         "erases the largest built-in disk",
         "2 GiB",
         "8 GB",
-        &unreleased_label(),
+        "New in 0.3.0",
     ] {
         assert!(text.contains(needed), "the panel doesn't say {needed:?}");
     }
