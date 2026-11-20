@@ -529,6 +529,112 @@ class HarnessResumeWiring(unittest.TestCase):
         self.assertIn('check power-cut "$evidence" ${restarts[@]+"${restarts[@]}"}', body)
 
 
+class FaultOverlapWiring(unittest.TestCase):
+    """#2105: the harness holds each gated fault for a run of every mode on
+    its node, right before it strikes, and records a wait that runs out."""
+
+    functions = HarnessResumeWiring.functions
+
+    def test_the_mark_before_each_gated_fault_waits(self):
+        bodies = self.functions()
+        # power_off (sustained/power.sh) calls this hook before it stops the VM.
+        self.assertIn('job_mark_fault "$node" "${current_slot:-power-off}" wait', bodies["power_before_off"])
+        self.assertIn('job_mark_fault "$node" "${current_slot:-agent-kill}" wait', bodies["kill_bun"])
+        self.assertLess(bodies["kill_bun"].index("job_mark_fault"), bodies["kill_bun"].index("kill -9"))
+        node_fault = bodies["slot_node_fault"]
+        first = node_fault.index('job_mark_fault "$node" "${current_slot%%:*}:$kind" wait')
+        self.assertLess(first, node_fault.index('node_fault_script "$kind" start'))
+        # The marks through the hold only record; they never hold the fault.
+        self.assertEqual(node_fault.count(" wait\n"), 1)
+
+    def test_a_wait_passes_the_flag_and_a_missed_overlap_is_an_event(self):
+        body = self.functions()["job_mark_fault"]
+        self.assertIn('${3:+--wait}', body)
+        self.assertIn("3) event --phase job-overlap", body)
+
+    def test_the_wait_fits_the_compressed_slot(self):
+        import job_soak
+        self.assertLess(job_soak.OVERLAP_WAIT_SECS, 600 // 6)
+
+
+class DayHookApply(unittest.TestCase):
+    """#1935: the day tier deploys once, so it applies the job fixtures again
+    every hour, and its deploy hooks and after jobs run while the controller
+    watches rather than only in the first seconds of the campaign."""
+
+    functions = HarnessResumeWiring.functions
+    release = Path(__file__).parent
+
+    def plan(self, script, tier):
+        import subprocess
+        return subprocess.run([str(self.release / script), "--tier", tier, "--plan"], capture_output=True, text=True,
+                              check=True, env=dict(os.environ, RELIABURGER_SOAK_CAFFEINATED="1")).stdout
+
+    def test_the_day_plan_applies_the_job_fixtures_every_hour(self):
+        self.assertIn("plan: hook-apply every 3600 s", self.plan("qualify-jobs-sustained.sh", "day"))
+
+    def test_no_tier_with_a_fault_schedule_plans_one(self):
+        # Their deploy-kill slots apply the fixtures with every rolling deploy.
+        for script in ("qualify-sustained.sh", "qualify-jobs-sustained.sh"):
+            for tier in ("fast", "final"):
+                with self.subTest(script=script, tier=tier):
+                    self.assertNotIn("hook-apply", self.plan(script, tier))
+
+    def test_the_wait_applies_them_outside_any_window(self):
+        body = self.functions()["wait_until"]
+        branch = body[body.index('[ "$hook_every" -gt 0 ]'):]
+        self.assertIn('[ -z "$window_label" ]', branch[:branch.index("then")])
+        self.assertIn("run_slot hook_apply", branch[:branch.index("elif")])
+
+    def run_hook_apply(self, stop=None, stop_at=None, installed=True):
+        import subprocess
+        bodies = self.functions()
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory)
+            (evidence / "jobs").mkdir()
+            (evidence / "snapshots").mkdir()
+            if installed: (evidence / "jobs" / "installed").touch()
+            if stop: (evidence / "jobs" / "stop").touch()
+            template = evidence / "template.toml"
+            template.write_text('[app.soak-identity]\nimage = "x"\n[app.soak-identity.env]\nSOAK_GENERATION = "0"\n'
+                                'SOAK_SLO_GENERATION = "0"\n[policy.deny]\nrule = "x"\n')
+            (evidence / "day.toml").write_text('[app.soak-quiet]\nimage = "x"\n')
+            functions = "".join(f"{name}() {{\n{bodies[name]}\n}}\n" for name in
+                                ("jobs_applied", "soak_workloads", "write_workloads", "apply_soak_manifests", "hook_apply"))
+            script = f"""set -eu
+evidence={evidence}; repository={self.release.parent.parent}; workloads_template={template}
+day_workloads={evidence / "day.toml"}; tier=day; generation=4; slo_generation=7; hook_applies=0
+rel() {{ echo "rel $*" >> {evidence}/calls; }}
+event() {{ echo "event $*" >> {evidence}/calls; }}
+meta_get() {{ echo "{stop_at or ''}"; }}
+{functions}
+hook_apply
+"""
+            subprocess.run(["bash", "-c", script], check=True, capture_output=True, text=True)
+            calls = (evidence / "calls").read_text() if (evidence / "calls").exists() else ""
+            workloads = (evidence / "workloads.toml").read_text() if (evidence / "workloads.toml").exists() else ""
+            return calls, workloads
+
+    def test_a_hook_apply_applies_the_policies_then_the_workloads_with_the_fixtures(self):
+        calls, workloads = self.run_hook_apply()
+        applies = [line for line in calls.splitlines() if line.startswith("rel apply")]
+        self.assertEqual(len(applies), 2)
+        self.assertIn("policies.toml", applies[0])
+        self.assertIn("workloads.toml", applies[1])
+        for mode in ("runc", "shared-runc", "process"):
+            self.assertIn(f"[job.soak-job-hook-{mode}]", workloads)
+        # The same generations: no app rolls, only the jobs run again.
+        self.assertIn('SOAK_GENERATION = "4"', workloads)
+        self.assertIn('SOAK_SLO_GENERATION = "7"', workloads)
+        self.assertIn("event --phase jobs:hook-apply --verdict ok", calls)
+
+    def test_no_hook_apply_once_the_drain_is_asked_for_or_due_within_a_minute(self):
+        import time
+        for case in (dict(stop=True), dict(stop_at=int(time.time()) + 30), dict(installed=False)):
+            with self.subTest(**case):
+                self.assertEqual(self.run_hook_apply(**case), ("", ""))
+
+
 class BoundedCommands(unittest.TestCase):
     """with_timeout must stop a command that ignores SIGALRM, as Go's limactl
     does: `perl -e 'alarm; exec'` left a `limactl shell` to a guest that went
