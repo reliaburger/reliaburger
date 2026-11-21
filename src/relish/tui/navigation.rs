@@ -41,12 +41,15 @@ impl TuiApp {
             KeyAction::ToggleFollow => self.log_follow = !self.log_follow,
             KeyAction::NextTab => self.cycle_tab(1),
             KeyAction::PreviousTab => self.cycle_tab(-1),
+            KeyAction::Kill => self.confirm_kill = self.selected_instance(),
         }
     }
 
     pub(super) fn push(&mut self, view: View) {
         if self.view() != &view {
             self.view_stack.push(view);
+            self.clear_filter();
+            self.instances_cursor = 0;
         }
     }
 
@@ -58,7 +61,16 @@ impl TuiApp {
                 self.pending.push(Effect::CloseLogStream);
             }
             self.view_stack.pop();
+            self.clear_filter();
         }
+    }
+
+    /// A `/` search belongs to the screen it was typed on. Without this, a
+    /// search for `error` in the logs would come back as a filter on the
+    /// apps list.
+    fn clear_filter(&mut self) {
+        self.filter = None;
+        self.filter_editing = false;
     }
 
     fn view_is_log_stream(&self) -> bool {
@@ -83,6 +95,8 @@ impl TuiApp {
         };
         let old = *tab;
         *tab = tab.offset(delta);
+        self.filter = None;
+        self.filter_editing = false;
         if old == DetailTab::Logs {
             self.pending.push(Effect::CloseLogStream);
         }
@@ -118,7 +132,7 @@ impl TuiApp {
             View::Nodes => {
                 if let Some(node) = self.data.nodes.get(self.nodes_cursor) {
                     self.push(View::NodeDetail {
-                        node: node.node_id.clone(),
+                        node: node.status.node_id.clone(),
                     });
                 }
             }
@@ -171,6 +185,14 @@ impl TuiApp {
             View::Jobs => self.jobs_cursor = moved(self.jobs_cursor, self.data.jobs.len(), delta),
             View::Routes => {
                 self.routes_cursor = moved(self.routes_cursor, self.data.routes.len(), delta)
+            }
+            View::AppDetail {
+                app,
+                namespace,
+                tab: DetailTab::Instances,
+            } => {
+                let count = self.app_instances(app, namespace).len();
+                self.instances_cursor = moved(self.instances_cursor, count, delta)
             }
             View::Help => {
                 self.events_scroll =

@@ -120,6 +120,16 @@ fn sections(markdown: &str) -> Vec<Section> {
         .collect()
 }
 
+/// GitHub's anchor for every heading in `markdown`, in order, so other
+/// modules' tests can check a link into the manual names a real section.
+#[cfg(test)]
+pub(crate) fn anchors(markdown: &str) -> Vec<String> {
+    sections(markdown)
+        .into_iter()
+        .map(|section| section.anchor)
+        .collect()
+}
+
 /// `line` as an ATX heading: its level and text.
 fn heading_of(line: &str) -> Option<(u8, String)> {
     let hashes = line.bytes().take_while(|byte| *byte == b'#').count();

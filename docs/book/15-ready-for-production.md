@@ -733,6 +733,25 @@ more, held for 30 seconds, stops the build whether swap is in use or not. Passin
 49% for one ten-second sample. None of that helps a host that freezes outright, because the
 watcher freezes with it. That case is why the step's own `timeout` stays.
 
+The same day the 24.04 job, which had none of those guards, lost two runners of its own. We
+went back through every CI run of the past week to see where. All three of its losses since
+15 November came in one step, "Prove rootless port adoption", and in no other. That step runs
+`make test-rootless-runc`, and in CI it's the job's first build, cold on a train or a pull
+request. Its recipe didn't have the split build `make test-linux` had just been given, so the
+lib and the lib tests compiled side by side again. It has the split now, and the job has the
+26.04 job's guards: the shield, swap, the watcher with its three stops, and a limit on every
+heavy step inside a longer job limit, so a hang fails one step and the rest still report.
+
+A step limit has a catch: when it fires, it kills the processes we wanted to look at. So the
+watcher now takes snapshots on a schedule. `scripts/ci/runner-snapshot` prints memory, swap,
+the pressure-stall figures, which tests nextest is running and for how long, the process
+tree, the kernel stacks of every stuck task and test binary, and the end of the kernel log.
+The 24.04 job takes one every five minutes from minute 20; the 26.04 job takes one at minute
+36, past every passing run and before its tests' own 40-minute `timeout`. Each snapshot gets
+its own file, so a later one can't overwrite the one taken before a kill, and the job's last
+step uploads them all. A host that freezes outright still keeps nothing, but a hung step now
+leaves a picture of itself from a few minutes before it died.
+
 Coverage finds unvisited code. It does not tell us whether an assertion is useful, whether a
 webhook test accidentally exercised startup, or whether a five-second performance limit is
 portable. The audit found all three in a suite with lots of coverage. Read the uncovered
@@ -3748,6 +3767,96 @@ checks and filters alerts, restarts, services and deploys to `api`; it doesn't
 manufacture `Unknown` rows for cluster evidence it deliberately didn't fetch.
 Unknown means missing required evidence. It doesn't mean "we chose not to ask".
 
+### Three ways to read one report
+
+The first human report printed every result: each finding with its details
+and `next:` step, and every OK row in full. On the three-node Wyse lab that
+was seventeen OK lines to scroll past to learn that nothing was wrong. In
+0.3.1 (#2180) `relish wtf` got three views instead. The default is a table,
+one row per check with its status. `--short` prints the counts and only what
+isn't OK. `--explain` prints every check with what it tests, the numbers that
+decide it and where the manual covers it.
+
+A table needs a row per *check*, and the report doesn't have checks. It has
+three kinds of id. An OK row carries the check's id (`crashloops`), a finding
+carries its own (`crashloop`), and an UNKNOWN carries the evidence source it
+couldn't read (`restarts`). The council check alone can report nine different
+findings. So a new module, `src/relish/wtf/checks.rs`, ties them together:
+
+```rust
+pub struct CheckKind {
+    pub id: &'static str,
+    pub findings: &'static [&'static str],
+    pub sources: &'static [&'static str],
+    pub tests: &'static str,
+    pub docs: &'static str,
+    pub manual: &'static str,
+}
+
+pub const CHECKS: &[CheckKind] = &[ /* one per check, in run order */ ];
+```
+
+`&'static str` is a borrowed string that lives for the whole program: a
+literal compiled into the binary. A `const` table built from them costs
+nothing at run time, and needs no allocation, no `lazy_static` and no
+`String`. It's the same shape as the finding catalogue `relish agent
+explain` reads (see "Built for Humans and Their Agents"), and the explanation of each
+check sits right beside that catalogue's thresholds. `--explain` doesn't
+repeat the numbers in prose. It prints them from the constants the checks
+compare against, so the words can't say 15 minutes while the code says 10.
+
+The renderer groups the report's four lists into rows, and the row type
+borrows from the report rather than copying it:
+
+```rust
+struct CheckRow<'a> {
+    name: &'a str,
+    kind: Option<&'static CheckKind>,
+    critical: Vec<&'a WtfFinding>,
+    warnings: Vec<&'a WtfFinding>,
+    unknown: Vec<&'a WtfUnknown>,
+    ok: Vec<&'a WtfOk>,
+    // ...
+}
+```
+
+The `'a` is a lifetime parameter. It says every reference in a `CheckRow`
+points into something that lives at least as long as `'a`, here the
+`WtfReport`. In C you'd keep pointers into the report and promise yourself not
+to free it first. In Go the garbage collector keeps it alive for you. Rust
+makes the promise part of the type, so the compiler rejects any code that
+drops the report while a row still points into it.
+
+Sorting worst first falls out of one derive:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Status {
+    Ok,
+    Unknown,
+    Warning,
+    Critical,
+}
+```
+
+A derived `Ord` on a fieldless enum orders the variants as they're declared,
+so `Critical > Warning` holds and a row's status is just the worst thing in
+it. The order of the lines in the source is the policy, which is a little
+surprising the first time you see it, so the comment above the enum says so.
+
+What does a check that the catalogue doesn't know about do? It still gets a
+row, named after its own id, without the explanation. A result that vanished
+from the table because nobody updated a list would be the green hat again.
+Tests stop that from shipping, though: every finding id must belong to exactly
+one check, every UNKNOWN source the engine can produce must too, and every
+check's docs link must name a heading that exists in the manual chapter that
+`relish manual <topic>` opens. A new check without an explanation fails CI.
+
+The views change only the human report. `--short --output json` is refused
+rather than quietly ignored, because the JSON contract above doesn't change:
+the machine report always carries every finding. Exit codes don't change
+either. The view is how much you read, not what `wtf` found.
+
 ## A small diagnostic surface
 
 Mayo already records CPU usage. Could `wtf` call an application throttled when
@@ -4550,7 +4659,24 @@ means (the scheduler, the council and Pickle all treat "published" as "worth
 talking to"), gossip got a second one. `MembershipTable::roster()` returns
 every member, down ones included, until they're reaped, and
 `MustardNode::set_roster_watch` publishes it next to the old view. The
-refresher reads the roster. A `Left` entry is forgotten on sight.
+refresher reads the roster. A `Left` entry was forgotten on sight.
+
+That last rule didn't survive the Wyse lab. We rebooted one of three council
+voters with Ctrl+Alt+Del, and `relish nodes` went straight from three rows to
+two. A clean shutdown runs gossip's graceful leave, so the node was `Left`,
+and the table forgot it. Yet `relish council status` still listed it as a
+voter, still counted towards the quorum, and it came back two minutes later.
+Pulling the cord on another voter had shown it as `dead`, which is the more
+violent event and got the more honest answer. Leaving tells you the node
+meant to go. It doesn't tell you it's gone for good.
+
+So a `Left` member now stays in the table like a dead one, with the same
+24-hour limit, and keeps its `Left` state when gossip reaps it, where a
+reaped dead member stays `Dead`. `relish nodes` shows it as `left` with its
+council seat, and `relish status` counts it on the nodes line (`1 left`)
+without calling the cluster degraded. It drops off when it comes back, when
+its identity is retired, or when a day passes. Retirement is the real "gone
+for good", and the operator says so with `relish decommission-node`.
 
 A node the operator *retired* is gone for good: its identity is on the CRL,
 and Chapter 4's mTLS verifiers already refuse it. Every node keeps a
@@ -5407,8 +5533,9 @@ pub(super) async fn sweep_states<G: Grill>(grill: G, reads: Vec<StateRead>) -> S
 
 `buffered(8)` turns a stream of futures into a pool of eight running at once
 that still yields results in the original order. All of them share one
-one-second deadline; a read that misses it comes back `Unknown` and the next
-sweep asks again. The sweep goes into a `JoinSet`, at most one at a time, and a
+one-second deadline; a read that misses it comes back `Unknown`, and the next
+sweep tries again. (How it tries again changed later, and the section after
+next tells why.) The sweep goes into a `JoinSet`, at most one at a time, and a
 new `select!` branch applies what it saw.
 
 Earlier in this chapter a `buffered` stream gave us 380 errors about `Send`
@@ -5437,6 +5564,67 @@ A restart bumps `restart_count`; a fresh deploy under the same id gets a new
 field, the way a C programmer would hope `memcmp` would. The cost of all this
 is latency: a crash now restarts on the tick after the sweep reports, up to a
 second later than before. The restart backoff is longer than that anyway.
+
+#### A read that outlives its sweep
+
+"The next sweep asks again" sounds harmless. On runc it wasn't, and it took
+a flaky test to show us (#2085). `standalone_automatic_restart_replaces_the_original_address_owner`
+kills a container and gives Bun 30 seconds to restart it. On a quiet VM the
+restart takes two seconds. Now and then, on a busy one, it never happened at
+all. We put the VM under disk load (a few `dd ... conv=fsync` loops beside
+the test) and it failed five runs in six. The traces showed why: Bun never
+noticed the container had died. Every sweep's read of it came back
+`Unknown`.
+
+Each runc read takes the instance's lifecycle lock, and the runtime runs it
+in a task of its own, so a caller that gives up can't leave it half done.
+Timing out the sweep's future stopped the *sweep* waiting. It didn't stop the
+read. The read kept the lock, the next sweep's read queued behind it, and the
+lock serves its waiters in order. Once one read takes longer than the
+deadline, every read after it waits out its predecessor's leftover time and
+then its own, so every read misses the deadline, every sweep says `Unknown`,
+and the exit is never seen. The test made it likelier, because it polled the
+same instance twenty times a second through the same lock, but a node on a
+struggling disk would get there by itself.
+
+So the sweep stops starting reads it can't finish. Each read now runs in a
+spawned task, and one still running at the deadline goes back to the loop as
+unfinished. The next sweep waits on that same task instead of asking the
+runtime a second time:
+
+```rust
+let mut task = earlier.unwrap_or_else(|| {
+    let id = read.id.clone();
+    tokio::spawn(async move { observe(&grill, &id).await })
+});
+match tokio::time::timeout_at(deadline, &mut task).await {
+    Ok(observed) => (read, observed.unwrap_or(Observed::Unknown), None),
+    Err(_) => (read, Observed::Unknown, Some(task)),
+}
+```
+
+`tokio::spawn` returns a `JoinHandle`, which is itself a future: awaiting it
+gives you the task's result. We await `&mut task` rather than `task`, so the
+timeout borrows the handle and we still own it when the deadline passes. A
+`JoinHandle` is `Unpin` (moving it doesn't break anything that points into
+it), and that's what lets a plain `&mut` reference be awaited. In C you'd keep
+the `pthread_t` and `pthread_join` it later; in Go you'd keep the channel.
+Here the handle *is* the channel. Dropping a `JoinHandle` doesn't stop its
+task, so a handle the sweep no longer wants (the instance was retired, or has
+restarted since) gets an explicit `abort()`.
+
+The carried reads live on the agent as `unfinished_state_reads`, keyed by
+instance and stamped with the incarnation they read, so a result from before
+a restart still can't touch the replacement. The test that pins it,
+`a_state_read_slower_than_the_sweep_deadline_is_collected_by_the_next_sweep`
+in `src/bun/agent/tests/restart_ownership.rs`, gives the mock runtime a
+crashed instance and one-and-a-half-second reads. Before the change three
+sweeps came back `Unknown` and asked the runtime three times; now the second
+sweep collects the first read and restarts the instance, and the runtime was
+asked once. The flaky test also polls at 250 ms instead of 50, and it treats
+`StateUnavailable` (a read racing the restart's create, which the runtime
+says it can't answer yet) as "look again" rather than a failure, which was
+the other way it failed.
 
 #### A restart, one step at a time
 

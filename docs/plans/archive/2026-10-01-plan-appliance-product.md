@@ -1,6 +1,6 @@
 # Plan: the appliance, from spike to product (0.3.0)
 
-*Written 1 October 2026, after the spike (S1–S4 in [`2026-09-28-plan-appliance-lab.md`](2026-09-28-plan-appliance-lab.md), PR [#259](https://github.com/reliaburger/reliaburger/pull/259)). It turns the spike's shell scripts and preview tools into Reliaburger proper, in the order of the research note's §5 ([#218](https://github.com/reliaburger/reliaburger/pull/218), `docs/plans/2026-09-26-research-appliance-os.md` on that branch). Milestone: [0.3.0](https://github.com/reliaburger/reliaburger/milestone/6).*
+*Written 1 October 2026, after the spike (S1–S4 in [`2026-09-28-plan-appliance-lab.md`](../2026-09-28-plan-appliance-lab.md), PR [#259](https://github.com/reliaburger/reliaburger/pull/259)). It turns the spike's shell scripts and preview tools into Reliaburger proper, in the order of the research note's §5 ([#218](https://github.com/reliaburger/reliaburger/pull/218), `docs/plans/2026-09-26-research-appliance-os.md` on that branch). Milestone: [0.3.0](https://github.com/reliaburger/reliaburger/milestone/6).*
 
 ## Where the spike left us
 
@@ -20,7 +20,7 @@ What's missing is the part a user touches: bun and relish doing all of this them
 - **`relish netboot` needs root** for UDP 67, 69 and 4011: run it with `sudo`; on Linux, `setcap cap_net_bind_service` is the documented alternative.
 - **No merging before 0.3.0.** Each workstream is a PR stacked on the previous one, starting from #259; every PR references its issue below.
 - **No backwards compatibility** with spike-era installs (pre-1.0 policy): a node installed from a spike image may need a reinstall. In particular, its first `etc-sync` has no record and keeps every file that differs.
-- **The Wyse 3040 run (S5) is last**, once everything else is green ([runbook](2026-10-01-plan-appliance-s5-wyse.md)).
+- **The Wyse 3040 run (S5) is last**, once everything else is green ([runbook](../2026-10-01-plan-appliance-s5-wyse.md)).
 
 ## Workstreams
 
@@ -130,7 +130,7 @@ What was built, and (in italics) what the original plan had that wasn't:
 - **Retire the preview tools:** `image/tools/` and the lab's hand staging go once their replacements are tested. The lab keeps only what QEMU needs. **Done 7 October 2026:** `image/tools/` is gone; the lab seeds with `relish cluster create --bare-metal` (`image/lab/seed-lab.sh`), and `fleet-measure.sh`, which S5 still needs, moved to `image/lab/`.
 - **The quickstart guest moves to Ubuntu 26.04**, sharing the appliance's package list (approved 27 Sep).
   - Done on 7 October: the guest is pinned to the 26.04 cloud images of 20260927, chrony is disabled as timesyncd was, the build grows the full root filesystem and names the NIC `eth0` before first boot (otherwise each new VM waited 2 minutes in `systemd-networkd-wait-online`), `build.rs` pins eBPF to `-mcpu=v1` (kernel 7.0 refused clang 21's default v3 code), and `scripts/release/test_guest_images.py` fails if the guest's list and the appliance's node packages drift (the guest adds Buildah). mkosi can't read the JSON, so the test holds the two lists together instead of one file generating the other.
-- **S5 and S6 last:** three Wyse 3040s from power-on to a cluster with the real commands, on a lab build of the train, measured as in the [S5 runbook](2026-10-01-plan-appliance-s5-wyse.md); then the go/no-go record against the [7 October thresholds](2026-10-02-plan-appliance-wyse-lab.md#decisions-7-october-2026). It gates the v0.3.0 tag, which follows the 0.2.0 release.
+- **S5 and S6 last:** three Wyse 3040s from power-on to a cluster with the real commands, on a lab build of the train, measured as in the [S5 runbook](../2026-10-01-plan-appliance-s5-wyse.md); then the go/no-go record against the [7 October thresholds](../2026-10-02-plan-appliance-wyse-lab.md#decisions-7-october-2026). It gates the v0.3.0 tag, which follows the 0.2.0 release.
 
 ## Order
 
@@ -143,3 +143,7 @@ W1 → W2 → W3 → W4 → W5 → W6 → W7, then S5. W2 and W3 together are th
 - Automatic OS updates in a maintenance window.
 - Static network configuration beyond what the seed or claim carries.
 - Debian 13 as a second base.
+
+## How it ended
+
+W1 to W6 shipped in 0.3.0, promoted on 20 November 2026 as `v0.3.0` ([closure](../../qualification/2026-11-20-v0.3.0-release-closure.md), [release log](../../release-log.md#030-bare-metal-in-an-hour)). The release gate doesn't cover the appliance; CI netboots, claims, seeds and updates QEMU appliances on every image change instead. W7's exit test, three Wyse 3040s from power-on to a cluster ([#407](https://github.com/reliaburger/reliaburger/issues/407)), ran on candidate 4's artefacts in parallel with the release: the maintainer chose not to hold the tag for it, and anything it finds goes into 0.3.1. Its runbook is the [Wyse lab checklist](../2026-11-06-wyse-lab-checklist.md), and #404, #405 and #407 stay open until its record is in.

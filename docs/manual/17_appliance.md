@@ -18,8 +18,8 @@ Four commands do it all:
 CI runs them against QEMU VMs on every change to the image. On x86_64 it
 runs the lot: netboot installs, claimed and seeded clusters, an OS update
 and a broken update falling back. On aarch64 it runs the boot test only. The hardware it's built for is the Dell Wyse 3040,
-netbooted from a Mac, and the release isn't tagged until three of them go
-from power-on to a working cluster. Other firmware may still have surprises;
+netbooted from a Mac, and 0.3.0's exit test takes three of them from
+power-on to a working cluster. Other firmware may still have surprises;
 "What's missing" lists the ones we know of.
 
 ## What you need
@@ -133,7 +133,9 @@ Before it serves anything, it checks the signature on each architecture's
 `SHA256SUMS` and the SHA-256 of every file it lists, and refuses to start if
 any of them is wrong. Then it prints what it serves and logs every boot
 request: each machine's MAC address, its firmware, and what it was told to
-boot. It stops after an hour (`--for 3h` to change that) or at Ctrl-C.
+boot. Every line it logs while serving starts with the local time, to the
+second, and so does the line that says it started serving, so you can time
+each machine's stages from the log alone. It stops after an hour (`--for 3h` to change that) or at Ctrl-C.
 
 It doesn't touch your router's DHCP. When a machine asks the network where to
 boot from, your router still hands out the address, and relish answers only
@@ -341,7 +343,7 @@ disk on its own. Before it writes anything, it reports what's on the disk to
 `relish netboot` and waits. The netboot terminal asks you:
 
 ```
-relish netboot: 6c:4b:90:12:34:56: /dev/mmcblk0, 7.8 GB, gpt, 4 partitions: vfat "EFI", ext4 "ThinOS", (no filesystem), swap — wipe? [y/N]
+21:04:17 relish netboot: 6c:4b:90:12:34:56: /dev/mmcblk0, 7.8 GB, gpt, 4 partitions: vfat "EFI", ext4 "ThinOS", (no filesystem), swap — wipe? [y/N]
 ```
 
 Type `y` and Enter to wipe it and install. Anything else, or no answer within
@@ -368,7 +370,7 @@ ask, so it wipes only the disks of `--wipe` machines and leaves every other
 used disk alone. Every decision goes into its log:
 
 ```
-http: 6c:4b:90:12:34:56: disk /dev/mmcblk0, 7.8 GB, gpt, 4 partitions: …: wiping it and installing (--wipe lists it)
+21:04:17 http: 6c:4b:90:12:34:56: disk /dev/mmcblk0, 7.8 GB, gpt, 4 partitions: …: wiping it and installing (--wipe lists it)
 ```
 
 If several machines report at once, the questions come one at a time.
@@ -546,7 +548,18 @@ terminal and without `--yes`, relish refuses before it makes anything. Every oth
 machine's seed holds only a join token: single-use, bound to that machine's
 name, and good for an hour (`--ttl` to change). Each machine fetches its
 certificate and the master key from the cluster itself when it joins. relish
-now points at node 1, with an admin token. Then:
+now points at node 1, with an admin token, and waits up to three minutes for
+every machine it claimed to start, printing each as it comes up:
+
+```
+waiting for home-1, home-2, home-3 to start (up to 180 s)
+  home-1: up
+  home-2: up
+  home-3: up
+```
+
+A machine that's still starting after that is named, with `relish nodes` to
+check on it; the claim itself succeeded. Then:
 
 ```sh
 relish nodes
@@ -556,6 +569,20 @@ relish wtf
 
 All of them alive, all three in the council, and nothing to fix. Each
 machine's monitor shows its name, address and whether bun is running.
+
+relish keeps one current cluster, in `~/.reliaburger/context.json`. The
+claim makes the new cluster that one, unless another cluster's context is
+already there and still works: then it keeps that one and prints the three
+`export` lines that reach the new cluster instead. A context whose cluster
+directory you've since deleted can't work, because its CA certificate went
+with the directory, so the claim replaces it and says so:
+
+```
+relish now talks to this cluster (node 1, https://192.168.1.51:9117).
+It replaced the context for bare-metal/lab, which no longer worked: /Users/you/lab/root-ca.crt is gone.
+```
+
+`relish cluster create --bare-metal` and `relish setup` do the same.
 
 The claim uses each machine's current address as its node address, so
 reserve those addresses for their MACs in your router first. mDNS doesn't

@@ -158,3 +158,23 @@ pub fn partial_warnings(warnings: &[String]) -> Vec<Line<'static>> {
         })
         .collect()
 }
+
+/// The `/` search's line, `filter: <text> (N of M <noun>)`, or `None` with
+/// no search. While it's being typed a block marks the cursor.
+pub fn filter_status(
+    app: &TuiApp,
+    shown: usize,
+    total: usize,
+    noun: &str,
+) -> Option<Line<'static>> {
+    let filter = app.filter.as_deref()?;
+    let (cursor, keys) = if app.filter_editing {
+        ("█", "Enter keeps it, Esc clears it")
+    } else {
+        ("", "Esc clears it")
+    };
+    Some(Line::styled(
+        format!("filter: {filter}{cursor} ({shown} of {total} {noun}) · {keys}"),
+        Style::default().fg(theme::ACCENT),
+    ))
+}

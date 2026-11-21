@@ -508,6 +508,26 @@ pub enum Outcome {
     TimedOut,
 }
 
+impl Outcome {
+    /// The log line for sending `name` to `peer`, or `None` for a size
+    /// probe, which UEFI firmware makes before every download. The client's
+    /// error text is escaped, as a disk report's labels are, so it prints
+    /// as one line of plain text.
+    pub fn describe(&self, peer: SocketAddr, name: &str) -> Option<String> {
+        match self {
+            Outcome::Sent { bytes, block_size } => Some(format!(
+                "tftp: {peer}: {name}, {bytes} bytes in {block_size}-byte blocks"
+            )),
+            Outcome::Probed => None,
+            Outcome::Aborted { message } => Some(format!(
+                "tftp: {peer}: {name}: the client stopped ({})",
+                message.escape_debug()
+            )),
+            Outcome::TimedOut => Some(format!("tftp: {peer}: {name}: no acknowledgement, gave up")),
+        }
+    }
+}
+
 /// Serve TFTP read requests on `socket` until it fails, starting one task
 /// per transfer. Each finished transfer goes to `log` with the client's
 /// address and the file name.
@@ -623,6 +643,21 @@ mod tests {
             .iter()
             .map(|(n, v)| (n.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn a_clients_error_text_reaches_the_log_escaped() {
+        let peer: SocketAddr = "192.168.1.50:1024".parse().unwrap();
+        let outcome = Outcome::Aborted {
+            message: "disk full\x1b[2J\x1b]0;title\x07".to_string(),
+        };
+        let line = outcome.describe(peer, "boot.ipxe").unwrap();
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+        assert_eq!(
+            line,
+            r"tftp: 192.168.1.50:1024: boot.ipxe: the client stopped (disk full\u{1b}[2J\u{1b}]0;title\u{7})"
+        );
+        assert_eq!(Outcome::Probed.describe(peer, "boot.ipxe"), None);
     }
 
     #[test]

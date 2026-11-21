@@ -446,6 +446,13 @@ struct WtfOptions {
     /// Seconds between `--watch` collections.
     #[arg(long, default_value_t = 30, requires = "watch", value_parser = clap::value_parser!(u64).range(1..))]
     interval: u64,
+    /// Print only the counts and what isn't OK, each with its next step.
+    #[arg(long, conflicts_with = "explain")]
+    short: bool,
+    /// Explain every check: what it found, what exactly it tests, and
+    /// where the manual covers it.
+    #[arg(long)]
+    explain: bool,
 }
 
 // `FaultAction::NodePressure`, boxed to keep the generated `Command` parser
@@ -4008,13 +4015,22 @@ async fn main() -> ExitCode {
                 app,
                 watch,
                 interval,
+                short,
+                explain,
             } = *options;
+            use reliaburger::relish::wtf_cmd::WtfView;
+            let view = match (short, explain) {
+                (true, _) => WtfView::Short,
+                (_, true) => WtfView::Explain,
+                _ => WtfView::Table,
+            };
             return finish_outcome(
                 reliaburger::relish::wtf_cmd::run(reliaburger::relish::wtf_cmd::WtfArgs {
                     app,
                     watch,
                     interval: std::time::Duration::from_secs(interval),
                     output: cli.output,
+                    view,
                 })
                 .await,
             );
@@ -5434,6 +5450,22 @@ mod tests {
         ));
         assert!(parse(&["relish", "wtf", "--interval", "5"]).is_err());
         assert!(parse(&["relish", "wtf", "--watch", "--interval", "0"]).is_err());
+    }
+
+    #[test]
+    fn parse_wtf_short_and_explain_but_not_both() {
+        let short = parse(&["relish", "wtf", "--short", "--watch", "--app", "api"]).unwrap();
+        assert!(matches!(
+            short.command,
+            Command::Wtf(ref options) if options.short && !options.explain && options.watch
+        ));
+        let explain = parse(&["relish", "wtf", "--explain"]).unwrap();
+        assert!(matches!(
+            explain.command,
+            Command::Wtf(ref options) if options.explain && !options.short
+        ));
+        let both = parse(&["relish", "wtf", "--short", "--explain"]);
+        assert!(both.is_err(), "--short and --explain must conflict");
     }
 
     #[test]

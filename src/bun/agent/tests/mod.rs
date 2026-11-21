@@ -7507,6 +7507,32 @@ async fn status_returns_all_instances() {
     agent_handle.await.unwrap();
 }
 
+// `relish tui` shows the image an app's instances run, so a running
+// instance's status names the image the node started it from (#2167).
+#[tokio::test]
+async fn running_instance_status_carries_its_image() {
+    let (mut agent, tx, shutdown) = test_agent();
+
+    let agent_handle = tokio::spawn(async move {
+        agent.run().await;
+    });
+
+    let events = send_deploy(&tx, basic_config()).await;
+    expect_complete(&events);
+
+    let (resp_tx, resp_rx) = oneshot::channel();
+    tx.send(AgentCommand::Status { response: resp_tx })
+        .await
+        .unwrap();
+    let statuses = resp_rx.await.unwrap();
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].state, "running");
+    assert_eq!(statuses[0].image.as_deref(), Some("myapp:v1"));
+
+    shutdown.cancel();
+    agent_handle.await.unwrap();
+}
+
 #[tokio::test]
 async fn stop_command_stops_instances() {
     let (mut agent, tx, shutdown) = test_agent();
@@ -14282,6 +14308,7 @@ fn runtime_unknown_is_serialised_only_when_set() {
         runtime_unknown: false,
         status_age_ms: None,
         age_seconds: None,
+        image: None,
         reason: None,
     };
     let plain = serde_json::to_value(&status).unwrap();

@@ -235,7 +235,7 @@ pub const FINDINGS: &[FindingKind] = &[
     FindingKind {
         id: "registry-redundancy",
         severities: WARNING,
-        meaning: "a node's registry isn't listening, peers can't reach it, or layers have fewer live copies than [images] redundancy asks for",
+        meaning: "a node's registry isn't listening, peers can't reach it, or, on a cluster of more than one node, layers have fewer live copies than [images] redundancy asks for",
         thresholds: &[],
     },
     FindingKind {

@@ -1,7 +1,7 @@
 //! Alert evaluation engine.
 //!
 //! Evaluates threshold-based alert rules against the MayoStore.
-//! State machine: Inactive → Pending → Firing. Five built-in rules
+//! State machine: Inactive → Pending → Firing. Four built-in rules
 //! cover the most common failure modes.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -152,7 +152,7 @@ impl AlertEvaluator {
         }
     }
 
-    /// Create an evaluator with the five default built-in rules.
+    /// Create an evaluator with the four default built-in rules.
     pub fn with_defaults() -> Self {
         Self::new(default_rules())
     }
@@ -305,7 +305,10 @@ fn status_for(
     }
 }
 
-/// The 5 default built-in alert rules.
+/// The 4 default built-in alert rules.
+///
+/// All four are node-level and fire on pressure, never on idleness: an
+/// idle node is spare capacity, not a fault (#2171).
 pub fn default_rules() -> Vec<AlertRule> {
     vec![
         AlertRule {
@@ -343,15 +346,6 @@ pub fn default_rules() -> Vec<AlertRule> {
             for_duration: Duration::from_secs(5 * 60),
             severity: AlertSeverity::Warning,
             description: "Disk usage above 80% for 5 minutes".to_string(),
-        },
-        AlertRule {
-            name: "cpu_idle".to_string(),
-            metric_name: "node_cpu_usage_percent".to_string(),
-            threshold: 5.0,
-            operator: AlertOperator::LessThan,
-            for_duration: Duration::from_secs(30 * 60),
-            severity: AlertSeverity::Warning,
-            description: "CPU below 5% for 30 minutes (possible zombie)".to_string(),
         },
     ]
 }
@@ -586,7 +580,41 @@ mod tests {
     #[test]
     fn default_rules_count() {
         let rules = default_rules();
-        assert_eq!(rules.len(), 5);
+        assert_eq!(rules.len(), 4);
+    }
+
+    /// An idle node is spare capacity, not a fault (#2171). With every
+    /// default rule's `for` window zeroed, a node reading near-zero CPU
+    /// and modest memory and disk must raise nothing, or `relish status`
+    /// and `relish wtf` would call a quiet cluster DEGRADED.
+    #[test]
+    fn idle_healthy_node_fires_no_default_rule() {
+        let rules = default_rules()
+            .into_iter()
+            .map(|rule| AlertRule {
+                for_duration: Duration::from_secs(0),
+                ..rule
+            })
+            .collect();
+        let mut eval = AlertEvaluator::new(rules);
+        let idle = make_values(&[
+            ("node_cpu_usage_percent", 0.5),
+            ("node_memory_usage_percent", 20.0),
+            ("node_disk_usage_percent", 30.0),
+        ]);
+        eval.evaluate(&idle);
+        let transitions = eval.evaluate(&idle);
+        assert!(transitions.is_empty(), "{transitions:?}");
+        assert!(
+            eval.firing_alerts().is_empty(),
+            "{:?}",
+            eval.firing_alerts()
+        );
+        assert!(
+            eval.all_statuses()
+                .iter()
+                .all(|s| s.state == AlertPhase::Inactive)
+        );
     }
 
     #[test]
@@ -600,7 +628,7 @@ mod tests {
     fn all_statuses_includes_every_rule() {
         let eval = AlertEvaluator::with_defaults();
         let statuses = eval.all_statuses();
-        assert_eq!(statuses.len(), 5);
+        assert_eq!(statuses.len(), 4);
         assert!(statuses.iter().all(|s| s.state == AlertPhase::Inactive));
     }
 

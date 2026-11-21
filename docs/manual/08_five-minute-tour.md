@@ -7,7 +7,7 @@ bad one back, scale one up, let an AI agent propose a change and undo it, set a 
 `relish manual tour`.
 
 It needs a Mac with Apple silicon, or Linux with QEMU and KVM, plus about 8 GiB
-of free memory and 15 GiB of disk. The one-line install fetches the signed 0.2.8 release.
+of free memory and 15 GiB of disk. The one-line install fetches the signed 0.3.0 release.
 
 ## Install and build the cluster
 
@@ -224,7 +224,7 @@ guardrails, leases between agents and setting up an agent client.
 ## Set a house rule
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/reliaburger/reliaburger/v0.2.8/examples/policies/platform.toml
+curl -fsSLO https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/examples/policies/platform.toml
 relish policy test -f platform.toml -f burger/burger.toml
 ```
 

@@ -974,6 +974,9 @@ pub struct BunAgent<G: Grill> {
     status_tx: watch::Sender<Arc<status_snapshot::StatusSnapshot>>,
     /// The health tick's runtime state reads, at most one sweep at a time.
     state_sweeps: tokio::task::JoinSet<state_sweep::StateSweep>,
+    /// Reads the last sweep was still waiting for at its deadline, for the
+    /// next sweep to collect instead of asking again (#2085).
+    unfinished_state_reads: state_sweep::UnfinishedReads,
     /// Restarts with a runtime step in flight, by instance.
     restarts: restarts::Restarts,
     /// Those steps' tasks.
@@ -1190,6 +1193,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             identity_signing_tasks: tokio::task::JoinSet::new(),
             status_tx: watch::Sender::new(Arc::new(status_snapshot::StatusSnapshot::unpublished())),
             state_sweeps: tokio::task::JoinSet::new(),
+            unfinished_state_reads: state_sweep::UnfinishedReads::new(),
             restarts: restarts::Restarts::new(),
             restart_steps: tokio::task::JoinSet::new(),
             follow_ups: tokio::task::JoinSet::new(),
@@ -1362,6 +1366,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             identity_signing_tasks: tokio::task::JoinSet::new(),
             status_tx: watch::Sender::new(Arc::new(status_snapshot::StatusSnapshot::unpublished())),
             state_sweeps: tokio::task::JoinSet::new(),
+            unfinished_state_reads: state_sweep::UnfinishedReads::new(),
             restarts: restarts::Restarts::new(),
             restart_steps: tokio::task::JoinSet::new(),
             follow_ups: tokio::task::JoinSet::new(),

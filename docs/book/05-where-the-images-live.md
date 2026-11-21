@@ -663,6 +663,17 @@ configured redundancy, current member count and the number of under-replicated c
 layers. Those are deliberately separate facts. Three live nodes make two copies *possible*;
 only the holder sets prove whether the catalogue has achieved it.
 
+`relish wtf` used to turn either fact into a `registry-redundancy` warning, and the Wyse
+lab's one-node dry run showed why that's wrong (#2147). One node can't hold a second copy
+of anything, so it reported `redundancy_possible=false` and twelve under-replicated layers,
+and `wtf` told the operator to "restore registry peer reachability and allow Pickle to heal",
+which no amount of waiting does. `relish status` read the warning and called the cluster
+DEGRADED. Now `check_registry` counts the nodes the cluster knows, dead ones included, and
+on exactly one it puts the registry under OK with the reason: `one node: Pickle keeps one
+copy of each layer; add a node for redundancy`. Counting the dead matters: a three-node
+cluster down to one live node *is* degraded, and still warns. A registry that isn't
+listening, or that peers can't reach, warns however many nodes there are.
+
 TLS comes for free from the same PKI: when the node has an mTLS identity, the registry serves with `build_api_server_config` — the very config the agent API listener uses — and peers address each other as `https://`. The scheme is threaded through one function (`pickle_peers_scheme`) so the server and every peer-URL derivation always agree.
 
 Two resource limits ride along. A storage **quota** caps the bytes each node's blob store holds (`[images] max_storage`, `0` meaning unlimited, the default). And upload **sessions now expire**: a chunked upload that goes quiet past its TTL is refused on its next chunk and swept, so an abandoned `docker push` can't leak a temp file forever. Both were review findings. A registry with no quota and no session expiry is a disk-exhaustion waiting to happen. (There used to be a per-repository quota too. Nothing could configure it, so 0.2.1 deleted it rather than keep a feature that existed only in this chapter.)
