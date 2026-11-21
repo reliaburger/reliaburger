@@ -71,24 +71,38 @@ pub(super) struct Signalled {
     response: oneshot::Sender<Result<FaultSummary, BunError>>,
 }
 
-/// Read each target's pids at once until `deadline`, keeping the pids of
-/// at most `count` targets (0: all). Reads that don't finish in time are
-/// left out, and so is a target with no process left.
+/// Read each target's pids for `signal` at once until `deadline`, keeping
+/// the pids of at most `signal.count()` targets (0: all). Reads that don't
+/// finish in time are left out, and so is a target with no process left.
+///
+/// A kill signals the process the runtime names as the instance's
+/// (`Grill::pid`). A pause or resume signals the workload's own processes
+/// (`Grill::workload_pids`): on runc `pid` is the `runc run` launcher, and
+/// freezing that left the container running (#2079).
 pub(super) async fn read_pids<G: Grill>(
     grill: &G,
     targets: &[SignalTarget],
-    count: u32,
+    signal: Signal,
     deadline: tokio::time::Instant,
 ) -> Vec<u32> {
     let reads = targets.iter().map(|target| async move {
         match target {
-            SignalTarget::Instance(id) => tokio::time::timeout_at(deadline, grill.pid(id))
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .flatten()
-                .into_iter()
-                .collect(),
+            SignalTarget::Instance(id) => match signal {
+                Signal::Kill { .. } => tokio::time::timeout_at(deadline, grill.pid(id))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .flatten()
+                    .into_iter()
+                    .collect(),
+                Signal::Pause | Signal::Resume => {
+                    tokio::time::timeout_at(deadline, grill.workload_pids(id))
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .unwrap_or_default()
+                }
+            },
             // BLOCKING-OK: cgroupfs, an in-memory kernel interface: no disk behind it
             SignalTarget::TaskGroup(cgroup) => task_group_pids(cgroup),
         }
@@ -102,6 +116,7 @@ pub(super) async fn read_pids<G: Grill>(
             .into_iter()
             .filter(|pids: &Vec<u32>| !pids.is_empty())
             .collect();
+    let count = signal.count();
     if count > 0 {
         per_target.truncate(count as usize);
     }
@@ -194,7 +209,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let service = rule.target_service.clone();
         self.follow_ups.spawn(async move {
             let deadline = tokio::time::Instant::now() + PID_READ_PATIENCE;
-            let pids = read_pids(&grill, &ids, signal.count(), deadline).await;
+            let pids = read_pids(&grill, &ids, signal, deadline).await;
             FollowUp::Signalled(Signalled {
                 rule_id,
                 result: send(signal, &pids, &service),

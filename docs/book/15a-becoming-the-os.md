@@ -455,7 +455,7 @@ Ten second-hand Dell Wyse 3040s arrived for the lab. Some had blank eMMCs. Some 
 So the decision moved to the person at the `relish netboot` terminal. Before it writes anything, the installer runs `ask-to-wipe`, which posts what `lsblk -P` sees on the disk to the URL `relish netboot` gave it on the command line (`reliaburger.ask=http://…/disk?mac=…&uuid=…`). It gets back a ticket, and polls `GET /disk/<ticket>` every two seconds. Meanwhile the operator sees:
 
 ```
-relish netboot: 6c:4b:90:12:34:56: /dev/mmcblk0, 7.8 GB, gpt, 4 partitions: vfat "EFI", ext4 "ThinOS", (no filesystem), swap — wipe? [y/N]
+21:04:17 relish netboot: 6c:4b:90:12:34:56: /dev/mmcblk0, 7.8 GB, gpt, 4 partitions: vfat "EFI", ext4 "ThinOS", (no filesystem), swap — wipe? [y/N]
 ```
 
 The whole policy is one pure function in `src/relish/netboot/wipe.rs`:
@@ -709,6 +709,21 @@ pub enum OsNodePhase {
 The leader runs a loop every five seconds, and the loop calls one pure function, `step`, which looks at the record, asks the nodes what they're doing through a trait, and returns the next record. Pure apart from the trait, it's tested like `next_step` earlier in this chapter: a table of situations and what should come out. One node at a time, workers first, council members only while the council can lose a voter and keep its majority, and the leader last.
 
 `Draining` is the new part. While a node is draining or updating, the scheduler's cache marks it not ready, exactly as Chapter 14's upgrade cordon does, so on its next pass the scheduler moves that node's replicas elsewhere. The leader waits until no movable replica is placed there, or five minutes, whichever comes first. Replicas of apps with a managed volume don't move: their data is on that disk, so they wait for the node, as they would through any reboot.
+
+An app that bind-mounts a host path (a volume with a `source`) waits too, though that took a bug report to get right (#2120). `undrained`, the function that tells the leader which nodes still hold movable replicas, filtered on `has_managed_volume` alone, so it counted a host-path app as movable, and the scheduler agreed: a cordoned node is not ready, and a replica on a node that isn't ready moves. The app was started on another node, away from whatever it kept under its host path. The fix has two halves that have to agree. `undrained` now asks `stays_through_os_rollout`, which is true for a managed volume or a host path, and the scheduler's `Liveness::keeps` keeps a host-path replica on any node the OS rollout is draining or updating, through the reboot as well, when the node drops out of gossip for a minute. Leave out the second half and the leader stops waiting for the app but the scheduler moves it anyway.
+
+Why only during an OS rollout, when a managed volume stays put through anything short of decommissioning? Because a managed volume is always on the node's disk, and a host path needn't be: it can be an NFS mount every node shares, and then moving the app when its node dies is exactly right. During an OS rollout we know the node is coming back in a minute or two, so waiting costs little whichever kind of path it is.
+
+The same review found the cordon was invisible (#2119). `relish nodes` and `relish status` read each node's `cordoned` flag from the leader's capacity view, and `capacity_from_reports` set it from the bun upgrade alone, so a node the OS rollout was draining looked like any other healthy node that, for no stated reason, got no new work. Now the leader asks both rollouts, and records which one holds the node:
+
+```rust
+pub enum Cordon {
+    Upgrade,
+    OsRollout,
+}
+```
+
+`NodeCapacity` keeps its `cordoned` flag and gains `cordoned_by: Option<Cordon>`, which `serde` writes as `"upgrade"`, `"os_rollout"` or `null`. `relish nodes` prints a line under its table (`node-2 is cordoned by the OS rollout: it takes no new work (relish os status)`), and `relish status` counts the two kinds apart: `1 cordoned by the OS rollout`. Why an enum and not a second `bool`, say `os_rollout_cordoned`? Two flags allow "cordoned by both", which never happens, and a third cordon would need a third flag; an `Option` of an enum holds exactly one owner or none, and a `match` on it has to handle every owner. `cordoned` stays for the scripts that already read it, always equal to `cordoned_by.is_some()`. The new fields carry `#[serde(default)]`, so a node that reads a leader's answer from before the change gets `None` and zeros rather than an error.
 
 Then the leader posts the directive, and the node takes over. It fetches the release's `SHA256SUMS` and signature from the GitHub release named after the version, checks the signature, streams each file to disk while hashing it, and hands the directory to sysupdate, exactly as `os-stage` did. Which key does it check against? The release keys compiled into bun, *and* the key in `/usr/lib/reliaburger/os-signing-key.pub.pem` in its own image. dm-verity guards that file like every other byte of `/usr`, so an image vouches for its successors. A published image carries the release key; a CI lab build carries its own throwaway key, which is what lets CI test a real update between two lab builds.
 
@@ -1018,6 +1033,33 @@ The real command hands `refresh_resent` a closure that borrows one client for ev
 
 `async move` moves what it uses into the future, and we want the node and seed path moved but the client only borrowed. Writing `let client = &client;` first makes the thing that gets moved a reference, which is cheap to copy. Without it, `move` would try to move the client itself into the first future, and the second call of the closure would find it gone. The tests pass closures that either succeed or fail with "connection refused". The time is a parameter too, so a test can ask what happens two hours later without waiting two hours.
 
+The Wyse lab's first real claim found the last gap (#2146). `claim` printed `relish now talks to this cluster` the moment node 1 had its seed, and the very next `relish nodes` failed with "connection refused": node 1 still had to unpack the seed and start bun. A few seconds later everything answered. On a 3040 that's a few seconds; on slower hardware, or for machines that still have to join through node 1, longer. So `claim` now waits before it returns, up to three minutes, asking the cluster's `/v1/cluster/nodes` once a second until every machine whose seed arrived is listed alive, and printing `home-1: up` as each one is. A machine that's still starting at the end isn't a failure: its seed arrived. `claim` names it, says `relish nodes` will list it once it's up, and exits 0. The wait asks the new cluster with a client built from the context `create` wrote, not the one relish adopted, so it works even when another cluster's context was kept. `wait_for_claimed_nodes` takes the "which nodes are alive?" question as a closure, like `deliver_seeds`, so a test answers "connection refused", then nothing, then one node, then both, on a paused clock (`#[tokio::test(start_paused = true)]`), and three minutes pass in no time.
+
+That same lab run found the context's other trap (#2162). The Mac already had a context from an earlier cluster, and that cluster's directory had since been deleted. `claim --create` saw another cluster's context in the way, kept it, and printed three `export` lines. The next `relish nodes` said:
+
+```
+error: API error (status 0): No such file or directory (os error 2)
+```
+
+Nothing in that line is true except the last part. No API answered, and the error names neither the context nor the file. relish keeps the token inside `context.json`, but only a path to the CA certificate, and the certificate lived in the deleted directory. Building the client failed reading it. `BunClient` doesn't fail at that point: it keeps the reason and returns it from the first request, so a command that never talks to the cluster isn't stopped by a broken one. That deferred reason went out as `RelishError::ApiError { status: 0, .. }`, the variant for "the agent answered with an error".
+
+There are two fixes. The first is an honest error. A client relish couldn't set up now fails with `RelishError::ClientConfig`, which prints its reason as it is, and the reason for a missing CA is its own variant, `ContextFileMissing`, holding the context file, the cluster it was for and the missing certificate:
+
+```
+error: the relish context for bare-metal/lab can't be used: its CA certificate /Users/you/lab/root-ca.crt is gone. If that cluster is gone too, remove /Users/you/.reliaburger/context.json so relish goes back to the local default, or create a new cluster with `relish setup` or `relish machines claim --create`, which replaces it. ...
+```
+
+`relish agent` maps both to `no_endpoint`, so an agent driving relish sees a configuration problem rather than an API error with no status.
+
+The second fix stops keeping a context nothing can use. `LocalContext::missing_file` returns the CA path when it no longer exists, and `LocalContext::save` now returns `Result<Option<ReplacedContext>, RelishError>`: it still refuses to overwrite another cluster's working context, but it replaces one whose certificate is gone and hands back what it replaced. `adopt`, which `cluster create --bare-metal` and `machines claim --create` both call, checks first, so a working context is kept as before and a dead one is replaced, and the report says so:
+
+```
+relish now talks to this cluster (node 1, https://192.168.1.51:9117).
+It replaced the context for bare-metal/lab, which no longer worked: /Users/you/lab/root-ca.crt is gone.
+```
+
+`relish setup` refused a dead context too ("another cluster owns the active context"), so it got the same check. Only a *missing* file counts. A certificate relish can't read for another reason, say a permissions slip, still marks a context someone may want back, so relish keeps it and says what it couldn't read. `adopt` became a thin wrapper around `adopt_at`, which takes the context's path, because the default path comes from `RELIABURGER_HOME` and changing the environment in a test races every other test in the process. The three tests for `adopt_at` cover no context, a working one (kept) and the lab's case, a context whose cluster directory is gone (replaced, with the line above). In `local_context.rs`, `a_context_whose_ca_is_gone_says_which_context_and_file_and_what_to_do` checks the new error names the cluster, the file and `relish machines claim --create`, and never says "status 0".
+
 ## A LAN on a laptop
 
 We had no KVM machine and no spare PCs, only CI and one Apple silicon Mac without root. Everything had to run virtualised until the last step.
@@ -1181,6 +1223,12 @@ Before the 0.3.0 gate, four reviewers read the train against `main`, and the net
 The TFTP sender waited for each acknowledgement with `tokio::time::timeout(negotiated.timeout, socket.recv(...))`, inside the loop. That reads as "wait up to two seconds for a packet", and it is, every time round. But a packet that isn't the one we want, an old ACK repeated by a client whose clock is out of step with ours, ends the wait and starts a fresh one, so a lost DATA block could wait for ever while stale ACKs kept arriving. The fix is to wait for a *moment*, not a *duration*: `resend_at` is set when a packet goes out, and the loop waits with `tokio::time::timeout_at(resend_at, ...)`. Stray packets come and go, and the deadline stays put. The test sends a stale ACK every 100 ms and expects the lost block again within about one timeout; against the old loop it failed, as it should.
 
 The rest were one-liners with tests. A requested TFTP timeout over 30 s is declined (RFC 2349 lets a server accept the client's value or leave it out, never answer another), and at most 64 transfers run at once, after which a request is told the server is busy. A "y" typed for one machine's wipe question could land just after the next one appeared, so for a second after a question is shown, an answer is ignored and the operator asked again. `relish netboot` exited 0 when one of its four servers died, because the `select!` arm just returned a message; it now returns an error, so a script notices. And 32-bit x86 UEFI firmware, option 93 value 6, was being sent our 64-bit iPXE, which it can't run; it's now refused with a reason, like BIOS.
+
+### What time is it here?
+
+The three-Wyse lab measures intervals: from the moment `relish netboot` starts serving, how long until each machine says `ack on 4011`, finishes its download, reports `installed`. The log printed none of those times, so someone sat beside it writing them down. Now every line starts with the local time, `21:04:17 dhcp: …`. All of them pass through the one `Log` closure, so the fix is a pure function, `stamped(time, line)`, that a unit test can call with a fixed time, plus one call to read the clock.
+
+Reading the clock turned out to be the interesting part. The `time` crate was already a dependency, but it won't tell you the local offset from UTC in a process that has more than one thread. Working that out on Unix means calling C's `localtime_r`, which reads the `TZ` environment variable, and another thread changing the environment at the same moment is undefined behaviour. A library can't rule that out, so `time` refuses, and under tokio's multi-threaded runtime it would refuse every time. `jiff`, which `k8s-openapi` already pulled into our build, reads the time zone file itself and never touches the C library's state, so `jiff::Zoned::now().time()` is safe from any thread. It costs a direct dependency on a crate we were already compiling, with three of its features switched on.
 
 ### A binary that can't write next to itself
 

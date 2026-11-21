@@ -545,6 +545,17 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
         })
         .await
     }
+    async fn workload_pids(&self, id: &InstanceId) -> Result<Vec<u32>, GrillError> {
+        self.operation(id, |this, id| async move {
+            let route = this.selected(&id).await?;
+            if route.runtime == RuntimeKind::Process {
+                this.host.workload_pids(&id).await
+            } else {
+                this.container.workload_pids(&id).await
+            }
+        })
+        .await
+    }
     async fn retain_network_reference(
         &self,
         id: &InstanceId,

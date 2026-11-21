@@ -19,14 +19,14 @@ expression: "render_to_string(&app, 120, 40)"
 │Esc             global        back                                                                                    │
 │Enter           lists         open selection                                                                          │
 │↑/↓             lists         move selection                                                                          │
-│/               lists         filter                                                                                  │
-│Tab             app detail    next tab                                                                                │
-│Shift-Tab       app detail    previous tab                                                                            │
+│/               lists         filter; Esc clears it                                                                   │
+│/               logs, metrics search; Esc clears it                                                                   │
+│→ or Tab        app detail    next tab                                                                                │
+│← or Shift-Tab  app detail    previous tab                                                                            │
+│↑/↓             instances     select an instance                                                                      │
+│k or Ctrl-K     instances     kill the selected instance (asks first)                                                 │
 │f               logs          toggle follow                                                                           │
 │PgUp/PgDn       streams       scroll                                                                                  │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │

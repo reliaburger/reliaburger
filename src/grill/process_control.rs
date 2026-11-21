@@ -19,6 +19,15 @@ use super::process_owner::{self, OwnerPhase, OwnerRecord, ProcessLaunch};
 use crate::durable::validate_directory;
 use crate::file_lock::{FileLock, FileLockError};
 
+/// How long Bun waits on an owner's exec socket for the answer.
+///
+/// A backstop: the agent's exec deadline (at most
+/// `bun::agent::MAX_EXEC_TIMEOUT`) wraps this wait in the same future and
+/// fires first with an error naming the app. Below the owner's own
+/// `OWNER_EXEC_DEADLINE`, so this side gives up before the owner closes the
+/// socket on it (#2128).
+pub(crate) const OWNER_SOCKET_EXEC_TIMEOUT: Duration = Duration::from_secs(310);
+
 mod prune;
 
 /// How many times `prepare` starts again after a concurrent forget removed
@@ -675,7 +684,7 @@ impl ProcessControl {
         }
         // Keep this socket in the caller's async future. Cancellation or Bun
         // death closes it, allowing the independent owner to retire execution.
-        tokio::time::timeout(Duration::from_secs(300), async {
+        tokio::time::timeout(OWNER_SOCKET_EXEC_TIMEOUT, async {
             let socket = deliver_exec_request(&path, &request).await?;
             let mut bytes = Vec::new();
             tokio::io::BufReader::new(socket)

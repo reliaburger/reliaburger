@@ -661,24 +661,58 @@ impl RuncGrill {
     ///
     /// A paused process holds its stop signal pending: a workload that traps
     /// it would sit out its grace and die by SIGKILL. Smoker's pause freezes
-    /// the pid the runtime reports, which is the `runc run` launcher, and a
-    /// frozen launcher can't see its container exit; a pause can also freeze
-    /// the container's own init. So both get SIGCONT. A running process
-    /// ignores it, and a failure only leaves the stop to its grace and force
-    /// kill, so neither result is an error.
+    /// every process in the container (#2079), and a shell init runs its
+    /// trap only once its frozen child returns, so every one of them gets
+    /// SIGCONT. A running process ignores it, and a failure only leaves the
+    /// stop to its grace and force kill, so neither result is an error.
     async fn owned_resume(&self, id: &InstanceId, context: &ClaimedCommandExecutor) {
-        if let Ok(Some(CommandState::Running { pid })) =
-            context.role_state(RuntimeRole::Launcher).await
-            && let Ok(pid) = i32::try_from(pid)
-        {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid),
-                nix::sys::signal::Signal::SIGCONT,
-            );
+        let processes = self
+            .owned_container_processes(id, context)
+            .await
+            .unwrap_or_default();
+        for pid in processes {
+            if let Ok(pid) = i32::try_from(pid) {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGCONT,
+                );
+            }
         }
-        let _ = self
-            .owned_runc_command(context, &["kill", &id.0, "SIGCONT"])
-            .await;
+    }
+
+    /// The processes Smoker's pause freezes: the container's, never the
+    /// `runc run` launcher `owned_pid` reports (#2079). Empty when no
+    /// container is running.
+    pub(super) async fn owned_workload_pids(
+        &self,
+        instance: &InstanceId,
+    ) -> Result<Vec<u32>, GrillError> {
+        let read = self.owned_operation(instance, |runtime, id, context| async move {
+            runtime.owned_container_processes(&id, &context).await
+        });
+        match read.await {
+            Err(GrillError::NotFound { .. }) => Ok(Vec::new()),
+            result => result,
+        }
+    }
+
+    /// The processes in `id`'s running container, as [`container_processes`]
+    /// names them from its init.
+    async fn owned_container_processes(
+        &self,
+        id: &InstanceId,
+        context: &ClaimedCommandExecutor,
+    ) -> io::Result<Vec<u32>> {
+        let Some(CommandState::Running { pid: launcher }) =
+            context.role_state(RuntimeRole::Launcher).await?
+        else {
+            return Ok(Vec::new());
+        };
+        let Some(init) = self.owned_running_pid(id, context).await? else {
+            return Ok(Vec::new());
+        };
+        // BLOCKING-OK: procfs and cgroupfs, in-memory kernel interfaces: no disk behind them
+        Ok(container_processes(init, launcher))
     }
 
     /// Report positive owner evidence and complete any observed retirement.
@@ -1334,5 +1368,57 @@ impl RuncGrill {
             }
         })
         .await;
+    }
+}
+
+/// The processes in the container whose init is `init`: every member of
+/// init's cgroup v2 group. When that group isn't the container's own, init
+/// alone: the root group, or one that also holds the `runc run` launcher or
+/// Bun itself, as when rootless runc leaves the workload in its caller's
+/// group. Freezing those would freeze Bun's side of the container too.
+fn container_processes(init: u32, launcher: u32) -> Vec<u32> {
+    let members = std::fs::read_to_string(format!("/proc/{init}/cgroup"))
+        .ok()
+        .and_then(|membership| {
+            membership
+                .lines()
+                .find_map(|line| line.strip_prefix("0::"))
+                .map(str::to_owned)
+        })
+        .filter(|group| group != "/")
+        .and_then(|group| {
+            let procs = Path::new("/sys/fs/cgroup")
+                .join(group.trim_start_matches('/'))
+                .join("cgroup.procs");
+            std::fs::read_to_string(procs).ok()
+        })
+        .map(|listed| {
+            listed
+                .lines()
+                .filter_map(|line| line.trim().parse::<u32>().ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let own = members.contains(&init)
+        && !members.contains(&launcher)
+        && !members.contains(&std::process::id());
+    if own { members } else { vec![init] }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::container_processes;
+
+    #[test]
+    fn a_group_that_holds_the_launcher_names_only_the_init() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        // The child shares this test's group, which holds the test itself.
+        let named = container_processes(child.id(), std::process::id());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(named, vec![child.id()]);
     }
 }

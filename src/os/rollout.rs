@@ -435,8 +435,9 @@ impl OsControl for HttpOsControl {
 }
 
 /// The nodes that still hold workloads the scheduler could move: any
-/// placement of an app without a managed volume. Volume apps stay with
-/// their data and wait for the node to come back.
+/// placement of an app that keeps no data on its node. Apps with a managed
+/// volume or a host-path mount stay with their data and wait for the node
+/// to come back (#2120); the scheduler keeps them there.
 pub fn undrained(desired: &crate::council::types::DesiredState) -> BTreeSet<String> {
     desired
         .scheduling
@@ -445,7 +446,7 @@ pub fn undrained(desired: &crate::council::types::DesiredState) -> BTreeSet<Stri
             desired
                 .apps
                 .get(app)
-                .is_none_or(|spec| !crate::cluster::orchestrate::has_managed_volume(spec))
+                .is_none_or(|spec| !crate::cluster::orchestrate::stays_through_os_rollout(spec))
         })
         .flat_map(|(_, placements)| placements.iter().map(|p| p.node_id.0.clone()))
         .collect()
@@ -844,6 +845,46 @@ mod tests {
         rollout = step(rollout, &fleet, &context(0)).await;
         assert_eq!(rollout.phase, OsRolloutPhase::Completed);
         assert!(rollout.phase.is_terminal());
+    }
+
+    /// #2120: an app that keeps its data in a host path waits for its node
+    /// like a managed-volume app does. Only the stateless one has anywhere
+    /// to go, so only its node counts as undrained.
+    #[test]
+    fn apps_that_keep_data_on_their_node_dont_hold_up_the_drain() {
+        use crate::config::types::VolumeSpec;
+        use crate::meat::types::{AppId, NodeId, Placement};
+
+        let mut desired = crate::council::types::DesiredState::default();
+        let volume = |source: Option<&str>| VolumeSpec {
+            path: "/data".into(),
+            source: source.map(Into::into),
+            size: None,
+        };
+        let apps = [
+            ("db", "w-volume", Some(volume(None))),
+            ("cache", "w-host", Some(volume(Some("/srv/cache")))),
+            ("web", "w-stateless", None),
+        ];
+        for (name, node, volume) in apps {
+            let app = AppId::new(name, "default");
+            let mut spec: crate::config::AppSpec = toml::from_str(r#"image = "x:1""#).unwrap();
+            spec.volumes.extend(volume);
+            desired.apps.insert(app.clone(), spec);
+            desired.scheduling.insert(
+                app,
+                vec![Placement {
+                    node_id: NodeId::new(node),
+                    resources: Default::default(),
+                    ordinal: 0,
+                }],
+            );
+        }
+
+        assert_eq!(
+            undrained(&desired),
+            BTreeSet::from(["w-stateless".to_string()])
+        );
     }
 
     #[test]

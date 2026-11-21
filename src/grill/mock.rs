@@ -49,6 +49,8 @@ pub struct MockGrill {
     shares_network: Arc<AtomicBool>,
     runtime_kind: Arc<Mutex<crate::grill::records::RuntimeKind>>,
     pid: Arc<Mutex<Option<u32>>>,
+    /// The processes `workload_pids` names, when they differ from `pid`.
+    workload_pids: Arc<Mutex<Option<Vec<u32>>>>,
     cgroup_paths: Arc<Mutex<HashMap<InstanceId, std::path::PathBuf>>>,
     rootless_network: Arc<Mutex<Option<crate::grill::records::RootlessNetworkRecord>>>,
     exec_outputs: Arc<Mutex<std::collections::VecDeque<String>>>,
@@ -152,6 +154,7 @@ impl Default for MockGrill {
             shares_network: Arc::new(AtomicBool::new(true)),
             runtime_kind: Arc::new(Mutex::new(crate::grill::records::RuntimeKind::Process)),
             pid: Arc::default(),
+            workload_pids: Arc::default(),
             cgroup_paths: Arc::default(),
             rootless_network: Arc::default(),
             exec_outputs: Arc::default(),
@@ -448,6 +451,13 @@ impl MockGrill {
     #[allow(dead_code)]
     pub fn set_pid(&self, pid: u32) {
         *self.pid.lock().unwrap() = Some(pid);
+    }
+
+    /// Make `workload_pids()` name `pids` instead of `pid()`'s process, as
+    /// runc names its container's processes and not its launcher (#2079).
+    #[allow(dead_code)]
+    pub fn set_workload_pids(&self, pids: Vec<u32>) {
+        *self.workload_pids.lock().unwrap() = Some(pids);
     }
 
     /// Make adoption records include rootless userspace-network ownership.
@@ -1047,6 +1057,14 @@ impl super::Grill for MockGrill {
             });
         }
         Ok(*self.pid.lock().unwrap())
+    }
+
+    async fn workload_pids(&self, instance: &InstanceId) -> Result<Vec<u32>, GrillError> {
+        let named = self.workload_pids.lock().unwrap().clone();
+        match named {
+            Some(pids) => Ok(pids),
+            None => Ok(self.pid(instance).await?.into_iter().collect()),
+        }
     }
 
     async fn exec(

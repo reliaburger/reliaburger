@@ -108,6 +108,7 @@ fn cluster_instance_status() {
             runtime_unknown: false,
             status_age_ms: Some(120),
             age_seconds: None,
+            image: None,
             reason: None,
         },
     }];

@@ -4,7 +4,7 @@ expression: "render(&data, false)"
 ---
 cluster: HEALTHY, no problems (node-1 answered at 14:02:11 UTC)
 
-nodes      3 alive, 0 suspect, 0 dead, 1 cordoned
+nodes      3 alive, 0 suspect, 0 dead, 1 cordoned by the bun upgrade
 council    leader node-1 (term 41), 3/3 voters, quorum ok, 0 lagging
 gossip     3 members, last change 4 m ago, 18,442 updates received
 versions   bun 0.2.8 on 2 nodes, 0.2.7 on 1: upgrade in progress  relish upgrade status

@@ -190,7 +190,9 @@ rollback to a version some node doesn't hold, is refused before anything is
 recorded.
 
 **Diagnostics built for incidents.** `relish wtf` correlates cluster health into
-one screen of problems and next steps. `relish path` walks the network path
+a table of checks with what's wrong; `--short` prints only the problems and
+their next steps, and `--explain` says exactly what each check tests and where
+the manual covers it. `relish path` walks the network path
 between two apps and labels each step observed, inferred or unavailable.
 `relish test` runs a live-cluster test catalogue, and `relish bench` measures
 the data plane.
@@ -275,7 +277,7 @@ and its trade-offs; the [design docs](design/) cover each subsystem.
   ([#1412](https://github.com/reliaburger/reliaburger/issues/1412)), and gossip
   at 1,000 not settling within six minutes
   ([#1413](https://github.com/reliaburger/reliaburger/issues/1413)).
-- **Alerts are five built-in node rules.** CPU, memory and disk thresholds,
+- **Alerts are four built-in node rules.** CPU, memory and disk thresholds,
   delivered by webhook; you can't define your own rules yet
   ([manual](manual/04_observability.md#alerts)).
 - **One Bun per writable image store.** Registry startup claims exclusive
@@ -1158,9 +1160,11 @@ TUI keys:
 |-----|--------|
 | `a`, `n`, `j`, `e`, `l`, `r` | Open apps, nodes, jobs, events, logs or routes |
 | `s`, `?`, `:` | Search, help or command palette |
-| Arrow keys, Enter | Select and open a row |
-| Tab, Shift-Tab | Cycle app-detail tabs |
-| `/` | Filter the current list |
+| ↑/↓, Enter | Select and open a row |
+| ←/→, Tab, Shift-Tab | Cycle app-detail tabs |
+| `/` | Filter the current list; search the logs or the Logs and Metrics tabs, matches in red and bold |
+| Escape (with a filter or search) | Clear it |
+| `k`, Ctrl-K | Kill the selected instance in the Instances tab, after a `[y/N]` prompt; it's an audited Smoker kill fault |
 | `f` | Toggle log following |
 | Escape, `q` | Go back; quit from the dashboard |
 
@@ -1692,7 +1696,7 @@ The bun agent exposes a local HTTP API on port 9117:
 | `POST` | `/v1/stop/{app}/{namespace}` | Stop an app. In a cluster it answers `202 Accepted` with `{"status":"stopping"}` once the council records the stop; poll `/v1/status` for the instances to go. A standalone node answers `200` with `stopped` after the local stop completes |
 | `POST` | `/v1/delete/{app}/{namespace}` | Remove an app. In a cluster it answers `202 Accepted` with `{"status":"deleting"}`; cleanup on the workers follows asynchronously |
 | `GET` | `/v1/logs/{app}/{namespace}` | Captured stdout/stderr (`?tail=N&follow=true`) |
-| `POST` | `/v1/exec/{app}/{namespace}` | Execute a command (JSON body: `{"command":["..."]}`) |
+| `POST` | `/v1/exec/{app}/{namespace}` | Execute a command (JSON body: `{"command":["..."]}`, optional `"timeout_seconds"`, at most 300) |
 | `GET` | `/v1/cluster/nodes` | List cluster nodes (gossip membership, dead members included with state `dead`) |
 | `GET` | `/v1/cluster/summary` | The whole cluster at a glance: counts per section (nodes, council, gossip, versions, capacity, usage, apps, instances, jobs, logs, faults, alerts, certs, GitOps, agents: leases held and proposals waiting), each marked `complete`, `partial` or `missing` with the nodes that answered. A scoped token sees its own apps and jobs; the cluster-wide sections come back `missing` |
 | `GET` | `/v1/cluster/capacity` | Requested CPU, memory and GPUs against schedulable capacity per node, from the leader's state reports; unscoped tokens only |

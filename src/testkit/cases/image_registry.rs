@@ -92,13 +92,11 @@ async fn deploy_from_cluster_registry(ctx: TestContext) -> Result<(), String> {
     let image = crate::grill::image::ImageReference::parse(PINNED_TEST_WORKLOAD_IMAGE)
         .map_err(|error| error.to_string())?;
     let digest = ctx
-        .deadline
-        .run(
+        .step(
             "stage pinned runnable image",
             oci::stage_upstream_image(&client, &base, &repo, lease, &upstream, &image),
         )
-        .await
-        .map_err(|error| error.to_string())??;
+        .await??;
     let app = "registry-web";
     let spec = ctx
         .container_http_spec(app, 1)

@@ -1375,7 +1375,7 @@ fn security_headers() -> HeaderMap {
 
 ### 8.6 Secret Handling
 
-Brioche never displays plaintext secret values. Environment variables that originate from `ENC[AGE:...]` fields are transmitted to the browser as `[encrypted]`. The API endpoint `GET /v1/apps/:name/env` returns `EnvValue::Encrypted` for these fields; the plaintext is never included in the API response. This is enforced at the API layer, not just the UI layer, so even a compromised browser or a direct API call cannot retrieve secret values through Brioche.
+Brioche never displays plaintext secret values. Environment variables that originate from `ENC[AGE:...]` fields are transmitted to the browser as `[encrypted]`. The dashboard's environment endpoint, `GET /ui/app/{app}/{namespace}/env`, runs every value through `safe_env` (`src/brioche/types.rs`), which replaces an `EnvValue::Encrypted` with `[encrypted]`, so the plaintext is never in the response. This is enforced at the API layer, not just the UI layer, so even a compromised browser or a direct API call cannot retrieve secret values through Brioche.
 
 ### 8.7 Management Perimeter
 

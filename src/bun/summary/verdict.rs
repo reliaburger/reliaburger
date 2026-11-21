@@ -298,9 +298,17 @@ fn nodes_line(nodes: &crate::bun::summary::NodesSection) -> Line {
         "{} alive, {} suspect, {} dead",
         nodes.alive, nodes.suspect, nodes.dead
     );
+    // A summary that doesn't say whose cordon it is (one from a leader that
+    // predates #2119) still shows the count rather than dropping it.
+    let unattributed = nodes
+        .cordoned
+        .saturating_sub(nodes.cordoned_by_upgrade)
+        .saturating_sub(nodes.cordoned_by_os_rollout);
     for (count, what) in [
         (nodes.left, "left"),
-        (nodes.cordoned, "cordoned"),
+        (nodes.cordoned_by_upgrade, "cordoned by the bun upgrade"),
+        (nodes.cordoned_by_os_rollout, "cordoned by the OS rollout"),
+        (unattributed, "cordoned"),
         (nodes.disk_pressure, "under disk pressure"),
     ] {
         if count > 0 {

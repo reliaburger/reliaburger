@@ -166,6 +166,9 @@ pub enum AgentCommand {
         app_name: String,
         namespace: String,
         command: Vec<String>,
+        /// How long the command may run: the request's `timeout_seconds`,
+        /// capped by [`exec_timeout`].
+        timeout: std::time::Duration,
         response: oneshot::Sender<Result<crate::grill::ExecOutput, BunError>>,
     },
     /// Run the fixed Phase 15 connectivity probe from a local workload.
@@ -664,6 +667,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 app_name,
                 namespace,
                 command,
+                timeout,
                 response,
             } => {
                 // Resolve the target instance on the loop (cheap), then run the
@@ -675,17 +679,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     Ok(instance_id) => {
                         let grill = self.supervisor.grill().clone();
                         tokio::spawn(async move {
-                            let result = match tokio::time::timeout(
-                                EXEC_TIMEOUT,
+                            let result = exec_deadline::run_exec_within(
                                 grill.exec(&instance_id, &command),
+                                &app_name,
+                                &namespace,
+                                timeout,
                             )
-                            .await
-                            {
-                                Ok(inner) => inner.map_err(BunError::from),
-                                Err(_) => Err(BunError::ExecTimeout {
-                                    seconds: EXEC_TIMEOUT.as_secs(),
-                                }),
-                            };
+                            .await;
                             let _ = response.send(result);
                         });
                     }

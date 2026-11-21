@@ -1448,11 +1448,22 @@ fn check_registry(inputs: &WtfInputs, report: &mut WtfReport) {
             affected_resource: "registry".to_string(),
         });
     }
+    // One node can't hold a second copy of anything, so on a one-node
+    // cluster missing redundancy is how it's built, not a fault (#2147).
+    // Every node the cluster knows counts, dead ones included: a three-node
+    // cluster down to one is degraded.
+    let node_count = inputs
+        .cluster
+        .nodes
+        .value()
+        .map_or(registries.len(), Vec::len);
+    let lone = node_count == 1;
     for registry in registries.iter().filter(|registry| {
         !registry.ready
             || (registry.clustered && !registry.peer_reachable)
-            || (registry.clustered && !registry.redundancy_possible)
-            || registry.under_replicated_layers > 0
+            || (!lone
+                && ((registry.clustered && !registry.redundancy_possible)
+                    || registry.under_replicated_layers > 0))
     }) {
         found = true;
         report.warnings.push(WtfFinding {
@@ -1470,13 +1481,23 @@ fn check_registry(inputs: &WtfInputs, report: &mut WtfReport) {
             affected_resource: format!("node.{}", registry.node_id),
         });
     }
-    if !found {
-        report.ok.push(WtfOk {
-            id: "registry".to_string(),
-            description: "Pickle is reachable and its known layers meet the redundancy target"
-                .to_string(),
-        });
+    if found {
+        return;
     }
+    let one_copy = lone
+        && registries.iter().any(|registry| {
+            (registry.clustered && !registry.redundancy_possible)
+                || registry.under_replicated_layers > 0
+        });
+    let description = if one_copy {
+        "one node: Pickle keeps one copy of each layer; add a node for redundancy"
+    } else {
+        "Pickle is reachable and its known layers meet the redundancy target"
+    };
+    report.ok.push(WtfOk {
+        id: "registry".to_string(),
+        description: description.to_string(),
+    });
 }
 
 /// With more than one namespace, every node must keep them apart. A node
@@ -1951,6 +1972,44 @@ pub(super) mod tests {
                 alerts: available(Vec::new()),
                 cpu_throttling: available(Vec::new()),
                 recent_logs: available(Vec::new()),
+            },
+        }
+    }
+
+    /// Every source unreadable, so every UNKNOWN row `wtf` can give shows.
+    pub(in crate::relish::wtf) fn unknown_inputs() -> WtfInputs {
+        fn gone<T>() -> Evidence<T> {
+            Evidence::Unavailable {
+                reason: "unreadable".to_string(),
+            }
+        }
+        WtfInputs {
+            cluster_name: "test".to_string(),
+            collected_at: NOW,
+            app: None,
+            cluster: ClusterEvidence {
+                nodes: gone(),
+                builds: gone(),
+                council: gone(),
+                faults: gone(),
+                disks: gone(),
+                export_holds: gone(),
+                certificates: gone(),
+                registry: gone(),
+                tokens: gone(),
+                isolation: gone(),
+                gitops: gone(),
+                policies: gone(),
+                backups: gone(),
+            },
+            applications: ApplicationEvidence {
+                restarts: gone(),
+                deploys: gone(),
+                services: gone(),
+                replicas: gone(),
+                alerts: gone(),
+                cpu_throttling: gone(),
+                recent_logs: gone(),
             },
         }
     }
@@ -3103,6 +3162,98 @@ pub(super) mod tests {
         assert!(report.ok.iter().any(|ok| ok.id == "registry"));
         assert!(
             !report
+                .warnings
+                .iter()
+                .any(|finding| finding.id == "registry-redundancy")
+        );
+    }
+
+    /// A clustered registry on one node, ready and reachable, that can't
+    /// hold a second copy of anything.
+    fn lone_registry(node_id: &str) -> RegistryObservation {
+        RegistryObservation {
+            node_id: node_id.to_string(),
+            clustered: true,
+            ready: true,
+            peer_reachable: true,
+            redundancy_possible: false,
+            under_replicated_layers: 12,
+            lost_images: Vec::new(),
+            lost_image_count: 0,
+            needs_mtls: false,
+        }
+    }
+
+    /// #2147: one node can't hold a second copy of a layer, so on a
+    /// one-node cluster that's expected, not something to fix. It's OK,
+    /// with the reason and what adding a node would buy.
+    #[test]
+    fn a_one_node_cluster_without_redundancy_is_ok_and_says_why() {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.registry = available(vec![lone_registry("node-1")]);
+
+        let report = diagnose(&inputs);
+
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|finding| finding.id == "registry-redundancy"),
+            "{:?}",
+            report.warnings
+        );
+        let ok = report
+            .ok
+            .iter()
+            .find(|ok| ok.id == "registry")
+            .expect("registry ok");
+        assert!(ok.description.contains("one node"), "{}", ok.description);
+        assert!(ok.description.contains("add a node"), "{}", ok.description);
+    }
+
+    /// With two nodes, a registry that can't reach its redundancy target
+    /// is still degraded: a second node is there to hold the copies.
+    #[test]
+    fn a_two_node_cluster_without_redundancy_still_warns() {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.nodes = available(vec![
+            NodeObservation {
+                node_id: "node-1".to_string(),
+                membership_state: "Alive".to_string(),
+                agent_reachable: true,
+            },
+            NodeObservation {
+                node_id: "node-2".to_string(),
+                membership_state: "Dead".to_string(),
+                agent_reachable: false,
+            },
+        ]);
+        inputs.cluster.registry = available(vec![lone_registry("node-1")]);
+
+        let report = diagnose(&inputs);
+
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|finding| finding.id == "registry-redundancy")
+        );
+    }
+
+    /// One node whose registry isn't listening is degraded however many
+    /// nodes there are.
+    #[test]
+    fn a_one_node_registry_that_is_not_ready_still_warns() {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.registry = available(vec![RegistryObservation {
+            ready: false,
+            ..lone_registry("node-1")
+        }]);
+
+        let report = diagnose(&inputs);
+
+        assert!(
+            report
                 .warnings
                 .iter()
                 .any(|finding| finding.id == "registry-redundancy")

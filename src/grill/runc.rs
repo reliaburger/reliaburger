@@ -655,6 +655,10 @@ impl super::Grill for RuncGrill {
         self.owned_pid(instance).await
     }
 
+    async fn workload_pids(&self, instance: &InstanceId) -> Result<Vec<u32>, GrillError> {
+        self.owned_workload_pids(instance).await
+    }
+
     async fn workload_cgroup(&self, instance: &InstanceId) -> Result<Option<u64>, GrillError> {
         // Rootless runc may not own its cgroup tree.
         if self.rootless {

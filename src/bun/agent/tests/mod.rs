@@ -4645,7 +4645,7 @@ async fn shutdown_escalates_to_kill_when_stop_is_ignored() {
     let port_allocator = PortAllocator::new(30000, 31000);
     let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown);
     // Escalation is under test, not the length of the production grace.
-    agent.set_shutdown_grace(std::time::Duration::from_millis(200));
+    agent.set_shutdown_budget(std::time::Duration::from_millis(200));
 
     let (ev_tx, mut ev_rx) = mpsc::channel(64);
     agent.deploy(basic_config(), &ev_tx).await;
@@ -7033,7 +7033,7 @@ fn stubborn_agent() -> (
     agent.set_volumes_dir(volumes.path().to_path_buf());
     allow_host_workloads(&mut agent, &[]);
     agent.set_stop_grace(STUBBORN_GRACE);
-    agent.set_shutdown_grace(std::time::Duration::from_millis(200));
+    agent.set_shutdown_budget(std::time::Duration::from_millis(200));
     let handle = tokio::spawn(async move { agent.run().await });
     (tx, shutdown, handle, grill_handle, volumes)
 }
@@ -7392,7 +7392,7 @@ async fn deploy_is_refused_while_the_workload_is_stopping() {
 async fn shutdown_reports_pending_stops_unconfirmed() {
     let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
     agent.set_stop_grace(std::time::Duration::from_secs(60));
-    agent.set_shutdown_grace(std::time::Duration::from_millis(200));
+    agent.set_shutdown_budget(std::time::Duration::from_millis(200));
     expect_complete(&drain_deploy(&mut agent, basic_config()).await);
     grill.set_ignore_stop(true);
     grill.set_state(
@@ -7502,6 +7502,32 @@ async fn status_returns_all_instances() {
     assert_eq!(statuses[0].app_name, "web");
     // Without health checks, goes straight to Running
     assert_eq!(statuses[0].state, "running");
+
+    shutdown.cancel();
+    agent_handle.await.unwrap();
+}
+
+// `relish tui` shows the image an app's instances run, so a running
+// instance's status names the image the node started it from (#2167).
+#[tokio::test]
+async fn running_instance_status_carries_its_image() {
+    let (mut agent, tx, shutdown) = test_agent();
+
+    let agent_handle = tokio::spawn(async move {
+        agent.run().await;
+    });
+
+    let events = send_deploy(&tx, basic_config()).await;
+    expect_complete(&events);
+
+    let (resp_tx, resp_rx) = oneshot::channel();
+    tx.send(AgentCommand::Status { response: resp_tx })
+        .await
+        .unwrap();
+    let statuses = resp_rx.await.unwrap();
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].state, "running");
+    assert_eq!(statuses[0].image.as_deref(), Some("myapp:v1"));
 
     shutdown.cancel();
     agent_handle.await.unwrap();
@@ -12145,6 +12171,32 @@ async fn resource_faults_reject_off_linux() {
     assert!(err.contains("Linux cgroups"), "unexpected reason: {err}");
 }
 
+/// A pause freezes the workload's processes, not the process the runtime
+/// names as the instance's. On runc that one is the `runc run` launcher,
+/// and freezing it left the container running (#2079). A kill still
+/// signals the instance's process.
+#[tokio::test]
+async fn a_pause_signals_the_workload_processes_and_a_kill_the_instance_process() {
+    use super::signal_faults::{Signal, SignalTarget, read_pids};
+    let grill = MockGrill::new();
+    grill.set_pid(100);
+    grill.set_workload_pids(vec![200, 201]);
+    let targets = [SignalTarget::Instance(InstanceId("default__web-0".into()))];
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    assert_eq!(
+        read_pids(&grill, &targets, Signal::Pause, deadline).await,
+        vec![200, 201]
+    );
+    assert_eq!(
+        read_pids(&grill, &targets, Signal::Resume, deadline).await,
+        vec![200, 201]
+    );
+    assert_eq!(
+        read_pids(&grill, &targets, Signal::Kill { count: 0 }, deadline).await,
+        vec![100]
+    );
+}
+
 /// Reversing a Pause fault SIGCONTs the frozen process.
 ///
 /// We freeze a real child with SIGSTOP, then drive `reverse_fault` with
@@ -14256,6 +14308,7 @@ fn runtime_unknown_is_serialised_only_when_set() {
         runtime_unknown: false,
         status_age_ms: None,
         age_seconds: None,
+        image: None,
         reason: None,
     };
     let plain = serde_json::to_value(&status).unwrap();

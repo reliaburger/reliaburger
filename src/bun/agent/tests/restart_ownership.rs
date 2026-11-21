@@ -202,7 +202,8 @@ async fn a_state_read_from_before_a_restart_leaves_the_replacement_alone() {
     let reads = agent.plan_state_reads(|_| true);
     assert_eq!(reads.len(), 1);
     crash(&grill);
-    let sweep = state_sweep::sweep_states(grill.clone(), reads).await;
+    let sweep =
+        state_sweep::sweep_states(grill.clone(), reads, state_sweep::UnfinishedReads::new()).await;
     assert_eq!(sweep.observations[0].1, state_sweep::Observed::Exited);
 
     // Meanwhile the instance went through a restart and is Running again.
@@ -229,7 +230,12 @@ async fn a_state_sweep_reads_in_parallel_under_one_deadline() {
 
     grill.set_call_delay(MockCall::State, Some(std::time::Duration::from_millis(200)));
     let started = std::time::Instant::now();
-    let sweep = state_sweep::sweep_states(grill.clone(), reads.clone()).await;
+    let sweep = state_sweep::sweep_states(
+        grill.clone(),
+        reads.clone(),
+        state_sweep::UnfinishedReads::new(),
+    )
+    .await;
     assert!(started.elapsed() < std::time::Duration::from_millis(900));
     assert!(
         sweep
@@ -240,7 +246,8 @@ async fn a_state_sweep_reads_in_parallel_under_one_deadline() {
 
     grill.set_call_delay(MockCall::State, Some(std::time::Duration::from_secs(30)));
     let started = std::time::Instant::now();
-    let sweep = state_sweep::sweep_states(grill.clone(), reads).await;
+    let sweep =
+        state_sweep::sweep_states(grill.clone(), reads, state_sweep::UnfinishedReads::new()).await;
     assert!(started.elapsed() < state_sweep::STATE_SWEEP_DEADLINE * 2);
     assert!(
         sweep
@@ -248,6 +255,45 @@ async fn a_state_sweep_reads_in_parallel_under_one_deadline() {
             .iter()
             .all(|(_, observed)| *observed == state_sweep::Observed::Unknown)
     );
+}
+
+/// A read that outlasts the sweep's deadline isn't abandoned and asked
+/// again (#2085). On runc an abandoned read kept running and held the
+/// instance's lifecycle lock, so each later sweep's read queued behind it
+/// and missed its own deadline too: a crash on a runtime answering in more
+/// than a second was never seen. The next sweep collects the same read.
+#[tokio::test]
+async fn a_state_read_slower_than_the_sweep_deadline_is_collected_by_the_next_sweep() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
+    let id = InstanceId(WEB_0.into());
+    crash(&grill);
+    grill.set_call_delay(
+        MockCall::State,
+        Some(state_sweep::STATE_SWEEP_DEADLINE * 3 / 2),
+    );
+    let before = grill.calls().len();
+
+    // The exit is seen within three sweeps; after it, there's nothing
+    // left to read until the restart runs.
+    for _ in 0..3 {
+        agent.begin_state_sweep();
+        let Some(sweep) = agent.state_sweeps.join_next().await else {
+            break;
+        };
+        agent.apply_state_sweep(sweep).await;
+    }
+
+    assert_eq!(
+        agent.supervisor.get_instance(&id).unwrap().restart_count,
+        1,
+        "the crash behind a slow runtime was never seen"
+    );
+    let reads = calls_on(&grill, &id, before)
+        .iter()
+        .filter(|call| *call == "state")
+        .count();
+    assert_eq!(reads, 1, "each sweep asked again instead of collecting");
 }
 
 /// The rule each recorded event names, in order.

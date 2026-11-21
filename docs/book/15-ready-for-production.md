@@ -714,6 +714,44 @@ build in the VM. The watcher also logs swap and the kernel's memory-stall figure
 the build if available memory stays under 512 MiB for a minute while swap is in use. Paging
 hard is now a failed step with a log, not a vanished runner.
 
+The Ubuntu 26.04 job had been losing runners the same way, and on 20 November one finally
+came back with a log. Its build had been compiling the lib and the lib tests together when the
+host went quiet for 34 minutes. Available memory had dipped to 1 GiB and the host had started
+to swap; then the watcher, which samples every five seconds, wrote nothing at all. When the
+step's own `timeout` ended it, the load was 41 and every task had spent 98% of the last ten
+seconds waiting on memory. The kernel stacks
+the job printed on failure gave the answer. The writeback thread was stuck in
+`dm_snapshot`'s `wait_for_in_progress`, and `df` showed `/` on `/dev/mapper/cow-root`. That
+runner had come up with its root on a device-mapper snapshot and no swap. So our "give the
+compile swap" step put an 8 GiB swap file on the snapshot. Each page swapped out was a write
+the snapshot had to copy first, and that copy needs memory, which was exactly what the host
+had run out of. All 70 passing runs from 15 to 20 November had the plain `/dev/root` and kept their
+image's 3 GiB swap file. Now `scripts/ci/give-swap` refuses to put swap on device-mapper,
+`make test-linux` builds the lib tests on their own before the lib, so the two big rustc
+processes never overlap, and the watcher gets a third trigger: a "full" memory stall of 60% or
+more, held for 30 seconds, stops the build whether swap is in use or not. Passing runs peak at
+49% for one ten-second sample. None of that helps a host that freezes outright, because the
+watcher freezes with it. That case is why the step's own `timeout` stays.
+
+The same day the 24.04 job, which had none of those guards, lost two runners of its own. We
+went back through every CI run of the past week to see where. All three of its losses since
+15 November came in one step, "Prove rootless port adoption", and in no other. That step runs
+`make test-rootless-runc`, and in CI it's the job's first build, cold on a train or a pull
+request. Its recipe didn't have the split build `make test-linux` had just been given, so the
+lib and the lib tests compiled side by side again. It has the split now, and the job has the
+26.04 job's guards: the shield, swap, the watcher with its three stops, and a limit on every
+heavy step inside a longer job limit, so a hang fails one step and the rest still report.
+
+A step limit has a catch: when it fires, it kills the processes we wanted to look at. So the
+watcher now takes snapshots on a schedule. `scripts/ci/runner-snapshot` prints memory, swap,
+the pressure-stall figures, which tests nextest is running and for how long, the process
+tree, the kernel stacks of every stuck task and test binary, and the end of the kernel log.
+The 24.04 job takes one every five minutes from minute 20; the 26.04 job takes one at minute
+36, past every passing run and before its tests' own 40-minute `timeout`. Each snapshot gets
+its own file, so a later one can't overwrite the one taken before a kill, and the job's last
+step uploads them all. A host that freezes outright still keeps nothing, but a hung step now
+leaves a picture of itself from a few minutes before it died.
+
 Coverage finds unvisited code. It does not tell us whether an assertion is useful, whether a
 webhook test accidentally exercised startup, or whether a five-second performance limit is
 portable. The audit found all three in a suite with lots of coverage. Read the uncovered
@@ -1241,6 +1279,17 @@ that has since merged can never be restored again, but it still counts, and it c
 request is closed, whose branch is gone, or which a newer cache of the same family on the
 same ref has replaced. The rule is a pure function, `stale(caches, open_pulls, branches)`,
 tested on fixtures, with the `gh` calls kept at the edges so it can be tested without network access.
+
+Then November's runner losses pushed portable Linux back up. With the coverage build at one
+job at a time, portable Linux went from a median of 22.7 minutes over 13 green train PRs to 34.8 over
+the next 14. Part of that was avoidable. `Swatinem/rust-cache` keys its cache on the
+toolchain and `Cargo.lock`, and only `main` saved one. So the cache that paragraph protects,
+`main`'s, wasn't one a train PR could use: a train changes the lock file, and no train PR
+ever restored a cache. Run 44721359618 says "No cache found" and then builds every
+dependency, one crate at a time, for about ten minutes. GitHub lets a pull request restore
+caches saved on its base branch, so now the train's own pushes save that cache too. Pull
+request and merge-queue refs still never save one, so nothing a PR builds ends up in a cache
+another run trusts.
 
 ### A release gate that fits in a week
 
@@ -3718,6 +3767,96 @@ checks and filters alerts, restarts, services and deploys to `api`; it doesn't
 manufacture `Unknown` rows for cluster evidence it deliberately didn't fetch.
 Unknown means missing required evidence. It doesn't mean "we chose not to ask".
 
+### Three ways to read one report
+
+The first human report printed every result: each finding with its details
+and `next:` step, and every OK row in full. On the three-node Wyse lab that
+was seventeen OK lines to scroll past to learn that nothing was wrong. In
+0.3.1 (#2180) `relish wtf` got three views instead. The default is a table,
+one row per check with its status. `--short` prints the counts and only what
+isn't OK. `--explain` prints every check with what it tests, the numbers that
+decide it and where the manual covers it.
+
+A table needs a row per *check*, and the report doesn't have checks. It has
+three kinds of id. An OK row carries the check's id (`crashloops`), a finding
+carries its own (`crashloop`), and an UNKNOWN carries the evidence source it
+couldn't read (`restarts`). The council check alone can report nine different
+findings. So a new module, `src/relish/wtf/checks.rs`, ties them together:
+
+```rust
+pub struct CheckKind {
+    pub id: &'static str,
+    pub findings: &'static [&'static str],
+    pub sources: &'static [&'static str],
+    pub tests: &'static str,
+    pub docs: &'static str,
+    pub manual: &'static str,
+}
+
+pub const CHECKS: &[CheckKind] = &[ /* one per check, in run order */ ];
+```
+
+`&'static str` is a borrowed string that lives for the whole program: a
+literal compiled into the binary. A `const` table built from them costs
+nothing at run time, and needs no allocation, no `lazy_static` and no
+`String`. It's the same shape as the finding catalogue `relish agent
+explain` reads (see "Built for Humans and Their Agents"), and the explanation of each
+check sits right beside that catalogue's thresholds. `--explain` doesn't
+repeat the numbers in prose. It prints them from the constants the checks
+compare against, so the words can't say 15 minutes while the code says 10.
+
+The renderer groups the report's four lists into rows, and the row type
+borrows from the report rather than copying it:
+
+```rust
+struct CheckRow<'a> {
+    name: &'a str,
+    kind: Option<&'static CheckKind>,
+    critical: Vec<&'a WtfFinding>,
+    warnings: Vec<&'a WtfFinding>,
+    unknown: Vec<&'a WtfUnknown>,
+    ok: Vec<&'a WtfOk>,
+    // ...
+}
+```
+
+The `'a` is a lifetime parameter. It says every reference in a `CheckRow`
+points into something that lives at least as long as `'a`, here the
+`WtfReport`. In C you'd keep pointers into the report and promise yourself not
+to free it first. In Go the garbage collector keeps it alive for you. Rust
+makes the promise part of the type, so the compiler rejects any code that
+drops the report while a row still points into it.
+
+Sorting worst first falls out of one derive:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Status {
+    Ok,
+    Unknown,
+    Warning,
+    Critical,
+}
+```
+
+A derived `Ord` on a fieldless enum orders the variants as they're declared,
+so `Critical > Warning` holds and a row's status is just the worst thing in
+it. The order of the lines in the source is the policy, which is a little
+surprising the first time you see it, so the comment above the enum says so.
+
+What does a check that the catalogue doesn't know about do? It still gets a
+row, named after its own id, without the explanation. A result that vanished
+from the table because nobody updated a list would be the green hat again.
+Tests stop that from shipping, though: every finding id must belong to exactly
+one check, every UNKNOWN source the engine can produce must too, and every
+check's docs link must name a heading that exists in the manual chapter that
+`relish manual <topic>` opens. A new check without an explanation fails CI.
+
+The views change only the human report. `--short --output json` is refused
+rather than quietly ignored, because the JSON contract above doesn't change:
+the machine report always carries every finding. Exit codes don't change
+either. The view is how much you read, not what `wtf` found.
+
 ## A small diagnostic surface
 
 Mayo already records CPU usage. Could `wtf` call an application throttled when
@@ -3944,27 +4083,115 @@ exceeded its 600000 ms deadline". The case's own wait knew precisely what it
 was stuck on (three running replicas, and the states it last saw), but it
 gives up on the same deadline the runner enforces, and the runner won the
 race and cancelled it before the message came back. Now each poll helper also
-leaves a note on the context as it goes, a `WaitNote`, which is a newtype
-around `Arc<tokio::sync::Mutex<Option<String>>>` so every clone of the context
-shares one note. On a timeout the runner appends it:
+leaves a note on the context as it goes. The note lives in a `CaseTrace`, a
+newtype around `Arc<tokio::sync::Mutex<TraceState>>`, so every clone of the
+context shares one trace. On a timeout the runner appends the note:
 
 ```rust
-if let (Some(note), TestOutcome::Unknown { reason, .. }) =
-    (context.wait_note.take().await, &mut outcome)
-{
+if let Some(note) = context.trace.take_wait().await {
     reason.push_str("; it was still ");
     reason.push_str(&note);
 }
 ```
 
-That `if let` matches a *tuple* of two values at once, so the body runs only
-when there's a note *and* the outcome is the `Unknown` variant. The `..` skips
-the fields we don't need, and matching on `&mut outcome` binds `reason` as a
-mutable reference into the enum, so we can extend the string in place without
-rebuilding the variant. We didn't give the body a grace period to return its
-own message instead: an existing test insists that a timed-out body stops at
-its deadline, and a case that can keep acting after it would be a worse bug
-than a terse report.
+`reason` here was bound by an earlier `if let TestOutcome::Unknown { reason, .. }
+= &mut outcome`. Matching on `&mut outcome` binds `reason` as a mutable
+reference into the enum, so we can extend the string in place without
+rebuilding the variant, and the `..` skips the fields we don't need. We didn't
+give the body a grace period to return its own message instead: an existing
+test insists that a timed-out body stops at its deadline, and a case that can
+keep acting after it would be a worse bug than a terse report.
+
+### Evidence before cleanup
+
+The note helped only while a wait helper was running. In 0.3.0 candidate 4's
+final soak, `deploy_from_cluster_registry` ran for five minutes and the report
+said "case exceeded its 300000 ms deadline", full stop (#2128). The case had
+four stretches where it could hang: staging the image into the registry, the
+apply, the wait for a running instance and the `wget` inside the container.
+Nothing said which. And by the time the soak harness bundled its evidence, the
+runner had released the case's lease, which removed the app. The journals
+showed it had been applied, and that was all. Was the instance never started,
+or did the probe inside it hang? Nobody could tell, and a five-minute stall in
+58 clean runs doesn't reproduce on demand.
+
+So a case now names its steps. `TestContext::step` runs a future under the
+case deadline, and puts its name in the trace while it runs:
+
+```rust
+pub async fn step<T, F>(&self, name: &str, future: F) -> Result<T, String>
+where
+    F: std::future::Future<Output = T>,
+{
+    let sequence = self.trace.begin_step(name).await;
+    let output = self
+        .deadline
+        .run(name, future)
+        .await
+        .map_err(|error| error.to_string())?;
+    self.trace.end_step(sequence).await;
+    Ok(output)
+}
+```
+
+`step` is generic over two types. `F` is whatever future the caller hands
+over, and the `where` clause says it must be a `Future` whose output is `T`,
+so `step` gives back exactly what the future produced, wrapped in a
+`Result`. Rust compiles a separate copy of `step` for each `F` and `T` it's
+called with (monomorphisation), so unlike a Go interface value there's no
+boxing and no dynamic dispatch. The wait
+helpers, `apply` and `exec_in_workload` open steps the same way, so most cases
+get them without asking.
+
+The interesting part is what *doesn't* happen. When the runner's deadline
+fires, it drops the case's future, and Rust drops a future by simply never
+polling it again. `end_step` never runs. That's exactly what we want: a step
+with no end is the step the case was in when it was cancelled, and the runner
+reads it from the trace and says so: `case exceeded its 300000 ms deadline
+during step "exec in registry-web"`. The `?` on the deadline does the same
+when the step runs out of time by itself. No guard object, no `Drop`
+implementation. Cancellation leaving state behind is usually a bug; here it's
+the evidence.
+
+The trace keeps at most 16 steps in a `VecDeque` (a ring buffer from the
+standard library, cheap to push at the back and pop at the front). When it's
+full it drops the oldest *finished* step first. The workload-identity case
+polls `exec_in_workload` every 100 ms inside its own "wait for workload
+certificate" step, and a plain ring would push that enclosing step out after
+a couple of seconds of polling.
+
+Then the state. After a case fails or times out, and before teardown, the
+runner calls `capture_failure_state`. It reads the case's instances on every
+reachable node, the newest deployment of each app, recent events about them
+and what the server says of the lease, and puts the lot in the case's report
+entry as `failure_state`. So `relish test -o json` and every soak pulse
+snapshot carry the app's state at the moment it failed. Three rules keep it
+honest:
+
+- **Bounded.** 16 steps, 8 apps, 32 instances, 20 events and 300 characters
+  per text field. A pulse snapshot is kept for every hour of an 8-hour soak,
+  and a capture mustn't turn one into a megabyte.
+- **Missing isn't empty.** A read that fails goes into `errors`. An empty
+  `instances` list then means the cluster said there were none, not that we
+  couldn't ask. Each node's status is its own read, and they run together
+  through `futures_util::future::join_all`, which polls a list of futures at
+  once and returns their outputs in order. The first version asked the nodes
+  one after another inside a single read, so one partitioned node cost the
+  capture every node's instances. That's exactly when you want them.
+- **App text stays marked.** An event's message can quote what an app said,
+  so it's wrapped as untrusted text, the same wrapper `relish events -o json`
+  uses, before it reaches a report an agent might read.
+- **It can't wedge teardown.** Each read gets three seconds, the whole
+  capture 15, and the case's lease is 15 seconds longer to cover it.
+
+The soak harness had the mirror image of the problem. Its `record_failure`
+already ran before its own cleanup for most checks, but `relish test` cleans
+up inside the run, minutes before the harness gets to look. Now the pulse and
+the chaos scenario hand their JSON report to `record_failure`, which copies
+each failing case's capture into `failures/<n>/captured-state.json`, takes
+the journals from a minute before the case started (or the last 15 minutes,
+whichever reaches further back), and links the capture from the failure line, so the next reader
+starts from it.
 
 The registry cases failed faster: "blob upload POST failed … https://127.0.0.1:5050".
 They push to `ctx.registry_base()`, the registry origin from the capability
@@ -4256,6 +4483,78 @@ reached node 2 and ran there; the request was slow on the far side, not lost
 on a dead pooled connection. The earlier candidates were lucky: the loop was
 as unfair then, and the case passes whenever the coin tosses go its way.
 
+### An exec that ate the case
+
+A 0.3.0 soak pulse failed `deploy_from_cluster_registry` with nothing but
+"case exceeded its deadline" after 300 s ([#2128](https://github.com/reliaburger/reliaburger/issues/2128)).
+The app had been committed, the status polls were bounded at 5 s each, and
+the reason carried no note from a wait that was still polling. What was left
+was the step after them: a `busybox wget` run inside the container through
+`exec_in_workload`. Forty attempts to reproduce it passed, so we still don't
+know that the exec hung. We do know that if it had, nobody could have said
+so, because every layer an exec crosses allowed exactly 300 s: the `relish`
+client, the agent, Bun's wait on the process owner's socket, and the owner's
+own deadline. The case's budget was 300 s too. A wedged exec spent all of
+it, and whichever timer fired first threw away the others' explanations.
+
+Two timeouts that are equal aren't nested; they race. The fix gives each
+layer a different length, in the order the error should come out:
+
+| Layer | Limit | Why that length |
+|-------|-------|-----------------|
+| agent (`exec_deadline.rs`) | the request's `timeout_seconds`, at most 300 s | the one that answers `504` naming the app |
+| Bun's owner-socket wait | 310 s | a backstop in the same future; mustn't beat the agent |
+| the exec owner | 320 s | retires a command whose caller stopped asking |
+| `relish` client | requested + 30 s (330 s by default) | hears the agent's answer instead of timing out blind |
+
+`relish exec` sends no timeout, so a person waiting on a long command keeps
+the five minutes they always had. The test kit asks for less. It waits at
+most 60 s, never past a second before the case's own deadline, and asks the
+agent for 5 s less than that, so the agent's `504` arrives while the test kit
+is still listening:
+
+```rust
+let wait = WORKLOAD_EXEC_BOUND.min(
+    self.deadline
+        .remaining()
+        .saturating_sub(EXEC_DEADLINE_RESERVE),
+);
+let asked = wait
+    .saturating_sub(EXEC_ANSWER_MARGIN)
+    .max(Duration::from_secs(1));
+```
+
+`saturating_sub` stops at zero instead of wrapping round or panicking, as
+`Duration` subtraction would with plain `-` when the right side is larger.
+Either way the case fails with `inspect workload contents: exec in
+rbtest-…/registry-web timed out on node rb-…-1`, followed by the agent's
+answer or "no answer within 60 s", with most of its budget unspent. If the
+wedge happens again, that line confirms or rules out the exec reading.
+
+One layer sits outside the table. When the test kit can't reach a peer
+directly it goes through the entry node's relay, and the relay gives any
+forwarded request 30 s. A relayed exec that wedges gets the relay's `504`,
+"node … did not answer within 30s", under the same heading. That's still a
+named timeout, so we left the relay alone.
+
+The request field is optional, `#[serde(default)] timeout_seconds:
+Option<u64>`, and the handler holds it between 1 s and the cap, so a caller
+can't ask an agent to keep a command running for a day. Old clients send no
+field and get the cap, so nothing about the cluster's wire format changed and
+`CURRENT` keeps its numbers.
+
+The tests check each piece. `a_hanging_exec_fails_with_a_named_timeout` runs
+`run_exec_within` on a future that never finishes, under Tokio's paused clock,
+and checks the error names the app and fires at exactly 60 s;
+`exec_deadlines_nest_inside_the_clients_wait` checks the table's order, so a
+later edit to one constant can't make two layers race again. In the test kit,
+`a_wedged_exec_fails_naming_the_app_node_and_timeout` serves a node whose exec
+never answers and a case with 3 s left, and checks the named error comes back
+before the case deadline; `an_exec_the_agent_timed_out_names_the_app_and_node`
+answers `504` and checks the timeout the test kit asked for. All four failed
+before the change: the first two because every layer was 300 s, the test kit
+pair because the case deadline fired first with nothing to say.
+
 ### Busy isn't dead
 
 `biased;` bought fairness for commands, and the final tier of the soak on
@@ -4360,7 +4659,24 @@ means (the scheduler, the council and Pickle all treat "published" as "worth
 talking to"), gossip got a second one. `MembershipTable::roster()` returns
 every member, down ones included, until they're reaped, and
 `MustardNode::set_roster_watch` publishes it next to the old view. The
-refresher reads the roster. A `Left` entry is forgotten on sight.
+refresher reads the roster. A `Left` entry was forgotten on sight.
+
+That last rule didn't survive the Wyse lab. We rebooted one of three council
+voters with Ctrl+Alt+Del, and `relish nodes` went straight from three rows to
+two. A clean shutdown runs gossip's graceful leave, so the node was `Left`,
+and the table forgot it. Yet `relish council status` still listed it as a
+voter, still counted towards the quorum, and it came back two minutes later.
+Pulling the cord on another voter had shown it as `dead`, which is the more
+violent event and got the more honest answer. Leaving tells you the node
+meant to go. It doesn't tell you it's gone for good.
+
+So a `Left` member now stays in the table like a dead one, with the same
+24-hour limit, and keeps its `Left` state when gossip reaps it, where a
+reaped dead member stays `Dead`. `relish nodes` shows it as `left` with its
+council seat, and `relish status` counts it on the nodes line (`1 left`)
+without calling the cluster degraded. It drops off when it comes back, when
+its identity is retired, or when a day passes. Retirement is the real "gone
+for good", and the operator says so with `relish decommission-node`.
 
 A node the operator *retired* is gone for good: its identity is on the CRL,
 and Chapter 4's mTLS verifiers already refuse it. Every node keeps a
@@ -5217,8 +5533,9 @@ pub(super) async fn sweep_states<G: Grill>(grill: G, reads: Vec<StateRead>) -> S
 
 `buffered(8)` turns a stream of futures into a pool of eight running at once
 that still yields results in the original order. All of them share one
-one-second deadline; a read that misses it comes back `Unknown` and the next
-sweep asks again. The sweep goes into a `JoinSet`, at most one at a time, and a
+one-second deadline; a read that misses it comes back `Unknown`, and the next
+sweep tries again. (How it tries again changed later, and the section after
+next tells why.) The sweep goes into a `JoinSet`, at most one at a time, and a
 new `select!` branch applies what it saw.
 
 Earlier in this chapter a `buffered` stream gave us 380 errors about `Send`
@@ -5247,6 +5564,67 @@ A restart bumps `restart_count`; a fresh deploy under the same id gets a new
 field, the way a C programmer would hope `memcmp` would. The cost of all this
 is latency: a crash now restarts on the tick after the sweep reports, up to a
 second later than before. The restart backoff is longer than that anyway.
+
+#### A read that outlives its sweep
+
+"The next sweep asks again" sounds harmless. On runc it wasn't, and it took
+a flaky test to show us (#2085). `standalone_automatic_restart_replaces_the_original_address_owner`
+kills a container and gives Bun 30 seconds to restart it. On a quiet VM the
+restart takes two seconds. Now and then, on a busy one, it never happened at
+all. We put the VM under disk load (a few `dd ... conv=fsync` loops beside
+the test) and it failed five runs in six. The traces showed why: Bun never
+noticed the container had died. Every sweep's read of it came back
+`Unknown`.
+
+Each runc read takes the instance's lifecycle lock, and the runtime runs it
+in a task of its own, so a caller that gives up can't leave it half done.
+Timing out the sweep's future stopped the *sweep* waiting. It didn't stop the
+read. The read kept the lock, the next sweep's read queued behind it, and the
+lock serves its waiters in order. Once one read takes longer than the
+deadline, every read after it waits out its predecessor's leftover time and
+then its own, so every read misses the deadline, every sweep says `Unknown`,
+and the exit is never seen. The test made it likelier, because it polled the
+same instance twenty times a second through the same lock, but a node on a
+struggling disk would get there by itself.
+
+So the sweep stops starting reads it can't finish. Each read now runs in a
+spawned task, and one still running at the deadline goes back to the loop as
+unfinished. The next sweep waits on that same task instead of asking the
+runtime a second time:
+
+```rust
+let mut task = earlier.unwrap_or_else(|| {
+    let id = read.id.clone();
+    tokio::spawn(async move { observe(&grill, &id).await })
+});
+match tokio::time::timeout_at(deadline, &mut task).await {
+    Ok(observed) => (read, observed.unwrap_or(Observed::Unknown), None),
+    Err(_) => (read, Observed::Unknown, Some(task)),
+}
+```
+
+`tokio::spawn` returns a `JoinHandle`, which is itself a future: awaiting it
+gives you the task's result. We await `&mut task` rather than `task`, so the
+timeout borrows the handle and we still own it when the deadline passes. A
+`JoinHandle` is `Unpin` (moving it doesn't break anything that points into
+it), and that's what lets a plain `&mut` reference be awaited. In C you'd keep
+the `pthread_t` and `pthread_join` it later; in Go you'd keep the channel.
+Here the handle *is* the channel. Dropping a `JoinHandle` doesn't stop its
+task, so a handle the sweep no longer wants (the instance was retired, or has
+restarted since) gets an explicit `abort()`.
+
+The carried reads live on the agent as `unfinished_state_reads`, keyed by
+instance and stamped with the incarnation they read, so a result from before
+a restart still can't touch the replacement. The test that pins it,
+`a_state_read_slower_than_the_sweep_deadline_is_collected_by_the_next_sweep`
+in `src/bun/agent/tests/restart_ownership.rs`, gives the mock runtime a
+crashed instance and one-and-a-half-second reads. Before the change three
+sweeps came back `Unknown` and asked the runtime three times; now the second
+sweep collects the first read and restarts the instance, and the runtime was
+asked once. The flaky test also polls at 250 ms instead of 50, and it treats
+`StateUnavailable` (a read racing the restart's create, which the runtime
+says it can't answer yet) as "look again" rather than a failure, which was
+the other way it failed.
 
 #### A restart, one step at a time
 

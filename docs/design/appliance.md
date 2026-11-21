@@ -427,8 +427,9 @@ transition per tick:
 1. **Pending → Draining.** The node is cordoned. A council member moves only
    when the council can lose it and keep a majority.
 2. **Draining → Updating.** Once its workloads have moved, or after 5
-   minutes, the leader sends the stage directive. Apps with managed volumes
-   aren't waited for.
+   minutes, the leader sends the stage directive. Apps with a managed volume
+   or a host-path mount aren't waited for: the scheduler keeps their
+   replicas on the node through the drain and the reboot (#2120).
 3. **Updating → Done.** The node reports the target version and is healthy.
 
 **Pauses.** The rollout pauses, marking the node Failed, when:

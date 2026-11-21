@@ -401,7 +401,7 @@ That's worse than useless. A chaos tool that lies about what it did teaches you 
 
 Each fault type now maps to a mechanism, and the mechanism is the truth:
 
-- **Kill, Pause, Resume** send signals to the workload's real PIDs. The agent already knows every instance's process id through the supervisor, so a `kill` fault resolves the target service to its PIDs and delivers `SIGKILL`; pause/resume use `SIGSTOP`/`SIGCONT`. A pause now records its frozen PIDs and auto-resumes them on clear or expiry, so a paused workload can't be left wedged. These work on every platform because signals are POSIX, not Linux-specific.
+- **Kill, Pause, Resume** send signals to the workload's real PIDs. The agent already knows every instance's process id through the supervisor, so a `kill` fault resolves the target service to its PIDs and delivers `SIGKILL`; pause/resume use `SIGSTOP`/`SIGCONT` on the workload's own processes, which on runc are the container's rather than the `runc run` launcher's (#2079). A pause now records its frozen PIDs and auto-resumes them on clear or expiry, so a paused workload can't be left wedged. These work on every platform because signals are POSIX, not Linux-specific.
 - **CPU stress, memory pressure and disk-IO throttle** cap the *target* instance's cgroup — `cpu.max`, `memory.high`, `io.max` — after threading the workload's namespace/app/ordinal into the fault. The pre-limit value is saved and restored on clear or expiry. They need cgroups, so they work on Linux and return a clear "requires Linux cgroups" error elsewhere.
 - **Node drain and node kill** are authenticated cluster-level operations with
   separate scheduler and transport effects. They never borrow a workload
@@ -1636,11 +1636,49 @@ SIGTERM and exits, but the frozen launcher never notices, and the stop still
 waits out its whole grace (27 seconds of a 20-second grace in the test). A
 pause that freezes the container's own init is the case the review described:
 the SIGTERM stays pending and the workload never runs its handler. So a runc
-stop now follows the signal with SIGCONT to both, the launcher's pid and
-`runc kill <id> SIGCONT`, and two tests in `tests/owned_runc.rs` pause one
-each and require the stop to finish well inside its grace. That a pause of a
-runc app freezes the launcher rather than the workload is a gap of its own
-([#2079](https://github.com/reliaburger/reliaburger/issues/2079)).
+stop now follows the signal with SIGCONT, and two tests in
+`tests/owned_runc.rs` pause the container and require the stop to finish well
+inside its grace.
+
+The first bug was a gap of its own
+([#2079](https://github.com/reliaburger/reliaburger/issues/2079)): a Smoker
+pause of a runc app froze the launcher and left the app running. `Grill::pid`
+stays the launcher, because stops, status reads and adoption all mean the
+launcher when they ask for a pid. What Smoker wants is a different question,
+so the `Grill` trait gained a second method for it:
+
+```rust
+fn workload_pids(
+    &self,
+    instance: &InstanceId,
+) -> impl std::future::Future<Output = Result<Vec<u32>, GrillError>> + Send {
+    async move { Ok(self.pid(instance).await?.into_iter().collect()) }
+}
+```
+
+That's a trait method with a default body, which every runtime gets unless
+it writes its own. The process runtime's workload *is* the process `pid`
+names, so the default asks `pid`. `Option::into_iter` turns `Some(pid)` into
+an iterator of one item and `None` into an empty one, so `collect()` makes a
+`Vec` of zero or one pids without a `match`. Runc writes its own: it asks
+`runc state` for the container's init, reads init's group from
+`/proc/<init>/cgroup`, and names every pid in that group's `cgroup.procs`.
+Freezing init alone isn't enough. A web server's workers would keep serving,
+and a shell init that traps SIGTERM runs its handler only once its foreground
+child returns, which a frozen child never does. That's also why the stop's
+SIGCONT now goes to the same set rather than to init alone.
+
+The group is only the container's when nothing else lives in it. Rootless
+runc can leave the workload in its caller's group, next to the launcher and
+Bun, and freezing that group would freeze Bun. So when init's group is the
+root, or holds the launcher or Bun itself, runc names init alone. Smoker's
+kill still signals `pid`, the launcher, as before. The regression tests are
+`runc_pause_freezes_the_workload_not_its_launcher`, which writes a heartbeat
+from a real container and requires it to stand still while paused and move
+again once resumed, and
+`a_pause_signals_the_workload_processes_and_a_kill_the_instance_process`, which
+checks against the mock runtime that pause and resume ask `workload_pids` and
+kill asks `pid`.
 
 The lesson is an old one with a new face. A status the kernel hands back is
 only what you asked for if you check that it is. And a supervisor that's the
