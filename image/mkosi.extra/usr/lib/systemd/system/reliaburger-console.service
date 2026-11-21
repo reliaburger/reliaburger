@@ -1,9 +1,14 @@
-# The node's status on tty1: its name, cluster, address, MAC and whether bun
-# is up (`bun appliance console`). The appliance has no login, so this
-# replaces the getty there.
+# The node's status on tty1: its name, cluster, address, MAC, whether bun
+# is up and, until the machine is claimed, its claim key (`bun appliance
+# console`). The appliance has no login, so this replaces the getty there.
+#
+# Not ordered after reliaburger-seed.service, the network or bun. An
+# unclaimed machine's seed unit stays activating until the claim, and the
+# claim key is what its screen has to show meanwhile (#2161). The console
+# redraws every 5 s and says "waiting for DHCP" or "not answering" itself,
+# so it starts at once and shows each thing as it appears.
 [Unit]
 Description=Reliaburger console status
-After=reliaburger-seed.service
 Conflicts=getty@tty1.service
 After=getty@tty1.service
 

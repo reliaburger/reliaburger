@@ -20,10 +20,12 @@ swap atomic, so this runs on Linux only, as CI's script job does.
     python3 -m unittest discover -s image/tests -p 'test_start.py'
 """
 
+import fcntl
 import os
 import platform
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -122,6 +124,46 @@ class Launcher(unittest.TestCase):
         self.boot("2026.46.1", "0.3.0")
         self.boot("2026.46.3", "0.3.2")
         self.assertEqual(self.active(), "bun-v0.3.2")
+
+    def test_one_launcher_installs_at_a_time(self):
+        # The console starts beside the seed's prepare, and on a claimed
+        # node beside bun, all through this launcher (#2161). Two installs
+        # at once would write the same temporary files, so each takes
+        # $bin/.install.lock first; flock(1) and fcntl.flock share the lock.
+        self.bin.mkdir()
+        self.os_release.write_text('ID=ubuntu\nIMAGE_VERSION=2026.46.1\n')
+        fake_bun(self.image, "0.3.0")
+        env = dict(os.environ, RELIABURGER_BIN_DIR=str(self.bin),
+                   RELIABURGER_IMAGE_BUN=str(self.image),
+                   RELIABURGER_OS_RELEASE=str(self.os_release))
+        with open(self.bin / ".install.lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            launcher = subprocess.Popen(["sh", str(START), "console"], env=env,
+                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                        text=True)
+            self.addCleanup(launcher.stdout.close)
+            self.addCleanup(launcher.kill)
+            time.sleep(1)
+            self.assertIsNone(launcher.poll(), "the launcher didn't wait for the lock")
+            self.assertFalse((self.bin / "bun").exists())
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        out, _ = launcher.communicate(timeout=30)
+        self.assertEqual(launcher.returncode, 0, out)
+        self.assertEqual(self.active(), "bun-v0.3.0")
+        self.assertIn("ran 0.3.0: appliance console", out)
+
+    def test_bun_does_not_hold_the_install_lock(self):
+        # The launcher execs bun, which inherits its open files. A bun that
+        # kept the lock would hold every later launcher (the console's
+        # restarts, prepare) back for as long as it ran.
+        self.boot("2026.46.1", "0.3.0")
+        (self.bin / "bun-v0.3.0").write_text(
+            "#!/bin/sh\n"
+            '[ "$1" = --version ] && { echo "bun 0.3.0"; exit 0; }\n'
+            f'exec 8>"{self.bin}/.install.lock"\n'
+            'if flock -n 8; then echo "lock free"; else echo "lock held"; fi\n')
+        out = self.boot("2026.46.1", "0.3.0")
+        self.assertIn("lock free", out)
 
 
 if __name__ == "__main__":

@@ -66,7 +66,7 @@ Packages=
         iproute2
 ```
 
-`resolute` is 26.04's codename. `Format=disk` produces a whole partitioned disk image, and `SplitArtifacts=` also writes the pieces an update needs as separate files. The boot artefact is a UKI (Unified Kernel Image): the kernel, the initrd and the kernel command line glued into one EFI executable, which systemd-boot starts like any other EFI program. `%i_%v` names it `reliaburger-os_<version>.efi`, a name that matters later. The locked root password means there's no console login at all. The last six packages match the quickstart guest's list, `scripts/release/guest-images.json`, less Buildah, which the guest needs for `relish build`. From 0.3.0 the quickstart guest runs Ubuntu 26.04 too, so the two channels install the same packages from the same archive and test the same userland. mkosi can't read a JSON file, so rather than generate one list from the other we let a test hold them together: `test_guest_images.py` parses the `Packages=` block and fails if its tail and the guest's list drift apart.
+`resolute` is 26.04's codename. `Format=disk` produces a whole partitioned disk image, and `SplitArtifacts=` also writes the pieces an update needs as separate files. The boot artefact is a UKI (Unified Kernel Image): the kernel, the initrd and the kernel command line glued into one EFI executable, which systemd-boot starts like any other EFI program. `%i_%v` names it `reliaburger-os_<version>.efi`, a name that matters later. The locked root password means there's no console login at all. The last six packages match the quickstart guest's list, `scripts/release/guest-images.json`, less Buildah, which the guest needs for `relish build`. An appliance cluster builds nothing itself: you build elsewhere and push into Pickle ("A tour that couldn't build", below). From 0.3.0 the quickstart guest runs Ubuntu 26.04 too, so the two channels install the same packages from the same archive and test the same userland. mkosi can't read a JSON file, so rather than generate one list from the other we let a test hold them together: `test_guest_images.py` parses the `Packages=` block and fails if its tail and the guest's list drift apart.
 
 The kernel package drags in the full `linux-firmware` set, hundreds of megabytes, unless something else provides it. `linux-firmware-minimal` does, and we add back only the Wyse's Realtek NIC firmware (and its Intel graphics firmware on x86-64, in `mkosi.conf.d/10-x86-64.conf`, a drop-in whose `[Match] Architecture=` line applies it to one architecture only).
 
@@ -1277,6 +1277,43 @@ The installer then booted to a login prompt and sat there. Its screen said `syst
 The Wyse's RTL8111 needs two modules. `r8169` drives the controller, and `realtek` drives its PHY, the chip that negotiates the link on the cable. `r8169` doesn't call into `realtek`; it declares `softdep r8169 pre: realtek`, "load that one first", and `modprobe` honours it. mkosi copies hard dependencies only, so the installer had `r8169` and an empty `drivers/net/phy/realtek/` directory. Without its PHY driver, `r8169` never brings the link up. CI's VMs use virtio, which has no PHY, so nothing there could have noticed.
 
 Looking for siblings found a bigger gap: no Intel or Broadcom drivers at all, so the installer would have failed the same way on most mini PCs. The fix lists them, and `installer_modules.py` makes the class of bug visible. It reads the UKI's `.initrd` section, unpacks the cpio archive the kernel would, and fails on any carried module whose soft dependency is missing, on any driver from a fixed list that isn't there, and on missing firmware for those drivers. Run against the Wyse's installer from that night, it names exactly `realtek`, `e1000`, `e1000e`, `igb`, `igc` and `tg3`. QEMU can't emulate the RTL8111, so reading the artefact is the only CI check that sees this bug.
+
+### A screen that waited for the claim
+
+Claiming asks you to compare each machine's claim key with its monitor. In the three-Wyse run (#407), none of the monitors showed one. Each sat on the boot's last kernel messages, a probe error from an audio driver at about 40 seconds, while `relish machines` listed all three keys.
+
+The console's unit said `After=reliaburger-seed.service`, which reads as harmless: show the status once the seed is sorted out. But on an unclaimed machine the seed unit never finishes starting. It's a `Type=oneshot` with `TimeoutStartSec=infinity`, and `bun appliance prepare` sits in it serving port 9119 until a seed arrives. So systemd held the console back until the claim, the one moment the claim key stops mattering. The console's own test rendered the screen with a key on it and passed. Nothing had ever started the unit on a machine waiting to be claimed.
+
+The seed unit's own line, `no seed: unclaimed, claim key … on port 9119`, didn't help either. It goes to `/dev/console`, and that's the last `console=` on the command line, the serial port the 3040 doesn't have. The installer had already met this (see "Booting from a wire" above) and writes to `/dev/tty1` itself.
+
+The fix is to order the console after nothing of ours. It redraws every five seconds and already says "waiting for DHCP" or "not answering" on its own, so starting early costs nothing. We didn't also copy the seed's line to tty1: the console clears tty1 on every redraw, so the line would last five seconds at most.
+
+Starting early did expose something. The console, prepare and bun all start through the same launcher, `/usr/lib/reliaburger/start`, which copies the image's bun into `/var/lib/reliaburger/bin` when it's newer. With the console beside prepare, two launchers could now write the same temporary file at once on a first boot. (The console and bun already started together on a claimed node after an OS update, so the race wasn't entirely new.) So the launcher takes a lock first:
+
+```sh
+exec 9>"$bin/.install.lock"
+flock 9
+# ... read the versions, install if newer ...
+exec 9>&-
+```
+
+`exec 9>file` opens the file as descriptor 9 for the rest of the script, and `flock 9` waits for an exclusive lock on it. The `exec 9>&-` before starting bun matters as much as the lock. An `exec` keeps the process's open descriptors, so without it bun would hold the lock for as long as it ran, and the console's next restart would wait for ever. `test_start.py` checks both: a launcher waits while the test holds the lock, and a bun it started can take the lock itself.
+
+`test_console_unit.py` now refuses a console ordered after any of our units that can wait for ever, and the claimed-pair test in CI reads each unclaimed VM's screen before claiming it. It doesn't photograph the screen: `/dev/vcs1` holds the text on tty1, so the test reads it over the lab image's SSH and looks for the key that port 9119 serves.
+
+### A tour that couldn't build
+
+The tour's first step is `relish build burger/burger.toml`, and on the Wyse cluster it failed:
+
+```
+error: API error (status 503): {"error":"no builder available: buildah is not on this node's PATH and no peer reports the capability"}
+```
+
+That was no surprise to the image. `mkosi.conf` lists the quickstart guest's packages "less Buildah", and `test_guest_images.py` keeps it that way. It was a surprise to the docs, which sent appliance users through a tour whose first command can't work there, and to the error, which said what was missing without saying what to do.
+
+We could have added Buildah. Its cost isn't only megabytes. Every package goes into both 1.1 GB `/usr` slots, a build pulls a toolchain image and writes layers to an eMMC we're counting writes on, and a multi-platform build on a 2 GB Atom is slow at best. A build also runs whatever `RUN` steps a Dockerfile holds, on the machines that keep the cluster's state. The appliance's whole pitch is that it does one job.
+
+So the appliance stays without it, and the refusal now names the ways out. bun keeps the message in one constant, `NO_BUILDER_ERROR`, rather than inline in the handler, so a test can hold it to its promises: it says appliance nodes never have Buildah, shows `docker push <node>:5050/<name>:<tag>`, points at `relish manual images`, and suggests adding a Linux node with Buildah, since bun hands a build to any peer that reports it. A second test checks that the manual section it names exists, so a renamed heading can't leave the error pointing at nothing. Manual 17 now walks through building the burger on a laptop and pushing it into Pickle before the tour's `relish apply`.
 
 ### Reading it all again
 
