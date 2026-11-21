@@ -76,7 +76,12 @@ test-linux: ## Run provisioned Linux runtime, network, eBPF, Btrfs and Buildah t
 	$(CARGO) test --no-run --features ebpf
 	RELIABURGER_RUNC_TESTS=1 RELIABURGER_NETNS_TESTS=1 RELIABURGER_EBPF_TESTS=1 RELIABURGER_BTRFS_TESTS=1 RELIABURGER_BUILDAH_TESTS=1 RELIABURGER_CGROUP_TESTS=1 RELIABURGER_NODE_PRESSURE_TESTS=1 RELIABURGER_BUN_BINARY="$(TARGET_DIR)/debug/bun" $(WITH_TEST_IMAGES) $(NEXTEST) --features ebpf --run-ignored=only -E '(binary(ebpf) | binary(build) | binary(node_pressure) | binary(test_storage) | binary(owned_network) | binary(owned_runc) | binary(kubernetes_demo) | test(/^grill::(volume|image)::tests::/) | test(/(runc_|netns|btrfs_|cgroup_|identity_dir_is_tmpfs|pinned_images_serve)/)) & not binary(oci_crash) & !test(/^actual_(host_reboot|bun_kernel_discovery_host_reboot)/) $(LINUX_EXCLUDE)'
 
+# The same split build as test-linux: in CI this is the 24.04 privileged
+# job's first, cold build, and a parallel build of the lib beside its lib
+# tests lost that job's runner (#1943).
 test-rootless-runc: ## Prove rootless runc networking and port adoption as a non-root user
+	$(CARGO) test --no-run --features ebpf --lib
+	$(CARGO) test --no-run --features ebpf
 	RELIABURGER_ROOTLESS_RUNC_TESTS=1 $(NEXTEST) --features ebpf --run-ignored=only -E 'binary(owned_rootless) | test(rootless_published_port_survives_bun_replacement) | test(normal_rootless_bun)'
 
 test-cluster: ## Run all real multi-node cluster acceptance suites and the scripted feature demos

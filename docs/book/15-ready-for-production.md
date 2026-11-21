@@ -733,6 +733,25 @@ more, held for 30 seconds, stops the build whether swap is in use or not. Passin
 49% for one ten-second sample. None of that helps a host that freezes outright, because the
 watcher freezes with it. That case is why the step's own `timeout` stays.
 
+The same day the 24.04 job, which had none of those guards, lost two runners of its own. We
+went back through every CI run of the past week to see where. All three of its losses since
+15 November came in one step, "Prove rootless port adoption", and in no other. That step runs
+`make test-rootless-runc`, and in CI it's the job's first build, cold on a train or a pull
+request. Its recipe didn't have the split build `make test-linux` had just been given, so the
+lib and the lib tests compiled side by side again. It has the split now, and the job has the
+26.04 job's guards: the shield, swap, the watcher with its three stops, and a limit on every
+heavy step inside a longer job limit, so a hang fails one step and the rest still report.
+
+A step limit has a catch: when it fires, it kills the processes we wanted to look at. So the
+watcher now takes snapshots on a schedule. `scripts/ci/runner-snapshot` prints memory, swap,
+the pressure-stall figures, which tests nextest is running and for how long, the process
+tree, the kernel stacks of every stuck task and test binary, and the end of the kernel log.
+The 24.04 job takes one every five minutes from minute 20; the 26.04 job takes one at minute
+36, past every passing run and before its tests' own 40-minute `timeout`. Each snapshot gets
+its own file, so a later one can't overwrite the one taken before a kill, and the job's last
+step uploads them all. A host that freezes outright still keeps nothing, but a hung step now
+leaves a picture of itself from a few minutes before it died.
+
 Coverage finds unvisited code. It does not tell us whether an assertion is useful, whether a
 webhook test accidentally exercised startup, or whether a five-second performance limit is
 portable. The audit found all three in a suite with lots of coverage. Read the uncovered
@@ -4374,6 +4393,78 @@ reached node 2 and ran there; the request was slow on the far side, not lost
 on a dead pooled connection. The earlier candidates were lucky: the loop was
 as unfair then, and the case passes whenever the coin tosses go its way.
 
+### An exec that ate the case
+
+A 0.3.0 soak pulse failed `deploy_from_cluster_registry` with nothing but
+"case exceeded its deadline" after 300 s ([#2128](https://github.com/reliaburger/reliaburger/issues/2128)).
+The app had been committed, the status polls were bounded at 5 s each, and
+the reason carried no note from a wait that was still polling. What was left
+was the step after them: a `busybox wget` run inside the container through
+`exec_in_workload`. Forty attempts to reproduce it passed, so we still don't
+know that the exec hung. We do know that if it had, nobody could have said
+so, because every layer an exec crosses allowed exactly 300 s: the `relish`
+client, the agent, Bun's wait on the process owner's socket, and the owner's
+own deadline. The case's budget was 300 s too. A wedged exec spent all of
+it, and whichever timer fired first threw away the others' explanations.
+
+Two timeouts that are equal aren't nested; they race. The fix gives each
+layer a different length, in the order the error should come out:
+
+| Layer | Limit | Why that length |
+|-------|-------|-----------------|
+| agent (`exec_deadline.rs`) | the request's `timeout_seconds`, at most 300 s | the one that answers `504` naming the app |
+| Bun's owner-socket wait | 310 s | a backstop in the same future; mustn't beat the agent |
+| the exec owner | 320 s | retires a command whose caller stopped asking |
+| `relish` client | requested + 30 s (330 s by default) | hears the agent's answer instead of timing out blind |
+
+`relish exec` sends no timeout, so a person waiting on a long command keeps
+the five minutes they always had. The test kit asks for less. It waits at
+most 60 s, never past a second before the case's own deadline, and asks the
+agent for 5 s less than that, so the agent's `504` arrives while the test kit
+is still listening:
+
+```rust
+let wait = WORKLOAD_EXEC_BOUND.min(
+    self.deadline
+        .remaining()
+        .saturating_sub(EXEC_DEADLINE_RESERVE),
+);
+let asked = wait
+    .saturating_sub(EXEC_ANSWER_MARGIN)
+    .max(Duration::from_secs(1));
+```
+
+`saturating_sub` stops at zero instead of wrapping round or panicking, as
+`Duration` subtraction would with plain `-` when the right side is larger.
+Either way the case fails with `inspect workload contents: exec in
+rbtest-…/registry-web timed out on node rb-…-1`, followed by the agent's
+answer or "no answer within 60 s", with most of its budget unspent. If the
+wedge happens again, that line confirms or rules out the exec reading.
+
+One layer sits outside the table. When the test kit can't reach a peer
+directly it goes through the entry node's relay, and the relay gives any
+forwarded request 30 s. A relayed exec that wedges gets the relay's `504`,
+"node … did not answer within 30s", under the same heading. That's still a
+named timeout, so we left the relay alone.
+
+The request field is optional, `#[serde(default)] timeout_seconds:
+Option<u64>`, and the handler holds it between 1 s and the cap, so a caller
+can't ask an agent to keep a command running for a day. Old clients send no
+field and get the cap, so nothing about the cluster's wire format changed and
+`CURRENT` keeps its numbers.
+
+The tests check each piece. `a_hanging_exec_fails_with_a_named_timeout` runs
+`run_exec_within` on a future that never finishes, under Tokio's paused clock,
+and checks the error names the app and fires at exactly 60 s;
+`exec_deadlines_nest_inside_the_clients_wait` checks the table's order, so a
+later edit to one constant can't make two layers race again. In the test kit,
+`a_wedged_exec_fails_naming_the_app_node_and_timeout` serves a node whose exec
+never answers and a case with 3 s left, and checks the named error comes back
+before the case deadline; `an_exec_the_agent_timed_out_names_the_app_and_node`
+answers `504` and checks the timeout the test kit asked for. All four failed
+before the change: the first two because every layer was 300 s, the test kit
+pair because the case deadline fired first with nothing to say.
+
 ### Busy isn't dead
 
 `biased;` bought fairness for commands, and the final tier of the soak on
@@ -5335,8 +5426,9 @@ pub(super) async fn sweep_states<G: Grill>(grill: G, reads: Vec<StateRead>) -> S
 
 `buffered(8)` turns a stream of futures into a pool of eight running at once
 that still yields results in the original order. All of them share one
-one-second deadline; a read that misses it comes back `Unknown` and the next
-sweep asks again. The sweep goes into a `JoinSet`, at most one at a time, and a
+one-second deadline; a read that misses it comes back `Unknown`, and the next
+sweep tries again. (How it tries again changed later, and the section after
+next tells why.) The sweep goes into a `JoinSet`, at most one at a time, and a
 new `select!` branch applies what it saw.
 
 Earlier in this chapter a `buffered` stream gave us 380 errors about `Send`
@@ -5365,6 +5457,67 @@ A restart bumps `restart_count`; a fresh deploy under the same id gets a new
 field, the way a C programmer would hope `memcmp` would. The cost of all this
 is latency: a crash now restarts on the tick after the sweep reports, up to a
 second later than before. The restart backoff is longer than that anyway.
+
+#### A read that outlives its sweep
+
+"The next sweep asks again" sounds harmless. On runc it wasn't, and it took
+a flaky test to show us (#2085). `standalone_automatic_restart_replaces_the_original_address_owner`
+kills a container and gives Bun 30 seconds to restart it. On a quiet VM the
+restart takes two seconds. Now and then, on a busy one, it never happened at
+all. We put the VM under disk load (a few `dd ... conv=fsync` loops beside
+the test) and it failed five runs in six. The traces showed why: Bun never
+noticed the container had died. Every sweep's read of it came back
+`Unknown`.
+
+Each runc read takes the instance's lifecycle lock, and the runtime runs it
+in a task of its own, so a caller that gives up can't leave it half done.
+Timing out the sweep's future stopped the *sweep* waiting. It didn't stop the
+read. The read kept the lock, the next sweep's read queued behind it, and the
+lock serves its waiters in order. Once one read takes longer than the
+deadline, every read after it waits out its predecessor's leftover time and
+then its own, so every read misses the deadline, every sweep says `Unknown`,
+and the exit is never seen. The test made it likelier, because it polled the
+same instance twenty times a second through the same lock, but a node on a
+struggling disk would get there by itself.
+
+So the sweep stops starting reads it can't finish. Each read now runs in a
+spawned task, and one still running at the deadline goes back to the loop as
+unfinished. The next sweep waits on that same task instead of asking the
+runtime a second time:
+
+```rust
+let mut task = earlier.unwrap_or_else(|| {
+    let id = read.id.clone();
+    tokio::spawn(async move { observe(&grill, &id).await })
+});
+match tokio::time::timeout_at(deadline, &mut task).await {
+    Ok(observed) => (read, observed.unwrap_or(Observed::Unknown), None),
+    Err(_) => (read, Observed::Unknown, Some(task)),
+}
+```
+
+`tokio::spawn` returns a `JoinHandle`, which is itself a future: awaiting it
+gives you the task's result. We await `&mut task` rather than `task`, so the
+timeout borrows the handle and we still own it when the deadline passes. A
+`JoinHandle` is `Unpin` (moving it doesn't break anything that points into
+it), and that's what lets a plain `&mut` reference be awaited. In C you'd keep
+the `pthread_t` and `pthread_join` it later; in Go you'd keep the channel.
+Here the handle *is* the channel. Dropping a `JoinHandle` doesn't stop its
+task, so a handle the sweep no longer wants (the instance was retired, or has
+restarted since) gets an explicit `abort()`.
+
+The carried reads live on the agent as `unfinished_state_reads`, keyed by
+instance and stamped with the incarnation they read, so a result from before
+a restart still can't touch the replacement. The test that pins it,
+`a_state_read_slower_than_the_sweep_deadline_is_collected_by_the_next_sweep`
+in `src/bun/agent/tests/restart_ownership.rs`, gives the mock runtime a
+crashed instance and one-and-a-half-second reads. Before the change three
+sweeps came back `Unknown` and asked the runtime three times; now the second
+sweep collects the first read and restarts the instance, and the runtime was
+asked once. The flaky test also polls at 250 ms instead of 50, and it treats
+`StateUnavailable` (a read racing the restart's create, which the runtime
+says it can't answer yet) as "look again" rather than a failure, which was
+the other way it failed.
 
 #### A restart, one step at a time
 

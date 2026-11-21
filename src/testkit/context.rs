@@ -268,10 +268,55 @@ fn millis(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
+/// The longest the test kit waits for one exec into a workload. Well under
+/// a case's budget, so a wedged exec leaves time to report it (#2128).
+const WORKLOAD_EXEC_BOUND: Duration = Duration::from_secs(60);
+
+/// How much sooner than the test kit's wait the agent is asked to give up,
+/// so its named `504` crosses the network before the test kit stops waiting.
+const EXEC_ANSWER_MARGIN: Duration = Duration::from_secs(5);
+
+/// How much of the case's deadline an exec leaves unspent, so its own
+/// timeout, not the runner's anonymous one, is what the case reports.
+const EXEC_DEADLINE_RESERVE: Duration = Duration::from_secs(1);
+
+/// Why one exec into a workload failed.
+enum ExecFailure {
+    /// A server on the way answered `504`: the agent's exec deadline, or a
+    /// relay's, fired. Carries the answer's body.
+    ServerTimedOut(String),
+    /// Nothing answered within the test kit's own wait.
+    NoAnswer(Duration),
+    /// Any other failure, as the client reported it.
+    Failed(String),
+}
+
+impl ExecFailure {
+    /// The case's failure reason, naming the step, app and node.
+    fn describe(&self, step: &str, namespace: &str, app: &str, node: &str) -> String {
+        match self {
+            ExecFailure::ServerTimedOut(body) => {
+                format!("{step}: exec in {namespace}/{app} timed out on node {node}: {body}")
+            }
+            ExecFailure::NoAnswer(wait) => format!(
+                "{step}: exec in {namespace}/{app} timed out on node {node}: \
+                 no answer within {} s",
+                wait.as_secs()
+            ),
+            ExecFailure::Failed(error) => format!("workload inspection failed on {node}: {error}"),
+        }
+    }
+}
+
 impl TestContext {
     /// Inspect the actual owning node, since the entry node may not run this app.
+    ///
+    /// The exec gets its own bound, [`WORKLOAD_EXEC_BOUND`] or less when the
+    /// case has less left, so a wedged exec fails naming the app and node
+    /// instead of spending the whole case budget silently (#2128).
     pub async fn exec_in_workload(&self, app: &str, command: &[String]) -> Result<String, String> {
-        self.step(&format!("exec in {app}"), async {
+        let step = format!("exec in {app}");
+        self.step(&step, async {
             for (node, client) in self.node_clients().await? {
                 let instances = client
                     .status()
@@ -282,11 +327,17 @@ impl TestContext {
                         && instance.namespace == self.namespace
                         && instance.state == "running"
                 }) {
-                    return client
-                        .exec(app, &self.namespace, command)
+                    return self
+                        .bounded_exec(&client, app, command)
                         .await
-                        .map(|answer| answer.output)
-                        .map_err(|error| format!("workload inspection failed on {node}: {error}"));
+                        .map_err(|failure| {
+                            failure.describe(
+                                "inspect workload contents",
+                                &self.namespace,
+                                app,
+                                &node,
+                            )
+                        });
                 }
             }
             Err(format!(
@@ -316,6 +367,34 @@ impl TestContext {
             .map_err(|error| error.to_string())?;
         self.trace.end_step(sequence).await;
         Ok(output)
+    }
+
+    /// Run one exec on `client` under the test kit's exec bound, asking the
+    /// agent to give up [`EXEC_ANSWER_MARGIN`] sooner so its answer arrives
+    /// while we're still listening.
+    async fn bounded_exec(
+        &self,
+        client: &BunClient,
+        app: &str,
+        command: &[String],
+    ) -> Result<String, ExecFailure> {
+        let wait = WORKLOAD_EXEC_BOUND.min(
+            self.deadline
+                .remaining()
+                .saturating_sub(EXEC_DEADLINE_RESERVE),
+        );
+        let asked = wait
+            .saturating_sub(EXEC_ANSWER_MARGIN)
+            .max(Duration::from_secs(1));
+        let exec = client.exec_with_timeout(app, &self.namespace, command, Some(asked));
+        match tokio::time::timeout(wait, exec).await {
+            Ok(Ok(answer)) => Ok(answer.output),
+            Ok(Err(crate::relish::RelishError::ApiError { status: 504, body })) => {
+                Err(ExecFailure::ServerTimedOut(body))
+            }
+            Ok(Err(error)) => Err(ExecFailure::Failed(error.to_string())),
+            Err(_) => Err(ExecFailure::NoAnswer(wait)),
+        }
     }
 
     /// Build a bounded HTTP client for workloads, without cluster credentials.
@@ -1868,6 +1947,98 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         (base, server)
+    }
+
+    /// One node, `local`, running `web` in `namespace`, whose exec route is
+    /// `exec`.
+    fn exec_router(namespace: &str, exec: axum::routing::MethodRouter) -> axum::Router {
+        let instances = serde_json::json!([{
+            "id": "web-0", "app_name": "web", "namespace": namespace,
+            "state": "running", "restart_count": 0, "host_port": null, "pid": null
+        }]);
+        axum::Router::new()
+            .route(
+                "/v1/cluster/nodes",
+                axum::routing::get(|| async {
+                    axum::Json(Vec::<crate::bun::agent::NodeStatus>::new())
+                }),
+            )
+            .route(
+                "/v1/status",
+                axum::routing::get(move || {
+                    let instances = instances.clone();
+                    async move { axum::Json(instances) }
+                }),
+            )
+            .route(&format!("/v1/exec/web/{namespace}"), exec)
+    }
+
+    /// #2128: an exec that never answers fails before the case deadline,
+    /// naming the step, the app, the node and the timeout, instead of
+    /// spending the whole case budget silently.
+    #[tokio::test]
+    async fn a_wedged_exec_fails_naming_the_app_node_and_timeout() {
+        let (base, server) = serve(exec_router(
+            "rbtest-exec",
+            axum::routing::post(std::future::pending::<axum::Json<serde_json::Value>>),
+        ))
+        .await;
+        let mut context = context("rbtest-exec");
+        context.client = BunClient::new_with_token(&base, None);
+        context.deadline = Deadline::after(Duration::from_secs(3)).unwrap();
+        let started = std::time::Instant::now();
+        let error = context
+            .exec_in_workload("web", &["true".to_string()])
+            .await
+            .unwrap_err();
+        server.abort();
+        assert!(started.elapsed() < Duration::from_secs(3), "{error}");
+        assert!(
+            error.contains(
+                "inspect workload contents: exec in rbtest-exec/web timed out on node local"
+            ),
+            "{error}"
+        );
+    }
+
+    /// #2128: the agent's own timeout answer reads the same way, and the
+    /// testkit asked for a timeout well inside its bound.
+    #[tokio::test]
+    async fn an_exec_the_agent_timed_out_names_the_app_and_node() {
+        let asked = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let recorded = asked.clone();
+        let (base, server) = serve(exec_router(
+            "rbtest-exec",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let recorded = recorded.clone();
+                async move {
+                    *recorded.lock().await = body["timeout_seconds"].as_u64();
+                    (
+                        axum::http::StatusCode::GATEWAY_TIMEOUT,
+                        axum::Json(serde_json::json!({
+                            "error": "exec in rbtest-exec/web timed out after 55s"
+                        })),
+                    )
+                }
+            }),
+        ))
+        .await;
+        let mut context = context("rbtest-exec");
+        context.client = BunClient::new_with_token(&base, None);
+        context.deadline = Deadline::after(Duration::from_secs(300)).unwrap();
+        let error = context
+            .exec_in_workload("web", &["true".to_string()])
+            .await
+            .unwrap_err();
+        server.abort();
+        assert!(
+            error.contains(
+                "inspect workload contents: exec in rbtest-exec/web timed out on node local"
+            ),
+            "{error}"
+        );
+        let asked = asked.lock().await.expect("the testkit sends a timeout");
+        assert!((1..60).contains(&asked), "asked for {asked} s");
     }
 
     /// An entry node that lists `nodes` and relays `health` and `status` for

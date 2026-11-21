@@ -31,8 +31,8 @@
 # After each release, update the statuses, `since` versions and `release`
 # below (docs/releasing.md, step 10).
 
-release = "0.2.8"
-released = "12 November 2026"
+release = "0.3.0"
+released = "20 November 2026"
 reviewed = "10 November 2026"
 
 # GitHub milestone numbers, for the links on planned rows.
@@ -142,13 +142,14 @@ needs_maintainer = "Beta or Alpha? The site offers it from 0.2.8, with bottles, 
 
 [[group.feature]]
 name = "Bare metal in an hour"
-status = "planned"
-milestone = "0.3.0"
-summary = "An appliance OS, `relish netboot` and claiming machines over the LAN, with signed OS builds (weekly once v0.3.0 is out) and A/B updates."
-restrictions = "Built on the 0.3.0 merge train, not in any release yet. Exit test: three Dell Wyse 3040s from power-on to a cluster."
-issues = [401, 402, 403, 404, 405, 406, 407]
-docs = ["docs/roadmap.md#releases-after-010"]
-evidence = "Roadmap 0.3.0 entry; the release-1-3-0 branch (the 0.3.0 train) carries netboot, claiming, OS updates and the Ubuntu 26.04 guest."
+status = "alpha"
+since = "0.3.0"
+summary = "An appliance OS, `relish netboot` and claiming machines over the LAN, with signed weekly OS builds and A/B updates."
+restrictions = "x86_64 and arm64 machines with UEFI network boot and a wired card the installer has a driver for. Built for the Dell Wyse 3040; other firmware may still have surprises. New in 0.3.0, so its shape may still change."
+issues = [404, 405, 407]
+docs = ["docs/manual/17_appliance.md"]
+evidence = "CI netboots, claims, seeds and updates QEMU appliances on every image change (x86_64; boot test only on aarch64). The release gate doesn't cover it. The Wyse lab exit test (#407) ran on candidate 4's artefacts in parallel with the release; #404 and #405 stay open for its findings."
+needs_maintainer = "Alpha or Beta once the Wyse lab exit test has a record?"
 
 [[group.feature]]
 name = "Raspberry Pi 4 and 5"
@@ -328,10 +329,10 @@ name = "Task arrays"
 status = "ready"
 since = "0.2.0"
 summary = "The same command run thousands or millions of times, stored as a template and a count rather than a record per task."
-restrictions = "In 0.2.3's day run one node's job storage filled its disk; 0.2.7's run peaked at 28 MiB and didn't repeat it, but the cause isn't fixed (#1418)."
-issues = [1418]
+restrictions = "None known."
+issues = []
 docs = ["docs/manual/14_batch-jobs.md#submit-compact-work", "docs/manual/01_deploy-an-app.md#task-arrays"]
-evidence = "0.2.7 jobs final: median 1,048,576-task array in 140 s. The 0.2.8 memory run (docs/qualification/2026-11-14-v0.2.8-memory-run.md) counted 2,649,391,295 host-job tasks in 24 hours, 30,654 a second, and every node's Bun memory levelled off under its target (#1417). #1418 (0.3.0) is from the 0.2.3 day run and still open."
+evidence = "0.2.7 jobs final: median 1,048,576-task array in 140 s. The 0.2.8 memory run (docs/qualification/2026-11-14-v0.2.8-memory-run.md) counted 2,649,391,295 host-job tasks in 24 hours, 30,654 a second, and every node's Bun memory levelled off under its target (#1417). #1418, from the 0.2.3 day run, closed in 0.3.0: the fixes in #1479 and #1482 keep instance storage under 29 MiB allocated."
 needs_maintainer = "Ready, though #1418 only shows up in a day-long run at 20,000 to 31,000 a second. Downgrade to Beta if you count it as serious."
 
 [[group.feature]]
@@ -492,9 +493,9 @@ status = "beta"
 since = "0.1.0"
 summary = "WebSocket and streaming responses pass through the ingress."
 restrictions = "None known: since 0.3.0 a drained WebSocket is closed with code 1001, and its proxy headers match plain HTTP's."
-issues = [369]
+issues = []
 docs = ["docs/manual/03_networking.md#ingress"]
-evidence = "F08 #369 in 0.3.0; the fix (b0de7b66) is on the 0.3.0 train."
+evidence = "F08 #369, shipped in 0.3.0."
 
 [[group.feature]]
 name = "ACME certificates"
@@ -570,9 +571,9 @@ status = "beta"
 since = "0.1.6"
 summary = "The root CA is offline: `relish init` writes its key only to a sealed backup you keep, and `relish ca rotate` rotates an intermediate CA signed with it."
 restrictions = "Rotating the root itself isn't supported."
-issues = [362, 709]
+issues = [362]
 docs = ["docs/manual/10_security.md#the-root-ca-backup", "docs/manual/10_security.md#rotating-an-intermediate-ca"]
-evidence = "F04 R1-R4 in 0.1.6; the offline root (#709) on the 0.3.0 train; root rotation is F04 (#362, Later). Not exercised by the release gate."
+evidence = "F04 R1-R4 in 0.1.6; the offline root (#709) in 0.3.0; root rotation is F04 (#362, Later). Not exercised by the release gate."
 
 [[group.feature]]
 name = "Tags bound to digests"
@@ -636,10 +637,10 @@ name = "Secrets from an exec provider"
 status = "beta"
 since = "0.2.4"
 summary = "A node runs a command you configure to fetch a secret at deploy time, so values can come from your own secret store."
-restrictions = "Jobs can't use providers yet, and a brief provider outage on restart isn't retried."
-issues = [1307, 1308]
+restrictions = "Jobs can't use providers yet."
+issues = [1307]
 docs = ["docs/manual/10_security.md#secrets-from-a-provider"]
-evidence = "0.2.4 (roadmap); #1307 and #1308 open, no milestone."
+evidence = "0.2.4 (roadmap); 0.3.0 retries a brief outage and resolves only typed references (#1308). #1307 open, no milestone."
 
 # --- Storage and volumes -----------------------------------------------------
 
@@ -699,9 +700,9 @@ status = "ready"
 since = "0.1.0"
 summary = "An OCI registry built into the cluster: push once and nodes pull layers from each other."
 restrictions = "Deleting by digest isn't supported: an image leaves by losing its tags. One Bun per writable image store."
-issues = []
+issues = [2128]
 docs = ["docs/manual/11_images-and-volumes.md#where-images-come-from", "docs/design/registry-pickle.md"]
-evidence = "Gate: 7 images pushed and re-verified in the 0.2.7 V02 fast tier (Data). Manual 'Deleting a tag'; docs/README 'Scope and limits'."
+evidence = "Gate: 7 images pushed and re-verified in the 0.2.7 V02 fast tier (Data). Manual 'Deleting a tag'; docs/README 'Scope and limits'. 0.3.0 ships with #2128: in its 8-hour final, one of 59 catalogue deploys from the cluster registry stalled for 5 minutes after a disk fault and recovered by itself, cause unverified."
 
 [[group.feature]]
 name = "Building images in the cluster"
@@ -854,13 +855,13 @@ evidence = "One recorded cross-release walk: 0.2.2 to 0.2.3 (qualification/2026-
 
 [[group.feature]]
 name = "OS updates"
-status = "planned"
-milestone = "0.3.0"
-summary = "Signed A/B updates of the appliance OS, rolled across the cluster by `bun`."
-restrictions = ""
-issues = [406]
-docs = ["docs/roadmap.md#releases-after-010"]
-evidence = "#406 in 0.3.0; built on the 0.3.0 train."
+status = "alpha"
+since = "0.3.0"
+summary = "Signed A/B updates of the appliance OS, rolled across the cluster by `relish os`, workers first and the leader last."
+restrictions = "Node shutdown skips each app's `pre_stop` hook and gives it 5 s instead of its `stop_grace` (#2118); a rollout moves host-path apps away from their data (#2120), and `relish status` and `relish nodes` don't show its cordons (#2119)."
+issues = [2118, 2119, 2120]
+docs = ["docs/manual/17_appliance.md#updating-the-os"]
+evidence = "Shipped in 0.3.0 (#406). CI updates a QEMU appliance cluster and falls back from a broken update on every image change; the release gate doesn't cover it."
 
 # --- Self-healing ------------------------------------------------------------
 
@@ -896,7 +897,7 @@ summary = "A new leader takes over within seconds, and a restarted `bun` adopts 
 restrictions = "None known: since 0.3.0 a returning voter holds its elections until it hears from a leader (#1524)."
 issues = []
 docs = ["docs/manual/02_cluster-basics.md#watch-it"]
-evidence = "Gate: SIGKILL of the leader and of followers, six times each in the 0.2.7 V02 fast tier; no leader for over 30 s fails the release. Replicas kept on restart since 0.2.4 (#1449)."
+evidence = "Gate: SIGKILL of the leader and of followers, six times each in the 0.2.7 V02 fast tier; no leader for over 30 s fails the release. Replicas kept on restart since 0.2.4 (#1449); since 0.3.0 a replaced voter coming back no longer forces an election (#1524)."
 
 [[group.feature]]
 name = "Recovering a lost council"

@@ -518,8 +518,10 @@ migration and no feature gate
   [release log](release-log.md#028-agents-you-can-trust-built-faster)).
   0.2.8 changes the cluster formats, so a 0.2.7 cluster starts afresh
   ([upgrading from 0.2.7](releasing.md#upgrading-from-027)).
-- [ ] **0.3.0: "Bare metal in an hour"**
+- [x] **0.3.0: "Bare metal in an hour".** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.0)
+  on 20 November 2026
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/6),
+  [plan](plans/archive/2026-10-01-plan-appliance-product.md),
   research and spikes in [#218](https://github.com/reliaburger/reliaburger/pull/218)
   and [#259](https://github.com/reliaburger/reliaburger/pull/259)). The
   appliance OS (our own mkosi image on Ubuntu 26.04), `relish netboot` and
@@ -529,9 +531,25 @@ migration and no feature gate
   fleet control plane can extend it later. Alongside it: the acceptance gates
   0.1.0 didn't close (V01–V04, below) and WebSocket drain parity (F08,
   [#369](https://github.com/reliaburger/reliaburger/issues/369)). Exit test:
-  three Dell Wyse 3040s from power-on to a cluster.
-  Next. Its merge train is [#490](https://github.com/reliaburger/reliaburger/pull/490),
-  which waited for the 0.2.x patch releases.
+  three Dell Wyse 3040s from power-on to a cluster
+  ([#407](https://github.com/reliaburger/reliaburger/issues/407)), which runs
+  on the release's artefacts in parallel with it: the maintainer chose not to
+  hold the tag for it. Candidate 4 passed the full gate but for one
+  catalogue deploy that stalled for its 5-minute deadline after a disk fault
+  in the 8-hour final, accepted as a known issue
+  ([#2128](https://github.com/reliaburger/reliaburger/issues/2128), in 0.3.1;
+  [closure](qualification/2026-11-20-v0.3.0-release-closure.md),
+  [release log](release-log.md#030-bare-metal-in-an-hour)). 0.3.0 changes
+  the cluster formats, so a 0.2.8 cluster starts afresh
+  ([upgrading from 0.2.8](releasing.md#upgrading-from-028)).
+- [ ] **0.3.1: gate follow-ups**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/33)).
+  A patch release: what 0.3.0's gate and freeze left, from #2128 and a soak
+  schedule that always overlaps a runc job with a power-off
+  ([#2105](https://github.com/reliaburger/reliaburger/issues/2105)) to stop
+  hooks on node shutdown
+  ([#2118](https://github.com/reliaburger/reliaburger/issues/2118)), and
+  whatever the Wyse lab exit test finds. Next.
 - [ ] **0.4.0: "Planned maintenance"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/7),
   [review](plans/2026-11-19-review-0.4.x.md),

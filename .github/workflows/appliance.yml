@@ -1,7 +1,7 @@
 name: Appliance image
 
 # The Reliaburger appliance: Ubuntu 26.04 built with mkosi, one native build
-# per architecture (docs/plans/2026-10-01-plan-appliance-product.md, W1).
+# per architecture (docs/plans/archive/2026-10-01-plan-appliance-product.md, W1).
 #
 # Pull requests build the `lab` profile, boot-test it and sign it with a
 # throwaway key, for the QEMU lab. On x86-64 they also build a next version
