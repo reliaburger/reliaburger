@@ -451,3 +451,118 @@ node 2's row showed node 1's. The view now carries the node and instance too,
 the same identity the row has, and the page looks up exactly that. When a view
 is keyed by less than the row it was opened from, it will eventually show the
 wrong row. `job_detail_shows_the_selected_nodes_instance` pins it.
+
+### Finding the line that matters
+
+Picture the Wyse lab: three nodes, an app that keeps restarting, and two
+hundred log lines a minute scrolling past. You want the one that says
+`error`. The logs view could already filter on `/`, but it didn't show where
+in each line the match was, and the app detail's Logs and Metrics tabs had no
+search at all. The Metrics tab didn't even show every metric: it picked the
+rows whose names contained `cpu` or `memory` and drew two sparklines.
+
+Now `/` opens a search box in all three places. Only the lines containing the
+text stay, ignoring case, each match is red and bold, and a line above them
+says `filter: error (2 of 40 lines)`. Esc clears it. The Metrics tab lists
+every series the app exports, one row each, as Prometheus writes them
+(`http_requests_total{route="/health"}`), with its last value and a sparkline,
+and the search covers labels as well as names.
+
+The highlight is the interesting part, because it needs to know *where* the
+match is, in bytes, so it can cut the line into three spans: before, match,
+after. The obvious way is to lowercase both strings and call `find`. It's
+also wrong, and Rust is the language that makes you notice. A Rust `String`
+is UTF-8, and `"İ".to_lowercase()` is two characters, `i` and a combining
+dot, three bytes where the original had two. An offset found in the
+lowercased copy can land in the middle of a character in the original, and
+slicing a `&str` there (`&text[3..7]`) panics rather than hand you half a
+character. C would hand you the half character; Python and Go would both let
+the offsets quietly drift.
+
+So `matching.rs` compares a character at a time against the line as it is:
+
+```rust
+fn match_length(text: &str, needle: &[char]) -> Option<usize> {
+    let mut characters = text.char_indices();
+    for wanted in needle {
+        let (_, found) = characters.next()?;
+        if !found.to_lowercase().eq(wanted.to_lowercase()) {
+            return None;
+        }
+    }
+    Some(characters.next().map_or(text.len(), |(index, _)| index))
+}
+```
+
+`char_indices` yields each character with its byte offset, so the answer is
+always a character boundary. `char::to_lowercase` returns an iterator, not a
+`char`, precisely because one character can lowercase to several, and
+`Iterator::eq` compares two iterators item by item. `match_ranges` walks the
+line calling this and returns a `Vec<Range<usize>>`: `Range` is the type
+behind `3..7`, a start and an end you can slice with. The same function
+decides which lines are shown, so the count, the filtering and the highlight
+can't disagree.
+
+The colour is `Color::Red` with `Modifier::BOLD`, not one of the theme's RGB
+values. The appliance's console (#2150) has sixteen colours, and an RGB
+highlight there comes out as whatever the nearest one happens to be.
+
+Two things only showed up once the search worked. The filter is one field on
+`TuiApp`, shared by every screen, so a search for `error` in the logs came
+back as a filter on the apps list when you pressed Esc. Now pushing a view,
+popping one or switching tabs clears it. And Esc used to mean "back", so
+clearing a search would have closed the view you searched in. Esc clears a
+search first; the next Esc goes back.
+
+`render_to_string` drops styles, as "Testing a screen" explained, so the
+snapshots show which lines survive a search (some, none, a match mid-line)
+but not the red. One test renders into a `TestBackend` and reads the cells
+under `health` back: red and bold on the match, not on `GET /` before it or
+` 200` after. The span splitting has its own unit tests, with several
+matches in one line and a match at either end.
+
+### Killing from the Instances tab
+
+The Instances tab was a read-only table. In the Wyse lab the next thing
+anyone wanted, having found the replica that misbehaved, was to kill it and
+watch the scheduler bring up another. That meant leaving the TUI for
+`relish fault kill web --instance web-1 --node node-2 --acknowledge`.
+
+Now ↑ and ↓ select a row and `k` (or Ctrl-K) asks:
+
+```text
+Kill instance web-1 on node-2? The scheduler starts a replacement. [y/N]
+```
+
+Only `y` kills. Enter, `n`, Esc, even `q`, cancel it, which is why the
+capital `N` is the default. A key that destroys something should need a
+deliberate second key, and the test `k_without_confirming_does_nothing`
+presses each of those after `k` and checks nothing was queued.
+
+The interesting decision is what the kill *is*. We could have added a
+"restart instance" endpoint to Bun. We didn't, because Smoker already has
+one, with everything a kill should have: the fault is recorded, so it shows
+in `relish fault list` and the events; the API audits it under the caller's
+token; and Smoker's safety rails apply, so a namespace-scoped token can't
+reach another tenant's replica. A second path would have needed all of that
+again, and would have drifted. So `fault.rs` gained one function,
+`instance_kill_request`, which builds the request the command builds from
+`--namespace`, `--instance`, `--node`, `--acknowledge` and `--reason`, and
+the TUI sends it through the same `BunClient::inject_fault`. A test
+serialises both requests to JSON and compares them, so they can't drift
+apart quietly. Its reason is `relish tui`, so the audit log says where the
+kill came from.
+
+The reducer stays pure. A `y` doesn't send anything; it pushes
+`Effect::KillInstance(InstanceTarget)` onto `pending`, and the event loop
+spawns the request and posts the answer back as a message. The answer goes
+in the status line. Success says which fault id did it and asks for a
+refresh; a refusal shows the API's own words (`kill refused: …`), because
+"403" tells nobody which rail they hit. A refusal is also not a lost
+connection, so it doesn't turn the header red.
+
+The prompt holds the whole `InstanceTarget`, not the cursor position. A
+refresh can reorder or shorten the list between `k` and `y`, and a prompt
+that names `web-1` must kill `web-1`, not whatever row slid under the
+cursor. It's the job-detail lesson again: carry the identity of the row,
+not where it was.

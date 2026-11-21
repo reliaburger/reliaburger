@@ -14,8 +14,15 @@ use crate::relish::client::BunClient;
 use crate::relish::nodes_cmd::NodeRow;
 use crate::wrapper::types::RouteInfo;
 
+use crate::smoker::types::FaultSummary;
+
 use super::fixtures::TestScenario;
 use super::msg::StreamItem;
+use super::state::InstanceTarget;
+
+/// The reason a kill from the terminal UI carries into the fault record
+/// and the audit log.
+const KILL_REASON: &str = "relish tui";
 
 /// Failures surfaced by a data provider.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -66,6 +73,12 @@ pub trait DataProvider: Send + Sync + 'static {
         app: &str,
         namespace: &str,
     ) -> impl Future<Output = Result<MetricsQueryResult, ProviderError>> + Send;
+    /// Kill one instance with Smoker's kill fault, as `relish fault kill`
+    /// does with `--instance` and `--node`.
+    fn kill_instance(
+        &self,
+        target: &InstanceTarget,
+    ) -> impl Future<Output = Result<FaultSummary, ProviderError>> + Send;
     fn follow_logs(
         &self,
         app: String,
@@ -133,6 +146,17 @@ impl DataProvider for HttpDataProvider {
             .app_metrics(app, namespace)
             .await
             .map_err(Into::into)
+    }
+
+    async fn kill_instance(&self, target: &InstanceTarget) -> Result<FaultSummary, ProviderError> {
+        let request = crate::relish::fault::instance_kill_request(
+            &target.app,
+            &target.namespace,
+            &target.instance,
+            &target.node,
+            KILL_REASON,
+        );
+        self.client.inject_fault(&request).await.map_err(Into::into)
     }
 
     async fn follow_logs(
@@ -224,6 +248,21 @@ impl DataProvider for MockDataProvider {
                 warnings: Vec::new(),
             }))
     }
+    async fn kill_instance(&self, target: &InstanceTarget) -> Result<FaultSummary, ProviderError> {
+        Ok(FaultSummary {
+            id: 1,
+            fault_type: "kill".into(),
+            target_service: target.app.clone(),
+            namespace: Some(target.namespace.clone()),
+            target_instance: Some(target.instance.clone()),
+            task_index: None,
+            target_node: Some(target.node.clone()),
+            remaining_secs: 0,
+            injected_by: "test".into(),
+            node: Some(target.node.clone()),
+            routed: Vec::new(),
+        })
+    }
     async fn follow_logs(
         &self,
         _app: String,
@@ -297,6 +336,100 @@ mod tests {
         let json = serde_json::to_value(statuses).unwrap();
         assert_eq!(json[0]["node"], "node-b");
         assert_eq!(json[0]["namespace"], "production");
+    }
+
+    /// Serve `/v1/fault`, keeping each request, and answer with `status`
+    /// and `body`, or with a fault summary on 200.
+    async fn serve_fault(
+        status: u16,
+        body: &'static str,
+    ) -> (
+        String,
+        Arc<tokio::sync::Mutex<Vec<crate::smoker::types::FaultRequest>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::routing::post;
+
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let app = Router::new().route(
+            "/v1/fault",
+            post({
+                let seen = Arc::clone(&seen);
+                move |Json(request): Json<crate::smoker::types::FaultRequest>| async move {
+                    seen.lock().await.push(request);
+                    let code = axum::http::StatusCode::from_u16(status).unwrap();
+                    if status != 200 {
+                        return axum::response::IntoResponse::into_response((code, body));
+                    }
+                    axum::response::IntoResponse::into_response(Json(serde_json::json!({
+                        "id": 7, "fault_type": "kill", "target_service": "web",
+                        "namespace": "default", "target_instance": "web-1",
+                        "target_node": "node-2", "remaining_secs": 0,
+                        "injected_by": "admin"
+                    })))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), seen, server)
+    }
+
+    fn web_1_on_node_2() -> crate::relish::tui::state::InstanceTarget {
+        crate::relish::tui::state::InstanceTarget {
+            app: "web".into(),
+            namespace: "default".into(),
+            instance: "web-1".into(),
+            node: "node-2".into(),
+        }
+    }
+
+    // The TUI's kill is `relish fault kill web --namespace default
+    // --instance web-1 --node node-2 --acknowledge --reason "relish tui"`,
+    // sent to the same API, so it's audited and rail-checked the same way
+    // (#2175).
+    #[tokio::test]
+    async fn kill_instance_sends_the_smoker_kill_fault_for_that_instance_and_node() {
+        let (url, seen, server) = serve_fault(200, "").await;
+        let provider = HttpDataProvider {
+            client: BunClient::new(&url),
+        };
+        let summary = provider.kill_instance(&web_1_on_node_2()).await.unwrap();
+        server.abort();
+        assert_eq!(summary.id, 7);
+        let seen = seen.lock().await;
+        assert_eq!(seen.len(), 1);
+        let request = &seen[0];
+        assert!(matches!(
+            request.fault_type,
+            crate::smoker::types::FaultType::Kill { count: 1 }
+        ));
+        assert_eq!(request.target_service, "web");
+        assert_eq!(request.namespace.as_deref(), Some("default"));
+        assert_eq!(request.target_instance.as_deref(), Some("web-1"));
+        assert_eq!(request.target_node.as_deref(), Some("node-2"));
+        assert_eq!(request.reason.as_deref(), Some("relish tui"));
+        assert!(request.acknowledged);
+        assert!(!request.override_safety, "the TUI never overrides a rail");
+        assert_eq!(request.duration, std::time::Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn a_refused_kill_comes_back_with_the_apis_words() {
+        let (url, _seen, server) =
+            serve_fault(403, "safety rail: would kill the last replica").await;
+        let provider = HttpDataProvider {
+            client: BunClient::new(&url),
+        };
+        let result = provider.kill_instance(&web_1_on_node_2()).await;
+        server.abort();
+        assert!(
+            matches!(&result, Err(ProviderError::Api { status: 403, body }) if body.contains("last replica")),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]

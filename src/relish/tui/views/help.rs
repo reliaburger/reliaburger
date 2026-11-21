@@ -199,6 +199,184 @@ mod tests {
         assert!(output.contains("image          unknown"), "{output}");
     }
 
+    /// An app's log view with four lines, one of them a warning.
+    fn logs_in(view: View) -> TuiApp {
+        let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);
+        app.view_stack.push(view);
+        for (instance, line) in [
+            ("web-0", "GET /health 200 in 3ms"),
+            ("web-1", "ERROR: disk full on /var/lib/web"),
+            ("web-0", "retrying after error, attempt 2"),
+            ("web-1", "server ready"),
+        ] {
+            app.log_lines.push_back(LogLine {
+                instance: instance.into(),
+                line: line.into(),
+            });
+        }
+        app
+    }
+
+    fn logs_tab() -> View {
+        View::AppDetail {
+            app: "web".into(),
+            namespace: "default".into(),
+            tab: DetailTab::Logs,
+        }
+    }
+
+    fn logs_view() -> View {
+        View::Logs {
+            app: Some(("web".into(), "default".into())),
+        }
+    }
+
+    // `/` in the Logs tab and the logs view shows only the matching lines
+    // and says how many of how many (#2174).
+    #[test]
+    fn log_search_snapshots() {
+        for (name, view) in [("app_detail_logs", logs_tab()), ("logs", logs_view())] {
+            let mut app = logs_in(view);
+            app.filter = Some("error".into());
+            let output = render_to_string(&app, 120, 40);
+            assert!(output.contains("filter: error (2 of 4 lines)"), "{output}");
+            assert!(!output.contains("server ready"), "{output}");
+            insta::assert_snapshot!(format!("{name}_search_some"), output);
+
+            app.filter = Some("panic".into());
+            let output = render_to_string(&app, 120, 40);
+            assert!(output.contains("filter: panic (0 of 4 lines)"), "{output}");
+            assert!(output.contains("no lines match"), "{output}");
+            insta::assert_snapshot!(format!("{name}_search_none"), output);
+        }
+
+        let mut app = logs_in(logs_tab());
+        app.filter = Some("health".into());
+        app.filter_editing = true;
+        insta::assert_snapshot!(
+            "app_detail_logs_search_mid_line",
+            render_to_string(&app, 120, 40)
+        );
+    }
+
+    /// The first cell of `text` on screen and its style, from a render that
+    /// keeps the styles `render_to_string` drops.
+    fn styled_cell(app: &TuiApp, text: &str) -> ratatui::style::Style {
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| super::super::render(frame, app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows = render_to_string(app, 120, 40);
+        let (y, row) = rows
+            .lines()
+            .enumerate()
+            .find(|(_, row)| row.contains(text))
+            .unwrap_or_else(|| panic!("{text:?} is not on screen:\n{rows}"));
+        let x = row[..row.find(text).unwrap()].chars().count();
+        buffer[(x as u16, y as u16)].style()
+    }
+
+    #[test]
+    fn a_search_match_is_red_and_bold_and_the_rest_of_the_line_is_not() {
+        use ratatui::style::{Color, Modifier};
+
+        let mut app = logs_in(logs_tab());
+        app.filter = Some("HEALTH".into());
+        let matched = styled_cell(&app, "health 200");
+        assert_eq!(matched.fg, Some(Color::Red));
+        assert!(matched.add_modifier.contains(Modifier::BOLD));
+        let before = styled_cell(&app, "GET /health");
+        assert_ne!(before.fg, Some(Color::Red));
+        let after = styled_cell(&app, "200 in 3ms");
+        assert_ne!(after.fg, Some(Color::Red));
+    }
+
+    // Without a search the Metrics tab lists every series the app exports,
+    // not only CPU and memory; with one, the series whose name or labels
+    // match (#2174).
+    #[test]
+    fn metrics_search_snapshots() {
+        let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);
+        app.view_stack.push(View::AppDetail {
+            app: "web".into(),
+            namespace: "default".into(),
+            tab: DetailTab::Metrics,
+        });
+        let output = render_to_string(&app, 120, 40);
+        assert!(
+            output.contains("http_requests_total{route=\"/health\"}"),
+            "{output}"
+        );
+
+        app.filter = Some("process".into());
+        let output = render_to_string(&app, 120, 40);
+        assert!(
+            output.contains("filter: process (2 of 3 metrics)"),
+            "{output}"
+        );
+        assert!(!output.contains("http_requests_total"), "{output}");
+        insta::assert_snapshot!("app_detail_metrics_search_some", output);
+
+        // Labels count: `health` is only in the route label.
+        app.filter = Some("health".into());
+        let output = render_to_string(&app, 120, 40);
+        assert!(
+            output.contains("filter: health (1 of 3 metrics)"),
+            "{output}"
+        );
+        assert!(output.contains("http_requests_total"), "{output}");
+
+        app.filter = Some("disk".into());
+        let output = render_to_string(&app, 120, 40);
+        assert!(output.contains("no metrics match"), "{output}");
+        insta::assert_snapshot!("app_detail_metrics_search_none", output);
+    }
+
+    // The Instances tab asks before it kills (#2175).
+    #[test]
+    fn kill_confirmation_snapshot() {
+        let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);
+        app.view_stack.push(View::AppDetail {
+            app: "web".into(),
+            namespace: "default".into(),
+            tab: DetailTab::Instances,
+        });
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('k'),
+            KeyModifiers::NONE,
+        )));
+        let output = render_to_string(&app, 120, 40);
+        assert!(
+            output.contains(
+                "Kill instance web-1 on node-2? The scheduler starts a replacement. [y/N]"
+            ),
+            "{output}"
+        );
+        insta::assert_snapshot!("app_detail_instances_confirm_kill", output);
+    }
+
+    #[test]
+    fn the_selected_instance_is_highlighted() {
+        let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);
+        app.view_stack.push(View::AppDetail {
+            app: "web".into(),
+            namespace: "default".into(),
+            tab: DetailTab::Instances,
+        });
+        app.instances_cursor = 1;
+        assert_eq!(
+            styled_cell(&app, "node-2       web-1").bg,
+            crate::relish::tui::theme::selected().bg
+        );
+        assert_ne!(
+            styled_cell(&app, "node-1       web-0").bg,
+            crate::relish::tui::theme::selected().bg
+        );
+    }
+
     #[test]
     fn help_lists_keybindings() {
         let mut app = TuiApp::with_test_data(TestScenario::Empty);

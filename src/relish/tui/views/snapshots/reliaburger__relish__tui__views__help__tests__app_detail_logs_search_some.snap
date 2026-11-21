@@ -1,0 +1,43 @@
+---
+source: src/relish/tui/views/help.rs
+expression: output
+---
+ RELISH  3 nodes · 3 apps · leader node-1 · CONNECTED                                                                   
+                                                                                                                        
+┌app detail────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│web · default                                                                                                         │
+│ Overview  │  Instances  │ [Logs] │  Metrics  │  Deploys  │  Config                                                   │
+│←/→ or Tab: switch tabs · /: search · f: follow                                                                       │
+│                                                                                                                      │
+│live logs from every node running the app                                                                             │
+│filter: error (2 of 4 lines) · Esc clears it                                                                          │
+│web-1 │ ERROR: disk full on /var/lib/web                                                                              │
+│web-0 │ retrying after error, attempt 2                                                                               │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ [a]pps [n]odes [j]obs [e]vents [l]ogs [r]outes [s]earch [?]help [:]cmd [q]uit  /error
