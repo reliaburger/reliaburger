@@ -34,6 +34,9 @@ COMMON = {
     "r8152", "ax88179_178a", "cdc_ether",  # USB Ethernet adapters
     "virtio_net",
     "nvme", "ahci", "mmc_block", "usb_storage", "xhci_pci",
+    # Boot logs over the network (#2149): netconsole through configfs, and
+    # the installed ESP mounted to write netlog.conf.
+    "netconsole", "configfs", "vfat", "nls_cp437", "nls_iso8859_1",
 }
 REQUIRED = {
     "x86_64": COMMON | {"sdhci_pci", "sdhci_acpi"},

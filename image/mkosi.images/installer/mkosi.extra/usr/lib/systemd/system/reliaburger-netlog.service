@@ -1,0 +1,19 @@
+# The installer's half of #2149: with reliaburger.netlog=<address>[:<port>]
+# on the command line (`relish netboot --stream-logs`), stream the kernel log
+# and the installer's own lines there. The same script as the installed
+# system's (image/mkosi.extra/usr/lib/reliaburger/netlog; a test keeps the
+# two copies equal). The installer then writes the target to netlog.conf on
+# the installed ESP, so the installed system streams too.
+[Unit]
+Description=Reliaburger boot logs over the network
+After=network-online.target
+Wants=network-online.target
+Before=reliaburger-install.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=30
+StandardOutput=journal+console
+UnsetEnvironment=NETLOG_CMDLINE NETLOG_CONF NETLOG_CONFIGFS NETLOG_RUN
+ExecStart=-/usr/lib/reliaburger/netlog

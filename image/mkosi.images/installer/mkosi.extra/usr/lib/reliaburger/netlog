@@ -1,0 +1,211 @@
+#!/bin/bash
+# Send this machine's kernel log, and the lines of the units that matter
+# during a boot, to an operator's machine over UDP (#2149,
+# docs/plans/2026-11-20-plan-appliance-console-and-boot-logs.md §1).
+#
+# Off unless something names a target:
+#   - reliaburger.netlog=<address>[:<port>] on the kernel command line, which
+#     `relish netboot --stream-logs` passes to the installer;
+#   - reliaburger/netlog.conf on the ESP, which the installer writes from
+#     that argument, with a line target=<address>[:<port>].
+# The port is 6666 unless it says otherwise. Without a target, or with one
+# that doesn't parse, it says so and exits 0: boot logs are a lab aid, and
+# never stop a boot.
+#
+# With one, it
+#   1. points the kernel's netconsole at the target through configfs, bound
+#      to the interface the route to the target leaves through. The UKI's
+#      command line is fixed and signed, so `netconsole=` can't go there;
+#   2. lets info lines reach the consoles (`dmesg -n 7`), since netconsole
+#      is one, and gives the units that matter StandardOutput=journal+kmsg
+#      through runtime drop-ins, so their lines go out too. Runtime, not in
+#      /usr: without a target, their lines stay on the console as before,
+#      which the CI boot tests read;
+#   3. sends the kernel log so far (`dmesg`) once per boot, so the start of
+#      the boot isn't lost.
+#
+# The lines cross the LAN in cleartext; nothing here is authenticated.
+#
+# NETLOG_CMDLINE, NETLOG_CONF, NETLOG_CONFIGFS and NETLOG_RUN are for
+# image/tests/test_netlog.py; the units unset them (UnsetEnvironment=).
+set -u
+
+DEFAULT_PORT=6666
+cmdline=${NETLOG_CMDLINE:-/proc/cmdline}
+# gpt-auto mounts the ESP at /boot, or at /efi when /boot isn't empty.
+configs=${NETLOG_CONF:-/boot/reliaburger/netlog.conf /efi/reliaburger/netlog.conf}
+configfs=${NETLOG_CONFIGFS:-/sys/kernel/config}
+run=${NETLOG_RUN:-/run}
+# The installed system's boot units, and the installer's.
+units="reliaburger-boot-check reliaburger reliaburger-seed reliaburger-time-wait reliaburger-install"
+
+# To stderr, which the unit sends where stdout goes: the reasons
+# find_target gives would otherwise be captured with its result.
+say() { echo "reliaburger-netlog: $*" >&2; }
+
+valid_ipv4() {
+    local IFS=. part count=0
+    case $1 in '' | *[!0-9.]* | .* | *. | *..*) return 1 ;; esac
+    for part in $1; do
+        count=$((count + 1))
+        [ ${#part} -le 3 ] && [ "$((10#$part))" -le 255 ] || return 1
+    done
+    [ "$count" -eq 4 ]
+}
+
+# "<address>[:<port>]" -> "<address> <port>", or fail.
+parse_target() {
+    local value=$1 address port
+    case $value in
+        *:*) address=${value%%:*} port=${value#*:} ;;
+        *) address=$value port=$DEFAULT_PORT ;;
+    esac
+    valid_ipv4 "$address" || return 1
+    case $port in '' | *[!0-9]*) return 1 ;; esac
+    [ ${#port} -le 5 ] && [ "$((10#$port))" -ge 1 ] && [ "$((10#$port))" -le 65535 ] || return 1
+    echo "$address $((10#$port))"
+}
+
+# The target in netlog.conf $1, or fail saying why.
+read_config() {
+    local file=$1 line key value target=
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%$'\r'}
+        case $line in '' | '#'*) continue ;; esac
+        case $line in *=*) ;; *)
+            say "ignoring $file: \"$line\" isn't key=value"
+            return 1
+            ;;
+        esac
+        key=${line%%=*} value=${line#*=}
+        case $key in
+            target) target=$value ;;
+            # Unknown keys are for a later version; this one ignores them.
+            *) ;;
+        esac
+    done <"$file"
+    if [ -z "$target" ]; then
+        say "ignoring $file: it has no target="
+        return 1
+    fi
+    parse_target "$target" || {
+        say "ignoring $file: target=$target isn't <IPv4 address>[:<port>]"
+        return 1
+    }
+}
+
+# The target, from the command line first, then netlog.conf.
+find_target() {
+    local word value file
+    for word in $(cat "$cmdline" 2>/dev/null); do
+        case $word in reliaburger.netlog=*) value=${word#*=} ;; esac
+    done
+    if [ -n "${value:-}" ]; then
+        parse_target "$value" || {
+            say "ignoring reliaburger.netlog=$value: not <IPv4 address>[:<port>]"
+            return 1
+        }
+        return 0
+    fi
+    for file in $configs; do
+        [ -r "$file" ] && { read_config "$file"; return; }
+    done
+    say "no reliaburger.netlog= and no netlog.conf; boot logs stay on this machine"
+    return 1
+}
+
+# The word after $1 in the rest of the arguments.
+after() {
+    local key=$1 previous= word
+    shift
+    for word in "$@"; do
+        [ "$previous" = "$key" ] && { echo "$word"; return; }
+        previous=$word
+    done
+}
+
+target=$(find_target) || exit 0
+read -r address port <<<"$target"
+
+route=$(ip -4 -o route get "$address" 2>/dev/null) || {
+    say "no route to $address; not streaming"
+    exit 0
+}
+# shellcheck disable=SC2086 # split the route into words on purpose
+dev=$(after dev $route)
+# shellcheck disable=SC2086
+src=$(after src $route)
+# shellcheck disable=SC2086
+via=$(after via $route)
+if [ -z "$dev" ] || [ -z "$src" ]; then
+    say "the route to $address has no interface or source address ($route); not streaming"
+    exit 0
+fi
+
+# Say hello, which also makes the kernel resolve the next hop's MAC.
+mac=$(cat "/sys/class/net/$dev/address" 2>/dev/null)
+{ echo "reliaburger-netlog: streaming from $src ($dev ${mac:-}) to $address:$port" >"/dev/udp/$address/$port"; } 2>/dev/null
+hop=${via:-$address}
+remote_mac=
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    # shellcheck disable=SC2046
+    remote_mac=$(after lladdr $(ip neigh show "$hop" dev "$dev" 2>/dev/null))
+    [ -n "$remote_mac" ] && break
+    sleep 0.2
+done
+
+# What the kernel logged so far, before netconsole starts sending the rest.
+marker=$run/reliaburger/netlog-sent
+backlog=
+[ -e "$marker" ] || backlog=$(dmesg 2>/dev/null)
+
+modprobe configfs 2>/dev/null || true # built in on Ubuntu's kernel
+mountpoint -q "$configfs" || mount -t configfs configfs "$configfs" 2>/dev/null
+if ! modprobe netconsole; then
+    say "can't load netconsole; not streaming"
+    exit 0
+fi
+nc=$configfs/netconsole/reliaburger
+if ! mkdir -p "$nc"; then
+    say "can't create a netconsole target in $configfs; not streaming"
+    exit 0
+fi
+# A target is changed only while disabled.
+[ "$(cat "$nc/enabled" 2>/dev/null)" = 1 ] && echo 0 >"$nc/enabled"
+echo "$dev" >"$nc/dev_name"
+echo "$src" >"$nc/local_ip"
+echo "$address" >"$nc/remote_ip"
+echo "$port" >"$nc/remote_port"
+# Without the next hop's MAC, netconsole broadcasts, which reaches a target
+# on the same LAN.
+[ -n "$remote_mac" ] && echo "$remote_mac" >"$nc/remote_mac"
+if ! echo 1 >"$nc/enabled"; then
+    say "netconsole refused the target $address:$port on $dev; not streaming"
+    exit 0
+fi
+# netconsole is a console: let info lines through to it (and to the screen).
+dmesg -n 7 2>/dev/null || true
+
+changed=
+for unit in $units; do
+    dir=$run/systemd/system/$unit.service.d
+    want=$'# reliaburger-netlog: this unit\'s lines go out with the kernel\'s (#2149)\n[Service]\nStandardOutput=journal+kmsg\n'
+    [ "$(cat "$dir/50-netlog.conf" 2>/dev/null)"$'\n' = "$want" ] && continue
+    mkdir -p "$dir" && printf '%s' "$want" >"$dir/50-netlog.conf" && changed=1
+done
+[ -n "$changed" ] && systemctl daemon-reload
+
+if [ -n "$backlog" ]; then
+    lines=$(printf '%s\n' "$backlog" | wc -l | tr -d ' ')
+    {
+        exec 3>"/dev/udp/$address/$port"
+        echo "reliaburger-netlog: the kernel log so far, $lines lines" >&3
+        while IFS= read -r line; do
+            printf '%s\n' "$line" >&3
+        done <<<"$backlog"
+        echo "reliaburger-netlog: end of the kernel log so far" >&3
+        exec 3>&-
+    } 2>/dev/null
+    mkdir -p "${marker%/*}" && : >"$marker"
+fi
+say "streaming kernel and boot logs from $dev ($src) to $address:$port"
