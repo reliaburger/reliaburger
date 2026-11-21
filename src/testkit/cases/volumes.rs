@@ -269,6 +269,7 @@ mod tests {
             status_age_ms: None,
             age_seconds: None,
             image: None,
+            data_on_node: false,
             reason: None,
         }
     }

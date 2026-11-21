@@ -566,3 +566,84 @@ refresh can reorder or shorten the list between `k` and `y`, and a prompt
 that names `web-1` must kill `web-1`, not whatever row slid under the
 cursor. It's the job-detail lesson again: carry the identity of the row,
 not where it was.
+
+### What runs on this node?
+
+The Wyse lab asked the k9s question next. You pick a node because you want
+to reboot it, or update its OS, or pull it out of the rack. What runs there,
+and what breaks if it goes?
+
+The node page had the answer's raw material and showed none of it. It listed
+the node's own numbers (version, CPU, memory, disk, allocation) and nothing
+about its workloads. Yet the TUI already polls the cluster status, and every
+row of it is a `ClusterInstanceStatus` that names its node. So the page grew
+tabs, as the app detail has, and `View::NodeDetail` gained a field:
+
+```rust
+NodeDetail {
+    node: String,
+    tab: NodeTab,
+},
+```
+
+`NodeTab` has three variants: Overview, Workloads and Maintenance. Adding the
+field broke every place that built or matched a `NodeDetail`, which is the
+point. The compiler listed them: the nodes list's Enter, the search results,
+the renderer and the tab cycling. No view could quietly forget it had tabs
+now.
+
+Workloads is the app detail's Instances tab turned on its side. The same
+instance list, filtered by node instead of by app, through
+`TuiApp::node_instances`. ↑ and ↓ select a row and Enter opens that app's
+detail, so "what's this thing on node-2?" is two keys away. There's no `k`
+here. The page is for looking before you act, and the kill lives where you
+can see the app's other replicas.
+
+Maintenance asks one question: if this node went away, what would we lose?
+`impact::node_impact` answers it from data the TUI already holds. For each
+app with an instance on the node, it counts the app's ready replicas on the
+other nodes that are still up. None left means the app goes down: a
+single-replica app, or one whose other replicas are failing anyway. One left
+means it keeps serving with no spare. More than one, and it barely notices.
+The table puts the worst first:
+
+```text
+council   a voter: the council loses quorum, only 1 of 3 voters would answer
+APP     NAMESPACE  HERE  READY ELSEWHERE  IMPACT            DATA
+cache   default       1                0  goes down         here
+app-2   default       1                1  loses redundancy  -
+web     default       1                2  keeps serving     -
+```
+
+The council line reuses the upgrade orchestrator's own check,
+`live_quorum_headroom_ok`, which asks before a bun upgrade restarts a voter
+whether the rest can still commit. The summary already says how many voters
+there are and how many answer. One wrinkle: that function waves a lone voter
+through, since a one-node council has no other way to upgrade. For the
+"what if it's gone" question, losing your only voter loses the council, so
+`council_impact` says so before it asks.
+
+The DATA column needed one thing the TUI didn't have. An OS rollout leaves an
+app on its node when it keeps data there, in a managed volume or a host-path
+mount (#2120), and the scheduler agrees. That's the replica you can't just
+move. Only the leader's desired state and the node itself know an app's
+volumes, so `InstanceStatus` grew one more optional field:
+
+```rust
+#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+pub data_on_node: bool,
+```
+
+The node fills it with `stays_through_os_rollout`, the very function the
+rollout uses, so the page and the rollout can't disagree about which apps
+stay. `skip_serializing_if` takes a path to a function that gets
+`&bool` and returns `bool`. `std::ops::Not::not` is the trait method behind
+the `!` operator, so the field is left out whenever it's `false` and the
+JSON of an app with no volumes doesn't change. As with `image`, `default`
+reads a missing key as `false`, so an older node's answer still parses.
+
+It's a forecast from the last refresh, not a promise. The scheduler decides
+where replacements go, and a replica that's starting now may be ready by the
+time you pull the plug. Still, a red `goes down` line before a reboot beats
+finding out from the pager after it.
+

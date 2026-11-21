@@ -362,6 +362,7 @@ pub(super) async fn common_local_statuses(state: &ApiState) -> Vec<InstanceStatu
             status_age_ms: None,
             age_seconds: None,
             image: None,
+            data_on_node: false,
             reason: None,
         };
         if let Some((runtime, physical, binding)) = node.singleton_runtime(id) {

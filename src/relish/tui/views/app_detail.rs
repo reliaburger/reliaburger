@@ -82,20 +82,9 @@ pub fn lines(app: &TuiApp, height: usize) -> Vec<Line<'static>> {
     else {
         return Vec::new();
     };
-    let tabs = DetailTab::ALL
-        .iter()
-        .map(|item| {
-            if item == tab {
-                format!("[{item:?}]")
-            } else {
-                format!(" {item:?} ")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" │ ");
     let mut lines = vec![
         widgets::heading(format!("{name} · {namespace}")),
-        Line::raw(tabs),
+        widgets::tab_bar(&DetailTab::ALL, tab),
         // The tabs looked stuck without it (#2169).
         Line::raw(tab_hint(*tab)),
         Line::raw(""),

@@ -91,6 +91,7 @@ impl TestScenario {
                         status_age_ms: None,
                         age_seconds: None,
                         image: Some(format!("registry.example/{name}:v1")),
+                        data_on_node: false,
                         reason: None,
                     },
                 });

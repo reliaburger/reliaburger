@@ -7479,6 +7479,40 @@ async fn deploy_streams_progress_events() {
     agent_handle.await.unwrap();
 }
 
+// `relish tui`'s node page says which apps keep data on the node, so a
+// node's status flags an instance whose app has a host-path mount or a
+// managed volume: the same test an OS rollout uses (#2120, #2170).
+#[tokio::test]
+async fn status_says_which_instances_keep_data_on_their_node() {
+    let (mut agent, _tx, _shutdown, _grill) = test_agent_with_grill();
+    let shared = tempfile::tempdir().unwrap();
+    agent.set_host_path_policy(crate::bun::host_paths::HostPathPolicy::new(
+        vec![shared.path().to_path_buf()],
+        Vec::new(),
+    ));
+    let config = Config::parse(&format!(
+        "[app.db]\nimage = \"db:v1\"\n\n[[app.db.volumes]]\npath = \"/srv\"\nsource = \"{}\"\n\n\
+         [app.web]\nimage = \"web:v1\"\n",
+        shared.path().display()
+    ))
+    .unwrap();
+    let (ev_tx, mut ev_rx) = mpsc::channel(256);
+    agent.deploy(config, &ev_tx).await;
+    drop(ev_tx);
+    while ev_rx.recv().await.is_some() {}
+
+    let statuses = agent.get_status().await;
+    let keeps_data = |app: &str| {
+        statuses
+            .iter()
+            .find(|status| status.app_name == app)
+            .unwrap_or_else(|| panic!("no {app} in {statuses:?}"))
+            .data_on_node
+    };
+    assert!(keeps_data("db"), "a host-path app keeps data on its node");
+    assert!(!keeps_data("web"), "an app with no volume keeps none");
+}
+
 #[tokio::test]
 async fn status_returns_all_instances() {
     let (mut agent, tx, shutdown) = test_agent();
@@ -14309,6 +14343,7 @@ fn runtime_unknown_is_serialised_only_when_set() {
         status_age_ms: None,
         age_seconds: None,
         image: None,
+        data_on_node: false,
         reason: None,
     };
     let plain = serde_json::to_value(&status).unwrap();
