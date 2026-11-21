@@ -46,6 +46,8 @@ async fn watch_recovers_from_collection_failure_and_retains_warning_exit() {
             "--watch",
             "--interval",
             "1",
+            // `--explain` names every UNKNOWN and prints every OK row's words.
+            "--explain",
         ])
         .env_remove("RELIABURGER_TOKEN")
         .env_remove("RELIABURGER_CA_CERT")

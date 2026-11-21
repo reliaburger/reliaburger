@@ -1976,6 +1976,44 @@ pub(super) mod tests {
         }
     }
 
+    /// Every source unreadable, so every UNKNOWN row `wtf` can give shows.
+    pub(in crate::relish::wtf) fn unknown_inputs() -> WtfInputs {
+        fn gone<T>() -> Evidence<T> {
+            Evidence::Unavailable {
+                reason: "unreadable".to_string(),
+            }
+        }
+        WtfInputs {
+            cluster_name: "test".to_string(),
+            collected_at: NOW,
+            app: None,
+            cluster: ClusterEvidence {
+                nodes: gone(),
+                builds: gone(),
+                council: gone(),
+                faults: gone(),
+                disks: gone(),
+                export_holds: gone(),
+                certificates: gone(),
+                registry: gone(),
+                tokens: gone(),
+                isolation: gone(),
+                gitops: gone(),
+                policies: gone(),
+                backups: gone(),
+            },
+            applications: ApplicationEvidence {
+                restarts: gone(),
+                deploys: gone(),
+                services: gone(),
+                replicas: gone(),
+                alerts: gone(),
+                cpu_throttling: gone(),
+                recent_logs: gone(),
+            },
+        }
+    }
+
     fn available<T>(value: T) -> Evidence<T> {
         Evidence::available(NOW, value)
     }

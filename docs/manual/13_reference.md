@@ -136,6 +136,18 @@ table for `nodes`. On `status`, a section a node didn't answer for ends in
 `partial (2 of 3 nodes)`, one it couldn't read says `unknown:` and the reason,
 and one a scoped token can't see says `not visible to a scoped token`.
 
+`relish wtf` goes one level deeper than `status`, at three lengths:
+
+| Command | What it shows |
+|---|---|
+| `relish wtf` | one row per check, worst first: its status (`critical`, `warning`, `unknown` or `ok`) and, for one that isn't OK, its first problem in a line; then the counts |
+| `relish wtf --short` | the counts, then each finding that isn't OK on one line with its `next:` step; just the counts when all is well *(0.3.0, not in 0.2.8)* |
+| `relish wtf --explain` | every check over several lines: what it found, what exactly it tests, the thresholds that decide it, a manual link and the `relish manual` chapter *(0.3.0, not in 0.2.8)* |
+
+`--short` and `--explain` can't be combined; both work with `--app` and
+`--watch`, and `--output json` or `yaml` refuses them, since the machine
+report always carries everything (see [diagnostics](07_diagnostics.md#three-ways-to-read-it)).
+
 ## Environment variables
 
 | Variable | Read by | Meaning |
