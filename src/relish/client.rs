@@ -355,6 +355,20 @@ pub fn lease_release_budget() -> std::time::Duration {
 /// the owning node (its agent's answer plus the release wait).
 pub const FAULT_CLEAR_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 /// Pause between those attempts.
+/// The status relish reports for a stream's `Error` event that names none:
+/// one from a server before #2157, or a failure with no status of its own.
+const STREAM_ERROR_STATUS: u16 = 500;
+
+/// The error an apply or rollback stream ended with. The stream answered
+/// `200` before the failure, so the event carries the status the failure
+/// answers on its own (404 for an image nobody built, #2157).
+fn stream_error(message: String, status: Option<u16>) -> RelishError {
+    RelishError::ApiError {
+        status: status.unwrap_or(STREAM_ERROR_STATUS),
+        body: message,
+    }
+}
+
 const FAULT_CLEAR_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Attach an `Idempotency-Key` header when the caller has one.
@@ -1460,11 +1474,8 @@ impl BunClient {
                                 instances: instances.clone(),
                             });
                         }
-                        ApplyEvent::Error { message } => {
-                            return Err(RelishError::ApiError {
-                                status: 500,
-                                body: message.clone(),
-                            });
+                        ApplyEvent::Error { message, status } => {
+                            return Err(stream_error(message.clone(), *status));
                         }
                     }
                 }
@@ -1481,11 +1492,8 @@ impl BunClient {
                 ApplyEvent::Complete { created, instances } => {
                     result = Some(ApplyResult { created, instances });
                 }
-                ApplyEvent::Error { message } => {
-                    return Err(RelishError::ApiError {
-                        status: 500,
-                        body: message,
-                    });
+                ApplyEvent::Error { message, status } => {
+                    return Err(stream_error(message, status));
                 }
                 _ => {}
             }
@@ -1542,11 +1550,8 @@ impl BunClient {
                 {
                     match event {
                         ApplyEvent::Progress { message } => eprintln!("  {message}"),
-                        ApplyEvent::Error { message } => {
-                            return Err(RelishError::ApiError {
-                                status: 500,
-                                body: message,
-                            });
+                        ApplyEvent::Error { message, status } => {
+                            return Err(stream_error(message, status));
                         }
                         _ => {}
                     }
@@ -4403,6 +4408,7 @@ mod tests {
         let event = format!(
             "data: {}\n\n",
             serde_json::to_string(&ApplyEvent::Error {
+                status: None,
                 message: message.to_string(),
             })
             .unwrap()
@@ -4434,6 +4440,53 @@ mod tests {
         server.abort();
         for error in [applied, rolled_back] {
             assert!(matches!(error, RelishError::ApiError { body, .. } if body == message));
+        }
+    }
+
+    /// Serve `data` as the one event of every apply and rollback stream, and
+    /// return the errors `relish apply` and `relish rollback` end with.
+    async fn stream_errors_for(data: &str) -> Vec<RelishError> {
+        use axum::{Router, routing::post};
+        let event = format!("data: {data}\n\n");
+        let handler = move || {
+            let event = event.clone();
+            async move { event }
+        };
+        let app = Router::new()
+            .route("/v1/apply", post(handler.clone()))
+            .route("/v1/rollback/web/default", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = BunClient::new_with_token(&format!("http://{address}"), None);
+        let applied = client.apply(&Config::default()).await.unwrap_err();
+        let rolled_back = client.rollback("web", "default").await.unwrap_err();
+        server.abort();
+        vec![applied, rolled_back]
+    }
+
+    /// #2157: a stream's error names the status the server gave it, not 500.
+    #[tokio::test]
+    async fn a_streamed_error_reports_the_status_it_carries() {
+        let data = serde_json::to_string(&ApplyEvent::Error {
+            message: "burger:v1 isn't in this cluster's registry (Pickle)".into(),
+            status: Some(404),
+        })
+        .unwrap();
+
+        for error in stream_errors_for(&data).await {
+            assert_eq!(
+                error.to_string(),
+                "API error (status 404): burger:v1 isn't in this cluster's registry (Pickle)"
+            );
+        }
+    }
+
+    /// A server from before #2157 sends no status: relish says 500, as it did.
+    #[tokio::test]
+    async fn a_streamed_error_with_no_status_still_reports_500() {
+        for error in stream_errors_for(r#"{"type":"Error","message":"boom"}"#).await {
+            assert_eq!(error.to_string(), "API error (status 500): boom");
         }
     }
 
