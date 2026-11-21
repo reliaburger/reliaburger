@@ -190,7 +190,9 @@ rollback to a version some node doesn't hold, is refused before anything is
 recorded.
 
 **Diagnostics built for incidents.** `relish wtf` correlates cluster health into
-one screen of problems and next steps. `relish path` walks the network path
+a table of checks with what's wrong; `--short` prints only the problems and
+their next steps, and `--explain` says exactly what each check tests and where
+the manual covers it. `relish path` walks the network path
 between two apps and labels each step observed, inferred or unavailable.
 `relish test` runs a live-cluster test catalogue, and `relish bench` measures
 the data plane.

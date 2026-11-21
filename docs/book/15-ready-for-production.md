@@ -3767,6 +3767,96 @@ checks and filters alerts, restarts, services and deploys to `api`; it doesn't
 manufacture `Unknown` rows for cluster evidence it deliberately didn't fetch.
 Unknown means missing required evidence. It doesn't mean "we chose not to ask".
 
+### Three ways to read one report
+
+The first human report printed every result: each finding with its details
+and `next:` step, and every OK row in full. On the three-node Wyse lab that
+was seventeen OK lines to scroll past to learn that nothing was wrong. In
+0.3.1 (#2180) `relish wtf` got three views instead. The default is a table,
+one row per check with its status. `--short` prints the counts and only what
+isn't OK. `--explain` prints every check with what it tests, the numbers that
+decide it and where the manual covers it.
+
+A table needs a row per *check*, and the report doesn't have checks. It has
+three kinds of id. An OK row carries the check's id (`crashloops`), a finding
+carries its own (`crashloop`), and an UNKNOWN carries the evidence source it
+couldn't read (`restarts`). The council check alone can report nine different
+findings. So a new module, `src/relish/wtf/checks.rs`, ties them together:
+
+```rust
+pub struct CheckKind {
+    pub id: &'static str,
+    pub findings: &'static [&'static str],
+    pub sources: &'static [&'static str],
+    pub tests: &'static str,
+    pub docs: &'static str,
+    pub manual: &'static str,
+}
+
+pub const CHECKS: &[CheckKind] = &[ /* one per check, in run order */ ];
+```
+
+`&'static str` is a borrowed string that lives for the whole program: a
+literal compiled into the binary. A `const` table built from them costs
+nothing at run time, and needs no allocation, no `lazy_static` and no
+`String`. It's the same shape as the finding catalogue `relish agent
+explain` reads (see "Built for Humans and Their Agents"), and the explanation of each
+check sits right beside that catalogue's thresholds. `--explain` doesn't
+repeat the numbers in prose. It prints them from the constants the checks
+compare against, so the words can't say 15 minutes while the code says 10.
+
+The renderer groups the report's four lists into rows, and the row type
+borrows from the report rather than copying it:
+
+```rust
+struct CheckRow<'a> {
+    name: &'a str,
+    kind: Option<&'static CheckKind>,
+    critical: Vec<&'a WtfFinding>,
+    warnings: Vec<&'a WtfFinding>,
+    unknown: Vec<&'a WtfUnknown>,
+    ok: Vec<&'a WtfOk>,
+    // ...
+}
+```
+
+The `'a` is a lifetime parameter. It says every reference in a `CheckRow`
+points into something that lives at least as long as `'a`, here the
+`WtfReport`. In C you'd keep pointers into the report and promise yourself not
+to free it first. In Go the garbage collector keeps it alive for you. Rust
+makes the promise part of the type, so the compiler rejects any code that
+drops the report while a row still points into it.
+
+Sorting worst first falls out of one derive:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Status {
+    Ok,
+    Unknown,
+    Warning,
+    Critical,
+}
+```
+
+A derived `Ord` on a fieldless enum orders the variants as they're declared,
+so `Critical > Warning` holds and a row's status is just the worst thing in
+it. The order of the lines in the source is the policy, which is a little
+surprising the first time you see it, so the comment above the enum says so.
+
+What does a check that the catalogue doesn't know about do? It still gets a
+row, named after its own id, without the explanation. A result that vanished
+from the table because nobody updated a list would be the green hat again.
+Tests stop that from shipping, though: every finding id must belong to exactly
+one check, every UNKNOWN source the engine can produce must too, and every
+check's docs link must name a heading that exists in the manual chapter that
+`relish manual <topic>` opens. A new check without an explanation fails CI.
+
+The views change only the human report. `--short --output json` is refused
+rather than quietly ignored, because the JSON contract above doesn't change:
+the machine report always carries every finding. Exit codes don't change
+either. The view is how much you read, not what `wtf` found.
+
 ## A small diagnostic surface
 
 Mayo already records CPU usage. Could `wtf` call an application throttled when
