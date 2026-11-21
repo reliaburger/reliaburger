@@ -514,8 +514,11 @@ Either way the job runs relish and the macOS-only tests, not the whole suite
 ([what runs on macOS](#what-runs-on-macos-and-what-runs-on-linux)), so in CI a
 change to Bun, grill or the cluster code is tested on Linux only.
 
-Every train merges through the merge queue, with `gh pr merge --merge --auto`
-([merging through the queue](releasing.md#merging-through-the-queue)).
+Every train merges through the merge queue, with `gh pr merge --merge` once
+the PR's checks have passed, never `--auto`
+([merging through the queue](releasing.md#merging-through-the-queue)). Each
+train is named in the queue's ruleset when it opens
+([opening a train](releasing.md#opening-a-train)).
 The queue requires one check, `ignored-test evidence`. It waits for
 every other job, fails if any of them failed or was cancelled, and then runs
 the evidence aggregation below, so a skipped job can only count when select
