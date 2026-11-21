@@ -155,7 +155,7 @@ async fn an_init_containers_slow_provider_fails_the_instance_closed() {
     )
     .unwrap();
     let events = send_deploy(&tx, config).await;
-    let Some(ApplyEvent::Error { message }) = events.last() else {
+    let Some(ApplyEvent::Error { message, .. }) = events.last() else {
         panic!("the deploy must fail: {events:?}");
     };
     let reason = "cannot resolve secret TOKEN: secret provider \"vault\" did not answer within 1s and was killed";
@@ -188,7 +188,7 @@ async fn a_slow_provider_fails_the_instance_closed_with_its_reason() {
     let handle = tokio::spawn(async move { agent.run().await });
 
     let events = send_deploy(&tx, provider_app("api")).await;
-    let Some(ApplyEvent::Error { message }) = events.last() else {
+    let Some(ApplyEvent::Error { message, .. }) = events.last() else {
         panic!("the deploy must fail: {events:?}");
     };
     let reason = "cannot resolve secret DB_PASSWORD: secret provider \"vault\" did not answer within 1s and was killed";
@@ -216,7 +216,7 @@ async fn a_provider_the_node_lacks_fails_closed_and_unrelated_apps_still_start()
     let handle = tokio::spawn(async move { agent.run().await });
 
     let events = send_deploy(&tx, provider_app("api")).await;
-    let Some(ApplyEvent::Error { message }) = events.last() else {
+    let Some(ApplyEvent::Error { message, .. }) = events.last() else {
         panic!("the deploy must fail: {events:?}");
     };
     assert!(

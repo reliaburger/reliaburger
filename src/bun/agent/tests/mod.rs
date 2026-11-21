@@ -931,7 +931,7 @@ async fn capacity_refusal_while_adding_replicas_reaches_the_state_snapshot() {
         "the scale-up must take the add-replicas path: {events:?}"
     );
     assert!(
-        matches!(events.last(), Some(ApplyEvent::Error { message }) if message.contains("capacity")),
+        matches!(events.last(), Some(ApplyEvent::Error { message, .. }) if message.contains("capacity")),
         "{events:?}"
     );
     assert_eq!(reported_refusals(&mut agent).await, web_refused(&[1]));
@@ -998,7 +998,7 @@ async fn capacity_refusal_while_reserving_a_rolling_replacement_reaches_the_stat
     let events = drain_deploy(&mut agent, budgeted_web("web:v2", 1)).await;
     assert!(
         events.iter().any(|event| matches!(event,
-            ApplyEvent::Error { message } if message.contains("capacity"))),
+            ApplyEvent::Error { message, .. } if message.contains("capacity"))),
         "{events:?}"
     );
     assert_eq!(reported_refusals(&mut agent).await, web_refused(&[0]));
@@ -3597,7 +3597,7 @@ async fn send_deploy(tx: &mpsc::Sender<AgentCommand>, config: Config) -> Vec<App
 fn expect_complete(events: &[ApplyEvent]) -> (usize, &[String]) {
     match events.last().expect("no events received") {
         ApplyEvent::Complete { created, instances } => (*created, instances),
-        ApplyEvent::Error { message } => panic!("deploy failed: {message}"),
+        ApplyEvent::Error { message, .. } => panic!("deploy failed: {message}"),
         other => panic!("unexpected final event: {other:?}"),
     }
 }
@@ -3687,7 +3687,7 @@ async fn overlapping_volume_layout_is_refused_before_any_directory_is_provisione
     handle.await.unwrap();
     assert!(
         events.iter().any(
-            |event| matches!(event, ApplyEvent::Error { message } if message.contains("overlap"))
+            |event| matches!(event, ApplyEvent::Error { message, .. } if message.contains("overlap"))
         ),
         "{events:?}"
     );
@@ -3826,7 +3826,7 @@ async fn a_rolling_redeploy_refuses_a_host_path_the_node_does_not_allow() {
     assert!(
         events.iter().any(|event| matches!(
             event,
-            ApplyEvent::Error { message } if message.contains("allowed_host_paths")
+            ApplyEvent::Error { message, .. } if message.contains("allowed_host_paths")
         )),
         "{events:?}"
     );
@@ -4007,7 +4007,7 @@ async fn an_accepted_restore_owns_the_volumes_until_it_resolves() {
     .unwrap();
     let events = send_deploy(&tx, config.clone()).await;
     match events.last() {
-        Some(ApplyEvent::Error { message }) => {
+        Some(ApplyEvent::Error { message, .. }) => {
             assert!(message.contains("being restored"), "{message}")
         }
         other => panic!("a deploy during a restore was not refused: {other:?}"),
@@ -4584,7 +4584,7 @@ async fn deploy_refusal(key: &str, image: &str) -> Option<String> {
     shutdown.cancel();
     let _ = handle.await;
     events.into_iter().find_map(|event| match event {
-        ApplyEvent::Error { message } => Some(message),
+        ApplyEvent::Error { message, .. } => Some(message),
         _ => None,
     })
 }
@@ -4705,7 +4705,7 @@ async fn a_refused_launch_fails_the_deploy_and_the_instance_with_its_reason() {
     });
 
     let events = send_deploy(&tx, basic_config()).await;
-    let Some(ApplyEvent::Error { message }) = events.last() else {
+    let Some(ApplyEvent::Error { message, .. }) = events.last() else {
         panic!("the deploy must fail: {events:?}");
     };
     assert!(
@@ -4748,7 +4748,7 @@ async fn a_launch_refused_at_exec_fails_the_deploy_and_the_instance_with_its_rea
     });
 
     let events = send_deploy(&tx, basic_config()).await;
-    let Some(ApplyEvent::Error { message }) = events.last() else {
+    let Some(ApplyEvent::Error { message, .. }) = events.last() else {
         panic!("the deploy must fail: {events:?}");
     };
     assert!(
@@ -5266,7 +5266,7 @@ async fn deploy_steps_progress_while_status_queries_keep_the_queue_busy() {
         while let Some(event) = received.recv().await {
             match event {
                 ApplyEvent::Complete { .. } => return Ok(()),
-                ApplyEvent::Error { message } => return Err(message),
+                ApplyEvent::Error { message, .. } => return Err(message),
                 _ => {}
             }
         }
@@ -5405,7 +5405,7 @@ async fn cancellation_waits_for_in_flight_create_before_releasing_ownership() {
     assert!(receipt.outcome.is_none());
     let conflict = send_deploy(&tx, basic_config()).await;
     assert!(conflict.iter().any(
-        |event| matches!(event, ApplyEvent::Error { message } if message.contains(&operation_id))
+        |event| matches!(event, ApplyEvent::Error { message, .. } if message.contains(&operation_id))
     ));
     grill.release_creates(1);
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -5676,7 +5676,7 @@ async fn deploy_operations_track_live_phase_conflicts_and_disconnected_clients()
     .await
     .unwrap();
     match conflict_rx.recv().await.unwrap() {
-        ApplyEvent::Error { message } => {
+        ApplyEvent::Error { message, .. } => {
             assert!(message.contains(&operation_id));
             assert!(message.contains("already being changed"));
         }
@@ -7375,7 +7375,7 @@ async fn deploy_is_refused_while_the_workload_is_stopping() {
     let stopped = send_stop(&tx, "web");
     let events = send_deploy(&tx, basic_config()).await;
     match events.last() {
-        Some(ApplyEvent::Error { message }) => {
+        Some(ApplyEvent::Error { message, .. }) => {
             assert!(message.contains("still stopping"), "{message}")
         }
         other => panic!("deploy over a pending stop was not refused: {other:?}"),
@@ -7438,7 +7438,7 @@ async fn deploy_fails_closed_on_encrypted_secret_without_key() {
     let events = send_deploy(&tx, config).await;
 
     match events.last().expect("no events received") {
-        ApplyEvent::Error { message } => {
+        ApplyEvent::Error { message, .. } => {
             assert!(
                 message.contains("encrypted secrets"),
                 "unexpected error: {message}"
@@ -7479,6 +7479,40 @@ async fn deploy_streams_progress_events() {
     agent_handle.await.unwrap();
 }
 
+// `relish tui`'s node page says which apps keep data on the node, so a
+// node's status flags an instance whose app has a host-path mount or a
+// managed volume: the same test an OS rollout uses (#2120, #2170).
+#[tokio::test]
+async fn status_says_which_instances_keep_data_on_their_node() {
+    let (mut agent, _tx, _shutdown, _grill) = test_agent_with_grill();
+    let shared = tempfile::tempdir().unwrap();
+    agent.set_host_path_policy(crate::bun::host_paths::HostPathPolicy::new(
+        vec![shared.path().to_path_buf()],
+        Vec::new(),
+    ));
+    let config = Config::parse(&format!(
+        "[app.db]\nimage = \"db:v1\"\n\n[[app.db.volumes]]\npath = \"/srv\"\nsource = \"{}\"\n\n\
+         [app.web]\nimage = \"web:v1\"\n",
+        shared.path().display()
+    ))
+    .unwrap();
+    let (ev_tx, mut ev_rx) = mpsc::channel(256);
+    agent.deploy(config, &ev_tx).await;
+    drop(ev_tx);
+    while ev_rx.recv().await.is_some() {}
+
+    let statuses = agent.get_status().await;
+    let keeps_data = |app: &str| {
+        statuses
+            .iter()
+            .find(|status| status.app_name == app)
+            .unwrap_or_else(|| panic!("no {app} in {statuses:?}"))
+            .data_on_node
+    };
+    assert!(keeps_data("db"), "a host-path app keeps data on its node");
+    assert!(!keeps_data("web"), "an app with no volume keeps none");
+}
+
 #[tokio::test]
 async fn status_returns_all_instances() {
     let (mut agent, tx, shutdown) = test_agent();
@@ -7502,6 +7536,32 @@ async fn status_returns_all_instances() {
     assert_eq!(statuses[0].app_name, "web");
     // Without health checks, goes straight to Running
     assert_eq!(statuses[0].state, "running");
+
+    shutdown.cancel();
+    agent_handle.await.unwrap();
+}
+
+// `relish tui` shows the image an app's instances run, so a running
+// instance's status names the image the node started it from (#2167).
+#[tokio::test]
+async fn running_instance_status_carries_its_image() {
+    let (mut agent, tx, shutdown) = test_agent();
+
+    let agent_handle = tokio::spawn(async move {
+        agent.run().await;
+    });
+
+    let events = send_deploy(&tx, basic_config()).await;
+    expect_complete(&events);
+
+    let (resp_tx, resp_rx) = oneshot::channel();
+    tx.send(AgentCommand::Status { response: resp_tx })
+        .await
+        .unwrap();
+    let statuses = resp_rx.await.unwrap();
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].state, "running");
+    assert_eq!(statuses[0].image.as_deref(), Some("myapp:v1"));
 
     shutdown.cancel();
     agent_handle.await.unwrap();
@@ -7863,7 +7923,7 @@ async fn halted_rollout_keeps_healthy_replacements_in_ordinary_supervision() {
         let replacement = Config::parse(&format!("[app.web]\nimage = 'web:v2'\nport = 8080\nreplicas = 2\n[app.web.deploy]\nstrategy = '{strategy}'\nauto_rollback = false\nhealth_timeout = '1s'\n")).unwrap();
         let outcome = drain_deploy(&mut agent, replacement).await;
         assert!(
-            matches!(outcome.last(), Some(ApplyEvent::Error { message }) if message.contains("halted")),
+            matches!(outcome.last(), Some(ApplyEvent::Error { message, .. }) if message.contains("halted")),
             "{outcome:?}"
         );
         let healthy = InstanceId("default__web-g1-0".into());
@@ -7954,7 +8014,7 @@ async fn rolling_redeploy_halts_without_reverting_when_auto_rollback_is_false() 
 
     let events = send_deploy(&tx, halt_config()).await;
     match events.last().expect("no events received") {
-        ApplyEvent::Error { message } => {
+        ApplyEvent::Error { message, .. } => {
             assert!(
                 message.contains("halted"),
                 "expected a halt, got: {message}"
@@ -8620,7 +8680,7 @@ async fn rolling_redeploy_rolls_back_when_the_probe_fails() {
     let error = events
         .iter()
         .find_map(|e| match e {
-            ApplyEvent::Error { message } => Some(message.clone()),
+            ApplyEvent::Error { message, .. } => Some(message.clone()),
             _ => None,
         })
         .expect("a probe-failing redeploy must produce an error event");
@@ -8736,7 +8796,7 @@ async fn auto_rollback_after_a_retirement_restores_old_capacity() {
         .iter()
         .rev()
         .find_map(|event| match event {
-            ApplyEvent::Error { message } => Some(message.clone()),
+            ApplyEvent::Error { message, .. } => Some(message.clone()),
             _ => None,
         })
         .expect("the failed rollout must report an error");
@@ -8833,7 +8893,7 @@ async fn abort_keeps_healthy_new_instances_when_old_capacity_cannot_return() {
         .iter()
         .rev()
         .find_map(|event| match event {
-            ApplyEvent::Error { message } => Some(message.clone()),
+            ApplyEvent::Error { message, .. } => Some(message.clone()),
             _ => None,
         })
         .expect("the failed rollout must report an error");
@@ -9277,7 +9337,7 @@ async fn deploy_with_failing_init_container_fails() {
     let events = send_deploy(&tx, config_with_init_container()).await;
     let last = events.last().expect("no events");
     assert!(
-        matches!(last, ApplyEvent::Error { message } if message.contains("exited with code 1")),
+        matches!(last, ApplyEvent::Error { message, .. } if message.contains("exited with code 1")),
         "expected an Error event naming the exit code, got {last:?}"
     );
 
@@ -9313,7 +9373,7 @@ async fn failing_init_container_reports_the_runtimes_stderr() {
     let message = events
         .iter()
         .find_map(|event| match event {
-            ApplyEvent::Error { message } => Some(message.clone()),
+            ApplyEvent::Error { message, .. } => Some(message.clone()),
             _ => None,
         })
         .expect("the failed initialiser produced no Error event");
@@ -9488,7 +9548,7 @@ async fn rollout_gate_probes_health_port_without_app_port() {
     let error = events
         .iter()
         .find_map(|e| match e {
-            ApplyEvent::Error { message } => Some(message.clone()),
+            ApplyEvent::Error { message, .. } => Some(message.clone()),
             _ => None,
         })
         .expect("the gate must probe health.port and refuse the failing replacement");
@@ -9807,7 +9867,7 @@ async fn exhausted_rollout_generation_refuses_without_mutating_the_old_instance(
     let events = drain_deploy(&mut agent, basic_config()).await;
     let calls = grill.calls();
     agent.stop_app("web", "default").await.unwrap();
-    assert!(events.iter().any(|event| matches!(event, ApplyEvent::Error { message } if message.contains("generation exhausted"))), "{events:?}");
+    assert!(events.iter().any(|event| matches!(event, ApplyEvent::Error { message, .. } if message.contains("generation exhausted"))), "{events:?}");
     assert_eq!(calls.len(), before);
 }
 
@@ -10210,7 +10270,7 @@ async fn rolling_record_failure_retains_cleanup_ownership_until_directory_recove
                 "[app.web]\nimage = \"web:v2\"\nport = 8080\n[app.web.deploy]\nstrategy = \"{strategy}\"\n"
             )).unwrap();
         let outcome = drain_deploy(&mut agent, replacement).await;
-        assert!(outcome.iter().any(|event| matches!(event, ApplyEvent::Error { message } if message.contains("persist replacement record"))), "{outcome:?}");
+        assert!(outcome.iter().any(|event| matches!(event, ApplyEvent::Error { message, .. } if message.contains("persist replacement record"))), "{outcome:?}");
         assert!(
             agent
                 .supervisor
@@ -11472,7 +11532,7 @@ async fn rolling_redeploy_of_a_volume_app_never_overlaps_writers() {
     drop(ev_tx);
     let mut errors = Vec::new();
     while let Some(event) = ev_rx.recv().await {
-        if let ApplyEvent::Error { message } = event {
+        if let ApplyEvent::Error { message, .. } = event {
             errors.push(message);
         }
     }
@@ -13362,7 +13422,7 @@ async fn a_new_allocation_waits_here_until_the_old_incarnation_has_retired() {
     let _ = pending.await;
 
     match events.as_slice() {
-        [ApplyEvent::Error { message }] => assert!(
+        [ApplyEvent::Error { message, .. }] => assert!(
             message.contains("new service allocation"),
             "unexpected refusal: {message}"
         ),
@@ -13542,7 +13602,7 @@ async fn deploy_before_its_committed_allocation_leaves_nothing_for_the_retry() {
     agent.supervisor.grill().set_pid(std::process::id());
     let events = drain_deploy(&mut agent, basic_config()).await;
     match events.last() {
-        Some(ApplyEvent::Error { message }) => assert!(
+        Some(ApplyEvent::Error { message, .. }) => assert!(
             message.contains("committed cluster allocation"),
             "unexpected failure: {message}"
         ),
@@ -14282,6 +14342,8 @@ fn runtime_unknown_is_serialised_only_when_set() {
         runtime_unknown: false,
         status_age_ms: None,
         age_seconds: None,
+        image: None,
+        data_on_node: false,
         reason: None,
     };
     let plain = serde_json::to_value(&status).unwrap();

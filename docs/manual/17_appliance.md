@@ -375,6 +375,53 @@ used disk alone. Every decision goes into its log:
 
 If several machines report at once, the questions come one at a time.
 
+### Watch the boot logs from your terminal
+
+A machine with no serial port, such as the Wyse 3040, only shows its boot on
+its monitor. With `--stream-logs`, each machine you install sends its kernel
+and boot lines to `relish netboot` over UDP, from the installer on and on
+every boot after:
+
+```sh
+sudo relish netboot os --stream-logs
+```
+
+They print among the netboot server's own lines, named by the machine's MAC:
+
+```
+log 6c:4b:90:12:34:56: reliaburger-install: target /dev/mmcblk0, 7818 MB
+log 6c:4b:90:12:34:56: [    9.412871] r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full
+log 6c:4b:90:12:34:56: reliaburger: bun not healthy after 120 s on OS 2026.47.228
+```
+
+Each line also goes to `os/logs/<mac>.log`. The machine's first line on
+each boot names its MAC, so it keeps its name when your router gives the
+installed system a different address from the one it network-booted with. A
+line from a machine `relish netboot` didn't answer shows as
+`log <address> (not served):`.
+
+- The installer writes your machine's address into `reliaburger/netlog.conf`
+  on the installed disk's EFI partition. On each boot, once the network is up,
+  the machine points the kernel's netconsole at it and sends the kernel log so
+  far, then every kernel line after (panics too) and the lines of the boot
+  units: the boot check, bun, the seed and the clock wait.
+- A boot that dies before its network comes up sends nothing. Use the monitor.
+- It's UDP: lines can be lost, and nothing is retried.
+- The lines cross your LAN unencrypted, and anyone on it can send lines to
+  the listener. That's why it's off unless you ask for it. To stop a machine
+  sending, delete `reliaburger/netlog.conf` from its EFI partition.
+
+To listen without serving anything, say while an installed machine reboots,
+run only the listener. It doesn't need root:
+
+```sh
+relish machines logs --interface en7 --dir os
+```
+
+It listens on UDP 6666 until Ctrl-C. Without `--dir` it only prints. It
+answered no machine, so it names each line by its address, marked
+`(not served)`.
+
 ### Without network boot
 
 A machine that can't network-boot, or that you'd rather not run a boot server
@@ -523,6 +570,20 @@ relish wtf
 All of them alive, all three in the council, and nothing to fix. Each
 machine's monitor shows its name, address and whether bun is running.
 
+relish keeps one current cluster, in `~/.reliaburger/context.json`. The
+claim makes the new cluster that one, unless another cluster's context is
+already there and still works: then it keeps that one and prints the three
+`export` lines that reach the new cluster instead. A context whose cluster
+directory you've since deleted can't work, because its CA certificate went
+with the directory, so the claim replaces it and says so:
+
+```
+relish now talks to this cluster (node 1, https://192.168.1.51:9117).
+It replaced the context for bare-metal/lab, which no longer worked: /Users/you/lab/root-ca.crt is gone.
+```
+
+`relish cluster create --bare-metal` and `relish setup` do the same.
+
 The claim uses each machine's current address as its node address, so
 reserve those addresses for their MACs in your router first. mDNS doesn't
 cross routers; if relish can't see a machine, give its address instead of
@@ -655,13 +716,41 @@ drop it until you add it to their `[security] bootstrap_peers`.
 
 ## Take the tour
 
-The cluster is ready for the [five-minute tour](08_five-minute-tour.md), from
-`relish apply` onwards. There are two differences:
+The cluster is ready for the [five-minute tour](08_five-minute-tour.md).
+There are three differences:
+- **Build the burger on your laptop.** The appliance has no Buildah, so no
+  node can run `relish build`; it stops with `no builder available`. Build
+  the image where you have Docker and push it into the cluster's registry,
+  Pickle, as below. Then carry on from the tour's `relish apply`.
 - The ingress listens on port 80 of every node, not on `localhost:18080`. So
   use `curl -H 'Host: podinfo.localhost' http://192.168.1.51/`, or put the
   name in your laptop's hosts file.
 - Instead of `relish local stop`, pull a node's power cord. Plug it back in
   later and it rejoins by itself.
+
+To push the burger, your laptop has to reach a node by its name and trust
+the cluster's CA ([Trusting the cluster CA](11_images-and-volumes.md#trusting-the-cluster-ca)).
+With Docker Desktop, and `home-1` at 192.168.1.51 in your hosts file:
+
+```sh
+mkdir -p ~/.docker/certs.d/home-1:5050
+cp ~/home-cluster/root-ca.crt ~/.docker/certs.d/home-1:5050/ca.crt
+TOKEN="$(relish token create --name laptop-push --role deployer)"
+docker login home-1:5050 -u push --password-stdin <<<"$TOKEN"
+docker buildx build --platform linux/amd64 -t home-1:5050/burger:v1 --push burger
+```
+
+Restart Docker Desktop after adding the CA. Name the platforms your nodes
+have: `linux/arm64` for Arm machines, or both, comma-separated. The pushed
+image isn't signed by the cluster as a built one is, which only matters if
+you turned `require_signatures` on.
+
+Why no Buildah? Every package goes into both 1.1 GB `/usr` slots, a build
+fills the data partition and wears the eMMC with layers, and it would run
+every Dockerfile's `RUN` steps on the machines that hold the cluster's state. If you want the
+cluster to build for itself, add a Linux node with Buildah
+([Linux servers](https://github.com/reliaburger/reliaburger/blob/main/docs/linux-servers.md)):
+bun hands every build to a node that can run it.
 
 ## Updating the OS
 
@@ -669,7 +758,9 @@ Each node keeps two copies of the operating system: the one it runs, and a
 spare slot for the next. An update goes into the spare slot. The node reboots
 into it with three tries, and it's only marked good once bun is healthy
 again. If bun doesn't come up, the node goes back to the previous version by
-itself after the third try.
+itself after the third try. Each try waits up to 90 seconds for bun, so on a
+Wyse 3040, which takes about a minute to boot, a broken update is back on the
+old version in about 9 minutes.
 
 bun does this across the cluster, one node at a time. See what each node runs
 and what the newest release is:
@@ -821,6 +912,9 @@ across a cluster you care about.
   you need" boots iPXE and the installer, which then can't reach the
   network: its screen shows `reliaburger-install: FAILED: can't fetch …`.
   A USB Ethernet adapter gets it going.
+- **No builds on the cluster.** The image has no Buildah, so `relish build`
+  needs a node that isn't an appliance. Build elsewhere and push into Pickle
+  ("Take the tour", above).
 - **Two machines can't roll a bun upgrade or an OS update.** Both are in
   the council, and taking one down would leave the other without a majority,
   so `relish upgrade start` and `relish os upgrade` refuse. Use three or more.

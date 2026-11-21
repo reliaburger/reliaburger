@@ -4,6 +4,7 @@
 //! what it observed, including unavailable and unsupported sources, while the
 //! pure engine turns that evidence into a stable report.
 
+pub mod checks;
 mod collect;
 mod diagnose;
 pub mod findings;

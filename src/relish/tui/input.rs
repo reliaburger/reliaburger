@@ -4,16 +4,22 @@ use crossterm::event::{KeyCode, KeyEvent};
 
 use super::keys::key_to_action;
 use super::palette::{PaletteCommand, parse_command};
-use super::state::{DetailTab, Effect, Level, SearchHit, TuiApp, View};
+use super::state::{DetailTab, Effect, Level, NodeTab, SearchHit, TuiApp, View};
 
 impl TuiApp {
     pub(super) fn handle_key(&mut self, key: KeyEvent) {
-        if self.palette.is_some() {
+        if self.confirm_kill.is_some() {
+            self.handle_confirm_kill_key(key);
+        } else if self.palette.is_some() {
             self.handle_palette_key(key);
         } else if matches!(self.view(), View::Search) {
             self.handle_search_key(key);
         } else if self.filter_editing {
             self.handle_filter_key(key);
+        } else if key.code == KeyCode::Esc && self.filter.is_some() {
+            // Esc clears a search before it goes back, so the view you
+            // searched in stays open.
+            self.filter = None;
         } else if let Some(action) = key_to_action(key) {
             let action = if action == super::keys::KeyAction::Refresh
                 && matches!(
@@ -33,6 +39,23 @@ impl TuiApp {
         }
     }
 
+    /// The `[y/N]` prompt: `y` sends the kill, and every other key,
+    /// Enter included, cancels it.
+    fn handle_confirm_kill_key(&mut self, key: KeyEvent) {
+        let Some(target) = self.confirm_kill.take() else {
+            return;
+        };
+        if matches!(key.code, KeyCode::Char('y' | 'Y')) {
+            self.status_message = Some((
+                format!("killing {} on {}…", target.instance, target.node),
+                Level::Info,
+            ));
+            self.pending.push(Effect::KillInstance(target));
+        } else {
+            self.status_message = Some(("kill cancelled".into(), Level::Info));
+        }
+    }
+
     fn handle_filter_key(&mut self, key: KeyEvent) {
         let filter = self.filter.get_or_insert_default();
         match key.code {
@@ -48,6 +71,7 @@ impl TuiApp {
             _ => {}
         }
         self.apps_cursor = 0;
+        self.log_scroll = 0;
     }
 
     fn handle_palette_key(&mut self, key: KeyEvent) {
@@ -151,7 +175,7 @@ impl TuiApp {
                     });
                 }
             }
-            for node in &self.data.nodes {
+            for node in self.data.nodes.iter().map(|row| &row.status) {
                 if node.node_id.to_lowercase().contains(&query) {
                     hits.push(SearchHit {
                         kind: "node".into(),
@@ -159,6 +183,7 @@ impl TuiApp {
                         context: node.address.clone(),
                         target: View::NodeDetail {
                             node: node.node_id.clone(),
+                            tab: NodeTab::Overview,
                         },
                     });
                 }

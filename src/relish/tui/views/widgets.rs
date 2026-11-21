@@ -131,6 +131,23 @@ pub fn row(text: impl Into<String>, selected: bool) -> Line<'static> {
     }
 }
 
+/// A detail view's tab bar: every tab by name, the current one in
+/// brackets.
+pub fn tab_bar<T: std::fmt::Debug + PartialEq>(tabs: &[T], current: &T) -> Line<'static> {
+    let tabs = tabs
+        .iter()
+        .map(|item| {
+            if item == current {
+                format!("[{item:?}]")
+            } else {
+                format!(" {item:?} ")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" │ ");
+    Line::raw(tabs)
+}
+
 pub fn heading(text: impl Into<String>) -> Line<'static> {
     Line::styled(text.into(), theme::title())
 }
@@ -157,4 +174,24 @@ pub fn partial_warnings(warnings: &[String]) -> Vec<Line<'static>> {
             )
         })
         .collect()
+}
+
+/// The `/` search's line, `filter: <text> (N of M <noun>)`, or `None` with
+/// no search. While it's being typed a block marks the cursor.
+pub fn filter_status(
+    app: &TuiApp,
+    shown: usize,
+    total: usize,
+    noun: &str,
+) -> Option<Line<'static>> {
+    let filter = app.filter.as_deref()?;
+    let (cursor, keys) = if app.filter_editing {
+        ("█", "Enter keeps it, Esc clears it")
+    } else {
+        ("", "Esc clears it")
+    };
+    Some(Line::styled(
+        format!("filter: {filter}{cursor} ({shown} of {total} {noun}) · {keys}"),
+        Style::default().fg(theme::ACCENT),
+    ))
 }

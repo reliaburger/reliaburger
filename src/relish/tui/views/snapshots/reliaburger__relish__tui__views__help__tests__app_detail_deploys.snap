@@ -7,10 +7,10 @@ expression: "render_to_string(&app, 120, 40)"
 ┌app detail────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │web · default                                                                                                         │
 │ Overview  │  Instances  │  Logs  │  Metrics  │ [Deploys] │  Config                                                   │
+│←/→ or Tab: switch tabs                                                                                               │
 │                                                                                                                      │
 │deployment history from every node                                                                                    │
 │no deploy history                                                                                                     │
-│                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │

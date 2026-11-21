@@ -88,8 +88,9 @@ mirror, `mirrors` now covers every image you apply.
   Run `relish build` (or push the image) and apply again. An image whose own
   registry says it doesn't exist (`ghcr.io/acme/burger:v1`) fails with
   `doesn't exist or isn't visible to this node`: check the name, the tag and
-  the node's registry credentials. Neither is worth retrying, so a standalone
-  node answers `404`, not the `502` of a registry that's down.
+  the node's registry credentials. Neither is worth retrying, so `relish
+  apply` reports `404`, not the `502` of a registry that's down, on a
+  standalone node and on a cluster alike.
 - **Where you see it:** `relish history` shows the bound reference in its
   `IMAGE` column, one row per version. `relish rollback`
   restores the bound reference of the version before, so it runs the bytes
@@ -237,7 +238,10 @@ Relish uploads the context to the registry: through the quickstart's registry
 forward (`127.0.0.1:15050`) on a laptop cluster, otherwise at `localhost:5050`,
 so run it on a node or through a forward to one (`--registry-port` names the
 port on this host). A node then builds it with Buildah, which must be installed
-there (the quickstart's VMs have it). The five-minute tour builds
+there (the quickstart's VMs have it; the bare-metal appliance doesn't, so on
+an appliance cluster build elsewhere and push, below). A node without
+Buildah hands the build to one that has it, and with none the build stops
+with `no builder available` and these two ways out. The five-minute tour builds
 `examples/demo/burger` this way. A build has 15 minutes per stage
 (`[images] build_timeout_secs`) and a 256 MiB context. Refer to the result by
 its bare name, as `api:v1.2.3`, and nodes find it in Pickle. Built images are

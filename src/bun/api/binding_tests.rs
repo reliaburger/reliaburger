@@ -228,6 +228,39 @@ async fn a_standalone_apply_of_an_image_nobody_built_is_a_404_naming_pickle() {
     shutdown.cancel();
 }
 
+/// #2157: on a cluster the binding fails inside the apply's event stream,
+/// after its `200`, and relish still reports the 404 a standalone node
+/// answers, with Pickle's message.
+#[tokio::test]
+async fn a_cluster_apply_of_an_image_nobody_built_reaches_relish_as_a_404_naming_pickle() {
+    let council = seeded_council("bind-cluster-not-built").await;
+    let binder = ImageBinder::with_upstream(Arc::new(crate::pickle::binding::MissingUpstream));
+    let (app, shutdown) = router_with(Some(council.clone()), None, Some(binder));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client =
+        crate::relish::client::BunClient::new_with_token(&format!("http://{address}"), None);
+    let config = Config::parse("[app.web]\nimage = \"burger:v1\"\n").unwrap();
+
+    let error = client.apply(&config).await.unwrap_err();
+
+    match error {
+        crate::relish::RelishError::ApiError { status, body } => {
+            assert_eq!(status, 404, "{body}");
+            assert!(
+                body.contains("burger:v1 isn't in this cluster's registry (Pickle)"),
+                "{body}"
+            );
+        }
+        other => panic!("expected an API error, got {other:?}"),
+    }
+    assert_eq!(desired_image(&council, "web").await, None);
+    server.abort();
+    shutdown.cancel();
+    council.raft().shutdown().await.unwrap();
+}
+
 /// `[images.trust_policy.upstream_default] allow = false` with one rule
 /// for Docker Hub's official images.
 fn allow_list() -> crate::config::node::TrustPolicySection {

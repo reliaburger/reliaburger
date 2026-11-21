@@ -805,6 +805,20 @@ async fn run_bounded(
     }
 }
 
+/// Why a build was refused when neither this node nor any peer has
+/// Buildah, and what to do instead.
+///
+/// The appliance image ships no Buildah (`image/mkosi.conf`), so on an
+/// appliance cluster this is what `relish build` prints (#2144). The ways
+/// out are building elsewhere and pushing into Pickle, which takes any OCI
+/// client, or joining a node that can build: bun hands a build to any peer
+/// that reports Buildah.
+pub const NO_BUILDER_ERROR: &str = "no builder available: no node in this cluster has Buildah \
+     on its PATH (appliance nodes never do). Build the image on a machine with Docker, \
+     Podman or Buildah and push it into Pickle, as in `docker push <node>:5050/<name>:<tag>` \
+     with a deployer token (`relish manual images`, under Pushing with docker, podman, \
+     skopeo or crane), or add a Linux node with Buildah to the cluster to build here";
+
 /// Whether this node can build (probed per call — cheap, and the
 /// submit path is rare).
 pub async fn local_buildah_available() -> bool {
@@ -1637,10 +1651,7 @@ pub async fn build_submit_handler(
     if candidates.is_empty() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": "no builder available: buildah is not on this node's PATH \
-                          and no peer reports the capability"
-            })),
+            Json(serde_json::json!({ "error": NO_BUILDER_ERROR })),
         )
             .into_response();
     }
@@ -2532,5 +2543,42 @@ mod tests {
         // The capable node itself is excluded — "peer" means peer.
         let builders = find_peer_builders(&members, &aggregated, Some("builder"), &http, 5050);
         assert!(builders.is_empty());
+    }
+
+    // An appliance cluster has no Buildah anywhere (#2144), so the refusal
+    // is all an operator running the tour on bare metal sees. It has to say
+    // why and name the two ways out.
+    #[test]
+    fn a_cluster_with_no_builder_names_the_ways_out() {
+        let message = NO_BUILDER_ERROR;
+        assert!(message.starts_with("no builder available: "), "{message}");
+        assert!(message.contains("Buildah"), "{message}");
+        assert!(message.contains("appliance nodes never do"), "{message}");
+        // Build elsewhere and push into Pickle...
+        assert!(message.contains("docker push <node>:5050/"), "{message}");
+        assert!(message.contains("`relish manual images`"), "{message}");
+        // ...or bring a node that can build.
+        assert!(
+            message.contains("add a Linux node with Buildah"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn the_manual_section_the_refusal_names_is_there() {
+        use crate::relish::manual::{assets, find_chapter};
+        let chapters = assets::chapters();
+        let chapter = &chapters[find_chapter(&chapters, "images").unwrap()];
+        assert!(
+            chapter
+                .markdown
+                .contains("## Pushing with docker, podman, skopeo or crane"),
+            "{}",
+            chapter.file
+        );
+        assert!(NO_BUILDER_ERROR.contains("under Pushing with docker, podman, skopeo or crane"));
+        // relish prints the body as it comes, JSON and all, where a double
+        // quote would show escaped.
+        assert!(!NO_BUILDER_ERROR.contains('"'));
     }
 }

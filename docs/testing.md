@@ -289,7 +289,7 @@ record goes in [`qualification/`](qualification):
 | `qualify-power-cut-reboot.sh`, which runs `qualify-oci-reboot.sh`, `qualify-discovery-reboot.sh` and `qualify-storage-power-cut.sh` | A disposable VM, which it creates and deletes that can be rebooted or powered off ([below](#pulling-the-plug)) | The maintainer, on every release candidate ([release gate](releasing.md#staging-a-candidate)) |
 | `qualify-ssh-setup.sh` (`relish setup --ssh` end to end) | Lima on the host. It creates three disposable VMs from `ssh-setup-vm.yaml` (or `--machines N`; eight puts one past the council's cap of seven), on Ubuntu 24.04 or, with `--ubuntu 26.04`, the newest LTS, builds a cluster on them over SSH, checks `status` and `wtf` and that every node's Bun stays up, runs setup again to show it resumes without restarting a node, shows a second operator refused, and deletes the VMs | The maintainer, before any release that touches SSH setup (`src/relish/quickstart/ssh.rs`, `server.rs`, `server_runner.rs`), from 0.2.6 ([#1529](https://github.com/reliaburger/reliaburger/issues/1529)) |
 | `qualify-cold-install.sh` (V04: the published release's `curl \| bash -s -- --laptop --timings` on a clean Linux host, then a check, teardown and a before-and-after diff of the host) | A fresh Linux host with KVM that it may change: a new Lima VM with `nestedVirtualization: true` for arm64, a new GitHub-hosted runner for x86_64 (the `Cold install` workflow, `cold-install.yml`, runs it three times) | The maintainer, after a promote, for the Linux rows of V04 ([#288](https://github.com/reliaburger/reliaburger/issues/288), [record](qualification/2026-11-12-v04-cold-installs-linux.md)). `make test-ci-scripts` tests its arguments and the workflow's shape ([`test_cold_install.py`](../scripts/release/test_cold_install.py)) |
-| `nightly-qualify.sh` (the power-cut runs and the soak tiers, one after another on a train's tip) | The quiet host with Lima, a staged build of the tip for the soaks, and the signed soak bun for the job final | The quiet host every night, from 0.2.4 ([nightly qualification](releasing.md#nightly-qualification-on-the-train-tip)); `nightly.py freeze-check` compares the candidate with the latest green night. `make test-ci-scripts` tests its plan, record and freeze rule ([`test_nightly.py`](../scripts/release/test_nightly.py)) |
+| `nightly-qualify.sh` (the power-cut runs and the soak tiers, one after another on a train's tip) | The quiet host with Lima, a staged build of the tip for the soaks, and the signed soak bun for the job final | The quiet host, the night before a planned freeze, armed with `nightly-qualify.sh --once` ([arming a nightly](releasing.md#arming-a-nightly), [#1721](https://github.com/reliaburger/reliaburger/issues/1721)); `nightly.py freeze-check` compares the candidate with the latest green night. `make test-ci-scripts` tests its plan, record, freeze rule, the one-night launchd job and the evening's build and staging, with fakes for `gh` and `launchctl` ([`test_nightly.py`](../scripts/release/test_nightly.py)) |
 | `make test-gym` (the agent gym's scenarios on throwaway local clusters, [below](#an-agent-gym)) | macOS or Linux, about ten minutes and the ports from `GYM_PORT_BASE` (default 29400) to 29413 free; nothing else. `GYM_SOLVER=command:PROGRAM` runs an agent instead of the scripted baseline, which costs API spend | The maintainer, before any release that changes `relish wtf`, `relish agent` or a scenario; the 0.2.7 exit test ([#1093](https://github.com/reliaburger/reliaburger/issues/1093)) runs it with an agent. The record goes in [`qualification/`](qualification) |
 | `make test-gym-user` (`relish gym run` on a throwaway local cluster: the baseline, then Ctrl-C mid-run, [below](#on-a-users-cluster-relish-gym-run)) | macOS or Linux, about ten minutes, and the ports from `GYM_PORT_BASE` free; no API spend | The maintainer, before any release that changes `relish gym`, Smoker's workload faults or token scoping |
 | `qualify-profile.sh` (the release profile: where the time goes, against the previous release) | A quiet Mac with Lima: no build or soak beside it. It creates and deletes a disposable VM, and runs `perf` on each version's never-shipped profiling build from `build.yml` | The maintainer, on every release from 0.2.4, after the tag ([release step 9](releasing.md#staging-a-candidate)). Its rules report what they would flag and don't gate yet. `make test-ci-scripts` tests its parsing, medians, rules and README ([`test_profile.py`](../scripts/release/test_profile.py)) |
@@ -437,13 +437,15 @@ jobs. What else runs depends on where the change is going:
 
 | Run | Jobs | Typical wall time |
 |---|---|---|
-| Pull request into a merge train (`release-*`, e.g. `release-0-2-4`) | The light set: CI policy, dependency audit, lint and format, minimum Rust, the demo app, the source bundle build, portable Linux (with coverage), the doctests and the nightly-signing key test, and the optimised contract boundaries | about 19 minutes of running, set by portable Linux, down from 30 (#1723, [measured](qualification/2026-11-09-v0.2.8-train-pr-timings.md)), then about 35 once the coverage build went to one job at a time (#2102; median 22.7 minutes in 13 green train PRs before, 34.8 in 14 after), plus however long the runners queue. The train's pushes now save portable Linux's dependency cache, so its PRs no longer build every dependency at one job |
+| Pull request into a merge train (`release-*`, e.g. `release-0-2-4`) | The light set: CI policy (with the dependency audit and the demo app's Go tests), lint and format, minimum Rust, the source bundle build, portable Linux (with coverage), the doctests and the nightly-signing key test, and the optimised contract boundaries | about 19 minutes of running, set by portable Linux, down from 30 (#1723, [measured](qualification/2026-11-09-v0.2.8-train-pr-timings.md)), then about 35 once the coverage build went to one job at a time (#2102; median 22.7 minutes in 13 green train PRs before, 34.8 in 14 after). From 18 to 20 November, with the train's dependency cache saved by its pushes, 22 green train PRs without macOS took a median of 31.3 minutes of running and 43.9 of wall time: portable Linux builds the crate for 13 of its 25 to 31 minutes, one compile at a time. Since 0.3.2 `make coverage` builds the lib tests alone and then the rest, both at full parallelism (#1723): estimated at about 6 minutes of build and 18 to 24 of portable Linux (median near 21), to be confirmed by the first CI runs |
 | The same, labelled `full-ci` | The light set plus privileged Linux, the cluster, acceptance and upgrade suites, and the benchmarks the change touches | about 45 minutes |
 | The gate PR (a train into `main`) | The light set on each push; with `full-ci`, the heavy suites too | as above |
 | The gate PR labelled `release-gate` | Everything, portable macOS included; the evidence gate refuses less | about 45 minutes, plus any wait for macOS runners |
 | Any other pull request into `main` | The light set plus the heavy suites and the benchmarks the change touches | about 45 minutes |
 | Pull request stacked on any other branch | The light set; the heavy suites only with `full-ci` | about 17 minutes |
-| Push to a train or to `main`, merge-queue group, nightly, manual, `build.yml`'s candidate build | Everything | about 45 minutes, plus any wait for macOS runners |
+| Merge-queue group | Everything; only CI policy and the gate when the group changes nothing but documentation | about 60 minutes, set by portable macOS, plus any wait for runners |
+| Push to a train | Nothing but CI policy and the gate when the merge queue's run on that commit passed every job at its first attempt; portable Linux too when the train's `Cargo.lock`, `Cargo.toml` or `.cargo/config.toml` differs from `main`'s, to save its cache; everything otherwise | a few minutes; about 25 with portable Linux |
+| Push to `main`, nightly, manual, `build.yml`'s candidate build | Everything | about 45 minutes, plus any wait for macOS runners |
 
 **macOS only where it adds something**
 ([#1443](https://github.com/reliaburger/reliaburger/issues/1443), maintainer
@@ -494,15 +496,27 @@ failed. The resource log and snapshots are kept as `linux-evidence` and
 the lib tests before the rest, so the lib and its lib tests never compile at
 once on a 16 GB runner.
 
+Portable Linux's `make coverage` does the same inside cargo-llvm-cov (#1723).
+`cargo llvm-cov --no-report test --lib -- --list` builds the instrumented lib
+tests alone (10 to 12 GB of rustc) and lists them without running one; `cargo
+llvm-cov clean --profraw-only` deletes the profile that listing writes; then
+the instrumented nextest run builds the rest, the lib (about 7 GB) first,
+since every other target links it. Both phases run at full parallelism: the
+job no longer sets `CARGO_BUILD_JOBS=1`, which also held each rustc's codegen
+to one thread and made the build about 13 of the job's 25 to 31 minutes.
+cargo-llvm-cov keeps `--no-run` for itself (a deprecated alias for its report),
+hence `--list`. The first CI runs measure it: watch the resource log for
+`mem_floor:` and memory-stall stops, and the report step for kernel OOM lines.
+
 The light set exists because macOS was the critical path of almost every run:
 twelve runs before the change took 45–55 minutes of wall time, of which
 runner queueing was mostly under ten, portable macOS 35–49 and acceptance
 about 34; every other job finished in about 15. A pull request into a train
 only needs to show it compiles, lints and passes the portable suite on Linux,
 with the coverage floor (`COVERAGE_MIN_LINES`, which only the Linux job
-measures). Nothing is lost, only moved: the push to the train runs every job
-on the result, so every commit on a train has full coverage. The gate PR
-doesn't run it all again on each push, since that push just did; it runs
+measures). Nothing is lost, only moved: the merge queue runs every job on the
+result before it lands, so every commit on a train has full coverage. The gate PR
+doesn't run it all again on each push, since the queue just did; it runs
 everything once it's labelled `release-gate` at code freeze. Label a pull
 request `full-ci` when you want the heavy suites on the PR itself, for
 example for a change to privileged Linux, cluster or acceptance code. The
@@ -514,8 +528,11 @@ Either way the job runs relish and the macOS-only tests, not the whole suite
 ([what runs on macOS](#what-runs-on-macos-and-what-runs-on-linux)), so in CI a
 change to Bun, grill or the cluster code is tested on Linux only.
 
-Every train merges through the merge queue, with `gh pr merge --merge --auto`
-([merging through the queue](releasing.md#merging-through-the-queue)).
+Every train merges through the merge queue, with `gh pr merge --merge` once
+the PR's checks have passed, never `--auto`
+([merging through the queue](releasing.md#merging-through-the-queue)). Each
+train is named in the queue's ruleset when it opens
+([opening a train](releasing.md#opening-a-train)).
 The queue requires one check, `ignored-test evidence`. It waits for
 every other job, fails if any of them failed or was cancelled, and then runs
 the evidence aggregation below, so a skipped job can only count when select
@@ -526,7 +543,9 @@ Evidence there binds to the queue's temporary group commit
 
 A newer push to the same pull request, or to the same train, cancels the
 older run; pushes to `main`, merge-queue groups and nightly runs each keep
-their own. Closing (or merging) a pull request cancels its run too: the
+their own. The queue doesn't cancel the runs of groups it drops when it
+re-forms, so [`queue-sweep.yml`](../.github/workflows/queue-sweep.yml) does
+([below](#what-a-merge-costs-in-runners)). Closing (or merging) a pull request cancels its run too: the
 `closed` event starts a run in the same group whose only job is a no-op, and
 every other job skips it
 ([#1054](https://github.com/reliaburger/reliaburger/issues/1054)). When GitHub retargets a stacked pull request,
@@ -557,6 +576,50 @@ the run's artefacts through the API (the jobs, and every workflow that calls
 an HTTP `Range` request, abandons an attempt after 60 s without a byte, logs
 its progress, checks the zip's digest and stops at 13 minutes, inside the
 step's 14.
+
+### What a merge costs in runners
+
+The account runs a fixed number of hosted jobs at once, five of them macOS,
+and every train's PRs, queue groups and pushes share them. From 18 to 20
+November 2026 (194 runs of `ci.yml`, 22,120 runner-minutes) a queue group
+started 20 jobs and used about 280 runner-minutes, and the queue builds up to
+eight groups at once. On the evening of 20 November jobs waited up to 96
+minutes for a runner, and a train PR whose own work took 30 minutes took 70
+to 110 to report (#1723). Three things wasted runners, and each now has a fix:
+
+- **Pushes that repeated the queue.** The queue pushes a train exactly the
+  commit its group tested, and that push ran all 20 jobs again: 15 of the 18
+  train pushes in the window repeated a queue run that had passed, about 4,100
+  runner-minutes. Select jobs now asks the API for that run first, by the
+  rule a candidate build uses to reuse one
+  ([`ci_reuse.py`](../scripts/release/ci_reuse.py) with `--event
+  merge_group`: same commit, first attempt, every job green), and when it
+  finds one the push runs only CI policy and the gate, which names the run
+  it rests on. A candidate build of that commit reuses the queue's run, not
+  the push's. Any doubt, an API error included, runs everything.
+- **Groups the queue had dropped.** When the queue re-forms it deletes the
+  dropped groups' `gh-readonly-queue/...` branches but leaves their runs
+  going, and each merge-group run has a concurrency group of its own. Five
+  such runs kept 78 jobs and about 1,100 runner-minutes going after they were
+  dropped. [`queue_sweep.py`](../scripts/ci/queue_sweep.py), run by
+  `queue-sweep.yml` whenever the queue starts a group or a train moves,
+  cancels every unfinished merge-group run whose branch is gone. It's its own
+  workflow because cancelling needs `actions: write`, which `ci.yml`'s
+  callers don't grant.
+- **Small jobs waiting for runners of their own.** The dependency audit and
+  the demo app's Go tests each took under a minute but waited for a runner
+  like any other job, and the gate waits for the last of them. They're steps
+  of CI policy now: 9 jobs per train PR instead of 11, 18 per queue group
+  instead of 20.
+
+A queue group that changes only documentation runs no code job either (two of
+the window's 32 groups): its code is its base's, which the run before it is
+testing. Scripts are code here, since the jobs run them.
+
+What's left is mostly the queue's own settings, which only the maintainer can
+change: building eight groups at once (`max_entries_to_build` in the "release
+trains merge queue" ruleset) means up to 160 jobs, and portable macOS (52 to
+57 minutes with a warm cache) sets every group's length.
 
 ### What runs on macOS and what runs on Linux
 
@@ -736,8 +799,12 @@ a seal from another commit or run, a later attempt or an earlier attempt that a
 re-run replaced can't qualify.
 
 Linux coverage wraps the existing `make coverage` once, including its clean,
+the lib tests' build, the clean of that build's listing profile, the
 instrumented nextest run and its one report, which writes the LCOV file and
-checks the unchanged line floor. The HTML report isn't evidence: the job writes
+checks the unchanged line floor. A build stage (`--no-report test`) must only
+list its tests (`-- --list`), come before the run and be followed by a
+`clean --profraw-only` before it, so the report reads the run's profiles
+alone; the owner accepts the nextest handshake only during the run stage. The HTML report isn't evidence: the job writes
 it with `make coverage-html` on pushes to `main` and the nightly only. Discovery
 uses that run's instrumented environment, selectors and target directory.
 A separate ordinary test run doesn't validate the coverage run. The owner also
@@ -1373,8 +1440,8 @@ From 0.2.4 the gate scales with the release
 installs, the fast soak tiers and the power-cut and reboot runs; the final
 soak is for minor releases and any release that changes durable state, the
 wire or the agent loop (`scripts/release/release_tier.py` says which). The
-long tiers run every night on the train's tip
-(`scripts/release/nightly-qualify.sh`), so at code freeze
+long tiers run on the train's tip the night before a planned freeze
+(`scripts/release/nightly-qualify.sh --once` arms that one night), so at code freeze
 `scripts/release/nightly.py freeze-check` only has to show that the latest
 green nightly ran the candidate's code. Performance records (benchmarks, the
 profile, the day run) are published after the tag. `make test-ci-scripts`

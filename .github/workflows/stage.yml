@@ -51,6 +51,9 @@ jobs:
       CHANNEL: ${{ inputs.channel }}
     steps:
       # Scripts come from main, like promotion: this job holds a write token.
+      # A nightly's tag points at main's commit ($GITHUB_SHA), not the
+      # train's: a release on a commit whose workflows differ from main's
+      # needs the workflow scope, which this token can't have (#1721).
       - uses: actions/checkout@v4
       - name: Download and verify the candidate
         run: |
@@ -61,7 +64,8 @@ jobs:
         run: |
           base=$(python3 scripts/release/candidate.py stage --directory dist \
             --repository "$RELEASE_REPOSITORY" --run-id "$CANDIDATE_RUN" \
-            --qualified-digest "$QUALIFIED_DIGEST" --channel "$CHANNEL")
+            --qualified-digest "$QUALIFIED_DIGEST" --channel "$CHANNEL" \
+            --main-commit "$GITHUB_SHA")
           if [ "$CHANNEL" = nightly ]; then
             printf 'Staged base URL: `%s`\n\nQualify the train tip with:\n\n```sh\nscripts/release/nightly-qualify.sh --train TRAIN --base-url %s --qualified-digest %s\n```\n' \
               "$base" "$base" "$QUALIFIED_DIGEST" >> "$GITHUB_STEP_SUMMARY"

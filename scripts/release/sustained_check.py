@@ -11,6 +11,8 @@ renders the final Markdown record.
 Subcommands:
   event EVIDENCE --phase P [--target T] [--command C] [--exit N] [--duration S] [--verdict V] [--detail D]
   expect EVIDENCE restart NODE          a harnessed bun kill: one systemd restart is explained
+  expect EVIDENCE workload-restart INSTANCE
+                                        a harness fault restarts INSTANCE once (a chaos pause)
   window EVIDENCE open|close [LABEL]    faults in progress; outages are allowed while open
   power-cut EVIDENCE                    a node lost power: a log tail may end below an earlier one once
   baseline EVIDENCE SNAPSHOT            record each node's leak inventory as the baseline
@@ -643,6 +645,60 @@ def restart_expectations(evidence, node):
     return times
 
 
+# `relish wtf` counts a crash loop as CRASHLOOP_RESTARTS restarts of one
+# instance inside CRASHLOOP_WINDOW (src/relish/wtf/findings.rs).
+CRASHLOOP_RESTARTS = 3
+CRASHLOOP_WINDOW = 15 * 60
+WORKLOAD_RESTARTS = "workload-restart-expectations.jsonl"
+LOOPING_INSTANCE = re.compile(r"instance (\S+) restarted (\d+) times")
+
+
+def workload_restart_expectations(evidence):
+    """Restarts the harness's own faults cause, as (instance, time) pairs.
+
+    A chaos pause freezes one instance, its health checks fail and Bun
+    restarts it (#2079). Append-only, like restart-expectations.jsonl."""
+    path = Path(evidence) / WORKLOAD_RESTARTS
+    if not path.exists():
+        return []
+    expected = []
+    for line in path.read_text().splitlines():
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        expected.append((entry["instance"], entry["ts"]))
+    return expected
+
+
+def excuse_expected_restarts(report, expectations, now):
+    """The `wtf` report without the crash loops the harness's faults explain (#2197).
+
+    A crashloop finding names each looping instance and its restart count. It
+    is excused when every instance falls below the threshold once the restarts
+    the harness caused inside the window are taken off. A line that names no
+    instance excuses nothing."""
+    def excused(entry):
+        if entry.get("id") != "crashloop" or not entry.get("details"):
+            return False
+        for line in entry["details"]:
+            match = LOOPING_INSTANCE.match(line)
+            if not match:
+                return False
+            instance, count = match.group(1), int(match.group(2))
+            caused = sum(1 for name, at in expectations if name == instance and now - CRASHLOOP_WINDOW <= at <= now)
+            if count - caused >= CRASHLOOP_RESTARTS:
+                return False
+        return True
+    critical = report.get("critical", [])
+    kept = [entry for entry in critical if not excused(entry)]
+    if len(kept) == len(critical):
+        return report, []
+    notes = [finding("wtf-crashloop", "info", "restarts the harness caused: " + "; ".join(entry["details"]),
+                     entry.get("affected_resource")) for entry in critical if excused(entry)]
+    return dict(report, critical=kept), notes
+
+
 def restart_findings(state, node, inventory, expectations, now):
     """systemd restarts of bun that no harness kill explains.
 
@@ -1081,6 +1137,8 @@ def evaluate(evidence, snapshot):
 
     report = read_json(snapshot, "wtf.json")
     if report is not None:
+        report, notes = excuse_expected_restarts(report, workload_restart_expectations(evidence), now)
+        findings += notes
         findings += wtf_findings(state, report, now, fault_window)
         if report.get("critical"):
             state["wtf_critical_samples"] = state.get("wtf_critical_samples", 0) + 1
@@ -2499,8 +2557,8 @@ def main(argv=None):
         event.add_argument("--" + name, type=int)
     expect = commands.add_parser("expect")
     expect.add_argument("evidence")
-    expect.add_argument("what", choices=["restart"])
-    expect.add_argument("node")
+    expect.add_argument("what", choices=["restart", "workload-restart"])
+    expect.add_argument("node", help="the node for `restart`, the instance for `workload-restart`")
     expect.add_argument("--at", type=int, help="when the kill happens (default: now)")
     power_cut = commands.add_parser("power-cut", help="a node's power was cut: the log view may lose unsynced lines")
     power_cut.add_argument("evidence")
@@ -2604,8 +2662,13 @@ def main(argv=None):
                      settle_seconds=args.settle_seconds)
         return 0
     if args.command == "expect":
+        at = args.at if args.at is not None else int(time.time())
+        if args.what == "workload-restart":
+            with open(Path(args.evidence) / WORKLOAD_RESTARTS, "a") as out:
+                out.write(json.dumps({"instance": args.node, "ts": at}) + "\n")
+            return 0
         with open(Path(args.evidence) / "restart-expectations.jsonl", "a") as out:
-            out.write(json.dumps({"node": args.node, "ts": args.at if args.at is not None else int(time.time())}) + "\n")
+            out.write(json.dumps({"node": args.node, "ts": at}) + "\n")
         return 0
     if args.command == "power-cut":
         state = load_state(args.evidence)
