@@ -1,5 +1,5 @@
 //! Bare-metal clusters from the laptop: `relish cluster create --bare-metal`
-//! and `relish image seed` (docs/plans/2026-10-01-plan-appliance-product.md,
+//! and `relish image seed` (docs/plans/archive/2026-10-01-plan-appliance-product.md,
 //! W3).
 //!
 //! The cluster's PKI is made here, on the operator's machine, as the
@@ -971,20 +971,33 @@ pub struct ContextReport {
     pub endpoint: String,
     pub ca_cert: PathBuf,
     pub token_file: PathBuf,
+    /// Another cluster's context this one replaced, because a file it
+    /// needed was gone (#2162).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replaced: Option<super::local_context::ReplacedContext>,
 }
 
 impl std::fmt::Display for ContextReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.adopted {
-            return writeln!(
+            writeln!(
                 f,
                 "relish now talks to this cluster (node 1, {}).",
                 self.endpoint
-            );
+            )?;
+            if let Some(replaced) = &self.replaced {
+                writeln!(
+                    f,
+                    "It replaced the context for {}, which no longer worked: {} is gone.",
+                    replaced.owner,
+                    replaced.missing.display()
+                )?;
+            }
+            return Ok(());
         }
         writeln!(
             f,
-            "Another cluster's relish context is in place, so it was kept. To use this one:"
+            "Another cluster's relish context is in place and still works, so it was kept. To use this one:"
         )?;
         writeln!(f, "  export RELIABURGER_ENDPOINT={}", self.endpoint)?;
         writeln!(f, "  export RELIABURGER_CA_CERT={}", self.ca_cert.display())?;
@@ -997,22 +1010,36 @@ impl std::fmt::Display for ContextReport {
 }
 
 /// Point relish at a newly created cluster, unless another cluster's
-/// context is in the way.
+/// working context is in the way. A context whose files are gone is
+/// replaced, since nothing can use it.
 pub fn adopt(created: &Created, directory: &Path) -> Result<ContextReport, RelishError> {
+    adopt_at(created, directory, &super::local_context::default_path()?)
+}
+
+/// [`adopt`], with the context saved at `path`.
+fn adopt_at(
+    created: &Created,
+    directory: &Path,
+    path: &Path,
+) -> Result<ContextReport, RelishError> {
     let context = context(&created.fleet, directory, &created.admin_token)?;
-    let path = super::local_context::default_path()?;
-    let adopted = match super::local_context::LocalContext::load(&path) {
-        Ok(None) => context.save(&path).map(|()| true)?,
-        Ok(Some(existing)) if existing.owner == context.owner => {
-            context.save(&path).map(|()| true)?
-        }
-        _ => false,
+    let in_the_way = match super::local_context::LocalContext::load(path) {
+        Ok(None) => false,
+        Ok(Some(existing)) => existing.owner != context.owner && existing.missing_file().is_none(),
+        // An unreadable context isn't relish's to overwrite.
+        Err(_) => true,
+    };
+    let replaced = if in_the_way {
+        None
+    } else {
+        context.save(path)?
     };
     Ok(ContextReport {
-        adopted,
+        adopted: !in_the_way,
         endpoint: context.endpoint,
         ca_cert: context.ca_cert,
         token_file: directory.join("secrets").join("admin.token"),
+        replaced,
     })
 }
 
@@ -1430,6 +1457,7 @@ mod tests {
             endpoint: "https://192.168.1.51:9117".into(),
             ca_cert: PathBuf::from("/c/root-ca.crt"),
             token_file: PathBuf::from("/c/secrets/admin.token"),
+            replaced: None,
         };
         let report = ClusterCreated::new(&created, &options, context);
 
@@ -1492,11 +1520,95 @@ mod tests {
             endpoint: "https://192.168.1.51:9117".into(),
             ca_cert: PathBuf::from("/c/root-ca.crt"),
             token_file: PathBuf::from("/c/secrets/admin.token"),
+            replaced: None,
         };
         assert_eq!(
             context.to_string(),
             "relish now talks to this cluster (node 1, https://192.168.1.51:9117).\n"
         );
+    }
+
+    /// Another cluster's context at `path`, trusting `ca_cert`.
+    fn save_other_context(path: &Path, ca_cert: PathBuf) {
+        super::super::local_context::LocalContext {
+            schema: 1,
+            owner: "bare-metal/old".to_string(),
+            endpoint: "https://192.168.1.99:9117".to_string(),
+            token: "rbrg_old".to_string(),
+            ca_cert,
+            service_endpoints: Default::default(),
+        }
+        .save(path)
+        .unwrap();
+    }
+
+    fn saved_owner(path: &Path) -> String {
+        super::super::local_context::LocalContext::load(path)
+            .unwrap()
+            .unwrap()
+            .owner
+    }
+
+    #[test]
+    fn a_new_cluster_becomes_the_context_when_there_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("context.json");
+        let created = create(&options(dir.path(), &["d8:9e:f3:00:00:01@192.168.1.51"])).unwrap();
+
+        let report = adopt_at(&created, dir.path(), &path).unwrap();
+
+        assert!(report.adopted);
+        assert_eq!(report.replaced, None);
+        assert_eq!(saved_owner(&path), "bare-metal/home");
+    }
+
+    #[test]
+    fn a_working_context_for_another_cluster_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("context.json");
+        let old_ca = home.path().join("old-ca.crt");
+        std::fs::write(&old_ca, b"old cluster ca").unwrap();
+        save_other_context(&path, old_ca);
+        let created = create(&options(dir.path(), &["d8:9e:f3:00:00:01@192.168.1.51"])).unwrap();
+
+        let report = adopt_at(&created, dir.path(), &path).unwrap();
+
+        assert!(!report.adopted);
+        assert_eq!(saved_owner(&path), "bare-metal/old");
+        assert!(report.to_string().contains("still works, so it was kept"));
+    }
+
+    /// The Wyse lab's case: the old cluster's directory was deleted, so
+    /// its context pointed at a CA certificate that no longer existed and
+    /// every command failed (#2162).
+    #[test]
+    fn a_context_whose_cluster_directory_is_gone_is_replaced_by_the_new_cluster() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("context.json");
+        let gone = home.path().join("deleted-cluster/root-ca.crt");
+        save_other_context(&path, gone.clone());
+        let created = create(&options(dir.path(), &["d8:9e:f3:00:00:01@192.168.1.51"])).unwrap();
+
+        let report = adopt_at(&created, dir.path(), &path).unwrap();
+
+        assert!(report.adopted);
+        assert_eq!(saved_owner(&path), "bare-metal/home");
+        let replaced = report.replaced.clone().unwrap();
+        assert_eq!(replaced.owner, "bare-metal/old");
+        assert_eq!(replaced.missing, gone);
+        assert_eq!(
+            report.to_string(),
+            format!(
+                "relish now talks to this cluster (node 1, https://192.168.1.51:9117).\n\
+                 It replaced the context for bare-metal/old, which no longer worked: {} is gone.\n",
+                gone.display()
+            )
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["replaced"]["owner"], "bare-metal/old");
     }
 
     #[test]

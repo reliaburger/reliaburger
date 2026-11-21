@@ -798,7 +798,7 @@ To serve environment variables, the API needs the original `AppSpec` after deplo
 
 ## Alert webhooks
 
-In Chapter 6, we built the alert state machine: five rules, three states (Inactive → Pending → Firing), and a `firing_alerts()` method for the API. But we never actually drove it. The evaluator sat there, idle, waiting for someone to call `evaluate()`. Now we wire it up and add webhook delivery.
+In Chapter 6, we built the alert state machine: the built-in rules, three states (Inactive → Pending → Firing), and a `firing_alerts()` method for the API. But we never actually drove it. The evaluator sat there, idle, waiting for someone to call `evaluate()`. Now we wire it up and add webhook delivery.
 
 ### The evaluation loop
 

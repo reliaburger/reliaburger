@@ -439,7 +439,9 @@ impl From<&RelishError> for AgentError {
                 agent_error.endpoint = Some(endpoint.clone());
                 agent_error
             }
-            RelishError::AgentRequired { .. } => AgentError::new(ErrorCode::NoEndpoint, message),
+            RelishError::AgentRequired { .. }
+            | RelishError::ContextFileMissing { .. }
+            | RelishError::ClientConfig(_) => AgentError::new(ErrorCode::NoEndpoint, message),
             RelishError::RequestTimeout | RelishError::DeployStreamDeadline { .. } => {
                 AgentError::new(ErrorCode::Timeout, message)
             }

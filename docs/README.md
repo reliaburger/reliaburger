@@ -5,8 +5,8 @@ laptop, see the [quickstart guide](quickstart.md). For the architectural vision,
 see the [whitepaper](whitepaper.md); for status and what's next, see the
 [roadmap](roadmap.md).
 
-0.2.8 was released on 12 November 2026. Its signed binaries, guest images and
-installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.8),
+0.3.0 was released on 20 November 2026. Its signed binaries, guest images and
+installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.0),
 and `curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop` installs it
 and builds a laptop cluster; without a flag the installer explains the choices.
 Until 1.0.0 Reliaburger is good enough for home labs and dev clusters, not production. Every
@@ -14,7 +14,7 @@ release follows the same [build, staging and promotion procedure](releasing.md#m
 From 0.2.7, every release file also carries a build provenance
 attestation that anyone can check with `gh attestation verify`, and the macOS `relish` can be
 notarised ([checks a stranger can run](releasing.md#checks-a-stranger-can-run)).
-The limits below are the ones 0.2.8 ships with; the [changelog](../CHANGELOG.md)
+The limits below are the ones 0.3.0 ships with; the [changelog](../CHANGELOG.md)
 says what changed in each release, and the [roadmap](roadmap.md) tracks
 what comes after it. The [feature status page](https://reliaburger.com/features)
 rates every feature Ready, Beta, Alpha or Planned, with its restrictions and open
@@ -35,7 +35,7 @@ and trade-offs against other projects, with dated evidence and explicit release 
 
 ## What's in the binary
 
-This is what 0.2.8, the release the installer fetches, does. Each node runs
+This is what 0.3.0, the release the installer fetches, does. Each node runs
 one agent, `bun`; you drive the cluster with one CLI, `relish`. Scheduling,
 clustering, service discovery, ingress, PKI, secrets, an image registry,
 metrics, logs, GitOps, jobs and fault injection are compiled into that agent,
@@ -184,13 +184,15 @@ each node's platform. Until 1.0 it works only between builds with the same
 cluster formats. 0.2.3 kept 0.2.2's, and a 0.2.2 cluster rolled onto it in
 place ([record](qualification/2026-10-29-rolling-walk-0.2.2-to-0.2.3.md));
 0.2.4, 0.2.5 and 0.2.6 each change them again, 0.2.7 kept 0.2.6's, and 0.2.8
-changes them again, so a 0.2.7 cluster starts afresh on 0.2.8
+and 0.3.0 each change them again, so a 0.2.8 cluster starts afresh on 0.3.0
 ([compatibility before 1.0.0](releasing.md#compatibility-before-100)). A release with other cluster formats, or a
 rollback to a version some node doesn't hold, is refused before anything is
 recorded.
 
 **Diagnostics built for incidents.** `relish wtf` correlates cluster health into
-one screen of problems and next steps. `relish path` walks the network path
+a table of checks with what's wrong; `--short` prints only the problems and
+their next steps, and `--explain` says exactly what each check tests and where
+the manual covers it. `relish path` walks the network path
 between two apps and labels each step observed, inferred or unavailable.
 `relish test` runs a live-cluster test catalogue, and `relish bench` measures
 the data plane.
@@ -275,7 +277,7 @@ and its trade-offs; the [design docs](design/) cover each subsystem.
   ([#1412](https://github.com/reliaburger/reliaburger/issues/1412)), and gossip
   at 1,000 not settling within six minutes
   ([#1413](https://github.com/reliaburger/reliaburger/issues/1413)).
-- **Alerts are five built-in node rules.** CPU, memory and disk thresholds,
+- **Alerts are four built-in node rules.** CPU, memory and disk thresholds,
   delivered by webhook; you can't define your own rules yet
   ([manual](manual/04_observability.md#alerts)).
 - **One Bun per writable image store.** Registry startup claims exclusive
@@ -383,7 +385,7 @@ lists which work.
 
 ### Jobs and cron
 
-Jobs arrived in 0.2.0. 0.2.8 changes the cluster formats, so a 0.2.7 or older
+Jobs arrived in 0.2.0. 0.3.0 changes the cluster formats, so a 0.2.8 or older
 cluster starts afresh
 ([compatibility before 1.0.0](releasing.md#compatibility-before-100)). The
 [job manual](manual/14_batch-jobs.md) covers jobs in full.
@@ -560,7 +562,7 @@ xcode-select --install
 
 ## Container runtimes (optional)
 
-For 0.2.8, Bun selects Linux runc or the built-in process runtime. macOS containers run through managed Linux VMs. **ProcessGrill** (plain OS processes) is the built-in fallback that works everywhere without extra software — you don't need to install anything else to get started.
+For 0.3.0, Bun selects Linux runc or the built-in process runtime. macOS containers run through managed Linux VMs. **ProcessGrill** (plain OS processes) is the built-in fallback that works everywhere without extra software — you don't need to install anything else to get started.
 
 ### runc (Linux)
 
@@ -599,7 +601,7 @@ or operator firewall rules when diagnosing direct-host connectivity.
 
 ### macOS containers: managed Linux VMs
 
-For 0.2.8, run containers through the [managed laptop quickstart](quickstart.md):
+For 0.3.0, run containers through the [managed laptop quickstart](quickstart.md):
 
 ```sh
 relish setup --quickstart --nodes 3
@@ -610,7 +612,7 @@ foreground process workloads. Direct Apple Container selection is disabled,
 even when its CLI is installed: interrupted CLI requests can outlive Bun and
 mutate the Apple daemon, and their recovery guarantees are not yet complete.
 The adapter and its manual development tests remain in the repository for future
-work; they are outside the 0.2.8 runtime profile.
+work; they are outside the 0.3.0 runtime profile.
 
 ### ProcessGrill (built-in fallback)
 
@@ -630,7 +632,7 @@ sixteen concurrent exec requests, with a five-minute deadline, 64 KiB request
 limit and 1 MiB combined stdout/stderr response limit. Commands inherit the host
 environment and run without container isolation.
 
-**0.2.8 contract: foreground workloads only.** The main process stays under Bun's
+**0.3.0 contract: foreground workloads only.** The main process stays under Bun's
 supervision and children must remain in its supervised process group. A service
 can run unattended and spawn workers; foreground does not mean an open terminal.
 Use the application's foreground/no-daemon option. A shell wrapper should `exec`
@@ -1158,9 +1160,11 @@ TUI keys:
 |-----|--------|
 | `a`, `n`, `j`, `e`, `l`, `r` | Open apps, nodes, jobs, events, logs or routes |
 | `s`, `?`, `:` | Search, help or command palette |
-| Arrow keys, Enter | Select and open a row |
-| Tab, Shift-Tab | Cycle app-detail tabs |
-| `/` | Filter the current list |
+| ↑/↓, Enter | Select and open a row |
+| ←/→, Tab, Shift-Tab | Cycle app-detail tabs |
+| `/` | Filter the current list; search the logs or the Logs and Metrics tabs, matches in red and bold |
+| Escape (with a filter or search) | Clear it |
+| `k`, Ctrl-K | Kill the selected instance in the Instances tab, after a `[y/N]` prompt; it's an audited Smoker kill fault |
 | `f` | Toggle log following |
 | Escape, `q` | Go back; quit from the dashboard |
 
@@ -1692,7 +1696,7 @@ The bun agent exposes a local HTTP API on port 9117:
 | `POST` | `/v1/stop/{app}/{namespace}` | Stop an app. In a cluster it answers `202 Accepted` with `{"status":"stopping"}` once the council records the stop; poll `/v1/status` for the instances to go. A standalone node answers `200` with `stopped` after the local stop completes |
 | `POST` | `/v1/delete/{app}/{namespace}` | Remove an app. In a cluster it answers `202 Accepted` with `{"status":"deleting"}`; cleanup on the workers follows asynchronously |
 | `GET` | `/v1/logs/{app}/{namespace}` | Captured stdout/stderr (`?tail=N&follow=true`) |
-| `POST` | `/v1/exec/{app}/{namespace}` | Execute a command (JSON body: `{"command":["..."]}`) |
+| `POST` | `/v1/exec/{app}/{namespace}` | Execute a command (JSON body: `{"command":["..."]}`, optional `"timeout_seconds"`, at most 300) |
 | `GET` | `/v1/cluster/nodes` | List cluster nodes (gossip membership, dead members included with state `dead`) |
 | `GET` | `/v1/cluster/summary` | The whole cluster at a glance: counts per section (nodes, council, gossip, versions, capacity, usage, apps, instances, jobs, logs, faults, alerts, certs, GitOps, agents: leases held and proposals waiting), each marked `complete`, `partial` or `missing` with the nodes that answered. A scoped token sees its own apps and jobs; the cluster-wide sections come back `missing` |
 | `GET` | `/v1/cluster/capacity` | Requested CPU, memory and GPUs against schedulable capacity per node, from the leader's state reports; unscoped tokens only |
@@ -1946,7 +1950,7 @@ different name or namespace for the other kind.
 
 Release maintainers: see [the build, signing and publication procedure](releasing.md).
 
-Direct Apple Container is disabled for 0.2.8 while interrupted daemon-command
+Direct Apple Container is disabled for 0.3.0 while interrupted daemon-command
 recovery remains unfinished. Use the managed Linux/runc quickstart on macOS.
 
 Node chaos (kill, drain, pressure and council partitions) reserves one cluster-wide

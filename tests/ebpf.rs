@@ -5911,11 +5911,19 @@ async fn check_backend_retirement(
                     runtime.kill(&id).await?;
                     let started = std::time::Instant::now();
                     let mut last = String::from("nothing observed");
+                    // Each runtime read takes the instance's lifecycle lock,
+                    // as the agent's state sweep and restart steps do, so the
+                    // runtime is asked only every 250 ms. A read racing the
+                    // restart's create can say it can't tell yet
+                    // (`StateUnavailable`), which means look again (#2085).
                     let replacement = tokio::time::timeout(std::time::Duration::from_secs(30), async {
                         loop {
                             let backends = services.borrow().resolve(&ServiceId::new("default", name)).map(|entry| entry.backends.iter().map(|backend| (backend.instance_id.clone(), backend.healthy)).collect::<Vec<_>>());
                             let published = backends.as_ref().is_some_and(|backends| backends.iter().any(|(instance, healthy)| *instance == id.0 && *healthy));
-                            let reference = runtime.network_reference(&id).await?;
+                            let reference = match runtime.network_reference(&id).await {
+                                Err(reliaburger::grill::GrillError::StateUnavailable { .. }) => None,
+                                reference => reference?,
+                            };
                             let state = runtime.state(&id).await;
                             let new_generation = reference.as_ref().is_some_and(|reference| reference.generation != original.generation);
                             let running = matches!(state, Ok(reliaburger::grill::ContainerState::Running));
@@ -5923,14 +5931,15 @@ async fn check_backend_retirement(
                             if let Some(reference) = reference && new_generation && published && running {
                                 break Ok::<_, anyhow::Error>(reference);
                             }
-                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                         }
                     }).await.map_err(|_| anyhow::anyhow!("restart did not finish in 30 s; last seen {last}"))??;
                     eprintln!("restart finished in {:?}", started.elapsed());
                     let checkpoint: serde_json::Value = serde_json::from_slice(&std::fs::read(root.path().join("discovery/discovery.json"))?)?;
                     let inventory: reliaburger::bun::discovery_owners::DiscoveryInventory = serde_json::from_value(checkpoint["inventory"].clone())?;
                     anyhow::ensure!(inventory.references.len() == 1 && inventory.references[0].reference == replacement && inventory.references[0].phase == reliaburger::bun::discovery_owners::ReferencePhase::Held, "restart did not replace its original durable hold");
-                    let ready = read_runtime_fixture_page(SocketAddr::new(vip.0.into(), 8080)).await?;
+                    let ready = read_runtime_fixture_page(SocketAddr::new(vip.0.into(), 8080))
+                        .await.map_err(|error| anyhow::anyhow!("replacement through the original VIP: {error}"))?;
                     anyhow::ensure!(ready.contains(&id.0), "replacement is not reachable through the original VIP");
                 }
                 if freeze {

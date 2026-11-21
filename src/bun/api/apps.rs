@@ -441,6 +441,10 @@ pub(super) async fn stop_local(state: &ApiState, app: String, namespace: String)
 #[derive(Deserialize)]
 pub(super) struct ExecRequest {
     pub(super) command: Vec<String>,
+    /// How long the command may run, in seconds. Absent means the
+    /// agent's cap; a larger value is held to it.
+    #[serde(default)]
+    pub(super) timeout_seconds: Option<u64>,
 }
 
 /// Execute a command inside a running instance.
@@ -473,6 +477,7 @@ pub(super) async fn exec_handler(
         app_name: app,
         namespace,
         command: body.command,
+        timeout: crate::bun::agent::exec_timeout(body.timeout_seconds),
         response,
     })
     .await

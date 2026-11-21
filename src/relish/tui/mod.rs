@@ -5,6 +5,7 @@ pub mod data;
 pub mod fixtures;
 mod input;
 pub mod keys;
+mod matching;
 pub mod msg;
 mod navigation;
 pub mod palette;
@@ -146,6 +147,16 @@ async fn event_loop<P: DataProvider, B: Backend>(
                                 namespace,
                                 result,
                             }))
+                            .await;
+                    });
+                }
+                Effect::KillInstance(target) => {
+                    let provider = Arc::clone(&provider);
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let result = provider.kill_instance(&target).await;
+                        let _ = tx
+                            .send(Msg::Data(DataUpdate::InstanceKilled { target, result }))
                             .await;
                     });
                 }

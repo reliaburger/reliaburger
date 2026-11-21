@@ -183,8 +183,12 @@ pub enum BunError {
     StopIncomplete { reason: String },
 
     /// An `exec` did not finish within its deadline.
-    #[error("exec timed out after {seconds}s")]
-    ExecTimeout { seconds: u64 },
+    #[error("exec in {namespace}/{app_name} timed out after {seconds}s")]
+    ExecTimeout {
+        app_name: String,
+        namespace: String,
+        seconds: u64,
+    },
 
     /// A health check was configured but the app has no port to probe.
     #[error("app {app_name:?} has a health check but no port")]

@@ -1,6 +1,6 @@
 # Plan: the Wyse lab, from today's code to netbooted nodes
 
-*Written 2 October 2026 on the `appliance-train` branch (the spike, W1–W6 and the fleet research in one PR). It answers one question: what's left between the code on that branch and the maintainer's lab? It reads the code rather than the plans, cites files and functions, and marks anything not checked on real hardware or on macOS as **[unverified]**. It doesn't replace the [product plan](2026-10-01-plan-appliance-product.md) or the [S5 runbook](2026-10-01-plan-appliance-s5-wyse.md); it feeds both.*
+*Written 2 October 2026 on the `appliance-train` branch (the spike, W1–W6 and the fleet research in one PR). It answers one question: what's left between the code on that branch and the maintainer's lab? It reads the code rather than the plans, cites files and functions, and marks anything not checked on real hardware or on macOS as **[unverified]**. It doesn't replace the [product plan](archive/2026-10-01-plan-appliance-product.md) or the [S5 runbook](2026-10-01-plan-appliance-s5-wyse.md); it feeds both.*
 
 ## The lab
 

@@ -35,6 +35,15 @@
 # freezes outright, as one with swap on a dm-snapshot did (give-swap), stops
 # this watcher too, so the step's own `timeout` is the last guard.
 #
+# With WATCH_SNAPSHOT_AFTER (seconds) and WATCH_SNAPSHOT_DIR set, once the
+# watcher has run that long it writes a runner-snapshot to
+# snapshot-<age>s.txt in that directory, in the background, tailing the
+# logs in WATCH_SNAPSHOT_LOGS (space-separated), and logs a "snapshot: "
+# line. With WATCH_SNAPSHOT_EVERY (seconds) it takes another each period
+# after that, each in its own file. Set them so one lands a few minutes
+# before a step's own timeout: that timeout kills the hung processes the
+# snapshot shows, and the job's last step uploads the directory (#1943).
+#
 # The stop goes through `sudo -n` when it can, so it reaches a build or
 # tests running as root, as the 26.04 job's do.
 #
@@ -56,6 +65,11 @@ memory_window=${WATCH_MEM_FLOOR_SECONDS:-60}
 stall_limit=${WATCH_PSI_FULL_PERCENT:-}
 stall_window=${WATCH_PSI_SECONDS:-30}
 stop=${WATCH_STOP:-}
+snapshot_next=${WATCH_SNAPSHOT_AFTER:-}
+snapshot_every=${WATCH_SNAPSHOT_EVERY:-}
+snapshot_directory=${WATCH_SNAPSHOT_DIR:-}
+snapshot_logs=${WATCH_SNAPSHOT_LOGS:-}
+here=$(cd "$(dirname "$0")" && pwd)
 stopped=no
 low_since=
 stalled_since=
@@ -89,6 +103,23 @@ while :; do
     swap=$(awk '/^SwapTotal/ {t = $2} /^SwapFree/ {f = $2} END {print t - f + 0}' "$proc/meminfo" 2>/dev/null)
     stall=$(awk '/^full/ {sub("avg10=", "", $2); print $2}' "$proc/pressure/memory" 2>/dev/null)
     echo "$(date -u +%T) disk_kb=$disk mem_kb=$memory load=$load swap_kb=${swap:-0} psi_full=${stall:-none} runners=${runners:-none}"
+    if [ -n "$snapshot_next" ] && [ -n "$snapshot_directory" ] \
+        && [ "$SECONDS" -ge "$snapshot_next" ]; then
+        snapshot="${snapshot_directory%/}/snapshot-${snapshot_next}s.txt"
+        # In the background, so a slow snapshot on a paging host doesn't
+        # hold up the samples and the stops. Word splitting is the point.
+        # shellcheck disable=SC2086
+        nohup "$here/runner-snapshot" $snapshot_logs > "$snapshot" 2>&1 < /dev/null &
+        echo "snapshot: writing $snapshot"
+        if [ -n "$snapshot_every" ] && [ "$snapshot_every" -gt 0 ]; then
+            # Skip periods a stalled host slept through, rather than burst.
+            while [ "$snapshot_next" -le "$SECONDS" ]; do
+                snapshot_next=$((snapshot_next + snapshot_every))
+            done
+        else
+            snapshot_next=
+        fi
+    fi
     if [ -n "$floor" ] && [ -n "$stop" ] && [ "$stopped" = no ] \
         && [ -n "$disk" ] && [ "$disk" -lt "$floor" ]; then
         matched=$(stop_all)
