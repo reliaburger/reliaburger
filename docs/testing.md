@@ -477,6 +477,23 @@ reusing the run. The 24.04 `privileged Linux` job stays required. Taking
 `linux-next` off that list, and the job's `continue-on-error` with it, is part
 of closing #1943.
 
+Both privileged Linux jobs guard their hosted runner the way the 26.04 job
+learned to (#1943). The runner's own processes run at `oom_score_adj` -1000
+(`scripts/ci/protect-runner`) and every heavy step goes back under
+`choom -n 0`; swap is topped up to 8 GiB, never on device-mapper
+(`scripts/ci/give-swap`); and `scripts/ci/watch-runner` samples disk, memory,
+swap and memory stall every 5 s, stopping the build or the tests at a disk or
+memory floor or a held stall. Every heavy step has its own limit inside the
+job's, so a hang fails one step and the reports still run. The watcher writes
+`scripts/ci/runner-snapshot` files (memory, pressure, the tests nextest is
+running, the process tree, stuck tasks' kernel stacks, the kernel log): in the
+24.04 job every 5 minutes from minute 20, in the 26.04 job once at minute 36,
+before the tests' own `timeout`. The last step takes one more when anything
+failed. The resource log and snapshots are kept as `linux-evidence` and
+`linux-next-evidence`. `make test-linux` and `make test-rootless-runc` build
+the lib tests before the rest, so the lib and its lib tests never compile at
+once on a 16 GB runner.
+
 The light set exists because macOS was the critical path of almost every run:
 twelve runs before the change took 45–55 minutes of wall time, of which
 runner queueing was mostly under ten, portable macOS 35–49 and acceptance

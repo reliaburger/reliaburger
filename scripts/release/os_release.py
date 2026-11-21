@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sign and publish appliance OS builds (docs/plans/2026-10-01-plan-appliance-product.md, W1).
+"""Sign and publish appliance OS builds (docs/plans/archive/2026-10-01-plan-appliance-product.md, W1).
 
 Subcommands, each run by .github/workflows/appliance.yml:
 

@@ -150,6 +150,18 @@ class MakefilePrebuilds(unittest.TestCase):
                                      "$(CARGO) test --no-run --features ebpf"])
         self.assertIn("--features ebpf", lines[2].split("$(NEXTEST)", 1)[1])
 
+    def test_test_rootless_runc_builds_the_lib_tests_on_their_own_first(self):
+        # It is the 24.04 privileged job's first, cold build. On 15 and 20
+        # Nov that job lost its runner three times in this step and nowhere
+        # else (runs 43715576493, 44729365098, 44783868580): one parallel
+        # build compiles the lib (about 7 GB) beside its lib tests (10 to
+        # 12 GB) on a 16 GB runner, #1943's mechanism. test-linux's split
+        # build keeps the two apart.
+        lines = workflow_assembly.recipe((ROOT / "Makefile").read_text(), "test-rootless-runc")
+        self.assertEqual(lines[:2], ["$(CARGO) test --no-run --features ebpf --lib",
+                                     "$(CARGO) test --no-run --features ebpf"])
+        self.assertIn("--features ebpf", lines[2].split("$(NEXTEST)", 1)[1])
+
     def test_test_linux_names_bun_in_cargos_target_directory(self):
         # target/ in the checkout doesn't exist under an out-of-tree
         # CARGO_TARGET_DIR, and every runtime test then failed in 30 ms (#1859).
