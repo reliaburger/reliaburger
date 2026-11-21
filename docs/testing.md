@@ -437,7 +437,7 @@ jobs. What else runs depends on where the change is going:
 
 | Run | Jobs | Typical wall time |
 |---|---|---|
-| Pull request into a merge train (`release-*`, e.g. `release-0-2-4`) | The light set: CI policy (with the dependency audit and the demo app's Go tests), lint and format, minimum Rust, the source bundle build, portable Linux (with coverage), the doctests and the nightly-signing key test, and the optimised contract boundaries | about 19 minutes of running, set by portable Linux, down from 30 (#1723, [measured](qualification/2026-11-09-v0.2.8-train-pr-timings.md)), then about 35 once the coverage build went to one job at a time (#2102; median 22.7 minutes in 13 green train PRs before, 34.8 in 14 after). From 18 to 20 November, with the train's dependency cache saved by its pushes, 22 green train PRs without macOS took a median of 31.3 minutes of running and 43.9 of wall time: portable Linux builds the crate for 13 of its 25 to 31 minutes, one compile at a time |
+| Pull request into a merge train (`release-*`, e.g. `release-0-2-4`) | The light set: CI policy (with the dependency audit and the demo app's Go tests), lint and format, minimum Rust, the source bundle build, portable Linux (with coverage), the doctests and the nightly-signing key test, and the optimised contract boundaries | about 19 minutes of running, set by portable Linux, down from 30 (#1723, [measured](qualification/2026-11-09-v0.2.8-train-pr-timings.md)), then about 35 once the coverage build went to one job at a time (#2102; median 22.7 minutes in 13 green train PRs before, 34.8 in 14 after). From 18 to 20 November, with the train's dependency cache saved by its pushes, 22 green train PRs without macOS took a median of 31.3 minutes of running and 43.9 of wall time: portable Linux builds the crate for 13 of its 25 to 31 minutes, one compile at a time. Since 0.3.2 `make coverage` builds the lib tests alone and then the rest, both at full parallelism (#1723): estimated at about 6 minutes of build and 18 to 24 of portable Linux (median near 21), to be confirmed by the first CI runs |
 | The same, labelled `full-ci` | The light set plus privileged Linux, the cluster, acceptance and upgrade suites, and the benchmarks the change touches | about 45 minutes |
 | The gate PR (a train into `main`) | The light set on each push; with `full-ci`, the heavy suites too | as above |
 | The gate PR labelled `release-gate` | Everything, portable macOS included; the evidence gate refuses less | about 45 minutes, plus any wait for macOS runners |
@@ -495,6 +495,18 @@ failed. The resource log and snapshots are kept as `linux-evidence` and
 `linux-next-evidence`. `make test-linux` and `make test-rootless-runc` build
 the lib tests before the rest, so the lib and its lib tests never compile at
 once on a 16 GB runner.
+
+Portable Linux's `make coverage` does the same inside cargo-llvm-cov (#1723).
+`cargo llvm-cov --no-report test --lib -- --list` builds the instrumented lib
+tests alone (10 to 12 GB of rustc) and lists them without running one; `cargo
+llvm-cov clean --profraw-only` deletes the profile that listing writes; then
+the instrumented nextest run builds the rest, the lib (about 7 GB) first,
+since every other target links it. Both phases run at full parallelism: the
+job no longer sets `CARGO_BUILD_JOBS=1`, which also held each rustc's codegen
+to one thread and made the build about 13 of the job's 25 to 31 minutes.
+cargo-llvm-cov keeps `--no-run` for itself (a deprecated alias for its report),
+hence `--list`. The first CI runs measure it: watch the resource log for
+`mem_floor:` and memory-stall stops, and the report step for kernel OOM lines.
 
 The light set exists because macOS was the critical path of almost every run:
 twelve runs before the change took 45–55 minutes of wall time, of which
@@ -784,8 +796,12 @@ a seal from another commit or run, a later attempt or an earlier attempt that a
 re-run replaced can't qualify.
 
 Linux coverage wraps the existing `make coverage` once, including its clean,
+the lib tests' build, the clean of that build's listing profile, the
 instrumented nextest run and its one report, which writes the LCOV file and
-checks the unchanged line floor. The HTML report isn't evidence: the job writes
+checks the unchanged line floor. A build stage (`--no-report test`) must only
+list its tests (`-- --list`), come before the run and be followed by a
+`clean --profraw-only` before it, so the report reads the run's profiles
+alone; the owner accepts the nextest handshake only during the run stage. The HTML report isn't evidence: the job writes
 it with `make coverage-html` on pushes to `main` and the nightly only. Discovery
 uses that run's instrumented environment, selectors and target directory.
 A separate ordinary test run doesn't validate the coverage run. The owner also

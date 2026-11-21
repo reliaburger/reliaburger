@@ -18,6 +18,8 @@ EXPECTED_RECIPE = """COVERAGE_MIN_LINES ?= 78.65
 COVERAGE_REPORT = $(CARGO) llvm-cov report --failure-mode all
 coverage: ## Run the portable suite once under line coverage, write the lcov report and enforce the floor
 	$(CARGO) llvm-cov clean --workspace
+	$(CARGO) llvm-cov --no-report test --lib -- --list
+	$(CARGO) llvm-cov clean --profraw-only
 	$(CARGO) llvm-cov --no-report nextest --profile $(NEXTEST_PROFILE) --no-tests=fail
 	mkdir -p target/coverage
 	$(COVERAGE_REPORT) --lcov --output-path target/coverage/lcov.info --fail-under-lines $(COVERAGE_MIN_LINES)
@@ -98,6 +100,17 @@ class Owner(unittest.TestCase):
                     return SimpleNamespace(returncode=status)
             return SimpleNamespace(returncode=0)
         if name == 'coverage':
+            if '--no-report' in cmd and 'test' in cmd:
+                # The lib tests' build: it lists them and runs none. A
+                # handshake from here is the prebuild posing as the run.
+                if self.mode == 'prebuild-handshake':
+                    configuration = c.read_json(kw['env']['RELIABURGER_COVERAGE_OWNER_CONFIG'])
+                    try:
+                        self.o.request(configuration, dict(kind='handshake', argv=[], environment={}))
+                    except c.Invalid as error:
+                        self.refusal = str(error)
+                        return SimpleNamespace(returncode=77)
+                return SimpleNamespace(returncode=23 if self.mode == 'prebuild-failure' else 0)
             if '--no-report' in cmd:
                 if self.mode == 'disabled':
                     return SimpleNamespace(returncode=0)
@@ -210,11 +223,41 @@ class Owner(unittest.TestCase):
         # Plan 2026-11-06, F3: each report stage merged every profile again;
         # the HTML is make coverage-html's, outside the evidence owner (D5).
         stages = self.o.recipe_stages('ci', '78.65')
-        self.assertEqual(stages[2:], [[
+        self.assertEqual(stages[-1:], [[
             'report', '--failure-mode', 'all', '--lcov', '--output-path',
             'target/coverage/lcov.info', '--fail-under-lines', '78.65',
         ]])
         self.assertFalse(any('--html' in stage for stage in stages))
+
+    def test_the_lib_tests_build_alone_before_the_run_and_their_list_profiles_go(self):
+        # #1723: at one build job the instrumented build took about 13 of
+        # portable Linux's 25 to 31 minutes. The lib tests (10 to 12 GB of
+        # rustc) build first on their own at full parallelism; the run then
+        # builds the rest, starting with the lib (about 7 GB), so the two
+        # never compile together on a 16 GB runner (#1943). The build lists
+        # the lib tests and runs none; the profile that listing writes is
+        # deleted before the run, so the report reads only the run's.
+        self.assertEqual(self.o.recipe_stages('ci', '78.65')[:4], [
+            ['clean', '--workspace'],
+            ['--no-report', 'test', '--lib', '--', '--list'],
+            ['clean', '--profraw-only'],
+            ['--no-report', 'nextest', '--profile', 'ci', '--no-tests=fail'],
+        ])
+
+    def test_a_handshake_during_the_lib_test_build_is_refused(self):
+        self.mode = 'prebuild-handshake'
+        with self.assertRaisesRegex(c.Invalid, 'failed'):
+            self.execute()
+        self.assertIn('outside genuine instrumented stage', self.refusal)
+        self.assertEqual(self.child_count, 0)
+
+    def test_a_failed_lib_test_build_stops_before_the_run(self):
+        self.mode = 'prebuild-failure'
+        with self.assertRaisesRegex(c.Invalid, 'make coverage exited 23'):
+            self.execute()
+        owner = c.read_json(self.directory / 'owner.json')
+        self.assertEqual([stage['exit_code'] for stage in owner['stages']], [0, 23])
+        self.assertEqual(self.child_count, 0)
 
     def test_disabled_overlay_cannot_supply_success_owner(self):
         self.mode = 'disabled'
@@ -297,7 +340,7 @@ class Owner(unittest.TestCase):
             self.execute()
         owner = c.read_json(self.directory / 'owner.json')
         self.assertEqual(owner['stages'][-1]['exit_code'], 17)
-        self.assertEqual(len(owner['stages']), 2)
+        self.assertEqual(len(owner['stages']), 4)
         self.assertEqual(self.child_count, 1)
 
     def test_a_failed_test_is_named_in_the_owner_failure(self):
@@ -313,7 +356,7 @@ class Owner(unittest.TestCase):
             self.execute()
         owner = c.read_json(self.directory / 'owner.json')
         self.assertEqual(owner['stages'][-1]['exit_code'], 18)
-        self.assertEqual(len(owner['stages']), 3)
+        self.assertEqual(len(owner['stages']), 5)
         self.assertEqual(self.child_count, 1)
 
     def test_runtime_tool_and_original_front_door_bytes_bind_completion(self):
@@ -345,7 +388,7 @@ class Owner(unittest.TestCase):
             '--no-tests=fail', '--profile', 'ci',
         ])
         self.assertEqual(self.child_count, 1)
-        self.assertEqual(configuration['expected']['stages'][1][2:],
+        self.assertEqual(configuration['expected']['stages'][3][2:],
                          ['--no-report', 'nextest', '--profile', 'ci', '--no-tests=fail'])
 
     def test_owner_refuses_old_order_without_normalizing_equivalent_flags(self):
