@@ -113,11 +113,14 @@ fn fixture_seeds_are_in_the_checked_in_corpus() {
                 std::fs::create_dir_all(&directory).expect("corpus directory creates");
                 std::fs::write(&path, &seed.bytes).expect("seed writes");
             }
-            // Seeds with random keys or nonces differ on every run, so this
-            // checks presence, not bytes.
+            // Every seed is the same bytes on every run (no random keys or
+            // nonces), so the checked-in file must be exactly the seed.
+            let bytes = std::fs::read(&path).unwrap_or_else(|_| {
+                panic!("{} is missing: run make fuzz-corpus-seed", path.display())
+            });
             assert!(
-                path.is_file(),
-                "{} is missing: run make fuzz-corpus-seed",
+                bytes == seed.bytes,
+                "{} differs from its seed: run make fuzz-corpus-seed",
                 path.display()
             );
         }
