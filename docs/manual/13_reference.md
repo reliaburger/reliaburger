@@ -510,7 +510,7 @@ See [getting started](00_getting-started.md) and [cluster basics](02_cluster-bas
   - `relish image delete <REFERENCE>`: Delete a registry tag: the same as `relish images delete`
 - `relish machines`: Unclaimed appliances on the LAN: list them, or claim them with seeds over the network
   - `relish machines claim <DIRECTORY> <MACHINES>...`: Claim machines: compare each one's claim key with its console, then send it a seed, joining it to the cluster in DIRECTORY (or, with --create, making a new cluster there from them)
-  - `relish machines logs`: Print the kernel and boot logs machines send over the network (UDP 6666), as `relish netboot --stream-logs` does, without serving anything. Runs until Ctrl-C *(0.3.1, not in 0.3.0)*
+  - `relish machines logs`: Print the kernel and boot logs machines send over the network (UDP 6666), as `relish netboot --stream-logs` does, without serving anything. Runs until Ctrl-C *(0.3.2, not in 0.3.0)*
 - `relish netboot <DIR>`: Install appliances over the network: ProxyDHCP, TFTP and HTTP for the OS that `relish image download` saved
 - `relish os`: The appliance OS across the cluster: what each node runs, and rolling a new version out node by node
   - `relish os list`: Each node's OS version, and the newest release
