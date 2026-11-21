@@ -19,6 +19,10 @@ Fixes from the Wyse 3040 lab that need a new appliance image. Not released yet: 
 
 - 0.3.2 moves the wire protocol from 60 to 61, because an apply error now carries its real status instead of 500 ([#2157](https://github.com/reliaburger/reliaburger/issues/2157)). Start a fresh 0.3.2 cluster: 0.3.1 and 0.3.2 nodes refuse each other, so there's no rolling upgrade ([compatibility before 1.0.0](docs/releasing.md#compatibility-before-100)).
 
+### Fixed
+
+- `relish wtf` calls a crash loop only when one instance restarts three times in 15 minutes. Three replicas that restarted once each were a critical `crashloop` for 15 minutes, and the instance a restart named was never read ([#2197](https://github.com/reliaburger/reliaburger/issues/2197)).
+
 ## [0.3.1] - 2026-11-21
 
 Fixes from 0.3.0's gate and the first Wyse lab, and a terminal UI you can act from.
