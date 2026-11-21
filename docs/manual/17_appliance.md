@@ -523,6 +523,20 @@ relish wtf
 All of them alive, all three in the council, and nothing to fix. Each
 machine's monitor shows its name, address and whether bun is running.
 
+relish keeps one current cluster, in `~/.reliaburger/context.json`. The
+claim makes the new cluster that one, unless another cluster's context is
+already there and still works: then it keeps that one and prints the three
+`export` lines that reach the new cluster instead. A context whose cluster
+directory you've since deleted can't work, because its CA certificate went
+with the directory, so the claim replaces it and says so:
+
+```
+relish now talks to this cluster (node 1, https://192.168.1.51:9117).
+It replaced the context for bare-metal/lab, which no longer worked: /Users/you/lab/root-ca.crt is gone.
+```
+
+`relish cluster create --bare-metal` and `relish setup` do the same.
+
 The claim uses each machine's current address as its node address, so
 reserve those addresses for their MACs in your router first. mDNS doesn't
 cross routers; if relish can't see a machine, give its address instead of
