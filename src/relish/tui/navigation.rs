@@ -1,7 +1,7 @@
 //! View-stack navigation and cursor movement.
 
 use super::keys::KeyAction;
-use super::state::{DetailTab, Effect, SearchState, TuiApp, View};
+use super::state::{DetailTab, Effect, NodeTab, SearchState, TuiApp, View};
 
 impl TuiApp {
     pub(super) fn handle_action(&mut self, action: KeyAction) {
@@ -85,6 +85,11 @@ impl TuiApp {
     }
 
     fn cycle_tab(&mut self, delta: isize) {
+        if let Some(View::NodeDetail { tab, .. }) = self.view_stack.last_mut() {
+            *tab = tab.offset(delta);
+            self.instances_cursor = 0;
+            return;
+        }
         let Some(View::AppDetail {
             app,
             namespace,
@@ -133,7 +138,23 @@ impl TuiApp {
                 if let Some(node) = self.data.nodes.get(self.nodes_cursor) {
                     self.push(View::NodeDetail {
                         node: node.status.node_id.clone(),
+                        tab: NodeTab::Overview,
                     });
+                }
+            }
+            View::NodeDetail {
+                node,
+                tab: NodeTab::Workloads,
+            } => {
+                let rows = self.node_instances(&node);
+                let selected = self.instances_cursor.min(rows.len().saturating_sub(1));
+                if let Some(row) = rows.get(selected) {
+                    let view = View::AppDetail {
+                        app: row.instance.app_name.clone(),
+                        namespace: row.instance.namespace.clone(),
+                        tab: DetailTab::Overview,
+                    };
+                    self.push(view);
                 }
             }
             View::Jobs => {
@@ -192,6 +213,13 @@ impl TuiApp {
                 tab: DetailTab::Instances,
             } => {
                 let count = self.app_instances(app, namespace).len();
+                self.instances_cursor = moved(self.instances_cursor, count, delta)
+            }
+            View::NodeDetail {
+                node,
+                tab: NodeTab::Workloads,
+            } => {
+                let count = self.node_instances(node).len();
                 self.instances_cursor = moved(self.instances_cursor, count, delta)
             }
             View::Help => {

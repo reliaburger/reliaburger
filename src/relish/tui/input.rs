@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 
 use super::keys::key_to_action;
 use super::palette::{PaletteCommand, parse_command};
-use super::state::{DetailTab, Effect, Level, SearchHit, TuiApp, View};
+use super::state::{DetailTab, Effect, Level, NodeTab, SearchHit, TuiApp, View};
 
 impl TuiApp {
     pub(super) fn handle_key(&mut self, key: KeyEvent) {
@@ -183,6 +183,7 @@ impl TuiApp {
                         context: node.address.clone(),
                         target: View::NodeDetail {
                             node: node.node_id.clone(),
+                            tab: NodeTab::Overview,
                         },
                     });
                 }

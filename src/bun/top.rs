@@ -163,6 +163,7 @@ pub fn add_job_rows(
                 status_age_ms: None,
                 age_seconds: None,
                 image: None,
+                data_on_node: false,
                 reason: None,
             },
             cpu_percent: sample.cpu_percent,
@@ -194,6 +195,7 @@ mod tests {
             status_age_ms: None,
             age_seconds: None,
             image: None,
+            data_on_node: false,
             reason: None,
         }
     }
