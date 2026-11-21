@@ -12,6 +12,13 @@
 //! read carries the instance's [`Incarnation`], and the loop applies an
 //! exit only to the same incarnation, still in a state whose exit it
 //! watches ([`watches_exit`]).
+//!
+//! Each read runs in a task of its own. One still running at the deadline
+//! is handed back as unfinished, and the next sweep waits on it again
+//! rather than asking the runtime a second time (#2085): on runc a read the
+//! sweep stopped waiting for kept running and held the instance's lifecycle
+//! lock, so a fresh read queued behind it and missed its deadline as well,
+//! and an exit on a runtime slower than the deadline was never seen.
 
 use std::time::{Duration, Instant};
 
@@ -23,10 +30,10 @@ use super::{ContainerState, Grill, InstanceId, WorkloadInstance};
 /// At most this many runtime state reads run at once in one sweep.
 pub(super) const STATE_READ_CONCURRENCY: usize = 8;
 
-/// How long one sweep may read for. A read still running then is dropped,
-/// and the next sweep asks again. A new sweep starts only when the last one
-/// has reported, so this also bounds how stale a crash can get before the
-/// loop sees it.
+/// How long one sweep may read for. A read still running then comes back
+/// `Unknown`, and the next sweep collects it. A new sweep starts only when
+/// the last one has reported, so this also bounds how long the loop waits
+/// between looks at a crash the runtime reports promptly.
 pub(super) const STATE_SWEEP_DEADLINE: Duration = Duration::from_secs(1);
 
 /// Which run of an instance a read was about. A restart bumps
@@ -73,34 +80,77 @@ pub(super) enum Observed {
     Unknown,
 }
 
+/// Reads a sweep was still waiting for at its deadline, by instance, each
+/// with the incarnation it reads.
+pub(super) type UnfinishedReads =
+    std::collections::HashMap<InstanceId, (Incarnation, tokio::task::JoinHandle<Observed>)>;
+
 /// Everything one sweep saw, in the order it was planned.
 #[derive(Debug)]
 pub(super) struct StateSweep {
     pub(super) observations: Vec<(StateRead, Observed)>,
+    /// The reads still running at the deadline, for the next sweep.
+    pub(super) unfinished: UnfinishedReads,
 }
 
 /// Read every planned instance's state, [`STATE_READ_CONCURRENCY`] at a
-/// time, giving up on whatever hasn't answered by [`STATE_SWEEP_DEADLINE`].
-pub(super) async fn sweep_states<G: Grill>(grill: G, reads: Vec<StateRead>) -> StateSweep {
+/// time, waiting for whatever hasn't answered only until
+/// [`STATE_SWEEP_DEADLINE`]. A read of the same incarnation that an earlier
+/// sweep left `unfinished` is waited on again instead of started afresh;
+/// one for an instance no longer planned, or since restarted, is cancelled.
+pub(super) async fn sweep_states<G: Grill + Clone + 'static>(
+    grill: G,
+    reads: Vec<StateRead>,
+    mut unfinished: UnfinishedReads,
+) -> StateSweep {
     let deadline = tokio::time::Instant::now() + STATE_SWEEP_DEADLINE;
-    let grill = &grill;
-    let observations = futures_util::stream::iter(reads)
-        .map(|read| async move {
-            // `timeout_at` polls once even past the deadline, so a runtime
-            // that answers at once always counts.
-            let observed = tokio::time::timeout_at(deadline, observe(grill, &read))
-                .await
-                .unwrap_or(Observed::Unknown);
-            (read, observed)
+    let reads: Vec<_> = reads
+        .into_iter()
+        .map(|read| {
+            let earlier = unfinished
+                .remove(&read.id)
+                .filter(|(incarnation, _)| *incarnation == read.incarnation)
+                .map(|(_, task)| task);
+            (read, earlier)
+        })
+        .collect();
+    for (_, task) in unfinished.into_values() {
+        task.abort();
+    }
+    let results: Vec<_> = futures_util::stream::iter(reads)
+        .map(|(read, earlier)| {
+            let grill = grill.clone();
+            async move {
+                let mut task = earlier.unwrap_or_else(|| {
+                    let id = read.id.clone();
+                    tokio::spawn(async move { observe(&grill, &id).await })
+                });
+                match tokio::time::timeout_at(deadline, &mut task).await {
+                    Ok(observed) => (read, observed.unwrap_or(Observed::Unknown), None),
+                    Err(_) => (read, Observed::Unknown, Some(task)),
+                }
+            }
         })
         .buffered(STATE_READ_CONCURRENCY)
         .collect()
         .await;
-    StateSweep { observations }
+    let mut sweep = StateSweep {
+        observations: Vec::with_capacity(results.len()),
+        unfinished: UnfinishedReads::new(),
+    };
+    for (read, observed, task) in results {
+        if let Some(task) = task {
+            sweep
+                .unfinished
+                .insert(read.id.clone(), (read.incarnation, task));
+        }
+        sweep.observations.push((read, observed));
+    }
+    sweep
 }
 
-async fn observe<G: Grill>(grill: &G, read: &StateRead) -> Observed {
-    match grill.state(&read.id).await {
+async fn observe<G: Grill>(grill: &G, id: &InstanceId) -> Observed {
+    match grill.state(id).await {
         Ok(ContainerState::Stopped) => Observed::Exited,
         Ok(_) => Observed::Alive,
         Err(_) => Observed::Unknown,
@@ -153,11 +203,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         let reads = self.plan_state_reads(|_| true);
         if reads.is_empty() {
+            for (_, task) in std::mem::take(&mut self.unfinished_state_reads).into_values() {
+                task.abort();
+            }
             return;
         }
         let grill = self.supervisor.grill().clone();
+        let unfinished = std::mem::take(&mut self.unfinished_state_reads);
         self.state_sweeps
-            .spawn(state_sweep::sweep_states(grill, reads));
+            .spawn(state_sweep::sweep_states(grill, reads, unfinished));
     }
 
     /// Apply a finished sweep: every app it saw exit goes through the
@@ -174,6 +228,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 return;
             }
         };
+        self.unfinished_state_reads = sweep.unfinished;
         for (read, observed) in sweep.observations {
             let state_sweep::Observed::Exited = observed else {
                 continue;

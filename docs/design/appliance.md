@@ -1,7 +1,7 @@
 # Appliance: netboot, claim and `relish os`
 
 **Component:** the appliance OS, `relish netboot`, `relish machines claim`, `relish os`
-**Status:** Implemented on the 0.3.0 train (#401–#406); to be qualified by the Wyse exit test (#407)
+**Status:** Shipped in 0.3.0 (#401–#406); the Wyse exit test (#407) runs alongside the release
 
 ---
 

@@ -195,7 +195,7 @@ loopback IP.
 
 `relish netboot`, on the machine that serves the appliance images, listens on
 UDP 67 (ProxyDHCP; not with `--mode-dhcp-proxy`), UDP 4011 (ProxyDHCP), UDP 69
-(TFTP) and TCP 8080 (HTTP, `--http-port`) *(0.3.0, not in 0.2.8)*.
+(TFTP) and TCP 8080 (HTTP, `--http-port`).
 
 On a clustered Linux node, Bun's perimeter firewall drops 9117, 9443–9445 and
 the host port range for anyone but cluster members, `[security]
@@ -223,7 +223,7 @@ Everything the installer and the quickstart write lives in `~/.reliaburger`
 | `tools/`, `lima/` | the private Lima install and its VMs |
 
 A bare-metal cluster's own files go in the directory you name to `relish
-cluster create --bare-metal` or `relish machines claim --create` *(0.3.0, not in 0.2.8)*:
+cluster create --bare-metal` or `relish machines claim --create`:
 
 | Path | What |
 |------|------|
@@ -232,7 +232,7 @@ cluster create --bare-metal` or `relish machines claim --create` *(0.3.0, not in
 | `secrets/security-bootstrap.json`, `secrets/identity/` | node 1's bootstrap material and identity |
 | `root-ca.crt` | the cluster's root certificate, which the context trusts |
 | `root-ca-backup.age` | the root CA key, sealed to an identity in `~/.reliaburger/root-backup-keys/` |
-| `fleet.json` | the cluster's machines, which `relish image seed` and `relish machines claim` read to add more *(0.3.0, not in 0.2.8)* |
+| `fleet.json` | the cluster's machines, which `relish image seed` and `relish machines claim` read to add more |
 | `stick/seeds/<mac>.seed` | a seed per machine, for an `RBSEED` stick |
 
 `relish local destroy --yes` removes a cluster's VMs, credentials and state
@@ -470,27 +470,27 @@ See [getting started](00_getting-started.md) and [cluster basics](02_cluster-bas
 - `relish setup`: Guided setup: detect or install bun, then write a starter config
 - `relish local <status|start|stop|destroy> [NODE]`: Manage a laptop cluster created by setup --quickstart
 - `relish init [DIR]`: Initialise a new cluster (generates CAs, age keypair, node identity)
-- `relish cluster`: Create a cluster of bare-metal appliances (`relish manual appliance`) *(0.3.0, not in 0.2.8)*
-  - `relish cluster create --bare-metal --name <NAME> --operator <OPERATORS>... <DIRECTORY> <MACHINES>...`: Create a cluster for appliance machines: its PKI and admin token on this machine, and a seed per machine for an RBSEED stick *(0.3.0, not in 0.2.8)*
-- `relish image`: Appliance OS images: download, write to a disk, and seed machines *(0.3.0, not in 0.2.8)*
-  - `relish image download`: Download the newest OS build for every architecture and check it against the release key *(0.3.0, not in 0.2.8)*
-  - `relish image write <IMAGE> <DEVICE>`: Write a disk image (.raw or .raw.zst) onto a device, erasing it *(0.3.0, not in 0.2.8)*
-  - `relish image seed <DIRECTORY> <MACHINES>...`: Write seeds for machines joining a running bare-metal cluster *(0.3.0, not in 0.2.8)*
-  - `relish image delete <REFERENCE>`: Delete a registry tag: the same as `relish images delete` *(0.3.0, not in 0.2.8)*
-- `relish machines`: Unclaimed appliances on the LAN: list them, or claim them with seeds over the network *(0.3.0, not in 0.2.8)*
-  - `relish machines claim <DIRECTORY> <MACHINES>...`: Claim machines: compare each one's claim key with its console, then send it a seed, joining it to the cluster in DIRECTORY (or, with --create, making a new cluster there from them) *(0.3.0, not in 0.2.8)*
-- `relish netboot <DIR>`: Install appliances over the network: ProxyDHCP, TFTP and HTTP for the OS that `relish image download` saved *(0.3.0, not in 0.2.8)*
-- `relish os`: The appliance OS across the cluster: what each node runs, and rolling a new version out node by node *(0.3.0, not in 0.2.8)*
-  - `relish os list`: Each node's OS version, and the newest release *(0.3.0, not in 0.2.8)*
-  - `relish os upgrade [VERSION]`: Roll an OS version across the cluster, one node at a time: workers, then the council, the leader last. Each node's workloads move off before it reboots *(0.3.0, not in 0.2.8)*
-  - `relish os status`: The rollout in progress, or the last one *(0.3.0, not in 0.2.8)*
-  - `relish os resume`: Carry on with a paused rollout, retrying the node that stopped it *(0.3.0, not in 0.2.8)*
-  - `relish os abort`: Stop the rollout; nodes keep the version they're on *(0.3.0, not in 0.2.8)*
+- `relish cluster`: Create a cluster of bare-metal appliances (`relish manual appliance`)
+  - `relish cluster create --bare-metal --name <NAME> --operator <OPERATORS>... <DIRECTORY> <MACHINES>...`: Create a cluster for appliance machines: its PKI and admin token on this machine, and a seed per machine for an RBSEED stick
+- `relish image`: Appliance OS images: download, write to a disk, and seed machines
+  - `relish image download`: Download the newest OS build for every architecture and check it against the release key
+  - `relish image write <IMAGE> <DEVICE>`: Write a disk image (.raw or .raw.zst) onto a device, erasing it
+  - `relish image seed <DIRECTORY> <MACHINES>...`: Write seeds for machines joining a running bare-metal cluster
+  - `relish image delete <REFERENCE>`: Delete a registry tag: the same as `relish images delete`
+- `relish machines`: Unclaimed appliances on the LAN: list them, or claim them with seeds over the network
+  - `relish machines claim <DIRECTORY> <MACHINES>...`: Claim machines: compare each one's claim key with its console, then send it a seed, joining it to the cluster in DIRECTORY (or, with --create, making a new cluster there from them)
+- `relish netboot <DIR>`: Install appliances over the network: ProxyDHCP, TFTP and HTTP for the OS that `relish image download` saved
+- `relish os`: The appliance OS across the cluster: what each node runs, and rolling a new version out node by node
+  - `relish os list`: Each node's OS version, and the newest release
+  - `relish os upgrade [VERSION]`: Roll an OS version across the cluster, one node at a time: workers, then the council, the leader last. Each node's workloads move off before it reboots
+  - `relish os status`: The rollout in progress, or the last one
+  - `relish os resume`: Carry on with a paused rollout, retrying the node that stopped it
+  - `relish os abort`: Stop the rollout; nodes keep the version they're on
 - `relish join --node-id <NODE_ID> <ADDR>`: Join an existing cluster
 - `relish join-token`: Manage short-lived node-enrolment tokens
   - `relish join-token create --node-id <NODE_ID>`: Create a single-use token for enrolling one node
-  - `relish join-token list`: List join tokens: node id, expiry and whether each has been used *(0.3.0, not in 0.2.8)*
-  - `relish join-token revoke <NODE_ID>`: Revoke every unused join token for a node id *(0.3.0, not in 0.2.8)*
+  - `relish join-token list`: List join tokens: node id, expiry and whether each has been used
+  - `relish join-token revoke <NODE_ID>`: Revoke every unused join token for a node id
 - `relish nodes`: List cluster nodes: gossip state, version, usage and what's allocated
 - `relish council`: Show the council (Raft) on every node, or recover from full loss
   - `relish council status`: Show every node's view of the council (the default)
@@ -664,11 +664,11 @@ See [security and access](10_security.md).
   - `relish secret encrypt --pubkey <PUBKEY> <VALUE>`: Encrypt a plaintext value for use in app config ENC[AGE:...] fields
   - `relish secret rotate`: Rotate the secret encryption key (start or finalise)
 - `relish ca`: Back up the cluster's root CA, check the backup, and rotate intermediates
-  - `relish ca backup --from <FROM> --out <OUT>`: Re-seal a root CA backup to a new passphrase or age recipient *(0.3.0, not in 0.2.8)*
+  - `relish ca backup --from <FROM> --out <OUT>`: Re-seal a root CA backup to a new passphrase or age recipient
   - `relish ca verify --fingerprint <FINGERPRINT> <FILE>`: Check a root CA backup offline
   - `relish ca rotate --role <ROLE>`: Rotate an intermediate CA, signing the new one with your root backup
-- `relish identity`: Rotate the key that signs workload identity tokens *(0.3.0, not in 0.2.8)*
-  - `relish identity rotate-signing-key`: Sign workload identity tokens with a new key *(0.3.0, not in 0.2.8)*
+- `relish identity`: Rotate the key that signs workload identity tokens
+  - `relish identity rotate-signing-key`: Sign workload identity tokens with a new key
 - `relish sign --key <KEY> <IMAGE>`: Sign a Pickle-hosted image with your own key so `require_signatures` admits it
   - `relish sign keygen --out <OUT>`: Generate an image signing key and print the public key line for `[images.trust_policy] keys`
 - `relish audit`: Show who did what: the durable audit log of applies, deletes, execs, upgrades, faults, tokens and the other changes to the cluster

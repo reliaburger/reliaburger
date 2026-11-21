@@ -1,7 +1,7 @@
-# What relish v0.2.8 accepts, read from its -h pages by
+# What relish v0.3.0 accepts, read from its -h pages by
 # scripts/release/released_cli.py. Regenerate it when docs/website/install.sh's
 # default version changes; tests/suite/website.rs checks the two match.
-version	v0.2.8
+version	v0.3.0
 argument	relish agent explain	[ID]
 argument	relish agent lease release	<KIND>
 argument	relish agent lease release	<NAME>
@@ -45,6 +45,8 @@ argument	relish batch-status	<ID>
 argument	relish build	<PATH>
 argument	relish ca verify	<FILE>
 argument	relish cancel-deploy	<OPERATION_ID>
+argument	relish cluster create	<DIRECTORY>
+argument	relish cluster create	<MACHINES>...
 argument	relish compile	<PATH>
 argument	relish decommission-node	<NODE_ID>
 argument	relish delete	<APP>
@@ -89,10 +91,16 @@ argument	relish fmt	<PATH>
 argument	relish gitops set	<PATH>
 argument	relish help	[COMMAND]...
 argument	relish history	<APP>
+argument	relish image delete	<REFERENCE>
+argument	relish image seed	<DIRECTORY>
+argument	relish image seed	<MACHINES>...
+argument	relish image write	<DEVICE>
+argument	relish image write	<IMAGE>
 argument	relish images delete	<REFERENCE>
 argument	relish init	[DIR]
 argument	relish inspect	<NAME>
 argument	relish join	<ADDR>
+argument	relish join-token revoke	<NODE_ID>
 argument	relish lease break	<KIND>
 argument	relish lease break	<NAME>
 argument	relish lease release	<KIND>
@@ -107,8 +115,12 @@ argument	relish local	[NODE]
 argument	relish logs	<NAME>
 argument	relish logs-search	<SOURCE>
 argument	relish logs-search	<SQL>
+argument	relish machines claim	<DIRECTORY>
+argument	relish machines claim	<MACHINES>...
 argument	relish manual	[CHAPTER]
 argument	relish metrics	<APP>
+argument	relish netboot	<DIR>
+argument	relish os upgrade	[VERSION]
 argument	relish path	<SOURCE>
 argument	relish policy delete	<NAME>
 argument	relish proposal approve	<ID>
@@ -192,6 +204,8 @@ command	relish ca backup
 command	relish ca rotate
 command	relish ca verify
 command	relish cancel-deploy
+command	relish cluster
+command	relish cluster create
 command	relish compile
 command	relish council
 command	relish council backups
@@ -247,6 +261,13 @@ command	relish gym list
 command	relish gym run
 command	relish help
 command	relish history
+command	relish identity
+command	relish identity rotate-signing-key
+command	relish image
+command	relish image delete
+command	relish image download
+command	relish image seed
+command	relish image write
 command	relish images
 command	relish images delete
 command	relish import
@@ -256,6 +277,8 @@ command	relish jobs
 command	relish join
 command	relish join-token
 command	relish join-token create
+command	relish join-token list
+command	relish join-token revoke
 command	relish lease
 command	relish lease break
 command	relish lease list
@@ -267,11 +290,20 @@ command	relish local
 command	relish logs
 command	relish logs-export
 command	relish logs-search
+command	relish machines
+command	relish machines claim
 command	relish manual
 command	relish manual examples
 command	relish mcp
 command	relish metrics
+command	relish netboot
 command	relish nodes
+command	relish os
+command	relish os abort
+command	relish os list
+command	relish os resume
+command	relish os status
+command	relish os upgrade
 command	relish path
 command	relish policy
 command	relish policy audit
@@ -528,8 +560,9 @@ option	relish bench	--tolerance	<TOLERANCE>
 option	relish bench	--yes		
 option	relish build	--registry-port	<REGISTRY_PORT>	
 option	relish build	--timeout	<TIMEOUT>	
-option	relish ca backup	--cluster-name	<CLUSTER_NAME>	
-option	relish ca backup	--dir	<DIR>	
+option	relish ca backup	--from	<FROM>	
+option	relish ca backup	--identity	<IDENTITY>	
+option	relish ca backup	--new-passphrase-file	<NEW_PASSPHRASE_FILE>	
 option	relish ca backup	--out	<OUT>	
 option	relish ca backup	--passphrase-file	<PASSPHRASE_FILE>	
 option	relish ca backup	--recipient	<RECIPIENT>	
@@ -539,11 +572,12 @@ option	relish ca backup	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and t
 option	relish ca backup	Output format: human,json,or yaml. Every command takes json and yaml except the interactive ones,which refuse them [default: human] [possible values: human,json,yaml]		human,json,yaml
 option	relish ca backup	Path to the cluster CA certificate (PEM). When set,the CLI reaches the agent API over HTTPS. Overrides	`RELIABURGER_CA_CERT`	
 option	relish ca backup	Print help (see more with	'--help')	
-option	relish ca backup	Read the passphrase from the first line of this file instead of	asking	
-option	relish ca backup	Seal to this age public key (`age1...`) instead of a	passphrase	
-option	relish ca backup	The cluster name,when the directory holds more than	one	
-option	relish ca backup	The directory `relish init` wrote to [default:	/etc/reliaburger]	
-option	relish ca backup	Where to write the sealed backup (created	owner-only)	
+option	relish ca backup	Read `--from`'s passphrase from the first line of this file instead of	asking	
+option	relish ca backup	Read the new copy's passphrase from the first line of this file instead of	asking	
+option	relish ca backup	Seal the new copy to this age public key (`age1...`) instead of a	passphrase	
+option	relish ca backup	The backup to	re-seal	
+option	relish ca backup	Where to write the re-sealed backup (created	owner-only)	
+option	relish ca backup	Your age identity file,when `--from` is sealed to a	recipient	
 option	relish ca rotate	--finalize		
 option	relish ca rotate	--identity	<IDENTITY>	
 option	relish ca rotate	--passphrase-file	<PASSPHRASE_FILE>	
@@ -572,6 +606,32 @@ option	relish ca verify	Print help (see more with	'--help')
 option	relish ca verify	Read the passphrase from the first line of this file instead of	asking	
 option	relish ca verify	The cluster's root CA fingerprint	(`sha256:...`)	
 option	relish ca verify	Your age identity file,for a backup sealed with	`--recipient`	
+option	relish cluster create	--bare-metal		
+option	relish cluster create	--council-size	<N>	
+option	relish cluster create	--external-signing-key	<EXTERNAL_SIGNING_KEY>	
+option	relish cluster create	--faults		
+option	relish cluster create	--name	<NAME>	
+option	relish cluster create	--network	<NETWORK>	
+option	relish cluster create	--operator	<OPERATORS>	
+option	relish cluster create	--ssh-key	<SSH_KEY>	
+option	relish cluster create	--ttl	<TTL>	
+option	relish cluster create	--yes		
+option	relish cluster create	-o,--output	<OUTPUT>	
+option	relish cluster create	API token for authenticating to the agent. Overrides	`RELIABURGER_TOKEN`	
+option	relish cluster create	Address or network relish runs from	(repeatable)	
+option	relish cluster create	Admit workload and node faults,as the laptop quickstart	does	
+option	relish cluster create	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
+option	relish cluster create	Don't wait for confirmation that the master key is backed up (required without a	terminal)	
+option	relish cluster create	How long the seeds' join tokens stay valid (s,m,h or d; at most 7d) [default:	7d]	
+option	relish cluster create	How many voters the council grows to: an odd number from 1 to 7 [default:	5]	
+option	relish cluster create	Operator countersignature key for cluster bun	upgrades	
+option	relish cluster create	Output format: human,json,or yaml. Every command takes json and yaml except the interactive ones,which refuse them [default: human] [possible values: human,json,yaml]		human,json,yaml
+option	relish cluster create	Path to the cluster CA certificate (PEM). When set,the CLI reaches the agent API over HTTPS. Overrides	`RELIABURGER_CA_CERT`	
+option	relish cluster create	Print	help	
+option	relish cluster create	Public key for root SSH on lab images (which have	sshd)	
+option	relish cluster create	The LAN machines added later join from (for example	192.168.1.0/24)	
+option	relish cluster create	The cluster's name; machines become <name>-1,<name>-2,...		
+option	relish cluster create	The only kind of cluster this creates (laptop clusters are `relish	local`)	
 option	relish council backups	--from	<FROM>	
 option	relish council re-enrol	--data-dir	<DATA_DIR>	
 option	relish council re-enrol	--force		
@@ -726,11 +786,34 @@ option	relish gym run	--solver	<SOLVER>
 option	relish gym run	--timeout	<TIMEOUT>	
 option	relish gym run	--yes		
 option	relish history	--namespace	<NAMESPACE>	
+option	relish image download	--all		
+option	relish image download	--arch	<ARCH>	
+option	relish image download	--channel	<CHANNEL>	
+option	relish image download	--dir	<DIR>	
+option	relish image download	--key	<PEM>	
+option	relish image seed	--ssh-key	<SSH_KEY>	
+option	relish image seed	--ttl	<TTL>	
+option	relish image write	--yes		
 option	relish import	--strict		
 option	relish import	-f,--file	<FILES>	
 option	relish init	--cluster-name	<CLUSTER_NAME>	
 option	relish init	--development-plaintext		
 option	relish init	--node-id	<NODE_ID>	
+option	relish init	--passphrase-file	<PASSPHRASE_FILE>	
+option	relish init	--recipient	<RECIPIENT>	
+option	relish init	--root-backup	<ROOT_BACKUP>	
+option	relish init	-o,--output	<OUTPUT>	
+option	relish init	API token for authenticating to the agent. Overrides	`RELIABURGER_TOKEN`	
+option	relish init	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
+option	relish init	Cluster name [default:	default]	
+option	relish init	Generate a development-only config whose internal cluster transports are plaintext. Never use this on a shared	network	
+option	relish init	Node ID for this node [default:	node-01]	
+option	relish init	Output format: human,json,or yaml. Every command takes json and yaml except the interactive ones,which refuse them [default: human] [possible values: human,json,yaml]		human,json,yaml
+option	relish init	Path to the cluster CA certificate (PEM). When set,the CLI reaches the agent API over HTTPS. Overrides	`RELIABURGER_CA_CERT`	
+option	relish init	Print	help	
+option	relish init	Read the backup's passphrase from the first line of this file instead of	asking	
+option	relish init	Seal the backup to this age public key (`age1...`) instead of a	passphrase	
+option	relish init	Where to write the root CA backup,the only copy of the root key. Put it off this node,such as on a USB stick. At a terminal you're asked if it's missing; without one it's	required	
 option	relish jobs	--definitions		
 option	relish join	--ca-fingerprint	<CA_FINGERPRINT>	
 option	relish join	--identity-dir	<IDENTITY_DIR>	
@@ -769,6 +852,35 @@ option	relish logs	-f,--follow
 option	relish logs-export	--dest	<DEST>	
 option	relish logs-export	--node-id	<NODE_ID>	
 option	relish logs-export	--source	<SOURCE>	
+option	relish machines	--wait	<WAIT>	
+option	relish machines claim	--council-size	<N>	
+option	relish machines claim	--create		
+option	relish machines claim	--external-signing-key	<EXTERNAL_SIGNING_KEY>	
+option	relish machines claim	--faults		
+option	relish machines claim	--name	<NAME>	
+option	relish machines claim	--network	<NETWORK>	
+option	relish machines claim	--operator	<OPERATORS>	
+option	relish machines claim	--ssh-key	<SSH_KEY>	
+option	relish machines claim	--trust-lan		
+option	relish machines claim	--ttl	<TTL>	
+option	relish machines claim	--yes		
+option	relish machines claim	-o,--output	<OUTPUT>	
+option	relish machines claim	API token for authenticating to the agent. Overrides	`RELIABURGER_TOKEN`	
+option	relish machines claim	Address or network relish runs from (with --create;	repeatable)	
+option	relish machines claim	Admit workload and node faults (with	--create)	
+option	relish machines claim	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
+option	relish machines claim	Create a new cluster named --name from these machines,node 1	first	
+option	relish machines claim	Don't ask to compare claim keys with the machines'	consoles	
+option	relish machines claim	Don't wait for confirmation that the new cluster's master key is backed up (with --create; required without a	terminal)	
+option	relish machines claim	How long join tokens stay valid (s,m,h or d; at most 7d) [default:	1h]	
+option	relish machines claim	How many voters the new council grows to: an odd number from 1 to 7 (with --create; default	5)	
+option	relish machines claim	Operator countersignature key for cluster bun upgrades (with	--create)	
+option	relish machines claim	Output format: human,json,or yaml. Every command takes json and yaml except the interactive ones,which refuse them [default: human] [possible values: human,json,yaml]		human,json,yaml
+option	relish machines claim	Path to the cluster CA certificate (PEM). When set,the CLI reaches the agent API over HTTPS. Overrides	`RELIABURGER_CA_CERT`	
+option	relish machines claim	Print	help	
+option	relish machines claim	Public key for root SSH on lab	images	
+option	relish machines claim	The LAN machines added later join from (with	--create)	
+option	relish machines claim	The new cluster's name (with	--create)	
 option	relish manual	--port	<PORT>	
 option	relish manual	--web		
 option	relish manual examples	--dir	<DIR>	
@@ -781,7 +893,22 @@ option	relish mcp	--toolsets	<TOOLSET>
 option	relish metrics	--name	<NAME>	
 option	relish metrics	--namespace	<NAMESPACE>	
 option	relish metrics	--since	<SINCE>	
+option	relish netboot	--address	<ADDRESS>	
+option	relish netboot	--for	<DURATION>	
+option	relish netboot	--http-port	<HTTP_PORT>	
+option	relish netboot	--interface	<INTERFACE>	
+option	relish netboot	--ipxe	<BUILD>	
+option	relish netboot	--key	<PEM>	
+option	relish netboot	--mac	<MAC>	
+option	relish netboot	--mode-dhcp-proxy		
+option	relish netboot	--reinstall		
+option	relish netboot	--wipe	<MAC>	
 option	relish nodes	--unhealthy		
+option	relish os list	--channel	<CHANNEL>	
+option	relish os list	--key	<PEM>	
+option	relish os upgrade	--allow-downgrade		
+option	relish os upgrade	--channel	<CHANNEL>	
+option	relish os upgrade	--key	<PEM>	
 option	relish path	--count	<COUNT>	
 option	relish path	--namespace	<NAMESPACE>	
 option	relish path	--port	<PORT>	

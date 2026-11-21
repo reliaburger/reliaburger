@@ -91,6 +91,7 @@ mod discovery_ownership;
 mod discovery_recovery;
 mod egress_ownership;
 mod egress_resolution;
+mod exec_deadline;
 mod fault_coverage;
 mod faults;
 mod follow_ups;
@@ -126,6 +127,7 @@ pub use consumer::ConsumerUpdate;
 use deploy_ops::{DeployOp, DeployOps, PreparedInstance, RollingInstance};
 use deploy_worker::DeployWorker;
 use discovery_ownership::{DiscoveryOwnership, JournalReference};
+pub use exec_deadline::{MAX_EXEC_TIMEOUT, client_exec_wait, exec_timeout};
 use faults::{InstalledNetworkFaults, NodeFaultFence};
 use health_checks::wait_instance_healthy;
 pub use identity::workload_spiffe_uri;
@@ -139,11 +141,6 @@ pub use status_snapshot::{StatusReader, StatusUnavailable};
 use trace::MAX_CONCURRENT_TRACES;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use trace::backend_addresses;
-
-/// Deadline for an `exec` run off the command loop (H3). Bounds an orphaned
-/// task if the caller disconnects; the exec no longer blocks the loop, so this
-/// is generous — it only stops a truly runaway command from lingering forever.
-const EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Maximum time an init container may run before the deploy fails. Bounds the
 /// init wait so a hung init can't wedge the agent event loop indefinitely.
@@ -977,6 +974,9 @@ pub struct BunAgent<G: Grill> {
     status_tx: watch::Sender<Arc<status_snapshot::StatusSnapshot>>,
     /// The health tick's runtime state reads, at most one sweep at a time.
     state_sweeps: tokio::task::JoinSet<state_sweep::StateSweep>,
+    /// Reads the last sweep was still waiting for at its deadline, for the
+    /// next sweep to collect instead of asking again (#2085).
+    unfinished_state_reads: state_sweep::UnfinishedReads,
     /// Restarts with a runtime step in flight, by instance.
     restarts: restarts::Restarts,
     /// Those steps' tasks.
@@ -1193,6 +1193,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             identity_signing_tasks: tokio::task::JoinSet::new(),
             status_tx: watch::Sender::new(Arc::new(status_snapshot::StatusSnapshot::unpublished())),
             state_sweeps: tokio::task::JoinSet::new(),
+            unfinished_state_reads: state_sweep::UnfinishedReads::new(),
             restarts: restarts::Restarts::new(),
             restart_steps: tokio::task::JoinSet::new(),
             follow_ups: tokio::task::JoinSet::new(),
@@ -1365,6 +1366,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             identity_signing_tasks: tokio::task::JoinSet::new(),
             status_tx: watch::Sender::new(Arc::new(status_snapshot::StatusSnapshot::unpublished())),
             state_sweeps: tokio::task::JoinSet::new(),
+            unfinished_state_reads: state_sweep::UnfinishedReads::new(),
             restarts: restarts::Restarts::new(),
             restart_steps: tokio::task::JoinSet::new(),
             follow_ups: tokio::task::JoinSet::new(),

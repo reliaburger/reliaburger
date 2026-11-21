@@ -10,7 +10,14 @@ pub(crate) const REQUEST_LIMIT: usize = 64 * 1024;
 pub(crate) const RESPONSE_LIMIT: u64 = 6 * 1024 * 1024 + 1024;
 const OUTPUT_LIMIT: u64 = 1024 * 1024;
 const EXEC_LIMIT: usize = 16;
-const EXEC_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long the owner lets an exec run before it retires the command itself.
+///
+/// It's a backstop: the agent's deadline (at most
+/// `bun::agent::MAX_EXEC_TIMEOUT`) drops the socket first, which cancels the
+/// command. Above the agent's cap and the owner-socket wait, so neither
+/// hears a closed socket where it should have heard its own named timeout
+/// (#2128).
+pub(crate) const OWNER_EXEC_DEADLINE: Duration = Duration::from_secs(320);
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn cancel(_: nix::libc::c_int) {
@@ -113,7 +120,7 @@ impl Execution {
             directory: temporary.keep(),
             child: Some(child),
             socket: Some(socket),
-            deadline: Instant::now() + EXEC_TIMEOUT,
+            deadline: Instant::now() + OWNER_EXEC_DEADLINE,
             reply: None,
             retired: false,
         });

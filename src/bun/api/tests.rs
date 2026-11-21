@@ -9080,7 +9080,11 @@ async fn exec_answers_with_the_exit_code_and_distinct_failure_statuses() {
             output: "boom\n".into(),
             exit_code: 3,
         }),
-        Err(crate::bun::BunError::ExecTimeout { seconds: 300 }),
+        Err(crate::bun::BunError::ExecTimeout {
+            app_name: "web".into(),
+            namespace: "default".into(),
+            seconds: 300,
+        }),
         Err(crate::bun::BunError::AppNotFound {
             app_name: "web".into(),
             namespace: "default".into(),
@@ -9094,6 +9098,59 @@ async fn exec_answers_with_the_exit_code_and_distinct_failure_statuses() {
     assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
     let (status, _) = post_exec(&app).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// #2128: the request's `timeout_seconds` reaches the agent, held to the
+/// cap, and a request without one gets the cap.
+#[tokio::test]
+async fn exec_passes_the_requested_timeout_to_the_agent_capped() {
+    let (tx, mut rx) = mpsc::channel(4);
+    let seen = tokio::spawn(async move {
+        let mut timeouts = Vec::new();
+        while let Some(command) = rx.recv().await {
+            if let AgentCommand::Exec {
+                timeout, response, ..
+            } = command
+            {
+                timeouts.push(timeout);
+                let _ = response.send(Ok(crate::grill::ExecOutput {
+                    output: String::new(),
+                    exit_code: 0,
+                }));
+                if timeouts.len() == 3 {
+                    break;
+                }
+            }
+        }
+        timeouts
+    });
+    let app = router(
+        tx, None, None, None, None, None, None, None, None, None, None, None, 9117, None,
+    );
+    for body in [
+        r#"{"command":["true"],"timeout_seconds":60}"#,
+        r#"{"command":["true"],"timeout_seconds":100000}"#,
+        r#"{"command":["true"]}"#,
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/exec/web/default")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{body}");
+    }
+    let cap = crate::bun::agent::MAX_EXEC_TIMEOUT;
+    assert_eq!(
+        seen.await.unwrap(),
+        vec![std::time::Duration::from_secs(60), cap, cap]
+    );
 }
 
 #[tokio::test]

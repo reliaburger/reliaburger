@@ -2508,11 +2508,31 @@ impl BunClient {
         namespace: &str,
         command: &[String],
     ) -> Result<crate::grill::ExecOutput, RelishError> {
+        self.exec_with_timeout(app, namespace, command, None).await
+    }
+
+    /// [`Self::exec`], asking the agent to give up after `timeout` (held to
+    /// [`crate::bun::agent::MAX_EXEC_TIMEOUT`]). The agent then answers `504`
+    /// naming the app, and this waits long enough to hear it (#2128).
+    pub async fn exec_with_timeout(
+        &self,
+        app: &str,
+        namespace: &str,
+        command: &[String],
+        timeout: Option<std::time::Duration>,
+    ) -> Result<crate::grill::ExecOutput, RelishError> {
         let url = format!("{}{}", self.base_url, app_path("/v1/exec", app, namespace)?);
+        let mut body = serde_json::json!({ "command": command });
+        if let Some(timeout) = timeout {
+            body["timeout_seconds"] = timeout.as_secs().max(1).into();
+        }
+        // The ordinary request deadline would race the agent's own: wait
+        // past it, so the caller hears the agent's named `504`.
         let response = self
             .http()?
             .post(&url)
-            .json(&serde_json::json!({ "command": command }))
+            .timeout(crate::bun::agent::client_exec_wait(timeout))
+            .json(&body)
             .send()
             .await
             .map_err(classify_error)?;
@@ -4249,6 +4269,45 @@ mod tests {
                 exit_code: 3,
             }
         );
+    }
+
+    /// #2128: a caller's exec timeout travels in the request, in whole
+    /// seconds, and a caller without one sends none.
+    #[tokio::test]
+    async fn exec_with_timeout_sends_the_timeout_in_seconds() {
+        let bodies = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorded = bodies.clone();
+        let app = axum::Router::new().route(
+            "/v1/exec/web/default",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let recorded = recorded.clone();
+                async move {
+                    recorded.lock().await.push(body);
+                    axum::Json(serde_json::json!({"output": "", "exit_code": 0}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client =
+            BunClient::new_with_token(&format!("http://{}", listener.local_addr().unwrap()), None);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let command = ["true".to_string()];
+        client
+            .exec_with_timeout(
+                "web",
+                "default",
+                &command,
+                Some(std::time::Duration::from_secs(60)),
+            )
+            .await
+            .unwrap();
+        client.exec("web", "default", &command).await.unwrap();
+        server.abort();
+        let bodies = bodies.lock().await;
+        assert_eq!(bodies[0]["timeout_seconds"], 60);
+        assert!(bodies[1].get("timeout_seconds").is_none(), "{}", bodies[1]);
     }
 
     #[test]

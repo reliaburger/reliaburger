@@ -11,9 +11,9 @@ This file is the short version. The longer records are:
 - [docs/releasing.md](docs/releasing.md#compatibility-before-100), for the full upgrade steps between each pair of releases;
 - the [GitHub release pages](https://github.com/reliaburger/reliaburger/releases), for the binaries and every merged pull request.
 
-## [Unreleased] - 0.3.0
+## [0.3.0] - 2026-11-20
 
-"Bare metal in an hour". Not released yet: this is what the [roadmap](docs/roadmap.md#releases-after-010) plans for 0.3.0 and its train ([#490](https://github.com/reliaburger/reliaburger/issues/490)) carries, and it can change before the tag.
+"Bare metal in an hour": blank machines boot our appliance OS over the network, join a cluster when you claim them, and take signed OS updates one node at a time. [Release page](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.0), [release log](docs/release-log.md#030-bare-metal-in-an-hour).
 
 ### Upgrading
 
@@ -63,6 +63,7 @@ This file is the short version. The longer records are:
 - Node shutdown, which every OS update goes through, skips each app's `pre_stop` hook and gives it 5 s instead of its `stop_grace` ([#2118](https://github.com/reliaburger/reliaburger/issues/2118)).
 - An OS rollout moves apps that keep data in a host path away from it, and `relish status` and `relish nodes` don't show its cordons ([#2120](https://github.com/reliaburger/reliaburger/issues/2120), [#2119](https://github.com/reliaburger/reliaburger/issues/2119)).
 - A Smoker `pause` of a runc app stops its launcher, not the app ([#2079](https://github.com/reliaburger/reliaburger/issues/2079)).
+- In the release gate's 8-hour final, one catalogue deploy from the cluster registry stalled for its whole 5-minute deadline right after an injected disk fault, then recovered by itself with no data lost. The cause isn't verified yet ([#2128](https://github.com/reliaburger/reliaburger/issues/2128)).
 
 ## [0.2.8] - 2026-11-12
 
