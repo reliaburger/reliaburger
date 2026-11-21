@@ -2418,7 +2418,7 @@ _ = health_interval.tick() => {
 }
 ```
 
-`check_jobs` monitors running jobs for process exit and handles retry logic. `drive_pending_restarts` picks up instances that have been reset to Pending after a failure and drives them through startup again. We'll look at both of these next.
+`check_jobs` (gone since 0.2.0, as the next section says) watched running jobs for process exit and handled retries. `drive_pending_restarts` picks up instances that have been reset to Pending after a failure and drives them through startup again. We'll look at both of these next.
 
 ## Jobs, init containers, and restarts
 
