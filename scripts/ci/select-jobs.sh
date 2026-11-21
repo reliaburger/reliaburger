@@ -11,18 +11,33 @@
 #   macos        - run the portable suite on macOS (one job)
 #   s3           - log export, council backups or the S3 client changed, or
 #                  the script that gives `make test-s3` its server
+#   portable     - run portable Linux: with `code`, or alone to save a train's
+#                  dependency cache (below)
+#   tested_by    - the merge-queue run that already tested a train push's
+#                  commit, or empty
 #
 # Pushes (to main and to every train), merge-queue groups, schedules and
-# manual runs get everything; so does build.yml's call. Pull requests are
-# judged by the files they change against their base:
+# manual runs get everything; so does build.yml's call. Two exceptions save
+# runners (#1723):
+#
+#   - a merge group that changes only documentation runs no code job. Its
+#     code is its base's, which the train's last run or the group ahead of
+#     it is testing; if that group fails, the queue rebuilds this one.
+#   - a push to a train whose commit the merge queue already passed, every
+#     job on its first attempt (QUEUE_RUN, found by ci_reuse.py), runs
+#     nothing: the queue pushes exactly the commit it tested. Portable Linux
+#     still runs when the train's dependency graph differs from main's
+#     (MAIN_REF), because only a train push saves the cache its PRs restore.
+#
+# Pull requests are judged by the files they change against their base:
 #
 #   - into a release's merge train (`release-*`): the light set. Lint, MSRV,
-#     portable Linux, the demo app, the source bundle build and the optimized
-#     contract boundaries answer in about 15 minutes; the heavy suites and the benchmarks wait
-#     for the push to the train, which runs everything on the merged result.
+#     portable Linux, the source bundle build and the optimized contract
+#     boundaries; the heavy suites and the benchmarks wait for the merge
+#     queue, which runs everything on the merged result before it lands.
 #     A `full-ci` label adds the heavy suites and the benchmarks.
 #   - from a train (the gate PR into main): the light set too, since the
-#     push to the train has just run everything on the same code (#1443).
+#     queue has just run everything on the same code (#1443).
 #     A `release-gate` label, put on at code freeze, runs everything; a
 #     `full-ci` label adds the heavy suites.
 #   - into main: everything the change touches except macOS.
@@ -43,20 +58,45 @@
 #
 # Fixtures: scripts/ci/test_select_jobs.py.
 #
-# Inputs (environment): EVENT, BASE_REF, HEAD_REF, BASE_SHA, FULL_CI,
-# RELEASE_GATE and MACOS_LABEL (each "true"/"false": whether the PR carries
-# the full-ci, release-gate or macos label), and optionally HEAD_SHA
-# (defaults to HEAD).
+# Inputs (environment): EVENT, BASE_REF, HEAD_REF, BASE_SHA (a merge
+# group's base for merge_group), FULL_CI, RELEASE_GATE and MACOS_LABEL (each
+# "true"/"false": whether the PR carries the full-ci, release-gate or macos
+# label), and optionally HEAD_SHA (defaults to HEAD). For a push: GITHUB_REF,
+# QUEUE_RUN and MAIN_REF (defaults to origin/main).
 set -euo pipefail
 
 output="${GITHUB_OUTPUT:-/dev/stdout}"
 
+# emit code gossip heavy task_arrays macos s3 [portable [tested_by]]
 emit() {
-    printf 'code=%s\ngossip=%s\nheavy=%s\ntask_arrays=%s\nmacos=%s\ns3=%s\n' "$1" "$2" "$3" "$4" "$5" "$6" >>"$output"
-    printf 'code=%s gossip=%s heavy=%s task_arrays=%s macos=%s s3=%s\n' "$1" "$2" "$3" "$4" "$5" "$6" >&2
+    local portable="${7:-$1}" tested_by="${8:-}"
+    printf 'code=%s\ngossip=%s\nheavy=%s\ntask_arrays=%s\nmacos=%s\ns3=%s\nportable=%s\ntested_by=%s\n' \
+        "$1" "$2" "$3" "$4" "$5" "$6" "$portable" "$tested_by" >>"$output"
+    printf 'code=%s gossip=%s heavy=%s task_arrays=%s macos=%s s3=%s portable=%s tested_by=%s\n' \
+        "$1" "$2" "$3" "$4" "$5" "$6" "$portable" "$tested_by" >&2
 }
 
-if [ "${EVENT}" != "pull_request" ]; then
+case "${GITHUB_REF:-}" in
+    refs/heads/release-*) train_push=true ;;
+    *) train_push=false ;;
+esac
+if [ "${EVENT}" = push ] && [ "$train_push" = true ] && [[ "${QUEUE_RUN:-}" =~ ^[0-9]+$ ]]; then
+    # What rust-cache keys on, apart from the toolchain and the workflow.
+    portable=false
+    if ! git diff --quiet "${MAIN_REF:-origin/main}" "${HEAD_SHA:-HEAD}" -- \
+        Cargo.lock Cargo.toml .cargo/config.toml 2>/dev/null; then
+        portable=true
+    fi
+    echo "merge-queue run ${QUEUE_RUN} already passed every job on this commit" >&2
+    emit false false false false false false "$portable" "$QUEUE_RUN"
+    exit 0
+fi
+
+if [ "${EVENT}" = merge_group ] && [ -z "${BASE_SHA:-}" ]; then
+    emit true true true true true true
+    exit 0
+fi
+if [ "${EVENT}" != pull_request ] && [ "${EVENT}" != merge_group ]; then
     emit true true true true true true
     exit 0
 fi
@@ -167,6 +207,15 @@ case "${HEAD_REF:-}" in
     dependabot/*) dependabot=true ;;
     *) dependabot=false ;;
 esac
+
+if [ "${EVENT}" = merge_group ]; then
+    if [ "$code" = false ]; then
+        emit false false false false false false
+    else
+        emit true true true true true true
+    fi
+    exit 0
+fi
 
 if [ "$code" = false ]; then
     emit false "$gossip" false "$task_arrays" false "$s3"
