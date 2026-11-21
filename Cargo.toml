@@ -71,6 +71,10 @@ rcgen = { version = "0.14", features = ["x509-parser"] }
 # rcgen's validity fields are `time::OffsetDateTime`; the direct dependency
 # lets us set exact timestamped windows instead of calendar dates (PKI6).
 time = "0.3"
+# `relish netboot` stamps its log with the local time of day. `time` can't
+# read the local offset once the process has threads, and jiff reads the
+# zone itself; k8s-openapi already builds it.
+jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 ring = "0.17"
 x509-parser = { version = "0.18", features = ["verify"] }
 pem = "4"

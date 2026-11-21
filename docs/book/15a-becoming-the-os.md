@@ -455,7 +455,7 @@ Ten second-hand Dell Wyse 3040s arrived for the lab. Some had blank eMMCs. Some 
 So the decision moved to the person at the `relish netboot` terminal. Before it writes anything, the installer runs `ask-to-wipe`, which posts what `lsblk -P` sees on the disk to the URL `relish netboot` gave it on the command line (`reliaburger.ask=http://…/disk?mac=…&uuid=…`). It gets back a ticket, and polls `GET /disk/<ticket>` every two seconds. Meanwhile the operator sees:
 
 ```
-relish netboot: 6c:4b:90:12:34:56: /dev/mmcblk0, 7.8 GB, gpt, 4 partitions: vfat "EFI", ext4 "ThinOS", (no filesystem), swap — wipe? [y/N]
+21:04:17 relish netboot: 6c:4b:90:12:34:56: /dev/mmcblk0, 7.8 GB, gpt, 4 partitions: vfat "EFI", ext4 "ThinOS", (no filesystem), swap — wipe? [y/N]
 ```
 
 The whole policy is one pure function in `src/relish/netboot/wipe.rs`:
@@ -1033,6 +1033,8 @@ The real command hands `refresh_resent` a closure that borrows one client for ev
 
 `async move` moves what it uses into the future, and we want the node and seed path moved but the client only borrowed. Writing `let client = &client;` first makes the thing that gets moved a reference, which is cheap to copy. Without it, `move` would try to move the client itself into the first future, and the second call of the closure would find it gone. The tests pass closures that either succeed or fail with "connection refused". The time is a parameter too, so a test can ask what happens two hours later without waiting two hours.
 
+The Wyse lab's first real claim found the last gap (#2146). `claim` printed `relish now talks to this cluster` the moment node 1 had its seed, and the very next `relish nodes` failed with "connection refused": node 1 still had to unpack the seed and start bun. A few seconds later everything answered. On a 3040 that's a few seconds; on slower hardware, or for machines that still have to join through node 1, longer. So `claim` now waits before it returns, up to three minutes, asking the cluster's `/v1/cluster/nodes` once a second until every machine whose seed arrived is listed alive, and printing `home-1: up` as each one is. A machine that's still starting at the end isn't a failure: its seed arrived. `claim` names it, says `relish nodes` will list it once it's up, and exits 0. The wait asks the new cluster with a client built from the context `create` wrote, not the one relish adopted, so it works even when another cluster's context was kept. `wait_for_claimed_nodes` takes the "which nodes are alive?" question as a closure, like `deliver_seeds`, so a test answers "connection refused", then nothing, then one node, then both, on a paused clock (`#[tokio::test(start_paused = true)]`), and three minutes pass in no time.
+
 ## A LAN on a laptop
 
 We had no KVM machine and no spare PCs, only CI and one Apple silicon Mac without root. Everything had to run virtualised until the last step.
@@ -1197,6 +1199,12 @@ The TFTP sender waited for each acknowledgement with `tokio::time::timeout(negot
 
 The rest were one-liners with tests. A requested TFTP timeout over 30 s is declined (RFC 2349 lets a server accept the client's value or leave it out, never answer another), and at most 64 transfers run at once, after which a request is told the server is busy. A "y" typed for one machine's wipe question could land just after the next one appeared, so for a second after a question is shown, an answer is ignored and the operator asked again. `relish netboot` exited 0 when one of its four servers died, because the `select!` arm just returned a message; it now returns an error, so a script notices. And 32-bit x86 UEFI firmware, option 93 value 6, was being sent our 64-bit iPXE, which it can't run; it's now refused with a reason, like BIOS.
 
+### What time is it here?
+
+The three-Wyse lab measures intervals: from the moment `relish netboot` starts serving, how long until each machine says `ack on 4011`, finishes its download, reports `installed`. The log printed none of those times, so someone sat beside it writing them down. Now every line starts with the local time, `21:04:17 dhcp: …`. All of them pass through the one `Log` closure, so the fix is a pure function, `stamped(time, line)`, that a unit test can call with a fixed time, plus one call to read the clock.
+
+Reading the clock turned out to be the interesting part. The `time` crate was already a dependency, but it won't tell you the local offset from UTC in a process that has more than one thread. Working that out on Unix means calling C's `localtime_r`, which reads the `TZ` environment variable, and another thread changing the environment at the same moment is undefined behaviour. A library can't rule that out, so `time` refuses, and under tokio's multi-threaded runtime it would refuse every time. `jiff`, which `k8s-openapi` already pulled into our build, reads the time zone file itself and never touches the C library's state, so `jiff::Zoned::now().time()` is safe from any thread. It costs a direct dependency on a crate we were already compiling, with three of its features switched on.
+
 ### A binary that can't write next to itself
 
 We covered bun's version above. The lesson is broader: anything that assumes it can write next to its own executable breaks on an immutable OS, and it breaks late, at upgrade time, long after the first boot looked fine.
@@ -1209,7 +1217,7 @@ We went back after the Wyse's first night, this time reading for firmware quirks
 
 ## What's next
 
-The spike's interim record is a pass for everything that can be proven without hardware. Turning it into part of Reliaburger is the [product plan](../plans/2026-10-01-plan-appliance-product.md) for 0.3.0, and these are the big pieces:
+The spike's interim record is a pass for everything that can be proven without hardware. Turning it into part of Reliaburger is the [product plan](../plans/archive/2026-10-01-plan-appliance-product.md) for 0.3.0, and these are the big pieces:
 
 - **S5, three Dell Wyse 3040s.** The lab has ten, but on 7 October 2026 we decided the release gate needs only three. The go/no-go is 3 of 3 claimed, a working cluster within an hour of power-on, 1.0 GB free per node under the tour, five years of eMMC life, and a fallback within ten minutes. The run covers BIOS setup, PXE on the real Realtek NIC, whether the firmware keeps the boot entry the installer makes, `MemAvailable` under the tour, eMMC writes per day, one OS update across the fleet, and whether Linux 7.0 still hangs on reboot without our `dw_dmac` blacklist. A node that can't reboot can't finish an A/B update, so that last one matters more than it sounds. The run uses only the real commands: `relish netboot` on an M2 MacBook over a USB-C Ethernet adapter, either the home router or the Mac itself for addresses, and `relish machines claim` for the cluster ([the S5 runbook](../plans/2026-10-01-plan-appliance-s5-wyse.md)). We first planned a Raspberry Pi as the lab's own router, to keep the lab off the home network, and dropped it on 8 October 2026 for two setups that need no extra box. On the home network, the rails relish already has protect the rest of the LAN: `--mac`, the yes before a used disk is wiped, and the refusal to start beside another boot server. Isolated, the Mac runs dnsmasq and relish answers on port 4011 beside it ("A lab with no router", above).
 - **`relish netboot` on real firmware.** The first Wyse night found two bugs, both fixed ("The Wyse's first night" and "A driver that needs a driver", above). The rerun on fixed builds, then the three-Wyse gate, are next.

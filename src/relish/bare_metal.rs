@@ -1,5 +1,5 @@
 //! Bare-metal clusters from the laptop: `relish cluster create --bare-metal`
-//! and `relish image seed` (docs/plans/2026-10-01-plan-appliance-product.md,
+//! and `relish image seed` (docs/plans/archive/2026-10-01-plan-appliance-product.md,
 //! W3).
 //!
 //! The cluster's PKI is made here, on the operator's machine, as the
