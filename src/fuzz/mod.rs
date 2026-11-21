@@ -125,6 +125,11 @@ pub const TARGETS: &[Target] = &[
         decoder: "relish::netboot::dhcp::decode",
         run: dhcp_request,
     },
+    Target {
+        name: "netboot_disk_report",
+        decoder: "relish::netboot::wipe::DiskReport::parse (POST /disk)",
+        run: netboot_disk_report,
+    },
 ];
 
 /// A gossip datagram, as any host that can reach the UDP port sends it.
@@ -829,6 +834,44 @@ pub fn dhcp_request(data: &[u8]) -> Outcome {
             |fname: Option<&[u8]>| fname.map(|f| f.split(|b| *b == 0).next().unwrap_or(f).to_vec());
         assert_eq!(name(again.fname()), name(reply.fname()));
         assert!(again.yiaddr().is_unspecified());
+    }
+    Outcome::Accepted
+}
+
+/// A disk report, as an installer posts it to `relish netboot`'s `POST
+/// /disk` before anyone checks its install ticket.
+///
+/// The summary the operator is asked about must print as plain text, and
+/// nothing in a report may turn the operator's "no" (or no answer) into a
+/// wipe.
+pub fn netboot_disk_report(data: &[u8]) -> Outcome {
+    use crate::relish::netboot::MacAddress;
+    use crate::relish::netboot::wipe::{
+        Answer, DiskReport, MAX_REPORT_BYTES, WipeDecision, decide,
+    };
+
+    if data.len() > MAX_REPORT_BYTES {
+        return Outcome::Refused;
+    }
+    let Ok(report) = DiskReport::parse(&String::from_utf8_lossy(data)) else {
+        return Outcome::Refused;
+    };
+    let summary = report.summary();
+    assert!(
+        !summary.chars().any(moves_the_terminal),
+        "a disk summary reached the operator raw: {summary:?}"
+    );
+    let mac = Some(MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]));
+    for answer in [Answer::No, Answer::NoAnswer, Answer::NoTerminal] {
+        let decision = decide(&report, mac, &[], answer);
+        assert_ne!(
+            decision,
+            WipeDecision::WipeAndInstall,
+            "{answer:?} wiped {summary:?}"
+        );
+    }
+    if report.is_blank() {
+        assert_eq!(decide(&report, mac, &[], Answer::No), WipeDecision::Install);
     }
     Outcome::Accepted
 }

@@ -126,3 +126,10 @@ path = "fuzz_targets/dhcp_request.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "netboot_disk_report"
+path = "fuzz_targets/netboot_disk_report.rs"
+test = false
+doc = false
+bench = false

@@ -51,6 +51,7 @@ pub(super) fn for_target(target: &str) -> Vec<Seed> {
         "ingress_request" => ingress_requests(),
         "tftp_packet" => tftp_packets(),
         "dhcp_request" => dhcp_requests(),
+        "netboot_disk_report" => disk_reports(),
         other => panic!("no seeds for fuzz target {other}"),
     }
 }
@@ -617,5 +618,40 @@ fn dhcp_requests() -> Vec<Seed> {
             crate::relish::netboot::dhcp::encode(&message).expect("a seed request encodes"),
         )
     })
+    .collect()
+}
+
+fn disk_reports() -> Vec<Seed> {
+    [
+        (
+            "blank",
+            r#"NAME="/dev/mmcblk0" TYPE="disk" SIZE="7818182656" PTTYPE="" FSTYPE="" LABEL="" PARTLABEL="""#,
+        ),
+        (
+            "used",
+            concat!(
+                r#"NAME="/dev/mmcblk0" TYPE="disk" SIZE="7818182656" PTTYPE="gpt" FSTYPE="" LABEL="" PARTLABEL="""#,
+                "\n",
+                r#"NAME="/dev/mmcblk0p1" TYPE="part" SIZE="536870912" PTTYPE="gpt" FSTYPE="vfat" LABEL="EFI" PARTLABEL="EFI System""#,
+                "\n",
+                r#"NAME="/dev/mmcblk0p2" TYPE="part" SIZE="6442450944" PTTYPE="gpt" FSTYPE="ext4" LABEL="ThinOS" PARTLABEL="""#,
+                "\n",
+            ),
+        ),
+        (
+            "escaped-label",
+            concat!(
+                r#"NAME="/dev/sda" TYPE="disk" SIZE="1000000000" PTTYPE="dos" FSTYPE="" LABEL="" PARTLABEL="""#,
+                "\n",
+                r#"NAME="/dev/sda1" TYPE="part" SIZE="1" PTTYPE="dos" FSTYPE="ntfs" LABEL="My\x20\x22Data\x22\x1b" PARTLABEL="""#,
+            ),
+        ),
+        (
+            "whole-disk-filesystem",
+            r#"NAME="/dev/sda" TYPE="disk" SIZE="8000000000" PTTYPE="" FSTYPE="ext4" LABEL="data" PARTLABEL="""#,
+        ),
+    ]
+    .into_iter()
+    .map(|(name, text)| seed(name, text.as_bytes().to_vec()))
     .collect()
 }

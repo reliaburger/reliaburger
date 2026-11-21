@@ -42,6 +42,7 @@ on:
       - src/wrapper/routing.rs
       - src/relish/netboot/tftp.rs
       - src/relish/netboot/dhcp.rs
+      - src/relish/netboot/wipe.rs
       - .github/workflows/fuzz.yml
   workflow_dispatch:
     inputs:
