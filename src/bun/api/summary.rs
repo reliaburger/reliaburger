@@ -482,7 +482,12 @@ async fn local_leader_view(state: &ApiState) -> Result<LeaderView, String> {
     let apps = super::node_info::council_app_evidence(&desired, Some(&live_names));
     let capacity = state.aggregated_rx.as_ref().map(|reports| {
         let reports = reports.borrow();
-        capacity_from_reports(&live_names, &reports, desired.active_upgrade.as_ref())
+        capacity_from_reports(
+            &live_names,
+            &reports,
+            desired.active_upgrade.as_ref(),
+            desired.os_rollout.as_ref(),
+        )
     });
     let gitops = GitOpsSection {
         configured: desired.gitops_config.is_some(),
@@ -517,12 +522,14 @@ async fn local_leader_view(state: &ApiState) -> Result<LeaderView, String> {
     })
 }
 
-/// Each live node's committed resources from its fresh state report.
-/// Nodes with no fresh report are named, never counted as zero.
+/// Each live node's committed resources from its fresh state report, and
+/// whether a bun upgrade or an OS rollout has cordoned it. Nodes with no
+/// fresh report are named, never counted as zero.
 pub(super) fn capacity_from_reports(
     live: &HashSet<String>,
     reports: &crate::reporting::aggregator::AggregatedState,
     upgrade: Option<&crate::upgrade::types::ClusterUpgradeState>,
+    os_rollout: Option<&crate::os::rollout::OsRollout>,
 ) -> ClusterCapacity {
     let mut capacity = ClusterCapacity::default();
     let mut names: Vec<&String> = live.iter().collect();
@@ -538,6 +545,7 @@ pub(super) fn capacity_from_reports(
             continue;
         };
         let usage = &report.resource_usage;
+        let cordoned_by = crate::bun::summary::Cordon::of_node(name, upgrade, os_rollout);
         capacity.nodes.push(NodeCapacity {
             node: name.clone(),
             cpu_allocated_millicores: u64::from(usage.cpu_used_millicores)
@@ -548,7 +556,8 @@ pub(super) fn capacity_from_reports(
             memory_total_mb: u64::from(usage.memory_total_mb),
             gpu_allocated: usage.gpu_used,
             gpu_total: usage.gpu_total,
-            cordoned: upgrade.is_some_and(|upgrade| upgrade.is_node_cordoned(name)),
+            cordoned: cordoned_by.is_some(),
+            cordoned_by,
         });
     }
     capacity

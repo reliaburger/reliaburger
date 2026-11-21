@@ -3,6 +3,7 @@ while the Ubuntu 26.04 privileged tests run (#1943)."""
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -11,6 +12,8 @@ PROTECT = HERE / "protect-runner"
 WATCH = HERE / "watch-runner"
 HEADROOM = HERE / "assert-headroom"
 FREE_DISK = HERE / "free-runner-disk"
+GIVE_SWAP = HERE / "give-swap"
+SNAPSHOT = HERE / "runner-snapshot"
 
 
 class FakeHost:
@@ -260,6 +263,270 @@ cat "{host.kernel_log}"
             self.assertNotIn("mem_floor", output)
 
 
+    def memory_stall(self, host, rounds, full, **extra):
+        (host.proc / "pressure").mkdir(exist_ok=True)
+        (host.proc / "pressure" / "memory").write_text(
+            f"some avg10=99.00 avg60=50.00 avg300=5.00 total=1\n"
+            f"full avg10={full} avg60=40.00 avg300=3.00 total=1\n")
+        settings = dict(WATCH_PSI_FULL_PERCENT="60", WATCH_PSI_SECONDS="0")
+        settings.update(extra)
+        return self.memory_floor(host, rounds, **settings)
+
+    def test_a_memory_stall_held_over_the_limit_stops_the_build_once_swap_or_not(self):
+        # 20 Nov 2026 (run 44648854969): the 26.04 job's build paged, and
+        # every task stalled on memory, with 5 GiB still "available" and no
+        # memory floor crossed. Passing runs peak at 49% for ten seconds.
+        with tempfile.TemporaryDirectory() as directory:
+            host = FakeHost(directory)
+            host.meminfo(available=5000000, swap_total=0, swap_free=0)
+            output, calls = self.memory_stall(host, 3, "72.10")
+            self.assertEqual(calls, "-TERM -x cargo-nextest\n-TERM -x cargo\n-TERM -x rustc\n")
+            stall = [line for line in output.splitlines() if line.startswith("mem_stall: ")]
+            self.assertEqual(len(stall), 1, output)
+            self.assertRegex(stall[0], r"^mem_stall: every task waited on memory 72\.10% of the last 10 s, "
+                                       r"at or over 60% for [01] s: stopping cargo-nextest cargo rustc "
+                                       r"\(3 processes\)$")
+
+    def test_a_stall_shorter_than_its_window_or_under_the_limit_stops_nothing(self):
+        for full, window in (("72.10", "3600"), ("49.25", "0")):
+            with self.subTest(full=full, window=window), tempfile.TemporaryDirectory() as directory:
+                host = FakeHost(directory)
+                output, calls = self.memory_stall(host, 3, full, WATCH_PSI_SECONDS=window)
+                self.assertEqual(calls, "")
+                self.assertNotIn("mem_stall", output)
+
+    def test_without_a_stall_limit_a_stall_stops_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            host = FakeHost(directory)
+            output, calls = self.memory_stall(host, 3, "99.00", WATCH_PSI_FULL_PERCENT="")
+            self.assertEqual(calls, "")
+            self.assertNotIn("mem_stall", output)
+
+    def test_a_stop_reaches_processes_that_run_as_root(self):
+        # The 26.04 job runs its build and tests as root; the watcher runs
+        # as the runner's user, which can't signal them by itself.
+        with tempfile.TemporaryDirectory() as directory:
+            host = FakeHost(directory)
+            host.write_tool("sudo", f'echo "$*" >> "{host.root}/sudo-calls"\n'
+                                    'if [ "$1" = -n ]; then shift; fi\nexec "$@"\n')
+            host.meminfo(available=400000, swap_total=3145728, swap_free=1048576)
+            _, calls = self.memory_floor(host, 1, WATCH_STOP="rustc")
+            self.assertEqual(calls, "-TERM -x rustc\n")
+            self.assertIn("-n pkill -TERM -x rustc\n", (host.root / "sudo-calls").read_text())
+
+
+class RunnerSnapshotTests(unittest.TestCase):
+    """One dump of what a stuck job is doing, while it is still doing it.
+
+    On 20 Nov 2026 three privileged jobs ran into their limits and GitHub
+    kept no log (runs 44729365098, 44778442800, 44783868580). A step's own
+    timeout kills the hung processes before a report step can look at them,
+    so the watcher takes this snapshot a few minutes before that."""
+
+    PS_SELECT = (
+        "  1 Ss   /sbin/init\n"
+        "  4242 Dl  /home/runner/work/x/target/debug/deps/owned_rootless-0a1b --exact "
+        "rootless_published_port_survives_bun_replacement --nocapture\n"
+        "  4300 Sl  /usr/bin/cargo-nextest nextest run --profile ci\n"
+        "  4400 D   [kworker/u8:3+flush-8:0]\n"
+        "  4500 S   bash\n"
+    )
+
+    def host(self, directory):
+        host = FakeHost(directory)
+        host.meminfo(available=812000, swap_total=3145728, swap_free=1048576)
+        (host.proc / "pressure").mkdir()
+        for name in ("memory", "io", "cpu"):
+            (host.proc / "pressure" / name).write_text(
+                f"some avg10=1.00 avg60=0.50 avg300=0.10 total=1 {name}\n")
+        for pid, comm in ((4242, "owned_rootless-0a1b"), (4400, "kworker/u8:3"), (4500, "bash")):
+            task = host.process(pid, comm) / "task" / str(pid)
+            task.mkdir(parents=True)
+            (task / "comm").write_text(comm + "\n")
+            (task / "wchan").write_text("do_wait\n")
+            (task / "stack").write_text(f"[<0>] stack-of-{pid}\n")
+        select = host.root / "ps-select"
+        select.write_text(self.PS_SELECT)
+        host.write_tool("ps", f"""
+case "$*" in
+*pid=,stat=,args=*) cat "{select}" ;;
+*etimes=*) cat "{select}" ;;
+*) echo "PS FOREST $*" ;;
+esac
+""")
+        host.write_tool("free", 'echo "FREE $*"\n')
+        host.write_tool("swapon", 'echo "SWAPON $*"\n')
+        host.write_tool("df", 'echo "DF $*"\n')
+        host.kernel_log.write_text("".join(f"kernel line {n}\n" for n in range(300)))
+        return host
+
+    def test_it_dumps_memory_pressure_the_running_tests_and_the_processes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            host = self.host(directory)
+            result = host.run(SNAPSHOT)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            out = result.stdout
+            self.assertIn("=== runner snapshot at ", out)
+            for text in ("MemAvailable: 812000 kB", "SwapFree: 1048576 kB", "FREE ", "SWAPON ",
+                         "DF ", "some avg10=1.00 avg60=0.50 avg300=0.10 total=1 memory",
+                         "total=1 io", "total=1 cpu", "PS FOREST "):
+                self.assertIn(text, out)
+            # The running tests are nextest's progress: which ones, for how long.
+            tests = out.split("--- running test processes", 1)[1].split("\n--- ", 1)[0]
+            self.assertIn("rootless_published_port_survives_bun_replacement", tests)
+            self.assertNotIn("bash", tests)
+
+    def test_it_prints_kernel_stacks_of_stuck_and_test_processes_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            host = self.host(directory)
+            out = host.run(SNAPSHOT).stdout
+            self.assertIn("[<0>] stack-of-4242", out)
+            self.assertIn("[<0>] stack-of-4400", out)
+            self.assertNotIn("stack-of-4500", out)
+            self.assertIn("(owned_rootless-0a1b, do_wait)", out)
+
+    def test_it_keeps_the_end_of_the_kernel_log_and_of_each_log_it_is_given(self):
+        with tempfile.TemporaryDirectory() as directory:
+            host = self.host(directory)
+            log = host.root / "tests.log"
+            log.write_text("".join(f"test line {n}\n" for n in range(500)))
+            out = host.run(SNAPSHOT, str(log), str(host.root / "missing.log")).stdout
+            self.assertIn("kernel line 299", out)
+            self.assertNotIn("kernel line 99\n", out)
+            self.assertIn(f"--- last lines of {log}", out)
+            self.assertIn("test line 499", out)
+            self.assertNotIn("test line 399\n", out)
+            self.assertIn("missing.log: not there", out)
+
+    def test_a_host_without_the_tools_still_gets_a_snapshot_and_a_zero_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            host = FakeHost(directory)
+            for tool in ("ps", "free", "swapon", "df", "dmesg", "sudo"):
+                host.write_tool(tool, "exit 1\n")
+            result = host.run(SNAPSHOT)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("=== runner snapshot at ", result.stdout)
+
+
+class WatchRunnerSnapshotTests(unittest.TestCase):
+    """The watcher takes snapshots from a set age on, each to its own file,
+    before a step's own timeout kills what they would show."""
+
+    def run_watch(self, host, **extra):
+        pids = host.root / "runner-pids"
+        pids.write_text("")
+        snapshots = host.root / "snapshots"
+        snapshots.mkdir()
+        # A stand-in for runner-snapshot beside a copy of the watcher.
+        scripts = host.root / "scripts"
+        scripts.mkdir()
+        watch = scripts / "watch-runner"
+        watch.write_text(WATCH.read_text())
+        watch.chmod(0o755)
+        fake = scripts / "runner-snapshot"
+        fake.write_text('#!/bin/sh\necho "snapshot of $*"\n')
+        fake.chmod(0o755)
+        settings = dict(WATCH_INTERVAL="0", WATCH_SNAPSHOT_DIR=str(snapshots))
+        settings.update(extra)
+        result = host.run(watch, str(pids), **settings)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout, snapshots
+
+    def written(self, snapshots, count):
+        """The snapshot files, once `count` of them have content (they're written in the background)."""
+        for _ in range(50):
+            files = sorted(snapshots.iterdir())
+            if len(files) >= count and all(path.read_text() for path in files):
+                break
+            time.sleep(0.1)
+        return sorted(snapshots.iterdir())
+
+    def test_past_the_set_age_it_writes_one_snapshot_and_says_where(self):
+        with tempfile.TemporaryDirectory() as directory:
+            host = FakeHost(directory)
+            out, snapshots = self.run_watch(host, WATCH_ROUNDS="3", WATCH_SNAPSHOT_AFTER="0",
+                                            WATCH_SNAPSHOT_LOGS="/tmp/a.log /tmp/b.log")
+            files = self.written(snapshots, 1)
+            self.assertEqual([path.name for path in files], ["snapshot-0s.txt"])
+            self.assertEqual(files[0].read_text(), "snapshot of /tmp/a.log /tmp/b.log\n")
+            said = [line for line in out.splitlines() if line.startswith("snapshot: ")]
+            self.assertEqual(said, [f"snapshot: writing {files[0]}"])
+
+    def test_with_a_period_it_takes_one_per_period_each_in_its_own_file(self):
+        # A later snapshot must never overwrite the one taken before a kill.
+        with tempfile.TemporaryDirectory() as directory:
+            host = FakeHost(directory)
+            out, snapshots = self.run_watch(host, WATCH_INTERVAL="1", WATCH_ROUNDS="4",
+                                            WATCH_SNAPSHOT_AFTER="0", WATCH_SNAPSHOT_EVERY="2")
+            names = [path.name for path in self.written(snapshots, 2)]
+            self.assertEqual(names[:2], ["snapshot-0s.txt", "snapshot-2s.txt"])
+            self.assertLessEqual(len(names), 3)
+            self.assertEqual(len([line for line in out.splitlines() if line.startswith("snapshot: ")]),
+                             len(names))
+
+    def test_before_the_set_age_or_without_one_it_takes_none(self):
+        for extra in (dict(WATCH_SNAPSHOT_AFTER="3600"), dict()):
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as directory:
+                host = FakeHost(directory)
+                out, snapshots = self.run_watch(host, WATCH_ROUNDS="2", **extra)
+                time.sleep(0.3)
+                self.assertEqual(list(snapshots.iterdir()), [])
+                self.assertNotIn("snapshot:", out)
+
+class GiveSwapTests(unittest.TestCase):
+    """Swap for the build's peak, but never through a device-mapper snapshot."""
+
+    def host(self, directory, source, swap_total):
+        host = FakeHost(directory)
+        host.meminfo(available=14000000, swap_total=swap_total, swap_free=swap_total)
+        host.write_tool("findmnt", f'echo "$*" >> "{host.root}/findmnt-calls"\necho "{source}"\n')
+        for tool in ("fallocate", "chmod", "mkswap", "swapon"):
+            host.write_tool(tool, f'echo "{tool} $*" >> "{host.root}/swap-calls"\n')
+        return host
+
+    def give(self, host, *arguments):
+        result = host.run(GIVE_SWAP, *arguments)
+        calls = host.root / "swap-calls"
+        return result, calls.read_text() if calls.exists() else ""
+
+    def test_it_tops_the_swap_up_with_a_file_in_the_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            host = self.host(directory, "/dev/sdb1", 3145728)
+            result, calls = self.give(host, "8388608", "/mnt")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(calls, "fallocate -l 5242880K /mnt/ci-swapfile\n"
+                                    "chmod 600 /mnt/ci-swapfile\n"
+                                    "mkswap /mnt/ci-swapfile\n"
+                                    "swapon /mnt/ci-swapfile\n")
+            self.assertIn("--target /mnt", (host.root / "findmnt-calls").read_text())
+
+    def test_it_keeps_the_image_s_swap_when_that_is_enough(self):
+        with tempfile.TemporaryDirectory() as directory:
+            host = self.host(directory, "/dev/root", 8388608)
+            result, calls = self.give(host, "8388608", "/")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(calls, "")
+
+    def test_it_never_puts_swap_on_a_device_mapper_disk(self):
+        # 20 Nov 2026 (run 44648854969): a 26.04 runner whose / was
+        # /dev/mapper/cow-root, a dm-snapshot, got an 8 GiB swap file there.
+        # When the build paged, writeback waited on the snapshot's copy-on-
+        # write (wait_for_in_progress, kcopyd) and the host froze for 34
+        # minutes, the watcher with it.
+        for source in ("/dev/mapper/cow-root", "/dev/dm-0"):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as directory:
+                host = self.host(directory, source, 0)
+                result, calls = self.give(host, "8388608", "/")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(calls, "")
+                self.assertIn(f"no swap file: / is on {source}, a device-mapper device", result.stdout)
+
+    def test_it_refuses_to_run_without_its_arguments(self):
+        result = subprocess.run([str(GIVE_SWAP), "8388608"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("usage", result.stderr)
+
+
 class AssertHeadroomTests(unittest.TestCase):
     """The report step fails while there is still disk left to say so."""
 
@@ -303,6 +570,13 @@ class AssertHeadroomTests(unittest.TestCase):
         result = self.check(log, 5 * 1024 * 1024)
         self.assertEqual(result.returncode, 1)
         self.assertIn("::error::the watcher stopped the run: mem_floor: 400000 kB available", result.stdout)
+
+    def test_a_memory_stall_stop_fails_the_report(self):
+        log = self.LOG + ("mem_stall: every task waited on memory 72.10% of the last 10 s, at or over 60% "
+                          "for 30 s: stopping cargo-nextest cargo rustc (5 processes)\n")
+        result = self.check(log, 5 * 1024 * 1024)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("::error::the watcher stopped the run: mem_stall: every task waited", result.stdout)
 
     def test_it_reports_the_most_swap_in_use_and_the_worst_memory_stall(self):
         log = (

@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::bun::agent::{ClusterInstanceStatus, CouncilStatus, JobStatus, NodeStatus};
+use crate::bun::agent::{ClusterInstanceStatus, CouncilStatus, JobStatus};
 use crate::bun::cluster_view::{ClusterDeployHistory, NodeTagged};
 use crate::bun::events::ClusterEvent;
 use crate::bun::summary::ClusterSummary;
@@ -80,7 +80,9 @@ pub struct ClusterData {
     /// dashboard and the header show. `None` until the first one arrives.
     pub summary: Option<ClusterSummary>,
     pub instances: Vec<ClusterInstanceStatus>,
-    pub nodes: Vec<NodeStatus>,
+    /// Every node as `relish nodes` lists it: gossip's view, its own
+    /// usage and what the scheduler allocated there.
+    pub nodes: Vec<crate::relish::nodes_cmd::NodeRow>,
     pub council: Option<CouncilStatus>,
     pub alerts: Vec<crate::mayo::alert::AlertStatus>,
     pub routes: Vec<RouteInfo>,
@@ -140,14 +142,35 @@ pub enum Level {
     Error,
 }
 
+/// One app instance on one node: what a kill from the Instances tab names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceTarget {
+    pub app: String,
+    pub namespace: String,
+    pub instance: String,
+    pub node: String,
+}
+
 /// Side effect requested by the pure reducer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     RefreshAll,
-    OpenLogStream { app: String, namespace: String },
+    OpenLogStream {
+        app: String,
+        namespace: String,
+    },
     CloseLogStream,
-    FetchDeployHistory { app: String, namespace: String },
-    FetchAppMetrics { app: String, namespace: String },
+    FetchDeployHistory {
+        app: String,
+        namespace: String,
+    },
+    FetchAppMetrics {
+        app: String,
+        namespace: String,
+    },
+    /// Send Smoker's kill fault for one instance, as `relish fault kill`
+    /// does. Only a `y` at the confirmation prompt queues it.
+    KillInstance(InstanceTarget),
 }
 
 /// Cache key for [`ClusterData::deploy_history`].
@@ -168,6 +191,10 @@ pub struct TuiApp {
     pub nodes_cursor: usize,
     pub jobs_cursor: usize,
     pub routes_cursor: usize,
+    /// The selected row in the app detail's Instances tab.
+    pub instances_cursor: usize,
+    /// The instance `k` asked to kill, while the `[y/N]` prompt is open.
+    pub confirm_kill: Option<InstanceTarget>,
     pub events_scroll: usize,
     pub log_scroll: usize,
     pub(super) log_generation: u64,
@@ -202,6 +229,8 @@ impl TuiApp {
             nodes_cursor: 0,
             jobs_cursor: 0,
             routes_cursor: 0,
+            instances_cursor: 0,
+            confirm_kill: None,
             events_scroll: 0,
             log_scroll: 0,
             log_generation: 0,
@@ -239,6 +268,47 @@ impl TuiApp {
         apps.sort();
         apps.dedup();
         apps
+    }
+
+    /// One app's instances, in the order the cluster status listed them:
+    /// the rows of the app detail's Instances tab.
+    pub fn app_instances(&self, app: &str, namespace: &str) -> Vec<&ClusterInstanceStatus> {
+        self.data
+            .instances
+            .iter()
+            .filter(|row| row.instance.app_name == app && row.instance.namespace == namespace)
+            .collect()
+    }
+
+    /// The Instances tab's selected row, if that tab is showing and has
+    /// one. The cursor is clamped, since a refresh can shorten the list.
+    pub fn selected_instance(&self) -> Option<InstanceTarget> {
+        let View::AppDetail {
+            app,
+            namespace,
+            tab: DetailTab::Instances,
+        } = self.view()
+        else {
+            return None;
+        };
+        let rows = self.app_instances(app, namespace);
+        let row = rows.get(self.instances_cursor.min(rows.len().saturating_sub(1)))?;
+        Some(InstanceTarget {
+            app: app.clone(),
+            namespace: namespace.clone(),
+            instance: row.instance.id.clone(),
+            node: row.node.clone(),
+        })
+    }
+
+    /// The buffered log lines the `/` search leaves, oldest first: all of
+    /// them with no search, or those containing it, ignoring case.
+    pub fn visible_log_lines(&self) -> Vec<&LogLine> {
+        let needle = self.filter.as_deref().unwrap_or_default();
+        self.log_lines
+            .iter()
+            .filter(|line| super::matching::contains(&line.line, needle))
+            .collect()
     }
 
     pub fn filtered_apps(&self) -> Vec<(String, String)> {

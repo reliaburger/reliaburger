@@ -332,7 +332,7 @@ Both the single-app path (`/v1/metrics/app`, via the Meat placement map) and the
 
 The alert loop runs when `metrics.alerts_enabled` is set (default true), every `alerts.evaluation_interval_secs` (default **30**, not 15). Each tick, the loop reads the clock once and `gather_latest_values(store, now)` reads the metrics from 120 seconds before that instant onwards, keeps the newest reading per `(metric_name, labels)` series, drops any reading older than a 90-second freshness bound, derives the memory/disk usage percentages *within* a label set, then collapses to one value per metric name (freshest series wins, deterministic tie-break). The evaluator (`src/mayo/alert.rs`) applies each rule to that value.
 
-**Built-in alert rules (5, always active, node-scoped):**
+**Built-in alert rules (4, always active, node-scoped):**
 
 | Name | Metric | Condition | Duration | Severity |
 |------|--------|-----------|----------|----------|
@@ -340,9 +340,12 @@ The alert loop runs when `metrics.alerts_enabled` is set (default true), every `
 | `oom_risk` | `node_memory_usage_percent` | `> 85` | 2 min | Critical |
 | `memory_high` | `node_memory_usage_percent` | `> 70` | 10 min | Warning |
 | `disk_high` | `node_disk_usage_percent` | `> 80` | 5 min | Warning |
-| `cpu_idle` | `node_cpu_usage_percent` | `< 5` | 30 min | Warning |
 
 These are node-level rules against `node_*` metrics, not per-app rules. The state machine is `Inactive → Pending → Firing`, with the stale-telemetry handling described in §4.3.
+
+Every rule fires on pressure, none on idleness. Up to 0.3.0 a fifth rule, `cpu_idle`, fired when node CPU stayed below 5 % for 30 minutes, labelled "possible zombie". An idle node isn't a fault: it's spare capacity, and it's what every new or quiet cluster looks like, so the rule turned healthy clusters `DEGRADED` in `relish status`, `relish wtf` and the dashboard. We dropped it in 0.3.1 ([#2171](https://github.com/reliaburger/reliaburger/issues/2171)).
+
+**Per-app zombie detection: Status: planned -- not yet implemented.** A zombie is an app that holds a reservation and does no work, so the check belongs per app: instances whose CPU use stays far below their CPU reservation for a long window. A node has no reservation to waste, so this can't be a node rule. It's later work, not a built-in rule today.
 
 **Custom / PromQL alert expressions: Status: planned -- not yet implemented.** There is no expression parser and no PromQL subset. Rules are the fixed threshold shape only; there is no `[[alert]]` TOML block, no `expr`, no range selectors, functions, or label matchers.
 
@@ -382,7 +385,7 @@ Note the real shape: `severity`/`status` are lowercase strings; `value` is the n
 
 ### 5.8 Alert Suppression and Tuning Per-App
 
-**Status: planned -- not yet implemented.** There is no per-app alert config (`[app.*.alerts]`), no suppression, and no threshold tuning. The five built-in rules are node-scoped and fixed; an operator cannot currently silence or retune them per app.
+**Status: planned -- not yet implemented.** There is no per-app alert config (`[app.*.alerts]`), no suppression, and no threshold tuning. The four built-in rules are node-scoped and fixed; an operator cannot currently silence or retune them per app.
 
 ---
 
@@ -457,7 +460,7 @@ severity = ["critical"]
 secret = "your-pagerduty-routing-key"
 ```
 
-**Custom rules (`[[alert]]` with `expr`/`for`/`message`) and per-app suppression (`[app.*.alerts]`): Status: planned -- not yet implemented.** The five built-in threshold rules are fixed; there is no way to add, retune, or suppress rules from config today.
+**Custom rules (`[[alert]]` with `expr`/`for`/`message`) and per-app suppression (`[app.*.alerts]`): Status: planned -- not yet implemented.** The four built-in threshold rules are fixed; there is no way to add, retune, or suppress rules from config today.
 
 ### 6.4 Aggregation Configuration
 

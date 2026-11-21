@@ -132,7 +132,7 @@ class EvidenceTests(unittest.TestCase):
             producers = [index for index, step in enumerate(blocks)
                          if ('workflow_adapter.py produce' in step and '--gate ' + gate + ' ' in step)
                          or (gate == 'oci-interruptions'
-                             and 'run: scripts/release/qualify-oci-interruptions.sh' in step)]
+                             and 'run: choom -n 0 -- scripts/release/qualify-oci-interruptions.sh' in step)]
             self.assertEqual(len(producers), 1, gate)
             index = producers[0]
             producer = blocks[index]
@@ -178,7 +178,7 @@ class EvidenceTests(unittest.TestCase):
                       if 'uses: Swatinem/rust-cache@' in step]
             producers = [index for index, step in enumerate(blocks)
                          if 'workflow_adapter.py produce' in step
-                         or 'run: scripts/release/qualify-oci-interruptions.sh' in step]
+                         or 'run: choom -n 0 -- scripts/release/qualify-oci-interruptions.sh' in step]
             if not caches or not producers:
                 continue
             matched.add(name)
@@ -317,7 +317,7 @@ class EvidenceTests(unittest.TestCase):
             self.assertEqual(len(found), 1)
             return found[0]
 
-        producer = only(lambda step: 'run: scripts/release/qualify-oci-interruptions.sh' in step)
+        producer = only(lambda step: 'run: choom -n 0 -- scripts/release/qualify-oci-interruptions.sh' in step)
         watch = only(lambda step: 'name: Watch disk and memory during the OCI interruptions' in step)
         report = only(lambda step: "name: Report the OCI interruptions' headroom and leftovers" in step)
         upload = only(lambda step: 'name: contract-linux-oci-interruptions\n' in step)
@@ -345,15 +345,16 @@ class EvidenceTests(unittest.TestCase):
         original = self.jobs['linux']
         blocks = steps(original)
         producer = next(step for step in blocks
-                        if 'run: scripts/release/qualify-oci-interruptions.sh' in step)
+                        if 'run: choom -n 0 -- scripts/release/qualify-oci-interruptions.sh' in step)
         watch = next(step for step in blocks
                      if 'name: Watch disk and memory during the OCI interruptions' in step)
         report = next(step for step in blocks
                       if "name: Report the OCI interruptions' headroom and leftovers" in step)
         unbounded = re.sub(r'\n        timeout-minutes: \d+', '', producer)
+        job_limit = int(re.search(r'^    timeout-minutes: (\d+)$', original, re.M).group(1))
         changes = [
             original.replace(producer, unbounded),
-            original.replace(producer, re.sub(r'timeout-minutes: \d+', 'timeout-minutes: 39', producer)),
+            original.replace(producer, re.sub(r'timeout-minutes: \d+', f'timeout-minutes: {job_limit - 1}', producer)),
             original.replace(watch, ''),
             original.replace(watch, watch.replace(' < /dev/null', '')),
             original.replace(report, ''),
@@ -798,8 +799,27 @@ class LinuxNextTests(unittest.TestCase):
         self.assertLess(watch, tests)
         self.assertGreater(report, tests)
         self.assertIn("if: always()", self.steps[report])
-        # On a failed or timed-out step, the stuck processes' kernel stacks.
-        self.assertIn("/stack", self.steps[report])
+        # On a failed or timed-out step, the stuck processes' kernel stacks
+        # and the rest of runner-snapshot, kept with the evidence.
+        self.assertIn("scripts/ci/runner-snapshot", self.steps[report])
+        self.assertIn("$RUNNER_TEMP/linux-next-snapshots/", self.steps[report])
+
+    def test_a_snapshot_is_taken_before_the_tests_own_timeout_kills_them(self):
+        # 26.04 jobs that hit their limit kept nothing (#1943), and after the
+        # inner `timeout` fires, the hung tests are gone. The watcher starts
+        # just before the tests, so its age is the tests' age.
+        watch = self.steps[self.step("scripts/ci/watch-runner")]
+        tests = self.steps[self.step("make test-linux")]
+        inner = int(re.search(r"timeout --kill-after=1m (\d+)m", tests).group(1))
+        after = int(re.search(r"WATCH_SNAPSHOT_AFTER=(\d+)", watch).group(1))
+        # Passing runs take up to 31 minutes.
+        self.assertGreaterEqual(after, 32 * 60)
+        self.assertLessEqual(after, (inner - 2) * 60)
+        self.assertIn('WATCH_SNAPSHOT_DIR="$RUNNER_TEMP/linux-next-snapshots"', watch)
+        self.assertIn('WATCH_SNAPSHOT_LOGS="$RUNNER_TEMP/linux-next-tests.log"', watch)
+        self.assertIn('mkdir -p "$RUNNER_TEMP/linux-next-snapshots"', watch)
+        keep = self.steps[self.step("name: linux-next-evidence")]
+        self.assertIn("${{ runner.temp }}/linux-next-snapshots", keep)
 
     def test_the_runner_is_shielded_from_the_oom_killer_before_anything_is_watched(self):
         # The job died with its test step "in progress" nine times in two
@@ -829,21 +849,38 @@ class LinuxNextTests(unittest.TestCase):
         inner = int(re.search(r"timeout --kill-after=1m (\d+)m", command).group(1))
         self.assertLessEqual(inner + 1, self.minutes(step) - 1)
 
-    def test_the_compile_gets_swap_before_the_tests_run(self):
+    def test_the_compile_gets_swap_before_the_tests_run_but_never_on_a_snapshot(self):
         # With the runner shielded, #1943 showed up as a global OOM: on
         # 15 Nov rustc reached 10.6 GB resident building the lib tests while
-        # rust-lld linked, and the kernel killed it (run 43715574887).
-        swap = self.step("sudo swapon /ci-swapfile")
+        # rust-lld linked, and the kernel killed it (run 43715574887). On
+        # 20 Nov a swap file on a dm-snapshot / froze the host for 34
+        # minutes (run 44648854969), so give-swap refuses device-mapper.
+        swap = self.step("scripts/ci/give-swap 8388608 /")
         self.assertLess(swap, self.step("make test-linux"))
-        self.assertIn("swapon --show --noheadings", self.steps[swap])
         self.assertNotIn("if: always()", self.steps[swap])
+        self.assertNotIn("fallocate", self.steps[swap])
+        self.assertIn("swapon --show", self.steps[swap])
+
+    def test_the_watcher_stops_a_build_or_test_run_that_pages_or_fills_the_disk(self):
+        # The guards the portable job has, plus the memory-stall limit, which
+        # fires with or without swap. The tests run as root, so the watcher
+        # signals through sudo (test_runner_guard.py).
+        watch = self.steps[self.step("scripts/ci/watch-runner")]
+        for setting in ("WATCH_DISK_FLOOR_KB=2097152", "WATCH_MEM_FLOOR_KB=524288",
+                        "WATCH_MEM_FLOOR_SECONDS=60", "WATCH_PSI_FULL_PERCENT=60",
+                        "WATCH_PSI_SECONDS=30"):
+            self.assertIn(setting, watch)
+        stop = watch.split("WATCH_STOP=", 1)[1].split('"')[1].split()
+        for name in ("cargo-nextest", "cargo", "rustc"):
+            self.assertIn(name, stop)
+        report = self.steps[self.step('kill "$(cat "$RUNNER_TEMP/linux-next-resources.pid")"')]
+        self.assertIn('scripts/ci/assert-headroom "$RUNNER_TEMP/linux-next-resources.log" 10485760', report)
 
     def test_the_watcher_logs_kernel_oom_kills_and_whether_the_runner_lives(self):
         watch = self.steps[self.step("scripts/ci/watch-runner")]
         self.assertIn('scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids"', watch)
         report = self.steps[self.step('kill "$(cat "$RUNNER_TEMP/linux-next-resources.pid")"')]
         # The low-water marks sort only the resource lines, not kernel lines.
-        self.assertIn("grep ' disk_kb='", report)
         self.assertIn("dmesg -T", report)
         self.assertIn("'oom|killed process'", report)
 
@@ -888,8 +925,118 @@ class LinuxNextTests(unittest.TestCase):
         # ("separator must be exactly one character long").
         text = (WORKFLOWS / "ci.yml").read_text()
         self.assertNotIn("sort -t=", text)
-        self.assertIn("sort -t '=' -k2 -n", self.job)
-        self.assertIn("sort -t '=' -k3 -n", self.job)
+
+    def test_make_test_linux_compiles_the_lib_tests_before_the_lib(self):
+        # The lib (about 7 GB) and its lib tests (10 to 12 GB) both need
+        # only the dependencies, so one parallel build compiles them at
+        # once, and on 20 Nov that pair paged the runner into a stall.
+        # Building the lib tests first, on their own, leaves them the last
+        # unit of that build; the lib follows with them already done.
+        recipe = re.search(r"(?m)^test-linux:.*\n((?:\t.*\n)+)", (REPO / "Makefile").read_text()).group(1)
+        builds = [line.strip() for line in recipe.splitlines() if "--no-run" in line]
+        self.assertEqual(builds, ["$(CARGO) test --no-run --features ebpf --lib",
+                                  "$(CARGO) test --no-run --features ebpf"])
+
+
+class PrivilegedLinuxRunnerTests(unittest.TestCase):
+    """The 24.04 privileged job keeps its runner through its cold build, and
+    leaves evidence when a step hangs (#1943).
+
+    On 15 and 20 Nov 2026 it ran into its 40-minute limit three times with
+    "Prove rootless port adoption" in progress (or, once, failed after 3.5
+    minutes), no later step run and no log kept (runs 43715576493,
+    44729365098, 44783868580). That step runs `make test-rootless-runc`, the
+    job's first and cold build of every test binary, which compiled the lib
+    beside its lib tests on a 16 GB runner with nothing guarding it: the
+    26.04 job's mechanism. The build is now split (test_make_prebuilds.py),
+    and the job gets the 26.04 job's guards: the runner out of the OOM
+    killer's reach, swap, and a watcher that stops a build that pages, takes
+    snapshots of the host before the step limits kill what they would show,
+    and is reported and kept whatever happens."""
+
+    HEAVY = ("--gate rootless-linux ", "qualify-oci-interruptions.sh", "--gate linux-root-storage ")
+
+    def setUp(self):
+        self.job = jobs((WORKFLOWS / "ci.yml").read_text())["linux"]
+        self.steps = steps(self.job)
+
+    def step(self, text):
+        found = [index for index, step in enumerate(self.steps) if text in step]
+        self.assertEqual(len(found), 1, text)
+        return found[0]
+
+    def minutes(self, text):
+        return int(re.search(r"(?m)^\s+timeout-minutes: (\d+)$", text).group(1))
+
+    def command(self, index):
+        block = self.steps[index]
+        return " ".join(re.sub(r"\\\n", " ", block.split("run:", 1)[1]).split()).lstrip("| ")
+
+    def test_the_runner_is_shielded_and_every_heavy_step_is_handed_back_to_the_oom_killer(self):
+        shield = self.step('scripts/ci/protect-runner "$RUNNER_TEMP/runner-pids"')
+        self.assertNotIn("if: always()", self.steps[shield])
+        for text in self.HEAVY:
+            with self.subTest(step=text):
+                heavy = self.step(text)
+                self.assertLess(shield, heavy)
+                # Children inherit the runner's -1000: left there, a rustc
+                # could never be killed and a full memory hangs the host.
+                self.assertTrue(self.command(heavy).startswith("choom -n 0 -- "), self.command(heavy))
+
+    def test_the_build_gets_swap_but_never_on_a_snapshot(self):
+        swap = self.step("scripts/ci/give-swap 8388608 /")
+        self.assertLess(swap, self.step(self.HEAVY[0]))
+        self.assertNotIn("fallocate", self.steps[swap])
+        self.assertIn("swapon --show", self.steps[swap])
+
+    def test_one_watcher_covers_every_heavy_step_with_the_26_04_jobs_stops(self):
+        watch = self.step('scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids"')
+        self.assertLess(self.step("scripts/ci/protect-runner"), watch)
+        self.assertLess(watch, self.step(self.HEAVY[0]))
+        block = self.steps[watch]
+        for setting in ("WATCH_DISK_FLOOR_KB=2097152", "WATCH_MEM_FLOOR_KB=524288",
+                        "WATCH_MEM_FLOOR_SECONDS=60", "WATCH_PSI_FULL_PERCENT=60",
+                        "WATCH_PSI_SECONDS=30", "nohup ", "< /dev/null",
+                        '> "$RUNNER_TEMP/linux-resources.log"'):
+            self.assertIn(setting, block)
+        stop = block.split("WATCH_STOP=", 1)[1].split('"')[1].split()
+        for name in ("cargo-nextest", "cargo", "rustc"):
+            self.assertIn(name, stop)
+
+    def test_every_heavy_step_fails_inside_the_job_limit_and_a_snapshot_lands_before_it_does(self):
+        job = self.minutes(self.job.split("\n    steps:", 1)[0])
+        watch = self.steps[self.step("scripts/ci/watch-runner")]
+        first = int(re.search(r"WATCH_SNAPSHOT_AFTER=(\d+)", watch).group(1))
+        every = int(re.search(r"WATCH_SNAPSHOT_EVERY=(\d+)", watch).group(1))
+        self.assertIn('WATCH_SNAPSHOT_DIR="$RUNNER_TEMP/linux-snapshots"', watch)
+        # Passing jobs take 23 to 35 minutes (34 runs, 14 to 20 Nov); the
+        # rootless step, with the cold build, up to 17.
+        self.assertGreaterEqual(job, 50)
+        for text in self.HEAVY:
+            with self.subTest(step=text):
+                limit = self.minutes(self.steps[self.step(text)])
+                # One hung step still leaves the others and the report time.
+                self.assertLessEqual(limit + 15, job)
+        # Snapshots start before the first step could hit its limit and
+        # come often enough that one precedes any step's kill by minutes.
+        rootless = self.minutes(self.steps[self.step(self.HEAVY[0])])
+        self.assertLess(first, (rootless - 2) * 60)
+        self.assertLessEqual(every, 300)
+
+    def test_the_report_and_the_evidence_run_last_whatever_happened(self):
+        report = self.step('kill "$(cat "$RUNNER_TEMP/linux-resources.pid")"')
+        keep = self.step("name: linux-evidence\n")
+        for text in self.HEAVY:
+            self.assertGreater(report, self.step(text))
+        self.assertGreater(keep, report)
+        block = self.steps[report]
+        for text in ("if: always()", "timeout-minutes:",
+                     'scripts/ci/assert-headroom "$RUNNER_TEMP/linux-resources.log" 10485760',
+                     "'oom|killed process'", "job.status", "scripts/ci/runner-snapshot",
+                     "$RUNNER_TEMP/linux-snapshots/"):
+            self.assertIn(text, block)
+        for text in ("if: always()", "linux-resources.log", "linux-snapshots", "retention-days: 14"):
+            self.assertIn(text, self.steps[keep])
 
 
 class PortableLinuxRunnerTests(unittest.TestCase):
@@ -939,17 +1086,15 @@ class PortableLinuxRunnerTests(unittest.TestCase):
         self.assertTrue(command.startswith("choom -n 0 -- python3 scripts/ci/workflow_adapter.py produce "), command)
 
     def test_swap_is_topped_up_only_on_a_separate_scratch_disk_never_on_root(self):
-        swap = self.step("sudo swapon")
+        swap = self.step("scripts/ci/give-swap")
         self.assertLess(swap, self.producer())
         self.assertNotIn("if: always()", self.steps[swap])
-        self.assertIn("SwapTotal", self.steps[swap])
-        self.assertIn("8388608", self.steps[swap])
         # A swap file on / spent 5 GB of the disk that ran out (run
         # 44293229949). On 24.04 /mnt is on /dev/root, so the step adds
-        # nothing there.
+        # nothing there. give-swap also refuses a device-mapper disk.
         self.assertIn("if ! mountpoint -q /mnt; then", self.steps[swap])
-        self.assertNotIn("dir=/\n", self.steps[swap])
-        self.assertIn('"/mnt/ci-swapfile"', self.steps[swap])
+        self.assertIn("scripts/ci/give-swap 8388608 /mnt", self.steps[swap])
+        self.assertNotIn("give-swap 8388608 /\n", self.steps[swap])
 
     def test_headroom_is_watched_from_before_the_run_and_reported_and_kept_after_it(self):
         watch = self.step('scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids"')
@@ -997,12 +1142,31 @@ class PortableLinuxRunnerTests(unittest.TestCase):
         for name in ("cargo-llvm-cov", "cargo", "rustc"):
             self.assertIn(name, watch.split("WATCH_STOP=", 1)[1].split('"')[1].split())
 
+    def test_the_watcher_also_stops_the_build_when_every_task_stalls_on_memory(self):
+        # Passing portable runs peak at 21% (avg10); 60% held for 30 s is a
+        # host paging hard, with or without swap in use.
+        watch = self.steps[self.step('scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids"')]
+        self.assertIn("WATCH_PSI_FULL_PERCENT=60", watch)
+        self.assertIn("WATCH_PSI_SECONDS=30", watch)
+
     def test_the_coverage_build_compiles_one_crate_at_a_time(self):
         producer = self.steps[self.producer()]
         self.assertIn('CARGO_BUILD_JOBS: "1"', producer)
         # Only this job: the others don't build the instrumented lib tests.
         text = (WORKFLOWS / "ci.yml").read_text()
         self.assertEqual(text.count("CARGO_BUILD_JOBS:"), 1)
+
+    def test_train_pushes_save_the_dependency_cache_that_train_prs_restore(self):
+        # The cache key carries the toolchain and the lock file, which a
+        # train changes, so train PRs never matched main's cache and built
+        # every dependency one job at a time: about ten of a run's 37
+        # minutes (run 44721359618, "No cache found"). A PR restores its
+        # base branch's caches, so the train's own pushes save one (#1723).
+        # Pull request and merge-queue refs still never save.
+        cache = self.steps[self.step("uses: Swatinem/rust-cache@")]
+        self.assertIn("shared-key: portable", cache)
+        self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' || "
+                      "startsWith(github.ref, 'refs/heads/release-') }}", cache)
 
     def test_the_report_fails_when_the_low_water_mark_is_under_ten_gibibytes(self):
         report = self.steps[self.step('kill "$(cat "$RUNNER_TEMP/portable-linux-resources.pid")"')]

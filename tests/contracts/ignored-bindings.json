@@ -366,6 +366,12 @@
     "test": "a_controller_fails_a_templated_database_pair_over_when_its_node_dies"
   },
   {
+    "source": "tests/cluster_failover.rs",
+    "function": "a_voter_that_shut_down_cleanly_stays_listed_as_left",
+    "binary": "reliaburger::cluster_failover",
+    "test": "a_voter_that_shut_down_cleanly_stays_listed_as_left"
+  },
+  {
     "source": "tests/cluster_gossip.rs",
     "function": "three_nodes_join_by_address_and_converge",
     "binary": "reliaburger::cluster_gossip",
@@ -1336,6 +1342,12 @@
     "function": "runc_container_with_a_paused_init_takes_its_stop_signal_at_once",
     "binary": "reliaburger::owned_runc",
     "test": "runc_container_with_a_paused_init_takes_its_stop_signal_at_once"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_pause_freezes_the_workload_not_its_launcher",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_pause_freezes_the_workload_not_its_launcher"
   },
   {
     "source": "tests/owned_runc.rs",

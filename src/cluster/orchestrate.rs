@@ -1112,12 +1112,24 @@ pub fn plan_pass(
         .keys()
         .map(NodeId::new)
         .collect();
+    let os_rollout_cordoned: HashSet<NodeId> = desired
+        .os_rollout
+        .iter()
+        .flat_map(|rollout| {
+            rollout
+                .nodes
+                .iter()
+                .filter(|node| rollout.is_node_cordoned(&node.node_id))
+                .map(|node| NodeId::new(node.node_id.as_str()))
+        })
+        .collect();
     let liveness = Liveness {
         alive,
         suspect,
         unheard,
         lapsed,
         retired: &retired,
+        os_rollout_cordoned: &os_rollout_cordoned,
         dns_required,
     };
     let mut decisions = Vec::new();
@@ -1706,6 +1718,9 @@ struct Liveness<'a> {
     lapsed: &'a HashSet<NodeId>,
     /// Decommissioned nodes, whose volumes the operator has written off.
     retired: &'a HashSet<NodeId>,
+    /// Nodes an OS rollout is draining or updating. A host-path app's
+    /// replica stays on one through the reboot (#2120).
+    os_rollout_cordoned: &'a HashSet<NodeId>,
     dns_required: bool,
 }
 
@@ -1715,7 +1730,8 @@ impl Liveness<'_> {
     /// A changed hard selector is the one spec change that moves a replica,
     /// volume or not: the operator asked for other nodes. Otherwise a
     /// managed-volume app stays on its home whatever its node is doing
-    /// (#423), even when its new request no longer fits there. Any other
+    /// (#423), even when its new request no longer fits there, and a
+    /// host-path app stays on a node an OS rollout is updating (#2120). Any other
     /// replica stays while its node holds it and still has room for the
     /// request it makes now (#434), unless the node reported it couldn't
     /// start this replica: job leases may have taken the room since it was
@@ -1741,6 +1757,9 @@ impl Liveness<'_> {
             return false;
         }
         if keeps_volume_home(placement, spec, self.retired) {
+            return true;
+        }
+        if has_host_path_volume(spec) && self.os_rollout_cordoned.contains(&placement.node_id) {
             return true;
         }
         if cache.capacity_refused(&placement.node_id, app_id, placement.ordinal) {
@@ -1861,6 +1880,21 @@ pub(crate) fn volume_homes(
 pub(crate) fn has_managed_volume(spec: &AppSpec) -> bool {
     matches!(spec.replicas, Replicas::Fixed(_))
         && spec.volumes.iter().any(|volume| volume.source.is_none())
+}
+
+/// Whether an app bind-mounts a path from its node's own disk (a volume
+/// with a `source`). Its data may be on that node, so an OS rollout leaves
+/// it there to wait out the reboot (#2120). Outside a rollout it can move:
+/// the path may be shared storage every node mounts.
+pub(crate) fn has_host_path_volume(spec: &AppSpec) -> bool {
+    spec.volumes.iter().any(|volume| volume.source.is_some())
+}
+
+/// Whether an app stays on its node while an OS rollout updates that node,
+/// rather than moving elsewhere: its data lives there, in a managed volume
+/// or a host path.
+pub(crate) fn stays_through_os_rollout(spec: &AppSpec) -> bool {
+    has_managed_volume(spec) || has_host_path_volume(spec)
 }
 
 /// Whether a reported node is ready and can enforce what `spec` needs.
@@ -4169,6 +4203,7 @@ mod tests {
                             runtime_unknown: false,
                             status_age_ms: None,
                             age_seconds: None,
+                            image: None,
                             reason: None,
                         }]);
                     }
@@ -4790,6 +4825,7 @@ image = "busybox:latest"
             runtime_unknown: false,
             status_age_ms: None,
             age_seconds: None,
+            image: None,
             reason: None,
         };
         let mut asked = Vec::new();
@@ -5113,6 +5149,7 @@ image = "busybox:latest"
                 runtime_unknown: false,
                 status_age_ms: None,
                 age_seconds: None,
+                image: None,
                 reason: None,
             },
             crate::bun::agent::InstanceStatus {
@@ -5127,6 +5164,7 @@ image = "busybox:latest"
                 runtime_unknown: false,
                 status_age_ms: None,
                 age_seconds: None,
+                image: None,
                 reason: None,
             },
         ];
@@ -7297,6 +7335,83 @@ image = "busybox:latest"
         let decisions =
             plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
         assert!(decisions.is_empty(), "{decisions:?}");
+    }
+
+    fn app_with_host_path(cpu_request: u64) -> AppSpec {
+        let mut spec = app_spec(cpu_request, 1);
+        spec.volumes.push(crate::config::types::VolumeSpec {
+            path: "/data".into(),
+            source: Some("/srv/data".into()),
+            size: None,
+        });
+        spec
+    }
+
+    /// An OS rollout working on `node`: cordoned while it drains or updates.
+    fn os_rollout_on(
+        node: &str,
+        phase: crate::os::rollout::OsNodePhase,
+    ) -> crate::os::rollout::OsRollout {
+        let mut rollout = crate::os::rollout::plan(
+            "r1",
+            "2026.42.0",
+            "https://example/os-channel.json",
+            "leader",
+            vec![(
+                node.into(),
+                "10.0.0.2:9117".into(),
+                false,
+                "2026.41.0".into(),
+            )],
+            0,
+        );
+        rollout.nodes[0].phase = phase;
+        rollout
+    }
+
+    /// #2120: an app that keeps its data in a host path stays on a node the
+    /// OS rollout cordons, through the drain and the reboot, as a managed-
+    /// volume app does. Moving it would start it away from its data.
+    #[test]
+    fn a_host_path_app_stays_on_its_node_through_an_os_rollout() {
+        use crate::os::rollout::OsNodePhase;
+
+        let (mut desired, mut cache) = stopped_and_applied_again(app_with_host_path(100));
+        let app = AppId::new("db", "default");
+        desired.scheduling.insert(app, placed_on(&["home"]));
+        let alive = HashSet::from([NodeId::new("busy"), NodeId::new("home")]);
+
+        desired.os_rollout = Some(os_rollout_on("home", OsNodePhase::Draining));
+        crate::meat::filter::apply_os_rollout_cordon(&mut cache, desired.os_rollout.as_ref());
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+        assert!(decisions.is_empty(), "draining: {decisions:?}");
+
+        // Rebooting into the new version: out of gossip for a while.
+        desired.os_rollout = Some(os_rollout_on("home", OsNodePhase::Updating));
+        let alive = HashSet::from([NodeId::new("busy")]);
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+        assert!(decisions.is_empty(), "updating: {decisions:?}");
+    }
+
+    /// Outside an OS rollout a host-path app moves off a node that can't
+    /// run it, as before: the path may be shared storage every node mounts.
+    #[test]
+    fn a_host_path_app_leaves_a_node_that_is_not_ready_outside_an_os_rollout() {
+        let (mut desired, mut cache) = stopped_and_applied_again(app_with_host_path(100));
+        let app = AppId::new("db", "default");
+        desired.scheduling.insert(app, placed_on(&["home"]));
+        let mut unready = sched_node("home", 4000, BTreeMap::new());
+        unready.ready = false;
+        cache.set_node(unready);
+        let alive = HashSet::from([NodeId::new("busy"), NodeId::new("home")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert_eq!(nodes_of(&decisions[0]), ["busy"]);
     }
 
     /// The operator moving an app with `placement.required` is on purpose.

@@ -518,21 +518,36 @@ fn summarise(rejected: &[RejectedRoute]) -> String {
 /// A bare `myapp.com:8080` becomes `myapp.com`. A bracketed IPv6 literal
 /// `[::1]:8080` becomes `[::1]` — splitting naively on `:` would truncate
 /// it to `[` and never match (ING5).
+///
+/// Only a port of digits is stripped (RFC 3986's `port = *DIGIT`). Any
+/// other tail stays on the host, so a Host header that isn't `host[:port]`
+/// matches no route; the HTTPS redirect repeats the Host header, so only a
+/// well-formed one may reach it.
 fn normalise_host(host: &str) -> String {
     let host = host.trim().to_lowercase();
-    if let Some(rest) = host.strip_prefix('[') {
+    let (name, tail) = if let Some(rest) = host.strip_prefix('[') {
         // Bracketed IPv6: keep everything up to and including the closing
-        // bracket, drop any `:port` after it.
-        if let Some(end) = rest.find(']') {
-            return format!("[{}]", &rest[..end]);
+        // bracket; what follows can only be a port.
+        let Some(end) = rest.find(']') else {
+            return host;
+        };
+        host.split_at(end + 2)
+    } else {
+        // Non-bracketed: a single trailing `:port` is a port; anything with
+        // more than one colon is a bare IPv6 literal we leave as-is.
+        match host.rsplit_once(':') {
+            Some((left, _)) if !left.contains(':') => host.split_at(left.len()),
+            _ => return host,
         }
-        return host;
-    }
-    // Non-bracketed: a single trailing `:port` is a port; anything with more
-    // than one colon is a bare IPv6 literal we leave as-is.
-    match host.rsplit_once(':') {
-        Some((left, _)) if !left.contains(':') => left.to_string(),
-        _ => host,
+    };
+    let port_is_digits = tail.is_empty()
+        || tail
+            .strip_prefix(':')
+            .is_some_and(|port| port.bytes().all(|b| b.is_ascii_digit()));
+    if port_is_digits {
+        name.to_string()
+    } else {
+        host
     }
 }
 
@@ -1309,6 +1324,28 @@ mod tests {
         assert_eq!(normalise_host("[2001:db8::1]:443"), "[2001:db8::1]");
         assert_eq!(normalise_host("myapp.com:8080"), "myapp.com");
         assert_eq!(normalise_host("MyApp.Com"), "myapp.com");
+    }
+
+    #[test]
+    fn a_host_whose_port_isnt_digits_matches_no_route() {
+        let (map, configs) = setup_map_and_configs();
+        let mut table = RoutingTable::new();
+        table.rebuild(&map, &configs).unwrap();
+
+        // None of these is `host[:port]`, so none routes as myapp.com.
+        for host in [
+            "myapp.com:@evil.example",
+            "myapp.com:443@evil.example",
+            "myapp.com:80/x",
+            "myapp.com: 80",
+        ] {
+            assert!(table.lookup(host, "/").is_none(), "{host} routed");
+            assert!(!table.contains_host(host), "{host} has a certificate");
+        }
+        assert_eq!(normalise_host("[::1]@evil.example"), "[::1]@evil.example");
+        assert_eq!(normalise_host("[::1]:"), "[::1]");
+        assert_eq!(normalise_host("myapp.com:"), "myapp.com");
+        assert!(table.lookup("myapp.com:8443", "/").is_some());
     }
 
     #[test]

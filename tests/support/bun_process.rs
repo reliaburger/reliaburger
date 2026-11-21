@@ -210,7 +210,12 @@ impl Drop for BunProcess {
             let pid = nix::unistd::Pid::from_raw(self.child.id() as i32);
             let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Bun stops every workload before it exits, for up to
+        // `shutdown_completion_bound()`. Killing it sooner would leave them
+        // running with nobody to stop them.
+        let deadline = Instant::now()
+            + reliaburger::bun::agent::shutdown_completion_bound()
+            + Duration::from_secs(5);
         while Instant::now() < deadline {
             if self.child.try_wait().ok().flatten().is_some() {
                 return;

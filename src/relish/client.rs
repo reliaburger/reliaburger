@@ -932,15 +932,19 @@ impl BunClient {
     /// Create a client with an explicit token (or none). Used by tests; `new`
     /// resolves the token from the flag/env instead.
     pub fn new_with_token(base_url: &str, token: Option<&str>) -> Self {
-        let ca_pem = match resolve_ca_cert().map(std::fs::read).transpose() {
-            Ok(pem) => pem,
-            Err(error) => {
-                return Self::unusable(
-                    base_url,
-                    token,
-                    format!("failed to read cluster CA: {error}"),
-                );
-            }
+        let ca_pem = match resolve_ca_cert() {
+            None => None,
+            // BLOCKING-OK: relish CLI: a one-shot read of the `--ca-cert` file before the command does anything long-lived, as the old `map(std::fs::read)` was
+            Some(path) => match std::fs::read(&path) {
+                Ok(pem) => Some(pem),
+                Err(error) => {
+                    return Self::unusable(
+                        base_url,
+                        token,
+                        format!("can't read the CA certificate {}: {error}", path.display()),
+                    );
+                }
+            },
         };
         Self::build(base_url, token, ca_pem.as_deref())
     }
@@ -1168,10 +1172,7 @@ impl BunClient {
     pub fn http(&self) -> Result<&reqwest::Client, RelishError> {
         self.client
             .as_ref()
-            .map_err(|reason| RelishError::ApiError {
-                status: 0,
-                body: reason.clone(),
-            })
+            .map_err(|reason| RelishError::ClientConfig(reason.clone()))
     }
 
     /// The HTTP client for a response that streams for as long as the work
@@ -1181,10 +1182,7 @@ impl BunClient {
     fn streaming_http(&self) -> Result<&reqwest::Client, RelishError> {
         self.stream_client
             .as_ref()
-            .map_err(|reason| RelishError::ApiError {
-                status: 0,
-                body: reason.clone(),
-            })
+            .map_err(|reason| RelishError::ClientConfig(reason.clone()))
     }
 
     /// Send a request whose answer streams. The work before the first byte
@@ -2510,11 +2508,31 @@ impl BunClient {
         namespace: &str,
         command: &[String],
     ) -> Result<crate::grill::ExecOutput, RelishError> {
+        self.exec_with_timeout(app, namespace, command, None).await
+    }
+
+    /// [`Self::exec`], asking the agent to give up after `timeout` (held to
+    /// [`crate::bun::agent::MAX_EXEC_TIMEOUT`]). The agent then answers `504`
+    /// naming the app, and this waits long enough to hear it (#2128).
+    pub async fn exec_with_timeout(
+        &self,
+        app: &str,
+        namespace: &str,
+        command: &[String],
+        timeout: Option<std::time::Duration>,
+    ) -> Result<crate::grill::ExecOutput, RelishError> {
         let url = format!("{}{}", self.base_url, app_path("/v1/exec", app, namespace)?);
+        let mut body = serde_json::json!({ "command": command });
+        if let Some(timeout) = timeout {
+            body["timeout_seconds"] = timeout.as_secs().max(1).into();
+        }
+        // The ordinary request deadline would race the agent's own: wait
+        // past it, so the caller hears the agent's named `504`.
         let response = self
             .http()?
             .post(&url)
-            .json(&serde_json::json!({ "command": command }))
+            .timeout(crate::bun::agent::client_exec_wait(timeout))
+            .json(&body)
             .send()
             .await
             .map_err(classify_error)?;
@@ -4001,6 +4019,23 @@ mod tests {
     use futures_util::StreamExt;
     use std::sync::{Arc, Mutex};
 
+    /// A client relish couldn't set up says why, not "API error (status
+    /// 0)", which reads as if the cluster answered (#2162).
+    #[tokio::test]
+    async fn an_unusable_client_reports_its_reason_not_an_api_error() {
+        let client = BunClient::unusable(
+            "https://127.0.0.1:9",
+            None,
+            "the relish context for lab can't be used".to_string(),
+        );
+        let error = client.nodes().await.unwrap_err();
+        assert!(matches!(error, RelishError::ClientConfig(_)), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            "the relish context for lab can't be used"
+        );
+    }
+
     #[test]
     fn the_audit_query_carries_the_app_filter() {
         let filter = crate::bun::audit::AuditFilter {
@@ -4236,6 +4271,45 @@ mod tests {
         );
     }
 
+    /// #2128: a caller's exec timeout travels in the request, in whole
+    /// seconds, and a caller without one sends none.
+    #[tokio::test]
+    async fn exec_with_timeout_sends_the_timeout_in_seconds() {
+        let bodies = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorded = bodies.clone();
+        let app = axum::Router::new().route(
+            "/v1/exec/web/default",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let recorded = recorded.clone();
+                async move {
+                    recorded.lock().await.push(body);
+                    axum::Json(serde_json::json!({"output": "", "exit_code": 0}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client =
+            BunClient::new_with_token(&format!("http://{}", listener.local_addr().unwrap()), None);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let command = ["true".to_string()];
+        client
+            .exec_with_timeout(
+                "web",
+                "default",
+                &command,
+                Some(std::time::Duration::from_secs(60)),
+            )
+            .await
+            .unwrap();
+        client.exec("web", "default", &command).await.unwrap();
+        server.abort();
+        let bodies = bodies.lock().await;
+        assert_eq!(bodies[0]["timeout_seconds"], 60);
+        assert!(bodies[1].get("timeout_seconds").is_none(), "{}", bodies[1]);
+    }
+
     #[test]
     fn explicit_ca_constructor_refuses_invalid_trust_material() {
         assert!(
@@ -4319,7 +4393,7 @@ mod tests {
     async fn malformed_bearer_is_an_error_instead_of_an_anonymous_request() {
         let client = BunClient::new_with_token("http://127.0.0.1:9", Some("bad\nheader"));
         let error = client.health().await.unwrap_err();
-        assert!(matches!(error, RelishError::ApiError { body, .. } if body.contains("bearer")));
+        assert!(matches!(error, RelishError::ClientConfig(reason) if reason.contains("bearer")));
     }
 
     #[tokio::test]

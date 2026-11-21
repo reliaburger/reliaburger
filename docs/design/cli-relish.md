@@ -965,11 +965,16 @@ One row per node: `NODE ADDRESS STATE COUNCIL LEADER VERSION CPU MEM DISK
 ALLOCATED`, problems first. `STATE` is the gossip state, with `cordoned` or
 `disk` (disk pressure, 85% or more) added, as in `alive,cordoned`.
 `ALLOCATED` is what the scheduler has placed there (`cpu 75% mem 25%`). Under
-the table, a line names each node that didn't answer and why. `--unhealthy`
-keeps nodes that aren't alive, are cordoned, are under disk pressure or didn't
-answer. `-o json` adds `version`, `cpu_percent`, `memory_percent`,
-`disk_percent`, `allocated`, `cordoned`, `disk_pressure` and `unanswered` to
-each node's record.
+the table, a line names each cordoned node and what cordoned it (the bun
+upgrade or the OS rollout, with the command that shows its progress), and a
+line names each node that didn't answer and why. `--unhealthy` keeps nodes
+that aren't alive, are cordoned, are under disk pressure or didn't answer.
+`-o json` adds `version`, `cpu_percent`, `memory_percent`, `disk_percent`,
+`allocated`, `cordoned`, `cordoned_by` (`upgrade`, `os_rollout` or null),
+`disk_pressure` and `unanswered` to each node's record. `relish status`
+counts cordons on its `nodes` line by owner (`1 cordoned by the OS
+rollout`), and its JSON carries `cordoned_by_upgrade` and
+`cordoned_by_os_rollout` beside the `cordoned` total.
 
 **`relish apply <path>`**
 
@@ -1281,7 +1286,10 @@ It is one-shot: no stdin and no terminal, and the output comes back when the
 command ends (D34). `POST /v1/exec/{app}/{namespace}` answers `200` with
 `{"output", "exit_code"}` whatever the code, and relish exits with that code.
 Only failing to run the command is an HTTP error: `404` when no instance is
-running, `504` when it outlives the five-minute limit, `500` otherwise.
+running, `504` when it outlives its limit, `500` otherwise. The limit is the
+body's optional `timeout_seconds`, held between 1 s and five minutes; without
+one it's five minutes, which is what `relish exec` gets. `relish test` asks
+for at most 55 s (#2128).
 Interactive, streaming exec is #710 (0.4.1).
 
 The `--debug`, `--privileged` and `--node` variants are **Status: planned — not

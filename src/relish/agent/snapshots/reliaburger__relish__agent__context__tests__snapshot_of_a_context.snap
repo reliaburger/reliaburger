@@ -293,6 +293,8 @@ expression: value
             "value": {
               "alive": 3,
               "cordoned": 0,
+              "cordoned_by_os_rollout": 0,
+              "cordoned_by_upgrade": 0,
               "dead": 0,
               "disk_pressure": 0,
               "left": 0,

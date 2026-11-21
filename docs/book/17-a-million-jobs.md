@@ -4204,9 +4204,22 @@ and counts a hook from either place. A failed outcome in that history fails
 the campaign, just as a failed row does (#1935). That history survives a
 re-apply, so on a cluster adopted with `--home` it can still hold the last
 campaign's runs; only outcomes that started after this campaign did, give or
-take five minutes of clock skew, count either way. One gap remains: a one-off
-`after` job has no definition, so its coverage still depends on catching its
-row before it's pruned.
+take five minutes of clock skew, count either way.
+
+That fixed what the checker could see, not what the day tier did. A day
+run still deployed once, in the campaign's first seconds, so its hooks ran
+once, and a one-off `after` job, which has no definition to keep a history,
+still had to be caught in a summary row before it was pruned. The 0.3.0
+rehearsal's day run covered both. That says the race went our way that day.
+It doesn't say it always will. So the day tier now applies the job fixtures
+again every hour, with the workloads at the generations they already run.
+No app changes, so nothing rolls, but an apply is the desired state: every
+`run_before` hook and every plain job runs once more, with the controller
+long since scanning every 30 seconds. That's 23 more chances a day instead
+of one lucky one. `hook_apply` goes through `jobs_applied` like every other
+apply, so none lands once the drain is asked for or within the minute before
+it, and `test_no_hook_apply_once_the_drain_is_asked_for_or_due_within_a_minute`
+runs the real function in bash, with `rel` stubbed out, to show it (#1935).
 
 ### Soak jobs while the apps keep running
 
@@ -4444,6 +4457,45 @@ leaves the campaign either way. Whether it drained is a separate question. If
 the controller's last look showed it drained, it did. Anything else, including
 a run last seen nearly finished, is an unknown outcome and fails the record.
 "Probably finished" is exactly the guess the soak exists to refuse (#989).
+
+0.3.0's candidate 4 failed its fast tier on a single line: "runc missing
+coverage: active power-off overlap". Everything else passed. The soak had cut
+power three times, and each time only `shared-runc` and `process` runs were
+active on the node. The gate is right to ask for that evidence, since a fault
+no job lived through proves nothing about jobs. But the harness asked the
+controller what was running at the instant of the cut, once. A runc task
+sleeps 20 seconds and then spends a while starting its next container, so a
+node is between runc commands for a good part of every minute. Three cuts, three
+coin tosses, and the seed lost all three. The next run of the same candidate
+would probably have passed, which is exactly what's wrong with it: a red tier
+that a rerun turns green teaches everyone to rerun.
+
+So the harness now waits for its witnesses. Before a power-off, a Bun kill or
+a node fault, `job_soak.py mark --wait` reads the controller's snapshot every
+two seconds until a run of each mode is active on the target node, and only
+then lets the fault strike, for at most 90 seconds. The kinds it waits for
+are the ones the gate owes, `GATED_KINDS`; a deploy kill, which has to land a
+set number of seconds into its rollout, marks at once. A wait that runs out
+doesn't hold up the schedule. It records a `job-overlap` event naming the
+mode it never saw, and the fault goes ahead, so if the gate fails after that,
+a mode really had no work on that node for a minute and a half. That's worth
+a look. The check itself didn't change at all.
+
+`mark` takes the clock and the sleep as parameters, `clock=time.time` and
+`pause=time.sleep` by default, so a test can drive it on a fake clock
+without waiting. Python lets a default be any object, functions included,
+and evaluates it once, when the `def` runs. That's the classic trap with a
+mutable default like `[]`, but for a function it's what you want. Two tests
+lean on it. `test_a_power_off_waits_for_a_runc_run_on_its_node` replays
+candidate 4's cut: runc starts on the node six seconds after the fault was
+due, and the mark lands then. `OverlapEverySeed` reads each tier's schedule
+from the harness's own `--plan`, then, for each of 150 seeds, places every
+gated fault in its slot, picks its node and draws every mode's activity on
+every node. Every fault in every tier must overlap all three modes. The
+activity model has gaps of up to four seconds between tasks of 20 to 30,
+which means some moment in any 90-second wait has all three running; that's
+the part of the run the harness can't choose. The same seeds without the
+wait leave faults uncovered, so the test can fail (#2105).
 
 This machinery still needs the normal staged fast and final qualification on
 the integrated candidate. It records reliability under app load and faults;

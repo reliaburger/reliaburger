@@ -162,6 +162,7 @@ pub fn add_job_rows(
                 runtime_unknown: false,
                 status_age_ms: None,
                 age_seconds: None,
+                image: None,
                 reason: None,
             },
             cpu_percent: sample.cpu_percent,
@@ -192,6 +193,7 @@ mod tests {
             runtime_unknown: false,
             status_age_ms: None,
             age_seconds: None,
+            image: None,
             reason: None,
         }
     }

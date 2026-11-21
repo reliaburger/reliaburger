@@ -536,7 +536,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let deadline = self.turn_deadline();
                 // LOOP-INLINE: each read inside waits at most until the turn's runtime deadline
                 let pids =
-                    signal_faults::read_pids(self.supervisor.grill(), &ids, signal.count(), deadline)
+                    signal_faults::read_pids(self.supervisor.grill(), &ids, signal, deadline)
                         .await;
                 // Remember which PIDs we froze so clear/expiry can SIGCONT
                 // them. Without this a paused workload stayed frozen forever

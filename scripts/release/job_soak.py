@@ -90,6 +90,14 @@ CAUSES = ("exit_code", "signal", "timeout", "unknown", "launch", "unrecorded")
 FAULT_KINDS = ("leader-kill", "follower-kill", "power-off")
 # Node-level faults the job qualification adds (#686, D19-B).
 NODE_FAULT_KINDS = ("delay", "disk-full", "slow-fsync")
+# The fault kinds the coverage gate owes an overlap with every mode, and so
+# the ones a mark waits for (#2105). The harness holds such a fault at most
+# OVERLAP_WAIT_SECS for a run of every mode on its node, reading the
+# controller's snapshot every OVERLAP_POLL_SECS (it refreshes about that
+# often). The wait fits inside the compressed schedule's 100 s slot.
+GATED_KINDS = FAULT_KINDS + NODE_FAULT_KINDS
+OVERLAP_WAIT_SECS = 90
+OVERLAP_POLL_SECS = 2
 # How long a drained fixture's result may stay on an unreachable node. A
 # killed or powered-off node is back within the soak's longest settle budget
 # (600 s); a result still missing after that is lost, not late (V02 candidate
@@ -985,9 +993,10 @@ def coverage_failures(snapshot, nodes=(), kinds=FAULT_KINDS):
     return problems
 
 
-def mark(directory, target, kind, now):
-    directory=Path(directory)
-    try: snapshot=json.loads(directory.joinpath("snapshot.json").read_text())
+def active_runs(directory, target, now):
+    """The runs the controller's snapshot shows active on `target` in the
+    last 15 s: a summary's live commands there, or a fresh runc start."""
+    try: snapshot=json.loads(Path(directory).joinpath("snapshot.json").read_text())
     except (OSError,ValueError): snapshot={}
     runs=[]
     if now-snapshot.get("heartbeat",0)<=15:
@@ -1000,8 +1009,31 @@ def mark(directory, target, kind, now):
         for row in snapshot.get("fresh_activity",[]):
             if row.get("node")==target and 0<=now-row.get("observed_at",0)<=15:
                 runs.append(dict(mode="runc",id=row["id"],instance=row["instance"],generation=row["generation"],boot=row["boot"],ticks=row["ticks"]))
+    return runs
+
+
+def mark(directory, target, kind, now, wait=0, clock=time.time, pause=time.sleep):
+    """Record which runs were active on `target` as a fault of `kind` hit it,
+    and return the modes that had none.
+
+    A fault of a kind the coverage gate owes (GATED_KINDS) first waits up to
+    `wait` seconds for a run of every mode on its node (#2105). Whether one
+    runs at the instant of a fault is chance: a runc task on a node is often
+    between commands, and 0.3.0 candidate 4 cut power three times with no
+    runc run on the node, so its fast tier failed with nothing wrong. Any
+    other label (a deploy-kill, an upgrade walk, a special) marks at once."""
+    directory=Path(directory)
+    started=now
+    deadline=now+wait if kind.split(":")[-1] in GATED_KINDS else now
+    while True:
+        runs=active_runs(directory,target,now)
+        missing=[mode for mode in MODES if mode not in {run["mode"] for run in runs}]
+        if not missing or now>=deadline: break
+        pause(min(OVERLAP_POLL_SECS,deadline-now))
+        now=int(clock())
     with directory.joinpath("faults.jsonl").open("a") as file:
-        file.write(json.dumps(dict(ts=now,target=target,kind=kind,runs=runs))+"\n")
+        file.write(json.dumps(dict(ts=now,target=target,kind=kind,runs=runs,waited=now-started))+"\n")
+    return missing
 
 
 def consume_faults(campaign):
@@ -1200,6 +1232,8 @@ def main():
     budget.add_argument("--runs-per-hour",type=int,default=PLANNED_RUNS_PER_HOUR)
     marker=commands.add_parser("mark")
     marker.add_argument("directory",type=Path); marker.add_argument("target"); marker.add_argument("kind")
+    marker.add_argument("--wait",type=int,nargs="?",const=OVERLAP_WAIT_SECS,help="hold a gated fault up to this many seconds (default %d) for a run of "
+                        "every mode on its node; exit 3, naming the modes still missing, if the wait runs out" % OVERLAP_WAIT_SECS)
     options=parser.parse_args()
     if options.command=="run":
         # The harness reads this instead of `wait`: macOS bash 3.2 can forget
@@ -1223,7 +1257,10 @@ def main():
         print(json.dumps(dict(node=options.node,ts=int(time.time()),owners=job_soak_inventory.fresh_activity(options.root),
                               starts={name:EffectLedger(options.database).starts(name) for name in options.run})))
     elif options.command=="effects": print(json.dumps(EffectLedger(options.database).rows(options.run)))
-    else: mark(options.directory,options.target,options.kind,int(time.time()))
+    else:
+        missing=mark(options.directory,options.target,options.kind,int(time.time()),wait=options.wait or 0)
+        if options.wait is not None and options.kind.split(":")[-1] in GATED_KINDS and missing:
+            print(" ".join(missing)); return 3
     return 0
 
 

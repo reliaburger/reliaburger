@@ -31,7 +31,7 @@ Reading the cluster:
 | `status` | the agent envelope (`relish.agent/v1`): `data.verdict`, `data.problems`, `data.lines`, `data.wtf` and `data.summary` (the `GET /v1/cluster/summary` answer), with `next` steps |
 | `apps` | one row per app: `namespace`, `app`, `state`, `desired`, `running`, `restarts`, `nodes`, `age_seconds`, `reason` |
 | `apps NAME`, `apps --instances` | one record per instance: `node`, `id`, `app_name`, `namespace`, `state`, `pid`, `restart_count`, `age_seconds`, `reason` |
-| `nodes` | one record per node: its gossip state and address, `version`, `cpu_percent`, `memory_percent`, `disk_percent`, `allocated`, `cordoned`, `disk_pressure` and `unanswered`; an empty list on a standalone node |
+| `nodes` | one record per node: its gossip state and address, `version`, `cpu_percent`, `memory_percent`, `disk_percent`, `allocated`, `cordoned`, `cordoned_by` (`upgrade`, `os_rollout` or null), `disk_pressure` and `unanswered`; an empty list on a standalone node |
 | `logs` | one object per line (JSON Lines): `at`, `node`, `instance`, `stream`, and the line in `text`, an `untrusted` object |
 | `events` | `events`, each with its `message` in an `untrusted` object, and `warnings` for the members that didn't answer |
 | `inspect` | `desired` (or `desired_error`), then each node's `answer`: its `instances`, or the `reason` it's missing |
@@ -136,6 +136,18 @@ table for `nodes`. On `status`, a section a node didn't answer for ends in
 `partial (2 of 3 nodes)`, one it couldn't read says `unknown:` and the reason,
 and one a scoped token can't see says `not visible to a scoped token`.
 
+`relish wtf` goes one level deeper than `status`, at three lengths:
+
+| Command | Flags | What it shows |
+|---|---|---|
+| `relish wtf` | none | one row per check, worst first: its status (`critical`, `warning`, `unknown` or `ok`) and, for one that isn't OK, its first problem in a line; then the counts |
+| `relish wtf` | `--short` | the counts, then each finding that isn't OK on one line with its `next:` step; just the counts when all is well |
+| `relish wtf` | `--explain` | every check over several lines: what it found, what exactly it tests, the thresholds that decide it, a manual link and the `relish manual` chapter |
+
+`--short` and `--explain` can't be combined; both work with `--app` and
+`--watch`, and `--output json` or `yaml` refuses them, since the machine
+report always carries everything (see [diagnostics](07_diagnostics.md#three-ways-to-read-it)).
+
 ## Environment variables
 
 | Variable | Read by | Meaning |
@@ -215,7 +227,7 @@ Everything the installer and the quickstart write lives in `~/.reliaburger`
 | Path | What |
 |------|------|
 | `bin/relish` | the CLI (`~/.local/bin/relish` links here if that's on your `PATH`) |
-| `context.json` | the current cluster's endpoint, CA path and admin token (mode 0600): the laptop cluster's, or a bare-metal cluster's node 1 once `relish cluster create --bare-metal` or `relish machines claim --create` saves it (they leave another cluster's context in place) |
+| `context.json` | the current cluster's endpoint, CA path and admin token (mode 0600): the laptop cluster's, or a bare-metal cluster's node 1 once `relish cluster create --bare-metal` or `relish machines claim --create` saves it (they leave another cluster's working context in place, and replace one whose CA certificate is gone) |
 | `root-backup-keys/` | the age identities that open each cluster's root CA backup; keep a copy offline, since the root CA key has no other copy |
 | `clusters/NAME/` | a laptop cluster's state, node configs and `timings.json` |
 | `clusters/NAME/security/` | its master key, admin token and CA (`identity/root-ca.crt`) |
@@ -285,7 +297,7 @@ is a field the node can't honour; nothing is silently dropped.
 | `placement` | `required` and `preferred` node labels, `key=value` |
 | `deploy` | `strategy` (`rolling` or `blue-green`), `max_surge`, `max_unavailable`, `drain_timeout`, `health_timeout`, `auto_rollback` |
 | `stop_signal` | The signal a stop sends: `SIGTERM` (default), `SIGINT`, `SIGQUIT`, `SIGHUP`, `SIGUSR1`, `SIGUSR2` or `SIGWINCH` |
-| `stop_grace` | Time to exit after that signal before the kill, `"1s"` to `"1h"`. Default: the deploy's `drain_timeout`, or 10 s for a plain stop |
+| `stop_grace` | Time to exit after that signal before the kill, `"1s"` to `"1h"`. Default: the deploy's `drain_timeout`, or 10 s for a plain stop. When Bun shuts down, every stop on the node shares 20 s |
 | `runtime` | A `[app.NAME.runtime]` table: `capabilities` to add, namespaced `sysctls` and `devices` (`path`, `permissions`). Each needs the node's `[runtime]` allowlist and, from a token with a `[permission]` block, `host-exec`; not on `exec` or `script` apps (see `security`) |
 | `pre_stop`, `pre_stop_timeout` | A command run inside each instance before its signal, and its bound (default 30 s, at most an hour). A failure is logged, never fatal. On `exec` and `script` apps it runs on the host and needs an absolute, allowlisted path |
 | `autoscale` | `metric` (`cpu` or `memory`), `target`, `min` (at least 1), `max`, `evaluation_window`, `cooldown`, `scale_down_threshold`. Removing it returns the app to `replicas` |
@@ -455,6 +467,25 @@ way, so check the exit code before you trust it.
 `relish exec` exits with the remote command's own exit code, so
 `relish exec web ls /ready` works in a shell `if`. It exits `1` when it
 can't run the command at all, with an `error:` line on stderr.
+
+## Terminal UI keys
+
+`relish tui` (or `relish` with no command) opens the terminal UI. `?` shows
+these keys inside it too.
+
+| Key | Where | What it does |
+|-----|-------|--------------|
+| `a`, `n`, `j`, `e`, `l`, `r` | anywhere | apps, nodes, jobs, events, logs, routes (`r` refreshes a list) |
+| `s`, `?`, `:` | anywhere | search, help, command palette |
+| `q`, Esc | anywhere | back; `q` on the dashboard quits |
+| Enter, ↑/↓ | lists | open the selected row, move the selection |
+| `/` | lists | filter; Esc clears it |
+| `/` | logs, app detail Logs and Metrics tabs | search: show only the lines (or metrics, by name and labels) containing the text, ignoring case, each match in red and bold; Enter keeps it, Esc clears it |
+| → or Tab, ← or Shift-Tab | app detail | next or previous tab (Overview, Instances, Logs, Metrics, Deploys, Config) |
+| ↑/↓ | app detail Instances tab | select an instance |
+| `k` or Ctrl-K | app detail Instances tab | kill the selected instance, after a `[y/N]` prompt (only `y` kills); it sends the same audited kill as `relish fault kill APP --instance ID --node NODE --acknowledge --reason "relish tui"`, and the scheduler starts a replacement |
+| `f` | logs | follow the newest lines, or stop |
+| PgUp/PgDn | logs, events | scroll |
 
 ## Every relish command
 

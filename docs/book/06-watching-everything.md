@@ -251,13 +251,16 @@ Configure fixed URLs with `[[metrics.scrape_targets]]` when there's no app to ha
 
 ## Alert evaluation
 
-Five built-in alert rules catch the most common failure modes:
+Four built-in alert rules catch the most common failure modes:
 
 1. **cpu_throttle** — CPU above 90% for 5 minutes (critical)
 2. **oom_risk** — memory above 85% for 2 minutes (critical)
 3. **memory_high** — memory above 70% for 10 minutes (warning)
 4. **disk_high** — disk above 80% for 5 minutes (warning)
-5. **cpu_idle** — CPU below 5% for 30 minutes (warning, possible zombie)
+
+There used to be a fifth, `cpu_idle`: node CPU below 5% for 30 minutes, labelled "possible zombie". It looked sensible on paper. Then a healthy three-node cluster in the Wyse lab went `DEGRADED` half an hour after we claimed it, because two of its nodes had nothing to do: the only app ran on the third. An idle node isn't broken. It's spare capacity, and every new or quiet cluster looks exactly like that. Since any firing alert turns `relish status` and the dashboard `DEGRADED`, the rule cried wolf on the clusters that were doing best, so we dropped it in 0.3.1 ([#2171](https://github.com/reliaburger/reliaburger/issues/2171)). A test now feeds an idle node's readings through the default rules, with every `for` window set to zero, and checks that nothing fires.
+
+The zombie it was hunting is real, though. It's an *app* that holds a CPU reservation and does no work, and a node has no reservation to waste. So zombie detection belongs per app, comparing each instance's CPU use with its reservation. That's later work.
 
 The alert state machine is simple: Inactive → Pending → Firing. A metric breaches its threshold, the alert goes to Pending. If the breach persists for the required duration, it fires. If the metric recovers, the alert goes back to Inactive. No hysteresis, no complex inhibition rules. Just thresholds.
 
@@ -1784,9 +1787,9 @@ DataFusion gives us SQL parsing, query planning, columnar execution, predicate p
 
 The temptation was to build something simpler: a custom iterator over Parquet files with hardcoded filters. It would have been "enough" for v1. But then you want time-range queries, then aggregations, then LIKE filters, then JSON field extraction, and suddenly you've built half a query engine badly. Start with DataFusion and you skip the reinvention.
 
-### Five default alerts cover 90% of incidents
+### Four default alerts cover 90% of incidents
 
-We thought operators would want to define custom alert rules from day one. In practice, the five defaults (CPU throttle, OOM risk, memory high, disk high, CPU idle) catch nearly every production incident that metrics can detect. Custom rules still aren't supported, and nobody has complained yet.
+We thought operators would want to define custom alert rules from day one. In practice, the four defaults (CPU throttle, OOM risk, memory high, disk high) catch nearly every production incident that metrics can detect. Custom rules still aren't supported, and nobody has complained yet.
 
 The lesson: don't build config for things that have obvious defaults. Ship the defaults, add config later if someone needs it.
 
