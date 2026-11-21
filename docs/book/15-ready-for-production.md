@@ -1401,6 +1401,36 @@ release is the version in the commit's `Cargo.toml`, the previous release the ne
 tag behind it, and the rest is `release_tier.decide`. `--gate` survives only to raise the
 gate; asking for less than the rule says is refused, with the rule's reasons.
 
+**Then it ran one night, not every night.** The nightly was built, tested and installable for
+weeks, and it never ran every night. The Studio had better things to do with its nights:
+agents, the power-cut endurance run, the odd 24-hour memory run. And a train in the middle of
+its week is still taking merges, so a green night on Tuesday says little about the candidate on
+Friday. What `freeze-check` needs is one green night on the code that becomes the candidate,
+which is the train the evening before the freeze. So that's when it runs (maintainer decision,
+20 November 2026, [#1721](https://github.com/reliaburger/reliaburger/issues/1721)):
+`nightly-qualify.sh --once` arms a single night. At the cut-off the night dispatches
+`build.yml` on the train and `stage.yml` on the nightly channel, waits for both, runs the long
+tiers and disarms itself.
+
+"Runs once" turned out to need three locks on the same door, because launchd thinks in
+calendars, not in dates. A calendar entry has no year, so a job for 24 November would fire
+again next year. A Mac asleep at the cut-off runs the missed job when it wakes, perhaps the
+next day. And unloading a launchd job from inside it stops it. So the job is named for its
+date and marked `LaunchOnlyOnce`; the night deletes its own job file before it does anything
+else, refuses to run on any other date, and asks a detached shell to unload the job a few
+seconds after it exits. Kill it halfway and the job file is already gone. Every night also
+asks `power_cut/quiet.py` whether a release gate holds the host, and holds the quiet lock
+while its tiers run, so the endurance run pauses instead of booting VMs beside a soak.
+
+Staging a train's build hit one more wall in 0.3.0. GitHub won't let a workflow's
+token create a release on a commit whose `.github/workflows/` differ from the default
+branch's: that needs the `workflow` scope, which no workflow token can have. 0.3.0's candidate
+4 was the first train build whose `ci.yml` had moved on from `main`'s, and `stage.yml` failed
+with a bare 403. The tag was never the evidence, though. The digest-pinned `candidate.json`
+names the commit, and the nightly checks it against the tip, so a nightly's tag now points at
+the `main` commit `stage.yml` runs on. If staging still fails, the night stages the build
+itself with the same `candidate.py` and the operator's own login, and says so in its log.
+
 **Publish performance after the tag.** Benchmarks, the profile and the day run don't decide
 whether a release works, so they no longer stand between it and its users. A regression they
 find is a bug for the next patch release.

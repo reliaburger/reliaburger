@@ -15,6 +15,7 @@ from candidate import (candidate_names, identity, record_candidate, staging_step
 from package import GUEST_METADATA
 
 WORKFLOWS = Path(__file__).resolve().parents[2] / ".github" / "workflows"
+MAIN = "e" * 40
 
 
 def run_blocks(text):
@@ -283,13 +284,61 @@ class NightlyStagingTests(unittest.TestCase):
         calls = []
         with mock.patch.object(candidate, "find_release", side_effect=[None, dict(published, draft=True), published]), \
                 mock.patch.object(candidate, "gh", side_effect=lambda *a: calls.append(a)), \
-                mock.patch.object(candidate, "gh_json", return_value={"sha": "a" * 40}):
-            self.assertEqual(candidate.stage(self.directory, document, self.digest), tag)
+                mock.patch.object(candidate, "gh_json", return_value={"sha": MAIN}):
+            self.assertEqual(candidate.stage(self.directory, document, self.digest, main_commit=MAIN), tag)
         create = calls[0]
         self.assertEqual(create[2], tag)
         self.assertIn("Nightly build", create[create.index("--title") + 1])
         for call in calls:
             self.assertIn("--latest=false", call)
+
+    def published_nightly(self):
+        document = verify_downloaded(self.directory, self.pins, "reliaburger/reliaburger", self.run, self.digest)
+        tag = "nightly-v0.2.4-123-1"
+        assets = [{"name": path.name, "size": path.stat().st_size, "state": "uploaded",
+                   "digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()}
+                  for path in self.directory.iterdir()]
+        return document, dict(tag_name=tag, draft=False, prerelease=True, assets=assets)
+
+    def test_a_nightly_s_tag_points_at_main_so_a_train_s_workflow_changes_need_no_workflow_scope(self):
+        # GITHUB_TOKEN can't have the workflow scope, and GitHub refuses it a
+        # release on a commit whose .github/workflows/ differ from main's
+        # (0.3.0's candidate 4, #1721). main's own commit never differs.
+        document, published = self.published_nightly()
+        calls = []
+        with mock.patch.object(candidate, "find_release", side_effect=[None, dict(published, draft=True), published]), \
+                mock.patch.object(candidate, "gh", side_effect=lambda *a: calls.append(a)), \
+                mock.patch.object(candidate, "gh_json", return_value={"sha": MAIN}):
+            candidate.stage(self.directory, document, self.digest, main_commit=MAIN)
+        create = calls[0]
+        self.assertEqual(create[create.index("--target") + 1], MAIN)
+        notes = create[create.index("--notes") + 1]
+        self.assertIn("a" * 40, notes)
+        self.assertIn("points at `main`", notes)
+
+    def test_a_nightly_without_main_s_commit_is_refused_before_anything_is_created(self):
+        document, published = self.published_nightly()
+        with mock.patch.object(candidate, "find_release", return_value=None), \
+                mock.patch.object(candidate, "gh") as gh, self.assertRaises(ValueError):
+            candidate.stage(self.directory, document, self.digest)
+        gh.assert_not_called()
+
+    def test_a_nightly_tag_must_point_at_the_main_commit_it_was_given(self):
+        document, published = self.published_nightly()
+        with mock.patch.object(candidate, "find_release", side_effect=[published, published]), \
+                mock.patch.object(candidate, "gh"), \
+                mock.patch.object(candidate, "gh_json", return_value={"sha": "a" * 40}), \
+                self.assertRaises(ValueError):
+            candidate.stage(self.directory, document, self.digest, main_commit=MAIN)
+
+    def test_a_release_candidate_s_tag_still_points_at_its_own_commit(self):
+        document = dict(channel="release", commit="a" * 40)
+        self.assertEqual(candidate.staging_target(document, MAIN), "a" * 40)
+        self.assertEqual(candidate.staging_target(document, None), "a" * 40)
+        self.assertEqual(candidate.staging_target(dict(document, channel="nightly"), MAIN), MAIN)
+        for bad in (None, "", "main", "A" * 40):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                candidate.staging_target(dict(document, channel="nightly"), bad)
 
 
 class StagingPinsTests(unittest.TestCase):
@@ -436,6 +485,11 @@ class NightlyStageWorkflowTests(unittest.TestCase):
         self.assertIn("CHANNEL: ${{ inputs.channel }}", self.text)
         scripts = "\n".join(run_blocks(self.text))
         self.assertEqual(scripts.count('--channel "$CHANNEL"'), 2)
+
+    def test_staging_passes_main_s_own_commit_for_a_nightly_s_tag(self):
+        stage = [block for block in run_blocks(self.text) if "candidate.py stage " in block]
+        self.assertEqual(len(stage), 1)
+        self.assertIn('--main-commit "$GITHUB_SHA"', stage[0])
 
     def test_old_nightlies_are_pruned_only_by_a_nightly_staging(self):
         prune = [block for block in run_blocks(self.text) if "prune-nightly" in block]

@@ -2029,8 +2029,11 @@ machines.
   the first failure, writes the records and a rule-of-three summary
   (`DIR.md`), and deletes the VM and checkout (`--keep` keeps them). It
   refuses `reliaburger-test`, an existing VM and a dirty checkout.
-- `scripts/release/nightly-qualify.sh --train release-X-Y-Z`
-  runs the long tiers on a train's tip every night: the power-cut and reboot
+- `scripts/release/nightly-qualify.sh --once --train release-X-Y-Z`
+  arms one night, the evening before a planned freeze: a launchd job that
+  builds and stages the train's tip at the cut-off, runs the long tiers
+  overnight and disarms itself (`--disarm` cancels; `--dispatch` instead of
+  `--once` starts the same night now). A night runs the power-cut and reboot
   runs, then the V02 and jobs fast soaks against a staged build of the tip,
   then the job final when the release needs the full gate, which it works
   out with `release_tier.py` (`--gate full` can raise it, never lower it).

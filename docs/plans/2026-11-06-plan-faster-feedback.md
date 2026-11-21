@@ -274,7 +274,9 @@ missing is operation:
    tip of the active train in nightly mode at, say, 16:00 London and runs
    `stage.yml` with `channel=nightly` on success, so the 18:00 launchd job
    finds a staged build without anyone dispatching anything;
-2. the [`nightly-qualify.plist.example`](../../scripts/release/nightly-qualify.plist.example)
+2. the `nightly-qualify.plist.example` launchd job (since replaced by
+   `nightly-qualify.sh --once`, which arms one night,
+   [#1721](https://github.com/reliaburger/reliaburger/issues/1721))
    installed on the Studio, with the train name in one place;
 3. for a full gate, the nightly-key soak `bun`, built and signed on the
    Studio before the final starts, which `nightly.py` could do itself before
