@@ -105,3 +105,10 @@ path = "fuzz_targets/council_backup_state.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "ingress_request"
+path = "fuzz_targets/ingress_request.rs"
+test = false
+doc = false
+bench = false

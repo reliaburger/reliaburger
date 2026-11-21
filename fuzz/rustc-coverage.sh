@@ -25,6 +25,7 @@ reliaburger
 serde serde_core serde_json serde_spanned postcard
 toml toml_edit toml_parser toml_datetime winnow
 hickory_proto
+http
 x509_parser der_parser asn1_rs rcgen pem
 oci_client oci_spec
 base64 semver humantime ipnet url idna chrono time uuid

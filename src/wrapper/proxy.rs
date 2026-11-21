@@ -510,7 +510,7 @@ pub(super) fn generate_request_id() -> String {
 /// `Host` header beside it decides. That's `curl -k https://<node-ip>/ -H
 /// 'Host: app.example'`, the usual way to test an ingress before DNS points
 /// at it. An empty string matches no route.
-fn request_host(req: &Request<Body>) -> Result<String, StatusCode> {
+pub(crate) fn request_host(req: &Request<Body>) -> Result<String, StatusCode> {
     let header = req
         .headers()
         .get(axum::http::header::HOST)
@@ -1010,7 +1010,7 @@ where
 ///
 /// 308 (Permanent Redirect) preserves the method and body, unlike 301/302
 /// which some clients rewrite to GET.
-fn redirect_to_https(host: &str, uri: &Uri) -> Response {
+pub(crate) fn redirect_to_https(host: &str, uri: &Uri) -> Response {
     let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
     let location = format!("https://{host}{path_and_query}");
     Response::builder()
@@ -1035,7 +1035,7 @@ pub(super) fn is_forwarded_header(name: &str) -> bool {
 /// served on the same host as a node's API carries the node's dashboard
 /// session too. That cookie is the node's, not the app's: the proxy never
 /// hands it to a backend.
-pub(super) fn without_session_cookie(value: &str) -> Option<String> {
+pub(crate) fn without_session_cookie(value: &str) -> Option<String> {
     let kept: Vec<&str> = value
         .split(';')
         .map(str::trim)
@@ -1099,7 +1099,7 @@ pub(super) fn connection_tokens(
 }
 
 /// Build the upstream URI from the backend address and request URI.
-fn build_upstream_uri(backend: &std::net::SocketAddr, request_uri: &Uri) -> Option<Uri> {
+pub(crate) fn build_upstream_uri(backend: &std::net::SocketAddr, request_uri: &Uri) -> Option<Uri> {
     let path_and_query = request_uri
         .path_and_query()
         .map(|pq| pq.as_str())

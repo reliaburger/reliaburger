@@ -15,6 +15,7 @@
 //! This module is compiled for the crate's own tests and under the `fuzzing`
 //! feature, which only the `fuzz/` crate turns on. No binary carries it.
 
+use std::net::SocketAddr;
 use std::sync::OnceLock;
 
 use crate::council::fence::RecoveryFence;
@@ -108,6 +109,11 @@ pub const TARGETS: &[Target] = &[
         name: "council_backup_state",
         decoder: "council::types::DesiredState, as a restore parses an unsealed backup",
         run: council_backup_state,
+    },
+    Target {
+        name: "ingress_request",
+        decoder: "wrapper::proxy::request_host and wrapper::routing::RoutingTable::lookup",
+        run: ingress_request,
     },
 ];
 
@@ -480,5 +486,126 @@ pub fn council_backup_state(data: &[u8]) -> Outcome {
     let key = BackupKey::for_state(&state, std::time::UNIX_EPOCH);
     let parsed = BackupKey::parse(&key.object_name()).expect("a backup's own name parses");
     assert_eq!(parsed, key, "a backup name didn't parse back to its key");
+    Outcome::Accepted
+}
+
+/// The routes every fuzzed ingress request is matched against: a plain
+/// route under `/api` on one host and a TLS route for all of another.
+fn ingress_table() -> &'static crate::wrapper::routing::RoutingTable {
+    use crate::config::app::IngressSpec;
+    use crate::onion::service_map::ServiceMap;
+    use crate::wrapper::routing::RoutingTable;
+
+    static TABLE: OnceLock<RoutingTable> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut map = ServiceMap::new();
+        let mut ingress = std::collections::HashMap::new();
+        for (app, host, path, tls) in [
+            ("api", "app.example", "/api", None),
+            ("shop", "tls.example", "/", Some("cluster")),
+        ] {
+            map.register_app(app, "default", 8080, None)
+                .expect("a fuzz app registers");
+            ingress.insert(
+                ("default".to_string(), app.to_string()),
+                IngressSpec {
+                    host: host.to_string(),
+                    path: Some(path.to_string()),
+                    tls: tls.map(str::to_string),
+                    websocket: None,
+                    rate_limit_rps: None,
+                    rate_limit_burst: None,
+                },
+            );
+        }
+        let mut table = RoutingTable::new();
+        table
+            .rebuild(&map, &ingress)
+            .expect("the fuzz routes are valid");
+        table
+    })
+}
+
+/// An HTTP request's `Host` header, request target and `Cookie` header, as
+/// any client on the internet sends them to the ingress proxy, one per
+/// line.
+///
+/// Each part must be something hyper would hand the proxy, or the input is
+/// refused. A request that routes must match its route's prefix on a
+/// segment boundary; a TLS route's redirect must name the routed host and
+/// nothing else; the upstream URI must name the backend; and the
+/// dashboard's session cookie must never be passed on.
+pub fn ingress_request(data: &[u8]) -> Outcome {
+    use crate::wrapper::proxy::{
+        build_upstream_uri, redirect_to_https, request_host, without_session_cookie,
+    };
+    use axum::body::Body;
+    use axum::http::{HeaderValue, Request, Uri, header};
+
+    let mut parts = data.splitn(3, |b| *b == b'\n');
+    let (Some(host), Some(target)) = (parts.next(), parts.next()) else {
+        return Outcome::Refused;
+    };
+    // hyper trims a header value's surrounding whitespace.
+    let Ok(host) = HeaderValue::from_bytes(host.trim_ascii()) else {
+        return Outcome::Refused;
+    };
+    let Ok(uri) = Uri::try_from(target) else {
+        return Outcome::Refused;
+    };
+    if let Some(cookie) = parts.next().and_then(|c| std::str::from_utf8(c).ok())
+        && let Some(kept) = without_session_cookie(cookie)
+    {
+        let session = crate::sesame::session::SESSION_COOKIE;
+        assert!(
+            kept.split(';')
+                .all(|pair| pair.split_once('=').map_or(pair, |(name, _)| name).trim() != session),
+            "the session cookie was passed on: {kept:?}"
+        );
+    }
+    let Ok(request) = Request::builder()
+        .uri(uri.clone())
+        .header(header::HOST, host)
+        .body(Body::empty())
+    else {
+        return Outcome::Refused;
+    };
+    let Ok(host) = request_host(&request) else {
+        return Outcome::Refused;
+    };
+    let path = uri.path();
+    let Some(route) = ingress_table().lookup(&host, path) else {
+        return Outcome::Accepted;
+    };
+    let prefix = route.path_prefix.trim_end_matches('/');
+    assert!(
+        prefix.is_empty() || path == prefix || path.starts_with(&format!("{prefix}/")),
+        "{path:?} routed to the {prefix:?} route"
+    );
+
+    if route.tls_mode.requires_tls() {
+        let response = redirect_to_https(&host, &uri);
+        if let Some(location) = response.headers().get(header::LOCATION) {
+            let location: Uri = location
+                .to_str()
+                .ok()
+                .and_then(|l| l.parse().ok())
+                .unwrap_or_else(|| panic!("an unparseable redirect: {location:?}"));
+            assert_eq!(
+                location.host().map(str::to_ascii_lowercase).as_deref(),
+                Some(route.host.as_str()),
+                "the redirect for {host:?} leaves the routed host: {location}"
+            );
+        }
+    }
+
+    let backend = SocketAddr::from(([10, 0, 2, 2], 30001));
+    if let Some(upstream) = build_upstream_uri(&backend, &uri) {
+        assert_eq!(
+            upstream.authority().map(|a| a.as_str()),
+            Some(backend.to_string().as_str()),
+            "the upstream URI names another authority: {upstream}"
+        );
+    }
     Outcome::Accepted
 }

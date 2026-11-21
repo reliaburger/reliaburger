@@ -38,6 +38,8 @@ on:
       - src/smoker/types.rs
       - src/smoker/scenario.rs
       - src/council/types.rs
+      - src/wrapper/proxy.rs
+      - src/wrapper/routing.rs
       - .github/workflows/fuzz.yml
   workflow_dispatch:
     inputs:
@@ -63,12 +65,13 @@ jobs:
   fuzz:
     name: fuzz every decoder
     runs-on: ubuntu-24.04
-    # Uncached: a 33-minute sanitizer build (run 40697356210), twelve targets
-    # at five minutes each and about 3 minutes of set-up, 96 in all, with
-    # half that again to spare. Cached, only reliaburger itself rebuilds
-    # (14 minutes): a path dependency's fingerprint is its files' mtimes,
-    # which every checkout resets.
-    timeout-minutes: 145
+    # Uncached: a 33-minute sanitizer build (run 40697356210), five minutes
+    # a target and about 3 minutes of set-up, with half that again to spare
+    # (scripts/ci/test_fuzz_workflow.py checks the sum for the targets in
+    # fuzz/fuzz_targets/). Cached, only reliaburger itself rebuilds (14
+    # minutes): a path dependency's fingerprint is its files' mtimes, which
+    # every checkout resets.
+    timeout-minutes: 185
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master

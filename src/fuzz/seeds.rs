@@ -48,6 +48,7 @@ pub(super) fn for_target(target: &str) -> Vec<Seed> {
         "task_manifest" => task_manifests(),
         "chaos_scenario" => scenario_files(),
         "council_backup_state" => council_states(),
+        "ingress_request" => ingress_requests(),
         other => panic!("no seeds for fuzz target {other}"),
     }
 }
@@ -474,4 +475,25 @@ fn council_states() -> Vec<Seed> {
             )
         })
         .collect()
+}
+
+fn ingress_requests() -> Vec<Seed> {
+    [
+        ("api", "app.example\n/api/v1/orders?page=2\n"),
+        (
+            "api-with-port",
+            "APP.example:8080\n/api\nrb_session=abc; theme=dark",
+        ),
+        ("api-prefix-only", "app.example\n/apiary\n"),
+        ("tls-redirect", "tls.example\n/basket?item=1\n"),
+        (
+            "absolute-form",
+            "tls.example:80\nhttp://tls.example/checkout\n",
+        ),
+        ("ipv6", "[::1]:8080\n/\n"),
+        ("unknown-host", "other.example\n/\nsession=1"),
+    ]
+    .into_iter()
+    .map(|(name, text)| seed(name, text.as_bytes().to_vec()))
+    .collect()
 }
