@@ -111,6 +111,11 @@ pub const TARGETS: &[Target] = &[
         run: council_backup_state,
     },
     Target {
+        name: "api_bearer",
+        decoder: "sesame::auth::authenticate and sesame::oidc::verify_jwt_with_keys",
+        run: api_bearer,
+    },
+    Target {
         name: "ingress_request",
         decoder: "wrapper::proxy::request_host and wrapper::routing::RoutingTable::lookup",
         run: ingress_request,
@@ -872,6 +877,122 @@ pub fn netboot_disk_report(data: &[u8]) -> Outcome {
     }
     if report.is_blank() {
         assert_eq!(decide(&report, mac, &[], Answer::No), WipeDecision::Install);
+    }
+    Outcome::Accepted
+}
+
+/// The plaintext of the person's token the API's store holds while fuzzing.
+const BEARER_HUMAN: &str = "rbrg_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+/// The plaintext of the agent's token the store holds.
+const BEARER_AGENT: &str = "rbrg_fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+/// The cluster's service token while fuzzing.
+const BEARER_SERVICE: &str =
+    "rbrg_5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e";
+/// The workload-identity key's `kid`, its issuer and the cluster it's for.
+const JWT_KEY_ID: &str = "fuzz-key";
+const JWT_ISSUER: &str = "https://fuzz.reliaburger.dev";
+const JWT_CLUSTER: &str = "fuzz";
+
+/// The workload-identity signing key, from a fixed seed so every seed JWT
+/// is the same bytes on every run. Ed25519 signatures are deterministic.
+fn jwt_signing_key() -> ring::signature::Ed25519KeyPair {
+    ring::signature::Ed25519KeyPair::from_seed_unchecked(&[7u8; 32])
+        .expect("a 32-byte seed is an Ed25519 key")
+}
+
+/// The API's token store while fuzzing: a person's deployer token and an
+/// agent's, both stored as the SHA-256 of their plaintext.
+fn bearer_tokens() -> &'static [crate::sesame::types::ApiToken] {
+    use crate::sesame::types::{ApiRole, ApiToken, TokenKind, TokenScope};
+
+    static TOKENS: OnceLock<Vec<ApiToken>> = OnceLock::new();
+    TOKENS.get_or_init(|| {
+        [
+            ("person", BEARER_HUMAN, TokenKind::Human),
+            ("agent", BEARER_AGENT, TokenKind::Agent),
+        ]
+        .into_iter()
+        .map(|(name, plaintext, kind)| ApiToken {
+            name: name.to_string(),
+            token_hash: crate::sesame::token::hash_secret(plaintext)
+                .expect("a fuzz token is shaped like a real one"),
+            role: ApiRole::Deployer,
+            kind,
+            scope: TokenScope {
+                apps: None,
+                namespaces: None,
+            },
+            expires_at: None,
+            created_at: std::time::UNIX_EPOCH,
+            previous_secret: None,
+        })
+        .collect()
+    })
+}
+
+/// An `Authorization` header, as any client that can reach the API sends
+/// it, before anything has authenticated it.
+///
+/// Only the exact plaintext of a stored token may authenticate, and only
+/// as that token, with an agent's always confined to reading. Only the
+/// exact service token is the system. No workload JWT may verify: the
+/// fuzzer can't sign one, and the seed JWTs are too old.
+pub fn api_bearer(data: &[u8]) -> Outcome {
+    use crate::sesame::auth::{authenticate, extract_bearer, tokens_equal};
+    use crate::sesame::oidc::{JwtConstraints, OidcVerifyingKey, verify_jwt_with_keys};
+    use crate::sesame::types::{ApiRole, TokenKind};
+    use axum::http::HeaderValue;
+
+    // The middleware reads the header with `to_str`, as this does.
+    let Ok(value) = HeaderValue::from_bytes(data) else {
+        return Outcome::Refused;
+    };
+    let Some(bearer) = value.to_str().ok().and_then(extract_bearer) else {
+        return Outcome::Refused;
+    };
+
+    if tokens_equal(bearer, BEARER_SERVICE) {
+        assert_eq!(
+            bearer, BEARER_SERVICE,
+            "another bearer passed as the system"
+        );
+    }
+
+    let key = OidcVerifyingKey {
+        key_id: JWT_KEY_ID.to_string(),
+        public_key_der: ring::signature::KeyPair::public_key(&jwt_signing_key())
+            .as_ref()
+            .to_vec(),
+    };
+    let constraints = JwtConstraints {
+        expected_issuer: JWT_ISSUER.to_string(),
+        expected_audience: crate::sesame::oidc::api_audience(JWT_CLUSTER),
+        expected_algorithm: "EdDSA".to_string(),
+        max_clock_skew_secs: crate::sesame::oidc::MAX_CLOCK_SKEW_SECS,
+        max_age_secs: crate::sesame::oidc::MAX_TOKEN_AGE_SECS,
+    };
+    if let Ok(claims) = verify_jwt_with_keys(bearer, &[key], &constraints) {
+        panic!("a JWT nobody signed today verified: {claims:?}");
+    }
+
+    let tokens = bearer_tokens();
+    if let Ok(context) = authenticate(bearer, tokens) {
+        let stored = tokens
+            .iter()
+            .find(|token| token.name == context.token_name)
+            .unwrap_or_else(|| panic!("{bearer:?} authenticated as {context:?}"));
+        let plaintext = match stored.kind {
+            TokenKind::Human => BEARER_HUMAN,
+            TokenKind::Agent => BEARER_AGENT,
+        };
+        assert_eq!(
+            bearer, plaintext,
+            "a bearer authenticated as {}",
+            stored.name
+        );
+        if stored.kind == TokenKind::Agent {
+            assert_eq!(context.role, ApiRole::ReadOnly, "an agent token can write");
+        }
     }
     Outcome::Accepted
 }

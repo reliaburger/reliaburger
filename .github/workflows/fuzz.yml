@@ -38,6 +38,9 @@ on:
       - src/smoker/types.rs
       - src/smoker/scenario.rs
       - src/council/types.rs
+      - src/sesame/auth.rs
+      - src/sesame/oidc.rs
+      - src/sesame/token.rs
       - src/wrapper/proxy.rs
       - src/wrapper/routing.rs
       - src/relish/netboot/tftp.rs

@@ -133,3 +133,10 @@ path = "fuzz_targets/netboot_disk_report.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "api_bearer"
+path = "fuzz_targets/api_bearer.rs"
+test = false
+doc = false
+bench = false

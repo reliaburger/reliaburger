@@ -48,6 +48,7 @@ pub(super) fn for_target(target: &str) -> Vec<Seed> {
         "task_manifest" => task_manifests(),
         "chaos_scenario" => scenario_files(),
         "council_backup_state" => council_states(),
+        "api_bearer" => bearers(),
         "ingress_request" => ingress_requests(),
         "tftp_packet" => tftp_packets(),
         "dhcp_request" => dhcp_requests(),
@@ -654,4 +655,49 @@ fn disk_reports() -> Vec<Seed> {
     .into_iter()
     .map(|(name, text)| seed(name, text.as_bytes().to_vec()))
     .collect()
+}
+
+fn bearers() -> Vec<Seed> {
+    use super::{BEARER_AGENT, BEARER_HUMAN, BEARER_SERVICE, JWT_CLUSTER, JWT_ISSUER};
+
+    let claims = serde_json::json!({
+        "iss": JWT_ISSUER,
+        "sub": "spiffe://fuzz/ns/default/app/web",
+        "aud": [crate::sesame::oidc::api_audience(JWT_CLUSTER)],
+        "exp": 4_102_444_800u64,
+        "iat": 1_700_000_000u64,
+        "reliaburger.dev/namespace": "default",
+        "reliaburger.dev/app": "web",
+        "reliaburger.dev/cluster": JWT_CLUSTER,
+        "reliaburger.dev/node": "node-1",
+        "reliaburger.dev/instance": "web-0",
+    });
+    let wrong = format!("{}0", &BEARER_HUMAN[..BEARER_HUMAN.len() - 1]);
+    [
+        ("person", BEARER_HUMAN.to_string()),
+        ("agent", BEARER_AGENT.to_string()),
+        ("service", BEARER_SERVICE.to_string()),
+        ("wrong-secret", wrong),
+        ("workload-jwt", seed_jwt(&claims)),
+    ]
+    .into_iter()
+    .map(|(name, bearer)| seed(name, format!("Bearer {bearer}").into_bytes()))
+    .collect()
+}
+
+/// A workload JWT for the API, signed with [`super::jwt_signing_key`], issued at
+/// a fixed time long past, so it's refused for its age: a seed has to be the
+/// same bytes on every run, and a JWT that verifies today wouldn't be.
+fn seed_jwt(claims: &serde_json::Value) -> String {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    let header = serde_json::json!({"alg": "EdDSA", "typ": "JWT", "kid": super::JWT_KEY_ID});
+    let input = format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(header.to_string()),
+        URL_SAFE_NO_PAD.encode(claims.to_string())
+    );
+    let signature = super::jwt_signing_key().sign(input.as_bytes());
+    format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature.as_ref()))
 }
