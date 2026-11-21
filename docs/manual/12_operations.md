@@ -354,7 +354,7 @@ holds the `bun-<platform>` binaries for the signature check and
 `--release-url` points at a mirror of the release downloads instead.
 
 ```sh
-gh release download v0.3.0 --repo reliaburger/reliaburger --pattern metadata.json --pattern cli-metadata.json --pattern 'bun-*' --dir release
+gh release download v0.3.1 --repo reliaburger/reliaburger --pattern metadata.json --pattern cli-metadata.json --pattern 'bun-*' --dir release
 relish verify --metadata release/metadata.json --cli-metadata release/cli-metadata.json --artefacts release
 ```
 

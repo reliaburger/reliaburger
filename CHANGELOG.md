@@ -11,9 +11,9 @@ This file is the short version. The longer records are:
 - [docs/releasing.md](docs/releasing.md#compatibility-before-100), for the full upgrade steps between each pair of releases;
 - the [GitHub release pages](https://github.com/reliaburger/reliaburger/releases), for the binaries and every merged pull request.
 
-## [Unreleased] - 0.3.1
+## [0.3.1] - 2026-11-21
 
-Fixes from 0.3.0's gate and the first Wyse lab, and a terminal UI you can act from. Not released yet: this is what the train carries, and it can change before the tag.
+Fixes from 0.3.0's gate and the first Wyse lab, and a terminal UI you can act from. [Release page](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.1), [release log](docs/release-log.md#031-gate-follow-ups).
 
 ### Upgrading
 
@@ -39,6 +39,7 @@ Fixes from 0.3.0's gate and the first Wyse lab, and a terminal UI you can act fr
 
 ### Known issues
 
+- [#2197](https://github.com/reliaburger/reliaburger/issues/2197): `relish wtf` counts a crash loop per app, so three replicas that each restarted once show as a critical `crashloop` for 15 minutes. Fixed on the 0.3.2 train.
 - [#2128](https://github.com/reliaburger/reliaburger/issues/2128): one registry deploy case stalled for five minutes after an injected disk fault in 0.3.0's gate. Two possible causes are fixed in this release, but the cause isn't proven.
 
 ## [0.3.0] - 2026-11-20
