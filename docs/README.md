@@ -951,7 +951,10 @@ already run, from packages and firewall rules to systemd units, see
 [Running Reliaburger on your own Linux servers](linux-servers.md).
 To turn spare mini PCs or thin clients into appliance nodes over the network
 instead, with no distro to install, see
-[Bare metal: the appliance and netboot](manual/17_appliance.md).
+[Bare metal: the appliance and netboot](manual/17_appliance.md). `relish
+netboot --stream-logs` prints each machine's kernel and boot logs as it
+installs and boots, so a machine with no serial port needn't be watched on its
+monitor.
 
 Keep `[cluster].name` identical on every node. `relish init`, `relish setup`
 and `relish dev create` write it for you; Bun validates it as a DNS-style SPIFFE trust domain.
@@ -1854,9 +1857,9 @@ that gossip reports dead is named rather than silently left out.
 (`--app`, `--severity`, `--limit`). `relish exec <app> <cmd>` runs a command
 once, without stdin or a terminal, and exits with its exit code. `relish
 resolve <name> --namespace <ns>` picks a service whose name exists in several
-namespaces. `-o json` works on every command except the eight interactive
+namespaces. `-o json` works on every command except the nine interactive
 ones (`tui`, `dashboard`, `manual`, `source`, the guided `setup`, `dev
-shell`, `machines claim`, `netboot`), which refuse it with exit 2; `setup --quickstart` and `setup --ssh`
+shell`, `machines claim`, `machines logs`, `netboot`), which refuse it with exit 2; `setup --quickstart` and `setup --ssh`
 print what they built, for an agent to quote; `logs` and `batch watch` print one object per line,
 and a command that changes something reports what it did (manual chapter
 13). `relish fmt` keeps comments.

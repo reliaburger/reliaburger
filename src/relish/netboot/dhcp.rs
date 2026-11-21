@@ -482,12 +482,15 @@ pub fn address_server(reply: &Message, xid: u32, source: Ipv4Addr) -> Option<Ipv
 }
 
 /// Answer PXE requests arriving on `socket` until it fails. Each answer
-/// and each refusal worth knowing about goes to `log`.
+/// and each refusal worth knowing about goes to `log`, and each answered
+/// client's source address and MAC to `seen` (unspecified before the client
+/// has an address).
 pub async fn serve(
     socket: Arc<UdpSocket>,
     port: ListenPort,
     context: Arc<DhcpContext>,
     log: impl Fn(String),
+    seen: impl Fn(Ipv4Addr, MacAddress),
 ) -> std::io::Result<()> {
     let mut buffer = vec![0u8; 1500];
     loop {
@@ -511,6 +514,10 @@ pub async fn serve(
                     ));
                     continue;
                 }
+                // A client that asks from an address of its own (iPXE and
+                // PXE firmware on 4011) pairs it with its MAC, which names
+                // the boot logs it sends later (super::netlog).
+                seen(*source.ip(), answer.mac);
                 log(describe_answer(&answer, port, &context));
             }
             Err(ignored) => {
@@ -985,12 +992,16 @@ mod tests {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let server = socket.local_addr().unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
         let task = tokio::spawn(serve(
             socket,
             ListenPort::ProxyDhcp,
             Arc::new(context()),
             move |line| {
                 let _ = tx.send(line);
+            },
+            move |address, mac| {
+                let _ = seen_tx.send((address, mac));
             },
         ));
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1026,6 +1037,12 @@ mod tests {
             "dhcp: 52:54:00:12:34:56 (iPXE): ack on 4011, boot boot.ipxe"
         );
         assert!(rx.try_recv().is_err(), "the laptop's request is not logged");
+        // The answered client's address names its boot logs later.
+        assert_eq!(
+            seen.recv().await.unwrap(),
+            (Ipv4Addr::LOCALHOST, MacAddress(MAC))
+        );
+        assert!(seen.try_recv().is_err(), "only answered clients are seen");
         task.abort();
     }
 
