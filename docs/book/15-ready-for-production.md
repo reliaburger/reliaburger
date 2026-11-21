@@ -10041,6 +10041,82 @@ derives `PartialEq`, and `DesiredState` holds `HashMap`s that re-encode in a dif
 each time. So each round trip compares `serde_json::Value`s, whose maps are ordered, rather
 than the structs.
 
+### Ranking what's left
+
+Twelve targets is a list, not a policy. Which decoder gets the next one? We
+listed every place the code reads bytes it didn't make and ranked them by
+who can send those bytes: anyone on the internet first, then anyone on the
+LAN, then any workload, then authenticated clients and peers, then
+operators. The table is in [`docs/testing.md`](../testing.md#which-decoders-have-targets).
+Of the six decoders at the top, only gossip had a target. The other five are
+the API's bearer check, the ingress proxy's request handling, and the three
+netboot servers, which answer anyone on the LAN while `relish netboot` runs.
+So 0.3.2 adds five targets:
+
+- `api_bearer`: the `Authorization` header, before anything has
+  authenticated it. Only a stored token's exact plaintext may authenticate,
+  only as that token, and an agent's token only ever reads.
+- `ingress_request`: the `Host` header, request target and `Cookie` header a
+  client sends the ingress proxy. A request must match its route on a segment
+  boundary, the HTTPS redirect must name the routed host, and the
+  dashboard's session cookie never reaches a backend.
+- `tftp_packet`, `dhcp_request` and `netboot_disk_report`: the three things a
+  machine on the LAN can send `relish netboot`.
+
+The TFTP target is the first one that runs a protocol rather than a parse. A
+read request that names a served file goes to a real `Transfer`, the
+sender's state machine, and the target plays an honest client against it:
+acknowledge each block, collect the data, check it's the whole file in
+order. Whatever options the request asked for, a `blksize` of 7 or 65,464,
+a `timeout` of 0 or 255, the agreed values must be in range and the file
+must arrive intact.
+
+What did they find? The ingress target, run against the code as it stood,
+found in under a minute that a `Host` header whose "port" wasn't digits
+routed as the host in front of it. `tls.example:>0` routed to
+`tls.example`, and the HTTPS redirect, which repeats the `Host` header, sent
+the client to `https://tls.example:>0/`, which isn't a URL at all. A port is
+digits; anything else after the colon now stays on the host and matches no
+route. Writing the TFTP target's assertions turned up a second bug before
+the fuzzer ran: the netboot log printed a client's ERROR text as it came,
+control characters and all, while the disk report's labels next door were
+already escaped. Both fixes went in with a failing unit test first.
+
+The DHCP target needed a trick. `dhcp::decode` wraps dhcproto in
+`std::panic::catch_unwind`, which runs a closure and turns a panic inside it
+into an `Err` instead of unwinding further (C has nothing like it; it's
+closest to a `recover()` in a Go `defer`). A crafted packet can make
+dhcproto panic, and the server should call that "not DHCP" and carry on. But libFuzzer installs a *panic hook*, a function Rust calls the
+moment anything panics, before unwinding starts, and its hook aborts the
+process. So the catch never runs, and every dhcproto panic would look like
+our crash. The target steps the hook aside for the decode alone:
+
+```rust
+fn without_panic_hook<T>(decode: impl FnOnce() -> T) -> T {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = decode();
+    std::panic::set_hook(hook);
+    result
+}
+```
+
+`impl FnOnce() -> T` takes any closure that can be called once and returns
+a `T`, and the generic `T` lets one helper wrap a call of any type. A panic
+anywhere else in the target, in our `answer` or `encode`, still aborts.
+
+One more fix came out of the seeds. A seed is supposed to be the same bytes
+every time `make fuzz-corpus-seed` writes it, but two weren't. The join CSRs
+came from fresh ECDSA keys, and ECDSA signs with a random nonce, so even a
+fixed key gives new bytes each time. The backup was sealed with a random
+salt and nonce, as a real backup must be. Every run of the seeder changed
+three files in git for nothing. Ed25519 signatures are deterministic, so the
+CSR and JWT seeds are now signed with Ed25519 keys made from fixed seeds,
+and the backup seed is sealed by hand with a fixed salt and nonce, under the
+key the target unseals with, so the target now gets past the GCM tag too.
+With nothing random left, the corpus test compares each checked-in seed's
+bytes, not just its name.
+
 ## Did it happen in some order?
 
 Here's a history from three clients and one lease. Client 1 renews it through node A, and the
