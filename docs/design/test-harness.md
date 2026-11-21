@@ -87,12 +87,13 @@ Pull requests stacked on another branch skip the acceptance suites (wall-clock,
 cluster, upgrade and privileged Linux) unless labelled `full-ci`; they run once the
 PR targets `main`, and `ci-retarget.yml` reruns CI as soon as GitHub retargets one.
 Pull requests into a release's merge-train branch (`release-*`) run the light set:
-lint, minimum Rust, portable Linux with coverage, the demo app and the optimised
-contract boundaries. Labelled `full-ci`, they run every heavy owner but not
-portable macOS (the `train-full` selection), which is also what a code PR into
-`main` runs. The merge queue on the train, the push to it, pushes to `main`,
+lint, minimum Rust, portable Linux with coverage, CI policy (with the demo app)
+and the optimised contract boundaries. Labelled `full-ci`, they run every heavy
+owner but not portable macOS (the `train-full` selection), which is also what a
+code PR into `main` runs. The merge queue on the train, pushes to `main`,
 the nightly and the gate PR into `main` labelled `release-gate` run
-everything, portable macOS included; any other PR runs it only
+everything, portable macOS included; a push to the train reuses the queue's
+run on the same commit when it passed every job (#1723); any other PR runs it only
 when it touches macOS-specific code or carries a `macos` label
 ([which jobs run](../testing.md#which-jobs-a-pull-request-runs)). Portable
 macOS runs `make test-macos`, relish's tests and the tests only macOS

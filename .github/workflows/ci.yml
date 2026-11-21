@@ -27,8 +27,10 @@ on:
 
 # A newer push to a PR, or to a merge train, supersedes the older run: the
 # newer commit contains the older one, and closing a PR supersedes its run.
-# Main, merge-queue and called runs each keep their own group; the queue
-# cancels its own groups when it re-forms.
+# Main, merge-queue and called runs each keep their own group. The queue
+# doesn't cancel the runs of groups it drops when it re-forms, and no key
+# here can tell a dropped group from a live one, so queue-sweep.yml cancels
+# them (#1723).
 # Fixed prefixes also keep reusable source CI separate from its release caller,
 # and github.workflow (the caller's name when called) keeps a retarget run
 # (ci-retarget.yml) from cancelling the pull request's own run.
@@ -80,6 +82,11 @@ jobs:
     name: select jobs
     if: github.event.action != 'closed'
     runs-on: ubuntu-24.04
+    # actions: read lets a train push look up the merge queue's run on its
+    # commit. ci.yml's callers grant no more than this.
+    permissions:
+      contents: read
+      actions: read
     outputs:
       code: ${{ steps.select.outputs.code }}
       gossip: ${{ steps.select.outputs.gossip }}
@@ -87,10 +94,28 @@ jobs:
       task_arrays: ${{ steps.select.outputs.task_arrays }}
       macos: ${{ steps.select.outputs.macos }}
       s3: ${{ steps.select.outputs.s3 }}
+      portable: ${{ steps.select.outputs.portable }}
+      tested_by: ${{ steps.select.outputs.tested_by }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # The merge queue pushes a train exactly the commit it has just
+      # tested with every job, so the push's run would repeat about 280
+      # runner-minutes of work while the queue waits for runners (#1723).
+      # The same rule a candidate build uses to reuse a run decides whether
+      # the queue's run stands in: first attempt, every job green. Any doubt,
+      # an API error included, leaves this empty and the push runs everything.
+      - name: Find the merge-queue run that tested this train push
+        id: queue
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-')
+        continue-on-error: true
+        timeout-minutes: 8
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 scripts/release/ci_reuse.py --repository "$GITHUB_REPOSITORY"
+          --commit "$GITHUB_SHA" --event merge_group --wait-minutes 5
       - id: select
         env:
           EVENT: ${{ github.event_name }}
@@ -99,7 +124,9 @@ jobs:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
           # A train's gate PR into main, or any PR from a train, runs everything.
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          # A merge group is judged against the commit it sits on.
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          QUEUE_RUN: ${{ steps.queue.outputs.ci_run }}
           FULL_CI: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
           # The gate PR runs everything only once labelled release-gate, and
           # a macos label asks for portable macOS on any PR (#1443).
@@ -109,12 +136,16 @@ jobs:
 
   ci-policy:
     # The CI scripts' own tests (job selection, ignored-test owners, JUnit
-    # keeping) and the rule that every #[ignore] names who runs it. Cheap,
-    # so it runs on every change, documentation included.
+    # keeping), the rule that every #[ignore] names who runs it, the
+    # dependency advisory audit and the demo app's Go tests. Each takes
+    # seconds, so they share one runner and run on every change,
+    # documentation included. They were three jobs, and when runners ran
+    # short each waited for its own, sometimes for longer than the whole
+    # suite took (#1723).
     name: CI policy
     if: github.event.action != 'closed'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       # test_shard_partition.py checks the macOS partition merge against what
@@ -126,15 +157,19 @@ jobs:
         run: make test-ci-scripts
       - name: Every ignored test names its owner
         run: make check-ignored
-
-  dependency-audit:
-    name: dependency advisory audit
-    if: github.event.action != 'closed'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
       - uses: taiki-e/install-action@cargo-audit
-      - run: make audit
+      - name: Dependency advisory audit
+        run: make audit
+      # The five-minute tour builds examples/demo/burger on a node.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: examples/demo/burger/go.mod
+          cache: false
+      - name: Vet and test the demo app
+        working-directory: examples/demo/burger
+        run: |
+          go vet ./...
+          go test ./...
 
   lint:
     # Formatting and Clippy report on their own, a few minutes in, instead of
@@ -164,26 +199,6 @@ jobs:
           sudo apt-get install -y -qq clang libbpf-dev llvm
       - name: Lint every target, with all features and with none
         run: make lint
-
-  demo-app:
-    # The five-minute tour builds examples/demo/burger on a node. Its own Go
-    # tests take seconds, so they run on every code change.
-    name: demo app
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: examples/demo/burger/go.mod
-          cache: false
-      - name: Vet and test the demo app
-        working-directory: examples/demo/burger
-        run: |
-          go vet ./...
-          go test ./...
 
   minimum-rust:
     # The declared minimum compiler must build every target with and without
@@ -267,7 +282,9 @@ jobs:
     # nightly-signing test run beside it, and the HTML report waits for main.
     name: portable Linux
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    # With code, or alone on a train push the queue already tested whose
+    # dependencies differ from main's, to save the cache below.
+    if: needs.changes.outputs.portable == 'true'
     runs-on: ubuntu-24.04
     # About 19 minutes at four build jobs (run 44311598552), 8 of them
     # building. One job at a time (docs/flakes.md) tripled the build in the
@@ -1032,7 +1049,7 @@ jobs:
     # always reports, so a skipped owner can never stand in for a pass. A
     # closed PR's run has nothing to report.
     name: ignored-test evidence
-    needs: [changes, ci-policy, dependency-audit, lint, demo-app, minimum-rust, source-bundle, portable, doctests, linux, linux-next, build-tests, cluster, acceptance, contract-boundaries, macos, benchmarks, task-array-benchmarks, s3]
+    needs: [changes, ci-policy, lint, minimum-rust, source-bundle, portable, doctests, linux, linux-next, build-tests, cluster, acceptance, contract-boundaries, macos, benchmarks, task-array-benchmarks, s3]
     if: ${{ always() && github.event.action != 'closed' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
