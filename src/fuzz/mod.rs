@@ -613,11 +613,10 @@ pub fn ingress_request(data: &[u8]) -> Outcome {
     if route.tls_mode.requires_tls() {
         let response = redirect_to_https(&host, &uri);
         if let Some(location) = response.headers().get(header::LOCATION) {
-            let location: Uri = location
-                .to_str()
-                .ok()
-                .and_then(|l| l.parse().ok())
-                .unwrap_or_else(|| panic!("an unparseable redirect: {location:?}"));
+            // As bytes: the redirect repeats the request's query, which may
+            // hold bytes past ASCII, as hyper and the http crate allow.
+            let location = Uri::try_from(location.as_bytes())
+                .unwrap_or_else(|_| panic!("an unparseable redirect: {location:?}"));
             assert_eq!(
                 location.host().map(str::to_ascii_lowercase).as_deref(),
                 Some(route.host.as_str()),
