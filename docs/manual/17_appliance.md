@@ -669,13 +669,41 @@ drop it until you add it to their `[security] bootstrap_peers`.
 
 ## Take the tour
 
-The cluster is ready for the [five-minute tour](08_five-minute-tour.md), from
-`relish apply` onwards. There are two differences:
+The cluster is ready for the [five-minute tour](08_five-minute-tour.md).
+There are three differences:
+- **Build the burger on your laptop.** The appliance has no Buildah, so no
+  node can run `relish build`; it stops with `no builder available`. Build
+  the image where you have Docker and push it into the cluster's registry,
+  Pickle, as below. Then carry on from the tour's `relish apply`.
 - The ingress listens on port 80 of every node, not on `localhost:18080`. So
   use `curl -H 'Host: podinfo.localhost' http://192.168.1.51/`, or put the
   name in your laptop's hosts file.
 - Instead of `relish local stop`, pull a node's power cord. Plug it back in
   later and it rejoins by itself.
+
+To push the burger, your laptop has to reach a node by its name and trust
+the cluster's CA ([Trusting the cluster CA](11_images-and-volumes.md#trusting-the-cluster-ca)).
+With Docker Desktop, and `home-1` at 192.168.1.51 in your hosts file:
+
+```sh
+mkdir -p ~/.docker/certs.d/home-1:5050
+cp ~/home-cluster/root-ca.crt ~/.docker/certs.d/home-1:5050/ca.crt
+TOKEN="$(relish token create --name laptop-push --role deployer)"
+docker login home-1:5050 -u push --password-stdin <<<"$TOKEN"
+docker buildx build --platform linux/amd64 -t home-1:5050/burger:v1 --push burger
+```
+
+Restart Docker Desktop after adding the CA. Name the platforms your nodes
+have: `linux/arm64` for Arm machines, or both, comma-separated. The pushed
+image isn't signed by the cluster as a built one is, which only matters if
+you turned `require_signatures` on.
+
+Why no Buildah? Every package goes into both 1.1 GB `/usr` slots, a build
+fills the data partition and wears the eMMC with layers, and it would run
+every Dockerfile's `RUN` steps on the machines that hold the cluster's state. If you want the
+cluster to build for itself, add a Linux node with Buildah
+([Linux servers](https://github.com/reliaburger/reliaburger/blob/main/docs/linux-servers.md)):
+bun hands every build to a node that can run it.
 
 ## Updating the OS
 
@@ -835,6 +863,9 @@ across a cluster you care about.
   you need" boots iPXE and the installer, which then can't reach the
   network: its screen shows `reliaburger-install: FAILED: can't fetch …`.
   A USB Ethernet adapter gets it going.
+- **No builds on the cluster.** The image has no Buildah, so `relish build`
+  needs a node that isn't an appliance. Build elsewhere and push into Pickle
+  ("Take the tour", above).
 - **Two machines can't roll a bun upgrade or an OS update.** Both are in
   the council, and taking one down would leave the other without a majority,
   so `relish upgrade start` and `relish os upgrade` refuse. Use three or more.

@@ -45,6 +45,12 @@ On first boot `systemd-repart` grows the data partition and adds an empty
 everything a node changes lives on the data partition. That's also why an OS
 update never touches the cluster's state (§4.4).
 
+The image has no Buildah, so no appliance node can run `relish build`. bun
+refuses a build that no node can run with `NO_BUILDER_ERROR`
+(`src/bun/build_runner.rs`), which names the ways out: build elsewhere and
+push into Pickle, or add a Linux node with Buildah, which bun hands builds to
+(#2144).
+
 Lab builds add `openssh-server` for debugging. Published images don't have
 it, and `image/tests/no_ssh_server.py` checks it twice. Its unit test reads
 the mkosi configs, where only a `Profiles=lab` drop-in may name an SSH
@@ -227,7 +233,11 @@ With none, the machine is unclaimed and waits to be claimed
   `3f9a-12bc-77de-0a41`.
 - **Console.** The tty1 status screen redraws every 5 seconds and shows the
   short claim key while the node has no name, with the hint to compare it in
-  `relish machines claim`.
+  `relish machines claim`. `reliaburger-console.service` is ordered after
+  none of our units: the seed unit stays activating until the claim, and a
+  console ordered after it showed nothing until the key no longer mattered
+  (#2161). It shares bun's launcher with prepare and bun, which installs
+  bun under a lock (`/var/lib/reliaburger/bin/.install.lock`).
 - **mDNS.** It announces `_rb-unclaimed._tcp.local.` (RFC 6763 caps the name
   at 15 bytes) as `reliaburger-<mac>`, with TXT `mac`, `arch` and `fp` (the
   short fingerprint). It waits up to 60 seconds for an IPv4 address before
