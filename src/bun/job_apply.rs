@@ -231,6 +231,7 @@ pub(crate) async fn apply(
             let Some((_, record)) = arrays.deployments().find(|(id, _)| *id == operation_id) else {
                 let _ = tx
                     .send(ApplyEvent::Error {
+                        status: None,
                         message: "deployment receipt is no longer retained; query run summaries"
                             .into(),
                     })
@@ -252,7 +253,7 @@ pub(crate) async fn apply(
                 return;
             }
             if record.cancelled() {
-                let _ = tx.send(ApplyEvent::Error { message: format!("deployment {operation_id} cancelled or a hook failed; apps remain gated") }).await;
+                let _ = tx.send(ApplyEvent::Error { status: None, message: format!("deployment {operation_id} cancelled or a hook failed; apps remain gated") }).await;
                 return;
             }
             if record.runs().any(|id| {
@@ -261,11 +262,11 @@ pub(crate) async fn apply(
                     .run(id)
                     .is_some_and(|run| !run.unknown_owners.is_empty())
             }) {
-                let _ = tx.send(ApplyEvent::Error { message: format!("deployment {operation_id} retains unknown hook ownership; inspect run summaries and acknowledge replay only if repeating side effects is acceptable") }).await;
+                let _ = tx.send(ApplyEvent::Error { status: None, message: format!("deployment {operation_id} retains unknown hook ownership; inspect run summaries and acknowledge replay only if repeating side effects is acceptable") }).await;
                 return;
             }
             if tokio::time::Instant::now() >= deadline {
-                let _ = tx.send(ApplyEvent::Error { message: format!("deployment {operation_id} is still durable and pending; query /v1/deploys/operations") }).await;
+                let _ = tx.send(ApplyEvent::Error { status: None, message: format!("deployment {operation_id} is still durable and pending; query /v1/deploys/operations") }).await;
                 return;
             }
             if tx.is_closed() {

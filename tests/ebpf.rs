@@ -5458,7 +5458,7 @@ async fn init_exit_preserves_policy_before_the_next_container_starts() {
         .unwrap();
     let mut failures = Vec::new();
     while let Some(event) = results.recv().await {
-        if let ApplyEvent::Error { message } = event {
+        if let ApplyEvent::Error { message, .. } = event {
             failures.push(message);
         }
     }
@@ -5563,7 +5563,7 @@ async fn uncertain_initialiser_preserves_parent_policy_until_confirmed_retiremen
         .unwrap();
     let mut failures = Vec::new();
     while let Some(event) = results.recv().await {
-        if let ApplyEvent::Error { message } = event {
+        if let ApplyEvent::Error { message, .. } = event {
             failures.push(message);
         }
     }
@@ -5855,7 +5855,7 @@ async fn check_backend_retirement(
             let (events, mut results) = mpsc::channel(64);
             commands.send(AgentCommand::Deploy { config, events }).await?;
             while let Some(event) = results.recv().await {
-                if let ApplyEvent::Error { message } = event { anyhow::bail!(message); }
+                if let ApplyEvent::Error { message, .. } = event { anyhow::bail!(message); }
             }
             let id = InstanceId(format!("default__{name}-0"));
             let ip = runtime.container_ip(&id).await.ok_or_else(|| anyhow::anyhow!("runtime omitted container address"))?;
@@ -5955,10 +5955,10 @@ async fn check_backend_retirement(
                     let mut completed = false;
                     while let Some(event) = results.recv().await {
                         match event {
-                            ApplyEvent::Error { message } if freeze => {
+                            ApplyEvent::Error { message, .. } if freeze => {
                                 refused |= message.contains("cannot retire backend") || message.contains("cannot publish backend");
                             }
-                            ApplyEvent::Error { message } => anyhow::bail!(message),
+                            ApplyEvent::Error { message, .. } => anyhow::bail!(message),
                             ApplyEvent::Complete { .. } => completed = true,
                             _ => {}
                         }
@@ -6090,7 +6090,7 @@ async fn refused_backend_publication_cannot_report_a_completed_deployment() {
         let mut failed = false;
         while let Some(event) = results.recv().await {
             completed |= matches!(event, ApplyEvent::Complete { .. });
-            if let ApplyEvent::Error { message } = event {
+            if let ApplyEvent::Error { message, .. } = event {
                 failed |= message.contains("cannot publish backend");
             }
         }
@@ -6336,7 +6336,7 @@ async fn check_stopped_address_retention(lose_enforcement: bool, durable_discove
         let (events, mut results) = mpsc::channel(64);
         commands.send(AgentCommand::Deploy { config, events }).await?;
         while let Some(event) = results.recv().await {
-            if let ApplyEvent::Error { message } = event { anyhow::bail!(message); }
+            if let ApplyEvent::Error { message, .. } = event { anyhow::bail!(message); }
         }
         let original_ip = runtime.container_ip(&old).await.ok_or_else(|| anyhow::anyhow!("original address absent"))?;
         let original = read_runtime_fixture_page(SocketAddr::new(vip.0.into(), 8080)).await?;
@@ -6513,7 +6513,7 @@ async fn refused_health_publication_prevents_restart_and_preserves_ownership() {
         let (events, mut results) = mpsc::channel(64);
         commands.send(AgentCommand::Deploy { config, events }).await?;
         while let Some(event) = results.recv().await {
-            if let ApplyEvent::Error { message } = event { anyhow::bail!(message); }
+            if let ApplyEvent::Error { message, .. } = event { anyhow::bail!(message); }
         }
         let mut frozen = false;
         let mut unhealthy_since = None;

@@ -280,12 +280,18 @@ pub struct Compatibility {
 /// fields, #2062); and the API token's separate audience
 /// (`reliaburger-api:CLUSTER`, the `api-token` file beside `token`).
 ///
+/// 0.3.2 (61/76): one protocol bump for the release; the durable state
+/// doesn't change. Each later 0.3.2 change adds its line below this one.
+/// `ApplyEvent::Error` carries the HTTP `status` of a failure that comes
+/// after the apply's stream has answered `200`, so `relish apply` on a
+/// cluster reports an image nobody built as `404`, not `500` (#2157).
+///
 /// Bumping either number makes the checked-in gossip and Raft fuzz seeds
 /// stale: run `make fuzz-corpus-seed` in the same change (#1941). Keep the
 /// two fields directly inside the braces: the release scripts read them with
 /// a regex.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 60,
+    protocol: 61,
     state: 76,
 };
 

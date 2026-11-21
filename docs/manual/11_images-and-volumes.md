@@ -88,8 +88,9 @@ mirror, `mirrors` now covers every image you apply.
   Run `relish build` (or push the image) and apply again. An image whose own
   registry says it doesn't exist (`ghcr.io/acme/burger:v1`) fails with
   `doesn't exist or isn't visible to this node`: check the name, the tag and
-  the node's registry credentials. Neither is worth retrying, so a standalone
-  node answers `404`, not the `502` of a registry that's down.
+  the node's registry credentials. Neither is worth retrying, so `relish
+  apply` reports `404`, not the `502` of a registry that's down, on a
+  standalone node and on a cluster alike.
 - **Where you see it:** `relish history` shows the bound reference in its
   `IMAGE` column, one row per version. `relish rollback`
   restores the bound reference of the version before, so it runs the bytes

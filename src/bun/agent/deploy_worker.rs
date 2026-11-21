@@ -159,6 +159,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         {
             let _ = events
                 .send(ApplyEvent::Error {
+                    status: None,
                     message: "deploy cancellation requested; finishing owned cleanup".into(),
                 })
                 .await;
@@ -196,6 +197,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         if !config.job.is_empty() {
             let _ = events
                 .send(ApplyEvent::Error {
+                    status: None,
                     message: "jobs run through the common job lifecycle, not a node's app deploy"
                         .into(),
                 })
@@ -263,7 +265,12 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             let pinned_spec = match self.pin_images(spec).await {
                 Ok(pinned) => pinned,
                 Err(reason) => {
-                    let _ = events.send(ApplyEvent::Error { message: reason }).await;
+                    let _ = events
+                        .send(ApplyEvent::Error {
+                            status: None,
+                            message: reason,
+                        })
+                        .await;
                     return;
                 }
             };
@@ -285,6 +292,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 Err(error) => {
                     let _ = events
                         .send(ApplyEvent::Error {
+                            status: None,
                             message: error.to_string(),
                         })
                         .await;
@@ -332,6 +340,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 {
                     let _ = events
                         .send(ApplyEvent::Error {
+                            status: None,
                             message: error.to_string(),
                         })
                         .await;
@@ -399,6 +408,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 Err(e) => {
                     let _ = events
                         .send(ApplyEvent::Error {
+                            status: None,
                             message: e.to_string(),
                         })
                         .await;
@@ -428,6 +438,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                         .await;
                     let _ = events
                         .send(ApplyEvent::Error {
+                            status: None,
                             message: error.to_string(),
                         })
                         .await;
@@ -452,6 +463,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 {
                     let _ = events
                         .send(ApplyEvent::Error {
+                            status: None,
                             message: e.to_string(),
                         })
                         .await;
@@ -908,6 +920,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 .await;
             let _ = events
                 .send(ApplyEvent::Error {
+                    status: None,
                     message: format!("could not retire {}: {error}", old_id.0),
                 })
                 .await;
@@ -924,6 +937,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     .await;
                 let _ = events
                     .send(ApplyEvent::Error {
+                        status: None,
                         message: error.to_string(),
                     })
                     .await;
@@ -944,6 +958,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             {
                 let _ = events
                     .send(ApplyEvent::Error {
+                        status: None,
                         message: error.to_string(),
                     })
                     .await;
@@ -1024,6 +1039,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             Err(error) => {
                 let _ = events
                     .send(ApplyEvent::Error {
+                        status: None,
                         message: error.to_string(),
                     })
                     .await;
@@ -1073,6 +1089,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     // than spin.
                     let _ = events
                         .send(ApplyEvent::Error {
+                            status: None,
                             message: format!(
                                 "rolling deploy cannot progress with max_surge={} and \
                                  max_unavailable={}",
@@ -1109,6 +1126,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                             .await;
                         let _ = events
                             .send(ApplyEvent::Error {
+                                status: None,
                                 message: format!(
                                     "old instance retirement unconfirmed: {error}; {}",
                                     match retention {
@@ -1151,6 +1169,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                             };
                             let _ = events
                                 .send(ApplyEvent::Error {
+                                    status: None,
                                     message: format!(
                                         "old instance artifact retirement failed: {error}; {detail}"
                                     ),
@@ -1188,7 +1207,12 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 )
                 .await
             {
-                let _ = events.send(ApplyEvent::Error { message }).await;
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        status: None,
+                        message,
+                    })
+                    .await;
                 new_failed = true;
                 break;
             }
@@ -1245,6 +1269,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     .await;
                 let _ = events
                     .send(ApplyEvent::Error {
+                        status: None,
                         message: format!(
                             "old instance retirement unconfirmed: {error}; {}",
                             match retention {
@@ -1292,6 +1317,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             };
             let _ = events
                 .send(ApplyEvent::Error {
+                    status: None,
                     message: format!("rollout finalisation failed: {error}; {detail}"),
                 })
                 .await;
@@ -1575,7 +1601,12 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 })
                 .await;
         }
-        let _ = events.send(ApplyEvent::Error { message }).await;
+        let _ = events
+            .send(ApplyEvent::Error {
+                status: None,
+                message,
+            })
+            .await;
     }
 
     /// Bring an aborted rollout back to its old capacity on the previous
@@ -1871,6 +1902,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             Err(error) => {
                 let _ = events
                     .send(ApplyEvent::Error {
+                        status: None,
                         message: error.to_string(),
                     })
                     .await;
@@ -1919,6 +1951,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 Err(error) => {
                     let _ = events
                         .send(ApplyEvent::Error {
+                            status: None,
                             message: error.to_string(),
                         })
                         .await;
@@ -1938,6 +1971,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 Err(e) => {
                     let _ = events
                         .send(ApplyEvent::Error {
+                            status: None,
                             message: e.to_string(),
                         })
                         .await;
@@ -1948,6 +1982,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             let Some(cgroup_path) = oci_spec.linux.host_cgroup_path() else {
                 let _ = events
                     .send(ApplyEvent::Error {
+                        status: None,
                         message: format!(
                             "replacement {} has no valid original cgroup path",
                             new_id.0
@@ -1970,6 +2005,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             {
                 let _ = events
                     .send(ApplyEvent::Error {
+                        status: None,
                         message: format!("failed to create {}: {e}", new_id.0),
                     })
                     .await;
@@ -1982,6 +2018,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             {
                 let _ = events
                     .send(ApplyEvent::Error {
+                        status: None,
                         message: format!("failed to program egress for {}: {e}", new_id.0),
                     })
                     .await;
@@ -1991,6 +2028,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             if let Err(e) = self.grill.start(&new_id).await {
                 let _ = events
                     .send(ApplyEvent::Error {
+                        status: None,
                         message: format!("failed to start {}: {e}", new_id.0),
                     })
                     .await;
@@ -2013,6 +2051,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             {
                 let _ = events
                     .send(ApplyEvent::Error {
+                        status: None,
                         message: error.to_string(),
                     })
                     .await;
@@ -2042,7 +2081,12 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                         .await;
                 }
                 Err(message) => {
-                    let _ = events.send(ApplyEvent::Error { message }).await;
+                    let _ = events
+                        .send(ApplyEvent::Error {
+                            status: None,
+                            message,
+                        })
+                        .await;
                     new_failed = true;
                     break;
                 }
@@ -2103,6 +2147,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             {
                 let _ = events
                     .send(ApplyEvent::Error {
+                        status: None,
                         message: error.to_string(),
                     })
                     .await;
@@ -2123,6 +2168,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     .await;
                 let _ = events
                     .send(ApplyEvent::Error {
+                        status: None,
                         message: format!(
                             "old instance retirement unconfirmed: {error}; {}",
                             match retention {
@@ -2163,6 +2209,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             };
             let _ = events
                 .send(ApplyEvent::Error {
+                    status: None,
                     message: format!("rollout finalisation failed: {error}; {detail}"),
                 })
                 .await;
