@@ -287,11 +287,12 @@ jobs:
     if: needs.changes.outputs.portable == 'true'
     runs-on: ubuntu-24.04
     # About 19 minutes at four build jobs (run 44311598552), 8 of them
-    # building. One job at a time (docs/flakes.md) tripled the build in the
-    # Lima VM, so about 35 minutes, and up to 55 on a slow runner (#1421).
-    # nextest's per-test timeouts catch a hung test, so this only catches a
-    # stuck runner.
-    timeout-minutes: 85
+    # building, and up to 41 on a slow runner (#1421). One job at a time
+    # (#1943) made the build about 13 minutes; the coverage recipe now builds
+    # the lib tests alone and then the rest, both at full parallelism
+    # (#1723). nextest's per-test timeouts catch a hung test, so this only
+    # catches a stuck runner.
+    timeout-minutes: 62
     steps:
       - uses: actions/checkout@v4
       - name: Free the runner's disk
@@ -365,12 +366,13 @@ jobs:
         id: portable_linux
         # Each test has a nextest slow-timeout with terminate-after (the
         # `ci` profile). `choom` undoes the -1000 inherited from the runner.
-        # One crate at a time: the instrumented lib tests' rustc peaks at
-        # 12 GB and the lib's at 7 GB, and any parallel build runs the two
-        # at once, which swapped a runner's 14 GiB and 3 GiB of swap full in
-        # the Lima VM (docs/flakes.md). Alone, the peak is 12 GB.
-        env:
-          CARGO_BUILD_JOBS: "1"
+        # The instrumented lib tests' rustc peaks at 12 GB and the lib's at
+        # 7 GB; one parallel build ran the two at once and swapped a
+        # runner's 14 GiB and 3 GiB of swap full in the Lima VM
+        # (docs/flakes.md). The coverage recipe builds the lib tests alone
+        # first, then the rest, so each phase runs at full parallelism and
+        # the peak stays one 12 GB rustc (#1723). No cap on build jobs:
+        # one job would also hold each rustc's codegen to one thread.
         run: |
           choom -n 0 -- python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate portable-linux --host linux --directory target/contracts/linux/portable-linux --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
       - name: Report the coverage run's headroom

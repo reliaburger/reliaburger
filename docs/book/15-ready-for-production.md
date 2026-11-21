@@ -708,7 +708,7 @@ parallel build starts them together. In the Lima VM, under a runner's 14 GiB and
 swap, four jobs and three jobs ran out and the kernel killed the lib tests' rustc. Two jobs
 didn't help: the same pair still overlapped, filled the swap and stalled for minutes. On the
 runner nobody dies. We'd shielded it from the OOM killer, so the host pages instead, the
-runner's heartbeat stops, and GitHub gives up on it. So the coverage build now runs one job
+runner's heartbeat stops, and GitHub gives up on it. So the coverage build went to one job
 at a time: the peak is 12 GB and nothing swaps. It costs time, about three times as long to
 build in the VM. The watcher also logs swap and the kernel's memory-stall figure, and stops
 the build if available memory stays under 512 MiB for a minute while swap is in use. Paging
@@ -1367,11 +1367,74 @@ Two of the window's 32 groups would have.
 
 Together that's about a quarter of the window's runner-minutes, 5,700 of 22,120, that no
 longer compete with the PRs an author is waiting for. What we didn't do matters as much.
-Portable Linux still builds one crate at a time, 13 of its 25 to 31 minutes, because two
-instrumented compiles at once ran a 16 GB runner out of memory; that's the floor of every
-train PR until the build itself changes. Portable macOS, 52 to 57 minutes with a warm cache,
-still sets the length of every queue group. And the queue builds up to eight groups at once,
-160 jobs, a setting in the repository ruleset that only the maintainer can change.
+Portable macOS, 52 to 57 minutes with a warm cache, still sets the length of every queue
+group. And the queue builds up to eight groups at once, 160 jobs, a setting in the
+repository ruleset that only the maintainer can change.
+
+That left portable Linux, which builds the crate for 13 of its 25 to 31 minutes, one
+compile at a time. Every train PR waits for it. Did the build really have to be that slow?
+The problem was never parallelism as such. It was two particular rustc processes running at
+the same time: the lib tests at 12 GB and the lib at 7 GB. Why do they even start together?
+Because `cargo test --lib` doesn't link against the library at all. It compiles
+`src/lib.rs` a second time, as a different crate, with `cfg(test)` switched on, so every
+`#[cfg(test)] mod tests` block and every `#[test]` function is in it. The two compiles
+share the dependencies and nothing else, so the moment the dependencies are done Cargo
+starts both.
+
+`CARGO_BUILD_JOBS=1` kept them apart, but it costs more than it looks. Cargo hands its
+rustc processes tokens from a jobserver, one per job, and rustc uses those tokens for its
+own codegen threads too. At one job, the lib tests' rustc type-checks over half a million lines and then
+generates code on one thread, while three of the runner's four cores sit idle.
+
+`make test-linux` already had the fix: build the lib tests on their own, then the rest. So
+the coverage recipe does the same, inside cargo-llvm-cov:
+
+```make
+coverage:
+	$(CARGO) llvm-cov clean --workspace
+	$(CARGO) llvm-cov --no-report test --lib -- --list
+	$(CARGO) llvm-cov clean --profraw-only
+	$(CARGO) llvm-cov --no-report nextest --profile $(NEXTEST_PROFILE) --no-tests=fail
+	mkdir -p target/coverage
+	$(COVERAGE_REPORT) --lcov --output-path target/coverage/lcov.info --fail-under-lines $(COVERAGE_MIN_LINES)
+```
+
+The second line builds the instrumented lib tests and nothing else, at full parallelism.
+Then nextest's own build compiles what's left, and the lib comes first, because every
+binary and integration test links it. The big two never overlap, so the peak is still one
+12 GB rustc, and every phase gets all four cores.
+
+Two details are less obvious than they look. First, why not `--no-run`? Because
+cargo-llvm-cov claims that flag for itself (it's a deprecated way of asking for a report)
+and never passes it to Cargo. So the build runs the lib tests' binary with `--list`
+instead, which prints the test names and runs none of them. The binary is instrumented, so
+even that listing writes a `.profraw` file on exit, and the third line deletes it before
+the real run. Second, does nextest really reuse what `cargo llvm-cov test` built? Only if
+Cargo sees the same compiler, flags and environment, and cargo-llvm-cov sets those the same
+way for both subcommands. The only thing that differs is `LLVM_PROFILE_FILE`, which matters
+when a test runs, not when it compiles. We checked on a throwaway crate: after the split,
+nextest left the lib tests' binary untouched and compiled only the lib, the binary and the
+integration test.
+
+The coverage owner that runs `make coverage` in CI pins the recipe line for line, so it
+learned the new stages, and its contract learned what a build stage may do. A stage of the
+form `--no-report test` must end in `-- --list`, must come before the one instrumented run,
+and must be followed by a `clean --profraw-only` before that run. The owner still accepts
+the nextest handshake only during the run stage, so a build stage that tried to pose as the
+run is refused. The report reads the run's profiles and nothing else.
+
+How much does it buy? We can't know until a runner says so, and the first CI run is the
+measurement. In the Lima VM, under a runner's memory and four cores, the uncapped build
+(both big compiles together) took 5:51, two jobs took 10:51 and one job 17:35. The split
+should land between the first two: the big two run one after the other, but each with four
+codegen threads. Scaled to the runner's 13 minutes at one job, that's about 4.5 to 8
+minutes, call it 6, which takes portable Linux from 25 to 31 minutes to about 18 to 24, a
+median near 21. That's close to the 19 we were after, not at it, and the job's limit drops
+from 85 minutes back to 62. What should the first runs be watched for? The watcher's
+`mem_floor:` and memory-stall stops, any kernel OOM line in the report step, and a lost
+runner. The lib still compiles alone, since everything after it links it, so any of those
+would mean the targets built after it, four at a time with the suite among them, hold more
+than we think.
 
 ### A release gate that fits in a week
 
