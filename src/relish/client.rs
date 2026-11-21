@@ -1524,7 +1524,40 @@ impl BunClient {
         let response = self
             .start_stream(self.lease_header(self.streaming_http()?.post(&url)))
             .await?;
+        self.follow_apply_events(response).await
+    }
 
+    /// Set an app's replica count (`POST /v1/scale/{app}/{namespace}`),
+    /// printing the leader's progress on stderr as an apply does. With
+    /// `current_replicas`, the scale is refused if the app has another
+    /// count now; with `force`, it changes an app GitOps manages.
+    pub async fn scale(
+        &self,
+        app: &str,
+        namespace: &str,
+        replicas: u32,
+        current_replicas: Option<u32>,
+        force: bool,
+    ) -> Result<(), RelishError> {
+        let url = format!(
+            "{}{}{}",
+            self.base_url,
+            app_path("/v1/scale", app, namespace)?,
+            force_query(force)
+        );
+        let mut body = serde_json::json!({ "replicas": replicas });
+        if let Some(current) = current_replicas {
+            body["current_replicas"] = current.into();
+        }
+        let response = self
+            .start_stream(self.lease_header(self.streaming_http()?.post(&url).json(&body)))
+            .await?;
+        self.follow_apply_events(response).await
+    }
+
+    /// Read an apply-shaped progress stream to its end: progress on stderr,
+    /// and the first error as the result.
+    async fn follow_apply_events(&self, response: reqwest::Response) -> Result<(), RelishError> {
         let status = response.status().as_u16();
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -4420,6 +4453,68 @@ mod tests {
         for error in [applied, rolled_back] {
             assert!(matches!(error, RelishError::ApiError { body, .. } if body == message));
         }
+    }
+
+    /// `scale` posts the count (and the one the caller saw, when given) as
+    /// JSON, with `force` as the query, and reads the answer as an apply's
+    /// stream: an error event is the result (#2176).
+    #[tokio::test]
+    async fn scale_posts_the_count_and_reads_the_stream() {
+        use axum::{Router, routing::post};
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+        let recorder = Arc::clone(&seen);
+        let handler = move |uri: axum::http::Uri, body: String| {
+            let recorder = Arc::clone(&recorder);
+            async move {
+                let refuse = body.contains("\"replicas\":9");
+                recorder.lock().unwrap().push((uri.to_string(), body));
+                let event = if refuse {
+                    ApplyEvent::Error {
+                        message: "refused by the cluster".into(),
+                    }
+                } else {
+                    ApplyEvent::Progress {
+                        message: "app web: committed to the cluster".into(),
+                    }
+                };
+                format!("data: {}\n\n", serde_json::to_string(&event).unwrap())
+            }
+        };
+        let app = Router::new().route("/v1/scale/web/default", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = BunClient::new_with_token(&format!("http://{address}"), None);
+
+        client
+            .scale("web", "default", 3, None, false)
+            .await
+            .unwrap();
+        client
+            .scale("web", "default", 4, Some(3), true)
+            .await
+            .unwrap();
+        let refused = client
+            .scale("web", "default", 9, None, false)
+            .await
+            .unwrap_err();
+        server.abort();
+        assert!(
+            matches!(&refused, RelishError::ApiError { body, .. } if body == "refused by the cluster"),
+            "{refused:?}"
+        );
+        let seen = seen.lock().unwrap().clone();
+        let bodies: Vec<serde_json::Value> = seen
+            .iter()
+            .map(|(_, body)| serde_json::from_str(body).unwrap())
+            .collect();
+        assert_eq!(seen[0].0, "/v1/scale/web/default");
+        assert_eq!(bodies[0], serde_json::json!({ "replicas": 3 }));
+        assert_eq!(seen[1].0, "/v1/scale/web/default?force=true");
+        assert_eq!(
+            bodies[1],
+            serde_json::json!({ "replicas": 4, "current_replicas": 3 })
+        );
     }
 
     /// Serve one canned `/v1/logs/query` answer and return what `relish logs`

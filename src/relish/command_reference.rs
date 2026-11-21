@@ -101,6 +101,7 @@ pub const GROUPS: &[CommandGroup] = &[
             "cancel-deploy",
             "history",
             "rollback",
+            "scale",
             "stop",
             "delete",
             "release",

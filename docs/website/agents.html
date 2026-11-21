@@ -371,7 +371,8 @@ decide it, with a permalink when the build is clean) and <code>next</code> (read
 commands such as <code>relish agent explain crashloop</code>). An app's log line, or an
 event message quoting one, travels only inside <code>untrusted</code>; where <code>wtf</code>'s own
 sentence quoted it, <code>diagnose</code> says <code>&lt;the app's log line, in events as untrusted text&gt;</code> instead. The <code>suggestion</code> can name commands that change the
-cluster, such as <code>relish rollback</code>: those are for you to run, not your agent.</p>
+cluster, such as <code>relish rollback</code> or <code>relish scale</code>: those are for you to
+run, not your agent. An agent asks for a scale with <code>relish agent propose scale</code>, which refuses the same things <code>relish scale</code> does.</p>
 <p><code>diagnose</code> exits <code>0</code> whatever it finds; <code>relish wtf</code>'s exit codes don't apply.</p>
 <p><code>explain crashloop</code> says what a finding means, reading only the binary: its
 <code>meaning</code>, <code>thresholds</code> (the constants the check compares against) and

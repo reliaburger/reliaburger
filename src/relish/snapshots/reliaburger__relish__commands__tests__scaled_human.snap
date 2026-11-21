@@ -1,0 +1,6 @@
+---
+source: src/relish/commands.rs
+expression: scaled.to_string()
+---
+scaled web to 3 replicas; `relish apps web` shows them start or stop
+applying the app's file again puts back the file's count

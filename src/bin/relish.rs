@@ -773,6 +773,30 @@ enum Command {
         #[arg(long)]
         break_lease: bool,
     },
+    /// Set an app's replica count. It lasts until the app's file is applied
+    /// again, which puts back the file's count.
+    Scale {
+        /// App name.
+        app: String,
+        /// The new count, at least 1 (`relish stop` scales to zero).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        replicas: u32,
+        /// Namespace the app lives in. Defaults to "default".
+        #[arg(long, default_value = "default")]
+        namespace: String,
+        /// Scale only if the app has this many replicas now, so you don't
+        /// overwrite someone else's scale.
+        #[arg(long)]
+        current_replicas: Option<u32>,
+        /// Scale an app GitOps manages. The next sync puts back the
+        /// repository's count.
+        #[arg(long)]
+        force: bool,
+        /// Break any agent lease on the app in your way (audited); without
+        /// it, someone else's lease refuses the change, naming them.
+        #[arg(long)]
+        break_lease: bool,
+    },
     /// Remove an app from the cluster; each node then stops its instances.
     Delete {
         /// App name.
@@ -2619,6 +2643,25 @@ async fn main() -> ExitCode {
             ref namespace,
             break_lease,
         } => commands::stop(app, namespace, break_lease, cli.output).await,
+        Command::Scale {
+            ref app,
+            replicas,
+            ref namespace,
+            current_replicas,
+            force,
+            break_lease,
+        } => {
+            commands::scale(
+                app,
+                namespace,
+                replicas,
+                current_replicas,
+                force,
+                break_lease,
+                cli.output,
+            )
+            .await
+        }
         Command::Delete {
             ref app,
             ref namespace,
@@ -4134,6 +4177,7 @@ fn output_support(command: &Command) -> OutputSupport {
         | Command::LogsSearch { .. }
         | Command::Exec { .. }
         | Command::Stop { .. }
+        | Command::Scale { .. }
         | Command::Delete { .. }
         | Command::Release { .. }
         | Command::Init(_)
@@ -4280,6 +4324,7 @@ mod tests {
         "undo",
         "exec",
         "stop",
+        "scale",
         "delete",
         "release",
         "init",
@@ -5556,6 +5601,45 @@ mod tests {
             cli.command,
             Command::Delete { ref app, ref namespace, force: false, break_lease: false } if app == "web" && namespace == "team-a"
         ));
+    }
+
+    /// #2176: `relish scale` takes the count as `--replicas`, as `kubectl
+    /// scale` does, refuses zero (that's `relish stop`), and takes the
+    /// precondition, `--force` and `--break-lease`.
+    #[test]
+    fn scale_takes_a_positive_count_and_its_flags() {
+        let cli = parse(&["relish", "scale", "web", "--replicas", "3"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Scale { ref app, replicas: 3, ref namespace, current_replicas: None, force: false, break_lease: false }
+                if app == "web" && namespace == "default"
+        ));
+        let cli = parse(&[
+            "relish",
+            "scale",
+            "web",
+            "--replicas",
+            "2",
+            "--namespace",
+            "shop",
+            "--current-replicas",
+            "1",
+            "--force",
+            "--break-lease",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Scale {
+                replicas: 2,
+                current_replicas: Some(1),
+                force: true,
+                break_lease: true,
+                ..
+            }
+        ));
+        assert!(parse(&["relish", "scale", "web", "--replicas", "0"]).is_err());
+        assert!(parse(&["relish", "scale", "web"]).is_err());
     }
 
     /// #693: `--force` deletes or rolls back an app that GitOps manages.

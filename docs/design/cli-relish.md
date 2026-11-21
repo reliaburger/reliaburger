@@ -638,6 +638,7 @@ relish deploy <path>                # Health-gated rolling deploy from a config 
 relish deploy <path> --dry-run      # Print the plan without deploying
 relish rollback <app>               # Roll back an app one step, to its previous version
 relish rollback <app> --namespace <ns>  # Roll back within a namespace
+relish scale <app> --replicas <n>   # Set an app's replica count until its file is applied again
 relish stop <app>                   # Stop all instances of an app
 relish release <app> [--namespace <ns>]  # Hand an app a controller owns back to apply and GitOps (#1125)
 relish inspect <app>                # Per-instance detail (bare app name, not app.X)
@@ -844,7 +845,6 @@ relish setup [--yes] [--dir <dir>] [--binary-dir <dir>]  # Guided install + star
 The following appear in earlier drafts of this document but are not in the
 shipped CLI. **Status: planned — not yet implemented.**
 
-- `relish scale <app> <n>` — no imperative scale; set `replicas` in config and `apply`.
 - `relish plan <path>` — use `relish apply <path> --dry-run`.
 - `relish events --follow` — event streaming exists only as a TUI/dashboard view.
 - `relish route <hostname>` — only `relish routes` (no argument) exists.
@@ -1015,10 +1015,17 @@ Relish apply plan:
 Plan: 1 to create, 0 to update, 0 to destroy.
 ```
 
-`relish scale <app> <n>` *(planned)* — **Status: planned — not yet implemented.**
+**`relish scale <app> --replicas <n>`**
 
-There is no imperative scale command. Set `replicas` in the app's config and
-re-run `relish apply`.
+Sets the count in the app's spec in the council, through the same path as
+`relish apply` (#2176). It isn't an override: the next apply of the app's file
+puts back the file's count, and `relish apply --dry-run` shows the difference
+until then. `--current-replicas <n>` refuses the scale when the spec's count
+has moved since you looked; `--force` scales an app GitOps manages;
+`--break-lease` breaks an agent's lease on it. Zero (`relish stop`), an
+autoscaled app and a daemon set are refused. The terminal UI's Instances tab
+does the same with `+` and `-`, after a `[y/N]` question. The design, and the
+alternatives we didn't take, are in [deployments](deployments.md) section 5.13.
 
 **`relish rollback <app>`**
 
