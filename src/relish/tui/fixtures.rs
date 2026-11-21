@@ -6,6 +6,7 @@ use crate::bun::agent::{
     ClusterInstanceStatus, CouncilStatus, InstanceStatus, JobStatus, NodeStatus,
 };
 use crate::bun::cluster_view::NodeTagged;
+use crate::bun::diagnostics::DesiredAppEvidence;
 use crate::bun::events::{ClusterEvent, EventKind, EventSeverity};
 use crate::bun::summary::{
     AgentsSection, AlertsSection, AppBrief, AppState, AppsSection, CapacitySection, CertsSection,
@@ -48,6 +49,20 @@ impl TestScenario {
             } else {
                 format!("app-{app_index}")
             };
+            data.desired_apps.push(DesiredAppEvidence {
+                app: name.clone(),
+                namespace: "default".to_string(),
+                desired_replicas: 2,
+                scheduled_replicas: 2,
+                placements: BTreeMap::new(),
+                service_port: None,
+                blocked: None,
+                volume_home_away: None,
+                unschedulable: None,
+                volume_homes: Vec::new(),
+                rollout_failed: None,
+                owner: None,
+            });
             for replica in 0..2 {
                 let degraded = matches!(self, Self::DegradedApp) && app_index == 0 && replica == 1;
                 data.instances.push(ClusterInstanceStatus {

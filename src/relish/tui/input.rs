@@ -8,13 +8,19 @@ use super::state::{DetailTab, Effect, Level, SearchHit, TuiApp, View};
 
 impl TuiApp {
     pub(super) fn handle_key(&mut self, key: KeyEvent) {
-        if self.palette.is_some() {
+        // An open question takes the next key, whatever it is, so `q`
+        // there says no rather than leaving the view.
+        if self.scale_prompt.is_some() {
+            self.answer_scale_prompt(key);
+        } else if self.palette.is_some() {
             self.handle_palette_key(key);
         } else if matches!(self.view(), View::Search) {
             self.handle_search_key(key);
         } else if self.filter_editing {
             self.handle_filter_key(key);
-        } else if let Some(action) = key_to_action(key) {
+        } else if !self.handle_scale_key(key)
+            && let Some(action) = key_to_action(key)
+        {
             let action = if action == super::keys::KeyAction::Refresh
                 && matches!(
                     self.view(),

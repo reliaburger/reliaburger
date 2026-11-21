@@ -169,6 +169,83 @@ Pressing `:` opens a small command palette. Its language is intentionally tiny:
 
 Search is similarly modest. It scans cached apps, nodes, jobs, routes and event messages case-insensitively. Prefix matches sort first. We didn't add a fuzzy-matching crate because substring matching solves the current problem and is easy to explain.
 
+## The first key that changes something
+
+For its first year the TUI only looked. Then, in the Wyse lab, the
+maintainer wanted to press `+` on an app and get another replica (#2176).
+There was no API for it: replicas lived in the app's spec, and only `relish
+apply` changed the spec.
+
+The interesting question isn't the key. It's what happens after. Say the
+file says `replicas = 1`, you scale to 3, and next week somebody runs
+`relish apply app.toml`. Should the cluster keep 3 or go back to 1?
+
+Kubernetes answers "it depends". `kubectl scale` writes the live object, and
+the next `kubectl apply` of a manifest that sets `replicas` writes it back;
+leave `replicas` out of the manifest and the scale sticks. GitOps tools then
+spot the difference and either revert it or learn to ignore it. That's three
+behaviours, chosen by whether a field is absent from a file.
+
+We picked one. A scale is an ordinary spec write, and the file wins. The new
+`POST /v1/scale/{app}/{namespace}` handler reads the app's stored spec from
+the council, sets `replicas`, and hands that one-app config to the same
+`cluster_apply` that `relish apply` uses. Policy, owners, agent leases, the
+audit record and the Raft write come along for free. There's no second
+number hiding beside the spec, so `relish apply --dry-run` against the file
+shows the app as changed until someone decides which count is right. Drift
+you can see beats drift you can't.
+
+Here's the heart of it:
+
+```rust
+let Some(spec) = desired.apps.get(app_id) else {
+    return Err((StatusCode::NOT_FOUND, format!("there's no app {app_id} to scale")));
+};
+if let Some(refusal) = spec.scale_refusal(replicas) {
+    // zero is `relish stop`; an autoscaled app and a daemon set have no
+    // count to set
+}
+let mut spec = spec.clone();
+spec.replicas = crate::config::Replicas::Fixed(replicas);
+```
+
+`desired.apps.get` returns `Option<&AppSpec>`, a borrow into the council's
+snapshot. We can't change something we only borrowed, so `spec.clone()`
+makes our own copy first; the compiler would refuse `spec.replicas = ...` on
+the borrow. `let ... else` is the Rust way to say "bind this or leave": the
+`else` block must end the function (here with `return`), so after it `spec`
+is known to exist.
+
+`scale_refusal` lives on `AppSpec` and returns `Option<ScaleRefusal>`, a
+three-variant enum. An agent's `relish agent propose scale` (Chapter 19)
+calls the same method, so a person and an agent are refused for exactly the
+same things, each with its own wording.
+
+Two smaller decisions are worth a sentence each. We re-apply the *stored*
+spec, whose images are already bound to digests, so a scale never quietly
+pulls a newer image behind a moving tag. And the body may carry
+`current_replicas`, borrowed from `kubectl scale --current-replicas`: the
+scale is refused when the spec's count is no longer the one you saw.
+
+In the TUI, `+` and `-` on the Instances tab don't do anything straight
+away. They fill `scale_prompt`, an `Option<ScalePrompt>`, and the next key
+answers it:
+
+```rust
+if self.scale_prompt.is_some() {
+    self.answer_scale_prompt(key);
+} else if self.palette.is_some() {
+    // ...
+```
+
+Putting the question first means `q` says no instead of leaving the view, so
+you can't back out of a view with a question still hanging. Only `y` pushes
+an `Effect::Scale`, carrying the count the question showed as
+`current_replicas`. The question says "from 2 to 3", so 3 mustn't land on top
+of someone else's 5. The count comes from `/v1/diagnostics/apps`, what the
+spec asks for, not from how many instances happen to be running. The
+reducer stays pure: it never makes the HTTP call, it only asks for one.
+
 ## Testing a screen
 
 Ratatui's `TestBackend` renders into an in-memory cell buffer. Tests render at 120 by 40 cells, concatenate the visible symbols and compare the result with an Insta snapshot. Styles are excluded deliberately. Changing a warning colour shouldn't rewrite twenty files.

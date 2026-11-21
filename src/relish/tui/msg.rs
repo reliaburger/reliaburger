@@ -48,6 +48,13 @@ pub enum DataUpdate {
         result: Result<ClusterDeployHistory, ProviderError>,
     },
     AppMetrics(Result<MetricsQueryResult, ProviderError>),
+    DesiredApps(Result<Vec<crate::bun::diagnostics::DesiredAppEvidence>, ProviderError>),
+    /// The answer to a scale the person confirmed.
+    Scaled {
+        app: String,
+        to: u32,
+        result: Result<(), ProviderError>,
+    },
 }
 
 /// Live stream identifiers used in connection banners.

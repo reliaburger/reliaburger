@@ -8,11 +8,11 @@ expression: "render_to_string(&app, 120, 40)"
 │web · default                                                                                                         │
 │ Overview  │ [Instances] │  Logs  │  Metrics  │  Deploys  │  Config                                                   │
 │                                                                                                                      │
+│desired 2 · [+] scale up  [-] scale down                                                                              │
+│                                                                                                                      │
 │NODE         ID                       STATE         RESTARTS  HOST PORT  PID                                          │
 │node-1       web-0                    running              0       8000  1000                                         │
 │node-2       web-1                    running              0       8000  1001                                         │
-│                                                                                                                      │
-│                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │

@@ -210,6 +210,9 @@ never retries a failure. See [how Reliaburger is tested](testing.md).
 
 **A terminal UI and a web dashboard.** Run `relish` with no arguments for the
 TUI; `relish dashboard` opens the web UI through your authenticated CLI session.
+The TUI scales an app with `+` and `-` on its Instances tab, after asking, as
+`relish scale web --replicas 3` does from the shell. The count goes into the
+app's spec, so the next apply of its file puts back the file's count.
 
 **The manual ships in the binary.** `relish manual` is a searchable reader with
 runnable examples, and `relish source` fuzzy-searches the exact source the

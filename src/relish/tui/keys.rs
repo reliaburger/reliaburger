@@ -20,6 +20,11 @@ pub const KEYBINDINGS: &[(&str, &str, &str)] = &[
     ("/", "lists", "filter"),
     ("Tab", "app detail", "next tab"),
     ("Shift-Tab", "app detail", "previous tab"),
+    (
+        "+/-",
+        "app instances",
+        "scale up / down, after a y/N question",
+    ),
     ("f", "logs", "toggle follow"),
     ("PgUp/PgDn", "streams", "scroll"),
 ];
