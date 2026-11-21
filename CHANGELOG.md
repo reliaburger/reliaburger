@@ -23,6 +23,10 @@ Fixes from the Wyse 3040 lab that need a new appliance image. Not released yet: 
 
 - `relish netboot --stream-logs` shows an appliance's kernel and boot logs as it installs and boots, so a machine with no serial port can be watched from the terminal, and `relish machines logs` listens for them on its own. Off by default, because the logs cross the LAN in cleartext ([#2149](https://github.com/reliaburger/reliaburger/issues/2149)).
 
+### Fixed
+
+- `relish wtf` calls a crash loop only when one instance restarts three times in 15 minutes. Three replicas that restarted once each were a critical `crashloop` for 15 minutes, and the instance a restart named was never read ([#2197](https://github.com/reliaburger/reliaburger/issues/2197)).
+
 ## [0.3.1] - 2026-11-21
 
 Fixes from 0.3.0's gate and the first Wyse lab, and a terminal UI you can act from.

@@ -615,7 +615,7 @@ mod tests {
         report.critical.push(WtfFinding {
             id: "crashloop".to_string(),
             title: "app api/default restarted repeatedly".to_string(),
-            details: vec!["3 timestamped restarts in the last 15 minutes".to_string()],
+            details: vec!["instance api-0 restarted 3 times in the last 15 minutes".to_string()],
             suggestion: "app api is crashlooping; inspect its recent logs and run \
                          `relish rollback api` if this started after a deploy"
                 .to_string(),

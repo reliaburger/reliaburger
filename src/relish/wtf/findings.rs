@@ -334,13 +334,13 @@ pub const FINDINGS: &[FindingKind] = &[
     FindingKind {
         id: "crashloop",
         severities: CRITICAL,
-        meaning: "an app restarted repeatedly in a short window; a recent deploy and the app's first error line are attached when there are any",
+        meaning: "one instance of an app restarted repeatedly in a short window; a recent deploy and the app's first error line are attached when there are any",
         thresholds: &[
             Threshold {
                 constant: "CRASHLOOP_RESTARTS",
                 value: CRASHLOOP_RESTARTS as u64,
                 unit: Unit::Count,
-                meaning: "restarts inside the window that make a crash loop",
+                meaning: "restarts of one instance inside the window that make a crash loop",
             },
             Threshold {
                 constant: "CRASHLOOP_WINDOW_SECONDS",
