@@ -1,16 +1,16 @@
 jobs-vm-baseline: 60 seconds, concurrency 27 locally; image/executable preparation precedes the window; positive drain follows it
 0.0s: 1 raw successful exits within the window; 0 failures
-5.0s: 82154 raw successful exits within the window; 0 failures
-10.0s: 163310 raw successful exits within the window; 0 failures
-15.0s: 245210 raw successful exits within the window; 0 failures
-20.0s: 326870 raw successful exits within the window; 0 failures
-25.0s: 406312 raw successful exits within the window; 0 failures
-30.0s: 484061 raw successful exits within the window; 0 failures
-35.0s: 562125 raw successful exits within the window; 0 failures
-40.0s: 641324 raw successful exits within the window; 0 failures
-45.0s: 719275 raw successful exits within the window; 0 failures
-50.0s: 798791 raw successful exits within the window; 0 failures
-55.0s: 878850 raw successful exits within the window; 0 failures
-jobs-vm-baseline: 958758 raw successful exits in 60 seconds (15979.3/s)
+5.0s: 82206 raw successful exits within the window; 0 failures
+10.0s: 165394 raw successful exits within the window; 0 failures
+15.0s: 249416 raw successful exits within the window; 0 failures
+20.0s: 333101 raw successful exits within the window; 0 failures
+25.0s: 416821 raw successful exits within the window; 0 failures
+30.0s: 500562 raw successful exits within the window; 0 failures
+35.0s: 584406 raw successful exits within the window; 0 failures
+40.0s: 667941 raw successful exits within the window; 0 failures
+45.0s: 751826 raw successful exits within the window; 0 failures
+50.0s: 835618 raw successful exits within the window; 0 failures
+55.0s: 919393 raw successful exits within the window; 0 failures
+jobs-vm-baseline: 1003259 raw successful exits in 60 seconds (16721.0/s)
 0 failures, 0 retries; cleanup verified
 1.4B runs/day extrapolated — not an observed daily total

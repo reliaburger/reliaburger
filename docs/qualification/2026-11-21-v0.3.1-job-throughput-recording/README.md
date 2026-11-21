@@ -1,6 +1,6 @@
 # Homepage job-throughput recording, v0.3.1
 
-21 November 2026, 22:09–22:13 GMT, on the Mac Studio (Apple M5 Max,
+21 November 2026, 22:27–22:32 GMT, on the quiet Mac Studio (Apple M5 Max,
 128 GiB, macOS 27.2). `jobs.cast` and `report.json` are byte-for-byte the
 homepage's `assets/job-throughput.cast` and `assets/job-throughput-report.json`
 (`scripts/ci/test_job_demo.py` checks it). Each scenario's directory keeps its
@@ -8,27 +8,28 @@ homepage's `assets/job-throughput.cast` and `assets/job-throughput-report.json`
 
 | Scenario | Completed in 60 seconds | Rate | Failures | Retries |
 |---|---:|---:|---:|---:|
-| VM baseline (raw exits) | 958,758 | 15,979.3/s | 0 | n/a |
-| Fresh containers (runc) | 710 | 11.8/s | 0 | 1 |
-| Shared containers (shared-runc) | 405,000 | 6,750.0/s | 0 | 0 |
-| Host jobs (process) | 745,000 | 12,416.7/s | 0 | 0 |
+| VM baseline (raw exits) | 1,003,259 | 16,721.0/s | 0 | n/a |
+| Fresh containers (runc) | 774 | 12.9/s | 0 | 0 |
+| Shared containers (shared-runc) | 437,000 | 7,283.3/s | 0 | 0 |
+| Host jobs (process) | 772,000 | 12,866.7/s | 0 | 0 |
 
 One run, not a median; the homepage's table still gives the v0.2.0 medians of
 five rounds on the M2 Max laptop, so the two sets of rates aren't comparable.
 
-## Not a quiet host
+## The host
 
-The Studio wasn't to itself: other work (unit tests and Python checks from
-other worktrees) kept its load average between 3.3 and 6.1 during the run,
-sampled every 10 s. A first attempt at 21:49, while builds held the load
-between 10 and 33, gave rates 25% to 82% lower and wasn't published.
+The recorder held `~/.reliaburger/quiet.lock` for the whole run, so the
+power-cut endurance run (#2067) stood down, and no other build, test or VM
+ran. The host's 1-minute load average was 1.48 when the run started
+(22:27:50) and 4.41 when it ended (22:31:56); sampled every 10 s, it
+stayed between 1.48 and 5.39, which is the VM's own four busy vCPUs.
 
 Against the [0.2.8 recording](../2026-11-12-v0.2.8-job-throughput-recording/README.md)
-every rate is lower, the raw VM baseline by 25%. The guest changed too: 0.3.0
-moved the quickstart to Ubuntu 26.04 and Linux 7.0 (0.2.8's was 24.04 and
-6.8), so neither the host's load nor the release alone accounts for it.
-Read these as one run on a loaded host, not as a comparison between
-releases; the release-to-release comparison is the profile
+every rate is lower, the raw VM baseline by 22%, which no Reliaburger code
+runs in. The guest changed between them: 0.3.0 moved the quickstart to
+Ubuntu 26.04 and Linux 7.0 (0.2.8's was 24.04 and 6.8). Read these as one
+run of 0.3.1, not as a comparison between releases; the release-to-release
+comparison is the profile
 ([releasing step 9](../../releasing.md#staging-a-candidate)).
 
 ## Binaries
@@ -65,3 +66,5 @@ The published v0.3.1, each checked against the release's `SHA256SUMS`:
 
    The service is the quickstart's `hello` app through the node's ingress.
 5. `relish local destroy --yes` and `relish uninstall --yes`.
+
+Nothing else ran on the Studio during the recording.

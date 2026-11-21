@@ -341,7 +341,7 @@ A million in one go? 0.3.1’s 8-hour release soak ran 64 arrays of 1,048,576 ta
 
 What does each kind of isolation cost? Here’s the same command, run four ways on the same VM with the same concurrency.
 
-Recorded on 0.3.1, the published binaries, in one 4-vCPU, 8 GiB VM on a Mac Studio that other work kept busy (21 November 2026). Four real 60-second windows: 958,758 VM baseline exits, then 710 fresh containers, 405,000 shared containers and 745,000 host jobs accepted. Chapter jumps and playback speed change only your view; preparation and cleanup stay visible.
+Recorded on 0.3.1, the published binaries, in one 4-vCPU, 8 GiB VM on a Mac Studio (21 November 2026). Four real 60-second windows: 1,003,259 VM baseline exits, then 774 fresh containers, 437,000 shared containers and 772,000 host jobs accepted. Chapter jumps and playback speed change only your view; preparation and cleanup stay visible.
 
 Show the commands run the four scenarios on your own setup
 

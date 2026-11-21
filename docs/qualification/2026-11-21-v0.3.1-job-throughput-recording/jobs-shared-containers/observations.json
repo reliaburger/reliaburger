@@ -3,130 +3,130 @@
   "application_failures": 0,
   "resource_observations": [
     {
-      "elapsed_seconds": 0.0027601660001437267,
+      "elapsed_seconds": 0.0008617079999737598,
       "cpu_ticks": [
-        24231,
+        10953,
         0,
-        82944,
-        422526,
-        11955,
+        34853,
+        25242,
+        937,
         0,
-        3360,
+        520,
         0,
         0,
         0
       ],
       "storage": {
         "/var/lib/reliaburger/data": {
-          "allocated_bytes_observed": 11952128,
-          "files_observed": 494,
+          "allocated_bytes_observed": 6090752,
+          "files_observed": 472,
           "raced_entries": 0,
           "complete": true,
-          "filesystem_available_bytes": 6309109760
+          "filesystem_available_bytes": 6355660800
         }
       },
       "processes": [
         {
-          "pid": 2387,
-          "start_ticks": 3218,
+          "pid": 2355,
+          "start_ticks": 3014,
           "complete": true,
-          "rss_bytes": 202874880,
-          "peak_rss_bytes": 203063296
+          "rss_bytes": 166174720,
+          "peak_rss_bytes": 166174720
         },
         {
-          "pid": 2564,
-          "start_ticks": 4631,
+          "pid": 2527,
+          "start_ticks": 3983,
           "complete": true,
-          "rss_bytes": 2068480,
-          "peak_rss_bytes": 2068480
+          "rss_bytes": 2072576,
+          "peak_rss_bytes": 2072576
         }
       ]
     },
     {
-      "elapsed_seconds": 30.142937972000027,
+      "elapsed_seconds": 30.092994888999982,
       "cpu_ticks": [
-        26365,
+        13105,
         0,
-        92060,
-        423180,
-        12010,
+        44060,
+        25826,
+        957,
         0,
-        3461,
+        608,
         0,
         0,
         0
       ],
       "storage": {
         "/var/lib/reliaburger/data": {
-          "allocated_bytes_observed": 41598976,
-          "files_observed": 1036,
+          "allocated_bytes_observed": 36356096,
+          "files_observed": 1013,
           "raced_entries": 0,
           "complete": true,
-          "filesystem_available_bytes": 6279426048
+          "filesystem_available_bytes": 6325346304
         }
       },
       "processes": [
         {
-          "pid": 2387,
-          "start_ticks": 3218,
+          "pid": 2355,
+          "start_ticks": 3014,
           "complete": true,
-          "rss_bytes": 221331456,
-          "peak_rss_bytes": 221331456
+          "rss_bytes": 222683136,
+          "peak_rss_bytes": 222683136
         },
         {
-          "pid": 2564,
-          "start_ticks": 4631,
+          "pid": 2527,
+          "start_ticks": 3983,
           "complete": true,
-          "rss_bytes": 2068480,
-          "peak_rss_bytes": 2068480
+          "rss_bytes": 2072576,
+          "peak_rss_bytes": 2072576
         }
       ]
     },
     {
-      "elapsed_seconds": 60.23587244500004,
+      "elapsed_seconds": 60.21596152799998,
       "cpu_ticks": [
-        28590,
+        15319,
         0,
-        101567,
-        423386,
-        12012,
+        53706,
+        25946,
+        958,
         0,
-        3509,
+        641,
         0,
         0,
         0
       ],
       "storage": {
         "/var/lib/reliaburger/data": {
-          "allocated_bytes_observed": 52191232,
-          "files_observed": 1036,
+          "allocated_bytes_observed": 47489024,
+          "files_observed": 1014,
           "raced_entries": 0,
           "complete": true,
-          "filesystem_available_bytes": 6268833792
+          "filesystem_available_bytes": 6314205184
         }
       },
       "processes": [
         {
-          "pid": 2387,
-          "start_ticks": 3218,
+          "pid": 2355,
+          "start_ticks": 3014,
           "complete": true,
-          "rss_bytes": 221458432,
-          "peak_rss_bytes": 221458432
+          "rss_bytes": 222707712,
+          "peak_rss_bytes": 222707712
         },
         {
-          "pid": 2564,
-          "start_ticks": 4631,
+          "pid": 2527,
+          "start_ticks": 3983,
           "complete": true,
-          "rss_bytes": 2068480,
-          "peak_rss_bytes": 2068480
+          "rss_bytes": 2072576,
+          "peak_rss_bytes": 2072576
         }
       ]
     }
   ],
   "service_latency_ms": {
     "samples": 62,
-    "maximum": 25.46775000018897,
-    "p95": 4.98474999994869
+    "maximum": 20.150540999992472,
+    "p95": 7.63762500000098
   },
   "observation_boundary": "Service and resource observations span preparation, measured work and positive drain"
 }
