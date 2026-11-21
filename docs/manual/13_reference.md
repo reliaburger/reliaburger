@@ -486,6 +486,7 @@ these keys inside it too.
 | ↑/↓, Enter | node detail Workloads tab | select an instance on the node; Enter opens its app |
 | ↑/↓ | app detail Instances tab | select an instance |
 | `k` or Ctrl-K | app detail Instances tab | kill the selected instance, after a `[y/N]` prompt (only `y` kills); it sends the same audited kill as `relish fault kill APP --instance ID --node NODE --acknowledge --reason "relish tui"`, and the scheduler starts a replacement |
+| `+`, `-` | app detail Instances tab | scale the app up or down by one, after a `[y/N]` prompt (only `y` scales); it's `relish scale APP --replicas N --current-replicas M` *(0.3.2, not in 0.3.0)*, and the next apply of the app's file puts back the file's count |
 | `f` | logs | follow the newest lines, or stop |
 | PgUp/PgDn | logs, events | scroll |
 
@@ -547,6 +548,7 @@ See [deploy an app](01_deploy-an-app.md) and [writing a controller](15_writing-a
 - `relish cancel-deploy <OPERATION_ID>`: Cancel a node-local deploy and wait for its current work to finish
 - `relish history <APP>`: Show deploy history for an app, from every node
 - `relish rollback <APP>`: Rollback an app to the previous version
+- `relish scale --replicas <REPLICAS> <APP>`: Set an app's replica count. It lasts until the app's file is applied again, which puts back the file's count *(0.3.2, not in 0.3.0)*
 - `relish stop <APP>`: Scale an app to zero, keeping its configuration; `relish apply` starts it again
 - `relish delete <APP>`: Remove an app from the cluster; each node then stops its instances
 - `relish release <APP>`: Take an app back from the controller that owns it, so `relish apply` and GitOps manage it again (owner or admin)

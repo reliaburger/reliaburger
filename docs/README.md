@@ -212,6 +212,9 @@ never retries a failure. See [how Reliaburger is tested](testing.md).
 
 **A terminal UI and a web dashboard.** Run `relish` with no arguments for the
 TUI; `relish dashboard` opens the web UI through your authenticated CLI session.
+The TUI scales an app with `+` and `-` on its Instances tab, after asking, as
+`relish scale web --replicas 3` does from the shell. The count goes into the
+app's spec, so the next apply of its file puts back the file's count.
 
 **The manual ships in the binary.** `relish manual` is a searchable reader with
 runnable examples, and `relish source` fuzzy-searches the exact source the
@@ -1170,6 +1173,7 @@ TUI keys:
 | `/` | Filter the current list; search the logs or the Logs and Metrics tabs, matches in red and bold |
 | Escape (with a filter or search) | Clear it |
 | `k`, Ctrl-K | Kill the selected instance in the Instances tab, after a `[y/N]` prompt; it's an audited Smoker kill fault |
+| `+`, `-` | Scale the app in the Instances tab up or down by one, after a `[y/N]` prompt; the next apply of its file puts back the file's count |
 | `f` | Toggle log following |
 | Escape, `q` | Go back; quit from the dashboard |
 

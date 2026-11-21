@@ -27,6 +27,7 @@ pub const KEYBINDINGS: &[(&str, &str, &str)] = &[
         "instances",
         "kill the selected instance (asks first)",
     ),
+    ("+/-", "instances", "scale the app up / down (asks first)"),
     ("↑/↓", "workloads", "select an instance"),
     ("Enter", "workloads", "open the instance's app"),
     ("f", "logs", "toggle follow"),

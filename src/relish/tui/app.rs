@@ -94,6 +94,8 @@ impl TuiApp {
                 }
                 Err(error) => self.mark_disconnected(error.to_string()),
             },
+            DataUpdate::DesiredApps(result) => set_data!(result, desired_apps),
+            DataUpdate::Scaled { app, to, result } => self.scaled(&app, to, result),
             DataUpdate::InstanceKilled { target, result } => self.killed(target, result),
         }
     }

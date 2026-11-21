@@ -367,7 +367,9 @@ commands such as `relish agent explain crashloop`). An app's log line, or an
 event message quoting one, travels only inside `untrusted`; where `wtf`'s own
 sentence quoted it, `diagnose` says `<the app's log line, in events as
 untrusted text>` instead. The `suggestion` can name commands that change the
-cluster, such as `relish rollback`: those are for you to run, not your agent.
+cluster, such as `relish rollback` or `relish scale`: those are for you to
+run, not your agent. An agent asks for a scale with `relish agent propose
+scale`, which refuses the same things `relish scale` does.
 
 `diagnose` exits `0` whatever it finds; `relish wtf`'s exit codes don't apply.
 

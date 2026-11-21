@@ -940,7 +940,7 @@ Relish is the CLI and interactive terminal UI for Reliaburger. Running `relish` 
 | `relish timeline` | What changed in a window: events, the decisions behind them, the audit log and deploys | `kubectl get events` (1h expiry) |
 | `relish history <app>` | Deploy history for an app | `kubectl rollout history` |
 | `relish rollback <app>` | One-command rollback | `kubectl rollout undo` |
-| `relish scale <app> <n>` *(planned)* | Set replica count | `kubectl scale` |
+| `relish scale <app> --replicas <n>` | Set replica count until the file is applied again | `kubectl scale` |
 | `relish secret encrypt` | Encrypt a secret value | (none — requires Sealed Secrets) |
 | `relish fault <type> <app>` | Inject a fault | (none — requires Chaos Mesh / Litmus) |
 | `relish test` | Run integration test suite | (none) |
@@ -1068,7 +1068,7 @@ Claims about agents are only worth what measures them. An agent gym in `scripts/
 
 From 0.2.8 the gym also tests proposals, with the solver holding a deployer agent token: a rollback proposed after a bad deploy, a proposal a guardrail refuses, two agents after the same app (the second must meet the first one's lease) and an approval that goes stale because a person changed the app first. Proposing and taking a lease don't make a run unsafe; changing the cluster directly still does, and each scenario checks what the cluster answered, as well as what the agent said.
 
-Every concept an agent must learn is a cost, so a test counts them: on the 0.3.0 train, 8 resource kinds and 209 `relish` commands and subcommands, hidden ones included, read from the CLI's own definitions. The budget lives in `docs/testing/concept-budget.json` with the reason for every number, and the test fails when a count moves either way, so a new concept is a line a reviewer has to agree with. Small local models have been through the gym ([#1687](https://github.com/reliaburger/reliaburger/issues/1687)): four open models in Ollama at an 8K window, three runs a scenario, scored 12 of 36 (Qwen3 8B and 14B), 7 (Llama 3.1 8B) and 6 (gpt-oss 20B). They manage the simple diagnoses and not much past them ([record](qualification/2026-11-10-gym-local-models-second-pass.md)). One measurement isn't made yet, and we quote no numbers for it: the tokens and time the same agent spends on the same faults on Kubernetes ([#1679](https://github.com/reliaburger/reliaburger/issues/1679), for [#1681](https://github.com/reliaburger/reliaburger/issues/1681)).
+Every concept an agent must learn is a cost, so a test counts them: on the 0.3.0 train, 8 resource kinds and 210 `relish` commands and subcommands, hidden ones included, read from the CLI's own definitions. The budget lives in `docs/testing/concept-budget.json` with the reason for every number, and the test fails when a count moves either way, so a new concept is a line a reviewer has to agree with. Small local models have been through the gym ([#1687](https://github.com/reliaburger/reliaburger/issues/1687)): four open models in Ollama at an 8K window, three runs a scenario, scored 12 of 36 (Qwen3 8B and 14B), 7 (Llama 3.1 8B) and 6 (gpt-oss 20B). They manage the simple diagnoses and not much past them ([record](qualification/2026-11-10-gym-local-models-second-pass.md)). One measurement isn't made yet, and we quote no numbers for it: the tokens and time the same agent spends on the same faults on Kubernetes ([#1679](https://github.com/reliaburger/reliaburger/issues/1679), for [#1681](https://github.com/reliaburger/reliaburger/issues/1681)).
 
 ### 17.8 What's Planned
 

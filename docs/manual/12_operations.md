@@ -467,8 +467,8 @@ GitOps owns:
 - `relish apply` of a GitOps-managed resource goes ahead and warns:
   `warning: namespace 'production' is managed by GitOps; manual changes are
   reverted on the next sync`.
-- `relish delete` and `relish rollback` of a GitOps-managed app are refused,
-  because the next sync would undo them. Change the repository instead, or
+- `relish delete`, `relish rollback` and `relish scale` of a GitOps-managed
+  app are refused, because the next sync would undo them. Change the repository instead, or
   pass `--force` when you really want the cluster to differ for a poll.
 - A forced delete also forgets the ownership. While the repository still
   declares the app, the next sync recreates it and owns it again.

@@ -4,6 +4,7 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::bun::agent::{ClusterInstanceStatus, CouncilStatus, JobStatus};
 use crate::bun::cluster_view::{ClusterDeployHistory, NodeTagged};
+use crate::bun::diagnostics::DesiredAppEvidence;
 use crate::bun::events::ClusterEvent;
 use crate::bun::summary::ClusterSummary;
 use crate::mayo::rollup::MetricsQueryResult;
@@ -118,6 +119,9 @@ pub struct ClusterData {
     /// name in different namespaces have separate histories (C3).
     pub deploy_history: HashMap<String, ClusterDeployHistory>,
     pub app_metrics: Option<MetricsQueryResult>,
+    /// Every app the council knows, with the replica count its spec asks
+    /// for: where the Instances tab's scale starts from.
+    pub desired_apps: Vec<DesiredAppEvidence>,
     pub last_updated: Option<u64>,
 }
 
@@ -192,6 +196,32 @@ pub enum Effect {
     /// Send Smoker's kill fault for one instance, as `relish fault kill`
     /// does. Only a `y` at the confirmation prompt queues it.
     KillInstance(InstanceTarget),
+    /// Set an app's replica count, if it's still `from` (#2176).
+    Scale {
+        app: String,
+        namespace: String,
+        from: u32,
+        to: u32,
+    },
+}
+
+/// A scale waiting for the person to say yes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScalePrompt {
+    pub app: String,
+    pub namespace: String,
+    pub from: u32,
+    pub to: u32,
+}
+
+impl ScalePrompt {
+    /// The question, with what undoes the answer.
+    pub fn question(&self) -> String {
+        format!(
+            "Scale {} from {} to {}? Applying its file again puts back the file's count. [y/N]",
+            self.app, self.from, self.to
+        )
+    }
 }
 
 /// Cache key for [`ClusterData::deploy_history`].
@@ -226,6 +256,8 @@ pub struct TuiApp {
     pub filter: Option<String>,
     pub filter_editing: bool,
     pub palette: Option<PaletteState>,
+    /// A scale asked for with `+` or `-`, until it's answered.
+    pub scale_prompt: Option<ScalePrompt>,
     pub status_message: Option<(String, Level)>,
     pub should_quit: bool,
     pub pending: Vec<Effect>,
@@ -262,6 +294,7 @@ impl TuiApp {
             filter: None,
             filter_editing: false,
             palette: None,
+            scale_prompt: None,
             status_message: None,
             should_quit: false,
             pending: Vec::new(),

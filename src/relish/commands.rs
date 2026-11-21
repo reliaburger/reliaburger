@@ -1016,6 +1016,81 @@ async fn delete_with_client(
     print_output(&change, output)
 }
 
+/// Set an app's replica count (#2176). The count goes into the app's spec
+/// in the cluster, so it lasts until the app's file is applied again,
+/// which puts back the file's count. A GitOps-managed app needs `force`.
+pub async fn scale(
+    app: &str,
+    namespace: &str,
+    replicas: u32,
+    current_replicas: Option<u32>,
+    force: bool,
+    break_lease: bool,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
+    let client = BunClient::default_local().breaking_leases(break_lease);
+    let scaled = Scaled {
+        app,
+        namespace,
+        replicas,
+        forced: force,
+    };
+    scale_with_client(&scaled, current_replicas, output, &client).await
+}
+
+async fn scale_with_client(
+    scaled: &Scaled<'_>,
+    current_replicas: Option<u32>,
+    output: OutputFormat,
+    client: &BunClient,
+) -> Result<(), RelishError> {
+    client
+        .scale(
+            scaled.app,
+            scaled.namespace,
+            scaled.replicas,
+            current_replicas,
+            scaled.forced,
+        )
+        .await?;
+    print_output(scaled, output)
+}
+
+/// A scale the cluster committed.
+#[derive(Debug, serde::Serialize)]
+pub struct Scaled<'a> {
+    pub app: &'a str,
+    pub namespace: &'a str,
+    /// The count the app's spec now holds.
+    pub replicas: u32,
+    /// `--force` scaled an app GitOps manages; the next sync puts back
+    /// the repository's count.
+    pub forced: bool,
+}
+
+impl std::fmt::Display for Scaled<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let noun = if self.replicas == 1 {
+            "replica"
+        } else {
+            "replicas"
+        };
+        writeln!(
+            f,
+            "scaled {} to {} {noun}; `relish apps {}` shows them start or stop",
+            self.app, self.replicas, self.app
+        )?;
+        if self.forced {
+            writeln!(f, "the next GitOps sync puts back the repository's count")
+        } else {
+            writeln!(
+                f,
+                "applying the app's file again puts back the file's count"
+            )
+        }
+    }
+}
+
 /// Hand an app a controller owns back to `relish apply` and GitOps (#1125).
 pub async fn release(
     app: &str,
@@ -6078,6 +6153,36 @@ spec:
         .await
         .unwrap_err();
         assert!(matches!(err, RelishError::AgentUnreachable { .. }));
+    }
+
+    #[tokio::test]
+    async fn scale_returns_agent_unreachable() {
+        let scaled = Scaled {
+            app: "web",
+            namespace: "default",
+            replicas: 3,
+            forced: false,
+        };
+        let err = scale_with_client(&scaled, None, OutputFormat::Human, &bogus_client())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RelishError::AgentUnreachable { .. }));
+    }
+
+    /// `relish scale` says the count and that the file's count comes back
+    /// with the next apply; `-o json` is the same facts as data.
+    #[test]
+    fn a_scale_reports_the_count_and_what_puts_it_back() {
+        let mut scaled = Scaled {
+            app: "web",
+            namespace: "shop",
+            replicas: 3,
+            forced: false,
+        };
+        insta::assert_snapshot!("scaled_human", scaled.to_string());
+        scaled.forced = true;
+        insta::assert_snapshot!("scaled_forced_human", scaled.to_string());
+        insta::assert_json_snapshot!("scaled_json", scaled);
     }
 
     #[tokio::test]

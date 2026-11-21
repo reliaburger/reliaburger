@@ -17,7 +17,7 @@ fn tab_hint(tab: DetailTab) -> &'static str {
     match tab {
         DetailTab::Logs => "←/→ or Tab: switch tabs · /: search · f: follow",
         DetailTab::Metrics => "←/→ or Tab: switch tabs · /: search",
-        DetailTab::Instances => "←/→ or Tab: switch tabs · ↑/↓: select · k: kill",
+        DetailTab::Instances => "←/→ or Tab: switch tabs · ↑/↓: select · k: kill · +/-: scale",
         _ => "←/→ or Tab: switch tabs",
     }
 }
@@ -114,6 +114,14 @@ pub fn lines(app: &TuiApp, height: usize) -> Vec<Line<'static>> {
             ]);
         }
         DetailTab::Instances => {
+            match &app.scale_prompt {
+                Some(prompt) => lines.push(widgets::heading(prompt.question())),
+                None => lines.push(Line::raw(match app.desired_replicas(name, namespace) {
+                    Some(count) => format!("desired {count} · [+] scale up  [-] scale down"),
+                    None => "desired unknown".to_string(),
+                })),
+            }
+            lines.push(Line::raw(""));
             lines.push(widgets::heading(
                 "NODE         ID                       STATE         RESTARTS  HOST PORT  PID      IMAGE",
             ));

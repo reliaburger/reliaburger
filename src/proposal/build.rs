@@ -422,23 +422,20 @@ fn one_app_change(
             let Some(replicas) = replicas else {
                 return invalid("a scale names the new count in `replicas`");
             };
-            if replicas == 0 {
-                return refused(
-                    "scale_to_zero",
-                    format!("scaling {app} to zero is `stop`; propose that instead"),
-                );
-            }
-            if spec.autoscale.is_some() {
-                return refused(
-                    "autoscaled",
-                    format!("{app} is autoscaled; the autoscaler owns its replica count"),
-                );
-            }
-            if spec.replicas == Replicas::DaemonSet {
-                return refused(
-                    "daemon",
-                    format!("{app} runs one replica on every node and has no count to scale"),
-                );
+            if let Some(refusal) = spec.scale_refusal(replicas) {
+                use crate::config::app::ScaleRefusal;
+                let message = match refusal {
+                    ScaleRefusal::ToZero => {
+                        format!("scaling {app} to zero is `stop`; propose that instead")
+                    }
+                    ScaleRefusal::Autoscaled => {
+                        format!("{app} is autoscaled; the autoscaler owns its replica count")
+                    }
+                    ScaleRefusal::DaemonSet => {
+                        format!("{app} runs one replica on every node and has no count to scale")
+                    }
+                };
+                return refused(refusal.rule(), message);
             }
             let mut after = spec;
             after.replicas = Replicas::Fixed(replicas);

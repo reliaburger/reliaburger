@@ -1,0 +1,10 @@
+---
+source: src/relish/commands.rs
+expression: scaled
+---
+{
+  "app": "web",
+  "namespace": "shop",
+  "replicas": 3,
+  "forced": true
+}
