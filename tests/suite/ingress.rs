@@ -25,6 +25,10 @@ use tokio_util::sync::CancellationToken;
 use crate::task_harness;
 use task_harness::TestTasks;
 
+/// A port every connection to is refused, like `refused_address()` in the
+/// library (#1844): below every ephemeral range, so no test is given it.
+const REFUSED_PORT: u16 = 1;
+
 /// Agent + API + bound ingress listeners, all on ephemeral ports.
 struct IngressHarness {
     client: BunClient,
@@ -161,17 +165,32 @@ async fn wait_for_status(
     host: &str,
     expected: u16,
 ) -> reqwest::Response {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    let mut last = None;
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_secs(20);
+    // Every answer the proxy gave, counted, plus the last body: a 404 means
+    // the route never went in, a 2xx means something answered for the
+    // backend, a 503 points at drains or the lease (#2156).
+    let mut seen = std::collections::BTreeMap::<String, u32>::new();
+    let mut last_body = String::new();
     while tokio::time::Instant::now() < deadline {
         match http_client.get(url).header("host", host).send().await {
             Ok(response) if response.status().as_u16() == expected => return response,
-            Ok(response) => last = Some(format!("status {}", response.status())),
-            Err(error) => last = Some(error.to_string()),
+            Ok(response) => {
+                *seen
+                    .entry(format!("status {}", response.status()))
+                    .or_default() += 1;
+                let body = response.text().await.unwrap_or_default();
+                last_body = body.chars().take(200).collect();
+            }
+            Err(error) => *seen.entry(format!("error {error}")).or_default() += 1,
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    panic!("proxy never returned {expected} for host {host} at {url}; last saw {last:?}");
+    panic!(
+        "proxy never returned {expected} for host {host} at {url} in {:?}; \
+         saw {seen:?}; last body {last_body:?}",
+        started.elapsed()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -217,19 +236,24 @@ async fn ingress_returns_404_for_unknown_host() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ingress_returns_502_when_backend_unreachable() {
-    let harness = IngressHarness::start().await;
+    // ProcessGrill registers the allocated host port as the backend, not the
+    // app's `port`, so the allocator is pinned to port 1. A port drawn from
+    // 42000-43000 sits inside Linux's ephemeral range (32768-60999), and a
+    // parallel test's listener there answered for the "dead" backend (#2156).
+    // Port 1 is below every ephemeral range and refuses at once (#1844).
+    let harness = IngressHarness::start_reaching(REFUSED_PORT).await;
 
-    // Port 1 is never listening: the route exists, the forward fails.
-    let config = Config::parse(
+    // The route exists, the forward fails.
+    let config = Config::parse(&format!(
         r#"
         [app.dead]
         script = "exec sleep 86400"
-        port = 1
+        port = {REFUSED_PORT}
 
         [app.dead.ingress]
         host = "dead.test"
-    "#,
-    )
+    "#
+    ))
     .unwrap();
     harness.client.apply(&config).await.unwrap();
 

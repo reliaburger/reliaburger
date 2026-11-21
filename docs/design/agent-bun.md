@@ -33,7 +33,7 @@ Bun's responsibilities on every node:
 
 Grill is Bun's container runtime interface -- the abstraction layer between Bun's workload management logic and the underlying runtime. Grill handles OCI image unpacking, container creation, network namespace setup, cgroup configuration, port mapping, and stdio stream attachment. The name follows the Reliaburger convention: Grill is where containers get cooked.
 
-> **Decision log — Grill drives runtimes directly, not via containerd.** An earlier draft (still visible in a few listings below, e.g. §2 and §4.1) had Grill talk to `containerd` over its gRPC socket. The shipped Grill has three concrete backends and no containerd dependency: `runc` on Linux (Grill writes the OCI bundle and drives foreground `runc run` plus the state/exec commands itself), Apple Container on macOS, and a `process` backend that runs a host binary with no OCI runtime at all. We dropped containerd because it duplicated the exact state Bun already keeps (which container is where, in what state) and added a socket, a gRPC dependency, and a second thing to keep alive under memory pressure — for a single-binary orchestrator that already reconciles container state on restart, the shim earned its keep nowhere. Where the text below says "containerd," read "the Grill backend for this node's runtime." References to state surviving Bun restarts still hold: `runc`'s own `state` and the Apple VM outlive Bun, and Grill re-adopts them on startup.
+> **Decision log — Grill drives runtimes directly, not via containerd.** An earlier draft had Grill talk to `containerd` over its gRPC socket. The shipped Grill has three concrete backends and no containerd dependency: `runc` on Linux (Grill writes the OCI bundle and drives foreground `runc run` plus the state/exec commands itself), Apple Container on macOS, and a `process` backend that runs a host binary with no OCI runtime at all. We dropped containerd because it duplicated the exact state Bun already keeps (which container is where, in what state) and added a socket, a gRPC dependency, and a second thing to keep alive under memory pressure — for a single-binary orchestrator that already reconciles container state on restart, the shim earned its keep nowhere. Where the text below says "containerd," read "the Grill backend for this node's runtime." References to state surviving Bun restarts still hold: `runc`'s own `state` and the Apple VM outlive Bun, and Grill re-adopts them on startup.
 
 **0.1.0 process-mode scope (20 September 2026):** Native process workloads must
 run in the foreground and keep all children in the supervised process group.
@@ -1854,7 +1854,7 @@ The default seccomp profile blocks the following syscall families (identical for
 | Apps per node | 500 | Design goal from Section 2 |
 | Per-app overhead (Bun tracking) | < 1ms | Sub-millisecond at 500 apps |
 | Memory per app (Bun tracking) | ~1.2 MB | Measured: 312 MB at 500 apps vs 48 MB idle = ~528 KB tracking + workload overhead |
-| Bun agent memory (idle) | ~48 MB | Baseline: Tokio runtime, eBPF management, gRPC channels, config |
+| Bun agent memory (idle) | ~48 MB | Baseline: Tokio runtime, eBPF management, gossip and Raft, config |
 | Bun agent memory (500 apps) | ~312 MB | Scales linearly with app count |
 | eBPF service map entries | 500/node, 5M cluster-wide (10K nodes) | One entry per workload instance |
 | eBPF map memory (kernel) | ~0.8 MB per node | Measured at ~5,800 entries |

@@ -28,8 +28,13 @@
 # <target>, and the rollout has paused on the fallback bun reported. It
 # records how long the fallback took, from the reboot into <target> to bun
 # healthy on <version>, and fails if that took more than the 10 minutes the
-# Wyse exit test allows (S5, image/tests/fallback.sh).
-# Needs root (the bridge), qemu-system-x86, ovmf, dnsmasq and /dev/kvm.
+# Wyse exit test allows (S5, image/tests/fallback.sh). The node streams its
+# boot logs to `relish machines logs` on the runner (#2149), as a Wyse in the
+# lab does to the lab Mac: reliaburger/netlog.conf on its ESP names the
+# runner. The stream must carry each of the three failed tries and bun
+# healthy again on <version>.
+# Needs root (the bridge), qemu-system-x86, ovmf, dnsmasq, mtools and
+# /dev/kvm.
 set -euo pipefail
 # shellcheck source=image/tests/disk.sh
 . "$(dirname "$0")/disk.sh"
@@ -72,6 +77,7 @@ sudo ip link set rbbr0 up
 cleanup() {
     [ -n "${qemu:-}" ] && kill "$qemu" 2>/dev/null || true
     [ -n "${http:-}" ] && kill "$http" 2>/dev/null || true
+    [ -n "${netlog:-}" ] && kill "$netlog" 2>/dev/null || true
     sudo pkill -f "dnsmasq.*rbbr0" || true
     sudo ip link del rbtap0 2>/dev/null || true
     sudo ip link del rbbr0 2>/dev/null || true
@@ -95,6 +101,17 @@ sudo ip tuntap add rbtap0 mode tap user "$(id -un)"
 sudo ip link set rbtap0 master rbbr0 up
 zstd -q -d "$out/reliaburger-os_$version.raw.zst" -o "$work/disk.raw"
 disk_from_image "$work/disk.raw"
+if [ "$mode" = fallback ]; then
+    # Boot logs to the runner (#2149): netlog.conf on the ESP, the image's
+    # first partition, as `relish netboot --stream-logs` has the installer
+    # write it.
+    esp="$work/disk.raw@@$(( $(sfdisk -J "$work/disk.raw" | jq '.partitiontable.partitions[0].start') * 512 ))"
+    printf 'target=10.42.0.1:6666\n' > "$work/netlog.conf"
+    mmd -i "$esp" ::reliaburger
+    mcopy -i "$esp" "$work/netlog.conf" ::reliaburger/netlog.conf
+    "$relish" machines logs --interface rbbr0 --dir "$work/netlog" >"$work/netlog.out" 2>&1 &
+    netlog=$!
+fi
 cp /usr/share/OVMF/OVMF_VARS_4M.fd "$work/vars.fd"
 seed="$work/cluster/stick/seeds/$(echo "$mac" | tr : -).seed"
 log="$work/serial.log"
@@ -169,6 +186,18 @@ else
         result=fail
     fi
     detail="$tries failed tries, $boots boots"
+    # The same, as the node streamed it. relish answered no DHCP here, so
+    # the lines are under the node's address.
+    streamed="$work/netlog/logs/$ip.log"
+    streamed_seen() { grep -a -c -e "$1" "$streamed" 2>/dev/null || true; }
+    s_tries=$(streamed_seen "reliaburger: bun not healthy after [0-9]* s on OS $target")
+    s_back=$(streamed_seen "$healthy $version")
+    s_rebooting=$(streamed_seen "reliaburger: counted boot failed, rebooting")
+    detail="$detail; streamed: $s_tries failed tries, $s_rebooting reboots, healthy on $version $s_back times"
+    if [ "$result" = pass ] && { [ "$s_tries" -ne 3 ] || [ "$s_back" -lt 2 ]; }; then
+        result=fail
+        detail="$detail, not the three tries and the fallback"
+    fi
     if [ -n "$t_back" ]; then
         fallback=$((t_back - t_reboot))
         detail="$detail, fell back in ${fallback} s ($((fallback / 60)) min $((fallback % 60)) s) from the reboot into $target, $((t_back - t_upgrade)) s from \`relish os upgrade\`"
@@ -183,6 +212,10 @@ fi
 elapsed=$(( $(date +%s) - start ))
 echo "--- serial console ---"
 cat "$log" || true
+if [ -n "${netlog:-}" ]; then
+    echo "--- relish machines logs ---"
+    cat "$work/netlog.out" || true
+fi
 echo "--- release server ---"
 cat "$work/http.log" || true
 {

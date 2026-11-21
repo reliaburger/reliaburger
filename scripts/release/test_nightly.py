@@ -5,19 +5,27 @@ happens after a failure, the record, and the freeze rule. The tiers themselves
 need Lima and hours (docs/releasing.md, "Nightly qualification").
 """
 import base64
+import datetime
 import hashlib
+import io
 import json
+import os
 from pathlib import Path
 import plistlib
 import subprocess
+import sys
 import tempfile
 import unittest
+from unittest import mock
+
+import nightly
 
 from nightly import (FAIL, GATE_TIERS, JOBS_FAST, JOBS_FINAL, NOT_RUN, PASS, POWER_CUT, V02_FAST,
                      choose_gate, freeze_problems, green, load_records, main, plan_steps, render_readme,
                      required_gate, run_tiers, signature_problems, staged_problems, tier_environment)
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE / "power_cut"))
 REPOSITORY = HERE.parents[1]
 COMMIT = "c" * 40
 TREE = "t" * 40
@@ -350,8 +358,7 @@ class GateTests(unittest.TestCase):
         self.assertEqual(status, 0)
 
     def test_no_example_passes_the_patch_gate_by_hand(self):
-        for path in (REPOSITORY / "docs" / "releasing.md", HERE / "nightly-qualify.plist.example",
-                     HERE / "nightly-qualify.sh"):
+        for path in (REPOSITORY / "docs" / "releasing.md", HERE / "nightly-qualify.sh"):
             self.assertNotIn("--gate patch", path.read_text(), path)
 
 
@@ -365,10 +372,389 @@ class WrapperTests(unittest.TestCase):
         self.assertIn("--train NAME", result.stdout)
         self.assertIn("--plan, --dry-run", result.stdout)
 
-    def test_the_launchd_example_is_a_valid_plist_that_runs_the_wrapper(self):
-        plist = plistlib.loads((HERE / "nightly-qualify.plist.example").read_bytes())
-        self.assertEqual(plist["Label"], "com.reliaburger.nightly-qualify")
-        self.assertIn("scripts/release/nightly-qualify.sh --train ", plist["ProgramArguments"][-1])
+    def test_the_wrapper_names_the_one_night_switch(self):
+        result = subprocess.run([str(HERE / "nightly-qualify.sh"), "--help"], capture_output=True, text=True,
+                                check=True)
+        self.assertIn("--once", result.stdout)
+        self.assertIn("--disarm", result.stdout)
+
+    def test_no_launchd_job_runs_every_night(self):
+        # Maintainer decision, 20 November 2026 (#1721): a nightly runs only
+        # the night before a planned freeze, so nothing ships a job that
+        # repeats.
+        self.assertFalse((HERE / "nightly-qualify.plist.example").exists())
+
+
+TRAIN = "release-1-3-2"
+REPO = "reliaburger/reliaburger"
+MAIN_COMMIT = "e" * 40
+
+
+def train_git(**gate):
+    """fake_git, plus the tip of the train and its fetch."""
+    gate_git = fake_git(**gate)
+
+    def answer(*arguments):
+        if arguments[0] == "ls-remote":
+            return f"{COMMIT}\trefs/heads/{arguments[-1].rsplit('/', 1)[-1]}"
+        if arguments[0] == "fetch":
+            return ""
+        return gate_git(*arguments)
+    return answer
+
+
+def refuse_gh(*arguments):
+    raise AssertionError(f"gh must not be called: {arguments}")
+
+
+class FakeGitHub:
+    """A `gh` for one evening: build.yml on the train, then stage.yml on main."""
+
+    def __init__(self, build="success", stage="success", finishes_after=1, new_run_after=0):
+        self.calls = []
+        self.conclusions = {"build.yml": build, "stage.yml": stage}
+        self.finishes_after = finishes_after
+        self.new_run_after = new_run_after
+        self.dispatched = {}
+        self.views = {}
+        self.lists = {}
+        self.manifest = json.dumps(dict(version="v0.3.2", commit=COMMIT, run_id=2, run_attempt=1,
+                                        channel="nightly")).encode()
+
+    def __call__(self, *arguments):
+        self.calls.append(arguments)
+        if arguments[:2] == ("workflow", "run"):
+            self.dispatched[arguments[2]] = True
+            return ""
+        if arguments[:2] == ("run", "list"):
+            workflow = arguments[arguments.index("--workflow") + 1]
+            old = {"build.yml": 1, "stage.yml": 11}[workflow]
+            listed = self.lists.get(workflow, 0)
+            self.lists[workflow] = listed + 1
+            runs = [dict(databaseId=old)]
+            if self.dispatched.get(workflow) and listed > self.new_run_after:
+                runs.insert(0, dict(databaseId=old + 1))
+            return json.dumps(runs)
+        if arguments[:2] == ("run", "view"):
+            run_id = int(arguments[2])
+            workflow = "build.yml" if run_id == 2 else "stage.yml"
+            seen = self.views.get(run_id, 0) + 1
+            self.views[run_id] = seen
+            done = seen >= self.finishes_after
+            return json.dumps(dict(status="completed" if done else "in_progress",
+                                   conclusion=self.conclusions[workflow] if done else "",
+                                   headSha=COMMIT, attempt=1))
+        if arguments[:2] == ("run", "download"):
+            directory = Path(arguments[arguments.index("-D") + 1])
+            self.name = arguments[arguments.index("-n") + 1]
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "candidate.json").write_bytes(self.manifest)
+            return ""
+        raise AssertionError(f"unexpected gh {arguments}")
+
+
+class DispatchTests(unittest.TestCase):
+    """At the cut-off the night builds the train tip and stages it on the nightly channel (#1721)."""
+
+    def dispatch(self, github, local=None):
+        self.sleeps = []
+        self.local = []
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", stderr):
+            result = nightly.dispatch_and_stage(
+                TRAIN, REPO, github, sleep=self.sleeps.append,
+                stage_locally=local or (lambda *arguments: self.local.append(arguments)))
+        return result, stderr.getvalue()
+
+    def test_it_builds_the_train_then_stages_that_build_on_the_nightly_channel(self):
+        github = FakeGitHub()
+        (commit, base_url, digest), _ = self.dispatch(github)
+        self.assertEqual(commit, COMMIT)
+        self.assertEqual(digest, hashlib.sha256(github.manifest).hexdigest())
+        self.assertEqual(base_url, f"https://github.com/{REPO}/releases/download/nightly-v0.3.2-2-1")
+        self.assertIn(("workflow", "run", "build.yml", "--repo", REPO, "--ref", TRAIN), github.calls)
+        self.assertIn(("workflow", "run", "stage.yml", "--repo", REPO, "--ref", "main", "-f", "channel=nightly",
+                       "-f", "candidate_run=2", "-f", f"qualified_digest={digest}"), github.calls)
+        self.assertEqual(github.name, f"nightly-manifest-{COMMIT}-1")
+        self.assertEqual(self.local, [])
+
+    def test_the_build_followed_is_the_new_run_not_an_earlier_one(self):
+        github = FakeGitHub(new_run_after=3)
+        (_, base_url, _), _ = self.dispatch(github)
+        self.assertIn("-2-1", base_url)
+        self.assertNotIn(("run", "view", "1", "--repo", REPO, "--json", "status,conclusion,headSha,attempt"),
+                         github.calls)
+        self.assertTrue(self.sleeps)
+
+    def test_a_failed_build_stages_nothing(self):
+        github = FakeGitHub(build="failure")
+        with self.assertRaises(nightly.NightlyError) as raised:
+            self.dispatch(github)
+        self.assertIn("build.yml run 2", str(raised.exception))
+        self.assertNotIn("stage.yml", github.dispatched)
+
+    def test_a_build_that_never_finishes_gives_up(self):
+        github = FakeGitHub(finishes_after=10 ** 6)
+        with self.assertRaises(nightly.NightlyError) as raised:
+            self.dispatch(github)
+        self.assertIn("didn't finish", str(raised.exception))
+
+    def test_a_failed_stage_run_stages_locally_and_says_why(self):
+        github = FakeGitHub(stage="failure")
+        (_, base_url, digest), stderr = self.dispatch(github)
+        self.assertEqual(self.local, [(REPO, 2, digest)])
+        self.assertIn("stage.yml run 12 ended failure", stderr)
+        self.assertIn("staging locally", stderr)
+        self.assertIn("nightly-v0.3.2-2-1", base_url)
+
+    def test_local_staging_fetches_and_verifies_then_stages_with_the_tag_on_main(self):
+        fetch, stage = nightly.local_staging_commands(REPO, 2, "d" * 64, Path("/tmp/x/dist"), MAIN_COMMIT)
+        self.assertEqual(Path(fetch[1]).name, "candidate.py")
+        self.assertEqual(fetch[2:], ["stage-fetch", "--directory", "/tmp/x/dist", "--repository", REPO,
+                                     "--run-id", "2", "--qualified-digest", "d" * 64, "--channel", "nightly"])
+        self.assertEqual(stage[2], "stage")
+        self.assertEqual(stage[-2:], ["--main-commit", MAIN_COMMIT])
+
+    def test_plan_with_dispatch_names_both_workflows_and_dispatches_nothing(self):
+        stdout = io.StringIO()
+        with mock.patch("sys.stdout", stdout):
+            status = main(["run", "--train", TRAIN, "--dispatch", "--plan"], git=train_git(), gh=refuse_gh)
+        self.assertEqual(status, 0)
+        self.assertIn("build.yml", stdout.getvalue())
+        self.assertIn("stage.yml", stdout.getvalue())
+
+
+class QuietTests(unittest.TestCase):
+    """The night shares the Studio through power_cut/quiet.py's lock (#1721)."""
+
+    def test_a_busy_host_stops_the_night_before_anything_is_dispatched(self):
+        stderr = io.StringIO()
+        with mock.patch.object(nightly, "compilers_running", return_value=False), \
+                mock.patch.object(nightly, "quiet_problem", return_value="a gate chain is running: x"), \
+                mock.patch("sys.stderr", stderr):
+            status = main(["run", "--train", TRAIN, "--dispatch"], git=train_git(), gh=refuse_gh)
+        self.assertEqual(status, 2)
+        self.assertIn("a gate chain is running", stderr.getvalue())
+
+    def test_the_night_holds_the_quiet_lock_so_other_long_runs_pause(self):
+        import quiet
+        with tempfile.TemporaryDirectory() as directory:
+            lock = Path(directory) / "quiet" / "quiet.lock"
+            held = nightly.take_quiet_lock(lock)
+            self.assertIsNotNone(held)
+            self.assertIn("quiet lock", quiet.busy_reason(str(lock), str(Path(directory) / "none-*"), 60))
+            self.assertIsNone(nightly.take_quiet_lock(lock))
+            os.close(held)
+            self.assertIsNone(quiet.busy_reason(str(lock), str(Path(directory) / "none-*"), 60))
+
+
+class ArmTests(unittest.TestCase):
+    """One command arms the nightly for one night; nothing repeats (#1721)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name)
+        self.records = self.home / "records"
+        self.launchctl = []
+        self.now = datetime.datetime(2026, 11, 23, 9, 30)
+        for name, value in (("launchctl", lambda *arguments: self.launchctl.append(arguments) or 0),
+                            ("local_now", lambda: self.now), ("home_directory", lambda: self.home),
+                            ("PLATFORM", "darwin"), ("quiet_problem", lambda: None)):
+            patcher = mock.patch.object(nightly, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.label = f"{nightly.LABEL}.2026-11-23"
+        self.job = self.home / "Library" / "LaunchAgents" / f"{self.label}.plist"
+
+    def arm(self, *extra):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
+            status = main(["arm", "--train", TRAIN, "--records", str(self.records), *extra])
+        return status, stdout.getvalue() + stderr.getvalue()
+
+    def test_tonight_is_today_at_the_cut_off(self):
+        self.assertEqual(nightly.armed_night(self.now, "18:00"), datetime.datetime(2026, 11, 23, 18, 0))
+
+    def test_a_cut_off_that_has_passed_is_refused(self):
+        with self.assertRaises(ValueError) as raised:
+            nightly.armed_night(datetime.datetime(2026, 11, 23, 18, 30), "18:00")
+        self.assertIn("passed", str(raised.exception))
+
+    def test_the_night_before_a_freeze_can_be_armed_days_ahead(self):
+        self.assertEqual(nightly.armed_night(self.now, "19:15", "2026-11-24"),
+                         datetime.datetime(2026, 11, 24, 19, 15))
+
+    def test_a_malformed_time_is_refused(self):
+        for at in ("25:00", "6pm", "18", "18:60"):
+            with self.subTest(at=at), self.assertRaises(ValueError):
+                nightly.armed_night(self.now, at)
+
+    def test_the_job_fires_once_on_that_date_and_runs_the_armed_night(self):
+        job = nightly.launchd_job(Path("/checkout"), Path("/records"), datetime.datetime(2026, 11, 24, 18, 0),
+                                  ["--train", TRAIN, "--dispatch"])
+        self.assertEqual(job["Label"], f"{nightly.LABEL}.2026-11-24")
+        self.assertEqual(job["StartCalendarInterval"], dict(Month=11, Day=24, Hour=18, Minute=0))
+        self.assertTrue(job["LaunchOnlyOnce"])
+        self.assertFalse(job.get("RunAtLoad", False))
+        self.assertEqual(job["WorkingDirectory"], "/checkout")
+        self.assertEqual(job["ProgramArguments"][:2], ["/bin/bash", "-lc"])
+        self.assertEqual(job["ProgramArguments"][2], "exec scripts/release/nightly-qualify.sh --armed-for "
+                                                     f"2026-11-24 --train {TRAIN} --dispatch")
+        self.assertEqual(job["StandardOutPath"], "/records/launchd.log")
+        plistlib.loads(plistlib.dumps(job))
+
+    def test_arm_writes_and_loads_the_job_for_tonight(self):
+        status, output = self.arm()
+        self.assertEqual(status, 0, output)
+        job = plistlib.loads(self.job.read_bytes())
+        self.assertEqual(job["StartCalendarInterval"], dict(Month=11, Day=23, Hour=18, Minute=0))
+        command = job["ProgramArguments"][2]
+        self.assertIn("--armed-for 2026-11-23", command)
+        self.assertIn("--dispatch", command)
+        self.assertIn(f"--records {self.records}", command)
+        self.assertEqual(job["WorkingDirectory"], str(REPOSITORY))
+        self.assertEqual(self.launchctl, [("bootstrap", f"gui/{os.getuid()}", str(self.job))])
+        self.assertTrue(self.records.is_dir())
+        self.assertIn("2026-11-23 18:00", output)
+        self.assertIn("--disarm", output)
+
+    def test_arming_the_same_night_again_replaces_the_job(self):
+        self.arm()
+        self.launchctl.clear()
+        status, _ = self.arm("--at", "19:00")
+        self.assertEqual(status, 0)
+        domain = f"gui/{os.getuid()}"
+        self.assertEqual(self.launchctl, [("bootout", f"{domain}/{self.label}"),
+                                          ("bootstrap", domain, str(self.job))])
+        self.assertEqual(plistlib.loads(self.job.read_bytes())["StartCalendarInterval"]["Hour"], 19)
+
+    def test_two_nights_can_be_armed_and_neither_replaces_the_other(self):
+        self.arm()
+        status, _ = self.arm("--date", "2026-11-24")
+        self.assertEqual(status, 0)
+        self.assertEqual(sorted(path.name for path in self.job.parent.iterdir()),
+                         [f"{nightly.LABEL}.2026-11-23.plist", f"{nightly.LABEL}.2026-11-24.plist"])
+
+    def test_arm_passes_the_run_options_through(self):
+        status, _ = self.arm("--at", "19:00", "--gate", "full", "--previous", "v0.3.1",
+                             "--soak-bun", "/soak/bun", "--iterations", "5")
+        self.assertEqual(status, 0)
+        command = plistlib.loads(self.job.read_bytes())["ProgramArguments"][2]
+        for option in ("--gate full", "--previous v0.3.1", "--soak-bun /soak/bun", "--iterations 5"):
+            self.assertIn(option, command)
+
+    def test_arm_with_a_staged_build_does_not_dispatch_one(self):
+        status, _ = self.arm("--base-url", "https://example.test/nightly-v0.3.2-2-1",
+                             "--qualified-digest", "d" * 64)
+        self.assertEqual(status, 0)
+        command = plistlib.loads(self.job.read_bytes())["ProgramArguments"][2]
+        self.assertNotIn("--dispatch", command)
+        self.assertIn("--qualified-digest " + "d" * 64, command)
+
+    def test_dry_run_prints_the_job_and_loads_nothing(self):
+        status, output = self.arm("--dry-run")
+        self.assertEqual(status, 0)
+        self.assertIn("<plist", output)
+        self.assertFalse(self.job.exists())
+        self.assertEqual(self.launchctl, [])
+
+    def test_arming_after_the_cut_off_loads_nothing(self):
+        self.now = datetime.datetime(2026, 11, 23, 20, 0)
+        status, output = self.arm()
+        self.assertEqual(status, 2)
+        self.assertIn("passed", output)
+        self.assertEqual(self.launchctl, [])
+
+    def test_arming_is_for_launchd_only(self):
+        with mock.patch.object(nightly, "PLATFORM", "linux"):
+            status, output = self.arm()
+        self.assertEqual(status, 2)
+        self.assertIn("launchd", output)
+        self.assertEqual(self.launchctl, [])
+
+    def test_arming_warns_when_the_host_is_busy_now(self):
+        with mock.patch.object(nightly, "quiet_problem", return_value="the quiet lock x is held"):
+            status, output = self.arm()
+        self.assertEqual(status, 0)
+        self.assertIn("the quiet lock x is held", output)
+
+    def test_disarm_unloads_and_removes_every_armed_night(self):
+        self.arm()
+        self.arm("--date", "2026-11-24")
+        self.launchctl.clear()
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertEqual(main(["disarm"]), 0)
+        self.assertEqual(list(self.job.parent.iterdir()), [])
+        domain = f"gui/{os.getuid()}"
+        self.assertEqual(self.launchctl, [("bootout", f"{domain}/{nightly.LABEL}.2026-11-23"),
+                                          ("bootout", f"{domain}/{nightly.LABEL}.2026-11-24")])
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertEqual(main(["disarm"]), 0)
+
+
+class ArmedNightTests(unittest.TestCase):
+    """The armed job runs once and disarms itself, whatever the result (#1721)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name)
+        self.agents = self.home / "Library" / "LaunchAgents"
+        self.agents.mkdir(parents=True)
+        self.bootouts = []
+        self.today = datetime.datetime(2026, 11, 23, 18, 0)
+        for name, value in (("home_directory", lambda: self.home), ("local_now", lambda: self.today),
+                            ("schedule_bootout", self.bootouts.append)):
+            patcher = mock.patch.object(nightly, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def armed(self, date="2026-11-23", qualify=None):
+        self.job = self.agents / f"{nightly.LABEL}.{date}.plist"
+        self.job.write_bytes(b"armed")
+        self.other = self.agents / f"{nightly.LABEL}.2026-11-30.plist"
+        self.other.write_bytes(b"armed for another night")
+        seen = []
+
+        def fake_qualify(args, git, gh):
+            seen.append(self.job.exists())
+            return qualify() if qualify else 0
+        stderr = io.StringIO()
+        with mock.patch.object(nightly, "qualify", fake_qualify), mock.patch("sys.stderr", stderr):
+            status = main(["run", "--armed-for", date, "--train", TRAIN, "--dispatch"])
+        return status, seen, stderr.getvalue()
+
+    def test_the_job_is_removed_before_the_night_starts_and_unloaded_after(self):
+        status, seen, _ = self.armed()
+        self.assertEqual(status, 0)
+        self.assertEqual(seen, [False])
+        self.assertEqual(self.bootouts, [f"{nightly.LABEL}.2026-11-23"])
+        self.assertTrue(self.other.exists())
+
+    def test_a_red_night_disarms_too(self):
+        status, _, _ = self.armed(qualify=lambda: 1)
+        self.assertEqual(status, 1)
+        self.assertFalse(self.job.exists())
+        self.assertEqual(len(self.bootouts), 1)
+
+    def test_a_crashed_night_disarms_too(self):
+        def crash():
+            raise RuntimeError("boom")
+        with self.assertRaises(RuntimeError):
+            self.armed(qualify=crash)
+        self.assertFalse(self.job.exists())
+        self.assertEqual(len(self.bootouts), 1)
+
+    def test_a_late_fire_on_another_day_runs_nothing_and_disarms(self):
+        # launchd runs a calendar job missed while the Mac slept when it
+        # wakes, and the date has no year.
+        status, seen, stderr = self.armed(date="2026-11-22")
+        self.assertEqual(status, 2)
+        self.assertEqual(seen, [])
+        self.assertIn("armed for 2026-11-22", stderr)
+        self.assertFalse(self.job.exists())
+        self.assertEqual(len(self.bootouts), 1)
 
 
 if __name__ == "__main__":

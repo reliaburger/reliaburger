@@ -22,7 +22,7 @@ use super::{
     report::{ServerFacts, SetupReport},
     runner::{
         JOIN_SCRIPT, NodeSources, check_release_source, checkpoint, demo_config, node_files,
-        open_operation, probe_demo, saved_endpoint, wait_for_quorum,
+        open_operation, probe_demo, save_context, saved_endpoint, wait_for_quorum,
     },
     security::Bootstrap,
     server::{Facts, PACKAGES, PREFLIGHT},
@@ -470,8 +470,7 @@ async fn build(
             ingress_https: None,
         },
     };
-    let path = root.join("context.json");
-    tokio::task::spawn_blocking(move || context.save(&path)).await??;
+    save_context(context, root.join("context.json")).await?;
     let direct = bootstrap.client(&endpoint)?;
     let reachable = tokio::time::timeout(Duration::from_secs(5), direct.node_version()).await;
     if matches!(reachable, Ok(Ok(_))) {

@@ -15,7 +15,7 @@
 //! reports carry the install ticket its install script was given
 //! ([`InstallTickets`]); a report without that machine's ticket is refused.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -67,6 +67,8 @@ pub struct HttpState {
     pub disks: Mutex<DiskSession>,
     /// The install tickets issued this session.
     pub installs: Mutex<InstallTickets>,
+    /// Where the installer sends boot logs (`--stream-logs`), if anywhere.
+    pub netlog: Option<SocketAddrV4>,
     /// Where request lines go.
     pub log: Log,
 }
@@ -151,6 +153,7 @@ async fn boot_script(
                         &client,
                         reinstall,
                         ticket.as_deref(),
+                        state.netlog,
                     ),
                     "install".to_string(),
                 )
@@ -504,6 +507,7 @@ mod tests {
             question_timeout,
             disks: Mutex::new(DiskSession::default()),
             installs: Mutex::new(InstallTickets::default()),
+            netlog: None,
             log: Arc::new(move |line| sink.lock().unwrap().push(line)),
         });
         Fixture { dir, state, lines }

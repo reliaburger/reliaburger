@@ -1546,6 +1546,36 @@ release is the version in the commit's `Cargo.toml`, the previous release the ne
 tag behind it, and the rest is `release_tier.decide`. `--gate` survives only to raise the
 gate; asking for less than the rule says is refused, with the rule's reasons.
 
+**Then it ran one night, not every night.** The nightly was built, tested and installable for
+weeks, and it never ran every night. The Studio had better things to do with its nights:
+agents, the power-cut endurance run, the odd 24-hour memory run. And a train in the middle of
+its week is still taking merges, so a green night on Tuesday says little about the candidate on
+Friday. What `freeze-check` needs is one green night on the code that becomes the candidate,
+which is the train the evening before the freeze. So that's when it runs (maintainer decision,
+20 November 2026, [#1721](https://github.com/reliaburger/reliaburger/issues/1721)):
+`nightly-qualify.sh --once` arms a single night. At the cut-off the night dispatches
+`build.yml` on the train and `stage.yml` on the nightly channel, waits for both, runs the long
+tiers and disarms itself.
+
+"Runs once" turned out to need three locks on the same door, because launchd thinks in
+calendars, not in dates. A calendar entry has no year, so a job for 24 November would fire
+again next year. A Mac asleep at the cut-off runs the missed job when it wakes, perhaps the
+next day. And unloading a launchd job from inside it stops it. So the job is named for its
+date and marked `LaunchOnlyOnce`; the night deletes its own job file before it does anything
+else, refuses to run on any other date, and asks a detached shell to unload the job a few
+seconds after it exits. Kill it halfway and the job file is already gone. Every night also
+asks `power_cut/quiet.py` whether a release gate holds the host, and holds the quiet lock
+while its tiers run, so the endurance run pauses instead of booting VMs beside a soak.
+
+Staging a train's build hit one more wall in 0.3.0. GitHub won't let a workflow's
+token create a release on a commit whose `.github/workflows/` differ from the default
+branch's: that needs the `workflow` scope, which no workflow token can have. 0.3.0's candidate
+4 was the first train build whose `ci.yml` had moved on from `main`'s, and `stage.yml` failed
+with a bare 403. The tag was never the evidence, though. The digest-pinned `candidate.json`
+names the commit, and the nightly checks it against the tip, so a nightly's tag now points at
+the `main` commit `stage.yml` runs on. If staging still fails, the night stages the build
+itself with the same `candidate.py` and the operator's own login, and says so in its log.
+
 **Publish performance after the tag.** Benchmarks, the profile and the day run don't decide
 whether a release works, so they no longer stand between it and its users. A regression they
 find is a bug for the next patch release.
@@ -3877,10 +3907,10 @@ time window deterministic in a unit test.
 
 Take crashloops. A workload with a lifetime restart count of 30 may have run
 perfectly for six months since its last failure. Calling that a current
-crashloop is nonsense. We require three timestamped restart events inside the
-last 15 minutes. When that pattern fires, the engine looks for a deploy of the
-same application and namespace in the preceding 30 minutes, then attaches the
-first recent error log. One finding now answers three questions: what failed,
+crashloop is nonsense. We require three timestamped restart events of one
+instance inside the last 15 minutes. When that pattern fires, the engine looks
+for a deploy of the same application and namespace in the preceding 30
+minutes, then attaches the first recent error log. One finding now answers three questions: what failed,
 what changed, and what did the process say?
 
 That rule is only as good as the events behind it, and in 0.2.7 the agent gym
@@ -3894,6 +3924,41 @@ history. The fix is to have one door: `observe_app_exit` now calls
 `retry_restart` too, so whichever tick moves the instance back to Pending
 records the event, exactly once, and an exhausted budget fails the instance
 with the same `exhausted its restart budget` event either way (#1652).
+
+"Of one instance" came later, from 0.3.1's soak (#2197). Until then the rule
+counted an app's restarts together. The soak's chaos scenario restarted two of
+a three-replica app's instances on purpose, and a moment later its pause froze
+the third, whose health checks failed, so Bun restarted that one too. Three
+restarts, one app, inside 15 minutes: `wtf` called it a crash loop and kept
+saying so for the whole window. Each replica had restarted once, for its own
+reason. A crash loop is one process that keeps dying, so the check now groups
+restarts by instance, and each instance needs three of its own.
+
+Grouping by instance turned up a second bug. Bun records the instance as the
+restart decision's `instance` evidence, but the collector read a key called
+`instance_id`, which no event has ever carried. Every restart reached
+`diagnose` with no instance, and no unit test noticed, because the tests built
+their `RestartObservation`s by hand. The new test records a real decision in an
+`EventStore` and reads it back through the collector. Restarts that still name
+no instance, such as a restart that failed before it got going, are counted
+together, as the old rule counted all of them.
+
+The grouping is a map of maps. Spelled out, its type is:
+
+```rust
+BTreeMap<(&str, &str), BTreeMap<Option<&str>, Vec<&RestartObservation>>>
+```
+
+The outer key is the app and namespace, borrowed from the observations as
+`&str` rather than copied into new `String`s; the borrow checker makes sure
+the map doesn't outlive the inputs it points into. The inner key is the
+instance, `Option<&str>`, so "no instance" is a key of its own, `None`, rather
+than an empty string that might collide with a real name. `BTreeMap` rather
+than `HashMap` keeps the report's order the same on every run. Clippy calls
+a type this deep "very complex", so the code names the inner map
+`RestartsByInstance<'a>`, a `type` alias: a second name for the same type, as
+`typedef` is in C, carrying the lifetime `'a` that ties its borrows to the
+inputs.
 
 The same rule keeps the other checks honest. Disk pressure needs used capacity
 with a node and storage-domain attribution. CPU throttling needs an increase in
@@ -3911,6 +3976,96 @@ Finally, application scope is structural. `relish wtf --app api` runs app
 checks and filters alerts, restarts, services and deploys to `api`; it doesn't
 manufacture `Unknown` rows for cluster evidence it deliberately didn't fetch.
 Unknown means missing required evidence. It doesn't mean "we chose not to ask".
+
+### Three ways to read one report
+
+The first human report printed every result: each finding with its details
+and `next:` step, and every OK row in full. On the three-node Wyse lab that
+was seventeen OK lines to scroll past to learn that nothing was wrong. In
+0.3.1 (#2180) `relish wtf` got three views instead. The default is a table,
+one row per check with its status. `--short` prints the counts and only what
+isn't OK. `--explain` prints every check with what it tests, the numbers that
+decide it and where the manual covers it.
+
+A table needs a row per *check*, and the report doesn't have checks. It has
+three kinds of id. An OK row carries the check's id (`crashloops`), a finding
+carries its own (`crashloop`), and an UNKNOWN carries the evidence source it
+couldn't read (`restarts`). The council check alone can report nine different
+findings. So a new module, `src/relish/wtf/checks.rs`, ties them together:
+
+```rust
+pub struct CheckKind {
+    pub id: &'static str,
+    pub findings: &'static [&'static str],
+    pub sources: &'static [&'static str],
+    pub tests: &'static str,
+    pub docs: &'static str,
+    pub manual: &'static str,
+}
+
+pub const CHECKS: &[CheckKind] = &[ /* one per check, in run order */ ];
+```
+
+`&'static str` is a borrowed string that lives for the whole program: a
+literal compiled into the binary. A `const` table built from them costs
+nothing at run time, and needs no allocation, no `lazy_static` and no
+`String`. It's the same shape as the finding catalogue `relish agent
+explain` reads (see "Built for Humans and Their Agents"), and the explanation of each
+check sits right beside that catalogue's thresholds. `--explain` doesn't
+repeat the numbers in prose. It prints them from the constants the checks
+compare against, so the words can't say 15 minutes while the code says 10.
+
+The renderer groups the report's four lists into rows, and the row type
+borrows from the report rather than copying it:
+
+```rust
+struct CheckRow<'a> {
+    name: &'a str,
+    kind: Option<&'static CheckKind>,
+    critical: Vec<&'a WtfFinding>,
+    warnings: Vec<&'a WtfFinding>,
+    unknown: Vec<&'a WtfUnknown>,
+    ok: Vec<&'a WtfOk>,
+    // ...
+}
+```
+
+The `'a` is a lifetime parameter. It says every reference in a `CheckRow`
+points into something that lives at least as long as `'a`, here the
+`WtfReport`. In C you'd keep pointers into the report and promise yourself not
+to free it first. In Go the garbage collector keeps it alive for you. Rust
+makes the promise part of the type, so the compiler rejects any code that
+drops the report while a row still points into it.
+
+Sorting worst first falls out of one derive:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Status {
+    Ok,
+    Unknown,
+    Warning,
+    Critical,
+}
+```
+
+A derived `Ord` on a fieldless enum orders the variants as they're declared,
+so `Critical > Warning` holds and a row's status is just the worst thing in
+it. The order of the lines in the source is the policy, which is a little
+surprising the first time you see it, so the comment above the enum says so.
+
+What does a check that the catalogue doesn't know about do? It still gets a
+row, named after its own id, without the explanation. A result that vanished
+from the table because nobody updated a list would be the green hat again.
+Tests stop that from shipping, though: every finding id must belong to exactly
+one check, every UNKNOWN source the engine can produce must too, and every
+check's docs link must name a heading that exists in the manual chapter that
+`relish manual <topic>` opens. A new check without an explanation fails CI.
+
+The views change only the human report. `--short --output json` is refused
+rather than quietly ignored, because the JSON contract above doesn't change:
+the machine report always carries every finding. Exit codes don't change
+either. The view is how much you read, not what `wtf` found.
 
 ## A small diagnostic surface
 
@@ -4714,7 +4869,24 @@ means (the scheduler, the council and Pickle all treat "published" as "worth
 talking to"), gossip got a second one. `MembershipTable::roster()` returns
 every member, down ones included, until they're reaped, and
 `MustardNode::set_roster_watch` publishes it next to the old view. The
-refresher reads the roster. A `Left` entry is forgotten on sight.
+refresher reads the roster. A `Left` entry was forgotten on sight.
+
+That last rule didn't survive the Wyse lab. We rebooted one of three council
+voters with Ctrl+Alt+Del, and `relish nodes` went straight from three rows to
+two. A clean shutdown runs gossip's graceful leave, so the node was `Left`,
+and the table forgot it. Yet `relish council status` still listed it as a
+voter, still counted towards the quorum, and it came back two minutes later.
+Pulling the cord on another voter had shown it as `dead`, which is the more
+violent event and got the more honest answer. Leaving tells you the node
+meant to go. It doesn't tell you it's gone for good.
+
+So a `Left` member now stays in the table like a dead one, with the same
+24-hour limit, and keeps its `Left` state when gossip reaps it, where a
+reaped dead member stays `Dead`. `relish nodes` shows it as `left` with its
+council seat, and `relish status` counts it on the nodes line (`1 left`)
+without calling the cluster degraded. It drops off when it comes back, when
+its identity is retired, or when a day passes. Retirement is the real "gone
+for good", and the operator says so with `relish decommission-node`.
 
 A node the operator *retired* is gone for good: its identity is on the CRL,
 and Chapter 4's mTLS verifiers already refuse it. Every node keeps a

@@ -59,11 +59,16 @@ while preparing; do
     fi
     sleep 2
 done
-# A counted boot is a new version on trial: two minutes, so a bad update
-# falls back in minutes, not a quarter of an hour (three tries). The lab's
-# nodes answer in 8 to 23 s; S5 measures the Wyse. Other boots get five,
-# since nothing falls back from them.
-if counted; then limit=120; else limit=300; fi
+# A counted boot is a new version on trial: 90 s, so a bad update falls
+# back in minutes (three tries). A Wyse 3040 needs about 65 s a try before
+# this check starts, so with 120 s its fallback took 10 min 28 s, past
+# S5's 10 (#2143); 90 s brings it to about 9. A healthy bun answers well
+# inside 90 s even there: at most the 30 s clock wait
+# (reliaburger-time-wait.service) plus the 38 s the 3040 took, and the
+# lab's x86 nodes take 8 to 23 s. Other boots get 300 s, since nothing
+# falls back from them. test_fallback_limit.py and test_time_wait.py read
+# this line, so keep it one line.
+if counted; then limit=90; else limit=300; fi
 deadline=$(( $(uptime_seconds) + limit ))
 while [ "$(uptime_seconds)" -lt "$deadline" ]; do
     if curl -fsS --max-time 2 http://127.0.0.1:9117/v1/health >/dev/null 2>&1 \

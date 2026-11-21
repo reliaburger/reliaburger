@@ -164,8 +164,8 @@ Lessons from running many agents on one machine (6–7 November 2026, #1724):
 Example configs in `examples/phase-N/` use a runtime prefix so it's immediately clear what runtime they target:
 
 - **`proc-*`** — ProcessGrill (`--runtime process`; runs local processes, no container runtime needed). Host `exec` or `script` workloads with no `image`: ProcessGrill refuses an image app (#914). Use `exec = "target/debug/testapp"` (arguments in `command`) or an absolute host binary, and start Bun with `--config examples/node/process-runtime.toml` (or a node config whose `[process_workloads] allowed_binaries` names the binary, with `mount_isolation = false`).
-- **`container-*`** — Real OCI images pulled from Docker Hub. Works with runc (`--runtime runc`) or Apple Container (`--runtime apple`).
-- **`apple-*`** — Tests Apple Container-specific features (macOS only).
+- **`container-*`** — Real OCI images pulled from Docker Hub. Runs on runc (`--runtime runc`, Linux), or on macOS in the managed Linux VM that `relish setup --quickstart` provisions. Bun refuses `--runtime apple`: direct Apple Container is disabled.
+- **`apple-*`** — Apple Container-specific features (macOS only). There are none today: the Apple adapter is deferred development code, which only `make test-apple` exercises.
 - **`runc-*`** — Tests runc-specific features (Linux only).
 
 When adding a new example, pick the prefix that matches its runtime requirement.

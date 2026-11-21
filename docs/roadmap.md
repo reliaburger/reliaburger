@@ -421,8 +421,10 @@ migration and no feature gate
   tiers first failed on a harness bug, a p99 judged on 20 samples
   ([#1485](https://github.com/reliaburger/reliaburger/issues/1485)), and pass
   with the fixed checker. It ships with the `zstd` 0.13 advisories under the
-  exception 0.2.3 took, which expires on 18 November 2026
-  ([#1366](https://github.com/reliaburger/reliaburger/issues/1366), in 0.3.1).
+  exception 0.2.3 took, which 0.3.0 dropped once zstd 0.13.4 patched them
+  ([record](qualification/2026-11-12-dependency-exceptions.md)); moving
+  DataFusion to arrow 60 stays open
+  ([#1366](https://github.com/reliaburger/reliaburger/issues/1366)).
   The profile after the tag found 0.2.4 4.5% faster on host jobs than 0.2.3
   ([record](qualification/2026-10-30-v0.2.4-profile/README.md)). The 24-hour
   memory run failed at hour 21 when the Mac lost its forwards to the VMs; up
@@ -730,7 +732,7 @@ what's shipped and what's scheduled.
   ([#1776](https://github.com/reliaburger/reliaburger/issues/1776)), static builds
   ([#1774](https://github.com/reliaburger/reliaburger/issues/1774)) and Raft
   snapshot encryption ([#1775](https://github.com/reliaburger/reliaburger/issues/1775)).
-- **Custom alert rules.** Each node evaluates five built-in rules; you can't
+- **Custom alert rules.** Each node evaluates four built-in rules; you can't
   define your own yet ([#1773](https://github.com/reliaburger/reliaburger/issues/1773), planned for 0.4.2).
 - **Scale beyond three nodes.** Every release is soaked on three nodes. The
   [hollow-node record](qualification/2026-10-28-hollow-nodes.md) found limits

@@ -136,6 +136,18 @@ table for `nodes`. On `status`, a section a node didn't answer for ends in
 `partial (2 of 3 nodes)`, one it couldn't read says `unknown:` and the reason,
 and one a scoped token can't see says `not visible to a scoped token`.
 
+`relish wtf` goes one level deeper than `status`, at three lengths:
+
+| Command | Flags | What it shows |
+|---|---|---|
+| `relish wtf` | none | one row per check, worst first: its status (`critical`, `warning`, `unknown` or `ok`) and, for one that isn't OK, its first problem in a line; then the counts |
+| `relish wtf` | `--short` | the counts, then each finding that isn't OK on one line with its `next:` step; just the counts when all is well |
+| `relish wtf` | `--explain` | every check over several lines: what it found, what exactly it tests, the thresholds that decide it, a manual link and the `relish manual` chapter |
+
+`--short` and `--explain` can't be combined; both work with `--app` and
+`--watch`, and `--output json` or `yaml` refuses them, since the machine
+report always carries everything (see [diagnostics](07_diagnostics.md#three-ways-to-read-it)).
+
 ## Environment variables
 
 | Variable | Read by | Meaning |
@@ -215,7 +227,7 @@ Everything the installer and the quickstart write lives in `~/.reliaburger`
 | Path | What |
 |------|------|
 | `bin/relish` | the CLI (`~/.local/bin/relish` links here if that's on your `PATH`) |
-| `context.json` | the current cluster's endpoint, CA path and admin token (mode 0600): the laptop cluster's, or a bare-metal cluster's node 1 once `relish cluster create --bare-metal` or `relish machines claim --create` saves it (they leave another cluster's context in place) |
+| `context.json` | the current cluster's endpoint, CA path and admin token (mode 0600): the laptop cluster's, or a bare-metal cluster's node 1 once `relish cluster create --bare-metal` or `relish machines claim --create` saves it (they leave another cluster's working context in place, and replace one whose CA certificate is gone) |
 | `root-backup-keys/` | the age identities that open each cluster's root CA backup; keep a copy offline, since the root CA key has no other copy |
 | `clusters/NAME/` | a laptop cluster's state, node configs and `timings.json` |
 | `clusters/NAME/security/` | its master key, admin token and CA (`identity/root-ca.crt`) |
@@ -456,6 +468,27 @@ way, so check the exit code before you trust it.
 `relish exec web ls /ready` works in a shell `if`. It exits `1` when it
 can't run the command at all, with an `error:` line on stderr.
 
+## Terminal UI keys
+
+`relish tui` (or `relish` with no command) opens the terminal UI. `?` shows
+these keys inside it too.
+
+| Key | Where | What it does |
+|-----|-------|--------------|
+| `a`, `n`, `j`, `e`, `l`, `r` | anywhere | apps, nodes, jobs, events, logs, routes (`r` refreshes a list) |
+| `s`, `?`, `:` | anywhere | search, help, command palette |
+| `q`, Esc | anywhere | back; `q` on the dashboard quits |
+| Enter, ↑/↓ | lists | open the selected row, move the selection |
+| `/` | lists | filter; Esc clears it |
+| `/` | logs, app detail Logs and Metrics tabs | search: show only the lines (or metrics, by name and labels) containing the text, ignoring case, each match in red and bold; Enter keeps it, Esc clears it |
+| → or Tab, ← or Shift-Tab | app detail | next or previous tab (Overview, Instances, Logs, Metrics, Deploys, Config) |
+| → or Tab, ← or Shift-Tab | node detail | next or previous tab (Overview, Workloads, Maintenance); Maintenance lists what would go down or lose redundancy if the node went away, and whether the council keeps quorum |
+| ↑/↓, Enter | node detail Workloads tab | select an instance on the node; Enter opens its app |
+| ↑/↓ | app detail Instances tab | select an instance |
+| `k` or Ctrl-K | app detail Instances tab | kill the selected instance, after a `[y/N]` prompt (only `y` kills); it sends the same audited kill as `relish fault kill APP --instance ID --node NODE --acknowledge --reason "relish tui"`, and the scheduler starts a replacement |
+| `f` | logs | follow the newest lines, or stop |
+| PgUp/PgDn | logs, events | scroll |
+
 ## Every relish command
 
 <!-- relish-commands:start -->
@@ -479,6 +512,7 @@ See [getting started](00_getting-started.md) and [cluster basics](02_cluster-bas
   - `relish image delete <REFERENCE>`: Delete a registry tag: the same as `relish images delete`
 - `relish machines`: Unclaimed appliances on the LAN: list them, or claim them with seeds over the network
   - `relish machines claim <DIRECTORY> <MACHINES>...`: Claim machines: compare each one's claim key with its console, then send it a seed, joining it to the cluster in DIRECTORY (or, with --create, making a new cluster there from them)
+  - `relish machines logs`: Print the kernel and boot logs machines send over the network (UDP 6666), as `relish netboot --stream-logs` does, without serving anything. Runs until Ctrl-C *(0.3.2, not in 0.3.0)*
 - `relish netboot <DIR>`: Install appliances over the network: ProxyDHCP, TFTP and HTTP for the OS that `relish image download` saved
 - `relish os`: The appliance OS across the cluster: what each node runs, and rolling a new version out node by node
   - `relish os list`: Each node's OS version, and the newest release

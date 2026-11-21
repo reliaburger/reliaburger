@@ -136,21 +136,28 @@ where
     F: Fn(BunClient) -> Fut,
     Fut: Future<Output = Result<T, RelishError>>,
 {
-    let requests = nodes.iter().filter(|node| !node.is_down()).map(|node| {
-        let name = node.node_id.clone();
-        let answer = client.via_node(&name).map(&ask);
-        async move {
-            let answer = match answer {
-                Ok(request) => match tokio::time::timeout(NODE_TIMEOUT, request).await {
-                    Ok(Ok(value)) => Ok(value),
-                    Ok(Err(error)) => Err(error.to_string()),
-                    Err(_) => Err(format!("no answer in {} s", NODE_TIMEOUT.as_secs())),
-                },
-                Err(error) => Err(error.to_string()),
-            };
-            (name, answer)
-        }
-    });
+    // Built up front: a lazy `filter`/`map` over borrowed nodes leaves the
+    // compiler unable to prove the stream `Send` for every lifetime, which
+    // the terminal UI's provider needs (#2168).
+    let requests: Vec<_> = nodes
+        .iter()
+        .filter(|node| !node.is_down())
+        .map(|node| {
+            let name = node.node_id.clone();
+            let answer = client.via_node(&name).map(&ask);
+            async move {
+                let answer = match answer {
+                    Ok(request) => match tokio::time::timeout(NODE_TIMEOUT, request).await {
+                        Ok(Ok(value)) => Ok(value),
+                        Ok(Err(error)) => Err(error.to_string()),
+                        Err(_) => Err(format!("no answer in {} s", NODE_TIMEOUT.as_secs())),
+                    },
+                    Err(error) => Err(error.to_string()),
+                };
+                (name, answer)
+            }
+        })
+        .collect();
     let mut answers = futures_util::stream::iter(requests).buffer_unordered(FAN_OUT);
     let mut answered = Vec::new();
     let mut unanswered = Vec::new();
@@ -502,6 +509,8 @@ mod tests {
                 runtime_unknown: false,
                 status_age_ms: None,
                 age_seconds: Some(3_600 * u64::from(index + 1)),
+                image: None,
+                data_on_node: false,
                 reason: None,
             },
         }
