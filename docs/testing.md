@@ -437,13 +437,15 @@ jobs. What else runs depends on where the change is going:
 
 | Run | Jobs | Typical wall time |
 |---|---|---|
-| Pull request into a merge train (`release-*`, e.g. `release-0-2-4`) | The light set: CI policy, dependency audit, lint and format, minimum Rust, the demo app, the source bundle build, portable Linux (with coverage), the doctests and the nightly-signing key test, and the optimised contract boundaries | about 19 minutes of running, set by portable Linux, down from 30 (#1723, [measured](qualification/2026-11-09-v0.2.8-train-pr-timings.md)), then about 35 once the coverage build went to one job at a time (#2102; median 22.7 minutes in 13 green train PRs before, 34.8 in 14 after), plus however long the runners queue. The train's pushes now save portable Linux's dependency cache, so its PRs no longer build every dependency at one job |
+| Pull request into a merge train (`release-*`, e.g. `release-0-2-4`) | The light set: CI policy (with the dependency audit and the demo app's Go tests), lint and format, minimum Rust, the source bundle build, portable Linux (with coverage), the doctests and the nightly-signing key test, and the optimised contract boundaries | about 19 minutes of running, set by portable Linux, down from 30 (#1723, [measured](qualification/2026-11-09-v0.2.8-train-pr-timings.md)), then about 35 once the coverage build went to one job at a time (#2102; median 22.7 minutes in 13 green train PRs before, 34.8 in 14 after). From 18 to 20 November, with the train's dependency cache saved by its pushes, 22 green train PRs without macOS took a median of 31.3 minutes of running and 43.9 of wall time: portable Linux builds the crate for 13 of its 25 to 31 minutes, one compile at a time. Since 0.3.2 `make coverage` builds the lib tests alone and then the rest, both at full parallelism (#1723): estimated at about 6 minutes of build and 18 to 24 of portable Linux (median near 21), to be confirmed by the first CI runs |
 | The same, labelled `full-ci` | The light set plus privileged Linux, the cluster, acceptance and upgrade suites, and the benchmarks the change touches | about 45 minutes |
 | The gate PR (a train into `main`) | The light set on each push; with `full-ci`, the heavy suites too | as above |
 | The gate PR labelled `release-gate` | Everything, portable macOS included; the evidence gate refuses less | about 45 minutes, plus any wait for macOS runners |
 | Any other pull request into `main` | The light set plus the heavy suites and the benchmarks the change touches | about 45 minutes |
 | Pull request stacked on any other branch | The light set; the heavy suites only with `full-ci` | about 17 minutes |
-| Push to a train or to `main`, merge-queue group, nightly, manual, `build.yml`'s candidate build | Everything | about 45 minutes, plus any wait for macOS runners |
+| Merge-queue group | Everything; only CI policy and the gate when the group changes nothing but documentation | about 60 minutes, set by portable macOS, plus any wait for runners |
+| Push to a train | Nothing but CI policy and the gate when the merge queue's run on that commit passed every job at its first attempt; portable Linux too when the train's `Cargo.lock`, `Cargo.toml` or `.cargo/config.toml` differs from `main`'s, to save its cache; everything otherwise | a few minutes; about 25 with portable Linux |
+| Push to `main`, nightly, manual, `build.yml`'s candidate build | Everything | about 45 minutes, plus any wait for macOS runners |
 
 **macOS only where it adds something**
 ([#1443](https://github.com/reliaburger/reliaburger/issues/1443), maintainer
@@ -494,15 +496,27 @@ failed. The resource log and snapshots are kept as `linux-evidence` and
 the lib tests before the rest, so the lib and its lib tests never compile at
 once on a 16 GB runner.
 
+Portable Linux's `make coverage` does the same inside cargo-llvm-cov (#1723).
+`cargo llvm-cov --no-report test --lib -- --list` builds the instrumented lib
+tests alone (10 to 12 GB of rustc) and lists them without running one; `cargo
+llvm-cov clean --profraw-only` deletes the profile that listing writes; then
+the instrumented nextest run builds the rest, the lib (about 7 GB) first,
+since every other target links it. Both phases run at full parallelism: the
+job no longer sets `CARGO_BUILD_JOBS=1`, which also held each rustc's codegen
+to one thread and made the build about 13 of the job's 25 to 31 minutes.
+cargo-llvm-cov keeps `--no-run` for itself (a deprecated alias for its report),
+hence `--list`. The first CI runs measure it: watch the resource log for
+`mem_floor:` and memory-stall stops, and the report step for kernel OOM lines.
+
 The light set exists because macOS was the critical path of almost every run:
 twelve runs before the change took 45–55 minutes of wall time, of which
 runner queueing was mostly under ten, portable macOS 35–49 and acceptance
 about 34; every other job finished in about 15. A pull request into a train
 only needs to show it compiles, lints and passes the portable suite on Linux,
 with the coverage floor (`COVERAGE_MIN_LINES`, which only the Linux job
-measures). Nothing is lost, only moved: the push to the train runs every job
-on the result, so every commit on a train has full coverage. The gate PR
-doesn't run it all again on each push, since that push just did; it runs
+measures). Nothing is lost, only moved: the merge queue runs every job on the
+result before it lands, so every commit on a train has full coverage. The gate PR
+doesn't run it all again on each push, since the queue just did; it runs
 everything once it's labelled `release-gate` at code freeze. Label a pull
 request `full-ci` when you want the heavy suites on the PR itself, for
 example for a change to privileged Linux, cluster or acceptance code. The
@@ -526,7 +540,9 @@ Evidence there binds to the queue's temporary group commit
 
 A newer push to the same pull request, or to the same train, cancels the
 older run; pushes to `main`, merge-queue groups and nightly runs each keep
-their own. Closing (or merging) a pull request cancels its run too: the
+their own. The queue doesn't cancel the runs of groups it drops when it
+re-forms, so [`queue-sweep.yml`](../.github/workflows/queue-sweep.yml) does
+([below](#what-a-merge-costs-in-runners)). Closing (or merging) a pull request cancels its run too: the
 `closed` event starts a run in the same group whose only job is a no-op, and
 every other job skips it
 ([#1054](https://github.com/reliaburger/reliaburger/issues/1054)). When GitHub retargets a stacked pull request,
@@ -557,6 +573,50 @@ the run's artefacts through the API (the jobs, and every workflow that calls
 an HTTP `Range` request, abandons an attempt after 60 s without a byte, logs
 its progress, checks the zip's digest and stops at 13 minutes, inside the
 step's 14.
+
+### What a merge costs in runners
+
+The account runs a fixed number of hosted jobs at once, five of them macOS,
+and every train's PRs, queue groups and pushes share them. From 18 to 20
+November 2026 (194 runs of `ci.yml`, 22,120 runner-minutes) a queue group
+started 20 jobs and used about 280 runner-minutes, and the queue builds up to
+eight groups at once. On the evening of 20 November jobs waited up to 96
+minutes for a runner, and a train PR whose own work took 30 minutes took 70
+to 110 to report (#1723). Three things wasted runners, and each now has a fix:
+
+- **Pushes that repeated the queue.** The queue pushes a train exactly the
+  commit its group tested, and that push ran all 20 jobs again: 15 of the 18
+  train pushes in the window repeated a queue run that had passed, about 4,100
+  runner-minutes. Select jobs now asks the API for that run first, by the
+  rule a candidate build uses to reuse one
+  ([`ci_reuse.py`](../scripts/release/ci_reuse.py) with `--event
+  merge_group`: same commit, first attempt, every job green), and when it
+  finds one the push runs only CI policy and the gate, which names the run
+  it rests on. A candidate build of that commit reuses the queue's run, not
+  the push's. Any doubt, an API error included, runs everything.
+- **Groups the queue had dropped.** When the queue re-forms it deletes the
+  dropped groups' `gh-readonly-queue/...` branches but leaves their runs
+  going, and each merge-group run has a concurrency group of its own. Five
+  such runs kept 78 jobs and about 1,100 runner-minutes going after they were
+  dropped. [`queue_sweep.py`](../scripts/ci/queue_sweep.py), run by
+  `queue-sweep.yml` whenever the queue starts a group or a train moves,
+  cancels every unfinished merge-group run whose branch is gone. It's its own
+  workflow because cancelling needs `actions: write`, which `ci.yml`'s
+  callers don't grant.
+- **Small jobs waiting for runners of their own.** The dependency audit and
+  the demo app's Go tests each took under a minute but waited for a runner
+  like any other job, and the gate waits for the last of them. They're steps
+  of CI policy now: 9 jobs per train PR instead of 11, 18 per queue group
+  instead of 20.
+
+A queue group that changes only documentation runs no code job either (two of
+the window's 32 groups): its code is its base's, which the run before it is
+testing. Scripts are code here, since the jobs run them.
+
+What's left is mostly the queue's own settings, which only the maintainer can
+change: building eight groups at once (`max_entries_to_build` in the "release
+trains merge queue" ruleset) means up to 160 jobs, and portable macOS (52 to
+57 minutes with a warm cache) sets every group's length.
 
 ### What runs on macOS and what runs on Linux
 
@@ -736,8 +796,12 @@ a seal from another commit or run, a later attempt or an earlier attempt that a
 re-run replaced can't qualify.
 
 Linux coverage wraps the existing `make coverage` once, including its clean,
+the lib tests' build, the clean of that build's listing profile, the
 instrumented nextest run and its one report, which writes the LCOV file and
-checks the unchanged line floor. The HTML report isn't evidence: the job writes
+checks the unchanged line floor. A build stage (`--no-report test`) must only
+list its tests (`-- --list`), come before the run and be followed by a
+`clean --profraw-only` before it, so the report reads the run's profiles
+alone; the owner accepts the nextest handshake only during the run stage. The HTML report isn't evidence: the job writes
 it with `make coverage-html` on pushes to `main` and the nightly only. Discovery
 uses that run's instrumented environment, selectors and target directory.
 A separate ordinary test run doesn't validate the coverage run. The owner also

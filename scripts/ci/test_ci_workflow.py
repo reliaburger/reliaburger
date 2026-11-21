@@ -415,6 +415,18 @@ class EvidenceTests(unittest.TestCase):
         self.assertIn("make test-ci-scripts", policy)
         self.assertIn("make check-ignored", policy)
 
+    def test_the_quick_checks_share_one_runner(self):
+        # The audit and the demo app's Go tests take seconds; as jobs of
+        # their own each waited for a runner when runners ran short (#1723).
+        policy = self.jobs["ci-policy"]
+        self.assertIn("run: make audit", policy)
+        self.assertIn("go test ./...", policy)
+        self.assertIn("working-directory: examples/demo/burger", policy)
+        for gone in ["dependency-audit", "demo-app"]:
+            self.assertNotIn(gone, self.jobs)
+        for step in steps(policy):
+            self.assertNotIn("if:", step)
+
     def test_the_crane_client_has_a_provisioned_job(self):
         acceptance = self.jobs["acceptance"]
         self.assertIn("--gate standard-clients --host linux", acceptance)
@@ -447,8 +459,9 @@ class TrainAndQueueTests(unittest.TestCase):
         # The train ruleset's queue requires one check, "ignored-test
         # evidence". A merge group has no pull request and no label, so no
         # job may hang its condition on the event: each follows select jobs
-        # (which picks everything for merge_group, see test_select_jobs.py)
-        # or the closed-PR guard, and the gate always reports.
+        # (which picks everything for a merge group that changes code, see
+        # test_select_jobs.py) or the closed-PR guard, and the gate always
+        # reports.
         allowed = {"github.event.action == 'closed'", "github.event.action != 'closed'",
                    "${{ always() && github.event.action != 'closed' }}"}
         for name, job in self.jobs.items():
@@ -467,6 +480,32 @@ class TrainAndQueueTests(unittest.TestCase):
         self.assertIn("RELEASE_GATE: ${{ contains(github.event.pull_request.labels.*.name, 'release-gate') }}",
                       changes)
         self.assertIn("MACOS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'macos') }}", changes)
+
+    def test_a_merge_group_is_judged_against_the_commit_it_sits_on(self):
+        self.assertIn("BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}",
+                      self.jobs["changes"])
+
+    def test_a_train_push_looks_for_the_merge_queue_run_on_its_commit(self):
+        changes = self.jobs["changes"]
+        blocks = steps(changes)
+        queue = next(index for index, step in enumerate(blocks) if "ci_reuse.py" in step)
+        select = next(index for index, step in enumerate(blocks) if "select-jobs.sh" in step)
+        self.assertLess(queue, select)
+        step = blocks[queue]
+        self.assertIn("if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-')", step)
+        self.assertIn("--event merge_group", step)
+        self.assertIn('--commit "$GITHUB_SHA"', step)
+        # Any doubt runs everything: a failed lookup must not fail the run.
+        self.assertIn("continue-on-error: true", step)
+        self.assertRegex(step, r"timeout-minutes: \d+")
+        self.assertIn("QUEUE_RUN: ${{ steps.queue.outputs.ci_run }}", blocks[select])
+        for output in ["portable", "tested_by"]:
+            self.assertIn(f"{output}: ${{{{ steps.select.outputs.{output} }}}}", changes)
+
+    def test_select_jobs_may_read_runs_but_never_cancel_them(self):
+        # ci.yml's callers grant actions: read; queue-sweep.yml cancels.
+        self.assertRegex(self.jobs["changes"], r"\n    permissions:\n      contents: read\n      actions: read\n")
+        self.assertNotIn("actions: write", self.ci)
 
     def test_evidence_binds_to_the_merge_groups_own_commit(self):
         self.assertIn("  EXPECTED_CHECKOUT_COMMIT: ${{ github.event.merge_group.head_sha || github.sha }}\n",
@@ -513,7 +552,7 @@ class TrainAndQueueTests(unittest.TestCase):
             self.assertIn("changes", needs.group(1), name)
             if condition:
                 self.assertNotRegex(condition.group(1), r"always\(\)|failure\(\)|cancelled\(\)", name)
-        for name in ["changes", "ci-policy", "dependency-audit", "ignored-evidence"]:
+        for name in ["changes", "ci-policy", "ignored-evidence"]:
             self.assertIn(guard, self.jobs[name], name)
 
     def test_the_final_gate_waits_for_every_other_job_and_always_reports(self):
@@ -580,8 +619,10 @@ class TrainAndQueueTests(unittest.TestCase):
     def test_the_heavy_jobs_wait_for_their_own_selection(self):
         for name in ["linux", "linux-next", "build-tests", "cluster", "acceptance"]:
             self.assertIn("if: needs.changes.outputs.heavy == 'true'", self.jobs[name])
-        for name in ["lint", "minimum-rust", "portable", "doctests", "contract-boundaries", "demo-app", "source-bundle"]:
+        for name in ["lint", "minimum-rust", "doctests", "contract-boundaries", "source-bundle"]:
             self.assertIn("if: needs.changes.outputs.code == 'true'", self.jobs[name])
+        # Portable Linux also runs alone to save a train's cache (#1723).
+        self.assertIn("if: needs.changes.outputs.portable == 'true'", self.jobs["portable"])
 
     def test_the_embedded_source_builds_on_its_own(self):
         # relish carries its source (#1570); the job proves the bundle alone
@@ -611,13 +652,15 @@ class TrainAndQueueTests(unittest.TestCase):
         self.assertIn("save-if: false", job)
 
     def test_the_portable_suite_finishes_on_a_slow_runner_with_headroom(self):
-        # 35 to 41 minutes on a slow runner (#1421), then up to 55 once the
-        # coverage build ran one job at a time, which tripled the build in
-        # the Lima VM. nextest's per-test timeouts catch a hung test, so the
-        # job limit only has to outlast a slow runner by half again.
+        # 35 to 41 minutes on a slow runner (#1421). One build job (#1943)
+        # tripled the build and the limit went to 85; the split build runs
+        # at full parallelism again (#1723), so 41 is the slow runner once
+        # more. nextest's per-test timeouts catch a hung test, so the job
+        # limit only has to outlast a slow runner by half again.
         limit = re.search(r"\n    timeout-minutes: (\d+)\n", self.jobs["portable"])
         self.assertIsNotNone(limit)
-        self.assertGreaterEqual(int(limit.group(1)), 55 * 3 // 2)
+        self.assertGreaterEqual(int(limit.group(1)), 41 * 3 // 2)
+        self.assertLess(int(limit.group(1)), 85)
 
     def test_the_nightly_signing_build_s_own_key_test_runs(self):
         # The nightly build trusts the nightly key instead of every release
@@ -1149,12 +1192,15 @@ class PortableLinuxRunnerTests(unittest.TestCase):
         self.assertIn("WATCH_PSI_FULL_PERCENT=60", watch)
         self.assertIn("WATCH_PSI_SECONDS=30", watch)
 
-    def test_the_coverage_build_compiles_one_crate_at_a_time(self):
+    def test_the_coverage_build_runs_at_full_parallelism(self):
+        # #1723: `make coverage` builds the lib tests alone before the run
+        # builds the rest (test_make_prebuilds.py), so the lib's 7 GB rustc
+        # never shares the runner with the lib tests' 12 GB one. A one-job
+        # cap on top would only throttle each rustc's codegen to one thread.
         producer = self.steps[self.producer()]
-        self.assertIn('CARGO_BUILD_JOBS: "1"', producer)
-        # Only this job: the others don't build the instrumented lib tests.
+        self.assertNotIn("CARGO_BUILD_JOBS", producer)
         text = (WORKFLOWS / "ci.yml").read_text()
-        self.assertEqual(text.count("CARGO_BUILD_JOBS:"), 1)
+        self.assertEqual(text.count("CARGO_BUILD_JOBS:"), 0)
 
     def test_train_pushes_save_the_dependency_cache_that_train_prs_restore(self):
         # The cache key carries the toolchain and the lock file, which a

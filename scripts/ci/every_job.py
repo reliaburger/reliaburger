@@ -3,8 +3,10 @@
 
 "ignored-test evidence" needs every other job in ci.yml, so a merge queue
 can require that one check. A job may be skipped only because select jobs
-left it out: that job must itself have succeeded first. Only a pull request
-may skip the code jobs altogether (a documentation-only change). The
+left it out: that job must itself have succeeded first. Three kinds of run may
+skip the code jobs altogether: a pull request or a merge group that changes
+only documentation, and a push to a train whose commit the merge queue already
+passed, which names that run in select jobs' `tested_by` (#1723). The
 evidence owners' own checks are in workflow_adapter.py aggregate.
 
 A job in ADVISORY runs and reports on every run, but its failure prints a
@@ -54,10 +56,17 @@ def problems(needs, event):
              if name not in ADVISORY and job.get('result') not in ('success', 'skipped')]
     if needs['changes'].get('result') == 'skipped':
         found.append("changes finished as 'skipped'")
-    code = needs['changes'].get('outputs', {}).get('code')
-    if not found and code != 'true' and event != 'pull_request':
+    outputs = needs['changes'].get('outputs', {})
+    if not found and outputs.get('code') != 'true' and event not in ('pull_request', 'merge_group') \
+            and not (event == 'push' and tested_by(needs)):
         found.append(f'a {event} run must select the code jobs')
     return found
+
+
+def tested_by(needs):
+    """The merge-queue run select jobs says already tested this push's commit, or None."""
+    run = needs.get('changes', {}).get('outputs', {}).get('tested_by') or ''
+    return run if run.isdigit() else None
 
 
 def main(argv=None):
@@ -69,6 +78,10 @@ def main(argv=None):
     for warning in warnings(needs):
         print('::warning::CI gate: ' + warning)
     found = problems(needs, args.event)
+    run = tested_by(needs) if args.event == 'push' else None
+    if run and not found:
+        print(f'::notice::CI gate: merge-queue run {run} already passed every job on this commit, '
+              'so this push ran none of them')
     for problem in found:
         print('CI gate: ' + problem, file=sys.stderr)
     return 1 if found else 0

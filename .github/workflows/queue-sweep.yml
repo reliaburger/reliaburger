@@ -1,0 +1,40 @@
+name: Merge queue sweep
+
+# Cancels the ci.yml runs of merge-queue groups the queue has dropped (#1723).
+# GitHub deletes a dropped group's gh-readonly-queue branch but leaves its run
+# going, and ci.yml gives each merge-group run a concurrency group of its own,
+# so on 20 November 2026 superseded runs held runners for an hour while the
+# live groups queued behind them. scripts/ci/queue_sweep.py has the rule.
+#
+# Every re-formation either starts a new group (its merge_group event) or
+# merges one (a push to the train), so sweeping on both catches each dropped
+# run within a minute or so of its being dropped.
+#
+# It is its own workflow because cancelling a run needs `actions: write`,
+# which ci.yml's callers don't grant. The queue doesn't wait for it: its one
+# required check is ci.yml's `ignored-test evidence`.
+
+on:
+  merge_group:
+    types: [checks_requested]
+  push:
+    branches: ["release-*"]
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  sweep:
+    name: cancel superseded queue runs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/ci/queue_sweep.py
+          sparse-checkout-cone-mode: false
+      - name: Cancel the runs of groups the queue dropped
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/queue_sweep.py --repository "$GITHUB_REPOSITORY" --own-run-id "$GITHUB_RUN_ID"
