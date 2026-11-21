@@ -722,10 +722,12 @@ for the audit, exact suite contracts and CI mapping.
 
 ### Fuzzing
 
-Every decoder that reads bytes from another machine (gossip, Raft frames, DNS,
-backups, OCI manifests, join CSRs, app and node TOML) has a
-[cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html) target in
-`fuzz/`. See [testing.md](testing.md#fuzzing).
+The decoders that read bytes from another machine (gossip, Raft frames, DNS,
+the API's bearer check, ingress requests, the netboot TFTP, DHCP and disk
+reports, backups, OCI manifests, join CSRs, app and node TOML) have
+[cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html) targets in
+`fuzz/`. See [testing.md](testing.md#fuzzing), which ranks the decoders still
+without one.
 
 ```sh
 make fuzz-corpus-check  # every target body over its checked-in corpus, on stable

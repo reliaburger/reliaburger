@@ -843,9 +843,10 @@ real cloud's durability guarantees; those have separate owners.
 
 ## Fuzzing
 
-Every decoder that reads bytes from another machine has a
-[cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html) target
-(libFuzzer) ([#1398](https://github.com/reliaburger/reliaburger/issues/1398);
+The decoders that read bytes from another machine have
+[cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html) targets
+(libFuzzer), and [the ranking below](#which-decoders-have-targets) says which
+come next ([#1398](https://github.com/reliaburger/reliaburger/issues/1398);
 plan: [`plans/2026-10-28-research-kubernetes-release-testing.md`](plans/2026-10-28-research-kubernetes-release-testing.md)):
 
 | Target | Decoder | Bytes from |
@@ -862,6 +863,11 @@ plan: [`plans/2026-10-28-research-kubernetes-release-testing.md`](plans/2026-10-
 | `task_manifest` | `TaskManifestRequest` and `validate_submission` (`bun::task_array_api`) | `relish batch submit` or `POST /v1/batch/manifest` |
 | `chaos_scenario` | `ScriptedScenario` and `smoker::scenario::build_timeline` | a chaos scenario file for `relish fault scenario` |
 | `council_backup_state` | `DesiredState`, then `BackupKey::for_state` and `BackupKey::parse` | the state inside an unsealed backup, during `relish council recover` |
+| `api_bearer` | `sesame::auth::extract_bearer`, `authenticate` and `sesame::oidc::verify_jwt_with_keys` | any client that can reach the API, before it has authenticated |
+| `ingress_request` | `wrapper::proxy::request_host`, `RoutingTable::lookup`, the HTTPS redirect, the upstream URI and the session-cookie filter | any client on the internet, through the ingress proxy |
+| `tftp_packet` | `relish::netboot::tftp::Packet::parse`, `route`, `negotiate` and a whole `Transfer` | any host on the LAN while `relish netboot` runs |
+| `dhcp_request` | `relish::netboot::dhcp::decode`, `answer` and `encode` | any host on the LAN while `relish netboot` runs |
+| `netboot_disk_report` | `relish::netboot::wipe::DiskReport::parse`, `summary` and `decide` | any host on the LAN, in `POST /disk`, before its install ticket is checked |
 
 A target's body lives in [`src/fuzz/mod.rs`](../src/fuzz/mod.rs), behind the
 `fuzzing` feature, and [`fuzz/fuzz_targets/`](../fuzz/fuzz_targets) only wraps
@@ -871,7 +877,53 @@ Raft frame and upstream manifest compare JSON values, because key order isn't
 meaning; gossip compares postcard bytes. Other checks are specific to the
 decoder: the push target checks that Pickle serves a manifest as the media type
 the client declared, and the CSR target checks that the certificate names the
-node the CA chose, never one the CSR asked for.
+node the CA chose, never one the CSR asked for. The bearer target checks that
+only a stored token's exact plaintext authenticates; the ingress target that a
+request matches its route on a segment boundary and that the HTTPS redirect
+names the routed host; the TFTP target that an honest client gets the whole
+file in order whatever options it asked for; the DHCP target that no reply
+hands out an address; and the netboot targets that a client's text reaches the
+operator's terminal escaped.
+
+Seeds must be the same bytes every time `make fuzz-corpus-seed` runs, so a
+seed never uses a random key or nonce: the JWT and join CSR seeds are signed
+with Ed25519 keys from fixed seeds (Ed25519 signatures are deterministic,
+ECDSA's aren't), and the backup seed is sealed with a fixed salt and nonce.
+
+### Which decoders have targets
+
+Every decoder that reads bytes from outside the process, ranked by who can
+send them: network-facing and unauthenticated first. The ranking decides which
+decoder gets the next target
+([#1414](https://github.com/reliaburger/reliaburger/issues/1414)).
+
+| Rank | Decoder | Who sends the bytes | Target |
+|---|---|---|---|
+| 1 | Gossip datagrams (`mustard::message`) | anyone who reaches the gossip UDP port | `gossip_datagram` |
+| 1 | `Authorization` bearer: token shape, API tokens, workload JWTs (`sesame::auth`, `sesame::oidc`) | any API client, before authentication | `api_bearer` |
+| 1 | Ingress `Host`, request target and `Cookie` (`wrapper::proxy`, `wrapper::routing`); HTTP framing itself is hyper's | any internet client | `ingress_request` |
+| 2 | TFTP packets (`relish::netboot::tftp`) | any LAN host, while `relish netboot` runs | `tftp_packet` |
+| 2 | DHCP requests (`relish::netboot::dhcp`, on dhcproto) | any LAN host, while `relish netboot` runs | `dhcp_request` |
+| 2 | Disk reports, `POST /disk` (`relish::netboot::wipe`) | any LAN host, before the ticket check | `netboot_disk_report` |
+| 3 | DNS queries (`onion::dns`) | any workload | `dns_query` |
+| 3 | Prometheus text from an app's metrics endpoint (`mayo::scrape`, on prometheus-parse) | any workload | none yet |
+| 3 | A backend's WebSocket handshake response (`wrapper::websocket::parse_handshake`) | any workload behind an ingress route | none yet |
+| 4 | Join CSRs (`sesame::ca::sign_node_csr`) | a node holding a join token | `join_csr` |
+| 4 | Pushed manifests (`pickle::api`) | a client with a registry token | `oci_manifest_push` |
+| 4 | API JSON bodies, task-array manifests (`bun::task_array_api`) | an authenticated client | `task_manifest` (the rest are serde derives) |
+| 4 | GitOps webhook body (`lettuce::webhook`) | a sender holding the webhook secret; the HMAC is checked first | none yet |
+| 5 | Raft RPC frames (`council::network`) | a council peer, over mTLS | `raft_rpc_frame` |
+| 5 | Reporting frames (`reporting::transport`) | a node, over mTLS | none yet |
+| 6 | Upstream manifests (`grill::oci_pull`) | the registry an app names | `oci_manifest_upstream` |
+| 6 | Layer tarballs and whiteouts (`grill::image::unpack_layers`) | the registry an app names, pinned by the manifest's digests | none yet: it writes a filesystem |
+| 6 | Release and OS channel metadata (`upgrade::metadata`, `os::channel`) | the release server, signed | none yet |
+| 7 | Backup files and the state inside (`council::backup`) | an operator | `council_backup`, `council_backup_state` |
+| 7 | App, node, chaos scenario TOML (`config`, `smoker`) | an operator or a GitOps repository | `app_config`, `node_config`, `chaos_scenario` |
+| 7 | Join tokens, Kubernetes YAML for `relish import`, the source bundle | an operator, on their own machine | none: nothing remote sends them |
+
+The next targets, in order: the Prometheus text parser, the WebSocket
+handshake parser and the layer unpacker (into a scratch directory, checking
+that nothing lands outside it).
 
 The `fuzz/` crate has its own `[workspace]`, so the root crate's `cargo`
 commands never build it. Three things run the targets:
@@ -886,7 +938,7 @@ Every fuzz build and run goes through
 [`fuzz/rustc-coverage.sh`](../fuzz/rustc-coverage.sh), a `RUSTC_WRAPPER` that
 keeps libFuzzer's coverage instrumentation (`-Cpasses=sancov-module`) only on
 reliaburger and the parsers the decoders run through (serde_json, postcard,
-toml, hickory-proto, x509-parser, oci-spec and a few more), and drops it from
+toml, hickory-proto, dhcproto, http, x509-parser, oci-spec and a few more), and drops it from
 every other dependency
 ([#1953](https://github.com/reliaburger/reliaburger/issues/1953)).
 AddressSanitizer stays on everywhere. libFuzzer scans every counter after
