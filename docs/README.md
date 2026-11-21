@@ -277,7 +277,7 @@ and its trade-offs; the [design docs](design/) cover each subsystem.
   ([#1412](https://github.com/reliaburger/reliaburger/issues/1412)), and gossip
   at 1,000 not settling within six minutes
   ([#1413](https://github.com/reliaburger/reliaburger/issues/1413)).
-- **Alerts are five built-in node rules.** CPU, memory and disk thresholds,
+- **Alerts are four built-in node rules.** CPU, memory and disk thresholds,
   delivered by webhook; you can't define your own rules yet
   ([manual](manual/04_observability.md#alerts)).
 - **One Bun per writable image store.** Registry startup claims exclusive
