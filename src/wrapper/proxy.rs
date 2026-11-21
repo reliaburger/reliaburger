@@ -1011,8 +1011,7 @@ where
 /// 308 (Permanent Redirect) preserves the method and body, unlike 301/302
 /// which some clients rewrite to GET.
 pub(crate) fn redirect_to_https(host: &str, uri: &Uri) -> Response {
-    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-    let location = format!("https://{host}{path_and_query}");
+    let location = format!("https://{host}{}", origin_form(uri));
     Response::builder()
         .status(StatusCode::PERMANENT_REDIRECT)
         .header("location", location)
@@ -1098,14 +1097,28 @@ pub(super) fn connection_tokens(
     set
 }
 
+/// The request target's path and query, ready to follow an authority in a
+/// URL: always starting with `/`.
+///
+/// A target without a path, such as the asterisk-form `*` of
+/// `OPTIONS * HTTP/1.1`, becomes `/`. Written straight after an authority,
+/// `*` would run on into the host or port.
+fn origin_form(uri: &Uri) -> String {
+    let path = uri.path();
+    if !path.starts_with('/') {
+        return "/".to_string();
+    }
+    match uri.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path.to_string(),
+    }
+}
+
 /// Build the upstream URI from the backend address and request URI.
 pub(crate) fn build_upstream_uri(backend: &std::net::SocketAddr, request_uri: &Uri) -> Option<Uri> {
-    let path_and_query = request_uri
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
-
-    format!("http://{backend}{path_and_query}").parse().ok()
+    format!("http://{backend}{}", origin_form(request_uri))
+        .parse()
+        .ok()
 }
 
 #[cfg(test)]
@@ -1127,6 +1140,14 @@ mod tests {
     fn build_upstream_uri_root_path() {
         let addr: std::net::SocketAddr = "10.0.2.2:30001".parse().unwrap();
         let req_uri: Uri = "/".parse().unwrap();
+        let upstream = build_upstream_uri(&addr, &req_uri).unwrap();
+        assert_eq!(upstream.to_string(), "http://10.0.2.2:30001/");
+    }
+
+    #[test]
+    fn build_upstream_uri_sends_an_asterisk_form_target_to_the_root() {
+        let addr: std::net::SocketAddr = "10.0.2.2:30001".parse().unwrap();
+        let req_uri: Uri = "*".parse().unwrap();
         let upstream = build_upstream_uri(&addr, &req_uri).unwrap();
         assert_eq!(upstream.to_string(), "http://10.0.2.2:30001/");
     }
@@ -1241,6 +1262,17 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT);
         let location = resp.headers().get("location").unwrap().to_str().unwrap();
         assert_eq!(location, "https://myapp.com/dashboard?tab=1");
+    }
+
+    /// `OPTIONS * HTTP/1.1` carries the asterisk-form request target, which
+    /// has no path to repeat: the redirect goes to the host's root, so the
+    /// `*` can't run on into the redirect's host.
+    #[test]
+    fn redirect_to_https_sends_an_asterisk_form_target_to_the_root() {
+        let uri: Uri = "*".parse().unwrap();
+        let resp = redirect_to_https("tls.example", &uri);
+        let location = resp.headers().get("location").unwrap().to_str().unwrap();
+        assert_eq!(location, "https://tls.example/");
     }
 
     /// Z6.7: once a cluster node's view lease lapses, the leader may discharge
