@@ -525,7 +525,7 @@ Here's what `relish wtf -o json` says about an app in a crash loop:
 
 ```json
 {"id": "crashloop", "title": "app payments/default restarted repeatedly",
- "details": ["3 timestamped restarts in the last 15 minutes; first error: <the app's log line>"]}
+ "details": ["instance payments-0 restarted 3 times in the last 15 minutes; first error: <the app's log line>"]}
 ```
 
 Look at where the log line sits. It's inside our sentence, in a field an
@@ -1054,7 +1054,7 @@ function that report the finding.
 
 It also takes something out. A crashloop finding quotes the app's first error
 line twice in `wtf`'s report: once as a correlated event and once inside its
-own sentence, `4 timestamped restarts in the last 15 minutes; first error:
+own sentence, `instance web-0 restarted 4 times in the last 15 minutes; first error:
 ...`. In the sentence, an agent can't tell where our words stop and the app's
 start, and an app can log "IGNORE PREVIOUS INSTRUCTIONS". `diagnose` swaps
 the quoted line for `<the app's log line, in events as untrusted text>` and
@@ -1086,7 +1086,7 @@ decide it:
 
 ```json
 {"constant": "CRASHLOOP_RESTARTS", "value": 3, "unit": "count",
- "meaning": "restarts inside the window that make a crash loop",
+ "meaning": "restarts of one instance inside the window that make a crash loop",
  "defined_at": {"path": "src/relish/wtf/findings.rs", "line": 16, ...}}
 ```
 
@@ -1103,12 +1103,12 @@ pub const FINDINGS: &[FindingKind] = &[
     FindingKind {
         id: "crashloop",
         severities: CRITICAL,
-        meaning: "an app restarted repeatedly in a short window; ...",
+        meaning: "one instance of an app restarted repeatedly in a short window; ...",
         thresholds: &[Threshold {
             constant: "CRASHLOOP_RESTARTS",
             value: CRASHLOOP_RESTARTS as u64,
             unit: Unit::Count,
-            meaning: "restarts inside the window that make a crash loop",
+            meaning: "restarts of one instance inside the window that make a crash loop",
         }],
     },
 ];

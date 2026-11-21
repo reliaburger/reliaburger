@@ -3844,10 +3844,10 @@ time window deterministic in a unit test.
 
 Take crashloops. A workload with a lifetime restart count of 30 may have run
 perfectly for six months since its last failure. Calling that a current
-crashloop is nonsense. We require three timestamped restart events inside the
-last 15 minutes. When that pattern fires, the engine looks for a deploy of the
-same application and namespace in the preceding 30 minutes, then attaches the
-first recent error log. One finding now answers three questions: what failed,
+crashloop is nonsense. We require three timestamped restart events of one
+instance inside the last 15 minutes. When that pattern fires, the engine looks
+for a deploy of the same application and namespace in the preceding 30
+minutes, then attaches the first recent error log. One finding now answers three questions: what failed,
 what changed, and what did the process say?
 
 That rule is only as good as the events behind it, and in 0.2.7 the agent gym
@@ -3861,6 +3861,41 @@ history. The fix is to have one door: `observe_app_exit` now calls
 `retry_restart` too, so whichever tick moves the instance back to Pending
 records the event, exactly once, and an exhausted budget fails the instance
 with the same `exhausted its restart budget` event either way (#1652).
+
+"Of one instance" came later, from 0.3.1's soak (#2197). Until then the rule
+counted an app's restarts together. The soak's chaos scenario restarted two of
+a three-replica app's instances on purpose, and a moment later its pause froze
+the third, whose health checks failed, so Bun restarted that one too. Three
+restarts, one app, inside 15 minutes: `wtf` called it a crash loop and kept
+saying so for the whole window. Each replica had restarted once, for its own
+reason. A crash loop is one process that keeps dying, so the check now groups
+restarts by instance, and each instance needs three of its own.
+
+Grouping by instance turned up a second bug. Bun records the instance as the
+restart decision's `instance` evidence, but the collector read a key called
+`instance_id`, which no event has ever carried. Every restart reached
+`diagnose` with no instance, and no unit test noticed, because the tests built
+their `RestartObservation`s by hand. The new test records a real decision in an
+`EventStore` and reads it back through the collector. Restarts that still name
+no instance, such as a restart that failed before it got going, are counted
+together, as the old rule counted all of them.
+
+The grouping is a map of maps. Spelled out, its type is:
+
+```rust
+BTreeMap<(&str, &str), BTreeMap<Option<&str>, Vec<&RestartObservation>>>
+```
+
+The outer key is the app and namespace, borrowed from the observations as
+`&str` rather than copied into new `String`s; the borrow checker makes sure
+the map doesn't outlive the inputs it points into. The inner key is the
+instance, `Option<&str>`, so "no instance" is a key of its own, `None`, rather
+than an empty string that might collide with a real name. `BTreeMap` rather
+than `HashMap` keeps the report's order the same on every run. Clippy calls
+a type this deep "very complex", so the code names the inner map
+`RestartsByInstance<'a>`, a `type` alias: a second name for the same type, as
+`typedef` is in C, carrying the lifetime `'a` that ties its borrows to the
+inputs.
 
 The same rule keeps the other checks honest. Disk pressure needs used capacity
 with a node and storage-domain attribution. CPU throttling needs an increase in

@@ -541,7 +541,7 @@ fn collect_restarts(
                             .namespace
                             .clone()
                             .unwrap_or_else(|| "default".to_string()),
-                        instance: event.details.get("instance_id").cloned(),
+                        instance: event.details.get("instance").cloned(),
                         timestamp: event.timestamp,
                         reason: event.message.clone(),
                     })
@@ -1509,6 +1509,47 @@ mod tests {
         assert!(evidence.caveat().is_some());
     }
 
+    /// Bun records a restart's instance as the decision's `instance`
+    /// evidence. The crash-loop check counts per instance, so it must read
+    /// that key (#2197).
+    #[test]
+    fn a_restart_names_the_instance_its_decision_recorded() {
+        let mut store = crate::bun::events::EventStore::new();
+        let decision = crate::bun::restart::restart_decision(
+            "restart.health_failed",
+            "default__web-1",
+            1,
+            &Default::default(),
+        );
+        store.record_with_details(
+            5,
+            EventKind::Restart,
+            crate::bun::events::EventSeverity::Warning,
+            Some("web".to_string()),
+            Some("default".to_string()),
+            None,
+            "instance default__web-1 restarted (attempt 1)".to_string(),
+            decision.into_details(),
+        );
+        let collected = vec![NodeCollection {
+            node_id: "node-1".to_string(),
+            reachable: true,
+            diagnostics: Err("unused".to_string()),
+            events: Ok(store.recent(EVENT_LIMIT, None, None)),
+            deploys: Err("unused".to_string()),
+            alerts: Err("unused".to_string()),
+            faults: Err("unused".to_string()),
+            instances: Err("unused".to_string()),
+            version: Err("unused".into()),
+            council: Err("unused".into()),
+        }];
+
+        let evidence = collect_restarts(&collected, 10);
+
+        let restarts = evidence.value().unwrap();
+        assert_eq!(restarts[0].instance.as_deref(), Some("default__web-1"));
+    }
+
     /// The agent gym's crash loop (#1652): an app that exits a few seconds
     /// after each start, restarted at once each time. Its node's events hold
     /// one `restart` per restart, as the agent records them, and its status
@@ -1581,7 +1622,7 @@ mod tests {
             .find(|finding| finding.id == "crashloop")
             .unwrap_or_else(|| panic!("no crashloop finding: {report:?}"));
         assert_eq!(finding.title, "app web/default restarted repeatedly");
-        assert!(finding.details[0].contains("5 timestamped restarts"));
+        assert!(finding.details[0].contains("5 restarts that name no instance"));
     }
 
     #[test]
