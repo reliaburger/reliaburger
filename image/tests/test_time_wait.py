@@ -13,14 +13,28 @@ the bounded wait.
     python3 -m unittest discover -s image/tests -p 'test_time_wait.py'
 """
 
+import re
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 UNITS = ROOT / "image" / "mkosi.extra" / "usr" / "lib" / "systemd" / "system"
-# boot-check gives a counted boot 120 s, and bun answers in 8 to 23 s.
-COUNTED_BOOT_BUDGET = 120
-SLOWEST_HEALTHY_BUN = 23
+BOOT_CHECK = ROOT / "image" / "mkosi.extra" / "usr" / "lib" / "reliaburger" / "boot-check"
+# The slowest healthy boot measured: a Wyse 3040 (#2143, 20 Nov 2026) had bun
+# healthy 38 s after its boot's first journal line. The lab's x86 nodes
+# answer in 8 to 23 s.
+SLOWEST_HEALTHY_BUN = 38
+# What a counted boot must have left over even then.
+MARGIN = 20
+
+
+def counted_boot_budget():
+    """The seconds boot-check gives a counted boot, read from the script."""
+    match = re.search(r"^if counted; then limit=(\d+); else limit=\d+; fi$",
+                      BOOT_CHECK.read_text(), re.MULTILINE)
+    if match is None:
+        raise AssertionError("boot-check no longer sets its limits on one line")
+    return int(match.group(1))
 
 
 def unit(name):
@@ -65,8 +79,9 @@ class TimeWaitTests(unittest.TestCase):
         seconds = int(start.split()[1])
         self.assertTrue(start.endswith(" /usr/lib/systemd/systemd-time-wait-sync"), start)
         # A clock that never syncs must still leave a counted boot time to
-        # see bun healthy, or every update on an offline LAN would fall back.
-        self.assertLessEqual(seconds + SLOWEST_HEALTHY_BUN, COUNTED_BOOT_BUDGET // 2)
+        # see the slowest bun healthy, or every update on an offline LAN
+        # would fall back.
+        self.assertLessEqual(seconds + SLOWEST_HEALTHY_BUN + MARGIN, counted_boot_budget())
         self.assertEqual(service["Type"], ["oneshot"])
         # Once per boot: bun's own restarts don't wait again.
         self.assertEqual(service["RemainAfterExit"], ["yes"])
