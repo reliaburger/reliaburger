@@ -113,6 +113,32 @@ on Linux only ([what runs on macOS](testing.md#what-runs-on-macos-and-what-runs-
 Dependabot's PRs never get macOS unless labelled; the nightly on `main`
 covers them.
 
+### Opening a train
+
+A train opens in one sitting, in this order:
+
+1. **Create the branch** `release-X-Y-Z` from the previous train's frozen
+   tip, or from `main` once the previous release is out.
+2. **Bump the version first.** The first PR into the train sets the
+   version in `Cargo.toml` (and its lockfile entries), so everything built
+   from the train says which release it's heading for.
+3. **Add the branch to the merge-queue ruleset** by its exact name. Only a
+   repository admin can:
+
+   ```
+   gh api repos/reliaburger/reliaburger/rulesets/25015244 > ruleset.json
+   # add "refs/heads/release-X-Y-Z" to .conditions.ref_name.include, then
+   gh api -X PUT repos/reliaburger/reliaburger/rulesets/25015244 --input ruleset.json
+   ```
+
+   Then check it took:
+   `gh api repos/reliaburger/reliaburger/rules/branches/release-X-Y-Z`
+   must list `merge_queue` and `required_status_checks`. An empty list
+   means the train has no queue ([merging through the queue](#merging-through-the-queue)).
+4. **Open the gate PR** from the train into `main`, with an empty list of
+   `Fixes` lines that grows as PRs merge
+   ([every issue closes itself](#every-issue-closes-itself)).
+
 ### Every issue closes itself
 
 Every issue a release resolves closes automatically when its fix reaches
@@ -156,14 +182,20 @@ Every train merges through GitHub's merge queue (maintainer decision of 6
 November 2026). The repository ruleset "release trains merge queue" holds the
 queue and its one required check, `ignored-test evidence`, and it names each
 train branch exactly: GitHub doesn't allow a wildcard such as `release-*` in a
-ruleset with a merge-queue rule. So when a train opens, the maintainer adds
-its branch (`refs/heads/release-0-2-8`, say) to that ruleset by name, in the
-same sitting as creating the branch. A train missing from the ruleset has
+ruleset with a merge-queue rule; retargeting it to one fails with "Wildcard
+ref names are not supported when merge queue is enabled" (#1053). So when a
+train opens, an admin adds its branch (`refs/heads/release-0-2-8`, say) to
+that ruleset by name, in the same sitting as creating the branch
+([opening a train](#opening-a-train)). A train missing from the ruleset has
 no queue, and its PRs merge on the light set alone; that's how 0.2.2 to 0.2.6
 merged, because the ruleset still named only `release-0-2-1`.
 
-Merge a PR into a train with `gh pr merge --merge --auto`, or the "Merge when
-ready" button, which adds it to the queue. Don't merge it directly. The queue
+Merge a reviewed PR whose checks have passed into a train with
+`gh pr merge --merge`, or the "Merge when ready" button, which adds it to
+the queue. Don't use `--auto` (maintainer decision of 17 November 2026): a
+PR queues only once a person has seen it green. GitHub can drop a PR from
+the queue without saying so, so afterwards check that `isInMergeQueue` is
+true, and again after any queue event. The queue
 builds a temporary branch with the train plus the PR (and up to seven more
 waiting behind it: the ruleset's group size went from 4 to 8 on 7 November
 2026, #1724), and `ci.yml`'s `merge_group` trigger runs every job on it.
