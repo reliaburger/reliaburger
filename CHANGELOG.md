@@ -11,9 +11,17 @@ This file is the short version. The longer records are:
 - [docs/releasing.md](docs/releasing.md#compatibility-before-100), for the full upgrade steps between each pair of releases;
 - the [GitHub release pages](https://github.com/reliaburger/reliaburger/releases), for the binaries and every merged pull request.
 
-## [Unreleased] - 0.3.1
+## [Unreleased] - 0.3.2
 
-Fixes from 0.3.0's gate and the first Wyse lab, and a terminal UI you can act from. Not released yet: this is what the train carries, and it can change before the tag.
+Fixes from the Wyse 3040 lab that need a new appliance image. Not released yet: this is what the train carries, and it can change before the tag.
+
+### Upgrading
+
+- 0.3.2 moves the wire protocol from 60 to 61, because an apply error now carries its real status instead of 500 ([#2157](https://github.com/reliaburger/reliaburger/issues/2157)). Start a fresh 0.3.2 cluster: 0.3.1 and 0.3.2 nodes refuse each other, so there's no rolling upgrade ([compatibility before 1.0.0](docs/releasing.md#compatibility-before-100)).
+
+## [0.3.1] - 2026-11-21
+
+Fixes from 0.3.0's gate and the first Wyse lab, and a terminal UI you can act from.
 
 ### Upgrading
 
