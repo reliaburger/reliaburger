@@ -419,16 +419,8 @@ fn tftp_files(
 }
 
 fn log_transfer(log: &Log, peer: SocketAddr, name: &str, outcome: Outcome) {
-    match outcome {
-        Outcome::Sent { bytes, block_size } => log(format!(
-            "tftp: {peer}: {name}, {bytes} bytes in {block_size}-byte blocks"
-        )),
-        // UEFI firmware asks for the size first, then for the file.
-        Outcome::Probed => {}
-        Outcome::Aborted { message } => log(format!(
-            "tftp: {peer}: {name}: the client stopped ({message})"
-        )),
-        Outcome::TimedOut => log(format!("tftp: {peer}: {name}: no acknowledgement, gave up")),
+    if let Some(line) = outcome.describe(peer, name) {
+        log(line);
     }
 }
 
