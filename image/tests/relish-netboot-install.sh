@@ -170,8 +170,9 @@ fi
 # Boot logs (#2149): the installer streamed its own lines, and wrote the
 # address onto the installed ESP, so the installed system streamed its boot
 # check too. Both are named by the VM's MAC, though the router may have given
-# them other addresses than iPXE's: their hello names it.
-streamed() { grep -q "^log $mac: .*$1" "$work/netboot.log"; }
+# them other addresses than iPXE's: their hello names it. relish puts the
+# local time before each line (#2159), as in `09:34:29 log <mac>: …`.
+streamed() { grep -q "^[0-9:]* *log $mac: .*$1" "$work/netboot.log"; }
 if [ "$result" = pass ]; then
     for _ in $(seq 30); do
         streamed "reliaburger: \\(unclaimed\\|bun healthy\\)" && break
