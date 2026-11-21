@@ -3213,3 +3213,82 @@ async fn the_dashboard_clears_a_fault_another_node_holds() {
     );
     fixture.root.cancel();
 }
+
+/// `GET /v1/cluster/nodes` on `node`, as `relish nodes` asks it, or `None`
+/// while the node can't answer.
+async fn listed_nodes(
+    node: &WiredNode,
+    bearer: &str,
+) -> Option<Vec<reliaburger::bun::agent::NodeStatus>> {
+    reqwest::Client::new()
+        .get(format!(
+            "http://127.0.0.1:{}/v1/cluster/nodes",
+            node.api_port
+        ))
+        .bearer_auth(bearer)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()
+}
+
+/// #2164: a council voter that shuts down cleanly announces a graceful
+/// leave, which is usually a reboot. `relish nodes` keeps listing it as a
+/// `left` voter, also after gossip reaps its Left entry a minute later,
+/// rather than dropping it while the council still counts it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
+async fn a_voter_that_shut_down_cleanly_stays_listed_as_left() {
+    assert!(cluster_tests_enabled());
+    let operator = admin_token("operator");
+    let mut fixture = Fixture::new();
+    let mut nodes = vec![
+        fixture
+            .start_racked_node(720, vec![], operator.token.clone(), "a")
+            .await,
+    ];
+    for (index, rack) in [(721, "b"), (722, "c")] {
+        let seed = fixture.gossip(720);
+        nodes.push(
+            fixture
+                .start_racked_node(index, vec![seed], operator.token.clone(), rack)
+                .await,
+        );
+    }
+    let (leader, [stopped, _]) = settled_roles(&nodes).await;
+    let name = nodes[stopped].name.clone();
+
+    // Cancelling a node's token runs gossip's graceful leave, as a clean
+    // shutdown of `bun` does.
+    kill(&nodes[stopped]).await;
+    let row = async || {
+        listed_nodes(&nodes[leader], &operator.plaintext)
+            .await
+            .and_then(|rows| rows.into_iter().find(|row| row.node_id == name))
+    };
+    wait_until(
+        "the stopped voter listed as a left council member",
+        Duration::from_secs(30),
+        async || {
+            row()
+                .await
+                .is_some_and(|row| row.state == "left" && row.is_council)
+        },
+    )
+    .await;
+
+    // Gossip reaps a Left member after its 60 s cleanup timeout; the listing
+    // must not lose it then.
+    tokio::time::sleep(Duration::from_secs(75)).await;
+    let listed = row().await;
+    assert!(
+        listed
+            .as_ref()
+            .is_some_and(|row| row.state == "left" && row.is_council),
+        "{name} after gossip reaped it: {listed:?}"
+    );
+    fixture.root.cancel();
+}

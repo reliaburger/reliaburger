@@ -708,7 +708,7 @@ parallel build starts them together. In the Lima VM, under a runner's 14 GiB and
 swap, four jobs and three jobs ran out and the kernel killed the lib tests' rustc. Two jobs
 didn't help: the same pair still overlapped, filled the swap and stalled for minutes. On the
 runner nobody dies. We'd shielded it from the OOM killer, so the host pages instead, the
-runner's heartbeat stops, and GitHub gives up on it. So the coverage build now runs one job
+runner's heartbeat stops, and GitHub gives up on it. So the coverage build went to one job
 at a time: the peak is 12 GB and nothing swaps. It costs time, about three times as long to
 build in the VM. The watcher also logs swap and the kernel's memory-stall figure, and stops
 the build if available memory stays under 512 MiB for a minute while swap is in use. Paging
@@ -732,6 +732,25 @@ processes never overlap, and the watcher gets a third trigger: a "full" memory s
 more, held for 30 seconds, stops the build whether swap is in use or not. Passing runs peak at
 49% for one ten-second sample. None of that helps a host that freezes outright, because the
 watcher freezes with it. That case is why the step's own `timeout` stays.
+
+The same day the 24.04 job, which had none of those guards, lost two runners of its own. We
+went back through every CI run of the past week to see where. All three of its losses since
+15 November came in one step, "Prove rootless port adoption", and in no other. That step runs
+`make test-rootless-runc`, and in CI it's the job's first build, cold on a train or a pull
+request. Its recipe didn't have the split build `make test-linux` had just been given, so the
+lib and the lib tests compiled side by side again. It has the split now, and the job has the
+26.04 job's guards: the shield, swap, the watcher with its three stops, and a limit on every
+heavy step inside a longer job limit, so a hang fails one step and the rest still report.
+
+A step limit has a catch: when it fires, it kills the processes we wanted to look at. So the
+watcher now takes snapshots on a schedule. `scripts/ci/runner-snapshot` prints memory, swap,
+the pressure-stall figures, which tests nextest is running and for how long, the process
+tree, the kernel stacks of every stuck task and test binary, and the end of the kernel log.
+The 24.04 job takes one every five minutes from minute 20; the 26.04 job takes one at minute
+36, past every passing run and before its tests' own 40-minute `timeout`. Each snapshot gets
+its own file, so a later one can't overwrite the one taken before a kill, and the job's last
+step uploads them all. A host that freezes outright still keeps nothing, but a hung step now
+leaves a picture of itself from a few minutes before it died.
 
 Coverage finds unvisited code. It does not tell us whether an assertion is useful, whether a
 webhook test accidentally exercised startup, or whether a five-second performance limit is
@@ -1078,7 +1097,7 @@ floor. Portable Linux does all of that in about 15 minutes. macOS, the privilege
 suites, upgrades and benchmarks still have to pass, but on what lands, not on every draft of
 it. `select-jobs.sh` now gives a pull request into `release-*` a fourth output, `macos=false`,
 along with `heavy=false`. The full set runs in GitHub's merge queue, on the batch merged onto
-the train before any of it lands, and again on the push to the train. A `full-ci` label still
+the train before any of it lands (and, until November, again on the push to the train). A `full-ci` label still
 buys the whole set on the pull request, and the gate PR into `main` (its head is a train) gets
 it too.
 
@@ -1152,7 +1171,7 @@ to do with macOS ([#1443](https://github.com/reliaburger/reliaburger/issues/1443
 The rule now is that macOS runs where it can find something Linux can't. Every push, to a
 train or to `main`, and the nightly still run all three shards, so no commit lands without
 them, and the candidate build demands them. The gate PR gets the light set on each push,
-because the push to the train has just run everything; at code freeze the maintainer labels
+because the train's commit has just passed everything; at code freeze the maintainer labels
 it `release-gate`, and from then on it runs everything and the evidence gate refuses it
 without every owner. Any other pull request gets macOS only if it touches macOS-specific
 code, or someone labels it `macos`. "macOS-specific" is a list of paths (the Apple runtime,
@@ -1272,6 +1291,151 @@ caches saved on its base branch, so now the train's own pushes save that cache t
 request and merge-queue refs still never save one, so nothing a PR builds ends up in a cache
 another run trusts.
 
+That fixed the build. It didn't fix the wait. On the evening of 20 November the 0.3.1 train
+had five groups in the merge queue, and jobs sat for up to 96 minutes before a runner picked
+them up. A train PR whose own jobs took 30 minutes took 70 to 110 to go green. The account
+runs a fixed number of hosted jobs at once, so the question wasn't how fast a job ran. It was
+who else wanted a runner.
+
+So we counted. Over the 194 `ci.yml` runs from 18 to 20 November, 22,120 runner-minutes, a
+queue group starts 20 jobs and burns about 280 runner-minutes, and the queue builds up to
+eight groups at once. Three kinds of run were waste.
+
+The biggest was the push to the train. The merge queue pushes exactly the commit its group
+tested, and the run IDs prove it: in 15 of the window's 18 train pushes, a merge-group run with the
+same `head_sha` had already passed every job. The push then ran all 20 again, about 4,100
+runner-minutes for answers we already had. We already had a function that decides whether one
+run can stand in for another: the candidate build's `ci_reuse.py`, which demands the exact
+commit, the first attempt and every job green. It gained one option, `--event merge_group`,
+and select jobs calls it on a train push. When it finds the queue's run, the push runs only CI
+policy and the gate, and `every_job.py` accepts a push that skipped the code jobs only when
+select jobs names the run it rests on, in a `tested_by` output. Anything doubtful, an API error
+or a re-run that went green, runs everything, as before.
+
+One thing that push still did was save the dependency cache from the paragraph above. So
+when the train's `Cargo.lock`, `Cargo.toml` or `.cargo/config.toml` differs from `main`'s,
+the push still runs portable Linux alone, for its cache. That's one job instead of twenty.
+
+The second was groups the queue had already thrown away. When an entry fails, the queue
+re-forms: it drops the groups behind the failure, deletes their `gh-readonly-queue/...`
+branches and starts new ones. It doesn't cancel the dropped groups' runs. Our `concurrency`
+block couldn't either: a merge-group run's group is its own run ID. Could a better key fix
+it? A dropped group and its replacement share the PR number, but the number lives inside the
+branch name, and workflow expressions have no way to cut a string. The base SHA in the name
+changes with every re-formation. So five superseded runs kept 78 jobs and about 1,100
+runner-minutes going after the queue stopped caring, two of them for over an hour.
+
+The branch is the signal. If `gh-readonly-queue/release-1-3-1/pr-2154-09de86c7...` is gone, the
+queue will never read that run's checks. `queue_sweep.py` lists the unfinished merge-group
+runs and cancels each whose branch has gone. Like the cache trimmer, the rule is a pure
+function over API rows and a lookup, tested on fixtures taken from that evening:
+
+```python
+def superseded(runs, branch_exists, now):
+    found = []
+    for run in runs:
+        branch = run.get("head_branch") or ""
+        if run.get("event") != "merge_group" or not branch.startswith(QUEUE_PREFIX):
+            continue
+        if run.get("status") == FINISHED:
+            continue
+        if now - parse_time(run["created_at"]) < GRACE:
+            continue
+        if branch_exists(branch) is False:
+            found.append(run)
+    return found
+```
+
+`branch_exists` answers `True`, `False` or `None`, and only a definite `False` cancels: a 502
+from the API keeps the run. A finished run is skipped because a group that merged loses its
+branch too.
+
+When should it run? Every re-formation either starts a new group, a `merge_group` event, or
+merges one, a push to the train, so a small workflow listening to both catches each dropped
+run within a minute or so. It's its own workflow, `queue-sweep.yml`, for the same reason the
+cache trimmer is: cancelling a run needs `actions: write`, and `ci.yml` is also called by
+`build.yml` and `ci-retarget.yml`, which grant it `actions: read`. GitHub refuses a called
+workflow that asks for more than its caller grants, whatever the job's `if` says.
+
+The third was small jobs. The dependency audit and the demo app's Go tests each take under a
+minute, but a job is a job: each waited for its own runner, and the gate waits for the last.
+That evening `demo app` waited 96 minutes to run for 30 seconds. They're steps of `CI policy`
+now, which runs on every change anyway, so a train PR asks for 9 runners instead of 11 and a
+queue group for 18 instead of 20. A queue group that changes only documentation now skips the
+code jobs as a pull request does, since its code is the code of the group in front of it.
+Two of the window's 32 groups would have.
+
+Together that's about a quarter of the window's runner-minutes, 5,700 of 22,120, that no
+longer compete with the PRs an author is waiting for. What we didn't do matters as much.
+Portable macOS, 52 to 57 minutes with a warm cache, still sets the length of every queue
+group. And the queue builds up to eight groups at once, 160 jobs, a setting in the
+repository ruleset that only the maintainer can change.
+
+That left portable Linux, which builds the crate for 13 of its 25 to 31 minutes, one
+compile at a time. Every train PR waits for it. Did the build really have to be that slow?
+The problem was never parallelism as such. It was two particular rustc processes running at
+the same time: the lib tests at 12 GB and the lib at 7 GB. Why do they even start together?
+Because `cargo test --lib` doesn't link against the library at all. It compiles
+`src/lib.rs` a second time, as a different crate, with `cfg(test)` switched on, so every
+`#[cfg(test)] mod tests` block and every `#[test]` function is in it. The two compiles
+share the dependencies and nothing else, so the moment the dependencies are done Cargo
+starts both.
+
+`CARGO_BUILD_JOBS=1` kept them apart, but it costs more than it looks. Cargo hands its
+rustc processes tokens from a jobserver, one per job, and rustc uses those tokens for its
+own codegen threads too. At one job, the lib tests' rustc type-checks over half a million lines and then
+generates code on one thread, while three of the runner's four cores sit idle.
+
+`make test-linux` already had the fix: build the lib tests on their own, then the rest. So
+the coverage recipe does the same, inside cargo-llvm-cov:
+
+```make
+coverage:
+	$(CARGO) llvm-cov clean --workspace
+	$(CARGO) llvm-cov --no-report test --lib -- --list
+	$(CARGO) llvm-cov clean --profraw-only
+	$(CARGO) llvm-cov --no-report nextest --profile $(NEXTEST_PROFILE) --no-tests=fail
+	mkdir -p target/coverage
+	$(COVERAGE_REPORT) --lcov --output-path target/coverage/lcov.info --fail-under-lines $(COVERAGE_MIN_LINES)
+```
+
+The second line builds the instrumented lib tests and nothing else, at full parallelism.
+Then nextest's own build compiles what's left, and the lib comes first, because every
+binary and integration test links it. The big two never overlap, so the peak is still one
+12 GB rustc, and every phase gets all four cores.
+
+Two details are less obvious than they look. First, why not `--no-run`? Because
+cargo-llvm-cov claims that flag for itself (it's a deprecated way of asking for a report)
+and never passes it to Cargo. So the build runs the lib tests' binary with `--list`
+instead, which prints the test names and runs none of them. The binary is instrumented, so
+even that listing writes a `.profraw` file on exit, and the third line deletes it before
+the real run. Second, does nextest really reuse what `cargo llvm-cov test` built? Only if
+Cargo sees the same compiler, flags and environment, and cargo-llvm-cov sets those the same
+way for both subcommands. The only thing that differs is `LLVM_PROFILE_FILE`, which matters
+when a test runs, not when it compiles. We checked on a throwaway crate: after the split,
+nextest left the lib tests' binary untouched and compiled only the lib, the binary and the
+integration test.
+
+The coverage owner that runs `make coverage` in CI pins the recipe line for line, so it
+learned the new stages, and its contract learned what a build stage may do. A stage of the
+form `--no-report test` must end in `-- --list`, must come before the one instrumented run,
+and must be followed by a `clean --profraw-only` before that run. The owner still accepts
+the nextest handshake only during the run stage, so a build stage that tried to pose as the
+run is refused. The report reads the run's profiles and nothing else.
+
+How much does it buy? We can't know until a runner says so, and the first CI run is the
+measurement. In the Lima VM, under a runner's memory and four cores, the uncapped build
+(both big compiles together) took 5:51, two jobs took 10:51 and one job 17:35. The split
+should land between the first two: the big two run one after the other, but each with four
+codegen threads. Scaled to the runner's 13 minutes at one job, that's about 4.5 to 8
+minutes, call it 6, which takes portable Linux from 25 to 31 minutes to about 18 to 24, a
+median near 21. That's close to the 19 we were after, not at it, and the job's limit drops
+from 85 minutes back to 62. What should the first runs be watched for? The watcher's
+`mem_floor:` and memory-stall stops, any kernel OOM line in the report step, and a lost
+runner. The lib still compiles alone, since everything after it links it, so any of those
+would mean the targets built after it, four at a time with the suite among them, hold more
+than we think.
+
 ### A release gate that fits in a week
 
 Pull requests were quick by 0.2.3. The release wasn't. From code freeze to ready-to-tag took
@@ -1381,6 +1545,36 @@ the point it matters, so `run` and `freeze-check` now work out the gate themselv
 release is the version in the commit's `Cargo.toml`, the previous release the nearest `v*`
 tag behind it, and the rest is `release_tier.decide`. `--gate` survives only to raise the
 gate; asking for less than the rule says is refused, with the rule's reasons.
+
+**Then it ran one night, not every night.** The nightly was built, tested and installable for
+weeks, and it never ran every night. The Studio had better things to do with its nights:
+agents, the power-cut endurance run, the odd 24-hour memory run. And a train in the middle of
+its week is still taking merges, so a green night on Tuesday says little about the candidate on
+Friday. What `freeze-check` needs is one green night on the code that becomes the candidate,
+which is the train the evening before the freeze. So that's when it runs (maintainer decision,
+20 November 2026, [#1721](https://github.com/reliaburger/reliaburger/issues/1721)):
+`nightly-qualify.sh --once` arms a single night. At the cut-off the night dispatches
+`build.yml` on the train and `stage.yml` on the nightly channel, waits for both, runs the long
+tiers and disarms itself.
+
+"Runs once" turned out to need three locks on the same door, because launchd thinks in
+calendars, not in dates. A calendar entry has no year, so a job for 24 November would fire
+again next year. A Mac asleep at the cut-off runs the missed job when it wakes, perhaps the
+next day. And unloading a launchd job from inside it stops it. So the job is named for its
+date and marked `LaunchOnlyOnce`; the night deletes its own job file before it does anything
+else, refuses to run on any other date, and asks a detached shell to unload the job a few
+seconds after it exits. Kill it halfway and the job file is already gone. Every night also
+asks `power_cut/quiet.py` whether a release gate holds the host, and holds the quiet lock
+while its tiers run, so the endurance run pauses instead of booting VMs beside a soak.
+
+Staging a train's build hit one more wall in 0.3.0. GitHub won't let a workflow's
+token create a release on a commit whose `.github/workflows/` differ from the default
+branch's: that needs the `workflow` scope, which no workflow token can have. 0.3.0's candidate
+4 was the first train build whose `ci.yml` had moved on from `main`'s, and `stage.yml` failed
+with a bare 403. The tag was never the evidence, though. The digest-pinned `candidate.json`
+names the commit, and the nightly checks it against the tip, so a nightly's tag now points at
+the `main` commit `stage.yml` runs on. If staging still fails, the night stages the build
+itself with the same `candidate.py` and the operator's own login, and says so in its log.
 
 **Publish performance after the tag.** Benchmarks, the profile and the day run don't decide
 whether a release works, so they no longer stand between it and its users. A regression they
@@ -3713,10 +3907,10 @@ time window deterministic in a unit test.
 
 Take crashloops. A workload with a lifetime restart count of 30 may have run
 perfectly for six months since its last failure. Calling that a current
-crashloop is nonsense. We require three timestamped restart events inside the
-last 15 minutes. When that pattern fires, the engine looks for a deploy of the
-same application and namespace in the preceding 30 minutes, then attaches the
-first recent error log. One finding now answers three questions: what failed,
+crashloop is nonsense. We require three timestamped restart events of one
+instance inside the last 15 minutes. When that pattern fires, the engine looks
+for a deploy of the same application and namespace in the preceding 30
+minutes, then attaches the first recent error log. One finding now answers three questions: what failed,
 what changed, and what did the process say?
 
 That rule is only as good as the events behind it, and in 0.2.7 the agent gym
@@ -3730,6 +3924,41 @@ history. The fix is to have one door: `observe_app_exit` now calls
 `retry_restart` too, so whichever tick moves the instance back to Pending
 records the event, exactly once, and an exhausted budget fails the instance
 with the same `exhausted its restart budget` event either way (#1652).
+
+"Of one instance" came later, from 0.3.1's soak (#2197). Until then the rule
+counted an app's restarts together. The soak's chaos scenario restarted two of
+a three-replica app's instances on purpose, and a moment later its pause froze
+the third, whose health checks failed, so Bun restarted that one too. Three
+restarts, one app, inside 15 minutes: `wtf` called it a crash loop and kept
+saying so for the whole window. Each replica had restarted once, for its own
+reason. A crash loop is one process that keeps dying, so the check now groups
+restarts by instance, and each instance needs three of its own.
+
+Grouping by instance turned up a second bug. Bun records the instance as the
+restart decision's `instance` evidence, but the collector read a key called
+`instance_id`, which no event has ever carried. Every restart reached
+`diagnose` with no instance, and no unit test noticed, because the tests built
+their `RestartObservation`s by hand. The new test records a real decision in an
+`EventStore` and reads it back through the collector. Restarts that still name
+no instance, such as a restart that failed before it got going, are counted
+together, as the old rule counted all of them.
+
+The grouping is a map of maps. Spelled out, its type is:
+
+```rust
+BTreeMap<(&str, &str), BTreeMap<Option<&str>, Vec<&RestartObservation>>>
+```
+
+The outer key is the app and namespace, borrowed from the observations as
+`&str` rather than copied into new `String`s; the borrow checker makes sure
+the map doesn't outlive the inputs it points into. The inner key is the
+instance, `Option<&str>`, so "no instance" is a key of its own, `None`, rather
+than an empty string that might collide with a real name. `BTreeMap` rather
+than `HashMap` keeps the report's order the same on every run. Clippy calls
+a type this deep "very complex", so the code names the inner map
+`RestartsByInstance<'a>`, a `type` alias: a second name for the same type, as
+`typedef` is in C, carrying the lifetime `'a` that ties its borrows to the
+inputs.
 
 The same rule keeps the other checks honest. Disk pressure needs used capacity
 with a node and storage-domain attribution. CPU throttling needs an increase in
@@ -3747,6 +3976,96 @@ Finally, application scope is structural. `relish wtf --app api` runs app
 checks and filters alerts, restarts, services and deploys to `api`; it doesn't
 manufacture `Unknown` rows for cluster evidence it deliberately didn't fetch.
 Unknown means missing required evidence. It doesn't mean "we chose not to ask".
+
+### Three ways to read one report
+
+The first human report printed every result: each finding with its details
+and `next:` step, and every OK row in full. On the three-node Wyse lab that
+was seventeen OK lines to scroll past to learn that nothing was wrong. In
+0.3.1 (#2180) `relish wtf` got three views instead. The default is a table,
+one row per check with its status. `--short` prints the counts and only what
+isn't OK. `--explain` prints every check with what it tests, the numbers that
+decide it and where the manual covers it.
+
+A table needs a row per *check*, and the report doesn't have checks. It has
+three kinds of id. An OK row carries the check's id (`crashloops`), a finding
+carries its own (`crashloop`), and an UNKNOWN carries the evidence source it
+couldn't read (`restarts`). The council check alone can report nine different
+findings. So a new module, `src/relish/wtf/checks.rs`, ties them together:
+
+```rust
+pub struct CheckKind {
+    pub id: &'static str,
+    pub findings: &'static [&'static str],
+    pub sources: &'static [&'static str],
+    pub tests: &'static str,
+    pub docs: &'static str,
+    pub manual: &'static str,
+}
+
+pub const CHECKS: &[CheckKind] = &[ /* one per check, in run order */ ];
+```
+
+`&'static str` is a borrowed string that lives for the whole program: a
+literal compiled into the binary. A `const` table built from them costs
+nothing at run time, and needs no allocation, no `lazy_static` and no
+`String`. It's the same shape as the finding catalogue `relish agent
+explain` reads (see "Built for Humans and Their Agents"), and the explanation of each
+check sits right beside that catalogue's thresholds. `--explain` doesn't
+repeat the numbers in prose. It prints them from the constants the checks
+compare against, so the words can't say 15 minutes while the code says 10.
+
+The renderer groups the report's four lists into rows, and the row type
+borrows from the report rather than copying it:
+
+```rust
+struct CheckRow<'a> {
+    name: &'a str,
+    kind: Option<&'static CheckKind>,
+    critical: Vec<&'a WtfFinding>,
+    warnings: Vec<&'a WtfFinding>,
+    unknown: Vec<&'a WtfUnknown>,
+    ok: Vec<&'a WtfOk>,
+    // ...
+}
+```
+
+The `'a` is a lifetime parameter. It says every reference in a `CheckRow`
+points into something that lives at least as long as `'a`, here the
+`WtfReport`. In C you'd keep pointers into the report and promise yourself not
+to free it first. In Go the garbage collector keeps it alive for you. Rust
+makes the promise part of the type, so the compiler rejects any code that
+drops the report while a row still points into it.
+
+Sorting worst first falls out of one derive:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Status {
+    Ok,
+    Unknown,
+    Warning,
+    Critical,
+}
+```
+
+A derived `Ord` on a fieldless enum orders the variants as they're declared,
+so `Critical > Warning` holds and a row's status is just the worst thing in
+it. The order of the lines in the source is the policy, which is a little
+surprising the first time you see it, so the comment above the enum says so.
+
+What does a check that the catalogue doesn't know about do? It still gets a
+row, named after its own id, without the explanation. A result that vanished
+from the table because nobody updated a list would be the green hat again.
+Tests stop that from shipping, though: every finding id must belong to exactly
+one check, every UNKNOWN source the engine can produce must too, and every
+check's docs link must name a heading that exists in the manual chapter that
+`relish manual <topic>` opens. A new check without an explanation fails CI.
+
+The views change only the human report. `--short --output json` is refused
+rather than quietly ignored, because the JSON contract above doesn't change:
+the machine report always carries every finding. Exit codes don't change
+either. The view is how much you read, not what `wtf` found.
 
 ## A small diagnostic surface
 
@@ -4550,7 +4869,24 @@ means (the scheduler, the council and Pickle all treat "published" as "worth
 talking to"), gossip got a second one. `MembershipTable::roster()` returns
 every member, down ones included, until they're reaped, and
 `MustardNode::set_roster_watch` publishes it next to the old view. The
-refresher reads the roster. A `Left` entry is forgotten on sight.
+refresher reads the roster. A `Left` entry was forgotten on sight.
+
+That last rule didn't survive the Wyse lab. We rebooted one of three council
+voters with Ctrl+Alt+Del, and `relish nodes` went straight from three rows to
+two. A clean shutdown runs gossip's graceful leave, so the node was `Left`,
+and the table forgot it. Yet `relish council status` still listed it as a
+voter, still counted towards the quorum, and it came back two minutes later.
+Pulling the cord on another voter had shown it as `dead`, which is the more
+violent event and got the more honest answer. Leaving tells you the node
+meant to go. It doesn't tell you it's gone for good.
+
+So a `Left` member now stays in the table like a dead one, with the same
+24-hour limit, and keeps its `Left` state when gossip reaps it, where a
+reaped dead member stays `Dead`. `relish nodes` shows it as `left` with its
+council seat, and `relish status` counts it on the nodes line (`1 left`)
+without calling the cluster degraded. It drops off when it comes back, when
+its identity is retired, or when a day passes. Retirement is the real "gone
+for good", and the operator says so with `relish decommission-node`.
 
 A node the operator *retired* is gone for good: its identity is on the CRL,
 and Chapter 4's mTLS verifiers already refuse it. Every node keeps a
@@ -5407,8 +5743,9 @@ pub(super) async fn sweep_states<G: Grill>(grill: G, reads: Vec<StateRead>) -> S
 
 `buffered(8)` turns a stream of futures into a pool of eight running at once
 that still yields results in the original order. All of them share one
-one-second deadline; a read that misses it comes back `Unknown` and the next
-sweep asks again. The sweep goes into a `JoinSet`, at most one at a time, and a
+one-second deadline; a read that misses it comes back `Unknown`, and the next
+sweep tries again. (How it tries again changed later, and the section after
+next tells why.) The sweep goes into a `JoinSet`, at most one at a time, and a
 new `select!` branch applies what it saw.
 
 Earlier in this chapter a `buffered` stream gave us 380 errors about `Send`
@@ -5437,6 +5774,67 @@ A restart bumps `restart_count`; a fresh deploy under the same id gets a new
 field, the way a C programmer would hope `memcmp` would. The cost of all this
 is latency: a crash now restarts on the tick after the sweep reports, up to a
 second later than before. The restart backoff is longer than that anyway.
+
+#### A read that outlives its sweep
+
+"The next sweep asks again" sounds harmless. On runc it wasn't, and it took
+a flaky test to show us (#2085). `standalone_automatic_restart_replaces_the_original_address_owner`
+kills a container and gives Bun 30 seconds to restart it. On a quiet VM the
+restart takes two seconds. Now and then, on a busy one, it never happened at
+all. We put the VM under disk load (a few `dd ... conv=fsync` loops beside
+the test) and it failed five runs in six. The traces showed why: Bun never
+noticed the container had died. Every sweep's read of it came back
+`Unknown`.
+
+Each runc read takes the instance's lifecycle lock, and the runtime runs it
+in a task of its own, so a caller that gives up can't leave it half done.
+Timing out the sweep's future stopped the *sweep* waiting. It didn't stop the
+read. The read kept the lock, the next sweep's read queued behind it, and the
+lock serves its waiters in order. Once one read takes longer than the
+deadline, every read after it waits out its predecessor's leftover time and
+then its own, so every read misses the deadline, every sweep says `Unknown`,
+and the exit is never seen. The test made it likelier, because it polled the
+same instance twenty times a second through the same lock, but a node on a
+struggling disk would get there by itself.
+
+So the sweep stops starting reads it can't finish. Each read now runs in a
+spawned task, and one still running at the deadline goes back to the loop as
+unfinished. The next sweep waits on that same task instead of asking the
+runtime a second time:
+
+```rust
+let mut task = earlier.unwrap_or_else(|| {
+    let id = read.id.clone();
+    tokio::spawn(async move { observe(&grill, &id).await })
+});
+match tokio::time::timeout_at(deadline, &mut task).await {
+    Ok(observed) => (read, observed.unwrap_or(Observed::Unknown), None),
+    Err(_) => (read, Observed::Unknown, Some(task)),
+}
+```
+
+`tokio::spawn` returns a `JoinHandle`, which is itself a future: awaiting it
+gives you the task's result. We await `&mut task` rather than `task`, so the
+timeout borrows the handle and we still own it when the deadline passes. A
+`JoinHandle` is `Unpin` (moving it doesn't break anything that points into
+it), and that's what lets a plain `&mut` reference be awaited. In C you'd keep
+the `pthread_t` and `pthread_join` it later; in Go you'd keep the channel.
+Here the handle *is* the channel. Dropping a `JoinHandle` doesn't stop its
+task, so a handle the sweep no longer wants (the instance was retired, or has
+restarted since) gets an explicit `abort()`.
+
+The carried reads live on the agent as `unfinished_state_reads`, keyed by
+instance and stamped with the incarnation they read, so a result from before
+a restart still can't touch the replacement. The test that pins it,
+`a_state_read_slower_than_the_sweep_deadline_is_collected_by_the_next_sweep`
+in `src/bun/agent/tests/restart_ownership.rs`, gives the mock runtime a
+crashed instance and one-and-a-half-second reads. Before the change three
+sweeps came back `Unknown` and asked the runtime three times; now the second
+sweep collects the first read and restarts the instance, and the runtime was
+asked once. The flaky test also polls at 250 ms instead of 50, and it treats
+`StateUnavailable` (a read racing the restart's create, which the runtime
+says it can't answer yet) as "look again" rather than a failure, which was
+the other way it failed.
 
 #### A restart, one step at a time
 

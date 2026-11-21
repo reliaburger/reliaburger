@@ -563,27 +563,46 @@ fn check_council_split(council: &CouncilObservation, report: &mut WtfReport) -> 
     healthy
 }
 
-fn check_crashloops(inputs: &WtfInputs, report: &mut WtfReport) {
+/// Restarts by instance; `None` holds those whose event named no instance.
+type RestartsByInstance<'a> = BTreeMap<Option<&'a str>, Vec<&'a RestartObservation>>;
+
+/// The instances that restarted [`CRASHLOOP_RESTARTS`] times or more inside
+/// the window, with their restarts, by app and namespace. A crash loop is one
+/// instance restarting over and over: three replicas that restarted once each
+/// are three separate events (#2197). Restarts whose event named no instance
+/// can't be told apart, so they're counted together under `None`.
+fn crashlooping_instances(inputs: &WtfInputs) -> BTreeMap<(&str, &str), RestartsByInstance<'_>> {
     let Some(restarts) = inputs.applications.restarts.value() else {
-        return;
+        return BTreeMap::new();
     };
     let cutoff = inputs.collected_at.saturating_sub(CRASHLOOP_WINDOW_SECONDS);
-    let mut grouped: BTreeMap<(&str, &str), Vec<&RestartObservation>> = BTreeMap::new();
+    let mut grouped: BTreeMap<(&str, &str), RestartsByInstance> = BTreeMap::new();
     for restart in restarts.iter().filter(|restart| {
         restart.timestamp >= cutoff && app_matches(inputs.app.as_deref(), &restart.app)
     }) {
         grouped
             .entry((&restart.app, &restart.namespace))
             .or_default()
+            .entry(restart.instance.as_deref())
+            .or_default()
             .push(restart);
+    }
+    for instances in grouped.values_mut() {
+        instances.retain(|_, restarts| restarts.len() >= CRASHLOOP_RESTARTS);
+    }
+    grouped.retain(|_, instances| !instances.is_empty());
+    grouped
+}
+
+fn check_crashloops(inputs: &WtfInputs, report: &mut WtfReport) {
+    if inputs.applications.restarts.value().is_none() {
+        return;
     }
 
     let mut found = false;
-    for ((app, namespace), mut app_restarts) in grouped {
-        if app_restarts.len() < CRASHLOOP_RESTARTS {
-            continue;
-        }
+    for ((app, namespace), instances) in crashlooping_instances(inputs) {
         found = true;
+        let mut app_restarts = instances.values().flatten().collect::<Vec<_>>();
         app_restarts.sort_by_key(|restart| restart.timestamp);
         let mut correlated_events = app_restarts
             .iter()
@@ -628,17 +647,26 @@ fn check_crashloops(inputs: &WtfInputs, report: &mut WtfReport) {
                 "app {app} is crashlooping; inspect its recent logs and run `relish rollback {app}` if this started after a deploy"
             )
         };
+        let mut details = instances
+            .iter()
+            .map(|(instance, restarts)| match instance {
+                Some(instance) => format!(
+                    "instance {instance} restarted {} times in the last 15 minutes",
+                    restarts.len()
+                ),
+                None => format!(
+                    "{} restarts that name no instance in the last 15 minutes",
+                    restarts.len()
+                ),
+            })
+            .collect::<Vec<_>>();
+        if let (Some(first), Some(entry)) = (details.first_mut(), log) {
+            first.push_str(&format!("; first error: {}", entry.line));
+        }
         report.critical.push(WtfFinding {
             id: "crashloop".to_string(),
             title: format!("app {app}/{namespace} restarted repeatedly"),
-            details: vec![format!(
-                "{} timestamped restarts in the last 15 minutes{}",
-                app_restarts.len(),
-                log.map_or_else(String::new, |entry| format!(
-                    "; first error: {}",
-                    entry.line
-                ))
-            )],
+            details,
             suggestion,
             correlated_events,
             affected_resource: app_resource(app, namespace),
@@ -648,7 +676,7 @@ fn check_crashloops(inputs: &WtfInputs, report: &mut WtfReport) {
         report.ok.push(WtfOk {
             id: "crashloops".to_string(),
             description: with_caveat(
-                "no applications have three timestamped restarts in 15 minutes",
+                "no instance restarted three times in 15 minutes",
                 inputs.applications.restarts.caveat(),
             ),
         });
@@ -951,23 +979,7 @@ fn volume_home_away_finding(app: &ReplicaObservation, home: &str, running: u32) 
 }
 
 fn has_crashloop(inputs: &WtfInputs, app: &str, namespace: &str) -> bool {
-    let cutoff = inputs.collected_at.saturating_sub(CRASHLOOP_WINDOW_SECONDS);
-    inputs
-        .applications
-        .restarts
-        .value()
-        .map(|restarts| {
-            restarts
-                .iter()
-                .filter(|restart| {
-                    restart.app == app
-                        && restart.namespace == namespace
-                        && restart.timestamp >= cutoff
-                })
-                .count()
-                >= CRASHLOOP_RESTARTS
-        })
-        .unwrap_or(false)
+    crashlooping_instances(inputs).contains_key(&(app, namespace))
 }
 
 fn has_stuck_deploy(inputs: &WtfInputs, app: &str, namespace: &str) -> bool {
@@ -1448,11 +1460,22 @@ fn check_registry(inputs: &WtfInputs, report: &mut WtfReport) {
             affected_resource: "registry".to_string(),
         });
     }
+    // One node can't hold a second copy of anything, so on a one-node
+    // cluster missing redundancy is how it's built, not a fault (#2147).
+    // Every node the cluster knows counts, dead ones included: a three-node
+    // cluster down to one is degraded.
+    let node_count = inputs
+        .cluster
+        .nodes
+        .value()
+        .map_or(registries.len(), Vec::len);
+    let lone = node_count == 1;
     for registry in registries.iter().filter(|registry| {
         !registry.ready
             || (registry.clustered && !registry.peer_reachable)
-            || (registry.clustered && !registry.redundancy_possible)
-            || registry.under_replicated_layers > 0
+            || (!lone
+                && ((registry.clustered && !registry.redundancy_possible)
+                    || registry.under_replicated_layers > 0))
     }) {
         found = true;
         report.warnings.push(WtfFinding {
@@ -1470,13 +1493,23 @@ fn check_registry(inputs: &WtfInputs, report: &mut WtfReport) {
             affected_resource: format!("node.{}", registry.node_id),
         });
     }
-    if !found {
-        report.ok.push(WtfOk {
-            id: "registry".to_string(),
-            description: "Pickle is reachable and its known layers meet the redundancy target"
-                .to_string(),
-        });
+    if found {
+        return;
     }
+    let one_copy = lone
+        && registries.iter().any(|registry| {
+            (registry.clustered && !registry.redundancy_possible)
+                || registry.under_replicated_layers > 0
+        });
+    let description = if one_copy {
+        "one node: Pickle keeps one copy of each layer; add a node for redundancy"
+    } else {
+        "Pickle is reachable and its known layers meet the redundancy target"
+    };
+    report.ok.push(WtfOk {
+        id: "registry".to_string(),
+        description: description.to_string(),
+    });
 }
 
 /// With more than one namespace, every node must keep them apart. A node
@@ -1951,6 +1984,44 @@ pub(super) mod tests {
                 alerts: available(Vec::new()),
                 cpu_throttling: available(Vec::new()),
                 recent_logs: available(Vec::new()),
+            },
+        }
+    }
+
+    /// Every source unreadable, so every UNKNOWN row `wtf` can give shows.
+    pub(in crate::relish::wtf) fn unknown_inputs() -> WtfInputs {
+        fn gone<T>() -> Evidence<T> {
+            Evidence::Unavailable {
+                reason: "unreadable".to_string(),
+            }
+        }
+        WtfInputs {
+            cluster_name: "test".to_string(),
+            collected_at: NOW,
+            app: None,
+            cluster: ClusterEvidence {
+                nodes: gone(),
+                builds: gone(),
+                council: gone(),
+                faults: gone(),
+                disks: gone(),
+                export_holds: gone(),
+                certificates: gone(),
+                registry: gone(),
+                tokens: gone(),
+                isolation: gone(),
+                gitops: gone(),
+                policies: gone(),
+                backups: gone(),
+            },
+            applications: ApplicationEvidence {
+                restarts: gone(),
+                deploys: gone(),
+                services: gone(),
+                replicas: gone(),
+                alerts: gone(),
+                cpu_throttling: gone(),
+                recent_logs: gone(),
             },
         }
     }
@@ -2645,7 +2716,88 @@ pub(super) mod tests {
             .iter()
             .find(|item| item.id == "crashloop")
             .unwrap();
-        assert!(finding.details[0].contains("3 timestamped restarts"));
+        assert!(finding.details[0].contains("instance api-0 restarted 3 times"));
+    }
+
+    fn restart_of(instance: Option<&str>, timestamp: u64) -> RestartObservation {
+        RestartObservation {
+            instance: instance.map(str::to_string),
+            ..restart(timestamp)
+        }
+    }
+
+    /// The 0.3.1 soak (#2197): chaos restarted two replicas and its pause
+    /// froze the third, which Bun restarted. Three restarts of one app, one
+    /// per replica, are three separate events, not a crash loop.
+    #[test]
+    fn three_replicas_restarting_once_each_are_not_a_crashloop() {
+        let mut inputs = healthy_inputs();
+        inputs.applications.restarts = available(vec![
+            restart_of(Some("api-0"), NOW - 300),
+            restart_of(Some("api-1"), NOW - 200),
+            restart_of(Some("api-2"), NOW - 100),
+        ]);
+
+        let report = diagnose(&inputs);
+
+        assert!(!report.critical.iter().any(|item| item.id == "crashloop"));
+        assert!(report.ok.iter().any(|ok| ok.id == "crashloops"));
+        assert!(!has_crashloop(&inputs, "api", "default"));
+    }
+
+    #[test]
+    fn one_replica_restarting_three_times_is_a_crashloop_named_after_it() {
+        let mut inputs = healthy_inputs();
+        inputs.applications.restarts = available(vec![
+            restart_of(Some("api-1"), NOW - 300),
+            restart_of(Some("api-0"), NOW - 250),
+            restart_of(Some("api-1"), NOW - 200),
+            restart_of(Some("api-2"), NOW - 150),
+            restart_of(Some("api-1"), NOW - 100),
+        ]);
+
+        let report = diagnose(&inputs);
+
+        let finding = report
+            .critical
+            .iter()
+            .find(|item| item.id == "crashloop")
+            .unwrap();
+        assert_eq!(
+            finding.details[0],
+            "instance api-1 restarted 3 times in the last 15 minutes"
+        );
+        let restarts = finding
+            .correlated_events
+            .iter()
+            .filter(|event| event.kind == "restart")
+            .count();
+        assert_eq!(restarts, 3, "only the looping instance's restarts");
+        assert!(has_crashloop(&inputs, "api", "default"));
+    }
+
+    /// A restart event without an instance can't be told apart from its
+    /// app's others, so those are counted together, as before #2197.
+    #[test]
+    fn restarts_that_name_no_instance_are_counted_together() {
+        let mut inputs = healthy_inputs();
+        inputs.applications.restarts = available(vec![
+            restart_of(None, NOW - 300),
+            restart_of(None, NOW - 200),
+            restart_of(None, NOW - 100),
+        ]);
+
+        let report = diagnose(&inputs);
+
+        let finding = report
+            .critical
+            .iter()
+            .find(|item| item.id == "crashloop")
+            .unwrap();
+        assert_eq!(
+            finding.details[0],
+            "3 restarts that name no instance in the last 15 minutes"
+        );
     }
 
     #[test]
@@ -3103,6 +3255,98 @@ pub(super) mod tests {
         assert!(report.ok.iter().any(|ok| ok.id == "registry"));
         assert!(
             !report
+                .warnings
+                .iter()
+                .any(|finding| finding.id == "registry-redundancy")
+        );
+    }
+
+    /// A clustered registry on one node, ready and reachable, that can't
+    /// hold a second copy of anything.
+    fn lone_registry(node_id: &str) -> RegistryObservation {
+        RegistryObservation {
+            node_id: node_id.to_string(),
+            clustered: true,
+            ready: true,
+            peer_reachable: true,
+            redundancy_possible: false,
+            under_replicated_layers: 12,
+            lost_images: Vec::new(),
+            lost_image_count: 0,
+            needs_mtls: false,
+        }
+    }
+
+    /// #2147: one node can't hold a second copy of a layer, so on a
+    /// one-node cluster that's expected, not something to fix. It's OK,
+    /// with the reason and what adding a node would buy.
+    #[test]
+    fn a_one_node_cluster_without_redundancy_is_ok_and_says_why() {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.registry = available(vec![lone_registry("node-1")]);
+
+        let report = diagnose(&inputs);
+
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|finding| finding.id == "registry-redundancy"),
+            "{:?}",
+            report.warnings
+        );
+        let ok = report
+            .ok
+            .iter()
+            .find(|ok| ok.id == "registry")
+            .expect("registry ok");
+        assert!(ok.description.contains("one node"), "{}", ok.description);
+        assert!(ok.description.contains("add a node"), "{}", ok.description);
+    }
+
+    /// With two nodes, a registry that can't reach its redundancy target
+    /// is still degraded: a second node is there to hold the copies.
+    #[test]
+    fn a_two_node_cluster_without_redundancy_still_warns() {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.nodes = available(vec![
+            NodeObservation {
+                node_id: "node-1".to_string(),
+                membership_state: "Alive".to_string(),
+                agent_reachable: true,
+            },
+            NodeObservation {
+                node_id: "node-2".to_string(),
+                membership_state: "Dead".to_string(),
+                agent_reachable: false,
+            },
+        ]);
+        inputs.cluster.registry = available(vec![lone_registry("node-1")]);
+
+        let report = diagnose(&inputs);
+
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|finding| finding.id == "registry-redundancy")
+        );
+    }
+
+    /// One node whose registry isn't listening is degraded however many
+    /// nodes there are.
+    #[test]
+    fn a_one_node_registry_that_is_not_ready_still_warns() {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.registry = available(vec![RegistryObservation {
+            ready: false,
+            ..lone_registry("node-1")
+        }]);
+
+        let report = diagnose(&inputs);
+
+        assert!(
+            report
                 .warnings
                 .iter()
                 .any(|finding| finding.id == "registry-redundancy")

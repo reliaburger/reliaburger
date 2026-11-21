@@ -225,6 +225,23 @@ def artefact_name(channel, commit, run_attempt):
     return f"{ARTEFACTS[channel]}-{commit}-{run_attempt}"
 
 
+def staging_target(document, main_commit):
+    """The commit a staging tag points at: the candidate's own, or for a nightly, `main_commit`.
+
+    GitHub refuses `GITHUB_TOKEN` a release on a commit whose
+    `.github/workflows/` differ from the default branch's, since that needs the
+    `workflow` scope no workflow token can have (0.3.0's candidate 4, #1721). A
+    train often changes its workflows, so a nightly's tag points at the `main`
+    commit stage.yml runs on instead. Nothing reads the code from the tag: the
+    digest-pinned candidate.json names the commit, and the nightly checks it.
+    """
+    if document.get("channel", "release") != "nightly":
+        return document["commit"]
+    if type(main_commit) is not str or not re.fullmatch(r"[0-9a-f]{40}", main_commit):
+        raise ValueError("a nightly's staging tag points at main: pass --main-commit with main's commit")
+    return main_commit
+
+
 def staging_step(release, tag):
     """What a staging run does next, given the release already under `tag` (or None).
 
@@ -367,7 +384,9 @@ def staging_notes(document, tag, qualified_digest):
             f"{document['run_attempt']}), signed with the nightly key, which no released "
             f"Reliaburger trusts. It exists so the nightly qualification can install the train's "
             f"tip, and a later nightly staging deletes it. Every version string inside says "
-            f"{document['version']}.\n\n"
+            f"{document['version']}. The tag points at `main`, not at that commit: GitHub "
+            f"refuses the workflow token a release on a commit whose workflows differ from "
+            f"main's.\n\n"
             f"`candidate.json` SHA-256: `{qualified_digest}`\n\n"
             f"The website installer refuses it unless qualification asks for it:\n\n"
             f"```sh\ncurl -fsSL https://reliaburger.com/install.sh | RELIABURGER_ACCEPT_NIGHTLY=1 "
@@ -386,11 +405,15 @@ def staging_notes(document, tag, qualified_digest):
     )
 
 
-def stage(directory, document, qualified_digest):
+def stage(directory, document, qualified_digest, main_commit=None):
     """Publish a verified candidate as a pre-release under its staging tag, or
-    re-verify the one an earlier run published. Never marks anything latest."""
+    re-verify the one an earlier run published. Never marks anything latest.
+
+    The tag points at `staging_target`: the candidate's commit, or for a
+    nightly, `main_commit`."""
     channel = document.get("channel", "release")
     tag = staging_tag(document["version"], document["run_id"], document["run_attempt"], channel)
+    target = staging_target(document, main_commit)
     repository = document["repository"]
     record_size = (directory / RECORD).stat().st_size
     step = staging_step(find_release(repository, tag), tag)
@@ -400,7 +423,7 @@ def stage(directory, document, qualified_digest):
         gh("release", "delete", tag, "--repo", repository, "--yes")
     if step in ("create", "resume"):
         what = "Nightly build" if channel == "nightly" else "Staging candidate"
-        gh("release", "create", tag, "--repo", repository, "--target", document["commit"],
+        gh("release", "create", tag, "--repo", repository, "--target", target,
            "--draft", "--prerelease", "--latest=false",
            "--title", f"{what} {document['version']} (run {document['run_id']}, "
                       f"attempt {document['run_attempt']})",
@@ -412,8 +435,8 @@ def stage(directory, document, qualified_digest):
            "--draft=false", "--prerelease", "--latest=false")
     verify_uploaded_assets(find_release(repository, tag), document, qualified_digest,
                            record_size, tag=tag, draft=False, prerelease=True)
-    if gh_json(f"repos/{repository}/commits/{tag}")["sha"] != document["commit"]:
-        raise ValueError(f"{tag} does not point at the candidate commit")
+    if gh_json(f"repos/{repository}/commits/{tag}")["sha"] != target:
+        raise ValueError(f"{tag} does not point at {target}")
     return tag
 
 
@@ -457,6 +480,8 @@ def main():
     parser.add_argument("--qualified-digest")
     parser.add_argument("--channel", choices=CHANNELS, default="release",
                         help="release (a build of main) or nightly (a build of a release-* train)")
+    parser.add_argument("--main-commit",
+                        help="stage: the main commit a nightly's tag points at (stage.yml passes its own)")
     parser.add_argument("--keep", type=int, default=7, help="prune-nightly: how many nightlies to keep")
     parser.add_argument("--source-digest", help="record and verify: the source bundle's sha256: digest")
     parser.add_argument("--source-ci-run", type=int,
@@ -499,7 +524,7 @@ def main():
             print(f"verified candidate {run['head_sha']} from run {args.run_id}, "
                   f"attempt {run['run_attempt']}")
             return
-        tag = stage(args.directory, document, digest)
+        tag = stage(args.directory, document, digest, args.main_commit)
         print(f"https://github.com/{args.repository}/releases/download/{tag}")
         return
 

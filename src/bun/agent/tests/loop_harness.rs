@@ -5026,7 +5026,7 @@ async fn deploy_completes(mut progress: mpsc::Receiver<ApplyEvent>) {
         while let Some(event) = progress.recv().await {
             match event {
                 ApplyEvent::Complete { .. } => return Ok(()),
-                ApplyEvent::Error { message } => return Err(message),
+                ApplyEvent::Error { message, .. } => return Err(message),
                 _ => {}
             }
         }

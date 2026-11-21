@@ -5458,7 +5458,7 @@ async fn init_exit_preserves_policy_before_the_next_container_starts() {
         .unwrap();
     let mut failures = Vec::new();
     while let Some(event) = results.recv().await {
-        if let ApplyEvent::Error { message } = event {
+        if let ApplyEvent::Error { message, .. } = event {
             failures.push(message);
         }
     }
@@ -5563,7 +5563,7 @@ async fn uncertain_initialiser_preserves_parent_policy_until_confirmed_retiremen
         .unwrap();
     let mut failures = Vec::new();
     while let Some(event) = results.recv().await {
-        if let ApplyEvent::Error { message } = event {
+        if let ApplyEvent::Error { message, .. } = event {
             failures.push(message);
         }
     }
@@ -5855,7 +5855,7 @@ async fn check_backend_retirement(
             let (events, mut results) = mpsc::channel(64);
             commands.send(AgentCommand::Deploy { config, events }).await?;
             while let Some(event) = results.recv().await {
-                if let ApplyEvent::Error { message } = event { anyhow::bail!(message); }
+                if let ApplyEvent::Error { message, .. } = event { anyhow::bail!(message); }
             }
             let id = InstanceId(format!("default__{name}-0"));
             let ip = runtime.container_ip(&id).await.ok_or_else(|| anyhow::anyhow!("runtime omitted container address"))?;
@@ -5911,11 +5911,19 @@ async fn check_backend_retirement(
                     runtime.kill(&id).await?;
                     let started = std::time::Instant::now();
                     let mut last = String::from("nothing observed");
+                    // Each runtime read takes the instance's lifecycle lock,
+                    // as the agent's state sweep and restart steps do, so the
+                    // runtime is asked only every 250 ms. A read racing the
+                    // restart's create can say it can't tell yet
+                    // (`StateUnavailable`), which means look again (#2085).
                     let replacement = tokio::time::timeout(std::time::Duration::from_secs(30), async {
                         loop {
                             let backends = services.borrow().resolve(&ServiceId::new("default", name)).map(|entry| entry.backends.iter().map(|backend| (backend.instance_id.clone(), backend.healthy)).collect::<Vec<_>>());
                             let published = backends.as_ref().is_some_and(|backends| backends.iter().any(|(instance, healthy)| *instance == id.0 && *healthy));
-                            let reference = runtime.network_reference(&id).await?;
+                            let reference = match runtime.network_reference(&id).await {
+                                Err(reliaburger::grill::GrillError::StateUnavailable { .. }) => None,
+                                reference => reference?,
+                            };
                             let state = runtime.state(&id).await;
                             let new_generation = reference.as_ref().is_some_and(|reference| reference.generation != original.generation);
                             let running = matches!(state, Ok(reliaburger::grill::ContainerState::Running));
@@ -5923,14 +5931,15 @@ async fn check_backend_retirement(
                             if let Some(reference) = reference && new_generation && published && running {
                                 break Ok::<_, anyhow::Error>(reference);
                             }
-                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                         }
                     }).await.map_err(|_| anyhow::anyhow!("restart did not finish in 30 s; last seen {last}"))??;
                     eprintln!("restart finished in {:?}", started.elapsed());
                     let checkpoint: serde_json::Value = serde_json::from_slice(&std::fs::read(root.path().join("discovery/discovery.json"))?)?;
                     let inventory: reliaburger::bun::discovery_owners::DiscoveryInventory = serde_json::from_value(checkpoint["inventory"].clone())?;
                     anyhow::ensure!(inventory.references.len() == 1 && inventory.references[0].reference == replacement && inventory.references[0].phase == reliaburger::bun::discovery_owners::ReferencePhase::Held, "restart did not replace its original durable hold");
-                    let ready = read_runtime_fixture_page(SocketAddr::new(vip.0.into(), 8080)).await?;
+                    let ready = read_runtime_fixture_page(SocketAddr::new(vip.0.into(), 8080))
+                        .await.map_err(|error| anyhow::anyhow!("replacement through the original VIP: {error}"))?;
                     anyhow::ensure!(ready.contains(&id.0), "replacement is not reachable through the original VIP");
                 }
                 if freeze {
@@ -5946,10 +5955,10 @@ async fn check_backend_retirement(
                     let mut completed = false;
                     while let Some(event) = results.recv().await {
                         match event {
-                            ApplyEvent::Error { message } if freeze => {
+                            ApplyEvent::Error { message, .. } if freeze => {
                                 refused |= message.contains("cannot retire backend") || message.contains("cannot publish backend");
                             }
-                            ApplyEvent::Error { message } => anyhow::bail!(message),
+                            ApplyEvent::Error { message, .. } => anyhow::bail!(message),
                             ApplyEvent::Complete { .. } => completed = true,
                             _ => {}
                         }
@@ -6081,7 +6090,7 @@ async fn refused_backend_publication_cannot_report_a_completed_deployment() {
         let mut failed = false;
         while let Some(event) = results.recv().await {
             completed |= matches!(event, ApplyEvent::Complete { .. });
-            if let ApplyEvent::Error { message } = event {
+            if let ApplyEvent::Error { message, .. } = event {
                 failed |= message.contains("cannot publish backend");
             }
         }
@@ -6327,7 +6336,7 @@ async fn check_stopped_address_retention(lose_enforcement: bool, durable_discove
         let (events, mut results) = mpsc::channel(64);
         commands.send(AgentCommand::Deploy { config, events }).await?;
         while let Some(event) = results.recv().await {
-            if let ApplyEvent::Error { message } = event { anyhow::bail!(message); }
+            if let ApplyEvent::Error { message, .. } = event { anyhow::bail!(message); }
         }
         let original_ip = runtime.container_ip(&old).await.ok_or_else(|| anyhow::anyhow!("original address absent"))?;
         let original = read_runtime_fixture_page(SocketAddr::new(vip.0.into(), 8080)).await?;
@@ -6504,7 +6513,7 @@ async fn refused_health_publication_prevents_restart_and_preserves_ownership() {
         let (events, mut results) = mpsc::channel(64);
         commands.send(AgentCommand::Deploy { config, events }).await?;
         while let Some(event) = results.recv().await {
-            if let ApplyEvent::Error { message } = event { anyhow::bail!(message); }
+            if let ApplyEvent::Error { message, .. } = event { anyhow::bail!(message); }
         }
         let mut frozen = false;
         let mut unhealthy_since = None;

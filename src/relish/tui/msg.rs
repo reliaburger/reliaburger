@@ -2,7 +2,7 @@
 
 use crossterm::event::KeyEvent;
 
-use crate::bun::agent::{ClusterInstanceStatus, CouncilStatus, NodeStatus};
+use crate::bun::agent::{ClusterInstanceStatus, CouncilStatus};
 use crate::bun::cluster_view::{ClusterDeployHistory, ClusterEvents, ClusterJobs};
 use crate::bun::events::ClusterEvent;
 use crate::bun::summary::ClusterSummary;
@@ -36,7 +36,7 @@ pub enum DataUpdate {
     /// pay for that space.
     Summary(Result<Box<ClusterSummary>, ProviderError>),
     Status(Result<Vec<ClusterInstanceStatus>, ProviderError>),
-    Nodes(Result<Vec<NodeStatus>, ProviderError>),
+    Nodes(Result<Vec<crate::relish::nodes_cmd::NodeRow>, ProviderError>),
     Council(Result<CouncilStatus, ProviderError>),
     Alerts(Result<Vec<crate::mayo::alert::AlertStatus>, ProviderError>),
     Routes(Result<Vec<RouteInfo>, ProviderError>),
@@ -54,6 +54,11 @@ pub enum DataUpdate {
         app: String,
         to: u32,
         result: Result<(), ProviderError>,
+    },
+    /// The answer to a kill from the Instances tab.
+    InstanceKilled {
+        target: super::state::InstanceTarget,
+        result: Result<crate::smoker::types::FaultSummary, ProviderError>,
     },
 }
 

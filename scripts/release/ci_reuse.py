@@ -31,6 +31,12 @@ then applies the same rules. The build jobs run meanwhile, and they take about
 waits a few minutes, too, when there's no run at all yet: GitHub may not have
 created the push's run when a build is dispatched the moment a merge lands.
 
+ci.yml asks the same question on a push to a merge train, with `--event
+merge_group`: the queue tested exactly the commit it then pushed, so a run
+that passed every job there leaves the push's own run nothing to do (#1723).
+The queue's run exists before the push, so that form never waits for one to
+appear.
+
 Anything else, an API error included, means "run the suite here": the build
 fails safe, never open. The decision goes to `$GITHUB_OUTPUT` as
 `reuse=true|false`, `ci_run=<id>` and `ci_run_attempt=1`, with the reason on
@@ -49,8 +55,10 @@ import time
 
 WORKFLOW_PATH = ".github/workflows/ci.yml"
 
-# Events whose ci.yml run selects every job (scripts/ci/select-jobs.sh gives
-# everything to anything but a pull request) and checks out the commit itself.
+# Events whose ci.yml run selects every job and checks out the commit itself.
+# scripts/ci/select-jobs.sh gives everything to anything but a pull request,
+# apart from a documentation-only merge group and a train push the queue has
+# already tested; those runs skip required jobs, so the job check refuses them.
 FULL_EVENTS = ("push", "merge_group", "schedule")
 
 # The job ci.yml starts only for a closed pull request; any real run skips it.
@@ -70,9 +78,7 @@ GRACE_SECONDS = 180
 REQUIRED_JOBS = (
     "select jobs",
     "CI policy",
-    "dependency advisory audit",
     "lint",
-    "demo app",
     "minimum Rust 1.97.0",
     "source bundle builds",
     "portable Linux",
@@ -144,17 +150,17 @@ def run_problems(run, jobs, commit, repository, warnings=None):
     return found
 
 
-def candidates(runs, commit):
+def candidates(runs, commit, events=FULL_EVENTS):
     """The runs on `commit` from an event whose run could be reused."""
-    return [run for run in runs if run.get("head_sha") == commit and run.get("event") in FULL_EVENTS]
+    return [run for run in runs if run.get("head_sha") == commit and run.get("event") in events]
 
 
-def still_going(runs, commit):
+def still_going(runs, commit, events=FULL_EVENTS):
     """The runs worth waiting for: on `commit`, from a full event, and not finished."""
-    return [run for run in candidates(runs, commit) if run.get("status") != "completed"]
+    return [run for run in candidates(runs, commit, events) if run.get("status") != "completed"]
 
 
-def decide(commit, repository, runs, jobs_for):
+def decide(commit, repository, runs, jobs_for, events=FULL_EVENTS):
     """Return (run id or None, reasons): the first finished run on `commit` that passed everything.
 
     With a run id, the reasons are warnings about its advisory jobs, if any.
@@ -165,7 +171,7 @@ def decide(commit, repository, runs, jobs_for):
     `wait_for_evidence`.
     """
     reasons = []
-    for run in candidates(runs, commit):
+    for run in candidates(runs, commit, events):
         if run.get("status") != "completed":
             continue
         warnings = []
@@ -173,34 +179,35 @@ def decide(commit, repository, runs, jobs_for):
         if not problems:
             return run["id"], warnings
         reasons.append(f"run {run.get('id')}: " + "; ".join(problems))
-    return None, reasons or [f"no completed {'/'.join(FULL_EVENTS)} run of ci.yml on {commit}"]
+    return None, reasons or [f"no completed {'/'.join(events)} run of ci.yml on {commit}"]
 
 
 def wait_for_evidence(commit, repository, fetch_runs, jobs_for, *, wait_seconds,
                       poll_seconds=POLL_SECONDS, grace_seconds=GRACE_SECONDS,
-                      now=time.monotonic, sleep=time.sleep):
+                      now=time.monotonic, sleep=time.sleep, events=FULL_EVENTS):
     """Return (run id or None, reasons, seconds waited), waiting for a run still going.
 
     With a run id, the reasons are `decide`'s warnings about its advisory jobs.
 
     Polls `fetch_runs()` until a finished run passes, or nothing is left to
     wait for, or `wait_seconds` have gone by. With no run on the commit at
-    all, it keeps asking for `grace_seconds`. An exception from either
-    callable propagates: the caller treats it as "run the suite".
+    all, it keeps asking for `grace_seconds`. Only runs from `events` count.
+    An exception from either callable propagates: the caller treats it as
+    "run the suite".
     """
     start = now()
     while True:
         runs = fetch_runs()
-        run_id, reasons = decide(commit, repository, runs, jobs_for)
+        run_id, reasons = decide(commit, repository, runs, jobs_for, events)
         waited = now() - start
         if run_id is not None:
             return run_id, reasons, waited
-        going = still_going(runs, commit)
+        going = still_going(runs, commit, events)
         if going:
             if waited >= wait_seconds:
                 state = ", ".join(f"run {run.get('id')} still {run.get('status')}" for run in going)
                 return None, reasons + [f"{state} after {round(waited / 60)} minutes"], waited
-        elif candidates(runs, commit) or waited >= grace_seconds:
+        elif candidates(runs, commit, events) or waited >= grace_seconds:
             return None, reasons, waited
         sleep(poll_seconds)
 
@@ -238,6 +245,9 @@ def main(argv=None, runs_for=fetch_runs, jobs_for=fetch_jobs, now=time.monotonic
     parser.add_argument("--commit", required=True)
     parser.add_argument("--wait-minutes", type=int, default=120,
                         help="how long to wait for a run on the commit that's still going")
+    parser.add_argument("--event", choices=FULL_EVENTS,
+                        help="count only runs from this event; with merge_group, don't wait for a "
+                             "run that doesn't exist yet, since the queue's run comes before the push")
     parser.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
     parser.add_argument("--step-summary", default=os.environ.get("GITHUB_STEP_SUMMARY"))
     args = parser.parse_args(argv)
@@ -249,7 +259,8 @@ def main(argv=None, runs_for=fetch_runs, jobs_for=fetch_jobs, now=time.monotonic
             run_id, reasons, waited = wait_for_evidence(
                 args.commit, args.repository, lambda: runs_for(args.repository, args.commit),
                 lambda run: jobs_for(args.repository, run), wait_seconds=args.wait_minutes * 60,
-                now=now, sleep=sleep)
+                now=now, sleep=sleep, events=(args.event,) if args.event else FULL_EVENTS,
+                grace_seconds=0 if args.event == "merge_group" else GRACE_SECONDS)
         except Exception as error:  # fail safe: any doubt runs the suite
             run_id, reasons = None, [f"GitHub API error: {error}"]
     minutes = round(waited / 60)

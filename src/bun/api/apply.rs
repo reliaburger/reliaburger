@@ -7,8 +7,9 @@ use crate::pickle::binding::{AppliedBinding, BindError, ImageBinder};
 /// that must know the bound config before their stream starts (a
 /// standalone deploy, a cluster apply with jobs). A refusal is the HTTP
 /// response: 400 for a reference that doesn't parse, 403 for an image the
-/// node's upstream trust rules refuse, 502 when the registry couldn't name a
-/// digest and the cache doesn't hold the tag.
+/// node's upstream trust rules refuse, 404 for an image neither Pickle nor
+/// its registry has, 502 when the registry couldn't name a digest and the
+/// cache doesn't hold the tag.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn bind_images(
     state: &ApiState,
@@ -17,17 +18,24 @@ pub(crate) async fn bind_images(
 ) -> Result<Vec<AppliedBinding>, Response> {
     let catalog = binding_catalog(state).await;
     binder.bind_config(config, &catalog).await.map_err(|error| {
-        let status = match error {
-            BindError::InvalidReference { .. } => StatusCode::BAD_REQUEST,
-            BindError::Unresolved { .. } => StatusCode::BAD_GATEWAY,
-            BindError::NotAllowed(_) => StatusCode::FORBIDDEN,
-        };
         (
-            status,
+            bind_error_status(&error),
             Json(serde_json::json!({ "error": error.to_string() })),
         )
             .into_response()
     })
+}
+
+/// The HTTP status a binding refusal answers. A cluster apply binds inside
+/// its event stream, after the `200`, and carries this status in the
+/// stream's `Error` event instead (#2157), so both paths name the same one.
+pub(crate) fn bind_error_status(error: &BindError) -> StatusCode {
+    match error {
+        BindError::InvalidReference { .. } => StatusCode::BAD_REQUEST,
+        BindError::NotInPickle { .. } | BindError::NoSuchImage { .. } => StatusCode::NOT_FOUND,
+        BindError::Unresolved { .. } => StatusCode::BAD_GATEWAY,
+        BindError::NotAllowed(_) => StatusCode::FORBIDDEN,
+    }
 }
 
 /// The catalogue a binding resolves Pickle images against: the council's,
@@ -971,6 +979,7 @@ pub(super) async fn cluster_apply(
                     let _ = event_tx
                         .send(ApplyEvent::Error {
                             message: error.to_string(),
+                            status: Some(bind_error_status(&error).as_u16()),
                         })
                         .await;
                     return;
@@ -995,6 +1004,7 @@ pub(super) async fn cluster_apply(
                 Err(e) => {
                     let _ = event_tx
                         .send(ApplyEvent::Error {
+                            status: None,
                             message: e.to_string(),
                         })
                         .await;
@@ -1046,6 +1056,7 @@ pub(super) async fn cluster_apply(
                         Err(refusal) => {
                             let _ = event_tx
                                 .send(ApplyEvent::Error {
+                                    status: None,
                                     message: format!("{describe}: {}", refusal.message()),
                                 })
                                 .await;
@@ -1079,7 +1090,12 @@ pub(super) async fn cluster_apply(
                             }
                         }
                         Err(message) => {
-                            let _ = event_tx.send(ApplyEvent::Error { message }).await;
+                            let _ = event_tx
+                                .send(ApplyEvent::Error {
+                                    status: None,
+                                    message,
+                                })
+                                .await;
                             return;
                         }
                     }
@@ -1100,6 +1116,7 @@ pub(super) async fn cluster_apply(
                     .await;
                     let _ = event_tx
                         .send(ApplyEvent::Error {
+                            status: None,
                             message: format!("{describe}: refused by the cluster: {reason}"),
                         })
                         .await;
@@ -1129,6 +1146,7 @@ pub(super) async fn cluster_apply(
                 Err(crate::council::CouncilError::WriteTimedOut { waited }) => {
                     let _ = event_tx
                         .send(ApplyEvent::Error {
+                            status: None,
                             message: format!(
                                 "{describe}: outcome unknown: the write didn't commit within \
                                  {}s; the {committed} writes before it in this apply were \
@@ -1142,6 +1160,7 @@ pub(super) async fn cluster_apply(
                 Err(e) => {
                     let _ = event_tx
                         .send(ApplyEvent::Error {
+                            status: None,
                             message: format!("{describe}: raft write failed: {e}"),
                         })
                         .await;

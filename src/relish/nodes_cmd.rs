@@ -76,6 +76,29 @@ pub async fn run_with_client(
         }
         return print_rows(&[], output);
     }
+    let (mut rows, allocations_error) = rows_for(client, nodes).await;
+    if let Some(error) = allocations_error {
+        eprintln!("warning: allocations unavailable: {error}");
+    }
+    if unhealthy {
+        rows.retain(NodeRow::is_unhealthy);
+    }
+    print_rows(&rows, output)
+}
+
+/// Every node's row, as `relish nodes` and the terminal UI's nodes view
+/// show it: gossip's `nodes`, each node's own summary and the leader's
+/// allocations. The second value says why the allocations are missing,
+/// when they are; the rows then show `-` for them.
+pub async fn fetch_rows(client: &BunClient) -> Result<(Vec<NodeRow>, Option<String>), RelishError> {
+    let nodes = client.nodes().await?;
+    if nodes.is_empty() {
+        return Ok((Vec::new(), None));
+    }
+    Ok(rows_for(client, nodes).await)
+}
+
+async fn rows_for(client: &BunClient, nodes: Vec<NodeStatus>) -> (Vec<NodeRow>, Option<String>) {
     let (capacity, (shares, unanswered)) = tokio::join!(
         client.cluster_capacity(),
         ask_each_node(
@@ -84,19 +107,15 @@ pub async fn run_with_client(
             |node| async move { node.node_summary().await }
         ),
     );
-    let capacity = match capacity {
-        Ok(capacity) => Some(capacity),
-        Err(error) => {
-            eprintln!("warning: allocations unavailable: {error}");
-            None
-        }
+    let (capacity, allocations_error) = match capacity {
+        Ok(capacity) => (Some(capacity), None),
+        Err(error) => (None, Some(error.to_string())),
     };
     let shares: Vec<NodeSummary> = shares.into_iter().map(|(_, share)| share).collect();
-    let mut rows = node_rows(nodes, &shares, &unanswered, capacity.as_ref());
-    if unhealthy {
-        rows.retain(NodeRow::is_unhealthy);
-    }
-    print_rows(&rows, output)
+    (
+        node_rows(nodes, &shares, &unanswered, capacity.as_ref()),
+        allocations_error,
+    )
 }
 
 fn print_rows(rows: &[NodeRow], output: OutputFormat) -> Result<(), RelishError> {
@@ -201,40 +220,66 @@ fn state_cell(row: &NodeRow) -> String {
     state
 }
 
+/// The `relish nodes` column headings, which the terminal UI's nodes view
+/// shares. CPU, MEM and DISK (indexes 6 to 8) are right-aligned numbers.
+pub const COLUMNS: [&str; 10] = [
+    "NODE",
+    "ADDRESS",
+    "STATE",
+    "COUNCIL",
+    "LEADER",
+    "VERSION",
+    "CPU",
+    "MEM",
+    "DISK",
+    "ALLOCATED",
+];
+
+/// One row's cells, in [`COLUMNS`] order.
+pub fn row_cells(row: &NodeRow) -> [String; 10] {
+    [
+        row.status.node_id.clone(),
+        row.status.address.clone(),
+        state_cell(row),
+        if row.status.is_council { "yes" } else { "-" }.to_string(),
+        if row.status.is_leader { "yes" } else { "-" }.to_string(),
+        row.version.clone().unwrap_or_else(|| "-".to_string()),
+        percent(row.cpu_percent),
+        percent(row.memory_percent),
+        percent(row.disk_percent),
+        allocated_cell(row.allocated.as_ref()),
+    ]
+}
+
+/// Lay out a heading or a row of cells in the `relish nodes` table.
+fn format_line<S: AsRef<str>>(cells: &[S; 10]) -> String {
+    let [
+        node,
+        address,
+        state,
+        council,
+        leader,
+        version,
+        cpu,
+        memory,
+        disk,
+        allocated,
+    ] = cells.each_ref().map(AsRef::as_ref);
+    format!(
+        "{node:<20} {address:<22} {state:<16} {council:<8} {leader:<7} {version:<10} {cpu:>5} {memory:>5} {disk:>5}  {allocated}"
+    )
+}
+
 /// The `relish nodes` table, then a line for each node a rollout cordoned
 /// and each node that didn't answer.
 pub fn render_nodes(rows: &[NodeRow]) -> String {
     if rows.is_empty() {
         return "no nodes match\n".to_string();
     }
-    let mut out = format!(
-        "{:<20} {:<22} {:<16} {:<8} {:<7} {:<10} {:>5} {:>5} {:>5}  {}\n",
-        "NODE",
-        "ADDRESS",
-        "STATE",
-        "COUNCIL",
-        "LEADER",
-        "VERSION",
-        "CPU",
-        "MEM",
-        "DISK",
-        "ALLOCATED"
-    );
+    let mut out = format_line(&COLUMNS);
+    out.push('\n');
     for row in rows {
-        let _ = writeln!(
-            out,
-            "{:<20} {:<22} {:<16} {:<8} {:<7} {:<10} {:>5} {:>5} {:>5}  {}",
-            row.status.node_id,
-            row.status.address,
-            state_cell(row),
-            if row.status.is_council { "yes" } else { "-" },
-            if row.status.is_leader { "yes" } else { "-" },
-            row.version.as_deref().unwrap_or("-"),
-            percent(row.cpu_percent),
-            percent(row.memory_percent),
-            percent(row.disk_percent),
-            allocated_cell(row.allocated.as_ref()),
-        );
+        let _ = writeln!(out, "{}", format_line(&row_cells(row)));
     }
     let cordons: Vec<(&NodeRow, Cordon)> = rows
         .iter()

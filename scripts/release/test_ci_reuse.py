@@ -328,13 +328,14 @@ class FetchTests(unittest.TestCase):
 
 
 class MainTests(unittest.TestCase):
-    def main(self, runs_for, jobs_for=lambda repository, run_id: green_jobs(), commit=COMMIT, clock=None):
+    def main(self, runs_for, jobs_for=lambda repository, run_id: green_jobs(), commit=COMMIT, clock=None,
+             extra=()):
         clock = clock or Clock([[]])
         with tempfile.NamedTemporaryFile("r", suffix=".out") as output, \
                 tempfile.NamedTemporaryFile("r", suffix=".md") as summary, \
                 contextlib.redirect_stderr(io.StringIO()):
             status = main(["--repository", REPOSITORY, "--commit", commit, "--github-output", output.name,
-                           "--step-summary", summary.name],
+                           "--step-summary", summary.name, *extra],
                           runs_for=runs_for, jobs_for=jobs_for, now=clock.now, sleep=clock.sleep)
             self.summary = summary.read()
             return status, output.read()
@@ -392,6 +393,31 @@ class MainTests(unittest.TestCase):
             raise ValueError("run 7 has 120 jobs; only 100 were read")
         self.assertEqual(self.main(lambda repository, commit: [run(7)], broken),
                          (0, "reuse=false\nci_run=\nci_run_attempt=\n"))
+
+    def test_a_train_push_finds_the_merge_queue_run_that_tested_its_commit(self):
+        # ci.yml asks with --event merge_group on a push to a train (#1723).
+        runs = [run(6, event="push", status="in_progress"), run(7, event="merge_group")]
+        self.assertEqual(self.main(lambda repository, commit: runs, extra=["--event", "merge_group"]),
+                         (0, "reuse=true\nci_run=7\nci_run_attempt=1\n"))
+
+    def test_a_train_push_never_counts_its_own_run_or_another_push(self):
+        clock = Clock([[run(6, event="push")]])
+        self.assertEqual(self.main(clock.runs_for, clock=clock, extra=["--event", "merge_group"]),
+                         (0, "reuse=false\nci_run=\nci_run_attempt=\n"))
+
+    def test_a_train_push_without_a_queue_run_does_not_wait_for_one(self):
+        # A direct push to the train has no queue run, and none will appear.
+        clock = Clock([[]])
+        self.assertEqual(self.main(clock.runs_for, clock=clock, extra=["--event", "merge_group"])[1],
+                         "reuse=false\nci_run=\nci_run_attempt=\n")
+        self.assertEqual(clock.calls, 1)
+
+    def test_a_queue_run_that_skipped_a_job_leaves_the_push_to_run_everything(self):
+        # A documentation-only group selects no code jobs (select-jobs.sh).
+        self.assertEqual(self.main(lambda repository, commit: [run(7, event="merge_group")],
+                                   jobs_for=lambda repository, run_id: with_job("portable Linux", "skipped"),
+                                   extra=["--event", "merge_group"])[1],
+                         "reuse=false\nci_run=\nci_run_attempt=\n")
 
     def test_a_short_commit_runs_the_suite(self):
         self.assertEqual(self.main(lambda repository, commit: [run(7, commit="aaaa")], commit="aaaa"),

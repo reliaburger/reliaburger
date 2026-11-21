@@ -230,9 +230,14 @@ impl NodeMembershipInfo {
 /// rather than dropping it. `bun` attaches it as a layer; without it the relay
 /// reaches live members only.
 ///
-/// Remembering is bounded. A member that left on purpose, or whose identity
-/// the operator retired, is forgotten at once: nothing on it needs healing.
-/// A member unheard of for [`KNOWN_MEMBER_RETENTION`] is forgotten too.
+/// A member that shut down cleanly announced a graceful leave, so gossip
+/// calls it Left. That's a reboot as often as a departure, and a council
+/// voter that left still holds its seat, so it stays listed as `left` until
+/// it comes back (#2164).
+///
+/// Remembering is bounded. A member whose identity the operator retired is
+/// forgotten at once: nothing on it needs healing and it isn't coming back.
+/// A down member unheard of for [`KNOWN_MEMBER_RETENTION`] is forgotten too.
 #[derive(Clone, Default)]
 pub struct KnownMembers(Arc<RwLock<Vec<KnownMember>>>);
 
@@ -281,9 +286,10 @@ impl KnownMembers {
     /// really has gone just fails to connect, which is the honest answer for
     /// a reversal aimed at it.
     ///
-    /// Members gossip reports as Left, and those named in `retired`, are
-    /// dropped, as is any down member not heard from since
-    /// [`KNOWN_MEMBER_RETENTION`] before `now`.
+    /// A member gossip reaps after it left stays `Left`; one reaped after it
+    /// died stays `Dead`. Members named in `retired` are dropped, as is any
+    /// down member not heard from since [`KNOWN_MEMBER_RETENTION`] before
+    /// `now`.
     pub async fn refresh(
         &self,
         roster: Vec<RosterMember>,
@@ -301,7 +307,7 @@ impl KnownMembers {
         };
         let mut next = Vec::new();
         for member in &roster {
-            if member.state == NodeState::Left || retired.contains(&member.info.node_id.0) {
+            if retired.contains(&member.info.node_id.0) {
                 continue;
             }
             let last_heard = if member.state.is_down() {
@@ -321,10 +327,12 @@ impl KnownMembers {
             {
                 continue;
             }
-            // Gossip reaps only down members, and a Left one was forgotten
-            // the moment the roster showed it, so a reaped member was dead.
+            // Gossip reaps only down members. A Left one keeps its state;
+            // anything else gossip stopped listing died.
             let mut known = known.clone();
-            known.member.state = NodeState::Dead;
+            if known.member.state != NodeState::Left {
+                known.member.state = NodeState::Dead;
+            }
             next.push(known);
         }
         next.retain(|known| {

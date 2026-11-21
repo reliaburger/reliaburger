@@ -1,7 +1,7 @@
 # Appliance: netboot, claim and `relish os`
 
 **Component:** the appliance OS, `relish netboot`, `relish machines claim`, `relish os`
-**Status:** Implemented on the 0.3.0 train (#401–#406); to be qualified by the Wyse exit test (#407)
+**Status:** Shipped in 0.3.0 (#401–#406); the Wyse exit test (#407) runs alongside the release
 
 ---
 
@@ -44,6 +44,12 @@ On first boot `systemd-repart` grows the data partition and adds an empty
 `51-usr-verity-b.conf`). `/usr` is read-only and verified block by block, so
 everything a node changes lives on the data partition. That's also why an OS
 update never touches the cluster's state (§4.4).
+
+The image has no Buildah, so no appliance node can run `relish build`. bun
+refuses a build that no node can run with `NO_BUILDER_ERROR`
+(`src/bun/build_runner.rs`), which names the ways out: build elsewhere and
+push into Pickle, or add a Linux node with Buildah, which bun hands builds to
+(#2144).
 
 Lab builds add `openssh-server` for debugging. Published images don't have
 it, and `image/tests/no_ssh_server.py` checks it twice. Its unit test reads
@@ -227,7 +233,11 @@ With none, the machine is unclaimed and waits to be claimed
   `3f9a-12bc-77de-0a41`.
 - **Console.** The tty1 status screen redraws every 5 seconds and shows the
   short claim key while the node has no name, with the hint to compare it in
-  `relish machines claim`.
+  `relish machines claim`. `reliaburger-console.service` is ordered after
+  none of our units: the seed unit stays activating until the claim, and a
+  console ordered after it showed nothing until the key no longer mattered
+  (#2161). It shares bun's launcher with prepare and bun, which installs
+  bun under a lock (`/var/lib/reliaburger/bin/.install.lock`).
 - **mDNS.** It announces `_rb-unclaimed._tcp.local.` (RFC 6763 caps the name
   at 15 bytes) as `reliaburger-<mac>`, with TXT `mac`, `arch` and `fp` (the
   short fingerprint). It waits up to 60 seconds for an IPv4 address before
@@ -479,7 +489,7 @@ Staging, Rebooting, Failed) and in `/v1/version` as `os_version` and
 
 **Boot counting.** `reliaburger-boot-check.service` is required by
 `boot-complete.target`, so `systemd-bless-boot` marks the new UKI good only
-once bun answers as healthy. It allows 120 seconds on a counted boot and 300
+once bun answers as healthy. It allows 90 seconds on a counted boot and 300
 seconds otherwise, and the clock doesn't start until prepare is done. The
 clock is seconds since boot (`/proc/uptime`), not the wall clock, which jumps
 when it first syncs: a machine with a flat RTC battery boots behind, and the
@@ -489,15 +499,29 @@ back to the previous UKI, whose `usrhash` pins the old `/usr`. Back on the old
 version, bun turns `Rebooting` into `Failed` ("failed its boot checks, so
 systemd-boot fell back"), which pauses the rollout.
 
+The 90 s is a trade between the two ways the check can be wrong. Too long,
+and a broken update takes three times too long to fall back: a Wyse 3040
+spends about 65 s per try booting, rebooting and in firmware before the
+check starts, so with 120 s its fallback took 10 min 28 s, past the 10
+minutes S5 allows (#2143). 90 s brings that to about 9 minutes. Too short,
+and a slow but healthy first boot of a good update gets rolled back. The
+slowest healthy start is the 30 s clock wait below on a LAN with no NTP,
+plus bun's own start-up, which took 38 s on the 3040, so 90 s still leaves
+about 20 s spare. Three tries stay, so one transient failure doesn't roll a
+good update back. `image/tests/test_fallback_limit.py` models the Wyse's
+fallback from its measured timings and fails if the budget would take it
+past 10 minutes; `test_time_wait.py` fails if the budget no longer covers the
+slowest healthy start.
+
 **Time before bun.** bun and its peers expect a node's wall clock to move
 forward across restarts, so `reliaburger.service` starts after
 `reliaburger-time-wait.service`, which runs
 `systemd-time-wait-sync` under `timeout 30` once per boot, after the network
 and `systemd-timesyncd` are up. It waits only until the first sync, so a
 node that can reach NTP waits a second or two. Giving up isn't a failure
-(`ExecStart=-`), so a LAN with no NTP server delays bun by 30 s, still well
-inside a counted boot's 120 s. bun isn't ordered after `time-sync.target`:
-systemd's own `systemd-time-wait-sync.service` never gives up
+(`ExecStart=-`), so a LAN with no NTP server delays bun by 30 s, still
+inside a counted boot's 90 s even on a Wyse 3040. bun isn't ordered after
+`time-sync.target`: systemd's own `systemd-time-wait-sync.service` never gives up
 (`TimeoutStartSec=infinity`), and if anything enabled it, a node with no NTP
 would never start bun. `image/tests/test_time_wait.py` holds the units to
 this.

@@ -13,7 +13,7 @@ a Docker registry, GitOps and chaos testing, in one Rust agent and one CLI.
 And that CLI speaks to your AI agent too.
 <!-- hero:end -->
 
-**Status:** 0.2.8 was released on 12 November 2026. Until 1.0.0, Reliaburger is good enough for home labs and dev clusters, not for production.
+**Status:** 0.3.0 was released on 20 November 2026. Until 1.0.0, Reliaburger is good enough for home labs and dev clusters, not for production.
 
 ## Five minutes, zero to cluster
 
@@ -112,19 +112,20 @@ a read-only token of its own, so an agent never holds admin credentials.
 - **Tenants kept apart:** namespaces can't reach each other unless you let them, and egress has allowlists.
 - **An audit log:** who applied, deleted, exec'd, upgraded or broke what, and from where.
 - **A registry on every node:** Pickle stores, caches and builds OCI images inside the cluster.
-- **Metrics, logs and alerts:** scraped, captured and exported by the agent, with nothing else to install. Alerts are five built-in node rules for now ([#1773](https://github.com/reliaburger/reliaburger/issues/1773)).
+- **Metrics, logs and alerts:** scraped, captured and exported by the agent, with nothing else to install. Alerts are four built-in node rules for now ([#1773](https://github.com/reliaburger/reliaburger/issues/1773)).
 - **Batch jobs:** one-off jobs, cron, deploy hooks and task arrays of millions, beside your apps.
 - **Deploys and GitOps:** health-gated rolling deploys with rollback, blue-green, autoscaling and Git sync.
 - **Policies and templates:** CEL rules that refuse, warn or fill in defaults, and typed templates instead of CRDs.
 - **Your own controllers:** an ordinary app with a scoped token, no operator SDK.
 - **Chaos as a command:** `relish fault` injects latency, partitions, kills and pressure, and cleans up after itself.
+- **Bare metal in an hour:** `relish netboot` installs our appliance OS on blank machines over the network, `relish machines claim` brings them into a cluster, and `relish os` rolls an OS update across it one node at a time, with automatic fallback.
 - **Self-upgrade:** `relish upgrade` rolls a signed `bun` across the cluster without restarting workloads, and `relish verify` checks every node runs the published release, byte for byte.
 - **Diagnostics for incidents:** `relish wtf` and `relish path` say what's wrong and where. `relish status` sums up the whole cluster on one screen, `relish apps` lists the apps, and `relish timeline` shows what changed before a failure, with the rule and evidence behind each decision.
 - **Built for agents:** `relish agent` answers in bounded JSON, and `relish mcp` serves it over MCP. An agent proposes a change, a person or a policy approves it with `relish proposal approve` or the web dashboard's buttons, `relish undo` puts it back, `relish lease` keeps two of them off the same app, and `relish gym run` tests your own agent on your own cluster.
-- **A terminal UI and a web dashboard:** run `relish` with no arguments, or `relish dashboard`. Scale an app with `+` and `-` on its Instances tab, or `relish scale web --replicas 3` (0.3.0, not in 0.2.8); the next apply of its file puts back the file's count.
+- **A terminal UI and a web dashboard:** run `relish` with no arguments, or `relish dashboard`. Scale an app with `+` and `-` on its Instances tab, or `relish scale web --replicas 3` (0.3.2, not in 0.3.0); the next apply of its file puts back the file's count.
 - **The manual and the source in the binary:** `relish manual` and `relish source` work offline.
 
-[Everything 0.2.8 does](docs/README.md#whats-in-the-binary), what you
+[Everything 0.3.0 does](docs/README.md#whats-in-the-binary), what you
 don't have to install, and its [limits](docs/README.md#scope-and-limits) are
 in the documentation. The
 [feature status page](https://reliaburger.com/features) rates every

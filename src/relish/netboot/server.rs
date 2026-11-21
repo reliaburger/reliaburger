@@ -14,6 +14,7 @@ use super::dhcp::{self, DhcpContext, ListenPort};
 use super::http::{self, HttpState};
 use super::installed::{InstallTickets, InstalledRecord, RECORD_FILE, chain_script};
 use super::interface::{self, Interface, udp_socket};
+use super::netlog::{self, NETLOG_PORT, SharedPeers};
 use super::tftp::{self, Outcome, TftpFiles, TftpSettings};
 use super::wipe::{self, DiskSession, Question};
 use super::{DhcpSetup, IpxeBuild, Log, MacAddress, NetbootError, NetbootOptions};
@@ -58,11 +59,20 @@ pub async fn run(options: NetbootOptions) -> Result<(), NetbootError> {
     let listener = TcpListener::bind(SocketAddrV4::new(server, options.http_port))
         .await
         .map_err(|e| interface::bind_error("HTTP", options.http_port, e))?;
+    let netlog_socket = if options.stream_logs {
+        Some(udp_socket(
+            "the boot log listener",
+            SocketAddrV4::new(server, NETLOG_PORT),
+            None,
+        )?)
+    } else {
+        None
+    };
     // BLOCKING-OK: relish netboot: read once at start, before it serves anything
     let record = InstalledRecord::load(&options.directory.join(RECORD_FILE))?;
 
     print_summary(&options, &interface, &artefacts, &record);
-    let log: Log = Arc::new(|line| println!("{line}"));
+    let log: Log = Arc::new(|line| println!("{}", stamped(time_of_day(), &line)));
     let context = Arc::new(DhcpContext {
         server,
         http_port: options.http_port,
@@ -82,19 +92,41 @@ pub async fn run(options: NetbootOptions) -> Result<(), NetbootError> {
         question_timeout: wipe::QUESTION_TIMEOUT,
         disks: Mutex::new(DiskSession::default()),
         installs: Mutex::new(InstallTickets::default()),
+        netlog: options
+            .stream_logs
+            .then_some(SocketAddrV4::new(server, NETLOG_PORT)),
         log: log.clone(),
     });
     let http_state = state.clone();
 
-    let (dhcp_context, dhcp_log) = (context.clone(), log.clone());
+    let peers = SharedPeers::default();
+    let (dhcp_context, dhcp_log, dhcp_peers) = (context.clone(), log.clone(), peers.clone());
     let dhcp_task = async move {
         match dhcp_socket {
-            Some(socket) => dhcp_loop(socket, ListenPort::Dhcp, dhcp_context, dhcp_log).await,
+            Some(socket) => {
+                dhcp_loop(socket, ListenPort::Dhcp, dhcp_context, dhcp_log, dhcp_peers).await
+            }
             // Never finishes, so the select! below never picks it.
             None => std::future::pending().await,
         }
     };
-    let proxy_task = dhcp_loop(proxy_socket, ListenPort::ProxyDhcp, context, log.clone());
+    let proxy_task = dhcp_loop(
+        proxy_socket,
+        ListenPort::ProxyDhcp,
+        context,
+        log.clone(),
+        peers.clone(),
+    );
+    // Its lines go through the same `log` as the servers' own, so they
+    // print the same way, among them.
+    let directory = options.directory.clone();
+    let netlog_log = log.clone();
+    let netlog_task = async move {
+        match netlog_socket {
+            Some(socket) => netlog::listen(socket, peers, Some(directory), netlog_log).await,
+            None => std::future::pending().await,
+        }
+    };
     let tftp_log = log.clone();
     let tftp_task = tftp::serve(
         tftp_socket,
@@ -113,8 +145,9 @@ pub async fn run(options: NetbootOptions) -> Result<(), NetbootError> {
         result = proxy_task => Err(failed("ProxyDHCP", result)),
         result = tftp_task => Err(failed("TFTP", result)),
         result = http_task => Err(failed("HTTP", result)),
+        result = netlog_task => Err(failed("boot log", result)),
     };
-    println!("relish netboot: {}", stopped?);
+    log(format!("relish netboot: {}", stopped?));
     Ok(())
 }
 
@@ -141,7 +174,12 @@ fn operator() -> Option<mpsc::UnboundedSender<Question>> {
         questions,
         lines,
         wipe::ANSWER_GRACE,
-        |line| println!("relish netboot: {line}"),
+        |line| {
+            println!(
+                "{}",
+                stamped(time_of_day(), &format!("relish netboot: {line}"))
+            )
+        },
     ));
     Some(ask)
 }
@@ -378,8 +416,16 @@ async fn dhcp_loop(
     port: ListenPort,
     context: Arc<DhcpContext>,
     log: Log,
+    peers: SharedPeers,
 ) -> std::io::Result<()> {
-    dhcp::serve(Arc::new(socket), port, context, move |line| log(line)).await
+    dhcp::serve(
+        Arc::new(socket),
+        port,
+        context,
+        move |line| log(line),
+        move |address, mac| netlog::learn(&peers, address, mac),
+    )
+    .await
 }
 
 /// What TFTP serves: iPXE for each architecture and the chain script.
@@ -414,16 +460,8 @@ fn tftp_files(
 }
 
 fn log_transfer(log: &Log, peer: SocketAddr, name: &str, outcome: Outcome) {
-    match outcome {
-        Outcome::Sent { bytes, block_size } => log(format!(
-            "tftp: {peer}: {name}, {bytes} bytes in {block_size}-byte blocks"
-        )),
-        // UEFI firmware asks for the size first, then for the file.
-        Outcome::Probed => {}
-        Outcome::Aborted { message } => log(format!(
-            "tftp: {peer}: {name}: the client stopped ({message})"
-        )),
-        Outcome::TimedOut => log(format!("tftp: {peer}: {name}: no acknowledgement, gave up")),
+    if let Some(line) = outcome.describe(peer, name) {
+        log(line);
     }
 }
 
@@ -481,6 +519,24 @@ fn describe_duration(duration: Duration) -> String {
     }
 }
 
+/// The local wall-clock time now. When the time zone can't be read, jiff
+/// falls back to UTC rather than failing, which still orders the lines.
+fn time_of_day() -> jiff::civil::Time {
+    jiff::Zoned::now().time()
+}
+
+/// `line` with `time` in front, to the second: `21:04:17 dhcp: …`. Every
+/// line `relish netboot` logs while it serves goes through this, so a lab
+/// can time each machine's stages from the log alone.
+fn stamped(time: jiff::civil::Time, line: &str) -> String {
+    format!(
+        "{:02}:{:02}:{:02} {line}",
+        time.hour(),
+        time.minute(),
+        time.second()
+    )
+}
+
 fn print_summary(
     options: &NetbootOptions,
     interface: &Interface,
@@ -489,11 +545,14 @@ fn print_summary(
 ) {
     let server = interface.address;
     let port = options.http_port;
-    println!(
+    // The one stamped line of the summary: when serving started, the T0
+    // a lab measures each machine's stages from.
+    let serving = format!(
         "relish netboot: serving on {} ({server}) for {}; Ctrl-C stops it",
         interface.name,
         describe_duration(options.duration)
     );
+    println!("{}", stamped(time_of_day(), &serving));
     for (arch, release) in &artefacts.architectures {
         println!(
             "  {arch}: OS {}, {} files checked; PXE boots {} (TFTP, iPXE's {} build), then http://{server}:{port}/{}/installer.efi",
@@ -522,6 +581,16 @@ fn print_summary(
             macs.join(", ")
         );
     }
+    if options.stream_logs {
+        println!(
+            "  --stream-logs: installs send their boot logs to {server}:{NETLOG_PORT}; they print here as log <mac>: and go to {}",
+            options
+                .directory
+                .join(netlog::LOGS_DIRECTORY)
+                .join("<mac>.log")
+                .display()
+        );
+    }
     if std::io::stdin().is_terminal() {
         println!("  a machine whose disk isn't blank asks here first: answer y to wipe it");
     } else {
@@ -548,6 +617,23 @@ mod tests {
 
     use crate::relish::netboot::dhcp::DhcpContext;
     use dhcproto::v4::{DhcpOption, Message, MessageType, Opcode};
+
+    /// A lab times each machine's stages from the log (#2159), so every
+    /// line starts with the wall-clock time, seconds included and
+    /// zero-padded so the columns line up.
+    #[test]
+    fn a_log_line_starts_with_the_time_of_day() {
+        let evening = jiff::civil::time(21, 4, 17, 0);
+        assert_eq!(
+            stamped(
+                evening,
+                "dhcp: 6c:4b:90:12:34:56 (iPXE): ack on 4011, boot boot.ipxe"
+            ),
+            "21:04:17 dhcp: 6c:4b:90:12:34:56 (iPXE): ack on 4011, boot boot.ipxe"
+        );
+        let morning = jiff::civil::time(9, 5, 3, 999_999_999);
+        assert_eq!(stamped(morning, "http: done"), "09:05:03 http: done");
+    }
 
     /// A server that dies is a failure of the whole run, so `relish
     /// netboot` exits non-zero and a script or a test notices.

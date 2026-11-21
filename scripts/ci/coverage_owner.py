@@ -31,20 +31,30 @@ MAKE_RECIPE = """COVERAGE_MIN_LINES ?= 78.65
 COVERAGE_REPORT = $(CARGO) llvm-cov report --failure-mode all
 coverage: ## Run the portable suite once under line coverage, write the lcov report and enforce the floor
 	$(CARGO) llvm-cov clean --workspace
+	$(CARGO) llvm-cov --no-report test --lib -- --list
+	$(CARGO) llvm-cov clean --profraw-only
 	$(CARGO) llvm-cov --no-report nextest --profile $(NEXTEST_PROFILE) --no-tests=fail
 	mkdir -p target/coverage
 	$(COVERAGE_REPORT) --lcov --output-path target/coverage/lcov.info --fail-under-lines $(COVERAGE_MIN_LINES)
 """
 
-def recipe_stages(profile, floor):
-    """Return the three Makefile coverage operations in their original order.
+# The stage whose cargo-nextest child is the one instrumented run.
+RUN_STAGE = 3
 
-    One report call writes the lcov file and enforces the floor (plan
-    2026-11-06, F3); the HTML is make coverage-html's, outside this owner.
+def recipe_stages(profile, floor):
+    """Return the five Makefile coverage operations in their original order.
+
+    The lib tests build alone first and list their tests without running one;
+    their listing's profile is deleted before the run, which builds the rest
+    (#1723, #1943). One report call writes the lcov file and enforces the
+    floor (plan 2026-11-06, F3); the HTML is make coverage-html's, outside
+    this owner.
     """
     c.require(profile == 'ci' and floor == '78.65', 'unaudited coverage selection/floor')
     return [
         ['clean', '--workspace'],
+        ['--no-report', 'test', '--lib', '--', '--list'],
+        ['clean', '--profraw-only'],
         ['--no-report', 'nextest', '--profile', profile, '--no-tests=fail'],
         ['report', '--failure-mode', 'all', '--lcov', '--output-path', 'target/coverage/lcov.info',
          '--fail-under-lines', floor],
@@ -158,7 +168,7 @@ class Controller:
             return dict(index=self.index, command=command)
         if kind == 'handshake':
             c.fields(row, ('kind', 'nonce', 'argv', 'environment'))
-            c.require(self.active == 1, 'child handshake is outside genuine instrumented stage')
+            c.require(self.active == RUN_STAGE, 'child handshake is outside genuine instrumented stage')
             c.require(self.count == 0, 'duplicate instrumented child handshake')
             c.require(
                 row['argv'] == self.expected['run_argv'],
@@ -222,7 +232,7 @@ class Controller:
             c.require(type(row['exit_code']) is int, 'invalid actual stage exit')
             self.stages.append(dict(command=self.expected['stages'][self.index], exit_code=row['exit_code']))
             c.require(
-                self.index != 1 or self.count == 1,
+                self.index != RUN_STAGE or self.count == 1,
                 'instrumented stage completed without actual child handshake',
             )
             self.active = None

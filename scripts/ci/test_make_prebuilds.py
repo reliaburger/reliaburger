@@ -24,9 +24,14 @@ VALUED_BUILD_FLAGS = ("--features", "-F", "--target", "--manifest-path", "--carg
 
 
 def build_flags(arguments):
-    """The flags in `arguments` that change what Cargo compiles, normalised."""
+    """The flags in `arguments` that change what Cargo compiles, normalised.
+
+    Anything after `--` goes to the test binaries, not to Cargo.
+    """
     flags = {}
     features = set()
+    if "--" in arguments:
+        arguments = arguments[:arguments.index("--")]
     tokens = iter(arguments)
     for token in tokens:
         name, equals, value = token.partition("=")
@@ -63,13 +68,36 @@ def lines_run_by(text, target, known):
 
 
 def test_build(line):
-    """The arguments of a line's test build, or None when it builds no tests."""
+    """The arguments of a line's test build, or None when it builds no tests.
+
+    `make coverage` builds through cargo-llvm-cov: its `nextest` stage is the
+    test build and a `test` stage before it a pre-build.
+    """
     if "$(NEXTEST)" in line:
         return shlex.split(line.split("$(NEXTEST)", 1)[1])
+    coverage = llvm_cov_build(line)
+    if coverage is not None:
+        return coverage[1:]
     if not line.startswith("$(CARGO) test"):
         return None
     words = shlex.split(line)
     return None if "--doc" in words else words[2:]
+
+
+def llvm_cov_build(line):
+    """A `$(CARGO) llvm-cov` line's subcommand and arguments, or None when it builds nothing."""
+    words = shlex.split(line) if line.startswith("$(CARGO) llvm-cov ") else []
+    words = [word for word in words[2:] if word != "--no-report"]
+    return words if words[:1] in (["test"], ["nextest"]) else None
+
+
+def build_only(arguments):
+    """Whether a test build's arguments build its tests without running one.
+
+    cargo-llvm-cov takes `--no-run` for itself, so its pre-build lists the
+    tests (`-- --list`) instead.
+    """
+    return "--no-run" in arguments or arguments[-2:] == ["--", "--list"]
 
 
 def prebuild_problems(text):
@@ -79,16 +107,19 @@ def prebuild_problems(text):
     for target in known:
         lines = lines_run_by(text, target, known)
         builds = [(index, arguments) for index, line in enumerate(lines)
-                  if (arguments := test_build(line)) is not None and "--no-run" not in arguments]
+                  if (arguments := test_build(line)) is not None and not build_only(arguments)]
         if not builds:
             continue
         first, tests = builds[0]
         wanted = build_flags(tests)
         for line in lines[:first]:
             words = shlex.split(line) if line.startswith("$(CARGO) ") else []
+            coverage = llvm_cov_build(line)
+            if coverage is not None:
+                words = ["$(CARGO)"] + coverage
             if words[:2] == ["$(CARGO)", "build"]:
                 problems.append(f"{target}: `{line}` builds without the dev-dependencies' features")
-            elif words[:2] == ["$(CARGO)", "test"] and "--no-run" in words and build_flags(words[2:]) != wanted:
+            elif words[:2] == ["$(CARGO)", "test"] and build_only(words[2:]) and build_flags(words[2:]) != wanted:
                 problems.append(f"{target}: `{line}` builds with {build_flags(words[2:])}, "
                                 f"its tests with {wanted}")
     return problems
@@ -125,6 +156,19 @@ class PrebuildChecker(unittest.TestCase):
                 "\t$(NEXTEST) --features extra,ebpf -E 'binary(ebpf)'\n")
         self.assertEqual(prebuild_problems(text), [])
 
+    def test_a_coverage_prebuild_with_other_features_is_reported(self):
+        text = ("coverage: ## Coverage\n"
+                "\t$(CARGO) llvm-cov --no-report test --features ebpf --lib -- --list\n"
+                "\t$(CARGO) llvm-cov --no-report nextest --profile ci\n")
+        self.assertEqual(len(prebuild_problems(text)), 1)
+        self.assertIn("coverage", prebuild_problems(text)[0])
+
+    def test_a_coverage_prebuild_with_the_runs_features_passes(self):
+        text = ("coverage: ## Coverage\n"
+                "\t$(CARGO) llvm-cov --no-report test --lib -- --list\n"
+                "\t$(CARGO) llvm-cov --no-report nextest --profile ci\n")
+        self.assertEqual(prebuild_problems(text), [])
+
     def test_a_build_with_no_tests_after_it_is_not_a_prebuild(self):
         text = ("build: ## Build\n"
                 "\t$(CARGO) build\n"
@@ -149,6 +193,34 @@ class MakefilePrebuilds(unittest.TestCase):
         self.assertEqual(lines[:2], ["$(CARGO) test --no-run --features ebpf --lib",
                                      "$(CARGO) test --no-run --features ebpf"])
         self.assertIn("--features ebpf", lines[2].split("$(NEXTEST)", 1)[1])
+
+    def test_test_rootless_runc_builds_the_lib_tests_on_their_own_first(self):
+        # It is the 24.04 privileged job's first, cold build. On 15 and 20
+        # Nov that job lost its runner three times in this step and nowhere
+        # else (runs 43715576493, 44729365098, 44783868580): one parallel
+        # build compiles the lib (about 7 GB) beside its lib tests (10 to
+        # 12 GB) on a 16 GB runner, #1943's mechanism. test-linux's split
+        # build keeps the two apart.
+        lines = workflow_assembly.recipe((ROOT / "Makefile").read_text(), "test-rootless-runc")
+        self.assertEqual(lines[:2], ["$(CARGO) test --no-run --features ebpf --lib",
+                                     "$(CARGO) test --no-run --features ebpf"])
+        self.assertIn("--features ebpf", lines[2].split("$(NEXTEST)", 1)[1])
+
+    def test_coverage_builds_the_lib_tests_on_their_own_before_the_run(self):
+        # #1723: one build job (#1943) made the instrumented build about 13
+        # of portable Linux's 25 to 31 minutes. The lib tests (10 to 12 GB
+        # of rustc) now build alone at full parallelism, then the run builds
+        # the rest, the lib (about 7 GB) first, since every other target
+        # links it. The two big rustc processes never overlap. cargo-llvm-cov
+        # keeps --no-run for itself, so the build lists the tests instead of
+        # running them, and the profile that leaves is deleted before the run.
+        lines = workflow_assembly.recipe((ROOT / "Makefile").read_text(), "coverage")
+        self.assertEqual(lines[:4], [
+            "$(CARGO) llvm-cov clean --workspace",
+            "$(CARGO) llvm-cov --no-report test --lib -- --list",
+            "$(CARGO) llvm-cov clean --profraw-only",
+            "$(CARGO) llvm-cov --no-report nextest --profile $(NEXTEST_PROFILE) --no-tests=fail",
+        ])
 
     def test_test_linux_names_bun_in_cargos_target_directory(self):
         # target/ in the checkout doesn't exist under an out-of-tree

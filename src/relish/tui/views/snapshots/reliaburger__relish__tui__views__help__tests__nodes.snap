@@ -5,10 +5,10 @@ expression: "render_to_string(&app, 120, 40)"
  RELISH  3 nodes · 3 apps · leader node-1 · CONNECTED                                                                   
                                                                                                                         
 ┌nodes─────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ID                 ADDRESS                 STATE      INC  COUNCIL  LEADER  LABELS                                    │
-│node-1             10.0.0.1:9118           alive        1  yes      ★       {"zone": "z1"}                            │
-│node-2             10.0.0.2:9118           alive        1  yes              {"zone": "z2"}                            │
-│node-3             10.0.0.3:9118           alive        1  yes              {"zone": "z3"}                            │
+│NODE    ADDRESS        STATE  COUNCIL  LEADER  VERSION  CPU  MEM  DISK  ALLOCATED        LABELS                       │
+│node-1  10.0.0.1:9118  alive  yes      yes     0.3.1    12%  25%   30%  cpu 25% mem 25%  zone=z1                      │
+│node-2  10.0.0.2:9118  alive  yes      -       0.3.1    48%  25%   30%  cpu 50% mem 25%  zone=z2                      │
+│node-3  10.0.0.3:9118  alive  yes      -       -          -    -     -  cpu 75% mem 25%  zone=z3                      │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │

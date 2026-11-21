@@ -66,7 +66,7 @@ Packages=
         iproute2
 ```
 
-`resolute` is 26.04's codename. `Format=disk` produces a whole partitioned disk image, and `SplitArtifacts=` also writes the pieces an update needs as separate files. The boot artefact is a UKI (Unified Kernel Image): the kernel, the initrd and the kernel command line glued into one EFI executable, which systemd-boot starts like any other EFI program. `%i_%v` names it `reliaburger-os_<version>.efi`, a name that matters later. The locked root password means there's no console login at all. The last six packages match the quickstart guest's list, `scripts/release/guest-images.json`, less Buildah, which the guest needs for `relish build`. From 0.3.0 the quickstart guest runs Ubuntu 26.04 too, so the two channels install the same packages from the same archive and test the same userland. mkosi can't read a JSON file, so rather than generate one list from the other we let a test hold them together: `test_guest_images.py` parses the `Packages=` block and fails if its tail and the guest's list drift apart.
+`resolute` is 26.04's codename. `Format=disk` produces a whole partitioned disk image, and `SplitArtifacts=` also writes the pieces an update needs as separate files. The boot artefact is a UKI (Unified Kernel Image): the kernel, the initrd and the kernel command line glued into one EFI executable, which systemd-boot starts like any other EFI program. `%i_%v` names it `reliaburger-os_<version>.efi`, a name that matters later. The locked root password means there's no console login at all. The last six packages match the quickstart guest's list, `scripts/release/guest-images.json`, less Buildah, which the guest needs for `relish build`. An appliance cluster builds nothing itself: you build elsewhere and push into Pickle ("A tour that couldn't build", below). From 0.3.0 the quickstart guest runs Ubuntu 26.04 too, so the two channels install the same packages from the same archive and test the same userland. mkosi can't read a JSON file, so rather than generate one list from the other we let a test hold them together: `test_guest_images.py` parses the `Packages=` block and fails if its tail and the guest's list drift apart.
 
 The kernel package drags in the full `linux-firmware` set, hundreds of megabytes, unless something else provides it. `linux-firmware-minimal` does, and we add back only the Wyse's Realtek NIC firmware (and its Intel graphics firmware on x86-64, in `mkosi.conf.d/10-x86-64.conf`, a drop-in whose `[Match] Architecture=` line applies it to one architecture only).
 
@@ -455,7 +455,7 @@ Ten second-hand Dell Wyse 3040s arrived for the lab. Some had blank eMMCs. Some 
 So the decision moved to the person at the `relish netboot` terminal. Before it writes anything, the installer runs `ask-to-wipe`, which posts what `lsblk -P` sees on the disk to the URL `relish netboot` gave it on the command line (`reliaburger.ask=http://…/disk?mac=…&uuid=…`). It gets back a ticket, and polls `GET /disk/<ticket>` every two seconds. Meanwhile the operator sees:
 
 ```
-relish netboot: 6c:4b:90:12:34:56: /dev/mmcblk0, 7.8 GB, gpt, 4 partitions: vfat "EFI", ext4 "ThinOS", (no filesystem), swap — wipe? [y/N]
+21:04:17 relish netboot: 6c:4b:90:12:34:56: /dev/mmcblk0, 7.8 GB, gpt, 4 partitions: vfat "EFI", ext4 "ThinOS", (no filesystem), swap — wipe? [y/N]
 ```
 
 The whole policy is one pure function in `src/relish/netboot/wipe.rs`:
@@ -530,6 +530,58 @@ A `oneshot` channel carries exactly one value, from one sender to one receiver: 
 One task, `ask_operator`, reads questions off that channel and asks them one at a time, so ten Wyses booting together become ten prompts in a row, not ten prompts fighting over one line of input. It waits with `tokio::time::timeout_at(question.deadline, lines.recv())`. The deadline is counted from the report, not from when the question appears, so a question stuck in the queue behind a slow operator still runs out on time. Before each question it throws away any lines typed since the last one: an Enter pressed twice shouldn't answer a question nobody has read yet.
 
 stdin is the awkward part. Reading a terminal is a blocking call, and tokio can't cancel a blocking read once it starts, so tokio's own documentation suggests a dedicated thread for interactive input. `relish netboot` starts one `std::thread` that reads lines and sends them into an unbounded `mpsc` channel, and only when `std::io::stdin().is_terminal()` says there's a person there. Run it from a script, or in CI with `< /dev/null`, and there's no operator at all: every used disk that `--wipe` doesn't list is left alone. CI's `relish-netboot-install.sh` now writes a GPT and an ext4 filesystem labelled `ThinOS` onto the VM's disk first and passes `--wipe <the VM's MAC>`, so every lab build installs over a used disk.
+
+### Watching a boot you can't see
+
+The Wyse lab's first fallback test went like this: stage a broken update, reboot, and wait while `reliaburger-boot-check` gives bun 120 seconds, gives up, and reboots. Three times. Then systemd-boot falls back and the old version comes up. All of that printed to a monitor, and the 3040 has no serial port, so the lab record for that step was a set of phone photos of a screen. A boot that never gets as far as SSH (a kernel panic, an initrd that can't find its disk) leaves nothing to read afterwards at all.
+
+So `relish netboot --stream-logs` has the machines send their boot logs to it over UDP, and prints them among its own lines:
+
+```
+log 6c:4b:90:12:34:56: reliaburger: bun not healthy after 120 s on OS 2026.47.228
+```
+
+The kernel already knows how to do the sending. [netconsole](https://docs.kernel.org/networking/netconsole.html) is a console like `tty0` or `ttyS0`, except that each line it prints goes out as a UDP packet. It runs inside the kernel, with no userspace, so it carries panics and oopses too. The usual way to set it up is `netconsole=` on the kernel command line, and that's exactly what we can't use: the UKI's command line is part of the signed file, built once in CI, and the operator's address is different in every lab. netconsole has a second way in, though. With `CONFIG_NETCONSOLE_DYNAMIC`, which Ubuntu's kernel has, a target is a directory in configfs, and a few `echo`s make one:
+
+```bash
+nc=$configfs/netconsole/reliaburger
+mkdir -p "$nc"
+echo "$dev" >"$nc/dev_name"
+echo "$src" >"$nc/local_ip"
+echo "$address" >"$nc/remote_ip"
+echo "$port" >"$nc/remote_port"
+[ -n "$remote_mac" ] && echo "$remote_mac" >"$nc/remote_mac"
+echo 1 >"$nc/enabled"
+```
+
+That's the core of `/usr/lib/reliaburger/netlog`, which `reliaburger-netlog.service` runs once the network is online. It reads the target from `reliaburger/netlog.conf` on the ESP (one line, `target=192.168.1.20:6666`), finds the interface and source address with `ip route get`, and asks the neighbour table for the next hop's MAC. Without a MAC, netconsole broadcasts, which still reaches a listener on the same LAN. No `netlog.conf`, or one that doesn't parse, and the script says why and exits 0. Boot logs are a lab aid. They must never be the reason a boot fails.
+
+Three things needed more than the `echo`s.
+
+**The start of the boot.** netconsole only sends what the kernel prints after it starts, and by the time the network is up the kernel has been talking for ten seconds. Those lines are still in its ring buffer, so the script reads `dmesg` once, just before it enables the target, and sends the lines itself through bash's `/dev/udp/<address>/<port>`, which opens a UDP socket when you redirect to it. A marker in `/run` keeps that to once per boot.
+
+**Userspace lines.** "bun not healthy" comes from a shell script, not the kernel. journald can forward everything to the kernel log with `ForwardToKMsg=`, but it's all or nothing, and we want five units, not the whole journal. So the script writes a runtime drop-in for each of them (`reliaburger-boot-check`, `reliaburger`, `reliaburger-seed`, `reliaburger-time-wait`, and the installer's `reliaburger-install`) with `StandardOutput=kmsg`, then runs `systemctl daemon-reload`. `kmsg` means the journal *and* the kernel log. The first version wrote `journal+kmsg`, which reads like the obvious spelling and isn't one: systemd accepts `journal+console` and `kmsg+console`, but not that. It didn't fail, either. It logged `Failed to parse output specifier, ignoring: journal+kmsg` during the reload, and the units went on writing to the journal alone, so the kernel's own lines streamed and boot-check's never did. The unit tests passed, because they checked the drop-in's text rather than what systemd made of it; only booting the image showed it, and the test now pins the value to systemd's list. A drop-in in `/usr` would have been simpler, and it would have broken CI. Those units print `journal+console` today, and the QEMU boot tests read their lines off the serial console. `kmsg` sends them to the kernel log instead, which reaches the console only if the console log level lets info lines through. `kmsg+console` would keep the direct path too, and print every line on the console twice, once from journald and once from the kernel, which doubles what a test counts. The runtime drop-in leaves a boot that isn't streaming exactly as it was. Two settings finish the path: `MaxLevelKMsg=info` in journald's drop-in, since journald otherwise forwards only notice and worse, and `dmesg -n 7`, since netconsole obeys the console log level like every other console.
+
+**Where it starts.** The plan had this unit in the initrd, so it would catch an initrd that can't find its disk. The image's initrd turned out to be the wrong place: it has no network drivers (we cut them to keep the UKI small) and nothing that mounts the ESP. So the unit runs in the real root, after `network-online.target`, and the `dmesg` backlog covers what the initrd printed. A machine that dies before its network comes up still needs the monitor. The installer is different: its whole system *is* an initrd, with networking, so it runs the same script there, taking the target from `reliaburger.netlog=` on the command line that `relish netboot` writes. After writing the image, the installer mounts the new disk's ESP and writes that target into `reliaburger/netlog.conf`, so the installed system streams on every boot after. One test keeps the two copies of the script byte for byte the same.
+
+On relish's side, the listener in `src/relish/netboot/netlog.rs` is a loop around `recv_from`. Each datagram becomes lines, and each line gets a name. The DHCP servers already see every PXE client's MAC, and a client asking on UDP 4011 asks from its own address, so `dhcp::serve` gained a second callback, `seen(address, mac)`, and the listener looks the sender up in what it filled in. That covers iPXE, and not much else. The installer and the installed system ask the LAN's DHCP server for their own addresses, with a client ID that systemd-networkd makes up rather than the MAC, so a router can give them a different address from iPXE's, and their lines would arrive from a stranger. So the script's first line on each boot, its hello, names the interface's MAC (`reliaburger-netlog: streaming from 10.0.0.77 (enp1s0 52:54:00:12:34:56) to …`), and when relish answered that MAC, the address is the machine's from then on. A hello naming a MAC relish never answered names nothing, so `relish machines logs`, which answers nobody, labels every sender by its address:
+
+```rust
+pub fn sender(&self, address: Ipv4Addr) -> Sender {
+    match self.by_address.get(&address) {
+        Some(mac) => Sender::Served(*mac),
+        None => Sender::NotServed(address),
+    }
+}
+```
+
+The map lives behind a `std::sync::Mutex`, not tokio's. The DHCP side updates it from a synchronous callback, which can't `.await` a tokio lock, and neither side holds it across an `.await`: one lookup or one insert, then it's released. That's the one case where the standard library's mutex is the right tool in async code.
+
+Nothing on this port is authenticated. Anyone on the LAN can send it lines, so the listener only prints and appends, marks a sender it never served as `log <address> (not served):`, and replaces control characters with `?`, so a packet can't clear your terminal or turn it red. Lines go through the same `Log` closure as the DHCP, TFTP and HTTP lines, so they print the same way, and to `<netboot dir>/logs/<mac>.log`, written before the line prints, so a line on the screen is already on disk. For a lab where nothing is being served, `relish machines logs` runs only the listener.
+
+The script's unit tests run it against stubs for `ip`, `modprobe` and `dmesg`, with a temporary directory standing in for configfs, and a UDP socket on loopback as the operator's machine. They check what the script writes, not what systemd and the kernel make of it, which is how `journal+kmsg` got through, and a second slip with it: the installer's copy of the unit had no `[Install]` section, so the preset line `enable reliaburger-netlog.service` enabled nothing, and the installer never streamed. A preset enables a unit through the `WantedBy=` in that section, and a unit without one is "static". So the QEMU tests now run with streaming on. The netboot install test passes `--stream-logs` and wants the installer's lines and the installed system's boot check among relish's, under the VM's MAC. The fallback test writes `netlog.conf` onto the disk's ESP with mtools before the first boot, runs `relish machines logs` beside it, and wants the three failed tries and the fallback in what arrived.
+
+What it isn't is log shipping. It's UDP, with no retries and no order beyond the network's, and the lines cross the LAN in cleartext, with addresses and bun's errors in them. That's why it's off unless you ask. A claimed node's logs already go through the cluster's own pipeline.
 
 ## Updating a read-only system
 
@@ -625,7 +677,7 @@ exit 1
 
 Only a counted boot reboots itself. A node running a blessed version whose bun is merely slow just reports the failure and stays up, because rebooting it would gain nothing.
 
-The 120 s used to be measured with `date +%s`. A review before the Wyse lab, whose plan warns that second-hand Wyses may have flat RTC batteries, showed why that was wrong. A machine with a flat RTC battery boots with its clock behind, sometimes by days, and `systemd-timesyncd` corrects it with one step forward at its first sync. If that step landed while the check was waiting, the deadline was already in the past: a good update on a counted boot would report bun unhealthy, reboot, and after three tries fall back. The check now counts seconds since boot from `/proc/uptime`, which only goes forward. The test's stub `date` jumps a day on every call, and the new test fails against the old script.
+The counted boot's budget (90 s now, 120 s back then) used to be measured with `date +%s`. A review before the Wyse lab, whose plan warns that second-hand Wyses may have flat RTC batteries, showed why that was wrong. A machine with a flat RTC battery boots with its clock behind, sometimes by days, and `systemd-timesyncd` corrects it with one step forward at its first sync. If that step landed while the check was waiting, the deadline was already in the past: a good update on a counted boot would report bun unhealthy, reboot, and after three tries fall back. The check now counts seconds since boot from `/proc/uptime`, which only goes forward. The test's stub `date` jumps a day on every call, and the new test fails against the old script.
 
 The same flat battery matters to bun, whose gossip expects a node's clock to move forward across restarts. So bun now waits briefly for the first sync, in a unit of its own:
 
@@ -640,15 +692,25 @@ RemainAfterExit=yes
 ExecStart=-/usr/bin/timeout 30 /usr/lib/systemd/systemd-time-wait-sync
 ```
 
-The obvious version would be `After=time-sync.target` on bun's unit, and we nearly wrote it. But systemd's own `systemd-time-wait-sync.service` has `TimeoutStartSec=infinity`: on a LAN with no NTP server, the target is never reached and bun never starts. So we bound the wait ourselves. The `-` in front of the command tells systemd that a non-zero exit, here `timeout`'s 124, isn't a failure. `RemainAfterExit=yes` makes the unit count as active once it has run, so bun's own restarts don't wait again. Thirty seconds plus the slowest healthy bun we've measured (23 s) leaves half of a counted boot's 120 s spare, and a unit test checks that sum.
+The obvious version would be `After=time-sync.target` on bun's unit, and we nearly wrote it. But systemd's own `systemd-time-wait-sync.service` has `TimeoutStartSec=infinity`: on a LAN with no NTP server, the target is never reached and bun never starts. So we bound the wait ourselves. The `-` in front of the command tells systemd that a non-zero exit, here `timeout`'s 124, isn't a failure. `RemainAfterExit=yes` makes the unit count as active once it has run, so bun's own restarts don't wait again. Thirty seconds plus the slowest healthy bun we'd measured then (23 s, on the lab's x86 nodes) left half of a counted boot's 120 s spare, and a unit test checks that sum. The Wyse changed both numbers, as we'll see below.
 
 The good update rolled across all five lab nodes, followers first and the leader last. Each came back blessed about 20 s after its reboot, the cluster never dropped below five nodes alive, and Raft carried on (term 12, log index 964 to 1008).
 
-Then the bad one. CI can build an image whose bun never starts (a `workflow_dispatch` input drops in a unit override with `ExecStart=/bin/false`), and we staged it on node-05. Three counted boots each ended with `bun not healthy after 300 s` and a reboot. The UKI ran out of tries at `+0-3`, systemd-boot picked the previous version by itself, and node-05 was healthy 7.6 s into that boot and back in the cluster. From the first try to the fallback took about 15 min 40 s, with no hands. Nearly all of that is the 300 s timeout, three times over, which told us where to tune: a counted boot now gets 120 s, since a healthy lab node answers in 8 to 23 s, and an ordinary boot keeps 300 s because nothing falls back from it. The Wyse will tell us whether 120 s is right for slow hardware. A unit test pins both limits down. The kernel publishes EFI variables as files under `/sys/firmware/efi/efivars`, and the check reads that directory from `BOOT_CHECK_EFIVARS` when it's set. So `image/tests/test_boot_check.py` can make a boot counted by creating one empty file, then check for 120 s and a reboot, or for 300 s and none.
+Then the bad one. CI can build an image whose bun never starts (a `workflow_dispatch` input drops in a unit override with `ExecStart=/bin/false`), and we staged it on node-05. Three counted boots each ended with `bun not healthy after 300 s` and a reboot. The UKI ran out of tries at `+0-3`, systemd-boot picked the previous version by itself, and node-05 was healthy 7.6 s into that boot and back in the cluster. From the first try to the fallback took about 15 min 40 s, with no hands. Nearly all of that is the 300 s timeout, three times over, which told us where to tune: a counted boot now gets 120 s, since a healthy lab node answers in 8 to 23 s, and an ordinary boot keeps 300 s because nothing falls back from it. The Wyse will tell us whether 120 s is right for slow hardware. A unit test pins both limits down. The kernel publishes EFI variables as files under `/sys/firmware/efi/efivars`, and the check reads that directory from `BOOT_CHECK_EFIVARS` when it's set. So `image/tests/test_boot_check.py` can make a boot counted by creating one empty file, then check for the counted budget and a reboot, or for 300 s and none.
 
-A test you run by hand proves something once. So CI now runs this one on every x86_64 lab build. The run builds a third image, two versions on, whose bun is broken. The breakage lives in a small tree, `image/tests/broken-bun`, which mkosi adds with a second `--extra-tree`, so this build and the dispatched broken one break bun in exactly the same way. Then `image/tests/os-update.sh --fallback` boots a one-node cluster on the lab build and runs `relish os upgrade` to the broken version, as an operator would. It reuses the update test's harness (the bridge, dnsmasq, the release server, the seeded VM) and differs only in what it waits for. Each boot prints a kernel banner on the serial console, so counting `Linux version` lines says which boot we're in: one before the update, three tries, one back. The test insists on exactly three `bun not healthy after 120 s` lines and no healthy one on the broken version. Then it waits for `relish os status` to say the rollout paused because the node booted the old version instead. The hand-run test never checked that part: bun noticing, on its own, that it isn't where it was sent.
+A test you run by hand proves something once. So CI now runs this one on every x86_64 lab build. The run builds a third image, two versions on, whose bun is broken. The breakage lives in a small tree, `image/tests/broken-bun`, which mkosi adds with a second `--extra-tree`, so this build and the dispatched broken one break bun in exactly the same way. Then `image/tests/os-update.sh --fallback` boots a one-node cluster on the lab build and runs `relish os upgrade` to the broken version, as an operator would. It reuses the update test's harness (the bridge, dnsmasq, the release server, the seeded VM) and differs only in what it waits for. Each boot prints a kernel banner on the serial console, so counting `Linux version` lines says which boot we're in: one before the update, three tries, one back. The test insists on exactly three `bun not healthy after` lines and no healthy one on the broken version. Then it waits for `relish os status` to say the rollout paused because the node booted the old version instead. The hand-run test never checked that part: bun noticing, on its own, that it isn't where it was sent.
 
 The first green run (7 October, on the train) took 7 min 12 s from `relish os upgrade` to the paused rollout, staging and drain included. The kernel's own clocks show where it went. Each of the three tries reached `bun not healthy after 120 s` about 129 s into its boot, and the fallback boot had bun healthy after 12 s. So the fallback itself, from the reboot into the broken version to healthy on the old one, was a little under 7 minutes, and 6 of those were the boot check doing its job. That's inside the 10 minutes the Wyse has to show, on a VM that boots in 9 s. A Wyse that needs a minute to boot would spend about 3 more, which is why the hardware run, not this one, decides. At first the test only warned past 10 minutes, and a warning is easy to scroll past on a green run. Now it fails: if a VM that boots in 9 s can't fall back in time, the Wyse certainly won't, and we'd rather CI said so than the lab.
+
+Then the hardware run decided. On the first Wyse 3040 lab run (20 November), the fallback worked by itself and took 10 min 28 s from the reboot to `bun healthy` on the old version. The S5 gate allows 10 minutes. The firmware counted the tries properly, `+3-0` to `+0-3`, so the mechanism was fine and the arithmetic wasn't. The journal showed where the time went: 41 s from the reboot to the first try's first log line, then three tries of about 3 min 5 s each, and 38 s on the old version to healthy. Of each try, 120 s was the boot check waiting out its whole budget, and about 65 s was the 3040 booting, rebooting and sitting in firmware. That 65 s is the hardware; we can't tune it. The budget we can.
+
+How far down? The budget has two jobs that pull against each other. It has to be short, because a broken update pays it three times. It also has to be long enough that a *good* update booting slowly isn't rolled back, which is the worse mistake: the node would quietly go back to the old version and the rollout would pause on a release that was fine. The slowest healthy start we can predict is the 3040 on a LAN with no NTP server. bun waits the full 30 s for the clock and then starts, and the whole boot to healthy took 38 s on the 3040. So 68 s is the worst case we know of. 60 s would roll that node back. 90 s leaves it about 20 s spare and cuts each broken try by 30 s, which brings the 3040's fallback to about 9 minutes. Two tries instead of three would save more, but then one transient failure (a slow disk, a network that took its time) would roll back a good update, and we'd rather spend the minute.
+
+```sh
+if counted; then limit=90; else limit=300; fi
+```
+
+Two tests hold the trade-off in place, one per side. `test_time_wait.py` reads the budget out of the script and fails unless the 30 s clock wait plus the 3040's 38 s plus a 20 s margin fits inside it. `test_fallback_limit.py` models a Wyse fallback from the lab's timings, 41 s plus three tries of 65 s and the budget, plus 38 s, checks that the model reproduces the measured run to within 10 s at the old 120 s, and fails if the current budget would take it past 10 minutes. CI's VMs boot in 9 s and can't see this; the model is what stands in for the Wyse between hardware runs. It leaves about a minute spare, not much, so a slower unit or a slower kernel is something the lab's fallback step will tell us about first.
 
 How the build is broken matters too, and the first way hid a bug. It used to be a unit override, `ExecStart=/bin/false`, so bun's launcher never ran. A real bad release breaks differently: its bun starts, says it's newer, and never answers. The launcher installs a bun from the image only when it's newer than the active one, so that no OS update can undo a bun upgrade, and that rule was the bug. Three failed tries, the fallback to the old OS, and its launcher saw a "newer" bun already active and left it. The fallback boot isn't counted, so nothing rebooted it again: a node with a dead bun and no way in. The review of the 0.3.0 train found it by reading the code.
 
@@ -1033,6 +1095,33 @@ The real command hands `refresh_resent` a closure that borrows one client for ev
 
 `async move` moves what it uses into the future, and we want the node and seed path moved but the client only borrowed. Writing `let client = &client;` first makes the thing that gets moved a reference, which is cheap to copy. Without it, `move` would try to move the client itself into the first future, and the second call of the closure would find it gone. The tests pass closures that either succeed or fail with "connection refused". The time is a parameter too, so a test can ask what happens two hours later without waiting two hours.
 
+The Wyse lab's first real claim found the last gap (#2146). `claim` printed `relish now talks to this cluster` the moment node 1 had its seed, and the very next `relish nodes` failed with "connection refused": node 1 still had to unpack the seed and start bun. A few seconds later everything answered. On a 3040 that's a few seconds; on slower hardware, or for machines that still have to join through node 1, longer. So `claim` now waits before it returns, up to three minutes, asking the cluster's `/v1/cluster/nodes` once a second until every machine whose seed arrived is listed alive, and printing `home-1: up` as each one is. A machine that's still starting at the end isn't a failure: its seed arrived. `claim` names it, says `relish nodes` will list it once it's up, and exits 0. The wait asks the new cluster with a client built from the context `create` wrote, not the one relish adopted, so it works even when another cluster's context was kept. `wait_for_claimed_nodes` takes the "which nodes are alive?" question as a closure, like `deliver_seeds`, so a test answers "connection refused", then nothing, then one node, then both, on a paused clock (`#[tokio::test(start_paused = true)]`), and three minutes pass in no time.
+
+That same lab run found the context's other trap (#2162). The Mac already had a context from an earlier cluster, and that cluster's directory had since been deleted. `claim --create` saw another cluster's context in the way, kept it, and printed three `export` lines. The next `relish nodes` said:
+
+```
+error: API error (status 0): No such file or directory (os error 2)
+```
+
+Nothing in that line is true except the last part. No API answered, and the error names neither the context nor the file. relish keeps the token inside `context.json`, but only a path to the CA certificate, and the certificate lived in the deleted directory. Building the client failed reading it. `BunClient` doesn't fail at that point: it keeps the reason and returns it from the first request, so a command that never talks to the cluster isn't stopped by a broken one. That deferred reason went out as `RelishError::ApiError { status: 0, .. }`, the variant for "the agent answered with an error".
+
+There are two fixes. The first is an honest error. A client relish couldn't set up now fails with `RelishError::ClientConfig`, which prints its reason as it is, and the reason for a missing CA is its own variant, `ContextFileMissing`, holding the context file, the cluster it was for and the missing certificate:
+
+```
+error: the relish context for bare-metal/lab can't be used: its CA certificate /Users/you/lab/root-ca.crt is gone. If that cluster is gone too, remove /Users/you/.reliaburger/context.json so relish goes back to the local default, or create a new cluster with `relish setup` or `relish machines claim --create`, which replaces it. ...
+```
+
+`relish agent` maps both to `no_endpoint`, so an agent driving relish sees a configuration problem rather than an API error with no status.
+
+The second fix stops keeping a context nothing can use. `LocalContext::missing_file` returns the CA path when it no longer exists, and `LocalContext::save` now returns `Result<Option<ReplacedContext>, RelishError>`: it still refuses to overwrite another cluster's working context, but it replaces one whose certificate is gone and hands back what it replaced. `adopt`, which `cluster create --bare-metal` and `machines claim --create` both call, checks first, so a working context is kept as before and a dead one is replaced, and the report says so:
+
+```
+relish now talks to this cluster (node 1, https://192.168.1.51:9117).
+It replaced the context for bare-metal/lab, which no longer worked: /Users/you/lab/root-ca.crt is gone.
+```
+
+`relish setup` refused a dead context too ("another cluster owns the active context"), so it got the same check. Only a *missing* file counts. A certificate relish can't read for another reason, say a permissions slip, still marks a context someone may want back, so relish keeps it and says what it couldn't read. `adopt` became a thin wrapper around `adopt_at`, which takes the context's path, because the default path comes from `RELIABURGER_HOME` and changing the environment in a test races every other test in the process. The three tests for `adopt_at` cover no context, a working one (kept) and the lab's case, a context whose cluster directory is gone (replaced, with the line above). In `local_context.rs`, `a_context_whose_ca_is_gone_says_which_context_and_file_and_what_to_do` checks the new error names the cluster, the file and `relish machines claim --create`, and never says "status 0".
+
 ## A LAN on a laptop
 
 We had no KVM machine and no spare PCs, only CI and one Apple silicon Mac without root. Everything had to run virtualised until the last step.
@@ -1189,6 +1278,43 @@ The Wyse's RTL8111 needs two modules. `r8169` drives the controller, and `realte
 
 Looking for siblings found a bigger gap: no Intel or Broadcom drivers at all, so the installer would have failed the same way on most mini PCs. The fix lists them, and `installer_modules.py` makes the class of bug visible. It reads the UKI's `.initrd` section, unpacks the cpio archive the kernel would, and fails on any carried module whose soft dependency is missing, on any driver from a fixed list that isn't there, and on missing firmware for those drivers. Run against the Wyse's installer from that night, it names exactly `realtek`, `e1000`, `e1000e`, `igb`, `igc` and `tg3`. QEMU can't emulate the RTL8111, so reading the artefact is the only CI check that sees this bug.
 
+### A screen that waited for the claim
+
+Claiming asks you to compare each machine's claim key with its monitor. In the three-Wyse run (#407), none of the monitors showed one. Each sat on the boot's last kernel messages, a probe error from an audio driver at about 40 seconds, while `relish machines` listed all three keys.
+
+The console's unit said `After=reliaburger-seed.service`, which reads as harmless: show the status once the seed is sorted out. But on an unclaimed machine the seed unit never finishes starting. It's a `Type=oneshot` with `TimeoutStartSec=infinity`, and `bun appliance prepare` sits in it serving port 9119 until a seed arrives. So systemd held the console back until the claim, the one moment the claim key stops mattering. The console's own test rendered the screen with a key on it and passed. Nothing had ever started the unit on a machine waiting to be claimed.
+
+The seed unit's own line, `no seed: unclaimed, claim key … on port 9119`, didn't help either. It goes to `/dev/console`, and that's the last `console=` on the command line, the serial port the 3040 doesn't have. The installer had already met this (see "Booting from a wire" above) and writes to `/dev/tty1` itself.
+
+The fix is to order the console after nothing of ours. It redraws every five seconds and already says "waiting for DHCP" or "not answering" on its own, so starting early costs nothing. We didn't also copy the seed's line to tty1: the console clears tty1 on every redraw, so the line would last five seconds at most.
+
+Starting early did expose something. The console, prepare and bun all start through the same launcher, `/usr/lib/reliaburger/start`, which copies the image's bun into `/var/lib/reliaburger/bin` when it's newer. With the console beside prepare, two launchers could now write the same temporary file at once on a first boot. (The console and bun already started together on a claimed node after an OS update, so the race wasn't entirely new.) So the launcher takes a lock first:
+
+```sh
+exec 9>"$bin/.install.lock"
+flock 9
+# ... read the versions, install if newer ...
+exec 9>&-
+```
+
+`exec 9>file` opens the file as descriptor 9 for the rest of the script, and `flock 9` waits for an exclusive lock on it. The `exec 9>&-` before starting bun matters as much as the lock. An `exec` keeps the process's open descriptors, so without it bun would hold the lock for as long as it ran, and the console's next restart would wait for ever. `test_start.py` checks both: a launcher waits while the test holds the lock, and a bun it started can take the lock itself.
+
+`test_console_unit.py` now refuses a console ordered after any of our units that can wait for ever, and the claimed-pair test in CI reads each unclaimed VM's screen before claiming it. It doesn't photograph the screen: `/dev/vcs1` holds the text on tty1, so the test reads it over the lab image's SSH and looks for the key that port 9119 serves.
+
+### A tour that couldn't build
+
+The tour's first step is `relish build burger/burger.toml`, and on the Wyse cluster it failed:
+
+```
+error: API error (status 503): {"error":"no builder available: buildah is not on this node's PATH and no peer reports the capability"}
+```
+
+That was no surprise to the image. `mkosi.conf` lists the quickstart guest's packages "less Buildah", and `test_guest_images.py` keeps it that way. It was a surprise to the docs, which sent appliance users through a tour whose first command can't work there, and to the error, which said what was missing without saying what to do.
+
+We could have added Buildah. Its cost isn't only megabytes. Every package goes into both 1.1 GB `/usr` slots, a build pulls a toolchain image and writes layers to an eMMC we're counting writes on, and a multi-platform build on a 2 GB Atom is slow at best. A build also runs whatever `RUN` steps a Dockerfile holds, on the machines that keep the cluster's state. The appliance's whole pitch is that it does one job.
+
+So the appliance stays without it, and the refusal now names the ways out. bun keeps the message in one constant, `NO_BUILDER_ERROR`, rather than inline in the handler, so a test can hold it to its promises: it says appliance nodes never have Buildah, shows `docker push <node>:5050/<name>:<tag>`, points at `relish manual images`, and suggests adding a Linux node with Buildah, since bun hands a build to any peer that reports it. A second test checks that the manual section it names exists, so a renamed heading can't leave the error pointing at nothing. Manual 17 now walks through building the burger on a laptop and pushing it into Pickle before the tour's `relish apply`.
+
 ### Reading it all again
 
 Before the 0.3.0 gate, four reviewers read the train against `main`, and the netboot server gave up a handful of small bugs that no test had tried.
@@ -1196,6 +1322,12 @@ Before the 0.3.0 gate, four reviewers read the train against `main`, and the net
 The TFTP sender waited for each acknowledgement with `tokio::time::timeout(negotiated.timeout, socket.recv(...))`, inside the loop. That reads as "wait up to two seconds for a packet", and it is, every time round. But a packet that isn't the one we want, an old ACK repeated by a client whose clock is out of step with ours, ends the wait and starts a fresh one, so a lost DATA block could wait for ever while stale ACKs kept arriving. The fix is to wait for a *moment*, not a *duration*: `resend_at` is set when a packet goes out, and the loop waits with `tokio::time::timeout_at(resend_at, ...)`. Stray packets come and go, and the deadline stays put. The test sends a stale ACK every 100 ms and expects the lost block again within about one timeout; against the old loop it failed, as it should.
 
 The rest were one-liners with tests. A requested TFTP timeout over 30 s is declined (RFC 2349 lets a server accept the client's value or leave it out, never answer another), and at most 64 transfers run at once, after which a request is told the server is busy. A "y" typed for one machine's wipe question could land just after the next one appeared, so for a second after a question is shown, an answer is ignored and the operator asked again. `relish netboot` exited 0 when one of its four servers died, because the `select!` arm just returned a message; it now returns an error, so a script notices. And 32-bit x86 UEFI firmware, option 93 value 6, was being sent our 64-bit iPXE, which it can't run; it's now refused with a reason, like BIOS.
+
+### What time is it here?
+
+The three-Wyse lab measures intervals: from the moment `relish netboot` starts serving, how long until each machine says `ack on 4011`, finishes its download, reports `installed`. The log printed none of those times, so someone sat beside it writing them down. Now every line starts with the local time, `21:04:17 dhcp: …`. All of them pass through the one `Log` closure, so the fix is a pure function, `stamped(time, line)`, that a unit test can call with a fixed time, plus one call to read the clock.
+
+Reading the clock turned out to be the interesting part. The `time` crate was already a dependency, but it won't tell you the local offset from UTC in a process that has more than one thread. Working that out on Unix means calling C's `localtime_r`, which reads the `TZ` environment variable, and another thread changing the environment at the same moment is undefined behaviour. A library can't rule that out, so `time` refuses, and under tokio's multi-threaded runtime it would refuse every time. `jiff`, which `k8s-openapi` already pulled into our build, reads the time zone file itself and never touches the C library's state, so `jiff::Zoned::now().time()` is safe from any thread. It costs a direct dependency on a crate we were already compiling, with three of its features switched on.
 
 ### A binary that can't write next to itself
 
@@ -1209,7 +1341,7 @@ We went back after the Wyse's first night, this time reading for firmware quirks
 
 ## What's next
 
-The spike's interim record is a pass for everything that can be proven without hardware. Turning it into part of Reliaburger is the [product plan](../plans/2026-10-01-plan-appliance-product.md) for 0.3.0, and these are the big pieces:
+The spike's interim record is a pass for everything that can be proven without hardware. Turning it into part of Reliaburger is the [product plan](../plans/archive/2026-10-01-plan-appliance-product.md) for 0.3.0, and these are the big pieces:
 
 - **S5, three Dell Wyse 3040s.** The lab has ten, but on 7 October 2026 we decided the release gate needs only three. The go/no-go is 3 of 3 claimed, a working cluster within an hour of power-on, 1.0 GB free per node under the tour, five years of eMMC life, and a fallback within ten minutes. The run covers BIOS setup, PXE on the real Realtek NIC, whether the firmware keeps the boot entry the installer makes, `MemAvailable` under the tour, eMMC writes per day, one OS update across the fleet, and whether Linux 7.0 still hangs on reboot without our `dw_dmac` blacklist. A node that can't reboot can't finish an A/B update, so that last one matters more than it sounds. The run uses only the real commands: `relish netboot` on an M2 MacBook over a USB-C Ethernet adapter, either the home router or the Mac itself for addresses, and `relish machines claim` for the cluster ([the S5 runbook](../plans/2026-10-01-plan-appliance-s5-wyse.md)). We first planned a Raspberry Pi as the lab's own router, to keep the lab off the home network, and dropped it on 8 October 2026 for two setups that need no extra box. On the home network, the rails relish already has protect the rest of the LAN: `--mac`, the yes before a used disk is wiped, and the refusal to start beside another boot server. Isolated, the Mac runs dnsmasq and relish answers on port 4011 beside it ("A lab with no router", above).
 - **`relish netboot` on real firmware.** The first Wyse night found two bugs, both fixed ("The Wyse's first night" and "A driver that needs a driver", above). The rerun on fixed builds, then the three-Wyse gate, are next.

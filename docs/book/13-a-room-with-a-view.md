@@ -121,6 +121,8 @@ An enum models a closed set of alternatives. Rust requires an exhaustive `match`
 
 `DetailTab` is another enum with six variants. It derives `Copy` because it is a small value with no owned data. Cycling a tab computes the next variant and queues any effect that the new tab needs.
 
+Tab and Shift-Tab cycled the tabs from day one. In the Wyse lab, though, the first thing people pressed was →, and nothing happened, so the tabs looked stuck. Now ← and → map to the same `KeyAction::PreviousTab` and `NextTab`, which is one `|` in a `match` arm (`KeyCode::Tab | KeyCode::Right`): a pattern that matches either value, like stacking two `case` labels in C or Go. A line under the tab bar says `←/→ or Tab: switch tabs`, and the help view lists both keys, since it renders the `KEYBINDINGS` table in `keys.rs`, next to the `match` that maps the keys. The arrows were free in this view: ↑ and ↓ move a list's selection, and nothing used ← or →.
+
 ## What just happened?
 
 Before this phase Bun had logs, deploy history and metrics, but no honest cluster event feed. The TUI needed one, so we added the smallest useful store.
@@ -171,10 +173,12 @@ Search is similarly modest. It scans cached apps, nodes, jobs, routes and event 
 
 ## The first key that changes something
 
-For its first year the TUI only looked. Then, in the Wyse lab, the
-maintainer wanted to press `+` on an app and get another replica (#2176).
-There was no API for it: replicas lived in the app's spec, and only `relish
-apply` changed the spec.
+For its first year the TUI only looked. The Wyse lab changed that twice in
+one release. `k` kills one instance, through Smoker's existing fault API
+(see "Killing from the Instances tab" below). And the maintainer wanted to
+press `+` on an app and get another replica (#2176). That one had no API at
+all: replicas lived in the app's spec, and only `relish apply` changed the
+spec.
 
 The interesting question isn't the key. It's what happens after. Say the
 file says `replicas = 1`, you scale to 3, and next week somebody runs
@@ -234,12 +238,17 @@ answers it:
 ```rust
 if self.scale_prompt.is_some() {
     self.answer_scale_prompt(key);
+} else if self.confirm_kill.is_some() {
+    self.handle_confirm_kill_key(key);
 } else if self.palette.is_some() {
     // ...
 ```
 
-Putting the question first means `q` says no instead of leaving the view, so
-you can't back out of a view with a question still hanging. Only `y` pushes
+Putting the questions first means `q` says no instead of leaving the view, so
+you can't back out of a view with a question still hanging. The two
+questions are separate `Option` fields rather than one, because each holds
+a different thing to act on; since an open question swallows every key,
+they can never both be open. Only `y` pushes
 an `Effect::Scale`, carrying the count the question showed as
 `current_replicas`. The question says "from 2 to 3", so 3 mustn't land on top
 of someone else's 5. The count comes from `/v1/diagnostics/apps`, what the
@@ -354,6 +363,66 @@ shorter list. Logs and deployment history still said plainly that they covered
 the connected node only; one cluster-wide view doesn't make the others
 cluster-wide.
 
+### Which image is it running?
+
+For months the app detail's Overview tab ended with `image          unknown`,
+for every app. It wasn't a bug in the lookup. There was no lookup: the line
+was a string literal, because `InstanceStatus` had no image to show. The node
+knew, of course. It pulled the image and started the instance from it, and
+`WorkloadInstance` keeps the reference (bound to its digest when apply pinned
+one, as in `nginx:1.27@sha256:…`). It just never said.
+
+So `InstanceStatus` grew one more field:
+
+```rust
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub image: Option<String>,
+```
+
+A process workload has no image, so it's `None` there rather than an empty
+string. The two serde attributes matter more than usual. `InstanceStatus`
+doesn't only travel from Bun to `relish`: for cluster status a node fans out
+to its peers' `/v1/status` and parses their answers into the same type. A
+0.3.0 node asking a 0.3.1 peer gets a field it doesn't know, and serde skips
+unknown fields unless a type says `#[serde(deny_unknown_fields)]`, which this
+one doesn't. A 0.3.1 node asking an older peer finds no `image` key, and
+`default` makes that `None`. Neither side refuses the other, so the change
+needs no bump of the cluster's protocol version.
+
+The Overview shows the distinct images across the app's instances. That's
+usually one. Mid-rollout it's two, and the tab lists both rather than picking
+the first and hiding the rollout. The Instances tab gets an IMAGE column, so
+you can see which replica runs which. With no image from any instance (a
+process app, or every node older than the field), it still says `unknown`,
+which is now true.
+
+### One table, two screens
+
+The nodes view had the same problem in a different shape. `relish nodes`
+grew VERSION, CPU, MEM, DISK and ALLOCATED columns months ago, built from
+three answers: gossip's member list, each node's own summary through the
+relay, and the leader's allocations. The TUI's nodes view still showed what
+the first version of `relish nodes` did: gossip's word and the labels.
+
+Copying the columns would have fixed it until the next one. Instead the TUI
+asks `nodes_cmd::fetch_rows` for the very `NodeRow`s the command prints, and
+both turn a row into cells with `nodes_cmd::row_cells`, which returns
+`[String; 10]`, an array whose length is part of its type. A new column means
+changing that `10`, and the compiler then points at every place that lays
+the cells out. The two screens differ only in layout. The command pads to
+fixed widths, which suits a pipe into `grep`. The TUI sizes each column to
+its widest cell, so the table fits a 120-column terminal, and leaves the
+SWIM incarnation number to the node's own page.
+
+Sharing the fetch turned up a compile error worth knowing about. The TUI's
+data provider promises futures that are `Send`, and `ask_each_node` built its
+per-node requests as a lazy `filter(...).map(...)` over borrowed nodes. The
+compiler couldn't prove that iterator `Send` "for any two lifetimes", a
+known limit of how Rust checks closures inside `async fn`s. Collecting the
+requests into a `Vec` before streaming them fixed it, as it had for the
+status snapshot reader. Nothing changed at runtime: the requests were
+always going to be built.
+
 ### Every view, not just one
 
 Saying so plainly was better than lying, but it was still a gap. Deploy
@@ -466,3 +535,199 @@ node 2's row showed node 1's. The view now carries the node and instance too,
 the same identity the row has, and the page looks up exactly that. When a view
 is keyed by less than the row it was opened from, it will eventually show the
 wrong row. `job_detail_shows_the_selected_nodes_instance` pins it.
+
+### Finding the line that matters
+
+Picture the Wyse lab: three nodes, an app that keeps restarting, and two
+hundred log lines a minute scrolling past. You want the one that says
+`error`. The logs view could already filter on `/`, but it didn't show where
+in each line the match was, and the app detail's Logs and Metrics tabs had no
+search at all. The Metrics tab didn't even show every metric: it picked the
+rows whose names contained `cpu` or `memory` and drew two sparklines.
+
+Now `/` opens a search box in all three places. Only the lines containing the
+text stay, ignoring case, each match is red and bold, and a line above them
+says `filter: error (2 of 40 lines)`. Esc clears it. The Metrics tab lists
+every series the app exports, one row each, as Prometheus writes them
+(`http_requests_total{route="/health"}`), with its last value and a sparkline,
+and the search covers labels as well as names.
+
+The highlight is the interesting part, because it needs to know *where* the
+match is, in bytes, so it can cut the line into three spans: before, match,
+after. The obvious way is to lowercase both strings and call `find`. It's
+also wrong, and Rust is the language that makes you notice. A Rust `String`
+is UTF-8, and `"İ".to_lowercase()` is two characters, `i` and a combining
+dot, three bytes where the original had two. An offset found in the
+lowercased copy can land in the middle of a character in the original, and
+slicing a `&str` there (`&text[3..7]`) panics rather than hand you half a
+character. C would hand you the half character; Python and Go would both let
+the offsets quietly drift.
+
+So `matching.rs` compares a character at a time against the line as it is:
+
+```rust
+fn match_length(text: &str, needle: &[char]) -> Option<usize> {
+    let mut characters = text.char_indices();
+    for wanted in needle {
+        let (_, found) = characters.next()?;
+        if !found.to_lowercase().eq(wanted.to_lowercase()) {
+            return None;
+        }
+    }
+    Some(characters.next().map_or(text.len(), |(index, _)| index))
+}
+```
+
+`char_indices` yields each character with its byte offset, so the answer is
+always a character boundary. `char::to_lowercase` returns an iterator, not a
+`char`, precisely because one character can lowercase to several, and
+`Iterator::eq` compares two iterators item by item. `match_ranges` walks the
+line calling this and returns a `Vec<Range<usize>>`: `Range` is the type
+behind `3..7`, a start and an end you can slice with. The same function
+decides which lines are shown, so the count, the filtering and the highlight
+can't disagree.
+
+The colour is `Color::Red` with `Modifier::BOLD`, not one of the theme's RGB
+values. The appliance's console (#2150) has sixteen colours, and an RGB
+highlight there comes out as whatever the nearest one happens to be.
+
+Two things only showed up once the search worked. The filter is one field on
+`TuiApp`, shared by every screen, so a search for `error` in the logs came
+back as a filter on the apps list when you pressed Esc. Now pushing a view,
+popping one or switching tabs clears it. And Esc used to mean "back", so
+clearing a search would have closed the view you searched in. Esc clears a
+search first; the next Esc goes back.
+
+`render_to_string` drops styles, as "Testing a screen" explained, so the
+snapshots show which lines survive a search (some, none, a match mid-line)
+but not the red. One test renders into a `TestBackend` and reads the cells
+under `health` back: red and bold on the match, not on `GET /` before it or
+` 200` after. The span splitting has its own unit tests, with several
+matches in one line and a match at either end.
+
+### Killing from the Instances tab
+
+The Instances tab was a read-only table. In the Wyse lab the next thing
+anyone wanted, having found the replica that misbehaved, was to kill it and
+watch the scheduler bring up another. That meant leaving the TUI for
+`relish fault kill web --instance web-1 --node node-2 --acknowledge`.
+
+Now ↑ and ↓ select a row and `k` (or Ctrl-K) asks:
+
+```text
+Kill instance web-1 on node-2? The scheduler starts a replacement. [y/N]
+```
+
+Only `y` kills. Enter, `n`, Esc, even `q`, cancel it, which is why the
+capital `N` is the default. A key that destroys something should need a
+deliberate second key, and the test `k_without_confirming_does_nothing`
+presses each of those after `k` and checks nothing was queued.
+
+The interesting decision is what the kill *is*. We could have added a
+"restart instance" endpoint to Bun. We didn't, because Smoker already has
+one, with everything a kill should have: the fault is recorded, so it shows
+in `relish fault list` and the events; the API audits it under the caller's
+token; and Smoker's safety rails apply, so a namespace-scoped token can't
+reach another tenant's replica. A second path would have needed all of that
+again, and would have drifted. So `fault.rs` gained one function,
+`instance_kill_request`, which builds the request the command builds from
+`--namespace`, `--instance`, `--node`, `--acknowledge` and `--reason`, and
+the TUI sends it through the same `BunClient::inject_fault`. A test
+serialises both requests to JSON and compares them, so they can't drift
+apart quietly. Its reason is `relish tui`, so the audit log says where the
+kill came from.
+
+The reducer stays pure. A `y` doesn't send anything; it pushes
+`Effect::KillInstance(InstanceTarget)` onto `pending`, and the event loop
+spawns the request and posts the answer back as a message. The answer goes
+in the status line. Success says which fault id did it and asks for a
+refresh; a refusal shows the API's own words (`kill refused: …`), because
+"403" tells nobody which rail they hit. A refusal is also not a lost
+connection, so it doesn't turn the header red.
+
+The prompt holds the whole `InstanceTarget`, not the cursor position. A
+refresh can reorder or shorten the list between `k` and `y`, and a prompt
+that names `web-1` must kill `web-1`, not whatever row slid under the
+cursor. It's the job-detail lesson again: carry the identity of the row,
+not where it was.
+
+### What runs on this node?
+
+The Wyse lab asked the k9s question next. You pick a node because you want
+to reboot it, or update its OS, or pull it out of the rack. What runs there,
+and what breaks if it goes?
+
+The node page had the answer's raw material and showed none of it. It listed
+the node's own numbers (version, CPU, memory, disk, allocation) and nothing
+about its workloads. Yet the TUI already polls the cluster status, and every
+row of it is a `ClusterInstanceStatus` that names its node. So the page grew
+tabs, as the app detail has, and `View::NodeDetail` gained a field:
+
+```rust
+NodeDetail {
+    node: String,
+    tab: NodeTab,
+},
+```
+
+`NodeTab` has three variants: Overview, Workloads and Maintenance. Adding the
+field broke every place that built or matched a `NodeDetail`, which is the
+point. The compiler listed them: the nodes list's Enter, the search results,
+the renderer and the tab cycling. No view could quietly forget it had tabs
+now.
+
+Workloads is the app detail's Instances tab turned on its side. The same
+instance list, filtered by node instead of by app, through
+`TuiApp::node_instances`. ↑ and ↓ select a row and Enter opens that app's
+detail, so "what's this thing on node-2?" is two keys away. There's no `k`
+here. The page is for looking before you act, and the kill lives where you
+can see the app's other replicas.
+
+Maintenance asks one question: if this node went away, what would we lose?
+`impact::node_impact` answers it from data the TUI already holds. For each
+app with an instance on the node, it counts the app's ready replicas on the
+other nodes that are still up. None left means the app goes down: a
+single-replica app, or one whose other replicas are failing anyway. One left
+means it keeps serving with no spare. More than one, and it barely notices.
+The table puts the worst first:
+
+```text
+council   a voter: the council loses quorum, only 1 of 3 voters would answer
+APP     NAMESPACE  HERE  READY ELSEWHERE  IMPACT            DATA
+cache   default       1                0  goes down         here
+app-2   default       1                1  loses redundancy  -
+web     default       1                2  keeps serving     -
+```
+
+The council line reuses the upgrade orchestrator's own check,
+`live_quorum_headroom_ok`, which asks before a bun upgrade restarts a voter
+whether the rest can still commit. The summary already says how many voters
+there are and how many answer. One wrinkle: that function waves a lone voter
+through, since a one-node council has no other way to upgrade. For the
+"what if it's gone" question, losing your only voter loses the council, so
+`council_impact` says so before it asks.
+
+The DATA column needed one thing the TUI didn't have. An OS rollout leaves an
+app on its node when it keeps data there, in a managed volume or a host-path
+mount (#2120), and the scheduler agrees. That's the replica you can't just
+move. Only the leader's desired state and the node itself know an app's
+volumes, so `InstanceStatus` grew one more optional field:
+
+```rust
+#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+pub data_on_node: bool,
+```
+
+The node fills it with `stays_through_os_rollout`, the very function the
+rollout uses, so the page and the rollout can't disagree about which apps
+stay. `skip_serializing_if` takes a path to a function that gets
+`&bool` and returns `bool`. `std::ops::Not::not` is the trait method behind
+the `!` operator, so the field is left out whenever it's `false` and the
+JSON of an app with no volumes doesn't change. As with `image`, `default`
+reads a missing key as `false`, so an older node's answer still parses.
+
+It's a forecast from the last refresh, not a promise. The scheduler decides
+where replacements go, and a replica that's starting now may be ready by the
+time you pull the plug. Still, a red `goes down` line before a reboot beats
+finding out from the pager after it.
+

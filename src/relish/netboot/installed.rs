@@ -10,7 +10,7 @@
 //! for the real script with the machine's MAC, UUID and architecture in the
 //! query, and [`decide`] picks [`install_script`] or [`EXIT_SCRIPT`].
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -373,6 +373,12 @@ pub fn chain_script(server: Ipv4Addr, http_port: u16) -> String {
 /// Reliaburger already like any other used disk, so it asks, rather than
 /// booting it.
 ///
+/// With `netlog` (`relish netboot --stream-logs`) it adds
+/// `reliaburger.netlog=<address>:<port>`: the installer sends its own lines
+/// there, and writes the address to `reliaburger/netlog.conf` on the
+/// installed ESP, so the installed system's boots stream there too
+/// ([`super::netlog`]).
+///
 /// Arguments to a UKI replace its built-in command line (Secure Boot
 /// off), so this passes the console too. `--autofree`: a failed attempt
 /// mustn't leave the installer registered, or iPXE hands it to the next
@@ -383,6 +389,7 @@ pub fn install_script(
     client: &BootClient,
     reinstall: bool,
     ticket: Option<&str>,
+    netlog: Option<SocketAddrV4>,
 ) -> String {
     let query = client.query();
     let (query, mut ask) = match ticket {
@@ -398,6 +405,9 @@ pub fn install_script(
     };
     if reinstall {
         ask.push_str(" reliaburger.reinstall=1");
+    }
+    if let Some(netlog) = netlog {
+        ask.push_str(&format!(" reliaburger.netlog={netlog}"));
     }
     format!(
         "#!ipxe\n\
@@ -572,6 +582,7 @@ mod tests {
             &client(Some(MAC), None),
             false,
             Some("00ff"),
+            None,
         );
         assert!(script.starts_with("#!ipxe\n"));
         assert!(script.contains("set base http://192.168.1.20:8081/${buildarch}\n"));
@@ -584,6 +595,7 @@ mod tests {
             8080,
             &BootClient::default(),
             false,
+            None,
             None,
         );
         assert!(anonymous.contains("${base}/installer.efi reliaburger.url="));
@@ -599,6 +611,7 @@ mod tests {
             &client(Some(MAC), Some(UUID)),
             false,
             Some("00ff"),
+            None,
         );
         assert!(
             script.contains(
@@ -614,6 +627,7 @@ mod tests {
             8080,
             &BootClient::default(),
             false,
+            None,
             None,
         );
         assert!(!anonymous.contains("reliaburger.ask"), "{anonymous}");
@@ -632,6 +646,7 @@ mod tests {
             &machine,
             true,
             Some("00ff"),
+            None,
         );
         assert!(again.contains(" reliaburger.reinstall=1 "), "{again}");
         assert!(!again.contains("reliaburger.wipe"), "{again}");
@@ -641,8 +656,46 @@ mod tests {
             &machine,
             false,
             Some("00ff"),
+            None,
         );
         assert!(!first.contains("reliaburger.reinstall"), "{first}");
+    }
+
+    /// `--stream-logs` tells the installer where boot logs go; without
+    /// it, nothing is streamed.
+    #[test]
+    fn stream_logs_tells_the_installer_where_to_send_boot_logs() {
+        let machine = client(Some(MAC), Some(UUID));
+        let server = Ipv4Addr::new(192, 168, 1, 20);
+        let streaming = install_script(
+            server,
+            8081,
+            &machine,
+            false,
+            Some("00ff"),
+            Some(SocketAddrV4::new(server, 6666)),
+        );
+        assert!(
+            streaming.contains(" reliaburger.netlog=192.168.1.20:6666 console=tty0 "),
+            "{streaming}"
+        );
+        let quiet = install_script(server, 8081, &machine, false, Some("00ff"), None);
+        assert!(!quiet.contains("reliaburger.netlog"), "{quiet}");
+        // A machine that sends nothing to key a ticket on still streams.
+        let anonymous = install_script(
+            server,
+            8081,
+            &BootClient::default(),
+            false,
+            None,
+            Some(SocketAddrV4::new(server, 6666)),
+        );
+        assert!(
+            anonymous.contains(
+                "installer.efi reliaburger.url=${base} reliaburger.netlog=192.168.1.20:6666 "
+            ),
+            "{anonymous}"
+        );
     }
 
     /// An install ticket is the machine's proof, on its disk report and its

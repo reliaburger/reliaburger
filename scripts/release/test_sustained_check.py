@@ -1182,6 +1182,39 @@ class Recovery(Evidence):
         self.assertEqual(self.failures(five), ["wtf-critical"])
         self.assertEqual(self.failures(ten), ["wtf-warning"])
 
+    def crashloop(self, *lines):
+        return wtf(critical=[("crashloop", "app.frontend/default")]) | {"critical": [{
+            "id": "crashloop", "title": "app frontend/default restarted repeatedly",
+            "affected_resource": "app.frontend/default", "details": list(lines)}]}
+
+    def test_a_restart_the_harness_caused_does_not_hold_back_a_settle(self):
+        # #2197: since #2079 a chaos pause freezes the workload, so its health
+        # checks fail and Bun restarts it. That restart is the harness's own.
+        checker.main(["expect", str(self.evidence), "workload-restart", "default__frontend-0", "--at", str(NOW)])
+        report = self.crashloop("instance default__frontend-0 restarted 3 times in the last 15 minutes")
+        code, verdict = self.evaluate(self.snapshot(kind="settle", ts=NOW + 60, **{
+            "wtf_json": report, "nodes_json": nodes(), "http_txt": "200 0.01\n", "status_json": []}))
+        self.assertTrue(verdict["settle_clean"])
+        self.assertEqual(code, 0)
+        _, later = self.evaluate(self.snapshot(ts=NOW + 400, **{"wtf_json": report}))
+        self.assertEqual(self.failures(later), [])
+
+    def test_restarts_beyond_the_harness_ones_are_still_a_crashloop(self):
+        checker.main(["expect", str(self.evidence), "workload-restart", "default__frontend-0", "--at", str(NOW)])
+        for report in (self.crashloop("instance default__frontend-0 restarted 4 times in the last 15 minutes"),
+                       self.crashloop("instance default__frontend-1 restarted 3 times in the last 15 minutes"),
+                       self.crashloop("3 restarts that name no instance in the last 15 minutes")):
+            _, verdict = self.evaluate(self.snapshot(kind="settle", ts=NOW + 60, **{
+                "wtf_json": report, "nodes_json": nodes(), "http_txt": "200 0.01\n", "status_json": []}))
+            self.assertFalse(verdict["settle_clean"], report)
+
+    def test_an_expected_restart_older_than_the_crashloop_window_excuses_nothing(self):
+        checker.main(["expect", str(self.evidence), "workload-restart", "default__frontend-0", "--at", str(NOW)])
+        report = self.crashloop("instance default__frontend-0 restarted 3 times in the last 15 minutes")
+        _, verdict = self.evaluate(self.snapshot(kind="settle", ts=NOW + checker.CRASHLOOP_WINDOW + 1, **{
+            "wtf_json": report, "nodes_json": nodes(), "http_txt": "200 0.01\n", "status_json": []}))
+        self.assertFalse(verdict["settle_clean"])
+
     def test_a_cleared_wtf_finding_starts_counting_again(self):
         report = wtf(warnings=[("under-replicated", "app.y")])
         self.evaluate(self.snapshot(ts=NOW, **{"wtf_json": report}))

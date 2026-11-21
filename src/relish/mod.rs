@@ -274,6 +274,31 @@ pub enum RelishError {
     #[error("request timed out (the operation may still be running on the agent)")]
     RequestTimeout,
 
+    /// The current relish context needs a file that's gone, usually
+    /// because its cluster's directory was deleted (#2162).
+    #[error(
+        "the relish context for {owner} can't be used: its CA certificate {} is gone. \
+         If that cluster is gone too, remove {} so relish goes back to the local default, \
+         or create a new cluster with `relish setup` or `relish machines claim --create`, \
+         which replaces it. To reach another cluster meanwhile, pass --endpoint, --ca-cert \
+         and --token (or RELIABURGER_ENDPOINT, RELIABURGER_CA_CERT and RELIABURGER_TOKEN)",
+        .missing.display(),
+        .context.display()
+    )]
+    ContextFileMissing {
+        /// The context file.
+        context: std::path::PathBuf,
+        /// The cluster it's for.
+        owner: String,
+        /// The file it needs that no longer exists.
+        missing: std::path::PathBuf,
+    },
+
+    /// relish couldn't set up its connection to the cluster, so it sent
+    /// nothing: an unreadable CA certificate, say.
+    #[error("{0}")]
+    ClientConfig(String),
+
     /// The API returned an error.
     #[error("API error (status {status}): {body}")]
     ApiError { status: u16, body: String },

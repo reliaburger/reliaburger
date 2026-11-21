@@ -3655,9 +3655,11 @@ dependencies = [
  "defmt",
  "jiff-core",
  "jiff-static",
+ "log",
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
+ "windows-link",
 ]
 
 [[package]]
@@ -5719,7 +5721,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "reliaburger"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "age",
  "anyhow",
@@ -5745,6 +5747,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "insta",
+ "jiff",
  "jsonschema",
  "k8s-openapi",
  "libc",

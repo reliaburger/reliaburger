@@ -18,3 +18,8 @@ pub fn selected() -> Style {
         .bg(ACCENT)
         .add_modifier(Modifier::BOLD)
 }
+
+/// A `/` search match: red and bold, which a 16-colour console shows too.
+pub fn search_match() -> Style {
+    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+}

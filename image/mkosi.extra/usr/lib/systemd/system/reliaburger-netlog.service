@@ -1,0 +1,29 @@
+# Stream the kernel log, and the lines of the units that matter during a
+# boot, to an operator's machine over UDP (#2149): only when the ESP's
+# reliaburger/netlog.conf names one, which `relish netboot --stream-logs`
+# has the installer write. /usr/lib/reliaburger/netlog says how.
+#
+# After network-online.target: the image's initrd carries no network
+# drivers, so this is the first point the NIC has an address. The kernel log
+# so far goes out once, so the start of the boot isn't lost, and netconsole
+# carries every kernel line after, panics included. Before the units whose
+# lines it forwards, so their first lines go out too.
+#
+# Enabled from /usr (multi-user.target.wants/ next to this file), not through
+# a preset: preset symlinks live in /etc, which an OS update doesn't change,
+# so a node installed from an older image would never enable it.
+[Unit]
+Description=Reliaburger boot logs over the network
+After=network-online.target
+Wants=network-online.target
+Before=reliaburger-seed.service reliaburger-time-wait.service reliaburger.service reliaburger-boot-check.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Never holds a boot up for long, and never fails one.
+TimeoutStartSec=30
+StandardOutput=journal+console
+# The script's test overrides (image/tests/test_netlog.py).
+UnsetEnvironment=NETLOG_CMDLINE NETLOG_CONF NETLOG_CONFIGFS NETLOG_RUN
+ExecStart=-/usr/lib/reliaburger/netlog

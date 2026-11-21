@@ -95,6 +95,11 @@ def installer(drop=(), extra=None, softdep="softdep r8169 pre: realtek\n", built
         f"{KERNEL}/mmc/host/sdhci-acpi.ko": module(),
         f"{KERNEL}/usb/storage/usb-storage.ko": module(),
         f"{KERNEL}/usb/host/xhci-pci.ko": module(),
+        f"{KERNEL}/net/netconsole.ko": module(),
+        f"usr/lib/modules/{KVER}/kernel/fs/configfs/configfs.ko": module(),
+        f"usr/lib/modules/{KVER}/kernel/fs/fat/vfat.ko": module(),
+        f"usr/lib/modules/{KVER}/kernel/fs/nls/nls_cp437.ko": module(),
+        f"usr/lib/modules/{KVER}/kernel/fs/nls/nls_iso8859-1.ko": module(),
         f"usr/lib/modules/{KVER}/modules.softdep": softdep.encode(),
         f"usr/lib/modules/{KVER}/modules.builtin": builtin.encode(),
         "usr/lib/firmware/rtl_nic/rtl8168h-2.fw.zst": b"fw",
@@ -148,6 +153,14 @@ class InstallerModules(unittest.TestCase):
         done = self.check(installer(drop=["e1000e/e1000e.ko"]))
         self.assertEqual(done.returncode, 1, done.stdout)
         self.assertIn("e1000e", done.stdout)
+
+    def test_an_installer_that_cannot_stream_boot_logs_fails(self):
+        # #2149: netconsole sends the installer's lines, and FAT mounts the
+        # installed ESP to write netlog.conf.
+        for missing in ("netconsole.ko", "vfat.ko", "nls_iso8859-1.ko"):
+            done = self.check(installer(drop=[missing]))
+            self.assertEqual(done.returncode, 1, done.stdout)
+            self.assertIn(missing.removesuffix(".ko").replace("-", "_"), done.stdout)
 
     def test_a_built_in_driver_counts_as_present(self):
         done = self.check(installer(drop=["virtio_net.ko"],

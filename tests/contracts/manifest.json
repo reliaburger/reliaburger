@@ -5554,6 +5554,17 @@
           ]
         },
         {
+          "id": "legacy-ci-reliaburger-cluster_failover-a_voter_that_shut_down_cleanly_stays_listed_as_left",
+          "binary": "reliaburger::cluster_failover",
+          "test": "a_voter_that_shut_down_cleanly_stays_listed_as_left",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
+          ]
+        },
+        {
           "id": "legacy-ci-reliaburger-cluster_gossip-three_nodes_join_by_address_and_converge",
           "binary": "reliaburger::cluster_gossip",
           "test": "three_nodes_join_by_address_and_converge",

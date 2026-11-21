@@ -11,9 +11,55 @@ This file is the short version. The longer records are:
 - [docs/releasing.md](docs/releasing.md#compatibility-before-100), for the full upgrade steps between each pair of releases;
 - the [GitHub release pages](https://github.com/reliaburger/reliaburger/releases), for the binaries and every merged pull request.
 
-## [Unreleased] - 0.3.0
+## [Unreleased] - 0.3.2
 
-"Bare metal in an hour". Not released yet: this is what the [roadmap](docs/roadmap.md#releases-after-010) plans for 0.3.0 and its train ([#490](https://github.com/reliaburger/reliaburger/issues/490)) carries, and it can change before the tag.
+Fixes from the Wyse 3040 lab that need a new appliance image. Not released yet: this is what the train carries, and it can change before the tag.
+
+### Upgrading
+
+- 0.3.2 moves the wire protocol from 60 to 61, because an apply error now carries its real status instead of 500 ([#2157](https://github.com/reliaburger/reliaburger/issues/2157)). Start a fresh 0.3.2 cluster: 0.3.1 and 0.3.2 nodes refuse each other, so there's no rolling upgrade ([compatibility before 1.0.0](docs/releasing.md#compatibility-before-100)).
+
+### Added
+
+- `relish netboot --stream-logs` shows an appliance's kernel and boot logs as it installs and boots, so a machine with no serial port can be watched from the terminal, and `relish machines logs` listens for them on its own. Off by default, because the logs cross the LAN in cleartext ([#2149](https://github.com/reliaburger/reliaburger/issues/2149)).
+
+### Fixed
+
+- `relish wtf` calls a crash loop only when one instance restarts three times in 15 minutes. Three replicas that restarted once each were a critical `crashloop` for 15 minutes, and the instance a restart named was never read ([#2197](https://github.com/reliaburger/reliaburger/issues/2197)).
+
+## [0.3.1] - 2026-11-21
+
+Fixes from 0.3.0's gate and the first Wyse lab, and a terminal UI you can act from.
+
+### Upgrading
+
+- 0.3.1 keeps 0.3.0's formats (protocol 60, state 76), so a 0.3.0 cluster rolls onto it node by node.
+- `relish wtf` prints a compact table by default; `--short` gives only the counts and what isn't OK, and `--explain` says what each check tests. `-o json` is unchanged ([#2180](https://github.com/reliaburger/reliaburger/issues/2180)).
+- The built-in `cpu_idle` alert is gone: it fired on idle nodes and marked a healthy cluster DEGRADED. Four node alerts remain, all for high load ([#2171](https://github.com/reliaburger/reliaburger/issues/2171)).
+
+### Added
+
+- `relish tui`: `/` searches the Logs and Metrics tabs and the logs view, highlighting what matches ([#2174](https://github.com/reliaburger/reliaburger/issues/2174)); `k` kills a selected instance after a y/N question, through Smoker's audited kill fault ([#2175](https://github.com/reliaburger/reliaburger/issues/2175)); the nodes view has `relish nodes`' VERSION, CPU, MEM, DISK and ALLOCATED columns ([#2168](https://github.com/reliaburger/reliaburger/issues/2168)); the app detail view shows each instance's image ([#2167](https://github.com/reliaburger/reliaburger/issues/2167)); and Left and Right switch its tabs ([#2169](https://github.com/reliaburger/reliaburger/issues/2169)).
+- `relish netboot` puts the local time on every log line ([#2159](https://github.com/reliaburger/reliaburger/issues/2159)).
+
+### Fixed
+
+- `relish apply` says an image isn't in the cluster's registry and how to build or push it, instead of blaming Docker Hub ([#2145](https://github.com/reliaburger/reliaburger/issues/2145)).
+- `relish machines claim` waits until the claimed nodes answer before it returns ([#2146](https://github.com/reliaburger/reliaburger/issues/2146)), and a relish context whose files are gone is named in the error and replaced by a new cluster ([#2162](https://github.com/reliaburger/reliaburger/issues/2162)).
+- `relish wtf` no longer calls Pickle degraded on a one-node cluster ([#2147](https://github.com/reliaburger/reliaburger/issues/2147)), and `relish nodes` keeps listing a node that shut down cleanly as `left` ([#2164](https://github.com/reliaburger/reliaburger/issues/2164)).
+- Node shutdown runs each app's `pre_stop` and stop grace ([#2118](https://github.com/reliaburger/reliaburger/issues/2118)); an OS rollout keeps host-path apps with their data and shows its cordons ([#2119](https://github.com/reliaburger/reliaburger/issues/2119), [#2120](https://github.com/reliaburger/reliaburger/issues/2120)).
+- Bun collects a state read that outlived its 1 s sweep instead of queuing a new one behind it, so a crashed container is still seen and restarted on a slow disk ([#2085](https://github.com/reliaburger/reliaburger/issues/2085)).
+- Smoker's pause on a runc app freezes the workload, not its launcher ([#2079](https://github.com/reliaburger/reliaburger/issues/2079)).
+- An ingress Host header is routed only when its port is digits, and `relish netboot` escapes a TFTP client's error text in its log.
+- An exec into a workload has its own deadline inside the client's, so a hung one fails naming the app and the node.
+
+### Known issues
+
+- [#2128](https://github.com/reliaburger/reliaburger/issues/2128): one registry deploy case stalled for five minutes after an injected disk fault in 0.3.0's gate. Two possible causes are fixed in this release, but the cause isn't proven.
+
+## [0.3.0] - 2026-11-20
+
+"Bare metal in an hour": blank machines boot our appliance OS over the network, join a cluster when you claim them, and take signed OS updates one node at a time. [Release page](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.0), [release log](docs/release-log.md#030-bare-metal-in-an-hour).
 
 ### Upgrading
 
@@ -63,6 +109,7 @@ This file is the short version. The longer records are:
 - Node shutdown, which every OS update goes through, skips each app's `pre_stop` hook and gives it 5 s instead of its `stop_grace` ([#2118](https://github.com/reliaburger/reliaburger/issues/2118)).
 - An OS rollout moves apps that keep data in a host path away from it, and `relish status` and `relish nodes` don't show its cordons ([#2120](https://github.com/reliaburger/reliaburger/issues/2120), [#2119](https://github.com/reliaburger/reliaburger/issues/2119)).
 - A Smoker `pause` of a runc app stops its launcher, not the app ([#2079](https://github.com/reliaburger/reliaburger/issues/2079)).
+- In the release gate's 8-hour final, one catalogue deploy from the cluster registry stalled for its whole 5-minute deadline right after an injected disk fault, then recovered by itself with no data lost. The cause isn't verified yet ([#2128](https://github.com/reliaburger/reliaburger/issues/2128)).
 
 ## [0.2.8] - 2026-11-12
 

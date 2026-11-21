@@ -96,7 +96,34 @@ impl TuiApp {
             },
             DataUpdate::DesiredApps(result) => set_data!(result, desired_apps),
             DataUpdate::Scaled { app, to, result } => self.scaled(&app, to, result),
+            DataUpdate::InstanceKilled { target, result } => self.killed(target, result),
         }
+    }
+
+    /// Say how a kill went. A refusal isn't a lost connection: the API
+    /// answered, so its words go in the status line as they are.
+    fn killed(
+        &mut self,
+        target: InstanceTarget,
+        result: Result<crate::smoker::types::FaultSummary, super::data::ProviderError>,
+    ) {
+        use super::data::ProviderError;
+        self.status_message = Some(match result {
+            Ok(fault) => {
+                self.pending.push(Effect::RefreshAll);
+                (
+                    format!(
+                        "killed {} on {} (fault {}); the scheduler starts a replacement",
+                        target.instance, target.node, fault.id
+                    ),
+                    Level::Info,
+                )
+            }
+            Err(ProviderError::Api { body, .. }) => {
+                (format!("kill refused: {}", body.trim()), Level::Error)
+            }
+            Err(error) => (format!("kill failed: {error}"), Level::Error),
+        });
     }
 
     fn push_log_line(&mut self, line: LogLine) {
@@ -215,6 +242,8 @@ mod tests {
                 runtime_unknown: false,
                 status_age_ms: None,
                 age_seconds: None,
+                image: None,
+                data_on_node: false,
                 reason: None,
             },
         });
@@ -324,6 +353,98 @@ mod tests {
         assert_eq!(app.view(), &View::Apps);
     }
 
+    // The arrow keys switch the app detail tabs, as Tab and Shift-Tab do
+    // (#2169).
+    #[test]
+    fn left_and_right_switch_app_detail_tabs() {
+        let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);
+        app.view_stack.push(View::AppDetail {
+            app: "web".into(),
+            namespace: "default".into(),
+            tab: DetailTab::Overview,
+        });
+        let tab = |app: &TuiApp| match app.view() {
+            View::AppDetail { tab, .. } => *tab,
+            other => panic!("left the app detail view for {other:?}"),
+        };
+        app.update(key(KeyCode::Right));
+        assert_eq!(tab(&app), DetailTab::Instances);
+        app.update(key(KeyCode::Right));
+        assert_eq!(tab(&app), DetailTab::Logs);
+        app.update(key(KeyCode::Left));
+        assert_eq!(tab(&app), DetailTab::Instances);
+        app.update(key(KeyCode::Left));
+        app.update(key(KeyCode::Left));
+        // Wraps round, as Shift-Tab does.
+        assert_eq!(tab(&app), DetailTab::Config);
+    }
+
+    // Enter on a node opens its page; the arrows and Tab switch its tabs,
+    // and Esc goes back to the list (#2170).
+    #[test]
+    fn enter_opens_a_node_and_the_arrows_switch_its_tabs() {
+        let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);
+        app.update(key(KeyCode::Char('n')));
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Enter));
+        let tab = |app: &TuiApp| match app.view() {
+            View::NodeDetail { node, tab } => {
+                assert_eq!(node, "node-2");
+                *tab
+            }
+            other => panic!("left the node page for {other:?}"),
+        };
+        assert_eq!(tab(&app), NodeTab::Overview);
+        app.update(key(KeyCode::Right));
+        assert_eq!(tab(&app), NodeTab::Workloads);
+        app.update(key(KeyCode::Tab));
+        assert_eq!(tab(&app), NodeTab::Maintenance);
+        app.update(key(KeyCode::Right));
+        assert_eq!(tab(&app), NodeTab::Overview, "wraps round");
+        app.update(key(KeyCode::Left));
+        assert_eq!(tab(&app), NodeTab::Maintenance);
+        assert!(app.pending.is_empty(), "node tabs fetch nothing");
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.view(), &View::Nodes);
+    }
+
+    #[test]
+    fn enter_on_a_workload_opens_its_app() {
+        let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);
+        app.view_stack.push(View::NodeDetail {
+            node: "node-2".into(),
+            tab: NodeTab::Workloads,
+        });
+        // node-2 runs app-2-1, web-1 and worker-1, in that order.
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Down));
+        assert_eq!(app.instances_cursor, 2, "stops at the last row");
+        app.update(key(KeyCode::Up));
+        app.update(key(KeyCode::Enter));
+        assert_eq!(
+            app.view(),
+            &View::AppDetail {
+                app: "web".into(),
+                namespace: "default".into(),
+                tab: DetailTab::Overview,
+            }
+        );
+        app.update(key(KeyCode::Esc));
+        assert!(matches!(app.view(), View::NodeDetail { .. }));
+    }
+
+    #[test]
+    fn k_on_the_workloads_tab_does_nothing() {
+        let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);
+        app.view_stack.push(View::NodeDetail {
+            node: "node-1".into(),
+            tab: NodeTab::Workloads,
+        });
+        app.update(key(KeyCode::Char('k')));
+        assert_eq!(app.confirm_kill, None, "the node page is read-only");
+    }
+
     #[test]
     fn dashboard_r_opens_routes_while_list_r_refreshes() {
         let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);
@@ -368,6 +489,279 @@ mod tests {
                 app: Some(("web".into(), "default".into()))
             }
         );
+    }
+
+    fn type_text(app: &mut TuiApp, text: &str) {
+        for character in text.chars() {
+            app.update(key(KeyCode::Char(character)));
+        }
+    }
+
+    fn app_detail(tab: DetailTab) -> TuiApp {
+        let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);
+        app.view_stack.push(View::AppDetail {
+            app: "web".into(),
+            namespace: "default".into(),
+            tab,
+        });
+        app
+    }
+
+    // `/` searches the Logs tab; Esc clears the search and stays put, and
+    // only a second Esc goes back (#2174).
+    #[test]
+    fn slash_searches_the_logs_tab_and_esc_clears_it_without_leaving() {
+        let mut app = app_detail(DetailTab::Logs);
+        app.update(key(KeyCode::Char('/')));
+        assert!(app.filter_editing);
+        type_text(&mut app, "err");
+        assert_eq!(app.filter.as_deref(), Some("err"));
+        app.update(key(KeyCode::Enter));
+        assert!(!app.filter_editing);
+        assert_eq!(app.filter.as_deref(), Some("err"));
+
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.filter, None);
+        assert!(matches!(
+            app.view(),
+            View::AppDetail {
+                tab: DetailTab::Logs,
+                ..
+            }
+        ));
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.view(), &View::Dashboard);
+    }
+
+    #[test]
+    fn esc_while_typing_a_search_clears_it() {
+        let mut app = app_detail(DetailTab::Metrics);
+        app.update(key(KeyCode::Char('/')));
+        type_text(&mut app, "cpu");
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.filter, None);
+        assert!(!app.filter_editing);
+        assert!(matches!(
+            app.view(),
+            View::AppDetail {
+                tab: DetailTab::Metrics,
+                ..
+            }
+        ));
+    }
+
+    // While the search box is open, letters are search text, not keys:
+    // `l` and `q` don't open the logs view or go back.
+    #[test]
+    fn typing_in_the_logs_view_search_box_does_not_navigate() {
+        let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);
+        app.view_stack.push(View::Logs {
+            app: Some(("web".into(), "default".into())),
+        });
+        app.update(key(KeyCode::Char('/')));
+        type_text(&mut app, "slow query");
+        assert_eq!(app.filter.as_deref(), Some("slow query"));
+        assert!(matches!(app.view(), View::Logs { app: Some(_) }));
+        app.update(key(KeyCode::Backspace));
+        assert_eq!(app.filter.as_deref(), Some("slow quer"));
+    }
+
+    // A search belongs to the screen it was typed on: another tab or view
+    // starts without it.
+    #[test]
+    fn a_search_does_not_follow_you_to_another_tab_or_view() {
+        let mut app = app_detail(DetailTab::Logs);
+        app.update(key(KeyCode::Char('/')));
+        type_text(&mut app, "err");
+        app.update(key(KeyCode::Enter));
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.filter, None);
+
+        app.update(key(KeyCode::Char('/')));
+        type_text(&mut app, "cpu");
+        app.update(key(KeyCode::Enter));
+        app.update(key(KeyCode::Char('q')));
+        assert_eq!(app.view(), &View::Dashboard);
+        assert_eq!(app.filter, None);
+
+        app.update(key(KeyCode::Char('/')));
+        type_text(&mut app, "web");
+        app.update(key(KeyCode::Enter));
+        app.update(key(KeyCode::Char('e')));
+        assert_eq!(app.filter, None);
+    }
+
+    #[test]
+    fn visible_log_lines_keep_only_matching_lines_ignoring_case() {
+        let mut app = app_detail(DetailTab::Logs);
+        for line in [
+            "GET /health 200",
+            "ERROR: disk full",
+            "retrying after error",
+        ] {
+            app.log_lines.push_back(LogLine {
+                instance: "web-0".into(),
+                line: line.into(),
+            });
+        }
+        assert_eq!(app.visible_log_lines().len(), 3);
+        app.filter = Some("error".into());
+        let visible: Vec<_> = app
+            .visible_log_lines()
+            .iter()
+            .map(|line| line.line.as_str())
+            .collect();
+        assert_eq!(visible, ["ERROR: disk full", "retrying after error"]);
+        app.filter = Some("panic".into());
+        assert!(app.visible_log_lines().is_empty());
+    }
+
+    fn web_1_on_node_2() -> InstanceTarget {
+        InstanceTarget {
+            app: "web".into(),
+            namespace: "default".into(),
+            instance: "web-1".into(),
+            node: "node-2".into(),
+        }
+    }
+
+    fn kills(app: &TuiApp) -> Vec<&Effect> {
+        app.pending
+            .iter()
+            .filter(|effect| matches!(effect, Effect::KillInstance(_)))
+            .collect()
+    }
+
+    // `k` asks first, and anything but `y` sends nothing (#2175).
+    #[test]
+    fn k_without_confirming_does_nothing() {
+        for answer in [
+            KeyCode::Char('n'),
+            KeyCode::Char('N'),
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Char('q'),
+            KeyCode::Char('k'),
+        ] {
+            let mut app = app_detail(DetailTab::Instances);
+            app.update(key(KeyCode::Char('k')));
+            assert!(app.confirm_kill.is_some(), "k asks before it kills");
+            assert!(kills(&app).is_empty(), "k alone sent a kill");
+            app.update(key(answer));
+            assert_eq!(app.confirm_kill, None, "{answer:?} left the prompt open");
+            assert!(kills(&app).is_empty(), "{answer:?} sent a kill");
+            assert!(!app.should_quit, "{answer:?} quit instead of cancelling");
+            assert!(matches!(
+                app.view(),
+                View::AppDetail {
+                    tab: DetailTab::Instances,
+                    ..
+                }
+            ));
+            assert_eq!(
+                app.status_message,
+                Some(("kill cancelled".into(), Level::Info))
+            );
+        }
+    }
+
+    #[test]
+    fn y_kills_the_selected_instance_on_its_node() {
+        let mut app = app_detail(DetailTab::Instances);
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Char('k')));
+        assert_eq!(app.confirm_kill, Some(web_1_on_node_2()));
+        app.update(key(KeyCode::Char('y')));
+        assert_eq!(app.confirm_kill, None);
+        assert_eq!(kills(&app), [&Effect::KillInstance(web_1_on_node_2())]);
+    }
+
+    #[test]
+    fn ctrl_k_asks_as_k_does() {
+        let mut app = app_detail(DetailTab::Instances);
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('k'),
+            KeyModifiers::CONTROL,
+        )));
+        assert_eq!(
+            app.confirm_kill
+                .as_ref()
+                .map(|target| target.instance.as_str()),
+            Some("web-0")
+        );
+    }
+
+    #[test]
+    fn up_and_down_select_an_instance_and_stop_at_either_end() {
+        let mut app = app_detail(DetailTab::Instances);
+        assert_eq!(app.instances_cursor, 0);
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Down));
+        assert_eq!(app.instances_cursor, 1, "web has two instances");
+        app.update(key(KeyCode::Up));
+        app.update(key(KeyCode::Up));
+        assert_eq!(app.instances_cursor, 0);
+    }
+
+    #[test]
+    fn k_outside_the_instances_tab_does_nothing() {
+        for tab in [DetailTab::Overview, DetailTab::Logs, DetailTab::Metrics] {
+            let mut app = app_detail(tab);
+            app.update(key(KeyCode::Char('k')));
+            assert_eq!(app.confirm_kill, None, "{tab:?}");
+        }
+        let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);
+        app.view_stack.push(View::Apps);
+        app.update(key(KeyCode::Char('k')));
+        assert_eq!(app.confirm_kill, None);
+    }
+
+    #[test]
+    fn a_kill_says_what_it_did_and_refreshes() {
+        let mut app = app_detail(DetailTab::Instances);
+        app.update(Msg::Data(DataUpdate::InstanceKilled {
+            target: web_1_on_node_2(),
+            result: Ok(crate::smoker::types::FaultSummary {
+                id: 7,
+                fault_type: "kill".into(),
+                target_service: "web".into(),
+                namespace: Some("default".into()),
+                target_instance: Some("web-1".into()),
+                task_index: None,
+                target_node: Some("node-2".into()),
+                remaining_secs: 0,
+                injected_by: "admin".into(),
+                node: Some("node-2".into()),
+                routed: Vec::new(),
+            }),
+        }));
+        let (message, level) = app.status_message.clone().unwrap();
+        assert_eq!(level, Level::Info);
+        assert!(message.contains("killed web-1 on node-2"), "{message}");
+        assert!(message.contains("fault 7"), "{message}");
+        assert_eq!(app.pending.last(), Some(&Effect::RefreshAll));
+    }
+
+    // A refusal (a scoped token, a safety rail) shows the API's own words.
+    #[test]
+    fn a_refused_kill_shows_the_refusal() {
+        let mut app = app_detail(DetailTab::Instances);
+        app.update(Msg::Data(DataUpdate::InstanceKilled {
+            target: web_1_on_node_2(),
+            result: Err(ProviderError::Api {
+                status: 403,
+                body: "token scope does not cover namespace default\n".into(),
+            }),
+        }));
+        assert_eq!(
+            app.status_message,
+            Some((
+                "kill refused: token scope does not cover namespace default".into(),
+                Level::Error
+            ))
+        );
+        assert!(matches!(app.connection, Connection::Connected));
+        assert!(app.pending.is_empty());
     }
 
     #[test]

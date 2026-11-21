@@ -29,7 +29,7 @@ async fn a_deploy_the_node_gate_refuses_never_reaches_the_runtime() {
     grill.set_applies_runtime_knobs(true);
 
     let events = drain_deploy(&mut agent, knobbed_app()).await;
-    let Some(ApplyEvent::Error { message }) = events.last() else {
+    let Some(ApplyEvent::Error { message, .. }) = events.last() else {
         panic!("the deploy must fail: {events:?}");
     };
     assert!(

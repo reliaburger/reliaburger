@@ -31,6 +31,13 @@ fn apply_events() {
         },
         ApplyEvent::Error {
             message: "app db-a: refused by the cluster: app pg/db-a is owned by \"other\"".into(),
+            status: None,
+        },
+        ApplyEvent::Error {
+            message: "burger:v1 isn't in this cluster's registry (Pickle); build it with \
+                      `relish build <file>` or push it, or name the registry that has it"
+                .into(),
+            status: Some(404),
         },
     ];
     insta::assert_json_snapshot!(events);
@@ -108,6 +115,8 @@ fn cluster_instance_status() {
             runtime_unknown: false,
             status_age_ms: Some(120),
             age_seconds: None,
+            image: None,
+            data_on_node: false,
             reason: None,
         },
     }];

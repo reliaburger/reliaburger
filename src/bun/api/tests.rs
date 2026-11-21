@@ -9264,7 +9264,8 @@ async fn nodes_endpoint_advertises_only_resolved_peer_api_addresses() {
 }
 
 /// Gossip's live view drops a dead member; the listing hands the agent
-/// the ones this node remembers, so `relish nodes` shows them as dead.
+/// the ones this node remembers, so `relish nodes` shows them as dead, or
+/// as left when they shut down cleanly.
 #[tokio::test]
 async fn nodes_endpoint_lists_remembered_dead_members_as_dead() {
     let (tx, mut rx) = mpsc::channel(1);
@@ -9288,13 +9289,15 @@ async fn nodes_endpoint_lists_remembered_dead_members_as_dead() {
         incarnation: 4,
         labels: std::collections::BTreeMap::from([("zone".to_string(), "a".to_string())]),
     };
-    use crate::mustard::state::NodeState::{Alive, Dead, Suspect};
+    use crate::mustard::state::NodeState::{Alive, Dead, Left, Suspect};
     known
         .refresh(
             vec![
                 member("one", 19117, Alive),
                 member("doubtful", 19217, Suspect),
                 member("dead", 19317, Dead),
+                // Shut down cleanly: a reboot, so still listed (#2164).
+                member("rebooting", 19417, Left),
             ],
             &Default::default(),
             std::time::Instant::now(),
@@ -9316,7 +9319,9 @@ async fn nodes_endpoint_lists_remembered_dead_members_as_dead() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let nodes: Vec<crate::bun::agent::NodeStatus> = serde_json::from_slice(&body).unwrap();
-    assert_eq!(nodes.len(), 1, "{nodes:?}");
+    assert_eq!(nodes.len(), 2, "{nodes:?}");
+    assert_eq!(nodes[1].node_id, "rebooting");
+    assert_eq!(nodes[1].state, "left");
     assert_eq!(nodes[0].node_id, "dead");
     assert_eq!(nodes[0].state, "dead");
     assert_eq!(nodes[0].address, "127.0.0.1:19314");

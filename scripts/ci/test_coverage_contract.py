@@ -13,7 +13,7 @@ class Coverage(unittest.TestCase):
         self.env=k.snapshot_environment({'RUSTC_WRAPPER':'/tools/coverage','CARGO_LLVM_COV':'1','__CARGO_LLVM_COV_RUSTC_WRAPPER':'1','__CARGO_LLVM_COV_RUSTC_WRAPPER_RUSTFLAGS':'-C\x1finstrument-coverage\x1f--cfg=coverage','__CARGO_LLVM_COV_RUSTC_WRAPPER_CRATE_NAMES':'reliaburger,bun,relish','LLVM_PROFILE_FILE':'/work/target/llvm-cov-target/reliaburger-%p-%8m.profraw'})
         run=['cargo','nextest','run','--profile','ci','--features=ebpf','--target-dir','/work/target/llvm-cov-target','--run-ignored=default','-E','all() & not binary(oci_crash)','--no-tests=fail','--no-fail-fast','--test-threads=2','--retries=0']
         ctx=dict(commit='a'*40,run_id='100',attempt='1',host='linux')
-        stages=[['cargo','llvm-cov','clean','--workspace'],['cargo','llvm-cov','--no-report','nextest','--profile','ci','--no-tests=fail'],['cargo','llvm-cov','report','--failure-mode','all','--lcov','--output-path','target/coverage/lcov.info','--fail-under-lines','78.65']]
+        stages=[['cargo','llvm-cov','clean','--workspace'],['cargo','llvm-cov','--no-report','test','--lib','--','--list'],['cargo','llvm-cov','clean','--profraw-only'],['cargo','llvm-cov','--no-report','nextest','--profile','ci','--no-tests=fail'],['cargo','llvm-cov','report','--failure-mode','all','--lcov','--output-path','target/coverage/lcov.info','--fail-under-lines','78.65']]
         self.expected=dict(context=ctx,owner_command=['make','coverage'],nonce='current-owner-nonce',tools=copy.deepcopy(self.tools),instrumentation=copy.deepcopy(self.env),target_dir='/work/target/llvm-cov-target',nextest_prefix=['cargo','nextest'],run_argv=run,stages=stages)
         self.child=dict(schema_version=1,context=ctx,nonce='current-owner-nonce',tools=self.tools,run_environment=copy.deepcopy(self.env),list_environment=copy.deepcopy(self.env),target_dir='/work/target/llvm-cov-target',command=run,discovery_command=k.list_argv(run,['cargo','nextest']),exit_code=0,discovery_sha256='d'*64,junit_sha256='e'*64)
         self.owner=dict(schema_version=1,context=ctx,owner_command=['make','coverage'],nonce='current-owner-nonce',exit_code=0,interception_count=1,child_sha256='',stages=[dict(command=x,exit_code=0) for x in stages])
@@ -26,6 +26,26 @@ class Coverage(unittest.TestCase):
         self.assertIn('--features=ebpf',args);self.assertIn('--target-dir',args);self.assertIn('all() & not binary(oci_crash)',args)
         self.assertNotIn('--test-threads=2',args);self.assertNotIn('--no-tests=fail',args)
         self.assertEqual(sum('nextest' in x and '--no-report' in x for x in self.expected['stages']),1)
+    # #1723: the lib tests build alone before the run (#1943's memory). That
+    # build may list tests but never run one, and the profile its listing
+    # writes is gone before the run, so the report reads the run's alone.
+    def stages(self,stages):
+        self.expected['stages']=stages;self.owner['stages']=[dict(command=x,exit_code=0) for x in stages]
+    def test_the_lib_tests_build_alone_and_their_listing_profile_is_dropped_before_the_run(self):
+        self.assertTrue(self.check())
+        self.assertEqual(k.prebuild_order(self.expected['stages']),[['cargo','llvm-cov','--no-report','test','--lib','--','--list']])
+    def test_a_build_stage_that_runs_tests_is_refused(self):
+        stages=copy.deepcopy(self.expected['stages']);stages[1]=['cargo','llvm-cov','--no-report','test','--lib']
+        self.stages(stages)
+        with self.assertRaisesRegex(c.Invalid,'only list'):self.check()
+    def test_a_build_without_dropping_its_listing_profile_is_refused(self):
+        stages=copy.deepcopy(self.expected['stages']);del stages[2]
+        self.stages(stages)
+        with self.assertRaisesRegex(c.Invalid,'profraw'):self.check()
+    def test_a_build_after_the_run_is_refused(self):
+        stages=copy.deepcopy(self.expected['stages']);stages.insert(4,stages[1]);stages.insert(5,stages[2])
+        self.stages(stages)
+        with self.assertRaisesRegex(c.Invalid,'before the instrumented run'):self.check()
     def test_absent_environment_values_remain_distinct_from_empty(self):
         self.child['list_environment']['RUSTFLAGS']='';self.write()
         with self.assertRaisesRegex(c.Invalid,'instrumentation differs'):self.check()

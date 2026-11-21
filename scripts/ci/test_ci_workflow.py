@@ -132,7 +132,7 @@ class EvidenceTests(unittest.TestCase):
             producers = [index for index, step in enumerate(blocks)
                          if ('workflow_adapter.py produce' in step and '--gate ' + gate + ' ' in step)
                          or (gate == 'oci-interruptions'
-                             and 'run: scripts/release/qualify-oci-interruptions.sh' in step)]
+                             and 'run: choom -n 0 -- scripts/release/qualify-oci-interruptions.sh' in step)]
             self.assertEqual(len(producers), 1, gate)
             index = producers[0]
             producer = blocks[index]
@@ -178,7 +178,7 @@ class EvidenceTests(unittest.TestCase):
                       if 'uses: Swatinem/rust-cache@' in step]
             producers = [index for index, step in enumerate(blocks)
                          if 'workflow_adapter.py produce' in step
-                         or 'run: scripts/release/qualify-oci-interruptions.sh' in step]
+                         or 'run: choom -n 0 -- scripts/release/qualify-oci-interruptions.sh' in step]
             if not caches or not producers:
                 continue
             matched.add(name)
@@ -317,7 +317,7 @@ class EvidenceTests(unittest.TestCase):
             self.assertEqual(len(found), 1)
             return found[0]
 
-        producer = only(lambda step: 'run: scripts/release/qualify-oci-interruptions.sh' in step)
+        producer = only(lambda step: 'run: choom -n 0 -- scripts/release/qualify-oci-interruptions.sh' in step)
         watch = only(lambda step: 'name: Watch disk and memory during the OCI interruptions' in step)
         report = only(lambda step: "name: Report the OCI interruptions' headroom and leftovers" in step)
         upload = only(lambda step: 'name: contract-linux-oci-interruptions\n' in step)
@@ -345,15 +345,16 @@ class EvidenceTests(unittest.TestCase):
         original = self.jobs['linux']
         blocks = steps(original)
         producer = next(step for step in blocks
-                        if 'run: scripts/release/qualify-oci-interruptions.sh' in step)
+                        if 'run: choom -n 0 -- scripts/release/qualify-oci-interruptions.sh' in step)
         watch = next(step for step in blocks
                      if 'name: Watch disk and memory during the OCI interruptions' in step)
         report = next(step for step in blocks
                       if "name: Report the OCI interruptions' headroom and leftovers" in step)
         unbounded = re.sub(r'\n        timeout-minutes: \d+', '', producer)
+        job_limit = int(re.search(r'^    timeout-minutes: (\d+)$', original, re.M).group(1))
         changes = [
             original.replace(producer, unbounded),
-            original.replace(producer, re.sub(r'timeout-minutes: \d+', 'timeout-minutes: 39', producer)),
+            original.replace(producer, re.sub(r'timeout-minutes: \d+', f'timeout-minutes: {job_limit - 1}', producer)),
             original.replace(watch, ''),
             original.replace(watch, watch.replace(' < /dev/null', '')),
             original.replace(report, ''),
@@ -414,6 +415,18 @@ class EvidenceTests(unittest.TestCase):
         self.assertIn("make test-ci-scripts", policy)
         self.assertIn("make check-ignored", policy)
 
+    def test_the_quick_checks_share_one_runner(self):
+        # The audit and the demo app's Go tests take seconds; as jobs of
+        # their own each waited for a runner when runners ran short (#1723).
+        policy = self.jobs["ci-policy"]
+        self.assertIn("run: make audit", policy)
+        self.assertIn("go test ./...", policy)
+        self.assertIn("working-directory: examples/demo/burger", policy)
+        for gone in ["dependency-audit", "demo-app"]:
+            self.assertNotIn(gone, self.jobs)
+        for step in steps(policy):
+            self.assertNotIn("if:", step)
+
     def test_the_crane_client_has_a_provisioned_job(self):
         acceptance = self.jobs["acceptance"]
         self.assertIn("--gate standard-clients --host linux", acceptance)
@@ -446,8 +459,9 @@ class TrainAndQueueTests(unittest.TestCase):
         # The train ruleset's queue requires one check, "ignored-test
         # evidence". A merge group has no pull request and no label, so no
         # job may hang its condition on the event: each follows select jobs
-        # (which picks everything for merge_group, see test_select_jobs.py)
-        # or the closed-PR guard, and the gate always reports.
+        # (which picks everything for a merge group that changes code, see
+        # test_select_jobs.py) or the closed-PR guard, and the gate always
+        # reports.
         allowed = {"github.event.action == 'closed'", "github.event.action != 'closed'",
                    "${{ always() && github.event.action != 'closed' }}"}
         for name, job in self.jobs.items():
@@ -466,6 +480,32 @@ class TrainAndQueueTests(unittest.TestCase):
         self.assertIn("RELEASE_GATE: ${{ contains(github.event.pull_request.labels.*.name, 'release-gate') }}",
                       changes)
         self.assertIn("MACOS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'macos') }}", changes)
+
+    def test_a_merge_group_is_judged_against_the_commit_it_sits_on(self):
+        self.assertIn("BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}",
+                      self.jobs["changes"])
+
+    def test_a_train_push_looks_for_the_merge_queue_run_on_its_commit(self):
+        changes = self.jobs["changes"]
+        blocks = steps(changes)
+        queue = next(index for index, step in enumerate(blocks) if "ci_reuse.py" in step)
+        select = next(index for index, step in enumerate(blocks) if "select-jobs.sh" in step)
+        self.assertLess(queue, select)
+        step = blocks[queue]
+        self.assertIn("if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release-')", step)
+        self.assertIn("--event merge_group", step)
+        self.assertIn('--commit "$GITHUB_SHA"', step)
+        # Any doubt runs everything: a failed lookup must not fail the run.
+        self.assertIn("continue-on-error: true", step)
+        self.assertRegex(step, r"timeout-minutes: \d+")
+        self.assertIn("QUEUE_RUN: ${{ steps.queue.outputs.ci_run }}", blocks[select])
+        for output in ["portable", "tested_by"]:
+            self.assertIn(f"{output}: ${{{{ steps.select.outputs.{output} }}}}", changes)
+
+    def test_select_jobs_may_read_runs_but_never_cancel_them(self):
+        # ci.yml's callers grant actions: read; queue-sweep.yml cancels.
+        self.assertRegex(self.jobs["changes"], r"\n    permissions:\n      contents: read\n      actions: read\n")
+        self.assertNotIn("actions: write", self.ci)
 
     def test_evidence_binds_to_the_merge_groups_own_commit(self):
         self.assertIn("  EXPECTED_CHECKOUT_COMMIT: ${{ github.event.merge_group.head_sha || github.sha }}\n",
@@ -512,7 +552,7 @@ class TrainAndQueueTests(unittest.TestCase):
             self.assertIn("changes", needs.group(1), name)
             if condition:
                 self.assertNotRegex(condition.group(1), r"always\(\)|failure\(\)|cancelled\(\)", name)
-        for name in ["changes", "ci-policy", "dependency-audit", "ignored-evidence"]:
+        for name in ["changes", "ci-policy", "ignored-evidence"]:
             self.assertIn(guard, self.jobs[name], name)
 
     def test_the_final_gate_waits_for_every_other_job_and_always_reports(self):
@@ -579,8 +619,10 @@ class TrainAndQueueTests(unittest.TestCase):
     def test_the_heavy_jobs_wait_for_their_own_selection(self):
         for name in ["linux", "linux-next", "build-tests", "cluster", "acceptance"]:
             self.assertIn("if: needs.changes.outputs.heavy == 'true'", self.jobs[name])
-        for name in ["lint", "minimum-rust", "portable", "doctests", "contract-boundaries", "demo-app", "source-bundle"]:
+        for name in ["lint", "minimum-rust", "doctests", "contract-boundaries", "source-bundle"]:
             self.assertIn("if: needs.changes.outputs.code == 'true'", self.jobs[name])
+        # Portable Linux also runs alone to save a train's cache (#1723).
+        self.assertIn("if: needs.changes.outputs.portable == 'true'", self.jobs["portable"])
 
     def test_the_embedded_source_builds_on_its_own(self):
         # relish carries its source (#1570); the job proves the bundle alone
@@ -610,13 +652,15 @@ class TrainAndQueueTests(unittest.TestCase):
         self.assertIn("save-if: false", job)
 
     def test_the_portable_suite_finishes_on_a_slow_runner_with_headroom(self):
-        # 35 to 41 minutes on a slow runner (#1421), then up to 55 once the
-        # coverage build ran one job at a time, which tripled the build in
-        # the Lima VM. nextest's per-test timeouts catch a hung test, so the
-        # job limit only has to outlast a slow runner by half again.
+        # 35 to 41 minutes on a slow runner (#1421). One build job (#1943)
+        # tripled the build and the limit went to 85; the split build runs
+        # at full parallelism again (#1723), so 41 is the slow runner once
+        # more. nextest's per-test timeouts catch a hung test, so the job
+        # limit only has to outlast a slow runner by half again.
         limit = re.search(r"\n    timeout-minutes: (\d+)\n", self.jobs["portable"])
         self.assertIsNotNone(limit)
-        self.assertGreaterEqual(int(limit.group(1)), 55 * 3 // 2)
+        self.assertGreaterEqual(int(limit.group(1)), 41 * 3 // 2)
+        self.assertLess(int(limit.group(1)), 85)
 
     def test_the_nightly_signing_build_s_own_key_test_runs(self):
         # The nightly build trusts the nightly key instead of every release
@@ -798,8 +842,27 @@ class LinuxNextTests(unittest.TestCase):
         self.assertLess(watch, tests)
         self.assertGreater(report, tests)
         self.assertIn("if: always()", self.steps[report])
-        # On a failed or timed-out step, the stuck processes' kernel stacks.
-        self.assertIn("/stack", self.steps[report])
+        # On a failed or timed-out step, the stuck processes' kernel stacks
+        # and the rest of runner-snapshot, kept with the evidence.
+        self.assertIn("scripts/ci/runner-snapshot", self.steps[report])
+        self.assertIn("$RUNNER_TEMP/linux-next-snapshots/", self.steps[report])
+
+    def test_a_snapshot_is_taken_before_the_tests_own_timeout_kills_them(self):
+        # 26.04 jobs that hit their limit kept nothing (#1943), and after the
+        # inner `timeout` fires, the hung tests are gone. The watcher starts
+        # just before the tests, so its age is the tests' age.
+        watch = self.steps[self.step("scripts/ci/watch-runner")]
+        tests = self.steps[self.step("make test-linux")]
+        inner = int(re.search(r"timeout --kill-after=1m (\d+)m", tests).group(1))
+        after = int(re.search(r"WATCH_SNAPSHOT_AFTER=(\d+)", watch).group(1))
+        # Passing runs take up to 31 minutes.
+        self.assertGreaterEqual(after, 32 * 60)
+        self.assertLessEqual(after, (inner - 2) * 60)
+        self.assertIn('WATCH_SNAPSHOT_DIR="$RUNNER_TEMP/linux-next-snapshots"', watch)
+        self.assertIn('WATCH_SNAPSHOT_LOGS="$RUNNER_TEMP/linux-next-tests.log"', watch)
+        self.assertIn('mkdir -p "$RUNNER_TEMP/linux-next-snapshots"', watch)
+        keep = self.steps[self.step("name: linux-next-evidence")]
+        self.assertIn("${{ runner.temp }}/linux-next-snapshots", keep)
 
     def test_the_runner_is_shielded_from_the_oom_killer_before_anything_is_watched(self):
         # The job died with its test step "in progress" nine times in two
@@ -918,6 +981,107 @@ class LinuxNextTests(unittest.TestCase):
                                   "$(CARGO) test --no-run --features ebpf"])
 
 
+class PrivilegedLinuxRunnerTests(unittest.TestCase):
+    """The 24.04 privileged job keeps its runner through its cold build, and
+    leaves evidence when a step hangs (#1943).
+
+    On 15 and 20 Nov 2026 it ran into its 40-minute limit three times with
+    "Prove rootless port adoption" in progress (or, once, failed after 3.5
+    minutes), no later step run and no log kept (runs 43715576493,
+    44729365098, 44783868580). That step runs `make test-rootless-runc`, the
+    job's first and cold build of every test binary, which compiled the lib
+    beside its lib tests on a 16 GB runner with nothing guarding it: the
+    26.04 job's mechanism. The build is now split (test_make_prebuilds.py),
+    and the job gets the 26.04 job's guards: the runner out of the OOM
+    killer's reach, swap, and a watcher that stops a build that pages, takes
+    snapshots of the host before the step limits kill what they would show,
+    and is reported and kept whatever happens."""
+
+    HEAVY = ("--gate rootless-linux ", "qualify-oci-interruptions.sh", "--gate linux-root-storage ")
+
+    def setUp(self):
+        self.job = jobs((WORKFLOWS / "ci.yml").read_text())["linux"]
+        self.steps = steps(self.job)
+
+    def step(self, text):
+        found = [index for index, step in enumerate(self.steps) if text in step]
+        self.assertEqual(len(found), 1, text)
+        return found[0]
+
+    def minutes(self, text):
+        return int(re.search(r"(?m)^\s+timeout-minutes: (\d+)$", text).group(1))
+
+    def command(self, index):
+        block = self.steps[index]
+        return " ".join(re.sub(r"\\\n", " ", block.split("run:", 1)[1]).split()).lstrip("| ")
+
+    def test_the_runner_is_shielded_and_every_heavy_step_is_handed_back_to_the_oom_killer(self):
+        shield = self.step('scripts/ci/protect-runner "$RUNNER_TEMP/runner-pids"')
+        self.assertNotIn("if: always()", self.steps[shield])
+        for text in self.HEAVY:
+            with self.subTest(step=text):
+                heavy = self.step(text)
+                self.assertLess(shield, heavy)
+                # Children inherit the runner's -1000: left there, a rustc
+                # could never be killed and a full memory hangs the host.
+                self.assertTrue(self.command(heavy).startswith("choom -n 0 -- "), self.command(heavy))
+
+    def test_the_build_gets_swap_but_never_on_a_snapshot(self):
+        swap = self.step("scripts/ci/give-swap 8388608 /")
+        self.assertLess(swap, self.step(self.HEAVY[0]))
+        self.assertNotIn("fallocate", self.steps[swap])
+        self.assertIn("swapon --show", self.steps[swap])
+
+    def test_one_watcher_covers_every_heavy_step_with_the_26_04_jobs_stops(self):
+        watch = self.step('scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids"')
+        self.assertLess(self.step("scripts/ci/protect-runner"), watch)
+        self.assertLess(watch, self.step(self.HEAVY[0]))
+        block = self.steps[watch]
+        for setting in ("WATCH_DISK_FLOOR_KB=2097152", "WATCH_MEM_FLOOR_KB=524288",
+                        "WATCH_MEM_FLOOR_SECONDS=60", "WATCH_PSI_FULL_PERCENT=60",
+                        "WATCH_PSI_SECONDS=30", "nohup ", "< /dev/null",
+                        '> "$RUNNER_TEMP/linux-resources.log"'):
+            self.assertIn(setting, block)
+        stop = block.split("WATCH_STOP=", 1)[1].split('"')[1].split()
+        for name in ("cargo-nextest", "cargo", "rustc"):
+            self.assertIn(name, stop)
+
+    def test_every_heavy_step_fails_inside_the_job_limit_and_a_snapshot_lands_before_it_does(self):
+        job = self.minutes(self.job.split("\n    steps:", 1)[0])
+        watch = self.steps[self.step("scripts/ci/watch-runner")]
+        first = int(re.search(r"WATCH_SNAPSHOT_AFTER=(\d+)", watch).group(1))
+        every = int(re.search(r"WATCH_SNAPSHOT_EVERY=(\d+)", watch).group(1))
+        self.assertIn('WATCH_SNAPSHOT_DIR="$RUNNER_TEMP/linux-snapshots"', watch)
+        # Passing jobs take 23 to 35 minutes (34 runs, 14 to 20 Nov); the
+        # rootless step, with the cold build, up to 17.
+        self.assertGreaterEqual(job, 50)
+        for text in self.HEAVY:
+            with self.subTest(step=text):
+                limit = self.minutes(self.steps[self.step(text)])
+                # One hung step still leaves the others and the report time.
+                self.assertLessEqual(limit + 15, job)
+        # Snapshots start before the first step could hit its limit and
+        # come often enough that one precedes any step's kill by minutes.
+        rootless = self.minutes(self.steps[self.step(self.HEAVY[0])])
+        self.assertLess(first, (rootless - 2) * 60)
+        self.assertLessEqual(every, 300)
+
+    def test_the_report_and_the_evidence_run_last_whatever_happened(self):
+        report = self.step('kill "$(cat "$RUNNER_TEMP/linux-resources.pid")"')
+        keep = self.step("name: linux-evidence\n")
+        for text in self.HEAVY:
+            self.assertGreater(report, self.step(text))
+        self.assertGreater(keep, report)
+        block = self.steps[report]
+        for text in ("if: always()", "timeout-minutes:",
+                     'scripts/ci/assert-headroom "$RUNNER_TEMP/linux-resources.log" 10485760',
+                     "'oom|killed process'", "job.status", "scripts/ci/runner-snapshot",
+                     "$RUNNER_TEMP/linux-snapshots/"):
+            self.assertIn(text, block)
+        for text in ("if: always()", "linux-resources.log", "linux-snapshots", "retention-days: 14"):
+            self.assertIn(text, self.steps[keep])
+
+
 class PortableLinuxRunnerTests(unittest.TestCase):
     """The portable Linux job keeps its runner through the coverage build.
 
@@ -1028,12 +1192,15 @@ class PortableLinuxRunnerTests(unittest.TestCase):
         self.assertIn("WATCH_PSI_FULL_PERCENT=60", watch)
         self.assertIn("WATCH_PSI_SECONDS=30", watch)
 
-    def test_the_coverage_build_compiles_one_crate_at_a_time(self):
+    def test_the_coverage_build_runs_at_full_parallelism(self):
+        # #1723: `make coverage` builds the lib tests alone before the run
+        # builds the rest (test_make_prebuilds.py), so the lib's 7 GB rustc
+        # never shares the runner with the lib tests' 12 GB one. A one-job
+        # cap on top would only throttle each rustc's codegen to one thread.
         producer = self.steps[self.producer()]
-        self.assertIn('CARGO_BUILD_JOBS: "1"', producer)
-        # Only this job: the others don't build the instrumented lib tests.
+        self.assertNotIn("CARGO_BUILD_JOBS", producer)
         text = (WORKFLOWS / "ci.yml").read_text()
-        self.assertEqual(text.count("CARGO_BUILD_JOBS:"), 1)
+        self.assertEqual(text.count("CARGO_BUILD_JOBS:"), 0)
 
     def test_train_pushes_save_the_dependency_cache_that_train_prs_restore(self):
         # The cache key carries the toolchain and the lock file, which a
