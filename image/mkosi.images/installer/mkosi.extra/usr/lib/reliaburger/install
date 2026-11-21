@@ -22,6 +22,12 @@
 #                                a disk that holds Reliaburger OS like any
 #                                other used disk (ask, or wipe=1), rather
 #                                than booting it
+#   reliaburger.netlog=<a>[:<p>] relish netboot --stream-logs passes this:
+#                                reliaburger-netlog.service streams this
+#                                installer's lines there, and this writes it
+#                                to reliaburger/netlog.conf on the installed
+#                                ESP, so the installed system's boots stream
+#                                there too (#2149)
 #
 # After writing, it puts a boot entry for the disk first in the firmware's
 # boot order, so the machine boots its disk from now on even where network
@@ -74,6 +80,27 @@ openssl pkeyutl -verify -pubin -inkey "$key" -rawin -in "/run/$sums" -sigfile "/
 expected=$(awk -v f="$image" '{ n = $2; sub(/^\*/, "", n); if (n == f) print $1 }' "/run/$sums")
 [ -n "$expected" ] || fail "$image isn't listed in $sums"
 say "signature good; $image should hash to ${expected:0:16}…"
+
+# Write reliaburger/netlog.conf, naming boot log target $2, onto the ESP of
+# the disk $1 now holds: its first partition, as boot_disk_first assumes.
+write_netlog_conf() {
+    local disk=$1 target=$2 esp mnt=/run/reliaburger-esp
+    blockdev --rereadpt "$disk" 2>/dev/null || true
+    udevadm settle 2>/dev/null || true
+    esp=$(lsblk -nlpo NAME,TYPE "$disk" | awk '$2 == "part" { print $1; exit }')
+    [ -b "$esp" ] || return 1
+    mkdir -p "$mnt"
+    mount -t vfat "$esp" "$mnt" || return 1
+    if mkdir -p "$mnt/reliaburger" && printf '%s\n' \
+        "# Boot logs go here over UDP (relish netboot --stream-logs, #2149)." \
+        "# Delete this file to stop sending them." \
+        "target=$target" >"$mnt/reliaburger/netlog.conf"; then
+        umount "$mnt"
+    else
+        umount "$mnt"
+        return 1
+    fi
+}
 
 # Put a firmware boot entry for $1's systemd-boot first in BootOrder,
 # replacing any earlier Reliaburger entry. The removable-media path
@@ -175,6 +202,14 @@ fi
 # then grows the data partition and adds slot B.
 sgdisk -e "$disk" >/dev/null
 sync
+netlog=$(arg reliaburger.netlog)
+if [ -n "$netlog" ]; then
+    if write_netlog_conf "$disk" "$netlog"; then
+        say "boot logs go to $netlog from now on (reliaburger/netlog.conf on the ESP)"
+    else
+        say "couldn't write netlog.conf to $disk's ESP; the installed system keeps its boot logs to itself"
+    fi
+fi
 if entry=$(boot_disk_first "$disk"); then
     say "boot entry $entry for $disk is now first in the boot order"
 else

@@ -375,6 +375,53 @@ used disk alone. Every decision goes into its log:
 
 If several machines report at once, the questions come one at a time.
 
+### Watch the boot logs from your terminal
+
+A machine with no serial port, such as the Wyse 3040, only shows its boot on
+its monitor. With `--stream-logs`, each machine you install sends its kernel
+and boot lines to `relish netboot` over UDP, from the installer on and on
+every boot after:
+
+```sh
+sudo relish netboot os --stream-logs
+```
+
+They print among the netboot server's own lines, named by the machine's MAC:
+
+```
+log 6c:4b:90:12:34:56: reliaburger-install: target /dev/mmcblk0, 7818 MB
+log 6c:4b:90:12:34:56: [    9.412871] r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full
+log 6c:4b:90:12:34:56: reliaburger: bun not healthy after 120 s on OS 2026.47.228
+```
+
+Each line also goes to `os/logs/<mac>.log`. The machine's first line on
+each boot names its MAC, so it keeps its name when your router gives the
+installed system a different address from the one it network-booted with. A
+line from a machine `relish netboot` didn't answer shows as
+`log <address> (not served):`.
+
+- The installer writes your machine's address into `reliaburger/netlog.conf`
+  on the installed disk's EFI partition. On each boot, once the network is up,
+  the machine points the kernel's netconsole at it and sends the kernel log so
+  far, then every kernel line after (panics too) and the lines of the boot
+  units: the boot check, bun, the seed and the clock wait.
+- A boot that dies before its network comes up sends nothing. Use the monitor.
+- It's UDP: lines can be lost, and nothing is retried.
+- The lines cross your LAN unencrypted, and anyone on it can send lines to
+  the listener. That's why it's off unless you ask for it. To stop a machine
+  sending, delete `reliaburger/netlog.conf` from its EFI partition.
+
+To listen without serving anything, say while an installed machine reboots,
+run only the listener. It doesn't need root:
+
+```sh
+relish machines logs --interface en7 --dir os
+```
+
+It listens on UDP 6666 until Ctrl-C. Without `--dir` it only prints. It
+answered no machine, so it names each line by its address, marked
+`(not served)`.
+
 ### Without network boot
 
 A machine that can't network-boot, or that you'd rather not run a boot server

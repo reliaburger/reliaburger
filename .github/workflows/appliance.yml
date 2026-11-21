@@ -576,10 +576,14 @@ jobs:
         # boots fail their boot checks, systemd-boot falls back on its own,
         # and bun reports it, which pauses the rollout. The summary records
         # how long the fallback took (#406; the Wyse exit test needs 10 min).
+        # The node streams its boot logs to `relish machines logs`, and the
+        # stream must show the three tries (#2149); mtools writes
+        # netlog.conf onto its ESP.
         if: env.BROKEN_VERSION != '' && hashFiles('source-bin/relish-linux-x86_64') != ''
         timeout-minutes: 30
         run: |
           set -euo pipefail
+          sudo apt-get install -y -qq mtools
           image/tests/os-update.sh image/mkosi.output "$IMAGE_VERSION" \
             "$RUNNER_TEMP/lab-release" "$BROKEN_VERSION" source-bin/relish-linux-x86_64 --fallback
 
