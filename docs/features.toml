@@ -31,8 +31,8 @@
 # After each release, update the statuses, `since` versions and `release`
 # below (docs/releasing.md, step 10).
 
-release = "0.3.0"
-released = "20 November 2026"
+release = "0.3.1"
+released = "21 November 2026"
 reviewed = "10 November 2026"
 
 # GitHub milestone numbers, for the links on planned rows.
@@ -702,7 +702,7 @@ summary = "An OCI registry built into the cluster: push once and nodes pull laye
 restrictions = "Deleting by digest isn't supported: an image leaves by losing its tags. One Bun per writable image store."
 issues = [2128]
 docs = ["docs/manual/11_images-and-volumes.md#where-images-come-from", "docs/design/registry-pickle.md"]
-evidence = "Gate: 7 images pushed and re-verified in the 0.2.7 V02 fast tier (Data). Manual 'Deleting a tag'; docs/README 'Scope and limits'. 0.3.0 ships with #2128: in its 8-hour final, one of 59 catalogue deploys from the cluster registry stalled for 5 minutes after a disk fault and recovered by itself, cause unverified."
+evidence = "Gate: 7 images pushed and re-verified in the 0.2.7 V02 fast tier (Data). Manual 'Deleting a tag'; docs/README 'Scope and limits'. 0.3.0 ships with #2128: in its 8-hour final, one of 59 catalogue deploys from the cluster registry stalled for 5 minutes after a disk fault and recovered by itself, cause unverified. It didn't recur in 0.3.1's gate, but 0.3.1 ships with it too: two possible causes are fixed, the cause isn't proven."
 
 [[group.feature]]
 name = "Building images in the cluster"
@@ -858,10 +858,10 @@ name = "OS updates"
 status = "alpha"
 since = "0.3.0"
 summary = "Signed A/B updates of the appliance OS, rolled across the cluster by `relish os`, workers first and the leader last."
-restrictions = "Node shutdown skips each app's `pre_stop` hook and gives it 5 s instead of its `stop_grace` (#2118); a rollout moves host-path apps away from their data (#2120), and `relish status` and `relish nodes` don't show its cordons (#2119)."
-issues = [2118, 2119, 2120]
+restrictions = "The rollout moves a node's workloads itself; draining every node before its reboot comes in 0.4.0 (#661)."
+issues = [661]
 docs = ["docs/manual/17_appliance.md#updating-the-os"]
-evidence = "Shipped in 0.3.0 (#406). CI updates a QEMU appliance cluster and falls back from a broken update on every image change; the release gate doesn't cover it."
+evidence = "Shipped in 0.3.0 (#406). Since 0.3.1 node shutdown runs each app's `pre_stop` and stop grace (#2118), and a rollout keeps host-path apps with their data and shows its cordons (#2119, #2120). CI updates a QEMU appliance cluster and falls back from a broken update on every image change; the release gate doesn't cover it."
 
 # --- Self-healing ------------------------------------------------------------
 
@@ -1138,7 +1138,7 @@ title = "Dashboard, TUI and diagnostics"
 name = "Terminal UI"
 status = "beta"
 since = "0.1.0"
-summary = "`relish` with no arguments opens a terminal dashboard of apps, nodes, jobs, routes, live logs and events, for the whole cluster."
+summary = "`relish` with no arguments opens a terminal dashboard of apps, nodes, jobs, routes, live logs and events, for the whole cluster; from 0.3.1 `/` searches logs and metrics and `k` kills an instance."
 restrictions = "Needs a terminal of at least 80 by 24."
 issues = []
 docs = ["docs/manual/04_observability.md#events-and-dashboards"]
@@ -1158,9 +1158,9 @@ evidence = "Documented and tested; not exercised by the release gate."
 name = "`relish wtf`"
 status = "ready"
 since = "0.1.0"
-summary = "One screen of what's wrong with the cluster, the likely causes and what to do next."
-restrictions = ""
-issues = []
+summary = "One screen of what's wrong with the cluster, the likely causes and what to do next: a table by default, `--short` for only the problems, `--explain` for what each check tests."
+restrictions = "In 0.3.1 it counts a crash loop per app, not per instance, so three replicas that each restarted once read as a critical `crashloop` for 15 minutes (#2197, fixed in 0.3.2)."
+issues = [2197]
 docs = ["docs/manual/07_diagnostics.md#relish-wtf-whats-broken-and-why"]
 evidence = "Every staged install runs it (2026-11-07 record, Tour)."
 

@@ -542,14 +542,28 @@ migration and no feature gate
   [release log](release-log.md#030-bare-metal-in-an-hour)). 0.3.0 changes
   the cluster formats, so a 0.2.8 cluster starts afresh
   ([upgrading from 0.2.8](releasing.md#upgrading-from-028)).
-- [ ] **0.3.1: gate follow-ups**
+- [x] **0.3.1: gate follow-ups.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.1)
+  on 21 November 2026
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/33)).
-  A patch release: what 0.3.0's gate and freeze left, from #2128 and a soak
-  schedule that always overlaps a runc job with a power-off
+  A patch release: what 0.3.0's gate and freeze left, from a soak schedule
+  that always overlaps a runc job with a power-off
   ([#2105](https://github.com/reliaburger/reliaburger/issues/2105)) to stop
   hooks on node shutdown
-  ([#2118](https://github.com/reliaburger/reliaburger/issues/2118)), and
-  whatever the Wyse lab exit test finds. Next.
+  ([#2118](https://github.com/reliaburger/reliaburger/issues/2118)), the
+  first Wyse lab's fixes, and a terminal UI you can act from. Candidate 1
+  passed the full gate but for two settles in the 8-hour final that waited
+  on `relish wtf` counting a crash loop per app, accepted as a known issue
+  ([#2197](https://github.com/reliaburger/reliaburger/issues/2197), fixed in
+  0.3.2); #2128's cause is still unproven
+  ([closure](qualification/2026-11-21-v0.3.1-release-closure.md),
+  [release log](release-log.md#031-gate-follow-ups)). 0.3.1 keeps 0.3.0's
+  cluster formats, so a 0.3.0 cluster rolls onto it in place.
+- [ ] **0.3.2: Wyse lab fixes**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/34)).
+  A patch release: the Wyse 3040 lab's fixes that need a new appliance
+  image, such as boot logs over the network
+  ([#2149](https://github.com/reliaburger/reliaburger/issues/2149)), and the
+  fix for #2197. Next.
 - [ ] **0.4.0: "Planned maintenance"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/7),
   [review](plans/2026-11-19-review-0.4.x.md),

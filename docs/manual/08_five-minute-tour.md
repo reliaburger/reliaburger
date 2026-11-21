@@ -7,7 +7,7 @@ bad one back, scale one up, let an AI agent propose a change and undo it, set a 
 `relish manual tour`.
 
 It needs a Mac with Apple silicon, or Linux with QEMU and KVM, plus about 8 GiB
-of free memory and 15 GiB of disk. The one-line install fetches the signed 0.3.0 release.
+of free memory and 15 GiB of disk. The one-line install fetches the signed 0.3.1 release.
 
 ## Install and build the cluster
 
@@ -224,7 +224,7 @@ guardrails, leases between agents and setting up an agent client.
 ## Set a house rule
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/examples/policies/platform.toml
+curl -fsSLO https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.1/examples/policies/platform.toml
 relish policy test -f platform.toml -f burger/burger.toml
 ```
 
@@ -330,12 +330,15 @@ names the node that didn't answer.
 
 ```sh
 relish wtf
+relish wtf --short
 ```
 
-One screen on what's wrong and what to do about it. Here it warns that a
-council member is missing and one more failure would lose quorum. Its `builds`
-row checks that every node runs the same build, and warns when one doesn't.
-It's what you'd run first in a real incident.
+One screen on what's wrong and what to do about it: a table with a row per
+check. Here it warns that a council member is missing and one more failure
+would lose quorum. Its `builds` row checks that every node runs the same
+build, and warns when one doesn't. It's what you'd run first in a real
+incident. `--short` keeps only the counts and what isn't OK, and `--explain`
+says what each check tests.
 
 ## Clean up
 

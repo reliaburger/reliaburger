@@ -1136,7 +1136,7 @@ and the [release asset digest fields](https://docs.github.com/en/rest/releases/r
 The website and installer are separate static assets under `docs/website`,
 published by `static.yml`. GitHub Pages cannot select a different response for
 curl and a browser at `/`; the shell endpoint is `/install.sh`. The bootstrap
-installs the version in its `RELIABURGER_VERSION` default (`v0.3.0` today), so
+installs the version in its `RELIABURGER_VERSION` default (`v0.3.1` today), so
 bump that default in the same change that announces a newer release. Both
 scripts need a mode, `--laptop` or `--install-only`; with none they explain the
 choices and exit 2. For a release from before 0.2.2 the bootstrap drops
@@ -1967,6 +1967,19 @@ the real `curl … | sh` install against it on every host we advertise.
     ([how](website/README.md#commands-the-installed-release-doesnt-have)). The
     website deploys from `main`, and publishes `/demo/*` from the tag the
     bootstrap installs, so merge that change after promotion, not before.
+
+    Re-record every other website recording (`docs/website/assets/*.cast`)
+    whose commands or output the release changed, and the job-throughput
+    recording every release, as the tour is
+    (maintainer decision, 21 November 2026). The job demo runs on the
+    published release on the quiet host
+    ([how](website/README.md#re-recording-the-job-demo)); the netboot demo
+    needs Linux x86_64 with KVM, so CI records it
+    ([how](website/README.md#recording-the-netboot-demo)); the agent
+    sessions have their own steps
+    ([how](website/README.md#recording-the-agent-sessions)). The
+    post-release docs PR says which recordings it re-recorded, and why any
+    other the release changed wasn't.
 
     Refresh the homepage's
     [How a release is tested](https://reliaburger.com/#release-testing)

@@ -13,7 +13,7 @@ a Docker registry, GitOps and chaos testing, in one Rust agent and one CLI.
 And that CLI speaks to your AI agent too.
 <!-- hero:end -->
 
-**Status:** 0.3.0 was released on 20 November 2026. Until 1.0.0, Reliaburger is good enough for home labs and dev clusters, not for production.
+**Status:** 0.3.1 was released on 21 November 2026. Until 1.0.0, Reliaburger is good enough for home labs and dev clusters, not for production.
 
 ## Five minutes, zero to cluster
 
@@ -125,7 +125,7 @@ a read-only token of its own, so an agent never holds admin credentials.
 - **A terminal UI and a web dashboard:** run `relish` with no arguments, or `relish dashboard`.
 - **The manual and the source in the binary:** `relish manual` and `relish source` work offline.
 
-[Everything 0.3.0 does](docs/README.md#whats-in-the-binary), what you
+[Everything 0.3.1 does](docs/README.md#whats-in-the-binary), what you
 don't have to install, and its [limits](docs/README.md#scope-and-limits) are
 in the documentation. The
 [feature status page](https://reliaburger.com/features) rates every
