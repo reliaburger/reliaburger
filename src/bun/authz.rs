@@ -207,6 +207,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     gated(Post, "/v1/stop/{app}/{namespace}", Deployer, App(SCALE)),
     gated(Post, "/v1/delete/{app}/{namespace}", Deployer, App(DEPLOY)),
     gated(Post, "/v1/release/{app}/{namespace}", Deployer, App(DEPLOY)),
+    gated(Post, "/v1/scale/{app}/{namespace}", Deployer, App(SCALE)),
     gated(Get, "/v1/logs/{app}/{namespace}", AnyToken, App(LOGS)),
     gated(
         Get,

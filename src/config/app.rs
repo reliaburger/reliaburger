@@ -194,6 +194,21 @@ impl AppSpec {
         }
     }
 
+    /// Why this app's replica count can't be set to `replicas` by hand, or
+    /// `None` when it can. `relish scale` and an agent's scale proposal
+    /// share this rule, so they refuse the same things.
+    pub fn scale_refusal(&self, replicas: u32) -> Option<ScaleRefusal> {
+        if replicas == 0 {
+            Some(ScaleRefusal::ToZero)
+        } else if self.autoscale.is_some() {
+            Some(ScaleRefusal::Autoscaled)
+        } else if self.replicas == Replicas::DaemonSet {
+            Some(ScaleRefusal::DaemonSet)
+        } else {
+            None
+        }
+    }
+
     /// Every explicitly declared main, init or sidecar image; omitted init
     /// and sidecar images inherit the main image.
     pub fn image_references(&self) -> impl Iterator<Item = &str> {
@@ -503,6 +518,29 @@ pub struct AutoscaleSpec {
     pub scale_down_threshold: Option<f64>,
 }
 
+/// Why an app's replica count can't be set by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScaleRefusal {
+    /// Zero replicas is `relish stop`, which keeps the count to start with
+    /// again; a spec's `replicas` is at least 1.
+    ToZero,
+    /// The autoscaler owns the count, between its `[autoscale]` bounds.
+    Autoscaled,
+    /// It runs one replica on every node, so there's no count to set.
+    DaemonSet,
+}
+
+impl ScaleRefusal {
+    /// The refusal's name, as a proposal's guardrail `rule` spells it.
+    pub fn rule(self) -> &'static str {
+        match self {
+            ScaleRefusal::ToZero => "scale_to_zero",
+            ScaleRefusal::Autoscaled => "autoscaled",
+            ScaleRefusal::DaemonSet => "daemon",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -515,6 +553,29 @@ mod tests {
         // Wrap in [app.test] table for top-level parsing,
         // or parse directly as an AppSpec
         toml::from_str(toml_str).unwrap()
+    }
+
+    #[test]
+    fn a_fixed_count_scales_to_any_positive_number() {
+        let app = parse_app("image = \"web:v1\"\nreplicas = 2");
+        assert_eq!(app.scale_refusal(1), None);
+        assert_eq!(app.scale_refusal(40), None);
+    }
+
+    #[test]
+    fn scaling_to_zero_is_refused_because_zero_is_stop() {
+        let app = parse_app("image = \"web:v1\"");
+        assert_eq!(app.scale_refusal(0), Some(ScaleRefusal::ToZero));
+    }
+
+    #[test]
+    fn an_autoscaled_app_and_a_daemon_set_refuse_a_count() {
+        let autoscaled = parse_app(
+            "image = \"web:v1\"\n[autoscale]\nmetric = \"cpu\"\ntarget = \"70%\"\nmin = 2\nmax = 8",
+        );
+        assert_eq!(autoscaled.scale_refusal(3), Some(ScaleRefusal::Autoscaled));
+        let daemon = parse_app("image = \"agent:v1\"\nreplicas = \"*\"");
+        assert_eq!(daemon.scale_refusal(3), Some(ScaleRefusal::DaemonSet));
     }
 
     #[test]
