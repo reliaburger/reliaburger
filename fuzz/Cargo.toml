@@ -112,3 +112,10 @@ path = "fuzz_targets/ingress_request.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "tftp_packet"
+path = "fuzz_targets/tftp_packet.rs"
+test = false
+doc = false
+bench = false

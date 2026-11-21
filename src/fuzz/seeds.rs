@@ -49,6 +49,7 @@ pub(super) fn for_target(target: &str) -> Vec<Seed> {
         "chaos_scenario" => scenario_files(),
         "council_backup_state" => council_states(),
         "ingress_request" => ingress_requests(),
+        "tftp_packet" => tftp_packets(),
         other => panic!("no seeds for fuzz target {other}"),
     }
 }
@@ -495,5 +496,63 @@ fn ingress_requests() -> Vec<Seed> {
     ]
     .into_iter()
     .map(|(name, text)| seed(name, text.as_bytes().to_vec()))
+    .collect()
+}
+
+fn tftp_packets() -> Vec<Seed> {
+    use crate::relish::netboot::tftp::{ErrorCode, Packet};
+
+    let options = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    };
+    let read = |filename: &str, pairs: &[(&str, &str)]| Packet::ReadRequest {
+        filename: filename.to_string(),
+        mode: "octet".to_string(),
+        options: options(pairs),
+    };
+    [
+        ("read", read("boot.ipxe", &[])),
+        (
+            "read-with-options",
+            read(
+                "ipxe-x86_64.efi",
+                &[("blksize", "1468"), ("tsize", "0"), ("timeout", "5")],
+            ),
+        ),
+        ("read-small-blocks", read("/boot.ipxe", &[("BLKSIZE", "8")])),
+        ("read-missing", read("pxelinux.0", &[])),
+        (
+            "write",
+            Packet::WriteRequest {
+                filename: "boot.ipxe".to_string(),
+            },
+        ),
+        ("ack", Packet::Ack { block: 1 }),
+        (
+            "data",
+            Packet::Data {
+                block: 2,
+                data: b"#!ipxe\n".to_vec(),
+            },
+        ),
+        (
+            "error",
+            Packet::Error {
+                code: ErrorCode::OptionsRefused,
+                message: "tsize only".to_string(),
+            },
+        ),
+        (
+            "option-ack",
+            Packet::OptionAck {
+                options: options(&[("blksize", "512")]),
+            },
+        ),
+    ]
+    .into_iter()
+    .map(|(name, packet)| seed(name, packet.encode()))
     .collect()
 }

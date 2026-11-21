@@ -115,6 +115,11 @@ pub const TARGETS: &[Target] = &[
         decoder: "wrapper::proxy::request_host and wrapper::routing::RoutingTable::lookup",
         run: ingress_request,
     },
+    Target {
+        name: "tftp_packet",
+        decoder: "relish::netboot::tftp::Packet::parse",
+        run: tftp_packet,
+    },
 ];
 
 /// A gossip datagram, as any host that can reach the UDP port sends it.
@@ -489,6 +494,13 @@ pub fn council_backup_state(data: &[u8]) -> Outcome {
     Outcome::Accepted
 }
 
+/// True for a character that changes a terminal rather than printing on
+/// it: the C0 and C1 controls, and the bidirectional overrides that reorder
+/// the text around them.
+fn moves_the_terminal(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
 /// The routes every fuzzed ingress request is matched against: a plain
 /// route under `/api` on one host and a TLS route for all of another.
 fn ingress_table() -> &'static crate::wrapper::routing::RoutingTable {
@@ -607,5 +619,138 @@ pub fn ingress_request(data: &[u8]) -> Outcome {
             "the upstream URI names another authority: {upstream}"
         );
     }
+    Outcome::Accepted
+}
+
+/// The files the fuzzed TFTP server hands out: the chain script and a
+/// stand-in iPXE binary, both small enough to send whole on every input.
+fn tftp_files() -> &'static crate::relish::netboot::tftp::TftpFiles {
+    static FILES: OnceLock<crate::relish::netboot::tftp::TftpFiles> = OnceLock::new();
+    FILES.get_or_init(|| {
+        let script = b"#!ipxe\nchain http://192.168.1.20:8080/boot.ipxe?mac=${netX/mac}\n";
+        let binary: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
+        [
+            ("boot.ipxe".to_string(), script.to_vec().into()),
+            ("ipxe-x86_64.efi".to_string(), binary.into()),
+        ]
+        .into_iter()
+        .collect()
+    })
+}
+
+/// A TFTP datagram, as any host on the LAN sends it to `relish netboot`.
+///
+/// A parsed packet must survive an encode and parse. A read request for a
+/// served file is then sent to an honest client: whatever options it
+/// asked for, the agreed block size and timeout must be in range, every
+/// block must come in order and fit the block size, and the client must
+/// end up with the whole file. The packet itself, arriving mid-transfer,
+/// must not upset the sender, and an ERROR's text must log as plain text.
+pub fn tftp_packet(data: &[u8]) -> Outcome {
+    use crate::relish::netboot::tftp::{
+        self, Packet, Request, Step, TftpSettings, Transfer, route,
+    };
+
+    let parsed = Packet::parse(data);
+    if let Ok(packet) = &parsed {
+        let again = Packet::parse(&packet.encode()).expect("an encoded packet parses");
+        assert_eq!(&again, packet, "a TFTP packet changed on its round trip");
+        if let Packet::Error { message, .. } = packet {
+            let peer = SocketAddr::from(([192, 168, 1, 50], 1024));
+            let aborted = tftp::Outcome::Aborted {
+                message: message.clone(),
+            };
+            let line = aborted
+                .describe(peer, "boot.ipxe")
+                .expect("an aborted transfer is logged");
+            assert!(
+                !line.chars().any(moves_the_terminal),
+                "a client's error text reached the log raw: {line:?}"
+            );
+        }
+    }
+
+    let settings = TftpSettings::default();
+    let (file, negotiated) = match route(data, tftp_files(), &settings) {
+        Request::Send {
+            data, negotiated, ..
+        } => (data, negotiated),
+        Request::Refuse(error) => {
+            assert!(
+                matches!(error, Packet::Error { .. }),
+                "a refusal: {error:?}"
+            );
+            return Outcome::Accepted;
+        }
+        Request::Ignore => {
+            assert!(
+                !matches!(
+                    parsed,
+                    Ok(Packet::ReadRequest { .. } | Packet::WriteRequest { .. })
+                ),
+                "a request was ignored"
+            );
+            return match parsed {
+                Ok(_) => Outcome::Accepted,
+                Err(_) => Outcome::Refused,
+            };
+        }
+    };
+    let block_size = usize::from(negotiated.block_size);
+    assert!(
+        (8..=usize::from(settings.max_block_size)).contains(&block_size),
+        "a block size of {block_size} was agreed"
+    );
+    assert!(
+        !negotiated.timeout.is_zero() && negotiated.timeout <= tftp::MAX_TIMEOUT,
+        "a timeout of {:?} was agreed",
+        negotiated.timeout
+    );
+
+    if let Ok(packet) = &parsed {
+        let (mut stray, _) = Transfer::start(file.clone(), &negotiated, 1);
+        let _ = stray.on_packet(packet);
+        let _ = stray.on_timeout();
+    }
+
+    let (mut transfer, first) = Transfer::start(file.clone(), &negotiated, 1);
+    let mut next = Packet::parse(&first).expect("the first packet parses");
+    if !negotiated.acknowledged.is_empty() {
+        assert_eq!(
+            next,
+            Packet::OptionAck {
+                options: negotiated.acknowledged.clone()
+            }
+        );
+        next = match transfer.on_packet(&Packet::Ack { block: 0 }) {
+            Step::Send(bytes) => Packet::parse(&bytes).expect("a block parses"),
+            other => panic!("the OACK's acknowledgement got {other:?}"),
+        };
+    }
+    let mut received = Vec::with_capacity(file.len());
+    let mut expected: u64 = 1;
+    loop {
+        let Packet::Data { block, data } = next else {
+            panic!("the sender sent {next:?} instead of block {expected}");
+        };
+        assert_eq!(block, expected as u16, "blocks came out of order");
+        assert!(data.len() <= block_size, "a block overflowed");
+        received.extend_from_slice(&data);
+        match transfer.on_packet(&Packet::Ack { block }) {
+            Step::Send(bytes) => next = Packet::parse(&bytes).expect("a block parses"),
+            Step::Done => break,
+            other => panic!("acknowledging block {block} got {other:?}"),
+        }
+        expected += 1;
+        assert!(
+            expected <= transfer.total_blocks(),
+            "the sender ran past its last block"
+        );
+    }
+    assert_eq!(
+        received.as_slice(),
+        &file[..],
+        "the client got another file"
+    );
     Outcome::Accepted
 }
