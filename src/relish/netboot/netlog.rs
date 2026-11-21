@@ -10,16 +10,17 @@
 //!
 //! The listener prints each line among `relish netboot`'s other lines as
 //! `log <mac>: <line>`, naming the sender by the MAC its own DHCP answers
-//! paired with that address ([`Peers`]), or by its address when it never
-//! answered that machine. It also appends the line to
-//! `<netboot dir>/logs/<mac>.log`, so a lab record can quote it.
+//! paired with that address, or that the machine's first line on each boot
+//! (its hello) names, when this process answered that MAC ([`Peers`]). A
+//! sender it never answered is named by its address. It also appends the
+//! line to `<netboot dir>/logs/<mac>.log`, so a lab record can quote it.
 //!
-//! Nothing here is authenticated: anyone on the LAN can send lines. So the
-//! listener only prints and appends, it marks a sender it didn't serve, and
-//! it replaces control characters, so a line can't move the cursor or
-//! change the terminal's colours.
+//! Nothing here is authenticated: anyone on the LAN can send lines, and a
+//! hello can name any MAC. So the listener only prints and appends, it
+//! marks a sender it didn't serve, and it replaces control characters, so a
+//! line can't move the cursor or change the terminal's colours.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
@@ -69,21 +70,36 @@ impl fmt::Display for Sender {
     }
 }
 
-/// The machines this process answered: each one's address and MAC, as its
-/// DHCP requests showed them.
+/// The machines this process answered: their MACs, and the address each
+/// one is sending from, as its DHCP requests or its hello showed them.
 #[derive(Debug, Default)]
 pub struct Peers {
+    answered: HashSet<MacAddress>,
     by_address: HashMap<Ipv4Addr, MacAddress>,
 }
 
 impl Peers {
-    /// Remember that `mac` asked from `address`. A later request from the
-    /// same address replaces it, since leases move.
+    /// Remember that this process answered `mac`, asking from `address`. A
+    /// later request from the same address replaces it, since leases move.
+    /// A request from no address yet (0.0.0.0) only remembers the MAC.
     pub fn learn(&mut self, address: Ipv4Addr, mac: MacAddress) {
+        self.answered.insert(mac);
         if address.is_unspecified() || address.is_broadcast() {
             return;
         }
         self.by_address.insert(address, mac);
+    }
+
+    /// A machine at `address` said hello naming `mac` ([`hello_mac`]).
+    /// When this process answered that MAC, lines from `address` are its
+    /// from now on. The installer and the installed system get their
+    /// addresses from the LAN's DHCP server with a client ID of their own,
+    /// so the address they send from needn't be the one iPXE asked from.
+    /// A MAC this process never answered names nothing.
+    pub fn hello(&mut self, address: Ipv4Addr, mac: MacAddress) {
+        if self.answered.contains(&mac) {
+            self.by_address.insert(address, mac);
+        }
     }
 
     /// Who sent a line from `address`.
@@ -111,11 +127,29 @@ pub fn learn(peers: &SharedPeers, address: Ipv4Addr, mac: MacAddress) {
         .learn(address, mac);
 }
 
-fn sender(peers: &SharedPeers, address: Ipv4Addr) -> Sender {
-    peers
+/// Who sent `line` from `address`, after learning from it if it's a hello.
+fn sender(peers: &SharedPeers, address: Ipv4Addr, line: &str) -> Sender {
+    let mut peers = peers
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .sender(address)
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(mac) = hello_mac(line) {
+        peers.hello(address, mac);
+    }
+    peers.sender(address)
+}
+
+/// The line `/usr/lib/reliaburger/netlog` sends before anything else on
+/// each boot starts with this, then `<address> (<interface> <mac>) to
+/// <target>`.
+const HELLO_PREFIX: &str = "reliaburger-netlog: streaming from ";
+
+/// The MAC a hello line names, if `line` is one.
+pub fn hello_mac(line: &str) -> Option<MacAddress> {
+    let rest = line.strip_prefix(HELLO_PREFIX)?;
+    let (_, inside) = rest.split_once('(')?;
+    let (inside, _) = inside.split_once(')')?;
+    let (_interface, mac) = inside.split_once(' ')?;
+    mac.parse().ok()
 }
 
 /// The lines in one datagram: split at newlines, without empty ones, and
@@ -190,8 +224,8 @@ pub async fn listen(
         let SocketAddr::V4(source) = source else {
             continue;
         };
-        let sender = sender(&peers, *source.ip());
         for line in lines(&buffer[..len]) {
+            let sender = sender(&peers, *source.ip(), &line);
             // The file first: once a line has printed, it's on disk too.
             if let Err(error) = files.append(sender, &line).await
                 && !files.warned
@@ -313,6 +347,104 @@ mod tests {
             peers.sender(Ipv4Addr::UNSPECIFIED),
             Sender::NotServed(Ipv4Addr::UNSPECIFIED)
         );
+    }
+
+    /// The line `/usr/lib/reliaburger/netlog` sends first on every boot.
+    const HELLO: &str = "reliaburger-netlog: streaming from 192.168.1.77 (enp1s0 52:54:00:12:34:56) to 192.168.1.20:6666";
+
+    #[test]
+    fn the_hello_line_names_the_senders_mac() {
+        assert_eq!(hello_mac(HELLO), Some(MAC));
+        // An interface without a MAC, another line, or a line that only
+        // looks like one.
+        assert_eq!(
+            hello_mac("reliaburger-netlog: streaming from 10.0.0.5 (eth0 ) to 10.0.0.1:6666"),
+            None
+        );
+        assert_eq!(hello_mac("reliaburger: bun healthy"), None);
+        assert_eq!(
+            hello_mac(
+                "[ 1.0] netlog[371]: reliaburger-netlog: streaming from 10.0.0.5 (eth0 52:54:00:12:34:56) to 10.0.0.1:6666"
+            ),
+            None
+        );
+        assert_eq!(
+            hello_mac("reliaburger-netlog: streaming from 10.0.0.5 (eth0 nonsense) to x"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_machine_with_a_new_address_is_named_by_the_mac_in_its_hello() {
+        // The installer and the installed system ask the router for an
+        // address with a client ID of their own, so they can get a
+        // different one from the one iPXE asked relish from. Their hello
+        // names the MAC relish answered, so it's the same machine.
+        let mut peers = Peers::default();
+        peers.learn(Ipv4Addr::new(192, 168, 1, 51), MAC);
+        let installer = Ipv4Addr::new(192, 168, 1, 77);
+        assert_eq!(peers.sender(installer), Sender::NotServed(installer));
+        peers.hello(installer, MAC);
+        assert_eq!(peers.sender(installer), Sender::Served(MAC));
+    }
+
+    #[test]
+    fn a_mac_answered_before_the_machine_had_an_address_still_counts() {
+        // The firmware's first request comes from 0.0.0.0.
+        let mut peers = Peers::default();
+        peers.learn(Ipv4Addr::UNSPECIFIED, MAC);
+        let address = Ipv4Addr::new(192, 168, 1, 77);
+        peers.hello(address, MAC);
+        assert_eq!(peers.sender(address), Sender::Served(MAC));
+    }
+
+    #[test]
+    fn a_hello_naming_a_mac_this_server_never_answered_names_nothing() {
+        // `relish machines logs` answers nobody, so every sender stays
+        // marked, whatever its hello says.
+        let mut peers = Peers::default();
+        let stranger = Ipv4Addr::new(192, 168, 1, 99);
+        peers.hello(stranger, MAC);
+        assert_eq!(peers.sender(stranger), Sender::NotServed(stranger));
+    }
+
+    #[tokio::test]
+    async fn the_hello_names_the_lines_that_follow_it() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listener = socket.local_addr().unwrap();
+        let peers = SharedPeers::default();
+        // relish answered the machine's firmware before it had an address.
+        learn(&peers, Ipv4Addr::UNSPECIFIED, MAC);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let log: Log = Arc::new(move |line| {
+            let _ = tx.send(line);
+        });
+        let task = tokio::spawn(listen(socket, peers, None, log));
+        let machine = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        machine
+            .send_to(format!("{HELLO}\n").as_bytes(), listener)
+            .await
+            .unwrap();
+        machine
+            .send_to(b"reliaburger-install: installed\n", listener)
+            .await
+            .unwrap();
+        let mut printed = Vec::new();
+        for _ in 0..2 {
+            let line = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            printed.push(line);
+        }
+        assert_eq!(
+            printed,
+            [
+                format!("log 52:54:00:12:34:56: {HELLO}"),
+                "log 52:54:00:12:34:56: reliaburger-install: installed".to_string(),
+            ]
+        );
+        task.abort();
     }
 
     #[test]

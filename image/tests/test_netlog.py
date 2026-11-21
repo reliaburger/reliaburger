@@ -4,7 +4,7 @@ A Wyse 3040 has no serial port, so the only way to watch it boot was its
 monitor. `/usr/lib/reliaburger/netlog` points the kernel's netconsole at the
 address in `reliaburger/netlog.conf` on the ESP (or `reliaburger.netlog=` on
 the installer's command line), sends the kernel log so far once, and gives
-the boot units StandardOutput=journal+kmsg, so `relish netboot
+the boot units StandardOutput=kmsg, so `relish netboot
 --stream-logs` prints what the machine is doing.
 
 The tests run the script with stub `ip` (one route, one neighbour),
@@ -34,6 +34,11 @@ FORWARDED_UNITS = [
     "reliaburger-boot-check", "reliaburger", "reliaburger-seed", "reliaburger-time-wait",
     "reliaburger-install",
 ]
+
+# What the drop-ins give the boot units while streaming.
+OUTPUT_TO_KERNEL_LOG = "StandardOutput=kmsg"
+# The fixed values systemd.exec(5) accepts for StandardOutput=.
+SYSTEMD_OUTPUTS = {"inherit", "null", "tty", "journal", "kmsg", "journal+console", "kmsg+console"}
 
 KERNEL_LOG = [
     "[    0.000000] Linux version 7.0.0-43-generic",
@@ -157,9 +162,15 @@ class NetlogScript(unittest.TestCase):
         self.assertEqual(run.target("enabled"), "1")
         # Info lines reach netconsole, which is a console.
         self.assertIn("dmesg -n 7", run.calls)
+        # The hello: relish names the machine by the MAC in it
+        # (src/relish/netboot/netlog.rs, hello_mac), so its shape is fixed.
+        # The stub interface may have no MAC to name.
+        self.assertRegex(
+            run.received[0],
+            rf"^reliaburger-netlog: streaming from 127\.0\.0\.1 \(lo ([0-9a-f]{{2}}(:[0-9a-f]{{2}}){{5}})?\) "
+            rf"to 127\.0\.0\.1:{self.port}$",
+        )
         # The kernel log so far, between a header and a footer.
-        self.assertTrue(run.received[0].startswith("reliaburger-netlog: streaming from 127.0.0.1"),
-                        run.received)
         self.assertEqual(run.received[1:], [
             "reliaburger-netlog: the kernel log so far, 2 lines",
             *KERNEL_LOG,
@@ -176,7 +187,13 @@ class NetlogScript(unittest.TestCase):
         run = self.run_netlog()
         for unit in FORWARDED_UNITS:
             dropin = run.run_dir / "systemd" / "system" / f"{unit}.service.d" / "50-netlog.conf"
-            self.assertIn("StandardOutput=journal+kmsg", dropin.read_text(), unit)
+            # `kmsg` is the journal and the kernel log. systemd has no
+            # `journal+kmsg`: it logs "Failed to parse output specifier",
+            # ignores the line, and the unit's lines never leave the
+            # machine. `kmsg+console` would print each line on the console
+            # twice, once from journald and once from the kernel.
+            self.assertIn(OUTPUT_TO_KERNEL_LOG, dropin.read_text().splitlines(), unit)
+            self.assertIn(OUTPUT_TO_KERNEL_LOG.partition("=")[2], SYSTEMD_OUTPUTS)
         self.assertIn("systemctl daemon-reload", run.calls)
         again = self.run_netlog()
         self.assertNotIn("systemctl daemon-reload", again.calls, "nothing changed, nothing to reload")
@@ -283,10 +300,13 @@ class NetlogUnits(unittest.TestCase):
         self.assertIn("reliaburger-install.service", words(service["Unit"], "Before"))
         preset = (INSTALLER / "systemd" / "system-preset" / "80-reliaburger-installer.preset").read_text()
         self.assertIn("enable reliaburger-netlog.service", preset.splitlines())
+        # A preset enables a unit through its [Install] section: without
+        # one, `enable` does nothing and the installer never streams.
+        self.assertEqual(words(service.get("Install", {}), "WantedBy"), ["multi-user.target"])
 
     def test_the_boot_units_keep_the_console_when_not_streaming(self):
         # The CI boot tests read boot-check's lines on the serial console;
-        # journal+kmsg is only a runtime drop-in while streaming.
+        # kmsg is only a runtime drop-in while streaming.
         service = unit(UNITS / "reliaburger-boot-check.service")
         self.assertEqual(service["Service"]["StandardOutput"], ["journal+console"])
 

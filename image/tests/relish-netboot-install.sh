@@ -23,7 +23,9 @@
 # the VM's MAC: there's no terminal here to answer the question. The test
 # passes once bun is healthy on it, relish has remembered the machine as
 # installed, relish's log shows it decided to wipe, and relish's start-up
-# probe saw the router's DHCP.
+# probe saw the router's DHCP. It runs with --stream-logs, so the installer's
+# lines and the installed system's boot-check line must also arrive as boot
+# logs named by the VM's MAC, and land in <dir>/logs/<mac>.log (#2149).
 #
 # In router mode it then reinstalls: a second `relish netboot --reinstall`
 # run, with the VM's network boot now first, so every boot asks relish. The
@@ -89,7 +91,7 @@ ln -s "$out" "$work/serve/x86_64"
 # The log is ours to read, so the redirect stays outside sudo.
 # shellcheck disable=SC2024
 sudo "$relish" netboot "$work/serve" --key "$out/spike-signing-key.pub.pem" \
-    --interface rbbr0 --mac "$mac" --wipe "$mac" --for 30m "${netboot_mode[@]}" \
+    --interface rbbr0 --mac "$mac" --wipe "$mac" --for 30m --stream-logs "${netboot_mode[@]}" \
     < /dev/null > "$work/netboot.log" 2>&1 &
 server=$!
 
@@ -163,6 +165,26 @@ if [ "$mode" = dhcp-proxy ] && [ "$result" = pass ]; then
         result="installed, but iPXE wasn't answered on UDP 4011"
     elif grep -q ": offer, boot" "$work/netboot.log"; then
         result="installed, but relish answered on UDP 67 beside the local DHCP server"
+    fi
+fi
+# Boot logs (#2149): the installer streamed its own lines, and wrote the
+# address onto the installed ESP, so the installed system streamed its boot
+# check too. Both are named by the VM's MAC, though the router may have given
+# them other addresses than iPXE's: their hello names it.
+streamed() { grep -q "^log $mac: .*$1" "$work/netboot.log"; }
+if [ "$result" = pass ]; then
+    for _ in $(seq 30); do
+        streamed "reliaburger: \\(unclaimed\\|bun healthy\\)" && break
+        sleep 2
+    done
+    if ! streamed "reliaburger-install: installed .* to "; then
+        result="installed, but the installer's lines didn't arrive as boot logs from $mac"
+    elif ! streamed "reliaburger-netlog: the kernel log so far"; then
+        result="installed, but the kernel log so far didn't arrive as boot logs from $mac"
+    elif ! streamed "reliaburger: \\(unclaimed\\|bun healthy\\)"; then
+        result="installed, but the installed system's boot check didn't arrive as boot logs from $mac"
+    elif ! sudo grep -q "reliaburger-install: installed .* to " "$work/serve/logs/$mac.log"; then
+        result="installed, but the boot logs weren't written to logs/$mac.log"
     fi
 fi
 # The reinstall pass (router mode): network first, so the firmware asks

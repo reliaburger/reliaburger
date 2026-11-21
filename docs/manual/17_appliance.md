@@ -392,8 +392,11 @@ log 6c:4b:90:12:34:56: [    9.412871] r8169 0000:01:00.0 enp1s0: Link is Up - 1G
 log 6c:4b:90:12:34:56: reliaburger: bun not healthy after 120 s on OS 2026.47.228
 ```
 
-Each line also goes to `os/logs/<mac>.log`. A line from an address
-`relish netboot` didn't answer shows as `log <address> (not served):`.
+Each line also goes to `os/logs/<mac>.log`. The machine's first line on
+each boot names its MAC, so it keeps its name when your router gives the
+installed system a different address from the one it network-booted with. A
+line from a machine `relish netboot` didn't answer shows as
+`log <address> (not served):`.
 
 - The installer writes your machine's address into `reliaburger/netlog.conf`
   on the installed disk's EFI partition. On each boot, once the network is up,

@@ -17,3 +17,6 @@ TimeoutStartSec=30
 StandardOutput=journal+console
 UnsetEnvironment=NETLOG_CMDLINE NETLOG_CONF NETLOG_CONFIGFS NETLOG_RUN
 ExecStart=-/usr/lib/reliaburger/netlog
+
+[Install]
+WantedBy=multi-user.target

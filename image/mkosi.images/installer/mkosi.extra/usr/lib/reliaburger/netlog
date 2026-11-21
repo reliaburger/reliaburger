@@ -17,10 +17,12 @@
 #      to the interface the route to the target leaves through. The UKI's
 #      command line is fixed and signed, so `netconsole=` can't go there;
 #   2. lets info lines reach the consoles (`dmesg -n 7`), since netconsole
-#      is one, and gives the units that matter StandardOutput=journal+kmsg
-#      through runtime drop-ins, so their lines go out too. Runtime, not in
-#      /usr: without a target, their lines stay on the console as before,
-#      which the CI boot tests read;
+#      is one, and gives the units that matter StandardOutput=kmsg (the
+#      journal and the kernel log) through runtime drop-ins, so their lines
+#      go out too, and reach the screen through the kernel. Not
+#      kmsg+console, which would print each line on the screen twice.
+#      Runtime, not in /usr: without a target, their lines stay on the
+#      console as before, which the CI boot tests read;
 #   3. sends the kernel log so far (`dmesg`) once per boot, so the start of
 #      the boot isn't lost.
 #
@@ -189,7 +191,7 @@ dmesg -n 7 2>/dev/null || true
 changed=
 for unit in $units; do
     dir=$run/systemd/system/$unit.service.d
-    want=$'# reliaburger-netlog: this unit\'s lines go out with the kernel\'s (#2149)\n[Service]\nStandardOutput=journal+kmsg\n'
+    want=$'# reliaburger-netlog: this unit\'s lines go out with the kernel\'s (#2149)\n[Service]\nStandardOutput=kmsg\n'
     [ "$(cat "$dir/50-netlog.conf" 2>/dev/null)"$'\n' = "$want" ] && continue
     mkdir -p "$dir" && printf '%s' "$want" >"$dir/50-netlog.conf" && changed=1
 done
