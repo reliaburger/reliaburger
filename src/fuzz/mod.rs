@@ -206,11 +206,15 @@ pub fn dns_query(data: &[u8]) -> Outcome {
     Outcome::Accepted
 }
 
+/// The master key `council_backup` unseals with. Its seed is sealed under
+/// it, so a seed gets as far as the snapshot inside.
+const BACKUP_FUZZ_KEY: [u8; 32] = [7u8; 32];
+
 /// A council backup file, as an operator hands it to `relish council restore`.
 ///
-/// A decoded envelope must re-encode and decode to an equal envelope. The
-/// fuzzer can't forge the GCM tag, so unsealing under any key must fail
-/// cleanly rather than panic.
+/// A decoded envelope must re-encode and decode to an equal envelope, and
+/// unsealing it must not panic. The fuzzer can't forge a GCM tag, so only
+/// the seed and inputs that keep its ciphertext whole unseal.
 pub fn council_backup(data: &[u8]) -> Outcome {
     use crate::council::backup::{decode_backup, encode_backup, unseal_snapshot};
 
@@ -220,7 +224,7 @@ pub fn council_backup(data: &[u8]) -> Outcome {
     let encoded = encode_backup(&sealed).expect("a decoded backup re-encodes");
     let again = decode_backup(&encoded).expect("a re-encoded backup decodes");
     assert_eq!(sealed, again, "a backup changed on its round trip");
-    let _ = unseal_snapshot(&[7u8; 32], &sealed);
+    let _ = unseal_snapshot(&BACKUP_FUZZ_KEY, &sealed);
     Outcome::Accepted
 }
 

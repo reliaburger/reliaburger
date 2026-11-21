@@ -221,11 +221,41 @@ fn dns() -> Vec<Seed> {
     ]
 }
 
+/// A backup sealed under the key the `council_backup` target tries, with a
+/// fixed salt and nonce, so the seed is the same bytes on every run and the
+/// target's unseal gets past the tag check. `seal_snapshot` picks both at
+/// random, as it must.
 fn backup() -> Vec<Seed> {
-    use crate::council::backup::{BackupConfig, encode_backup, seal_snapshot};
+    use crate::council::backup::{
+        BACKUP_ENVELOPE_VERSION, BACKUP_SEAL_INFO, SealedBackup, encode_backup, unseal_snapshot,
+    };
+    use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 
-    let sealed = seal_snapshot(&[5u8; 32], br#"{"apps":{}}"#, &BackupConfig::default())
-        .expect("seed backup seals");
+    let master_key = super::BACKUP_FUZZ_KEY;
+    let payload = br#"{"apps":{}}"#;
+    let (hkdf_salt, nonce) = ([3u8; 32], [9u8; 12]);
+    let key = crate::sesame::crypto::hkdf_derive_key(&master_key, &hkdf_salt, BACKUP_SEAL_INFO)
+        .expect("the seed key derives");
+    let key = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &key).expect("a 32-byte key"));
+    let mut ciphertext = payload.to_vec();
+    key.seal_in_place_append_tag(
+        Nonce::assume_unique_for_key(nonce),
+        Aad::empty(),
+        &mut ciphertext,
+    )
+    .expect("the seed seals");
+    let sealed = SealedBackup {
+        version: BACKUP_ENVELOPE_VERSION,
+        hkdf_salt,
+        hkdf_info: BACKUP_SEAL_INFO.to_string(),
+        nonce,
+        ciphertext,
+    };
+    assert_eq!(
+        unseal_snapshot(&master_key, &sealed).expect("the seed unseals"),
+        payload,
+        "the seed isn't sealed the way a backup is"
+    );
     vec![seed(
         "sealed-snapshot",
         encode_backup(&sealed).expect("seed backup encodes"),
@@ -321,14 +351,35 @@ fn upstream_manifests() -> Vec<Seed> {
     ]
 }
 
+/// Join CSRs signed with Ed25519 keys from fixed seeds. Ed25519 signatures
+/// are deterministic, so each seed is the same bytes on every run; an ECDSA
+/// key, as `create_node_csr` makes, signs with a random nonce.
 fn csrs() -> Vec<Seed> {
-    use crate::sesame::ca::create_node_csr;
+    use crate::sesame::ca::node_spiffe_uri;
+    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
 
-    ["node-1", "node-evil"]
+    // PKCS#8 v1 for an Ed25519 key (RFC 8410): this prefix, then the seed.
+    const PKCS8_PREFIX: [u8; 16] = [
+        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
+        0x20,
+    ];
+    [("node-1", 1u8), ("node-evil", 2u8)]
         .into_iter()
-        .map(|node| {
-            let (csr_der, _key) = create_node_csr(node).expect("seed CSR generates");
-            seed(node, csr_der)
+        .map(|(node, key_seed)| {
+            let mut pkcs8 = PKCS8_PREFIX.to_vec();
+            pkcs8.extend_from_slice(&[key_seed; 32]);
+            let key_pair = KeyPair::try_from(pkcs8.as_slice()).expect("a fixed Ed25519 key");
+            let mut params = CertificateParams::default();
+            let mut name = DistinguishedName::new();
+            name.push(DnType::CommonName, node);
+            params.distinguished_name = name;
+            params.subject_alt_names = vec![SanType::URI(
+                node_spiffe_uri(node).try_into().expect("a SPIFFE URI"),
+            )];
+            let csr = params
+                .serialize_request(&key_pair)
+                .expect("seed CSR serialises");
+            seed(node, csr.der().to_vec())
         })
         .collect()
 }
