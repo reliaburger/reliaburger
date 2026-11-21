@@ -531,6 +531,56 @@ One task, `ask_operator`, reads questions off that channel and asks them one at 
 
 stdin is the awkward part. Reading a terminal is a blocking call, and tokio can't cancel a blocking read once it starts, so tokio's own documentation suggests a dedicated thread for interactive input. `relish netboot` starts one `std::thread` that reads lines and sends them into an unbounded `mpsc` channel, and only when `std::io::stdin().is_terminal()` says there's a person there. Run it from a script, or in CI with `< /dev/null`, and there's no operator at all: every used disk that `--wipe` doesn't list is left alone. CI's `relish-netboot-install.sh` now writes a GPT and an ext4 filesystem labelled `ThinOS` onto the VM's disk first and passes `--wipe <the VM's MAC>`, so every lab build installs over a used disk.
 
+### Watching a boot you can't see
+
+The Wyse lab's first fallback test went like this: stage a broken update, reboot, and wait while `reliaburger-boot-check` gives bun 120 seconds, gives up, and reboots. Three times. Then systemd-boot falls back and the old version comes up. All of that printed to a monitor, and the 3040 has no serial port, so the lab record for that step was a set of phone photos of a screen. A boot that never gets as far as SSH (a kernel panic, an initrd that can't find its disk) leaves nothing to read afterwards at all.
+
+So `relish netboot --stream-logs` has the machines send their boot logs to it over UDP, and prints them among its own lines:
+
+```
+log 6c:4b:90:12:34:56: reliaburger: bun not healthy after 120 s on OS 2026.47.228
+```
+
+The kernel already knows how to do the sending. [netconsole](https://docs.kernel.org/networking/netconsole.html) is a console like `tty0` or `ttyS0`, except that each line it prints goes out as a UDP packet. It runs inside the kernel, with no userspace, so it carries panics and oopses too. The usual way to set it up is `netconsole=` on the kernel command line, and that's exactly what we can't use: the UKI's command line is part of the signed file, built once in CI, and the operator's address is different in every lab. netconsole has a second way in, though. With `CONFIG_NETCONSOLE_DYNAMIC`, which Ubuntu's kernel has, a target is a directory in configfs, and a few `echo`s make one:
+
+```bash
+nc=$configfs/netconsole/reliaburger
+mkdir -p "$nc"
+echo "$dev" >"$nc/dev_name"
+echo "$src" >"$nc/local_ip"
+echo "$address" >"$nc/remote_ip"
+echo "$port" >"$nc/remote_port"
+[ -n "$remote_mac" ] && echo "$remote_mac" >"$nc/remote_mac"
+echo 1 >"$nc/enabled"
+```
+
+That's the core of `/usr/lib/reliaburger/netlog`, which `reliaburger-netlog.service` runs once the network is online. It reads the target from `reliaburger/netlog.conf` on the ESP (one line, `target=192.168.1.20:6666`), finds the interface and source address with `ip route get`, and asks the neighbour table for the next hop's MAC. Without a MAC, netconsole broadcasts, which still reaches a listener on the same LAN. No `netlog.conf`, or one that doesn't parse, and the script says why and exits 0. Boot logs are a lab aid. They must never be the reason a boot fails.
+
+Three things needed more than the `echo`s.
+
+**The start of the boot.** netconsole only sends what the kernel prints after it starts, and by the time the network is up the kernel has been talking for ten seconds. Those lines are still in its ring buffer, so the script reads `dmesg` once, just before it enables the target, and sends the lines itself through bash's `/dev/udp/<address>/<port>`, which opens a UDP socket when you redirect to it. A marker in `/run` keeps that to once per boot.
+
+**Userspace lines.** "bun not healthy" comes from a shell script, not the kernel. journald can forward everything to the kernel log with `ForwardToKMsg=`, but it's all or nothing, and we want five units, not the whole journal. So the script writes a runtime drop-in for each of them (`reliaburger-boot-check`, `reliaburger`, `reliaburger-seed`, `reliaburger-time-wait`, and the installer's `reliaburger-install`) with `StandardOutput=journal+kmsg`, then runs `systemctl daemon-reload`. A drop-in in `/usr` would have been simpler, and it would have broken CI. Those units print `journal+console` today, and the QEMU boot tests read their lines off the serial console. `journal+kmsg` sends them to the kernel log instead, which reaches the console only if the console log level lets info lines through. The runtime drop-in leaves a boot that isn't streaming exactly as it was. Two settings finish the path: `MaxLevelKMsg=info` in journald's drop-in, since journald otherwise forwards only notice and worse, and `dmesg -n 7`, since netconsole obeys the console log level like every other console.
+
+**Where it starts.** The plan had this unit in the initrd, so it would catch an initrd that can't find its disk. The image's initrd turned out to be the wrong place: it has no network drivers (we cut them to keep the UKI small) and nothing that mounts the ESP. So the unit runs in the real root, after `network-online.target`, and the `dmesg` backlog covers what the initrd printed. A machine that dies before its network comes up still needs the monitor. The installer is different: its whole system *is* an initrd, with networking, so it runs the same script there, taking the target from `reliaburger.netlog=` on the command line that `relish netboot` writes. After writing the image, the installer mounts the new disk's ESP and writes that target into `reliaburger/netlog.conf`, so the installed system streams on every boot after. One test keeps the two copies of the script byte for byte the same.
+
+On relish's side, the listener in `src/relish/netboot/netlog.rs` is a loop around `recv_from`. Each datagram becomes lines, and each line gets a name. The DHCP servers already see every PXE client's MAC, and a client asking on UDP 4011 asks from its own address, so `dhcp::serve` gained a second callback, `seen(address, mac)`, and the listener looks the sender up in what it filled in:
+
+```rust
+pub fn sender(&self, address: Ipv4Addr) -> Sender {
+    match self.by_address.get(&address) {
+        Some(mac) => Sender::Served(*mac),
+        None => Sender::NotServed(address),
+    }
+}
+```
+
+The map lives behind a `std::sync::Mutex`, not tokio's. The DHCP side updates it from a synchronous callback, which can't `.await` a tokio lock, and neither side holds it across an `.await`: one lookup or one insert, then it's released. That's the one case where the standard library's mutex is the right tool in async code.
+
+Nothing on this port is authenticated. Anyone on the LAN can send it lines, so the listener only prints and appends, marks a sender it never served as `log <address> (not served):`, and replaces control characters with `?`, so a packet can't clear your terminal or turn it red. Lines go through the same `Log` closure as the DHCP, TFTP and HTTP lines, so they print the same way, and to `<netboot dir>/logs/<mac>.log`, written before the line prints, so a line on the screen is already on disk. For a lab where nothing is being served, `relish machines logs` runs only the listener.
+
+What it isn't is log shipping. It's UDP, with no retries and no order beyond the network's, and the lines cross the LAN in cleartext, with addresses and bun's errors in them. That's why it's off unless you ask. A claimed node's logs already go through the cluster's own pipeline.
+
 ## Updating a read-only system
 
 An appliance you can't update is a time bomb, and the whole point of the A/B layout is to make updates boring. The update path has three parts: something stages a new version into the idle slot, systemd-boot tries it a limited number of times, and a health check decides whether it stays.

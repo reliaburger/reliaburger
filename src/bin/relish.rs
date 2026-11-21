@@ -1133,6 +1133,12 @@ enum Command {
         /// leave UDP 67 to it. It must send option 60 PXEClient.
         #[arg(long)]
         mode_dhcp_proxy: bool,
+        /// Have each install send the machine's kernel and boot logs here
+        /// over UDP 6666, from the installer on and on every boot after,
+        /// and print them as `log <mac>:` lines. The lines cross the LAN in
+        /// cleartext.
+        #[arg(long)]
+        stream_logs: bool,
         /// Trust only this key (ed25519:BASE64) instead of the release keys.
         /// Debug builds only, for tests.
         #[arg(long, hide = true)]
@@ -1658,6 +1664,18 @@ enum MachinesAction {
         #[arg(required = true)]
         machines: Vec<String>,
     },
+    /// Print the kernel and boot logs machines send over the network (UDP
+    /// 6666), as `relish netboot --stream-logs` does, without serving
+    /// anything. Runs until Ctrl-C.
+    Logs {
+        /// The interface on your LAN (default: the one with the default route).
+        #[arg(long)]
+        interface: Option<String>,
+        /// Also append each machine's lines to DIR/logs/<machine>.log (the
+        /// netboot directory, say).
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
+    },
 }
 
 fn parse_machine(value: &str) -> Result<(String, std::net::IpAddr), String> {
@@ -1694,6 +1712,7 @@ async fn netboot(
     wipe: Vec<reliaburger::relish::netboot::MacAddress>,
     ipxe: reliaburger::relish::netboot::IpxeBuild,
     dhcp: reliaburger::relish::netboot::DhcpSetup,
+    stream_logs: bool,
     trust_key: Option<String>,
 ) -> Result<(), reliaburger::relish::RelishError> {
     use reliaburger::relish::netboot::{self, InterfaceChoice, NetbootOptions};
@@ -1715,6 +1734,7 @@ async fn netboot(
         wipe,
         ipxe,
         dhcp,
+        stream_logs,
     })
     .await?;
     Ok(())
@@ -3488,6 +3508,15 @@ async fn main() -> ExitCode {
                         cli.output,
                     )
                 }),
+            Some(MachinesAction::Logs { interface, dir }) => {
+                let choice = match interface {
+                    Some(name) => reliaburger::relish::netboot::InterfaceChoice::Named(name),
+                    None => reliaburger::relish::netboot::InterfaceChoice::DefaultRoute,
+                };
+                reliaburger::relish::netboot::netlog::run_listener(&choice, dir)
+                    .await
+                    .map_err(Into::into)
+            }
             Some(MachinesAction::Claim {
                 directory,
                 create,
@@ -3540,6 +3569,7 @@ async fn main() -> ExitCode {
             wipe,
             ipxe,
             mode_dhcp_proxy,
+            stream_logs,
             trust_key,
         } => {
             let dhcp = if mode_dhcp_proxy {
@@ -3548,8 +3578,19 @@ async fn main() -> ExitCode {
                 reliaburger::relish::netboot::DhcpSetup::Router
             };
             netboot(
-                dir, interface, address, http_port, macs, duration, key, reinstall, wipe, ipxe,
-                dhcp, trust_key,
+                dir,
+                interface,
+                address,
+                http_port,
+                macs,
+                duration,
+                key,
+                reinstall,
+                wipe,
+                ipxe,
+                dhcp,
+                stream_logs,
+                trust_key,
             )
             .await
         }
@@ -4076,7 +4117,7 @@ fn output_support(command: &Command) -> OutputSupport {
         // A claim waits for a person to compare each machine's claim key
         // with its console; netboot serves installs until it's stopped.
         Command::Machines {
-            action: Some(MachinesAction::Claim { .. }),
+            action: Some(MachinesAction::Claim { .. } | MachinesAction::Logs { .. }),
             ..
         }
         | Command::Netboot { .. } => Interactive,
@@ -6180,6 +6221,8 @@ mod tests {
         // Compares each machine's claim key with its console, one
         // question at a time.
         "machines claim",
+        // Prints boot log lines as they arrive, until it's stopped.
+        "machines logs",
         // Serves installs until it's stopped.
         "netboot",
     ];
@@ -6414,11 +6457,13 @@ mod tests {
             wipe,
             ipxe,
             mode_dhcp_proxy,
+            stream_logs,
             trust_key,
         } = cli.command
         else {
             panic!("expected netboot");
         };
+        assert!(!stream_logs, "boot logs cross the LAN in cleartext: opt-in");
         assert_eq!(dir, PathBuf::from("os"));
         assert_eq!((interface, address), (None, None));
         assert_eq!(http_port, 8080);
@@ -6431,6 +6476,42 @@ mod tests {
             !mode_dhcp_proxy,
             "serves beside the LAN's router by default"
         );
+    }
+
+    #[test]
+    fn netboot_streams_boot_logs_when_asked() {
+        let cli = parse(&["relish", "netboot", "os", "--stream-logs"]).unwrap();
+        let Command::Netboot { stream_logs, .. } = cli.command else {
+            panic!("expected netboot");
+        };
+        assert!(stream_logs);
+    }
+
+    #[test]
+    fn machines_logs_listens_on_the_default_route_or_a_named_interface() {
+        let logs = |args: &[&str]| match Cli::try_parse_from(args).map(|cli| cli.command) {
+            Ok(Some(Command::Machines {
+                action: Some(MachinesAction::Logs { interface, dir }),
+                ..
+            })) => Ok((interface, dir)),
+            Ok(_) => panic!("not machines logs"),
+            Err(error) => Err(error),
+        };
+        assert_eq!(logs(&["relish", "machines", "logs"]).unwrap(), (None, None));
+        assert_eq!(
+            logs(&[
+                "relish",
+                "machines",
+                "logs",
+                "--interface",
+                "en7",
+                "--dir",
+                "os"
+            ])
+            .unwrap(),
+            (Some("en7".to_string()), Some(PathBuf::from("os")))
+        );
+        assert!(logs(&["relish", "machines", "logs", "--interface"]).is_err());
     }
 
     #[test]

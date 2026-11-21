@@ -10,7 +10,7 @@ The flags, variables, files and ports you'll reach for. `relish help COMMAND`
 | `--endpoint URL` | `RELIABURGER_ENDPOINT` | Bun API to talk to |
 | `--token TOKEN` | `RELIABURGER_TOKEN` | API bearer token |
 | `--ca-cert PATH` | `RELIABURGER_CA_CERT` | cluster root CA; switches the default to HTTPS |
-| `-o`, `--output FORMAT` | | `human` (default), `json` or `yaml`; every command takes it except the eight interactive ones ([machine output](#machine-output)) |
+| `-o`, `--output FORMAT` | | `human` (default), `json` or `yaml`; every command takes it except the nine interactive ones ([machine output](#machine-output)) |
 
 A flag beats its variable. With neither, `relish` uses the laptop cluster's
 saved context, then `http://127.0.0.1:9117`.
@@ -106,12 +106,12 @@ would the token. Everything else names where a secret is (`init`'s
 `master_key`, `sign keygen`'s `path`), never the secret itself, and `secret
 encrypt` never echoes the plaintext.
 
-Eight commands refuse `-o json`, exit `2` and say they're interactive: `tui`,
+Nine commands refuse `-o json`, exit `2` and say they're interactive: `tui`,
 `dashboard`, `manual` (the reader and `--web`), `source`, the guided `setup`,
-`dev shell`, `machines claim` and `netboot`. They take over the terminal or a
-browser, ask their questions as they go (`machines claim` asks you to compare
-each machine's claim key with its console), or serve until stopped
-(`netboot`), so there's nothing to print as data. Bare `relish -o json` is
+`dev shell`, `machines claim`, `machines logs` and `netboot`. They take over
+the terminal or a browser, ask their questions as they go (`machines claim`
+asks you to compare each machine's claim key with its console), or serve until
+stopped (`netboot`, `machines logs`), so there's nothing to print as data. Bare `relish -o json` is
 `relish -o json tui`, so it refuses too. `setup --quickstart` and `setup
 --ssh` aren't among them: they never ask, so they print what they built, and
 an agent that ran them can quote it. `exec` isn't one of them either: it runs a
@@ -479,6 +479,7 @@ See [getting started](00_getting-started.md) and [cluster basics](02_cluster-bas
   - `relish image delete <REFERENCE>`: Delete a registry tag: the same as `relish images delete` *(0.3.0, not in 0.2.8)*
 - `relish machines`: Unclaimed appliances on the LAN: list them, or claim them with seeds over the network *(0.3.0, not in 0.2.8)*
   - `relish machines claim <DIRECTORY> <MACHINES>...`: Claim machines: compare each one's claim key with its console, then send it a seed, joining it to the cluster in DIRECTORY (or, with --create, making a new cluster there from them) *(0.3.0, not in 0.2.8)*
+  - `relish machines logs`: Print the kernel and boot logs machines send over the network (UDP 6666), as `relish netboot --stream-logs` does, without serving anything. Runs until Ctrl-C *(0.3.0, not in 0.2.8)*
 - `relish netboot <DIR>`: Install appliances over the network: ProxyDHCP, TFTP and HTTP for the OS that `relish image download` saved *(0.3.0, not in 0.2.8)*
 - `relish os`: The appliance OS across the cluster: what each node runs, and rolling a new version out node by node *(0.3.0, not in 0.2.8)*
   - `relish os list`: Each node's OS version, and the newest release *(0.3.0, not in 0.2.8)*

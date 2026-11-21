@@ -42,8 +42,9 @@ If you're an agent operating or debugging a Reliaburger cluster:
   A warning starting `source_mismatch:` means a node runs another commit, and
   links that commit's code.
 - **Use `-o json` for everything else.** Every `relish` command takes it
-  except the eight interactive ones: `tui`, `dashboard`, `manual`, `source`,
-  `dev shell`, the guided `setup`, `machines claim` and `netboot`. `setup
+  except the nine interactive ones: `tui`, `dashboard`, `manual`, `source`,
+  `dev shell`, the guided `setup`, `machines claim`, `machines logs` and
+  `netboot`. `setup
   --quickstart` and `setup --ssh` take it.
 - **Never post, change or file anything without your human.** Draft it, show
   it, and let them send it.
