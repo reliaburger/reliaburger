@@ -74,6 +74,13 @@ pub struct InstanceStatus {
     /// that doesn't report it. Instances of one app can differ mid-rollout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// Whether the instance's app keeps data on this node, in a managed
+    /// volume or a host-path mount: the apps an OS rollout leaves on their
+    /// node to wait out the reboot (#2120). `relish tui`'s node page shows
+    /// it as what maintenance on the node would affect. `false` from a node
+    /// that doesn't report it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub data_on_node: bool,
 }
 
 /// A workload status with the node that supplied it.
@@ -682,6 +689,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         age_seconds: Some(instance.created_at.elapsed().as_secs()),
                         reason: instance.launch_failure.clone(),
                         image: (!instance.image.is_empty()).then(|| instance.image.clone()),
+                        data_on_node: self
+                            .deployed_specs
+                            .get(&(instance.app_name.clone(), instance.namespace.clone()))
+                            .is_some_and(crate::cluster::orchestrate::stays_through_os_rollout),
                     },
                     evidence,
                 }

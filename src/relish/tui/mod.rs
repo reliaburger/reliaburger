@@ -3,6 +3,7 @@
 pub mod app;
 pub mod data;
 pub mod fixtures;
+mod impact;
 mod input;
 pub mod keys;
 mod matching;

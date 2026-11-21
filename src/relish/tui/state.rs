@@ -38,6 +38,26 @@ impl DetailTab {
     }
 }
 
+/// Node detail tabs in display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeTab {
+    /// What the node is: state, council seat, version and load.
+    Overview,
+    /// Every app instance running on it.
+    Workloads,
+    /// What would stop or lose redundancy if the node went away.
+    Maintenance,
+}
+
+impl NodeTab {
+    pub const ALL: [Self; 3] = [Self::Overview, Self::Workloads, Self::Maintenance];
+
+    pub(super) fn offset(self, delta: isize) -> Self {
+        let index = Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0);
+        Self::ALL[(index as isize + delta).rem_euclid(Self::ALL.len() as isize) as usize]
+    }
+}
+
 /// A screen in the navigation stack.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum View {
@@ -51,6 +71,7 @@ pub enum View {
     Nodes,
     NodeDetail {
         node: String,
+        tab: NodeTab,
     },
     Jobs,
     /// One node's run of a job: several nodes can each run a job of the
@@ -191,7 +212,8 @@ pub struct TuiApp {
     pub nodes_cursor: usize,
     pub jobs_cursor: usize,
     pub routes_cursor: usize,
-    /// The selected row in the app detail's Instances tab.
+    /// The selected row in the app detail's Instances tab, or in a node
+    /// detail's Workloads tab.
     pub instances_cursor: usize,
     /// The instance `k` asked to kill, while the `[y/N]` prompt is open.
     pub confirm_kill: Option<InstanceTarget>,
@@ -278,6 +300,25 @@ impl TuiApp {
             .iter()
             .filter(|row| row.instance.app_name == app && row.instance.namespace == namespace)
             .collect()
+    }
+
+    /// The instances running on one node, by namespace, app and instance:
+    /// the rows of the node detail's Workloads tab.
+    pub fn node_instances(&self, node: &str) -> Vec<&ClusterInstanceStatus> {
+        let mut rows: Vec<_> = self
+            .data
+            .instances
+            .iter()
+            .filter(|row| row.node == node)
+            .collect();
+        rows.sort_by(|a, b| {
+            (&a.instance.namespace, &a.instance.app_name, &a.instance.id).cmp(&(
+                &b.instance.namespace,
+                &b.instance.app_name,
+                &b.instance.id,
+            ))
+        });
+        rows
     }
 
     /// The Instances tab's selected row, if that tab is showing and has

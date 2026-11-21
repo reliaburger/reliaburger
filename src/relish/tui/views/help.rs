@@ -16,7 +16,7 @@ pub fn lines(app: &TuiApp) -> Vec<Line<'static>> {
 mod tests {
     use super::*;
     use crate::relish::tui::{
-        app::{DetailTab, LogLine, View},
+        app::{DetailTab, LogLine, NodeTab, View},
         fixtures::{TestScenario, render_to_string},
         msg::Msg,
     };
@@ -377,6 +377,81 @@ mod tests {
         );
     }
 
+    /// node-1 of the healthy fixture, plus a single-replica `cache` that
+    /// keeps data on node-1 and a third `web` replica on node-3, with one
+    /// of three voters already silent: every kind of impact at once.
+    fn node_with_every_impact(tab: NodeTab) -> TuiApp {
+        use crate::bun::agent::ClusterInstanceStatus;
+        let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);
+        let mut cache: ClusterInstanceStatus = app.data.instances[0].clone();
+        cache.instance.app_name = "cache".into();
+        cache.instance.id = "cache-0".into();
+        cache.instance.image = Some("registry.example/cache:v2".into());
+        cache.instance.data_on_node = true;
+        let mut web = app.data.instances[1].clone();
+        web.node = "node-3".into();
+        web.instance.id = "web-2".into();
+        app.data.instances.extend([cache, web]);
+        if let Some(council) = app
+            .data
+            .summary
+            .as_mut()
+            .and_then(|summary| summary.council.value.as_mut())
+        {
+            council.voters_answering = 2;
+        }
+        app.view_stack.push(View::Nodes);
+        app.view_stack.push(View::NodeDetail {
+            node: "node-1".into(),
+            tab,
+        });
+        app
+    }
+
+    // The node page at the smallest terminal the TUI draws in (#2170).
+    #[test]
+    fn node_detail_tabs_at_80_by_25() {
+        for tab in NodeTab::ALL {
+            let app = node_with_every_impact(tab);
+            insta::assert_snapshot!(
+                format!("node_detail_80x25_{tab:?}").to_lowercase(),
+                render_to_string(&app, 80, 25)
+            );
+        }
+    }
+
+    #[test]
+    fn the_maintenance_tab_flags_a_single_replica_app_and_a_lost_quorum() {
+        let app = node_with_every_impact(NodeTab::Maintenance);
+        let screen = render_to_string(&app, 120, 40);
+        let line = |needle: &str| {
+            screen
+                .lines()
+                .find(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle}:\n{screen}"))
+                .to_string()
+        };
+        let cache = line("cache ");
+        assert!(cache.contains("goes down"), "{cache}");
+        assert!(cache.contains("here"), "{cache}");
+        assert!(line("worker ").contains("loses redundancy"));
+        assert!(line("web ").contains("keeps serving"));
+        assert!(line("council ").contains("loses quorum"));
+    }
+
+    #[test]
+    fn the_workloads_tab_lists_only_that_nodes_instances() {
+        let app = node_with_every_impact(NodeTab::Workloads);
+        let screen = render_to_string(&app, 120, 40);
+        for id in ["web-0", "worker-0", "app-2-0", "cache-0"] {
+            assert!(screen.contains(id), "{id} missing:\n{screen}");
+        }
+        for id in ["web-1", "web-2", "worker-1"] {
+            assert!(!screen.contains(id), "{id} is on another node:\n{screen}");
+        }
+        assert!(screen.contains("registry.example/cache:v2"), "{screen}");
+    }
+
     #[test]
     fn help_lists_keybindings() {
         let mut app = TuiApp::with_test_data(TestScenario::Empty);
@@ -422,10 +497,17 @@ mod tests {
         app = TuiApp::with_test_data(TestScenario::HealthyCluster);
         app.view_stack.push(View::Nodes);
         insta::assert_snapshot!("nodes", render_to_string(&app, 120, 40));
-        app.view_stack.push(View::NodeDetail {
-            node: "node-1".into(),
-        });
-        insta::assert_snapshot!("node_detail", render_to_string(&app, 120, 40));
+        for tab in NodeTab::ALL {
+            app.view_stack.push(View::NodeDetail {
+                node: "node-1".into(),
+                tab,
+            });
+            insta::assert_snapshot!(
+                format!("node_detail_{tab:?}").to_lowercase(),
+                render_to_string(&app, 120, 40)
+            );
+            app.view_stack.pop();
+        }
 
         app = TuiApp::with_test_data(TestScenario::HealthyCluster);
         app.view_stack.push(View::Jobs);

@@ -470,6 +470,8 @@ these keys inside it too.
 | `/` | lists | filter; Esc clears it |
 | `/` | logs, app detail Logs and Metrics tabs | search: show only the lines (or metrics, by name and labels) containing the text, ignoring case, each match in red and bold; Enter keeps it, Esc clears it |
 | → or Tab, ← or Shift-Tab | app detail | next or previous tab (Overview, Instances, Logs, Metrics, Deploys, Config) |
+| → or Tab, ← or Shift-Tab | node detail | next or previous tab (Overview, Workloads, Maintenance); Maintenance lists what would go down or lose redundancy if the node went away, and whether the council keeps quorum |
+| ↑/↓, Enter | node detail Workloads tab | select an instance on the node; Enter opens its app |
 | ↑/↓ | app detail Instances tab | select an instance |
 | `k` or Ctrl-K | app detail Instances tab | kill the selected instance, after a `[y/N]` prompt (only `y` kills); it sends the same audited kill as `relish fault kill APP --instance ID --node NODE --acknowledge --reason "relish tui"`, and the scheduler starts a replacement |
 | `f` | logs | follow the newest lines, or stop |
