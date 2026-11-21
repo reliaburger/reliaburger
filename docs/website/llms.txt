@@ -39,27 +39,27 @@ If you're an agent operating or debugging a Reliaburger cluster:
 
 ## Start here
 
-- [Working with an AI agent](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/manual/16_working-with-an-ai-agent.md): the agent chapter; `relish agent guide` prints the copy that matches your installed `relish`
+- [Working with an AI agent](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.1/docs/manual/16_working-with-an-ai-agent.md): the agent chapter; `relish agent guide` prints the copy that matches your installed `relish`
 
 ## Manual
 
-- [Getting started](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/manual/00_getting-started.md)
-- [Deploy an app](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/manual/01_deploy-an-app.md)
-- [Cluster basics](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/manual/02_cluster-basics.md)
-- [Networking and ingress](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/manual/03_networking.md)
-- [Observability](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/manual/04_observability.md)
-- [Breaking things on purpose](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/manual/05_chaos.md)
-- [Under the hood](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/manual/06_under-the-hood.md)
-- [Diagnostics](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/manual/07_diagnostics.md)
-- [Five-minute tour](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/manual/08_five-minute-tour.md)
-- [Coming from Kubernetes](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/manual/09_kubernetes.md)
-- [Security and access](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/manual/10_security.md)
-- [Images and volumes](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/manual/11_images-and-volumes.md)
-- [Upgrades, GitOps and backups](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/manual/12_operations.md)
-- [Reference](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/manual/13_reference.md)
-- [Batch jobs](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/manual/14_batch-jobs.md)
-- [Writing a controller](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/manual/15_writing-a-controller.md)
-- [Bare metal: the appliance and netboot](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/manual/17_appliance.md)
+- [Getting started](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.1/docs/manual/00_getting-started.md)
+- [Deploy an app](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.1/docs/manual/01_deploy-an-app.md)
+- [Cluster basics](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.1/docs/manual/02_cluster-basics.md)
+- [Networking and ingress](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.1/docs/manual/03_networking.md)
+- [Observability](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.1/docs/manual/04_observability.md)
+- [Breaking things on purpose](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.1/docs/manual/05_chaos.md)
+- [Under the hood](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.1/docs/manual/06_under-the-hood.md)
+- [Diagnostics](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.1/docs/manual/07_diagnostics.md)
+- [Five-minute tour](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.1/docs/manual/08_five-minute-tour.md)
+- [Coming from Kubernetes](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.1/docs/manual/09_kubernetes.md)
+- [Security and access](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.1/docs/manual/10_security.md)
+- [Images and volumes](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.1/docs/manual/11_images-and-volumes.md)
+- [Upgrades, GitOps and backups](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.1/docs/manual/12_operations.md)
+- [Reference](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.1/docs/manual/13_reference.md)
+- [Batch jobs](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.1/docs/manual/14_batch-jobs.md)
+- [Writing a controller](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.1/docs/manual/15_writing-a-controller.md)
+- [Bare metal: the appliance and netboot](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.1/docs/manual/17_appliance.md)
 
 ## Website
 
@@ -81,9 +81,9 @@ Every page on reliaburger.com, as Markdown.
 
 ## Optional
 
-- [Building Reliaburger](https://github.com/reliaburger/reliaburger/tree/v0.3.0/docs/book): the book, how and why each part was built
-- [Design documents](https://github.com/reliaburger/reliaburger/tree/v0.3.0/docs/design): one per subsystem
-- [Whitepaper](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/whitepaper.md): the architecture in one document
-- [Becoming the Operating System](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/book/15a-becoming-the-os.md): how the appliance OS, `relish netboot`, claiming and A/B OS updates were built, and what real hardware taught us
-- [The appliance's design](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/design/appliance.md): the image, `relish netboot`, claiming, seeds and `relish os`
-- [The appliance's recipe](https://github.com/reliaburger/reliaburger/tree/v0.3.0/image): the mkosi configuration, the netboot installer, iPXE scripts and the lab tools
+- [Building Reliaburger](https://github.com/reliaburger/reliaburger/tree/v0.3.1/docs/book): the book, how and why each part was built
+- [Design documents](https://github.com/reliaburger/reliaburger/tree/v0.3.1/docs/design): one per subsystem
+- [Whitepaper](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.1/docs/whitepaper.md): the architecture in one document
+- [Becoming the Operating System](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.1/docs/book/15a-becoming-the-os.md): how the appliance OS, `relish netboot`, claiming and A/B OS updates were built, and what real hardware taught us
+- [The appliance's design](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.1/docs/design/appliance.md): the image, `relish netboot`, claiming, seeds and `relish os`
+- [The appliance's recipe](https://github.com/reliaburger/reliaburger/tree/v0.3.1/image): the mkosi configuration, the netboot installer, iPXE scripts and the lab tools
