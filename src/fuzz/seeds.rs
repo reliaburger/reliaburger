@@ -50,6 +50,7 @@ pub(super) fn for_target(target: &str) -> Vec<Seed> {
         "council_backup_state" => council_states(),
         "ingress_request" => ingress_requests(),
         "tftp_packet" => tftp_packets(),
+        "dhcp_request" => dhcp_requests(),
         other => panic!("no seeds for fuzz target {other}"),
     }
 }
@@ -554,5 +555,67 @@ fn tftp_packets() -> Vec<Seed> {
     ]
     .into_iter()
     .map(|(name, packet)| seed(name, packet.encode()))
+    .collect()
+}
+
+fn dhcp_requests() -> Vec<Seed> {
+    use dhcproto::v4::{Architecture, DhcpOption, HType, Message, MessageType, Opcode, OptionCode};
+
+    let request = |kind: MessageType, class: &[u8], arch: Option<u16>| {
+        let mut message = Message::default();
+        message
+            .set_opcode(Opcode::BootRequest)
+            .set_htype(HType::Eth)
+            .set_xid(0x1234_5678)
+            .set_chaddr(&[0x52, 0x54, 0x00, 0x12, 0x34, 0x56]);
+        let options = message.opts_mut();
+        options.insert(DhcpOption::MessageType(kind));
+        options.insert(DhcpOption::ClassIdentifier(class.to_vec()));
+        if let Some(arch) = arch {
+            options.insert(DhcpOption::ClientSystemArchitecture(Architecture::from(
+                arch,
+            )));
+        }
+        message
+    };
+    let pxe = b"PXEClient:Arch:00007:UNDI:003016";
+    let mut with_uuid = request(MessageType::Discover, pxe, Some(11));
+    with_uuid
+        .opts_mut()
+        .insert(DhcpOption::ClientMachineIdentifier(vec![0; 17]));
+    let mut ipxe = request(MessageType::Request, pxe, Some(7));
+    ipxe.opts_mut()
+        .insert(DhcpOption::UserClass(b"iPXE".to_vec()));
+    // A boot item (vendor sub-option 71), which a reply on 4011 echoes.
+    ipxe.opts_mut().insert(DhcpOption::VendorExtensions(vec![
+        71, 4, 0x80, 0x00, 0, 0, 255,
+    ]));
+    let mut to_us = request(MessageType::Request, pxe, Some(7));
+    to_us
+        .opts_mut()
+        .insert(DhcpOption::ServerIdentifier(std::net::Ipv4Addr::new(
+            192, 168, 1, 20,
+        )));
+    let mut plain = request(MessageType::Discover, b"android-dhcp-14", None);
+    plain.opts_mut().remove(OptionCode::ClassIdentifier);
+    [
+        ("pxe-x86-64", request(MessageType::Discover, pxe, Some(7))),
+        ("pxe-arm64-uuid", with_uuid),
+        (
+            "http-boot",
+            request(MessageType::Discover, b"HTTPClient:Arch:00016", Some(16)),
+        ),
+        ("ipxe-boot-item", ipxe),
+        ("request-to-us", to_us),
+        ("pxe-bios", request(MessageType::Discover, pxe, Some(0))),
+        ("ordinary", plain),
+    ]
+    .into_iter()
+    .map(|(name, message)| {
+        seed(
+            name,
+            crate::relish::netboot::dhcp::encode(&message).expect("a seed request encodes"),
+        )
+    })
     .collect()
 }

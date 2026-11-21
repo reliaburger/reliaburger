@@ -120,6 +120,11 @@ pub const TARGETS: &[Target] = &[
         decoder: "relish::netboot::tftp::Packet::parse",
         run: tftp_packet,
     },
+    Target {
+        name: "dhcp_request",
+        decoder: "relish::netboot::dhcp::decode",
+        run: dhcp_request,
+    },
 ];
 
 /// A gossip datagram, as any host that can reach the UDP port sends it.
@@ -752,5 +757,78 @@ pub fn tftp_packet(data: &[u8]) -> Outcome {
         &file[..],
         "the client got another file"
     );
+    Outcome::Accepted
+}
+
+/// The ProxyDHCP every fuzzed request is answered by.
+fn dhcp_context() -> &'static crate::relish::netboot::dhcp::DhcpContext {
+    use crate::relish::netboot::Arch;
+    use crate::relish::netboot::dhcp::DhcpContext;
+
+    static CONTEXT: OnceLock<DhcpContext> = OnceLock::new();
+    CONTEXT.get_or_init(|| DhcpContext {
+        server: std::net::Ipv4Addr::new(192, 168, 1, 20),
+        http_port: 8080,
+        architectures: [Arch::X86_64, Arch::Arm64].into(),
+        allowed: Vec::new(),
+    })
+}
+
+/// Run `decode` with the panic hook silenced. `dhcp::decode` catches the
+/// panics dhcproto can raise on a crafted packet and calls the packet "not
+/// DHCP", which is what the server does with it. libFuzzer's hook would
+/// abort the process before that catch ran, so it steps aside here, and
+/// only here: a panic anywhere else in the target is still a crash.
+fn without_panic_hook<T>(decode: impl FnOnce() -> T) -> T {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = decode();
+    std::panic::set_hook(hook);
+    result
+}
+
+/// A DHCP datagram, as any host on the LAN broadcasts it to `relish
+/// netboot`'s ProxyDHCP, on port 67 or 4011.
+///
+/// Whatever the request, a reply must never hand out an address, must
+/// answer the request's transaction, must encode to at least the BOOTP
+/// minimum, and must decode again to the same reply.
+pub fn dhcp_request(data: &[u8]) -> Outcome {
+    use crate::relish::netboot::dhcp::{ListenPort, answer, decode, destination, encode};
+    use dhcproto::v4::Opcode;
+
+    let Some(request) = without_panic_hook(|| decode(data)) else {
+        return Outcome::Refused;
+    };
+    let source = std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(192, 168, 1, 50), 68);
+    for port in [ListenPort::Dhcp, ListenPort::ProxyDhcp] {
+        let reply = match answer(&request, port, dhcp_context()) {
+            Ok(answer) => answer.reply,
+            Err(ignored) => {
+                let _ = ignored.describe();
+                continue;
+            }
+        };
+        assert_eq!(reply.opcode(), Opcode::BootReply);
+        assert_eq!(reply.xid(), request.xid(), "a reply to another transaction");
+        assert!(
+            reply.yiaddr().is_unspecified(),
+            "a reply handed out an address"
+        );
+        let _ = destination(&request, port, source);
+        // The server drops a reply that doesn't encode.
+        let Some(bytes) = encode(&reply) else {
+            continue;
+        };
+        assert!(bytes.len() >= 300, "a {}-byte reply", bytes.len());
+        let again = decode(&bytes).expect("an encoded reply decodes");
+        assert_eq!(again.xid(), reply.xid());
+        assert_eq!(again.opts().msg_type(), reply.opts().msg_type());
+        // The BOOTP field is NUL-padded on the wire, and dhcproto keeps a NUL.
+        let name =
+            |fname: Option<&[u8]>| fname.map(|f| f.split(|b| *b == 0).next().unwrap_or(f).to_vec());
+        assert_eq!(name(again.fname()), name(reply.fname()));
+        assert!(again.yiaddr().is_unspecified());
+    }
     Outcome::Accepted
 }

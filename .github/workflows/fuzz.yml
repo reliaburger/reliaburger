@@ -41,6 +41,7 @@ on:
       - src/wrapper/proxy.rs
       - src/wrapper/routing.rs
       - src/relish/netboot/tftp.rs
+      - src/relish/netboot/dhcp.rs
       - .github/workflows/fuzz.yml
   workflow_dispatch:
     inputs:

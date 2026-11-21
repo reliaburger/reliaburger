@@ -119,3 +119,10 @@ path = "fuzz_targets/tftp_packet.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "dhcp_request"
+path = "fuzz_targets/dhcp_request.rs"
+test = false
+doc = false
+bench = false
