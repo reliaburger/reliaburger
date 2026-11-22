@@ -27,6 +27,7 @@ Fixes from the Wyse 3040 lab that need a new appliance image. Not released yet: 
 
 - `relish test`'s firewall cases test what `allow_from` does: callers from another namespace, named as `namespace/app`. They put every app in one namespace, where `allow_from` doesn't apply, so on a cluster with eBPF they failed although the firewall worked. A fourth case checks that callers in the target's own namespace aren't restricted ([#2206](https://github.com/reliaburger/reliaburger/issues/2206)).
 - `relish wtf` calls a crash loop only when one instance restarts three times in 15 minutes. Three replicas that restarted once each were a critical `crashloop` for 15 minutes, and the instance a restart named was never read ([#2197](https://github.com/reliaburger/reliaburger/issues/2197)).
+- `relish nodes` no longer reports a healthy node as not answering every so often: the alert check releases the metrics store's lock before its query, so the node summary doesn't wait seconds behind it ([#2215](https://github.com/reliaburger/reliaburger/issues/2215)).
 
 ## [0.3.1] - 2026-11-21
 

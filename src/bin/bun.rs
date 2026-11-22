@@ -3601,9 +3601,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs();
-                        let store = eval_mayo.read().await;
-                        let latest = gather_latest_values(&store, now_secs).await;
-                        drop(store);
+                        let latest = gather_latest_values(&eval_mayo, now_secs).await;
 
                         let transitions = {
                             let mut eval = eval_alerts.write().await;
