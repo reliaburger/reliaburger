@@ -208,7 +208,7 @@ impl AuthContext {
 }
 
 /// Extract the Bearer token from an Authorization header value.
-fn extract_bearer(header_value: &str) -> Option<&str> {
+pub(crate) fn extract_bearer(header_value: &str) -> Option<&str> {
     header_value.strip_prefix("Bearer ")
 }
 

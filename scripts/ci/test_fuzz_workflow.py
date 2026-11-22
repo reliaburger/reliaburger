@@ -77,11 +77,13 @@ class FuzzWorkflowTests(unittest.TestCase):
                 self.assertIn("--codegen-units $(FUZZ_CODEGEN_UNITS)", rest)
 
     def test_the_sanitizer_build_is_cached_and_the_job_has_headroom(self):
-        # The uncached nightly is about 33 minutes of build, 45 of fuzzing
-        # and 3 of set-up: the limit leaves at least half again on top.
+        # The uncached nightly is about 33 minutes of build, five minutes of
+        # fuzzing per target and 3 of set-up: the limit leaves at least half
+        # again on top.
         limit = re.search(r"(?m)^    timeout-minutes: (\d+)$", self.text)
         self.assertIsNotNone(limit)
-        self.assertGreaterEqual(int(limit.group(1)), (33 + 45 + 3) * 1.5)
+        targets = len(list((REPO / "fuzz" / "fuzz_targets").glob("*.rs")))
+        self.assertGreaterEqual(int(limit.group(1)), (33 + 5 * targets + 3) * 1.5)
         cache = self.text[self.text.index("uses: Swatinem/rust-cache@"):]
         cache = cache[:cache.index("\n      - ")]
         self.assertIn("workspaces: fuzz -> target", cache)
