@@ -1626,6 +1626,21 @@ class ApplianceTests(unittest.TestCase):
         self.assertNotRegex(triggers, r"(?m)^\s+schedule:")
         self.assertNotRegex(triggers, r"(?m)^\s+- cron:")
 
+    def test_a_publish_signs_verifies_and_publishes_although_bun_is_skipped(self):
+        # A publish takes bun from the release, so the `bun` job (built from
+        # source for lab builds) is skipped. GitHub skips every job downstream
+        # of a skipped one unless its `if` says otherwise, so without
+        # `!cancelled()` the sign job never ran and no OS was ever published
+        # (0.3.1's publish, run 44952247459, 21 November 2026).
+        for name in ("sign", "verify", "publish"):
+            with self.subTest(job=name):
+                condition = re.search(r"(?m)^    if: (.+)$", self.jobs[name])
+                self.assertIsNotNone(condition, f"{name} has no if")
+                self.assertIn("!cancelled()", condition.group(1))
+        self.assertIn("needs.image.result == 'success'", self.jobs["sign"])
+        self.assertIn("needs.sign.result == 'success'", self.jobs["verify"])
+        self.assertIn("needs.verify.result == 'success'", self.jobs["publish"])
+
     def test_a_pull_request_changing_appliance_code_builds_and_tests_the_image(self):
         # src/os (the node's half of an OS update), src/appliance (prepare,
         # claim, the console) and src/relish/netboot run only in the image's

@@ -1,0 +1,18 @@
+jobs-shared-containers: 60 seconds, concurrency 27 per node; submission and cold startup are inside the window; positive drain follows it
+0.0s: 0 unique accepted successes, 0 failures, 0 retries; 0.0/s
+5.1s: 8000 unique accepted successes, 0 failures, 0 retries; 1575.1/s
+10.1s: 46000 unique accepted successes, 0 failures, 0 retries; 4544.5/s
+15.2s: 84000 unique accepted successes, 0 failures, 0 retries; 5544.0/s
+20.2s: 123000 unique accepted successes, 0 failures, 0 retries; 6093.7/s
+25.2s: 162000 unique accepted successes, 0 failures, 0 retries; 6417.3/s
+30.3s: 201000 unique accepted successes, 0 failures, 0 retries; 6639.1/s
+35.4s: 238000 unique accepted successes, 0 failures, 0 retries; 6728.9/s
+40.4s: 277000 unique accepted successes, 0 failures, 0 retries; 6854.6/s
+45.4s: 316000 unique accepted successes, 0 failures, 0 retries; 6953.0/s
+50.5s: 354000 unique accepted successes, 0 failures, 0 retries; 7010.0/s
+55.5s: 393000 unique accepted successes, 0 failures, 0 retries; 7076.7/s
+jobs-shared-containers: 437000 unique accepted successes in 60 seconds (7283.3/s)
+0 failures, 0 retries; cleanup verified
+629.3M runs/day extrapolated — not an observed daily total
+per node (successes each node reported; fair share by slots, +20% allowed): balanced
+  rb-a8302561bb48-1     7329.2/s  100.0% of successes, fair 100.0%, 27 slots

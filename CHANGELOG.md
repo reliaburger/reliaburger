@@ -29,7 +29,7 @@ Fixes from the Wyse 3040 lab that need a new appliance image. Not released yet: 
 
 ## [0.3.1] - 2026-11-21
 
-Fixes from 0.3.0's gate and the first Wyse lab, and a terminal UI you can act from.
+Fixes from 0.3.0's gate and the first Wyse lab, and a terminal UI you can act from. [Release page](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.1), [release log](docs/release-log.md#031-gate-follow-ups).
 
 ### Upgrading
 
@@ -55,6 +55,7 @@ Fixes from 0.3.0's gate and the first Wyse lab, and a terminal UI you can act fr
 
 ### Known issues
 
+- [#2197](https://github.com/reliaburger/reliaburger/issues/2197): `relish wtf` counts a crash loop per app, so three replicas that each restarted once show as a critical `crashloop` for 15 minutes. Fixed on the 0.3.2 train.
 - [#2128](https://github.com/reliaburger/reliaburger/issues/2128): one registry deploy case stalled for five minutes after an injected disk fault in 0.3.0's gate. Two possible causes are fixed in this release, but the cause isn't proven.
 
 ## [0.3.0] - 2026-11-20
