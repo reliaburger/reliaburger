@@ -1211,7 +1211,8 @@ scripts/release/qualify-power-cut-endurance.sh --release 0.2.8 --tier quick
 ```
 
 `--tier quick` cuts for an hour; `--duration 6h` sets any other length.
-`--plan` prints the seeded schedule and exits. Each cut writes a line to
+`--plan` prints the seeded schedule and exits. `--port-offset N` adds N to the cluster's
+ports, so several runs can share a host, each in its own checkout. Each cut writes a line to
 `cuts.jsonl` and a directory of evidence; the run ends with `summary.json`
 (schema `reliaburger.power-cut-endurance/1`) holding the cuts, violations,
 recovery percentiles and the rule-of-three bound. A violation powers the VM

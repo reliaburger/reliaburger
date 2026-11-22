@@ -4950,6 +4950,108 @@ answers `504` and checks the timeout the test kit asked for. All four failed
 before the change: the first two because every layer was 300 s, the test kit
 pair because the case deadline fired first with nothing to say.
 
+### What the port forwarder saw
+
+The bounded exec makes the next occurrence say where it was. We went back
+to the first one anyway, because one witness had been there all along. The
+soak keeps each VM's Lima host-agent log, and at debug level that log
+records every forwarded TCP connection as it closes. It writes "closing
+write" first when the client on the Mac hangs up, and "closing read" first
+when Bun inside the VM does.
+
+The pulse's connections to node 1's API port tell the story. The ones the
+test kit had pooled and finished with closed from the Bun side 75 to 120 s
+after their last use: that's the `request_head` idle limit, doing its job.
+One, opened at 04:17:20 as the pulse started, stayed open until 04:22:43,
+the case's deadline to the second, and the Mac's side closed it. So a
+request was in flight on it for minutes. Bun had the whole request head,
+or its 75 s head timer would have closed the connection first, and Bun
+never answered.
+
+That rules out more than it rules in:
+
+- **Not the test kit's wait.** It would have left its note.
+- **Not a lost connection in the forwarder.** Bun held its end open.
+- **Not the apply.** A later apply through node 1 committed and its case
+  passed at 04:18:08.
+- **Not the instance's lifecycle lock or its runtime claim.** The teardown
+  had to stop this same container, confirm it had exited and release its
+  address, and node 1 logged that last step at 04:22:55, twelve seconds
+  after the deadline. A queue in front of the exec 270 s long would have
+  held the stop too.
+
+What's left is `POST /v1/exec` itself, past the point where it takes those
+locks: the process owner running `runc exec`, `runc init` and `busybox wget`
+through an exec helper, all of which the teardown's kill released. There is
+a less likely reading too. If the forwarder delivered the request head but
+sat on the body, Bun would wait for the body for ever, because nothing in
+Hyper bounds a request body that stops arriving. The 504 and "no answer"
+messages tell those two apart.
+
+They don't say what the exec helper was doing, though, so Bun now writes
+that down. When an exec has had no answer from its owner for 30 s, Bun logs
+every exec helper under that owner: its phase, its command, and on Linux
+each process under it with its scheduler state and the kernel function it
+sleeps in, read from `/proc/<pid>/stat` and `/proc/<pid>/wchan`. A line
+looks something like this (shortened by hand):
+
+```text
+bun: exec through owner command-3f… has had no answer for 30 s:
+exec-Xk2b: running `runc --root … exec -- … /bin/busybox wget …` (gate handed over):
+pid 4121 (runc) S do_wait, pid 4127 (runc:[2:INIT]) S pipe_read
+```
+
+The wait that does this is a small generic function:
+
+```rust
+async fn report_if_slow<T, R>(
+    work: impl std::future::Future<Output = T>,
+    after: Duration,
+    report: impl FnOnce() -> R,
+) -> T
+where
+    R: std::future::Future<Output = ()>,
+{
+    tokio::pin!(work);
+    tokio::select! {
+        output = &mut work => return output,
+        () = tokio::time::sleep(after) => {}
+    }
+    let report = report();
+    tokio::pin!(report);
+    let mut reporting = true;
+    loop {
+        tokio::select! {
+            output = &mut work => return output,
+            () = &mut report, if reporting => reporting = false,
+        }
+    }
+}
+```
+
+`select!` polls several futures and runs the branch of whichever finishes
+first, dropping the rest. That's a problem when the one you want to keep is
+in the losing branch, so we poll `&mut work`, a borrow, instead of `work`
+itself: the timer's branch wins, and `work` is still there, half done, for
+the loop. Borrowing a future to poll it needs it pinned, which is what
+`tokio::pin!` does. It fixes the future at one place on the stack, because a
+future that's been polled may hold pointers into itself and mustn't move.
+The `if reporting` guard switches a branch off once its future has
+finished, as polling a finished future again would panic. The report reads
+procfs and the helpers' records off the runtime, on a blocking thread, and
+the answer never waits for it: an exec stuck on a slow disk shouldn't be
+held up by a report stuck on the same disk.
+
+The tests run under Tokio's paused clock. An exec answered at 15 s is never
+reported; one answered at 90 s is reported exactly once, at 30 s, and still
+answered; and a report that never finishes doesn't delay an answer at 31 s.
+`a_report_names_each_helper_its_phase_command_and_process` writes helper
+records the way `Execution::launch` does, around a real `sleep`, and checks
+the line names the phase, the command and, on Linux, `(sleep) S`; a second
+Linux test checks it follows a shell's child as well, since `runc exec` runs
+its command as a grandchild. We still can't make an exec wedge on purpose,
+so #2128 stays open until the next one tells us where.
+
 ### Busy isn't dead
 
 `biased;` bought fairness for commands, and the final tier of the soak on
