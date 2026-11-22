@@ -76,9 +76,9 @@ async fn probe(from: &TestContext, from_app: &str, vip: &str, port: u16) -> Resu
 
 /// Probe until `from_app` reaches `vip:port`, or the case's deadline ends.
 ///
-/// A changed `allow_from` reaches the other nodes with the service
-/// catalogue, so the old rule can still hold for a while after the
-/// redeployed target is healthy: on the Wyse cluster it took about 40 s.
+/// A changed `allow_from` takes effect with the redeployed target's new
+/// instance, and the old one, with the old rule, keeps the VIP healthy until
+/// the rollout replaces it: up to about 40 s on the Wyse cluster.
 /// Returns the last probe, reached or not, so a failure can show it.
 async fn probe_until_reached(
     from: &TestContext,

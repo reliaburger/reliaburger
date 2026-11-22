@@ -3264,11 +3264,19 @@ wrong: an unlisted app in the target's own namespace still connects.
 
 On the Wyses three of the four passed at once. The fourth, which adds a
 caller to `allow_from` and redeploys, still saw the connection refused. Probing
-by hand found the change did arrive, about 40 seconds after the apply. The new
-`allow_from` travels with the service catalogue, so the caller's node enforces
-the old rule until the catalogue reaches it, however healthy the target
-already is. So the case now probes every two seconds until the caller gets
-through or the deadline ends, and a failure still shows the last probe.
+by hand found the change did arrive, up to about 40 seconds after the apply.
+The new rule comes with the target's new instance, and until the rollout
+replaces the old one, the old instance and its old rule keep the VIP healthy.
+Waiting for a healthy backend therefore proves nothing here. So the case now
+probes every two seconds until the caller gets through or the deadline ends,
+and a failure still shows the last probe.
+
+The same probing found something worse. The scheduler had put every app on
+one node, so the callers always shared the target's node. With callers forced
+onto the other two, a listed caller was refused for good: the grant existed
+only on the target's node (#2216). These cases can't see that while the
+scheduler packs them together, which is why #2216 adds one that places its
+callers elsewhere.
 
 ## The thirteenth group
 
