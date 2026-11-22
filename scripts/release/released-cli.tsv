@@ -1,7 +1,7 @@
-# What relish v0.3.0 accepts, read from its -h pages by
+# What relish v0.3.1 accepts, read from its -h pages by
 # scripts/release/released_cli.py. Regenerate it when docs/website/install.sh's
 # default version changes; tests/suite/website.rs checks the two match.
-version	v0.3.0
+version	v0.3.1
 argument	relish agent explain	[ID]
 argument	relish agent lease release	<KIND>
 argument	relish agent lease release	<NAME>
@@ -1035,5 +1035,7 @@ option	relish verify	--cli-metadata	<FILE>
 option	relish verify	--metadata	<FILE>	
 option	relish verify	--release-url	<URL>	
 option	relish wtf	--app	<APP>	
+option	relish wtf	--explain		
 option	relish wtf	--interval	<INTERVAL>	
+option	relish wtf	--short		
 option	relish wtf	--watch		

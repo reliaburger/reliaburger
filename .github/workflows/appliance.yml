@@ -631,7 +631,9 @@ jobs:
     # whose branch rule admits main; without it the key reads empty.
     environment: release
     needs: [plan, image]
-    if: needs.plan.outputs.publish == 'true'
+    # The bun job is skipped on a publish, and GitHub skips everything
+    # downstream of a skipped job unless the `if` says otherwise.
+    if: ${{ !cancelled() && needs.plan.outputs.publish == 'true' && needs.image.result == 'success' }}
     runs-on: ubuntu-24.04
     outputs:
       changed: ${{ steps.changed.outputs.changed }}
@@ -708,7 +710,7 @@ jobs:
   # image's installer trusts only the release key.
   verify:
     needs: [plan, sign]
-    if: needs.sign.outputs.changed == 'true'
+    if: ${{ !cancelled() && needs.sign.result == 'success' && needs.sign.outputs.changed == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -734,6 +736,7 @@ jobs:
 
   publish:
     needs: [plan, sign, verify]
+    if: ${{ !cancelled() && needs.verify.result == 'success' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
