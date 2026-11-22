@@ -11,12 +11,13 @@
 //!
 //! [`Capability::Ebpf`]: crate::bun::capabilities::Capability::Ebpf
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use crate::bun::capabilities::Capability;
 use crate::testkit::TestContext;
 use crate::testkit::lease::LeaseScope;
-use crate::testkit::registry::TestCase;
+use crate::testkit::registry::{CaseResult, TestCase, unknown};
 use crate::testkit::report::TestGroup;
 use crate::testkit_case;
 
@@ -231,6 +232,107 @@ async fn same_namespace_callers_ignore_allow_from(ctx: TestContext) -> Result<()
     Ok(())
 }
 
+/// The nodes running a `running` instance of `app` in `ctx`'s namespace.
+/// A node whose status can't be read is an error, not "not hosting": the
+/// instance we're looking for may be exactly there.
+async fn nodes_running(
+    ctx: &TestContext,
+    nodes: &[(String, crate::relish::client::BunClient)],
+    app: &str,
+) -> Result<BTreeSet<String>, String> {
+    let mut hosting = BTreeSet::new();
+    for (node_id, client) in nodes {
+        let statuses = client
+            .status()
+            .await
+            .map_err(|error| format!("could not inspect node {node_id}: {error}"))?;
+        if statuses
+            .iter()
+            .any(|i| i.app_name == app && i.namespace == ctx.namespace && i.state == "running")
+        {
+            hosting.insert(node_id.clone());
+        }
+    }
+    Ok(hosting)
+}
+
+/// A node that runs every caller and none of the target, if there is one.
+fn node_apart(target_on: &BTreeSet<String>, callers_on: &[&BTreeSet<String>]) -> Option<String> {
+    let (first, rest) = callers_on.split_first()?;
+    first
+        .iter()
+        .find(|node| !target_on.contains(*node) && rest.iter().all(|on| on.contains(*node)))
+        .cloned()
+}
+
+/// A listed caller on another node than the target reaches it, and an
+/// unlisted one there is refused. Each caller's node enforces `allow_from`,
+/// so it needs the target's list from the catalogue (#2216). The other
+/// cases let the scheduler pack callers beside the target, which is how
+/// they missed that remote callers were refused whatever the list said.
+async fn allow_from_reaches_callers_on_other_nodes(ctx: TestContext) -> CaseResult {
+    let peer = peer(&ctx)?;
+    let nodes = ctx.node_clients().await?;
+    if nodes.len() < 2 {
+        return unknown("one node can't run a caller apart from the target");
+    }
+    let (target, listed, unlisted) = ("fw-target5", "fw-far", "fw-stranger");
+    // One replica per node, so each caller runs beside the target and
+    // away from it alike: replicas of one app spread across nodes. The
+    // callers serve HTTP only to publish a port: a node whose containers
+    // publish none has no masquerade rule yet, and its containers can't
+    // reach another node at all, firewall or not (#2219).
+    let everywhere = |app: &str| peer.container_http_spec(app, nodes.len() as u32);
+    ctx.apply(&target_allowing(&ctx, target, &[qualified(&peer, listed)]))
+        .await?;
+    peer.apply(&everywhere(listed)).await?;
+    peer.apply(&everywhere(unlisted)).await?;
+    ctx.wait_running_cluster(target, 1).await?;
+    peer.wait_running_cluster(listed, nodes.len() as u32)
+        .await?;
+    peer.wait_running_cluster(unlisted, nodes.len() as u32)
+        .await?;
+    let (vip, port) = healthy_vip(&ctx, target).await?;
+
+    let target_on = nodes_running(&ctx, &nodes, target).await?;
+    let listed_on = nodes_running(&peer, &nodes, listed).await?;
+    let unlisted_on = nodes_running(&peer, &nodes, unlisted).await?;
+    let Some(apart) = node_apart(&target_on, &[&listed_on, &unlisted_on]) else {
+        return Err(format!(
+            "no node runs both callers apart from the target, so this can't test a remote \
+             caller: {target} on {target_on:?}, {listed} on {listed_on:?}, {unlisted} on {unlisted_on:?}"
+        )
+        .into());
+    };
+    let Some((_, client)) = nodes.iter().find(|(node_id, _)| *node_id == apart) else {
+        return Err(format!("node {apart} left the listing").into());
+    };
+    let remote = TestContext {
+        client: client.clone(),
+        ..peer.clone()
+    };
+
+    // A healthy backend on the entry node doesn't mean the caller's node
+    // has it yet: its view comes with the next catalogue.
+    let seen = probe_until_reached(&remote, listed, &vip, port).await?;
+    if !seen.reached {
+        return Err(format!(
+            "a listed caller on {apart}, away from the target on {target_on:?}, was refused: {}",
+            seen.detail
+        )
+        .into());
+    }
+    let seen = probe(&remote, unlisted, &vip, port).await?;
+    if seen.reached {
+        return Err(format!(
+            "an unlisted caller on {apart} reached the target despite allow_from: {}",
+            seen.detail
+        )
+        .into());
+    }
+    Ok(())
+}
+
 pub fn cases() -> Vec<TestCase> {
     vec![
         TestCase {
@@ -265,6 +367,14 @@ pub fn cases() -> Vec<TestCase> {
             peer_namespace: false,
             run: testkit_case!(same_namespace_callers_ignore_allow_from),
         },
+        TestCase {
+            name: "allow_from_reaches_callers_on_other_nodes",
+            group: TestGroup::Firewall,
+            requires: &[Capability::ContainerRuntime, Capability::Ebpf],
+            lease: LeaseScope::Applications,
+            peer_namespace: true,
+            run: testkit_case!(allow_from_reaches_callers_on_other_nodes),
+        },
     ]
 }
 
@@ -287,6 +397,19 @@ mod tests {
                 panic!("the API would refuse this firewall target: {error}\n{spec}");
             }
         }
+    }
+
+    #[test]
+    fn a_remote_caller_runs_on_a_node_without_the_target() {
+        let set = |nodes: &[&str]| nodes.iter().map(|n| n.to_string()).collect::<BTreeSet<_>>();
+        let target = set(&["a"]);
+        assert_eq!(
+            node_apart(&target, &[&set(&["a", "b", "c"]), &set(&["a", "c"])]),
+            Some("c".to_string())
+        );
+        // Packed beside the target, or split across nodes: nothing to test.
+        assert_eq!(node_apart(&target, &[&set(&["a"]), &set(&["a"])]), None);
+        assert_eq!(node_apart(&target, &[&set(&["b"]), &set(&["c"])]), None);
     }
 
     /// #2206: the cases that restrict a caller put it in another namespace,

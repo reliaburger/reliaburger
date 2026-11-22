@@ -2906,7 +2906,7 @@ cluster.
 
 ### The cases are the tests
 
-The ordinary catalogue is now 40 cases across 13 groups: scheduling, service
+The ordinary catalogue is now 41 cases across 13 groups: scheduling, service
 discovery, deployments, health checks, secrets and config, firewall, workload
 identity, ingress, volumes, process workloads, jobs, image registry and cluster
 coordination. Each name is a behaviour sentence
@@ -3278,6 +3278,123 @@ only on the target's node (#2216). These cases can't see that while the
 scheduler packs them together, which is why #2216 adds one that places its
 callers elsewhere.
 
+### Whose node decides
+
+We first read that 40 seconds as propagation: a slow catalogue carrying the
+new rule to the other nodes. We wrote it up that way (#2216) and went to
+measure the other direction, a caller *removed* from the list, on a
+three-node Lima cluster with one copy of each caller on every node.
+
+The first probe made the question moot. The listed caller on the target's own
+node connected. The same caller on the other two nodes got `Operation not
+permitted` and kept getting it, minutes later, whatever we applied. `bpftool
+map dump name firewall_map` on one of those nodes printed `[]`: no grant at
+all. The Wyse lab confirmed it within the hour. With callers forced apart by a
+CPU request, the one beside the target got through every round and the ones on
+the other two Wyses never did.
+
+Here's why. The connect hook runs in the *caller's* kernel: it decides before
+the packet leaves, which is the point of doing it in `connect()`. So the
+caller's node has to know the target's `allow_from`. Each node builds its
+`firewall_map` from its merged service view: its own services, plus everyone
+else's from the leader's service catalogue. But `allow_from` reached that view
+only through `register_service_app`, which runs on the node that deploys the
+target. The catalogue had a VIP, a port and backends per service, and nothing
+else, so the merge filled in `firewall_allow_from: None` for every remote
+service, and `None` means "same namespace only". A listed caller was admitted
+on the target's node and refused everywhere else. The 40 seconds on the Wyses
+was the rollout, the redeployed target registering its new list on the one
+node that read it, with the caller that happened to share it.
+
+Why did nothing catch it? Every firewall case let the scheduler place its
+apps, and the scheduler packs apps with no CPU request onto one node. The
+cases were single-node tests running on a three-node cluster.
+
+The fix puts the list where every node already looks. `CatalogService` gains
+a field:
+
+```rust
+#[serde(default)]
+pub allow_from: Option<Vec<String>>,
+```
+
+`#[serde(default)]` lets a catalogue written before the field existed
+deserialise, with `None`. That isn't a compatibility promise (0.3.2 already
+moved the wire protocol to 61), just the cheapest way to keep old test
+fixtures loading. The leader's `build_endpoint_catalog` fills the field from
+each service's committed spec, after it has allocated the VIPs:
+
+```rust
+for (qualified, service) in &mut catalog.services {
+    service.allow_from = ServiceId::parse(qualified)
+        .and_then(|id| {
+            desired
+                .apps
+                .get(&crate::meat::types::AppId::new(&id.name, &id.namespace))
+        })
+        .and_then(|spec| spec.firewall.as_ref())
+        .filter(|firewall| !firewall.allow_from.is_empty())
+        .map(|firewall| firewall.allow_from.clone());
+}
+```
+
+That's one chain of `Option` steps. `and_then` runs the next step only if the
+last one found something, `filter` turns a `Some` into `None` when the
+predicate says no (an empty list asks for nothing, so it becomes `None`), and
+`map` transforms whatever is left. A Go programmer would write four `if`
+statements with early `continue`s; here a missing app, a spec with no
+`[firewall]` table and an empty list all land on `None` without a branch in
+sight. `&mut catalog.services` iterates the map by mutable reference, so we
+change each entry in place, and the borrow checker makes sure nothing else
+reads the map while we do.
+
+The merge on each node then copies the field into the service view instead of
+writing `None`. Since the field is part of `CatalogService`'s `PartialEq`, a
+changed list makes the freshly built catalogue differ from the committed one,
+so the leader publishes a new generation without any extra trigger. Each node
+fetches it with its next placement poll, every two seconds, and reconciles its
+`firewall_map`.
+
+So a changed list now reaches the caller's node from the *spec*, not from the
+rollout. The node running the target is still the exception: its own entry
+for the service wins over the catalogue's, so it switches when the new
+instance registers. That's the rollout time again, and it's a follow-up.
+
+We measured both directions on the same three-node Lima cluster before and
+after, probing from a copy of the caller on every node about once a second,
+three runs each, timed from `relish apply`:
+
+| Change | Node | 0.3.1 | With the fix |
+|--------|------|-------|--------------|
+| Add a caller | the target's | 6–8 s | 6–9 s |
+| Add a caller | the other two | never | 1–3 s |
+| Remove a caller | the target's | 2–5 s | 2–3 s |
+| Remove a caller | the other two | refused anyway | 1–4 s |
+
+On the Wyses, where only the target's node ever enforced the change, an add
+took 10 to 42 s and a removal 7 to 41 s: a rollout on an Atom x5 is that much
+slower. The probes turned up something else, too. While a one-replica target
+rolls, even a caller that was listed all along gets `Operation not permitted`
+for a few seconds, because the connect hook refuses a VIP with no backend in
+exactly the way it refuses a forbidden caller. Read a firewall probe with that
+in mind.
+
+The fifth firewall case, `allow_from_reaches_callers_on_other_nodes`, closes
+the hole that let this through. It runs both callers with one replica per
+node, finds a node that runs both and not the target, and probes from there
+through that node's own API, since `exec` runs in an instance on the node it's
+asked. If no such node exists it fails and says where everything landed,
+rather than quietly testing one node again. A single-node cluster gets
+`unknown`: there's nowhere else to put a caller.
+
+Two details came from running it. The callers serve HTTP, though nothing
+calls them, because a node whose containers publish no port has no masquerade
+rule yet, and its containers can't reach another node at all (#2219, its own
+fix). And the listed caller probes until it gets through, the same loop as
+the case above: the target is healthy on the node we asked, but the caller's
+node learns its backend from the next catalogue, and until then the hook
+refuses a VIP with no backend.
+
 ## The thirteenth group
 
 That last group — image-registry — is the one we said needed its own day. The
@@ -3312,7 +3429,7 @@ Pickle under the lease's namespace, deploys it by digest and checks that its
 HTTP server answers from inside the container. A successful upload alone can't
 pass it.
 
-That completes the catalogue: thirteen groups, thirty-nine cases (forty since #2206, below). Not all of
+That completes the catalogue: thirteen groups, thirty-nine cases (forty-one since #2206 and #2216, below). Not all of
 them run everywhere — the process-runtime cases skip on runc and the container
 cases skip on a process cluster; firewall wants eBPF, ingress wants the proxy,
 the registry cases need a declared reachable endpoint. But every skip names its reason, every
