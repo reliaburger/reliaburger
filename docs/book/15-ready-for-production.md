@@ -3262,6 +3262,14 @@ the service map lagged the instance), and put the probe's source, address and
 `wget` output in any failure. A fourth case pins the rule the old ones got
 wrong: an unlisted app in the target's own namespace still connects.
 
+On the Wyses three of the four passed at once. The fourth, which adds a
+caller to `allow_from` and redeploys, still saw the connection refused. Probing
+by hand found the change did arrive, about 40 seconds after the apply. The new
+`allow_from` travels with the service catalogue, so the caller's node enforces
+the old rule until the catalogue reaches it, however healthy the target
+already is. So the case now probes every two seconds until the caller gets
+through or the deadline ends, and a failure still shows the last probe.
+
 ## The thirteenth group
 
 That last group — image-registry — is the one we said needed its own day. The

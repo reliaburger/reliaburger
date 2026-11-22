@@ -74,6 +74,36 @@ async fn probe(from: &TestContext, from_app: &str, vip: &str, port: u16) -> Resu
     })
 }
 
+/// Probe until `from_app` reaches `vip:port`, or the case's deadline ends.
+///
+/// A changed `allow_from` reaches the other nodes with the service
+/// catalogue, so the old rule can still hold for a while after the
+/// redeployed target is healthy: on the Wyse cluster it took about 40 s.
+/// Returns the last probe, reached or not, so a failure can show it.
+async fn probe_until_reached(
+    from: &TestContext,
+    from_app: &str,
+    vip: &str,
+    port: u16,
+) -> Result<Probe, String> {
+    loop {
+        let seen = probe(from, from_app, vip, port).await?;
+        if seen.reached {
+            return Ok(seen);
+        }
+        let waited = from
+            .deadline
+            .run(
+                "allow_from change",
+                tokio::time::sleep(Duration::from_secs(2)),
+            )
+            .await;
+        if waited.is_err() {
+            return Ok(seen);
+        }
+    }
+}
+
 /// The target's VIP once it has a healthy backend. Waiting for the instance
 /// to run isn't enough: on a slow node the service map lags it, and a probe
 /// sent before then is refused for want of a backend, not by the firewall.
@@ -142,7 +172,8 @@ async fn unlisted_app_is_denied(ctx: TestContext) -> Result<(), String> {
     Ok(())
 }
 
-/// Adding an app to `allow_from` and redeploying opens the connection.
+/// Adding an app to `allow_from` and redeploying opens the connection,
+/// once the change has reached the caller's node.
 async fn firewall_reflects_allow_from_change(ctx: TestContext) -> Result<(), String> {
     let peer = peer(&ctx)?;
     let (target, first, second) = ("fw-target3", "fw-first", "fw-second");
@@ -169,7 +200,7 @@ async fn firewall_reflects_allow_from_change(ctx: TestContext) -> Result<(), Str
     .await?;
     ctx.wait_running_cluster(target, 1).await?;
     let (vip, port) = healthy_vip(&ctx, target).await?;
-    let after = probe(&peer, second, &vip, port).await?;
+    let after = probe_until_reached(&peer, second, &vip, port).await?;
     if !after.reached {
         return Err(format!(
             "second app still blocked after being added to allow_from: {}",
