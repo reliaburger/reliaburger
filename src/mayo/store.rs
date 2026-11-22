@@ -1684,6 +1684,24 @@ mod tests {
         assert_eq!(values, vec![1.0, 2.0]);
     }
 
+    /// A query that selects fewer than the four columns the row reader
+    /// takes gets no rows back, not a panic on the missing column.
+    #[tokio::test]
+    async fn a_query_without_the_four_metric_columns_returns_no_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = MayoStore::new(dir.path().to_path_buf());
+        store.insert(&MetricKey::simple("cpu"), Sample::at(100, 1.0));
+
+        let rows = store
+            .snapshot_since(0)
+            .await
+            .unwrap()
+            .query_sql("SELECT timestamp, metric_name, labels FROM metrics")
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "{rows:?}");
+    }
+
     #[test]
     fn the_store_keeps_the_newest_node_sample_for_the_summary() {
         let dir = tempfile::tempdir().unwrap();
