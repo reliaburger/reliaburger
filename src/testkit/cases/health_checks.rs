@@ -73,6 +73,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::HealthChecks,
             requires: &[Capability::ProcessRuntime],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(unhealthy_app_is_restarted),
         },
         TestCase {
@@ -80,6 +81,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::HealthChecks,
             requires: &[Capability::ProcessRuntime],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(hanging_health_check_marks_instance_unhealthy),
         },
         TestCase {
@@ -87,6 +89,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::HealthChecks,
             requires: &[Capability::ProcessRuntime],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(slow_but_within_timeout_app_stays_running),
         },
     ]

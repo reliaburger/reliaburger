@@ -118,6 +118,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::Volumes,
             requires: &[Capability::ContainerRuntime],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(volume_data_survives_instance_restart),
         },
         TestCase {
@@ -125,6 +126,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::Volumes,
             requires: &[Capability::ContainerRuntime],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(volume_is_isolated_per_app),
         },
         TestCase {
@@ -132,6 +134,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::Volumes,
             requires: &[Capability::ContainerRuntime],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(volume_size_limit_is_enforced),
         },
     ]
@@ -248,6 +251,7 @@ mod tests {
             deadline: Deadline::after(Duration::from_secs(5)).unwrap(),
             peer_route: PeerRoute::Relay,
             trace: Default::default(),
+            peer: None,
         };
 
         let output = exec_sh(&ctx, "vol-persist", "cat /data/marker").await;

@@ -2906,7 +2906,7 @@ cluster.
 
 ### The cases are the tests
 
-The ordinary catalogue is now 39 cases across 13 groups: scheduling, service
+The ordinary catalogue is now 40 cases across 13 groups: scheduling, service
 discovery, deployments, health checks, secrets and config, firewall, workload
 identity, ingress, volumes, process workloads, jobs, image registry and cluster
 coordination. Each name is a behaviour sentence
@@ -3210,6 +3210,58 @@ harness to speak the raw `/v2` protocol from *on* a node — a genuinely differe
 piece of plumbing, left for its own day. Twelve of thirteen groups, and the
 thirteenth's absence is written down rather than papered over.
 
+The firewall cases waited a long time for a cluster that could run them, and
+when one did, they failed. In November 2026 the Wyse 3040 lab gave the
+catalogue three real machines with eBPF on (#286), and all three firewall cases
+came back red: an unlisted app reached the target, and a listed one couldn't.
+That reads like a firewall that doesn't work. It wasn't. Since 0.2.0, namespaces
+are the isolation boundary, and `allow_from` only opens paths *into* a
+namespace from another one; it never restricts callers in the target's own
+namespace. The connect hook says so in its first line: a source in the
+target's namespace is let through before `firewall_map` is even consulted. The
+cases still put every app in the case's single namespace, as they had before
+0.2.0, so they were testing a rule the product no longer has. Nothing had run
+them against eBPF since, so nothing had noticed (#2206).
+
+The fix is a second namespace. A case's resources live under a server-owned
+lease, and a lease covers exactly one namespace, so a case that needs callers
+somewhere else needs a second lease. That lease has to belong to the runner,
+not the case, for the same reason the first one does: the runner is what
+proves cleanup after a pass, a failure, a timeout or a panic. So `TestCase`
+gained a `peer_namespace: bool`, and for a case that sets it the runner leases
+`<namespace>-peer` alongside the case's own, releases both at teardown, and
+reports `Unknown`, after releasing the first, if the second is refused. The
+case asks its context for the peer:
+
+```rust
+pub fn peer(&self) -> Option<TestContext> {
+    let peer = self.peer.as_ref()?;
+    Some(TestContext {
+        namespace: peer.namespace.clone(),
+        lease_id: peer.lease_id.clone(),
+        peer: None,
+        ..self.clone()
+    })
+}
+```
+
+`..self.clone()` is Chapter 1's struct update syntax: every field not named
+comes from a clone of this context, so the peer shares the connection, the
+deadline and the fault guard, and only its namespace and lease differ. The
+`?` after `as_ref()` works on `Option` as it does on `Result`: no peer, and the
+function returns `None` at once.
+
+We didn't add a variant to `LeaseScope`, though it looked like the natural
+home. `LeaseScope` is the server's type: it crosses the wire and sits in the
+council's state, so a new variant would have been a protocol change for the
+sake of a test. The flag lives on `TestCase`, which only the client sees.
+
+The rewritten cases name their callers as `namespace/app`, wait for the target
+to have a healthy backend rather than just a running instance (on the Atom x5
+the service map lagged the instance), and put the probe's source, address and
+`wget` output in any failure. A fourth case pins the rule the old ones got
+wrong: an unlisted app in the target's own namespace still connects.
+
 ## The thirteenth group
 
 That last group — image-registry — is the one we said needed its own day. The
@@ -3244,7 +3296,7 @@ Pickle under the lease's namespace, deploys it by digest and checks that its
 HTTP server answers from inside the container. A successful upload alone can't
 pass it.
 
-That completes the catalogue: thirteen groups, thirty-nine cases. Not all of
+That completes the catalogue: thirteen groups, thirty-nine cases (forty since #2206, below). Not all of
 them run everywhere — the process-runtime cases skip on runc and the container
 cases skip on a process cluster; firewall wants eBPF, ingress wants the proxy,
 the registry cases need a declared reachable endpoint. But every skip names its reason, every

@@ -132,6 +132,17 @@ pub struct TestContext {
     /// What the case is waiting for and which named steps it has run, for a
     /// failure report.
     pub(crate) trace: CaseTrace,
+    /// The case's second namespace and its lease, when the case asked for
+    /// one ([`TestCase::peer_namespace`](super::registry::TestCase)).
+    pub(crate) peer: Option<PeerNamespace>,
+}
+
+/// A case's second namespace, `<namespace>-peer`, owned by its own lease.
+#[derive(Debug, Clone)]
+pub(crate) struct PeerNamespace {
+    pub(crate) namespace: String,
+    /// `None` only in runner unit tests without a lease server.
+    pub(crate) lease_id: Option<String>,
 }
 
 /// What a case has been doing, kept so a failure can say where it was.
@@ -411,6 +422,19 @@ impl TestContext {
     /// Build a namespace name for case number `seq` of run `run_id`.
     pub fn namespace_for(run_id: &str, seq: usize) -> String {
         format!("{TEST_NAMESPACE_PREFIX}-{run_id}-{seq:02}")
+    }
+
+    /// The case's second namespace, for a case that asked for one: the same
+    /// connection, deadline and fault ownership, applying under the peer's
+    /// own lease. `None` for every other case, and for the peer itself.
+    pub fn peer(&self) -> Option<TestContext> {
+        let peer = self.peer.as_ref()?;
+        Some(TestContext {
+            namespace: peer.namespace.clone(),
+            lease_id: peer.lease_id.clone(),
+            peer: None,
+            ..self.clone()
+        })
     }
 
     /// Whether `namespace` was created by the test runner.
@@ -1209,7 +1233,10 @@ impl TestContext {
     /// lease-free unit-test path also checks [`is_test_namespace`](Self::is_test_namespace).
     pub async fn teardown(&self, deadline: Deadline) -> CleanupOutcome {
         let faults = self.chaos_guard.cleanup(deadline).await;
-        let resources = self.teardown_resources(deadline).await;
+        let mut resources = self.teardown_resources(deadline).await;
+        if let Some(peer) = self.peer() {
+            resources = merge_cleanup(resources, peer.teardown_resources(deadline).await);
+        }
         merge_cleanup(faults, resources)
     }
 
@@ -1445,6 +1472,7 @@ impl TestContext {
             deadline: Deadline::after(Duration::from_millis(200)).unwrap(),
             peer_route: PeerRoute::Direct,
             trace: Default::default(),
+            peer: None,
         }
     }
 }
