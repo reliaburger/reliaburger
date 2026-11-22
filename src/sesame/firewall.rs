@@ -921,6 +921,7 @@ mod tests {
                         healthy: true,
                     })
                     .collect(),
+                allow_from: None,
             },
         );
         catalog
@@ -1159,6 +1160,39 @@ mod tests {
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].src_cgroup_id, 1001);
         assert_eq!(rules[0].dst_app_id, 2);
+        assert_eq!(rules[0].action, FIREWALL_ALLOW);
+    }
+
+    /// The caller's node enforces `allow_from`, so a target running only on
+    /// another node must bring its grants with the catalogue (#2216).
+    #[test]
+    fn a_remote_target_grants_listed_callers_on_this_node() {
+        let mut catalog = catalog_with(
+            "backend",
+            "db",
+            Ipv4Addr::new(127, 128, 0, 9),
+            &[("other-node", Ipv4Addr::new(192, 168, 0, 2), 31001)],
+        );
+        for service in catalog.services.values_mut() {
+            service.allow_from = Some(vec!["frontend/api".to_string()]);
+        }
+        let merged = crate::onion::service_map::ServiceMap::new()
+            .with_cluster_catalog_excluding_node(&catalog, Some("this-node"));
+        let services: Vec<ServiceEntry> = merged.resolve_all().into_iter().cloned().collect();
+        let cgroups: HashMap<(String, String), Vec<u64>> = [
+            cg("frontend", "api", vec![1001]),
+            cg("frontend", "web", vec![1003]),
+        ]
+        .into();
+
+        let rules = resolve_firewall_rules(&services, &cgroups);
+        // Only the listed caller is granted; frontend/web stays refused.
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].src_cgroup_id, 1001);
+        assert_eq!(
+            rules[0].dst_app_id,
+            u32::from(Ipv4Addr::new(127, 128, 0, 9))
+        );
         assert_eq!(rules[0].action, FIREWALL_ALLOW);
     }
 

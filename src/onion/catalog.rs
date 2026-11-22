@@ -57,6 +57,12 @@ pub struct CatalogService {
     pub port: u16,
     /// Every backend of this service, on any node.
     pub backends: Vec<CatalogBackend>,
+    /// The service's `allow_from`, from its spec. Each caller's node
+    /// enforces it in the connect hook, so it travels with the catalogue to
+    /// every node, not only to the nodes running the service (#2216).
+    /// `None` keeps namespace-default isolation.
+    #[serde(default)]
+    pub allow_from: Option<Vec<String>>,
 }
 
 /// The replicated catalogue: qualified service id → its cluster entry.
@@ -177,6 +183,7 @@ impl EndpointCatalog {
                     vip,
                     port,
                     backends,
+                    allow_from: None,
                 },
             );
         }

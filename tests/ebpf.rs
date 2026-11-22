@@ -1788,6 +1788,7 @@ async fn cross_namespace_connect_to_node_host_port_is_denied() {
                 host_port: published.port(),
                 healthy: true,
             }],
+            allow_from: None,
         },
     );
     let entries = reliaburger::sesame::firewall::destination_entries(&[], &catalog, &[]);
