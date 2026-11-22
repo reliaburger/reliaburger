@@ -200,6 +200,7 @@ pub fn cases() -> Vec<TestCase> {
                 Capability::Identity,
             ],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(workload_receives_spiffe_certificate),
         },
         TestCase {
@@ -207,6 +208,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::WorkloadIdentity,
             requires: &[Capability::Council, Capability::Identity],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(jwks_endpoint_serves_signing_keys),
         },
         TestCase {
@@ -214,6 +216,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::WorkloadIdentity,
             requires: &[Capability::Council, Capability::Identity],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(namespace_scoped_token_is_rejected_elsewhere),
         },
     ]

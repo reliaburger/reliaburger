@@ -105,6 +105,7 @@ pub fn cases() -> Vec<TestCase> {
                 Capability::ProcessRuntime,
             ],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(resolve_returns_vip_and_healthy_backends),
         },
         TestCase {
@@ -116,6 +117,7 @@ pub fn cases() -> Vec<TestCase> {
                 Capability::ProcessRuntime,
             ],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(resolve_reflects_scale_up),
         },
         TestCase {
@@ -123,6 +125,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::ServiceDiscovery,
             requires: &[Capability::Cluster, Capability::ProcessRuntime],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(stopped_instance_leaves_the_backend_list),
         },
     ]

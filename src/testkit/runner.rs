@@ -22,7 +22,7 @@ use tokio::task::JoinSet;
 use crate::bun::capabilities::{CapabilityState, ClusterCapabilities};
 use crate::relish::client::BunClient;
 
-use super::context::TestContext;
+use super::context::{PeerNamespace, TestContext};
 use super::deadline::Deadline;
 use super::lease::LeaseScope;
 use super::registry::{CaseError, TestCase};
@@ -90,6 +90,60 @@ async fn create_lease(
             }
             other => return other,
         }
+    }
+}
+
+/// How long a case's lease lasts: the case's budget plus the failure capture
+/// and the teardown, both of which still need its resources owned.
+fn lease_ttl_seconds(timeout: Duration) -> u64 {
+    let lifetime = timeout
+        .saturating_add(CAPTURE_BUDGET)
+        .saturating_add(teardown_timeout());
+    lifetime
+        .as_secs()
+        .saturating_add(u64::from(lifetime.subsec_nanos() != 0))
+}
+
+/// Lease the case's second namespace, `<namespace>-peer`, for as long as its
+/// own lease lasts. The error is the case's `Unknown` reason.
+async fn create_peer(
+    context: &TestContext,
+    lease_ownership: LeaseOwnership,
+    timeout: Duration,
+) -> Result<PeerNamespace, String> {
+    let namespace = format!("{}-peer", context.namespace);
+    match lease_ownership {
+        LeaseOwnership::Required => {
+            match context
+                .deadline
+                .run(
+                    "peer lease creation",
+                    create_lease(
+                        &context.client,
+                        LeaseScope::Applications,
+                        lease_ttl_seconds(timeout),
+                        &namespace,
+                    ),
+                )
+                .await
+            {
+                Ok(Ok(lease)) => Ok(PeerNamespace {
+                    namespace: lease.namespace,
+                    lease_id: Some(lease.lease_id),
+                }),
+                Ok(Err(error)) => Err(format!(
+                    "server did not grant the case's peer namespace {namespace} a lease: {error}"
+                )),
+                Err(error) => Err(format!(
+                    "peer namespace {namespace} got no lease in time: {error}"
+                )),
+            }
+        }
+        #[cfg(test)]
+        LeaseOwnership::UnleasedForUnitTests => Ok(PeerNamespace {
+            namespace,
+            lease_id: None,
+        }),
     }
 }
 
@@ -435,14 +489,7 @@ async fn run_one(
 
     let (namespace, lease_id) = match lease_ownership {
         LeaseOwnership::Required => {
-            // The lease outlives the case by the failure capture and the
-            // teardown, both of which still need its resources owned.
-            let lifetime = timeout
-                .saturating_add(CAPTURE_BUDGET)
-                .saturating_add(teardown_timeout());
-            let ttl_seconds = lifetime
-                .as_secs()
-                .saturating_add(u64::from(lifetime.subsec_nanos() != 0));
+            let ttl_seconds = lease_ttl_seconds(timeout);
             if ttl_seconds > capabilities.test_policy.max_lease_seconds {
                 return TestCaseResult {
                     name: case.name.to_string(),
@@ -517,7 +564,7 @@ async fn run_one(
         LeaseOwnership::UnleasedForUnitTests => (namespace, None),
     };
 
-    let context = TestContext {
+    let mut context = TestContext {
         client,
         namespace,
         lease_id,
@@ -527,7 +574,35 @@ async fn run_one(
         deadline,
         peer_route,
         trace: Default::default(),
+        peer: None,
     };
+    if case.peer_namespace {
+        match create_peer(&context, lease_ownership, timeout).await {
+            Ok(peer) => context.peer = Some(peer),
+            Err(reason) => {
+                // Release the lease the case already holds before reporting.
+                let cleanup_deadline =
+                    Deadline::after(teardown_timeout()).expect("non-zero cleanup timeout");
+                let cleanup = context.teardown(cleanup_deadline).await;
+                return TestCaseResult {
+                    name: case.name.to_string(),
+                    group: case.group,
+                    required,
+                    started_at,
+                    finished_at: now_rfc3339(),
+                    deadline_at,
+                    outcome: TestOutcome::Unknown {
+                        kind: UnknownKind::CollectorFailed,
+                        reason,
+                    },
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    evidence: Vec::new(),
+                    cleanup,
+                    failure_state: None,
+                };
+            }
+        }
+    }
 
     // The case body gets its own task so a panic is data and the outer owner
     // still reaches cleanup. Spawning `run_one` directly did the opposite.
@@ -788,6 +863,7 @@ mod tests {
             group: TestGroup::Scheduling,
             requires,
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run,
         }
     }
@@ -802,6 +878,7 @@ mod tests {
             group: TestGroup::Chaos,
             requires,
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run,
         }
     }
@@ -1646,6 +1723,137 @@ mod tests {
                 "release:lease-2".to_string(),
                 "release:lease-3".to_string(),
             ]
+        );
+    }
+
+    /// #2206: `allow_from` only governs callers from another namespace, so a
+    /// firewall case needs a second namespace with a lease of its own.
+    #[tokio::test]
+    async fn a_case_with_a_peer_namespace_holds_a_second_lease_and_releases_both() {
+        async fn uses_peer(ctx: TestContext) -> Result<(), String> {
+            let peer = ctx.peer().ok_or("no peer namespace")?;
+            if peer.namespace != format!("{}-peer", ctx.namespace) {
+                return Err(format!("peer namespace is {}", peer.namespace));
+            }
+            if peer.lease_id.is_none() || peer.lease_id == ctx.lease_id {
+                return Err("the peer namespace has no lease of its own".to_string());
+            }
+            if peer.peer().is_some() {
+                return Err("a peer has a peer".to_string());
+            }
+            Ok(())
+        }
+        async fn has_no_peer(ctx: TestContext) -> Result<(), String> {
+            match ctx.peer() {
+                Some(peer) => Err(format!("unexpected peer {}", peer.namespace)),
+                None => Ok(()),
+            }
+        }
+        let (address, records) = spawn_lease_server().await;
+        let mut cfg = config(
+            BunClient::new_with_token(&address, None),
+            full_capabilities(),
+            1,
+        );
+        cfg.fixed_namespace = Some("rbtest-pair".to_string());
+        cfg.lease_ownership = LeaseOwnership::Required;
+        cfg.timeout = Duration::from_millis(50);
+        let mut paired = case("uses_peer", &[], testkit_case!(uses_peer));
+        paired.peer_namespace = true;
+
+        let report = run(
+            vec![paired, case("has_no_peer", &[], testkit_case!(has_no_peer))],
+            cfg,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.passed, 2, "{:?}", report.results);
+        assert!(
+            report
+                .results
+                .iter()
+                .all(|result| result.cleanup == CleanupOutcome::Confirmed)
+        );
+        let mut observed = records.lock().await.clone();
+        observed.sort();
+        let ttl = (CAPTURE_BUDGET + teardown_timeout()).as_secs() + 1;
+        assert_eq!(
+            observed,
+            vec![
+                format!("create:rbtest-pair-00-peer:{ttl}"),
+                format!("create:rbtest-pair-00:{ttl}"),
+                format!("create:rbtest-pair-01:{ttl}"),
+                "release:lease-1".to_string(),
+                "release:lease-2".to_string(),
+                "release:lease-3".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_peer_lease_releases_the_case_lease_and_is_unknown() {
+        async fn must_not_run(_ctx: TestContext) -> Result<(), String> {
+            panic!("case ran without its peer namespace");
+        }
+        let records = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let state = LeaseMockState {
+            records: Arc::clone(&records),
+            next_id: Arc::new(AtomicUsize::new(1)),
+        };
+        let create = |State(state): State<LeaseMockState>,
+                      Json(request): Json<serde_json::Value>| async move {
+            use axum::response::IntoResponse;
+            if request["namespace"]
+                .as_str()
+                .is_some_and(|namespace| namespace.ends_with("-peer"))
+            {
+                return (
+                    StatusCode::FORBIDDEN,
+                    "token scope does not allow the requested test namespace",
+                )
+                    .into_response();
+            }
+            create_mock_lease(State(state), Json(request))
+                .await
+                .into_response()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route("/v1/test/leases", post(create))
+            .route("/v1/test/leases/{id}", delete(release_mock_lease))
+            .route("/v1/cluster/nodes", get(empty_mock_list))
+            .route("/v1/status", get(empty_mock_list))
+            .with_state(state);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut cfg = config(
+            BunClient::new_with_token(&address, None),
+            full_capabilities(),
+            1,
+        );
+        cfg.fixed_namespace = Some("rbtest-lonely".to_string());
+        cfg.lease_ownership = LeaseOwnership::Required;
+        let mut paired = case("must_not_run", &[], testkit_case!(must_not_run));
+        paired.peer_namespace = true;
+
+        let report = run(vec![paired], cfg).await.unwrap();
+
+        assert_eq!(report.unknown, 1);
+        let result = &report.results[0];
+        assert!(
+            matches!(&result.outcome, TestOutcome::Unknown { reason, .. } if reason.contains("peer namespace")),
+            "{:?}",
+            result.outcome
+        );
+        assert_eq!(result.cleanup, CleanupOutcome::Confirmed);
+        assert!(
+            records
+                .lock()
+                .await
+                .contains(&"release:lease-1".to_string())
         );
     }
 

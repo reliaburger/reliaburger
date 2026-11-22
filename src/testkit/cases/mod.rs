@@ -142,7 +142,8 @@ mod tests {
 
     #[test]
     fn the_catalogue_is_the_expected_size() {
-        // All thirteen groups, three cases each.
-        assert_eq!(all().len(), 39);
+        // All thirteen groups, three cases each, and the firewall's
+        // same-namespace case (#2206).
+        assert_eq!(all().len(), 40);
     }
 }

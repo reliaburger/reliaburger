@@ -141,6 +141,7 @@ pub fn cases() -> Vec<TestCase> {
                 Capability::ProcessRuntime,
             ],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(rolling_deploy_keeps_the_app_running),
         },
         TestCase {
@@ -148,6 +149,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::Deployments,
             requires: &[Capability::Cluster, Capability::ProcessRuntime],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(failed_deploy_rolls_back_automatically),
         },
         TestCase {
@@ -155,6 +157,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::Deployments,
             requires: &[Capability::Cluster, Capability::ProcessRuntime],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(deploy_history_records_each_version),
         },
     ]
@@ -235,6 +238,7 @@ mod tests {
             deadline: crate::testkit::deadline::Deadline::after(timeout).unwrap(),
             peer_route: crate::testkit::context::PeerRoute::Direct,
             trace: Default::default(),
+            peer: None,
         };
         let case = cases()
             .into_iter()

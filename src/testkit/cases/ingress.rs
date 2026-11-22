@@ -119,6 +119,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::Ingress,
             requires: &[Capability::ContainerRuntime, Capability::Ingress],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(ingress_routes_host_header_to_app),
         },
         TestCase {
@@ -126,6 +127,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::Ingress,
             requires: &[Capability::ContainerRuntime, Capability::Ingress],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(ingress_removes_route_after_stop),
         },
         TestCase {
@@ -133,6 +135,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::Ingress,
             requires: &[Capability::ContainerRuntime, Capability::Ingress],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(ingress_route_appears_in_routing_table),
         },
     ]
