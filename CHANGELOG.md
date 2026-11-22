@@ -28,6 +28,7 @@ Fixes from the Wyse 3040 lab that need a new appliance image. Not released yet: 
 - Containers on a node where nothing publishes a port can reach services on other nodes. The node's masquerade rule was created only with the first published port, so a node running only workers or jobs sent their calls out with container source addresses, and they timed out. Network setup now creates it for every container ([#2219](https://github.com/reliaburger/reliaburger/issues/2219)).
 - `relish test`'s firewall cases test what `allow_from` does: callers from another namespace, named as `namespace/app`. They put every app in one namespace, where `allow_from` doesn't apply, so on a cluster with eBPF they failed although the firewall worked. A fourth case checks that callers in the target's own namespace aren't restricted ([#2206](https://github.com/reliaburger/reliaburger/issues/2206)).
 - `relish wtf` calls a crash loop only when one instance restarts three times in 15 minutes. Three replicas that restarted once each were a critical `crashloop` for 15 minutes, and the instance a restart named was never read ([#2197](https://github.com/reliaburger/reliaburger/issues/2197)).
+- `url` 2.5.9, for RUSTSEC-2026-0592 ([#2213](https://github.com/reliaburger/reliaburger/issues/2213)).
 
 ## [0.3.1] - 2026-11-21
 
