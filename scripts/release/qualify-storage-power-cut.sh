@@ -8,7 +8,7 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 --vm DISPOSABLE_LIMA_VM --fixture exporter|leases|backups [--iterations N] [--record FILE.md]" >&2
+    echo "usage: $0 --vm DISPOSABLE_LIMA_VM --fixture exporter|leases|backups|volumes [--iterations N] [--record FILE.md]" >&2
     exit 2
 }
 
@@ -33,8 +33,13 @@ case $fixture in
     exporter) test=actual_power_cut_preserves_acknowledged_log_exports ;;
     leases) test=actual_power_cut_preserves_acknowledged_lease_operations ;;
     backups) test=actual_power_cut_preserves_acknowledged_council_backups ;;
+    volumes) test=actual_power_cut_preserves_acknowledged_volume_snapshots ;;
     *) usage ;;
 esac
+# Bun's volumes fixture loop-mounts a Btrfs image, and only root may mount
+# it or make Btrfs subvolumes. Every other fixture runs as the VM's user.
+user=user
+[[ $fixture != volumes ]] || user=root
 # The shared development VM carries other people's builds and clusters.
 if [[ $vm == reliaburger-test ]]; then
     echo "refusing to cut the power of the development VM $vm; create a disposable one" >&2
@@ -96,16 +101,19 @@ iteration() {
     directory=$(limactl shell "$vm" mktemp -d /var/tmp/reliaburger-power-cut.XXXXXX) || return 1
     [[ $directory == /var/tmp/reliaburger-power-cut.* ]] || return 1
     printf '%s\n' "$directory" > "$log/guest-directory"
-    limactl shell "$vm" bash -s -- "$build" "$directory" "$test" > "$log/prepare.log" 2>&1 <<'GUEST' || return 1
+    limactl shell "$vm" bash -s -- "$build" "$directory" "$test" "$user" > "$log/prepare.log" 2>&1 <<'GUEST' || return 1
 set -euo pipefail
 build=$1
 directory=$2
+as=()
+[[ $4 != root ]] || as=(sudo)
 sha256sum --quiet --check "$build/power_cut.sha256"
-timeout 120s env RELIABURGER_POWER_CUT_DIRECTORY="$directory" RELIABURGER_REBOOT_PHASE=prepare \
+"${as[@]}" timeout 120s env RELIABURGER_POWER_CUT_DIRECTORY="$directory" RELIABURGER_REBOOT_PHASE=prepare \
     "$build/power_cut" --ignored --exact "$3" --nocapture --test-threads=1
 cd "$directory"
 for pid in *.pid; do
-    if ! kill -0 "$(cat "$pid")"; then
+    # Not kill -0: that can't signal a root worker from the VM's user.
+    if [[ ! -d /proc/$(cat "$pid") ]]; then
         echo "worker ${pid%.pid} died during prepare" >&2
         tail -n 20 "${pid%.pid}.log" >&2
         exit 1
@@ -131,12 +139,14 @@ GUEST
         limactl start "$vm" >> "$log/start.log" 2>&1 || return 1
         echo retried > "$log/start-retried"
     fi
-    limactl shell "$vm" bash -s -- "$build" "$directory" "$test" > "$log/verify.log" 2>&1 <<'GUEST' || return 1
+    limactl shell "$vm" bash -s -- "$build" "$directory" "$test" "$user" > "$log/verify.log" 2>&1 <<'GUEST' || return 1
 set -euo pipefail
 build=$1
 directory=$2
+as=()
+[[ $4 != root ]] || as=(sudo)
 sha256sum --quiet --check "$build/power_cut.sha256"
-timeout 300s env RELIABURGER_POWER_CUT_DIRECTORY="$directory" RELIABURGER_REBOOT_PHASE=verify \
+"${as[@]}" timeout 300s env RELIABURGER_POWER_CUT_DIRECTORY="$directory" RELIABURGER_REBOOT_PHASE=verify \
     "$build/power_cut" --ignored --exact "$3" --nocapture --test-threads=1
 printf 'verified boot: %s\n' "$(cat "$directory/verified-boot")"
 GUEST

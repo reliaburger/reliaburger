@@ -175,7 +175,7 @@ mod tests {
     fn load_bootstrap_state_round_trips_security_state() {
         let dir = std::env::temp_dir().join("rb-bootstrap-test-state-dir");
         std::fs::create_dir_all(&dir).unwrap();
-        let init = crate::sesame::init::initialize_cluster("testcluster", "node-1", &dir).unwrap();
+        let init = crate::sesame::init::initialize_cluster("testcluster", "node-1").unwrap();
         let json = serde_json::to_string_pretty(&init.security_state).unwrap();
         let path = write_secret("state.json", &json);
 

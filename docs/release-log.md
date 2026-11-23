@@ -4,9 +4,168 @@ One paragraph per release: when it shipped, how long qualifying it took, and
 what the soaks found on the way. It's the track record behind the
 [release gate](releasing.md#staging-a-candidate); the evidence is in the
 [qualification records](qualification/) each paragraph links, and what each
-release contains is in the [roadmap](roadmap.md#releases-after-010). A new
+release contains is in the [roadmap](roadmap.md#releases-after-010). What
+changed for you in each release, and whether a cluster can roll onto it, is
+in the [changelog](../CHANGELOG.md). A new
 paragraph goes at the top when a release is promoted
 ([release gate, step 9](releasing.md#staging-a-candidate)).
+
+## 0.3.2: Wyse lab fixes
+
+Promoted on 23 November 2026 as tag `v0.3.2` at `3edd5461`
+([promote run](https://github.com/reliaburger/reliaburger/actions/runs/45212658267)),
+two days after 0.3.1.
+A patch release: what the Wyse 3040 lab left that needs a new appliance
+image, such as boot logs over the network
+([#2149](https://github.com/reliaburger/reliaburger/issues/2149)), `allow_from`
+enforced on every node
+([#2216](https://github.com/reliaburger/reliaburger/issues/2216)) and
+containers reaching other nodes from a node that publishes no port
+([#2219](https://github.com/reliaburger/reliaburger/issues/2219)), plus the
+fix for 0.3.1's known issue
+([#2197](https://github.com/reliaburger/reliaburger/issues/2197)). It moves
+the wire protocol from 60 to 61 and changes the agent loop, so
+`release_tier.py` asked for the full gate. Candidate 1, `2aae7e2a`, ran it
+on the Mac Studio in one day, from 01:01 to 14:42 GMT on 23 November
+([closure record](qualification/2026-11-23-v0.3.2-release-closure.md)), and
+it was the first train build that `stage.yml` staged itself
+([#1721](https://github.com/reliaburger/reliaburger/issues/1721)). It passed
+both staged installs, in 134 s (one VM restarted after it didn't boot) and
+66 s
+([first](qualification/2026-11-23-v0.3.2-staged-install-apple-silicon.md),
+[second](qualification/2026-11-23-v0.3.2-staged-install-apple-silicon-2.md)),
+the power-cut and reboot lanes, 25 of 25 in every lane
+([record](qualification/2026-11-23-power-cut-reboot.md)), the V02 fast tier
+([record](qualification/2026-11-23-v0.3.2-sustained-v02-fast.md)) and the
+jobs fast tier at 9,110.7 accepted jobs a second
+([record](qualification/2026-11-23-v0.3.2-jobs-fast.md)). The 8-hour jobs
+final ran its whole schedule with no failures
+([record](qualification/2026-11-23-v0.3.2-jobs-final.md)): 9,650.4 accepted
+jobs a second against the 1,390 target, job-start p99 64 ms over 240
+million starts, a median 1,048,576-task array in 117 s, a council history
+linearizable over 202,245 operations, Bun's worst steady-state RSS
+235.21 MiB against 384 MiB, and no data lost. Every fault class settled
+every time, chaos pause and chaos drop included, and every tier was clean
+at the first attempt. One agent-loop turn ran 322 ms past its deadline
+during an upgrade walk, while the disk was busy with `fsync`, which no check
+gates. #2128, 0.3.0's registry deploy stall, didn't recur (the catalogue
+pulse passed all eight runs), but its cause is still unproven and it stays
+open ([#2128](https://github.com/reliaburger/reliaburger/issues/2128)).
+The tag is the merge of the train into `main`, byte for byte candidate 1's
+tree, so only the staged installs ran again on the release build, in
+87 s and 140 s, where the installer restarted two VMs that never booted
+([first](qualification/2026-11-23-v0.3.2-release-staged-install-apple-silicon.md),
+[second](qualification/2026-11-23-v0.3.2-release-staged-install-apple-silicon-2.md)). 0.3.2 moves the cluster protocol to 61
+and keeps state format 76, so a 0.3.1 cluster can't roll onto it: start a
+fresh 0.3.2 cluster.
+
+## 0.3.1: gate follow-ups
+
+Promoted on 21 November 2026 as tag `v0.3.1` at `a0315dc1`
+([promote run](https://github.com/reliaburger/reliaburger/actions/runs/44951836645)),
+the day after 0.3.0. A patch release: what 0.3.0's gate and the first Wyse
+3040 lab left, such as stop hooks on node shutdown
+([#2118](https://github.com/reliaburger/reliaburger/issues/2118)), Smoker's
+pause freezing a runc workload rather than its launcher
+([#2079](https://github.com/reliaburger/reliaburger/issues/2079)) and a
+`relish machines claim` that waits for its nodes
+([#2146](https://github.com/reliaburger/reliaburger/issues/2146)), plus a
+`relish tui` you can search and act from and a `relish wtf` that prints a
+table ([#2180](https://github.com/reliaburger/reliaburger/issues/2180)). It
+changes the agent loop, so `release_tier.py` asked for the full gate.
+Candidate 1, `1612ee38`, ran it on the Mac Studio in one day
+([closure record](qualification/2026-11-21-v0.3.1-release-closure.md)). It
+passed both staged installs, in 73 s and 70 s
+([first](qualification/2026-11-21-v0.3.1-staged-install-apple-silicon.md),
+[second](qualification/2026-11-21-v0.3.1-staged-install-apple-silicon-2.md)),
+the power-cut and reboot lanes, 25 of 25 in every lane
+([record](qualification/2026-11-21-power-cut-reboot.md)), the V02 fast tier
+([record](qualification/2026-11-21-v0.3.1-sustained-v02-fast.md)) and the
+jobs fast tier at 9,066.6 accepted jobs a second
+([record](qualification/2026-11-21-v0.3.1-jobs-fast.md)), all clean at the
+first attempt. The 8-hour jobs final ran its whole schedule
+([record](qualification/2026-11-21-v0.3.1-jobs-final.md)): 9,691.2 accepted
+jobs a second against the 1,390 target, job-start p99 64 ms over 236
+million starts, a median 1,048,576-task array in 117 s, a council history
+linearizable over 202,597 operations, Bun's worst steady-state RSS
+224.75 MiB against 384 MiB, and no data lost. It failed on two settles, after
+a chaos pause and a chaos drop, which waited out their 300 s: `relish wtf`
+counts a crash loop per app, not per instance, and 0.3.1's own pause fix
+made the paused workload fail its health checks and restart, as it should,
+which tipped `frontend` over the line. The maintainer accepted it as a known
+issue ([#2197](https://github.com/reliaburger/reliaburger/issues/2197)); its
+fix is on the 0.3.2 train. One agent-loop turn ran 268 ms past its deadline
+during a busy `fsync`, which no check gates. #2128, 0.3.0's registry deploy
+stall, didn't recur (the catalogue pulse passed all eight runs), but its
+cause is still unproven, so 0.3.1 ships with it too ([#2128](https://github.com/reliaburger/reliaburger/issues/2128)).
+The tag is the merge of the train into `main`, byte for byte candidate 1's
+tree, so only the staged installs ran again on the release build, in 82 s
+and 69 s
+([first](qualification/2026-11-21-v0.3.1-release-staged-install-apple-silicon.md),
+[second](qualification/2026-11-21-v0.3.1-release-staged-install-apple-silicon-2.md)).
+0.3.1 keeps 0.3.0's cluster formats, protocol 60 and state format 76, so a
+0.3.0 cluster rolls onto it in place.
+
+## 0.3.0: bare metal in an hour
+
+Promoted on 20 November 2026 as tag `v0.3.0` at `3a8cff38`
+([promote run](https://github.com/reliaburger/reliaburger/actions/runs/44770080507)).
+Reliaburger now installs on real machines with no distro to set up: our own
+appliance OS on Ubuntu 26.04, signed and published on an OS channel
+([#401](https://github.com/reliaburger/reliaburger/issues/401)), `relish netboot` to install it over the network from a
+laptop ([#404](https://github.com/reliaburger/reliaburger/issues/404)), `relish machines claim` to turn the installed
+machines into a cluster ([#405](https://github.com/reliaburger/reliaburger/issues/405)), or a seed per machine on a USB
+stick ([#403](https://github.com/reliaburger/reliaburger/issues/403)), and `relish os` to roll A/B OS updates across the
+cluster one node at a time, falling back by itself from a version that
+doesn't boot ([#406](https://github.com/reliaburger/reliaburger/issues/406)). The root CA is offline from `relish init`
+on ([#709](https://github.com/reliaburger/reliaburger/issues/709)), and the quickstart guest moved to Ubuntu 26.04
+([plan](plans/archive/2026-10-01-plan-appliance-product.md)). The gate
+doesn't cover the appliance: CI netboots, claims, seeds and updates QEMU
+appliances on every image change instead, and the exit test, three Dell
+Wyse 3040s from power-on to a cluster ([#407](https://github.com/reliaburger/reliaburger/issues/407)), runs on the
+release's artefacts in parallel with it, because the maintainer chose not
+to hold the tag for it. Anything it finds goes into 0.3.1. Candidates 0 to 3
+were rehearsals on the train from 14 to 17 November, to shake out the gate
+before the freeze; what they found was fixed before candidate 4, such as a
+stopping Bun that still launched job attempts ([#1965](https://github.com/reliaburger/reliaburger/issues/1965)).
+Candidate 4, `efc3fb2f`, ran the full gate on the Mac Studio on 19 and 20
+November, because 0.3.0 moves the cluster formats
+([closure record](qualification/2026-11-20-v0.3.0-release-closure.md)).
+`stage.yml` couldn't stage it, because its workflows differed from `main`'s
+and `GITHUB_TOKEN` can't create a release on such a commit; the
+maintainer's login staged it instead ([#1721](https://github.com/reliaburger/reliaburger/issues/1721)). It passed both
+staged installs, in 78 s and 75 s
+([first](qualification/2026-11-19-v0.3.0-staged-install-apple-silicon.md),
+[second](qualification/2026-11-19-v0.3.0-staged-install-apple-silicon-2.md)),
+the power-cut and reboot lanes, 25 of 25 in every lane
+([record](qualification/2026-11-19-power-cut-reboot.md)), and the jobs
+fast tier at 8,933.6 accepted jobs a second
+([record](qualification/2026-11-19-v0.3.0-jobs-fast.md)). The first V02
+fast tier failed on luck, not the product: its seed put no power-off inside
+a runc job campaign, so a coverage check had nothing to judge
+([#2105](https://github.com/reliaburger/reliaburger/issues/2105), [record](qualification/2026-11-19-v0.3.0-sustained-v02-fast.md));
+a second run on a fresh seed covered it and passed clean
+([record](qualification/2026-11-20-v0.3.0-sustained-v02-fast-2.md)). The
+8-hour jobs final ran its whole schedule, four upgrade walks and a quiet
+tail with every leak check armed
+([record](qualification/2026-11-20-v0.3.0-jobs-final.md)): 9,337.9 accepted
+jobs a second against the 1,390 target, about 0.2.8's rate, job-start p99
+64 ms over 220.5 million starts, a median 1,048,576-task array in 121 s
+against 0.2.8's 145, a council history linearizable over 210,335
+operations, Bun's worst steady-state RSS 318.26 MiB against 384 MiB, and no
+agent turn over budget. It failed on one thing: a catalogue pulse 28 s
+after a slow-fsync fault on node 1 staged an image in the cluster registry,
+applied the app and then stalled until its 5-minute deadline. The case's 58
+other runs passed in at most 41.7 s, both later pulses passed and nothing
+was lost. The maintainer accepted it as a known issue, and its cause, not
+yet verified, is for 0.3.1 ([#2128](https://github.com/reliaburger/reliaburger/issues/2128)). The tag is the merge of
+the train into `main`, which differs from candidate 4 only in seven lines
+of `build.rs` a release build never runs, so the soaks carry over and only
+the staged installs ran again on the release build, in 87 s and 74 s
+([first](qualification/2026-11-20-v0.3.0-release-staged-install-apple-silicon.md),
+[second](qualification/2026-11-20-v0.3.0-release-staged-install-apple-silicon-2.md)).
+0.3.0 moves the cluster formats to protocol 60 and state format 76, so a
+0.2.8 cluster starts afresh ([upgrading from 0.2.8](releasing.md#upgrading-from-028)).
 
 ## 0.2.8: agents you can trust, built faster
 

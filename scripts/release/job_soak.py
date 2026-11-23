@@ -20,6 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import random
 import re
 import signal
 import sqlite3
@@ -57,7 +58,10 @@ TARGET_FLOOR = 1158
 DEFAULT_TARGET_RATE = 1390
 # Starting per-node caps for the target load; calibrate on the rig. Fresh
 # containers can't approach the target, so their runs keep the calibration mix.
-TARGET_CAPS = {"shared-runc": 8, "process": 16}
+# Five shared-runc executors at 56 MiB each (#1958) reserve less than 0.2.8's
+# eight at 40 MiB did, leaving the soak's apps room to be re-placed after a
+# quorum loss or power-off.
+TARGET_CAPS = {"shared-runc": 5, "process": 16}
 MILLION = 1 << 20
 # The day run (#1032): 2 billion accepted host-job tasks in one real day on
 # three nodes is 23,148.1 a second, so 23,149; a billion, the floor, is 11,575.
@@ -86,11 +90,23 @@ CAUSES = ("exit_code", "signal", "timeout", "unknown", "launch", "unrecorded")
 FAULT_KINDS = ("leader-kill", "follower-kill", "power-off")
 # Node-level faults the job qualification adds (#686, D19-B).
 NODE_FAULT_KINDS = ("delay", "disk-full", "slow-fsync")
+# The fault kinds the coverage gate owes an overlap with every mode, and so
+# the ones a mark waits for (#2105). The harness holds such a fault at most
+# OVERLAP_WAIT_SECS for a run of every mode on its node, reading the
+# controller's snapshot every OVERLAP_POLL_SECS (it refreshes about that
+# often). The wait fits inside the compressed schedule's 100 s slot.
+GATED_KINDS = FAULT_KINDS + NODE_FAULT_KINDS
+OVERLAP_WAIT_SECS = 90
+OVERLAP_POLL_SECS = 2
 # How long a drained fixture's result may stay on an unreachable node. A
 # killed or powered-off node is back within the soak's longest settle budget
 # (600 s); a result still missing after that is lost, not late (V02 candidate
 # 6, run 15, #954).
 RESULT_UNREACHABLE_GRACE = 600
+# Chunks of a drained run's results checked for exactly-once completion,
+# beyond its first and last (#1415). Each costs one results read of at most
+# a chunk's rows.
+CHUNK_SAMPLE = 6
 # Final-attempt and start-lag bucket upper bounds in milliseconds; None is +Inf.
 BUCKETS = [1 << i for i in range(15)] + [None]
 
@@ -313,6 +329,42 @@ def audit_effects(count, ledgers):
     return dict(effects=len(seen), attempts=attempts, repeated_attempts=attempts-len(seen))
 
 
+def sampled_chunks(count, chunk_size, seed):
+    """The chunks a drained run's history check reads (#1415): all of a small
+    run, otherwise the first, the last and CHUNK_SAMPLE more picked by a
+    generator seeded with the run's name, so a rerun reads the same ones."""
+    chunks = -(-count // chunk_size)
+    if chunks <= CHUNK_SAMPLE + 2: return list(range(chunks))
+    middle = random.Random(seed).sample(range(1, chunks - 1), CHUNK_SAMPLE)
+    return sorted({0, chunks - 1, *middle})
+
+
+def check_chunk(chunk, chunk_size, count, rows):
+    """A chunk's accepted results: each of its tasks exactly once, every one from
+    the same grant. Two grants in one chunk mean the council accepted the chunk
+    twice. Returns that grant's attempt."""
+    start = chunk * chunk_size
+    if [row.get("index") for row in rows] != list(range(start, min(start + chunk_size, count))):
+        raise InvalidEvidence(f"chunk {chunk} results do not hold each task exactly once")
+    grants = {row.get("grant_attempt") for row in rows}
+    if len(grants) != 1: raise InvalidEvidence(f"chunk {chunk} was accepted from more than one grant: {sorted(map(str, grants))}")
+    grant = grants.pop()
+    if type(grant) is not int or grant < 1: raise InvalidEvidence(f"chunk {chunk} has no valid grant attempt")
+    return grant
+
+
+def explain_effects(rows, ledgers):
+    """A task whose chunk was granted only once ran no more often than its
+    accepted attempts. Running it again needs a re-grant, after a lost node."""
+    executions = {}
+    for ledger in ledgers:
+        for index, count in ledger: executions[index] = executions.get(index, 0) + count
+    for row in rows:
+        ran = executions.get(row["index"], 0)
+        if row["grant_attempt"] == 1 and ran > row["attempts"]:
+            raise InvalidEvidence(f'task {row["index"]} ran {ran} times but its only grant accepted {row["attempts"]} attempts')
+
+
 def serve(path, token, address, port):
     ledger = EffectLedger(path)
     class Handler(BaseHTTPRequestHandler):
@@ -452,7 +504,10 @@ class Campaign:
             script = effect_script + "sleep 30 & wait"; tasks["task_timeout_secs"] = 3
         elif purpose == "limit":
             script = "exec \"$SOAK_BUSYBOX\" awk 'BEGIN { for(i=0;;i++) a[i]=sprintf(\"%01024d\",i) }'"
-            template["memory"] = "8Mi"; tasks["task_timeout_secs"] = 15
+            # The awk grows until the limit kills it. A fresh runc job's limit
+            # covers runc init too, which needs up to 12.7 MiB with Ubuntu
+            # 26.04's runc 1.4, so 8 MiB never got the fixture started (#1957).
+            template["memory"] = "32Mi"; tasks["task_timeout_secs"] = 15
         elif purpose == "cancel": script = effect_script+"sleep 20"
         elif mode=="runc" and profile=="long": script=effect_script+script
         if mode != "process":
@@ -631,10 +686,17 @@ class Campaign:
                         rows[0]["started_effect"]=True
                 if not stop and not intent.get("failed_at"):
                     judge_terminal(intent["purpose"],value,rows)
+                    history=None
+                    if intent["purpose"] in ("work","audit"):
+                        history=self.read_chunks(intent,value,now)
+                        if history is None: continue
                     if intent["purpose"] == "audit":
                         if self.ledger_reader is None: raise InvalidEvidence("independent ledger unavailable")
                         receipts=self.ledger_reader(intent["name"])
                         proof=audit_effects(value["total"],receipts)
+                        explain_effects([row for _,_,chunk_rows in history for row in chunk_rows],receipts)
+                    if history is not None: self.record_chunks(intent,history)
+                    if intent["purpose"] == "audit":
                         self.state["totals"]["audit_attempts"]=self.state["totals"].get("audit_attempts",0)+proof["attempts"]
                     coverage=self.state["coverage"][intent["mode"]]
                     coverage[intent["purpose"] if intent["purpose"]!="work" else "reuse"]=True
@@ -651,6 +713,32 @@ class Campaign:
         if self.state.get("load")=="day": self.mark_hours(now)
         self.save(); self.publish(int(time.time()),fault)
         return not self.state["active"]
+    def read_chunks(self, intent, value, now):
+        """The sampled chunks of a drained run, each checked for exactly-once
+        completion from one grant (#1415), as (chunk, grant, rows). None while
+        a chunk's node is unreachable within RESULT_UNREACHABLE_GRACE."""
+        size=self.body(intent)["definition"]["tasks"]["chunk_size"]; count=value["total"]
+        history=[]
+        for chunk in sampled_chunks(count,size,intent["name"]):
+            start=chunk*size
+            query=f"limit={min(size,count-start)}"+(f"&after={start-1}" if start else "")
+            page=self.api.request("GET",f'/v1/batch/{intent["id"]}/results?{query}')
+            if page.get("unreachable"):
+                since=intent.setdefault("result_unreachable_since",now); self.save()
+                if now-since<RESULT_UNREACHABLE_GRACE: return None
+                raise InvalidEvidence(f"chunk {chunk} results incomplete: "+", ".join(map(str,page["unreachable"]))
+                                      +f" unreachable for {now-since} s")
+            history.append((chunk,check_chunk(chunk,size,count,page["rows"]),page["rows"]))
+        return history
+    def record_chunks(self, intent, history):
+        """Keep each checked chunk's grant as evidence, and count the re-granted ones."""
+        totals=self.state["totals"]
+        totals["chunks_checked"]=totals.get("chunks_checked",0)+len(history)
+        totals["chunks_regranted"]=totals.get("chunks_regranted",0)+sum(grant>1 for _,grant,_ in history)
+        with open(self.directory/"chunk-history.jsonl","a") as evidence:
+            for chunk,grant,chunk_rows in history:
+                evidence.write(json.dumps(dict(run=intent["name"],id=intent["id"],mode=intent["mode"],profile=intent["profile"],
+                                               purpose=intent["purpose"],chunk=chunk,grant_attempt=grant,tasks=len(chunk_rows)))+"\n")
     def count_nodes(self, intent, value):
         """Add each node's new host-job successes in this run (#1032), the
         way relish bench counts them (#1362): a counter that went backwards
@@ -801,6 +889,7 @@ def report(snapshot):
         accepted_successes_per_second=rate,target_met=target_met,
         retries=retries,retry_causes=causes,
         audited_attempts=totals.get("audit_attempts",0),
+        chunks_checked=totals.get("chunks_checked",0),chunks_regranted=totals.get("chunks_regranted",0),
         api_fallbacks=snapshot.get("api_fallbacks") or dict(missed={},answered={}),
         operator_replay_decisions=totals.get("operator_replay_decisions",0),
         fault_markers=totals.get("fault_markers",0),errors=list(snapshot.get("errors",[])),
@@ -904,9 +993,10 @@ def coverage_failures(snapshot, nodes=(), kinds=FAULT_KINDS):
     return problems
 
 
-def mark(directory, target, kind, now):
-    directory=Path(directory)
-    try: snapshot=json.loads(directory.joinpath("snapshot.json").read_text())
+def active_runs(directory, target, now):
+    """The runs the controller's snapshot shows active on `target` in the
+    last 15 s: a summary's live commands there, or a fresh runc start."""
+    try: snapshot=json.loads(Path(directory).joinpath("snapshot.json").read_text())
     except (OSError,ValueError): snapshot={}
     runs=[]
     if now-snapshot.get("heartbeat",0)<=15:
@@ -919,8 +1009,31 @@ def mark(directory, target, kind, now):
         for row in snapshot.get("fresh_activity",[]):
             if row.get("node")==target and 0<=now-row.get("observed_at",0)<=15:
                 runs.append(dict(mode="runc",id=row["id"],instance=row["instance"],generation=row["generation"],boot=row["boot"],ticks=row["ticks"]))
+    return runs
+
+
+def mark(directory, target, kind, now, wait=0, clock=time.time, pause=time.sleep):
+    """Record which runs were active on `target` as a fault of `kind` hit it,
+    and return the modes that had none.
+
+    A fault of a kind the coverage gate owes (GATED_KINDS) first waits up to
+    `wait` seconds for a run of every mode on its node (#2105). Whether one
+    runs at the instant of a fault is chance: a runc task on a node is often
+    between commands, and 0.3.0 candidate 4 cut power three times with no
+    runc run on the node, so its fast tier failed with nothing wrong. Any
+    other label (a deploy-kill, an upgrade walk, a special) marks at once."""
+    directory=Path(directory)
+    started=now
+    deadline=now+wait if kind.split(":")[-1] in GATED_KINDS else now
+    while True:
+        runs=active_runs(directory,target,now)
+        missing=[mode for mode in MODES if mode not in {run["mode"] for run in runs}]
+        if not missing or now>=deadline: break
+        pause(min(OVERLAP_POLL_SECS,deadline-now))
+        now=int(clock())
     with directory.joinpath("faults.jsonl").open("a") as file:
-        file.write(json.dumps(dict(ts=now,target=target,kind=kind,runs=runs))+"\n")
+        file.write(json.dumps(dict(ts=now,target=target,kind=kind,runs=runs,waited=now-started))+"\n")
+    return missing
 
 
 def consume_faults(campaign):
@@ -1119,6 +1232,8 @@ def main():
     budget.add_argument("--runs-per-hour",type=int,default=PLANNED_RUNS_PER_HOUR)
     marker=commands.add_parser("mark")
     marker.add_argument("directory",type=Path); marker.add_argument("target"); marker.add_argument("kind")
+    marker.add_argument("--wait",type=int,nargs="?",const=OVERLAP_WAIT_SECS,help="hold a gated fault up to this many seconds (default %d) for a run of "
+                        "every mode on its node; exit 3, naming the modes still missing, if the wait runs out" % OVERLAP_WAIT_SECS)
     options=parser.parse_args()
     if options.command=="run":
         # The harness reads this instead of `wait`: macOS bash 3.2 can forget
@@ -1142,7 +1257,10 @@ def main():
         print(json.dumps(dict(node=options.node,ts=int(time.time()),owners=job_soak_inventory.fresh_activity(options.root),
                               starts={name:EffectLedger(options.database).starts(name) for name in options.run})))
     elif options.command=="effects": print(json.dumps(EffectLedger(options.database).rows(options.run)))
-    else: mark(options.directory,options.target,options.kind,int(time.time()))
+    else:
+        missing=mark(options.directory,options.target,options.kind,int(time.time()),wait=options.wait or 0)
+        if options.wait is not None and options.kind.split(":")[-1] in GATED_KINDS and missing:
+            print(" ".join(missing)); return 3
     return 0
 
 

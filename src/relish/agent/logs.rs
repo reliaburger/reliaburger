@@ -451,7 +451,7 @@ fn group(request: &LogsRequest, shown: &[LogEntry]) -> Vec<LogLines> {
 pub async fn run(args: &LogsArgs, max_bytes: usize, rerun: &str) -> Rendered {
     run_with(
         args,
-        &BunClient::default_local(),
+        &BunClient::local().await,
         unix_now(),
         BuildInfo::current(),
         max_bytes,

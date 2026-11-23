@@ -184,6 +184,23 @@ We didn't add a JWT crate for this. JWT is three base64url segments joined by do
 
 The JWT claims include the SPIFFE URI as the subject, the cluster name, namespace, node, and instance ID. External verifiers use the JWKS endpoint (which publishes the Ed25519 public key in RFC 8037 OKP format) to validate these tokens.
 
+### Rotating the signing key
+
+For a long time that one key was forever: no command replaced it, though the incident runbook told operators to "rotate the OIDC signing keypair" ([#709](https://github.com/reliaburger/reliaburger/issues/709)). A rotation has one awkward property. Every running workload holds a token the old key signed, valid for up to an hour, and an outside verifier, a cloud provider say, caches the JWKS. Swap the key outright and both break at once.
+
+So the old key doesn't go away. It retires. `SecurityState` keeps a list of retiring keys beside the active one, each with a `not_after`, and the verifier picks a key by the token's `kid`:
+
+```rust
+let Some(key) = keys.iter().find(|key| key.key_id == kid) else {
+    return Err(OidcError::UnexpectedKeyId { got: kid.to_string(), want: /* the accepted kids */ });
+};
+let claims = verify_signature_and_decode(token, &key.public_key_der)?;
+```
+
+The order of those two lines matters. An unknown `kid` is refused before anything checks a signature, which is the same reason the algorithm is checked first: a token shouldn't get to choose what it's verified against. `relish identity rotate-signing-key` makes the new key on the leader, and Raft carries it to every replica. The leader makes it, not the state machine, because applying a log entry has to give the same answer on every node, and "generate a random key" doesn't. JWKS lists both keys during the window: 75 minutes, the token's hour plus clock skew plus ten minutes of slack. An hourly sweep then retires the old key.
+
+One piece of Rust is worth pausing on. The auth middleware's `verify` is a plain synchronous function, and each node now refreshes its verifier's keys every five seconds from council state. A `std::sync::Mutex` would work, but the project's rule keeps those out of shared state. A `tokio::sync::Mutex` can't be locked from synchronous code. So the keys live in a `watch` channel: `borrow()` is synchronous and cheap, and the refresher's `send_if_modified` replaces the set only when it really changed.
+
 ### Only the leader signs
 
 Signing a workload certificate reads the CA from linearised state and takes a serial number from Raft, so it only works on the leader. For most of the project every node called its own council to sign, and every follower got an error back. The error went into a progress message, the container started anyway, and its `/run/reliaburger/identity/` stayed empty. The V02 soak's identity app ran on all three nodes for 76 minutes and only the leader's copy ever had a certificate.
@@ -201,6 +218,7 @@ The workload sees its identity at `/run/reliaburger/identity/`:
     ca.pem        — Workload CA + Root CA chain
     bundle.pem    — cert + CA chain concatenated
     token         — OIDC JWT (owner-only)
+    api-token     — the same JWT for the Reliaburger API alone (owner-only)
     meta.json     — rotation metadata (no secrets)
 ```
 
@@ -420,9 +438,9 @@ mycluster-master.key              # hex-encoded 32-byte master secret (0o600)
 mycluster-security-bootstrap.json # full SecurityState as JSON
 ```
 
-The master key file is the crown jewel. Lose it and you can't unwrap any CA private key, which means you can't sign new node certificates, workload certificates, or JWTs. Back it up alongside the sealed root CA file, and make an operator-held copy of the root itself with `relish ca backup` (Chapter 4 explains why the sealed file alone isn't enough).
+The master key file is the crown jewel. Lose it and you can't unwrap any CA private key, which means you can't sign new node certificates, workload certificates, or JWTs. Back it up, but never with the root CA backup `relish init` wrote: the master key opens everything on the cluster, and the root backup is the one thing the cluster can't open (Chapter 4 explains why).
 
-The bootstrap file is a one-time transfer mechanism. When `bun` starts for the first time, it loads the JSON and writes a `SecurityStateInit` command to Raft. After that, SecurityState lives in Raft and replicates to every council node automatically. The file itself stays on disk: `relish ca backup` reads the root certificate and the cluster's `age` keys from it.
+The bootstrap file is a one-time transfer mechanism. When `bun` starts for the first time, it loads the JSON and writes a `SecurityStateInit` command to Raft. After that, SecurityState lives in Raft and replicates to every council node automatically. The file itself stays on disk; it holds no root key.
 
 ### Turning mTLS on: the mode matrix
 
@@ -524,6 +542,8 @@ Notice that the request carries the time. The state machine doesn't read the clo
 The rule that took the most thought is what the sweep must *not* remove. Remember the bootstrap window: an empty token store means "this cluster hasn't been set up yet", and the middleware lets everyone in. `RevokeApiToken` already refuses to remove the last Admin for that reason. A sweep that dutifully deleted every expired token would undo that protection on a timer. A cluster whose only tokens had all expired would wake up one night with an empty store and an open API.
 
 So the sweep keeps the last Admin, even an expired one (the one that expired most recently, if there are several), and it never empties the store, even if there's no Admin left at all. The token it keeps can't authenticate anyone, but its presence keeps the store non-empty, and a non-empty store means the API stays closed. A test pins that from the other side: a store whose every token has expired still answers an anonymous request with `401`.
+
+The revoke guard had the opposite gap for a while (#2014). It counted every Admin, expired or not, so with one live Admin and one expired one, revoking the live one passed: two Admins, after all. What was left was a store with one Admin token that couldn't authenticate anyone, and nobody could mint a new one. The guard now asks the question that matters, "would a usable Admin be left?", so it counts only Admins that haven't expired and aren't scoped: a namespace-scoped Admin can't create or revoke tokens (`require_unscoped`), so it can't replace root either. And it gets "now" the same way the sweep does: `RevokeApiToken { name, now_unix_ms }` carries the clock of the node that proposed it, so every replica judges expiry at the same instant. An expired Admin can still be revoked while a live one remains, and the only Admin in the store still can't be, expired or not, for the bootstrap-window reason above. The tests `revoke_refuses_to_remove_the_last_unexpired_admin_token` and `revoke_refuses_to_remove_the_last_unscoped_admin_token` set up exactly those pairs, and the refusal says which rule it hit, so an operator with one expired Admin isn't told it's "the last unexpired" one.
 
 Each removal is audited like a revoke. The leader records a `token.expired_swept` event per token, with principal `system`, since no person asked for it.
 
@@ -679,9 +699,11 @@ replace_tokens_unless_changed(store, &seen, tokens).await;
 
 What if the replica is more than two seconds behind? We can't wait for ever, and the write has committed, so the node drops the token from its store anyway and answers. A refresh from that lagging replica can bring it back until the replica catches up, though, and a silent "revoked" would be a lie. So the answer says so: `token ci revoked, but this node's replica is behind: it may accept the token again until it catches up`. Only a revoke gets that warning. A rotated secret on a lagging node just gets a `401` until it catches up, and the caller still has the secret. The one gap we left is a zero-grace rotation through a node that far behind: the old secret works there until the replica catches up, and the answer doesn't say so.
 
-The other timeout is the leader not answering at all, and here each route loses something different, so each caller of `forward_token_write` passes its own error. After 10 seconds the write may or may not have committed. A revoke loses nothing: revoking again is safe, because revoking a name that's gone is a no-op. A create or a rotation may have lost the only copy of a secret. A rotation is the nasty one, because the obvious reaction is wrong. A second rotation replaces the previous secret, so the secret your clients still hold stops at once, grace period or no grace period, and they get an outage instead of an overlap. The error tells you to look at the token's created time in `relish token list` first (a rotation moves it). And a join token may leave a hash behind that nobody has the plaintext for. Nothing can use it, and it expires by itself.
+The other timeout is the leader not answering at all, and here each route loses something different, so each caller of `forward_token_write` passes its own error. After 20 seconds the write may or may not have committed. (It was 10 seconds until [#2055](https://github.com/reliaburger/reliaburger/issues/2055) gave the leader's own council write a 10-second deadline. The leader can spend 3 seconds proving it leads, then up to 10 on the write, then 2 waiting for its replica, so a 10-second backstop could give up on a healthy leader. The test `the_token_forward_backstop_outlasts_the_leaders_own_deadlines` adds those up.) A revoke loses nothing: revoking again is safe, because revoking a name that's gone is a no-op. A create or a rotation may have lost the only copy of a secret. A rotation is the nasty one, because the obvious reaction is wrong. A second rotation replaces the previous secret, so the secret your clients still hold stops at once, grace period or no grace period, and they get an outage instead of an overlap. The error tells you to look at the token's created time in `relish token list` first (a rotation moves it). And a join token may leave a hash behind that nobody has the plaintext for. Nothing can use it, and it expires by itself.
 
 Writing the join-token test turned up one more. `join_token_create_handler` matched `Ok(_)` and answered `200` with a plaintext, even when the state machine had refused the entry because the node is retired. The caller got a credential that existed nowhere. Now a refusal is a `409`, like everywhere else. `Ok` from `council.write` means "the entry applied", not "the state machine agreed", and `CouncilResponse::Refused` is the second question. The compiler can't ask it for you past a wildcard arm.
+
+`join-token list` and `join-token revoke` came later (#1893), and at first they repeated the old pattern: read the node's own replica, then write. On a follower, revoke then called `council.write`, which answers `503` there. On a follower that hadn't yet applied a token the leader had just committed, the replica held nothing for that node id, so there was nothing to write, and the answer was `200` with `"revoked": 0`. Both now start the way create does, with `council_to_forward_to`, and the leader does the reading and the writing. The list is a `GET`, so it goes through `forward_get_to_leader`, and both are wrapped in the same timeout, 20 seconds today. The proxy passes on the leader's body but not its headers, so a small helper, `with_json_content_type`, labels a successful answer as JSON again, which is what create already did inline. Every join-token route now asks who leads before it touches the replica.
 
 ### Every node at once
 
@@ -993,7 +1015,122 @@ The matrix rows changed to match (`App(DEPLOY)` on the snapshot routes, `Body(FA
 
 Reads had a version of the same problem. Every container gets a JWT, and the manual calls it confined to the workload's own app and namespace. But `/v1/resolve`, `/v1/routes`, `/v1/fault` and `/v1/build/{id}` took no auth context at all, so one compromised container could list every service VIP, every ingress route and every fault in the cluster. They now filter like `/v1/status` does, with `authorize_scoped(...).is_ok()` in a `filter`. That needed a namespace on two wire types that only carried an app name (`RouteInfo` and `FaultSummary`), and a destination repository on each build record. `GET /v1/fault?cluster=true` refuses a scoped caller outright, as the events listing does, because node faults belong to no tenant. The legacy batch status branch got the scope check its task-array neighbour already had.
 
-Three smaller holes went in the same change. The node relay forwards only an allowlist of paths, but it built a URL from the path, and a URL resolves `..` away: `v1/exec/../apply` matched the exec rule and left as `POST /v1/apply`. The target re-authorised, so it wasn't an escalation, but an allowlist you can walk around isn't one. The relay now refuses any `.` or `..` segment, percent-encoded or not. The session cookie gets `Secure` when the API serves TLS, which the handler learns from the `TlsTransport` extension the TLS listener puts on every request. And the registry, which used to fall back to plaintext when its TLS configuration failed to build, now fails to start, as the API always did.
+Three smaller holes went in the same change. The node relay forwards only an allowlist of paths, but it built a URL from the path, and a URL resolves `..` away: `v1/exec/../apply` matched the exec rule and left as `POST /v1/apply`. The target re-authorised, so it wasn't an escalation, but an allowlist you can walk around isn't one. The relay first refused any `.` or `..` segment, percent-encoded or not, and that turned out to be checking the wrong thing; the next section says why. The CLI had the same blind spot from the other side until 0.3.0: `BunClient` put app and namespace names into its paths as typed, so `relish stop ../delete/web` sent `POST /v1/delete/web/default`, and `--namespace 'default?force=true'` added a query parameter. The token's own rights still bounded what happened, but a script or an agent passing a name it read somewhere could be steered. Every such path is now built by `app_path`, which checks each name against the config's own grammar (a lowercase DNS label) and refuses anything else with `RelishError::InvalidName` before a request goes out. A name that passes needs no escaping. Free text that does go in a path, a snapshot's name, is percent-encoded byte by byte, and `.` and `..` are refused outright, because a URL parser resolves `%2e%2e` as a dot segment too. The session cookie gets `Secure` when the API serves TLS, which the handler learns from the `TlsTransport` extension the TLS listener puts on every request. And the registry, which used to fall back to plaintext when its TLS configuration failed to build, now fails to start, as the API always did.
+
+### Build the path the peer will see
+
+That dot-segment check looked at the string the relay was handed. What the peer answers is the path in the URL the relay builds, and a URL parser does more to a string than resolve `..`. The [WHATWG URL Standard](https://url.spec.whatwg.org/#path-state), which the [`url`](https://docs.rs/url) crate under reqwest follows, reads `\` as `/` in an `http` or `https` URL, and it drops every tab and newline before it parses at all. So a segment written `..%5C..%5Cstatus` decodes to one segment, `..\..\status`, which matches no dot rule, and the URL turns it into three levels, two of them `..`. A segment `.%09.` decodes to `.`, a tab, `.`, and the parser hands back `..`. Checking a string and then letting a parser reshape it isn't a check on what gets sent.
+
+Two changes close the gap, and they go further than the relay, because every node that forwards a request formats the caller's values into a peer URL: the lease id in a test-lease read, an app and namespace in a stop, a policy name in a delete.
+
+First, a peer path is never formatted any more. `cluster::http::peer_path` takes the path's segments and encodes each one on its own:
+
+```rust
+pub fn peer_path<S: AsRef<str>>(segments: &[S]) -> Result<String, PeerPathError> {
+    for segment in segments {
+        let segment = segment.as_ref();
+        if segment.is_empty() {
+            return Err(PeerPathError::EmptySegment);
+        }
+        if segment == "." || segment == ".." {
+            return Err(PeerPathError::DotSegment(segment.to_string()));
+        }
+        if segment.chars().any(char::is_control) {
+            return Err(PeerPathError::ControlCharacter(segment.to_string()));
+        }
+    }
+    let mut url = url::Url::parse(ENCODING_BASE).map_err(|_| PeerPathError::Encoder)?;
+    url.path_segments_mut()
+        .map_err(|()| PeerPathError::Encoder)?
+        .pop_if_empty()
+        .extend(segments);
+    Ok(url.path().to_string())
+}
+```
+
+`S: AsRef<str>` is a generic bound: `S` can be any type that lends out a `&str`, so one function takes `["v1", "test", "leases", id]` whether `id` is a `&str` or a `String`. `path_segments_mut()` is the `url` crate's way to add segments to an existing URL: it percent-encodes `/`, `\`, `%`, `?` and `#` inside each one, so a segment stays one segment. It does two things quietly that we can't allow, though. It skips a `.` or `..` segment instead of adding it, and the parser underneath drops tabs and newlines. Skipping a segment changes the path as surely as resolving one, so `peer_path` refuses dot segments and every control character before the encoder sees them. The `Encoder` variant is there because `Url::parse` and `path_segments_mut` both return a `Result`, and the project doesn't `unwrap` in library code; a constant `http://` base never fails either.
+
+Every forward that carries a caller's value now goes through it: the lease reads, renewals and releases, app stops and deletes, job disables, deploy cancels, policy deletes, the cross-node log follow, the deploy-history fan-out and the snapshot forward. A value that can't be a segment gets a 400 at the first node, and nothing is sent.
+
+Second, the relay checks its allowlist against the path it built, not the one it was given. `relay_peer_path` splits the decoded path on `/`, runs the segments through `peer_path`, and passes only a path that came back unchanged: one that needed no encoding at all. App names, namespaces and the allowlisted routes are plain text, so nothing the relay serves needs a `%`, and a path that would need one is refused rather than rewritten. `Option::then_some` keeps the end tidy: `allowed.then_some(peer_path)` is `Some(peer_path)` when `allowed` is true and `None` otherwise.
+
+The tests come in three layers. `peer_path`'s own unit tests feed it backslashes, slashes, percent signs, tabs, newlines, NUL and a C1 control character, and one parses the result again with the scheme and authority to show the segment count survives. `relay_refuses_backslashes_in_a_segment` and its neighbours hold the allowlist to the built path. And `the_relay_refuses_encoded_backslashes_tabs_and_newlines` sends the encoded forms through a real entry node to a real peer, and checks the ordinary `v1/status` relay still answers beside them.
+
+### Node-only routes stay node-only
+
+A forwarded request has a second property that matters. The node sends it over its own TLS connection, which presents its own client certificate. Most routes don't care: they authorise the bearer token the request carries, and a forwarded request carries the person's. But a few routes admit a *node*, and one of them, `GET /v1/cluster/master-key`, admits a node by its certificate alone, because a node that has just joined has no service token yet. The service token is derived from the master key it's asking for.
+
+So a forwarded request now says what it is. `copy_forwarded_auth`, which every relay and leader forward already used to pass on the person's credential, also sets `x-reliaburger-forwarded-for-user`, and the lease forwarder, which copies the credential itself, sets it too. A middleware on the API router refuses any request that carries it when the matched route is node-only:
+
+```rust
+let node_only = request
+    .extensions()
+    .get::<axum::extract::MatchedPath>()
+    .is_some_and(|route| crate::bun::authz::is_node_only(request.method(), route.as_str()));
+```
+
+`MatchedPath` is the route pattern axum matched, like `/v1/placements/{node_id}`, rather than the concrete path, so the check reads the same table as the rest of the authorisation code. A route is node-only when its matrix row names the `System` principal, or when it's in `CERTIFICATE_ONLY_ROUTES`, a one-row list for the master-key handout. A middleware added with `Router::layer` runs after routing, which is why `MatchedPath` is there to read.
+
+The alternative was to make every node-only route demand the service token as well. Renewal and the other `System` routes already do. The master-key route can't, for the reason above, and a marker that the forwarding node adds is something no forwarded request can leave out. A client can set the header itself, but all that gets it is a 403.
+
+A static test, `every_route_that_reads_the_tls_peer_is_node_only`, reads every mounted handler's source, and any handler that takes a `TlsPeerCertificate` must sit on a node-only route. A suite test, `a_request_forwarded_for_a_person_is_refused_by_node_only_routes`, presents a valid member certificate with the marker and gets a 403 from the master-key route and from renewal, then drops the marker and gets the key.
+
+### Scope on the routes that name no app
+
+The source check above is good at one thing: a route whose pattern names an app. The `/v1/status` story showed what it can't see, and a review of the 0.3.0 train found four more places where a namespace-scoped token reached past its namespace. None of them names an app in its path, which is exactly why they got through.
+
+**The dashboard.** A token scoped to `shop` that logs in to the dashboard keeps its scope on the session cookie; we made sure of that back when sessions arrived. But the overview at `GET /`, the apps table at `/ui/fragment/apps` and the node page at `/ui/node/{name}` never asked the session anything. The overview passed the caller's `AuthContext` to the summary at the top and nowhere else, so the counts were right and the table under them listed every namespace's apps. The node page asked a peer for its instances with the service token and rendered whatever came back.
+
+The fix is the closure from `/v1/status`, once more. `gather_dashboard_apps` and the node handler take the caller's `auth` and keep only what `authorize_scoped` allows:
+
+```rust
+let visible = |app: &str, namespace: &str| {
+    crate::sesame::auth::authorize_scoped(auth, app, namespace).is_ok()
+};
+desired.retain(|app| visible(&app.app, &app.namespace));
+```
+
+The node table's per-node app counts go through the same filter, so a count can't tell you what the table won't. So does the alert panel. An alert carries the labels of the series it fired on, and every per-app series has `app = "<namespace>/<app>"`. A scoped caller sees an alert only when that label names an app in its scope. An alert on a node's own CPU names no app at all, so, like a node's events, it's for unscoped callers only. `/v1/alerts` had the same gap and takes the same filter. `namespace_scoped_token_sees_only_its_namespace_on_the_dashboard` runs the four pages against an agent and a peer that each run an app in `team-a` and one in `team-b`, and its mirror image checks that an unscoped token still sees both.
+
+**Clearing every fault.** `DELETE /v1/fault?service=web` with no namespace clears `web`'s faults in every namespace, and it already refused a scoped token. `DELETE /v1/fault` with no `service` at all clears every workload fault in every namespace, which is wider, and it didn't. The `match` on the query had a `None => None` arm with no check in it. It now calls `require_unscoped`, as its narrower neighbour does, and the manual's line about only an unscoped admin clearing every fault is finally true. A scoped Deployer clears its own faults by naming a service and a namespace it may touch.
+
+**Ingress hosts.** Wrapper keeps one list of routes per host and picks the longest matching path prefix, then the path, then the app name. That's what lets `shop/web` serve `/` and `shop/api` serve `/api` on the same host. It also meant nothing asked who owned a host. A Deployer scoped to `dev` could apply `dev/aaa` on `shop.example.com` at `/login`, and every node would send `shop`'s login requests to it. A longer prefix wins outright.
+
+Checking the exact host and path wouldn't help, because a longer prefix is a different path. So the rule is about the host: on the leader's apply path, a scoped token may put an app on a host only if every app already serving it is inside the token's scope. An app that already serves the host keeps it through later applies. Without that, an admin who shared a host between two namespaces would leave both tenants unable to redeploy their own apps. Unscoped tokens skip the check, since they could change any of those apps directly. `authorize_ingress_hosts` is a plain function over the manifest and the desired state, which makes it easy to read:
+
+```rust
+let id = crate::meat::types::AppId::new(name, namespace);
+if desired.apps.get(&id).is_some_and(serves) {
+    continue;
+}
+let outside_scope = desired.apps.iter().any(|(existing, existing_spec)| {
+    serves(existing_spec)
+        && crate::sesame::auth::authorize_scoped(auth, &existing.name, &existing.namespace)
+            .is_err()
+});
+```
+
+`Option::is_some_and` takes a closure and returns `true` only when the option holds a value the closure accepts, so "the app exists *and* already serves this host" is one expression with no `match`. `serves` is itself a closure that borrows `host`. A closure that captures only shared references is `Copy`, so we can hand it to `is_some_and` and still call it on the next line. Hosts are compared lowercased, as the routing table keys them, so `SHOP.Example.com` is the same host.
+
+The first version of this check sat on one path, and a review of it found the others at once. `relish apply` isn't the only way an app spec gets written. A manifest with a job in it goes down the job lifecycle instead of `cluster_apply`, so an app beside a job skipped the check. A proposal writes specs too: when a person approves it, and again when someone undoes it, putting each app back as it was. So the check became `authorize_ingress_apps`, which takes any list of `(AppId, &AppSpec)` pairs, and every one of those paths calls it with the caller it acts for. Creating a proposal checks the author. Approving checks the approver, against the cluster as it is by then, since the host may have been taken in the meantime. Undoing checks the undoer against the `before` specs. A policy can also approve a pending proposal later, from the leader's reaper, with nobody's request in hand. There the check runs as the author, whose scope the reaper reads from the stored token, against the cluster at that moment. `approve_with` already takes an optional action to run just before it writes, and whatever the action returns becomes the proposal's failure reason in the same Raft entry. So the host check is that action, and a host taken since the proposal was made fails it with a sentence saying why. GitOps doesn't need it: it syncs a repository that only an unscoped admin can configure, so it writes with that admin's authority.
+
+`impl IntoIterator<Item = (AppId, &'a AppSpec)>` is how the function says "anything I can loop over that yields these pairs". The `'a` is a lifetime: it ties the borrowed specs to whatever owns them, a `Config` on the apply paths and a `Proposal` on the others, without the function caring which. Both callers build the pairs with a `map` or `filter_map` over their own data, and nothing gets copied into a `Vec` first.
+
+**The token audience.** Every workload gets a JWT with the audience `spiffe://CLUSTER`. That's the token it hands to its peers and to a cloud provider's workload identity federation. The API accepted the same token as a read-only login confined to the workload's app. So any party a workload gave its token to could present it to the API for the rest of its hour. The access was narrow (read-only, one app), but a credential meant for others shouldn't log in to our API at all.
+
+The JWT checks (see "Constraining the JWT", later in this chapter) already compare `aud` against an expected value; the API was simply expecting the same one as everyone else. Now the council mints two tokens at once, with the same claims and different audiences:
+
+```rust
+let token = mint(&claims)?;
+let api_token = mint(&crate::sesame::types::WorkloadJwtClaims {
+    aud: vec![crate::sesame::oidc::api_audience(cluster_name)],
+    ..claims
+})?;
+```
+
+`..claims` is the struct update syntax from chapter 1, here taking every field but `aud` from an existing value rather than from `Default`. It moves `claims`, which is fine: it's the last use. Bun writes the second token as `api-token`, beside `token`, and `WorkloadJwtVerifier` builds its constraints with `JwtConstraints::for_api`, which expects `reliaburger-api:CLUSTER`. Neither token passes for the other. We considered requiring the workload's mTLS certificate alongside the JWT instead. That would need the API listener to trust the Workload CA for client certificates, a much bigger change than a second string in `aud`.
+
+One Rust detail in the minting: the two tokens exist only when the cluster has an OIDC key, so the code builds an `Option<(String, String)>` and splits it with `Option::unzip` into the `Option<String>` pair the result struct wants. Without OIDC both are `None`, and both files are written empty, as `token` always was.
 
 ### Don't hash under a lock
 
@@ -1680,7 +1817,7 @@ The ingress swap has its own test in `wrapper::tls`, which handshakes against a 
 
 ## Rotating a CA, part three: the operator signs
 
-Parts one and two gave the council room for two CAs and taught every verifier to trust both. Nothing made a new CA yet. That needs the root, and the root key isn't on the cluster: `relish init` sealed it away, and chapter 4's `relish ca backup` put it in a file the operator keeps. The maintainer's decision was to keep it there. So who signs the new intermediate?
+Parts one and two gave the council room for two CAs and taught every verifier to trust both. Nothing made a new CA yet. That needs the root, and the root key isn't on the cluster: `relish init` wrote it only into the backup the operator keeps (chapter 4). The maintainer's decision was to keep it there. So who signs the new intermediate?
 
 The answer is the oldest trick in PKI. The cluster makes the new key pair and sends a certificate signing request (a CSR: "here's my public key, please certify it"). The operator signs it on their own machine with the root key from the backup, and sends back only the certificate. The new private key never leaves the cluster. The root key never reaches it.
 
@@ -2278,6 +2415,20 @@ pub struct ImageBinder {
 Bun hands the binder to the routes as an axum `Extension` layer, and only when its runtime actually pulls images. ProcessGrill pulls no images: since 0.2.1 it refuses an image app outright (#914), so there's nothing to bind on a Mac dev cluster, and asking Docker Hub would only fail the apply. The handler takes `Option<Extension<ImageBinder>>`, so "no layer" arrives as `None` and the image is stored as written. That was the maintainer's call for this question: bind only when the leader's own runtime pulls, and document that a cluster runs one runtime kind.
 
 What if the registry is down? The apply fails with the registry's error, unless the pull-through cache holds the tag, in which case it binds the cached copy and says so. Here we found a hole of our own making. Once every apply binds, every pull asks for `nginx:1.27@sha256:…`, and the cache filed what it fetched under the digest. Nobody ever pulled the bare tag again, so the cache never held "the tag" and the fallback could never fire. `ImageReference` now keeps the tag a bound reference carries (`bound_tag`), and a fresh fill records the image under it too. The suite test `a_bound_pull_through_remembers_the_tag_for_binding_offline` pulls a bound image through the cache, then binds the bare tag with no registry at all.
+
+The Wyse lab found a second hole, in the error rather than the binding (#2145). An app named `burger:v1`, the tag `relish build` would have pushed to Pickle, except nobody had run the build. Pickle didn't hold it, so the binder asked Docker Hub, which answers 401 for a repository it doesn't have, and the apply said `upstream HEAD docker.io/library/burger:v1 failed: Not authorized …; pin it as burger:v1@sha256:… or try again when the registry answers`. Every word was true, and none of it helped. `OciUpstream` now tells a registry that has no such image (401, 403 or 404, or an OCI error code like `MANIFEST_UNKNOWN`) apart from one that's in trouble, and returns `PickleError::UpstreamImageMissing` for the first. `bind_image` turns that into `BindError::NotInPickle` when the name leaves out its registry, so it could have meant Pickle, and `BindError::NoSuchImage` when it names one. Both answer `404` on a standalone node instead of `502`. The tests `a_bare_name_neither_pickle_nor_upstream_has_points_at_relish_build` and `a_registry_that_refuses_or_lacks_the_image_says_it_is_missing` (which serves real 401 and 404 answers on loopback) pin both halves.
+
+That left a cluster still saying `status 500` (#2157). A cluster apply binds inside its event stream, so a slow registry shows up as a wait rather than a follower's forward timing out, and by the time the binder gives up the stream has already answered `200`. HTTP has no way to take a status back. So the stream's last event has to carry it: `ApplyEvent::Error` gained a `status` field, and the leader fills it from `bind_error_status`, the same `match` over `BindError` the standalone route turns into its response. One function, two paths, one answer.
+
+```rust
+Error {
+    message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    status: Option<u16>,
+},
+```
+
+The two serde attributes do opposite halves of one job. `skip_serializing_if` leaves the field out of the JSON when it's `None`, so every other error looks the way it always did. `default` lets the field be missing when we read one, so `relish` can still parse an error from a server that never heard of it; it says `500` then, as it did before. That's no promise of compatibility (a new field on the wire bumps the protocol, and nodes on 60 refuse a node on 61), but `relish` is the one program that talks to clusters of every version, and it should at least read their errors. `a_cluster_apply_of_an_image_nobody_built_reaches_relish_as_a_404_naming_pickle` runs the real cluster route on loopback and points `relish`'s own client at it, and `a_streamed_error_with_no_status_still_reports_500` feeds the client an event from an older server.
 
 GitOps needed one more thought. Git says `nginx:1.27`; Raft now says `nginx:1.27@sha256:…`. The diff compared them, saw drift, re-applied, re-bound, and did it again on the next poll, forever. `as_git_wrote_it` reads a bound image back as the tag Git names before comparing, so binding alone isn't drift. A tag that moves upstream gets picked up when the app changes in Git, the same way a manual apply picks it up when you run it.
 

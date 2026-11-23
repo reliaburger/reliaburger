@@ -33,6 +33,19 @@ on:
       - src/sesame/ca.rs
       - src/config/mod.rs
       - src/config/node.rs
+      - src/bun/task_array_api.rs
+      - src/meat/task_array_store.rs
+      - src/smoker/types.rs
+      - src/smoker/scenario.rs
+      - src/council/types.rs
+      - src/sesame/auth.rs
+      - src/sesame/oidc.rs
+      - src/sesame/token.rs
+      - src/wrapper/proxy.rs
+      - src/wrapper/routing.rs
+      - src/relish/netboot/tftp.rs
+      - src/relish/netboot/dhcp.rs
+      - src/relish/netboot/wipe.rs
       - .github/workflows/fuzz.yml
   workflow_dispatch:
     inputs:
@@ -58,12 +71,13 @@ jobs:
   fuzz:
     name: fuzz every decoder
     runs-on: ubuntu-24.04
-    # Uncached: a 33-minute sanitizer build (run 40697356210), nine targets
-    # at five minutes each and about 3 minutes of set-up, 81 in all, with
-    # half that again to spare. Cached, only reliaburger itself rebuilds
-    # (14 minutes): a path dependency's fingerprint is its files' mtimes,
-    # which every checkout resets.
-    timeout-minutes: 130
+    # Uncached: a 33-minute sanitizer build (run 40697356210), five minutes
+    # a target and about 3 minutes of set-up, with half that again to spare
+    # (scripts/ci/test_fuzz_workflow.py checks the sum for the targets in
+    # fuzz/fuzz_targets/). Cached, only reliaburger itself rebuilds (14
+    # minutes): a path dependency's fingerprint is its files' mtimes, which
+    # every checkout resets.
+    timeout-minutes: 185
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -88,10 +102,19 @@ jobs:
       # serves the nightly run and pull requests, and only the nightly (or a
       # run by hand) saves it: a PR's saved cache counts against the 10 GB
       # quota ci.yml keeps for main (#1442).
+      #
+      # The key also names the coverage wrapper, since Cargo doesn't
+      # fingerprint a RUSTC_WRAPPER. From 17 Nov 2026, main's nightly saved
+      # crates built through fuzz/rustc-coverage.sh, and pull requests into a
+      # train that didn't have the wrapper yet restored them. Each rebuilt
+      # the whole crate (33 minutes instead of 11) and then took about 20
+      # minutes per 30-second target, so every one hit the job's limit
+      # (#2125).
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz -> target
           shared-key: fuzz
+          key: coverage-${{ hashFiles('fuzz/rustc-coverage.sh') }}
           save-if: ${{ github.event_name != 'pull_request' }}
           cache-on-failure: true
           # reliaburger is a path dependency here, which rust-cache would
@@ -111,12 +134,15 @@ jobs:
           {
             echo '## Fuzzing'
             echo
-            echo '| Target | Last status line |'
-            echo '| --- | --- |'
+            echo '| Target | Coverage counters | Last status line |'
+            echo '| --- | --- | --- |'
             for log in fuzz/target/logs/*.log; do
               [ -e "$log" ] || continue
+              # Only the decoder crates are instrumented (#1953): a count in
+              # the millions means the whole dependency tree is again.
+              counters=$(grep -oE '[0-9]+ inline 8-bit counters' "$log" | head -n 1 | cut -d' ' -f1)
               line=$(grep -E '^#[0-9]+' "$log" | tail -n 1)
-              echo "| $(basename "$log" .log) | \`${line}\` |"
+              echo "| $(basename "$log" .log) | ${counters} | \`${line}\` |"
             done
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Keep any crashing input

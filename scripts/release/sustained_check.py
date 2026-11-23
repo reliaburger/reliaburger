@@ -11,6 +11,8 @@ renders the final Markdown record.
 Subcommands:
   event EVIDENCE --phase P [--target T] [--command C] [--exit N] [--duration S] [--verdict V] [--detail D]
   expect EVIDENCE restart NODE          a harnessed bun kill: one systemd restart is explained
+  expect EVIDENCE workload-restart INSTANCE
+                                        a harness fault restarts INSTANCE once (a chaos pause)
   window EVIDENCE open|close [LABEL]    faults in progress; outages are allowed while open
   power-cut EVIDENCE                    a node lost power: a log tail may end below an earlier one once
   baseline EVIDENCE SNAPSHOT            record each node's leak inventory as the baseline
@@ -30,6 +32,8 @@ Subcommands:
                                         keep Lima's host-agent logs before a stop truncates them
   curl-reason CODE                      name a curl exit code (refused, timeout, TLS...)
   test-failures REPORT [STDERR]         each failing case's reason from a `relish --output json test` report
+  test-states REPORT OUT                write the failing cases' state captured before cleanup to OUT;
+                                        prints "NAME SINCE" for the failure bundle, or nothing
   seed EVIDENCE [--seed N]              start (or resume) the run's fault and node choices; prints the seed
   choose EVIDENCE WHAT LOW HIGH         the run's next choice between LOW and HIGH, logged as an event
   render EVIDENCE RECORD                write the Markdown record (refuses to overwrite)
@@ -92,6 +96,12 @@ BUN_STEADY_AFTER = 600
 API_BUN_RSS_TARGET_MIB = 512
 BUN_RSS_TARGET_MIB = 384
 TASK_ARRAY_STORAGE_TARGET_MIB = 64
+# A node's data/instances in allocated blocks on its own filesystem, as the
+# job inventory counts it (#1418). Since the capture reclaim (0.2.5) every
+# record peaks at 24-29 MiB on every tier, the 24 h day runs included; the
+# 0.2.3 and 0.2.4 day runs grew node 1's to 0.9 GiB. 64 MiB is over twice
+# the highest peak, and far under a day of an unreclaimed capture.
+INSTANCE_STORAGE_LIMIT_MIB = 64
 # A leak-fd window: floors over 10-minute buckets after a 10-minute warm-up,
 # each at least FD_STEP above the last, 25% up overall. Bun images rarely
 # live more than two hours in the soak, so the window has to be short.
@@ -340,6 +350,118 @@ def writer_file_findings(text, highest_ack):
     return findings
 
 
+# Where each start resumed (#2094's power-cut work found the gap). The writer
+# appends where it resumed to /data/resumes, the Redis client pushes the
+# counter it found onto soak:starts, each before its first acknowledgement.
+# The file and counter checks can't see a loss on their own: by the next
+# check the writer has appended past the lost lines and the client has
+# counted past them. So every start must resume at or past the highest value
+# acknowledged before it.
+# The settle checks don't wait for the writer or the Redis client, so either
+# may record its new start after a fault window closes; a start still missing
+# this long after the close never came.
+RESTART_GRACE = 120
+
+RESUME_RECORDS = (
+    # kind, snapshot file, log tail, its prefix, the state key of its highest value
+    ("writer", "writer-resumes.txt", "writer-log.txt", "ACK", "writer-ack"),
+    ("redis", "redis-starts.txt", "redis-log.txt", "INCR", "redis-counter"),
+)
+
+
+def parse_record(text):
+    """A resume record, one number per start and oldest first; None when a
+    line isn't a number (an exec error, a record read mid-write)."""
+    values = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if not line.isdigit():
+            return None
+        values.append(int(line))
+    return values
+
+
+def resume_mark(record, values):
+    """Note that VALUES (a record read after the tails that gave
+    record["highest"]) held this many starts: any later start happened after
+    every acknowledgement counted in record["highest"]."""
+    if values is not None and len(values) >= record.get("seen", 0):
+        record.setdefault("marks", []).append([len(values), record.get("highest", 0)])
+
+
+def resume_findings(record, text, fault_window, kind, prefix, since_close=None):
+    """Judge the starts in a resume record that no earlier check judged.
+
+    RECORD is this kind's state: `seen` starts judged so far, `highest` the
+    highest acknowledged value any tail showed, and `marks`, each
+    `[starts, highest]` as one read found them. A start numbered N must
+    resume at or past the highest of the last mark with fewer than N starts:
+    those tails were read before its record was, so before it started.
+    `expect` is the count at a power cut that stopped this workload; a record
+    still at that count RESTART_GRACE seconds after the fault window closed
+    (SINCE_CLOSE seconds ago; None when unknown) is a start that never came."""
+    check = f"{kind}-resume"
+    values = parse_record(text)
+    if values is None:
+        return [finding(check, "warn", f"unreadable resume record: {text.strip()[:80]!r}")]
+    findings = []
+    seen = record.get("seen", 0)
+    marks = record.get("marks", [])
+    if len(values) < seen:
+        findings.append(finding(check, "warn", f"the record holds {len(values)} starts, fewer than the {seen} judged before"))
+    for number, value in enumerate(values[seen:], seen + 1):
+        required = max((acked for count, acked in marks if count < number), default=0)
+        if value < required:
+            findings.append(finding(check, "fail", f"start {number} resumed at {value}, below {prefix} {required} "
+                                                   "logged before it: acknowledged writes were lost"))
+    record["seen"] = len(values)
+    record["marks"] = []
+    resume_mark(record, values)
+    expect = record.get("expect")
+    if expect is not None and len(values) > expect:
+        record.pop("expect")
+    elif expect is not None and not fault_window and (since_close is None or since_close >= RESTART_GRACE):
+        findings.append(finding(f"{kind}-restart", "fail",
+                                f"no new start recorded since a power cut stopped it ({len(values)} starts)"))
+        record.pop("expect")
+    return findings
+
+
+def regression_findings(record, text):
+    """`LAST NOW` entries the Redis client pushed when an INCR answered no
+    more than the one before; each new one is a loss."""
+    entries = [line.strip() for line in text.splitlines() if line.strip()]
+    if not all(re.fullmatch(r"\d+ \d+", entry) for entry in entries):
+        # Redis replaying its AOF answers `LOADING ...` with exit status 0.
+        return [finding("redis-regression", "warn", f"unreadable regression record: {text.strip()[:80]!r}")]
+    findings = []
+    for entry in entries[record.get("regressions", 0):]:
+        before, after = entry.split()
+        findings.append(finding("redis-regression", "fail", f"the client saw the counter go back from {before} to {after}"))
+    record["regressions"] = len(entries)
+    return findings
+
+
+def raise_highest(state, kind, value):
+    record = state.setdefault("resumes", {}).setdefault(kind, {})
+    if value is not None:
+        record["highest"] = max(record.get("highest", 0), value)
+    return record
+
+
+def resume_record_lines(state):
+    """The record's lines on the resume checks."""
+    resumes = state.get("resumes", {})
+    writer = resumes.get("writer", {})
+    redis = resumes.get("redis", {})
+    return [f"- Volume writer resumes: {writer.get('seen', 0)} starts, each checked against the highest ACK "
+            "logged before it",
+            f"- Redis client starts: {redis.get('seen', 0)}, each checked against the highest INCR logged before it; "
+            f"counter regressions the client saw: {redis.get('regressions', 0)}"]
+
+
 def certificate_findings(check, not_after, now, margin, target):
     if not_after is None:
         return []
@@ -523,6 +645,60 @@ def restart_expectations(evidence, node):
     return times
 
 
+# `relish wtf` counts a crash loop as CRASHLOOP_RESTARTS restarts of one
+# instance inside CRASHLOOP_WINDOW (src/relish/wtf/findings.rs).
+CRASHLOOP_RESTARTS = 3
+CRASHLOOP_WINDOW = 15 * 60
+WORKLOAD_RESTARTS = "workload-restart-expectations.jsonl"
+LOOPING_INSTANCE = re.compile(r"instance (\S+) restarted (\d+) times")
+
+
+def workload_restart_expectations(evidence):
+    """Restarts the harness's own faults cause, as (instance, time) pairs.
+
+    A chaos pause freezes one instance, its health checks fail and Bun
+    restarts it (#2079). Append-only, like restart-expectations.jsonl."""
+    path = Path(evidence) / WORKLOAD_RESTARTS
+    if not path.exists():
+        return []
+    expected = []
+    for line in path.read_text().splitlines():
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        expected.append((entry["instance"], entry["ts"]))
+    return expected
+
+
+def excuse_expected_restarts(report, expectations, now):
+    """The `wtf` report without the crash loops the harness's faults explain (#2197).
+
+    A crashloop finding names each looping instance and its restart count. It
+    is excused when every instance falls below the threshold once the restarts
+    the harness caused inside the window are taken off. A line that names no
+    instance excuses nothing."""
+    def excused(entry):
+        if entry.get("id") != "crashloop" or not entry.get("details"):
+            return False
+        for line in entry["details"]:
+            match = LOOPING_INSTANCE.match(line)
+            if not match:
+                return False
+            instance, count = match.group(1), int(match.group(2))
+            caused = sum(1 for name, at in expectations if name == instance and now - CRASHLOOP_WINDOW <= at <= now)
+            if count - caused >= CRASHLOOP_RESTARTS:
+                return False
+        return True
+    critical = report.get("critical", [])
+    kept = [entry for entry in critical if not excused(entry)]
+    if len(kept) == len(critical):
+        return report, []
+    notes = [finding("wtf-crashloop", "info", "restarts the harness caused: " + "; ".join(entry["details"]),
+                     entry.get("affected_resource")) for entry in critical if excused(entry)]
+    return dict(report, critical=kept), notes
+
+
 def restart_findings(state, node, inventory, expectations, now):
     """systemd restarts of bun that no harness kill explains.
 
@@ -646,6 +822,45 @@ def test_failure_reasons(report_text, stderr_text=""):
         if tail:
             return tail
     return "no output"
+
+
+def test_failure_states(report_text):
+    """Each case that did not pass, with the state `relish test` captured
+    before its cleanup (#2131): the step it was in, its instances, recent
+    events. Cases without a capture are left out; an unreadable report gives
+    an empty list."""
+    try:
+        results = json.loads(report_text)["results"]
+    except (ValueError, KeyError, TypeError):
+        return []
+    return [{key: result.get(key) for key in ("name", "group", "started_at", "finished_at", "outcome", "cleanup",
+                                               "failure_state")}
+            for result in results
+            if result.get("outcome", {}).get("status") != "pass" and result.get("failure_state")]
+
+
+def write_test_states(report_path, out_path):
+    """Write the captured states of a report's failing cases to `out_path`.
+
+    Returns "NAME SINCE" for the bundle: the file's name and a journalctl
+    `--since` reaching back to one minute before the earliest failing case
+    started, and never less than the usual 15 minutes, or "" when no case
+    carried a capture."""
+    report = Path(report_path)
+    states = test_failure_states(report.read_text(errors="replace")) if report.exists() else []
+    if not states:
+        return ""
+    out = Path(out_path)
+    out.write_text(json.dumps(states, indent=1) + "\n")
+    starts = []
+    for state in states:
+        try:
+            starts.append(calendar.timegm(time.strptime(state.get("started_at") or "", "%Y-%m-%dT%H:%M:%SZ")))
+        except ValueError:
+            pass
+    fifteen_minutes_ago = int(time.time()) - 900
+    since = f"@{min(min(starts) - 60, fifteen_minutes_ago)}" if starts else "-15min"
+    return f"{out.name} {since}"
 
 
 def curl_reason(code):
@@ -907,8 +1122,23 @@ def evaluate(evidence, snapshot):
     if writer is not None:
         findings += writer_file_findings(writer, state.get("writer-ack"))
 
+    # The records are read after the tails, so every value those tails showed
+    # was acknowledged before any start the records don't hold yet.
+    closed_at = state.get("window_closed_at")
+    since_close = now - closed_at if closed_at is not None else None
+    for kind, name, _, prefix, key in RESUME_RECORDS:
+        record = raise_highest(state, kind, state.get(key))
+        text = read(snapshot, name)
+        if text is not None:
+            findings += resume_findings(record, text, fault_window, kind, prefix, since_close)
+    regressions = read(snapshot, "redis-regressions.txt")
+    if regressions is not None:
+        findings += regression_findings(raise_highest(state, "redis", None), regressions)
+
     report = read_json(snapshot, "wtf.json")
     if report is not None:
+        report, notes = excuse_expected_restarts(report, workload_restart_expectations(evidence), now)
+        findings += notes
         findings += wtf_findings(state, report, now, fault_window)
         if report.get("critical"):
             state["wtf_critical_samples"] = state.get("wtf_critical_samples", 0) + 1
@@ -974,6 +1204,7 @@ def evaluate(evidence, snapshot):
                     usage["peak_owners"]=max(usage.get("peak_owners",0),len(owned["owners"]))
                     peaks=usage.setdefault("peak_storage_kb",{})
                     for scope,size in owned["storage_kb"].items(): peaks[scope]=max(peaks.get(scope,0),size)
+                    findings+=instance_storage_findings(owned["storage_kb"],node,fault_window)
                     campaign_snapshot=read_json(snapshot,"jobs.json") or {}
                     if campaign_snapshot.get("stopped") and now-campaign_snapshot.get("heartbeat",0)>5 and owned["owners"]:
                         raise job_soak_inventory.InvalidInventory("job-owned resources remain after positive campaign drain")
@@ -1239,13 +1470,15 @@ def clock_findings(state, node, inventory, fault_window):
 
     Lima's guest agent sets the guest clock to the host's every 10 s once
     they differ by more than 100 ms. systemd-timesyncd running beside it
-    fought it: the agent stepped the clock back every 10 s. Each step the
-    agent logged since the last check is counted; one after a power-on is
-    expected, a steady run of them outside a fault window is not."""
+    fought it: the agent stepped the clock back every 10 s. Ubuntu 26.04's
+    chrony would fight it the same way. Each step the agent logged since the
+    last check is counted; one after a power-on is expected, a steady run of
+    them outside a fault window is not."""
     findings = []
-    if (inventory.get("timesyncd") or [None])[0] == "active":
-        findings.append(finding("guest-clock", "fail",
-                                "systemd-timesyncd is running beside Lima's guest agent", node))
+    for kind, daemon in (("timesyncd", "systemd-timesyncd"), ("chrony", "chrony")):
+        if (inventory.get(kind) or [None])[0] == "active":
+            findings.append(finding("guest-clock", "fail",
+                                    f"{daemon} is running beside Lima's guest agent", node))
     steps = inventory_number(inventory, "clock_steps")
     if steps:
         counts = state.setdefault("clock_steps", {})
@@ -1410,6 +1643,18 @@ def bun_rss_samples(metrics, inventory, pid, now):
     process["peak_kb"] = max(process["peak_kb"], rss)
     if now - process["first_seen"] >= BUN_STEADY_AFTER:
         process["steady_kb"].append(rss)
+
+
+def instance_storage_findings(storage_kb, node, fault_window):
+    """A node whose instance storage is over INSTANCE_STORAGE_LIMIT_MIB fails
+    the snapshot (#1418). Inside a fault window it is only reported: storage
+    a fault left behind that retirement doesn't remove is still there, and
+    fails, at the first check after the window."""
+    size=storage_kb.get("instances")
+    if size is None or size<=INSTANCE_STORAGE_LIMIT_MIB*1024:
+        return []
+    return [finding("instance-storage","info" if fault_window else "fail",
+                    f"data/instances holds {size/1024:.1f} MiB, over the {INSTANCE_STORAGE_LIMIT_MIB} MiB limit",node)]
 
 
 def job_host_metrics(state, accepted):
@@ -2134,6 +2379,7 @@ def render(evidence, record):
                   "- Explicit test-operator acknowledgements for known replay-safe fenced fixtures: "+str((job_report or {}).get("totals",{}).get("operator_replay_decisions",0)), ""]
         for node, sample in state.get("job_resources",{}).items():
             lines.append(f"- {node}: latest complete job storage (KiB) {sample.get('storage_kb')}; free {sample.get('available_kb')} KiB; live/peak owners {sample.get('live_owners')}/{sample.get('peak_owners')}; peak storage {sample.get('peak_storage_kb')}")
+        lines += ["", f"Instance storage limit: {INSTANCE_STORAGE_LIMIT_MIB} MiB per node (data/instances, allocated, outside fault windows; #1418)."]
         lines += ["", "Complete disk inventories are recorded. Global retention bounds and the 12-hour job qualification remain #668; this gate cannot certify an unimplemented retention policy.", ""]
         qualification = job_qualification(job_report, state, metadata, elapsed)
         lines += job_qualification_lines(qualification)
@@ -2149,6 +2395,7 @@ def render(evidence, record):
               "the writer file checks (writer-lost, writer-regression) decide data loss, "
               "and `*-log-order` failures are about the order the log view returned lines in",
               f"- Redis counter: highest INCR {state.get('redis-counter', 'none')} in the log view"]
+    lines += resume_record_lines(state)
     for node, count in sorted(state.get("export_counts", {}).items()):
         lines.append(f"- Export {node}: {count['source']} source files, {count['destination']} at the destination")
     lines.append(f"- Registry images pushed and re-verified: {len(state.get('registry_pushed', []))}")
@@ -2189,6 +2436,9 @@ def render(evidence, record):
         for row in failures:
             seen = time.strftime("%H:%M:%S", time.gmtime(row.get("ts", started)))
             symptom = str(row.get("detail", "")).replace("|", "\\|").replace("\n", " ")[:300]
+            if row.get("captured"):
+                # The state the check saw before anything cleaned up (#2131).
+                symptom += f" (state at failure: `failures/{row['number']}/{row['captured']}`)"
             lines.append(f"| {row['number']} | {seen} | {row.get('check', '')} | {symptom} | {row.get('class', 'unclassified')} | "
                          f"{row.get('cause', 'open')} | {row.get('action', 'open')} |")
     else:
@@ -2271,6 +2521,8 @@ def job_qualification_lines(report):
     missed = ", ".join(f"{node} missed {count}" for node, count in sorted((fallbacks.get("missed") or {}).items()))
     answered = ", ".join(f"{node} answered {count}" for node, count in sorted((fallbacks.get("answered") or {}).items()))
     lines += [f"- Audited executions: {report.get('audited_attempts', 0)}; operator replay decisions: {report.get('operator_replay_decisions', 0)}",
+              f"- Chunks checked for exactly-once completion: {report.get('chunks_checked', 0)}, "
+              f"{report.get('chunks_regranted', 0)} of them re-granted (#1415)",
               "- Job controller API fallbacks: " + (f"{missed}; {answered}" if missed else "none") +
               " (requests a node didn't answer, and the node that took them instead)", ""]
     return lines
@@ -2305,17 +2557,23 @@ def main(argv=None):
         event.add_argument("--" + name, type=int)
     expect = commands.add_parser("expect")
     expect.add_argument("evidence")
-    expect.add_argument("what", choices=["restart"])
-    expect.add_argument("node")
+    expect.add_argument("what", choices=["restart", "workload-restart"])
+    expect.add_argument("node", help="the node for `restart`, the instance for `workload-restart`")
     expect.add_argument("--at", type=int, help="when the kill happens (default: now)")
     power_cut = commands.add_parser("power-cut", help="a node's power was cut: the log view may lose unsynced lines")
     power_cut.add_argument("evidence")
+    power_cut.add_argument("--restarts", action="append", default=[], choices=[kind for kind, *_ in RESUME_RECORDS],
+                           help="a workload the cut stops, which must record a new start once the window closes")
+    mark = commands.add_parser("resume-mark", help="tails and resume records read just before a power cut")
+    mark.add_argument("evidence")
+    mark.add_argument("directory")
     window = commands.add_parser("window")
     window.add_argument("evidence")
     window.add_argument("action", choices=["open", "close", "settled"])
     window.add_argument("label", nargs="?")
     window.add_argument("--down", type=int, default=0)
     window.add_argument("--node", help="the node a node fault targets")
+    window.add_argument("--at", type=int, help="when, in Unix seconds (default: now)")
     for name in ("baseline", "evaluate"):
         sub = commands.add_parser(name)
         sub.add_argument("evidence")
@@ -2370,6 +2628,9 @@ def main(argv=None):
     failures = commands.add_parser("test-failures", help="why a relish test JSON run failed (#1068)")
     failures.add_argument("report")
     failures.add_argument("stderr", nargs="?")
+    states = commands.add_parser("test-states", help="keep a relish test report's captured failure states (#2131)")
+    states.add_argument("report")
+    states.add_argument("out")
     seed = commands.add_parser("seed", help="start or resume the run's seeded choices (#1062)")
     seed.add_argument("evidence")
     seed.add_argument("--seed", type=int)
@@ -2401,12 +2662,33 @@ def main(argv=None):
                      settle_seconds=args.settle_seconds)
         return 0
     if args.command == "expect":
+        at = args.at if args.at is not None else int(time.time())
+        if args.what == "workload-restart":
+            with open(Path(args.evidence) / WORKLOAD_RESTARTS, "a") as out:
+                out.write(json.dumps({"instance": args.node, "ts": at}) + "\n")
+            return 0
         with open(Path(args.evidence) / "restart-expectations.jsonl", "a") as out:
-            out.write(json.dumps({"node": args.node, "ts": args.at if args.at is not None else int(time.time())}) + "\n")
+            out.write(json.dumps({"node": args.node, "ts": at}) + "\n")
         return 0
     if args.command == "power-cut":
         state = load_state(args.evidence)
         state["power_cut"] = True
+        for kind in args.restarts:
+            record = raise_highest(state, kind, None)
+            record["expect"] = max([record.get("seen", 0)] + [count for count, _ in record.get("marks", [])])
+        save_state(args.evidence, state)
+        return 0
+    if args.command == "resume-mark":
+        # The highest acknowledged value just before the cut, so a start after
+        # it is held to that rather than to the last check's.
+        state = load_state(args.evidence)
+        directory = Path(args.directory)
+        for kind, name, tail, prefix, _ in RESUME_RECORDS:
+            text = read(directory, tail)
+            record = raise_highest(state, kind, max((value for run in parse_runs(text, prefix).values() for value in run), default=None)
+                                   if text is not None else None)
+            text = read(directory, name)
+            resume_mark(record, parse_record(text) if text is not None else None)
         save_state(args.evidence, state)
         return 0
     if args.command == "window":
@@ -2422,6 +2704,7 @@ def main(argv=None):
             state.pop("window", None)
             state.pop("window_node", None)
             state["nodes_down"] = 0
+            state["window_closed_at"] = args.at if args.at is not None else int(time.time())
             if args.action == "settled":
                 state["last_settled"] = int(time.time())
         save_state(args.evidence, state)
@@ -2490,6 +2773,9 @@ def main(argv=None):
         blocks = loop_stalls.extract(Path(args.journal).read_text(errors="replace"))
         if blocks:
             print("\n\n".join(blocks))
+        return 0
+    if args.command == "test-states":
+        print(write_test_states(args.report, args.out))
         return 0
     if args.command == "test-failures":
         stderr_text = Path(args.stderr).read_text(errors="replace") if args.stderr and Path(args.stderr).exists() else ""

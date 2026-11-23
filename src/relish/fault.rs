@@ -181,6 +181,33 @@ fn make_request(
     }
 }
 
+/// The request `relish fault kill APP --namespace NAMESPACE --instance
+/// INSTANCE --node NODE --acknowledge --reason REASON` sends: kill one
+/// instance on one node. The terminal UI's Instances tab sends it too, so a
+/// kill from there is recorded, audited and held to Smoker's safety rails
+/// exactly as the command's is.
+pub fn instance_kill_request(
+    app: &str,
+    namespace: &str,
+    instance: &str,
+    node: &str,
+    reason: &str,
+) -> FaultRequest {
+    make_request(
+        FaultType::Kill { count: 1 },
+        app.to_string(),
+        Duration::from_secs(0),
+        &FaultTargeting {
+            namespace: Some(namespace.to_string()),
+            instance: Some(instance.to_string()),
+            node: Some(node.to_string()),
+            reason: Some(reason.to_string()),
+            override_safety: false,
+            acknowledge: true,
+        },
+    )
+}
+
 /// Inject a delay fault.
 pub async fn delay(
     target: &str,
@@ -1231,6 +1258,30 @@ mod tests {
     #[test]
     fn parse_bandwidth_invalid() {
         assert!(parse_bandwidth("fast").is_err());
+    }
+
+    // The TUI's Instances tab kills through the request `relish fault kill`
+    // builds from these flags (#2175).
+    #[test]
+    fn instance_kill_request_is_the_clis_kill_with_instance_and_node() {
+        let cli = make_request(
+            FaultType::Kill { count: 1 },
+            "web".into(),
+            Duration::from_secs(0),
+            &FaultTargeting {
+                namespace: Some("team-a".into()),
+                instance: Some("web-1".into()),
+                node: Some("node-2".into()),
+                reason: Some("relish tui".into()),
+                override_safety: false,
+                acknowledge: true,
+            },
+        );
+        let tui = instance_kill_request("web", "team-a", "web-1", "node-2", "relish tui");
+        assert_eq!(
+            serde_json::to_value(&tui).unwrap(),
+            serde_json::to_value(&cli).unwrap()
+        );
     }
 
     #[test]

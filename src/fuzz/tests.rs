@@ -113,11 +113,38 @@ fn fixture_seeds_are_in_the_checked_in_corpus() {
                 std::fs::create_dir_all(&directory).expect("corpus directory creates");
                 std::fs::write(&path, &seed.bytes).expect("seed writes");
             }
-            // Seeds with random keys or nonces differ on every run, so this
-            // checks presence, not bytes.
+            // Every seed is the same bytes on every run (no random keys or
+            // nonces), so the checked-in file must be exactly the seed.
+            let bytes = std::fs::read(&path).unwrap_or_else(|_| {
+                panic!("{} is missing: run make fuzz-corpus-seed", path.display())
+            });
             assert!(
-                path.is_file(),
-                "{} is missing: run make fuzz-corpus-seed",
+                bytes == seed.bytes,
+                "{} differs from its seed: run make fuzz-corpus-seed",
+                path.display()
+            );
+        }
+    }
+}
+
+/// A protocol or state bump makes the old gossip and Raft seeds undecodable,
+/// and libFuzzer then starts from inputs its target refuses at the first
+/// byte. The presence check above can't see that, since the file names stay
+/// the same, so check the checked-in bytes too.
+#[test]
+fn checked_in_fixture_seeds_are_still_accepted() {
+    for target in TARGETS {
+        let directory = fuzz_dir().join("corpus").join(target.name);
+        for seed in seeds::for_target(target.name) {
+            let path = directory.join(&seed.name);
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            assert_eq!(
+                (target.run)(&bytes),
+                Outcome::Accepted,
+                "{} refuses its checked-in seed {}: run make fuzz-corpus-seed",
+                target.name,
                 path.display()
             );
         }

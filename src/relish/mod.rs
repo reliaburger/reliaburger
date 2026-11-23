@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod apps_cmd;
 pub mod audit_cmd;
+pub mod bare_metal;
 pub mod bench_cmd;
 pub mod bench_jobs;
 pub mod ca_cmd;
@@ -22,6 +23,7 @@ pub mod events_cmd;
 pub mod fault;
 pub mod fmt;
 pub mod gym;
+pub mod image;
 pub mod inspect;
 pub mod install;
 #[cfg(feature = "kubernetes")]
@@ -40,11 +42,14 @@ pub mod k8s_export;
 pub mod k8s_import;
 pub mod lease_cmd;
 pub mod local_context;
+pub mod machines;
 pub mod manifest;
 pub mod manual;
 pub mod mcp;
 pub mod metrics_cmd;
+pub mod netboot;
 pub mod nodes_cmd;
+pub mod os;
 pub mod output;
 pub mod path_cmd;
 pub mod plan;
@@ -236,6 +241,18 @@ pub enum RelishError {
     #[error("invalid --{flag} value: {reason}")]
     InvalidFlag { flag: String, reason: String },
 
+    /// An app or namespace name the cluster couldn't hold, refused before it
+    /// goes into a request's path.
+    #[error(
+        "invalid {kind} name {name:?}: a name is a lowercase DNS label of 1–63 bytes, with letters or digits at both ends and only letters, digits or hyphens within"
+    )]
+    InvalidName {
+        /// Whether it names an app or a namespace.
+        kind: client::NameKind,
+        /// The name as given.
+        name: String,
+    },
+
     /// `relish upgrade plan` couldn't see the live cluster, so it won't
     /// guess its shape (#1568).
     #[error(
@@ -243,9 +260,44 @@ pub enum RelishError {
     )]
     UnseenCluster(Box<RelishError>),
 
+    /// `relish apply` or `rollback` followed a deploy's progress for its
+    /// whole deadline without the deploy finishing.
+    #[error(
+        "stopped following the deploy after {seconds} s; it may still be running on the agent (see relish status)"
+    )]
+    DeployStreamDeadline {
+        /// The deadline, in seconds.
+        seconds: u64,
+    },
+
     /// A request to the agent timed out. The operation may still be running.
     #[error("request timed out (the operation may still be running on the agent)")]
     RequestTimeout,
+
+    /// The current relish context needs a file that's gone, usually
+    /// because its cluster's directory was deleted (#2162).
+    #[error(
+        "the relish context for {owner} can't be used: its CA certificate {} is gone. \
+         If that cluster is gone too, remove {} so relish goes back to the local default, \
+         or create a new cluster with `relish setup` or `relish machines claim --create`, \
+         which replaces it. To reach another cluster meanwhile, pass --endpoint, --ca-cert \
+         and --token (or RELIABURGER_ENDPOINT, RELIABURGER_CA_CERT and RELIABURGER_TOKEN)",
+        .missing.display(),
+        .context.display()
+    )]
+    ContextFileMissing {
+        /// The context file.
+        context: std::path::PathBuf,
+        /// The cluster it's for.
+        owner: String,
+        /// The file it needs that no longer exists.
+        missing: std::path::PathBuf,
+    },
+
+    /// relish couldn't set up its connection to the cluster, so it sent
+    /// nothing: an unreadable CA certificate, say.
+    #[error("{0}")]
+    ClientConfig(String),
 
     /// The API returned an error.
     #[error("API error (status {status}): {body}")]
@@ -287,6 +339,22 @@ pub enum RelishError {
     /// Cluster init (PKI generation) failed.
     #[error("cluster initialisation failed: {0}")]
     InitFailed(String),
+
+    /// A new bare-metal cluster's master-key backup can't be confirmed:
+    /// no `--yes` and no terminal to ask at.
+    #[error(
+        "the master key in {} needs backing up before the cluster starts: run this in a terminal to confirm, or pass --yes once you've arranged its backup",
+        .secrets.display()
+    )]
+    BackupConfirmationRequired { secrets: std::path::PathBuf },
+
+    /// The operator's input ended before they confirmed the master-key
+    /// backup.
+    #[error(
+        "the master-key backup wasn't confirmed, so the cluster wasn't created: relish removed the files cluster create wrote in {} and the root backup's identity, and left anything else there; create the cluster again",
+        .directory.display()
+    )]
+    BackupNotConfirmed { directory: std::path::PathBuf },
 
     /// TOML formatting failed.
     #[error("format failed: {0}")]
@@ -341,6 +409,10 @@ pub enum RelishError {
     /// `relish uninstall` refused or could not remove something.
     #[error("{0}")]
     Uninstall(#[from] uninstall::UninstallError),
+
+    /// `relish netboot` refused to start or failed.
+    #[error("{0}")]
+    Netboot(#[from] netboot::NetbootError),
 
     /// `relish manual CHAPTER` named no single chapter.
     #[error("{0}")]

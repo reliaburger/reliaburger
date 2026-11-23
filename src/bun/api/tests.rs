@@ -255,6 +255,19 @@ async fn seeded_council_with_log(
     Arc<crate::council::CouncilNode>,
     crate::council::log_store::MemLogStore,
 ) {
+    let (node, log, _) = seeded_council_with_init(tag).await;
+    (node, log)
+}
+
+/// [`seeded_council_with_log`], with the cluster's init result too: its
+/// `node_certificate` is a valid TLS identity for `node-1`.
+async fn seeded_council_with_init(
+    tag: &str,
+) -> (
+    Arc<crate::council::CouncilNode>,
+    crate::council::log_store::MemLogStore,
+    crate::sesame::init::InitResult,
+) {
     use std::collections::BTreeMap;
 
     use crate::council::log_store::MemLogStore;
@@ -275,7 +288,7 @@ async fn seeded_council_with_log(
     )
     .await
     .unwrap();
-    raft_router.register(1, node.raft().clone()).await;
+    raft_router.register(1, &node).await;
     let mut members = BTreeMap::new();
     members.insert(
         1,
@@ -290,7 +303,7 @@ async fn seeded_council_with_log(
         .prefix(&format!("rb-api-seeded-{tag}-"))
         .tempdir()
         .unwrap();
-    let init = crate::sesame::init::initialize_cluster("apitest", "node-1", dir.path()).unwrap();
+    let init = crate::sesame::init::initialize_cluster("apitest", "node-1").unwrap();
     drop(dir);
 
     // Retry while leadership settles after initialize.
@@ -305,7 +318,7 @@ async fn seeded_council_with_log(
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    (Arc::new(node), log)
+    (Arc::new(node), log, init)
 }
 
 /// Send a GET to `uri` against `app` and return (status, body bytes).
@@ -1489,7 +1502,7 @@ async fn leased_apply_with_jobs_uses_the_common_job_lifecycle() {
         desired
             .task_arrays
             .deployments()
-            .all(|(_, record)| record.cancelled || record.completed),
+            .all(|(_, record)| record.cancelled() || record.completed),
         "cleanup cancels the leased deployment"
     );
     assert!(
@@ -1578,7 +1591,7 @@ schedule = "* * * * *"
     assert!(
         after
             .deployments()
-            .all(|(_, record)| record.cancelled || record.completed)
+            .all(|(_, record)| record.cancelled() || record.completed)
     );
     for name in ["batch", "scheduled"] {
         assert!(after.jobs().definition(&lease.namespace, name).is_none());
@@ -1630,7 +1643,7 @@ async fn lease_reads_forward_user_authority_and_refuse_an_isolated_leader() {
             .await
             .unwrap(),
         );
-        network.register(id, node.raft().clone()).await;
+        network.register(id, &node).await;
         nodes.push(node);
     }
     nodes[0].initialize(members).await.unwrap();
@@ -1760,8 +1773,8 @@ async fn lease_reads_forward_user_authority_and_refuse_an_isolated_leader() {
     }
 }
 
-/// One request the fake leader received: path, bearer, whether it carried
-/// the leader-forwarded marker, body.
+/// One request the fake leader received: path with its query, bearer,
+/// whether it carried the leader-forwarded marker, body.
 pub(super) type SeenAtLeader = (String, Option<String>, bool, String);
 
 /// Serve a fake leader API on `listener` that accepts every request and
@@ -1774,7 +1787,12 @@ pub(super) fn serve_recording_leader(
     let leader = axum::Router::new().fallback(move |request: axum::extract::Request| {
         let recorder = recorder.clone();
         async move {
-            let path = request.uri().path().to_string();
+            // The query too: a forward that drops `?force=true` changes
+            // what the leader does.
+            let path = request
+                .uri()
+                .path_and_query()
+                .map_or_else(|| request.uri().path().to_string(), |path| path.to_string());
             let bearer = request
                 .headers()
                 .get("authorization")
@@ -1848,7 +1866,7 @@ async fn council_and_network_keyed(
             .await
             .unwrap(),
         );
-        network.register(id, node.raft().clone()).await;
+        network.register(id, &node).await;
         nodes.push(node);
     }
     nodes[0].initialize(members).await.unwrap();
@@ -1889,6 +1907,104 @@ async fn a_two_voter_council_refuses_to_roll_and_three_voters_can() {
     }
 }
 
+/// An OS rollout updates council members one at a time too. On two voters
+/// the rollout planner never finds the headroom to take one down, so the
+/// rollout would sit pending for ever: start refuses it instead, with the
+/// same reason a bun upgrade gives.
+#[tokio::test]
+async fn an_os_rollout_on_a_two_voter_council_is_refused_at_start() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let pair = council_of(2).await;
+    let app = router_over(pair[0].clone(), admin);
+    let (status, reply) = send_bounded(
+        app,
+        "POST",
+        "/v1/os/rollout/start",
+        &admin_key,
+        r#"{"version":"2026.42.0","channel_url":"https://example/os-channel.json"}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{reply}");
+    assert!(
+        reply.contains("council of 2 voters") && reply.contains("at least three voters"),
+        "{reply}"
+    );
+    for node in pair {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// A bun upgrade and an OS rollout both restart nodes, so the state machine
+/// never lets one start while the other runs. The start and rollback
+/// handlers must say so with a 409, not answer 202 for a run that was
+/// never recorded.
+#[tokio::test]
+async fn an_upgrade_or_rollback_during_an_os_rollout_is_refused() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let trio = council_of(3).await;
+    let rollout = crate::os::rollout::plan(
+        "os-1",
+        "2026.42.0",
+        "https://example/os-channel.json",
+        "node-1",
+        vec![(
+            "node-1".into(),
+            "127.0.0.1:7001".into(),
+            true,
+            "2026.41.0".into(),
+        )],
+        0,
+    );
+    trio[0]
+        .write(crate::council::types::RaftRequest::OsRolloutStart {
+            rollout: Box::new(rollout),
+            replaces: None,
+        })
+        .await
+        .unwrap();
+    let node = r#"{"node_id":"node-1","address":"127.0.0.1:7001","role":"Leader"}"#;
+    let start = format!(
+        r#"{{"target_version":"v0.2.0","binaries":[{{"platform":"linux-x86_64","sha256":"{}","embedded_signature":"c2ln"}}],"registry_address":"127.0.0.1:7001","nodes":[{node}]}}"#,
+        "a".repeat(64)
+    );
+    let rollback = format!(r#"{{"target_version":"v0.1.0","nodes":[{node}]}}"#);
+    let app = router_over(trio[0].clone(), admin);
+    for (uri, body) in [
+        ("/v1/upgrade/start", start),
+        ("/v1/upgrade/cluster-rollback", rollback),
+    ] {
+        let (status, reply) = send_bounded(app.clone(), "POST", uri, &admin_key, &body, &[]).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{uri}: {reply}");
+        assert!(reply.contains("OS rollout os-1"), "{uri}: {reply}");
+    }
+    // A rollout that starts after the handler looked: the refused write
+    // is a 409 too.
+    let upgrade = crate::upgrade::types::ClusterUpgradeState {
+        upgrade_id: "up-1".into(),
+        target_version: "v0.2.0".parse().unwrap(),
+        binaries: Vec::new(),
+        parallel: 1,
+        direction: crate::upgrade::types::UpgradeDirection::Upgrade,
+        phase: crate::upgrade::types::ClusterUpgradePhase::Preparing,
+        registry_address: String::new(),
+        allow_downgrade: false,
+        nodes: vec![],
+    };
+    let refused = super::upgrade::record_upgrade_start(
+        &trio[0],
+        upgrade,
+        None,
+        serde_json::json!({ "status": "starting" }),
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    assert!(trio[0].desired_state().await.active_upgrade.is_none());
+    for node in trio {
+        node.shutdown().await.unwrap();
+    }
+}
+
 /// A three-node council led by node 1, whose API is a fake that records
 /// every request and accepts it. Returns node 2's real router (a
 /// follower) with `token` in its store, what the leader has seen, and
@@ -1913,14 +2029,28 @@ async fn follower_with_history_of_a_recording_leader(
     Arc<tokio::sync::Mutex<Vec<SeenAtLeader>>>,
     Vec<Arc<crate::council::CouncilNode>>,
 ) {
+    let leader_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let leader_port = leader_listener.local_addr().unwrap().port();
+    let seen = serve_recording_leader(leader_listener);
+    let (follower, nodes) = follower_of_the_leader_api_on(token, history, leader_port).await;
+    (follower, seen, nodes)
+}
+
+/// A three-node council led by node 1, whose API is whatever listens on
+/// `leader_port`. Returns node 2's real router (a follower) with `token` in
+/// its store and `history` as its deploy records, and the council nodes to
+/// shut down.
+async fn follower_of_the_leader_api_on(
+    token: crate::sesame::types::ApiToken,
+    history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
+    leader_port: u16,
+) -> (Router, Vec<Arc<crate::council::CouncilNode>>) {
     use crate::council::CouncilNode;
     use crate::council::log_store::MemLogStore;
     use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
     use crate::council::state_machine::CouncilStateMachine;
     use crate::council::types::{CouncilConfig, CouncilNodeInfo};
 
-    let leader_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let leader_port = leader_listener.local_addr().unwrap().port();
     let network = InMemoryRaftRouter::new();
     let mut nodes = Vec::new();
     let mut members = std::collections::BTreeMap::new();
@@ -1946,7 +2076,7 @@ async fn follower_with_history_of_a_recording_leader(
             .await
             .unwrap(),
         );
-        network.register(id, node.raft().clone()).await;
+        network.register(id, &node).await;
         nodes.push(node);
     }
     nodes[0].initialize(members).await.unwrap();
@@ -1957,8 +2087,6 @@ async fn follower_with_history_of_a_recording_leader(
     })
     .await
     .unwrap();
-
-    let seen = serve_recording_leader(leader_listener);
 
     let (commands, _receiver) = mpsc::channel(4);
     let store = crate::sesame::auth::new_token_store();
@@ -1979,7 +2107,7 @@ async fn follower_with_history_of_a_recording_leader(
         leader_port,
         None,
     );
-    (follower, seen, nodes)
+    (follower, nodes)
 }
 
 /// #1442: a follower forwards stop, delete and release as the caller, not
@@ -2014,16 +2142,93 @@ async fn a_follower_forwards_app_changes_to_the_leader_with_the_callers_token() 
     }
 }
 
-/// #1310: a rollback re-applies the previous spec through `cluster_apply`,
-/// so a follower forwards it as an apply. It goes as the caller, bearer and
-/// all, so the leader audits it under the caller's token name and a policy
-/// sees the caller's role, not the follower's service identity.
+/// A follower forwards a lease read with the lease id as one encoded path
+/// segment. An id holding `\` and `..` reaches the leader as a lease read,
+/// never as another route, and one holding a tab or newline, which a URL
+/// parser would drop, is refused before anything is sent.
 #[tokio::test]
-async fn a_follower_forwards_a_rollback_to_the_leader_with_the_callers_token() {
+async fn a_follower_forwards_a_lease_id_as_one_path_segment() {
     let (deployer, deployer_key) = a_user_token(crate::sesame::types::ApiRole::Deployer);
-    // No spec in Raft and no gossip peers, so the follower's own records
-    // choose the target: the newest is the current version, the one before
-    // it is what the rollback re-applies.
+    let (follower, seen, nodes) = follower_of_a_recording_leader(deployer).await;
+
+    let (status, body) = get_authenticated(
+        follower.clone(),
+        "/v1/test/leases/..%5C..%5Ctoken%5Clist",
+        &deployer_key,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let paths: Vec<String> = seen
+        .lock()
+        .await
+        .iter()
+        .map(|(path, ..)| path.clone())
+        .collect();
+    assert_eq!(paths, ["/v1/test/leases/..%5C..%5Ctoken%5Clist"]);
+
+    for path in [
+        "/v1/test/leases/.%09.",
+        "/v1/test/leases/.%0A.",
+        "/v1/test/leases/lease%0D",
+    ] {
+        let (status, body) = get_authenticated(follower.clone(), path, &deployer_key).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{path}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    assert_eq!(seen.lock().await.len(), 1, "a refused id reaches no leader");
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// Every request a node forwards or relays for a person carries the
+/// person's credential and the forwarded-for-user mark, which node-only
+/// routes refuse.
+#[test]
+fn a_forwarded_request_carries_the_callers_credential_and_the_mark() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_static("Bearer rbrg_person"),
+    );
+    let client = crate::cluster::ClusterHttp::plaintext();
+    let request = copy_forwarded_auth(
+        client.client().get("http://127.0.0.1:1/v1/status"),
+        &headers,
+    )
+    .build()
+    .unwrap();
+    assert_eq!(
+        request.headers().get(FORWARDED_FOR_USER_HEADER).unwrap(),
+        "1"
+    );
+    assert_eq!(
+        request.headers().get("authorization").unwrap(),
+        "Bearer rbrg_person"
+    );
+}
+
+/// A follower forwards a rollback to the leader whole, before it reads
+/// anything, and the leader picks the target from its own state. The
+/// follower's replica can lag a deploy that has committed: a target picked
+/// there went back two versions instead of one. It goes as the caller,
+/// bearer and all, so the leader audits it under the caller's token name
+/// and a policy sees the caller's role, not the follower's service
+/// identity (#1310).
+#[tokio::test]
+async fn a_follower_forwards_a_rollback_to_the_leader_before_choosing_its_target() {
+    let (deployer, deployer_key) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+    // The follower's own records would choose nginx:1.26. It must not
+    // choose at all.
     let deployed = |id: u64, image: &str| DeployHistoryEntry {
         id: crate::meat::deploy_types::DeployId(id),
         created_at: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(id),
@@ -2039,35 +2244,70 @@ async fn a_follower_forwards_a_rollback_to_the_leader_with_the_callers_token() {
     let (follower, seen, nodes) =
         follower_with_history_of_a_recording_leader(deployer, Some(history)).await;
 
-    let (status, reply) = send_bounded(
-        follower,
-        "POST",
+    for path in [
         "/v1/rollback/web/default",
-        &deployer_key,
-        "",
-        &[],
-    )
-    .await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{reply}");
-    assert!(reply.contains("recorded by the leader"), "{reply}");
+        "/v1/rollback/web/default?force=true",
+    ] {
+        let (status, reply) =
+            send_bounded(follower.clone(), "POST", path, &deployer_key, "", &[]).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{path}: {reply}");
+        assert!(reply.contains("recorded by the leader"), "{reply}");
+    }
 
     let seen = seen.lock().await.clone();
-    let [(path, bearer, marked, body)] = seen.as_slice() else {
-        panic!("one forward to the leader: {seen:?}");
-    };
-    assert_eq!(path, "/v1/apply");
     assert_eq!(
-        bearer.as_deref(),
-        Some(format!("Bearer {deployer_key}").as_str()),
-        "the leader must see the caller's token"
+        seen.iter()
+            .map(|(path, ..)| path.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "/v1/rollback/web/default",
+            "/v1/rollback/web/default?force=true"
+        ],
+        "the leader resolves the rollback itself, not an apply of the follower's \
+         pick, and `force` reaches it"
     );
-    assert!(marked, "a forwarded rollback carries the forwarded mark");
-    let config: Config = toml::from_str(body).unwrap();
+    for (_, bearer, marked, body) in &seen {
+        assert_eq!(
+            bearer.as_deref(),
+            Some(format!("Bearer {deployer_key}").as_str()),
+            "the leader must see the caller's token"
+        );
+        assert!(marked, "a forwarded rollback carries the forwarded mark");
+        assert!(body.is_empty(), "the follower chose no spec: {body}");
+    }
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// A follower forwards a scale to the leader whole, body and `force`
+/// included, as the caller: the leader reads the spec it changes from its
+/// own state, which a follower's replica can lag (#2176).
+#[tokio::test]
+async fn a_follower_forwards_a_scale_to_the_leader_with_its_body() {
+    let (deployer, deployer_key) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+    let (follower, seen, nodes) = follower_of_a_recording_leader(deployer).await;
+    let body = r#"{"replicas":3}"#;
+    for path in ["/v1/scale/web/default", "/v1/scale/web/default?force=true"] {
+        let (status, reply) =
+            send_bounded(follower.clone(), "POST", path, &deployer_key, body, &[]).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{path}: {reply}");
+    }
+    let seen = seen.lock().await.clone();
     assert_eq!(
-        config.app.get("web").and_then(|spec| spec.image.as_deref()),
-        Some("nginx:1.26"),
-        "the forward re-applies the previous version: {body}"
+        seen.iter()
+            .map(|(path, ..)| path.as_str())
+            .collect::<Vec<_>>(),
+        ["/v1/scale/web/default", "/v1/scale/web/default?force=true"]
     );
+    for (_, bearer, marked, forwarded) in &seen {
+        assert_eq!(
+            bearer.as_deref(),
+            Some(format!("Bearer {deployer_key}").as_str())
+        );
+        assert!(marked);
+        assert_eq!(forwarded, body);
+    }
     for node in nodes {
         node.shutdown().await.unwrap();
     }
@@ -2086,6 +2326,12 @@ async fn a_follower_forwards_upgrade_control_calls_to_the_leader_with_the_caller
             "/v1/upgrade/cluster-rollback",
             r#"{"target_version":"v0.1.0"}"#,
         ),
+        (
+            "/v1/os/rollout/start",
+            r#"{"version":"2026.42.0","channel_url":"https://example/os-channel.json"}"#,
+        ),
+        ("/v1/os/rollout/resume", ""),
+        ("/v1/os/rollout/abort", ""),
     ];
     for (path, body) in calls {
         let (status, reply) =
@@ -2292,7 +2538,7 @@ async fn router_of_a_leader_without_quorum(
             .await
             .unwrap(),
         );
-        network.register(id, node.raft().clone()).await;
+        network.register(id, &node).await;
         nodes.push(node);
     }
     nodes[0].initialize(members).await.unwrap();
@@ -2441,9 +2687,11 @@ async fn a_follower_without_the_run_forwards_cancel_results_and_logs_to_the_lead
         assert!(reply.contains("recorded by the leader"), "{path}: {reply}");
     }
     let seen = seen.lock().await.clone();
+    // The results forward adds its own paging query; the route is what
+    // this test is about.
     assert_eq!(
         seen.iter()
-            .map(|(path, ..)| path.as_str())
+            .map(|(path, ..)| path.split('?').next().unwrap_or(path))
             .collect::<Vec<_>>(),
         RUN_CALLS.iter().map(|(_, path)| *path).collect::<Vec<_>>()
     );
@@ -2478,7 +2726,7 @@ async fn a_node_with_no_leader_or_a_closed_fence_answers_run_calls_503_not_404()
         )
         .await
         .unwrap();
-        network.register(1, node.raft().clone()).await;
+        network.register(1, &node).await;
         if initialised {
             let info = CouncilNodeInfo::new("127.0.0.1:9444".parse().unwrap(), "node-1");
             node.initialize(std::collections::BTreeMap::from([(1, info)]))
@@ -2873,6 +3121,57 @@ async fn a_settled_leader_prepares_begins_and_finalises_a_ca_rotation_after_a_mi
     }
 }
 
+// #1937 on the 0.3.0 train: the workload signing-key rotation (#709) read
+// the security state with one round after it had confirmed leadership. It
+// now reads with `security_state_confirmed`, so the lag answers 200, not 503.
+#[tokio::test]
+async fn a_settled_leader_rotates_the_signing_key_after_a_missed_heartbeat_round() {
+    const IKM: [u8; 32] = [9; 32];
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (nodes, network) = council_and_network_keyed(3, Some(IKM)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !nodes[0].is_leader().await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let old = crate::sesame::oidc::generate_oidc_keypair("https://lagging", &IKM).unwrap();
+    nodes[0]
+        .write(crate::council::RaftRequest::SecurityStateInit(Box::new(
+            crate::sesame::types::SecurityState {
+                oidc_signing_config: Some(old.clone()),
+                ..Default::default()
+            },
+        )))
+        .await
+        .unwrap();
+    for node in &nodes {
+        node.hold_elections_until(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    }
+    let app = router_over(nodes[0].clone(), admin);
+
+    let (status, reply) = send_while_heartbeats_lag(
+        &app,
+        &network,
+        nodes[0].as_ref(),
+        ("POST", "/v1/identity/signing-key/rotate", ""),
+        &admin_key,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "rotate: {reply}");
+    let rotated = nodes[0].security_state().await;
+    assert_ne!(
+        rotated.oidc_signing_config.unwrap().key_id,
+        old.key_id,
+        "the signing key didn't change"
+    );
+
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn a_settled_leader_serves_batch_apply_replay_disable_and_stop_after_a_missed_heartbeat_round()
  {
@@ -3092,6 +3391,172 @@ async fn a_follower_marks_every_request_it_forwards_to_the_leader() {
     }
 }
 
+/// Send `request` to `app` and read the whole answer, waiting up to
+/// `within`. Paused-clock tests pass more than the forward timeout.
+async fn send_within(
+    app: Router,
+    request: axum::http::Request<Body>,
+    within: std::time::Duration,
+) -> (StatusCode, String) {
+    let what = format!("{} {}", request.method(), request.uri());
+    let response = tokio::time::timeout(within, async {
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&body).to_string())
+    })
+    .await;
+    response.unwrap_or_else(|_| panic!("{what} didn't answer in {within:?}"))
+}
+
+/// A leader that accepts the connection and never answers (a stalled
+/// process, or a path that drops its replies) used to hold every request a
+/// follower forwarded to it for as long as the TCP connection lived. Each
+/// forward now gives up at the forward timeout and answers 504.
+#[tokio::test(start_paused = true)]
+async fn a_follower_answers_504_when_the_leader_never_answers() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    // Bound, never accepted: the kernel completes the handshake and holds
+    // the request, and no answer ever comes back.
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let leader_port = silent.local_addr().unwrap().port();
+    let (follower, nodes) = follower_of_the_leader_api_on(admin, None, leader_port).await;
+
+    let forwarded = [
+        // `forward_to_leader`'s plain answer, and its streamed job apply.
+        (
+            "POST",
+            "/v1/batch",
+            r#"{"jobs":[{"name":"render","namespace":"default","spec":{"image":"x:1","command":["true"]}}]}"#,
+        ),
+        (
+            "POST",
+            "/v1/apply",
+            "[job.render]\nimage = \"x:1\"\ncommand = [\"true\"]\n",
+        ),
+        // `forward_get_to_leader`.
+        ("GET", "/v1/batch/1", ""),
+        // An app change's own forward.
+        ("POST", "/v1/stop/web/default", ""),
+    ];
+    for (method, path, body) in forwarded {
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", format!("Bearer {admin_key}"));
+        if path != "/v1/apply" && !body.is_empty() {
+            request = request.header("content-type", "application/json");
+        }
+        let started = tokio::time::Instant::now();
+        let (status, reply) = send_within(
+            follower.clone(),
+            request.body(Body::from(body)).unwrap(),
+            crate::bun::batch::LEADER_FORWARD_TIMEOUT * 3,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::GATEWAY_TIMEOUT,
+            "{method} {path}: {reply}"
+        );
+        assert!(
+            reply.contains("outcome is unknown"),
+            "{method} {path}: {reply}"
+        );
+        assert!(started.elapsed() >= crate::bun::batch::LEADER_FORWARD_TIMEOUT);
+    }
+    drop(silent);
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// The forward timeout bounds only the wait for a job apply's headers: the
+/// leader's event stream then runs until the deployment settles, which can
+/// be far longer, and the follower relays every event of it.
+#[tokio::test(start_paused = true)]
+async fn a_forwarded_job_apply_streams_past_the_forward_timeout() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let leader_port = listener.local_addr().unwrap().port();
+    let leader = axum::Router::new().fallback(|| async {
+        let events = futures_util::stream::unfold(0, |sent| async move {
+            match sent {
+                0 => Some((Ok::<_, std::convert::Infallible>("data: accepted\n\n"), 1)),
+                1 => {
+                    tokio::time::sleep(crate::bun::batch::LEADER_FORWARD_TIMEOUT * 2).await;
+                    Some((Ok("data: complete\n\n"), 2))
+                }
+                _ => None,
+            }
+        });
+        (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            Body::from_stream(events),
+        )
+    });
+    tokio::spawn(async move { axum::serve(listener, leader).await.unwrap() });
+    let (follower, nodes) = follower_of_the_leader_api_on(admin, None, leader_port).await;
+
+    let request = axum::http::Request::post("/v1/apply")
+        .header("authorization", format!("Bearer {admin_key}"))
+        .body(Body::from(
+            "[job.render]\nimage = \"x:1\"\ncommand = [\"true\"]\n",
+        ))
+        .unwrap();
+    let (status, reply) = send_within(
+        follower,
+        request,
+        crate::bun::batch::LEADER_FORWARD_TIMEOUT * 4,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(reply, "data: accepted\n\ndata: complete\n\n");
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// Before its event stream starts, the leader binds each of a job apply's
+/// images against its upstream registry, up to 20 s apiece, and then writes
+/// to the council. With three slow registries that runs past the plain
+/// forward timeout, so the follower waits for the headers in proportion to
+/// the images instead of answering 504 while the leader goes on to commit.
+#[tokio::test(start_paused = true)]
+async fn a_forwarded_job_apply_waits_for_the_leader_to_bind_each_image() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let leader_port = listener.local_addr().unwrap().port();
+    // Three upstream binds that each run to their limit, then the write.
+    let binding =
+        3 * crate::pickle::binding::UPSTREAM_BIND_TIMEOUT + crate::council::node::WRITE_TIMEOUT;
+    let leader = axum::Router::new().fallback(move || async move {
+        tokio::time::sleep(binding).await;
+        (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            "data: accepted\n\n",
+        )
+    });
+    tokio::spawn(async move { axum::serve(listener, leader).await.unwrap() });
+    let (follower, nodes) = follower_of_the_leader_api_on(admin, None, leader_port).await;
+    assert!(binding > crate::bun::batch::LEADER_FORWARD_TIMEOUT);
+
+    let request = axum::http::Request::post("/v1/apply")
+        .header("authorization", format!("Bearer {admin_key}"))
+        .body(Body::from(
+            "[job.a]\nimage = \"a:1\"\ncommand = [\"true\"]\n\
+             [job.b]\nimage = \"b:1\"\ncommand = [\"true\"]\n\
+             [job.c]\nimage = \"c:1\"\ncommand = [\"true\"]\n",
+        ))
+        .unwrap();
+    let (status, reply) = send_within(follower, request, binding * 4).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(reply, "data: accepted\n\n");
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn lease_created_through_a_lagging_follower_is_in_its_replica_when_returned() {
     use crate::council::CouncilNode;
@@ -3126,7 +3591,7 @@ async fn lease_created_through_a_lagging_follower_is_in_its_replica_when_returne
             .await
             .unwrap(),
         );
-        network.register(id, node.raft().clone()).await;
+        network.register(id, &node).await;
         nodes.push(node);
     }
     nodes[0].initialize(members).await.unwrap();
@@ -3515,6 +3980,55 @@ async fn placements_expose_only_the_consumers_original_withdrawal_generations() 
     assert_eq!(
         instructions[1]["services"]["default__web"]["retire_vip"],
         true
+    );
+    shutdown.cancel();
+    council.shutdown().await.unwrap();
+}
+
+/// A node reports only its own failed rollouts: with a TLS identity, the
+/// report must name the node that identity belongs to.
+#[tokio::test]
+async fn a_rollout_failure_must_name_the_reporting_node() {
+    let (council, _log, init) = seeded_council_with_init("rollout-failed-peer").await;
+    let (app, shutdown) = setup_with_auth_leases_events_and_council(
+        vec![],
+        Some("internal".into()),
+        crate::bun::readiness::ReadinessTracker::new(),
+        lease_static_capabilities(),
+        None,
+        None,
+        Some(council.clone()),
+    )
+    .await;
+    let as_node_1 = app.layer(axum::Extension(crate::sesame::renewal::TlsPeerCertificate(
+        init.node_certificate.certificate_der.clone().into(),
+    )));
+    let report = |node: &str| {
+        format!(
+            r#"{{"app_name":"web","namespace":"default","node":"{node}","fingerprint":"0","reason":"test"}}"#
+        )
+    };
+    assert_eq!(
+        post_status(
+            as_node_1.clone(),
+            "/v1/rollouts/failed",
+            "internal",
+            &report("node-2")
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    // Its own report gets past the identity check; the state machine then
+    // refuses it because no app `web` exists.
+    assert_eq!(
+        post_status(
+            as_node_1,
+            "/v1/rollouts/failed",
+            "internal",
+            &report("node-1")
+        )
+        .await,
+        StatusCode::CONFLICT
     );
     shutdown.cancel();
     council.shutdown().await.unwrap();
@@ -4369,7 +4883,7 @@ async fn seeded_council_with_ikm(tag: &str) -> Arc<crate::council::CouncilNode> 
         .prefix(&format!("rb-api-seeded-{tag}-"))
         .tempdir()
         .unwrap();
-    let init = crate::sesame::init::initialize_cluster("apitest", "node-1", dir.path()).unwrap();
+    let init = crate::sesame::init::initialize_cluster("apitest", "node-1").unwrap();
     drop(dir);
 
     let raft_router = InMemoryRaftRouter::new();
@@ -4384,7 +4898,7 @@ async fn seeded_council_with_ikm(tag: &str) -> Arc<crate::council::CouncilNode> 
     )
     .await
     .unwrap();
-    raft_router.register(1, node.raft().clone()).await;
+    raft_router.register(1, &node).await;
     let mut members = BTreeMap::new();
     members.insert(
         1,
@@ -5164,7 +5678,11 @@ async fn a_scoped_token_reads_only_its_own_namespaces_events() {
 }
 
 /// Every route that upgrades, rolls back or re-elects the cluster.
-const CLUSTER_ADMIN_ROUTES: [&str; 7] = [
+const CLUSTER_ADMIN_ROUTES: [&str; 11] = [
+    "/v1/os/stage",
+    "/v1/os/rollout/start",
+    "/v1/os/rollout/resume",
+    "/v1/os/rollout/abort",
     "/v1/upgrade/apply",
     "/v1/upgrade/rollback",
     "/v1/upgrade/start",
@@ -5374,7 +5892,6 @@ async fn workload_admission_fixture(
             policy: crate::config::process_workloads::ProcessWorkloadsConfig {
                 mount_isolation: false,
                 allowed_binaries: vec!["/bin/sh".into(), "/bin/true".into()],
-                ..Default::default()
             },
             default_concurrency: 8,
             backoff: (std::time::Duration::ZERO, std::time::Duration::ZERO),
@@ -5494,6 +6011,141 @@ async fn assert_authorised_job_dispatch_and_settlement(
         commands.try_recv().is_err(),
         "common jobs dispatched through the supervisor"
     );
+}
+
+/// A manifest of one app named `name` in `namespace` with an ingress
+/// route on `host` at `path`.
+fn ingress_manifest(name: &str, namespace: &str, host: &str, path: &str) -> String {
+    format!(
+        "[app.{name}]\nimage = \"test:v1\"\nport = 8080\nnamespace = \"{namespace}\"\n\
+         [app.{name}.ingress]\nhost = \"{host}\"\npath = \"{path}\"\n"
+    )
+}
+
+/// Every node routes a host's requests by longest path prefix, then path,
+/// then app name, across every app on that host. Nothing checked who
+/// already served a host, so a Deployer scoped to `dev` could put an app
+/// on `shop`'s host at a longer prefix (or at `/` with a name that sorts
+/// first) and take `shop`'s requests. A scoped token may now only put a
+/// route on a host whose existing routes all lie inside its scope.
+#[tokio::test]
+async fn scoped_deployer_cannot_route_a_host_another_namespace_serves() {
+    let (app, council, _commands) = workload_admission_fixture("ingress-host-scope").await;
+    let shop: crate::config::app::AppSpec = toml::from_str(
+        "image = \"test:v1\"\nport = 8080\n[ingress]\nhost = \"shop.example.com\"\npath = \"/\"\n",
+    )
+    .unwrap();
+    council
+        .write(crate::council::RaftRequest::AppSpec {
+            app_id: crate::meat::types::AppId::new("web", "shop"),
+            spec: Box::new(shop),
+        })
+        .await
+        .unwrap();
+    let scoped_to = |namespace: &str| {
+        let mut auth = deployer_context();
+        auth.scoped_namespaces = Some(vec![namespace.to_string()]);
+        auth
+    };
+
+    for manifest in [
+        ingress_manifest("aaa", "dev", "shop.example.com", "/login"),
+        ingress_manifest("aaa", "dev", "shop.example.com", "/"),
+        ingress_manifest("aaa", "dev", "SHOP.Example.com", "/"),
+    ] {
+        assert_eq!(
+            apply_as_context(&app, scoped_to("dev"), &manifest).await,
+            StatusCode::FORBIDDEN,
+            "a token scoped to dev took shop's host: {manifest}"
+        );
+    }
+    let desired = council.desired_state().await;
+    assert!(
+        !desired
+            .apps
+            .contains_key(&crate::meat::types::AppId::new("aaa", "dev")),
+        "the refused app reached the desired state"
+    );
+
+    // Its own host, a second route on its own namespace's host, a
+    // cluster-wide token sharing the host on purpose, and the original app
+    // re-applied on the now-shared host all still apply.
+    for (auth, manifest) in [
+        (
+            scoped_to("dev"),
+            ingress_manifest("aaa", "dev", "dev.example.com", "/"),
+        ),
+        (
+            scoped_to("shop"),
+            ingress_manifest("api", "shop", "shop.example.com", "/api"),
+        ),
+        (
+            deployer_context(),
+            ingress_manifest("help", "support", "shop.example.com", "/help"),
+        ),
+        // Once shared, each app keeps its route through later applies.
+        (
+            scoped_to("shop"),
+            ingress_manifest("web", "shop", "shop.example.com", "/"),
+        ),
+    ] {
+        assert_ne!(
+            apply_as_context(&app, auth, &manifest).await,
+            StatusCode::FORBIDDEN,
+            "an apply inside the token's scope was refused: {manifest}"
+        );
+    }
+    council.shutdown().await.unwrap();
+}
+
+/// A manifest with a job takes the job lifecycle instead of the app path,
+/// and its apps take ingress hosts too, so the host rule holds there: an
+/// app beside a job can't route a host another namespace serves.
+#[tokio::test]
+async fn scoped_deployer_cannot_route_another_namespaces_host_beside_a_job() {
+    let (app, council, _commands) = workload_admission_fixture("ingress-host-job").await;
+    let shop: crate::config::app::AppSpec = toml::from_str(
+        "image = \"test:v1\"\nport = 8080\n[ingress]\nhost = \"shop.example.com\"\npath = \"/\"\n",
+    )
+    .unwrap();
+    council
+        .write(crate::council::RaftRequest::AppSpec {
+            app_id: crate::meat::types::AppId::new("web", "shop"),
+            spec: Box::new(shop),
+        })
+        .await
+        .unwrap();
+    let mut dev = deployer_context();
+    dev.scoped_namespaces = Some(vec!["dev".to_string()]);
+    let job = "[job.work]\nimage = \"test:v1\"\nnamespace = \"dev\"\n";
+
+    let taking = format!(
+        "{}{job}",
+        ingress_manifest("aaa", "dev", "shop.example.com", "/login")
+    );
+    assert_eq!(
+        apply_as_context(&app, dev.clone(), &taking).await,
+        StatusCode::FORBIDDEN,
+        "an app beside a job took another namespace's host"
+    );
+    assert!(
+        !council
+            .desired_state()
+            .await
+            .apps
+            .contains_key(&crate::meat::types::AppId::new("aaa", "dev"))
+    );
+
+    let own = format!(
+        "{}{job}",
+        ingress_manifest("aaa", "dev", "dev.example.com", "/")
+    );
+    assert_ne!(
+        apply_as_context(&app, dev, &own).await,
+        StatusCode::FORBIDDEN,
+        "an app beside a job was refused its own host"
+    );
+    council.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -6672,6 +7324,67 @@ async fn scoped_token_is_refused_faulting_another_namespace() {
     shutdown.cancel();
 }
 
+/// `DELETE /v1/fault` with no `service` clears every workload fault in
+/// every namespace. It refused a scoped token only on the narrower "this
+/// service in every namespace" form, so a Deployer scoped to `team-a` could
+/// end `team-b`'s fault experiments. It's cluster-wide, so a scoped token
+/// is refused; the same token still clears its own namespace's faults, and
+/// a cluster-wide admin still clears them all.
+#[tokio::test]
+async fn scoped_token_is_refused_clearing_every_namespaces_faults() {
+    let scoped = crate::sesame::token::create_token(
+        "tenant-a-chaos",
+        crate::sesame::types::ApiRole::Deployer,
+        crate::sesame::types::TokenScope {
+            apps: None,
+            namespaces: Some(vec!["team-a".to_string()]),
+        },
+        None,
+    )
+    .unwrap();
+    let (admin, admin_plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let capabilities = crate::bun::capabilities::StaticCapabilities {
+        test_policy: crate::testkit::safety::ClusterTestPolicy {
+            safety_class: crate::testkit::safety::ClusterSafetyClass::Development,
+            allowed_operations: std::collections::BTreeSet::from([
+                crate::testkit::safety::OperationPermission::InjectWorkloadFaults,
+            ]),
+            ..crate::testkit::safety::ClusterTestPolicy::default()
+        },
+        ..crate::bun::capabilities::StaticCapabilities::default()
+    };
+    let (app, shutdown) = setup_with_auth_readiness_and_leases(
+        vec![scoped.token, admin],
+        None,
+        crate::bun::readiness::ReadinessTracker::new(),
+        capabilities,
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        delete_authenticated(app.clone(), "/v1/fault", &scoped.plaintext).await,
+        StatusCode::FORBIDDEN,
+        "a scoped token cleared every namespace's faults"
+    );
+    assert_eq!(
+        delete_authenticated(
+            app.clone(),
+            "/v1/fault?service=web&namespace=team-a",
+            &scoped.plaintext
+        )
+        .await,
+        StatusCode::OK,
+        "a scoped token could not clear its own namespace's faults"
+    );
+    assert_eq!(
+        delete_authenticated(app, "/v1/fault", &admin_plaintext).await,
+        StatusCode::OK,
+        "a cluster-wide admin could not clear every fault"
+    );
+    shutdown.cancel();
+}
+
 /// The cluster-wide metrics endpoints read across every app and namespace,
 /// so — like `/v1/logs/sql` — a scoped token is refused (C3) rather than
 /// served every tenant's data. `/v1/events` used to be on this list; it now
@@ -7390,7 +8103,7 @@ async fn health_says_whether_this_node_is_a_council_voter() {
         )
         .await
         .unwrap();
-        router.register(1, node.raft().clone()).await;
+        router.register(1, &node).await;
         if initialised {
             let info = CouncilNodeInfo::new("127.0.0.1:9444".parse().unwrap(), "node-1");
             node.initialize(std::collections::BTreeMap::from([(1, info)]))
@@ -7645,6 +8358,257 @@ async fn namespace_scoped_token_sees_only_its_namespace_in_status() {
 
     peer_server.abort();
     worker.abort();
+}
+
+/// A router whose node runs `alpha-web` in `team-a` and `bravo-db` in
+/// `team-b`, with a peer running one more instance of each, and whose
+/// store holds the given tokens. The dashboard pages read all of it.
+async fn setup_two_tenant_dashboard(
+    tokens: Vec<crate::sesame::types::ApiToken>,
+) -> (
+    Router,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let status = |id: &str, app: &str, namespace: &str| -> InstanceStatus {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "app_name": app, "namespace": namespace, "state": "running",
+            "restart_count": 0, "host_port": null, "pid": null
+        }))
+        .unwrap()
+    };
+    let peer_statuses = vec![
+        status("peer-alpha-0", "alpha-web", "team-a"),
+        status("peer-bravo-0", "bravo-db", "team-b"),
+    ];
+    let peer = Router::new().route(
+        "/v1/status",
+        axum::routing::get(move || {
+            let statuses = peer_statuses.clone();
+            async move { Json(statuses) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer_address = listener.local_addr().unwrap();
+    let peer_server = tokio::spawn(async move {
+        axum::serve(listener, peer).await.unwrap();
+    });
+
+    let desired = |app: &str, namespace: &str| -> crate::bun::diagnostics::DesiredAppEvidence {
+        serde_json::from_value(serde_json::json!({
+            "app": app, "namespace": namespace, "desired_replicas": 2,
+            "scheduled_replicas": 2, "service_port": null
+        }))
+        .unwrap()
+    };
+    let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let local_statuses = vec![
+        status("local-alpha-1", "alpha-web", "team-a"),
+        status("local-bravo-1", "bravo-db", "team-b"),
+    ];
+    let desired_apps = vec![
+        desired("alpha-web", "team-a"),
+        desired("bravo-db", "team-b"),
+    ];
+    let worker = tokio::spawn(async move {
+        while let Some(command) = cmd_rx.recv().await {
+            match command {
+                AgentCommand::Status { response } => {
+                    let _ = response.send(local_statuses.clone());
+                }
+                AgentCommand::DesiredApps { response } => {
+                    let _ = response.send(desired_apps.clone());
+                }
+                _ => {}
+            }
+        }
+    });
+    let store = crate::sesame::auth::new_token_store();
+    store.write().await.extend(tokens);
+    let members = Arc::new(RwLock::new(vec![NodeMembershipInfo {
+        node_id: crate::meat::NodeId::new("peer"),
+        address: peer_address,
+        api_advertised: true,
+        jobs: None,
+    }]));
+    let app = router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(store),
+        None,
+        None,
+        Some(members),
+        None,
+        9117,
+        None,
+    );
+    (app, peer_server, worker)
+}
+
+/// The dashboard pages that list apps or instances (`/`, the apps
+/// fragment, and a node's page, this node's or a peer's) trim their rows
+/// to the caller's scope, as `/v1/status` does. Their routes name no app,
+/// so the per-app scope check never ran on them: a token scoped to
+/// `team-a`, or the dashboard session made from it, listed every
+/// namespace's apps and instances.
+#[tokio::test]
+async fn namespace_scoped_token_sees_only_its_namespace_on_the_dashboard() {
+    let scoped = crate::sesame::token::create_token(
+        "tenant-a-viewer",
+        crate::sesame::types::ApiRole::ReadOnly,
+        crate::sesame::types::TokenScope {
+            apps: None,
+            namespaces: Some(vec!["team-a".to_string()]),
+        },
+        None,
+    )
+    .unwrap();
+    let (app, peer_server, worker) = setup_two_tenant_dashboard(vec![scoped.token]).await;
+
+    for (uri, expected) in [
+        ("/", "alpha-web"),
+        ("/ui/fragment/apps", "alpha-web"),
+        ("/ui/node/local", "local-alpha-1"),
+        ("/ui/node/peer", "peer-alpha-0"),
+    ] {
+        let (code, body) = get_authenticated(app.clone(), uri, &scoped.plaintext).await;
+        assert_eq!(code, StatusCode::OK, "{uri}");
+        let body = String::from_utf8(body).unwrap();
+        assert!(
+            body.contains(expected),
+            "{uri} hid the token's own namespace"
+        );
+        assert!(
+            !body.contains("bravo-db") && !body.contains("team-b"),
+            "{uri} showed another namespace's workloads"
+        );
+    }
+
+    peer_server.abort();
+    worker.abort();
+}
+
+/// …while a cluster-wide token still sees every namespace there.
+#[tokio::test]
+async fn unscoped_token_sees_every_namespace_on_the_dashboard() {
+    let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (app, peer_server, worker) = setup_two_tenant_dashboard(vec![token]).await;
+
+    for (uri, expected) in [
+        ("/", ["alpha-web", "bravo-db"]),
+        ("/ui/fragment/apps", ["alpha-web", "bravo-db"]),
+        ("/ui/node/local", ["local-alpha-1", "local-bravo-1"]),
+        ("/ui/node/peer", ["peer-alpha-0", "peer-bravo-0"]),
+    ] {
+        let (code, body) = get_authenticated(app.clone(), uri, &plaintext).await;
+        assert_eq!(code, StatusCode::OK, "{uri}");
+        let body = String::from_utf8(body).unwrap();
+        for name in expected {
+            assert!(body.contains(name), "{uri} is missing {name}");
+        }
+    }
+
+    peer_server.abort();
+    worker.abort();
+}
+
+/// A router whose alert evaluator has one rule firing on three series: an
+/// app in `team-a`, an app in `team-b` and a node, which belongs to no
+/// tenant. Its store holds `tokens`.
+async fn setup_alerts_in_two_tenants(tokens: Vec<crate::sesame::types::ApiToken>) -> Router {
+    use crate::mayo::alert::{AlertEvaluator, AlertOperator, AlertRule, AlertSeverity};
+    use crate::mayo::types::MetricKey;
+    let series = |labels: &[(&str, &str)]| {
+        MetricKey::with_labels(
+            "process_cpu_percent",
+            labels
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        )
+    };
+    let observed = std::collections::HashMap::from([
+        (series(&[("app", "team-a/alpha-web")]), 95.0),
+        (series(&[("app", "team-b/bravo-db")]), 95.0),
+        (series(&[("node", "node-7")]), 95.0),
+    ]);
+    let mut evaluator = AlertEvaluator::new(vec![AlertRule {
+        name: "cpu-high".to_string(),
+        metric_name: "process_cpu_percent".to_string(),
+        threshold: 80.0,
+        operator: AlertOperator::GreaterThan,
+        for_duration: std::time::Duration::ZERO,
+        severity: AlertSeverity::Warning,
+        description: "CPU over 80%".to_string(),
+    }]);
+    // Pending on the first evaluation, firing on the second.
+    evaluator.evaluate(&observed);
+    evaluator.evaluate(&observed);
+    assert_eq!(evaluator.firing_alerts().len(), 3);
+    let store = crate::sesame::auth::new_token_store();
+    store.write().await.extend(tokens);
+    let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+    router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::new(RwLock::new(evaluator))),
+        None,
+        Some(store),
+        None,
+        None,
+        None,
+        None,
+        9117,
+        None,
+    )
+}
+
+/// The dashboard's alert panel and `/v1/alerts` show a scoped caller only
+/// the alerts on its own apps: not another namespace's, and not a node's,
+/// which names no namespace. A cluster-wide token still sees all three.
+#[tokio::test]
+async fn namespace_scoped_token_sees_only_its_namespaces_alerts() {
+    let scoped = crate::sesame::token::create_token(
+        "tenant-a-alerts",
+        crate::sesame::types::ApiRole::ReadOnly,
+        crate::sesame::types::TokenScope {
+            apps: None,
+            namespaces: Some(vec!["team-a".to_string()]),
+        },
+        None,
+    )
+    .unwrap();
+    let (admin, admin_plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let app = setup_alerts_in_two_tenants(vec![scoped.token, admin]).await;
+
+    for uri in ["/ui/fragment/alerts", "/v1/alerts"] {
+        let (code, body) = get_authenticated(app.clone(), uri, &scoped.plaintext).await;
+        assert_eq!(code, StatusCode::OK, "{uri}");
+        let body = String::from_utf8(body).unwrap();
+        assert!(
+            body.contains("alpha-web"),
+            "{uri} hid the token's own alert"
+        );
+        assert!(
+            !body.contains("bravo-db") && !body.contains("node-7"),
+            "{uri} showed an alert outside the token's scope: {body}"
+        );
+
+        let (code, body) = get_authenticated(app.clone(), uri, &admin_plaintext).await;
+        assert_eq!(code, StatusCode::OK, "{uri}");
+        let body = String::from_utf8(body).unwrap();
+        for name in ["alpha-web", "bravo-db", "node-7"] {
+            assert!(body.contains(name), "{uri} is missing {name} for an admin");
+        }
+    }
 }
 
 /// The registry holds a scoped token to `<namespace>/<app>` repositories
@@ -8149,7 +9113,11 @@ async fn exec_answers_with_the_exit_code_and_distinct_failure_statuses() {
             output: "boom\n".into(),
             exit_code: 3,
         }),
-        Err(crate::bun::BunError::ExecTimeout { seconds: 300 }),
+        Err(crate::bun::BunError::ExecTimeout {
+            app_name: "web".into(),
+            namespace: "default".into(),
+            seconds: 300,
+        }),
         Err(crate::bun::BunError::AppNotFound {
             app_name: "web".into(),
             namespace: "default".into(),
@@ -8163,6 +9131,59 @@ async fn exec_answers_with_the_exit_code_and_distinct_failure_statuses() {
     assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
     let (status, _) = post_exec(&app).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// #2128: the request's `timeout_seconds` reaches the agent, held to the
+/// cap, and a request without one gets the cap.
+#[tokio::test]
+async fn exec_passes_the_requested_timeout_to_the_agent_capped() {
+    let (tx, mut rx) = mpsc::channel(4);
+    let seen = tokio::spawn(async move {
+        let mut timeouts = Vec::new();
+        while let Some(command) = rx.recv().await {
+            if let AgentCommand::Exec {
+                timeout, response, ..
+            } = command
+            {
+                timeouts.push(timeout);
+                let _ = response.send(Ok(crate::grill::ExecOutput {
+                    output: String::new(),
+                    exit_code: 0,
+                }));
+                if timeouts.len() == 3 {
+                    break;
+                }
+            }
+        }
+        timeouts
+    });
+    let app = router(
+        tx, None, None, None, None, None, None, None, None, None, None, None, 9117, None,
+    );
+    for body in [
+        r#"{"command":["true"],"timeout_seconds":60}"#,
+        r#"{"command":["true"],"timeout_seconds":100000}"#,
+        r#"{"command":["true"]}"#,
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/exec/web/default")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{body}");
+    }
+    let cap = crate::bun::agent::MAX_EXEC_TIMEOUT;
+    assert_eq!(
+        seen.await.unwrap(),
+        vec![std::time::Duration::from_secs(60), cap, cap]
+    );
 }
 
 #[tokio::test]
@@ -8243,7 +9264,8 @@ async fn nodes_endpoint_advertises_only_resolved_peer_api_addresses() {
 }
 
 /// Gossip's live view drops a dead member; the listing hands the agent
-/// the ones this node remembers, so `relish nodes` shows them as dead.
+/// the ones this node remembers, so `relish nodes` shows them as dead, or
+/// as left when they shut down cleanly.
 #[tokio::test]
 async fn nodes_endpoint_lists_remembered_dead_members_as_dead() {
     let (tx, mut rx) = mpsc::channel(1);
@@ -8267,13 +9289,15 @@ async fn nodes_endpoint_lists_remembered_dead_members_as_dead() {
         incarnation: 4,
         labels: std::collections::BTreeMap::from([("zone".to_string(), "a".to_string())]),
     };
-    use crate::mustard::state::NodeState::{Alive, Dead, Suspect};
+    use crate::mustard::state::NodeState::{Alive, Dead, Left, Suspect};
     known
         .refresh(
             vec![
                 member("one", 19117, Alive),
                 member("doubtful", 19217, Suspect),
                 member("dead", 19317, Dead),
+                // Shut down cleanly: a reboot, so still listed (#2164).
+                member("rebooting", 19417, Left),
             ],
             &Default::default(),
             std::time::Instant::now(),
@@ -8295,7 +9319,9 @@ async fn nodes_endpoint_lists_remembered_dead_members_as_dead() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let nodes: Vec<crate::bun::agent::NodeStatus> = serde_json::from_slice(&body).unwrap();
-    assert_eq!(nodes.len(), 1, "{nodes:?}");
+    assert_eq!(nodes.len(), 2, "{nodes:?}");
+    assert_eq!(nodes[1].node_id, "rebooting");
+    assert_eq!(nodes[1].state, "left");
     assert_eq!(nodes[0].node_id, "dead");
     assert_eq!(nodes[0].state, "dead");
     assert_eq!(nodes[0].address, "127.0.0.1:19314");
@@ -9321,6 +10347,116 @@ async fn per_app_process_metric_is_queryable() {
 }
 
 #[tokio::test]
+async fn an_admin_opens_a_join_window_of_up_to_an_hour() {
+    let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (app, shutdown) = setup_with_auth(vec![token], None).await;
+    let admit = |minutes: u64| format!(r#"{{"address": "192.168.1.60", "minutes": {minutes}}}"#);
+    for (minutes, expected) in [
+        (0, StatusCode::BAD_REQUEST),
+        (61, StatusCode::BAD_REQUEST),
+        (15, StatusCode::OK),
+    ] {
+        let status = post_status(
+            app.clone(),
+            "/v1/perimeter/admit",
+            &plaintext,
+            &admit(minutes),
+        )
+        .await;
+        assert_eq!(status, expected, "{minutes} minutes");
+    }
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn a_node_that_isnt_an_appliance_refuses_to_stage_an_os() {
+    let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (app, shutdown) = setup_with_auth(vec![token], None).await;
+    let (status, body) = post_authenticated(
+        app,
+        "/v1/os/stage",
+        &plaintext,
+        r#"{"rollout_id":"r","version":"2026.42.0","channel_url":"https://example/os-channel.json"}"#,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(String::from_utf8_lossy(&body).contains("isn't an appliance"));
+    shutdown.cancel();
+}
+
+/// Serve `council`'s router on a local port and return a client for it,
+/// the token that stops the server, and the server task.
+async fn served_client_for_council(
+    council: Arc<crate::council::CouncilNode>,
+) -> (
+    crate::relish::client::BunClient,
+    CancellationToken,
+    tokio::task::JoinHandle<()>,
+) {
+    let (app, shutdown, token) = router_for_council(council).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = crate::relish::client::BunClient::new_with_token(
+        &format!("http://{}", listener.local_addr().unwrap()),
+        Some(&token),
+    );
+    let serving = shutdown.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move { serving.cancelled().await })
+            .await
+            .unwrap();
+    });
+    (client, shutdown, server)
+}
+
+/// `relish apply` is a person waiting on a slow disk, not a loop that can
+/// try again next tick: a commit slower than the background write timeout
+/// still completes the apply instead of aborting it halfway.
+#[tokio::test(start_paused = true)]
+async fn a_commit_slower_than_the_write_timeout_still_completes_an_apply() {
+    let council = seeded_council("slow-apply").await;
+    let (client, shutdown, server) = served_client_for_council(council.clone()).await;
+    council.slow_writes(crate::council::node::WRITE_TIMEOUT + std::time::Duration::from_secs(5));
+    let permission = crate::config::Config::parse(
+        "[permission.reader]\nactions = ['logs']\napps = ['web']\nnamespaces = ['default']\n",
+    )
+    .unwrap();
+    let result = client.apply(&permission).await;
+    assert!(
+        result.is_ok(),
+        "a slow commit aborted the apply: {result:?}"
+    );
+    assert!(
+        council
+            .desired_state()
+            .await
+            .permissions
+            .contains_key("reader")
+    );
+    shutdown.cancel();
+    server.await.unwrap();
+}
+
+/// A write that never commits ends the apply with an answer that says what
+/// the caller can do: the outcome is unknown, and applying again is safe.
+#[tokio::test(start_paused = true)]
+async fn an_apply_whose_write_never_commits_says_it_is_safe_to_repeat() {
+    let council = seeded_council("hung-apply").await;
+    let (client, shutdown, server) = served_client_for_council(council.clone()).await;
+    council.hang_writes();
+    let permission = crate::config::Config::parse(
+        "[permission.reader]\nactions = ['logs']\napps = ['web']\nnamespaces = ['default']\n",
+    )
+    .unwrap();
+    let error = client.apply(&permission).await.unwrap_err().to_string();
+    assert!(error.contains("outcome unknown"), "{error}");
+    assert!(error.contains("safe to repeat"), "{error}");
+    shutdown.cancel();
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn apply_uses_committed_namespace_context_before_any_resource_write() {
     use crate::council::RaftRequest;
     let council = seeded_council("namespace-context-review2").await;
@@ -10004,7 +11140,7 @@ async fn assert_stalled_settlement_is_bounded(settlement: StalledSettlement) {
     let run = seed_finished_hook(&council, failed).await;
     let before = council.desired_state().await;
     let record = before.task_arrays.deployment(HUNG_DEPLOYMENT_ID).unwrap();
-    assert!(!record.apps_committed && !record.cancelled && !record.completed);
+    assert!(!record.apps_committed && !record.cancelled() && !record.completed);
     assert_eq!(
         before.task_arrays.get(run).unwrap().state.status(),
         if failed {
@@ -10255,7 +11391,7 @@ async fn a_follower_forwards_the_signed_webhook_and_handover_keeps_its_admitted_
             .await
             .unwrap(),
         );
-        transport.register(id, node.raft().clone()).await;
+        transport.register(id, &node).await;
         nodes.push(node);
         listeners.push(listener);
     }
@@ -10561,7 +11697,7 @@ async fn whole_webhook_budget_bounds_held_follower_metadata_and_restores_reserva
             .await
             .unwrap(),
         );
-        transport.register(id, node.raft().clone()).await;
+        transport.register(id, &node).await;
         nodes.push(node);
         listeners.push(listener);
     }
@@ -10651,6 +11787,207 @@ async fn whole_webhook_budget_bounds_held_follower_metadata_and_restores_reserva
         leader_wake && !follower_wake,
         "only the admitted leader consumes the wakeup"
     );
+}
+
+/// #709 through the API: a rotation answers with the new and retiring key
+/// ids, JWKS then publishes both, the old key is in the retiring list until
+/// its window ends, and the step is audited.
+#[tokio::test]
+async fn rotating_the_signing_key_publishes_both_keys_and_is_audited() {
+    use crate::sesame::oidc::RotatedSigningKey;
+    let council = seeded_council_with_ikm("signing-key-rotation").await;
+    let before = council.security_state().await;
+    let old = before.oidc_signing_config.clone().unwrap();
+    let (admin, tok) = named_user_token("root-op", crate::sesame::types::ApiRole::Admin);
+    let token_store = crate::sesame::auth::new_token_store();
+    *token_store.write().await = vec![admin];
+    let events = Arc::new(RwLock::new(crate::bun::events::EventStore::new()));
+    let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+    let app = router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::clone(&council)),
+        Some(token_store),
+        None,
+        None,
+        None,
+        None,
+        9117,
+        Some(Arc::clone(&events)),
+    );
+    let send = |method: &'static str, uri: &'static str| {
+        let app = app.clone();
+        let tok = tok.clone();
+        async move {
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("authorization", format!("Bearer {tok}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (status, body)
+        }
+    };
+
+    let (status, body) = send("POST", "/v1/identity/signing-key/rotate").await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let rotated: RotatedSigningKey = serde_json::from_slice(&body).unwrap();
+    assert_eq!(rotated.retiring_key_id, old.key_id);
+    assert_ne!(rotated.key_id, old.key_id);
+
+    let after = council.security_state().await;
+    assert_eq!(after.oidc_signing_config.unwrap().key_id, rotated.key_id);
+    assert_eq!(after.retiring_oidc_keys.len(), 1);
+    assert_eq!(after.retiring_oidc_keys[0].not_after, rotated.retire_after);
+
+    let (status, body) = send("GET", "/v1/identity/jwks").await;
+    assert_eq!(status, StatusCode::OK);
+    let jwks: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let kids: Vec<&str> = jwks["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|key| key["kid"].as_str().unwrap())
+        .collect();
+    assert_eq!(kids, [rotated.key_id.as_str(), old.key_id.as_str()]);
+
+    let recorded = events.read().await.recent(20, None, None);
+    let audit = recorded
+        .iter()
+        .find(|event| event.action.as_deref() == Some("identity.signing_key_rotated"))
+        .expect("the rotation is audited");
+    assert_eq!(audit.details.get("key_id"), Some(&rotated.key_id));
+    assert_eq!(audit.details.get("retiring_key_id"), Some(&old.key_id));
+}
+
+/// #709: a rotation reaches every node. A follower's replica carries the
+/// new key and the retiring one, so its verifier, refreshed from that
+/// replica as Bun refreshes it, accepts tokens from both keys.
+#[tokio::test]
+async fn a_signing_key_rotation_reaches_every_node() {
+    let (nodes, _network) = council_and_network(3).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !nodes[0].is_leader().await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let ikm = [8u8; 32];
+    let issuer = "https://every-node";
+    let old = crate::sesame::oidc::generate_oidc_keypair(issuer, &ikm).unwrap();
+    let new = crate::sesame::oidc::generate_oidc_keypair(issuer, &ikm).unwrap();
+    nodes[0]
+        .write(crate::council::RaftRequest::SecurityStateInit(Box::new(
+            crate::sesame::types::SecurityState {
+                oidc_signing_config: Some(old.clone()),
+                ..Default::default()
+            },
+        )))
+        .await
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    nodes[0]
+        .write(crate::council::RaftRequest::RotateOidcSigningKey {
+            signing_key: new.clone(),
+            retire_after_unix_secs: now + crate::sesame::oidc::RETIRING_KEY_WINDOW_SECS,
+            now_unix_secs: now,
+        })
+        .await
+        .unwrap();
+
+    let token = |config: &crate::sesame::types::OidcSigningConfig| {
+        let claims = crate::sesame::types::WorkloadJwtClaims {
+            iss: issuer.to_string(),
+            sub: "spiffe://test/ns/default/app/api".to_string(),
+            aud: vec![crate::sesame::oidc::api_audience("test")],
+            exp: now + 600,
+            iat: now,
+            namespace: "default".to_string(),
+            app: "api".to_string(),
+            cluster: "test".to_string(),
+            node: "node-1".to_string(),
+            instance: "api-g1-0".to_string(),
+        };
+        crate::sesame::oidc::mint_jwt(&claims, config, &ikm).unwrap()
+    };
+    let (old_token, new_token) = (token(&old), token(&new));
+    for follower in &nodes[1..] {
+        let replicated = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let state = follower.security_state().await;
+                if state.oidc_signing_config.as_ref() == Some(&new) {
+                    return state;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the rotation reached the follower");
+        let verifier = crate::sesame::auth::WorkloadJwtVerifier::new(old.clone(), "test");
+        verifier.refresh(&replicated, now);
+        assert!(
+            verifier.verify(&old_token).is_some(),
+            "old token refused on a follower"
+        );
+        assert!(
+            verifier.verify(&new_token).is_some(),
+            "new token refused on a follower"
+        );
+    }
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// #709: rotation is leader only. A follower answers 421 and changes
+/// nothing, so the operator knows to ask the leader.
+#[tokio::test]
+async fn rotating_the_signing_key_is_refused_on_a_follower() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (nodes, _network) = council_and_network(3).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !nodes[0].is_leader().await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let follower = router_over(nodes[1].clone(), admin);
+    let (status, reply) = send_bounded(
+        follower,
+        "POST",
+        "/v1/identity/signing-key/rotate",
+        &admin_key,
+        "",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::MISDIRECTED_REQUEST, "{reply}");
+    assert!(
+        nodes[0]
+            .security_state()
+            .await
+            .retiring_oidc_keys
+            .is_empty()
+    );
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
 }
 
 /// F04 R4 through the API: prepare answers with a CSR the operator can
@@ -10911,4 +12248,47 @@ async fn a_hold_request_holds_this_nodes_elections() {
     assert_eq!(response.status(), StatusCode::OK);
     assert!(nodes[0].elections_held());
     nodes[0].shutdown().await.unwrap();
+}
+
+/// Ending a paused upgrade is two council writes. One that doesn't commit
+/// in time hasn't been refused: the answer is a 503 that says the outcome
+/// is unknown, not a 409 that says the run can't be ended.
+#[tokio::test(start_paused = true)]
+async fn ending_an_upgrade_whose_write_times_out_answers_503_outcome_unknown() {
+    let council = seeded_council("hung-archive").await;
+    council.hang_writes();
+    let aborted = crate::upgrade::types::ClusterUpgradeState {
+        upgrade_id: "up-1".to_string(),
+        target_version: "v0.2.0".parse().unwrap(),
+        binaries: Vec::new(),
+        parallel: 1,
+        direction: crate::upgrade::types::UpgradeDirection::Upgrade,
+        phase: crate::upgrade::types::ClusterUpgradePhase::Aborted {
+            reason: "aborted by the operator".to_string(),
+        },
+        registry_address: String::new(),
+        allow_downgrade: false,
+        nodes: vec![],
+    };
+    let response = super::upgrade::archive_aborted_upgrade(&council, aborted)
+        .await
+        .unwrap_err();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("outcome unknown"), "{body}");
+}
+
+/// A follower's backstop for a forwarded token write must outlast what the
+/// leader may spend on it: proving it leads, the council write, and the
+/// wait for its own replica. Otherwise a slow but healthy leader commits a
+/// token whose only copy of the secret the follower has already given up on.
+#[test]
+fn the_token_forward_backstop_outlasts_the_leaders_own_deadlines() {
+    assert!(
+        super::identity::LEADER_FORWARD_TIMEOUT
+            > crate::council::node::LEADER_CONFIRMATION
+                + crate::council::node::WRITE_TIMEOUT
+                + super::identity::TOKEN_REPLICATION_WAIT
+    );
 }

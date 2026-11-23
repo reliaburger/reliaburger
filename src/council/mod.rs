@@ -1,3 +1,4 @@
+pub mod admission;
 /// Raft consensus for the council (3–7 nodes).
 ///
 /// The council is a small group of nodes that replicate desired state
@@ -23,13 +24,16 @@ pub mod owner;
 pub mod proof;
 pub mod recovery;
 pub(crate) mod recovery_storage;
+pub mod return_hold;
 pub mod selection;
 pub mod state_machine;
 pub mod types;
 
 pub use apply::{config_to_desired_writes, config_to_leased_writes};
 pub use node::{CouncilNode, LEADER_CONFIRMATION};
-pub use selection::{CouncilSelectionConfig, select_council_candidates};
+pub use selection::{
+    CouncilSelectionConfig, CouncilSize, CouncilSizeError, select_council_candidates,
+};
 pub use state_machine::SnapshotStoreError;
 pub use types::{
     CouncilConfig, CouncilNodeInfo, CouncilResponse, DesiredState, RaftRequest, TypeConfig,
@@ -80,6 +84,10 @@ pub enum CouncilError {
     InitError(String),
     #[error("raft write failed: {0}")]
     WriteFailed(String),
+    /// A write didn't commit within its deadline. It may still commit:
+    /// the caller has to check, or repeat an idempotent write.
+    #[error("raft write outcome unknown: not committed within {waited:?}")]
+    WriteTimedOut { waited: std::time::Duration },
     #[error("linearizable read failed: {0}")]
     ReadFailed(String),
     #[error("network error: {0}")]

@@ -12,11 +12,11 @@ Design document for the Mustard gossip protocol and the Raft consensus layer in 
 
 Reliaburger coordinates a cluster of up to 10,000 homogeneous nodes without a dedicated control plane. Two protocols operate at different scales to make this work:
 
-- **Mustard** is the gossip protocol. It is based on SWIM (Scalable Weakly-consistent Infection-style Membership) and runs on every node. Mustard handles cluster membership discovery, failure detection, leader identity broadcast, node resource summaries, and catastrophic recovery candidate distribution. It carries only lightweight, fixed-size payloads and achieves O(log N) convergence with O(1) per-node network overhead.
+- **Mustard** is the gossip protocol. It is based on SWIM (Scalable Weakly-consistent Infection-style Membership) and runs on every node. Mustard handles cluster membership discovery, failure detection and leader identity broadcast. Node resource summaries and catastrophic-recovery candidate distribution are planned on top of it, not sent today (§3, §5.5). It carries only lightweight, fixed-size payloads and achieves O(log N) convergence with O(1) per-node network overhead.
 
 - **Raft** runs on a small dynamic council of 3 to 7 nodes selected from the cluster. One council member is the leader; the others are hot standbys. Raft handles leader election among council members, replication of desired state (app specs, secrets, scheduling decisions), and cluster configuration changes. Raft is explicitly not used for runtime state.
 
-- **The hierarchical reporting tree** is the third communication layer. Each worker node reports its runtime state (running containers, health, resource usage, job completions) to its assigned council member over mTLS. Council members aggregate reports for the leader. This keeps variable-size payloads off the gossip mesh, preserving SWIM's scaling properties.
+- **Reporting** is the third communication layer. Each node reports its runtime state (running containers, health, resource usage, job completions) over mTLS. Today every node reports straight to the leader; a hierarchical tree, with council members aggregating for the leader, is planned ([#364](https://github.com/reliaburger/reliaburger/issues/364)). This keeps variable-size payloads off the gossip mesh, preserving SWIM's scaling properties.
 
 **Key design decisions:**
 
@@ -124,16 +124,20 @@ Node A                                   Node B (random live peer)
   │── Sync { entries[0..8], wants_reply } ──>│  merge each entry
   │── Sync { entries[8..16] } ──────────────>│  (≤ MAX_SYNC_DATAGRAMS)
   │                                          │
+  │── Sync { floors[0..8] } ────────────────>│  (≤ 2 datagrams)
+  │                                          │
   │<── Sync { entries[0..8] } ───────────────│  B's table, never
   │<── Sync { entries[8..16] } ──────────────│  wants_reply
-  merge each entry
+  │<── Sync { floors[0..8] } ────────────────│
+  merge each entry and floor
 ```
 
 - **When.** Every `push_pull_interval` (10 s, twenty probe periods) a node picks one random live peer. The schedule starts due, so a joining node syncs on its first cycle with a live peer (the join sync) instead of waiting for rumours; an isolated node stays due until it finds one.
 - **What.** Every membership entry in any state: node id, address, state, incarnation. A peer that missed a `Dead` or `Left` needs it as much as one that missed a join. The directory extension is not included: it describes only the stamping node, every probe carries it, and probing reaches every member once membership has converged.
 - **Merge.** Each entry goes through the same `apply_update`/`resolve_conflict` path as a piggybacked update (incarnation first, then `Dead`/`Left` > `Suspect` > `Alive`), so a stale table can never resurrect a dead node or undo a refutation, and an entry about ourselves in `Suspect`/`Dead`/`Left` triggers the usual refutation. An unknown member is only added when `Alive`. Entries that change the table are re-queued for piggybacking.
+- **Floors.** After its entries, each side sends the sequence floors it keeps for reaped members (§8.1), in datagrams of their own: at most `MAX_PIGGYBACK_UPDATES` per datagram and `MAX_SYNC_FLOORS` (16) per exchange, rotating through a larger set like the table.
 - **Bounds.** Sync rides the existing authenticated UDP transport (the message HMAC covers the entries). A datagram carries at most `MAX_PIGGYBACK_UPDATES` (8) entries and no directory extension, which stays under 1,400 bytes even with 63-byte names and IPv6 addresses. One side of an exchange is at most `MAX_SYNC_DATAGRAMS` (8) datagrams, so `MAX_SYNC_ENTRIES` (64) entries. A table that fits goes whole every time. A larger one goes as a rotating window over the table sorted by node id, so a 10,000-member table is covered in 157 exchanges, and `tests/gossip_10k.rs` pins both the per-exchange cap and the sweep.
-- **Why UDP, not TCP.** memberlist sends the whole table over TCP and scales its interval with log N because the exchange grows with the cluster. Mustard has no gossip stream transport, and adding one means a listener, framing and authentication for a single message type. A capped exchange keeps the per-node cost flat (about 16 datagrams per 10 s, sent and answered), so the interval needn't scale. The price is that a 10,000-member cluster sweeps its table over many exchanges, so there anti-entropy is a slow backstop and piggybacking does the real work; in a small cluster every exchange is a full resync.
+- **Why UDP, not TCP.** memberlist sends the whole table over TCP and scales its interval with log N because the exchange grows with the cluster. Mustard has no gossip stream transport, and adding one means a listener, framing and authentication for a single message type. A capped exchange keeps the per-node cost flat (about 16 datagrams per 10 s, sent and answered, plus up to four of sequence floors, §8.1), so the interval needn't scale. The price is that a 10,000-member cluster sweeps its table over many exchanges, so there anti-entropy is a slow backstop and piggybacking does the real work; in a small cluster every exchange is a full resync.
 - **Loss.** Only the first datagram asks for a reply, and a reply never asks for one, so an exchange is one push and one pull. A lost datagram costs that part of one exchange; the next interval tries again.
 
 **Gossip message categories carried by Mustard:**
@@ -150,6 +154,10 @@ The Raft consensus group operates independently from Mustard but depends on it f
 
 1. **Leader discovery.** When a new Raft leader is elected, the leader announces itself via Mustard gossip so all 10,000 nodes learn the leader identity without Raft having to communicate with them.
 2. **Council member replacement.** When a council member departs, the leader uses Mustard's membership list to find a suitable replacement.
+
+**How a node resolves the leader** (`src/cluster/directory.rs`, `resolve_leader`). The leader stamps a `LeaderHint` (its id, term, recovery epoch and endpoints) on its gossip, and every node relays the newest one it has seen, ordered by recovery epoch and then term. A Raft member (voter or learner) trusts its own metrics, and takes a hint over them only when the hint is newer and its term is at most ten above the member's own (`MAX_LEADER_HINT_TERM_LEAD`), so an absurd term can't carry a member's reporting epoch away. The bound applies only to a hint from the recovery epoch the member's own term belongs to (`NodeDirectory::local_recovery_epoch`, from its fence): a fenced voter of a replaced council still holds its old term, which says nothing about the new council's term line. A node outside the Raft membership never hears AppendEntries and stays at term 0, so that bound would lose it the leader from the cluster's eleventh election on; it takes the hint as it is ([#1996](https://github.com/reliaburger/reliaburger/issues/1996)). Gossip is HMAC-authenticated with the cluster key, and the reporting epoch only gates anything on the leader, which is a member.
+
+A recovery (`relish council recover`) starts a fresh term line at a new recovery epoch, so a term only compares within one epoch. Each node's gossip directory holds a recovery floor, the newest epoch its own recovery fence knows (`FenceSnapshot::newest_known_epoch`). It never adopts a hint from below the floor and drops one when the floor rises, so the replaced council's hint, still relayed by survivors, can't outrank the recovered leader. The leader-target maintainer keys the reporting epoch on `(recovery_epoch, term)`: the node's own Raft metrics always set it, even downwards, and a gossip hint only moves it forward. Before this, an old council's higher term could raise a recovered leader's reporting epoch for good, and the scheduler skips every pass while that epoch differs from the leader's term ([#1997](https://github.com/reliaburger/reliaburger/issues/1997)).
 
 Raft is used for:
 
@@ -170,6 +178,7 @@ openraft doesn't forward client writes, so a node that can't confirm it leads (`
 
 - **Never to itself.** `leader_api_url` and `upgrade::leader_base_url` return `NoLeaderRoute::ThisNode` when Raft names this node as leader (`current_leader`, or its metrics). That node is a restored leader in the startup recovery probe, or a leader cut off from its quorum. The route answers 503 "this node holds the leader role but can't confirm it with a quorum" and makes no outbound request. `NoLeaderRoute::Unknown` keeps each route's "no cluster leader known yet" answer.
 - **Never twice.** Every forwarded request carries `x-reliaburger-forwarded: 1`. A node that receives a marked request and can't confirm it leads answers 503 (`NoLeaderRoute::AlreadyForwarded`) instead of forwarding again; a confirmed leader serves it. The header only ever turns a forward into a 503, so it needs no authentication of its own. The older per-route markers (`x-reliaburger-upgrade-forwarded`, `-lease-forwarded`, `-forwarded-sign`, `-desired-apps-forwarded`, `-webhook-forwarded`) still travel alongside it.
+- **Never without a deadline** ([#2055](https://github.com/reliaburger/reliaburger/issues/2055)). Every forward is bounded. The shared ones (`batch::relay_leader_answer`, behind `forward_to_leader`, `forward_get_to_leader` and an app's stop, delete and release) wait at most `LEADER_FORWARD_TIMEOUT` (60 s) for the leader's whole answer and then answer 504, saying the outcome is unknown. A streamed answer (a job apply's events, through `relay_leader_stream`; an app apply in `cluster_apply`, 5 s) bounds only the wait for the leader's headers, then streams for as long as the leader writes. A job apply's header deadline (`job_apply_header_deadline`) covers the leader's work before its stream starts: 20 s for each distinct image it binds, plus the leadership proof and two council writes, at least 60 s and at most 280 s. The other forwards keep their own deadlines: upgrade calls 30 s, GitOps webhooks, test leases 5 s, node faults, summaries, desired-app reads, election holds and the token and join-token routes 20 s (longer than the leader's 3 s proof, 10 s write and 2 s replica wait). On the leader, `CouncilNode::write` gives up after `WRITE_TIMEOUT` (10 s) with `CouncilError::WriteTimedOut` ("outcome unknown"), which request handlers answer as 503. Callers that need another deadline use `write_within`: the scheduler's loop 5 s, `relish apply`'s writes 60 s (its error says re-running is safe), and a fresh council's bootstrap writes 120 s each.
 
 #### Raft transport connections
 
@@ -179,6 +188,12 @@ Raft RPCs travel over TCP with mTLS (`src/council/network.rs`). Each node keeps 
 - **Retirement.** A pooled connection is closed instead of reused once it is 30 s old or 10 s idle, when this node's identity changed since it was dialled (renewal or new trust set, so the next handshake presents the new certificate), or when the peer's presented chain is now on the CRL.
 - **Server.** A connection serves requests until the peer is idle for 20 s or the connection is 60 s old (the client's limits are shorter, checked by `const` assertions). Before each request it re-checks the node fault gate and the client's chain against the live CRL, so a revocation takes effect at the next RPC. The handshake and each request keep the 10 s deadline (CP11).
 - Both ends set `TCP_NODELAY`, and a frame goes out in one write.
+
+**Council membership check.** The handshake proves only that the peer holds a node certificate, and every node holds one. So each RPC also has to come from the council (`src/council/admission.rs`). In openraft 0.9 an `AppendEntries` or `InstallSnapshot` is sent only by the leader and a `Vote` only by a candidate, and both are voters; a learner receives replication but never sends an RPC. The server therefore checks the sender, never the receiver: the node the RPC's vote names (`voted_for`) must be a voter in this node's council, and must be the node named in the connection's certificate. "This node's council" is the voters of its committed and effective Raft memberships together, read from openraft's own state, not from gossip. The effective membership includes an appended but uncommitted change, so a voter added in a joint config is known as soon as the entry arrives. The committed one keeps a leader that removes itself heard until that removal commits, after its followers have already appended the entry that drops it. An RPC that fails the check is closed without an answer, and its recovery epoch never moves this node's fence; when it carries an older epoch, the server still replies `Fenced` with the newer one, so an old voter learns of a recovery.
+
+- **Learners and fresh nodes.** The leader dials a learner, so adding one needs nothing from the check. A fresh node with no membership at all serves whoever replicates to it, since that is how it joins, and adopts that council's recovery epoch while it holds none. A node with no membership that already holds an epoch (a survivor `relish council recover` stamped, before it re-forms its council) serves only its own epoch and can't be fenced over Raft.
+- **A member whose view is behind.** A voter that was down while the leader joined holds a membership without it, and would refuse it until leadership moved. Its vote matters as much: a council that swapped a voter while this one lagged, and then lost its leader, may need this voter's vote to elect the new one. When a stranger sends it replication, or asks for its vote with a log at least as long as its own, it asks the voters it does know, with the `CouncilVoters` RPC over node-id-bound mTLS, which nodes are voters in their councils (one round per 2 s, 2 s per answer). If one names the sender, with the certificate's node name, the member admits that node for 60 s, long enough to read the membership from its own log. Only a node serving Raft at the asker's own epoch answers. One voucher is enough: a voter in the member's own view can already drive its Raft. **Limit:** vouching needs one live voter the member knows. If a voter is swapped out while a member lags, and that voter and the leader then both stop, the member can reach none of its known voters and won't vote for the new one; when the new voter needs that vote, the council has no leader until the old leader or the swapped-out voter returns. The way out is `relish council recover` or re-enrolling the lagging node (manual, chapter 12, "A voter that missed a swap"). Admitting an unvouched leader would hand that node's log to whoever asked, so the check doesn't.
+- **Plaintext.** Without mTLS there is no certificate to bind, so the claimed sender must still be a voter but isn't authenticated.
 
 **Measured heartbeat round trips.** `examples/raft-heartbeat-rtt.rs` forms a three-voter council over the production transport (mTLS, live identities, node-bound connectors) on loopback and times 1,000 `ensure_linearizable` calls on the leader, 5 ms apart. Apple M2 Max (12 cores), 17 October 2026, host otherwise quiet (no builds, one-minute load average below 3 at the start); "loaded" adds 12 `yes > /dev/null` processes, one per core. Debug builds include the optimised `ring` override from [#922](https://github.com/reliaburger/reliaburger/pull/922). No sample failed or exceeded 150 ms in any run.
 
@@ -216,6 +231,8 @@ The leader selects council members from the general node pool. Selection criteri
 | 7+ | 7 |
 
 Growth promotes two caught-up learners in one joint-consensus change (`PromotePair`, 1 to 3 or 3 to 5). A dead or disk-pressured voter is replaced by swapping a caught-up learner in for it in one change (`Replace`), so the count never passes through an even number. With no replacement, two dead voters leave together (`RemoveVoterPair`, 5 to 3, never below `min_council_size`). An even council found on entry (left by an older release, or by a decommission) goes back to odd: up by one (`Promote`) when a caught-up learner exists and the live nodes allow it, otherwise down by one (`RemoveVoter`), a dead voter first, while quorum allows. Spare eligible nodes join as learners up to `max_council_size`, and only nodes past that stay plain workers. A learner has the replicated state, and an mTLS node needs it: its API opens only once the API tokens reach it through Raft (#1477). A two-node cluster therefore has one voter and one learner: losing the other node is survivable, losing the voter stops the control plane until it returns or is recovered. The upgrade planner's refusal of a two-voter council (`src/upgrade/plan.rs`) stays as a guard.
+
+**A replaced voter coming back holds its elections (#1524).** A voter that was replaced while it was down comes back with its old Raft state, which still lists it as a voter, because it missed its own removal. On its election timer it would campaign, and each failed campaign raises its term past the leader's; when the reconciler then adds it as a learner, the leader's first replication meets the higher term and steps down (openraft 0.9's `HigherVote`). So a node that starts on a log store holding a vote starts openraft with elections off (`src/council/return_hold.rs`). The hold ends at the first AppendEntries from a leader, which the TCP server and the in-memory router note on the node's `LeaderContact`; or once a startup grace of three election timeouts passes while gossip names no live leader (the leader's own hint, for an alive node); or at a cap of ten election timeouts. A voter that's still a member hears from the leader within a heartbeat; a whole-council restart waits at most the grace. `a_replaced_voter_coming_back_joins_as_a_learner_without_an_election` in `tests/council_self_healing.rs` checks it.
 
 Council replacement flow:
 
@@ -297,7 +314,8 @@ struct GossipMessage {
     incarnation: u64,
     /// The sender's message counter (§8.1): seeded from wall-clock
     /// microseconds at process start, +1 per message. Receivers drop a
-    /// message at or below the highest sequence seen from its sender.
+    /// message no fresher, by (incarnation, sequence), than the freshest
+    /// seen from its sender, or than its floor once it has been reaped.
     sequence: u64,
     /// HMAC-SHA256 over the message with this field zeroed, keyed by the
     /// gossip key derived from the cluster master key.
@@ -336,10 +354,30 @@ enum GossipPayload {
     /// Anti-entropy push-pull: up to MAX_PIGGYBACK_UPDATES entries of the
     /// sender's full membership table. Only the first datagram of a request
     /// sets wants_reply; replies never do.
+    /// A datagram carries entries or sequence floors (§8.1), never both.
     Sync {
         entries: Vec<MembershipUpdate>,
+        floors: Vec<SequenceFloor>,
         wants_reply: bool,
     },
+    /// The answer to a datagram dropped as no fresher than what the
+    /// sender holds (§8.1): the receiver refutes past `held_incarnation`
+    /// only if what's held is fresher than anything it has sent this run.
+    Stale {
+        held_incarnation: u64,
+        held_sequence: u64,
+        updates: Vec<MembershipUpdate>,
+    },
+}
+
+/// A reaped member's freshest accepted (incarnation, sequence), with the
+/// seconds left before it expires (a floor travels with its remaining
+/// time, never a fresh one).
+struct SequenceFloor {
+    node_id: NodeId,
+    incarnation: u64,
+    sequence: u64,
+    expires_in_secs: u32,
 }
 
 /// Largest datagram any node sends.
@@ -610,7 +648,7 @@ struct EncryptedRecoveryCandidateList {
 |-------|-----------|----------|------------------|
 | Mustard gossip (PING/ACK/PING-REQ, including join via seed PING) | UDP | postcard (serde) | 1400 bytes (avoids IP fragmentation); piggybacked updates fill the room left after the header and directory extension |
 | Mustard anti-entropy (Sync push-pull) | UDP | postcard (serde) | 1400 bytes per datagram, at most 8 datagrams (64 entries) per side per exchange |
-| Raft (AppendEntries, Vote, InstallSnapshot) | TCP + mTLS, connections pooled and reused across RPCs (§3.3) | JSON (serde), length-prefixed, in an envelope carrying the compatibility version and recovery epoch | 64 MiB per frame (snapshots can be large) |
+| Raft (AppendEntries, Vote, InstallSnapshot, CouncilVoters) | TCP + mTLS, connections pooled and reused across RPCs (§3.3) | JSON (serde), length-prefixed, in an envelope carrying the compatibility version and recovery epoch | 64 MiB per frame (snapshots can be large) |
 | Reporting tree (StateReports) | TCP + mTLS | postcard | 1 MiB (bounded by max events per report) |
 
 All TCP connections use mTLS via Sesame's Node CA certificates.
@@ -702,7 +740,7 @@ Leave is **immediate**. There is no `LEAVING` state, no drain-wait, and no `reli
        └──────────────────┘
 ```
 
-**Suspicion subprotocol.** When a node is marked SUSPECT, the suspecting node begins a suspicion timer. During this period, any node can forward evidence that the suspect is alive (an ACK received from the suspect). If the suspect itself learns it is suspected (via piggybacked updates), it increments its incarnation number and broadcasts an ALIVE message, which overrides the SUSPECT state. Only if the suspicion timer expires without refutation does the node transition to DEAD. This prevents false positives from transient network blips.
+**Suspicion subprotocol.** When a node is marked SUSPECT, the suspecting node begins a suspicion timer. During this period, any node can forward evidence that the suspect is alive (an ACK received from the suspect). If the suspect itself learns it is suspected (via piggybacked updates), it increments its incarnation number and broadcasts an ALIVE message, which overrides the SUSPECT state. It refutes only a claim at or above its own incarnation: one below has already lost to its own record, and refuting it would only spread a needless bump. Only if the suspicion timer expires without refutation does the node transition to DEAD. This prevents false positives from transient network blips.
 
 ### 5.2 Leader Election
 
@@ -941,7 +979,7 @@ When a new leader is elected, it must rebuild its understanding of the cluster's
 
 > **Status — what ships vs what's proposed.** Full-council loss recovery ships as an **operator-triggered** flow, not the fully-automatic pre-seeded election described below. `relish council recover` runs against a stopped survivor (`src/council/recovery.rs`): it restores the desired state from the last sealed external backup (`src/council/backup.rs`) or the node's own durable snapshot and committed log, re-bootstraps a fresh single-voter Raft with a bumped recovery epoch, and the reconciler regrows the council from healthy members. Anything written after the last backup is lost, which is why a human confirms the restore. The pre-seeded recovery-candidate machinery in steps 1–5 below — priority-ordered candidates, the encrypted gossip candidate blob, and a survivor assuming leadership *without* an election — remains an **architecture proposal** (a later phase); it is documented here as the target design, not current behaviour. The learning period in §5.4, the backup/restore, and disk-pressure council step-down (which moves leadership off a pressured leader as §5.2 describes) all ship today.
 >
-> **Recovery fence (#424).** The recovery epoch is per-node fence state (`src/council/fence.rs`), not just a filter on RPC pairs. Gossip extensions carry each node's claimed epoch and leader hints order by (epoch, term). Each recovery also draws a random 128-bit recovery id (#694), stored with the epoch in the snapshot (`DesiredState::recovery_id`) and the fence record. The new epoch is `max(restored epoch, the recovering node's fence epoch, its fenced_by) + 1`, read before the old directory moves aside, and `relish council recover` refuses a data directory whose record says it's fenced unless `--force`. Raft envelopes carry `sender_recovery_id` and a `Fenced` reply carries the refusing node's own id; the gossip directory extension carries `recovery_epoch: Option<u64>` and `recovery_id: Option<RecoveryId>` side by side, folded into `NodeDirectory::recovery_claims: HashMap<NodeId, Option<RecoveryClaim>>`. A node that meets its own epoch with a different id moves to `FenceState::Split` and so does the other side, since neither can tell which recovery is real; `relish council status` and `relish wtf` report it as critical. A restarted voter doesn't serve Raft until gossip has joined and completed its first push-pull sync, then waits two anti-entropy intervals (20 s, overridable with `[cluster] recovery_probe_window_secs`) unless every peer its persisted membership names has advertised a claim sooner (`src/cluster/recovery_fence.rs`); a voter whose persisted membership names no other member has nobody to hear from and serves once gossip has synced (at once when it has no seeds), so a single-node cluster restarts as quickly as before. A failed fence write is retried every five seconds and reported in council status until it lands. Before it changes anything, `relish council recover` reads the persisted voter set (the data directory's or the backup's last membership) and asks each voter's `/v1/health` whether it is an unfenced council voter, refusing while one says yes or answers unreadably, and failing closed on an empty voter set; a node that learns of a newer epoch from gossip or from a peer's `Fenced` reply fences itself permanently (persisted in `raft/recovery-fence.json`), sends and serves no Raft, refuses writes and names no leader. A fresh data directory claims no epoch and adopts the first council that admits it, which is how the recovered council regrows and how `relish council re-enrol` brings a fenced voter back. The recovered council snapshots and purges its log after bootstrap so joiners receive the restored state by InstallSnapshot. Limit: old voters that reach only each other, never a newer-epoch node, can't learn of the recovery; operators re-enrol them first.
+> **Recovery fence (#424).** The recovery epoch is per-node fence state (`src/council/fence.rs`), not just a filter on RPC pairs. Gossip extensions carry each node's claimed epoch and leader hints order by (epoch, term). Each recovery also draws a random 128-bit recovery id (#694), stored with the epoch in the snapshot (`DesiredState::recovery_id`) and the fence record. The new epoch is `max(restored epoch, the recovering node's fence epoch, its fenced_by) + 1`, read before the old directory moves aside, and `relish council recover` refuses a data directory whose record says it's fenced unless `--force`. Raft envelopes carry `sender_recovery_id` and a `Fenced` reply carries the refusing node's own id; the gossip directory extension carries `recovery_epoch: Option<u64>` and `recovery_id: Option<RecoveryId>` side by side, folded into `NodeDirectory::recovery_claims: HashMap<NodeId, Option<RecoveryClaim>>`. A node that meets its own epoch with a different id moves to `FenceState::Split` and so does the other side, since neither can tell which recovery is real; `relish council status` and `relish wtf` report it as critical. A restarted voter doesn't serve Raft until gossip has joined and completed its first push-pull sync, then waits two anti-entropy intervals (20 s, overridable with `[cluster] recovery_probe_window_secs`) unless every peer its persisted membership names has advertised a claim sooner (`src/cluster/recovery_fence.rs`); a voter whose persisted membership names no other member has nobody to hear from and serves once gossip has synced (at once when it has no seeds), so a single-node cluster restarts as quickly as before. A failed fence write is retried every five seconds and reported in council status until it lands. Before it changes anything, `relish council recover` reads the persisted voter set (the data directory's or the backup's last membership) and asks each voter's `/v1/health` whether it is an unfenced council voter, refusing while one says yes or answers unreadably, and failing closed on an empty voter set; a node that learns of a newer epoch from gossip or from a peer's `Fenced` reply fences itself permanently (persisted in `raft/recovery-fence.json`), sends and serves no Raft, refuses writes and names no leader. Over Raft, only a council member's RPC can move a node's fence; a node outside the council is only told a newer epoch (§3.3). A fresh data directory claims no epoch and adopts the first council that admits it, which is how the recovered council regrows and how `relish council re-enrol` brings a fenced voter back. The recovered council snapshots and purges its log after bootstrap so joiners receive the restored state by InstallSnapshot. Limit: old voters that reach only each other, never a newer-epoch node, can't learn of the recovery; operators re-enrol them first.
 
 When the entire Raft council is lost simultaneously (all 3-7 members fail at once), the *proposed* pre-seeded recovery mechanism activates as follows.
 
@@ -1076,6 +1114,13 @@ raft_port = 9444
 # Reporting-tree state reports (TCP + mTLS). Default: 9445.
 reporting_port = 9445
 
+# How many voters the council grows to: odd, 1 to 7. Unset keeps the
+# default cap of 7. Read only by the node that bootstraps the cluster,
+# which commits it to council state (RaftRequest::CouncilSize).
+# `relish cluster create --bare-metal` and `relish machines claim --create`
+# write 5 into node 1's config unless --council-size says otherwise.
+# council_size = 5
+
 # How long a restarted voter keeps listening for its peers' recovery
 # epochs after gossip has synced, unless every peer advertises sooner.
 # Unset means two anti-entropy intervals (20 s).
@@ -1084,11 +1129,12 @@ reporting_port = 9445
 
 (The old `7946`/`7947` gossip/raft ports never shipped; the real defaults are `9443`/`9444`/`9445`. The node HTTP API is a separate port, `9117`.)
 
-The council sizing constants below are compile-time defaults in `CouncilSelectionConfig` (`src/council/selection.rs`), shown here for reference — they are **not** a `[council]` TOML section:
+The council sizing constants below are compile-time defaults in `CouncilSelectionConfig` (`src/council/selection.rs`), shown here for reference — they are **not** a `[council]` TOML section. The one exception is the cluster-wide council size above: when council state holds one (`DesiredState::council_size`), the reconciler caps `max_council_size` at it every tick, and lowers `min_council_size` to match when it's smaller (`CouncilSelectionConfig::sized`). It lives in council state rather than in each node's config so that every leader, after any failover, grows the council to the same size:
 
 ```text
 # Minimum council size: the planner's target never drops below it, and
-# it never removes voters past it.
+# it never removes voters past it. A smaller cluster-wide council_size
+# lowers it to match.
 min_council_size = 3
 
 # Maximum council size. The council holds the largest odd number of
@@ -1205,9 +1251,17 @@ When the node has a cluster master key (`[security] master_key_path`, produced b
 
 A node started without a master key (single-node and pre-security configurations) gossips unauthenticated. Generated secure clusters always have one.
 
-**Replay protection.** An HMAC proves the sender wrote a datagram once, not that it wrote it just now. Before #696 a captured, validly signed PING replayed from another host moved the sender's recorded address to the attacker's socket (so probes went there and the real node was declared dead), and an old directory extension rolled the sender's recovery epoch back. Every message now carries a `sequence` inside the HMAC: a process-wide counter seeded from wall-clock microseconds at start and incremented per message, so it rises across restarts. A receiver keeps the highest sequence it has accepted from each sender and drops any message at or below it before applying anything, so an address change or directory update can only come from a newer message. A receiver also ignores a directory extension that names anyone but the sender, so directory fields are bound to that sequence too. A relay forwards an indirect-probe ACK in its own name (`relayed_for`), so every message has exactly one stamping node.
+**Replay protection.** An HMAC proves the sender wrote a datagram once, not that it wrote it just now. Before #696 a captured, validly signed PING replayed from another host moved the sender's recorded address to the attacker's socket (so probes went there and the real node was declared dead), and an old directory extension rolled the sender's recovery epoch back. Every message now carries a `sequence` inside the HMAC: a process-wide counter seeded from wall-clock microseconds at start and incremented per message, so it usually rises across restarts ("Restarts" below covers a clock that went backwards). A receiver keeps the freshest `(incarnation, sequence)` it has accepted from each sender, compared incarnation first, and drops any message no fresher before applying anything, so an address change or directory update can only come from a newer message. A receiver also ignores a directory extension that names anyone but the sender, so directory fields are bound to that sequence too. A relay forwards an indirect-probe ACK in its own name (`relayed_for`), so every message has exactly one stamping node.
 
-The sequence is a counter, not a timestamp check, so receivers need no clock agreement and no acceptance window: a timestamp would have to tolerate skew between hosts, and anything inside that tolerance could be replayed. The cost is that strict ordering drops a datagram that UDP delivers out of order behind a newer one from the same sender; gossip already tolerates loss, so that's a lost datagram, not an error. A node whose clock stepped backwards across a restart is not heard until its old record is reaped (suspicion plus `cleanup_timeout`), because reaping a member forgets its sequence.
+**Sequence floors.** Reaping a member (60 s after it goes Dead or Left) removes it from the table, but not what it last sent. Its freshest accepted `(incarnation, sequence)` becomes a *floor*, kept for 24 hours (`SEQUENCE_FLOOR_RETENTION`), and any datagram from that sender no fresher than the floor is dropped. So the freshness check doesn't reset with the reap: an old datagram from a departed node stays old, and only the node itself can bring it back. The same node really coming back is heard straight away, whatever its clock says (see "Restarts" below); its first fresher datagram turns the floor back into an ordinary per-sender record. A node that never heard the departed member (one that joined, or restarted, after the reap) learns the floor in anti-entropy (§3.2): each side of a push-pull sends its floors after its entries, each with its remaining time, so passing a floor on never extends it. Members that are down but not yet reaped go too, and a node raises its own record for such a member to the freshest it hears, so by the reap the whole cluster agrees on the highest sequence any node accepted, including datagrams the member sent to someone else. A node keeps at most 1,024 floors (`MAX_SEQUENCE_FLOORS`), dropping the one closest to expiry first, ignores a floor about itself or about a sender it hears directly, and caps a received floor's lifetime at the retention.
+
+**Datagrams in our own name.** A node drops any datagram whose `sender` is itself, before anything is applied. It keeps no sequence for itself to check such a datagram against, and nothing in one can be news: applying it could only move the node's own address or roll its own directory entry back. The only legitimate case is a seed list that names the node's own address, and a reply from itself tells it nothing.
+
+**Restarts.** A node starts every run at incarnation 1, and its counter is seeded from the wall clock, so a node that boots with its clock behind (an appliance before NTP settles) sends datagrams that look older than its previous run's. A receiver that drops a datagram as stale answers the sender, at most once a second per sender, with `Stale { held_incarnation, held_sequence }`: the freshest datagram it holds from it. If that's fresher than anything the node has sent this run (its incarnation, then the highest sequence it has sent), it's from an earlier run, and the node refutes past `held_incarnation`, exactly as it refutes a `Suspect` or `Dead` about itself. Its next datagram carries a higher incarnation, so it's fresher whatever its sequence. A duplicate, a reordered datagram, or one of a live node's own datagrams sent again is at most the newest it sent, so the answer changes nothing. A restarted node is heard after one round trip to each peer, with no dependence on its clock and nothing persisted, and that holds after a wiped data directory too. A recorded datagram can't refute: the answer goes to whoever sent it, and it carries the old incarnation however often it's replayed. A node that has left ignores the answer.
+
+Peers can hold different incarnations for the old run: one that heard it last at 3 and another at 5. The restarted node refutes past each answer in turn, so it can sit briefly between them. While it does (at 4, say), the peer it refuted for holds 4, and a recording from the old run at incarnation 5 is fresher there than the node's own datagrams: the replay window is open again for that peer until the node's datagram to the other peer draws its answer and the node refutes past 5. So the window is bounded by one `Stale` round trip per disagreeing peer, and only after a restart.
+
+The sequence is a counter, not a timestamp check, so receivers need no clock agreement and no acceptance window: a timestamp would have to tolerate skew between hosts, and anything inside that tolerance could be replayed. The cost is that strict ordering drops a datagram that UDP delivers out of order behind a newer one from the same sender; gossip already tolerates loss, so that's a lost datagram, not an error (and at most one `Stale` answer a second, which changes nothing at the sender).
 
 **TODO (not yet implemented):** gossip key rotation. The key is fixed for the life of the master key; there's no rotation command and no dual-key acceptance window.
 
@@ -1223,7 +1277,7 @@ The council's shared age keypair is generated during `relish init` and stored en
 
 Raft log entries are encrypted at rest with AES-256-GCM under a key derived (HKDF) from the cluster master key, which is stored on the node. This protects the log's entries from someone who copies the disk or the log file; it doesn't protect against root on a running node, which can read the master key. The Raft snapshot (`snapshot.redb`) is not encrypted. See [security-sesame.md](security-sesame.md) §5.6.
 
-In transit, Raft messages are protected by mTLS (all inter-council communication uses TLS 1.3 with mutual certificate authentication via Sesame).
+In transit, Raft messages are protected by mTLS (all inter-council communication uses TLS 1.3 with mutual certificate authentication via Sesame). Every node holds a node certificate, so the Raft listener also serves only RPCs a council voter sends under its own certificate (§3.3, "Council membership check").
 
 ### 8.4 Reporting Tree Authentication
 
@@ -1438,7 +1492,7 @@ There is no production-quality Rust equivalent of HashiCorp's `memberlist` (Go).
 
 1. **Gossip library vs. custom implementation.** Should we use `foca` or write our own SWIM implementation? The fixed-size message constraint and HMAC authentication are non-standard requirements. A custom implementation is ~1000 lines and fully under our control, but a library gives us battle-tested edge case handling. Decision needed after evaluating `foca`'s extensibility.
 
-2. **Council size auto-tuning.** The whitepaper specifies a configurable council size of 3-7. Should the leader automatically adjust the council size based on cluster size (e.g., 3 at <50 nodes, 5 at 50-500 nodes, 7 at >500 nodes)? Or is a static default of 5 sufficient? Auto-tuning adds complexity but improves fault tolerance at scale.
+2. **Council size auto-tuning.** The whitepaper specifies a configurable council size of 3-7. Should the leader automatically adjust the council size based on cluster size (e.g., 3 at <50 nodes, 5 at 50-500 nodes, 7 at >500 nodes)? Or is a static default of 5 sufficient? Auto-tuning adds complexity but improves fault tolerance at scale. *Partly settled (0.3.0):* no auto-tuning. The cap stays 7 by default, and a cluster can be created with a fixed odd size from 1 to 7 (`[cluster] council_size`, committed to council state at bootstrap). Appliance clusters default to 5, for a ten-node lab of 2 GB machines. There's no command yet to change it on a running cluster.
 
 3. **Recovery candidate notification timing.** Recovery candidates are notified via the reporting tree's mTLS channel. If the reporting tree itself is disrupted (e.g., the candidate's council member parent dies), the notification may not arrive. Should candidates also be able to discover their priority from the encrypted gossip blob alone (requiring them to have a decryption key)? This changes the security model.
 

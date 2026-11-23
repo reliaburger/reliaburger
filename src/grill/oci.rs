@@ -75,6 +75,21 @@ pub struct OciSpec {
     /// refuses a spec that carries them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_knobs: Option<super::knobs::RuntimeKnobs>,
+    /// The managed volumes among [`Self::mounts`], recorded when the spec
+    /// is built. Not part of the OCI runtime spec: rootful runc hands
+    /// exactly these to the container user, and every other bind source
+    /// is the operator's and is never chowned, whatever files sit beside it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub managed_volumes: Vec<ManagedVolumeMount>,
+}
+
+/// A managed volume a spec mounts, as the spec builder named it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ManagedVolumeMount {
+    /// The node's volumes directory, which the source lies below.
+    pub volumes_dir: PathBuf,
+    /// The host directory bind-mounted read-write into the container.
+    pub source: PathBuf,
 }
 
 impl OciSpec {
@@ -369,11 +384,10 @@ pub struct OciResources {
     ///   derived from the CPU request. Passing it here avoids runc's
     ///   lossy `cpu.shares` (2-262144) -> weight conversion, since our
     ///   value is already in the v2 range.
-    /// - `memory.high` (bytes): the soft limit. The kernel throttles and
-    ///   reclaims a workload that crosses it, before the hard
-    ///   `memory.max` triggers an OOM kill. There is no classic OCI field
-    ///   for it (`memory.reservation` maps to `memory.low`, a protection
-    ///   floor with the opposite meaning).
+    ///
+    /// A memory request writes nothing here: it's a scheduling reservation,
+    /// and as `memory.high` it throttled `runc init` itself, which runs in
+    /// the workload's cgroup before the workload does (#1955).
     ///
     /// `BTreeMap` keeps serialisation deterministic; empty maps are
     /// omitted so specs without requests are unchanged.
@@ -457,7 +471,7 @@ pub fn generate_oci_spec_with_decryptor(
     let env = build_env_with_decryptor(spec, decryptor)?;
     let provider_env = declared_provider_env(&spec.env);
     let args = build_args(app_name, spec);
-    let mounts = build_mounts(
+    let (mounts, managed_volumes) = build_mounts(
         spec,
         host_port,
         app_name,
@@ -471,6 +485,7 @@ pub fn generate_oci_spec_with_decryptor(
     let resources = build_resources(spec);
 
     Ok(OciSpec {
+        managed_volumes,
         reusable_executor: false,
         host_process: spec.exec.is_some() || spec.script.is_some(),
         initialiser: false,
@@ -667,7 +682,7 @@ fn build_mounts(
     namespace: &str,
     instance_id: &str,
     volumes_dir: Option<&Path>,
-) -> Vec<OciMount> {
+) -> (Vec<OciMount>, Vec<ManagedVolumeMount>) {
     let mut mounts = standard_mounts();
 
     // Config files: read-only bind mounts.
@@ -704,6 +719,7 @@ fn build_mounts(
     }
 
     // Volumes: read-write bind mounts
+    let mut managed = Vec::new();
     for vol in &spec.volumes {
         let host_path = if let Some(source) = &vol.source {
             // HostPath mode: use the explicit host path
@@ -713,9 +729,15 @@ fn build_mounts(
             let base = volumes_dir
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| PathBuf::from("/var/lib/reliaburger/volumes"));
-            base.join(namespace)
+            let host_path = base
+                .join(namespace)
                 .join(app_name)
-                .join(vol.path.strip_prefix("/").unwrap_or(&vol.path))
+                .join(vol.path.strip_prefix("/").unwrap_or(&vol.path));
+            managed.push(ManagedVolumeMount {
+                volumes_dir: base,
+                source: host_path.clone(),
+            });
+            host_path
         };
 
         mounts.push(OciMount {
@@ -727,8 +749,8 @@ fn build_mounts(
     }
 
     // Workload identity mount — populated by Bun after CSR signing.
-    // Starts empty; cert.pem, key.pem, ca.pem, bundle.pem, token, and
-    // meta.json appear once the council signs the workload's CSR. The
+    // Starts empty; cert.pem, key.pem, ca.pem, bundle.pem, token,
+    // api-token and meta.json appear once the council signs the workload's CSR. The
     // source is per-INSTANCE (PKI7): replicas of the same app must not
     // share (or overwrite) each other's private key. Bun prepares the
     // directory (tmpfs-backed on Linux root) before create; the
@@ -747,7 +769,7 @@ fn build_mounts(
         options: vec!["bind".to_string(), "ro".to_string()],
     });
 
-    mounts
+    (mounts, managed)
 }
 
 /// Standard Linux namespaces for container isolation.
@@ -818,44 +840,99 @@ pub fn standard_mounts() -> Vec<OciMount> {
     ]
 }
 
+/// The memory `runc init` needs, charged to the cgroup it starts in.
+///
+/// `runc init` runs inside the new container's own cgroup before the
+/// workload does. With runc 1.4 (Ubuntu 26.04) it holds a copy of its
+/// 10.9 MB binary there, and its `memory.peak` reached 13,266,944 bytes on a
+/// soak node, so `runc create` failed at 8, 10 and 12 MiB with "container
+/// init was OOM-killed". runc 1.5 needs about 4 MiB, but a node can run
+/// either. Rounded up to 16 MiB for a runc a little bigger than that one.
+///
+/// It's two rules with one cause: the smallest memory limit an app or a
+/// fresh runc job may ask for (#1959), and the room a shared-runc executor's
+/// helper cgroup gets on top of the helper's own (#1957).
+pub const RUNC_INIT_MEMORY_BYTES: u64 = 16 << 20;
+
+// The highest memory.peak measured for runc init: lowering the room below it
+// fails the build.
+const _: () = assert!(RUNC_INIT_MEMORY_BYTES >= 13_266_944);
+
+/// Render a memory size as whole mebibytes (`"16Mi"`) when it is one, else
+/// in bytes, so a message reads like the config the user wrote.
+pub fn render_memory(bytes: u64) -> String {
+    if bytes.is_multiple_of(1 << 20) {
+        format!("{}Mi", bytes >> 20)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
+/// Explain a runc start failure caused by `runc init` running out of memory.
+///
+/// Returns `None` unless runc's stderr says its init was OOM-killed. The
+/// reason names the container's memory limit and
+/// [`RUNC_INIT_MEMORY_BYTES`], because runc's own words ("memory
+/// limit too low?") don't say how much it needs.
+pub fn explain_runc_init_oom(runc_stderr: &str, memory_limit: Option<u64>) -> Option<String> {
+    if !runc_stderr.contains("OOM-killed") {
+        return None;
+    }
+    let floor = render_memory(RUNC_INIT_MEMORY_BYTES);
+    let limit = match memory_limit {
+        Some(bytes) => format!("the memory limit of {}", render_memory(bytes)),
+        None => "the container's memory".to_string(),
+    };
+    Some(format!(
+        "runc init was OOM-killed before the workload started: it runs inside \
+         the container's cgroup and {limit} is too small for it; give the app or \
+         job a memory limit of at least {floor}"
+    ))
+}
+
 fn build_resources(spec: &AppSpec) -> Option<OciResources> {
     build_resources_from_ranges(spec.cpu.as_ref(), spec.memory.as_ref())
 }
 
 /// Build the OCI resource block from CPU and memory ranges.
 ///
-/// Hard limits go into the `cpu`/`memory` blocks; requests go into the
-/// `unified` map as `cpu.weight` and `memory.high`. A request is only
-/// emitted when it is actually declared (`request > 0`) — an app that
-/// sets only a limit (e.g. `cpu = "0-1000m"`) gets the ceiling without a
-/// weight or soft limit forced on it.
+/// Hard limits go into the `cpu`/`memory` blocks; a CPU request goes into
+/// the `unified` map as `cpu.weight`, and only when it is actually declared
+/// (`request > 0`), so an app that sets only a limit (e.g. `cpu = "0-1000m"`)
+/// gets the ceiling without a weight forced on it.
+///
+/// A memory request sets no cgroup file. The scheduler reserves it, and the
+/// limit is the only ceiling. It used to become `memory.high`, but `runc
+/// init` runs in the workload's cgroup first and holds about 10 MiB of
+/// anonymous memory with runc 1.4. With no swap the kernel can't reclaim
+/// that, so an 8 MiB request throttled the start past Bun's deadline
+/// (#1955).
 fn build_resources_from_ranges(
     cpu: Option<&ResourceRange>,
     memory: Option<&ResourceRange>,
 ) -> Option<OciResources> {
     let mut unified = BTreeMap::new();
 
-    let cpu_res = cpu.map(|range| {
+    let cpu_res = cpu.and_then(|range| {
         if range.request > 0 {
             let weight = cgroup::cpu_weight_from_millicores(range.request);
             unified.insert("cpu.weight".to_string(), weight.to_string());
         }
-        OciCpuResources {
-            quota: (range.limit * 100_000 / 1000) as i64,
-            period: 100_000,
-        }
+        // A quota too large to compute sets none, like `cpu.max`'s `max`.
+        // Config parsing refuses such a limit; this guards the arithmetic.
+        let quota =
+            cgroup::cpu_quota_us(range.limit).and_then(|quota| i64::try_from(quota).ok())?;
+        Some(OciCpuResources {
+            quota,
+            period: cgroup::CGROUP_PERIOD_US,
+        })
     });
 
-    let memory_res = memory.map(|range| {
-        if range.request > 0 {
-            unified.insert("memory.high".to_string(), range.request.to_string());
-        }
-        OciMemoryResources {
-            limit: range.limit as i64,
-        }
+    let memory_res = memory.map(|range| OciMemoryResources {
+        limit: range.limit as i64,
     });
 
-    if cpu_res.is_some() || memory_res.is_some() {
+    if cpu_res.is_some() || memory_res.is_some() || !unified.is_empty() {
         Some(OciResources {
             pids: None,
             cpu: cpu_res,
@@ -909,6 +986,7 @@ pub fn generate_job_oci_spec(
     }
 
     OciSpec {
+        managed_volumes: Vec::new(),
         reusable_executor: false,
         host_process: spec.is_host(),
         initialiser: false,
@@ -1010,6 +1088,7 @@ pub fn generate_init_oci_spec(
     // the app; a bare root filesystem has no config to read.
     let from_image = init.image.is_some() || app.process.overrides.is_some();
     OciSpec {
+        managed_volumes: Vec::new(),
         reusable_executor: false,
         // A host app's init that names no image runs on the host like its
         // app, so the mixed runtime routes it there too (#935).
@@ -1101,6 +1180,7 @@ pub fn generate_sidecar_oci_spec(
         }),
     }
     OciSpec {
+        managed_volumes: Vec::new(),
         reusable_executor: false,
         host_process: false,
         // A sidecar borrows the app's volumes as an init does, so a runtime
@@ -1204,6 +1284,36 @@ impl OciSpec {
 mod tests {
     use super::*;
     use crate::config::types::{ConfigFileSpec, VolumeSpec};
+
+    #[test]
+    fn runc_init_oom_names_the_limit_and_the_floor() {
+        let stderr = "time=\"2026-11-14T10:00:00Z\" level=error msg=\"runc run failed: \
+                      container init was OOM-killed (memory limit too low?)\"\n";
+        let reason = explain_runc_init_oom(stderr, Some(8 << 20)).unwrap();
+        assert!(reason.contains("8Mi"), "{reason}");
+        assert!(reason.contains("16Mi"), "{reason}");
+        assert!(reason.contains("runc init"), "{reason}");
+    }
+
+    #[test]
+    fn runc_init_oom_with_no_limit_still_names_the_floor() {
+        let reason = explain_runc_init_oom("container init was OOM-killed", None).unwrap();
+        assert!(reason.contains("16Mi"), "{reason}");
+    }
+
+    #[test]
+    fn a_start_failure_without_an_init_oom_gets_no_explanation() {
+        assert_eq!(
+            explain_runc_init_oom("exec: \"/app\": no such file or directory", Some(8 << 20)),
+            None
+        );
+    }
+
+    #[test]
+    fn mebibytes_render_whole_or_in_bytes() {
+        assert_eq!(render_memory(16 << 20), "16Mi");
+        assert_eq!(render_memory(1_000_000), "1000000 bytes");
+    }
 
     #[test]
     fn inline_config_file_name_is_the_first_eight_bytes_of_the_path_digest() {
@@ -1749,6 +1859,22 @@ mod tests {
         assert_eq!(cpu.period, 100_000);
     }
 
+    /// A CPU limit whose quota can't be computed sets no CFS quota rather
+    /// than a wrapped or negative one (#2042).
+    #[test]
+    fn a_cpu_limit_whose_quota_overflows_sets_no_quota() {
+        let range = ResourceRange {
+            request: 1000,
+            limit: u64::MAX,
+        };
+        let resources = build_resources_from_ranges(Some(&range), None).unwrap();
+        assert!(resources.cpu.is_none());
+        assert_eq!(
+            resources.unified.get("cpu.weight").map(String::as_str),
+            Some("100")
+        );
+    }
+
     #[test]
     fn generate_with_memory_limits() {
         let spec: AppSpec = toml::from_str(
@@ -1802,7 +1928,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_request_produces_high_in_unified() {
+    fn memory_request_sets_no_soft_limit() {
         let spec: AppSpec = toml::from_str(
             r#"
             image = "test:v1"
@@ -1822,12 +1948,12 @@ mod tests {
         );
 
         let resources = oci.linux.resources.unwrap();
-        // Hard ceiling stays the limit; the request becomes the soft limit.
+        // The limit is the only memory ceiling. A request is a reservation
+        // the scheduler counts, never a throttle: as `memory.high` it stalled
+        // `runc init` before the workload ran (#1955).
         assert_eq!(resources.memory.unwrap().limit, 512 * 1024 * 1024);
-        assert_eq!(
-            resources.unified.get("memory.high"),
-            Some(&(128 * 1024 * 1024).to_string())
-        );
+        assert_eq!(resources.unified.get("memory.high"), None);
+        assert!(resources.unified.is_empty());
     }
 
     #[test]
@@ -2169,6 +2295,15 @@ mod tests {
             .find(|m| m.destination == std::path::Path::new("/logs"));
         assert!(data_mount.is_some());
         assert!(logs_mount.is_some());
+        // Only the managed volume is recorded as one: runc hands exactly
+        // these to the container user and never touches the host path.
+        assert_eq!(
+            oci.managed_volumes,
+            vec![ManagedVolumeMount {
+                volumes_dir: PathBuf::from("/var/lib/reliaburger/volumes"),
+                source: PathBuf::from("/var/lib/reliaburger/volumes/default/web/logs"),
+            }]
+        );
     }
 
     #[test]

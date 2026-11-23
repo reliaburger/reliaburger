@@ -25,7 +25,7 @@ pub use dissemination::DisseminationQueue;
 pub use membership::{MembershipSnapshot, MembershipTable, NodeMembership, ResourceSummary};
 pub use message::{
     DirectoryExtension, GossipMessage, GossipPayload, LeaderHint, MAX_PIGGYBACK_UPDATES,
-    MAX_SYNC_DATAGRAMS, MAX_SYNC_ENTRIES, MembershipUpdate,
+    MAX_SYNC_DATAGRAMS, MAX_SYNC_ENTRIES, MembershipUpdate, SequenceFloor,
 };
 pub use protocol::MustardNode;
 pub use state::NodeState;

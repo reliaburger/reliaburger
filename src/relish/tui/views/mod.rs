@@ -68,6 +68,25 @@ pub fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     };
     frame.render_widget(paragraph, chunks[1]);
     widgets::status_bar(frame, chunks[2], app);
+    if let Some(target) = &app.confirm_kill {
+        let area = ratatui::layout::Rect::new(
+            1,
+            frame.area().height.saturating_sub(3),
+            frame.area().width.saturating_sub(2),
+            3,
+        );
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(kill_prompt(target))
+                .style(theme::title())
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("kill instance"),
+                ),
+            area,
+        );
+    }
     if let Some(palette) = &app.palette {
         let area = ratatui::layout::Rect::new(
             1,
@@ -83,4 +102,12 @@ pub fn render(frame: &mut Frame<'_>, app: &TuiApp) {
             area,
         );
     }
+}
+
+/// The question `k` asks before a kill. `N` is the default: only `y` kills.
+fn kill_prompt(target: &super::app::InstanceTarget) -> String {
+    format!(
+        "Kill instance {} on {}? The scheduler starts a replacement. [y/N]",
+        target.instance, target.node
+    )
 }

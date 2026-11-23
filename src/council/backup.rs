@@ -34,11 +34,11 @@ use crate::sesame::crypto::{self, CryptoError};
 /// HKDF info string that scopes the backup-sealing key. Binding the derived
 /// key to this purpose prevents a sealed backup from being decrypted with, or
 /// mistaken for, any other key derived from the same master secret.
-const BACKUP_SEAL_INFO: &str = "reliaburger-council-backup-seal-v2";
+pub(crate) const BACKUP_SEAL_INFO: &str = "reliaburger-council-backup-seal-v2";
 
 /// Format version of the sealed-backup envelope. Bump when the on-disk shape
 /// changes so an older binary refuses a newer blob rather than mis-parsing it.
-const BACKUP_ENVELOPE_VERSION: u32 = crate::compatibility::CURRENT.state;
+pub(crate) const BACKUP_ENVELOPE_VERSION: u32 = crate::compatibility::CURRENT.state;
 
 /// Configuration for the council backup loop (`[cluster.backup]`).
 ///
@@ -422,6 +422,117 @@ pub fn prune_plan(keys: &[BackupKey], retain: usize) -> Vec<BackupKey> {
     sorted
 }
 
+/// What a node's council backup loop is doing (#2016), as
+/// `GET /v1/diagnostics` reports it and `relish wtf` checks it.
+///
+/// A configured backup can be off without anything failing loudly: no master
+/// key to seal with, or a destination the object store can't open. This is
+/// how an operator finds out before they need a restore.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum BackupStatus {
+    /// No `[cluster.backup] url` on this node.
+    NotConfigured,
+    /// `[cluster.backup]` is set but the loop can't run.
+    Disabled {
+        /// Why, in one line.
+        reason: String,
+    },
+    /// The loop runs; only the leader exports.
+    Running(BackupProgress),
+}
+
+/// A running backup loop's history on this node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupProgress {
+    /// Seconds between exports (`interval_secs`).
+    pub interval_secs: u64,
+    /// When the loop started, Unix seconds.
+    pub started_at: u64,
+    /// When this node last exported a backup, Unix seconds. A follower that
+    /// has never led has none.
+    pub last_success_at: Option<u64>,
+    /// This node's most recent failed export, if any.
+    pub last_failure: Option<BackupFailure>,
+}
+
+/// One failed backup export.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupFailure {
+    /// When it failed, Unix seconds.
+    pub at: u64,
+    /// What went wrong.
+    pub error: String,
+}
+
+impl BackupStatus {
+    /// Record one export's outcome. A deposed leader skipping its export
+    /// isn't a failure: the new leader exports instead.
+    pub fn record_export(&mut self, outcome: &Result<(), BackupError>, at: u64) {
+        let Self::Running(progress) = self else {
+            return;
+        };
+        match outcome {
+            Ok(()) => progress.last_success_at = Some(at),
+            Err(BackupError::NotLeader(_)) => {}
+            Err(error) => {
+                progress.last_failure = Some(BackupFailure {
+                    at,
+                    error: error.to_string(),
+                })
+            }
+        }
+    }
+}
+
+/// A node's backup status for the diagnostics API: the loop's live state,
+/// shared as an axum extension.
+#[derive(Debug, Clone)]
+pub struct BackupMonitor(pub tokio::sync::watch::Receiver<BackupStatus>);
+
+/// Decide whether this node's backup loop can run, and open its store when
+/// it can. `now` is Unix seconds, the loop's start time.
+pub fn prepare_backup(
+    config: &BackupConfig,
+    master_key_present: bool,
+    now: u64,
+) -> (BackupStatus, Option<BackupStore>) {
+    let Some(url) = &config.url else {
+        return (BackupStatus::NotConfigured, None);
+    };
+    // Without the master key there is nothing to derive the seal key from,
+    // and plaintext state never leaves the node.
+    if !master_key_present {
+        return (
+            BackupStatus::Disabled {
+                reason: "no master key on this node to seal backups with \
+                         ([security] master_key_path)"
+                    .to_string(),
+            },
+            None,
+        );
+    }
+    match BackupStore::from_url(url) {
+        Ok(store) => (
+            BackupStatus::Running(BackupProgress {
+                interval_secs: config.interval_secs,
+                started_at: now,
+                last_success_at: None,
+                last_failure: None,
+            }),
+            Some(store),
+        ),
+        Err(error) => (
+            BackupStatus::Disabled {
+                reason: error.to_string(),
+            },
+            None,
+        ),
+    }
+}
+
 /// One backup export: read the leader's desired state, seal it, upload under
 /// the key of that state's position, prune. Called from the loop with the
 /// wall clock; returns an error per failure so the loop can log without
@@ -443,34 +554,34 @@ pub async fn backup_tick(
         .await
         .map_err(|e| BackupError::NotLeader(e.to_string()))?;
     let key = BackupKey::for_state(&desired, now);
-    let payload =
-        serde_json::to_vec(&desired).map_err(|e| BackupError::Serialise(e.to_string()))?;
-    let sealed = seal_snapshot(master_key, &payload, config)?;
+    // Encoding and encrypting the whole desired state is CPU work that grows
+    // with the cluster: off the runtime.
+    let master_key = *master_key;
+    let seal_config = config.clone();
+    let sealed = tokio::task::spawn_blocking(move || {
+        let payload =
+            serde_json::to_vec(&desired).map_err(|e| BackupError::Serialise(e.to_string()))?;
+        seal_snapshot(&master_key, &payload, &seal_config)
+    })
+    .await
+    .map_err(|e| BackupError::Serialise(e.to_string()))??;
     store.put(&key, &sealed).await?;
     store.prune(config.retain).await?;
     Ok(())
 }
 
-/// The long-lived backup loop. Spawned by the binary when
-/// `[cluster.backup] url` is set. Only the leader actually exports; followers
-/// tick and skip, so it's safe to run on every council node.
+/// The long-lived backup loop, spawned when [`prepare_backup`] opened a
+/// store. Only the leader actually exports; followers tick and skip, so it's
+/// safe to run on every council node. Each export's outcome goes to
+/// `status` for `relish wtf`.
 pub async fn run_backup_loop(
     council: std::sync::Arc<CouncilNode>,
     master_key: [u8; 32],
     config: BackupConfig,
+    store: BackupStore,
+    status: tokio::sync::watch::Sender<BackupStatus>,
     shutdown: CancellationToken,
 ) {
-    let Some(url) = config.url.clone() else {
-        return;
-    };
-    let store = match BackupStore::from_url(&url) {
-        Ok(store) => store,
-        Err(e) => {
-            eprintln!("council: backup disabled: {e}");
-            return;
-        }
-    };
-
     let mut ticker = tokio::time::interval(Duration::from_secs(config.interval_secs.max(1)));
     ticker.tick().await; // skip the immediate first tick
     loop {
@@ -481,10 +592,15 @@ pub async fn run_backup_loop(
         if !council.is_leader().await {
             continue;
         }
-        if let Err(e) = backup_tick(&council, &master_key, &store, &config, SystemTime::now()).await
-        {
+        let now = SystemTime::now();
+        let outcome = backup_tick(&council, &master_key, &store, &config, now).await;
+        if let Err(e) = &outcome {
             eprintln!("council: backup export failed: {e}");
         }
+        let at = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        status.send_modify(|status| status.record_export(&outcome, at));
     }
 }
 
@@ -750,6 +866,105 @@ mod tests {
         }
         payloads.sort();
         assert_eq!(payloads, vec![b"first".to_vec(), b"second".to_vec()]);
+    }
+
+    fn configured(url: &str) -> BackupConfig {
+        BackupConfig {
+            url: Some(url.to_string()),
+            ..BackupConfig::default()
+        }
+    }
+
+    #[test]
+    fn an_unconfigured_backup_says_so() {
+        let (status, store) = prepare_backup(&BackupConfig::default(), true, 100);
+        assert_eq!(status, BackupStatus::NotConfigured);
+        assert!(store.is_none());
+    }
+
+    /// #2016: a configured backup with no master key never runs, and says why.
+    #[test]
+    fn a_configured_backup_without_a_master_key_is_disabled() {
+        let dest = tempfile::tempdir().unwrap();
+        let url = format!("file://{}", dest.path().display());
+        let (status, store) = prepare_backup(&configured(&url), false, 100);
+        let BackupStatus::Disabled { reason } = status else {
+            panic!("expected disabled, got {status:?}");
+        };
+        assert!(reason.contains("master key"), "{reason}");
+        assert!(store.is_none());
+    }
+
+    /// #2016: a URL the store can't open disables the loop, and says why.
+    #[test]
+    fn a_configured_backup_with_a_bad_url_is_disabled() {
+        let (status, store) = prepare_backup(&configured("nope://bucket/x"), true, 100);
+        let BackupStatus::Disabled { reason } = status else {
+            panic!("expected disabled, got {status:?}");
+        };
+        assert!(reason.contains("nope://bucket/x"), "{reason}");
+        assert!(store.is_none());
+    }
+
+    #[test]
+    fn a_configured_backup_with_a_key_and_a_good_url_runs() {
+        let dest = tempfile::tempdir().unwrap();
+        let url = format!("file://{}", dest.path().display());
+        let (status, store) = prepare_backup(&configured(&url), true, 100);
+        assert_eq!(
+            status,
+            BackupStatus::Running(BackupProgress {
+                interval_secs: 300,
+                started_at: 100,
+                last_success_at: None,
+                last_failure: None,
+            })
+        );
+        assert!(store.is_some());
+    }
+
+    /// #2016: a failing store surfaces as the last failure; a success after
+    /// it keeps the failure on record but newer success wins.
+    #[test]
+    fn exports_record_their_outcome() {
+        let mut status = BackupStatus::Running(BackupProgress {
+            interval_secs: 60,
+            started_at: 100,
+            last_success_at: None,
+            last_failure: None,
+        });
+        status.record_export(
+            &Err(BackupError::ObjectStore("bucket gone".to_string())),
+            160,
+        );
+        let BackupStatus::Running(progress) = &status else {
+            panic!("{status:?}");
+        };
+        assert_eq!(progress.last_success_at, None);
+        let failure = progress.last_failure.as_ref().unwrap();
+        assert_eq!(failure.at, 160);
+        assert!(failure.error.contains("bucket gone"), "{failure:?}");
+
+        status.record_export(&Ok(()), 220);
+        let BackupStatus::Running(progress) = &status else {
+            panic!("{status:?}");
+        };
+        assert_eq!(progress.last_success_at, Some(220));
+        assert_eq!(progress.last_failure.as_ref().map(|f| f.at), Some(160));
+    }
+
+    /// A deposed leader skipping its export isn't a failure.
+    #[test]
+    fn a_skipped_export_on_a_deposed_leader_is_not_a_failure() {
+        let mut status = BackupStatus::Running(BackupProgress {
+            interval_secs: 60,
+            started_at: 100,
+            last_success_at: None,
+            last_failure: None,
+        });
+        let before = status.clone();
+        status.record_export(&Err(BackupError::NotLeader("deposed".to_string())), 160);
+        assert_eq!(status, before);
     }
 
     #[test]

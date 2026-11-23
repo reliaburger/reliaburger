@@ -16,12 +16,13 @@ use crate::relish::client::BunClient;
 use crate::relish::council_view::CouncilNodeObservation;
 
 use super::{
-    AlertObservation, ApplicationEvidence, BuildObservation, CertificateObservation,
-    ClusterEvidence, CouncilObservation, CpuThrottleObservation, DeployObservation,
-    DiskObservation, Evidence, FaultObservation, GitOpsObservation, IsolationObservation,
-    LaunchFailureObservation, LogObservation, NodeGitOpsDifference, NodeGitOpsUnreadable,
-    NodeIsolation, NodeObservation, RegistryObservation, ReplicaObservation, RestartObservation,
-    ServiceObservation, TokenObservation, WtfInputs,
+    AlertObservation, ApplicationEvidence, BackupObservation, BuildObservation,
+    CertificateObservation, ClusterEvidence, CouncilObservation, CpuThrottleObservation,
+    DeployObservation, DiskObservation, Evidence, ExportHoldObservation, FaultObservation,
+    GitOpsObservation, IsolationObservation, LaunchFailureObservation, LogObservation,
+    NodeGitOpsDifference, NodeGitOpsUnreadable, NodeIsolation, NodeObservation,
+    RegistryObservation, ReplicaObservation, RestartObservation, ServiceObservation,
+    TokenObservation, WtfInputs,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -49,6 +50,7 @@ struct NodeCollection {
 
 struct LocalEvidenceSet {
     disks: Evidence<Vec<DiskObservation>>,
+    export_holds: Evidence<Vec<ExportHoldObservation>>,
     cpu_throttling: Evidence<Vec<CpuThrottleObservation>>,
     certificates: Evidence<Vec<CertificateObservation>>,
 }
@@ -252,6 +254,12 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
         Evidence::available(collected_at, Default::default())
     };
     let recent_logs = collect_logs(client, app, &restarts, collected_at).await;
+    let backups = if cluster_enabled {
+        collect_backups(&endpoints, &collected, collected_at)
+    } else {
+        // A standalone node has no council to back up.
+        Evidence::available(collected_at, Vec::new())
+    };
 
     Ok(WtfInputs {
         cluster_name,
@@ -263,12 +271,14 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
             council,
             faults,
             disks: local.disks,
+            export_holds: local.export_holds,
             certificates: local.certificates,
             registry,
             tokens,
             isolation,
             gitops,
             policies,
+            backups,
         },
         applications: ApplicationEvidence {
             restarts,
@@ -437,6 +447,8 @@ fn collect_builds(
                 version: version.version.clone(),
                 commit: version.commit.clone(),
                 binary_sha256: version.binary_sha256.clone(),
+                os_version: version.os_version.clone(),
+                os_update: version.os_update.clone(),
             }),
             Err(error) => builder.unavailable(format!("node {}: {error}", node.node_id)),
         }
@@ -529,7 +541,7 @@ fn collect_restarts(
                             .namespace
                             .clone()
                             .unwrap_or_else(|| "default".to_string()),
-                        instance: event.details.get("instance_id").cloned(),
+                        instance: event.details.get("instance").cloned(),
                         timestamp: event.timestamp,
                         reason: event.message.clone(),
                     })
@@ -800,6 +812,7 @@ fn collect_alerts(
 
 fn collect_local_diagnostics(collected: &[NodeCollection], observed_at: u64) -> LocalEvidenceSet {
     let mut disks = EvidenceBuilder::default();
+    let mut export_holds = EvidenceBuilder::default();
     let mut cpu = EvidenceBuilder::default();
     let mut certificates = EvidenceBuilder::default();
     for node in collected {
@@ -808,6 +821,7 @@ fn collect_local_diagnostics(collected: &[NodeCollection], observed_at: u64) -> 
             Err(error) => {
                 let reason = format!("node {}: {error}", node.node_id);
                 disks.unavailable(reason.clone());
+                export_holds.unavailable(reason.clone());
                 cpu.unavailable(reason.clone());
                 certificates.unavailable(reason);
                 continue;
@@ -823,6 +837,18 @@ fn collect_local_diagnostics(collected: &[NodeCollection], observed_at: u64) -> 
                 used_percent: disk.used_percent,
             }
         });
+        export_holds
+            .values
+            .extend(
+                snapshot
+                    .export_holds
+                    .iter()
+                    .map(|hold| ExportHoldObservation {
+                        node_id: node.node_id.clone(),
+                        storage_domain: hold.storage_domain.clone(),
+                        failing_since: hold.failing_since,
+                    }),
+            );
         append_diagnostic_source(&snapshot.cpu_throttling, &node.node_id, &mut cpu, |item| {
             CpuThrottleObservation {
                 app: item.app.clone(),
@@ -849,6 +875,7 @@ fn collect_local_diagnostics(collected: &[NodeCollection], observed_at: u64) -> 
     coalesce_disk_filesystems(&mut disks.values);
     LocalEvidenceSet {
         disks: disks.finish(observed_at),
+        export_holds: export_holds.finish(observed_at),
         cpu_throttling: cpu.finish(observed_at),
         certificates: certificates.finish(observed_at),
     }
@@ -912,6 +939,42 @@ fn append_diagnostic_source<T, U, F>(
             builder.unsupported(format!("node {node_id}: {reason}"));
         }
     }
+}
+
+/// Each node's council backup loop, from its diagnostics (#2016). `endpoints`
+/// and `collected` are parallel: the endpoint says whether the node votes
+/// and leads.
+fn collect_backups(
+    endpoints: &[NodeEndpoint],
+    collected: &[NodeCollection],
+    observed_at: u64,
+) -> Evidence<Vec<BackupObservation>> {
+    let mut builder = EvidenceBuilder::default();
+    for (endpoint, node) in endpoints.iter().zip(collected) {
+        let snapshot = match &node.diagnostics {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                builder.unavailable(format!("node {}: {error}", node.node_id));
+                continue;
+            }
+        };
+        match &snapshot.backup {
+            DiagnosticSource::Available { value, .. }
+            | DiagnosticSource::Degraded { value, .. } => builder.values.push(BackupObservation {
+                node_id: node.node_id.clone(),
+                is_council: endpoint.status.is_council,
+                is_leader: endpoint.status.is_leader,
+                status: value.clone(),
+            }),
+            DiagnosticSource::Unavailable { reason } => {
+                builder.unavailable(format!("node {}: {reason}", node.node_id))
+            }
+            DiagnosticSource::Unsupported { reason } => {
+                builder.unsupported(format!("node {}: {reason}", node.node_id))
+            }
+        }
+    }
+    builder.finish(observed_at)
 }
 
 /// Token lifetimes from `GET /v1/token/list`. Only an unscoped Admin may
@@ -1350,6 +1413,13 @@ mod tests {
                 }],
                 reason: "workload inventory unavailable".to_string(),
             },
+            backup: DiagnosticSource::Unsupported {
+                reason: "fixture".to_string(),
+            },
+            export_holds: vec![crate::bun::diagnostics::ExportHoldEvidence {
+                storage_domain: "logs".to_string(),
+                failing_since: 7,
+            }],
         };
         let collected = vec![NodeCollection {
             node_id: "node-1".to_string(),
@@ -1366,6 +1436,14 @@ mod tests {
 
         let evidence = collect_local_diagnostics(&collected, 10);
 
+        assert_eq!(
+            evidence.export_holds.value().unwrap(),
+            &[ExportHoldObservation {
+                node_id: "node-1".to_string(),
+                storage_domain: "logs".to_string(),
+                failing_since: 7,
+            }]
+        );
         assert!(matches!(evidence.disks, Evidence::Degraded { .. }));
         assert_eq!(evidence.disks.value().unwrap().len(), 1);
         assert_eq!(evidence.disks.value().unwrap()[0].used_percent, 95.0);
@@ -1431,6 +1509,47 @@ mod tests {
         assert!(evidence.caveat().is_some());
     }
 
+    /// Bun records a restart's instance as the decision's `instance`
+    /// evidence. The crash-loop check counts per instance, so it must read
+    /// that key (#2197).
+    #[test]
+    fn a_restart_names_the_instance_its_decision_recorded() {
+        let mut store = crate::bun::events::EventStore::new();
+        let decision = crate::bun::restart::restart_decision(
+            "restart.health_failed",
+            "default__web-1",
+            1,
+            &Default::default(),
+        );
+        store.record_with_details(
+            5,
+            EventKind::Restart,
+            crate::bun::events::EventSeverity::Warning,
+            Some("web".to_string()),
+            Some("default".to_string()),
+            None,
+            "instance default__web-1 restarted (attempt 1)".to_string(),
+            decision.into_details(),
+        );
+        let collected = vec![NodeCollection {
+            node_id: "node-1".to_string(),
+            reachable: true,
+            diagnostics: Err("unused".to_string()),
+            events: Ok(store.recent(EVENT_LIMIT, None, None)),
+            deploys: Err("unused".to_string()),
+            alerts: Err("unused".to_string()),
+            faults: Err("unused".to_string()),
+            instances: Err("unused".to_string()),
+            version: Err("unused".into()),
+            council: Err("unused".into()),
+        }];
+
+        let evidence = collect_restarts(&collected, 10);
+
+        let restarts = evidence.value().unwrap();
+        assert_eq!(restarts[0].instance.as_deref(), Some("default__web-1"));
+    }
+
     /// The agent gym's crash loop (#1652): an app that exits a few seconds
     /// after each start, restarted at once each time. Its node's events hold
     /// one `restart` per restart, as the agent records them, and its status
@@ -1470,6 +1589,8 @@ mod tests {
                 runtime_unknown: false,
                 status_age_ms: None,
                 age_seconds: None,
+                image: None,
+                data_on_node: false,
                 reason: None,
             }]),
             version: Err("unused".into()),
@@ -1501,7 +1622,7 @@ mod tests {
             .find(|finding| finding.id == "crashloop")
             .unwrap_or_else(|| panic!("no crashloop finding: {report:?}"));
         assert_eq!(finding.title, "app web/default restarted repeatedly");
-        assert!(finding.details[0].contains("5 timestamped restarts"));
+        assert!(finding.details[0].contains("5 restarts that name no instance"));
     }
 
     #[test]
@@ -1553,6 +1674,7 @@ mod tests {
                 "disks":{"state":"available","observed_at":10,"value":disks},
                 "cpu_throttling":{"state":"unsupported","reason":"fixture"},
                 "certificates":{"state":"unsupported","reason":"fixture"},
+                "backup":{"state":"unsupported","reason":"fixture"},
             });
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
@@ -1662,6 +1784,8 @@ mod tests {
             version: "v0.1.1".into(),
             commit: Some("3fcb1fd".into()),
             binary_sha256: Some("aaaa".into()),
+            os_version: None,
+            os_update: Default::default(),
             platform: None,
             compatibility: None,
         };

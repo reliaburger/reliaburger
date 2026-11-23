@@ -6,7 +6,7 @@ Meat is the centralized scheduling engine of the Reliaburger container orchestra
 
 ### Role in the System
 
-Meat is the single decision-maker for "what runs where." Every App placement, Job allocation, rolling deploy step, and autoscale event flows through Meat. It consumes desired state (from the Raft log or Lettuce GitOps engine), combines it with the cluster's reported runtime state (from the hierarchical reporting tree), and emits scheduling decisions that are committed to Raft and distributed to Bun agents on target nodes.
+Meat is the single decision-maker for "what runs where." Every App placement, Job allocation, rolling deploy step, and autoscale event flows through Meat. It consumes desired state (from the Raft log or Lettuce GitOps engine), combines it with the cluster's reported runtime state (every node reports straight to the leader; a hierarchical reporting tree is planned, #364), and emits scheduling decisions that are committed to Raft and fetched by the Bun agents on target nodes.
 
 ### Key Design Decisions
 
@@ -28,8 +28,8 @@ Meat is the single decision-maker for "what runs where." Every App placement, Jo
 |-----------|----------------|-----|
 | **Raft (Council)** | Hard | Meat reads desired state from the Raft log and commits scheduling decisions to it. Meat only runs on the Raft leader. |
 | **Mustard (Gossip)** | Hard | Provides cluster membership, node liveness, leader identity broadcast, and per-node resource summaries (CPU/memory/GPU capacity and utilisation). |
-| **Hierarchical Reporting Tree** | Hard | Nodes report detailed runtime state (running apps, health, resource usage, job completions) to their assigned council member, which aggregates for the leader. This is Meat's primary source of "what is actually running." |
-| **Bun (Agent)** | Hard | Executes scheduling decisions on each node. Bun starts/stops containers, enforces cgroups, and reports back via the reporting tree. |
+| **Reporting** | Hard | Every node reports detailed runtime state (running apps, health, resource usage, job completions) straight to the leader over the reporting port. This is Meat's primary source of "what is actually running." A hierarchical tree, with council members aggregating for the leader, is planned (#364). |
+| **Bun (Agent)** | Hard | Executes scheduling decisions on each node. Bun starts/stops containers, enforces cgroups, and reports back to the leader. |
 | **Grill (Container Runtime)** | Indirect | Bun uses Grill to start containers. Meat does not interact with Grill directly but must account for Grill's startup latency in scheduling decisions. |
 | **Lettuce (GitOps)** | Soft | When GitOps is enabled, Lettuce prepares change sets from git and forwards deploy requests to the leader. Meat processes these identically to CLI/API deploys. |
 | **Mayo (Metrics)** | Soft | The leader's autoscaler reads per-instance `process_cpu_percent` and `process_memory_bytes` from its rollup store, which every node's rollup worker feeds once a minute. No custom metrics. |
@@ -73,8 +73,8 @@ Meat is structured as a set of cooperating async tasks within the leader's Bun p
 │  ┌─────────────────────────────────────────────────────────────┐ │
 │  │                   Cluster State Cache                       │ │
 │  │                                                             │ │
-│  │  - NodeCapacity per node (from Mustard + reporting tree)    │ │
-│  │  - Running workloads per node (from reporting tree)         │ │
+│  │  - NodeCapacity per node (from Mustard + node reports)      │ │
+│  │  - Running workloads per node (from node reports)           │ │
 │  │  - Namespace quota usage (computed)                         │ │
 │  │  - Image availability per node (from Pickle reports)        │ │
 │  │  - Node labels (from Mustard gossip)                        │ │
@@ -99,7 +99,7 @@ Meat uses a four-phase placement pipeline for App scheduling:
 - Node is not in "state unknown" (has reported since leader election).
 - Node has sufficient allocatable CPU, memory, and GPU.
 - Node matches all `required` placement labels.
-- Node is not cordoned or draining.
+- Node isn't cordoned by a binary upgrade or an OS rollout that's moving through it (`apply_upgrade_cordon`, `apply_os_rollout_cordon`). There's no operator cordon or drain yet ([#656](https://github.com/reliaburger/reliaburger/issues/656)).
 - Namespace quota would not be exceeded by this placement.
 - For image workloads: node runs containers. An app that names an `image` (or has only a `command`, which runs in a root filesystem), or an init container that names its own image, needs a container runtime (#914). Each node reports `NodeCapabilities::containers`, true when its runtime is runc, Apple Container or the mixed runtime, and false on `--runtime process`, which refuses image apps. A missing capability report counts as false. If no ready node with the labels runs containers, the app is unschedulable with `UnplacedReason::NoContainerRuntime` ("no ready node has a container runtime to run its image"), checked before the other capabilities.
 - For process workloads: node has the required binary in its allowlist. Each node reports its `[process_workloads]` policy in its capability report (`NodeCapabilities::process`): whether it runs host processes at all (its runtime can, and `mount_isolation` is off, since a node refuses every host workload under mount isolation until #714 implements it) and its `allowed_binaries`. An `exec` app needs its path there, and a `script` app needs `/bin/sh`. An init container of such an app that names no image runs on the host too, so the first word of its command needs to be there as well (`meat::filter::host_init_binaries`, #935). `meat::filter::host_binary` is the one place that says which binary an app needs, so the node's own refusal and app validation agree with placement. A placement whose node stops allowing the binary moves.
@@ -118,7 +118,7 @@ Spread was once a weight (60, scored on whether a node ran the App at all). That
 
 **Phase 3: Select.** Pick the first node: fewest replicas, then highest score. Remaining ties are broken by node ID (deterministic). For multi-replica placements, Meat runs the pipeline iteratively, updating the cluster state cache after each placement to reflect the newly committed resources.
 
-**Phase 4: Commit.** Write the scheduling decision to the Raft log. Once committed, the decision is replicated to council members and the assignment is sent to the target Bun agent via the reporting tree.
+**Phase 4: Commit.** Write the scheduling decision to the Raft log. Once committed, the decision is replicated to council members. Each Bun agent polls the leader's `GET /v1/placements/{node}` for its assignments; nothing is pushed down the reporting connection, which carries reports upward only.
 
 ### Data Flow
 
@@ -156,7 +156,7 @@ Spread was once a weight (60, scored on whether a node ran the App at all). That
               ┌─────────────────────┐
               │   Raft Commit       │
               └──────────┬──────────┘
-                         │
+                         │  GET /v1/placements/{node}
                          ▼
               ┌─────────────────────┐
               │   Bun Agent(s)      │
@@ -165,8 +165,8 @@ Spread was once a weight (60, scored on whether a node ran the App at all). That
                          │
                          ▼
               ┌─────────────────────┐
-              │   Report back via   │
-              │   hierarchical tree │
+              │   Report back to    │
+              │   the leader        │
               └─────────────────────┘
 ```
 
@@ -419,6 +419,12 @@ pub enum RunTrigger {
 ```
 
 ### Node State
+
+This is the design's shape, not the shipped one. The shipped `NodeCapacity`
+(in `meat::types`) holds the node's id, address, total, reserved and
+allocated resources, and labels. There's no `NodeStatus`: no node is ever
+`Draining` or `Cordoned` by an operator until drain ships
+([#656](https://github.com/reliaburger/reliaburger/issues/656)).
 
 ```rust
 /// A node's capacity and current utilisation, as tracked by the scheduler.

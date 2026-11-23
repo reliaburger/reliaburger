@@ -464,7 +464,6 @@ mod linux {
             let policy = ProcessWorkloadsConfig {
                 mount_isolation: false,
                 allowed_binaries: vec![executable.clone()],
-                ..Default::default()
             };
             let mut config = TaskArrayNodeConfig::for_data_dir(&options.root, policy);
             config.default_concurrency = options.concurrency;

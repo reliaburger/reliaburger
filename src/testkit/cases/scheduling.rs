@@ -231,6 +231,7 @@ pub fn cases() -> Vec<TestCase> {
                 Capability::ProcessRuntime,
             ],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(schedule_fixed_replicas_across_nodes),
         },
         TestCase {
@@ -242,6 +243,7 @@ pub fn cases() -> Vec<TestCase> {
                 Capability::ProcessRuntime,
             ],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(schedule_respects_required_placement_label),
         },
         TestCase {
@@ -249,6 +251,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::Scheduling,
             requires: &[Capability::Cluster, Capability::ProcessRuntime],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(schedule_rejects_app_exceeding_namespace_quota),
         },
     ]

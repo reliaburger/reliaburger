@@ -54,6 +54,17 @@ pub enum BindError {
         "cannot resolve {image} to a digest: {reason}; pin it as {image}@sha256:… or try again when the registry answers"
     )]
     Unresolved { image: String, reason: String },
+    /// A name with no registry (`burger:v1`) that Pickle doesn't hold and
+    /// Docker Hub doesn't have either: usually an image nobody built yet.
+    #[error(
+        "{image} isn't in this cluster's registry (Pickle); build it with `relish build <file>` or push it, or name the registry that has it ({reason})"
+    )]
+    NotInPickle { image: String, reason: String },
+    /// The image's own registry says it has no such image.
+    #[error(
+        "{image} doesn't exist or isn't visible to this node: {reason}; check its name and tag"
+    )]
+    NoSuchImage { image: String, reason: String },
     /// The node's upstream trust rules don't allow the image (F03 U2).
     #[error(transparent)]
     NotAllowed(#[from] crate::pickle::trust::UpstreamRefused),
@@ -93,7 +104,7 @@ pub async fn bind_image(
         image: image.to_string(),
         reason: error.to_string(),
     })?;
-    let upstream_error = match upstream {
+    let (upstream_error, missing) = match upstream {
         Some(registry) => match tokio::time::timeout(
             UPSTREAM_BIND_TIMEOUT,
             registry.head_manifest_digest(&reference),
@@ -101,21 +112,48 @@ pub async fn bind_image(
         .await
         {
             Ok(Ok(digest)) => return Ok(bound(digest, BindSource::Upstream)),
-            Ok(Err(error)) => error.to_string(),
-            Err(_) => format!(
-                "{} did not answer within {}s",
-                reference.registry,
-                UPSTREAM_BIND_TIMEOUT.as_secs()
+            Ok(Err(error)) => {
+                let missing = matches!(
+                    error,
+                    crate::pickle::types::PickleError::UpstreamImageMissing(_)
+                );
+                (error.to_string(), missing)
+            }
+            Err(_) => (
+                format!(
+                    "{} did not answer within {}s",
+                    reference.registry,
+                    UPSTREAM_BIND_TIMEOUT.as_secs()
+                ),
+                false,
             ),
         },
-        None => "no upstream registry is configured on this node".to_string(),
+        None => (
+            "no upstream registry is configured on this node".to_string(),
+            false,
+        ),
     };
-    match catalog.get_manifest_by_tag(&cached_repository(&reference), &reference.tag) {
-        Some(manifest) => Ok(bound(manifest.digest.clone(), BindSource::Cache)),
-        None => Err(BindError::Unresolved {
-            image: image.to_string(),
-            reason: upstream_error,
-        }),
+    if let Some(manifest) =
+        catalog.get_manifest_by_tag(&cached_repository(&reference), &reference.tag)
+    {
+        return Ok(bound(manifest.digest.clone(), BindSource::Cache));
+    }
+    let image = image.to_string();
+    let reason = upstream_error;
+    Err(match (missing, names_no_registry(name)) {
+        (true, true) => BindError::NotInPickle { image, reason },
+        (true, false) => BindError::NoSuchImage { image, reason },
+        (false, _) => BindError::Unresolved { image, reason },
+    })
+}
+
+/// Whether an image name leaves out its registry (`burger`, `team/burger`),
+/// so it could have been meant for Pickle. A first component with a `.` or
+/// a `:` (`ghcr.io/…`, `localhost:5050/…`) names a registry.
+fn names_no_registry(name: &str) -> bool {
+    match name.split_once('/') {
+        None => true,
+        Some((first, _)) => !first.contains('.') && !first.contains(':') && first != "localhost",
     }
 }
 
@@ -146,6 +184,21 @@ impl std::fmt::Display for AppliedBinding {
             self.workload, self.image, self.digest
         )
     }
+}
+
+/// How many distinct images [`ImageBinder::bind_config`] would bind for
+/// `config`, each at most one upstream lookup.
+pub fn distinct_images(config: &crate::config::Config) -> usize {
+    let mut config = config.clone();
+    let images: std::collections::BTreeSet<String> = config
+        .app
+        .iter_mut()
+        .flat_map(|(name, spec)| app_image_slots(name, spec))
+        .map(|(_, image)| image.clone())
+        .chain(config.job.values().map(|spec| spec.image.clone()))
+        .flatten()
+        .collect();
+    images.len()
 }
 
 /// Every image slot of app `name`, labelled for errors: its own, then each
@@ -329,6 +382,49 @@ impl UpstreamRegistry for FixedUpstream {
             crate::pickle::types::PickleError::ReplicationFailed("connection refused".into())
         });
         Box::pin(async move { answer })
+    }
+
+    fn fetch_manifest<'a>(
+        &'a self,
+        _image: &'a ImageReference,
+    ) -> crate::pickle::upstream::UpstreamFuture<'a, crate::pickle::upstream::UpstreamManifest>
+    {
+        unimplemented!("binding only asks for the digest")
+    }
+
+    fn fetch_root<'a>(
+        &'a self,
+        _image: &'a ImageReference,
+    ) -> crate::pickle::upstream::UpstreamFuture<'a, crate::pickle::upstream::UpstreamRoot> {
+        unimplemented!("binding only asks for the digest")
+    }
+
+    fn fetch_blob<'a>(
+        &'a self,
+        _image: &'a ImageReference,
+        _layer: &'a crate::pickle::types::LayerDescriptor,
+    ) -> crate::pickle::upstream::UpstreamFuture<'a, Vec<u8>> {
+        unimplemented!("binding only asks for the digest")
+    }
+}
+
+/// An upstream that has no image at all: every HEAD answers that the
+/// image is missing, as Docker Hub does for a repository it doesn't have.
+#[cfg(test)]
+pub(crate) struct MissingUpstream;
+
+#[cfg(test)]
+impl UpstreamRegistry for MissingUpstream {
+    fn head_manifest_digest<'a>(
+        &'a self,
+        image: &'a ImageReference,
+    ) -> crate::pickle::upstream::UpstreamFuture<'a, Digest> {
+        let error = crate::pickle::types::PickleError::UpstreamImageMissing(format!(
+            "{} answered 401 Unauthorized for {}",
+            image.registry,
+            image.full_reference()
+        ));
+        Box::pin(async move { Err(error) })
     }
 
     fn fetch_manifest<'a>(
@@ -591,6 +687,57 @@ command = ["migrate"]
             .unwrap_err();
         assert!(error.to_string().contains("redis:7"), "{error}");
         assert_eq!(config.app["web"].image.as_deref(), Some("redis:7"));
+    }
+
+    /// #2145: a bare name that isn't in Pickle, and that Docker Hub
+    /// doesn't have either, is almost always an image nobody built yet.
+    /// The error says so first, and doesn't blame the registry.
+    #[tokio::test]
+    async fn a_bare_name_neither_pickle_nor_upstream_has_points_at_relish_build() {
+        let error = bind_image(
+            "burger:v1",
+            &ManifestCatalog::default(),
+            Some(&super::MissingUpstream),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, BindError::NotInPickle { .. }), "{error:?}");
+        let message = error.to_string();
+        assert!(
+            message.starts_with("burger:v1 isn't in this cluster's registry (Pickle)"),
+            "{message}"
+        );
+        assert!(message.contains("relish build"), "{message}");
+        assert!(!message.contains("try again"), "{message}");
+    }
+
+    /// A name with its own registry can't be in Pickle under that name, so
+    /// the error is about that registry, and still not a "try again".
+    #[tokio::test]
+    async fn a_named_registry_without_the_image_says_so() {
+        let error = bind_image(
+            "ghcr.io/acme/burger:v1",
+            &ManifestCatalog::default(),
+            Some(&super::MissingUpstream),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, BindError::NoSuchImage { .. }), "{error:?}");
+        let message = error.to_string();
+        assert!(message.contains("ghcr.io/acme/burger:v1"), "{message}");
+        assert!(!message.contains("Pickle"), "{message}");
+        assert!(!message.contains("try again"), "{message}");
+    }
+
+    /// The pull-through cache still stands in when upstream has lost a tag
+    /// the cluster already pulled.
+    #[tokio::test]
+    async fn a_missing_upstream_image_still_binds_from_the_cache() {
+        let catalog = catalog_with(&[("cache/docker.io/library/redis", "7", 9)]);
+        let binding = bind_image("redis:7", &catalog, Some(&super::MissingUpstream))
+            .await
+            .unwrap();
+        assert_eq!(bound_to(binding).2, BindSource::Cache);
     }
 
     /// The runtime pulls a loopback registry over plain HTTP, so binding

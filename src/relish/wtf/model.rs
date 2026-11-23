@@ -124,6 +124,12 @@ pub struct BuildObservation {
     pub commit: Option<String>,
     /// SHA-256 of the running binary, when the node hashes it.
     pub binary_sha256: Option<String>,
+    /// The appliance OS version; `None` off an appliance.
+    #[serde(default)]
+    pub os_version: Option<String>,
+    /// The node's OS update in progress, or how the last one ended.
+    #[serde(default)]
+    pub os_update: crate::os::rollout::OsUpdateState,
 }
 
 /// Current council composition and liveness.
@@ -285,6 +291,18 @@ pub struct DiskObservation {
     pub used_percent: f64,
 }
 
+/// A node's store whose export is failing, so the node prunes none of it:
+/// its size cap and retention are on hold until an export works (#2062).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportHoldObservation {
+    /// Node identifier.
+    pub node_id: String,
+    /// `logs` or `metrics`.
+    pub storage_domain: String,
+    /// Unix seconds of the first failed export since one last worked.
+    pub failing_since: u64,
+}
+
 /// Observed cgroup CPU throttling for one application.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CpuThrottleObservation {
@@ -373,6 +391,8 @@ pub struct ClusterEvidence {
     pub faults: Evidence<Vec<FaultObservation>>,
     /// Per-node disk capacity evidence.
     pub disks: Evidence<Vec<DiskObservation>>,
+    /// Stores whose export is failing, so their retention is on hold.
+    pub export_holds: Evidence<Vec<ExportHoldObservation>>,
     /// Safe public certificate metadata.
     pub certificates: Evidence<Vec<CertificateObservation>>,
     /// Per-node Pickle readiness and redundancy evidence.
@@ -386,6 +406,22 @@ pub struct ClusterEvidence {
     /// What the policies in force would now say about every committed app
     /// and job (#1119), the report `relish policy audit` prints.
     pub policies: Evidence<crate::policy::audit::PolicyAudit>,
+    /// Each node's council backup loop (#2016). Empty on a standalone node,
+    /// which has no council to back up.
+    pub backups: Evidence<Vec<BackupObservation>>,
+}
+
+/// One node's council backup loop, from its `GET /v1/diagnostics` (#2016).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupObservation {
+    /// Node identifier.
+    pub node_id: String,
+    /// Whether the node is a council voter, and so may lead and export.
+    pub is_council: bool,
+    /// Whether the node led the council when wtf asked.
+    pub is_leader: bool,
+    /// What its backup loop is doing.
+    pub status: crate::council::backup::BackupStatus,
 }
 
 /// What `relish wtf` checks about GitOps (#693).

@@ -17,6 +17,10 @@ LINUX_EXCLUDE ?=
 TEST_IMAGE_CACHE ?= $(HOME)/.cache/reliaburger/test-images
 TEST_IMAGE_MIRROR ?= 127.0.0.1:5099
 WITH_TEST_IMAGES = python3 scripts/test-images/mirror.py run --cache "$(TEST_IMAGE_CACHE)" --listen $(TEST_IMAGE_MIRROR) --
+# Cargo's target directory, where the builds below put their binaries. Parallel
+# agents point CARGO_TARGET_DIR outside the checkout, and a path into target/
+# then named nothing (#1859).
+TARGET_DIR = $(or $(CARGO_TARGET_DIR),$(CURDIR)/target)
 
 # --- Rust targets ---
 
@@ -63,16 +67,25 @@ test-images: ## Fetch the pinned test images (with retries) into the local mirro
 	python3 scripts/test-images/mirror.py warm --cache "$(TEST_IMAGE_CACHE)"
 
 # Build bun, which RELIABURGER_BUN_BINARY names, the way nextest builds it, so
-# nextest compiles nothing again and leaves that file alone (#904).
+# nextest compiles nothing again and leaves that file alone (#904). The lib
+# tests (10 to 12 GB of rustc) build first, on their own, so they never
+# compile beside the lib (about 7 GB): together they paged a 16 GB CI runner
+# into a stall (#1943).
 test-linux: ## Run provisioned Linux runtime, network, eBPF, Btrfs and Buildah tests
+	$(CARGO) test --no-run --features ebpf --lib
 	$(CARGO) test --no-run --features ebpf
-	RELIABURGER_RUNC_TESTS=1 RELIABURGER_NETNS_TESTS=1 RELIABURGER_EBPF_TESTS=1 RELIABURGER_BTRFS_TESTS=1 RELIABURGER_BUILDAH_TESTS=1 RELIABURGER_CGROUP_TESTS=1 RELIABURGER_NODE_PRESSURE_TESTS=1 RELIABURGER_BUN_BINARY="$(CURDIR)/target/debug/bun" $(WITH_TEST_IMAGES) $(NEXTEST) --features ebpf --run-ignored=only -E '(binary(ebpf) | binary(build) | binary(node_pressure) | binary(test_storage) | binary(owned_network) | binary(owned_runc) | binary(kubernetes_demo) | test(/^grill::(volume|image)::tests::/) | test(/(runc_|netns|btrfs_|cgroup_|identity_dir_is_tmpfs|pinned_images_serve)/)) & not binary(oci_crash) & !test(/^actual_(host_reboot|bun_kernel_discovery_host_reboot)/) $(LINUX_EXCLUDE)'
+	RELIABURGER_RUNC_TESTS=1 RELIABURGER_NETNS_TESTS=1 RELIABURGER_EBPF_TESTS=1 RELIABURGER_BTRFS_TESTS=1 RELIABURGER_BUILDAH_TESTS=1 RELIABURGER_CGROUP_TESTS=1 RELIABURGER_NODE_PRESSURE_TESTS=1 RELIABURGER_BUN_BINARY="$(TARGET_DIR)/debug/bun" $(WITH_TEST_IMAGES) $(NEXTEST) --features ebpf --run-ignored=only -E '(binary(ebpf) | binary(build) | binary(node_pressure) | binary(test_storage) | binary(owned_network) | binary(owned_runc) | binary(kubernetes_demo) | test(/^grill::(volume|image)::tests::/) | test(/(runc_|netns|btrfs_|cgroup_|identity_dir_is_tmpfs|pinned_images_serve)/)) & not binary(oci_crash) & !test(/^actual_(host_reboot|bun_kernel_discovery_host_reboot)/) $(LINUX_EXCLUDE)'
 
+# The same split build as test-linux: in CI this is the 24.04 privileged
+# job's first, cold build, and a parallel build of the lib beside its lib
+# tests lost that job's runner (#1943).
 test-rootless-runc: ## Prove rootless runc networking and port adoption as a non-root user
+	$(CARGO) test --no-run --features ebpf --lib
+	$(CARGO) test --no-run --features ebpf
 	RELIABURGER_ROOTLESS_RUNC_TESTS=1 $(NEXTEST) --features ebpf --run-ignored=only -E 'binary(owned_rootless) | test(rootless_published_port_survives_bun_replacement) | test(normal_rootless_bun)'
 
 test-cluster: ## Run all real multi-node cluster acceptance suites and the scripted feature demos
-	RELIABURGER_CLUSTER_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(cluster_failover) | binary(cluster_gossip) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(placement) | binary(cluster_task_arrays) | binary(registry_durability) | binary(demos)'
+	RELIABURGER_CLUSTER_TESTS=1 $(NEXTEST) --run-ignored=only -E '(binary(cluster_failover) | binary(cluster_gossip) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(placement) | binary(cluster_task_arrays) | binary(registry_durability) | binary(demos))'
 
 test-hollow: ## Run the 20-node hollow-node harness check (#1401) and the 100-node, 1,000-app summary budget; measured fleets run through scripts/release/qualify-hollow-nodes.sh
 	$(NEXTEST) --run-ignored=only -E 'binary(hollow_nodes) & (test(twenty_hollow_nodes) | test(a_hundred_hollow_nodes))'
@@ -171,12 +184,21 @@ bench-large: ## Run reproducible 500 and 1000 node gossip benchmarks
 bench-task-arrays: ## Run in-process task-array benchmarks (leader cost, pool overhead, fork/exec floor)
 	$(CARGO) bench --bench task_arrays
 
-# One report call writes the lcov file and then checks the floor: each call
-# merges every profile and reads every binary's coverage map again, about two
-# minutes on CI (plan 2026-11-06, F3). scripts/ci/coverage_owner.py pins this
-# recipe, so CI's evidence owner runs exactly these stages.
+# The instrumented lib tests (10 to 12 GB of rustc) build first, on their
+# own, at full parallelism; the run then builds the rest, the lib (about
+# 7 GB) first, since every other target links it. Built together they paged
+# a 16 GB CI runner into a stall (#1943), and one build job instead took
+# about 13 minutes (#1723). cargo-llvm-cov keeps --no-run for itself, so the
+# build lists the lib tests instead of running them, and the profile the
+# listing leaves is deleted before the run. One report call writes the lcov
+# file and then checks the floor: each call merges every profile and reads
+# every binary's coverage map again, about two minutes on CI (plan
+# 2026-11-06, F3). scripts/ci/coverage_owner.py pins this recipe, so CI's
+# evidence owner runs exactly these stages.
 coverage: ## Run the portable suite once under line coverage, write the lcov report and enforce the floor
 	$(CARGO) llvm-cov clean --workspace
+	$(CARGO) llvm-cov --no-report test --lib -- --list
+	$(CARGO) llvm-cov clean --profraw-only
 	$(CARGO) llvm-cov --no-report nextest --profile $(NEXTEST_PROFILE) --no-tests=fail
 	mkdir -p target/coverage
 	$(COVERAGE_REPORT) --lcov --output-path target/coverage/lcov.info --fail-under-lines $(COVERAGE_MIN_LINES)
@@ -237,7 +259,21 @@ agent-docs: features-page ## Regenerate the agent-facing files from the manual's
 # checked-in seeds; crashes go to fuzz/artifacts/<target>/.
 # fuzz.yml pins a dated nightly here so its build cache stays valid.
 FUZZ_TOOLCHAIN ?= nightly
-FUZZ = $(CARGO) +$(FUZZ_TOOLCHAIN) fuzz
+# Coverage instrumentation only on reliaburger and the parsers the decoders
+# run through (#1953): the whole dependency tree was 15.3 million counters,
+# which libFuzzer scans after every input. Narrowed, each target runs about
+# 3.5 times as many inputs a second. fuzz/rustc-coverage.sh holds the list.
+# Empty instruments everything.
+FUZZ_RUSTC_WRAPPER ?= $(CURDIR)/fuzz/rustc-coverage.sh
+# Cargo doesn't fingerprint a RUSTC_WRAPPER, so a changed list (or a build
+# from before the wrapper) would reuse crates instrumented the old way. A
+# cfg named after the wrapper's checksum puts it in every crate's RUSTFLAGS,
+# which Cargo does fingerprint; nothing reads the cfg.
+FUZZ_COVERAGE_ID = $(if $(FUZZ_RUSTC_WRAPPER),$(shell cksum < $(FUZZ_RUSTC_WRAPPER) | cut -d' ' -f1),all)
+FUZZ_COVERAGE_CFG = fuzz_coverage_$(FUZZ_COVERAGE_ID)
+FUZZ = RUSTC_WRAPPER=$(FUZZ_RUSTC_WRAPPER) \
+	RUSTFLAGS="$$RUSTFLAGS --cfg=$(FUZZ_COVERAGE_CFG) --check-cfg=cfg($(FUZZ_COVERAGE_CFG))" \
+	$(CARGO) +$(FUZZ_TOOLCHAIN) fuzz
 FUZZ_SECONDS ?= 10
 # cargo-fuzz defaults --target to the triple it was built for; a prebuilt
 # musl cargo-fuzz then asks for a static CRT that AddressSanitizer refuses.

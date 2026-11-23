@@ -27,7 +27,16 @@ pub(crate) const DEFAULT_REUSABLE_CONCURRENCY: u32 = 27;
 /// Explicit reservation for the container's idle command helper.
 pub const HELPER_CPU_REQUEST: u64 = 10;
 /// The helper is independently capped, outside each command's memory limit.
+/// This is the host helper's whole cap, and the helper's own share of a
+/// container helper's.
 pub const HELPER_MEMORY_BYTES: u64 = 8 << 20;
+/// A shared-runc executor's helper cap and reservation: the helper's own
+/// [`HELPER_MEMORY_BYTES`] plus [`RUNC_INIT_MEMORY_BYTES`], since `runc init`
+/// runs in the helper's cgroup before the helper does (#1957).
+///
+/// [`RUNC_INIT_MEMORY_BYTES`]: crate::grill::oci::RUNC_INIT_MEMORY_BYTES
+pub const CONTAINER_HELPER_MEMORY_BYTES: u64 =
+    HELPER_MEMORY_BYTES + crate::grill::oci::RUNC_INIT_MEMORY_BYTES;
 /// A command's `pids.max` when its job doesn't set `pids`.
 pub const DEFAULT_COMMAND_PIDS: u32 = 256;
 /// The helper's own `pids.max`, outside every command's limit.
@@ -43,6 +52,9 @@ pub(crate) struct ExecutorProfile {
     pub memory: ResourceRange,
     /// The command cgroup's `pids.max`.
     pub pids: u32,
+    /// The helper cgroup's `memory.max`: [`CONTAINER_HELPER_MEMORY_BYTES`]
+    /// for a shared-runc executor, [`HELPER_MEMORY_BYTES`] for a host one.
+    pub helper_memory: u64,
     pub reservation: Resources,
 }
 
@@ -194,13 +206,18 @@ impl ExecutorProfile {
                 "unsupported CPU or memory range",
             ));
         }
+        let helper_memory = if template.runtime == crate::config::job::JobRuntime::Process {
+            HELPER_MEMORY_BYTES
+        } else {
+            CONTAINER_HELPER_MEMORY_BYTES
+        };
         let reservation = Resources::new(
             cpu.request
                 .checked_add(HELPER_CPU_REQUEST)
                 .ok_or(ExecutorError::Configuration("CPU reservation overflow"))?,
             memory
                 .request
-                .checked_add(HELPER_MEMORY_BYTES)
+                .checked_add(helper_memory)
                 .ok_or(ExecutorError::Configuration("memory reservation overflow"))?,
             0,
         );
@@ -210,8 +227,34 @@ impl ExecutorProfile {
             pids: template
                 .pids
                 .map_or(DEFAULT_COMMAND_PIDS, crate::config::types::PidsLimit::get),
+            helper_memory,
             reservation,
         })
+    }
+
+    /// The files of the executor's `task` cgroup, where every command it runs
+    /// lands, and the value each gets, in the order they are written.
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn task_cgroup_files(&self) -> [(&'static str, String); 7] {
+        let cpu_max = if self.cpu.limit < 10 {
+            format!("{} 1000000", self.cpu.limit * 1000)
+        } else {
+            crate::grill::cpu_max_from_millicores(self.cpu.limit)
+        };
+        [
+            ("cpu.max", cpu_max),
+            (
+                "cpu.weight",
+                crate::grill::cgroup::cpu_weight_from_millicores(self.cpu.request).to_string(),
+            ),
+            ("memory.max", self.memory.limit.to_string()),
+            ("memory.swap.max", "0".into()),
+            // A memory request is a scheduling reservation, not a throttle:
+            // the limit is the only ceiling, as for a container (#1955).
+            ("memory.high", "max".into()),
+            ("memory.oom.group", "1".into()),
+            ("pids.max", self.pids.to_string()),
+        ]
     }
 }
 
@@ -484,9 +527,50 @@ mod tests {
         );
     }
     #[test]
+    fn a_memory_request_sets_no_soft_limit_on_the_task_cgroup() {
+        // A request is a scheduling reservation, never a throttle (#1955).
+        // The task cgroup's limit is its only memory ceiling, as for an app's
+        // container cgroup (#1956).
+        let profile = ExecutorProfile::new(&template()).unwrap();
+        let files: std::collections::BTreeMap<_, _> =
+            profile.task_cgroup_files().into_iter().collect();
+        assert_eq!(files["memory.high"], "max");
+        assert_eq!(files["memory.max"], (64u64 << 20).to_string());
+        assert_eq!(files["memory.swap.max"], "0");
+        assert_eq!(files["pids.max"], DEFAULT_COMMAND_PIDS.to_string());
+    }
+    #[test]
+    fn a_container_helper_has_room_for_runc_init_and_a_host_helper_stays_small() {
+        // runc init runs in the helper's cgroup before the helper does.
+        // Ubuntu 26.04's runc 1.4.0 holds a copy of its 10.9 MB binary
+        // there: memory.peak reached 13,266,944 bytes on a soak guest, and an
+        // 8 MiB memory.max OOM-killed every shared-runc executor (#1957).
+        let container = ExecutorProfile::new(&template()).unwrap();
+        assert_eq!(
+            container.helper_memory,
+            (8 << 20) + crate::grill::oci::RUNC_INIT_MEMORY_BYTES
+        );
+        assert_eq!(
+            container.reservation.memory_bytes,
+            (32 << 20) + CONTAINER_HELPER_MEMORY_BYTES
+        );
+        // A host helper is a process Bun starts itself: no runc init, so it
+        // keeps the small cap and the host slots it buys.
+        let mut host = template();
+        host.runtime = crate::config::job::JobRuntime::Process;
+        host.image = None;
+        host.exec = Some("/bin/true".into());
+        let host = ExecutorProfile::new(&host).unwrap();
+        assert_eq!(host.helper_memory, HELPER_MEMORY_BYTES);
+        assert_eq!(host.reservation.memory_bytes, (32 << 20) + (8 << 20));
+    }
+    #[test]
     fn idle_profile_reservation_includes_the_helper_without_weakening_task_limits() {
         let profile = ExecutorProfile::new(&template()).unwrap();
-        assert_eq!(profile.reservation, Resources::new(110, 40 << 20, 0));
+        assert_eq!(
+            profile.reservation,
+            Resources::new(110, (32 << 20) + CONTAINER_HELPER_MEMORY_BYTES, 0)
+        );
         assert_eq!(profile.cpu.limit, 1000);
         assert_eq!(profile.memory.limit, 64 << 20);
         let mut invalid = template();

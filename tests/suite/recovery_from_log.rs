@@ -29,7 +29,7 @@ async fn run_a_young_voter(data_dir: &std::path::Path, key: [u8; 32]) {
     )
     .await
     .unwrap();
-    router.register(1, node.raft().clone()).await;
+    router.register(1, &node).await;
     let info = CouncilNodeInfo::new("127.0.0.1:9444".parse().unwrap(), "voter");
     node.initialize(BTreeMap::from([(1, info)])).await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {

@@ -272,7 +272,7 @@ pub struct TimelineEntry {
 
 /// Run `relish agent context`.
 pub async fn run(args: &ContextArgs, max_bytes: usize, rerun: &str) -> Rendered {
-    let client = BunClient::default_local();
+    let client = BunClient::local().await;
     let (collected, summary, events, leases, proposals) = tokio::join!(
         wtf::collect(&client, None),
         tokio::time::timeout(SUMMARY_TIMEOUT, client.cluster_summary()),
@@ -632,6 +632,7 @@ mod tests {
                 disks: Evidence::Unavailable {
                     reason: "node node-3: disks: timed out".to_string(),
                 },
+                export_holds: available(Vec::new()),
                 certificates: available(Vec::new()),
                 registry: available(Vec::new()),
                 tokens: available(Vec::new()),
@@ -641,6 +642,7 @@ mod tests {
                 }),
                 gitops: available(GitOpsObservation::default()),
                 policies: available(crate::policy::audit::PolicyAudit::default()),
+                backups: available(Vec::new()),
             },
             applications: ApplicationEvidence {
                 restarts: available(vec![

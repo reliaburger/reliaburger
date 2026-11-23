@@ -632,8 +632,14 @@ fn answer_internal(
         return build_status_response(query, RCODE_REFUSED);
     }
 
-    let sources = config.source_namespaces.borrow();
-    let Some(service_id) = service_id_for(stripped, sources.namespace(src)) else {
+    // Copied out in one statement, so this borrow ends before the fault and
+    // service-map borrows below: never two watch borrows at once (#2045).
+    let namespace = config
+        .source_namespaces
+        .borrow()
+        .namespace(src)
+        .map(str::to_owned);
+    let Some(service_id) = service_id_for(stripped, namespace.as_deref()) else {
         // A name with more labels than `<app>.<namespace>` can't exist, and
         // saying so lets a resolver walking its search list try the next
         // suffix (`redis.default` → `redis.default.<ns>.internal` first).
@@ -1505,9 +1511,18 @@ mod tests {
 
     #[tokio::test]
     async fn external_tcp_dns_relays_direct_queries_and_truncated_udp_retries() {
-        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // The TCP port's UDP twin can already be some parallel test's
+        // socket, so draw pairs until one has both halves free.
+        let mut pair = None;
+        for _ in 0..64 {
+            let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            if let Ok(udp) = UdpSocket::bind(tcp.local_addr().unwrap()).await {
+                pair = Some((tcp, udp));
+                break;
+            }
+        }
+        let (upstream, udp) = pair.expect("no free TCP and UDP port pair in 64 tries");
         let address = upstream.local_addr().unwrap();
-        let udp = UdpSocket::bind(address).await.unwrap();
         let query = build_dns_query("example.com");
         let mut expected = Message::from_vec(&build_a_response(
             &query,

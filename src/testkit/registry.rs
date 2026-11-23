@@ -59,6 +59,11 @@ pub struct TestCase {
     /// Applications lease refuses them. The group says where the case is
     /// reported, not what it owns.
     pub lease: LeaseScope,
+    /// Whether the case also needs a second namespace, `<namespace>-peer`,
+    /// under a lease of its own ([`TestContext::peer`]). `allow_from` only
+    /// governs callers from another namespace, so the firewall cases need
+    /// one (#2206).
+    pub peer_namespace: bool,
     pub run: TestFn,
 }
 
@@ -141,6 +146,7 @@ mod tests {
             group,
             requires: &[],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: crate::testkit_case!(body),
         }
     }

@@ -1,0 +1,21 @@
+# Give the clock a short chance to sync before bun starts. bun and its peers
+# expect a node's wall clock to move forward across restarts, and a machine
+# with a flat RTC battery, or a freshly imaged disk, boots with its clock
+# behind until systemd-timesyncd's first sync.
+#
+# Bounded, unlike systemd-time-wait-sync.service, which waits forever
+# (TimeoutStartSec=infinity): a LAN with no NTP server must still start bun.
+# 30 s plus bun's slowest measured start (38 s on a Wyse 3040) still leaves
+# 22 s of boot-check's 90 s on a counted boot. Once a boot's clock has synced, the wait returns at
+# once, and bun's own restarts don't run it again (RemainAfterExit=).
+[Unit]
+Description=Wait up to 30 s for the clock to sync before bun starts
+After=network-online.target systemd-timesyncd.service
+Wants=network-online.target
+Before=reliaburger.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# `-`: a clock that doesn't sync in time isn't a failure; bun starts anyway.
+ExecStart=-/usr/bin/timeout 30 /usr/lib/systemd/systemd-time-wait-sync

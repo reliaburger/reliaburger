@@ -884,6 +884,32 @@ class ReleaseKeyFormatTests(unittest.TestCase):
         self.assertEqual(self.public_key(self.converted(self.pem)), self.public)
         self.assertEqual(self.public_key(self.converted(self.der[-32:])), self.public)
 
+    def keygen_shaped(self, public_field):
+        """The key as `relish dev keygen` writes it: ring's PKCS#8 v2 document (RFC 5958)."""
+        self.assertEqual(len(self.der), 48)
+        seed = self.der[16:]
+        body = bytes.fromhex("020101300506032b657004220420") + seed + public_field
+        return bytes([0x30, len(body)]) + body
+
+    def test_keygen_v2_key_becomes_the_v1_document_openssl_3_0_reads(self):
+        # OpenSSL 3.0 (Ubuntu 24.04's, on the build runners) can't load a v2
+        # document, so a train's nightly build failed at signing (#1950).
+        # Compare bytes, not a derived key: a newer local OpenSSL reads both.
+        raw = self.public[-32:]
+        implicit = self.keygen_shaped(bytes.fromhex("812100") + raw)
+        explicit = self.keygen_shaped(bytes.fromhex("a123032100") + raw)
+        self.assertEqual(len(implicit), 83)
+        self.assertEqual(implicit[48:50], bytes.fromhex("8121"))
+        self.assertEqual(self.converted(implicit), self.der)
+        self.assertEqual(self.converted(explicit), self.der)
+
+    def test_v2_key_whose_public_key_disagrees_with_its_seed_is_refused(self):
+        wrong = bytes(32)
+        with self.assertRaises(ValueError) as caught:
+            self.converted(self.keygen_shaped(bytes.fromhex("812100") + wrong))
+        self.assertIn("public key", str(caught.exception))
+        self.assertNotIn(self.der[16:].hex(), str(caught.exception))
+
     def test_wrapped_base64_is_accepted(self):
         encoded = base64.encodebytes(self.pem).decode()
         self.assertIn("\n", encoded)

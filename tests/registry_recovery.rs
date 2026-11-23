@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 mod bun_process;
 use bun_process::{
     BunProcess, WAIT, assert_success, reserve_address, reserve_port_block_lease, run_relish,
-    spawn_bun_with_port_retry, wait_for_relish, write_portable_node_config,
+    run_relish_init, spawn_bun_with_port_retry, wait_for_relish, write_portable_node_config,
 };
 
 #[tokio::test]
@@ -141,14 +141,7 @@ async fn qualify_registry_owner_crash(with_followers: bool) {
     let root = tempfile::tempdir().unwrap();
     let cluster_dir = root.path().join("cluster");
     assert_success(
-        &run_relish(&[
-            "init",
-            cluster_dir.to_str().unwrap(),
-            "--cluster-name",
-            "registry-crash",
-            "--node-id",
-            "node-01",
-        ]),
+        &run_relish_init(&cluster_dir, "registry-crash", "node-01"),
         "initialise registry crash fixture",
     );
     let mut config = cluster_dir.join("reliaburger.toml");

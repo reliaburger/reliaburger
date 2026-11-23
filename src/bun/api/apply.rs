@@ -7,8 +7,9 @@ use crate::pickle::binding::{AppliedBinding, BindError, ImageBinder};
 /// that must know the bound config before their stream starts (a
 /// standalone deploy, a cluster apply with jobs). A refusal is the HTTP
 /// response: 400 for a reference that doesn't parse, 403 for an image the
-/// node's upstream trust rules refuse, 502 when the registry couldn't name a
-/// digest and the cache doesn't hold the tag.
+/// node's upstream trust rules refuse, 404 for an image neither Pickle nor
+/// its registry has, 502 when the registry couldn't name a digest and the
+/// cache doesn't hold the tag.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn bind_images(
     state: &ApiState,
@@ -17,17 +18,24 @@ pub(crate) async fn bind_images(
 ) -> Result<Vec<AppliedBinding>, Response> {
     let catalog = binding_catalog(state).await;
     binder.bind_config(config, &catalog).await.map_err(|error| {
-        let status = match error {
-            BindError::InvalidReference { .. } => StatusCode::BAD_REQUEST,
-            BindError::Unresolved { .. } => StatusCode::BAD_GATEWAY,
-            BindError::NotAllowed(_) => StatusCode::FORBIDDEN,
-        };
         (
-            status,
+            bind_error_status(&error),
             Json(serde_json::json!({ "error": error.to_string() })),
         )
             .into_response()
     })
+}
+
+/// The HTTP status a binding refusal answers. A cluster apply binds inside
+/// its event stream, after the `200`, and carries this status in the
+/// stream's `Error` event instead (#2157), so both paths name the same one.
+pub(crate) fn bind_error_status(error: &BindError) -> StatusCode {
+    match error {
+        BindError::InvalidReference { .. } => StatusCode::BAD_REQUEST,
+        BindError::NotInPickle { .. } | BindError::NoSuchImage { .. } => StatusCode::NOT_FOUND,
+        BindError::Unresolved { .. } => StatusCode::BAD_GATEWAY,
+        BindError::NotAllowed(_) => StatusCode::FORBIDDEN,
+    }
 }
 
 /// The catalogue a binding resolves Pickle images against: the council's,
@@ -46,6 +54,13 @@ async fn binding_catalog(state: &ApiState) -> ManifestCatalog {
 /// contains a JSON-serialised `ApplyEvent`. The stream ends after
 /// the `Complete` or `Error` event.
 pub(super) const CAPACITY_PROBE_HEADER: &str = "x-reliaburger-capacity-probe";
+
+/// How long each of an apply's council writes may take to commit. A person
+/// is waiting on `relish apply`, and an apply that stops halfway leaves them
+/// to work out where it got to, so a slow disk gets longer here than the
+/// [`crate::council::node::WRITE_TIMEOUT`] background loops use. Applying
+/// the same file again is safe, which is what the error says to do.
+pub(super) const APPLY_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub(super) async fn apply_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
@@ -561,7 +576,9 @@ pub(super) async fn apply_handler(
         Ok::<_, std::convert::Infallible>(Event::default().data(json))
     });
 
-    Sse::new(stream).into_response()
+    Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
 }
 
 /// One progress line per host-path `source` in `config`: the API can't see
@@ -599,6 +616,86 @@ pub(crate) fn runtime_knob_notes(config: &Config) -> Vec<String> {
             })
         })
         .collect()
+}
+
+/// Refuse an app whose ingress host is already served by an app the
+/// caller's token may not change. Every node routes a host's requests by
+/// longest path prefix across all the apps on it, so an app on a shared
+/// host can take requests meant for another: a token scoped to some
+/// namespaces (or apps) may only put a route on a host whose existing
+/// routes all lie inside its scope. An unscoped token passes, as it may
+/// change any of those apps anyway.
+#[allow(clippy::result_large_err)]
+pub(crate) fn authorize_ingress_hosts(
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    config: &Config,
+    desired: &crate::council::types::DesiredState,
+) -> Result<(), Response> {
+    authorize_ingress_apps(
+        auth,
+        config.app.iter().map(|(name, spec)| {
+            let namespace = spec.namespace.as_deref().unwrap_or("default");
+            (crate::meat::types::AppId::new(name, namespace), spec)
+        }),
+        desired,
+    )
+}
+
+/// [`authorize_ingress_hosts`] for apps given as their identity and the
+/// spec they would have, as a proposal carries them.
+#[allow(clippy::result_large_err)]
+pub(crate) fn authorize_ingress_apps<'a>(
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    apps: impl IntoIterator<Item = (crate::meat::types::AppId, &'a crate::config::app::AppSpec)>,
+    desired: &crate::council::types::DesiredState,
+) -> Result<(), Response> {
+    match ingress_host_conflict(auth, apps, desired) {
+        Some(reason) => Err(crate::sesame::auth::scope_refusal(reason)),
+        None => Ok(()),
+    }
+}
+
+/// Why one of `apps` may not take its ingress host under `auth`'s scope,
+/// or `None` when every one may. The rule [`authorize_ingress_hosts`]
+/// describes, as a sentence, for a caller that records the reason rather
+/// than answering with it (the proposal reaper).
+pub(crate) fn ingress_host_conflict<'a>(
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    apps: impl IntoIterator<Item = (crate::meat::types::AppId, &'a crate::config::app::AppSpec)>,
+    desired: &crate::council::types::DesiredState,
+) -> Option<String> {
+    for (id, spec) in apps {
+        let Some(ingress) = &spec.ingress else {
+            continue;
+        };
+        // Hosts are compared as the routing table keys them.
+        let host = ingress.host.to_lowercase();
+        let serves = |candidate: &crate::config::app::AppSpec| {
+            candidate
+                .ingress
+                .as_ref()
+                .is_some_and(|other| other.host.to_lowercase() == host)
+        };
+        // An app keeps the host it already serves: an unscoped token may
+        // have shared that host on purpose, and re-applying the app mustn't
+        // start failing because of it.
+        if desired.apps.get(&id).is_some_and(serves) {
+            continue;
+        }
+        let outside_scope = desired.apps.iter().any(|(existing, existing_spec)| {
+            serves(existing_spec)
+                && crate::sesame::auth::authorize_scoped(auth, &existing.name, &existing.namespace)
+                    .is_err()
+        });
+        if outside_scope {
+            return Some(format!(
+                "app.{}: ingress host {host:?} is already served by an app outside this \
+                 token's scope; a host's routes belong to the namespace that serves it",
+                id.name
+            ));
+        }
+    }
+    None
 }
 
 /// Apply a config in cluster mode: propose each app spec to Raft.
@@ -716,6 +813,13 @@ pub(super) async fn cluster_apply(
                 return owner_refusal(&error);
             }
         };
+
+    if config.app.values().any(|spec| spec.ingress.is_some())
+        && let Err(response) =
+            authorize_ingress_hosts(auth.as_ref(), &config, &council.desired_state().await)
+    {
+        return response;
+    }
 
     if caller_headers.contains_key(CAPACITY_PROBE_HEADER) {
         use crate::cluster::capacity::{CapacityAdmissionError, SchedulingRefusal};
@@ -875,6 +979,7 @@ pub(super) async fn cluster_apply(
                     let _ = event_tx
                         .send(ApplyEvent::Error {
                             message: error.to_string(),
+                            status: Some(bind_error_status(&error).as_u16()),
                         })
                         .await;
                     return;
@@ -899,6 +1004,7 @@ pub(super) async fn cluster_apply(
                 Err(e) => {
                     let _ = event_tx
                         .send(ApplyEvent::Error {
+                            status: None,
                             message: e.to_string(),
                         })
                         .await;
@@ -927,7 +1033,7 @@ pub(super) async fn cluster_apply(
                 }
                 _ => request.clone(),
             };
-            match council.write(write).await {
+            match council.write_within(APPLY_WRITE_TIMEOUT, write).await {
                 // A lease was taken, released or broken since the leader
                 // checked: check again, and stop if one is now in the way.
                 Ok(crate::council::CouncilResponse::LeaseGenerationMoved { .. }) => {
@@ -950,6 +1056,7 @@ pub(super) async fn cluster_apply(
                         Err(refusal) => {
                             let _ = event_tx
                                 .send(ApplyEvent::Error {
+                                    status: None,
                                     message: format!("{describe}: {}", refusal.message()),
                                 })
                                 .await;
@@ -983,7 +1090,12 @@ pub(super) async fn cluster_apply(
                             }
                         }
                         Err(message) => {
-                            let _ = event_tx.send(ApplyEvent::Error { message }).await;
+                            let _ = event_tx
+                                .send(ApplyEvent::Error {
+                                    status: None,
+                                    message,
+                                })
+                                .await;
                             return;
                         }
                     }
@@ -1004,6 +1116,7 @@ pub(super) async fn cluster_apply(
                     .await;
                     let _ = event_tx
                         .send(ApplyEvent::Error {
+                            status: None,
                             message: format!("{describe}: refused by the cluster: {reason}"),
                         })
                         .await;
@@ -1030,9 +1143,24 @@ pub(super) async fn cluster_apply(
                         let _ = event_tx.send(ApplyEvent::Progress { message }).await;
                     }
                 }
+                Err(crate::council::CouncilError::WriteTimedOut { waited }) => {
+                    let _ = event_tx
+                        .send(ApplyEvent::Error {
+                            status: None,
+                            message: format!(
+                                "{describe}: outcome unknown: the write didn't commit within \
+                                 {}s; the {committed} writes before it in this apply were \
+                                 committed; re-run apply (it's safe to repeat)",
+                                waited.as_secs()
+                            ),
+                        })
+                        .await;
+                    return;
+                }
                 Err(e) => {
                     let _ = event_tx
                         .send(ApplyEvent::Error {
+                            status: None,
                             message: format!("{describe}: raft write failed: {e}"),
                         })
                         .await;
@@ -1053,7 +1181,9 @@ pub(super) async fn cluster_apply(
         let json = serde_json::to_string(&apply_event).unwrap_or_default();
         Ok::<_, std::convert::Infallible>(Event::default().data(json))
     });
-    Sse::new(stream).into_response()
+    Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
 }
 
 /// What `relish apply` says after committing an app whose current spec is

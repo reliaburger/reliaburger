@@ -38,8 +38,7 @@ async fn workload_receives_spiffe_certificate(
     ctx.apply(&ctx.container_idle_spec(app)).await?;
     ctx.wait_running_cluster(app, 1).await?;
     let bundle = ctx
-        .deadline
-        .run("wait for workload certificate", async {
+        .step("wait for workload certificate", async {
             loop {
                 if let Ok(bundle) = ctx
                     .exec_in_workload(
@@ -58,8 +57,7 @@ async fn workload_receives_spiffe_certificate(
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         })
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     let certificates = CertificateDer::pem_slice_iter(bundle.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("invalid workload certificate PEM: {error}"))?;
@@ -202,6 +200,7 @@ pub fn cases() -> Vec<TestCase> {
                 Capability::Identity,
             ],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(workload_receives_spiffe_certificate),
         },
         TestCase {
@@ -209,6 +208,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::WorkloadIdentity,
             requires: &[Capability::Council, Capability::Identity],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(jwks_endpoint_serves_signing_keys),
         },
         TestCase {
@@ -216,6 +216,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::WorkloadIdentity,
             requires: &[Capability::Council, Capability::Identity],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(namespace_scoped_token_is_rejected_elsewhere),
         },
     ]

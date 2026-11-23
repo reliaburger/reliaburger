@@ -26,6 +26,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             // LOOP-INLINE: one of the first events on the caller's fresh channel; never waits
             let _ = events
                 .send(ApplyEvent::Error {
+                    status: None,
                     message: "startup cleanup still owns runtime allocations; retry after recovery"
                         .into(),
                 })
@@ -34,7 +35,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         if let Err(message) = self.validate_deploy_names(&config) {
             // LOOP-INLINE: one of the first events on the caller's fresh channel; never waits
-            let _ = events.send(ApplyEvent::Error { message }).await;
+            let _ = events
+                .send(ApplyEvent::Error {
+                    status: None,
+                    message,
+                })
+                .await;
             return;
         }
         // A stopping workload still owns its instances until their exit is
@@ -45,7 +51,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 target.namespace, target.name
             );
             // LOOP-INLINE: one of the first events on the caller's fresh channel; never waits
-            let _ = events.send(ApplyEvent::Error { message }).await;
+            let _ = events
+                .send(ApplyEvent::Error {
+                    status: None,
+                    message,
+                })
+                .await;
             return;
         }
         // Its old incarnation retires first, whatever it was waiting on, and
@@ -60,7 +71,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             self.request_app_stop(target.name, target.namespace, StopPurpose::Retire, response)
                 .await;
             // LOOP-INLINE: one of the first events on the caller's fresh channel; never waits
-            let _ = events.send(ApplyEvent::Error { message }).await;
+            let _ = events
+                .send(ApplyEvent::Error {
+                    status: None,
+                    message,
+                })
+                .await;
             return;
         }
         if let Some((namespace, app)) = self.restoring_target(&config) {
@@ -68,7 +84,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 "volumes of {namespace}/{app} are being restored from a snapshot; retry once the restore finishes"
             );
             // LOOP-INLINE: one of the first events on the caller's fresh channel; never waits
-            let _ = events.send(ApplyEvent::Error { message }).await;
+            let _ = events
+                .send(ApplyEvent::Error {
+                    status: None,
+                    message,
+                })
+                .await;
             return;
         }
         // LOOP-INLINE: in-memory lock, no I/O
@@ -85,7 +106,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 )
                 .await;
                 // LOOP-INLINE: one of the first events on the caller's fresh channel; never waits
-                let _ = events.send(ApplyEvent::Error { message }).await;
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        status: None,
+                        message,
+                    })
+                    .await;
                 return;
             }
         };
@@ -113,7 +139,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 )
                 .await;
             // LOOP-INLINE: one of the first events on the caller's fresh channel; never waits
-            let _ = events.send(ApplyEvent::Error { message }).await;
+            let _ = events
+                .send(ApplyEvent::Error {
+                    status: None,
+                    message,
+                })
+                .await;
             return;
         }
         // Forward deploy events to the caller, mirroring errors into the
@@ -156,7 +187,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         }
                         continue;
                     }
-                    ApplyEvent::Error { message: error } => {
+                    ApplyEvent::Error { message: error, .. } => {
                         outcome = DeployOperationOutcome::Failed;
                         message = error.clone();
                         completion = None;
@@ -203,7 +234,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 if let Some(event) = completion {
                     let _ = sender.try_send(event);
                 } else if outcome == DeployOperationOutcome::Unknown {
-                    let _ = sender.try_send(ApplyEvent::Error { message });
+                    let _ = sender.try_send(ApplyEvent::Error {
+                        status: None,
+                        message,
+                    });
                 }
             }
         });

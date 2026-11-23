@@ -31,14 +31,18 @@ If you're an agent operating or debugging a Reliaburger cluster:
   A warning starting `source_mismatch:` means a node runs another commit, and
   links that commit's code.
 - **Use `-o json` for everything else.** Every `relish` command takes it
-  except the six interactive ones: `tui`, `dashboard`, `manual`, `source`,
-  `dev shell` and the guided `setup`. `setup --quickstart` and `setup --ssh`
-  take it.
+  except the nine interactive ones: `tui`, `dashboard`, `manual`, `source`,
+  `dev shell`, the guided `setup`, `machines claim`, `machines logs` and
+  `netboot`. `setup
+  --quickstart` and `setup --ssh` take it.
 - **Never post, change or file anything without your human.** Draft it, show
   it, and let them send it.
 - **Asked to set up a cluster?** Follow the playbook "Setting up a cluster for
   your human" at <https://reliaburger.com/agents>, the last section of
-  `relish agent guide`, and spend nothing without an explicit yes.
+  `relish agent guide`, and spend nothing without an explicit yes. On spare
+  machines, Reliaburger installs its own OS over the network and erases
+  their disks: you check and download, and your human runs `relish netboot`
+  and `relish machines claim`.
 
 ## Commands
 

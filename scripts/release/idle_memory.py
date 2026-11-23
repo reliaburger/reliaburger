@@ -47,6 +47,9 @@ import sys
 import tempfile
 import time
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "profiling"))
+import relish_init  # noqa: E402
+
 
 class IdleMemoryError(Exception):
     """The measurement can't produce an honest number."""
@@ -267,11 +270,9 @@ def main(argv: list[str]) -> int:
     relish = args.relish.resolve()
     work = pathlib.Path(tempfile.mkdtemp(prefix="rb-idle-"))
     cluster = work / "cluster"
-    subprocess.run(
-        [str(relish), "init", str(cluster), "--cluster-name", "idle", "--node-id", "idle-01"],
-        check=True,
-        cwd=work,
-    )
+    # The root CA backup and its passphrase go into `work`, and only for a
+    # relish that takes them (#709).
+    relish_init.init_cluster(str(relish), cluster, "idle", "idle-01", work)
     config = cluster / "reliaburger.toml"
     config.write_text(isolate_config(config.read_text(), work / "state", args.port_base))
     command = [

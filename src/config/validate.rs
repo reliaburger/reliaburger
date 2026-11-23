@@ -290,13 +290,73 @@ fn validate_build(
 /// The built-in checks one app must pass, on their own. Policies run them
 /// again on an app their defaults filled in (#1118), so validation sees
 /// the final spec.
+/// Why a runc container with this memory range can't start, if it can't.
+///
+/// Refuses a limit below [`RUNC_INIT_MEMORY_BYTES`]: `runc init`
+/// runs in the container's cgroup first and is OOM-killed under it (#1959).
+/// Only the limit counts; a request is a reservation and sets no cgroup
+/// file (#1955).
+///
+/// [`RUNC_INIT_MEMORY_BYTES`]: crate::grill::oci::RUNC_INIT_MEMORY_BYTES
+pub(crate) fn runc_memory_floor_refusal(
+    memory: Option<&super::types::ResourceRange>,
+) -> Option<String> {
+    use crate::grill::oci::{RUNC_INIT_MEMORY_BYTES, render_memory};
+    let limit = memory?.limit;
+    (limit < RUNC_INIT_MEMORY_BYTES).then(|| {
+        format!(
+            "memory limit {} is below the {} a container needs to start: runc init \
+             runs inside the container's cgroup first and is OOM-killed under it",
+            render_memory(limit),
+            render_memory(RUNC_INIT_MEMORY_BYTES),
+        )
+    })
+}
+
+/// Refuse a container app or sidecar whose memory limit is below the runc floor.
+fn validate_app_memory_floor(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError> {
+    // A host app (exec or script, no image) runs without runc.
+    if app.image.is_none() {
+        return Ok(());
+    }
+    if let Some(reason) = runc_memory_floor_refusal(app.memory.as_ref()) {
+        return Err(ConfigError::Validation {
+            field: "memory".to_string(),
+            context: format!("app {name:?}"),
+            reason,
+        });
+    }
+    for sidecar in &app.sidecar {
+        if let Some(reason) = runc_memory_floor_refusal(sidecar.memory.as_ref()) {
+            return Err(ConfigError::Validation {
+                field: format!("sidecar.{}.memory", sidecar.name),
+                context: format!("app {name:?}"),
+                reason,
+            });
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_app_spec(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError> {
     validate_app(name, app)
 }
 
 fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError> {
-    // An app needs at least one of: image, command, exec, or script
-    if app.image.is_none() && app.command.is_empty() && app.exec.is_none() && app.script.is_none() {
+    // An app needs something to run: an image, or a host `exec` or
+    // `script`. A `command` alone has neither a root filesystem nor a host
+    // binary policy to run under, so no runtime could start it.
+    if app.image.is_none() && app.exec.is_none() && app.script.is_none() {
+        if !app.command.is_empty() {
+            return Err(ConfigError::Validation {
+                field: "command".to_string(),
+                context: format!("app {name:?}"),
+                reason: "a command needs something to run it in: add `image` for a container, \
+                         or use `exec` (with `command` as its arguments) or `script` for a host \
+                         process"
+                    .to_string(),
+            });
+        }
         return Err(ConfigError::MissingImage {
             name: name.to_string(),
         });
@@ -308,6 +368,7 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
     )?;
     validate_app_ingress(name, app)?;
     validate_app_honoured_fields(name, app)?;
+    validate_app_memory_floor(name, app)?;
 
     if let Some(owner) = &app.owner
         && let Err(reason) = crate::council::owner::validate_owner(owner)
@@ -577,7 +638,7 @@ fn validate_app_inits(name: &str, app: &super::app::AppSpec) -> Result<(), Confi
 
 /// Refuse sidecars that can't run as declared (#1120): a name that isn't a
 /// DNS label or appears twice, a host app (whose network is the node's, so
-/// there's no namespace to share), no image to run, an encrypted value in a
+/// there's no namespace to share), an encrypted value in a
 /// sidecar's own `env`, and an app with an egress allowlist, which would
 /// hold the app to it but not its sidecars.
 fn validate_app_sidecars(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError> {
@@ -613,12 +674,6 @@ fn validate_app_sidecars(name: &str, app: &super::app::AppSpec) -> Result<(), Co
         validate_label(&sidecar.name, &context, "sidecar.name")?;
         if !seen.insert(sidecar.name.as_str()) {
             return Err(refuse(format!("two sidecars are named {:?}", sidecar.name)));
-        }
-        if sidecar.image.is_none() && app.image.is_none() {
-            return Err(refuse(format!(
-                "sidecar {:?} names no image, and the app has none to lend it",
-                sidecar.name
-            )));
         }
         if let Some(variable) = sidecar
             .env
@@ -708,6 +763,18 @@ fn validate_app_honoured_fields(name: &str, app: &super::app::AppSpec) -> Result
     ];
     if let Some((field, _)) = zero.iter().find(|(_, is_zero)| *is_zero) {
         return Err(refuse(field, format!("{field} must be at least 1")));
+    }
+    // A delay near u64::MAX seconds overflows the probe scheduler's clock.
+    let max = crate::bun::health::MAX_HEALTH_DELAY_SECS;
+    let long = [
+        ("health.interval", health.interval),
+        ("health.initial_delay", health.initial_delay),
+    ];
+    if let Some((field, Some(value))) = long.iter().find(|(_, v)| v.is_some_and(|v| v > max)) {
+        return Err(refuse(
+            field,
+            format!("{field} ({value}s) must be at most {max}s (one day)"),
+        ));
     }
     let interval = health
         .interval
@@ -846,6 +913,13 @@ pub(crate) fn validate_job(name: &str, job: &super::job::JobSpec) -> Result<(), 
             context: format!("job {name:?}"),
             reason: reason.into(),
         })?;
+    if let Some(reason) = job.memory_floor_refusal() {
+        return Err(ConfigError::Validation {
+            field: "memory".into(),
+            context: format!("job {name:?}"),
+            reason,
+        });
+    }
     validate_job_policy(name, job)
 }
 
@@ -1063,6 +1137,13 @@ impl NodeConfig {
                 reason: error.to_string(),
             })?;
         }
+        for value in &self.security.bootstrap_peers {
+            crate::firewall::rules::parse_cidr(value).map_err(|error| ConfigError::Validation {
+                field: "security.bootstrap_peers".to_string(),
+                context: "node config".to_string(),
+                reason: error.to_string(),
+            })?;
+        }
 
         self.testing
             .validate()
@@ -1133,6 +1214,10 @@ impl NodeConfig {
                 self.metrics.app_scrape_interval_secs,
             ),
             ("logs.export_interval_secs", self.logs.export_interval_secs),
+            (
+                "reporting_tree.report_interval_secs",
+                self.reporting_tree.report_interval_secs,
+            ),
         ] {
             if value == 0 {
                 return Err(ConfigError::Validation {
@@ -1143,7 +1228,97 @@ impl NodeConfig {
             }
         }
 
-        Ok(())
+        self.validate_stale_report_timeout()?;
+        if self.reporting_tree.stale_node_grace_secs == 0 {
+            return Err(ConfigError::Validation {
+                field: "reporting_tree.stale_node_grace_secs".to_string(),
+                context: "node config".to_string(),
+                reason: "must be greater than zero".to_string(),
+            });
+        }
+        self.validate_smoker_durations()
+    }
+
+    /// Fault durations must satisfy `0 < default <= max <= 1 day`. A default
+    /// above the maximum refuses every fault injected without `--duration`,
+    /// a zero refuses every timed fault, and `FaultRule::new` would silently
+    /// cut anything over a day to 24 h.
+    fn validate_smoker_durations(&self) -> Result<(), ConfigError> {
+        let smoker = &self.smoker;
+        let max_secs = crate::smoker::types::MAX_FAULT_DURATION_NS / 1_000_000_000;
+        let (field, reason) = if smoker.default_duration_secs == 0 {
+            (
+                "default_duration_secs",
+                "must be greater than zero".to_string(),
+            )
+        } else if smoker.default_duration_secs > smoker.max_duration_secs {
+            (
+                "default_duration_secs",
+                format!(
+                    "must be at most smoker.max_duration_secs ({}s)",
+                    smoker.max_duration_secs
+                ),
+            )
+        } else if smoker.max_duration_secs > max_secs {
+            (
+                "max_duration_secs",
+                format!("must be at most {max_secs}s (one day)"),
+            )
+        } else {
+            return Ok(());
+        };
+        Err(ConfigError::Validation {
+            field: format!("smoker.{field}"),
+            context: "node config".to_string(),
+            reason,
+        })
+    }
+
+    /// A stale timeout at or below the report interval marks every node
+    /// stale between two of its own reports, and the report worker
+    /// multiplies the timeout into a `Duration`, which overflows near
+    /// u64::MAX seconds.
+    fn validate_stale_report_timeout(&self) -> Result<(), ConfigError> {
+        let tree = &self.reporting_tree;
+        let max = super::node::MAX_STALE_REPORT_TIMEOUT_SECS;
+        let reason = if tree.stale_report_timeout_secs <= tree.report_interval_secs {
+            format!(
+                "must be greater than reporting_tree.report_interval_secs ({}s)",
+                tree.report_interval_secs
+            )
+        } else if tree.stale_report_timeout_secs > max {
+            format!("must be at most {max}s (one day)")
+        } else {
+            return Ok(());
+        };
+        Err(ConfigError::Validation {
+            field: "reporting_tree.stale_report_timeout_secs".to_string(),
+            context: "node config".to_string(),
+            reason,
+        })
+    }
+
+    /// The ports this node serves on from its config: the cluster ports, the
+    /// registry, and ingress and DNS when they run. Port 0 (ask the OS) is
+    /// left out. Bun keeps the host-port allocator off these, together with
+    /// the API port from `--listen`, so a workload is never published on one.
+    pub fn service_ports(&self) -> Vec<u16> {
+        let mut ports = vec![
+            self.cluster.gossip_port,
+            self.cluster.raft_port,
+            self.cluster.reporting_port,
+            self.images.registry_port,
+        ];
+        if self.ingress.enabled {
+            ports.extend([self.ingress.http_port, self.ingress.https_port]);
+        }
+        if self.dns.enabled
+            && let Ok(listen) = self.dns.listen.parse::<std::net::SocketAddr>()
+        {
+            ports.push(listen.port());
+        }
+        ports.retain(|port| *port != 0);
+        ports
     }
 }
 
@@ -1303,6 +1478,103 @@ mod tests {
     }
 
     #[test]
+    fn node_config_rejects_a_zero_report_interval() {
+        // `tokio::time::interval` panics on a zero period, which would take
+        // the report worker down as soon as it starts.
+        let mut node = crate::config::NodeConfig::default();
+        node.reporting_tree.report_interval_secs = 0;
+        let err = node.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, .. }
+                if field == "reporting_tree.report_interval_secs"),
+            "expected a report-interval validation error, got {err:?}"
+        );
+    }
+
+    fn stale_report_timeout_error(stale: u64, interval: u64) -> Option<ConfigError> {
+        let mut node = crate::config::NodeConfig::default();
+        node.reporting_tree.report_interval_secs = interval;
+        node.reporting_tree.stale_report_timeout_secs = stale;
+        node.validate().err()
+    }
+
+    fn is_stale_timeout_error(error: Option<ConfigError>) -> bool {
+        matches!(error, Some(ConfigError::Validation { ref field, .. })
+            if field == "reporting_tree.stale_report_timeout_secs")
+    }
+
+    #[test]
+    fn node_config_rejects_a_zero_stale_report_timeout() {
+        assert!(is_stale_timeout_error(stale_report_timeout_error(0, 5)));
+    }
+
+    #[test]
+    fn stale_report_timeout_must_be_longer_than_the_report_interval() {
+        // A timeout at or below the interval marks every node stale between
+        // two of its own reports.
+        assert!(is_stale_timeout_error(stale_report_timeout_error(5, 5)));
+        assert!(is_stale_timeout_error(stale_report_timeout_error(4, 5)));
+        assert!(stale_report_timeout_error(6, 5).is_none());
+    }
+
+    #[test]
+    fn stale_report_timeout_is_capped() {
+        // The report worker multiplies the timeout into a `Duration`, which
+        // panics on overflow near u64::MAX seconds.
+        let max = crate::config::node::MAX_STALE_REPORT_TIMEOUT_SECS;
+        assert!(is_stale_timeout_error(stale_report_timeout_error(
+            u64::MAX,
+            5
+        )));
+        assert!(is_stale_timeout_error(stale_report_timeout_error(
+            max + 1,
+            5
+        )));
+        assert!(stale_report_timeout_error(max, 5).is_none());
+    }
+
+    fn refused_field(node: &crate::config::NodeConfig) -> Option<String> {
+        match node.validate() {
+            Err(ConfigError::Validation { field, .. }) => Some(field),
+            Err(other) => panic!("unexpected error {other:?}"),
+            Ok(()) => None,
+        }
+    }
+
+    #[test]
+    fn node_config_rejects_a_zero_stale_node_grace() {
+        // Zero would move a live node's replicas the moment its reports go
+        // stale.
+        let mut node = crate::config::NodeConfig::default();
+        node.reporting_tree.stale_node_grace_secs = 0;
+        assert_eq!(
+            refused_field(&node).as_deref(),
+            Some("reporting_tree.stale_node_grace_secs")
+        );
+    }
+
+    #[test]
+    fn smoker_durations_must_satisfy_zero_below_default_below_max_below_a_day() {
+        let smoker = |default, max| {
+            let mut node = crate::config::NodeConfig::default();
+            node.smoker.default_duration_secs = default;
+            node.smoker.max_duration_secs = max;
+            refused_field(&node)
+        };
+        let default_field = Some("smoker.default_duration_secs".to_string());
+        let max_field = Some("smoker.max_duration_secs".to_string());
+        // A default above the maximum refuses every fault given no duration.
+        assert_eq!(smoker(600, 300), default_field);
+        assert_eq!(smoker(0, 3600), default_field);
+        // Zero refuses every timed fault.
+        assert_eq!(smoker(0, 0), default_field);
+        // Over a day, FaultRule::new would silently cut it to 24 h.
+        assert_eq!(smoker(600, 86_401), max_field);
+        assert_eq!(smoker(300, 300), None);
+        assert_eq!(smoker(1, 86_400), None);
+    }
+
+    #[test]
     fn node_config_rejects_a_zero_stop_confirmation_timeout() {
         let mut node = crate::config::NodeConfig::default();
         node.runtime.stop_confirmation_timeout_secs = 0;
@@ -1441,6 +1713,22 @@ mod tests {
         );
     }
 
+    /// No runtime can start a `command` with no image, exec or script, so
+    /// lint refuses it instead of every launch failing.
+    #[test]
+    fn an_app_with_only_a_command_is_refused() {
+        let app: AppSpec = toml::from_str("command = [\"/bin/true\"]").unwrap();
+        let config = config_with_app("x", app);
+        let error = config.validate().unwrap_err();
+        assert!(
+            matches!(&error, ConfigError::Validation { field, .. } if field == "command"),
+            "{error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("image"), "{message}");
+        assert!(message.contains("exec"), "{message}");
+    }
+
     #[test]
     fn validate_config_file_both_content_and_source_rejected() {
         let mut app = minimal_app();
@@ -1480,6 +1768,40 @@ mod tests {
             config.validate(),
             Err(ConfigError::InvalidPort { .. })
         ));
+    }
+
+    #[test]
+    fn a_container_app_whose_memory_limit_is_below_the_runc_floor_is_refused() {
+        let app: AppSpec = toml::from_str("image = \"test:v1\"\nmemory = \"4Mi-8Mi\"").unwrap();
+        let err = config_with_app("tiny", app).validate().unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("8Mi"), "{message}");
+        assert!(message.contains("16Mi"), "{message}");
+    }
+
+    #[test]
+    fn a_container_app_may_request_below_the_runc_floor_if_its_limit_reaches_it() {
+        let app: AppSpec = toml::from_str("image = \"test:v1\"\nmemory = \"1Mi-16Mi\"").unwrap();
+        config_with_app("small", app).validate().unwrap();
+    }
+
+    #[test]
+    fn a_sidecar_whose_memory_limit_is_below_the_runc_floor_is_refused() {
+        let app: AppSpec =
+            toml::from_str("image = \"test:v1\"\n[[sidecar]]\nname = \"proxy\"\nmemory = \"8Mi\"")
+                .unwrap();
+        let message = config_with_app("web", app)
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("sidecar"), "{message}");
+        assert!(message.contains("16Mi"), "{message}");
+    }
+
+    #[test]
+    fn a_host_app_has_no_runc_memory_floor() {
+        let app: AppSpec = toml::from_str("script = \"sleep 1\"\nmemory = \"1Mi\"").unwrap();
+        config_with_app("host", app).validate().unwrap();
     }
 
     #[test]
@@ -1640,15 +1962,6 @@ mod tests {
         .unwrap();
         assert_eq!(field, "sidecar");
         assert!(reason.contains("two sidecars"), "{reason}");
-    }
-
-    #[test]
-    fn a_sidecar_needs_an_image_of_its_own_or_the_apps() {
-        let (_, reason) = sidecar_refusal(
-            "command = [\"/app/run\"]\n[[sidecar]]\nname = \"p\"\ncommand = [\"x\"]\n",
-        )
-        .unwrap();
-        assert!(reason.contains("no image"), "{reason}");
     }
 
     #[test]
@@ -1907,6 +2220,25 @@ mod tests {
     }
 
     #[test]
+    fn service_ports_are_the_ports_the_node_listens_on() {
+        let mut nc = NodeConfig::default();
+        nc.cluster.gossip_port = 29443;
+        nc.images.registry_port = 25050;
+        nc.ingress.http_port = 28080;
+        nc.ingress.https_port = 0;
+        nc.dns.listen = "0.0.0.0:20053".into();
+        // Ingress and DNS count only when those listeners run.
+        assert_eq!(nc.service_ports(), vec![29443, 9444, 9445, 25050]);
+        nc.ingress.enabled = true;
+        nc.dns.enabled = true;
+        // Port 0 asks the OS for a port and names none.
+        assert_eq!(
+            nc.service_ports(),
+            vec![29443, 9444, 9445, 25050, 28080, 20053]
+        );
+    }
+
+    #[test]
     fn validate_node_config_invalid_port_range_rejected() {
         let mut nc = NodeConfig::default();
         nc.network.port_range.start = 60000;
@@ -1955,6 +2287,24 @@ mod tests {
                 .to_string()
                 .contains("security.leaf_lifetime_override_secs")
         );
+    }
+
+    #[test]
+    fn bootstrap_peers_accept_addresses_and_networks_and_refuse_the_rest() {
+        let config = NodeConfig::parse(
+            "[security]\nbootstrap_peers = [\"192.168.1.51\", \"192.168.1.0/24\", \"fd00::/64\"]\n",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        for bad in ["0.0.0.0/0", "192.168.1.51/24", "not-an-address"] {
+            let mut config = NodeConfig::default();
+            config.security.bootstrap_peers = vec![bad.to_string()];
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("security.bootstrap_peers"),
+                "{bad}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -2789,6 +3139,17 @@ exec = "/usr/bin/python3""#,
         assert_app_refused(&format!("{health}\ntimeout = 11"), "timeout");
         // Seconds are whole, so a 1 s interval must allow a 1 s timeout.
         validate_app_toml(&format!("{health}\ninterval = 1\ntimeout = 1")).unwrap();
+    }
+
+    #[test]
+    fn health_delays_longer_than_a_day_are_refused() {
+        let health = "image = \"web:v1\"\nport = 8080\n[app.web.health]\npath = \"/healthz\"";
+        for field in ["interval", "initial_delay"] {
+            assert_app_refused(&format!("{health}\n{field} = 9223372036854775807"), field);
+            assert_app_refused(&format!("{health}\n{field} = 86401"), field);
+            validate_app_toml(&format!("{health}\n{field} = 86400"))
+                .unwrap_or_else(|error| panic!("{field} = 86400: {error}"));
+        }
     }
 
     #[test]

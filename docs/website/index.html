@@ -28,6 +28,7 @@
         <a href="#tour">Try it</a>
         <a href="#job-throughput">Batch jobs</a>
         <a href="#release-testing">Testing</a>
+        <a href="#netboot">Bare metal</a>
         <a href="#docs">Read the docs</a>
         <a href="#compare">Compare</a>
         <a href="#start">Build it</a>
@@ -38,7 +39,7 @@
     <main id="main">
       <section id="intro" class="intro" aria-labelledby="title">
         <div class="intro-copy">
-          <div class="eyebrow">RUST · APACHE 2.0 · 0.2.8</div>
+          <div class="eyebrow">RUST · APACHE 2.0 · 0.3.2</div>
           <h1 id="title">The container platform,<br>served ready.</h1>
           <p class="headline-agents">Built for humans and their agents.</p>
           <p class="lede">Kubernetes hands you the ingredients. Reliaburger hands you the burger:
@@ -96,17 +97,17 @@
             Popular code gets searched hardest, by everyone. What matters now is how fast a fix
             reaches every node, whether anyone can check the code, and how much of it there is.</p>
           <div class="throughput-comparison" role="region" aria-label="Where each part of the answer stands" tabindex="0">
-          <table><caption>Reliaburger’s answer, and where each part stands on 10 November 2026</caption>
+          <table><caption>Reliaburger’s answer, and where each part stands on 20 November 2026</caption>
             <thead><tr><th scope="col">The answer</th><th scope="col">What exists</th><th scope="col">What doesn’t yet</th></tr></thead>
             <tbody>
               <tr><th scope="row">One thing to upgrade</th><td>Not Kubernetes, etcd, a CNI, an
                 ingress controller, cert-manager, Prometheus, Grafana, a log stack, Argo CD and a
                 registry, each on its own release cycle, but one binary. <code>relish upgrade start</code> rolls it
-                across the cluster, signed, with automatic rollback, and we shipped sixteen
-                releases in <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md#releases-after-010">45 days</a>.</td>
-                <td>The OS patches separately until 0.3.0’s netbooted
-                <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md#releases-after-010">appliance image</a>, which is planned,
-                not shipped. A person starts every upgrade, and before 1.0 a format change needs a
+                across the cluster, signed, with automatic rollback, and we shipped seventeen
+                releases in <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md#releases-after-010">53 days</a>. On our
+                <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/17_appliance.md">appliance OS</a>, new in 0.3.0,
+                <code>relish os</code> rolls the OS the same way.</td>
+                <td>On any other Linux the OS patches separately. A person starts every upgrade, and before 1.0 a format change needs a
                 <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#compatibility-before-100">fresh cluster</a>.</td></tr>
               <tr><th scope="row">Continuously scrutinised</th><td>Apache 2.0, and every
                 release <code>relish</code> carries its own source. Claude Code found and patched a
@@ -456,7 +457,7 @@
           <span class="section-number" aria-hidden="true">03 /</span>
           <h2 id="install-title">Install it <a class="permalink" href="#install" aria-label="Link to the install section">#</a></h2>
         </div>
-        <!-- Two ways in, as radio buttons styled as tabs so they work without
+        <!-- Four ways in, as radio buttons styled as tabs so they work without
              a script (#1579). The first panel stays first in the markup:
              tests/suite/website.rs checks the page leads with its install line. -->
         <div class="install-tabs" role="radiogroup" aria-label="How to install">
@@ -466,6 +467,8 @@
         <label class="install-tab" for="install-agent">With your agent</label>
         <input class="install-tab-input" type="radio" name="install-way" id="install-homebrew">
         <label class="install-tab" for="install-homebrew">Homebrew</label>
+        <input class="install-tab-input" type="radio" name="install-way" id="install-hardware">
+        <label class="install-tab" for="install-hardware">Real hardware</label>
         <div class="install-grid install-panel install-panel-tyres">
           <div class="terminal">
             <div class="terminal-heading">INSTALL <span>sh</span></div>
@@ -486,7 +489,7 @@
               free memory and 15 GiB of disk. No Rust, no checkout.</p>
             <p class="install-links"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md">One node, CLI only, cleanup</a>
               · <a href="install.sh">Read the bootstrap script</a>
-              · <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.2.8">Release notes <span aria-hidden="true">↗</span></a></p>
+              · <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.3.2">Release notes <span aria-hidden="true">↗</span></a></p>
           </div>
         </div>
         <div class="install-grid install-panel install-panel-agent">
@@ -526,6 +529,29 @@ relish setup --quickstart</code></pre>
               · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md">One node, CLI only, cleanup</a></p>
           </div>
         </div>
+        <div class="install-grid install-panel install-panel-hardware">
+          <div class="terminal">
+            <div class="terminal-heading">NETBOOT <span>sh</span></div>
+            <pre><code data-netboot>relish image download --dir os</code>
+<code data-netboot>sudo relish netboot os</code>
+<code data-netboot>relish machines</code>
+<code data-netboot>relish machines claim ~/lab --create --name lab --operator 192.168.1.10 192.168.1.51 192.168.1.52 192.168.1.53</code></pre>
+          </div>
+          <div class="install-copy">
+            <p>New in 0.3.0. Skip the laptop VMs and use real machines: your
+              laptop serves the OS over the network, each machine installs itself in under a minute, and one
+              command makes them a cluster. Leave <code>relish netboot</code> running, power the
+              machines on, and claim them from a second terminal once each screen shows a claim
+              key. No USB sticks and no distro.</p>
+            <p>You’ll need two or more x86_64 or arm64 machines with UEFI network boot, a
+              supported wired network card, at least 2 GiB of RAM and an 8 GB disk, all on the
+              same LAN, plus a laptop or spare box to serve them. Turn Secure Boot off.
+              <strong>The installer erases the largest built-in disk.</strong> A disk that
+              isn’t blank waits for your yes first.</p>
+            <p class="install-links"><a href="#netboot">Watch it, and what hardware works</a>
+              · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/17_appliance.md">The appliance chapter of the manual</a></p>
+          </div>
+        </div>
         </div>
       </section>
 
@@ -534,22 +560,22 @@ relish setup --quickstart</code></pre>
       <aside class="status status-note" aria-label="Project status">
         <strong>Where it stands</strong>
         <p>Good enough for home labs and dev clusters. Not for production until 1.0.0,
-          expected in January 2027. Until then, an upgrade can mean starting a fresh cluster.
+          which has no date yet. Until then, an upgrade can mean starting a fresh cluster.
           <a href="features">What’s ready, feature by feature</a>.</p>
         <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md">Roadmap <span aria-hidden="true">↗</span></a>
       </aside>
 
       <aside class="status" aria-label="Release status: what the installer fetches">
-        <strong>0.2.8: Agents you can trust, built faster</strong>
-        <p>What that line installs, released on 12 November 2026. An AI agent proposes a
-          change and a person or a policy approves it, with the blast radius and the undo
-          shown first; leases keep agents and people off each other’s apps;
-          <code>relish timeline</code> says what changed and why; <code>relish verify</code>
-          checks every node runs the published release; and <code>relish status</code> fits
-          the whole cluster on one screen. 0.2.8 changes the cluster formats, so a 0.2.7
-          cluster starts afresh. <code>relish agent</code> and <code>relish mcp</code> arrived
-          in 0.2.7.</p>
-        <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.2.8">Release notes <span aria-hidden="true">↗</span></a>
+        <strong>0.3.2: Wyse lab fixes</strong>
+        <p>What that line installs, released on 23 November 2026. Fixes from the Wyse 3040
+          lab: <code>allow_from</code> works across nodes, containers on a node that publishes
+          no port reach other nodes, and <code>relish netboot --stream-logs</code> shows an
+          appliance’s boot logs as it installs. <code>relish tui</code> gains a node page, and
+          an app scales from the terminal UI or <code>relish scale</code>. It moves the wire
+          protocol to 61, so a 0.3.1 cluster starts afresh. Bare metal arrived in 0.3.0: our
+          own appliance OS, installed over the network by <code>relish netboot</code>, and
+          signed OS updates that <code>relish os</code> rolls one node at a time.</p>
+        <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.3.2">Release notes <span aria-hidden="true">↗</span></a>
       </aside>
 
       <section id="tour" class="section" aria-labelledby="tour-title">
@@ -576,7 +602,7 @@ relish setup --quickstart</code></pre>
               <span class="recording-chapters" role="group" aria-label="Tour recording chapters" hidden></span>
               <span>The whole tour on a real laptop cluster, run by
                 <a href="https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/tour.sh">scripts/demo/tour.sh</a>
-                against the published 0.2.8 install.
+                against the published 0.3.2 install.
                 Setup plays four times faster and idle time is cut to two seconds; every wait
                 says how long it really took. Jump to a step with the buttons above, or the marks on the progress bar.</span>
               <span class="recording-speed" role="group" aria-label="Playback speed" hidden>speed
@@ -686,7 +712,7 @@ relish setup --quickstart</code></pre>
                   in the audit log, with who asked, who decided and the agent’s reason.</p>
               </li>
               <li>
-                <pre><code data-tour>curl -fsSLO https://raw.githubusercontent.com/reliaburger/reliaburger/v0.2.8/examples/policies/platform.toml</code>
+                <pre><code data-tour>curl -fsSLO https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.2/examples/policies/platform.toml</code>
 <code data-tour>relish policy test -f platform.toml -f burger/burger.toml</code></pre>
                 <p>House rules, without forking anything. <code>platform.toml</code> is
                   the release’s example of the four policies platform teams ask for most, each a line or
@@ -746,10 +772,13 @@ relish setup --quickstart</code></pre>
                   and names the node that didn’t answer.</p>
               </li>
               <li>
-                <pre><code data-tour>relish wtf</code></pre>
-                <p>One screen on what’s wrong and what to do about it. Here: a council member is
-                  missing, and one more failure would lose quorum. It also checks that every node
-                  runs the same build. It’s what you’d run first in a real incident.</p>
+                <pre><code data-tour>relish wtf</code>
+<code data-tour>relish wtf --short</code></pre>
+                <p>One screen on what’s wrong and what to do about it, a row per check. Here: a
+                  council member is missing, and one more failure would lose quorum. It also checks
+                  that every node runs the same build. It’s what you’d run first in a real incident.
+                  <code>--short</code> keeps only the counts and what isn’t OK, and
+                  <code>--explain</code> says what each check tests.</p>
               </li>
             </ol>
             <p>Finished? Remove the cluster, then Relish itself:</p>
@@ -797,28 +826,28 @@ relish setup --quickstart</code></pre>
             drops at hours 6, 12, 18 and 24 are the run’s own diagnostic: it asked the allocator
             to hand its free memory back.</figcaption>
         </figure>
-        <p>A million in one go? 0.2.8’s 8-hour release soak ran 64 arrays of 1,048,576
-          tasks each while it broke things: the median took 145 seconds, the slowest 411.
-          <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-job-qualification.md">Soak record</a> ·
+        <p>A million in one go? 0.3.2’s 8-hour release soak ran 64 arrays of 1,048,576
+          tasks each while it broke things: the median took 117 seconds, the slowest 831.
+          <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-23-v0.3.2-jobs-final.md">Soak record</a> ·
           <a href="features#jobs">What’s ready in jobs</a></p>
         <p class="tour-note">What does each kind of isolation cost? Here’s the same command, run
           four ways on the same VM with the same concurrency.</p>
-        <figure id="throughput-recording" class="recording" data-cast="./assets/job-throughput.cast" data-poster="npt:246.1">
+        <figure id="throughput-recording" class="recording" data-cast="./assets/job-throughput.cast" data-poster="npt:246.644">
           <div class="recording-screen"></div>
           <noscript><p class="recording-fallback">The demonstration plays with JavaScript.
             <a href="./assets/job-throughput.cast">Download the recording</a> and play it
             with <code>asciinema play job-throughput.cast</code>.</p></noscript>
           <figcaption>
-            <span>Recorded on 0.2.8, the published binaries, in one 4-vCPU, 8 GiB VM on a Mac Studio
-              (12 November 2026). Four real 60-second windows: 1,283,276 VM baseline exits, then
-              1,082 fresh containers, 577,000 shared containers and 786,000 host jobs accepted.
+            <span>Recorded on 0.3.2, the published binaries, in one 4-vCPU, 8 GiB VM on a Mac Studio
+              (23 November 2026). Four real 60-second windows: 1,000,747 VM baseline exits, then
+              639 fresh containers, 468,000 shared containers and 771,000 host jobs accepted.
               Chapter jumps and playback speed change only your view; preparation and cleanup
               stay visible.</span>
             <span class="recording-chapters" role="group" aria-label="Throughput recording chapters" hidden>
-              <button type="button" data-start="0.000247">VM baseline</button>
-              <button type="button" data-start="60.006793">Fresh containers</button>
-              <button type="button" data-start="122.06">Shared containers</button>
-              <button type="button" data-start="184.580573">Host jobs</button></span>
+              <button type="button" data-start="0.000182">VM baseline</button>
+              <button type="button" data-start="60.007081">Fresh containers</button>
+              <button type="button" data-start="122.548323">Shared containers</button>
+              <button type="button" data-start="184.60196">Host jobs</button></span>
             <span class="recording-speed" role="group" aria-label="Throughput playback speed" hidden>speed
               <button type="button" data-speed="1" aria-pressed="true">1×</button>
               <button type="button" data-speed="4" aria-pressed="false">4×</button>
@@ -970,80 +999,83 @@ relish setup --quickstart</code></pre>
           drains, a council history that isn't linearizable, or job tasks slower than
           256 ms to start at the 99th percentile. A failure gets a root cause before anything else happens. A product fix
           means a new candidate, and every soak starts again.</p>
-        <p><strong>The latest: 0.2.8, 12 November 2026.</strong> Three candidates in three
-          days, on the full gate because it changes the cluster formats and the agent loop,
-          on the Mac Studio. The first two each failed a soak on a real bug: Bun crash-looped
-          after a power cut that hit it mid-deploy, and two agent turns waited on the disk.
-          The third passed everything clean, and ships with no known issue the gate found.
+        <p><strong>The latest: 0.3.2, 23 November 2026.</strong> One candidate in one day,
+          on the full gate because it changes the wire protocol and the agent loop, on the Mac
+          Studio. It passed everything, clean and at the first attempt, with no known issue
+          accepted at the gate: <code>relish wtf</code> now counts a crash loop per instance, and
+          chaos pause and drop settled in 23 and 70 seconds. The earlier registry stall
+          didn’t come back, but its cause isn’t proven, so it stays a known issue.
           <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/release-log.md">The release log</a>
           has every release’s story.</p>
         <details class="tour-commands" id="release-testing-results">
-          <summary>Show 0.2.8's results <span class="tour-commands-note">headline numbers and charts, each with its record</span></summary>
+          <summary>Show 0.3.2's results <span class="tour-commands-note">headline numbers and charts, each with its record</span></summary>
           <ul>
-            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-job-qualification.md">8-hour job soak</a>:
-              every fault and upgrade walk settled, no data lost, every job drained, agent
-              memory within target (the worst node steady at 208 MiB against 384), no agent
-              turn over budget, a council history linearizable over 213,407 operations, and a
-              quiet tail with every leak check armed. 9,311 accepted jobs a second against the
-              1,390 target, job tasks started within 32 ms at the 99th percentile, over 213
-              million of them, and a 1,048,576-task array took 145 s at the median. Clean.</li>
-            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-job-qualification-fast.md">One-hour job soak</a>:
-              8,630 accepted jobs a second. Clean.</li>
-            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-sustained-v02-fast.md">One-hour app soak</a>:
-              every fault kind, special and upgrade walk on the compressed schedule. Clean, and
-              so was <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-sustained-v02-fast-seed-3139726783.md">a
-              second run</a> on the seed that found the power-cut bug.</li>
-            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-power-cut-reboot.md">Power cuts and reboots</a>:
+            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-23-v0.3.2-jobs-final.md">8-hour job soak</a>:
+              every fault and upgrade walk settled, no data lost, every job drained, agent memory
+              within target (the worst node steady at 235 MiB against 384), a council history
+              linearizable over 202,245 operations, and a quiet tail with every leak check armed.
+              9,650 accepted jobs a second against the 1,390 target, job tasks started within
+              64 ms at the 99th percentile, over 240 million of them, and a 1,048,576-task array
+              took 117 s at the median. Clean.</li>
+            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-23-v0.3.2-jobs-fast.md">One-hour job soak</a>:
+              9,111 accepted jobs a second. Clean.</li>
+            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-23-v0.3.2-sustained-v02-fast.md">One-hour app soak</a>:
+              every fault kind, special and upgrade walk on the compressed schedule. Clean.</li>
+            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-23-power-cut-reboot.md">Power cuts and reboots</a>:
               25 of 25 in each of five lanes.</li>
-            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-staged-install-apple-silicon.md">Staged installs</a>:
-              <code>curl | sh</code> to a ready cluster in 125 s, then
-              <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-staged-install-apple-silicon-2.md">118 s</a>
-              from cold caches again.</li>
-            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-release-closure.md">Every gate and every candidate</a>:
-              three candidates, what the first two found, and what fixed it.</li>
+            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-23-v0.3.2-staged-install-apple-silicon.md">Staged installs</a>:
+              <code>curl | sh</code> to a ready cluster in 134 s, with one VM that didn’t boot
+              restarted, then
+              <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-23-v0.3.2-staged-install-apple-silicon-2.md">66 s</a>
+              from cold caches again, and in
+              <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-23-v0.3.2-release-staged-install-apple-silicon.md">87 s</a> and
+              <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-23-v0.3.2-release-staged-install-apple-silicon-2.md">140 s</a>
+              on the release build itself, where two VMs were restarted.</li>
+            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-23-v0.3.2-release-closure.md">Every gate and every candidate</a>:
+              one candidate, clean.</li>
           </ul>
           <p class="soak-charts-note">Time runs from the start of each soak. The marks under a
             chart are its faults and upgrade walks, and the dashed lines its targets. Open a
             chart to see it full size, with every mark named when you point at it.</p>
           <div class="soak-charts" role="group" aria-labelledby="soak-charts-jobs">
-            <h3 id="soak-charts-jobs"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-job-qualification.md">The 8-hour job soak</a></h3>
+            <h3 id="soak-charts-jobs"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-23-v0.3.2-jobs-final.md">The 8-hour job soak</a></h3>
             <figure class="soak-chart">
-              <a href="assets/soak/2026-11-11-v0.2.8-job-qualification-charts/jobs.svg"><img src="assets/soak/2026-11-11-v0.2.8-job-qualification-charts/jobs.svg" width="720" height="272" loading="lazy"
+              <a href="assets/soak/2026-11-23-v0.3.2-jobs-final-charts/jobs.svg"><img src="assets/soak/2026-11-23-v0.3.2-jobs-final-charts/jobs.svg" width="720" height="272" loading="lazy"
                 alt="Accepted jobs a second in 10-minute windows over the 8-hour job soak, against the target rate, with the faults marked along the time axis"></a>
               <figcaption>Accepted jobs a second, in 10-minute windows, against the target.</figcaption>
             </figure>
             <figure class="soak-chart">
-              <a href="assets/soak/2026-11-11-v0.2.8-job-qualification-charts/rss.svg"><img src="assets/soak/2026-11-11-v0.2.8-job-qualification-charts/rss.svg" width="720" height="272" loading="lazy"
+              <a href="assets/soak/2026-11-23-v0.3.2-jobs-final-charts/rss.svg"><img src="assets/soak/2026-11-23-v0.3.2-jobs-final-charts/rss.svg" width="720" height="272" loading="lazy"
                 alt="Bun resident memory per node over the 8-hour job soak, against the 512 MiB target for node 1 and 384 MiB for the others, with the faults marked along the time axis"></a>
               <figcaption>Bun memory per node, with the 512 and 384 MiB targets.</figcaption>
             </figure>
             <figure class="soak-chart">
-              <a href="assets/soak/2026-11-11-v0.2.8-job-qualification-charts/fds.svg"><img src="assets/soak/2026-11-11-v0.2.8-job-qualification-charts/fds.svg" width="720" height="272" loading="lazy"
+              <a href="assets/soak/2026-11-23-v0.3.2-jobs-final-charts/fds.svg"><img src="assets/soak/2026-11-23-v0.3.2-jobs-final-charts/fds.svg" width="720" height="272" loading="lazy"
                 alt="Open file descriptors per node over the 8-hour job soak, with the faults marked along the time axis"></a>
               <figcaption>Open file descriptors per node.</figcaption>
             </figure>
             <figure class="soak-chart">
-              <a href="assets/soak/2026-11-11-v0.2.8-job-qualification-charts/cpu.svg"><img src="assets/soak/2026-11-11-v0.2.8-job-qualification-charts/cpu.svg" width="720" height="272" loading="lazy"
+              <a href="assets/soak/2026-11-23-v0.3.2-jobs-final-charts/cpu.svg"><img src="assets/soak/2026-11-23-v0.3.2-jobs-final-charts/cpu.svg" width="720" height="272" loading="lazy"
                 alt="Bun CPU per node over the 8-hour job soak, as a percentage of one core, with the faults marked along the time axis"></a>
               <figcaption>Bun CPU per node, as a percentage of one core.</figcaption>
             </figure>
           </div>
           <div class="soak-charts" role="group" aria-labelledby="soak-charts-v02">
-            <h3 id="soak-charts-v02"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-sustained-v02-fast.md">The one-hour app soak</a></h3>
+            <h3 id="soak-charts-v02"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-23-v0.3.2-sustained-v02-fast.md">The one-hour app soak</a></h3>
             <p class="soak-charts-note">The gate has no separate 8-hour app soak: the job soak
               above runs the same apps and faults. These are from the compressed one.</p>
             <figure class="soak-chart">
-              <a href="assets/soak/2026-11-11-v0.2.8-sustained-v02-fast-charts/rss.svg"><img src="assets/soak/2026-11-11-v0.2.8-sustained-v02-fast-charts/rss.svg" width="720" height="272" loading="lazy"
+              <a href="assets/soak/2026-11-23-v0.3.2-sustained-v02-fast-charts/rss.svg"><img src="assets/soak/2026-11-23-v0.3.2-sustained-v02-fast-charts/rss.svg" width="720" height="272" loading="lazy"
                 alt="Bun resident memory per node over the one-hour app soak, against the 512 MiB target for node 1 and 384 MiB for the others, with the faults marked along the time axis"></a>
               <figcaption>Bun memory per node, with the 512 and 384 MiB targets.</figcaption>
             </figure>
             <figure class="soak-chart">
-              <a href="assets/soak/2026-11-11-v0.2.8-sustained-v02-fast-charts/fds.svg"><img src="assets/soak/2026-11-11-v0.2.8-sustained-v02-fast-charts/fds.svg" width="720" height="272" loading="lazy"
+              <a href="assets/soak/2026-11-23-v0.3.2-sustained-v02-fast-charts/fds.svg"><img src="assets/soak/2026-11-23-v0.3.2-sustained-v02-fast-charts/fds.svg" width="720" height="272" loading="lazy"
                 alt="Open file descriptors per node over the one-hour app soak, with the faults marked along the time axis"></a>
               <figcaption>Open file descriptors per node.</figcaption>
             </figure>
             <figure class="soak-chart">
-              <a href="assets/soak/2026-11-11-v0.2.8-sustained-v02-fast-charts/cpu.svg"><img src="assets/soak/2026-11-11-v0.2.8-sustained-v02-fast-charts/cpu.svg" width="720" height="272" loading="lazy"
+              <a href="assets/soak/2026-11-23-v0.3.2-sustained-v02-fast-charts/cpu.svg"><img src="assets/soak/2026-11-23-v0.3.2-sustained-v02-fast-charts/cpu.svg" width="720" height="272" loading="lazy"
                 alt="Bun CPU per node over the one-hour app soak, as a percentage of one core, with the faults marked along the time axis"></a>
               <figcaption>Bun CPU per node, as a percentage of one core.</figcaption>
             </figure>
@@ -1059,13 +1091,92 @@ relish setup --quickstart</code></pre>
         </div>
       </section>
 
+      <section id="netboot" class="section" aria-labelledby="netboot-title">
+        <!-- The netboot commands carry data-netboot. tests/suite/website.rs parses each one
+             with the real relish CLI, as it does the tour's. -->
+        <div class="section-heading">
+          <span class="section-number" aria-hidden="true">07 /</span>
+          <h2 id="netboot-title">Netboot real machines <a class="permalink" href="#netboot" aria-label="Link to the netboot section">#</a></h2>
+        </div>
+        <div class="tour">
+          <p class="tour-note">Old mini PCs, thin clients, anything x86_64 or arm64 with UEFI
+            network boot: plug them into your switch and power them on. Your laptop serves
+            the OS, they install themselves in under a minute, and one command makes them a
+            cluster. No USB sticks, no distro, nothing to configure on each machine. Your
+            router keeps handing out the addresses; relish only answers the boot part.</p>
+          <p class="tour-note">What works: we test on the Dell Wyse 3040, and 0.3.0’s exit
+            test takes three of them from power-on to a cluster. The installer drives
+            Realtek RTL8111, RTL8168 and RTL8125, Intel I219, I225, I226, I210 and I350 and
+            Broadcom tg3 network cards, plus USB Ethernet adapters. Secure Boot must be off.
+            Raspberry Pis aren’t supported yet; they’re
+            <a href="https://github.com/reliaburger/reliaburger/issues/1971">planned</a>.</p>
+          <figure id="netboot-recording" class="recording" data-cast="./assets/netboot.cast" data-poster="npt:118">
+            <div class="recording-screen"></div>
+            <noscript><p class="recording-fallback">The recording plays with JavaScript. Without it,
+              <a href="./assets/netboot.cast">download the recording</a> and play it in a terminal with
+              <code>asciinema play netboot.cast</code>, or follow the steps below.</p></noscript>
+            <figcaption>
+              <span>Three machines with blank disks network-boot into Reliaburger and become one
+                cluster. They’re QEMU VMs with UEFI firmware on a virtual switch, run by
+                <a href="https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/netboot.sh">scripts/demo/netboot.sh</a>
+                in CI, serving a lab build of the OS signed with that run’s own key.
+                Idle time is cut to two seconds; every wait says how long it really took.</span>
+              <span class="recording-speed" role="group" aria-label="Netboot playback speed" hidden>speed
+                <button type="button" data-speed="1" aria-pressed="true">1×</button>
+                <button type="button" data-speed="2" aria-pressed="false">2×</button>
+                <button type="button" data-speed="4" aria-pressed="false">4×</button></span>
+            </figcaption>
+          </figure>
+          <details class="tour-commands" id="netboot-commands">
+            <summary>Show the commands <span class="tour-commands-note">from blank disks to a cluster</span></summary>
+            <ol class="tour-steps">
+              <li>
+                <p>In each machine’s firmware setup, turn on UEFI network boot and turn Secure
+                  Boot off. A blank disk falls through to the network by itself.</p>
+              </li>
+              <li>
+                <pre><code data-netboot>relish image download --dir os</code></pre>
+                <p>Fetches the newest OS release for every architecture into <code>os/</code>,
+                  checked against the release key <code>relish</code> carries.</p>
+              </li>
+              <li>
+                <pre><code data-netboot>sudo relish netboot os --mac d8:9e:f3:12:34:56 --mac d8:9e:f3:12:34:57 --mac d8:9e:f3:12:34:58</code></pre>
+                <p>Serves the boot part, for the machines you list and no others: iPXE over
+                  TFTP, then the installer and the image over HTTP. Leave it running and power
+                  the machines on. Each one installs, reboots into Reliaburger and shows a claim
+                  key on its screen. A disk that isn’t blank waits for your yes here first.</p>
+              </li>
+              <li>
+                <pre><code data-netboot>relish machines</code></pre>
+                <p>Lists the machines on your network that are waiting to be claimed: address,
+                  MAC and architecture.</p>
+              </li>
+              <li>
+                <pre><code data-netboot>relish machines claim ~/lab --create --name lab --operator 192.168.1.10 d8:9e:f3:12:34:56 d8:9e:f3:12:34:57 d8:9e:f3:12:34:58</code></pre>
+                <p>Makes them one cluster. For each machine, it asks whether the claim key it got
+                  is the one on that machine’s screen, then asks you to back up the cluster’s
+                  master key. <code>--operator</code> is your laptop’s address.</p>
+              </li>
+              <li>
+                <pre><code data-netboot>relish nodes</code></pre>
+                <p>Three nodes alive. From here it’s the same cluster as the tour’s: deploy with
+                  <code>relish apply</code>, and update the OS with <code>relish os upgrade</code>,
+                  one node at a time.</p>
+              </li>
+            </ol>
+            <p class="tour-note">Serving from a Mac, an isolated switch, firmware quirks:
+              <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/17_appliance.md">the appliance chapter of the manual</a>.</p>
+          </details>
+        </div>
+      </section>
+
       <!-- What an agent does on a cluster, from 0.2.7. The recording slot stays empty
            until a real session is recorded (#1579): no mock-up. Every command here
            carries data-agent-command, and tests/suite/website.rs parses each with the
            real CLI. -->
       <section id="debug" class="section" aria-labelledby="debug-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">07 /</span>
+          <span class="section-number" aria-hidden="true">08 /</span>
           <h2 id="debug-title">Debug the platform, not just your app
             <a class="permalink" href="#debug" aria-label="Link to debugging with your agent">#</a></h2>
         </div>
@@ -1142,7 +1253,7 @@ relish setup --quickstart</code></pre>
            tests/suite/website.rs parses each with the real CLI. -->
       <section id="act" class="section" aria-labelledby="act-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">08 /</span>
+          <span class="section-number" aria-hidden="true">09 /</span>
           <h2 id="act-title">Let your agent act, then take it back
             <a class="permalink" href="#act" aria-label="Link to letting your agent act">#</a></h2>
         </div>
@@ -1270,7 +1381,7 @@ match = 'author.kind == "agent" &amp;&amp; proposal.kind == "scale" &amp;&amp; p
             The lists moved to <code data-act-command>relish apps --unhealthy</code> and
             <code data-act-command>relish nodes --unhealthy</code>.</p>
           <h3 id="act-context">Small enough to hold in your head, or a context window</h3>
-          <p>Reliaburger has 8 resource kinds and 189 commands and subcommands, counted from
+          <p>Reliaburger has 8 resource kinds and 211 commands and subcommands, counted from
             the CLI’s own definitions, hidden ones included. A test fails when either number
             moves, so a new concept is a line in a pull request that someone has to agree
             with.</p>
@@ -1307,37 +1418,28 @@ match = 'author.kind == "agent" &amp;&amp; proposal.kind == "scale" &amp;&amp; p
 
       <section id="next" class="section" aria-labelledby="next-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">09 /</span>
+          <span class="section-number" aria-hidden="true">10 /</span>
           <h2 id="next-title">What’s next <a class="permalink" href="#next" aria-label="Link to what's next">#</a></h2>
         </div>
-      <aside class="status" aria-label="Release status: in progress">
-        <strong>0.2.8: Agents you can trust, built faster</strong>
-        <p>In progress, with its scope still being settled. Agent changes as proposals
-          you review and can undo, trying a change on a copy of production, and a record
-          of why an agent did what it did. Alongside them, a faster loop for building
-          and releasing Reliaburger itself.</p>
-        <a href="https://github.com/reliaburger/reliaburger/milestone/30">Milestone <span aria-hidden="true">↗</span></a>
-      </aside>
-
       <aside class="status" aria-label="Release status: next">
-        <strong>0.3.0: Bare metal in an hour</strong>
-        <p>After 0.2.8. An appliance OS, netbooting and claiming machines over
-          the LAN, and signed A/B OS updates. The exit test: Dell Wyse
-          thin clients from power-on to a cluster.</p>
-        <a href="https://github.com/reliaburger/reliaburger/milestone/6">Milestone <span aria-hidden="true">↗</span></a>
+        <strong>0.4.0: Planned maintenance</strong>
+        <p>Next, after 0.3.2. Cordon, drain and uncordon, cold moves that carry volumes, and
+          weekly OS updates that drain each node first.</p>
+        <a href="https://github.com/reliaburger/reliaburger/milestone/7">Milestone <span aria-hidden="true">↗</span></a>
       </aside>
 
       <aside class="status" aria-label="Release status: planned">
-        <strong>0.4.0: Full container migration</strong>
-        <p>Planned. Cordon, drain and uncordon, cold moves that carry volumes, and
-          checkpoint moves that keep memory while connections reconnect.</p>
-        <a href="https://github.com/reliaburger/reliaburger/milestone/7">Milestone <span aria-hidden="true">↗</span></a>
+        <strong>0.4.1: The front door</strong>
+        <p>Planned. ACME certificates for the ingress, an ingress address that fails over
+          between nodes on bare metal, health checks that tell startup, readiness and restart
+          apart, interactive exec, port-forward and Compose import.</p>
+        <a href="https://github.com/reliaburger/reliaburger/milestone/13">Milestone <span aria-hidden="true">↗</span></a>
       </aside>
       </section>
 
       <section id="docs" class="section" aria-labelledby="docs-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">10 /</span>
+          <span class="section-number" aria-hidden="true">11 /</span>
           <h2 id="docs-title">Read the docs <a class="permalink" href="#docs" aria-label="Link to the documentation section">#</a></h2>
           <span class="section-note">Documentation lives with the code.</span>
         </div>
@@ -1370,7 +1472,7 @@ match = 'author.kind == "agent" &amp;&amp; proposal.kind == "scale" &amp;&amp; p
           <article class="reading-item">
             <span class="filetype">CURRENT STATE</span>
             <h3><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md">Roadmap &amp; backlog <span aria-hidden="true">↗</span></a></h3>
-            <p>What’s implemented, what 0.2.8 leaves out and what’s next.</p>
+            <p>What’s implemented, what 0.3.2 leaves out and what’s next.</p>
           </article>
         </div>
         <p class="pdf-note">Every release carries PDFs, and these links always fetch the latest:
@@ -1382,7 +1484,7 @@ match = 'author.kind == "agent" &amp;&amp; proposal.kind == "scale" &amp;&amp; p
       </section>
 
       <section id="compare" class="section" aria-labelledby="compare-title">
-        <div class="section-heading"><span class="section-number" aria-hidden="true">11 /</span><h2 id="compare-title">Compare the alternatives <a class="permalink" href="#compare" aria-label="Link to the comparisons">#</a></h2></div>
+        <div class="section-heading"><span class="section-number" aria-hidden="true">12 /</span><h2 id="compare-title">Compare the alternatives <a class="permalink" href="#compare" aria-label="Link to the comparisons">#</a></h2></div>
         <p class="section-intro">How Reliaburger compares, with commands and sources beside the claims.
           These pages were last re-checked on 21 October 2026, against 0.2.2; the policies, templates and sidecars 0.2.4 added aren’t in them yet.</p>
         <div class="reading-list">
@@ -1422,7 +1524,7 @@ match = 'author.kind == "agent" &amp;&amp; proposal.kind == "scale" &amp;&amp; p
 
       <section id="internals" class="section" aria-labelledby="internals-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">12 /</span>
+          <span class="section-number" aria-hidden="true">13 /</span>
           <h2 id="internals-title">Follow a subsystem <a class="permalink" href="#internals" aria-label="Link to the subsystems section">#</a></h2>
         </div>
         <p class="section-intro"><code>bun</code> runs on each node. <code>relish</code> talks to its API.
@@ -1445,7 +1547,7 @@ match = 'author.kind == "agent" &amp;&amp; proposal.kind == "scale" &amp;&amp; p
 
       <section id="start" class="section start" aria-labelledby="start-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">13 /</span>
+          <span class="section-number" aria-hidden="true">14 /</span>
           <h2 id="start-title">Build it from source <a class="permalink" href="#start" aria-label="Link to the build-from-source section">#</a></h2>
         </div>
         <div class="start-grid">
@@ -1456,7 +1558,7 @@ match = 'author.kind == "agent" &amp;&amp; proposal.kind == "scale" &amp;&amp; p
               a host process on one node: no images, no isolated container, only the binaries
               the node config allows.</p>
             <p>For real OCI containers, use runc on Linux. On macOS, the managed laptop
-              quickstart uses Linux VMs. Direct Apple Container is deferred beyond 0.2.8.</p>
+              quickstart uses Linux VMs. Direct Apple Container is deferred beyond 0.3.2.</p>
             <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/README.md">Build requirements &amp; runtime setup <span aria-hidden="true">↗</span></a>
           </div>
           <div class="terminal">

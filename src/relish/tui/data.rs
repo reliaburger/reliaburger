@@ -6,15 +6,24 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::bun::agent::{ClusterInstanceStatus, CouncilStatus, NodeStatus};
+use crate::bun::agent::{ClusterInstanceStatus, CouncilStatus};
 use crate::bun::cluster_view::{ClusterDeployHistory, ClusterEvents, ClusterJobs};
+use crate::bun::diagnostics::DesiredAppEvidence;
 use crate::bun::summary::ClusterSummary;
 use crate::mayo::rollup::MetricsQueryResult;
 use crate::relish::client::BunClient;
+use crate::relish::nodes_cmd::NodeRow;
 use crate::wrapper::types::RouteInfo;
+
+use crate::smoker::types::FaultSummary;
 
 use super::fixtures::TestScenario;
 use super::msg::StreamItem;
+use super::state::InstanceTarget;
+
+/// The reason a kill from the terminal UI carries into the fault record
+/// and the audit log.
+const KILL_REASON: &str = "relish tui";
 
 /// Failures surfaced by a data provider.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -43,7 +52,8 @@ pub trait DataProvider: Send + Sync + 'static {
     fn status(
         &self,
     ) -> impl Future<Output = Result<Vec<ClusterInstanceStatus>, ProviderError>> + Send;
-    fn nodes(&self) -> impl Future<Output = Result<Vec<NodeStatus>, ProviderError>> + Send;
+    /// Every node's `relish nodes` row.
+    fn nodes(&self) -> impl Future<Output = Result<Vec<NodeRow>, ProviderError>> + Send;
     fn council(&self) -> impl Future<Output = Result<CouncilStatus, ProviderError>> + Send;
     fn alerts(
         &self,
@@ -64,6 +74,24 @@ pub trait DataProvider: Send + Sync + 'static {
         app: &str,
         namespace: &str,
     ) -> impl Future<Output = Result<MetricsQueryResult, ProviderError>> + Send;
+    fn desired_apps(
+        &self,
+    ) -> impl Future<Output = Result<Vec<DesiredAppEvidence>, ProviderError>> + Send;
+    /// Set an app's replica count to `to`, if its spec still asks for
+    /// `from` (#2176).
+    fn scale(
+        &self,
+        app: &str,
+        namespace: &str,
+        from: u32,
+        to: u32,
+    ) -> impl Future<Output = Result<(), ProviderError>> + Send;
+    /// Kill one instance with Smoker's kill fault, as `relish fault kill`
+    /// does with `--instance` and `--node`.
+    fn kill_instance(
+        &self,
+        target: &InstanceTarget,
+    ) -> impl Future<Output = Result<FaultSummary, ProviderError>> + Send;
     fn follow_logs(
         &self,
         app: String,
@@ -91,8 +119,11 @@ impl DataProvider for HttpDataProvider {
     async fn status(&self) -> Result<Vec<ClusterInstanceStatus>, ProviderError> {
         self.client.cluster_status().await.map_err(Into::into)
     }
-    async fn nodes(&self) -> Result<Vec<NodeStatus>, ProviderError> {
-        self.client.nodes().await.map_err(Into::into)
+    async fn nodes(&self) -> Result<Vec<NodeRow>, ProviderError> {
+        // A missing allocation answer leaves `-` in the ALLOCATED column;
+        // the TUI has no stderr to warn on.
+        let (rows, _allocations_error) = crate::relish::nodes_cmd::fetch_rows(&self.client).await?;
+        Ok(rows)
     }
     async fn council(&self) -> Result<CouncilStatus, ProviderError> {
         self.client.council().await.map_err(Into::into)
@@ -129,6 +160,32 @@ impl DataProvider for HttpDataProvider {
             .await
             .map_err(Into::into)
     }
+    async fn desired_apps(&self) -> Result<Vec<DesiredAppEvidence>, ProviderError> {
+        self.client.desired_apps().await.map_err(Into::into)
+    }
+    async fn scale(
+        &self,
+        app: &str,
+        namespace: &str,
+        from: u32,
+        to: u32,
+    ) -> Result<(), ProviderError> {
+        self.client
+            .scale(app, namespace, to, Some(from), false)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn kill_instance(&self, target: &InstanceTarget) -> Result<FaultSummary, ProviderError> {
+        let request = crate::relish::fault::instance_kill_request(
+            &target.app,
+            &target.namespace,
+            &target.instance,
+            &target.node,
+            KILL_REASON,
+        );
+        self.client.inject_fault(&request).await.map_err(Into::into)
+    }
 
     async fn follow_logs(
         &self,
@@ -161,7 +218,7 @@ impl DataProvider for MockDataProvider {
     async fn status(&self) -> Result<Vec<ClusterInstanceStatus>, ProviderError> {
         Ok(self.scenario.data().instances)
     }
-    async fn nodes(&self) -> Result<Vec<NodeStatus>, ProviderError> {
+    async fn nodes(&self) -> Result<Vec<NodeRow>, ProviderError> {
         Ok(self.scenario.data().nodes)
     }
     async fn council(&self) -> Result<CouncilStatus, ProviderError> {
@@ -219,6 +276,33 @@ impl DataProvider for MockDataProvider {
                 warnings: Vec::new(),
             }))
     }
+    async fn desired_apps(&self) -> Result<Vec<DesiredAppEvidence>, ProviderError> {
+        Ok(self.scenario.data().desired_apps)
+    }
+    async fn scale(
+        &self,
+        _app: &str,
+        _namespace: &str,
+        _from: u32,
+        _to: u32,
+    ) -> Result<(), ProviderError> {
+        Ok(())
+    }
+    async fn kill_instance(&self, target: &InstanceTarget) -> Result<FaultSummary, ProviderError> {
+        Ok(FaultSummary {
+            id: 1,
+            fault_type: "kill".into(),
+            target_service: target.app.clone(),
+            namespace: Some(target.namespace.clone()),
+            target_instance: Some(target.instance.clone()),
+            task_index: None,
+            target_node: Some(target.node.clone()),
+            remaining_secs: 0,
+            injected_by: "test".into(),
+            node: Some(target.node.clone()),
+            routed: Vec::new(),
+        })
+    }
     async fn follow_logs(
         &self,
         _app: String,
@@ -237,7 +321,7 @@ impl DataProvider for MockDataProvider {
 /// Spawn a complete fetch and send one message per result.
 pub fn spawn_refresh<P: DataProvider>(provider: Arc<P>, tx: mpsc::Sender<super::msg::Msg>) {
     tokio::spawn(async move {
-        let (summary, status, nodes, council, alerts, routes, jobs, events) = tokio::join!(
+        let (summary, status, nodes, council, alerts, routes, jobs, events, desired) = tokio::join!(
             provider.summary(),
             provider.status(),
             provider.nodes(),
@@ -245,7 +329,8 @@ pub fn spawn_refresh<P: DataProvider>(provider: Arc<P>, tx: mpsc::Sender<super::
             provider.alerts(),
             provider.routes(),
             provider.jobs(),
-            provider.recent_events(100)
+            provider.recent_events(100),
+            provider.desired_apps()
         );
         for update in [
             super::msg::DataUpdate::Summary(summary.map(Box::new)),
@@ -256,6 +341,7 @@ pub fn spawn_refresh<P: DataProvider>(provider: Arc<P>, tx: mpsc::Sender<super::
             super::msg::DataUpdate::Routes(routes),
             super::msg::DataUpdate::Jobs(jobs),
             super::msg::DataUpdate::EventsSeed(events),
+            super::msg::DataUpdate::DesiredApps(desired),
         ] {
             if tx.send(super::msg::Msg::Data(update)).await.is_err() {
                 return;
@@ -292,6 +378,100 @@ mod tests {
         let json = serde_json::to_value(statuses).unwrap();
         assert_eq!(json[0]["node"], "node-b");
         assert_eq!(json[0]["namespace"], "production");
+    }
+
+    /// Serve `/v1/fault`, keeping each request, and answer with `status`
+    /// and `body`, or with a fault summary on 200.
+    async fn serve_fault(
+        status: u16,
+        body: &'static str,
+    ) -> (
+        String,
+        Arc<tokio::sync::Mutex<Vec<crate::smoker::types::FaultRequest>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::routing::post;
+
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let app = Router::new().route(
+            "/v1/fault",
+            post({
+                let seen = Arc::clone(&seen);
+                move |Json(request): Json<crate::smoker::types::FaultRequest>| async move {
+                    seen.lock().await.push(request);
+                    let code = axum::http::StatusCode::from_u16(status).unwrap();
+                    if status != 200 {
+                        return axum::response::IntoResponse::into_response((code, body));
+                    }
+                    axum::response::IntoResponse::into_response(Json(serde_json::json!({
+                        "id": 7, "fault_type": "kill", "target_service": "web",
+                        "namespace": "default", "target_instance": "web-1",
+                        "target_node": "node-2", "remaining_secs": 0,
+                        "injected_by": "admin"
+                    })))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), seen, server)
+    }
+
+    fn web_1_on_node_2() -> crate::relish::tui::state::InstanceTarget {
+        crate::relish::tui::state::InstanceTarget {
+            app: "web".into(),
+            namespace: "default".into(),
+            instance: "web-1".into(),
+            node: "node-2".into(),
+        }
+    }
+
+    // The TUI's kill is `relish fault kill web --namespace default
+    // --instance web-1 --node node-2 --acknowledge --reason "relish tui"`,
+    // sent to the same API, so it's audited and rail-checked the same way
+    // (#2175).
+    #[tokio::test]
+    async fn kill_instance_sends_the_smoker_kill_fault_for_that_instance_and_node() {
+        let (url, seen, server) = serve_fault(200, "").await;
+        let provider = HttpDataProvider {
+            client: BunClient::new(&url),
+        };
+        let summary = provider.kill_instance(&web_1_on_node_2()).await.unwrap();
+        server.abort();
+        assert_eq!(summary.id, 7);
+        let seen = seen.lock().await;
+        assert_eq!(seen.len(), 1);
+        let request = &seen[0];
+        assert!(matches!(
+            request.fault_type,
+            crate::smoker::types::FaultType::Kill { count: 1 }
+        ));
+        assert_eq!(request.target_service, "web");
+        assert_eq!(request.namespace.as_deref(), Some("default"));
+        assert_eq!(request.target_instance.as_deref(), Some("web-1"));
+        assert_eq!(request.target_node.as_deref(), Some("node-2"));
+        assert_eq!(request.reason.as_deref(), Some("relish tui"));
+        assert!(request.acknowledged);
+        assert!(!request.override_safety, "the TUI never overrides a rail");
+        assert_eq!(request.duration, std::time::Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn a_refused_kill_comes_back_with_the_apis_words() {
+        let (url, _seen, server) =
+            serve_fault(403, "safety rail: would kill the last replica").await;
+        let provider = HttpDataProvider {
+            client: BunClient::new(&url),
+        };
+        let result = provider.kill_instance(&web_1_on_node_2()).await;
+        server.abort();
+        assert!(
+            matches!(&result, Err(ProviderError::Api { status: 403, body }) if body.contains("last replica")),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]

@@ -460,7 +460,22 @@ pub async fn setup_container_network_with_commands(
     )
     .await?;
 
-    // 10. Enable IP forwarding on the host (idempotent)
+    // 10. Masquerade the container's outbound traffic behind the node's
+    // address. Every rootful container needs it, not only one that publishes
+    // a port: without it a call to another node leaves with the 10.x source,
+    // which that node drops and couldn't route a reply to anyway (#2219).
+    // Idempotent, node-wide, and never removed, so a later teardown can't
+    // take it from containers that still run.
+    if !rootless {
+        ensure_nft_table(executor)
+            .await
+            .map_err(|reason| NetnsError::SetupFailed {
+                instance: instance_id.0.clone(),
+                reason,
+            })?;
+    }
+
+    // 11. Enable IP forwarding on the host (idempotent)
     run_cmd(
         executor,
         "sysctl",
@@ -470,7 +485,7 @@ pub async fn setup_container_network_with_commands(
     )
     .await?;
 
-    // 11. Let that forwarded traffic past a host firewall's FORWARD policy
+    // 12. Let that forwarded traffic past a host firewall's FORWARD policy
     allow_container_forwarding()
         .await
         .map_err(|reason| NetnsError::SetupFailed {
@@ -639,7 +654,9 @@ pub async fn add_port_mapping_with_commands(
             container_port,
         })
     } else {
-        // Root: one element in the DNAT map, O(1) at any scale.
+        // Root: one element in the DNAT map, O(1) at any scale. Network setup
+        // already made the table; ensuring it again costs little and covers a
+        // host firewall reload that flushed the ruleset since.
         ensure_nft_table(executor)
             .await
             .map_err(|e| NetnsError::PortMappingFailed {
@@ -776,7 +793,9 @@ pub async fn teardown_container_network_with_commands(
 /// Anything a container sends is accepted: to another container on this
 /// node, or out through the masquerade. Traffic towards a container is
 /// accepted only as a reply, or when a published port's DNAT sent it there,
-/// so the rest of the network can't route into container addresses.
+/// so the rest of the network can't route into container addresses. Who may
+/// reach a published port at all is the perimeter's call, made in its
+/// forward chain after the DNAT (`firewall::rules`).
 const FORWARD_ACCEPT_RULES: [&[&str]; 2] = [
     &["-i", "veth-+", "-j", "ACCEPT"],
     &[
@@ -901,10 +920,13 @@ async fn ensure_nft_table(executor: &impl RuntimeCommandExecutor) -> Result<(), 
     // The named port map (`add map` is idempotent, like table/chain).
     run_nft(executor, &portmap::portmap_definition()).await?;
 
-    // The single lookup rule that consults the map, guarded the same way.
+    // The single lookup rule that consults the map. `add rule` appends, so
+    // probe first. A chain holding an older version of the rule (the kernel
+    // keeps it across a Bun upgrade) is emptied and rewritten, in one nft
+    // transaction.
     let prerouting = list_chain(executor, "prerouting").await?;
-    if !prerouting.contains("@portmap") {
-        run_nft(executor, &portmap::map_rule()).await?;
+    if !portmap::prerouting_is_current(&prerouting) {
+        run_nft(executor, &portmap::replace_map_rule()).await?;
     }
 
     Ok(())
@@ -1216,6 +1238,130 @@ mod tests {
         assert_ne!(host_veth_name(&first), host_veth_name(&second));
     }
 
+    /// Answers every command with success, listing `prerouting` as the given
+    /// text, and records the nft argv it saw.
+    struct ScriptedNft {
+        prerouting: &'static str,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RuntimeCommandExecutor for ScriptedNft {
+        async fn output(
+            &self,
+            _program: &str,
+            arguments: &[&str],
+        ) -> std::io::Result<crate::grill::command::CommandOutput> {
+            // A short, non-async critical section: the lock is never held
+            // across an await.
+            self.calls.lock().unwrap().push(arguments.join(" "));
+            let stdout = if arguments.ends_with(&["prerouting"]) && arguments[0] == "-a" {
+                self.prerouting.as_bytes().to_vec()
+            } else {
+                b"masquerade".to_vec()
+            };
+            Ok(crate::grill::command::CommandOutput {
+                exit_code: Some(0),
+                stdout,
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_older_port_map_rule_is_replaced_and_a_current_one_kept() {
+        let older = ScriptedNft {
+            prerouting: "dnat ip addr . port to tcp dport map @portmap # handle 4",
+            calls: Default::default(),
+        };
+        ensure_nft_table(&older).await.unwrap();
+        let calls = older.calls.lock().unwrap().clone();
+        // One nft invocation is one transaction: the chain is never left
+        // empty between the flush and the new rule.
+        let replacements: Vec<_> = calls
+            .iter()
+            .filter(|call| call.contains("prerouting") && !call.starts_with("-a list"))
+            .filter(|call| !call.starts_with("add chain"))
+            .collect();
+        assert_eq!(
+            replacements,
+            vec![
+                "flush chain ip reliaburger prerouting ; add rule ip reliaburger prerouting fib daddr type local dnat ip addr . port to tcp dport map @portmap"
+            ],
+            "{calls:?}"
+        );
+
+        let current = ScriptedNft {
+            prerouting: "fib daddr type local dnat ip addr . port to tcp dport map @portmap # handle 5",
+            calls: Default::default(),
+        };
+        ensure_nft_table(&current).await.unwrap();
+        let calls = current.calls.lock().unwrap().clone();
+        assert!(
+            !calls.iter().any(|call| call.starts_with("flush")
+                || call.contains("add rule ip reliaburger prerouting")),
+            "{calls:?}"
+        );
+    }
+
+    /// Answers every command with success and empty output, except that it
+    /// refuses to enable IP forwarding, and records each one as
+    /// `program argv…`.
+    #[derive(Default)]
+    struct RecordingCommands {
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RuntimeCommandExecutor for RecordingCommands {
+        async fn output(
+            &self,
+            program: &str,
+            arguments: &[&str],
+        ) -> std::io::Result<crate::grill::command::CommandOutput> {
+            // A short, non-async critical section: the lock is never held
+            // across an await.
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("{program} {}", arguments.join(" ")));
+            let refused = program == "sysctl" && arguments.contains(&"net.ipv4.ip_forward=1");
+            Ok(crate::grill::command::CommandOutput {
+                exit_code: Some(if refused { 1 } else { 0 }),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    /// #2219: a node whose containers publish no port still needs the
+    /// masquerade, or its containers' traffic leaves with a 10.x source
+    /// address that the target node drops and can't route back.
+    #[tokio::test]
+    async fn a_portless_rootful_container_gets_the_masquerade_rule() {
+        let commands = RecordingCommands::default();
+        let instance = InstanceId("default__worker-0".into());
+        // Refusing IP forwarding stops setup before the iptables FORWARD
+        // step, which runs outside the executor against the real host.
+        let error = setup_container_network_with_commands(&commands, &instance, 1, 0, false)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            error.to_string().contains("enable IP forwarding"),
+            "{error}"
+        );
+        let calls = commands.calls.lock().unwrap().clone();
+        for expected in [
+            "nft add table ip reliaburger",
+            "nft add chain ip reliaburger postrouting { type nat hook postrouting priority 100 ; }",
+            "nft add rule ip reliaburger postrouting ip saddr 10.0.0.0/8 masquerade",
+        ] {
+            assert!(
+                calls.iter().any(|call| call == expected),
+                "missing {expected:?} in {calls:#?}"
+            );
+        }
+    }
+
     // Argv generation for map elements is unit-tested in
     // `grill::portmap` (cross-platform); only the live nftables
     // behaviour is tested here, behind the netns gate.
@@ -1443,6 +1589,12 @@ mod tests {
         ensure_nft_table(&DirectCommandExecutor)
             .await
             .expect("failed to ensure table");
+        // The kernel's own listing of the rule we wrote must read as
+        // current, or every setup would flush and rewrite the chain.
+        let listing = list_chain(&DirectCommandExecutor, "prerouting")
+            .await
+            .unwrap();
+        assert!(portmap::prerouting_is_current(&listing), "{listing}");
         let executor = NftCommandExecutor;
         let container_ip = Ipv4Addr::new(10, 0, 2, 2);
 

@@ -823,7 +823,7 @@ pub fn answer(evidence: &Evidence, build: BuildInfo, max_bytes: usize, rerun: &s
 
 /// Run `relish agent upgrade-check` against the configured cluster.
 pub async fn run(args: &UpgradeCheckArgs, max_bytes: usize, rerun: &str) -> Rendered {
-    run_with_client(args, &BunClient::default_local(), max_bytes, rerun).await
+    run_with_client(args, &BunClient::local().await, max_bytes, rerun).await
 }
 
 /// [`run`] with an explicit client, for tests.

@@ -23,7 +23,8 @@ This subsystem is cross-cutting. It doesn't live in a single component; it coord
 > (`RolloutReleased`) and the spec whose rollout failed (`RolloutFailed`,
 > decision D11-B). A node whose rollout aborts posts `/v1/rollouts/failed` to
 > the leader; the leader stops releasing that spec until a different one is
-> applied. Full leader-coordinated rollouts, with one cluster-wide surge and
+> applied. A node reports only for itself: over mTLS the report's `node` must
+> match the caller's certificate identity, as for placements. Full leader-coordinated rollouts, with one cluster-wide surge and
 > unavailable budget, remain the target described below.
 >
 > We expose each node's real work through a separate `DeployOperation`: a
@@ -60,7 +61,7 @@ Dependency ordering via `run_before` ensures that prerequisite jobs (e.g., datab
 | Component | Role in Deploy System |
 |---|---|
 | **Meat** (scheduler, leader) | Orchestrates the deploy state machine. Makes placement decisions for new instances. Coordinates the rolling sequence across nodes. Enforces namespace quotas at scheduling time. |
-| **Bun** (node agent) | Starts and stops containers on each node. Runs health checks against new instances. Reports instance state back to the leader via the reporting tree. Updates the eBPF service map (Onion) on the local node. |
+| **Bun** (node agent) | Starts and stops containers on each node. Runs health checks against new instances. Reports instance state straight to the leader over the reporting connection. Updates the eBPF service map (Onion) on the local node. |
 | **Wrapper** (ingress proxy) | Maintains the routing pool for external traffic. Adds new instances and removes old instances from the pool during transitions. Implements connection draining (stops sending new requests to draining instances, waits for in-flight requests to complete). |
 | **Onion** (service discovery) | Updates the eBPF service map on every node so that internal service-to-service traffic routes to the correct backends. Map updates are atomic and take microseconds. |
 | **Ketchup** (log collector) | Records structured deploy events (start, step completion, health check pass/fail, drain start/complete, rollback trigger, completion) for audit trail and post-incident analysis. |
@@ -156,20 +157,15 @@ The deploy lifecycle is modeled as an explicit state machine. Each deploy has ex
 
 ### 3.2 Leader-Node Coordination
 
-The deploy orchestration loop runs on the leader node inside Meat. For each rollout step, the leader:
+The leader doesn't send commands to nodes. Each node rolls its own share of an app with the app's `[deploy]` table, and the leader releases a spec change one node at a time (`src/cluster/rollout.rs`, #692):
 
-1. Sends a `StartInstance` command to the target node's Bun agent (via the reporting tree).
-2. Bun starts the new container, allocates a host port, and begins health checking.
-3. Bun reports instance state transitions back to the leader: `Starting` -> `HealthChecking` -> `Healthy` (or `Unhealthy`).
-4. On `Healthy`, the leader sends `UpdateRouting` commands:
-   - To all Wrapper instances: add the new backend, remove the old backend.
-   - To all Bun agents: update the local Onion eBPF service map.
-5. The leader sends a `DrainAndStop` command to the node running the old instance.
-6. Bun on that node signals the old container (SIGTERM), waits for `drain_timeout`, then force-kills if necessary.
-7. Bun reports `Stopped` for the old instance.
-8. The leader advances to the next step.
+1. The leader publishes placements. The first node (by node id) that doesn't run the new spec yet gets it; every node after it keeps the last spec that rolled out everywhere.
+2. Each node's placement reconciler polls the leader's `GET /v1/placements/{node}` and converges on what it finds there: it starts the new instances, health-checks them, and retires the old ones with draining (§3.4).
+3. Each node reports to the leader over the reporting connection which version it last converged on and whether its instances are healthy.
+4. When that node reports its share healthy on the new spec, the leader releases the spec to the next node.
+5. If a node's rollout fails, its reconciler posts a `RolloutFailureReport` to the leader's `POST /v1/rollouts/failed`, and the leader marks the spec `RolloutFailed`.
 
-All communication uses the existing reporting tree and Raft log. Deploy progress isn't persisted in Raft: Raft holds only each app's rollout targets (the last specs that rolled out everywhere) and its `RolloutFailed` mark. A new leader reads each node's converged version and health from its reports and carries on from there (see Section 7: Failure Modes).
+So placements go down over the HTTP API, and state comes up over the reporting connection, which carries reports upward only. Deploy progress isn't persisted in Raft: Raft holds only each app's rollout targets (the last specs that rolled out everywhere) and its `RolloutFailed` mark. A new leader reads each node's converged version and health from its reports and carries on from there (see Section 7: Failure Modes).
 
 ### 3.3 Wrapper Routing Pool Updates During Transition
 
@@ -180,7 +176,7 @@ Wrapper maintains a routing pool per ingress route (keyed by `host` + `path`). D
 3. **During drain:** Wrapper stops sending NEW requests to web-1 but allows in-flight requests to complete. Web-1 remains in the pool in `draining` state until all connections close or `drain_timeout` expires.
 4. **After drain:** web-1 is fully removed from the pool and stopped.
 
-Wrapper receives routing pool updates via gossip (Mustard). The propagation delay is bounded by the gossip protocol's convergence time (typically under 2 seconds for health state changes). The leader doesn't advance to the drain phase until it has confirmation (via the reporting tree) that routing updates have propagated.
+Routing updates don't travel over gossip. The leader builds the endpoint catalogue from the nodes' reports and replicates it through Raft, and each node's Wrapper and service map follow their replica. The wait for propagation happens on the node retiring the old instance, not on the leader: before the stop, it asks the leader every 500 ms whether every node has dropped the old backend, while its own Wrapper drains in-flight requests (`retire_old_instance` in `src/bun/agent/deploy_worker.rs`, #1355). The two waits overlap, and the stop follows once both finish or the wait for the other nodes passes its 5 s patience.
 
 ### 3.4 Connection Draining Protocol
 
@@ -761,14 +757,6 @@ Rollback re-deploys a previous spec version through the same rolling mechanism, 
 
 ### 5.4 Dependency Ordering (`run_before`)
 
-> **Status: implemented.** Before an app deploys, the agent runs every job whose
-> `run_before` names that app to completion, gating on a clean (exit 0) finish
-> and aborting the deploy if a prerequisite fails or times out. A gating job runs
-> exactly once and is skipped in the regular jobs loop. The multi-stage
-> `DependencyGraph` and topological cycle detection below remain the target for a
-> future iteration; today's gating covers the job→app case (the common migration
-> ordering).
-
 Jobs can declare dependencies on Apps using the `run_before` field:
 
 ```toml
@@ -778,16 +766,14 @@ command = ["npm", "run", "migrate"]
 run_before = ["app.api"]
 ```
 
-When a deploy includes both the migration job and the API app (e.g., both reference the same new image tag, or both are declared in the same TOML file), the deploy system:
+A `run_before` job is a hook, and hooks run on the same lifecycle as every other job: [scheduler-meat.md §5.2](scheduler-meat.md#52-jobs-the-common-lifecycle) is the authority. In short, the leader drives it as one deployment operation:
 
-1. Parses the `DependencyGraph` from all jobs with `run_before` fields referencing the target app.
-2. Transitions the deploy to `RunningPreDeps` phase.
-3. Dispatches all dependency jobs to the Meat scheduler (jobs without inter-dependencies run in parallel).
-4. Waits for all dependency jobs to complete successfully.
-5. On success: transitions to `Rolling` phase and begins the rolling update.
-6. On failure (any dependency job fails after exhausting retries): transitions to `Failed` with a clear error indicating which job failed and why. The app isn't modified.
+1. An apply with hooks writes `DeployBegin` to the council. That persists the deployment intent and admits only the hooks.
+2. The leader grants the hooks to workers like any other job. By default a hook gets one attempt and a 600-second deadline (`src/meat/job.rs`); a job's own `max_attempts` and `task_timeout_secs` override that.
+3. When every hook has an accepted successful outcome, `DeployCommitted` publishes the apps and admits the ordinary jobs and schedules in one entry, and the rolling update begins.
+4. A failed hook fails the deploy before any instance changes. An unknown outcome never opens the gate. `relish cancel-deploy OPERATION_ID` (`POST /v1/deploys/operations/{id}/cancel`) writes `DeployCancel`.
 
-For multi-stage dependencies (e.g., `build-frontend` -> `build-api` -> `app.api`), the dependency graph is resolved topologically. Cycles are detected at deploy time and rejected with an error.
+There's no multi-stage `DependencyGraph` and no topological ordering between hooks: every hook of an apply gates every app in it.
 
 ### 5.5 Connection Draining
 
@@ -1174,6 +1160,88 @@ with a `default`; without one, required) and a `body` string of ordinary
 - **Not done.** No registry: templates come from files or git. No logic in
   templates, and no nesting.
 
+### 5.13 Scaling Outside the File (#2176)
+
+`relish scale web --replicas 3`, and `+` and `-` on the terminal UI's
+Instances tab, set an app's replica count without editing its file. The
+question that shapes the design is what a later `relish apply` of the file,
+or a GitOps sync, does with that count.
+
+**Decision: a scale is a spec write, and the file wins.** `POST
+/v1/scale/{app}/{namespace}` with `{"replicas": N}` reads the app's stored
+spec from the council, sets `replicas`, and re-applies that one-app config
+through `cluster_apply`, as `relish rollback` does. Policy admission, the
+owner rules (5.11), agent leases, the audit record (`app.scaled`, with
+`replicas_from` and `replicas_to`) and the Raft write are all the apply's,
+so nothing about who may change what is new. The count lives in exactly one
+place, the spec. Nothing undoes it except another write, and the next apply
+of the file is one: it writes the file's count back. That's the honest
+answer to drift. The cluster never pretends the file says 3, and `relish
+apply --dry-run` against the file shows the app as changed until someone
+either puts 3 in the file or applies the file and accepts its count. It's
+also what `kubectl scale` followed by `kubectl apply` does when the manifest
+sets `replicas`, so a Kubernetes user isn't surprised.
+
+- **The stored spec, not the declared one.** The re-applied spec is the
+  effective one (5.11's `declared_apps` holds the declared one beside it):
+  its images are already bound to digests, so a scale never resolves a tag
+  again and quietly changes the bytes that run. The policy defaults it
+  carries are judged again and fill nothing. `ordinals` is cleared, as
+  rollback clears it; `owner` stays, so only the owner's token or an admin
+  can scale an owned app.
+- **GitOps.** An app GitOps manages is refused with 409 unless
+  `?force=true` (`relish scale --force`), as `delete` and `rollback` are
+  (#693). A forced scale moves the declared spec too, so the next sync sees
+  git and the cluster differ and puts back git's count, within a poll. The
+  apply's own warning says so in the progress stream.
+- **What has no count.** Zero is refused (400): a spec's `replicas` is at
+  least 1, and `relish stop` is how an app goes to zero while keeping its
+  count for the next start. An autoscaled app (409) belongs to the
+  autoscaler between its `[autoscale]` bounds, and a daemon set (409) has
+  no count. `AppSpec::scale_refusal` holds these rules, and an agent's
+  `relish agent propose scale` uses the same function, so a person and an
+  agent are refused for the same things.
+- **A stopped app** keeps its count in the spec. Scaling it starts it with
+  the new count, as an apply starts it.
+- **The precondition.** The body may carry `current_replicas`, the count
+  the caller saw in the spec, like `kubectl scale --current-replicas`. When
+  the spec has another count now, the scale is refused (409) rather than
+  overwriting whoever scaled in between. The terminal UI always sends it:
+  its question says "from 2 to 3", and 3 must not land on top of someone
+  else's 5. Without it the last writer wins, as with apply.
+- **Where.** A follower forwards the request whole, body and `force`
+  included, as the caller (`forward_streamed_to_leader`, shared with
+  rollback), so the leader reads the spec from its own state. A standalone
+  node keeps no desired state, so it answers 400 and says to change the
+  file. The answer is the apply's progress stream (SSE), so `relish scale`
+  prints the same lines `relish apply` does. The scope is `scale`, the
+  same permission `relish stop` needs, on a `deployer` token.
+
+**Alternatives we didn't take.**
+
+- *An override beside the spec*, like the autoscaler's
+  `autoscale_overrides`, which an apply clears. It keeps the file's count
+  visible as "declared", but then two numbers describe one app, every
+  reader has to know which wins, and an apply that clears it is the same
+  behaviour as ours with more state. We'd want it only if scales had to
+  survive applies, and that is exactly the silent drift we don't want.
+- *An override that survives applies* (what Kubernetes users get by
+  leaving `replicas` out of the manifest so `kubectl scale` and an HPA own
+  it). That makes the file lie about the app, and GitOps could never
+  converge it. If an app's count should be someone else's, that's what
+  `[autoscale]` or a controller's `owner` (5.11) is for.
+- *A narrow Raft entry* (`AppScale { app_id, replicas }`) that changes only
+  the count inside the state machine. It would close the small window in
+  which an apply landing between our read and our write is overwritten by
+  the old spec with the new count. But it would skip policy admission or
+  need its own, and it's a wire change for a race that the precondition and
+  rollback already live with. Rollback re-applies a read spec the same way.
+- *Scaling through a proposal* that the person approves at once. Proposals
+  are how agents change things (`relish agent propose scale`); a person
+  with a deployer token doesn't need to ask themselves for permission.
+- *`relish scale <app> <N>`* with a positional count. `--replicas` is what
+  `kubectl scale` takes, and a flag can't be mistaken for an app name.
+
 ## 6. Configuration
 
 All deploy configuration lives under the `[app.<name>.deploy]` TOML section. Defaults are set per-directory in a `_defaults.toml` file, merged into each app by `relish compile`. There is no cluster-level `[defaults.app.deploy]` section — the block shown below is planned, not implemented.
@@ -1240,7 +1308,7 @@ health_timeout = "60s"
 
 In a cluster either outcome marks the app `RolloutFailed` (Section 5.2), so the leader stops releasing the spec to further nodes.
 
-**Detection:** Bun on the target node performs the health check (HTTP GET to the configured health endpoint). If the endpoint returns a non-2xx status or the connection times out for the entire `health_timeout` duration, the instance is considered unhealthy. Bun reports this to the leader via the reporting tree.
+**Detection:** Bun on the target node performs the health check (HTTP GET to the configured health endpoint). If the endpoint returns a non-2xx status or the connection times out for the entire `health_timeout` duration, the instance is considered unhealthy. Bun reports this to the leader in its next report.
 
 ### 7.2 Node Failure Mid-Deploy
 
@@ -1276,7 +1344,7 @@ In a cluster either outcome marks the app `RolloutFailed` (Section 5.2), so the 
 
 **Trigger:** An operator manually sets `replicas = 5` while the autoscaler's current evaluation says the app needs 3 replicas.
 
-**Behaviour:** Manual scale operations (via `relish scale` or a git push changing the `replicas` field) reset the autoscaler's runtime override. The autoscaler respects the new base count and re-evaluates from there. However, if the autoscaler's evaluation window still shows low utilisation, it may scale back down to 3 on the next evaluation cycle.
+**Behaviour:** `relish scale` refuses an autoscaled app (5.13): the autoscaler owns its count between `min` and `max`, so a manual count would only be undone. A git push or an apply that changes the `replicas` field resets the autoscaler's runtime override. The autoscaler respects the new base count and re-evaluates from there. However, if the autoscaler's evaluation window still shows low utilisation, it may scale back down to 3 on the next evaluation cycle.
 
 **Mitigation:** To temporarily override the autoscaler, operators can:
 

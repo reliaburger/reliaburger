@@ -90,6 +90,14 @@ class Admission(unittest.TestCase):
             self.assertEqual(ra["template"]["runtime"],mode)
             self.assertEqual("image" in ra["template"],mode!="process")
             self.assertEqual("exec" in ra["template"],mode=="process")
+    def test_limit_fixture_leaves_room_for_runc_init(self):
+        # #1957: a fresh runc job's limit covers runc init too, and Ubuntu
+        # 26.04's runc 1.4 init peaks at 12.7 MiB. At 8 MiB the container
+        # never started, so the fixture never ran into its own limit.
+        c=self.campaign()
+        for mode in jobs.MODES:
+            template=c.body(c.prepare(mode,"short","limit",100))["definition"]["template"]
+            self.assertGreaterEqual(int(template["memory"][:-2]),32,mode)
     def test_resume_rejects_different_cluster_or_audit_identity(self):
         c=self.campaign(); c.prepare("runc","short","work",100)
         with self.assertRaises(jobs.InvalidEvidence):
@@ -130,6 +138,94 @@ class Audit(unittest.TestCase):
         self.assertEqual(result,{"effects":3,"attempts":5,"repeated_attempts":2})
         for ledgers in ([[[0,1],[1,1]]],[[[0,1],[1,1],[2,1],[3,1]]]):
             with self.assertRaises(jobs.InvalidEvidence): jobs.audit_effects(3,ledgers)
+
+
+def rows(start, end, grant=1, attempts=1):
+    return [dict(index=i, grant_attempt=grant, attempts=attempts, succeeded=True) for i in range(start, end)]
+
+
+class ChunkHistory(unittest.TestCase):
+    """#1415: every task-array chunk completes exactly once, from one grant."""
+    def test_the_sample_always_holds_the_first_and_last_chunk_and_is_seeded(self):
+        picked=jobs.sampled_chunks(262144,64,"run-7")
+        self.assertEqual(len(picked),jobs.CHUNK_SAMPLE+2)
+        self.assertEqual((picked[0],picked[-1]),(0,4095))
+        self.assertEqual(picked,jobs.sampled_chunks(262144,64,"run-7"))
+        self.assertNotEqual(picked,jobs.sampled_chunks(262144,64,"run-8"))
+    def test_a_small_run_is_read_whole(self):
+        self.assertEqual(jobs.sampled_chunks(8,1,"audit"),list(range(8)))
+        self.assertEqual(jobs.sampled_chunks(130,64,"short"),[0,1,2])
+    def test_a_chunk_completed_once_from_one_grant_passes(self):
+        self.assertEqual(jobs.check_chunk(1,64,130,rows(64,128,grant=3)),3)
+        self.assertEqual(jobs.check_chunk(2,64,130,rows(128,130)),1)
+    def test_a_missing_repeated_or_foreign_task_fails(self):
+        for bad in (rows(64,127), rows(64,128)+rows(127,128), rows(65,129), rows(64,128)[::-1]):
+            with self.subTest(n=len(bad)), self.assertRaisesRegex(jobs.InvalidEvidence,"exactly once"):
+                jobs.check_chunk(1,64,130,bad)
+    def test_a_chunk_accepted_from_two_grants_fails(self):
+        mixed=rows(64,96,grant=1)+rows(96,128,grant=2)
+        with self.assertRaisesRegex(jobs.InvalidEvidence,"more than one grant"):
+            jobs.check_chunk(1,64,130,mixed)
+        for grant in (0,None,True):
+            with self.subTest(grant=grant), self.assertRaises(jobs.InvalidEvidence):
+                jobs.check_chunk(0,2,2,rows(0,2,grant=grant))
+    def test_extra_runs_need_a_regrant(self):
+        # Index 0's chunk was granted once and accepted after 2 attempts; a
+        # third execution happened that no accepted attempt explains.
+        once=rows(0,1,grant=1,attempts=2)
+        jobs.explain_effects(once,[[[0,2]]])
+        jobs.explain_effects(once,[[[0,1]]])
+        with self.assertRaisesRegex(jobs.InvalidEvidence,"ran 3 times"):
+            jobs.explain_effects(once,[[[0,2]],[[0,1]]])
+        jobs.explain_effects(rows(0,1,grant=2,attempts=1),[[[0,3]]])
+
+    def drain_audit(self, results, receipts=None, polls=(100,101)):
+        """Drain one audit run whose /results answers come from `results(start, limit)`."""
+        class API(FakeAPI):
+            def request(self,method,path,body=None,raw=False):
+                if path=="/v1/jobs/runs": return super().request(method,path,body)
+                if "/results?" in path:
+                    query=dict(p.split("=") for p in path.split("?")[1].split("&"))
+                    return results(int(query.get("after",-1))+1,int(query["limit"]))
+                identity=int(path.split("/")[3])
+                request=next(v for v in self.posts if self.runs[(v["name"],v["request_id"])]==identity)
+                count=request["definition"]["tasks"]["count"]; template=request["definition"]["template"]
+                value=summary(identity,total=count,succeeded=count,done=True,name=request["name"])
+                value.update(runtime=template["runtime"],cpu_request_millicores=25,
+                             memory_request_bytes=int(template["memory"][:-2])<<20)
+                return value
+        directory=tempfile.mkdtemp(); self.addCleanup(lambda: __import__("shutil").rmtree(directory))
+        # Every runtime's short profile starts with an audit run, and its long
+        # profile with a 512-task work run of one-task chunks.
+        c=jobs.Campaign(directory,API(),[],"token",ledger_reader=lambda name: receipts or [[[i,1] for i in range(8)]])
+        for now in polls: c.step(now)
+        return c,Path(directory)
+    def test_a_drained_audit_run_checks_every_chunk_and_keeps_the_evidence(self):
+        c,directory=self.drain_audit(lambda start,limit: dict(rows=rows(start,start+limit)))
+        self.assertEqual(c.state["errors"],[])
+        self.assertNotIn("process:short",c.state["active"])
+        lines=[json.loads(line) for line in (directory/"chunk-history.jsonl").read_text().splitlines()]
+        self.assertEqual(c.state["totals"]["chunks_checked"],len(lines))
+        self.assertEqual(c.state["totals"]["chunks_regranted"],0)
+        audit=[line["chunk"] for line in lines if line["purpose"]=="audit" and line["mode"]=="process"]
+        self.assertEqual(audit,list(range(8)))
+        work=[line for line in lines if line["purpose"]=="work" and line["mode"]=="process"]
+        self.assertEqual([line["chunk"] for line in work],jobs.sampled_chunks(512,1,work[0]["run"]))
+    def test_a_chunk_accepted_twice_is_a_campaign_error(self):
+        c,_=self.drain_audit(lambda start,limit: dict(rows=rows(start,start+limit)+rows(start,start+1)))
+        self.assertTrue(any("exactly once" in error for error in c.state["errors"]))
+    def test_an_unexplained_extra_run_is_a_campaign_error(self):
+        c,_=self.drain_audit(lambda start,limit: dict(rows=rows(start,start+limit)),
+                             receipts=[[[i,2 if i==3 else 1] for i in range(8)]])
+        self.assertTrue(any("task 3 ran 2 times" in error for error in c.state["errors"]))
+    def test_an_unreachable_chunk_waits_for_the_grace_then_fails(self):
+        c,_=self.drain_audit(lambda start,limit: dict(rows=[],unreachable=["rb-a-2"]),
+                             polls=(100,101,100+jobs.RESULT_UNREACHABLE_GRACE))
+        # Unreachable since the first poll of the drained run, at 101.
+        self.assertEqual(c.state["errors"],[])
+        self.assertIn("process:short",c.state["active"])
+        c.step(101+jobs.RESULT_UNREACHABLE_GRACE)
+        self.assertTrue(any("rb-a-2" in error for error in c.state["errors"]))
 
 
 class Gate(unittest.TestCase):
@@ -455,6 +551,14 @@ class TargetLoad(unittest.TestCase):
         self.path=Path(self.temp.name)/"jobs"; self.api=FakeAPI()
     def campaign(self, load="target", rate=jobs.DEFAULT_TARGET_RATE):
         return jobs.Campaign(self.path,self.api,[],"token",load=load,target_rate=rate)
+
+    def test_target_executors_leave_the_quickstart_apps_room_to_recover(self):
+        # #1958 made a shared-runc executor reserve 32 + 24 MiB, not 40. At
+        # 8 a node the jobs fast tier's executors took every MiB of a node's
+        # 1,438 after quorum loss, and redis couldn't be re-placed for 600 s
+        # (15 Nov rehearsal). Keep shared-runc's reservation at 0.2.8's
+        # 8 x 40 MiB, which left the apps about 100 MiB to recover in.
+        self.assertLessEqual(jobs.TARGET_CAPS["shared-runc"]*(32+24), 8*40)
 
     def test_target_load_turns_fast_short_runs_into_million_task_arrays(self):
         c=self.campaign()
@@ -829,3 +933,194 @@ class NamedFixtures(unittest.TestCase):
         scan = inspect.getsource(jobs.run)
         self.assertIn('api.request("GET","/v1/jobs/definitions")', scan)
         self.assertLess(scan.index('"/v1/batch/summaries"'), scan.index("named_fixture_coverage("))
+
+
+class FaultOverlap(unittest.TestCase):
+    """#2105: a gated fault waits, within a bound, until a run of every mode is
+    active on its node, so the coverage gate never fails on timing alone."""
+
+    @staticmethod
+    def snapshot(now, active):
+        """A controller snapshot at `now` with `active` {mode: {node, ...}}."""
+        return dict(heartbeat=now, active=[
+            dict(mode=mode, id=index + 1, observed_at=now,
+                 previous=dict(nodes=[dict(node=node, counters=dict(active_commands=1)) for node in sorted(nodes)]))
+            for index, (mode, nodes) in enumerate(sorted(active.items()))])
+
+    def marks(self, directory):
+        return [json.loads(line) for line in (directory / "faults.jsonl").read_text().splitlines()]
+
+    def run_mark(self, directory, kind, timeline, wait, now=100):
+        """Mark a fault on node `n` while `timeline(now)` gives what is active."""
+        clock = dict(now=now)
+        jobs.atomic(directory / "snapshot.json", self.snapshot(now, timeline(now)))
+        def pause(seconds):
+            clock["now"] += seconds
+            jobs.atomic(directory / "snapshot.json", self.snapshot(clock["now"], timeline(clock["now"])))
+        return jobs.mark(directory, "n", kind, now, wait=wait, clock=lambda: clock["now"], pause=pause)
+
+    def test_a_power_off_waits_for_a_runc_run_on_its_node(self):
+        # Seed 798889818's fast tier: at each cut only shared-runc and process
+        # ran on the node; a runc task started on it seconds later.
+        def timeline(now):
+            return {"shared-runc": {"n"}, "process": {"n"}, "runc": {"n"} if now >= 106 else {"other"}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            self.assertEqual(self.run_mark(path, "0:power-off", timeline, wait=90), [])
+            (row,) = self.marks(path)
+            self.assertEqual(sorted(run["mode"] for run in row["runs"]), sorted(jobs.MODES))
+            self.assertEqual((row["ts"], row["waited"]), (106, 6))
+
+    def test_without_a_wait_the_same_cut_misses_runc(self):
+        def timeline(now):
+            return {"shared-runc": {"n"}, "process": {"n"}, "runc": {"n"} if now >= 106 else set()}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            self.assertEqual(self.run_mark(path, "0:power-off", timeline, wait=0), ["runc"])
+            self.assertNotIn("runc", [run["mode"] for run in self.marks(path)[0]["runs"]])
+
+    def test_every_gated_kind_waits_and_no_other_does(self):
+        def timeline(now):
+            return {mode: {"n"} for mode in jobs.MODES} if now >= 110 else {"process": {"n"}}
+        for kind in jobs.FAULT_KINDS + jobs.NODE_FAULT_KINDS:
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                self.assertEqual(self.run_mark(Path(directory), "3:" + kind, timeline, wait=90), [])
+                self.assertEqual(self.marks(Path(directory))[0]["ts"], 110)
+        for label in ("3:deploy-kill", "3:upgrade", "3:settle", "agent-kill", "final"):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                self.assertEqual(self.run_mark(Path(directory), label, timeline, wait=90), ["runc", "shared-runc"])
+                self.assertEqual(self.marks(Path(directory))[0]["ts"], 100)
+
+    def test_a_wait_that_runs_out_marks_what_it_saw_and_names_what_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            missing = self.run_mark(path, "1:leader-kill", lambda now: {"process": {"n"}}, wait=30)
+            self.assertEqual(missing, ["runc", "shared-runc"])
+            (row,) = self.marks(path)
+            self.assertEqual((row["ts"], row["waited"]), (130, 30))
+            self.assertEqual([run["mode"] for run in row["runs"]], ["process"])
+
+    def test_a_stale_controller_never_counts_as_active(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            clock = dict(now=100)
+            jobs.atomic(path / "snapshot.json", self.snapshot(50, {mode: {"n"} for mode in jobs.MODES}))
+            def pause(seconds): clock["now"] += seconds
+            missing = jobs.mark(path, "n", "0:power-off", 100, wait=10, clock=lambda: clock["now"], pause=pause)
+            self.assertEqual(missing, list(jobs.MODES))
+
+    def test_the_cli_exits_3_when_the_wait_runs_out(self):
+        import subprocess, sys
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            jobs.atomic(path / "snapshot.json", dict(heartbeat=0, active=[]))
+            result = subprocess.run([sys.executable, str(Path(jobs.__file__)), "mark", str(path), "n", "0:power-off",
+                                     "--wait", "0"], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 3, result.stderr)
+            self.assertEqual(result.stdout.split(), list(jobs.MODES))
+            result = subprocess.run([sys.executable, str(Path(jobs.__file__)), "mark", str(path), "n", "0:settle"],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class OverlapEverySeed(unittest.TestCase):
+    """#2105, property-style: for every seed, each tier's schedule gives every
+    mode an active run overlapping every gated fault kind it owes.
+
+    Each tier's faults come from the harness's own --plan. A seed places each
+    fault in its slot and picks its node, and draws each mode's activity on
+    each node: tasks of 20-30 s with gaps of 2-4 s, on even seconds, as the
+    controller sees them every 2 s. In the 92 s a wait covers, at most five
+    gaps of up to 4 s fall on each mode, 60 s for all three, so some even
+    second within the wait has all three active. That the activity has such a second is the one thing
+    the harness can't choose; when it holds, the gate passes on every seed."""
+
+    SEEDS = range(150)
+    TIERS = (("qualify-sustained.sh", "fast"), ("qualify-sustained.sh", "final"),
+             ("qualify-jobs-sustained.sh", "fast"), ("qualify-jobs-sustained.sh", "final"))
+    NODES = ("n1", "n2", "n3")
+
+    @classmethod
+    def setUpClass(cls):
+        import subprocess
+        cls.plans = {}
+        for script, tier in cls.TIERS:
+            result = subprocess.run([str(Path(__file__).parent / script), "--tier", tier, "--plan"],
+                                    capture_output=True, text=True, check=True)
+            cls.plans[script, tier] = result.stdout.splitlines()
+
+    @staticmethod
+    def schedule(lines):
+        """The gated faults in a plan as (cycle, slot, kind), and whether the
+        tier has node faults. A real tier walks upgrades on odd cycles, which
+        then run no deploy-kill and no power-off."""
+        header = next(line for line in lines if line.startswith("plan: tier "))
+        node_faults = " node-faults true " in header
+        faults = []
+        for line in lines:
+            words = line.split()
+            if words[:2] != ["plan:", "cycle"]: continue
+            cycle, action = int(words[2]), words[3]
+            if action in ("follower-kill", "leader-kill"): faults.append((cycle, 0 if action[0] == "f" else 1, action))
+            elif action == "power-off" and cycle % 2 == 0: faults.append((cycle, 3, action))
+            elif action == "node-fault": faults.append((cycle, 5, words[4]))
+        return faults, node_faults
+
+    @staticmethod
+    def activity(rng, length):
+        """Active intervals [start, end) on even seconds over `length` s."""
+        intervals, at = [], -rng.randrange(0, 30, 2)
+        while at < length + 200:
+            end = at + rng.randrange(20, 31, 2)
+            intervals.append((at, end))
+            at = end + rng.choice((2, 4))
+        return intervals
+
+    def soak(self, lines, seed, wait):
+        import random, types
+        faults, node_faults = self.schedule(lines)
+        cycle = 600 if " schedule compressed " in lines[0] else 3600
+        rng = random.Random(seed)
+        length = (max(f[0] for f in faults) + 1) * cycle
+        traces = {(node, mode): self.activity(rng, length) for node in self.NODES for mode in jobs.MODES}
+        def active(now):
+            return {mode: {node for node in self.NODES
+                           if any(start <= now < end for start, end in traces[node, mode])} for mode in jobs.MODES}
+        missed = []
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            for number, slot, kind in faults:
+                node = rng.choice(self.NODES[1:] if kind == "power-off" else self.NODES)
+                clock = dict(now=number * cycle + slot * cycle // 6 + rng.randrange(0, 60, 2))
+                jobs.atomic(path / "snapshot.json", FaultOverlap.snapshot(clock["now"], active(clock["now"])))
+                def pause(seconds):
+                    clock["now"] += seconds
+                    jobs.atomic(path / "snapshot.json", FaultOverlap.snapshot(clock["now"], active(clock["now"])))
+                if jobs.mark(path, node, f"{number}:{kind}", clock["now"], wait=wait, clock=lambda: clock["now"], pause=pause):
+                    missed.append(f"{number}:{kind}")
+            campaign = types.SimpleNamespace(directory=path, save=lambda: None,
+                                             state=dict(fault_offset=0, totals={}, coverage={m: {} for m in jobs.MODES}))
+            jobs.consume_faults(campaign)
+        kinds = jobs.FAULT_KINDS + (jobs.NODE_FAULT_KINDS if node_faults else ())
+        coverage = {mode: dict({item: True for item in jobs.REQUIRED}, **campaign.state["coverage"][mode]) for mode in jobs.MODES}
+        return jobs.coverage_failures(dict(coverage=coverage, stopped=True, active=[], load="calibration"), (), kinds), missed
+
+    def test_every_tier_schedules_every_gated_kind_it_owes(self):
+        for (script, tier), lines in self.plans.items():
+            with self.subTest(script=script, tier=tier):
+                faults, node_faults = self.schedule(lines)
+                owed = set(jobs.FAULT_KINDS + (jobs.NODE_FAULT_KINDS if node_faults else ()))
+                self.assertEqual({kind for _, _, kind in faults}, owed)
+
+    def test_every_seed_overlaps_every_mode_with_every_gated_kind(self):
+        for (script, tier), lines in self.plans.items():
+            for seed in self.SEEDS:
+                with self.subTest(script=script, tier=tier, seed=seed):
+                    # Not just one fault of each kind: every gated fault.
+                    self.assertEqual(self.soak(lines, seed, jobs.OVERLAP_WAIT_SECS), ([], []))
+
+    def test_without_the_wait_the_same_seeds_miss(self):
+        # The model has teeth: marking only at the instant of each fault, as
+        # 0.3.0 candidate 4 did, leaves some faults without every mode.
+        lines = self.plans["qualify-sustained.sh", "fast"]
+        self.assertTrue([seed for seed in self.SEEDS if self.soak(lines, seed, 0)[1]])

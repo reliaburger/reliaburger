@@ -316,11 +316,15 @@ fn refuses_system_principal(path: &str) -> bool {
             | "/v1/token/revoke"
             | "/v1/token/rotate"
             | "/v1/join-token/create"
+            | "/v1/join-token/list"
+            | "/v1/join-token/revoke"
+            | "/v1/perimeter/admit"
             | "/v1/identity/sign"
             | "/v1/secret/rotate"
             | "/v1/ca/rotation/prepare"
             | "/v1/ca/rotation/begin"
             | "/v1/ca/rotation/finalize"
+            | "/v1/identity/signing-key/rotate"
             | "/v1/nodes/decommission"
             | "/v1/audit"
     )
@@ -478,6 +482,8 @@ fn instance(app: &str) -> InstanceStatus {
         runtime_unknown: false,
         status_age_ms: None,
         age_seconds: None,
+        image: None,
+        data_on_node: false,
         reason: None,
     }
 }

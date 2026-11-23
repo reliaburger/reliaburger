@@ -6,6 +6,7 @@ use crate::bun::agent::{
     ClusterInstanceStatus, CouncilStatus, InstanceStatus, JobStatus, NodeStatus,
 };
 use crate::bun::cluster_view::NodeTagged;
+use crate::bun::diagnostics::DesiredAppEvidence;
 use crate::bun::events::{ClusterEvent, EventKind, EventSeverity};
 use crate::bun::summary::{
     AgentsSection, AlertsSection, AppBrief, AppState, AppsSection, CapacitySection, CertsSection,
@@ -17,6 +18,32 @@ use crate::mayo::rollup::{MetricsQueryResult, MetricsQueryRow};
 use crate::wrapper::types::RouteInfo;
 
 use super::app::{ClusterData, TuiApp};
+use crate::bun::summary::{ClusterCapacity, NodeCapacity, NodeCouncilView, NodeSummary, NodeUsage};
+use crate::relish::nodes_cmd::node_rows;
+
+/// What a node says about itself in the fixtures: 1 GiB of 4 used, 30%
+/// of its data disk.
+fn node_share(node: &str, cpu_percent: f64) -> NodeSummary {
+    NodeSummary {
+        node: node.to_string(),
+        version: "0.3.1".to_string(),
+        council: NodeCouncilView::default(),
+        apps: Vec::new(),
+        newest_log_unix_ms: None,
+        usage: NodeUsage {
+            newest_sample_unix_ms: Some(FIXTURE_NOW * 1_000),
+            cpu_percent: Some(cpu_percent),
+            memory_used_bytes: Some(1_073_741_824.0),
+            memory_total_bytes: Some(4_294_967_296.0),
+            disk_used_bytes: None,
+            disk_total_bytes: None,
+        },
+        data_disk_percent: Some(30.0),
+        faults: Vec::new(),
+        alerts: Vec::new(),
+        certificate_not_after: None,
+    }
+}
 
 pub const FIXTURE_NOW: u64 = 1_750_000_000;
 
@@ -48,6 +75,20 @@ impl TestScenario {
             } else {
                 format!("app-{app_index}")
             };
+            data.desired_apps.push(DesiredAppEvidence {
+                app: name.clone(),
+                namespace: "default".to_string(),
+                desired_replicas: 2,
+                scheduled_replicas: 2,
+                placements: BTreeMap::new(),
+                service_port: None,
+                blocked: None,
+                volume_home_away: None,
+                unschedulable: None,
+                volume_homes: Vec::new(),
+                rollout_failed: None,
+                owner: None,
+            });
             for replica in 0..2 {
                 let degraded = matches!(self, Self::DegradedApp) && app_index == 0 && replica == 1;
                 data.instances.push(ClusterInstanceStatus {
@@ -64,14 +105,16 @@ impl TestScenario {
                         runtime_unknown: false,
                         status_age_ms: None,
                         age_seconds: None,
+                        image: Some(format!("registry.example/{name}:v1")),
+                        data_on_node: false,
                         reason: None,
                     },
                 });
             }
         }
         if !matches!(self, Self::Empty) {
-            for index in 0..3 {
-                data.nodes.push(NodeStatus {
+            let members: Vec<NodeStatus> = (0..3)
+                .map(|index| NodeStatus {
                     node_id: format!("node-{}", index + 1),
                     address: format!("10.0.0.{}:9118", index + 1),
                     api_address: None,
@@ -80,8 +123,24 @@ impl TestScenario {
                     is_council: true,
                     is_leader: index == 0,
                     labels: BTreeMap::from([("zone".into(), format!("z{}", index + 1))]),
-                });
-            }
+                })
+                .collect();
+            // node-3 has no metrics sample yet, so its usage is unknown.
+            let shares = [node_share("node-1", 12.0), node_share("node-2", 48.0)];
+            let capacity = ClusterCapacity {
+                nodes: (1..=3)
+                    .map(|index| NodeCapacity {
+                        node: format!("node-{index}"),
+                        cpu_allocated_millicores: 1_000 * index,
+                        cpu_total_millicores: 4_000,
+                        memory_allocated_mb: 1_024,
+                        memory_total_mb: 4_096,
+                        ..Default::default()
+                    })
+                    .collect(),
+                not_reporting: Vec::new(),
+            };
+            data.nodes = node_rows(members, &shares, &[], Some(&capacity));
             data.council = Some(CouncilStatus {
                 leader: Some("node-1".into()),
                 term: 4,
@@ -132,6 +191,12 @@ impl TestScenario {
                         metric_name: "process_memory_bytes".into(),
                         labels: "{}".into(),
                         value: 64.0,
+                    },
+                    MetricsQueryRow {
+                        timestamp: FIXTURE_NOW,
+                        metric_name: "http_requests_total".into(),
+                        labels: r#"{"route":"/health"}"#.into(),
+                        value: 1520.0,
                     },
                 ],
                 warnings: Vec::new(),

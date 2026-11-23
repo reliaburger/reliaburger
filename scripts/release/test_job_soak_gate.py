@@ -53,6 +53,16 @@ class Gate(unittest.TestCase):
         self.assertTrue(all(position>loop_over for position in sets),"job_stop_at is set before the cycles are over")
         self.assertIn("wait_for_job_drain",script[loop_over:])
 
+    def test_the_job_verifier_stops_only_after_bun(self):
+        # A stopping Bun whose verifier had already gone failed its job
+        # attempts against it: the rehearsal's graceful stop turned an
+        # ordinary task terminal (#1965). Before= starts the verifier first
+        # and so stops it last.
+        script=(Path(__file__).parent/"qualify-sustained.sh").read_text()
+        start=script.index("cat > /etc/systemd/system/reliaburger-soak-audit.service")
+        unit=script[start:script.index("\nUNIT\n",start)]
+        self.assertIn("\nBefore=reliaburger.service\n",unit)
+
     def test_a_controller_that_stops_before_the_harness_asks_for_the_drain_fails(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); snap=root/"snap"; snap.mkdir()
@@ -669,6 +679,12 @@ class RunBudget(unittest.TestCase):
             identity=int(path.split("/")[3])
             if identity in self.gone: raise jobs.Gone("candidate API refused "+method+" "+path+" (HTTP 404)")
             if path.endswith("/cancel"): return {}
+            if "/results?" in path:
+                # A drained run's sampled chunks (#1415): every task once, from one grant.
+                query=dict(pair.split("=") for pair in path.split("?")[1].split("&"))
+                start=int(query.get("after",-1))+1
+                return {"rows":[dict(index=i,grant_attempt=1,attempts=1,succeeded=True)
+                                for i in range(start,start+int(query["limit"]))]}
             self.gets.append(identity)
             body=next(b for i,b in self.posts.values() if i==identity)
             template=body["definition"]["template"]; count=body["definition"]["tasks"]["count"]
@@ -1031,7 +1047,12 @@ class CurrentPairExpectations(unittest.TestCase):
 
     def test_power_on_and_the_all_off_special_push_through_the_helper(self):
         bodies=self.functions()
-        for name in ("power_on","special_all_off"):
+        # power_on lives in sustained/power.sh, shared with the power-cut
+        # endurance harness; the soak's push is its power_after_on hook.
+        shared=(Path(__file__).parent/"sustained"/"power.sh").read_text()
+        on=shared[shared.index("\npower_on() {"):]
+        self.assertIn('power_after_on "$node"',on[:on.index("\n}\n")])
+        for name in ("power_after_on","special_all_off"):
             with self.subTest(function=name):
                 self.assertIn("push_current_pair",bodies[name])
                 self.assertNotIn('push_pair "$node" "$tls/current/',bodies[name])
@@ -1138,3 +1159,51 @@ class NodeFaultOverlap(unittest.TestCase):
         hold=slot[injected:removed]
         self.assertIn("job_mark_fault",hold)
         self.assertRegex(hold,r"while \[")
+
+
+class InstanceStorage(unittest.TestCase):
+    """#1418: a node's data/instances, counted in allocated blocks on its own
+    filesystem, must stay under INSTANCE_STORAGE_LIMIT_MIB. Before the
+    capture reclaim, the 0.2.3 and 0.2.4 day runs grew node 1's to 0.9 GiB;
+    since 0.2.5 every record peaks under 30 MiB."""
+
+    def setUp(self):
+        self.directory=tempfile.TemporaryDirectory(); self.root=Path(self.directory.name)
+        (self.root/"metadata.json").write_text(json.dumps(dict(job_soak=True,job_stop_at=10**10)))
+        self.count=0
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def check(self, instances_kb, window=None):
+        checker.save_state(self.root,{**checker.load_state(self.root),"nodes":["n"],"window":window})
+        self.count+=1; ts=10000*self.count
+        snap=self.root/("snap-%d"%self.count); snap.mkdir()
+        (snap/"meta.json").write_text(json.dumps(dict(ts=ts,kind="heavy",collected=ts+5)))
+        (snap/"inventory-n.txt").write_text("boot b1\nnrestarts 0\nbun_pid 100\nbun_fd 300\nbun_rss_kb 300000\n")
+        proof=inventory_proof(ts+1); proof["storage_kb"]={"task-arrays":8,"job-state":8,"instances":instances_kb}
+        (snap/"jobs-n.txt").write_text(json.dumps(proof))
+        import contextlib,io
+        with contextlib.redirect_stdout(io.StringIO()): checker.evaluate(self.root,snap)
+        verdict=json.loads((snap/"verdict.json").read_text())
+        return [(item["severity"],item["detail"]) for item in verdict["findings"] if item["check"]=="instance-storage"]
+
+    def test_the_limit_leaves_headroom_over_the_records(self):
+        # 0.3.0 rehearsal day run: node 1 peaked at 29,396 KiB.
+        self.assertGreaterEqual(checker.INSTANCE_STORAGE_LIMIT_MIB*1024,2*29396)
+
+    def test_instance_storage_under_the_limit_passes(self):
+        self.assertEqual(self.check(29396),[])
+        self.assertEqual(self.check(checker.INSTANCE_STORAGE_LIMIT_MIB*1024),[])
+
+    def test_instance_storage_over_the_limit_fails_the_snapshot(self):
+        found=self.check(checker.INSTANCE_STORAGE_LIMIT_MIB*1024+1)
+        self.assertEqual([severity for severity,_ in found],["fail"])
+        self.assertIn("over the %d MiB limit"%checker.INSTANCE_STORAGE_LIMIT_MIB,found[0][1])
+        self.assertEqual(checker.load_state(self.root)["job_resources"]["n"]["peak_storage_kb"]["instances"],
+                         checker.INSTANCE_STORAGE_LIMIT_MIB*1024+1)
+
+    def test_inside_a_fault_window_an_overshoot_is_reported_not_failed(self):
+        self.assertEqual([s for s,_ in self.check(10**6,window="power-off")],["info"])
+        # Still there once the window closes: now it fails.
+        self.assertEqual([s for s,_ in self.check(10**6)],["fail"])

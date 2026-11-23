@@ -39,8 +39,7 @@ async fn wait_for_proxy(ctx: &TestContext, expected_status: u16) -> Result<(), S
     url.set_path("/hostname");
     let mut last = "no response".to_string();
     let outcome = ctx
-        .deadline
-        .run("ingress convergence", async {
+        .step("ingress convergence", async {
             loop {
                 match client.get(url.clone()).send().await {
                     Ok(response) => {
@@ -94,25 +93,23 @@ async fn ingress_route_appears_in_routing_table(ctx: TestContext) -> Result<(), 
     ctx.apply(&app_with_ingress(&ctx, app)?).await?;
     ctx.wait_running_cluster(app, 1).await?;
 
-    ctx.deadline
-        .run("ingress route convergence", async {
-            loop {
-                let routes = ctx
-                    .client
-                    .routes()
-                    .await
-                    .map_err(|error| format!("could not read routes: {error}"))?;
-                if routes
-                    .iter()
-                    .any(|route| route.host == ingress_host(&ctx) && route.healthy_backends > 0)
-                {
-                    return Ok(());
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    ctx.step("ingress route convergence", async {
+        loop {
+            let routes = ctx
+                .client
+                .routes()
+                .await
+                .map_err(|error| format!("could not read routes: {error}"))?;
+            if routes
+                .iter()
+                .any(|route| route.host == ingress_host(&ctx) && route.healthy_backends > 0)
+            {
+                return Ok(());
             }
-        })
-        .await
-        .map_err(|error| error.to_string())?
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await?
 }
 
 pub fn cases() -> Vec<TestCase> {
@@ -122,6 +119,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::Ingress,
             requires: &[Capability::ContainerRuntime, Capability::Ingress],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(ingress_routes_host_header_to_app),
         },
         TestCase {
@@ -129,6 +127,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::Ingress,
             requires: &[Capability::ContainerRuntime, Capability::Ingress],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(ingress_removes_route_after_stop),
         },
         TestCase {
@@ -136,6 +135,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::Ingress,
             requires: &[Capability::ContainerRuntime, Capability::Ingress],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(ingress_route_appears_in_routing_table),
         },
     ]

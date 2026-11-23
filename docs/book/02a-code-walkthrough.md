@@ -202,7 +202,7 @@ The `write()` method handles the `ForwardToLeader` error case, which openraft re
 The algorithm:
 
 1. Clamp target size to `[min_council_size(3), max_council_size(7)]`.
-2. Filter: must be Alive, not already on council, older than `min_node_age` (600s default), have reported resources, and not be overloaded (CPU < 90%, memory < 85%).
+2. Filter: must be Alive, not already on council, older than `min_node_age` (600 s by default, though the cluster runtime sets it to 0, so age only orders candidates), and not be overloaded (CPU < 90%, memory < 85%). A node that hasn't reported resources counts as not overloaded: gossip doesn't carry resource summaries yet, so in a running cluster nobody has, and everyone alive is eligible.
 3. Sort: nodes in novel zones first (for diversity), then oldest first (stability), then lexicographic by node ID (determinism).
 4. Take however many are needed.
 
@@ -210,7 +210,9 @@ The sorting is the interesting bit. If the council already has members in zones 
 
 ### 4. Reporting tree (`src/reporting/`)
 
-How does the leader know what's actually running on each node? Workers tell it. But in a large cluster, having every worker report directly to the leader would overwhelm it. So we build a tree: workers report to their assigned council member, and council members aggregate.
+How does the leader know what's actually running on each node? Workers tell it. But in a large cluster, having every worker report directly to the leader would overwhelm it. So the design is a tree: workers report to their assigned council member, and council members aggregate.
+
+The module supports that tree, but a running cluster doesn't use it yet. `bun --cluster` gives every worker a council list holding only the leader (`spawn_leader_target_maintainer` in `src/cluster/runtime.rs`), so every node reports straight to the leader: a flat star. The tree is planned ([#364](https://github.com/reliaburger/reliaburger/issues/364)), and the star's limit is measured in [#1411](https://github.com/reliaburger/reliaburger/issues/1411).
 
 #### `types.rs` — Report structure
 
@@ -234,7 +236,7 @@ When the council changes (a member dies, a new one is promoted), the hash change
 
 `ReportAggregator` stores the latest report from each worker, detects stale reports (workers that stopped reporting), and publishes the aggregated view via a `watch::Sender<AggregatedState>`. The leader reads this to know what's actually happening across the cluster.
 
-**Critical path**: Worker sends report --> parent council member aggregates --> watch channel --> leader reads.
+**Critical path**: Worker sends report --> the leader's aggregator --> watch channel --> leader reads. (With the planned tree, a parent council member would sit in the middle.)
 
 ### 5. State reconstruction (`src/reconstruction/`)
 
@@ -404,9 +406,9 @@ The command-line interface that humans interact with.
 1. Node 1 starts with an empty `join` list. It self-promotes to council leader (quorum of 1 is itself).
 2. Node 2 starts with `join = ["node1:9443"]`. Gossip discovers node 1.
 3. Gossip convergence: O(log N) protocol periods for all nodes to learn about each other.
-4. The leader runs `select_council_candidates()` and promotes eligible nodes after they've been alive for `min_node_age` (600s default).
-5. `ReportWorker` on each non-council node sends a `StateReport` every 5 seconds.
-6. `ReportAggregator` on council members publishes via `watch` channel.
+4. The leader runs `select_council_candidates()` and promotes eligible nodes once they've been alive without a break for `candidate_alive_window` (5 s) and, as learners, have caught up with the log. `min_node_age` (600 s by default) would hold them back longer, but the cluster runtime sets it to 0.
+5. `ReportWorker` on every node sends a `StateReport` to the leader every 5 seconds.
+6. The leader's `ReportAggregator` publishes via `watch` channel.
 
 ### Leader failure recovery
 

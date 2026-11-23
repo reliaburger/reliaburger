@@ -202,7 +202,11 @@ pub enum RaftRequest {
     /// Add a new API token.
     CreateApiToken(crate::sesame::types::ApiToken),
     /// Revoke (remove) an API token by name.
-    RevokeApiToken { name: String },
+    ///
+    /// `now_unix_ms` is the proposer's clock, so every replica judges which
+    /// Admin tokens have expired the same way when it applies the guard
+    /// against revoking the last usable Admin (#2014).
+    RevokeApiToken { name: String, now_unix_ms: u64 },
     /// Allocate the next certificate serial number.
     AllocateSerial,
     /// Start a secret key rotation: add a new age keypair, mark the
@@ -227,7 +231,10 @@ pub enum RaftRequest {
     // NOTE: the log and the Raft RPC are JSON, which tags each variant by its
     // name, so renaming a variant changes the format and reordering doesn't.
     // New variants still go at the end, which keeps the history readable.
-    /// Start or advance a cluster-wide rolling binary upgrade (Phase 14).
+    /// Advance the cluster-wide rolling binary upgrade in progress (Phase
+    /// 14). Refused unless the active upgrade has the same id and hasn't
+    /// ended, so a write computed before an abort can't bring it back; a
+    /// new run or a resume is [`RaftRequest::UpgradeStart`].
     UpgradeUpdate {
         state: Box<crate::upgrade::types::ClusterUpgradeState>,
     },
@@ -391,6 +398,22 @@ pub enum RaftRequest {
     QuotaBlocked {
         blocked: Vec<(AppId, crate::meat::quota::QuotaError)>,
     },
+    /// Advance the appliance OS rollout in progress (W6). Refused unless
+    /// the active rollout has the same id and hasn't ended, so a write the
+    /// leader computed before `relish os abort` can't bring it back; a new
+    /// rollout or a resume is [`RaftRequest::OsRolloutStart`].
+    OsRolloutUpdate {
+        rollout: Box<crate::os::rollout::OsRollout>,
+    },
+    /// Finish an OS rollout: archive it to history and clear the slot.
+    OsRolloutClear { rollout_id: String },
+    /// Set how many voters the council grows to, cluster-wide. The node
+    /// that bootstraps an appliance cluster commits it straight after the
+    /// security state, so every later leader's reconciler reads the same
+    /// size.
+    CouncilSize {
+        voters: crate::council::selection::CouncilSize,
+    },
     /// Replace the set of fixed-size apps the leader's scheduling pass placed
     /// only part of, each with how many and why (#702). Proposed only when
     /// the set changes, like `QuotaBlocked`.
@@ -449,6 +472,19 @@ pub enum RaftRequest {
     /// `generation` (F04 R4). The leader proposes it for the node that
     /// authenticated the request.
     AcknowledgeNodeTrust { node_id: String, generation: u64 },
+    /// Sign workload JWTs with `signing_key` from now on (#709). The old key
+    /// keeps verifying until `retire_after_unix_secs`; `now_unix_secs` is
+    /// the proposer's clock, so every replica drops the same expired keys.
+    /// The leader made the key, because Raft apply must be deterministic.
+    /// Refused when the cluster has no key to rotate from.
+    RotateOidcSigningKey {
+        signing_key: crate::sesame::types::OidcSigningConfig,
+        retire_after_unix_secs: u64,
+        now_unix_secs: u64,
+    },
+    /// Drop every retiring OIDC signing key whose window ended by
+    /// `now_unix_secs`, the proposer's clock (#709).
+    RetireOidcSigningKeys { now_unix_secs: u64 },
     /// Register, sync, cancel or requeue a task array (0.2.0, million
     /// jobs). One variant wrapping the array's own write type, so the
     /// rules live beside the data in `meat::task_array_store`.
@@ -626,6 +662,34 @@ pub enum RaftRequest {
     /// The leader's reaper: drop the specs of proposals that can't be
     /// undone any more, and the oldest records beyond the limit.
     ProposalCompact { now_unix_ms: u64 },
+    /// Start a cluster-wide rolling binary upgrade. Refused during an OS
+    /// rollout, if the id has run before, or while another run is active,
+    /// unless `replaces` names that run and it's paused.
+    UpgradeStart {
+        state: Box<crate::upgrade::types::ClusterUpgradeState>,
+        replaces: Option<ReplacesPaused>,
+    },
+    /// Start an appliance OS rollout. Refused during a bun upgrade, if the
+    /// id has run before, or while another rollout is active, unless
+    /// `replaces` names that rollout and it's paused.
+    OsRolloutStart {
+        rollout: Box<crate::os::rollout::OsRollout>,
+        replaces: Option<ReplacesPaused>,
+    },
+}
+
+/// What a start does with the paused run it replaces, named by id so a
+/// start can't replace a run it never saw: one that ended, or another
+/// that took its place, is refused instead.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ReplacesPaused {
+    /// Carry the paused run on under the new id (`resume`). It's the same
+    /// run, so it isn't archived.
+    Resume { id: String },
+    /// End the paused run, archiving it as aborted with `reason`, in the
+    /// same entry that starts the new one (a rollback over a paused
+    /// upgrade), so nothing can land between the two.
+    Supersede { id: String, reason: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -785,6 +849,13 @@ pub struct DesiredState {
     pub active_upgrade: Option<crate::upgrade::types::ClusterUpgradeState>,
     /// Completed/abandoned cluster upgrades, newest last (bounded to 20).
     pub upgrade_history: Vec<crate::upgrade::types::ClusterUpgradeState>,
+    /// The appliance OS rollout in progress, if any. At most one, and never
+    /// at the same time as a bun upgrade.
+    #[serde(default)]
+    pub os_rollout: Option<crate::os::rollout::OsRollout>,
+    /// Finished OS rollouts, newest last (bounded to 20).
+    #[serde(default)]
+    pub os_rollout_history: Vec<crate::os::rollout::OsRollout>,
     /// The id counter task arrays, job runs and manifests share, so a new
     /// leader never hands out an id twice.
     pub batch_ids: crate::meat::batch_ids::BatchIds,
@@ -852,6 +923,11 @@ pub struct DesiredState {
     pub proposals: crate::proposal::Proposals,
     /// Durable ownership of the single cluster-wide node-chaos slot.
     pub node_fault_reservations: crate::smoker::reservation::NodeFaultReservations,
+    /// How many voters the council grows to, when the cluster was created
+    /// with a size (`relish cluster create --bare-metal --council-size`).
+    /// `None` keeps the reconciler's default cap of seven.
+    #[serde(default)]
+    pub council_size: Option<crate::council::selection::CouncilSize>,
     /// Log position of the last applied entry.
     pub last_applied_log: Option<openraft::LogId<u64>>,
     /// Last known membership configuration.
@@ -1150,6 +1226,7 @@ mod tests {
             }),
             RaftRequest::RevokeApiToken {
                 name: "ci-deploy".to_string(),
+                now_unix_ms: 0,
             },
             RaftRequest::RotateApiToken(crate::sesame::types::TokenRotation {
                 name: "ci-deploy".to_string(),

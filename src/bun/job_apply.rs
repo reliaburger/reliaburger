@@ -52,7 +52,9 @@ pub(crate) async fn apply(
     lease: Option<&crate::testkit::lease::TestLease>,
 ) -> Response {
     if let Some(council) = super::leadership::council_to_forward_to(&state).await {
-        return super::batch::forward_to_leader(&state, council, "/v1/apply", body, headers).await;
+        let images = crate::pickle::binding::distinct_images(&config);
+        return super::batch::forward_job_apply_to_leader(&state, council, body, headers, images)
+            .await;
     }
     let _gate = if state.council.is_none() {
         Some(state.task_arrays.apply_gate.clone().lock_owned().await)
@@ -89,6 +91,18 @@ pub(crate) async fn apply(
                 return super::api::apply::owner_refusal(&error);
             }
         };
+        // An app in a job manifest takes an ingress host under the same
+        // rule as on the app path: a scoped token can't route a host that
+        // an app outside its scope serves.
+        if config.app.values().any(|spec| spec.ingress.is_some())
+            && let Err(response) = super::api::apply::authorize_ingress_hosts(
+                auth,
+                &config,
+                &council.desired_state().await,
+            )
+        {
+            return response;
+        }
         // The apps and jobs in a job manifest are judged by the policies in
         // force, as `relish apply` judges any app (#1117, #1119). The state
         // machine commits them later, once their jobs have run, so their
@@ -217,13 +231,14 @@ pub(crate) async fn apply(
             let Some((_, record)) = arrays.deployments().find(|(id, _)| *id == operation_id) else {
                 let _ = tx
                     .send(ApplyEvent::Error {
+                        status: None,
                         message: "deployment receipt is no longer retained; query run summaries"
                             .into(),
                     })
                     .await;
                 return;
             };
-            if record.apps_committed && !record.cancelled {
+            if record.apps_committed && !record.cancelled() {
                 let instances: Vec<_> = record
                     .job_runs
                     .values()
@@ -237,8 +252,8 @@ pub(crate) async fn apply(
                     .await;
                 return;
             }
-            if record.cancelled {
-                let _ = tx.send(ApplyEvent::Error { message: format!("deployment {operation_id} cancelled or a hook failed; apps remain gated") }).await;
+            if record.cancelled() {
+                let _ = tx.send(ApplyEvent::Error { status: None, message: format!("deployment {operation_id} cancelled or a hook failed; apps remain gated") }).await;
                 return;
             }
             if record.runs().any(|id| {
@@ -247,11 +262,11 @@ pub(crate) async fn apply(
                     .run(id)
                     .is_some_and(|run| !run.unknown_owners.is_empty())
             }) {
-                let _ = tx.send(ApplyEvent::Error { message: format!("deployment {operation_id} retains unknown hook ownership; inspect run summaries and acknowledge replay only if repeating side effects is acceptable") }).await;
+                let _ = tx.send(ApplyEvent::Error { status: None, message: format!("deployment {operation_id} retains unknown hook ownership; inspect run summaries and acknowledge replay only if repeating side effects is acceptable") }).await;
                 return;
             }
             if tokio::time::Instant::now() >= deadline {
-                let _ = tx.send(ApplyEvent::Error { message: format!("deployment {operation_id} is still durable and pending; query /v1/deploys/operations") }).await;
+                let _ = tx.send(ApplyEvent::Error { status: None, message: format!("deployment {operation_id} is still durable and pending; query /v1/deploys/operations") }).await;
                 return;
             }
             if tx.is_closed() {
@@ -265,6 +280,7 @@ pub(crate) async fn apply(
             Event::default().data(serde_json::to_string(&event).unwrap_or_default()),
         )
     }))
+    .keep_alive(axum::response::sse::KeepAlive::default())
     .into_response()
 }
 
@@ -349,7 +365,7 @@ pub(crate) async fn settle(state: &ApiState) {
                 run.state.status().is_terminal() && run.state.status() != TaskArrayStatus::Succeeded
             })
         });
-        if failed && !record.cancelled {
+        if failed && !record.cancelled() {
             let _ = write_task_array(
                 state,
                 TaskArrayWrite::DeployCancel {
@@ -360,7 +376,7 @@ pub(crate) async fn settle(state: &ApiState) {
             .await;
             continue;
         }
-        if record.apps_committed || record.cancelled {
+        if record.apps_committed || record.cancelled() {
             if record.runs().all(|run| {
                 arrays
                     .get(run)
@@ -404,7 +420,7 @@ pub(crate) async fn settle(state: &ApiState) {
             let latest = read_task_arrays(state).await;
             if latest
                 .deployment(id)
-                .is_none_or(|current| current.cancelled || current.apps_committed)
+                .is_none_or(|current| current.cancelled() || current.apps_committed)
             {
                 continue;
             }

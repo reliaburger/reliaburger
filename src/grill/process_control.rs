@@ -19,6 +19,24 @@ use super::process_owner::{self, OwnerPhase, OwnerRecord, ProcessLaunch};
 use crate::durable::validate_directory;
 use crate::file_lock::{FileLock, FileLockError};
 
+/// How long Bun waits on an owner's exec socket for the answer.
+///
+/// A backstop: the agent's exec deadline (at most
+/// `bun::agent::MAX_EXEC_TIMEOUT`) wraps this wait in the same future and
+/// fires first with an error naming the app. Below the owner's own
+/// `OWNER_EXEC_DEADLINE`, so this side gives up before the owner closes the
+/// socket on it (#2128).
+pub(crate) const OWNER_SOCKET_EXEC_TIMEOUT: Duration = Duration::from_secs(310);
+
+/// How long an exec may go unanswered before Bun logs what its helper is
+/// doing (#2128).
+///
+/// Half the test kit's exec bound, so a wedged exec in a `relish test` case
+/// leaves its report in the node's journal before the case gives up on it.
+/// An exec that is merely long, like `relish exec app -- sleep 100`, gets one
+/// line in the journal and nothing else.
+const EXEC_REPORT_AFTER: Duration = Duration::from_secs(30);
+
 mod prune;
 
 /// How many times `prepare` starts again after a concurrent forget removed
@@ -398,6 +416,11 @@ impl ProcessControl {
     }
 
     /// Absence is only an unpublished directory, never a missing journal or socket.
+    ///
+    /// A forget renames a retired owner's directory away whole, so a read
+    /// that loses its journal because the directory went with it found a
+    /// forgotten owner (#2032); a directory still there without its journal
+    /// is corrupt and refuses, as the inventory's reads do (#877).
     pub(crate) async fn status_if_present(
         &self,
         id: &InstanceId,
@@ -411,7 +434,16 @@ impl ProcessControl {
                     Err(error) => return Err(error),
                 }
             }
-            this.inspect_status(&id).map(Some)
+            match this.inspect_status(&id) {
+                Ok(record) => Ok(Some(record)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    match std::fs::symlink_metadata(&directory) {
+                        Err(missing) if missing.kind() == io::ErrorKind::NotFound => Ok(None),
+                        _ => Err(error),
+                    }
+                }
+                Err(error) => Err(error),
+            }
         })
         .await
     }
@@ -659,15 +691,32 @@ impl ProcessControl {
         if request.len() > process_owner::exec::REQUEST_LIMIT {
             return Err(io::Error::other("exec request exceeds size limit"));
         }
+        let directory = self.directory(id)?;
+        let report = || async move {
+            // The helpers' records and procfs, read off the runtime.
+            let report = tokio::task::spawn_blocking(move || {
+                process_owner::exec::describe_helpers(&directory)
+            })
+            .await
+            .unwrap_or_else(|error| format!("report failed: {error}"));
+            eprintln!(
+                "bun: exec through owner {id} has had no answer for {} s: {report}",
+                EXEC_REPORT_AFTER.as_secs()
+            );
+        };
         // Keep this socket in the caller's async future. Cancellation or Bun
         // death closes it, allowing the independent owner to retire execution.
-        tokio::time::timeout(Duration::from_secs(300), async {
+        tokio::time::timeout(OWNER_SOCKET_EXEC_TIMEOUT, async {
             let socket = deliver_exec_request(&path, &request).await?;
             let mut bytes = Vec::new();
-            tokio::io::BufReader::new(socket)
-                .take(process_owner::exec::RESPONSE_LIMIT + 1)
-                .read_until(b'\n', &mut bytes)
-                .await?;
+            report_if_slow(
+                tokio::io::BufReader::new(socket)
+                    .take(process_owner::exec::RESPONSE_LIMIT + 1)
+                    .read_until(b'\n', &mut bytes),
+                EXEC_REPORT_AFTER,
+                report,
+            )
+            .await?;
             if bytes.len() as u64 > process_owner::exec::RESPONSE_LIMIT
                 || bytes.last() != Some(&b'\n')
             {
@@ -686,6 +735,33 @@ impl ProcessControl {
 
     pub(crate) fn log_stem(&self, id: &InstanceId) -> io::Result<PathBuf> {
         Ok(self.directory(id)?.join("output"))
+    }
+}
+
+/// Wait for `work`, running `report` once if it hasn't finished after
+/// `after`. The answer never waits for the report: one still running when
+/// `work` finishes is dropped.
+async fn report_if_slow<T, R>(
+    work: impl std::future::Future<Output = T>,
+    after: Duration,
+    report: impl FnOnce() -> R,
+) -> T
+where
+    R: std::future::Future<Output = ()>,
+{
+    tokio::pin!(work);
+    tokio::select! {
+        output = &mut work => return output,
+        () = tokio::time::sleep(after) => {}
+    }
+    let report = report();
+    tokio::pin!(report);
+    let mut reporting = true;
+    loop {
+        tokio::select! {
+            output = &mut work => return output,
+            () = &mut report, if reporting => reporting = false,
+        }
     }
 }
 
@@ -959,9 +1035,72 @@ mod tests {
     use std::io::{BufRead, Write};
     use std::os::unix::net::UnixListener;
 
+    // Under a paused clock the timer below advances only when everything
+    // else waits, so these show the order exactly, with no real sleeping.
+    #[tokio::test(start_paused = true)]
+    async fn an_exec_answered_in_time_is_not_reported() {
+        let reports = std::cell::Cell::new(0);
+        let answer = report_if_slow(
+            async {
+                tokio::time::sleep(EXEC_REPORT_AFTER / 2).await;
+                "answer"
+            },
+            EXEC_REPORT_AFTER,
+            || async { reports.set(reports.get() + 1) },
+        )
+        .await;
+        assert_eq!(answer, "answer");
+        assert_eq!(reports.get(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_exec_is_reported_once_and_still_answered() {
+        let reports = std::cell::Cell::new(0);
+        let started = tokio::time::Instant::now();
+        let reported_at = std::cell::Cell::new(None);
+        let answer = report_if_slow(
+            async {
+                tokio::time::sleep(EXEC_REPORT_AFTER * 3).await;
+                "late answer"
+            },
+            EXEC_REPORT_AFTER,
+            || async {
+                reports.set(reports.get() + 1);
+                reported_at.set(Some(started.elapsed()));
+            },
+        )
+        .await;
+        assert_eq!(answer, "late answer");
+        assert_eq!(reports.get(), 1);
+        assert_eq!(reported_at.get(), Some(EXEC_REPORT_AFTER));
+        assert_eq!(started.elapsed(), EXEC_REPORT_AFTER * 3);
+    }
+
+    /// The report reads the disk and procfs while the exec may be stuck on
+    /// exactly those, so a slow report mustn't hold back the answer.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_report_does_not_delay_the_answer() {
+        let started = tokio::time::Instant::now();
+        let answer = report_if_slow(
+            async {
+                tokio::time::sleep(EXEC_REPORT_AFTER + Duration::from_secs(1)).await;
+                "answer"
+            },
+            EXEC_REPORT_AFTER,
+            std::future::pending::<()>,
+        )
+        .await;
+        assert_eq!(answer, "answer");
+        assert_eq!(
+            started.elapsed(),
+            EXEC_REPORT_AFTER + Duration::from_secs(1)
+        );
+    }
+
     fn spec() -> OciSpec {
         use super::super::oci::{OciLinux, OciProcess, OciRoot, OciUser};
         OciSpec {
+            managed_volumes: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1254,6 +1393,41 @@ mod tests {
         assert!(control.status_if_present(&id).await.is_err());
         std::fs::write(directory.join("owner.json"), b"broken").unwrap();
         assert!(control.status_if_present(&id).await.is_err());
+    }
+
+    // #2032: a reader in another process (a test's own `ProcessGrill`, a
+    // second tool on the node) races Bun forgetting a retired generation.
+    // The forget renames the directory away whole, so a read that finds it
+    // gone halfway has found a forgotten owner, not a broken one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn optional_status_reads_a_generation_forgotten_under_it_as_absent() {
+        let root = tempfile::tempdir().unwrap();
+        let control = ProcessControl::new(root.path().join("owners"), PathBuf::from("/bin/false"));
+        for round in 0..100 {
+            let id = InstanceId(format!("default__forgotten-{round}"));
+            control.prepare(&id, &spec()).await.unwrap();
+            assert!(control.cancel_unstarted(&id).await.unwrap());
+            let readers: Vec<_> = (0..3)
+                .map(|_| {
+                    let control = control.clone();
+                    let id = id.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            match control.status_if_present(&id).await {
+                                Ok(Some(_)) => tokio::task::yield_now().await,
+                                Ok(None) => return Ok(()),
+                                Err(error) => return Err(error),
+                            }
+                        }
+                    })
+                })
+                .collect();
+            control.forget_retired(&id, None).await.unwrap();
+            for reader in readers {
+                let read = reader.await.unwrap();
+                assert!(read.is_ok(), "round {round}: {read:?}");
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

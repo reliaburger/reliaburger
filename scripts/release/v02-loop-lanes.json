@@ -10,18 +10,6 @@
     {"lane": "council_disaster_recovery (ubuntu-latest)"},
     {"lane": "cluster_failover (ubuntu-latest)"},
     {
-      "lane": "job-lease (ubuntu-latest)",
-      "tests": ["reliaburger::job_recovery::node_job_lease_reaps_a_surviving_process_after_bun_is_killed"]
-    },
-    {
-      "lane": "job-lease (ubuntu-24.04-arm)",
-      "tests": ["reliaburger::job_recovery::node_job_lease_reaps_a_surviving_process_after_bun_is_killed"]
-    },
-    {
-      "lane": "job-lease (macos-15)",
-      "tests": ["reliaburger::job_recovery::node_job_lease_reaps_a_surviving_process_after_bun_is_killed"]
-    },
-    {
       "lane": "registry-lease-expiry (ubuntu-latest)",
       "tests": ["reliaburger::registry_recovery::expired_registry_lease_recovers_after_bun_sigkill_and_preserves_shared_content"]
     },

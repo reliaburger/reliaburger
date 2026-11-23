@@ -2,6 +2,16 @@
 
 Research note, 19 October 2026, written against `origin/main` at `ef971e6a`. It answers the maintainer's question: could an app get stronger isolation by changing one field, `runtime`, and run as a Linux VM on the same hosts as containers, from the same OCI image (and from an ISO or disk image), and could that help move workloads between hosts? Nothing here is implemented, and no spike has run. Every claim about outside software links to its source.
 
+**Revised on 19 November 2026** by the
+[0.4.x review](2026-11-19-review-0.4.x.md), which this note hasn't been
+rewritten for yet. VM apps are now 0.4.4 and "VMs that move" is 0.4.5;
+"Bring your own disk" left 0.4.x for Later, and so did the Apple runtime's
+return (F10, #367), which reverses that part of decision 6. Container checkpoints (CRIU) are
+parked, so VM snapshots are the way an app keeps its memory across a move,
+and spike V4 decides whether that holds. `runtime = "vm"` stays, and the
+`[app.x.runtime]` knob table that 0.2.4 shipped is renamed to make room. The
+review's section 2 (items 16 to 20) lists what else has changed underneath.
+
 ## The short version
 
 Yes, and it fits the code better than you'd expect. Reliaburger already has three runtime backends behind one trait (`Grill` in `src/grill/mod.rs`), a per-workload router between two of them (`MixedGrill` in `src/grill/mixed.rs`), a scheduler that keeps workloads off nodes whose runtime can't run them (`NodeCapabilities::containers`, #914), and a precedent for "every container is a VM": the Apple runtime (`src/grill/apple.rs`), where Apple's `container` runs each container in its own lightweight VM ([apple/containerization](https://github.com/apple/containerization)).

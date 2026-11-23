@@ -167,10 +167,11 @@ Under the hood:
 4. Generate an `age` keypair for secret encryption
 5. Wrap all intermediate CA private keys with the master secret
 6. Issue the first node's certificate (signed by Node CA, 1-year lifetime)
-7. Seal the root CA private key with the `age` public key, write to disk
-8. Delete the root CA private key from memory
+7. Seal the root CA private key into the operator's backup, write it where
+   `--root-backup` says, and check it opens
+8. Drop the root CA private key from memory
 
-Notice what step 8 does *not* do: mint a join token. An earlier version did,
+Notice what none of these steps does: mint a join token. An earlier version did,
 and printed it in the summary. We took it out, and the reason is worth a
 paragraph because it's the whole point of the next section. A join token now
 names the one node it may enrol, and `init` cannot know the id of a node you
@@ -188,10 +189,11 @@ Cluster initialised.
   Workload CA:     serial 0x03
   Ingress CA:      serial 0x04
 
-  IMPORTANT: Back up the sealed root CA key:
-    ./prod-root-ca.age
+  IMPORTANT: The root CA key is only in this backup:
+    /media/usb/prod-root-backup.age
 
-  Losing this file means a full PKI re-bootstrap.
+  Move it off this node and keep it offline. Losing it means a
+  full PKI re-bootstrap the next time a CA needs the root.
 
   To enrol another node, start this one, then mint a token bound
   to that node's id:
@@ -200,46 +202,102 @@ Cluster initialised.
 
 ## A root backup you hold
 
-Look again at step 7. The root key is sealed to the cluster's own `age` key,
-and that key's private half is wrapped with the master key and stored in the
-security state. So `prod-root-ca.age` opens only for someone holding the
-master key *and* the cluster's state. That's a backup for the cluster. It
-isn't a backup for you. And the cluster's `age` keys rotate: the first
-version of `relish secret rotate --finalize` quietly threw away the very key
-this file was sealed to, and we had to make it keep that one (F04 R0). A
-backup that depends on a key the system rotates is a backup with an expiry
-date nobody wrote down.
+The root CA wasn't always offline, and how it got there is worth telling.
+The first `relish init` sealed the root key to the cluster's own `age` key and
+wrote it next to `master.key` as `prod-root-ca.age`. That key's private half is
+wrapped with the master key and stored in the security state. So the file
+opened for anyone holding the master key *and* the cluster's state, which is
+to say anyone with root on the node where init ran. That's a backup for the
+cluster, not for you. And the cluster's `age` keys rotate: the first version
+of `relish secret rotate --finalize` quietly threw away the very key the file
+was sealed to, and we had to make it keep that one (F04 R0). A backup that
+depends on a key the system rotates has an expiry date nobody wrote down.
 
 What does an operator actually want? The root key and its certificate, in a
 file they keep somewhere far from the cluster, that opens with something only
-they hold. That's `relish ca backup`:
+they hold. We first built that as a second step, `relish ca backup`, which ran
+on the init node and copied the root out of `prod-root-ca.age` into a file
+sealed to a passphrase. But the original file stayed on the node. The design
+said "offline after init" and the node said otherwise. An audit flagged it
+(#709), and the maintainer chose the strict fix: the root key goes *only* into
+the operator's backup, and `relish init` refuses to finish until it has
+written one.
+
+Now init asks where the backup goes and what seals it:
 
 ```bash
-$ relish ca backup --out prod-root-backup.age --dir /etc/reliaburger
+$ relish init /etc/reliaburger --cluster-name prod \
+    --root-backup /media/usb/prod-root-backup.age
 Passphrase for the root CA backup:
 Again:
-wrote the root CA backup to prod-root-backup.age
-  cluster:      prod
-  trust domain: prod
-  fingerprint:  sha256:0123...
-  expires:      2036-10-01 (2106475200 unix seconds)
 ```
 
-It runs on the node where `relish init` ran, because that's where the three
-ingredients are: the master key, the security bootstrap state and the sealed
-root. It unwraps the cluster's `age` keys with the master key, opens the
-sealed root with whichever one fits, and reseals the key, together with the
-certificate and some metadata, to a passphrase. `--recipient age1...` seals
-it to the operator's own `age` key instead. The plan's open question was
-whether a passphrase is good enough as the default. The maintainer said yes,
-with the recipient as the option, so that's what we built.
+The decision about *where* is the interesting part, because each way of making
+a cluster runs in a different place. `relish init` runs on a node, so any
+default file would put the root back on the node: at a terminal it asks, and
+without one it refuses and names the flags. The flags themselves become a
+small decision table:
 
-We also decided where the root key *lives* after init: with the operator.
-It never goes into Raft, and no node keeps it. When intermediate rotation
-arrives, the CLI will unseal this backup on the operator's machine and sign a
-request the cluster made, so the root key still never touches the cluster.
-That's why this backup has to be good. Some day it's the only copy anyone can
-use.
+```rust
+let target = match (recipient, passphrase_file) {
+    (Some(recipient), _) => BackupTarget::Recipient(recipient),
+    (None, Some(file)) => BackupTarget::Passphrase(PassphraseSource::File(file)),
+    (None, None) if terminal => BackupTarget::Passphrase(PassphraseSource::Prompt),
+    (None, None) => return Err(no_destination()),
+};
+```
+
+The third arm has a *match guard*: `if terminal` after the pattern means the
+arm only matches when the condition holds too, and otherwise matching falls
+through to the next arm. The compiler still checks the table is complete, and
+it can't see inside guards, which is why the last arm has to be there.
+
+`relish setup --ssh`, the laptop quickstart and `relish cluster create
+--bare-metal` run on the operator's own machine and promise never to ask
+anything, so an agent or cloud-init can run them. They seal the backup to a
+fresh `age` identity and write that identity to `~/.reliaburger/root-backup-keys/`,
+apart from the backup, then print both paths and say to move them offline.
+No node and no RBSEED stick ever gets either. On a laptop cluster the laptop
+is both the operator and the nodes, so the root is offline only in name, and
+the output says so plainly rather than pretend.
+
+Whichever path, nothing is reported until the file on disk has been opened
+again and checked:
+
+```rust
+BackupDestination::FreshIdentity { path, identity } => {
+    let key = age::x25519::Identity::generate();
+    // ...write the sealed backup, then the identity, owner-only...
+    let written = read_back(path)?;
+    check_opens(&written, &BackupOpener::Identity(key), backup, path, now)
+}
+```
+
+The order of the two writes matters more than it looks. Both open with
+`create_new`, which refuses to replace a file that's already there, so a
+failed attempt must not leave anything behind that blocks the retry. The
+first version wrote the identity first: a backup directory that didn't exist
+left an identity with no backup beside it, and the operator's second try
+failed on that file. Now the backup goes first, and if the identity can't be
+written the backup is removed again. A test makes each of the two writes fail
+in turn and checks that nothing is left over.
+
+`relish init` writes the backup *before* the master key, the state or the
+config, so if the backup can't be written, there's no half-made cluster
+without a root. A recipient seal is the one case it can't open, having only
+the public key, so there it checks the file is an `age` file sealed to a
+recipient. Removing the on-node file also let us undo F04 R0: nothing is
+sealed to a cluster key any more, so `relish secret rotate --finalize` retires
+every old key, generation 0 included. `relish ca backup` became a re-seal: it
+reads one backup (`--from`) and writes another, to a new passphrase or
+recipient, and never reads anything from a node, because there's nothing there
+to read.
+
+The root key lives with the operator. It never goes into Raft, and no node
+keeps it. Intermediate rotation (chapter 10) unseals this backup on the
+operator's machine and signs a request the cluster made, so the root key
+never touches the cluster. That's why this backup has to be good. It's the
+only copy there is.
 
 ### The file is just an age file
 
@@ -326,8 +384,7 @@ an `age` 0.10 build sealed, one to a passphrase and one to a recipient, under
 and `a_recipient_backup_sealed_by_age_0_10_still_opens` open and verify them on
 every build. A round-trip test can't catch this: it seals and opens with the
 same version, so a format change on both sides passes. The same fixtures pin
-the `ENC[AGE:...]` secrets apps carry in their config and the
-`<cluster>-root-ca.age` file every node keeps.
+the `ENC[AGE:...]` secrets apps carry in their config.
 
 ### Verifying without a cluster
 
@@ -350,8 +407,9 @@ $ relish ca verify prod-root-backup.age --fingerprint sha256:0123...
   another cluster gets caught;
 - a root that has expired.
 
-`relish ca backup` runs the same checks before it writes anything, so it
-never produces a file that `verify` would refuse.
+`relish init` and `relish ca backup` run the same checks on what they wrote
+before they report success, so neither leaves a file that `verify` would
+refuse.
 
 The tests follow the plan's list. A passphrase round trip opens what it
 sealed and verifies. A wrong passphrase doesn't open the file. A key swapped
@@ -360,8 +418,11 @@ its `notAfter` fails with `Expired` (we pass the clock in rather than forge a
 certificate from the past). A second cluster's backup, otherwise perfect,
 fails with `ForeignRoot`. Around those sit a few more: an intermediate passed
 off as a root, a tampered fingerprint, a recipient-sealed file that only its
-identity opens, a backup built straight from what `relish init` wrote (and
-not from a wrong master key), and `Debug` output with no key in it.
+identity opens, and `Debug` output with no key in it. For #709 we added the
+ones that matter most: no file `relish init` leaves on the node contains the
+root key's bytes (the test walks the whole directory and searches every file),
+init without a terminal refuses without a destination, and a backup that can't
+be written leaves the init directory empty.
 
 ## Join tokens and node certificates
 
@@ -377,6 +438,8 @@ in the joining node's `[cluster].join` configuration; pointing the HTTPS client
 at it can't work.
 
 The token is a 256-bit random value, SHA-256 hashed for storage. The cluster never stores the plaintext — only the hash goes into Raft. When a new node presents a token, the council hashes it and compares against stored hashes. If it matches, isn't expired, hasn't been consumed, and names the very node id in the request, the council marks it as consumed and issues a node certificate.
+
+One more check sits in front of that (#2050). Raft numbers its members with a `u64`, and we derive it from the node name with djb2 so every node can compute every peer's id. djb2 mixes short names badly: for any shared prefix, a name ending `c0` and one ending `ar` hash the same (33 × 99 + 48 = 33 × 97 + 114). Two nodes under one Raft id merge in the council directory, so if voter `worker-c0` died, a healthy `worker-ar` would fill its slot and the council would never replace the dead voter. A join is therefore refused when its Raft id matches a different node that has held a certificate or been retired, and the error names the node it clashes with. The pre-check in `check_join_token` gives the quick answer; the state machine repeats it when it consumes the token, so two joins racing each other can't both win, and again whenever it allocates a serial for a node leaf. Widening the hash would fix the cause, but every node derives every id, so that's a protocol change for another release.
 
 There's a subtlety in *who* issues the certificate. A brand-new node has nothing: no CA, no replicated state, no way to validate anyone. So it can't issue its own cert. Instead it asks an existing member. `relish join` POSTs to that member's `/v1/cluster/join` endpoint, which validates the token and signs the joiner a certificate, returning a bundle with the new cert plus the Node CA and Root CA certificates the joiner needs to verify future peers. The joiner writes all of that into its identity directory (the same `sesame::identity_store` layout the bootstrap node uses) and restarts. On the way back up it loads the identity and its listeners come up speaking mTLS.
 
@@ -745,6 +808,8 @@ let lifetime = self.lifetime_ceiling.map_or(signed, |ceiling| {
 ```
 
 `lifetime_ceiling` is an `Option<Duration>`. `map_or(default, f)` returns `default` for `None` and `f(value)` for `Some(value)`, so the common case (no override) keeps the signed lifetime untouched. The closure receives the unwrapped value. `saturating_add` clamps at the largest representable `Duration` instead of overflowing; C would silently wrap, and `Duration`'s plain `+` would panic. The ceiling gets the 300-second backdate added because every issued leaf's window includes it; without that, a perfectly normal hour-long leaf would look "too long" and renew early. The midpoint is then taken over whichever window is shorter. A node holding a year-long leaf renews about 27 minutes after it was issued, and a node whose leader ignores the override renews once per half-hour instead of on every one-second tick. We had a test prove that second part, because the obvious version ("renew now if the leaf is longer than the ceiling") would hammer the leader with a serial allocation every second for as long as the configs disagreed.
+
+The test for the override's own midpoint, `worker_renews_a_short_override_leaf_at_its_midpoint`, had a flake of its own ([#2008](https://github.com/reliaburger/reliaburger/issues/2008)). It installed a leaf whose midpoint was 3 s away, slept a second, and asserted that the worker hadn't renewed yet. On a Mac Studio running ten builds the setup alone used up the margin, so the renewal came on time and the test called it early. A 3 s pause before the worker starts reproduces it every time. The fix doesn't widen a guess. The test now reads the midpoint from the leaf as signed (X.509 keeps whole seconds, so it isn't exactly where the test asked), moves it 8 s out, and watches the worker right up to it. Each sample reads the call count first and the clock second. The worker reads its own clock before the leader counts the call, so a call counted before a clock reading that's still short of the midpoint is a real early renewal, and only those samples are checked. A slow host shortens the watch; it can't fake a failure. Watching all the way to the midpoint also makes the test stricter than before: a worker that renews 2 s early now fails it every time, where the old one-second look would have missed it.
 
 ## Gossip HMAC
 

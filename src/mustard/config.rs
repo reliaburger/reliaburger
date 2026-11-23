@@ -34,10 +34,11 @@ impl Default for GossipConfig {
             indirect_probe_count: 3,
             cleanup_timeout: Duration::from_secs(60),
             // Twenty probe periods. An exchange is capped at
-            // `MAX_SYNC_DATAGRAMS` each way whatever the cluster size, so
-            // unlike memberlist (whose TCP exchange grows with N and whose
-            // interval scales up to compensate) the cost per node is flat:
-            // at most 16 datagrams per 10 s, well under the probe traffic.
+            // `MAX_SYNC_DATAGRAMS` each way, plus two of sequence floors,
+            // whatever the cluster size, so unlike memberlist (whose TCP
+            // exchange grows with N and whose interval scales up to
+            // compensate) the cost per node is flat: at most 20 datagrams
+            // per 10 s, well under the probe traffic.
             push_pull_interval: Duration::from_secs(10),
         }
     }

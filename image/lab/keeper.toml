@@ -1,0 +1,8 @@
+# Spike S4: a volume that must survive OS updates. Appends one line per start.
+[app.keeper]
+image = "public.ecr.aws/docker/library/busybox:1.37"
+command = ["sh", "-c", "date -u >> /data/starts; sleep 100000000"]
+
+[[app.keeper.volumes]]
+path = "/data"
+size = "100Mi"

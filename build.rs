@@ -89,6 +89,13 @@ fn embed_source() {
     if !release && std::env::var_os("CARGO_FEATURE_EMBED_SOURCE").is_none() {
         return;
     }
+    // cargo-fuzz builds with the release profile, and nothing in a fuzz
+    // target reads the bundle. Watching the allowlist (fuzz/ included) made
+    // every log and corpus file a fuzz run writes under fuzz/target/ rebuild
+    // the whole crate, twice a target (#1953).
+    if std::env::var_os("CARGO_FEATURE_FUZZING").is_some() {
+        return;
+    }
     println!("cargo:rustc-cfg=source_bundle_embedded");
 
     let root = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo manifest dir"));
@@ -212,6 +219,11 @@ fn compile_ebpf() {
                 "-O2",
                 "-target",
                 "bpf",
+                // The original BPF instruction set, whichever clang builds
+                // it. Newer clang defaults to v3 and its 32-bit ALU: kernel
+                // 7.0's verifier refused clang 21's v3 build of Onion's
+                // backend selection (tests/ebpf.rs checks the objects).
+                "-mcpu=v1",
                 "-g",
                 &format!("-D__TARGET_ARCH_{linux_arch}"),
                 "-I/usr/include",

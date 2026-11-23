@@ -68,6 +68,19 @@ pub struct InstanceStatus {
     /// `binary not found: /usr/local/bin/app` (#881).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The image reference the node started this instance from, bound to
+    /// its digest (`nginx:1.27@sha256:…`) when apply pinned one. `None` for
+    /// a process workload, which has no image, and in an answer from a node
+    /// that doesn't report it. Instances of one app can differ mid-rollout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// Whether the instance's app keeps data on this node, in a managed
+    /// volume or a host-path mount: the apps an OS rollout leaves on their
+    /// node to wait out the reboot (#2120). `relish tui`'s node page shows
+    /// it as what maintenance on the node would affect. `false` from a node
+    /// that doesn't report it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub data_on_node: bool,
 }
 
 /// A workload status with the node that supplied it.
@@ -220,6 +233,10 @@ pub struct CouncilStatus {
     /// Index of the last entry in the answering node's log.
     #[serde(default)]
     pub last_log_index: Option<u64>,
+    /// How many voters the council grows to, when the cluster was created
+    /// with a size (`DesiredState::council_size`).
+    #[serde(default)]
+    pub council_size: Option<crate::council::CouncilSize>,
 }
 
 /// Work out a node's council role from its Raft metrics and recovery fence.
@@ -289,6 +306,7 @@ pub async fn council_status(
         split_with: fence.and_then(|fence| fence.split_with()),
         fence_persist_error,
         last_log_index: metrics.last_log_index,
+        council_size: desired.council_size,
     }
 }
 
@@ -670,6 +688,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         status_age_ms: None,
                         age_seconds: Some(instance.created_at.elapsed().as_secs()),
                         reason: instance.launch_failure.clone(),
+                        image: (!instance.image.is_empty()).then(|| instance.image.clone()),
+                        data_on_node: self
+                            .deployed_specs
+                            .get(&(instance.app_name.clone(), instance.namespace.clone()))
+                            .is_some_and(crate::cluster::orchestrate::stays_through_os_rollout),
                     },
                     evidence,
                 }

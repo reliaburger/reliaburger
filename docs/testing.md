@@ -20,7 +20,7 @@ run it.
 | Doc snippets | Every `relish` command and TOML block a reader copies from the manual, the READMEs and the whitepaper parses with the real code ([below](#doc-snippets)) | [`tests/suite/doc_snippets.rs`](../tests/suite/doc_snippets.rs) | `make test` |
 | Lint and format | Clippy with warnings as errors, all features and none, over every target; the macOS job runs the all-features pass only, because that one holds the macOS-only code, over the library, `relish` and `bun` ([what runs on macOS](#what-runs-on-macos-and-what-runs-on-linux)) | [`Makefile`](../Makefile) | `make lint`, `make lint-macos`, `make fmt-check` |
 | Coverage floor | Line coverage of the portable suite never drops below 78.65% | `COVERAGE_MIN_LINES` in the [`Makefile`](../Makefile) | `make coverage` (then `make coverage-html` for the HTML report) |
-| Dependency audit | No new RustSec advisory; every exception is dated | [`security.yml`](../.github/workflows/security.yml), [exceptions](qualification/2026-09-18-dependency-exceptions.md) ([12 Oct](qualification/2026-10-12-dependency-exceptions.md), [21 Oct](qualification/2026-10-21-dependency-exceptions.md), [24 Oct](qualification/2026-10-24-dependency-exceptions.md), [25 Oct](qualification/2026-10-25-dependency-exceptions.md), [26 Oct](qualification/2026-10-26-dependency-exceptions.md), [28 Oct](qualification/2026-10-28-dependency-exceptions.md) and [6 Nov](qualification/2026-11-06-dependency-exceptions.md) reviews) | `make audit` |
+| Dependency audit | No new RustSec advisory; every exception is dated | [`security.yml`](../.github/workflows/security.yml), [exceptions](qualification/2026-09-18-dependency-exceptions.md) ([12 Oct](qualification/2026-10-12-dependency-exceptions.md), [21 Oct](qualification/2026-10-21-dependency-exceptions.md), [24 Oct](qualification/2026-10-24-dependency-exceptions.md), [25 Oct](qualification/2026-10-25-dependency-exceptions.md), [26 Oct](qualification/2026-10-26-dependency-exceptions.md), [28 Oct](qualification/2026-10-28-dependency-exceptions.md), [6 Nov](qualification/2026-11-06-dependency-exceptions.md), [12 Nov](qualification/2026-11-12-dependency-exceptions.md) and [17 Nov](qualification/2026-11-17-dependency-exceptions.md) reviews) | `make audit` |
 | Dependency lag | Nothing: a report, never a failure. It lists what `cargo update` would move and every crate a major version behind, for the refresh at the start of each minor release ([`releasing.md`](releasing.md#refreshing-dependencies)); [Dependabot](../.github/dependabot.yml) opens the weekly compatible refresh | [`security.yml`](../.github/workflows/security.yml) prints it in the weekly job summary | `make outdated` |
 | CI scripts | Job selection, ignored-test owners, JUnit keeping, the benchmark baseline and the flakes register, against fixture repositories and the real workflow | [`scripts/ci/test_*.py`](../scripts/ci) | `make test-ci-scripts` |
 | Agent gym, without a cluster | Every scenario parses, each plant still applies to the checkout, the scorer's verdicts over recorded transcripts (right, partly right, wrong, steered, out of scope), the runner end to end with a fake cluster and a `relish` answering from calls recorded on a real one, and the Kubernetes ports against a rendered lab and fake `kubectl`, `claude`, `kubectl-ai` and `holmes` ([below](#an-agent-gym)) | [`scripts/gym/test_*.py`](../scripts/gym) | `make test-ci-scripts` |
@@ -35,6 +35,11 @@ portable suite and the doctests compile anything. CI's lint job likewise
 checks formatting before it restores a cache. `make ci-bench` is `make ci` followed by `make bench`. Neither
 runs a privileged, cluster or upgrade suite; those have their own targets
 below, because they need root, a provisioned host or a lot of wall time.
+
+Test threads get an 8 MiB stack (`RUST_MIN_STACK` in
+[`.cargo/config.toml`](../.cargo/config.toml)), not std's 2 MiB. An
+unoptimised build of clap's derived `relish` parser needs more than 2 MiB, so
+without it every test that parses the CLI overflows its stack.
 
 `make test` first runs `make warm-executables`: it builds the suite with
 `cargo test --no-run`, which builds the `[[bin]]` targets (`bun`, `relish`,
@@ -60,13 +65,23 @@ disclaims responsibility (`posix_spawn` with
 [Chapter 14](book/14-changing-the-tyres.md#the-deadline-was-timing-macos-not-the-candidate).
 
 The same rule holds for every target that builds before its tests. `make
-test-linux` needs `target/debug/bun` with the `ebpf` feature
+test-linux` needs `debug/bun` with the `ebpf` feature
 (`RELIABURGER_BUN_BINARY` names it), so it first runs `cargo test --no-run
 --features ebpf`, the build nextest's `--features ebpf` will ask for. It used
 to run `cargo build --features ebpf --bin bun`, so on a fresh target nextest
 compiled the library, every proc macro and `bun` a second time, and replaced
 the `bun` the step had built. On a Mac the two builds took 710 s; now they take 327 s
 ([#904](https://github.com/reliaburger/reliaburger/issues/904)).
+
+That `bun` is in cargo's target directory: `$CARGO_TARGET_DIR` if it's set,
+otherwise `target/` in the checkout. The Makefile's `TARGET_DIR` says so, and
+the demo scripts do the same. `make test-linux` used to name
+`target/debug/bun` in the checkout. Under an out-of-tree `CARGO_TARGET_DIR`
+that file doesn't exist, every runtime command failed with ENOENT in about
+30 ms, and the run looked like a burst of flaky runc failures. Now a test whose
+`RELIABURGER_BUN_BINARY` names a missing file fails at once, naming the path
+(`testkit::bun_binary`,
+[#1859](https://github.com/reliaburger/reliaburger/issues/1859)).
 A pre-build is `cargo test --no-run` with exactly the build flags of the test
 run that follows it (`--features`, `--release` and the like); selection flags
 such as `-E` don't matter, since nextest builds every test target anyway.
@@ -274,7 +289,7 @@ record goes in [`qualification/`](qualification):
 | `qualify-power-cut-reboot.sh`, which runs `qualify-oci-reboot.sh`, `qualify-discovery-reboot.sh` and `qualify-storage-power-cut.sh` | A disposable VM, which it creates and deletes that can be rebooted or powered off ([below](#pulling-the-plug)) | The maintainer, on every release candidate ([release gate](releasing.md#staging-a-candidate)) |
 | `qualify-ssh-setup.sh` (`relish setup --ssh` end to end) | Lima on the host. It creates three disposable VMs from `ssh-setup-vm.yaml` (or `--machines N`; eight puts one past the council's cap of seven), on Ubuntu 24.04 or, with `--ubuntu 26.04`, the newest LTS, builds a cluster on them over SSH, checks `status` and `wtf` and that every node's Bun stays up, runs setup again to show it resumes without restarting a node, shows a second operator refused, and deletes the VMs | The maintainer, before any release that touches SSH setup (`src/relish/quickstart/ssh.rs`, `server.rs`, `server_runner.rs`), from 0.2.6 ([#1529](https://github.com/reliaburger/reliaburger/issues/1529)) |
 | `qualify-cold-install.sh` (V04: the published release's `curl \| bash -s -- --laptop --timings` on a clean Linux host, then a check, teardown and a before-and-after diff of the host) | A fresh Linux host with KVM that it may change: a new Lima VM with `nestedVirtualization: true` for arm64, a new GitHub-hosted runner for x86_64 (the `Cold install` workflow, `cold-install.yml`, runs it three times) | The maintainer, after a promote, for the Linux rows of V04 ([#288](https://github.com/reliaburger/reliaburger/issues/288), [record](qualification/2026-11-12-v04-cold-installs-linux.md)). `make test-ci-scripts` tests its arguments and the workflow's shape ([`test_cold_install.py`](../scripts/release/test_cold_install.py)) |
-| `nightly-qualify.sh` (the power-cut runs and the soak tiers, one after another on a train's tip) | The quiet host with Lima, a staged build of the tip for the soaks, and the signed soak bun for the job final | The quiet host every night, from 0.2.4 ([nightly qualification](releasing.md#nightly-qualification-on-the-train-tip)); `nightly.py freeze-check` compares the candidate with the latest green night. `make test-ci-scripts` tests its plan, record and freeze rule ([`test_nightly.py`](../scripts/release/test_nightly.py)) |
+| `nightly-qualify.sh` (the power-cut runs and the soak tiers, one after another on a train's tip) | The quiet host with Lima, a staged build of the tip for the soaks, and the signed soak bun for the job final | The quiet host, the night before a planned freeze, armed with `nightly-qualify.sh --once` ([arming a nightly](releasing.md#arming-a-nightly), [#1721](https://github.com/reliaburger/reliaburger/issues/1721)); `nightly.py freeze-check` compares the candidate with the latest green night. `make test-ci-scripts` tests its plan, record, freeze rule, the one-night launchd job and the evening's build and staging, with fakes for `gh` and `launchctl` ([`test_nightly.py`](../scripts/release/test_nightly.py)) |
 | `make test-gym` (the agent gym's scenarios on throwaway local clusters, [below](#an-agent-gym)) | macOS or Linux, about ten minutes and the ports from `GYM_PORT_BASE` (default 29400) to 29413 free; nothing else. `GYM_SOLVER=command:PROGRAM` runs an agent instead of the scripted baseline, which costs API spend | The maintainer, before any release that changes `relish wtf`, `relish agent` or a scenario; the 0.2.7 exit test ([#1093](https://github.com/reliaburger/reliaburger/issues/1093)) runs it with an agent. The record goes in [`qualification/`](qualification) |
 | `make test-gym-user` (`relish gym run` on a throwaway local cluster: the baseline, then Ctrl-C mid-run, [below](#on-a-users-cluster-relish-gym-run)) | macOS or Linux, about ten minutes, and the ports from `GYM_PORT_BASE` free; no API spend | The maintainer, before any release that changes `relish gym`, Smoker's workload faults or token scoping |
 | `qualify-profile.sh` (the release profile: where the time goes, against the previous release) | A quiet Mac with Lima: no build or soak beside it. It creates and deletes a disposable VM, and runs `perf` on each version's never-shipped profiling build from `build.yml` | The maintainer, on every release from 0.2.4, after the tag ([release step 9](releasing.md#staging-a-candidate)). Its rules report what they would flag and don't gate yet. `make test-ci-scripts` tests its parsing, medians, rules and README ([`test_profile.py`](../scripts/release/test_profile.py)) |
@@ -422,13 +437,15 @@ jobs. What else runs depends on where the change is going:
 
 | Run | Jobs | Typical wall time |
 |---|---|---|
-| Pull request into a merge train (`release-*`, e.g. `release-0-2-4`) | The light set: CI policy, dependency audit, lint and format, minimum Rust, the demo app, the source bundle build, portable Linux (with coverage), the doctests and the nightly-signing key test, and the optimised contract boundaries | about 19 minutes of running, set by portable Linux, down from 30 (#1723, [measured](qualification/2026-11-09-v0.2.8-train-pr-timings.md)), plus however long the runners queue |
+| Pull request into a merge train (`release-*`, e.g. `release-0-2-4`) | The light set: CI policy (with the dependency audit and the demo app's Go tests), lint and format, minimum Rust, the source bundle build, portable Linux (with coverage), the doctests and the nightly-signing key test, and the optimised contract boundaries | about 19 minutes of running, set by portable Linux, down from 30 (#1723, [measured](qualification/2026-11-09-v0.2.8-train-pr-timings.md)), then about 35 once the coverage build went to one job at a time (#2102; median 22.7 minutes in 13 green train PRs before, 34.8 in 14 after). From 18 to 20 November, with the train's dependency cache saved by its pushes, 22 green train PRs without macOS took a median of 31.3 minutes of running and 43.9 of wall time: portable Linux builds the crate for 13 of its 25 to 31 minutes, one compile at a time. Since 0.3.2 `make coverage` builds the lib tests alone and then the rest, both at full parallelism (#1723): estimated at about 6 minutes of build and 18 to 24 of portable Linux (median near 21), to be confirmed by the first CI runs |
 | The same, labelled `full-ci` | The light set plus privileged Linux, the cluster, acceptance and upgrade suites, and the benchmarks the change touches | about 45 minutes |
 | The gate PR (a train into `main`) | The light set on each push; with `full-ci`, the heavy suites too | as above |
 | The gate PR labelled `release-gate` | Everything, portable macOS included; the evidence gate refuses less | about 45 minutes, plus any wait for macOS runners |
 | Any other pull request into `main` | The light set plus the heavy suites and the benchmarks the change touches | about 45 minutes |
 | Pull request stacked on any other branch | The light set; the heavy suites only with `full-ci` | about 17 minutes |
-| Push to a train or to `main`, merge-queue group, nightly, manual, `build.yml`'s candidate build | Everything | about 45 minutes, plus any wait for macOS runners |
+| Merge-queue group | Everything; only CI policy and the gate when the group changes nothing but documentation | about 60 minutes, set by portable macOS, plus any wait for runners |
+| Push to a train | Nothing but CI policy and the gate when the merge queue's run on that commit passed every job at its first attempt; portable Linux too when the train's `Cargo.lock`, `Cargo.toml` or `.cargo/config.toml` differs from `main`'s, to save its cache; everything otherwise | a few minutes; about 25 with portable Linux |
+| Push to `main`, nightly, manual, `build.yml`'s candidate build | Everything | about 45 minutes, plus any wait for macOS runners |
 
 **macOS only where it adds something**
 ([#1443](https://github.com/reliaburger/reliaburger/issues/1443), maintainer
@@ -462,15 +479,44 @@ reusing the run. The 24.04 `privileged Linux` job stays required. Taking
 `linux-next` off that list, and the job's `continue-on-error` with it, is part
 of closing #1943.
 
+Both privileged Linux jobs guard their hosted runner the way the 26.04 job
+learned to (#1943). The runner's own processes run at `oom_score_adj` -1000
+(`scripts/ci/protect-runner`) and every heavy step goes back under
+`choom -n 0`; swap is topped up to 8 GiB, never on device-mapper
+(`scripts/ci/give-swap`); and `scripts/ci/watch-runner` samples disk, memory,
+swap and memory stall every 5 s, stopping the build or the tests at a disk or
+memory floor or a held stall. Every heavy step has its own limit inside the
+job's, so a hang fails one step and the reports still run. The watcher writes
+`scripts/ci/runner-snapshot` files (memory, pressure, the tests nextest is
+running, the process tree, stuck tasks' kernel stacks, the kernel log): in the
+24.04 job every 5 minutes from minute 20, in the 26.04 job once at minute 36,
+before the tests' own `timeout`. The last step takes one more when anything
+failed. The resource log and snapshots are kept as `linux-evidence` and
+`linux-next-evidence`. `make test-linux` and `make test-rootless-runc` build
+the lib tests before the rest, so the lib and its lib tests never compile at
+once on a 16 GB runner.
+
+Portable Linux's `make coverage` does the same inside cargo-llvm-cov (#1723).
+`cargo llvm-cov --no-report test --lib -- --list` builds the instrumented lib
+tests alone (10 to 12 GB of rustc) and lists them without running one; `cargo
+llvm-cov clean --profraw-only` deletes the profile that listing writes; then
+the instrumented nextest run builds the rest, the lib (about 7 GB) first,
+since every other target links it. Both phases run at full parallelism: the
+job no longer sets `CARGO_BUILD_JOBS=1`, which also held each rustc's codegen
+to one thread and made the build about 13 of the job's 25 to 31 minutes.
+cargo-llvm-cov keeps `--no-run` for itself (a deprecated alias for its report),
+hence `--list`. The first CI runs measure it: watch the resource log for
+`mem_floor:` and memory-stall stops, and the report step for kernel OOM lines.
+
 The light set exists because macOS was the critical path of almost every run:
 twelve runs before the change took 45–55 minutes of wall time, of which
 runner queueing was mostly under ten, portable macOS 35–49 and acceptance
 about 34; every other job finished in about 15. A pull request into a train
 only needs to show it compiles, lints and passes the portable suite on Linux,
 with the coverage floor (`COVERAGE_MIN_LINES`, which only the Linux job
-measures). Nothing is lost, only moved: the push to the train runs every job
-on the result, so every commit on a train has full coverage. The gate PR
-doesn't run it all again on each push, since that push just did; it runs
+measures). Nothing is lost, only moved: the merge queue runs every job on the
+result before it lands, so every commit on a train has full coverage. The gate PR
+doesn't run it all again on each push, since the queue just did; it runs
 everything once it's labelled `release-gate` at code freeze. Label a pull
 request `full-ci` when you want the heavy suites on the PR itself, for
 example for a change to privileged Linux, cluster or acceptance code. The
@@ -482,8 +528,11 @@ Either way the job runs relish and the macOS-only tests, not the whole suite
 ([what runs on macOS](#what-runs-on-macos-and-what-runs-on-linux)), so in CI a
 change to Bun, grill or the cluster code is tested on Linux only.
 
-Every train merges through the merge queue, with `gh pr merge --merge --auto`
-([merging through the queue](releasing.md#merging-through-the-queue)).
+Every train merges through the merge queue, with `gh pr merge --merge` once
+the PR's checks have passed, never `--auto`
+([merging through the queue](releasing.md#merging-through-the-queue)). Each
+train is named in the queue's ruleset when it opens
+([opening a train](releasing.md#opening-a-train)).
 The queue requires one check, `ignored-test evidence`. It waits for
 every other job, fails if any of them failed or was cancelled, and then runs
 the evidence aggregation below, so a skipped job can only count when select
@@ -494,7 +543,9 @@ Evidence there binds to the queue's temporary group commit
 
 A newer push to the same pull request, or to the same train, cancels the
 older run; pushes to `main`, merge-queue groups and nightly runs each keep
-their own. Closing (or merging) a pull request cancels its run too: the
+their own. The queue doesn't cancel the runs of groups it drops when it
+re-forms, so [`queue-sweep.yml`](../.github/workflows/queue-sweep.yml) does
+([below](#what-a-merge-costs-in-runners)). Closing (or merging) a pull request cancels its run too: the
 `closed` event starts a run in the same group whose only job is a no-op, and
 every other job skips it
 ([#1054](https://github.com/reliaburger/reliaburger/issues/1054)). When GitHub retargets a stacked pull request,
@@ -525,6 +576,50 @@ the run's artefacts through the API (the jobs, and every workflow that calls
 an HTTP `Range` request, abandons an attempt after 60 s without a byte, logs
 its progress, checks the zip's digest and stops at 13 minutes, inside the
 step's 14.
+
+### What a merge costs in runners
+
+The account runs a fixed number of hosted jobs at once, five of them macOS,
+and every train's PRs, queue groups and pushes share them. From 18 to 20
+November 2026 (194 runs of `ci.yml`, 22,120 runner-minutes) a queue group
+started 20 jobs and used about 280 runner-minutes, and the queue builds up to
+eight groups at once. On the evening of 20 November jobs waited up to 96
+minutes for a runner, and a train PR whose own work took 30 minutes took 70
+to 110 to report (#1723). Three things wasted runners, and each now has a fix:
+
+- **Pushes that repeated the queue.** The queue pushes a train exactly the
+  commit its group tested, and that push ran all 20 jobs again: 15 of the 18
+  train pushes in the window repeated a queue run that had passed, about 4,100
+  runner-minutes. Select jobs now asks the API for that run first, by the
+  rule a candidate build uses to reuse one
+  ([`ci_reuse.py`](../scripts/release/ci_reuse.py) with `--event
+  merge_group`: same commit, first attempt, every job green), and when it
+  finds one the push runs only CI policy and the gate, which names the run
+  it rests on. A candidate build of that commit reuses the queue's run, not
+  the push's. Any doubt, an API error included, runs everything.
+- **Groups the queue had dropped.** When the queue re-forms it deletes the
+  dropped groups' `gh-readonly-queue/...` branches but leaves their runs
+  going, and each merge-group run has a concurrency group of its own. Five
+  such runs kept 78 jobs and about 1,100 runner-minutes going after they were
+  dropped. [`queue_sweep.py`](../scripts/ci/queue_sweep.py), run by
+  `queue-sweep.yml` whenever the queue starts a group or a train moves,
+  cancels every unfinished merge-group run whose branch is gone. It's its own
+  workflow because cancelling needs `actions: write`, which `ci.yml`'s
+  callers don't grant.
+- **Small jobs waiting for runners of their own.** The dependency audit and
+  the demo app's Go tests each took under a minute but waited for a runner
+  like any other job, and the gate waits for the last of them. They're steps
+  of CI policy now: 9 jobs per train PR instead of 11, 18 per queue group
+  instead of 20.
+
+A queue group that changes only documentation runs no code job either (two of
+the window's 32 groups): its code is its base's, which the run before it is
+testing. Scripts are code here, since the jobs run them.
+
+What's left is mostly the queue's own settings, which only the maintainer can
+change: building eight groups at once (`max_entries_to_build` in the "release
+trains merge queue" ruleset) means up to 160 jobs, and portable macOS (52 to
+57 minutes with a warm cache) sets every group's length.
 
 ### What runs on macOS and what runs on Linux
 
@@ -637,6 +732,14 @@ reliaburger/reliaburger` prints what it would delete; `--apply` deletes it.
 The rule can't shrink `main`'s current caches, which hold most of the quota
 (about 9 GB on 7 November), only stop stale ones from evicting them.
 
+One cache is saved on a train as well as on `main`: portable Linux's
+(`shared-key: portable`). Its key carries the toolchain and `Cargo.lock`,
+which a train usually changes, so a train PR never matched `main`'s cache
+and built every dependency from scratch, one job at a time (#1723). A pull
+request can restore its base branch's caches, so the train's own pushes
+save it. It costs about 1 GB of the quota while the train lives; the trim
+deletes it once the train's branch is gone.
+
 ## Finite contracts and current evidence
 
 [`tests/contracts/manifest.json`](../tests/contracts/manifest.json) is the finite
@@ -696,8 +799,12 @@ a seal from another commit or run, a later attempt or an earlier attempt that a
 re-run replaced can't qualify.
 
 Linux coverage wraps the existing `make coverage` once, including its clean,
+the lib tests' build, the clean of that build's listing profile, the
 instrumented nextest run and its one report, which writes the LCOV file and
-checks the unchanged line floor. The HTML report isn't evidence: the job writes
+checks the unchanged line floor. A build stage (`--no-report test`) must only
+list its tests (`-- --list`), come before the run and be followed by a
+`clean --profraw-only` before it, so the report reads the run's profiles
+alone; the owner accepts the nextest handshake only during the run stage. The HTML report isn't evidence: the job writes
 it with `make coverage-html` on pushes to `main` and the nightly only. Discovery
 uses that run's instrumented environment, selectors and target directory.
 A separate ordinary test run doesn't validate the coverage run. The owner also
@@ -736,9 +843,10 @@ real cloud's durability guarantees; those have separate owners.
 
 ## Fuzzing
 
-Every decoder that reads bytes from another machine has a
-[cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html) target
-(libFuzzer) ([#1398](https://github.com/reliaburger/reliaburger/issues/1398);
+The decoders that read bytes from another machine have
+[cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html) targets
+(libFuzzer), and [the ranking below](#which-decoders-have-targets) says which
+come next ([#1398](https://github.com/reliaburger/reliaburger/issues/1398);
 plan: [`plans/2026-10-28-research-kubernetes-release-testing.md`](plans/2026-10-28-research-kubernetes-release-testing.md)):
 
 | Target | Decoder | Bytes from |
@@ -752,6 +860,14 @@ plan: [`plans/2026-10-28-research-kubernetes-release-testing.md`](plans/2026-10-
 | `join_csr` | `sesame::ca::sign_node_csr` | a joining node |
 | `app_config` | `config::Config::parse` | `relish apply` or a GitOps repository |
 | `node_config` | `config::node::NodeConfig::parse` | a node's config file |
+| `task_manifest` | `TaskManifestRequest` and `validate_submission` (`bun::task_array_api`) | `relish batch submit` or `POST /v1/batch/manifest` |
+| `chaos_scenario` | `ScriptedScenario` and `smoker::scenario::build_timeline` | a chaos scenario file for `relish fault scenario` |
+| `council_backup_state` | `DesiredState`, then `BackupKey::for_state` and `BackupKey::parse` | the state inside an unsealed backup, during `relish council recover` |
+| `api_bearer` | `sesame::auth::extract_bearer`, `authenticate` and `sesame::oidc::verify_jwt_with_keys` | any client that can reach the API, before it has authenticated |
+| `ingress_request` | `wrapper::proxy::request_host`, `RoutingTable::lookup`, the HTTPS redirect, the upstream URI and the session-cookie filter | any client on the internet, through the ingress proxy |
+| `tftp_packet` | `relish::netboot::tftp::Packet::parse`, `route`, `negotiate` and a whole `Transfer` | any host on the LAN while `relish netboot` runs |
+| `dhcp_request` | `relish::netboot::dhcp::decode`, `answer` and `encode` | any host on the LAN while `relish netboot` runs |
+| `netboot_disk_report` | `relish::netboot::wipe::DiskReport::parse`, `summary` and `decide` | any host on the LAN, in `POST /disk`, before its install ticket is checked |
 
 A target's body lives in [`src/fuzz/mod.rs`](../src/fuzz/mod.rs), behind the
 `fuzzing` feature, and [`fuzz/fuzz_targets/`](../fuzz/fuzz_targets) only wraps
@@ -761,7 +877,53 @@ Raft frame and upstream manifest compare JSON values, because key order isn't
 meaning; gossip compares postcard bytes. Other checks are specific to the
 decoder: the push target checks that Pickle serves a manifest as the media type
 the client declared, and the CSR target checks that the certificate names the
-node the CA chose, never one the CSR asked for.
+node the CA chose, never one the CSR asked for. The bearer target checks that
+only a stored token's exact plaintext authenticates; the ingress target that a
+request matches its route on a segment boundary and that the HTTPS redirect
+names the routed host; the TFTP target that an honest client gets the whole
+file in order whatever options it asked for; the DHCP target that no reply
+hands out an address; and the netboot targets that a client's text reaches the
+operator's terminal escaped.
+
+Seeds must be the same bytes every time `make fuzz-corpus-seed` runs, so a
+seed never uses a random key or nonce: the JWT and join CSR seeds are signed
+with Ed25519 keys from fixed seeds (Ed25519 signatures are deterministic,
+ECDSA's aren't), and the backup seed is sealed with a fixed salt and nonce.
+
+### Which decoders have targets
+
+Every decoder that reads bytes from outside the process, ranked by who can
+send them: network-facing and unauthenticated first. The ranking decides which
+decoder gets the next target
+([#1414](https://github.com/reliaburger/reliaburger/issues/1414)).
+
+| Rank | Decoder | Who sends the bytes | Target |
+|---|---|---|---|
+| 1 | Gossip datagrams (`mustard::message`) | anyone who reaches the gossip UDP port | `gossip_datagram` |
+| 1 | `Authorization` bearer: token shape, API tokens, workload JWTs (`sesame::auth`, `sesame::oidc`) | any API client, before authentication | `api_bearer` |
+| 1 | Ingress `Host`, request target and `Cookie` (`wrapper::proxy`, `wrapper::routing`); HTTP framing itself is hyper's | any internet client | `ingress_request` |
+| 2 | TFTP packets (`relish::netboot::tftp`) | any LAN host, while `relish netboot` runs | `tftp_packet` |
+| 2 | DHCP requests (`relish::netboot::dhcp`, on dhcproto) | any LAN host, while `relish netboot` runs | `dhcp_request` |
+| 2 | Disk reports, `POST /disk` (`relish::netboot::wipe`) | any LAN host, before the ticket check | `netboot_disk_report` |
+| 3 | DNS queries (`onion::dns`) | any workload | `dns_query` |
+| 3 | Prometheus text from an app's metrics endpoint (`mayo::scrape`, on prometheus-parse) | any workload | none yet |
+| 3 | A backend's WebSocket handshake response (`wrapper::websocket::parse_handshake`) | any workload behind an ingress route | none yet |
+| 4 | Join CSRs (`sesame::ca::sign_node_csr`) | a node holding a join token | `join_csr` |
+| 4 | Pushed manifests (`pickle::api`) | a client with a registry token | `oci_manifest_push` |
+| 4 | API JSON bodies, task-array manifests (`bun::task_array_api`) | an authenticated client | `task_manifest` (the rest are serde derives) |
+| 4 | GitOps webhook body (`lettuce::webhook`) | a sender holding the webhook secret; the HMAC is checked first | none yet |
+| 5 | Raft RPC frames (`council::network`) | a council peer, over mTLS | `raft_rpc_frame` |
+| 5 | Reporting frames (`reporting::transport`) | a node, over mTLS | none yet |
+| 6 | Upstream manifests (`grill::oci_pull`) | the registry an app names | `oci_manifest_upstream` |
+| 6 | Layer tarballs and whiteouts (`grill::image::unpack_layers`) | the registry an app names, pinned by the manifest's digests | none yet: it writes a filesystem |
+| 6 | Release and OS channel metadata (`upgrade::metadata`, `os::channel`) | the release server, signed | none yet |
+| 7 | Backup files and the state inside (`council::backup`) | an operator | `council_backup`, `council_backup_state` |
+| 7 | App, node, chaos scenario TOML (`config`, `smoker`) | an operator or a GitOps repository | `app_config`, `node_config`, `chaos_scenario` |
+| 7 | Join tokens, Kubernetes YAML for `relish import`, the source bundle | an operator, on their own machine | none: nothing remote sends them |
+
+The next targets, in order: the Prometheus text parser, the WebSocket
+handshake parser and the layer unpacker (into a scratch directory, checking
+that nothing lands outside it).
 
 The `fuzz/` crate has its own `[workspace]`, so the root crate's `cargo`
 commands never build it. Three things run the targets:
@@ -770,7 +932,33 @@ commands never build it. Three things run the targets:
 |---|---|---|
 | `make test` (in `make ci`) | stable | `fuzz::tests`: every fixture seed is accepted and round-trips, every file in `fuzz/corpus/` runs without a panic, 512 mutated seeds run without a panic, and every target has its binary |
 | `make fuzz-corpus-check` | stable | Only those tests |
-| `make fuzz-smoke` | nightly, cargo-fuzz | Builds every target with sanitizers and runs each for `FUZZ_SECONDS` (default 10). `make fuzz-tools` says how to install what's missing. It builds for the nightly toolchain's host (`FUZZ_TARGET`), because cargo-fuzz otherwise picks the triple it was built for, and CI's prebuilt cargo-fuzz is a musl binary that AddressSanitizer can't use. It builds with `FUZZ_CODEGEN_UNITS` (default 64) codegen units: cargo-fuzz's default of one compiles reliaburger as a single sanitized LLVM module, which took 31 GB in one `rustc` and got the 16 GB hosted runner reclaimed ([#1839](https://github.com/reliaburger/reliaburger/issues/1839)) |
+| `make fuzz-smoke` | nightly, cargo-fuzz | Builds every target with sanitizers and runs each for `FUZZ_SECONDS` (default 10). `make fuzz-tools` says how to install what's missing. It builds for the nightly toolchain's host (`FUZZ_TARGET`), because cargo-fuzz otherwise picks the triple it was built for, and CI's prebuilt cargo-fuzz is a musl binary that AddressSanitizer can't use. It builds with `FUZZ_CODEGEN_UNITS` (default 64) codegen units: cargo-fuzz's default of one compiles reliaburger as a single sanitized LLVM module, which took 31 GB in one `rustc` and got the 16 GB hosted runner reclaimed ([#1839](https://github.com/reliaburger/reliaburger/issues/1839)). Coverage instrumentation is narrowed to the decoder crates (below) |
+
+Every fuzz build and run goes through
+[`fuzz/rustc-coverage.sh`](../fuzz/rustc-coverage.sh), a `RUSTC_WRAPPER` that
+keeps libFuzzer's coverage instrumentation (`-Cpasses=sancov-module`) only on
+reliaburger and the parsers the decoders run through (serde_json, postcard,
+toml, hickory-proto, dhcproto, http, x509-parser, oci-spec and a few more), and drops it from
+every other dependency
+([#1953](https://github.com/reliaburger/reliaburger/issues/1953)).
+AddressSanitizer stays on everywhere. libFuzzer scans every counter after
+every input: the whole tree was 15.3 million counters a target, the narrowed
+build 4.3 million, and a 60-second run from the seeds went from 259–287 to
+915–1,030 inputs a second (about 3.6×). reliaburger's own counters are the
+same in both builds, and the narrowed runs' corpora reached more coverage when
+replayed through the fully instrumented build. Cargo doesn't fingerprint a
+wrapper, so the Makefile adds a `--cfg` named after the wrapper's checksum to
+`RUSTFLAGS`: a changed list rebuilds every crate. `make fuzz-smoke
+FUZZ_RUSTC_WRAPPER=` instruments everything again. The job summary shows each
+target's counter count; one near 15 million means the narrowing
+is off. `scripts/ci/test_fuzz_workflow.py` runs the wrapper over a stand-in
+`rustc` and checks its list against `fuzz/Cargo.lock`.
+
+The fuzz build doesn't embed the source bundle (`build.rs` skips it under the
+`fuzzing` feature). A release build watches the bundle's allowlist, `fuzz/`
+included, so each log and corpus file a run wrote under `fuzz/target/`
+rebuilt reliaburger, twice a target: the nightly spent 25 minutes a target
+and hit its timeout.
 
 [`fuzz.yml`](../.github/workflows/fuzz.yml) runs `make fuzz-smoke` nightly at
 300 seconds a target, and for 30 seconds on a pull request that touches a
@@ -794,7 +982,9 @@ The seed corpus in [`fuzz/corpus/`](../fuzz/corpus) comes from the decoders'
 unit-test fixtures and the `examples/` configs
 ([`src/fuzz/seeds.rs`](../src/fuzz/seeds.rs)). `make fuzz-corpus-seed`
 rewrites it; run it after a protocol or state bump, since old gossip and Raft
-seeds then stop decoding. libFuzzer writes what it finds to
+seeds then stop decoding. `fuzz::tests` runs every checked-in fixture seed
+through its target and fails if one is refused, so a bump that leaves stale
+seeds fails `make test`. libFuzzer writes what it finds to
 `fuzz/target/corpus/`, never into the checked-in seeds.
 
 OSS-Fuzz is the follow-up: Google's continuous fuzzing runs Rust projects
@@ -802,7 +992,17 @@ through the same cargo-fuzz targets
 ([guide](https://google.github.io/oss-fuzz/getting-started/new-project-guide/rust-lang/)).
 Applying needs a `projects/reliaburger/` directory in the OSS-Fuzz repository
 (a `project.yaml`, a Dockerfile and a `build.sh` that runs `cargo fuzz build -O`),
-once the targets have run clean nightly for a while.
+once the targets have run clean nightly for a while. A draft of all three is
+in [`fuzz/oss-fuzz/`](../fuzz/oss-fuzz): `build.sh` builds every target
+`cargo fuzz list` names, with the same 64 codegen units as `make fuzz-build`,
+and ships each target's `fuzz/corpus/` seeds as its seed corpus. Unlike
+`make fuzz-build`, the draft doesn't set
+`RUSTC_WRAPPER=fuzz/rustc-coverage.sh`, so every crate keeps its coverage
+counters; whether OSS-Fuzz's build should narrow them too is decided when the
+pull request is opened. The maintainer fills in `project.yaml`'s contacts and
+opens the pull request against [google/oss-fuzz](https://github.com/google/oss-fuzz)
+([#1414](https://github.com/reliaburger/reliaburger/issues/1414)). Nothing in
+this repository runs the draft.
 
 ## Mutation testing
 
@@ -905,6 +1105,13 @@ heals.
 - Leases and safety rails: [`src/testkit/lease.rs`](../src/testkit/lease.rs), [`src/testkit/safety.rs`](../src/testkit/safety.rs)
 - Proven against a real cluster: [`tests/relish_test_catalogue.rs`](../tests/relish_test_catalogue.rs)
 
+A case that fails or times out keeps its evidence: before its lease is
+released, the runner records the step it was in, its instances and their
+states, its deployments and recent events, as `failure_state` in the case's
+`-o json` entry. The plain-text report prints the first few lines of it under
+the case. The soak harness keeps the same capture in each failure bundle
+([evidence before cleanup](design/test-harness.md#evidence-before-cleanup)).
+
 ## Pulling the plug
 
 Killing a process isn't a power cut: page-cache writes survive one and not the
@@ -913,7 +1120,7 @@ check that everything acknowledged is still there.
 
 | Fixture | Driver | Record |
 |---|---|---|
-| Log and metrics exporters, council backups, lease stores | [`tests/power_cut.rs`](../tests/power_cut.rs), [`qualify-storage-power-cut.sh`](../scripts/release/qualify-storage-power-cut.sh) | [2026-10-16](qualification/2026-10-16-power-cut-reboot.md) (first run: [2026-09-25](qualification/2026-09-25-v02-power-cut.md)) |
+| Log and metrics exporters, council backups, lease stores, volume snapshots on Btrfs | [`tests/power_cut.rs`](../tests/power_cut.rs), [`qualify-storage-power-cut.sh`](../scripts/release/qualify-storage-power-cut.sh) | [2026-10-16](qualification/2026-10-16-power-cut-reboot.md) (first run: [2026-09-25](qualification/2026-09-25-v02-power-cut.md); volume snapshots: [2026-11-23](qualification/2026-11-23-power-cut-volumes.md)) |
 | Container and network ownership across a reboot | [`qualify-oci-reboot.sh`](../scripts/release/qualify-oci-reboot.sh), [`qualify-discovery-reboot.sh`](../scripts/release/qualify-discovery-reboot.sh) | same |
 
 The first run of these found two real data-loss bugs, both now fixed. They need
@@ -934,6 +1141,94 @@ guest, runs each lane `N` times, stops at the first failure, writes the records
 and a rule-of-three summary, and deletes the VM. It never touches
 `reliaburger-test`. [`test_power_cut_reboot.py`](../scripts/release/test_power_cut_reboot.py)
 (in `make test-ci-scripts`) checks its decisions against a fake `limactl`.
+
+### What a forced-off VM loses
+
+A hypervisor cut isn't the harshest power cut, and the
+[calibration record](qualification/2026-11-18-power-cut-calibration.md) says
+by how much. On Lima's VZ driver on macOS, `limactl stop --force`, a `SIGKILL`
+of the VM's process and an in-guest `sysrq b` all lose the guest's page cache
+and keep every write a flush covered. A `sysrq b` also keeps every write the
+virtual disk completed, flushed or not, since the VM process outlives it:
+a disk with no volatile write cache (fault model 1 in the
+[power-cut endurance plan](plans/2026-11-18-plan-power-cut-endurance.md)).
+Whether a stop or a kill keeps completed but unflushed writes is untested:
+the first run's `O_DIRECT` records nearly always had another thread's flush
+after them. So a store that forgot an `fsync` can still pass every lane
+above. The plan's write-cache cut, built on `dm-log-writes` in the guest, is
+what tests the stronger model, and the record shows the guest kernel can
+build it (proved with a mark written at the cut; reading past the log's entry
+count without one is unit-tested only).
+
+To measure it again on your host (each kind takes about 20 minutes for 50
+cuts and needs 2 GiB of memory for its VM):
+
+```sh
+scripts/release/power_cut/calibrate.sh --kind stop --cuts 50 --evidence /tmp/cal-stop
+scripts/release/power_cut/calibrate.sh --logwrites --evidence /tmp/cal-logwrites
+```
+
+`--kind` also takes `kill` and `sysrq`. Add `--raw` to settle the open
+question: the writer then puts `O_DIRECT` records alone on a second virtual
+disk with no filesystem, records the disk's flush count with each one, and
+counts only cuts that left a record no flush covered (not yet run). The
+script creates its own VM and disk, named `pc-cal-*`, never touches
+`reliaburger-test`, and stops when a release gate holds the host.
+
+### Power-cut endurance
+
+[`qualify-power-cut-endurance.sh`](../scripts/release/qualify-power-cut-endurance.sh)
+is the start of the long run the
+[power-cut endurance plan](plans/2026-11-18-plan-power-cut-endurance.md)
+describes (step 1 of it). It installs a published release with the website's
+`curl | sh` into a private home under `/tmp`, builds a one-node quickstart
+cluster (2 vCPU, 2 GiB), runs the soak's volume writer and Redis on it, and
+then, until the time is up, works for a random 2–10 minutes, cuts the power
+with `limactl stop --force`, waits 5–60 s and powers it back on with
+`limactl start`. After each cut it only reads, and checks:
+
+| # | Invariant | Pass means |
+|---|---|---|
+| I1 | Acknowledged volume writes | `/data/seq` holds 1..N with no gap or duplicate, and the writer started again, and at every start since the previous check resumed at or past the last `ACK` read before the cut |
+| I2 | Redis counter | Never goes backwards, and the client started again, and at every start since the previous check found it at or past the last `INCR` read before the cut |
+| I4 | Stores open cleanly | Bun started once since boot, never exited, and logged no panic or store error |
+| I6 | Recovery in time | Bun answered an API read within 120 s of power-on, and every workload ran within 300 s |
+| I7 | Desired = running | Each workload runs exactly once |
+
+I1 and I2 check where each workload *resumed*, not just what the file or
+counter holds. By the time a cluster has settled, a writer that lost
+acknowledged lines has appended hundreds more after them and its file is
+whole again; so each start records its resume point durably before doing
+anything else, in `/data/resumes` and the Redis list `soak:starts`. Every
+start since the previous check counts, not just the latest: a second start
+during the settle that resumed higher mustn't hide the cut's own start losing
+writes. If the harness can't read a last `ACK` and `INCR` before a cut (the
+log is unreadable, holds none, or went below the last one read), it doesn't
+make the cut: I1 and I2 would hold whatever happened.
+
+```sh
+scripts/release/qualify-power-cut-endurance.sh --release 0.2.8 --tier quick
+```
+
+`--tier quick` cuts for an hour; `--duration 6h` sets any other length.
+`--plan` prints the seeded schedule and exits. `--port-offset N` adds N to the cluster's
+ports, so several runs can share a host, each in its own checkout. Each cut writes a line to
+`cuts.jsonl` and a directory of evidence; the run ends with `summary.json`
+(schema `reliaburger.power-cut-endurance/1`) holding the cuts, violations,
+recovery percentiles and the rule-of-three bound. A violation powers the VM
+off and keeps everything for diagnosis. Any other early exit (a harness
+error, a failed install, an interrupt) prints where the cluster and the
+evidence are and leaves `summary.json` saying `aborted`, as it also does when
+a cut that was made has no line in `cuts.jsonl`. Between cuts, such as when
+the last `ACK` couldn't be read three times running, it stops the cluster
+cleanly with `relish local stop` and `--resume` carries on: forcing the VM
+off there would be a cut nobody recorded. Mid-cut, or if the clean stop
+fails, it forces the VM off and the run can't resume. It never touches `reliaburger-test`
+or your own `~/.reliaburger`, and when a release gate holds the host it
+powers the cluster off cleanly and exits 75; `--resume --evidence DIR`
+carries on. [`test_power_cut_endurance.py`](../scripts/release/test_power_cut_endurance.py)
+(in `make test-ci-scripts`) covers its decisions. It runs outside the release
+gate, and the cuts it makes are fault model 1 (above).
 
 ## Hollow nodes
 
@@ -1146,8 +1441,8 @@ From 0.2.4 the gate scales with the release
 installs, the fast soak tiers and the power-cut and reboot runs; the final
 soak is for minor releases and any release that changes durable state, the
 wire or the agent loop (`scripts/release/release_tier.py` says which). The
-long tiers run every night on the train's tip
-(`scripts/release/nightly-qualify.sh`), so at code freeze
+long tiers run on the train's tip the night before a planned freeze
+(`scripts/release/nightly-qualify.sh --once` arms that one night), so at code freeze
 `scripts/release/nightly.py freeze-check` only has to show that the latest
 green nightly ran the candidate's code. Performance records (benchmarks, the
 profile, the day run) are published after the tag. `make test-ci-scripts`
@@ -1158,10 +1453,10 @@ candidate's commit ([`ci_reuse.py`](../scripts/release/ci_reuse.py)).
 | Gate | What it does | Where |
 |---|---|---|
 | Staged install | `curl \| sh` against the exact signed candidate, from empty caches, then the homepage tour and a full teardown | [`qualify-staged-install.sh`](../scripts/release/qualify-staged-install.sh), [records](qualification/) |
-| Sustained soak, fast tier | About an hour on a 10-minute cycle: every fault kind (killed agents, powered-off VMs, chaos faults, upgrade round trips) and every special (graceful restart, quorum loss, every VM off), with invariants checked every 30 seconds. Run after each round of fixes; it catches what shows up in the first hour | [`qualify-sustained.sh --tier fast`](../scripts/release/qualify-sustained.sh), [plan](plans/2026-09-25-v02-sustained.md); up to about 4 h without upgrade walks on a hosted Linux runner with [`soak.yml`](../.github/workflows/soak.yml), as a diagnostic that passes no tier ([runbook](releasing.md#soaking-a-candidate-in-ci)) |
+| Sustained soak, fast tier | About an hour on a 10-minute cycle: every fault kind (killed agents, powered-off VMs, chaos faults, upgrade round trips) and every special (graceful restart, quorum loss, every VM off), with invariants checked every 30 seconds. Each power-off, Bun kill and node fault waits, for up to 90 seconds, until a job of every runtime is running on its node, so the job campaign's fault coverage doesn't depend on timing ([#2105](https://github.com/reliaburger/reliaburger/issues/2105)). Run after each round of fixes; it catches what shows up in the first hour | [`qualify-sustained.sh --tier fast`](../scripts/release/qualify-sustained.sh), [plan](plans/2026-09-25-v02-sustained.md); up to about 4 h without upgrade walks on a hosted Linux runner with [`soak.yml`](../.github/workflows/soak.yml), as a diagnostic that passes no tier ([runbook](releasing.md#soaking-a-candidate-in-ci)) |
 | Job qualification, fast tier (0.2.0 exit gate, D18-C) | The same soak with jobs at the #668 target (1,390 accepted a second by default) and a node-level fault every cycle: inter-node delay, a full disk, slow fsync. About an hour compressed; every job mode overlaps every fault kind | [`qualify-jobs-sustained.sh --tier fast`](../scripts/release/qualify-jobs-sustained.sh), [plan](plans/archive/2026-10-10-plan-release-job-soak.md#job-qualification-tiers-686-decision-d18-c) |
 | Final soak | 8 hours of faults on the hourly schedule, then a 2¼-hour quiet tail that arms every leak checker on every node ([#1062](https://github.com/reliaburger/reliaburger/issues/1062)), once per final candidate of a release that needs the full gate (a minor release, or one that changes formats or the agent loop): the job soak above on the full schedule, so it checks everything the V02 final does as well as the jobs, and it's the only final soak the gate runs (maintainer decision, 17 October 2026, [#991](https://github.com/reliaburger/reliaburger/issues/991)). It's there for slow accumulation: bun memory growth, a registry 503 and a memory alert first showed up between 4.8 and 6.2 hours into the 12-hour run of 25 September. Only a clean final-tier run whose execution inventory is complete passes: every upgrade walk, fault kind, node fault and special its 8-hour schedule owes, the final job drain and the candidate bytes it verified, counted from what ran rather than from the run's labels ([#1061](https://github.com/reliaburger/reliaburger/issues/1061)). Fault and node choices come from a logged seed that `--seed` repeats, and every leak checker must be armed for 60 minutes on every node, with one unbroken 30-minute window, which the final's quiet tail makes possible ([#1062](https://github.com/reliaburger/reliaburger/issues/1062)). Records the September plan's measurements without gating on them, against targets restated for a soak (maintainer decision, 15 October 2026, [#668](https://github.com/reliaburger/reliaburger/issues/668)). `qualify-sustained.sh --tier final` still runs the V02 final alone, outside the gate | [`qualify-jobs-sustained.sh --tier final`](../scripts/release/qualify-jobs-sustained.sh), [plans](plans/2026-09-25-v02-sustained.md), [runbook](releasing.md#staging-a-candidate) |
-| Day run (0.2.3's record, [#1032](https://github.com/reliaburger/reliaburger/issues/1032)) | One real 24-hour day of host jobs on the three-node cluster, each node resized to 4 vCPU / 6 GiB first and host jobs running the scale-out record's `busybox-static`, with no faults, walks or specials, then cancellation and the drain. It fails unless host jobs average the day rate (23,149 a second, 2 billion a day, by default; never below 11,575, a billion), no node takes more than 20% over its slot-weighted fair share (as `relish bench` allows, [#1362](https://github.com/reliaburger/reliaburger/pull/1362)), the last full hour runs within 10% of the first, and every soak check holds for the whole day, with every leak checker armed. The record has each node's total and every hour's rate. A one-off record for 0.2.3, not a gate tier; whether it becomes one is the maintainer's later decision | [`qualify-jobs-sustained.sh --tier day`](../scripts/release/qualify-jobs-sustained.sh), [runbook](releasing.md#staging-a-candidate) |
+| Day run (0.2.3's record, [#1032](https://github.com/reliaburger/reliaburger/issues/1032)) | One real 24-hour day of host jobs on the three-node cluster, each node resized to 4 vCPU / 6 GiB first and host jobs running the scale-out record's `busybox-static`, with no faults, walks or specials, then cancellation and the drain. The job fixtures are applied again every hour, so the deploy hooks and `after` jobs run while the job controller watches ([#1935](https://github.com/reliaburger/reliaburger/issues/1935)). It fails unless host jobs average the day rate (23,149 a second, 2 billion a day, by default; never below 11,575, a billion), no node takes more than 20% over its slot-weighted fair share (as `relish bench` allows, [#1362](https://github.com/reliaburger/reliaburger/pull/1362)), the last full hour runs within 10% of the first, and every soak check holds for the whole day, with every leak checker armed. The record has each node's total and every hour's rate. A one-off record for 0.2.3, not a gate tier; whether it becomes one is the maintainer's later decision | [`qualify-jobs-sustained.sh --tier day`](../scripts/release/qualify-jobs-sustained.sh), [runbook](releasing.md#staging-a-candidate) |
 | Loops | Upgrade, council recovery and lease tests repeated for hours on Linux x86, Linux Arm and macOS | [`v02-loops.yml`](../.github/workflows/v02-loops.yml) |
 | Power cut and reboot | A disposable VM forced off mid-write for each storage path (exporters, leases, council backups), and rebooted with containers and eBPF network rules in place, 10 times per lane, or 25 when the release changes storage, locking or ownership (0.2.0, 0.2.1 and 0.2.2 ran 25); every acknowledged write and every owned resource must survive ([above](#pulling-the-plug)) | [`qualify-storage-power-cut.sh`](../scripts/release/qualify-storage-power-cut.sh), [`qualify-oci-reboot.sh`](../scripts/release/qualify-oci-reboot.sh), [`qualify-discovery-reboot.sh`](../scripts/release/qualify-discovery-reboot.sh), [0.2.2 record](qualification/2026-10-25-power-cut-reboot.md) |
 | Task-array benchmarks | Nightly on `main`, failing on a regression of more than 2x against the last baseline | [Benchmarks in CI](#benchmarks-in-ci) |
@@ -1174,7 +1469,15 @@ within two minutes; a fault that doesn't settle by its deadline; containers,
 namespaces, eBPF pins, file descriptors or memory leaking after settling; an
 upgrade that ends on the wrong version; a Bun panic or a restart no fault
 explains; an agent loop turn over a second; or, with jobs, a run that executes
-twice, goes missing or never drains. The full list is the soak plan's
+twice, goes missing or never drains, or a node's `data/instances` over 64 MiB
+outside a fault window. That last one counts allocated blocks on the data
+filesystem, as the job inventory does: `du -sb` also counts each container's
+mounted root filesystem and the length of capture files whose stored prefix
+Bun has punched out, so it overstates the space used several times over.
+Since 0.2.5 every record peaks at 24 to 29 MiB, the 24-hour day runs
+included; 0.2.3's and 0.2.4's day runs reached 0.9 GiB on node 1 before the
+capture reclaim
+([#1418](https://github.com/reliaburger/reliaburger/issues/1418)). The full list is the soak plan's
 [pass and fail](plans/2026-09-25-v02-sustained.md#4-pass-and-fail). Each
 failure gets a root cause; a product fix means a new candidate and every soak
 again. Before 1.0, a final run whose only failures match a documented harness
@@ -1210,10 +1513,10 @@ why we copied the idea and not the tooling.
 | SLO (p99) | What's timed | Threshold | Mode |
 |---|---|---|---|
 | Job task start | A job task's start lag on a pooled executor, from the job campaign's buckets, in runs no fault window overlapped | ≤ 256 ms | Gated in the fast and final tiers |
-| API read | `GET /v1/status?cluster=true` and `GET /v1/cluster/nodes` (what `relish status` and `relish nodes` ask) on every node, at every light check, from the host | ≤ 1,000 ms | Record only |
-| API write | `relish apply` of the soak workloads, from the call to the Raft commit | ≤ 2,000 ms | Record only |
-| App start | Each node's deploy of a new `soak-slo` instance, from its start until the instance passes its health check | ≤ 5,000 ms | Record only |
-| Rolling update | From `relish apply` returning until every node runs the new `soak-slo` | ≤ 30,000 ms | Record only |
+| API read | `GET /v1/status?cluster=true` and `GET /v1/cluster/nodes` (what `relish status` and `relish nodes` ask) on every node, at every light check, from the host | ≤ 3,000 ms | Gated in the fast and final tiers |
+| API write | `relish apply` of the soak workloads, from the call to the Raft commit | ≤ 3,000 ms | Gated in the fast and final tiers |
+| App start | Each node's deploy of a new `soak-slo` instance, from its start until the instance passes its health check | ≤ 30,000 ms | Gated in the fast and final tiers |
+| Rolling update | From `relish apply` returning until every node runs the new `soak-slo` | ≤ 100,000 ms | Gated in the fast and final tiers |
 
 **Where the gated number comes from.** The job start lag is the one latency
 earlier records already kept. Across the ten 0.2.0 to 0.2.2 soak records its
@@ -1243,15 +1546,54 @@ tail gives it millions, so a final short of 1,000 fails. 0.2.4's 8-hour
 final, the first to gate on it, measured 32 ms over 137,306,923 quiet tasks
 ([record](qualification/2026-10-30-v0.2.4-job-qualification.md)).
 
-**Record only, from 28 October 2026.** No soak before 0.2.4 timed the API,
-an app start or a rolling update, so those four start in record-only mode:
-the record shows the value and whether it's over the provisional threshold,
-and never fails on it. The provisional thresholds are Kubernetes's for reads
-and app start, and a guess with room to spare for writes and rolling updates.
-The first 0.2.4 fast and final records exist now
-([release closure](qualification/2026-10-30-v0.2.4-release-closure.md)),
-and the maintainer sets each gate from them, with margin, the same way as
-the job start.
+**The API and rollout gates, from 6 November 2026.** No soak before 0.2.4
+timed the API, an app start or a rolling update, so those four started in
+record-only mode on 28 October: the record showed the value and whether it
+was over a provisional threshold, and never failed on it. The fast and final
+records from 0.2.4 to 0.2.6 then set three of the gates
+([#1405](https://github.com/reliaburger/reliaburger/issues/1405);
+`python3 scripts/release/soak_slo.py trend docs/qualification` lists them):
+
+| SLO (p99) | Fast-tier records | Final records | Worst | Gate |
+|---|---|---|---|---|
+| API read | 100 to 150 ms | 150, 1,500, 150 ms | 1,500 ms | 3,000 ms |
+| API write | 150 to 300 ms | 500, 1,500, 1,500 ms | 1,500 ms | 3,000 ms |
+| Rolling update | 30,000 ms | 30,000, 50,000, 50,000 ms | 50,000 ms | 100,000 ms |
+
+Each gate sits two histogram buckets above the worst value. A p99 is the
+upper bound of its bucket, so one bucket of margin would fail a run that was
+only a little slower than the worst so far, and the job start's four times
+would leave the rolling update at 200 s, longer than the rollout's own
+budget. A day tier and a custom run still record these without gating them:
+the 0.2.4 day run measured a rolling update p99 of 100,000 ms at six times
+the load.
+
+**The app start gate, from 16 November 2026.** App start stayed record only
+at first. It's 1 ms in every record up to 0.2.8, because deploy history
+stamped a deploy's start at the moment it recorded the deploy's end, so
+`completed_at − created_at` measured nothing
+([#1640](https://github.com/reliaburger/reliaburger/issues/1640)). Ignore
+those records' App start column. The 0.3.0 rehearsal's soaks were the first
+to run on builds with the fix, and their 186 starts are real: each matches
+its deploy history entry, a few seconds from start to completion, and the
+three nodes' entries follow one another through the rolling update
+([#1913](https://github.com/reliaburger/reliaburger/issues/1913)):
+
+| Record | Starts | Median | Slowest | p99 bucket |
+|---|---|---|---|---|
+| V02 fast, candidates 2 and 3 | 24, 24 | 4,785, 4,663 ms | 7,346, 7,176 ms | 10,000 ms |
+| V02 fast, seeded, candidates 2 and 3 | 24, 24 | 4,439, 4,736 ms | 6,899, 6,208 ms | 7,000 ms |
+| Jobs fast, candidates 2 and 3 | 12, 18 | 5,640, 5,302 ms | 10,829, 8,789 ms | 15,000, 10,000 ms |
+| Jobs final (8 h), candidate 2 | 60 | 6,563 ms | 11,069 ms | 15,000 ms |
+
+The gate follows the same rule as the other three: two buckets above the
+worst p99, 15,000 ms, which puts it at 30,000 ms. A tier gets only twelve to
+sixty starts, two per cycle per node, so its p99 is close to its slowest
+start, and a margin of one bucket would fail a run on one slow start. The
+job tiers start apps more slowly than the V02 tiers, because the job
+campaign shares the nodes' CPU. Kubernetes's pod start-up SLO is 5 s, but it
+leaves out the image pull and the health check, and it isn't measured on
+three small VMs sharing one laptop.
 
 **How it's measured.** At every light, settle and heavy check outside a fault
 window, the harness times the two API reads on each node that is up
@@ -1352,6 +1694,14 @@ and checks the record. The gated
 `cluster_failover::a_lease_history_through_a_leader_kill_is_linearizable`
 (`make test-cluster`) runs the client against three in-process nodes while
 it kills the leader, and checks the history.
+`cluster_failover::a_lease_history_through_a_leader_partition_is_linearizable`
+runs the same client while the leader is cut off rather than killed
+([#1415](https://github.com/reliaburger/reliaburger/issues/1415)): every
+cluster transport of the old leader is quiesced, as a `node-kill` fault does,
+while its API keeps answering. The test waits for one of the other two to be
+elected, leaves the old leader cut off for ten seconds more, then heals it.
+That's the direct test for a stale read after a leader change, which a kill
+can't give, because a killed leader answers nothing.
 
 **Showing it can fail.** The bug the issue names is a follower answering a
 read from its own copy without confirming leadership: in
@@ -1386,6 +1736,11 @@ building it.
 cover lost admission replies, resumption with the same request ID, monotonic
 accounting, unknown-owner fences, independent effects, stale observations,
 exact orphan detection and failure propagation into the final V02 verdict.
+They also cover the exactly-once chunk check (#1415). A drained work or audit
+run's sampled chunks must each hold every task once, all from one grant. An
+audit task whose chunk was granted once mustn't have run more often than its
+accepted attempts. A chunk on an unreachable node waits out the same 600 s
+grace as a failure fixture's result.
 For the job qualification tiers they also parse `--plan` output (an hour-long
 fast tier whose first four cycles carry every fault kind and every special,
 node faults on every node, an 8-hour final whose cycles, quiet tail and run

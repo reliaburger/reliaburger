@@ -60,22 +60,20 @@ async fn job_logs_are_retrievable_after_completion(ctx: TestContext) -> Result<(
         tail: Some(50),
         ..LogOptions::default()
     };
-    ctx.deadline
-        .run("job log publication", async {
-            loop {
-                let logs = ctx
-                    .client
-                    .logs(job, &ctx.namespace, &options)
-                    .await
-                    .map_err(|error| format!("could not fetch job logs: {error}"))?;
-                if logs.contains("hello-from-job") {
-                    return Ok(());
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    ctx.step("job log publication", async {
+        loop {
+            let logs = ctx
+                .client
+                .logs(job, &ctx.namespace, &options)
+                .await
+                .map_err(|error| format!("could not fetch job logs: {error}"))?;
+            if logs.contains("hello-from-job") {
+                return Ok(());
             }
-        })
-        .await
-        .map_err(|error| error.to_string())?
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await?
 }
 
 pub fn cases() -> Vec<TestCase> {
@@ -85,6 +83,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::Jobs,
             requires: &[Capability::ProcessRuntime],
             lease: LeaseScope::NodeJobs,
+            peer_namespace: false,
             run: testkit_case!(job_runs_to_completion_and_reports_exit),
         },
         TestCase {
@@ -92,6 +91,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::Jobs,
             requires: &[Capability::ProcessRuntime],
             lease: LeaseScope::NodeJobs,
+            peer_namespace: false,
             run: testkit_case!(scheduled_job_fires_on_its_schedule),
         },
         TestCase {
@@ -99,6 +99,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::Jobs,
             requires: &[Capability::Logs, Capability::ProcessRuntime],
             lease: LeaseScope::NodeJobs,
+            peer_namespace: false,
             run: testkit_case!(job_logs_are_retrievable_after_completion),
         },
     ]
@@ -161,7 +162,8 @@ mod tests {
             timeout,
             deadline: crate::testkit::deadline::Deadline::after(timeout).unwrap(),
             peer_route: crate::testkit::context::PeerRoute::Direct,
-            wait_note: Default::default(),
+            trace: Default::default(),
+            peer: None,
         };
         let result = tokio::time::timeout(
             Duration::from_secs(2),
@@ -252,7 +254,8 @@ mod tests {
             timeout,
             deadline: crate::testkit::deadline::Deadline::after(timeout).unwrap(),
             peer_route: crate::testkit::context::PeerRoute::Direct,
-            wait_note: Default::default(),
+            trace: Default::default(),
+            peer: None,
         };
         let result = tokio::time::timeout(
             Duration::from_secs(2),

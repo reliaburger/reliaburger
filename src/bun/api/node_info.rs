@@ -226,6 +226,7 @@ pub(super) struct DiagnosticsQuery {
 pub(super) async fn diagnostics_handler(
     live_identity: Option<axum::Extension<crate::sesame::credentials::LiveNodeIdentity>>,
     renewal: Option<axum::Extension<crate::sesame::renewal_worker::RenewalMonitor>>,
+    backup: Option<axum::Extension<crate::council::backup::BackupMonitor>>,
     State(state): State<ApiState>,
     Query(query): Query<DiagnosticsQuery>,
 ) -> Json<crate::bun::diagnostics::LocalDiagnosticSnapshot> {
@@ -317,6 +318,17 @@ pub(super) async fn diagnostics_handler(
         },
     };
 
+    // Copied out of the watch borrow in one statement (CLAUDE.md).
+    let backup = match backup {
+        Some(axum::Extension(monitor)) => DiagnosticSource::Available {
+            observed_at,
+            value: monitor.0.borrow().clone(),
+        },
+        None => DiagnosticSource::Unsupported {
+            reason: "a standalone node has no council to back up".to_string(),
+        },
+    };
+
     Json(LocalDiagnosticSnapshot {
         schema_version: crate::bun::diagnostics::LOCAL_DIAGNOSTIC_SCHEMA_VERSION,
         node_id: state.static_capabilities.node_id.clone(),
@@ -324,6 +336,8 @@ pub(super) async fn diagnostics_handler(
         disks,
         cpu_throttling,
         certificates,
+        backup,
+        export_holds: state.static_capabilities.diagnostics.export_holds.current(),
     })
 }
 
@@ -724,8 +738,20 @@ pub(super) fn collected_capability_node_id(
 /// reached its target version, so it must answer even when the agent
 /// loop is busy — hence direct manager access, not an AgentCommand.
 pub(super) async fn version_handler(State(state): State<ApiState>) -> impl IntoResponse {
+    let mut version = version_body(&state).await;
+    // The appliance OS (W6): what's running and the update in progress, so
+    // the OS rollout can tell a node that updated from one that fell back.
+    if let Some(slot) = crate::os::slot::installed() {
+        version["os_version"] = serde_json::json!(slot.running());
+        version["os_update"] = serde_json::json!(slot.state().await);
+        version["os_trial"] = serde_json::json!(slot.on_trial().await);
+    }
+    Json(version)
+}
+
+async fn version_body(state: &ApiState) -> serde_json::Value {
     match &state.upgrade {
-        Some(manager) => Json(serde_json::json!({
+        Some(manager) => serde_json::json!({
             "version": manager.running_version().to_string(),
             // The version alone doesn't identify the bytes: the upgrade
             // start gate and the orchestrator compare this digest with the
@@ -749,8 +775,8 @@ pub(super) async fn version_handler(State(state): State<ApiState>) -> impl IntoR
             // What a rollback could return to. The leader refuses a
             // cluster rollback up front when a node lacks the target.
             "installed_versions": manager.installed_versions().await,
-        })),
-        None => Json(serde_json::json!({
+        }),
+        None => serde_json::json!({
             "version": crate::upgrade::version::compiled_version().to_string(),
             "commit": crate::upgrade::version::build_commit(),
             "compatibility": crate::compatibility::CURRENT,
@@ -759,6 +785,6 @@ pub(super) async fn version_handler(State(state): State<ApiState>) -> impl IntoR
             "failed_upgrade_ids": [],
             // No upgrade manager, so no way to apply a directive at all.
             "accepts_network_upgrades": false,
-        })),
+        }),
     }
 }

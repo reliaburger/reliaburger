@@ -169,6 +169,18 @@
   },
   {
     "source": "src/grill/volume.rs",
+    "function": "a_loop_image_without_its_record_is_never_formatted",
+    "binary": "reliaburger",
+    "test": "grill::volume::tests::a_loop_image_without_its_record_is_never_formatted"
+  },
+  {
+    "source": "src/grill/volume.rs",
+    "function": "a_failed_first_loop_provisioning_can_be_retried",
+    "binary": "reliaburger",
+    "test": "grill::volume::tests::a_failed_first_loop_provisioning_can_be_retried"
+  },
+  {
+    "source": "src/grill/volume.rs",
     "function": "btrfs_quota_blocks_writes_beyond_limit",
     "binary": "reliaburger",
     "test": "grill::volume::tests::btrfs_quota_blocks_writes_beyond_limit"
@@ -259,6 +271,12 @@
   },
   {
     "source": "tests/cluster_failover.rs",
+    "function": "workers_outside_raft_keep_the_leader_after_many_elections",
+    "binary": "reliaburger::cluster_failover",
+    "test": "workers_outside_raft_keep_the_leader_after_many_elections"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
     "function": "invalid_ingress_on_one_app_leaves_discovery_working_cluster_wide",
     "binary": "reliaburger::cluster_failover",
     "test": "invalid_ingress_on_one_app_leaves_discovery_working_cluster_wide"
@@ -301,6 +319,12 @@
   },
   {
     "source": "tests/cluster_failover.rs",
+    "function": "a_lease_history_through_a_leader_partition_is_linearizable",
+    "binary": "reliaburger::cluster_failover",
+    "test": "a_lease_history_through_a_leader_partition_is_linearizable"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
     "function": "an_agent_lease_survives_a_leader_change_and_the_new_leader_expires_it",
     "binary": "reliaburger::cluster_failover",
     "test": "an_agent_lease_survives_a_leader_change_and_the_new_leader_expires_it"
@@ -340,6 +364,12 @@
     "function": "a_controller_fails_a_templated_database_pair_over_when_its_node_dies",
     "binary": "reliaburger::cluster_failover",
     "test": "a_controller_fails_a_templated_database_pair_over_when_its_node_dies"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
+    "function": "a_voter_that_shut_down_cleanly_stays_listed_as_left",
+    "binary": "reliaburger::cluster_failover",
+    "test": "a_voter_that_shut_down_cleanly_stays_listed_as_left"
   },
   {
     "source": "tests/cluster_gossip.rs",
@@ -472,6 +502,18 @@
     "function": "two_node_cluster_survives_losing_the_non_voter",
     "binary": "reliaburger::council_self_healing",
     "test": "two_node_cluster_survives_losing_the_non_voter"
+  },
+  {
+    "source": "tests/council_self_healing.rs",
+    "function": "a_replaced_voter_coming_back_joins_as_a_learner_without_an_election",
+    "binary": "reliaburger::council_self_healing",
+    "test": "a_replaced_voter_coming_back_joins_as_a_learner_without_an_election"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "onion_objects_use_only_the_original_bpf_instruction_set",
+    "binary": "reliaburger::ebpf",
+    "test": "onion_objects_use_only_the_original_bpf_instruction_set"
   },
   {
     "source": "tests/ebpf.rs",
@@ -1176,6 +1218,12 @@
     "test": "operator_cidr_reaches_the_api_port_but_not_cluster_ports"
   },
   {
+    "source": "tests/owned_network.rs",
+    "function": "published_ports_answer_members_only_and_rewrite_only_local_destinations",
+    "binary": "reliaburger::owned_network",
+    "test": "published_ports_answer_members_only_and_rewrite_only_local_destinations"
+  },
+  {
     "source": "tests/owned_rootless.rs",
     "function": "rootless_cluster_refuses_before_ownership_recovery_for_every_selection",
     "binary": "reliaburger::owned_rootless",
@@ -1279,6 +1327,30 @@
   },
   {
     "source": "tests/owned_runc.rs",
+    "function": "a_memory_request_smaller_than_runc_init_does_not_hold_the_start",
+    "binary": "reliaburger::owned_runc",
+    "test": "a_memory_request_smaller_than_runc_init_does_not_hold_the_start"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_container_paused_by_smoker_takes_its_stop_signal_at_once",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_container_paused_by_smoker_takes_its_stop_signal_at_once"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_container_with_a_paused_init_takes_its_stop_signal_at_once",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_container_with_a_paused_init_takes_its_stop_signal_at_once"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_pause_freezes_the_workload_not_its_launcher",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_pause_freezes_the_workload_not_its_launcher"
+  },
+  {
+    "source": "tests/owned_runc.rs",
     "function": "recovered_source_identity_belongs_to_the_container_not_its_launcher",
     "binary": "reliaburger::owned_runc",
     "test": "recovered_source_identity_belongs_to_the_container_not_its_launcher"
@@ -1360,6 +1432,12 @@
     "function": "cluster_stop_scales_to_zero_until_apply_and_delete_removes_the_app",
     "binary": "reliaburger::placement",
     "test": "cluster_stop_scales_to_zero_until_apply_and_delete_removes_the_app"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "a_scale_through_a_follower_converges_until_the_file_is_applied_again",
+    "binary": "reliaburger::placement",
+    "test": "a_scale_through_a_follower_converges_until_the_file_is_applied_again"
   },
   {
     "source": "tests/placement.rs",

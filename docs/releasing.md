@@ -25,8 +25,8 @@ requests, main and manual candidate builds:
 | `relish-linux-x86_64` | Ubuntu 22.04 x86_64 | Linux CLI |
 | `relish-linux-aarch64` | Ubuntu 22.04 arm64 | Linux CLI |
 | `relish-macos-aarch64` | macOS 15 Apple silicon | Laptop CLI |
-| `reliaburger-guest-ubuntu-24.04-…-aarch64.qcow2` | Ubuntu 24.04 arm64 | Quickstart VM image |
-| `reliaburger-guest-ubuntu-24.04-…-x86_64.qcow2` | Ubuntu 24.04 x86_64 | Quickstart VM image |
+| `reliaburger-guest-ubuntu-26.04-…-aarch64.qcow2` | Ubuntu 24.04 arm64 | Quickstart VM image (Ubuntu 26.04) |
+| `reliaburger-guest-ubuntu-26.04-…-x86_64.qcow2` | Ubuntu 24.04 x86_64 | Quickstart VM image (Ubuntu 26.04) |
 
 Pull requests build the guest images only when `build_guest_image.sh`,
 `guest-images.json` or the workflow changes.
@@ -41,6 +41,19 @@ so the profile never compiles on the bench host. Pushes and manual runs
 build it, and pull requests only when the workflow changes. Its name matches
 neither the candidate job's `binaries-*` nor `candidate-*`, so it never
 reaches `candidate.json`, staging or promotion.
+
+The appliance OS images are built separately, by
+`.github/workflows/appliance.yml`. A publishing run releases them as
+`os-<version>-<arch>` with a signed `os-channel.json`, which is what `relish
+image download` and `relish os` read. Today only a manual dispatch with
+`publish` set publishes. The weekly scheduled build (Monday 04:00 UTC,
+`cron: "0 4 * * 1"`) is switched off until v0.3.0 is promoted (maintainer,
+7 October 2026), so the 0.3.0 train reaching main publishes nothing by
+itself. **After v0.3.0 is promoted, dispatch a publish and restore the
+`schedule` trigger** in `appliance.yml`, as [step 8 of
+staging](#staging-a-candidate) says. Its plan job already treats a scheduled
+run on main as a publishing one, and a build whose packages match the last
+release publishes nothing.
 
 There's no Intel macOS build. 0.2.1 was the last release with
 `relish-macos-x86_64` (maintainer decision, 17 October 2026,
@@ -66,8 +79,9 @@ version (`release-0-2-1`), and one gate PR takes the train into `main`. CI
 treats the three kinds of run differently ([which jobs run](testing.md#which-jobs-a-pull-request-runs)):
 
 - **A PR into the train** gets the light set: lint and format, minimum Rust,
-  portable Linux with the coverage floor, the demo app, the source bundle
-  build and the optimised contract boundaries, in about 25 minutes. A
+  portable Linux with the coverage floor, CI policy (with the dependency
+  audit and the demo app), the source bundle build and the optimised
+  contract boundaries, in about 30 minutes of running. A
   `full-ci` label adds everything except portable macOS: privileged
   Linux (on Ubuntu 24.04 and 26.04), cluster, acceptance,
   upgrades and benchmarks. Portable macOS runs on the PR only when it
@@ -75,10 +89,17 @@ treats the three kinds of run differently ([which jobs run](testing.md#which-job
 - **The merge queue** runs every job, portable macOS and the heavy suites
   included, on the batch merged onto the train, before any of it lands. The
   queue requires the single check `ignored-test evidence`, which waits for
-  every other job and demands every evidence owner.
-- **The push to the train** runs everything on the result, macOS included.
+  every other job and demands every evidence owner. A group that changes
+  only documentation runs no code job: its code is its base's. When the
+  queue drops a group, `queue-sweep.yml` cancels its run
+  ([what a merge costs](testing.md#what-a-merge-costs-in-runners)).
+- **The push to the train** runs nothing but CI policy when the queue's run
+  on that exact commit passed every job at its first attempt, and everything
+  when it didn't (a direct push, say). When the train's dependencies differ
+  from `main`'s it still runs portable Linux, to save the cache its PRs
+  restore.
 - **The gate PR** into `main` gets the light set on each push, because the
-  push to the train has just run everything on the same code
+  merge queue has just run everything on the same code
   ([#1443](https://github.com/reliaburger/reliaburger/issues/1443)). At code
   freeze, label it `release-gate`: from then on it runs everything, and the
   evidence gate refuses it without every owner, macOS included. Merging it
@@ -100,6 +121,32 @@ on Linux only ([what runs on macOS](testing.md#what-runs-on-macos-and-what-runs-
 Dependabot's PRs never get macOS unless labelled; the nightly on `main`
 covers them.
 
+### Opening a train
+
+A train opens in one sitting, in this order:
+
+1. **Create the branch** `release-X-Y-Z` from the previous train's frozen
+   tip, or from `main` once the previous release is out.
+2. **Bump the version first.** The first PR into the train sets the
+   version in `Cargo.toml` (and its lockfile entries), so everything built
+   from the train says which release it's heading for.
+3. **Add the branch to the merge-queue ruleset** by its exact name. Only a
+   repository admin can:
+
+   ```
+   gh api repos/reliaburger/reliaburger/rulesets/25015244 > ruleset.json
+   # add "refs/heads/release-X-Y-Z" to .conditions.ref_name.include, then
+   gh api -X PUT repos/reliaburger/reliaburger/rulesets/25015244 --input ruleset.json
+   ```
+
+   Then check it took:
+   `gh api repos/reliaburger/reliaburger/rules/branches/release-X-Y-Z`
+   must list `merge_queue` and `required_status_checks`. An empty list
+   means the train has no queue ([merging through the queue](#merging-through-the-queue)).
+4. **Open the gate PR** from the train into `main`, with an empty list of
+   `Fixes` lines that grows as PRs merge
+   ([every issue closes itself](#every-issue-closes-itself)).
+
 ### Every issue closes itself
 
 Every issue a release resolves closes automatically when its fix reaches
@@ -114,10 +161,16 @@ make up for that:
   cuts both ways: "close", "closes", "fix", "fixes", "resolve" or
   "resolves" before `#N` closes the issue wherever it stands in the
   message, even after "doesn't", so write "`#N` stays open" instead.
-- **The gate PR names every issue.** Before the gate PR merges into `main`,
-  rebuild its body with a `Fixes #N` line for every issue the train
-  resolves: list the train's merged PRs and commits, collect their lines,
-  check each issue on GitHub, and keep the list in
+- **The gate PR names every issue.** The gate PR is the only PR into the
+  default branch, so its body is where GitHub reads the keywords. It lists
+  `Fixes #N` for every issue that any PR merged into the train fixes, and
+  the line goes in as each PR merges, not in a sweep at the end. Then every
+  fixed issue closes the moment the gate PR merges. An issue that closes by
+  hand after a manual record, such as a hardware exit test, is named in the
+  body as well, without the keyword, with the record it waits for. Before
+  the gate PR merges into `main`, check the body against the train: list the
+  train's merged PRs and commits, collect their lines, check each issue on
+  GitHub, and keep the list in
   `docs/qualification/DATE-vX.Y.Z-freeze-fixes.txt` with the issues that
   stay open and why
   ([0.2.8's](qualification/2026-11-09-v0.2.8-freeze-fixes.txt)).
@@ -137,14 +190,20 @@ Every train merges through GitHub's merge queue (maintainer decision of 6
 November 2026). The repository ruleset "release trains merge queue" holds the
 queue and its one required check, `ignored-test evidence`, and it names each
 train branch exactly: GitHub doesn't allow a wildcard such as `release-*` in a
-ruleset with a merge-queue rule. So when a train opens, the maintainer adds
-its branch (`refs/heads/release-0-2-8`, say) to that ruleset by name, in the
-same sitting as creating the branch. A train missing from the ruleset has
+ruleset with a merge-queue rule; retargeting it to one fails with "Wildcard
+ref names are not supported when merge queue is enabled" (#1053). So when a
+train opens, an admin adds its branch (`refs/heads/release-0-2-8`, say) to
+that ruleset by name, in the same sitting as creating the branch
+([opening a train](#opening-a-train)). A train missing from the ruleset has
 no queue, and its PRs merge on the light set alone; that's how 0.2.2 to 0.2.6
 merged, because the ruleset still named only `release-0-2-1`.
 
-Merge a PR into a train with `gh pr merge --merge --auto`, or the "Merge when
-ready" button, which adds it to the queue. Don't merge it directly. The queue
+Merge a reviewed PR whose checks have passed into a train with
+`gh pr merge --merge`, or the "Merge when ready" button, which adds it to
+the queue. Don't use `--auto` (maintainer decision of 17 November 2026): a
+PR queues only once a person has seen it green. GitHub can drop a PR from
+the queue without saying so, so afterwards check that `isInMergeQueue` is
+true, and again after any queue event. The queue
 builds a temporary branch with the train plus the PR (and up to seven more
 waiting behind it: the ruleset's group size went from 4 to 8 on 7 November
 2026, #1724), and `ci.yml`'s `merge_group` trigger runs every job on it.
@@ -663,6 +722,44 @@ The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
 same steps and the same losses. A script that read `relish status -o json`
 as a list of instances should read `relish apps --instances -o json` instead.
 
+### Upgrading from 0.2.8
+
+0.3.0 can't roll onto a 0.2.8 cluster. The appliance OS rollout and the
+cluster-wide council size are new Raft requests and new fields in council
+state, and OIDC signing-key rotation adds two more requests and a field in
+the security state
+([#709](https://github.com/reliaburger/reliaburger/issues/709)); the full
+list is in `src/compatibility.rs`. So the protocol moved from 58 to 60 and
+the state format from 74 to 76, and a 0.2.8 leader refuses
+`relish upgrade start v0.3.0` before it records a run. The train bumped
+twice: once at its first format change (59/75) and once at its end, so a
+pre-release build made between the two is refused like any other format.
+
+The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
+same steps and the same losses, and one change to how you start it: the root
+CA is now offline
+([#709](https://github.com/reliaburger/reliaburger/issues/709)). `relish
+init` writes the root's private key only into the backup you name with
+`--root-backup`, and without a terminal it needs `--passphrase-file` or
+`--recipient` too. The setups that run on your machine write it there,
+sealed to a fresh age identity, and print both paths. `relish ca backup` now
+only re-seals such a backup (`--from`). Keep that backup somewhere safe and
+off the cluster: it's the only copy of the root's key.
+
+### Upgrading from 0.3.1
+
+0.3.2 can't roll onto a 0.3.0 or 0.3.1 cluster, which both speak protocol 60
+and state format 76. The apply stream's `Error` event carries the HTTP status
+of the failure it reports, so `relish apply` on a cluster names an image
+nobody built as `404` instead of `500`
+([#2157](https://github.com/reliaburger/reliaburger/issues/2157)); the full
+list is in `src/compatibility.rs`. So the protocol moved from 60 to 61; the
+state format stays at 76. A 0.3.1 leader refuses `relish upgrade start v0.3.2`
+before it records a run.
+
+The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
+same steps and the same losses.
+
 ## Signing identity
 
 Configure `RELIABURGER_RELEASE_KEY` as a secret of the `release` GitHub
@@ -734,7 +831,11 @@ cat ~/reliaburger-nightly-key/release.pub
 ```
 
 `relish dev keygen` names its files `release.key` and `release.pub` whatever
-they're for. The `ed25519:…` line it printed goes into
+they're for. Its key is a PKCS#8 v2 document, with the public key after the
+seed, which the runners' OpenSSL 3.0 can't read, so every train build failed
+at signing until `package.py` learnt to turn it into the v1 document of the
+same key, after checking the public key it carries matches the seed
+([#1950](https://github.com/reliaburger/reliaburger/issues/1950)). The `ed25519:…` line it printed goes into
 `NIGHTLY_SIGNING_KEYS`. With an empty list, a train's build fails at signing
 with "signing key is not trusted by the binaries it signs". The maintainers
 created the key on 27 October 2026, and the 0.2.4 train carries its public
@@ -1089,7 +1190,7 @@ and the [release asset digest fields](https://docs.github.com/en/rest/releases/r
 The website and installer are separate static assets under `docs/website`,
 published by `static.yml`. GitHub Pages cannot select a different response for
 curl and a browser at `/`; the shell endpoint is `/install.sh`. The bootstrap
-installs the version in its `RELIABURGER_VERSION` default (`v0.2.8` today), so
+installs the version in its `RELIABURGER_VERSION` default (`v0.3.2` today), so
 bump that default in the same change that announces a newer release. Both
 scripts need a mode, `--laptop` or `--install-only`; with none they explain the
 choices and exit 2. For a release from before 0.2.2 the bootstrap drops
@@ -1113,11 +1214,17 @@ in three ways, besides the candidate build's reuse of a passing CI run
 
 ### Nightly qualification on the train tip
 
-Every night the quiet host runs the long tiers on the current tip of the
-release's train, one after another: the power-cut and reboot runs, the V02
-and jobs fast soaks and, for a release that needs the full gate (below), the
-job final. A failure then turns up mid-week, on the train, instead of after
-the freeze on a candidate.
+A nightly runs the long tiers on the tip of the release's train, one after
+another on the quiet host: the power-cut and reboot runs, the V02 and jobs
+fast soaks and, for a release that needs the full gate (below), the job
+final. It runs only when a release is close: the evening before a planned
+freeze, when the train should be nearly frozen, so that
+[`freeze-check`](#code-freeze) can use its evidence and the gate gets
+shorter. The rest of the time the Studio is busy with agents and long runs
+such as the power-cut endurance test, so nothing runs every night
+(maintainer decision, 20 November 2026,
+[#1721](https://github.com/reliaburger/reliaburger/issues/1721)). One command
+arms it for that one night ([below](#arming-a-nightly)).
 
 ```sh
 scripts/release/nightly-qualify.sh --train release-0-2-4 \
@@ -1125,7 +1232,8 @@ scripts/release/nightly-qualify.sh --train release-0-2-4 \
   --qualified-digest ITS_DIGEST [--soak-bun /path/to/bun-v0.2.4-soak.1]
 ```
 
-It reads the tip with `git ls-remote`, fetches it, works out the gate the
+By hand, with a staged build already in place, a night looks like the
+command above. It reads the tip with `git ls-remote`, fetches it, works out the gate the
 release needs ([below](#a-gate-scaled-to-the-release)), and runs every tier
 from a
 detached checkout of that commit, so the tip's own harness runs. Power-cut
@@ -1135,7 +1243,11 @@ install a staged build through `curl | sh`, and the script refuses one whose
 staged build only the power-cut runs happen and the night isn't green. Every
 fast tier runs even after another one fails, so one night shows every
 problem; the job final is skipped after any failure. It refuses to start while
-`rustc` or `cargo` run, records the host's load around each tier, and writes
+`rustc` or `cargo` run, or while
+[`power_cut/quiet.py`](../scripts/release/power_cut/quiet.py) says a release
+gate holds the host. While its tiers run it holds the quiet lock
+(`~/.reliaburger/quiet.lock`), so the power-cut endurance run pauses between
+cuts until the night is over. It records the host's load around each tier, and writes
 `~/reliaburger-nightly/DATE-TRAIN-SHORTSHA/` (`--records` moves it): each
 tier's own record, `nightly.json` and a README naming the exact commit and
 the verdict. `--plan` (or `--dry-run`) resolves the tip and prints the tiers,
@@ -1145,7 +1257,8 @@ The staged build is the train's **nightly build**: the tip built by
 `build.yml` and signed with the [nightly key](#nightly-signing-key), never the
 release key, because a release-signed build of unreleased code is as
 dangerous as the soak build [below](#soaking-a-candidate-in-ci) (maintainer
-decision, 27 October 2026). Each day, after the last merge to the train:
+decision, 27 October 2026). An armed night dispatches both workflows itself;
+by hand, after the last merge to the train:
 
 ```sh
 gh workflow run build.yml --ref release-0-2-4
@@ -1167,8 +1280,19 @@ never marked latest. It checks the guest images against the
 data, because a train can pin other images than `main` until its gate PR
 merges: 0.3.0's moved to Ubuntu 26.04, and main's pins refused its nightly
 ([#1952](https://github.com/reliaburger/reliaburger/issues/1952)). A release
-candidate is built on `main`, so it keeps `main`'s pins. Nothing can mistake
-it for a release:
+candidate is built on `main`, so it keeps `main`'s pins.
+
+A nightly's tag points at the `main` commit `stage.yml` ran on, not at the
+train's. GitHub refuses a workflow's `GITHUB_TOKEN` a release on a commit
+whose `.github/workflows/` differ from the default branch's: that needs the
+`workflow` scope, which no workflow token can have. 0.3.0's candidate 4
+was the first train build whose `ci.yml` differed from `main`'s, and
+`stage.yml` failed on it with HTTP 403, so the maintainer's own login staged
+it ([closure record](qualification/2026-11-20-v0.3.0-release-closure.md)).
+Nothing reads the code from the tag: `candidate.json`, pinned by its digest,
+names the commit, and the nightly checks it against the tip. A release
+candidate's staging tag still points at its own commit, which is on `main`.
+Nothing can mistake a nightly for a release:
 
 - promotion refuses any tag containing `nightly`, and `candidate.py`
   refuses a nightly record, run or artefact for a release;
@@ -1201,17 +1325,75 @@ with `--features ebpf,nightly-signing` and signed with the nightly key
 (`relish dev sign-binary --key ~/reliaburger-nightly-key/release.key bun-v0.2.4-soak.1`),
 because a nightly cluster upgrades only to binaries the nightly key signed.
 
-**Cleanup.** Every nightly staging run ends by deleting all but the newest
+**Cleanup.** Every nightly staging run of `stage.yml` ends by deleting all but the newest
 seven `nightly-*` pre-releases, with their tags (`candidate.py
-prune-nightly --keep 7`). It never touches a release, a draft release of a
+prune-nightly --keep 7`); a night that staged its build locally leaves that
+to the next `stage.yml` run. It never touches a release, a draft release of a
 version or a `staging-*` candidate. A night that has no staged build of its
 tip is red, and the freeze falls back to running the soaks on the
 candidate (step 4).
 
-[`nightly-qualify.plist.example`](../scripts/release/nightly-qualify.plist.example)
-is a launchd job that starts it at 18:00; the patch gate's tiers take about
-3 hours and the full gate's about 14. Nothing installs it: the Mac Studio that
-becomes the quiet host arrives in the week of 2 November 2026.
+#### Arming a nightly
+
+The evening before a planned freeze, from a clean checkout of `main` on the
+quiet host:
+
+```sh
+scripts/release/nightly-qualify.sh --once --train release-0-3-2
+```
+
+That arms one night. It writes a launchd job,
+`~/Library/LaunchAgents/com.reliaburger.nightly-qualify.DATE.plist`, and
+loads it with `launchctl bootstrap`. The job fires once, at the evening
+cut-off (`--at`, default 18:00) today, or on `--date YYYY-MM-DD` to arm a
+later evening ahead. `--dry-run` prints the job and loads nothing. The other
+options (`--gate full`, `--previous`, `--soak-bun`, `--records`) pass
+through to the night. For a full-gate release, build and sign the nightly
+soak bun ([above](#nightly-qualification-on-the-train-tip)) before the
+cut-off and pass `--soak-bun`, or the job final doesn't run and the night is
+green only for the patch gate. The job runs this checkout's `nightly.py`;
+the tiers themselves run the tip's own harness.
+
+At the cut-off the night:
+
+1. removes its own job file first, and unloads the job when it ends, whatever
+   the result, a crash included. It runs only on the date it was armed for:
+   launchd's calendar entry has no year, and launchd runs a job it missed
+   while the Mac slept when it wakes, so a late start disarms and stops;
+2. refuses to start while `rustc` or `cargo` run, or while
+   `power_cut/quiet.py` says a release gate holds the host;
+3. dispatches `build.yml` on the train, waits for it (up to 5 hours: the
+   build waits up to two for the train's CI run), and takes the digest from
+   the build's own `nightly-manifest-COMMIT-ATTEMPT` artefact;
+4. dispatches `stage.yml` with `channel=nightly`, and waits for it. If the
+   staging run fails, the night stages the build itself, saying so in the
+   log: `candidate.py stage-fetch` and `candidate.py stage`, with the host's
+   `gh` login and the tag on `main`, as `stage.yml` would. If the build
+   fails, the night runs only the power-cut runs, and isn't green;
+5. runs the tiers on the commit that was built, holding the quiet lock, and
+   writes the night's record.
+
+The log goes to `~/reliaburger-nightly/launchd.log`. A patch gate's night
+takes about an hour of build and 3 hours of tiers; a full gate's about 15
+hours in all, so a night armed for 18:00 ends around 09:00.
+
+`scripts/release/nightly-qualify.sh --disarm` removes every armed night that
+hasn't started yet. A night that's already running has removed its own job
+file, so disarming leaves it alone; stop that one with
+`launchctl bootout gui/$(id -u)/com.reliaburger.nightly-qualify.DATE`. To
+start a night now rather than at a cut-off, run
+`scripts/release/nightly-qualify.sh --dispatch --train release-0-3-2`, the
+same night without launchd.
+
+To stage a nightly build by hand, as the night's fallback does:
+
+```sh
+python3 scripts/release/candidate.py stage-fetch --directory /tmp/nightly-dist \
+  --repository reliaburger/reliaburger --run-id RUN_ID --qualified-digest ITS_DIGEST --channel nightly
+python3 scripts/release/candidate.py stage --directory /tmp/nightly-dist \
+  --repository reliaburger/reliaburger --run-id RUN_ID --qualified-digest ITS_DIGEST --channel nightly \
+  --main-commit "$(git ls-remote origin refs/heads/main | cut -f1)"
+```
 
 A failed night is triaged that day, like a failed CI run: a product bug gets
 an issue and a fix on the train, and anything that passes on a re-run goes in
@@ -1258,9 +1440,27 @@ needs the full gate: it moves `CURRENT` and the agent loop.
 
 ### Code freeze
 
+The release checklist around a freeze:
+
+1. **The evening before a planned freeze, arm the nightly**
+   ([how](#arming-a-nightly)), once the day's last merge is on the train:
+   `scripts/release/nightly-qualify.sh --once --train release-X-Y-Z`, with
+   `--soak-bun` for a full-gate release. From then on the train takes no
+   more merges unless the night finds something.
+2. **The next morning, read the night's README** in
+   `~/reliaburger-nightly/`. A red night is triaged that day: fix it on the
+   train, then arm the next evening again or run the long tiers on the
+   candidate.
+3. **At freeze, run `freeze-check`** on the candidate, as below. When it
+   passes, the gate shrinks to the staged installs.
+
 At freeze the candidate is built on `main` from the gate PR's merge. If the
 latest nightly that's green for the release's gate ran the candidate's code,
-the soaks and power-cut runs don't run again:
+the soaks and power-cut runs don't run again. That's what the night before
+buys: if nothing merges into the train after the night's tip, the gate PR's
+merge has the tip's tree, `freeze-check` passes, and the gate is only the
+staged installs. The patch gate's 3 hours of long tiers, or the full gate's
+14, ran overnight instead of after the freeze:
 
 ```sh
 git fetch origin main
@@ -1275,7 +1475,16 @@ red: triage that night, and a newer green night on the code clears it. When
 it passes, the gate is the staged
 installs (step 3) on the candidate, and the matching nightly's directory is
 copied into `docs/qualification/` as the soak and power-cut records. When it
-fails, run steps 4 and 5 on the candidate as before.
+fails, run steps 4 and 5 on the candidate as before: a fix merged after the
+night changes the tree, so its candidate needs its own long tiers (or
+another armed night on the new tip).
+
+Freeze is also when the release notes are drafted
+(`docs/qualification/DATE-vX.Y.Z-release-notes.md`). Alongside the draft,
+bring the release's section in [`CHANGELOG.md`](../CHANGELOG.md) up to date
+under `## [Unreleased] - X.Y.Z`: Upgrading first, then what it adds, changes,
+fixes and removes, one line each. `scripts/ci/test_changelog.py` fails while
+the version in `Cargo.toml` has no section.
 
 ### Performance records after the tag
 
@@ -1332,7 +1541,8 @@ the real `curl … | sh` install against it on every host we advertise.
    code promotion runs. Then it uploads the unchanged files as a draft
    pre-release, checks GitHub's stored digests for every asset, publishes it as
    a pre-release (never `--latest`) and checks the tag points at the candidate
-   commit. The job summary prints the staged base URL:
+   commit (a train's nightly build is tagged on `main` instead,
+   [above](#nightly-qualification-on-the-train-tip)). The job summary prints the staged base URL:
 
    ```
    https://github.com/reliaburger/reliaburger/releases/download/staging-v0.1.0-RUN_ID-ATTEMPT
@@ -1508,7 +1718,19 @@ the real `curl … | sh` install against it on every host we advertise.
    The verifier binds each private VM address on TCP 8189 with a separate token.
    Drain begins once the last cycle, its special and any quiet tail are over
    (#1338); tier and recovery budgets stay unchanged. Missing support or incomplete coverage fails instead of skipping
-   a mode. A local smoke check is not staged fast/final acceptance, and global
+   a mode. Each mode needs a run active on the node as each gated kind of
+   fault strikes it, so the harness holds every power-off, Bun kill and node
+   fault for up to 90 seconds (`OVERLAP_WAIT_SECS` in `job_soak.py`) until a
+   run of every mode is active on that node. Whether one is running at the
+   instant of the fault is chance, and 0.3.0 candidate 4's fast tier failed
+   on it with nothing wrong in the product
+   ([#2105](https://github.com/reliaburger/reliaburger/issues/2105)). A wait
+   that runs out is a `job-overlap` event, and the fault goes ahead. The day
+   tier deploys once, so it applies the job fixtures again every hour, at the
+   workloads' unchanged generations: no app rolls, and every deploy hook and
+   `after` job runs again while the controller watches
+   ([#1935](https://github.com/reliaburger/reliaburger/issues/1935)).
+   A local smoke check is not staged fast/final acceptance, and global
    storage bounds remain #668.
 
    **The 0.2.0 job gate (decision D18-C).** A release that claims sustained
@@ -1744,6 +1966,40 @@ the real `curl … | sh` install against it on every host we advertise.
    `docs/qualification/DATE-vX.Y.Z-release-notes.md`, above that list:
    `gh release edit vX.Y.Z --notes-file NOTES` with the draft followed by
    the generated list ([0.2.8's draft](qualification/2026-11-09-v0.2.8-release-notes.md)).
+   In [`CHANGELOG.md`](../CHANGELOG.md), turn `## [Unreleased] - X.Y.Z` into
+   the dated `## [X.Y.Z] - YYYY-MM-DD`, add the known issues it ships with,
+   and point its link at the release page.
+
+   **Then publish the appliance OS**, from v0.3.0 on. `promote.yml` publishes
+   only `bun` and `relish`; the OS images that `relish image download` and
+   `relish os` read are published by `appliance.yml`, and only from `main`:
+
+   ```sh
+   gh workflow run appliance.yml --ref main -f publish=true
+   ```
+
+   With no `bun_release`, the image takes `bun` and `relish` from the newest
+   published `v*` release, the one you just promoted. The `sign` job runs in
+   the `release` environment, the only place `RELIABURGER_RELEASE_KEY`
+   lives, signs both architectures and the channel, and `publish` releases
+   them as `os-<version>-<arch>` and updates `os-channel.json` on the
+   `os-channel` release. A build whose packages match the last release
+   publishes nothing, so a patch release that changes no package is a no-op.
+
+   After v0.3.0's promotion, and only once, restore the weekly scheduled
+   publish the maintainer paused until then ([why](#what-the-workflow-builds)):
+   add back to `appliance.yml`'s `on:` block
+
+   ```yaml
+     schedule:
+       - cron: "0 4 * * 1"
+   ```
+
+   drop the paragraph saying it's off from the workflow's header and from
+   [What the workflow builds](#what-the-workflow-builds), and turn
+   `test_nothing_publishes_on_a_schedule_until_v0_3_0_is_promoted` in
+   `scripts/ci/test_ci_workflow.py` into a test that the schedule is there.
+   The plan job already treats a scheduled run on `main` as a publishing one.
 
 9. **Publish the performance records**, after the tag
    ([why](#performance-records-after-the-tag)). They don't block the release;
@@ -1868,6 +2124,19 @@ the real `curl … | sh` install against it on every host we advertise.
     website deploys from `main`, and publishes `/demo/*` from the tag the
     bootstrap installs, so merge that change after promotion, not before.
 
+    Re-record every other website recording (`docs/website/assets/*.cast`)
+    whose commands or output the release changed, and the job-throughput
+    recording every release, as the tour is
+    (maintainer decision, 21 November 2026). The job demo runs on the
+    published release on the quiet host
+    ([how](website/README.md#re-recording-the-job-demo)); the netboot demo
+    needs Linux x86_64 with KVM, so CI records it
+    ([how](website/README.md#recording-the-netboot-demo)); the agent
+    sessions have their own steps
+    ([how](website/README.md#recording-the-agent-sessions)). The
+    post-release docs PR says which recordings it re-recorded, and why any
+    other the release changed wasn't.
+
     Refresh the homepage's
     [How a release is tested](https://reliaburger.com/#release-testing)
     section (`#release-testing` in `index.html`) to the new release: its
@@ -1899,6 +2168,8 @@ the real `curl … | sh` install against it on every host we advertise.
     took and how many candidates, what each soak found and what fixed it, and
     any known issue it ships with, linking the records from step 6. When the
     profile from step 9 is in, add one line from its answer.
+    `scripts/ci/test_changelog.py` fails while a release in the log has no
+    dated section in [`CHANGELOG.md`](../CHANGELOG.md) (step 8).
 
 ## Soaking a candidate in CI
 
@@ -2011,32 +2282,44 @@ need their own evidence after publication.
 ## Guest images and bootstrap installer
 
 Each quickstart VM boots from a guest image the release builds itself: the
-dated Ubuntu 24.04 cloud image named in `scripts/release/guest-images.json`
+dated Ubuntu 26.04 cloud image named in `scripts/release/guest-images.json`
 with that file's `packages` (runc, uidmap, btrfs-progs, nftables, iptables,
 iproute2, buildah) already installed. Without them baked in, every VM spent 15–40 s of
 its first boot in `apt-get update` and `install`, against Ubuntu's live mirrors
 ([measurements](qualification/2026-09-24-guest-image.md)).
 
+The guest runs the same Ubuntu release as the appliance OS (`image/mkosi.conf`),
+and its packages are the appliance's node packages plus Buildah, which only the
+guest needs. `scripts/release/test_guest_images.py` reads both files and fails
+when the two lists drift, so a package added to one is added to the other.
+
 Buildah is there so the five-minute tour can `relish build` on the cluster.
 With what it pulls in that the stock image lacks (`containers-common`, the CNI
 plugins and netavark, `fuse-overlayfs`), it adds about 75 MiB installed,
 going by Ubuntu 24.04's package sizes: 47 MiB of that is
-`containernetworking-plugins`. Expect the compressed image to grow by roughly
-25–40 MiB; record the real figure with the next image build.
+`containernetworking-plugins`. On Ubuntu 26.04 the packages need about
+270 MiB, and the aarch64 image built on 7 October 2026 was 1009 MiB, 107 MiB
+more than the stock cloud image.
 
 `scripts/release/build_guest_image.sh` builds one image, for the host's own
 architecture:
 
 ```sh
-sudo apt-get install -y qemu-utils
+sudo apt-get install -y qemu-utils cloud-guest-utils
 sudo scripts/release/build_guest_image.sh --output guest > guest-record.json
 ```
 
 It downloads the upstream image (or takes `--source FILE`) and refuses it unless
-its SHA-256 matches the pin. It converts it to a sparse raw file, loop-mounts
-the root and boot partitions, and runs `apt-get install` in a chroot, with
+its SHA-256 matches the pin. It converts it to a sparse raw file and adds 1 GiB
+to it, because Ubuntu 26.04's 2.5 GiB root filesystem has only about 160 MiB
+free. It grows the root partition and filesystem into that space
+(`growpart`, `resize2fs`), loop-mounts the root and boot partitions, and runs `apt-get install` in a chroot, with
 package indexes and downloads on a tmpfs so they never reach the image and with
-service starts blocked. Then it seals the image: an empty `/etc/machine-id`,
+service starts blocked. It disables chrony, Ubuntu 26.04's time daemon, because
+Lima's guest agent owns the guest clock (#608). It adds a systemd `.link` file
+naming the virtio NIC `eth0`: 26.04's initrd brings the NIC up as `enp0s1`,
+cloud-init can't rename an interface that's up, and without the file each new
+VM waited two minutes for an `eth0` that never appeared. Then it seals the image: an empty `/etc/machine-id`,
 `cloud-init clean`, no SSH host keys, random seed, logs or temporary files, so
 every VM still generates its own identity at first boot. `fstrim` returns freed
 blocks to the sparse file, and `qemu-img convert -c` writes a zlib-compressed
@@ -2074,7 +2357,8 @@ Update `guest-images.json` deliberately when changing the guest baseline (new
 upstream image date or package list); don't introduce an unpinned `current`
 fallback. Development runs (`--development-binaries`) have no release to take a
 built image from, so they boot the pinned upstream image and install the
-packages at first boot. The VM's provisioning script skips `apt` whenever every
+packages at first boot. The stock image has no `.link` file, so its first boot
+loses the NIC rename and setup restarts the VM once; later boots are fine. The VM's provisioning script skips `apt` whenever every
 package is already present, so both paths use the same script.
 
 Packaging generates `install.sh` with the exact native CLI checksums. The

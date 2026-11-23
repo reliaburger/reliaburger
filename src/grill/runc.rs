@@ -516,12 +516,13 @@ const IDENTITY_MOUNT: &str = "/run/reliaburger/identity";
 
 /// Make every read-write volume usable by the user-namespaced process.
 ///
-/// Managed volumes (the ones with a provisioning sidecar) are handed to
-/// the container user. Host directories are the operator's and are never
-/// chowned: when the mode bits say the container user can't write to one,
-/// Bun warns and starts the container anyway, since it may only read.
-/// Rootless containers need none of this: their single mapped id is the
-/// user that created the volume.
+/// Managed volumes (the ones the spec records in
+/// [`OciSpec::managed_volumes`]) are handed to the container user. Every
+/// other bind source is a host directory: the operator's, and never
+/// chowned, whatever files sit beside it. When the mode bits say the
+/// container user can't write to one, Bun warns and starts the container
+/// anyway, since it may only read. Rootless containers need none of this:
+/// their single mapped id is the user that created the volume.
 async fn prepare_volumes(instance: &InstanceId, spec: &OciSpec) -> Result<(), GrillError> {
     let user = &spec.process.user;
     let (Some(uid), Some(gid)) = (
@@ -532,13 +533,7 @@ async fn prepare_volumes(instance: &InstanceId, spec: &OciSpec) -> Result<(), Gr
         return Ok(());
     };
     let wanted = super::volume::VolumeOwner { uid, gid };
-    let sources: Vec<PathBuf> = spec
-        .mounts
-        .iter()
-        .filter(|mount| mount.options.iter().any(|option| option == "rw"))
-        .filter(|mount| mount.options.iter().any(|option| option == "bind"))
-        .filter_map(|mount| mount.source.clone())
-        .collect();
+    let sources = volume_sources(spec);
     let container_user = format!("{}:{}", user.uid, user.gid);
     let prepared = tokio::task::spawn_blocking(move || {
         for source in sources {
@@ -555,23 +550,58 @@ async fn prepare_volumes(instance: &InstanceId, spec: &OciSpec) -> Result<(), Gr
     })
 }
 
+/// A read-write bind source, and whether Bun manages it.
+#[derive(Debug, Clone, PartialEq)]
+enum VolumeSource {
+    /// A managed volume, as the spec builder recorded it.
+    Managed(super::oci::ManagedVolumeMount),
+    /// Any other directory: the operator's.
+    Host(PathBuf),
+}
+
+/// Every read-write bind source of `spec`, classed by the spec's own
+/// record of its managed volumes, never by what lies beside the source.
+fn volume_sources(spec: &OciSpec) -> Vec<VolumeSource> {
+    spec.mounts
+        .iter()
+        .filter(|mount| mount.options.iter().any(|option| option == "rw"))
+        .filter(|mount| mount.options.iter().any(|option| option == "bind"))
+        .filter_map(|mount| mount.source.clone())
+        .map(|source| {
+            match spec
+                .managed_volumes
+                .iter()
+                .find(|managed| managed.source == source)
+            {
+                Some(managed) => VolumeSource::Managed(managed.clone()),
+                None => VolumeSource::Host(source),
+            }
+        })
+        .collect()
+}
+
 /// Hand one managed volume over, or check one host directory.
 fn prepare_volume(
-    source: &std::path::Path,
+    source: &VolumeSource,
     wanted: super::volume::VolumeOwner,
     container_user: &str,
 ) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
 
-    let handed = super::volume::hand_to_container_user(source, wanted).map_err(|e| {
-        format!(
-            "failed to hand volume {} to container user {container_user} (host {wanted}): {e}",
-            source.display()
-        )
-    })?;
-    if handed.is_some() {
-        return Ok(());
-    }
+    let source = match source {
+        VolumeSource::Managed(managed) => {
+            super::volume::hand_to_container_user(&managed.volumes_dir, &managed.source, wanted)
+                .map_err(|e| {
+                    format!(
+                        "failed to hand volume {} to container user {container_user} \
+                         (host {wanted}): {e}",
+                        managed.source.display()
+                    )
+                })?;
+            return Ok(());
+        }
+        VolumeSource::Host(source) => source,
+    };
     // A host path that doesn't exist yet is runc's to report.
     let Ok(metadata) = std::fs::metadata(source) else {
         return Ok(());
@@ -623,6 +653,10 @@ impl super::Grill for RuncGrill {
 
     async fn pid(&self, instance: &InstanceId) -> Result<Option<u32>, GrillError> {
         self.owned_pid(instance).await
+    }
+
+    async fn workload_pids(&self, instance: &InstanceId) -> Result<Vec<u32>, GrillError> {
+        self.owned_workload_pids(instance).await
     }
 
     async fn workload_cgroup(&self, instance: &InstanceId) -> Result<Option<u64>, GrillError> {
@@ -796,13 +830,7 @@ mod tests {
 
     /// The Bun binary that owns runtime commands in these tests.
     fn test_owner() -> PathBuf {
-        std::env::var_os("RELIABURGER_BUN_BINARY")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                // Unit tests run from target/<profile>/deps; Bun is built beside it.
-                let executable = std::env::current_exe().unwrap();
-                executable.parent().unwrap().parent().unwrap().join("bun")
-            })
+        crate::testkit::bun_binary::bun_binary().unwrap_or_else(|error| panic!("{error}"))
     }
 
     fn preparation_spec(command: &str) -> OciSpec {
@@ -812,6 +840,64 @@ mod tests {
             "mounts": [], "linux": {"namespaces": []}
         }))
         .unwrap()
+    }
+
+    /// Only the spec's own record makes a bind source a managed volume. A
+    /// host directory with a provisioning record copied beside it is still
+    /// the operator's: never chowned, never opened up.
+    #[test]
+    fn a_host_directory_beside_a_volume_record_is_never_handed_over() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let volumes_dir = dir.path().join("volumes");
+        let managed = super::super::volume::VolumeManager::new(&volumes_dir)
+            .create_managed_volume("default", "db", std::path::Path::new("/data"), None)
+            .unwrap();
+        std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let host = dir.path().join("srv");
+        std::fs::create_dir(&host).unwrap();
+        std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::copy(
+            dir.path().join("volumes/default/db/data.volume.json"),
+            dir.path().join("srv.volume.json"),
+        )
+        .unwrap();
+        let mut spec = preparation_spec("true");
+        for source in [&host, &managed] {
+            spec.mounts.push(crate::grill::oci::OciMount {
+                destination: PathBuf::from("/mnt"),
+                source: Some(source.clone()),
+                mount_type: Some("bind".to_string()),
+                options: vec!["bind".to_string(), "rw".to_string()],
+            });
+        }
+        let record = crate::grill::oci::ManagedVolumeMount {
+            volumes_dir: volumes_dir.clone(),
+            source: managed.clone(),
+        };
+        spec.managed_volumes.push(record.clone());
+
+        let sources = volume_sources(&spec);
+        assert_eq!(
+            sources,
+            vec![
+                VolumeSource::Host(host.clone()),
+                VolumeSource::Managed(record)
+            ]
+        );
+        let metadata = std::fs::metadata(dir.path()).unwrap();
+        let me = super::super::volume::VolumeOwner {
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        };
+        for source in &sources {
+            prepare_volume(source, me, "test").unwrap();
+        }
+
+        let mode = |path: &std::path::Path| std::fs::metadata(path).unwrap().mode() & 0o7777;
+        assert_eq!(mode(&host), 0o700, "host directory changed");
+        assert_eq!(mode(&managed), 0o755, "managed volume not handed over");
     }
 
     /// The bundle holds decrypted env: only its owner may list or read it.
@@ -937,6 +1023,7 @@ mod tests {
         .unwrap();
         let id = InstanceId("rootless-writable".to_string());
         let spec = crate::grill::oci::OciSpec {
+            managed_volumes: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1006,6 +1093,7 @@ mod tests {
         ).unwrap()).unwrap();
         let id = InstanceId(format!("capacity-{}", std::process::id()));
         let spec = crate::grill::oci::OciSpec {
+            managed_volumes: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1078,6 +1166,7 @@ mod tests {
         .unwrap();
         let id = InstanceId("runc-test-0".to_string());
         let spec = crate::grill::oci::OciSpec {
+            managed_volumes: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1179,6 +1268,7 @@ mod tests {
         }
         let _network_cleanup = TestNetworkCleanup(ids.to_vec());
         let spec = crate::grill::oci::OciSpec {
+            managed_volumes: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1346,6 +1436,7 @@ mod tests {
 
         let spec_for =
             |value: &str, initial_delay: u64, final_delay: u64| crate::grill::oci::OciSpec {
+                managed_volumes: Vec::new(),
                 reusable_executor: false,
                 host_process: false,
                 initialiser: false,
@@ -1519,6 +1610,7 @@ mod tests {
         )
         .unwrap();
         let spec = crate::grill::oci::OciSpec {
+            managed_volumes: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1586,6 +1678,7 @@ mod tests {
         remove_test_network(&id);
         let _network_cleanup = TestNetworkCleanup(vec![id.clone()]);
         let spec = crate::grill::oci::OciSpec {
+            managed_volumes: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1788,6 +1881,7 @@ mod tests {
         .unwrap();
         let id = InstanceId("runc-pinned-workload".to_string());
         let spec = crate::grill::oci::OciSpec {
+            managed_volumes: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,

@@ -1,15 +1,51 @@
 #!/usr/bin/env bash
 # Watch the runner while the privileged tests run (#800, #1943).
 #
-# Every few seconds, one line: free disk and memory, load, and whether each
-# runner process protect-runner recorded is still alive. Then any kernel log
-# lines about the OOM killer that weren't printed before, prefixed "kernel: ".
+# Every few seconds, one line: free disk and memory, load, swap in use
+# (swap_kb), the kernel's "full" memory pressure over ten seconds (psi_full,
+# the share of time every task waited on memory: a host thrashing shows it),
+# and whether each runner process protect-runner recorded is still alive.
+# Then any kernel log lines about the OOM killer that weren't printed before,
+# prefixed "kernel: ".
 # The resource lines keep the `disk_kb=... mem_kb=... load=...` order the
 # report step sorts on.
 #
 # OOM lines also appear on green runs: the tests kill their own memcg-limited
 # workloads on purpose. Only a killed `Runner.` process or `runners=...:gone`
 # means the runner died.
+#
+# With WATCH_DISK_FLOOR_KB and WATCH_STOP set, the first time free disk on /
+# falls under the floor it logs a "disk_floor: " line and sends SIGTERM to
+# every process named in WATCH_STOP, a space-separated list. A full / takes
+# a hosted runner with it and no log survives; stopping the tests first
+# leaves a failed step that says why, and assert-headroom fails on that line.
+#
+# With WATCH_MEM_FLOOR_KB and WATCH_STOP set, once MemAvailable has stayed
+# under the floor for WATCH_MEM_FLOOR_SECONDS (default 60) while swap is in
+# use, it logs a "mem_floor: " line and sends SIGTERM to the same processes.
+# A host thrashing on swap stalls the runner, which is shielded from the OOM
+# killer, until GitHub drops it with no log (18 Nov 2026). Without swap in
+# use the host can't thrash, and the OOM killer leaves a log of its own.
+#
+# With WATCH_PSI_FULL_PERCENT and WATCH_STOP set, once the kernel's "full"
+# memory pressure over ten seconds has stayed at or over that percentage for
+# WATCH_PSI_SECONDS (default 30), it logs a "mem_stall: " line and sends the
+# same SIGTERM. That catches a host paging hard whatever MemAvailable says,
+# swap or not; passing runs peak at about 49% for ten seconds. A host that
+# freezes outright, as one with swap on a dm-snapshot did (give-swap), stops
+# this watcher too, so the step's own `timeout` is the last guard.
+#
+# With WATCH_SNAPSHOT_AFTER (seconds) and WATCH_SNAPSHOT_DIR set, once the
+# watcher has run that long it writes a runner-snapshot to
+# snapshot-<age>s.txt in that directory, in the background, tailing the
+# logs in WATCH_SNAPSHOT_LOGS (space-separated), and logs a "snapshot: "
+# line. With WATCH_SNAPSHOT_EVERY (seconds) it takes another each period
+# after that, each in its own file. Set them so one lands a few minutes
+# before a step's own timeout: that timeout kills the hung processes the
+# snapshot shows, and the job's last step uploads the directory (#1943).
+#
+# The stop goes through `sudo -n` when it can, so it reaches a build or
+# tests running as root, as the 26.04 job's do.
 #
 # Usage: watch-runner PIDFILE
 # WATCH_INTERVAL (seconds, default 5), WATCH_ROUNDS (default 0, forever) and
@@ -23,6 +59,35 @@ pidfile=$1
 proc=${PROC_ROOT:-/proc}
 interval=${WATCH_INTERVAL:-5}
 rounds=${WATCH_ROUNDS:-0}
+floor=${WATCH_DISK_FLOOR_KB:-}
+memory_floor=${WATCH_MEM_FLOOR_KB:-}
+memory_window=${WATCH_MEM_FLOOR_SECONDS:-60}
+stall_limit=${WATCH_PSI_FULL_PERCENT:-}
+stall_window=${WATCH_PSI_SECONDS:-30}
+stop=${WATCH_STOP:-}
+snapshot_next=${WATCH_SNAPSHOT_AFTER:-}
+snapshot_every=${WATCH_SNAPSHOT_EVERY:-}
+snapshot_directory=${WATCH_SNAPSHOT_DIR:-}
+snapshot_logs=${WATCH_SNAPSHOT_LOGS:-}
+here=$(cd "$(dirname "$0")" && pwd)
+stopped=no
+low_since=
+stalled_since=
+
+# Send SIGTERM to every process named in WATCH_STOP; print how many matched.
+stop_all() {
+    local matched=0 name signal=()
+    for name in $stop; do
+        matched=$((matched + $(pgrep -x "$name" | grep -c '')))
+    done
+    echo "$matched"
+    if sudo -n true 2> /dev/null; then
+        signal=(sudo -n)
+    fi
+    for name in $stop; do
+        "${signal[@]}" pkill -TERM -x "$name"
+    done
+}
 seen=0
 round=0
 while :; do
@@ -35,7 +100,58 @@ while :; do
     disk=$(df -k --output=avail / 2>/dev/null | tail -1 | tr -d " ")
     memory=$(awk '/^MemAvailable/ {print $2}' "$proc/meminfo" 2>/dev/null)
     load=$(cut -d" " -f1 "$proc/loadavg" 2>/dev/null)
-    echo "$(date -u +%T) disk_kb=$disk mem_kb=$memory load=$load runners=${runners:-none}"
+    swap=$(awk '/^SwapTotal/ {t = $2} /^SwapFree/ {f = $2} END {print t - f + 0}' "$proc/meminfo" 2>/dev/null)
+    stall=$(awk '/^full/ {sub("avg10=", "", $2); print $2}' "$proc/pressure/memory" 2>/dev/null)
+    echo "$(date -u +%T) disk_kb=$disk mem_kb=$memory load=$load swap_kb=${swap:-0} psi_full=${stall:-none} runners=${runners:-none}"
+    if [ -n "$snapshot_next" ] && [ -n "$snapshot_directory" ] \
+        && [ "$SECONDS" -ge "$snapshot_next" ]; then
+        snapshot="${snapshot_directory%/}/snapshot-${snapshot_next}s.txt"
+        # In the background, so a slow snapshot on a paging host doesn't
+        # hold up the samples and the stops. Word splitting is the point.
+        # shellcheck disable=SC2086
+        nohup "$here/runner-snapshot" $snapshot_logs > "$snapshot" 2>&1 < /dev/null &
+        echo "snapshot: writing $snapshot"
+        if [ -n "$snapshot_every" ] && [ "$snapshot_every" -gt 0 ]; then
+            # Skip periods a stalled host slept through, rather than burst.
+            while [ "$snapshot_next" -le "$SECONDS" ]; do
+                snapshot_next=$((snapshot_next + snapshot_every))
+            done
+        else
+            snapshot_next=
+        fi
+    fi
+    if [ -n "$floor" ] && [ -n "$stop" ] && [ "$stopped" = no ] \
+        && [ -n "$disk" ] && [ "$disk" -lt "$floor" ]; then
+        matched=$(stop_all)
+        echo "disk_floor: $disk kB free on / is under $floor kB: stopping $stop ($matched processes)"
+        stopped=yes
+    fi
+    if [ -n "$memory_floor" ] && [ -n "$memory" ] && [ "$memory" -lt "$memory_floor" ] \
+        && [ "${swap:-0}" -gt 0 ]; then
+        low_since=${low_since:-$SECONDS}
+    else
+        low_since=
+    fi
+    held=$((SECONDS - ${low_since:-$SECONDS}))
+    if [ -n "$low_since" ] && [ -n "$stop" ] && [ "$stopped" = no ] \
+        && [ "$held" -ge "$memory_window" ]; then
+        matched=$(stop_all)
+        echo "mem_floor: $memory kB available is under $memory_floor kB for $held s with $swap kB swap in use: stopping $stop ($matched processes)"
+        stopped=yes
+    fi
+    if [ -n "$stall_limit" ] && [ -n "$stall" ] \
+        && awk -v now="$stall" -v limit="$stall_limit" 'BEGIN { exit !(now + 0 >= limit + 0) }'; then
+        stalled_since=${stalled_since:-$SECONDS}
+    else
+        stalled_since=
+    fi
+    stalled=$((SECONDS - ${stalled_since:-$SECONDS}))
+    if [ -n "$stalled_since" ] && [ -n "$stop" ] && [ "$stopped" = no ] \
+        && [ "$stalled" -ge "$stall_window" ]; then
+        matched=$(stop_all)
+        echo "mem_stall: every task waited on memory $stall% of the last 10 s, at or over $stall_limit% for $stalled s: stopping $stop ($matched processes)"
+        stopped=yes
+    fi
 
     # The kernel log needs root on Ubuntu (kernel.dmesg_restrict).
     hits=$(sudo -n dmesg -T 2>/dev/null | grep -iE 'oom|killed process')

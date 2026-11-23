@@ -110,6 +110,34 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 filter = 'test(/^mayo::store::tests::streamed_reads_match_the_eager_reader$/) | (binary(process_recovery) & test(=concurrent_forgets_of_retired_generations_all_succeed))'
 slow-timeout = { period = "60s", terminate-after = 3 }
 
+# Two more of the same kind. The runc intent race claims, publishes, retires
+# and forgets 128 generations, about nine full syncs each, while a reader
+# lists them. The upgrade stall test copies, hashes, signs, execs and stages
+# a 96 MB candidate, and its verdict is the runtime's longest gap, not the
+# total. Alone at load 26 both finish in about 3 s; beside twelve
+# F_FULLFSYNC writers they took 32 and 22 s, and inside a `make ci` on a
+# loaded Mac Studio each ran out of the default 60 s (#2009, #2021). The
+# limit only has to catch a hang.
+[[profile.default.overrides]]
+filter = '(binary(runc_intent) & test(=inventory_leaves_out_intents_forgotten_while_it_reads)) | test(=upgrade::manager::tests::preparing_a_large_binary_leaves_the_runtime_free)'
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+# Two `relish agent patch` tests extract the whole embedded source bundle,
+# git-add and commit its thousands of files, then run git again in three or
+# five more `relish` processes. Their work is object writes, not waiting:
+# beside Lima VM builds on the same SSD both ran out of the default 60 s
+# (#2034). The limit only has to catch a hang.
+[[profile.default.overrides]]
+filter = 'binary(suite) & test(/^relish_cli::agent_patch_(init_then_diff_shows_the_edit|apply_takes_a_miscounted_diff_and_diff_prints_a_correct_one)$/)'
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+# The process job cases give each case 60 s, and a failing job's three
+# attempts each start and retire a process owner through fsync'd journal
+# writes (#2035). The limit only has to catch a hang.
+[[profile.default.overrides]]
+filter = 'binary(relish_test_catalogue) & test(=secure_catalogue_process_job_cases_run_under_job_leases)'
+slow-timeout = { period = "60s", terminate-after = 3 }
+
 # The jobs catalogue runs a real cron case, which waits for the next UTC
 # minute, then releases each job lease once the leader has settled its
 # cancelled deployment. A late minute boundary plus coverage
@@ -196,6 +224,20 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 # The streamed-read and concurrent-forget override above (#1641).
 [[profile.ci.overrides]]
 filter = 'test(/^mayo::store::tests::streamed_reads_match_the_eager_reader$/) | (binary(process_recovery) & test(=concurrent_forgets_of_retired_generations_all_succeed))'
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+# The runc intent race and upgrade stall override above (#2009, #2021).
+[[profile.ci.overrides]]
+filter = '(binary(runc_intent) & test(=inventory_leaves_out_intents_forgotten_while_it_reads)) | test(=upgrade::manager::tests::preparing_a_large_binary_leaves_the_runtime_free)'
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+# The agent patch and process job case overrides above (#2034, #2035).
+[[profile.ci.overrides]]
+filter = 'binary(suite) & test(/^relish_cli::agent_patch_(init_then_diff_shows_the_edit|apply_takes_a_miscounted_diff_and_diff_prints_a_correct_one)$/)'
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+[[profile.ci.overrides]]
+filter = 'binary(relish_test_catalogue) & test(=secure_catalogue_process_job_cases_run_under_job_leases)'
 slow-timeout = { period = "60s", terminate-after = 3 }
 
 # The jobs catalogue's override above. CI's coverage run uses this profile,

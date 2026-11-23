@@ -237,6 +237,29 @@ async fn imperative_changes_to_an_owned_app_need_the_owner_or_an_admin() {
     assert!(cluster.db().await.is_none());
 }
 
+/// Rule: a scale of an owned app needs the owner or an admin, like the
+/// other imperative changes, and `--force` doesn't get round an owner. The
+/// owner's scale keeps the owner on the spec.
+#[tokio::test]
+async fn a_scale_of_an_owned_app_needs_the_owner_or_an_admin() {
+    let cluster = Cluster::claimed("owner-scale").await;
+    for uri in ["/v1/scale/db/pg", "/v1/scale/db/pg?force=true"] {
+        let (status, body) = cluster.call(uri, &cluster.human, r#"{"replicas":2}"#).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{uri}: {body}");
+        assert!(
+            body.contains("owned by \\\"pg-failover\\\""),
+            "{uri}: {body}"
+        );
+    }
+    let (status, body) = cluster
+        .call("/v1/scale/db/pg", &cluster.controller, r#"{"replicas":2}"#)
+        .await;
+    assert!(body.contains("committed"), "{status}: {body}");
+    let db = cluster.db().await.unwrap();
+    assert_eq!(db.replicas, crate::config::Replicas::Fixed(2));
+    assert_eq!(db.owner.as_deref(), Some("pg-failover"));
+}
+
 /// Rule: a release hands the app back, after which an ordinary apply
 /// writes it again. A release of an unowned app is a conflict.
 #[tokio::test]

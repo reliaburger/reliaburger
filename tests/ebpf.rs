@@ -127,6 +127,50 @@ fn tests_load_the_object_this_build_compiled() {
 }
 
 // ---------------------------------------------------------------------------
+// Tier 0: what the compiler produced
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "reads the build's eBPF objects; run with make test-linux"]
+fn onion_objects_use_only_the_original_bpf_instruction_set() {
+    use object::{Object, ObjectSection, SectionKind};
+    // Instruction classes: the low three bits of each 8-byte instruction's
+    // opcode. 32-bit ALU and 32-bit jumps came with BPF v3, which newer
+    // clang emits by default. Kernel 7.0's verifier refused clang 21's v3
+    // build of Onion's backend selection: after a 32-bit modulo it no
+    // longer knew the index was in bounds.
+    const BPF_ALU: u8 = 0x04;
+    const BPF_JMP32: u8 = 0x06;
+    // This build's own objects, embedded and aligned (ELF parsing needs
+    // it) like the library's: never a search of a shared target directory,
+    // which can find another worktree's (#878), and still there when the
+    // test archive runs on another machine.
+    for (name, bytes) in [
+        (
+            "onion_connect.bpf.o",
+            aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/onion_connect.bpf.o")),
+        ),
+        (
+            "onion_connect_owned.bpf.o",
+            aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/onion_connect_owned.bpf.o")),
+        ),
+    ] {
+        let file = object::File::parse(bytes).unwrap();
+        for section in file.sections().filter(|s| s.kind() == SectionKind::Text) {
+            let data = section.data().unwrap();
+            for (index, instruction) in data.as_chunks::<8>().0.iter().enumerate() {
+                let class = instruction[0] & 0x07;
+                assert!(
+                    class != BPF_ALU && class != BPF_JMP32,
+                    "{name} {}: instruction {index} has 32-bit class {class:#x}",
+                    section.name().unwrap_or("?"),
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tier 1: Load and map verification
 // ---------------------------------------------------------------------------
 
@@ -1744,6 +1788,7 @@ async fn cross_namespace_connect_to_node_host_port_is_denied() {
                 host_port: published.port(),
                 healthy: true,
             }],
+            allow_from: None,
         },
     );
     let entries = reliaburger::sesame::firewall::destination_entries(&[], &catalog, &[]);
@@ -1894,7 +1939,6 @@ async fn exec_workload_is_held_to_its_namespace() {
         reliaburger::config::process_workloads::ProcessWorkloadsConfig {
             allowed_binaries: vec!["/bin/bash".into()],
             mount_isolation: false,
-            ..Default::default()
         },
     );
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
@@ -3317,7 +3361,6 @@ fn test_agent<G: reliaburger::grill::Grill + Clone + 'static>(
         reliaburger::config::process_workloads::ProcessWorkloadsConfig {
             allowed_binaries: vec!["/bin/sh".into()],
             mount_isolation: false,
-            ..Default::default()
         },
     );
     agent
@@ -5416,7 +5459,7 @@ async fn init_exit_preserves_policy_before_the_next_container_starts() {
         .unwrap();
     let mut failures = Vec::new();
     while let Some(event) = results.recv().await {
-        if let ApplyEvent::Error { message } = event {
+        if let ApplyEvent::Error { message, .. } = event {
             failures.push(message);
         }
     }
@@ -5521,7 +5564,7 @@ async fn uncertain_initialiser_preserves_parent_policy_until_confirmed_retiremen
         .unwrap();
     let mut failures = Vec::new();
     while let Some(event) = results.recv().await {
-        if let ApplyEvent::Error { message } = event {
+        if let ApplyEvent::Error { message, .. } = event {
             failures.push(message);
         }
     }
@@ -5813,7 +5856,7 @@ async fn check_backend_retirement(
             let (events, mut results) = mpsc::channel(64);
             commands.send(AgentCommand::Deploy { config, events }).await?;
             while let Some(event) = results.recv().await {
-                if let ApplyEvent::Error { message } = event { anyhow::bail!(message); }
+                if let ApplyEvent::Error { message, .. } = event { anyhow::bail!(message); }
             }
             let id = InstanceId(format!("default__{name}-0"));
             let ip = runtime.container_ip(&id).await.ok_or_else(|| anyhow::anyhow!("runtime omitted container address"))?;
@@ -5867,23 +5910,37 @@ async fn check_backend_retirement(
                 if restart_original {
                     let original = runtime.network_reference(&id).await?.ok_or_else(|| anyhow::anyhow!("original address hold missing"))?;
                     runtime.kill(&id).await?;
+                    let started = std::time::Instant::now();
+                    let mut last = String::from("nothing observed");
+                    // Each runtime read takes the instance's lifecycle lock,
+                    // as the agent's state sweep and restart steps do, so the
+                    // runtime is asked only every 250 ms. A read racing the
+                    // restart's create can say it can't tell yet
+                    // (`StateUnavailable`), which means look again (#2085).
                     let replacement = tokio::time::timeout(std::time::Duration::from_secs(30), async {
                         loop {
-                            let published = services.borrow().resolve(&ServiceId::new("default", name)).is_some_and(|entry| entry.backends.iter().any(|backend| backend.instance_id == id.0 && backend.healthy));
-                            if let Some(reference) = runtime.network_reference(&id).await?
-                                && reference.generation != original.generation
-                                && published
-                                && runtime.state(&id).await? == reliaburger::grill::ContainerState::Running
-                            {
+                            let backends = services.borrow().resolve(&ServiceId::new("default", name)).map(|entry| entry.backends.iter().map(|backend| (backend.instance_id.clone(), backend.healthy)).collect::<Vec<_>>());
+                            let published = backends.as_ref().is_some_and(|backends| backends.iter().any(|(instance, healthy)| *instance == id.0 && *healthy));
+                            let reference = match runtime.network_reference(&id).await {
+                                Err(reliaburger::grill::GrillError::StateUnavailable { .. }) => None,
+                                reference => reference?,
+                            };
+                            let state = runtime.state(&id).await;
+                            let new_generation = reference.as_ref().is_some_and(|reference| reference.generation != original.generation);
+                            let running = matches!(state, Ok(reliaburger::grill::ContainerState::Running));
+                            last = format!("at {:?}: new generation {new_generation} ({:?} -> {:?}), published {published} ({backends:?}), state {state:?}", started.elapsed(), original.generation, reference.as_ref().map(|reference| reference.generation.clone()));
+                            if let Some(reference) = reference && new_generation && published && running {
                                 break Ok::<_, anyhow::Error>(reference);
                             }
-                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                         }
-                    }).await??;
+                    }).await.map_err(|_| anyhow::anyhow!("restart did not finish in 30 s; last seen {last}"))??;
+                    eprintln!("restart finished in {:?}", started.elapsed());
                     let checkpoint: serde_json::Value = serde_json::from_slice(&std::fs::read(root.path().join("discovery/discovery.json"))?)?;
                     let inventory: reliaburger::bun::discovery_owners::DiscoveryInventory = serde_json::from_value(checkpoint["inventory"].clone())?;
                     anyhow::ensure!(inventory.references.len() == 1 && inventory.references[0].reference == replacement && inventory.references[0].phase == reliaburger::bun::discovery_owners::ReferencePhase::Held, "restart did not replace its original durable hold");
-                    let ready = read_runtime_fixture_page(SocketAddr::new(vip.0.into(), 8080)).await?;
+                    let ready = read_runtime_fixture_page(SocketAddr::new(vip.0.into(), 8080))
+                        .await.map_err(|error| anyhow::anyhow!("replacement through the original VIP: {error}"))?;
                     anyhow::ensure!(ready.contains(&id.0), "replacement is not reachable through the original VIP");
                 }
                 if freeze {
@@ -5899,10 +5956,10 @@ async fn check_backend_retirement(
                     let mut completed = false;
                     while let Some(event) = results.recv().await {
                         match event {
-                            ApplyEvent::Error { message } if freeze => {
+                            ApplyEvent::Error { message, .. } if freeze => {
                                 refused |= message.contains("cannot retire backend") || message.contains("cannot publish backend");
                             }
-                            ApplyEvent::Error { message } => anyhow::bail!(message),
+                            ApplyEvent::Error { message, .. } => anyhow::bail!(message),
                             ApplyEvent::Complete { .. } => completed = true,
                             _ => {}
                         }
@@ -6034,7 +6091,7 @@ async fn refused_backend_publication_cannot_report_a_completed_deployment() {
         let mut failed = false;
         while let Some(event) = results.recv().await {
             completed |= matches!(event, ApplyEvent::Complete { .. });
-            if let ApplyEvent::Error { message } = event {
+            if let ApplyEvent::Error { message, .. } = event {
                 failed |= message.contains("cannot publish backend");
             }
         }
@@ -6280,7 +6337,7 @@ async fn check_stopped_address_retention(lose_enforcement: bool, durable_discove
         let (events, mut results) = mpsc::channel(64);
         commands.send(AgentCommand::Deploy { config, events }).await?;
         while let Some(event) = results.recv().await {
-            if let ApplyEvent::Error { message } = event { anyhow::bail!(message); }
+            if let ApplyEvent::Error { message, .. } = event { anyhow::bail!(message); }
         }
         let original_ip = runtime.container_ip(&old).await.ok_or_else(|| anyhow::anyhow!("original address absent"))?;
         let original = read_runtime_fixture_page(SocketAddr::new(vip.0.into(), 8080)).await?;
@@ -6457,7 +6514,7 @@ async fn refused_health_publication_prevents_restart_and_preserves_ownership() {
         let (events, mut results) = mpsc::channel(64);
         commands.send(AgentCommand::Deploy { config, events }).await?;
         while let Some(event) = results.recv().await {
-            if let ApplyEvent::Error { message } = event { anyhow::bail!(message); }
+            if let ApplyEvent::Error { message, .. } = event { anyhow::bail!(message); }
         }
         let mut frozen = false;
         let mut unhealthy_since = None;

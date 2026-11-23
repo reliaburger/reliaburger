@@ -19,7 +19,7 @@ pub mod policy;
 pub mod process_workloads;
 pub mod template;
 pub mod types;
-mod validate;
+pub(crate) mod validate;
 pub(crate) use validate::{valid_workload_label, validate_app_spec};
 
 use std::collections::BTreeMap;

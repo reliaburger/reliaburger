@@ -270,7 +270,7 @@ Resource faults operate entirely in userspace through Bun's existing cgroup and 
 
 **Disk I/O throttle.** Bun writes to the `blkio` cgroup controller for the target container, setting read/write bandwidth limits using `blkio.throttle.read_bps_device` and `blkio.throttle.write_bps_device`. This is the kernel's native I/O throttling mechanism.
 
-**Process faults.** Bun sends signals directly to the container's main process (PID 1 inside the container namespace). `kill` sends SIGKILL (immediate termination). `pause` sends SIGSTOP (freeze the process). `--resume` sends SIGCONT (unfreeze).
+**Process faults.** Bun sends signals directly to the container's main process (PID 1 inside the container namespace). `kill` sends SIGKILL (immediate termination). `pause` sends SIGSTOP (freeze the process). `--resume` sends SIGCONT (unfreeze). Stopping or deleting a paused instance doesn't need a resume first: every runtime follows the stop signal with SIGCONT (#2041). On runc, `pause` and `--resume` signal every process in the container, from its init's cgroup (`Grill::workload_pids`), not the `runc run` launcher the runtime reports as its pid ([#2079](https://github.com/reliaburger/reliaburger/issues/2079)); init alone when that cgroup also holds the launcher or Bun, as rootless runc can leave it. The stop's SIGCONT goes to the same processes. `kill` still signals the launcher.
 
 ### 3.3 Request Flow
 
@@ -1345,21 +1345,22 @@ Warning: No --duration specified. Fault will auto-expire in 10 minutes.
 
 ### 6.2 Maximum Duration
 
-Every fault has a maximum duration, configurable per cluster. The default maximum is **1 hour**.
+Every fault has a maximum duration, set per node in `node.toml`. The default maximum is **1 hour**, and a fault that names no duration lasts **10 minutes**.
 
 ```toml
-# cluster-config.toml
+# node.toml
 [smoker]
-default_duration = "10m"
-max_duration = "1h"
+default_duration_secs = 600
+max_duration_secs = 3600
 ```
 
-Attempts to set a duration longer than `max_duration` are rejected by the leader:
+Both are whole seconds. The node that injects the fault applies them (`smoker::config::effective_duration`, called from Bun's agent loop), so give every node the same values if you change them. A request longer than `max_duration_secs` is rejected:
 
 ```
-Error: Requested duration 2h exceeds maximum allowed duration 1h.
-Use a shorter duration or ask a cluster admin to increase smoker.max_duration.
+fault duration 7200s exceeds the configured maximum of 3600s
 ```
+
+Beneath both, a 24-hour hard ceiling in `FaultRule::new` still applies.
 
 ### 6.3 Safety Overrides
 

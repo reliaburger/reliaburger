@@ -396,11 +396,11 @@ pub async fn obtain(
     let reusable = |stored: &StoredToken| {
         stored.usable(scope, now) && rejected.is_none_or(|rejected| stored.token != rejected)
     };
-    if let Some(stored) = StoredToken::load(path)?.filter(reusable) {
+    if let Some(stored) = load_off_runtime(path).await?.filter(reusable) {
         return Ok((Credential::Minted(stored.token), Obtained::Reused));
     }
     let _lock = lock(path).await?;
-    let stored = StoredToken::load(path)?;
+    let stored = load_off_runtime(path).await?;
     if let Some(stored) = stored.as_ref().filter(|stored| reusable(stored)) {
         return Ok((Credential::Minted(stored.token.clone()), Obtained::Reused));
     }
@@ -453,6 +453,18 @@ pub async fn accepted(admin: &BunClient, token: &str) -> Option<bool> {
         Ok(Ok(TokenAccess::Admin | TokenAccess::Lesser)) => Some(true),
         Ok(Err(_)) | Err(_) => None,
     }
+}
+
+/// [`StoredToken::load`], off the runtime: `relish mcp` reads the file on
+/// every tool call that needs the cluster, beside other calls.
+async fn load_off_runtime(path: &Path) -> Result<Option<StoredToken>, CredentialError> {
+    let owned = path.to_path_buf();
+    tokio::task::spawn_blocking(move || StoredToken::load(&owned))
+        .await
+        .map_err(|error| CredentialError::Storage {
+            path: path.to_path_buf(),
+            reason: error.to_string(),
+        })?
 }
 
 /// Take the stored token out: revoke it, best effort, and delete the file

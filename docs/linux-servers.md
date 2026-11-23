@@ -71,8 +71,8 @@ Ensure the following ports are open:
 | `80`, `443` | TCP | Ingress HTTP/HTTPS proxy (Wrapper) | External |
 
 Bun manages its own nftables perimeter on top of that: once it's running, only
-cluster members (and the `bootstrap_peers` you list in `node.toml`) can reach
-the API, cluster and container host ports. Your laptop gets in to the API port,
+cluster members can reach the container host ports, and only they and the
+`bootstrap_peers` you list in `node.toml` can reach the API and cluster ports. Your laptop gets in to the API port,
 and only that port, through `operator_cidrs` (see §5.3). Your host firewall
 still has to let that traffic in. With UFW, run this on every node:
 
@@ -93,6 +93,17 @@ another firewall's rules, so a node can reach its containers while
 container-to-container traffic is still dropped. The
 [runc notes](README.md#runc-linux) cover what to check.
 
+Bun's own check for published container ports is a forward-hook chain at
+priority -10 in its `reliaburger_fw` table. nftables runs every table's chain
+on a hook independently: an `accept` in one only hands the packet to the next,
+while a `drop` anywhere is final. So on a host that also runs Docker or UFW,
+Docker's rules can't let an outsider past Bun's chain to a published port, and
+Bun's chain can't override a drop in theirs (that's the `FORWARD` trap above).
+It touches only connections Bun's port map rewrote to its own containers
+(`ct status dnat`, out through a `veth-…` link), never Docker's. To see every
+forward chain and its priority, run `sudo nft list ruleset | grep -B1 'hook
+forward'`; `sudo nft list chain ip reliaburger_fw forward` shows Bun's.
+
 ---
 
 ## 2. Install binaries and prepare directories
@@ -112,8 +123,8 @@ case "$ARCH" in
   *) echo "Unsupported architecture: $ARCH; the release has x86_64 and aarch64 builds" >&2 ;;
 esac
 
-# Release version to install (e.g. v0.2.8 or vX.Y.Z)
-VERSION="v0.2.8"
+# Release version to install (e.g. v0.3.2 or vX.Y.Z)
+VERSION="v0.3.2"
 BASE_URL="https://github.com/reliaburger/reliaburger/releases/download/${VERSION}"
 
 # Download binaries and SHA256SUMS into /tmp
@@ -140,7 +151,7 @@ relish --version
 ```
 
 Each prints its version and the commit it was built from, such as
-`bun 0.2.8 (e423d46)`. Every node should print the same commit.
+`bun 0.3.2 (3edd546)`. Every node should print the same commit.
 
 *(Optional: If building from source instead of using pre-built releases, install
 `build-essential clang llvm libbpf-dev` (the static job executor helpers need a
@@ -167,23 +178,28 @@ the initial security bootstrap state, and its own node identity.
 On **Node 1 (`192.168.0.101`)**, run:
 
 ```sh
-sudo relish init /etc/reliaburger --cluster-name prod --node-id node-01
+sudo relish init /etc/reliaburger --cluster-name prod --node-id node-01 \
+    --root-backup /media/usb/prod-root-backup.age
 ```
+
+It asks for a passphrase twice: the root CA's private key goes only into
+`--root-backup`, sealed to it, and no node keeps a copy. Point it at
+removable media or anywhere off this node. In a script, add
+`--passphrase-file FILE` or `--recipient age1...` (your age public key);
+without a terminal, `relish init` refuses to run without them.
 
 This writes the following files under `/etc/reliaburger`:
 - `prod-master.key`: Master secret key (used to encrypt CA and secrets).
 - `prod-security-bootstrap.json`: Initial cluster security state.
-- `prod-root-ca.age`: The sealed root CA key.
 - `reliaburger.toml`: Sample cluster node config file.
 - `app.toml`: Sample application manifest file.
 - `identity/`: Node 1's mTLS certificates (`node.crt`, `node.key`, `root-ca.crt`, etc.).
 
 > **Important**: `relish init` prints two `Root CA:` lines to stderr. Copy the
 > one that starts with `sha256:`; that's the root CA fingerprint the joining
-> nodes pin in §4. Back up `prod-master.key` and `prod-root-ca.age` together,
-> and make a copy of the root that only you can open with
-> `sudo relish ca backup --out prod-root-backup.age --dir /etc/reliaburger`
-> (see the manual's security chapter).
+> nodes pin in §4. Back up `prod-master.key`, and keep the root CA backup
+> offline and apart from it; `relish ca verify` checks the backup against
+> that fingerprint (see the manual's security chapter).
 
 ### 3.2 Write the Node 1 configuration
 
@@ -555,8 +571,8 @@ curl -fsSL https://reliaburger.com/install.sh | sh -s -- --install-only
 # The macOS build is Apple silicon only (arm64)
 ARCH="aarch64"
 
-# Release version to install (e.g. v0.2.8 or vX.Y.Z)
-VERSION="v0.2.8"
+# Release version to install (e.g. v0.3.2 or vX.Y.Z)
+VERSION="v0.3.2"
 BASE_URL="https://github.com/reliaburger/reliaburger/releases/download/${VERSION}"
 
 # Download relish binary and SHA256SUMS into /tmp

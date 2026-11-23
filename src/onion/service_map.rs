@@ -339,7 +339,9 @@ impl ServiceMap {
                                 local: false,
                             })
                             .collect(),
-                        firewall_allow_from: None,
+                        // The caller's node enforces the target's grants,
+                        // wherever the target runs (#2216).
+                        firewall_allow_from: service.allow_from.clone(),
                     };
                     merged.entries.insert(qualified.clone(), entry);
                     merged.allocated_vips.insert(service.vip);
@@ -837,6 +839,7 @@ mod tests {
                 vip: assigned,
                 port: 6379,
                 backends: Vec::new(),
+                allow_from: None,
             },
         );
         let merged = ServiceMap::new().with_cluster_catalog(&catalog);

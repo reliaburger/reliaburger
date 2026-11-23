@@ -11,6 +11,7 @@ use std::{fmt, net::Ipv4Addr, path::PathBuf};
 
 use super::{
     progress::{StageTiming, Timings},
+    security::RootBackupFiles,
     state::Operation,
 };
 
@@ -88,9 +89,12 @@ pub struct SetupReport {
     pub state_directory: PathBuf,
     /// Every step's timing, for a laptop cluster.
     pub timings_file: Option<PathBuf>,
-    /// The directory to back up: the master key and the only copy of the
-    /// root CA, for a cluster built over SSH.
+    /// The directory to back up, with the master key, for a cluster built
+    /// over SSH.
     pub back_up: Option<PathBuf>,
+    /// The only copy of the root CA's key and the identity that opens it,
+    /// on this machine, to move offline (#709).
+    pub root_backup: Option<RootBackupFiles>,
     /// Commands worth running next. All of them only read.
     pub next: Vec<NextStep>,
     /// How to take the cluster down.
@@ -114,6 +118,8 @@ pub struct LaptopFacts<'a> {
     /// How to invoke this `relish` (`relish`, or a path when it isn't on
     /// `PATH` yet).
     pub relish: &'a str,
+    /// The root CA backup and its identity.
+    pub root_backup: Option<RootBackupFiles>,
 }
 
 /// What a setup over SSH knows when it finishes.
@@ -132,6 +138,8 @@ pub struct ServerFacts<'a> {
     pub unreachable: Option<String>,
     /// How to invoke this `relish`.
     pub relish: &'a str,
+    /// The root CA backup and its identity.
+    pub root_backup: Option<RootBackupFiles>,
 }
 
 fn nodes(operation: &Operation) -> Vec<BuiltNode> {
@@ -180,6 +188,7 @@ impl SetupReport {
             state_directory: facts.operation.directory.clone(),
             timings_file: Some(facts.timings_file),
             back_up: None,
+            root_backup: facts.root_backup,
             next: vec![
                 step(
                     format!("{relish} manual tour"),
@@ -221,6 +230,7 @@ impl SetupReport {
             state_directory: facts.operation.directory.clone(),
             timings_file: None,
             back_up: Some(facts.back_up),
+            root_backup: facts.root_backup,
             next: vec![
                 step(format!("{relish} status"), "every app and node"),
                 step(format!("{relish} logs hello"), "the demo app's logs"),
@@ -251,9 +261,24 @@ impl fmt::Display for SetupReport {
         if let Some(directory) = &self.back_up {
             writeln!(
                 f,
-                "  back up {}: it holds the cluster's master key and the only copy of the root CA",
+                "  back up {}: it holds the cluster's master key",
                 directory.display()
             )?;
+        }
+        if let Some(root) = &self.root_backup {
+            writeln!(
+                f,
+                "  root CA: only in {}, which {} opens; move both offline, apart from each other",
+                root.backup.display(),
+                root.identity.display()
+            )?;
+            if self.kind == ClusterKind::Laptop {
+                writeln!(
+                    f,
+                    "  (on a laptop cluster the root is offline only in name: this machine \
+                     is both the operator and the nodes)"
+                )?;
+            }
         }
         // Last, so it isn't lost above the timings: until it's dealt with,
         // the `next` commands above all fail.
@@ -336,6 +361,14 @@ mod tests {
             context: PathBuf::from("/home/me/.reliaburger/context.json"),
             timings_file: PathBuf::from("/home/me/.reliaburger/clusters/laptop/timings.json"),
             relish: "relish",
+            root_backup: Some(RootBackupFiles {
+                backup: PathBuf::from(
+                    "/home/me/.reliaburger/clusters/laptop/security/root-ca-backup.age",
+                ),
+                identity: PathBuf::from(
+                    "/home/me/.reliaburger/root-backup-keys/root-0123456789abcdef.age-identity",
+                ),
+            }),
         })
     }
 
@@ -355,6 +388,14 @@ mod tests {
             back_up: PathBuf::from("/home/me/.reliaburger/clusters/servers/security"),
             unreachable,
             relish: "relish",
+            root_backup: Some(RootBackupFiles {
+                backup: PathBuf::from(
+                    "/home/me/.reliaburger/clusters/servers/security/root-ca-backup.age",
+                ),
+                identity: PathBuf::from(
+                    "/home/me/.reliaburger/root-backup-keys/root-fedcba9876543210.age-identity",
+                ),
+            }),
         })
     }
 
@@ -373,6 +414,23 @@ mod tests {
         let json = format_output(&laptop_report(), OutputFormat::Json).unwrap();
         assert!(!json.contains("token"), "{json}");
         assert!(!json.contains("rbrg_"), "{json}");
+    }
+
+    /// #709: both setups say where the root backup and its identity are,
+    /// to move offline, and a laptop setup says that's only nominal there.
+    #[test]
+    fn setup_says_where_the_root_backup_is_and_to_move_it_offline() {
+        let servers = servers_report(None).to_string();
+        assert!(servers.contains("root-ca-backup.age"), "{servers}");
+        assert!(
+            servers.contains("root-fedcba9876543210.age-identity"),
+            "{servers}"
+        );
+        assert!(servers.contains("move both offline"), "{servers}");
+        assert!(!servers.contains("offline only in name"), "{servers}");
+        let laptop = laptop_report().to_string();
+        assert!(laptop.contains("move both offline"), "{laptop}");
+        assert!(laptop.contains("offline only in name"), "{laptop}");
     }
 
     #[test]

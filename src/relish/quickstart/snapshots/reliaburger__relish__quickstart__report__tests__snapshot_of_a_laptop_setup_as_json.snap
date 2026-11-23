@@ -57,6 +57,10 @@ expression: "format_output(&laptop_report(), OutputFormat::Json).unwrap()"
   "state_directory": "/home/me/.reliaburger/clusters/laptop",
   "timings_file": "/home/me/.reliaburger/clusters/laptop/timings.json",
   "back_up": null,
+  "root_backup": {
+    "backup": "/home/me/.reliaburger/clusters/laptop/security/root-ca-backup.age",
+    "identity": "/home/me/.reliaburger/root-backup-keys/root-0123456789abcdef.age-identity"
+  },
   "next": [
     {
       "run": "relish manual tour",

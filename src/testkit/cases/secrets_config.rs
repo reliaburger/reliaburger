@@ -57,13 +57,11 @@ async fn encrypted_environment_roundtrip(
     plaintext: &str,
 ) -> Result<(), String> {
     let key = ctx
-        .deadline
-        .run(
+        .step(
             "fetch public encryption key",
             ctx.client.secret_public_key(None),
         )
-        .await
-        .map_err(|error| error.to_string())?
+        .await?
         .map_err(|error| format!("could not fetch public encryption key: {error}"))?;
     let first = crate::sesame::secret::encrypt_secret(plaintext, &key.public_key)
         .map_err(|error| error.to_string())?;
@@ -109,6 +107,7 @@ pub fn cases() -> Vec<TestCase> {
                 Capability::Council,
             ],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(encrypted_env_value_is_decrypted_in_workload),
         },
         TestCase {
@@ -116,6 +115,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::SecretsConfig,
             requires: &[Capability::ContainerRuntime],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(config_file_is_mounted_with_contents),
         },
         TestCase {
@@ -127,6 +127,7 @@ pub fn cases() -> Vec<TestCase> {
                 Capability::Council,
             ],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(cluster_pubkey_encrypt_roundtrip),
         },
     ]

@@ -288,6 +288,7 @@ fn removed_exposures(
                     vip: original.vip,
                     port: original.port,
                     backends,
+                    allow_from: original.allow_from.clone(),
                 },
                 retire_vip,
             },

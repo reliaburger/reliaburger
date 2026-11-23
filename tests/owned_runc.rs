@@ -696,6 +696,55 @@ async fn generated_cgroup_path_matches_the_actual_container_before_its_first_ins
     assert!(still_same, "runc replaced Bun's pre-programmed cgroup");
 }
 
+/// A memory request smaller than `runc init` itself must not hold the
+/// container's start: runc 1.4's init holds about 10 MiB of anonymous memory
+/// in the workload's cgroup, and as `memory.high` the burger demo's 8 MiB
+/// request throttled it past Bun's startup deadline (#1955).
+#[tokio::test]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
+async fn a_memory_request_smaller_than_runc_init_does_not_hold_the_start() {
+    let root = tempfile::tempdir().unwrap();
+    let id = instance(root.path());
+    let host_path = format!("/sys/fs/cgroup/{}", id.0);
+    let runtime = runtime(root.path());
+    let app: reliaburger::config::AppSpec = toml::from_str(
+        r#"
+        image = "test:v1"
+        memory = "4Mi-64Mi"
+        "#,
+    )
+    .unwrap();
+    let generated = reliaburger::grill::oci::generate_oci_spec(
+        "small", "default", &app, &id.0, None, &host_path, None, None,
+    );
+    let mut specification = spec(
+        root.path(),
+        "/bin/busybox touch /work/started; exec /bin/busybox sleep 60",
+    );
+    specification.linux.resources = generated.linux.resources;
+    specification.linux.cgroups_path =
+        Some(reliaburger::grill::oci::hierarchy_cgroup_path(&host_path));
+    runtime.create(&id, &specification).await.unwrap();
+    install_fixture(root.path(), &id);
+    let begun = std::time::Instant::now();
+    let started = runtime.start(&id).await;
+    let took = begun.elapsed();
+    let memory_high = std::fs::read_to_string(format!("{host_path}/memory.high"));
+    let memory_max = std::fs::read_to_string(format!("{host_path}/memory.max"));
+    if started.is_ok() {
+        wait_file(&root.path().join("shared/started")).await;
+    }
+    runtime.kill(&id).await.unwrap();
+    if Path::new(&host_path).exists() {
+        std::fs::remove_dir(&host_path).unwrap();
+    }
+    assert_absent(root.path(), &id);
+    started.unwrap();
+    assert!(took < Duration::from_secs(5), "start took {took:?}");
+    assert_eq!(memory_high.unwrap().trim(), "max");
+    assert_eq!(memory_max.unwrap().trim(), (64u64 << 20).to_string());
+}
+
 #[tokio::test]
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn recovered_source_identity_belongs_to_the_container_not_its_launcher() {
@@ -1182,6 +1231,166 @@ async fn actual_host_reboot_preserves_holds_and_retires_original_execution() {
     }
 }
 
+/// Which process a pause freezes.
+#[derive(Debug, Clone, Copy)]
+enum Paused {
+    /// Every process Smoker's pause signals: the container's (#2079).
+    Workload,
+    /// The container's own init, as `runc state` names it.
+    ContainerInit,
+}
+
+/// Start a container that handles SIGTERM, freeze `paused`, and stop it with
+/// a 20 s grace. A paused instance must take its stop signal at once: Bun
+/// follows the signal with SIGCONT (#2041), as ProcessGrill does, instead of
+/// letting the frozen process sit out its grace and die by SIGKILL.
+async fn paused_container_takes_its_stop_signal_at_once(paused: Paused) {
+    use reliaburger::bun::agent::{InstanceStop, stop_runtime_instance};
+    assert!(nix::unistd::geteuid().is_root());
+    let root = tempfile::tempdir().unwrap();
+    let id = instance(root.path());
+    let runtime = runtime(root.path());
+    runtime
+        .create(
+            &id,
+            &spec(
+                root.path(),
+                "trap '/bin/busybox touch /work/term; exit 0' TERM; \
+                 /bin/busybox touch /work/ready; \
+                 while :; do /bin/busybox sleep 0.05; done",
+            ),
+        )
+        .await
+        .unwrap();
+    install_fixture(root.path(), &id);
+    runtime.start(&id).await.unwrap();
+    wait_file(&root.path().join("shared/ready")).await;
+    let pids = match paused {
+        Paused::Workload => runtime.workload_pids(&id).await.unwrap(),
+        Paused::ContainerInit => vec![container_init(root.path(), &id).expect("a container init")],
+    };
+    assert!(!pids.is_empty(), "nothing to pause");
+    for pid in &pids {
+        reliaburger::smoker::process::pause_process(*pid as i32).unwrap();
+    }
+
+    let grace = Duration::from_secs(20);
+    let begun = std::time::Instant::now();
+    let stopped = tokio::time::timeout(
+        Duration::from_secs(60),
+        stop_runtime_instance(
+            &runtime,
+            &id,
+            &InstanceStop::for_policy(None, grace),
+            Duration::from_secs(10),
+        ),
+    )
+    .await;
+    let took = begun.elapsed();
+    let handled = root.path().join("shared/term").exists();
+    for pid in &pids {
+        let _ = reliaburger::smoker::process::resume_process(*pid as i32);
+    }
+    runtime.kill(&id).await.unwrap();
+    assert_absent(root.path(), &id);
+    stopped.expect("the stop never finished").unwrap();
+    assert!(
+        handled,
+        "the paused container never handled its stop signal"
+    );
+    assert!(took < grace, "the stop waited out its grace: {took:?}");
+}
+
+/// The container's init pid as `runc state` reports it.
+fn container_init(root: &Path, id: &InstanceId) -> Option<u32> {
+    let output = std::process::Command::new("runc")
+        .arg("--root")
+        .arg(root.join("state"))
+        .args(["state", &id.0])
+        .output()
+        .ok()?;
+    let state: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    state["pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+}
+
+#[tokio::test]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
+async fn runc_container_paused_by_smoker_takes_its_stop_signal_at_once() {
+    paused_container_takes_its_stop_signal_at_once(Paused::Workload).await;
+}
+
+#[tokio::test]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
+async fn runc_container_with_a_paused_init_takes_its_stop_signal_at_once() {
+    paused_container_takes_its_stop_signal_at_once(Paused::ContainerInit).await;
+}
+
+/// Smoker's pause freezes the container, not the `runc run` launcher that
+/// `Grill::pid` names (#2079). SIGSTOP can't be caught or forwarded, so a
+/// frozen launcher left the workload running. The workload here writes a
+/// heartbeat: while the processes a pause signals are frozen it stands
+/// still, and once they're resumed it moves again.
+#[tokio::test]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
+async fn runc_pause_freezes_the_workload_not_its_launcher() {
+    use reliaburger::smoker::process::{pause_process, resume_process};
+    assert!(nix::unistd::geteuid().is_root());
+    let root = tempfile::tempdir().unwrap();
+    let id = instance(root.path());
+    let runtime = runtime(root.path());
+    runtime
+        .create(
+            &id,
+            &spec(
+                root.path(),
+                "/bin/busybox touch /work/ready; \
+                 while :; do echo . >> /work/beats; /bin/busybox sleep 0.05; done",
+            ),
+        )
+        .await
+        .unwrap();
+    install_fixture(root.path(), &id);
+    runtime.start(&id).await.unwrap();
+    wait_file(&root.path().join("shared/ready")).await;
+    let beats = || {
+        std::fs::metadata(root.path().join("shared/beats"))
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
+    };
+    let launcher = runtime.pid(&id).await.unwrap().expect("a launcher");
+    let paused = runtime.workload_pids(&id).await.unwrap();
+    for pid in &paused {
+        pause_process(*pid as i32).unwrap();
+    }
+    // A write already under way when the signal landed may still finish.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let frozen = beats();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let still = beats();
+    for pid in &paused {
+        resume_process(*pid as i32).unwrap();
+    }
+    let moved = tokio::time::timeout(Duration::from_secs(10), async {
+        while beats() <= still {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    runtime.kill(&id).await.unwrap();
+    assert_absent(root.path(), &id);
+    assert_eq!(
+        frozen, still,
+        "the workload kept running while {paused:?} were paused"
+    );
+    assert!(
+        !paused.contains(&launcher),
+        "the pause froze the runc launcher {launcher}"
+    );
+    moved.expect("the workload never ran again after its resume");
+}
+
 /// Kill every process in a stand-in for Bun's systemd unit cgroup the way
 /// `KillMode=control-group` does: SIGTERM, a grace period, then SIGKILL.
 async fn stop_unit_cgroup(unit: &Path) {
@@ -1598,7 +1807,7 @@ mod capacity_contract {
         )
         .await
         .unwrap();
-        router.register(1, node.raft().clone()).await;
+        router.register(1, &node).await;
         let mut members = BTreeMap::new();
         members.insert(
             1u64,

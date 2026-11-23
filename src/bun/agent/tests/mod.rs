@@ -931,7 +931,7 @@ async fn capacity_refusal_while_adding_replicas_reaches_the_state_snapshot() {
         "the scale-up must take the add-replicas path: {events:?}"
     );
     assert!(
-        matches!(events.last(), Some(ApplyEvent::Error { message }) if message.contains("capacity")),
+        matches!(events.last(), Some(ApplyEvent::Error { message, .. }) if message.contains("capacity")),
         "{events:?}"
     );
     assert_eq!(reported_refusals(&mut agent).await, web_refused(&[1]));
@@ -998,7 +998,7 @@ async fn capacity_refusal_while_reserving_a_rolling_replacement_reaches_the_stat
     let events = drain_deploy(&mut agent, budgeted_web("web:v2", 1)).await;
     assert!(
         events.iter().any(|event| matches!(event,
-            ApplyEvent::Error { message } if message.contains("capacity"))),
+            ApplyEvent::Error { message, .. } if message.contains("capacity"))),
         "{events:?}"
     );
     assert_eq!(reported_refusals(&mut agent).await, web_refused(&[0]));
@@ -3597,7 +3597,7 @@ async fn send_deploy(tx: &mpsc::Sender<AgentCommand>, config: Config) -> Vec<App
 fn expect_complete(events: &[ApplyEvent]) -> (usize, &[String]) {
     match events.last().expect("no events received") {
         ApplyEvent::Complete { created, instances } => (*created, instances),
-        ApplyEvent::Error { message } => panic!("deploy failed: {message}"),
+        ApplyEvent::Error { message, .. } => panic!("deploy failed: {message}"),
         other => panic!("unexpected final event: {other:?}"),
     }
 }
@@ -3687,7 +3687,7 @@ async fn overlapping_volume_layout_is_refused_before_any_directory_is_provisione
     handle.await.unwrap();
     assert!(
         events.iter().any(
-            |event| matches!(event, ApplyEvent::Error { message } if message.contains("overlap"))
+            |event| matches!(event, ApplyEvent::Error { message, .. } if message.contains("overlap"))
         ),
         "{events:?}"
     );
@@ -3826,7 +3826,7 @@ async fn a_rolling_redeploy_refuses_a_host_path_the_node_does_not_allow() {
     assert!(
         events.iter().any(|event| matches!(
             event,
-            ApplyEvent::Error { message } if message.contains("allowed_host_paths")
+            ApplyEvent::Error { message, .. } if message.contains("allowed_host_paths")
         )),
         "{events:?}"
     );
@@ -4007,7 +4007,7 @@ async fn an_accepted_restore_owns_the_volumes_until_it_resolves() {
     .unwrap();
     let events = send_deploy(&tx, config.clone()).await;
     match events.last() {
-        Some(ApplyEvent::Error { message }) => {
+        Some(ApplyEvent::Error { message, .. }) => {
             assert!(message.contains("being restored"), "{message}")
         }
         other => panic!("a deploy during a restore was not refused: {other:?}"),
@@ -4277,7 +4277,7 @@ async fn catalogue_council(raft_port: u16) -> Arc<CouncilNode> {
     )
     .await
     .unwrap();
-    router.register(1, node.raft().clone()).await;
+    router.register(1, &node).await;
     let address = std::net::SocketAddr::from(([127, 0, 0, 1], raft_port));
     node.initialize(std::collections::BTreeMap::from([(
         1u64,
@@ -4584,7 +4584,7 @@ async fn deploy_refusal(key: &str, image: &str) -> Option<String> {
     shutdown.cancel();
     let _ = handle.await;
     events.into_iter().find_map(|event| match event {
-        ApplyEvent::Error { message } => Some(message),
+        ApplyEvent::Error { message, .. } => Some(message),
         _ => None,
     })
 }
@@ -4645,7 +4645,7 @@ async fn shutdown_escalates_to_kill_when_stop_is_ignored() {
     let port_allocator = PortAllocator::new(30000, 31000);
     let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown);
     // Escalation is under test, not the length of the production grace.
-    agent.set_shutdown_grace(std::time::Duration::from_millis(200));
+    agent.set_shutdown_budget(std::time::Duration::from_millis(200));
 
     let (ev_tx, mut ev_rx) = mpsc::channel(64);
     agent.deploy(basic_config(), &ev_tx).await;
@@ -4705,7 +4705,7 @@ async fn a_refused_launch_fails_the_deploy_and_the_instance_with_its_reason() {
     });
 
     let events = send_deploy(&tx, basic_config()).await;
-    let Some(ApplyEvent::Error { message }) = events.last() else {
+    let Some(ApplyEvent::Error { message, .. }) = events.last() else {
         panic!("the deploy must fail: {events:?}");
     };
     assert!(
@@ -4748,7 +4748,7 @@ async fn a_launch_refused_at_exec_fails_the_deploy_and_the_instance_with_its_rea
     });
 
     let events = send_deploy(&tx, basic_config()).await;
-    let Some(ApplyEvent::Error { message }) = events.last() else {
+    let Some(ApplyEvent::Error { message, .. }) = events.last() else {
         panic!("the deploy must fail: {events:?}");
     };
     assert!(
@@ -5266,7 +5266,7 @@ async fn deploy_steps_progress_while_status_queries_keep_the_queue_busy() {
         while let Some(event) = received.recv().await {
             match event {
                 ApplyEvent::Complete { .. } => return Ok(()),
-                ApplyEvent::Error { message } => return Err(message),
+                ApplyEvent::Error { message, .. } => return Err(message),
                 _ => {}
             }
         }
@@ -5405,7 +5405,7 @@ async fn cancellation_waits_for_in_flight_create_before_releasing_ownership() {
     assert!(receipt.outcome.is_none());
     let conflict = send_deploy(&tx, basic_config()).await;
     assert!(conflict.iter().any(
-        |event| matches!(event, ApplyEvent::Error { message } if message.contains(&operation_id))
+        |event| matches!(event, ApplyEvent::Error { message, .. } if message.contains(&operation_id))
     ));
     grill.release_creates(1);
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -5676,7 +5676,7 @@ async fn deploy_operations_track_live_phase_conflicts_and_disconnected_clients()
     .await
     .unwrap();
     match conflict_rx.recv().await.unwrap() {
-        ApplyEvent::Error { message } => {
+        ApplyEvent::Error { message, .. } => {
             assert!(message.contains(&operation_id));
             assert!(message.contains("already being changed"));
         }
@@ -5800,7 +5800,6 @@ fn allow_host_workloads<G: Grill + Clone + 'static>(
         .set_process_config(crate::config::process_workloads::ProcessWorkloadsConfig {
             allowed_binaries,
             mount_isolation: false,
-            ..Default::default()
         });
 }
 
@@ -7034,7 +7033,7 @@ fn stubborn_agent() -> (
     agent.set_volumes_dir(volumes.path().to_path_buf());
     allow_host_workloads(&mut agent, &[]);
     agent.set_stop_grace(STUBBORN_GRACE);
-    agent.set_shutdown_grace(std::time::Duration::from_millis(200));
+    agent.set_shutdown_budget(std::time::Duration::from_millis(200));
     let handle = tokio::spawn(async move { agent.run().await });
     (tx, shutdown, handle, grill_handle, volumes)
 }
@@ -7376,7 +7375,7 @@ async fn deploy_is_refused_while_the_workload_is_stopping() {
     let stopped = send_stop(&tx, "web");
     let events = send_deploy(&tx, basic_config()).await;
     match events.last() {
-        Some(ApplyEvent::Error { message }) => {
+        Some(ApplyEvent::Error { message, .. }) => {
             assert!(message.contains("still stopping"), "{message}")
         }
         other => panic!("deploy over a pending stop was not refused: {other:?}"),
@@ -7393,7 +7392,7 @@ async fn deploy_is_refused_while_the_workload_is_stopping() {
 async fn shutdown_reports_pending_stops_unconfirmed() {
     let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
     agent.set_stop_grace(std::time::Duration::from_secs(60));
-    agent.set_shutdown_grace(std::time::Duration::from_millis(200));
+    agent.set_shutdown_budget(std::time::Duration::from_millis(200));
     expect_complete(&drain_deploy(&mut agent, basic_config()).await);
     grill.set_ignore_stop(true);
     grill.set_state(
@@ -7439,7 +7438,7 @@ async fn deploy_fails_closed_on_encrypted_secret_without_key() {
     let events = send_deploy(&tx, config).await;
 
     match events.last().expect("no events received") {
-        ApplyEvent::Error { message } => {
+        ApplyEvent::Error { message, .. } => {
             assert!(
                 message.contains("encrypted secrets"),
                 "unexpected error: {message}"
@@ -7480,6 +7479,40 @@ async fn deploy_streams_progress_events() {
     agent_handle.await.unwrap();
 }
 
+// `relish tui`'s node page says which apps keep data on the node, so a
+// node's status flags an instance whose app has a host-path mount or a
+// managed volume: the same test an OS rollout uses (#2120, #2170).
+#[tokio::test]
+async fn status_says_which_instances_keep_data_on_their_node() {
+    let (mut agent, _tx, _shutdown, _grill) = test_agent_with_grill();
+    let shared = tempfile::tempdir().unwrap();
+    agent.set_host_path_policy(crate::bun::host_paths::HostPathPolicy::new(
+        vec![shared.path().to_path_buf()],
+        Vec::new(),
+    ));
+    let config = Config::parse(&format!(
+        "[app.db]\nimage = \"db:v1\"\n\n[[app.db.volumes]]\npath = \"/srv\"\nsource = \"{}\"\n\n\
+         [app.web]\nimage = \"web:v1\"\n",
+        shared.path().display()
+    ))
+    .unwrap();
+    let (ev_tx, mut ev_rx) = mpsc::channel(256);
+    agent.deploy(config, &ev_tx).await;
+    drop(ev_tx);
+    while ev_rx.recv().await.is_some() {}
+
+    let statuses = agent.get_status().await;
+    let keeps_data = |app: &str| {
+        statuses
+            .iter()
+            .find(|status| status.app_name == app)
+            .unwrap_or_else(|| panic!("no {app} in {statuses:?}"))
+            .data_on_node
+    };
+    assert!(keeps_data("db"), "a host-path app keeps data on its node");
+    assert!(!keeps_data("web"), "an app with no volume keeps none");
+}
+
 #[tokio::test]
 async fn status_returns_all_instances() {
     let (mut agent, tx, shutdown) = test_agent();
@@ -7503,6 +7536,32 @@ async fn status_returns_all_instances() {
     assert_eq!(statuses[0].app_name, "web");
     // Without health checks, goes straight to Running
     assert_eq!(statuses[0].state, "running");
+
+    shutdown.cancel();
+    agent_handle.await.unwrap();
+}
+
+// `relish tui` shows the image an app's instances run, so a running
+// instance's status names the image the node started it from (#2167).
+#[tokio::test]
+async fn running_instance_status_carries_its_image() {
+    let (mut agent, tx, shutdown) = test_agent();
+
+    let agent_handle = tokio::spawn(async move {
+        agent.run().await;
+    });
+
+    let events = send_deploy(&tx, basic_config()).await;
+    expect_complete(&events);
+
+    let (resp_tx, resp_rx) = oneshot::channel();
+    tx.send(AgentCommand::Status { response: resp_tx })
+        .await
+        .unwrap();
+    let statuses = resp_rx.await.unwrap();
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].state, "running");
+    assert_eq!(statuses[0].image.as_deref(), Some("myapp:v1"));
 
     shutdown.cancel();
     agent_handle.await.unwrap();
@@ -7864,7 +7923,7 @@ async fn halted_rollout_keeps_healthy_replacements_in_ordinary_supervision() {
         let replacement = Config::parse(&format!("[app.web]\nimage = 'web:v2'\nport = 8080\nreplicas = 2\n[app.web.deploy]\nstrategy = '{strategy}'\nauto_rollback = false\nhealth_timeout = '1s'\n")).unwrap();
         let outcome = drain_deploy(&mut agent, replacement).await;
         assert!(
-            matches!(outcome.last(), Some(ApplyEvent::Error { message }) if message.contains("halted")),
+            matches!(outcome.last(), Some(ApplyEvent::Error { message, .. }) if message.contains("halted")),
             "{outcome:?}"
         );
         let healthy = InstanceId("default__web-g1-0".into());
@@ -7882,6 +7941,44 @@ async fn halted_rollout_keeps_healthy_replacements_in_ordinary_supervision() {
                 .is_empty()
         );
     }
+}
+
+/// #1640: a history entry's `created_at` is when this node's deploy of the
+/// app started, so `completed_at − created_at` is how long it took. Both
+/// used to be stamped together as the entry was written, so the soak's app
+/// start read about 1 ms however slow the start was.
+#[tokio::test]
+async fn deploy_history_times_a_fresh_deploy_and_a_rolling_redeploy() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    grill.set_pid(std::process::id());
+    let slow = std::time::Duration::from_millis(200);
+    grill.set_call_delay(crate::grill::mock::MockCall::Start, Some(slow));
+    let history = agent.deploy_history_handle();
+    let took = |history: &[crate::meat::deploy_types::DeployHistoryEntry]| {
+        let entry = history.last().expect("a history entry");
+        entry
+            .completed_at
+            .duration_since(entry.created_at)
+            .unwrap_or_default()
+    };
+
+    let first = Config::parse("[app.web]\nimage = 'web:v1'\nport = 8080\n").unwrap();
+    expect_complete(&drain_deploy(&mut agent, first).await);
+    let fresh = took(&history.read().await);
+    assert!(
+        fresh >= slow,
+        "a fresh deploy that took over {slow:?} recorded {fresh:?}"
+    );
+
+    let second = Config::parse("[app.web]\nimage = 'web:v2'\nport = 8080\n").unwrap();
+    expect_complete(&drain_deploy(&mut agent, second).await);
+    let entries = history.read().await;
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    let rolled = took(&entries);
+    assert!(
+        rolled >= slow,
+        "a rolling redeploy that took over {slow:?} recorded {rolled:?}"
+    );
 }
 
 #[tokio::test]
@@ -7917,7 +8014,7 @@ async fn rolling_redeploy_halts_without_reverting_when_auto_rollback_is_false() 
 
     let events = send_deploy(&tx, halt_config()).await;
     match events.last().expect("no events received") {
-        ApplyEvent::Error { message } => {
+        ApplyEvent::Error { message, .. } => {
             assert!(
                 message.contains("halted"),
                 "expected a halt, got: {message}"
@@ -8583,7 +8680,7 @@ async fn rolling_redeploy_rolls_back_when_the_probe_fails() {
     let error = events
         .iter()
         .find_map(|e| match e {
-            ApplyEvent::Error { message } => Some(message.clone()),
+            ApplyEvent::Error { message, .. } => Some(message.clone()),
             _ => None,
         })
         .expect("a probe-failing redeploy must produce an error event");
@@ -8699,7 +8796,7 @@ async fn auto_rollback_after_a_retirement_restores_old_capacity() {
         .iter()
         .rev()
         .find_map(|event| match event {
-            ApplyEvent::Error { message } => Some(message.clone()),
+            ApplyEvent::Error { message, .. } => Some(message.clone()),
             _ => None,
         })
         .expect("the failed rollout must report an error");
@@ -8796,7 +8893,7 @@ async fn abort_keeps_healthy_new_instances_when_old_capacity_cannot_return() {
         .iter()
         .rev()
         .find_map(|event| match event {
-            ApplyEvent::Error { message } => Some(message.clone()),
+            ApplyEvent::Error { message, .. } => Some(message.clone()),
             _ => None,
         })
         .expect("the failed rollout must report an error");
@@ -9240,7 +9337,7 @@ async fn deploy_with_failing_init_container_fails() {
     let events = send_deploy(&tx, config_with_init_container()).await;
     let last = events.last().expect("no events");
     assert!(
-        matches!(last, ApplyEvent::Error { message } if message.contains("exited with code 1")),
+        matches!(last, ApplyEvent::Error { message, .. } if message.contains("exited with code 1")),
         "expected an Error event naming the exit code, got {last:?}"
     );
 
@@ -9276,7 +9373,7 @@ async fn failing_init_container_reports_the_runtimes_stderr() {
     let message = events
         .iter()
         .find_map(|event| match event {
-            ApplyEvent::Error { message } => Some(message.clone()),
+            ApplyEvent::Error { message, .. } => Some(message.clone()),
             _ => None,
         })
         .expect("the failed initialiser produced no Error event");
@@ -9451,7 +9548,7 @@ async fn rollout_gate_probes_health_port_without_app_port() {
     let error = events
         .iter()
         .find_map(|e| match e {
-            ApplyEvent::Error { message } => Some(message.clone()),
+            ApplyEvent::Error { message, .. } => Some(message.clone()),
             _ => None,
         })
         .expect("the gate must probe health.port and refuse the failing replacement");
@@ -9688,6 +9785,7 @@ fn adoption_record(
         host_port: Some(30123),
         app_spec: Some(app_spec),
         oci_spec: crate::grill::oci::OciSpec {
+            managed_volumes: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -9769,7 +9867,7 @@ async fn exhausted_rollout_generation_refuses_without_mutating_the_old_instance(
     let events = drain_deploy(&mut agent, basic_config()).await;
     let calls = grill.calls();
     agent.stop_app("web", "default").await.unwrap();
-    assert!(events.iter().any(|event| matches!(event, ApplyEvent::Error { message } if message.contains("generation exhausted"))), "{events:?}");
+    assert!(events.iter().any(|event| matches!(event, ApplyEvent::Error { message, .. } if message.contains("generation exhausted"))), "{events:?}");
     assert_eq!(calls.len(), before);
 }
 
@@ -10172,7 +10270,7 @@ async fn rolling_record_failure_retains_cleanup_ownership_until_directory_recove
                 "[app.web]\nimage = \"web:v2\"\nport = 8080\n[app.web.deploy]\nstrategy = \"{strategy}\"\n"
             )).unwrap();
         let outcome = drain_deploy(&mut agent, replacement).await;
-        assert!(outcome.iter().any(|event| matches!(event, ApplyEvent::Error { message } if message.contains("persist replacement record"))), "{outcome:?}");
+        assert!(outcome.iter().any(|event| matches!(event, ApplyEvent::Error { message, .. } if message.contains("persist replacement record"))), "{outcome:?}");
         assert!(
             agent
                 .supervisor
@@ -10545,6 +10643,130 @@ async fn a_retired_stale_record_does_not_stop_the_other_instances_adopting() {
     assert_eq!(kept, vec![healthy.0]);
 }
 
+/// Two records beside each other on disk: `stale` is changed by the test,
+/// `healthy` matches its runtime launch and must still adopt (#1852).
+async fn power_cut_split_fixture(
+    stale: crate::grill::records::InstanceRecord,
+    stale_launch: Option<crate::grill::oci::OciSpec>,
+) -> (
+    TestAgent,
+    MockGrill,
+    tempfile::TempDir,
+    InstanceId,
+    InstanceId,
+) {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    let records = tempfile::tempdir().unwrap();
+    agent.set_records_dir(records.path().to_path_buf());
+    let mut healthy = adoption_record("default__redis-0", "redis", false);
+    healthy.host_port = Some(30124);
+    crate::grill::records::write_record(records.path(), &stale).unwrap();
+    crate::grill::records::write_record(records.path(), &healthy).unwrap();
+    let stale_id = InstanceId(stale.instance_id.clone());
+    let healthy_id = InstanceId(healthy.instance_id.clone());
+    let mut launches = vec![crate::grill::RuntimeLaunch {
+        instance_id: healthy_id.clone(),
+        generation: crate::grill::RuntimeGeneration::process("healthy"),
+        spec: healthy.oci_spec.clone(),
+        network_reference: None,
+    }];
+    if let Some(spec) = stale_launch {
+        launches.push(crate::grill::RuntimeLaunch {
+            instance_id: stale_id.clone(),
+            generation: crate::grill::RuntimeGeneration::process("stale"),
+            spec,
+            network_reference: None,
+        });
+    }
+    grill.set_launch_inventory(launches).await;
+    grill.set_adopt_result(&healthy_id, true);
+    (agent, grill, records, stale_id, healthy_id)
+}
+
+fn kept_records(records: &tempfile::TempDir) -> Vec<String> {
+    crate::grill::records::load_records(records.path())
+        .unwrap()
+        .into_iter()
+        .map(|record| record.instance_id)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_record_from_an_earlier_boot_with_no_runtime_launch_is_retired() {
+    // #1852: a power cut kept the adoption record but lost the runtime's
+    // launch intent. The process died with the boot, so the instance
+    // reschedules instead of stopping the node starting.
+    let mut stale = adoption_record("default__frontend-0", "frontend", false);
+    stale.boot_id = Some("an-earlier-boot".into());
+    let (mut agent, grill, records, stale_id, healthy_id) =
+        power_cut_split_fixture(stale, None).await;
+
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+    assert!(agent.supervisor.get_instance(&stale_id).is_none());
+    assert!(
+        !grill
+            .calls()
+            .iter()
+            .any(|(call, id)| call == "adopt" && *id == stale_id)
+    );
+    assert_eq!(
+        agent.supervisor.get_instance(&healthy_id).unwrap().state,
+        ContainerState::Running
+    );
+    assert_eq!(kept_records(&records), vec![healthy_id.0]);
+}
+
+#[tokio::test]
+async fn a_record_from_this_boot_with_no_runtime_launch_still_refuses_startup() {
+    // The record's process may still be running with nothing in the runtime
+    // owning it: that's uncertain, so startup keeps refusing and keeps it.
+    let stale = adoption_record("default__frontend-0", "frontend", false);
+    let (mut agent, _grill, records, stale_id, healthy_id) =
+        power_cut_split_fixture(stale, None).await;
+
+    let error = agent.adopt_recorded_instances().await.unwrap_err();
+    assert!(
+        error.to_string().contains("no runtime launch intent"),
+        "{error}"
+    );
+    let mut kept = kept_records(&records);
+    kept.sort();
+    assert_eq!(kept, vec![stale_id.0, healthy_id.0]);
+}
+
+#[tokio::test]
+async fn a_record_conflicting_with_its_runtime_launch_is_retired_and_the_launch_fenced() {
+    // #1852: the record and the launch it names were written at different
+    // moments. The launch is what the runtime runs, so it's fenced and
+    // retired like a launch with no record, and the instance reschedules.
+    let stale = adoption_record("default__frontend-0", "frontend", false);
+    let mut launched = stale.oci_spec.clone();
+    launched.process.args = vec!["sleep".into(), "120".into()];
+    let (mut agent, grill, records, stale_id, healthy_id) =
+        power_cut_split_fixture(stale, Some(launched)).await;
+    grill.set_state(&stale_id, ContainerState::Running);
+
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+    let calls = grill.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|(call, id)| call == "kill" && *id == stale_id),
+        "the conflicting launch kept running: {calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|(call, id)| call == "adopt" && *id == stale_id)
+    );
+    assert!(agent.supervisor.get_instance(&stale_id).is_none());
+    assert_eq!(
+        agent.supervisor.get_instance(&healthy_id).unwrap().state,
+        ContainerState::Running
+    );
+    assert_eq!(kept_records(&records), vec![healthy_id.0]);
+}
+
 #[tokio::test]
 async fn startup_adopts_recorded_instances_instead_of_restarting() {
     let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
@@ -10689,6 +10911,7 @@ fn write_test_identity(
             hierarchy.root.ca.certificate_der.clone(),
         ],
         "adopted-jwt".to_string(),
+        "adopted-api-jwt".to_string(),
     );
     let dir = crate::sesame::identity::instance_identity_dir(volumes, instance);
     crate::sesame::identity::write_identity_files(&identity, &dir, None).unwrap();
@@ -11309,7 +11532,7 @@ async fn rolling_redeploy_of_a_volume_app_never_overlaps_writers() {
     drop(ev_tx);
     let mut errors = Vec::new();
     while let Some(event) = ev_rx.recv().await {
-        if let ApplyEvent::Error { message } = event {
+        if let ApplyEvent::Error { message, .. } = event {
             errors.push(message);
         }
     }
@@ -11980,6 +12203,32 @@ async fn resource_faults_reject_off_linux() {
         .await
         .expect_err("cpu stress must reject without cgroups");
     assert!(err.contains("Linux cgroups"), "unexpected reason: {err}");
+}
+
+/// A pause freezes the workload's processes, not the process the runtime
+/// names as the instance's. On runc that one is the `runc run` launcher,
+/// and freezing it left the container running (#2079). A kill still
+/// signals the instance's process.
+#[tokio::test]
+async fn a_pause_signals_the_workload_processes_and_a_kill_the_instance_process() {
+    use super::signal_faults::{Signal, SignalTarget, read_pids};
+    let grill = MockGrill::new();
+    grill.set_pid(100);
+    grill.set_workload_pids(vec![200, 201]);
+    let targets = [SignalTarget::Instance(InstanceId("default__web-0".into()))];
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    assert_eq!(
+        read_pids(&grill, &targets, Signal::Pause, deadline).await,
+        vec![200, 201]
+    );
+    assert_eq!(
+        read_pids(&grill, &targets, Signal::Resume, deadline).await,
+        vec![200, 201]
+    );
+    assert_eq!(
+        read_pids(&grill, &targets, Signal::Kill { count: 0 }, deadline).await,
+        vec![100]
+    );
 }
 
 /// Reversing a Pause fault SIGCONTs the frozen process.
@@ -13173,7 +13422,7 @@ async fn a_new_allocation_waits_here_until_the_old_incarnation_has_retired() {
     let _ = pending.await;
 
     match events.as_slice() {
-        [ApplyEvent::Error { message }] => assert!(
+        [ApplyEvent::Error { message, .. }] => assert!(
             message.contains("new service allocation"),
             "unexpected refusal: {message}"
         ),
@@ -13353,7 +13602,7 @@ async fn deploy_before_its_committed_allocation_leaves_nothing_for_the_retry() {
     agent.supervisor.grill().set_pid(std::process::id());
     let events = drain_deploy(&mut agent, basic_config()).await;
     match events.last() {
-        Some(ApplyEvent::Error { message }) => assert!(
+        Some(ApplyEvent::Error { message, .. }) => assert!(
             message.contains("committed cluster allocation"),
             "unexpected failure: {message}"
         ),
@@ -13994,6 +14243,7 @@ async fn signed_identity_is_stored_only_for_a_live_instance() {
                 root_ca_cert_der: vec![2],
                 ca_bundle_der: vec![vec![1], vec![2]],
                 jwt_token: Some("jwt".into()),
+                api_jwt_token: Some("api-jwt".into()),
             }),
         )
     };
@@ -14015,6 +14265,7 @@ async fn signed_identity_is_stored_only_for_a_live_instance() {
 
     let instance = agent.supervisor.get_instance(&live).unwrap();
     assert_eq!(instance.identity.as_ref().unwrap().jwt_token, "jwt");
+    assert_eq!(instance.identity.as_ref().unwrap().api_jwt_token, "api-jwt");
     assert!(agent.instance_identity_dir(&live).exists());
     assert!(
         !agent.instance_identity_dir(&retired).exists(),
@@ -14091,6 +14342,8 @@ fn runtime_unknown_is_serialised_only_when_set() {
         runtime_unknown: false,
         status_age_ms: None,
         age_seconds: None,
+        image: None,
+        data_on_node: false,
         reason: None,
     };
     let plain = serde_json::to_value(&status).unwrap();

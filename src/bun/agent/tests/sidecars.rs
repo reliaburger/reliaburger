@@ -321,7 +321,7 @@ async fn a_sidecar_that_cannot_start_fails_its_instance_which_never_starts() {
     let message = events
         .iter()
         .find_map(|event| match event {
-            ApplyEvent::Error { message } => Some(message.clone()),
+            ApplyEvent::Error { message, .. } => Some(message.clone()),
             _ => None,
         })
         .expect("the failed sidecar produced no Error event");
@@ -347,7 +347,7 @@ async fn a_node_whose_runtime_cannot_share_a_network_refuses_sidecars_with_a_rea
     let message = events
         .iter()
         .find_map(|event| match event {
-            ApplyEvent::Error { message } => Some(message.clone()),
+            ApplyEvent::Error { message, .. } => Some(message.clone()),
             _ => None,
         })
         .expect("sidecars on a runtime that can't share a network were accepted");
@@ -408,5 +408,80 @@ async fn an_adopted_instance_gets_its_sidecars_started_again() {
     assert!(
         operations(&calls, &id(WEB)).iter().all(|op| op == "state"),
         "the adopted instance was disturbed: {calls:?}"
+    );
+}
+
+/// An instance that never passes its startup probe is stopped with cleanup
+/// owed. A sidecar restart still in flight then must give up: the cleanup
+/// kills the sidecars it knows, and a relaunch that started its sidecar
+/// after that kill left it running beside a Failed instance (#1999).
+#[tokio::test]
+async fn a_sidecar_restarting_when_its_instance_is_given_up_does_not_survive() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    let config = Config::parse(
+        r#"
+        [app.web]
+        image = "myapp:v1"
+        port = 8080
+
+        [app.web.health]
+        path = "/healthz"
+
+        [[app.web.sidecar]]
+        name = "proxy"
+        image = "envoy:1.31"
+        "#,
+    )
+    .unwrap();
+    let (deploy_events, _receiver) = mpsc::channel(64);
+    agent.deploy(config, &deploy_events).await;
+    let (web, proxy) = (id(WEB), id(PROXY));
+    assert_eq!(
+        agent.supervisor.get_instance(&web).unwrap().state,
+        ContainerState::HealthWait
+    );
+    let from = grill.calls().len();
+
+    // The proxy crashes, and its restart is under way: past its kill, slow
+    // to create.
+    grill.set_state(&proxy, ContainerState::Stopped);
+    agent.check_apps().await;
+    grill.set_call_delay(
+        crate::grill::mock::MockCall::Create,
+        Some(std::time::Duration::from_secs(1)),
+    );
+    agent.relaunch_due_sidecars();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(agent.sidecars.relaunching(&web));
+
+    // Meanwhile the startup grace runs out, and the cleanup stops the
+    // instance and its sidecars.
+    let created_at = agent.supervisor.get_instance(&web).unwrap().created_at;
+    while agent.supervisor.get_instance(&web).unwrap().state == ContainerState::HealthWait {
+        agent
+            .complete_health_probe(
+                web.clone(),
+                created_at,
+                Ok(crate::bun::health::HealthStatus::ConnectionRefused),
+            )
+            .await;
+    }
+    agent.drive_pending_restarts_to_completion().await;
+    assert_eq!(
+        agent.supervisor.get_instance(&web).unwrap().state,
+        ContainerState::Failed
+    );
+
+    // The relaunch finishes after the cleanup.
+    agent.relaunch_due_sidecars_to_completion().await;
+    let proxy_operations: Vec<String> = operations(&grill.calls()[from..], &proxy)
+        .into_iter()
+        .filter(|op| op != "state")
+        .collect();
+    let last_start = proxy_operations.iter().rposition(|op| op == "start");
+    let last_kill = proxy_operations.iter().rposition(|op| op == "kill");
+    assert!(
+        last_start < last_kill,
+        "the proxy was left running beside its failed instance: {proxy_operations:?}"
     );
 }

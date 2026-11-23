@@ -128,7 +128,7 @@ Disk space isn't infinite. Cleanup comes in two steps, and keeping them apart is
 2. **Sole-copy protection.** A blob is deleted from a node only while some other node also holds it. You can't accidentally destroy the last copy.
 3. **Orphan grace.** A blob with no holder record that's younger than an hour is left alone: it's probably part of a push still in flight.
 
-After deletion, the node proposes a `GcReport` to Raft, which removes it from the layer holder sets. Because Raft proposals are serialised, two nodes can't simultaneously believe they're "not the sole copy" and both delete. "Expiry, then GC" is the 0.2.1 design; the story of how the first version never collected anything is in *Copies that can still answer*, below.
+The order matters. A node first *nominates* the blobs it would delete and proposes them to Raft as a `GcReport`. The state machine approves only those that pass the rails above and removes this node from their holder sets. Only then, and only for the approved blobs, does the node delete anything from disk, re-checking references once more as it goes (`PickleState::collect_garbage`). Because Raft proposals are serialised, two nodes can't simultaneously believe they're "not the sole copy" and both delete. "Expiry, then GC" is the 0.2.1 design; the story of how the first version never collected anything is in *Copies that can still answer*, below.
 
 ## Reachability is the whole game
 
@@ -216,6 +216,37 @@ A mount is kernel state, though, and kernel state doesn't survive a reboot. We o
 
 The same soak found a smaller trap in a new loop volume. `mkfs.ext4` leaves `lost+found` behind, so the app never sees an empty directory. The official Redis entrypoint only takes over its data directory when it holds nothing but `*.rdb` files and `appendonlydir`; anything else and it prints a notice, drops to the `redis` user and fails with "Permission denied". Postgres's `initdb` flatly refuses a non-empty directory. We remove `lost+found` right after mounting, so a new volume looks exactly like a Docker volume does. `e2fsck` makes a fresh one if it ever needs it.
 
+The record beside each volume, `data.volume.json`, turned out to carry more weight than it looked. It's how provisioning knows a volume already exists, so it's also the only thing standing between a loop image full of data and `mkfs.ext4 -F`. Three things were loose ([#2000](https://github.com/reliaburger/reliaburger/issues/2000)). The record was written to a temporary file and renamed, with no `fsync`, so a power cut soon after could leave it empty. Reading it turned *every* failure into "no record", and no record meant "new volume". And `setup_loop_mount` never asked whether the image was already there: `fallocate` keeps an existing file, and `-F` tells `mkfs` to format it without asking.
+
+Each gets its own fix. The record now goes through the same durable write as the node's identity files: write a temporary file, `sync_all` it, rename it, then sync the directory so the rename itself survives. Reading it returns a `Result<Option<VolumeSidecar>, VolumeError>`, and the three states mean three different things:
+
+```rust
+fn read_sidecar(host_path: &Path) -> Result<Option<VolumeSidecar>, VolumeError> {
+    let path = VolumeManager::sidecar_path(host_path);
+    crate::durable::read_json_if_exists(&path, SIDECAR_LIMIT, crate::durable::Access::Regular)
+        .map_err(|error| VolumeError::UnreadableRecord {
+            path: path.display().to_string(),
+            reason: error.to_string(),
+        })
+}
+```
+
+`Ok(Some(_))` is a provisioned volume, `Ok(None)` is no record at all, and `Err(_)` is a record we can't trust, which stops the start with a message naming the file. The old `Option` had only two states, so "missing" and "damaged" had to share one, and they shared the dangerous one. A type with a slot for each answer makes the caller say what it does with each; `?` passes the error up, and nothing formats anything.
+
+Last, the image is created with `OpenOptions::new().create_new(true)`, Rust's spelling of `O_CREAT | O_EXCL`: it fails with `AlreadyExists` instead of opening a file that's already there. An image with no record is either the leftover of a crash between formatting and recording, or a populated volume whose record was lost. Bun can't tell which, so it refuses and leaves the call to the operator. Just before `mkfs.ext4 -F` runs, a second check reads the image's first megabyte and refuses if any byte isn't zero, so `-F` only ever formats a blank file. Both helpers carry `#[cfg_attr(not(target_os = "linux"), allow(dead_code))]`: only the Linux build calls them outside tests, and the attribute applies `allow(dead_code)` on every other target, so macOS builds don't warn about them. The gated regression provisions a 16 MiB loop volume, writes to it, unmounts it, deletes its record and provisions again: the second call fails, and the data is still in the image.
+
+Refusing an existing image has a cost the first version missed, and review caught it. If `mkfs` or `mount` fails on a volume's very first start, the image this call just claimed stays behind with no record, maybe still mounted, and every retry refuses it for good. So the claim now comes with an undo. `setup_loop_mount` claims the image, then runs everything else in a helper, and on any error it unmounts the image if it got that far and deletes it:
+
+```rust
+claim_loop_image(&img_path)?;
+if let Err(error) = self.format_and_mount(path, &img_path, size_bytes) {
+    self.abandon_loop(path);
+    return Err(error);
+}
+```
+
+That's safe because nothing has used the image yet: the record that would let a container mount it is written last, and a failure there runs the same undo. Splitting the steps into a helper keeps the cleanup in one place. Inside `format_and_mount`, `?` returns at the first failure, and the single `if let Err` above sees it, whichever step failed. A crash can still land between the claim and `mkfs`, where no cleanup runs. That leaves an image that is still all zeros, so `claim_loop_image` takes back a blank image instead of refusing it. Blank means no filesystem, so there's no data to lose. The test needs failures that a real system won't produce on demand, so `VolumeManager` grows a test-only hook, `loop_fault: Option<fn(LoopStep) -> bool>`, behind `#[cfg(test)]`. It doesn't exist in a release build at all. The gated test fails the first start before formatting, after mounting and before recording, and checks each time that nothing is left mounted, the image is gone, and the next start provisions the volume.
+
 On macOS, there's no loop mount. Reliaburger creates a plain directory and logs a warning. Size limits are soft-only on macOS. This is a development convenience, not a production limitation — production clusters run Linux.
 
 ## Whose volume is it?
@@ -259,6 +290,25 @@ fn chown_tree(
 Host-path volumes (`source = "/srv/import"`) get none of this. They're the operator's directories, and silently chowning `/srv/import` to uid 2,000,000,999 is exactly the kind of surprise an orchestrator shouldn't spring. Bun checks the mode bits instead and, if the container's user plainly can't write, logs which host uid to `chown` the directory to. It still starts the container, because plenty of host mounts are only ever read.
 
 The proof is a gated test that runs the real Redis image with `--appendonly yes` over a managed volume: first as uid 999 directly (so no entrypoint `chown` can paper over a missing hand-over), writes a key, restarts, reads it back, then restarts as image root and reads it again.
+
+### Which directories are Bun's?
+
+Two questions decide whether a directory gets chowned: is it a managed volume, and is the path to it the path we think it is? Bun used to answer both by looking at the disk. A bind source with a `<name>.volume.json` beside it counted as managed, wherever it was, host paths included. And a volume's path was built by `join`ing its mount path onto the volumes directory and handing the result to `create_dir_all`, which follows symlinks like any other path lookup.
+
+The second answer is the subtle one. Everything inside a managed volume belongs to its container, symlinks included. A new volume whose mount path runs through an older volume of the same app (`/data/cache` after `/data`) is resolved through whatever that older container left there. The overlap check from earlier in this chapter doesn't see it: it compares the volumes of one spec, and this layout spans two deploys.
+
+Now each question gets an answer that doesn't depend on what a container wrote. Which mounts are managed is recorded when the OCI spec is built: `build_mounts` returns the mounts *and* a `Vec<ManagedVolumeMount>` naming the volumes directory and source of each managed volume, and `OciSpec::managed_volumes` carries that list to Runc. Runc hands over exactly those. Every other bind source is a host path, whatever sits beside it. The field isn't part of the OCI runtime spec, like `port_mapping` before it, and `#[serde(default, skip_serializing_if = "Vec::is_empty")]` keeps a spec with no managed volumes byte-for-byte what it was.
+
+The path is resolved one component at a time, from the volumes directory down:
+
+```rust
+let relative = managed_relative_path(namespace, app_name, mount_path)?;
+let host_path = resolve_volume_path(&self.volumes_dir, &relative, PathWalk::Create)?;
+```
+
+`managed_relative_path` refuses anything but plain names, and `resolve_volume_path` walks them with `symlink_metadata`, which describes a symlink rather than its target. It refuses a component that is a symlink, isn't a directory, or is itself a volume (it has a record beside it) or a snapshot restore's copy of one. It makes missing parents with `create_dir`, one name at a time, never `create_dir_all`. A new volume over a directory that already holds an older one is refused too, since the new container would mount the older volume, record and all. The hand-over runs the same walk in `PathWalk::Check` mode before it chowns anything.
+
+Checking a path and using it a moment later is normally a race. Here it isn't one, and the reason is the rule itself: every directory the walk accepts is outside every volume, so no container can write to it, and no container can swap one for a symlink between the check and the use. The rule that stops a path through a volume is also what makes the check safe to trust. The tests set up each layout: a symlink inside an older volume, a plain directory inside one, an older volume inside the new path, a symlinked namespace, parent or leaf, and a record copied beside a host directory. Each must leave the host directory exactly as it was.
 
 ### A host path is a tenant boundary
 
@@ -538,6 +588,8 @@ The fix content-addresses the rootfs: each set of layers unpacks into `…/{tag}
 
 That marker turned out to be a promise we hadn't kept. The V02 soak powered a node off a few seconds after it unpacked Redis. When the node came back, `gen-…/.complete` was there and `usr/local/bin/redis-server` was 0 bytes: ext4 had written the tiny marker and was still holding the unpacked data in the page cache when the power went. Every redeploy then failed with `exec format error`, the node never got its pinned workload back, and the agent retried every two seconds. The marker now waits for `syncfs` on the unpacked tree, which flushes the whole filesystem in one call rather than fsyncing thousands of files, and is itself written with the same synced temp-file-and-rename as everything else. Cached blobs got the same treatment: they used to be renamed into place without a sync.
 
+What goes *into* a generation got the same scrutiny. Unpacking applies each layer's whiteouts, and those are resolved by our code rather than by the `tar` crate, so they need their own rules: never follow a symlink the image put in the rootfs, and never remove an entry of the whiteout's own layer. Chapter 1's "Layer unpacking and whiteouts" walks through both; the short version is that every removal goes through a directory descriptor opened with `O_NOFOLLOW`, the pattern `chown_tree` uses for volumes earlier in this chapter.
+
 ### One writable rootfs per workload
 
 That fixed image publication, but not workload isolation. Two replicas still
@@ -610,6 +662,17 @@ The authenticated capability response carries the selected socket, TLS and P2P s
 configured redundancy, current member count and the number of under-replicated catalogue
 layers. Those are deliberately separate facts. Three live nodes make two copies *possible*;
 only the holder sets prove whether the catalogue has achieved it.
+
+`relish wtf` used to turn either fact into a `registry-redundancy` warning, and the Wyse
+lab's one-node dry run showed why that's wrong (#2147). One node can't hold a second copy
+of anything, so it reported `redundancy_possible=false` and twelve under-replicated layers,
+and `wtf` told the operator to "restore registry peer reachability and allow Pickle to heal",
+which no amount of waiting does. `relish status` read the warning and called the cluster
+DEGRADED. Now `check_registry` counts the nodes the cluster knows, dead ones included, and
+on exactly one it puts the registry under OK with the reason: `one node: Pickle keeps one
+copy of each layer; add a node for redundancy`. Counting the dead matters: a three-node
+cluster down to one live node *is* degraded, and still warns. A registry that isn't
+listening, or that peers can't reach, warns however many nodes there are.
 
 TLS comes for free from the same PKI: when the node has an mTLS identity, the registry serves with `build_api_server_config` — the very config the agent API listener uses — and peers address each other as `https://`. The scheme is threaded through one function (`pickle_peers_scheme`) so the server and every peer-URL derivation always agree.
 

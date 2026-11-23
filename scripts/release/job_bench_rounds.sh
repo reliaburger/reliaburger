@@ -45,6 +45,7 @@ case $busybox in /*) ;; *) fail '--busybox must be an absolute path' ;; esac
 
 image='public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028'
 work=/root/rb-bench-rounds
+here=$(cd "$(dirname "$0")" && pwd)
 install -m 0755 "$bun" /usr/local/bin/rb-bun
 install -m 0755 "$relish" /usr/local/bin/rb-relish
 systemctl stop rb-bun 2>/dev/null || true
@@ -54,7 +55,9 @@ sha256sum /usr/local/bin/rb-bun /usr/local/bin/rb-relish "$busybox" > "$out/bina
 { uname -r; runc --version | head -n 1; nproc; } >> "$out/binaries.txt"
 
 cd "$work"
-rb-relish init cluster --cluster-name bench --node-id node-01 > init.log 2>&1
+# The root CA backup and its passphrase stay in $work, which the next run
+# deletes; relish_init.py passes them only to a relish that takes them (#709).
+python3 "$here/profiling/relish_init.py" rb-relish cluster bench node-01 "$work" > init.log 2>&1
 python3 - "$busybox" <<'EOF'
 import sys
 path = 'cluster/reliaburger.toml'

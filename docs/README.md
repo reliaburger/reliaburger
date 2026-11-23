@@ -5,8 +5,8 @@ laptop, see the [quickstart guide](quickstart.md). For the architectural vision,
 see the [whitepaper](whitepaper.md); for status and what's next, see the
 [roadmap](roadmap.md).
 
-0.2.8 was released on 12 November 2026. Its signed binaries, guest images and
-installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.8),
+0.3.2 was released on 23 November 2026. Its signed binaries, guest images and
+installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.2),
 and `curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop` installs it
 and builds a laptop cluster; without a flag the installer explains the choices.
 Until 1.0.0 Reliaburger is good enough for home labs and dev clusters, not production. Every
@@ -14,7 +14,8 @@ release follows the same [build, staging and promotion procedure](releasing.md#m
 From 0.2.7, every release file also carries a build provenance
 attestation that anyone can check with `gh attestation verify`, and the macOS `relish` can be
 notarised ([checks a stranger can run](releasing.md#checks-a-stranger-can-run)).
-The limits below are the ones 0.2.8 ships with; the [roadmap](roadmap.md) tracks
+The limits below are the ones 0.3.2 ships with; the [changelog](../CHANGELOG.md)
+says what changed in each release, and the [roadmap](roadmap.md) tracks
 what comes after it. The [feature status page](https://reliaburger.com/features)
 rates every feature Ready, Beta, Alpha or Planned, with its restrictions and open
 issues; its source is [features.toml](features.toml).
@@ -34,15 +35,15 @@ and trade-offs against other projects, with dated evidence and explicit release 
 
 ## What's in the binary
 
-This is what 0.2.8, the release the installer fetches, does. Each node runs
+This is what 0.3.2, the release the installer fetches, does. Each node runs
 one agent, `bun`; you drive the cluster with one CLI, `relish`. Scheduling,
 clustering, service discovery, ingress, PKI, secrets, an image registry,
 metrics, logs, GitOps, jobs and fault injection are compiled into that agent,
 so there's no control plane to assemble and no add-ons to install. A Linux node
 needs a few distribution packages (`runc`, `nftables`, `iproute2` and friends,
 listed in the [Linux servers guide](linux-servers.md)), and releases are glibc
-builds; static builds are planned for 0.3.0
-([#401](https://github.com/reliaburger/reliaburger/issues/401)). Every
+builds; static builds are planned
+([#1774](https://github.com/reliaburger/reliaburger/issues/1774)). Every
 command is listed in the manual's
 [reference](manual/13_reference.md#every-relish-command).
 
@@ -183,13 +184,17 @@ each node's platform. Until 1.0 it works only between builds with the same
 cluster formats. 0.2.3 kept 0.2.2's, and a 0.2.2 cluster rolled onto it in
 place ([record](qualification/2026-10-29-rolling-walk-0.2.2-to-0.2.3.md));
 0.2.4, 0.2.5 and 0.2.6 each change them again, 0.2.7 kept 0.2.6's, and 0.2.8
-changes them again, so a 0.2.7 cluster starts afresh on 0.2.8
+and 0.3.0 each change them again, so a 0.2.8 cluster starts afresh on 0.3.0;
+0.3.1 keeps 0.3.0's, so a 0.3.0 cluster rolls onto it in place, and 0.3.2
+moves the protocol to 61, so a 0.3.1 cluster starts afresh on 0.3.2
 ([compatibility before 1.0.0](releasing.md#compatibility-before-100)). A release with other cluster formats, or a
 rollback to a version some node doesn't hold, is refused before anything is
 recorded.
 
 **Diagnostics built for incidents.** `relish wtf` correlates cluster health into
-one screen of problems and next steps. `relish path` walks the network path
+a table of checks with what's wrong; `--short` prints only the problems and
+their next steps, and `--explain` says exactly what each check tests and where
+the manual covers it. `relish path` walks the network path
 between two apps and labels each step observed, inferred or unavailable.
 `relish test` runs a live-cluster test catalogue, and `relish bench` measures
 the data plane.
@@ -209,6 +214,9 @@ never retries a failure. See [how Reliaburger is tested](testing.md).
 
 **A terminal UI and a web dashboard.** Run `relish` with no arguments for the
 TUI; `relish dashboard` opens the web UI through your authenticated CLI session.
+The TUI scales an app with `+` and `-` on its Instances tab, after asking, as
+`relish scale web --replicas 3` does from the shell. The count goes into the
+app's spec, so the next apply of its file puts back the file's count.
 
 **The manual ships in the binary.** `relish manual` is a searchable reader with
 runnable examples, and `relish source` fuzzy-searches the exact source the
@@ -274,7 +282,7 @@ and its trade-offs; the [design docs](design/) cover each subsystem.
   ([#1412](https://github.com/reliaburger/reliaburger/issues/1412)), and gossip
   at 1,000 not settling within six minutes
   ([#1413](https://github.com/reliaburger/reliaburger/issues/1413)).
-- **Alerts are five built-in node rules.** CPU, memory and disk thresholds,
+- **Alerts are four built-in node rules.** CPU, memory and disk thresholds,
   delivered by webhook; you can't define your own rules yet
   ([manual](manual/04_observability.md#alerts)).
 - **One Bun per writable image store.** Registry startup claims exclusive
@@ -382,7 +390,7 @@ lists which work.
 
 ### Jobs and cron
 
-Jobs arrived in 0.2.0. 0.2.8 changes the cluster formats, so a 0.2.7 or older
+Jobs arrived in 0.2.0. 0.3.0 changes the cluster formats, so a 0.2.8 or older
 cluster starts afresh
 ([compatibility before 1.0.0](releasing.md#compatibility-before-100)). The
 [job manual](manual/14_batch-jobs.md) covers jobs in full.
@@ -559,7 +567,7 @@ xcode-select --install
 
 ## Container runtimes (optional)
 
-For 0.2.8, Bun selects Linux runc or the built-in process runtime. macOS containers run through managed Linux VMs. **ProcessGrill** (plain OS processes) is the built-in fallback that works everywhere without extra software — you don't need to install anything else to get started.
+For 0.3.2, Bun selects Linux runc or the built-in process runtime. macOS containers run through managed Linux VMs. **ProcessGrill** (plain OS processes) is the built-in fallback that works everywhere without extra software — you don't need to install anything else to get started.
 
 ### runc (Linux)
 
@@ -598,7 +606,7 @@ or operator firewall rules when diagnosing direct-host connectivity.
 
 ### macOS containers: managed Linux VMs
 
-For 0.2.8, run containers through the [managed laptop quickstart](quickstart.md):
+For 0.3.2, run containers through the [managed laptop quickstart](quickstart.md):
 
 ```sh
 relish setup --quickstart --nodes 3
@@ -609,7 +617,7 @@ foreground process workloads. Direct Apple Container selection is disabled,
 even when its CLI is installed: interrupted CLI requests can outlive Bun and
 mutate the Apple daemon, and their recovery guarantees are not yet complete.
 The adapter and its manual development tests remain in the repository for future
-work; they are outside the 0.2.8 runtime profile.
+work; they are outside the 0.3.2 runtime profile.
 
 ### ProcessGrill (built-in fallback)
 
@@ -629,7 +637,7 @@ sixteen concurrent exec requests, with a five-minute deadline, 64 KiB request
 limit and 1 MiB combined stdout/stderr response limit. Commands inherit the host
 environment and run without container isolation.
 
-**0.2.8 contract: foreground workloads only.** The main process stays under Bun's
+**0.3.2 contract: foreground workloads only.** The main process stays under Bun's
 supervision and children must remain in its supervised process group. A service
 can run unattended and spawn workers; foreground does not mean an open terminal.
 Use the application's foreground/no-daemon option. A shell wrapper should `exec`
@@ -719,10 +727,12 @@ for the audit, exact suite contracts and CI mapping.
 
 ### Fuzzing
 
-Every decoder that reads bytes from another machine (gossip, Raft frames, DNS,
-backups, OCI manifests, join CSRs, app and node TOML) has a
-[cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html) target in
-`fuzz/`. See [testing.md](testing.md#fuzzing).
+The decoders that read bytes from another machine (gossip, Raft frames, DNS,
+the API's bearer check, ingress requests, the netboot TFTP, DHCP and disk
+reports, backups, OCI manifests, join CSRs, app and node TOML) have
+[cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html) targets in
+`fuzz/`. See [testing.md](testing.md#fuzzing), which ranks the decoders still
+without one.
 
 ```sh
 make fuzz-corpus-check  # every target body over its checked-in corpus, on stable
@@ -876,7 +886,8 @@ lease ownership must also be unscoped, for both inspection and cleanup.
 configuration; no security switch needs hand-editing:
 
 ```sh
-sudo target/debug/relish init cluster --cluster-name prod --node-id node-01
+sudo target/debug/relish init cluster --cluster-name prod --node-id node-01 \
+  --root-backup ~/prod-root-backup.age
 sudo target/debug/bun --cluster --runtime runc --config cluster/reliaburger.toml
 ```
 
@@ -897,17 +908,17 @@ target/debug/relish --ca-cert cluster/identity/root-ca.crt apply cluster/app.tom
 target/debug/relish --ca-cert cluster/identity/root-ca.crt status
 ```
 
-Then keep a copy of the root CA that only you can open, sealed to a passphrase
-(or `--recipient` for your age key), and check it offline against the
-fingerprint `init` printed:
+`init` asked for a passphrase and sealed the root CA's private key into
+`--root-backup`, its only copy (`--passphrase-file` or `--recipient` for your
+age key, in a script). Check it offline against the fingerprint `init`
+printed, and keep it off the cluster:
 
 ```sh
-target/debug/relish ca backup --out prod-root-backup.age --dir cluster
-target/debug/relish ca verify prod-root-backup.age --fingerprint sha256:...
+target/debug/relish ca verify ~/prod-root-backup.age --fingerprint sha256:...
 ```
 
 The same file is what replaces an intermediate CA later:
-`relish ca rotate --role node --root-backup prod-root-backup.age` signs the
+`relish ca rotate --role node --root-backup ~/prod-root-backup.age` signs the
 cluster's new Node CA on your machine, and `--finalize` retires the old one
 once every node has moved (see the manual's security chapter).
 
@@ -945,6 +956,12 @@ does not commit or disclose a usable token.
 For the whole walkthrough on three Linux VMs or bare-metal servers you
 already run, from packages and firewall rules to systemd units, see
 [Running Reliaburger on your own Linux servers](linux-servers.md).
+To turn spare mini PCs or thin clients into appliance nodes over the network
+instead, with no distro to install, see
+[Bare metal: the appliance and netboot](manual/17_appliance.md). `relish
+netboot --stream-logs` prints each machine's kernel and boot logs as it
+installs and boots, so a machine with no serial port needn't be watched on its
+monitor.
 
 Keep `[cluster].name` identical on every node. `relish init`, `relish setup`
 and `relish dev create` write it for you; Bun validates it as a DNS-style SPIFFE trust domain.
@@ -1051,7 +1068,9 @@ size on any cluster: a `HEALTHY`, `DEGRADED` or `DOWN` verdict, then one line
 per part of the cluster from `GET /v1/cluster/summary` plus `relish wtf`'s
 checks (2 s budget, `--quick` skips them), each line that needs attention
 ending in the command to run next. It exits 0 when it got an answer;
-`--check` exits 1 on `DEGRADED` and 2 on `DOWN`. `-o json` prints the agent
+`--check` exits 1 on `DEGRADED` and 2 on `DOWN`. With no answer it exits
+3 when it couldn't reach or authenticate to the cluster, 4 when it was
+refused and 5 for anything else, in every output format. `-o json` prints the agent
 envelope. The lists live in `relish apps` (one row per app, problems first;
 `relish apps NAME` or `--instances` for instances) and `relish nodes`
 (version, usage and allocation per node); both filter with `--unhealthy`.
@@ -1151,9 +1170,12 @@ TUI keys:
 |-----|--------|
 | `a`, `n`, `j`, `e`, `l`, `r` | Open apps, nodes, jobs, events, logs or routes |
 | `s`, `?`, `:` | Search, help or command palette |
-| Arrow keys, Enter | Select and open a row |
-| Tab, Shift-Tab | Cycle app-detail tabs |
-| `/` | Filter the current list |
+| ↑/↓, Enter | Select and open a row |
+| ←/→, Tab, Shift-Tab | Cycle app-detail tabs |
+| `/` | Filter the current list; search the logs or the Logs and Metrics tabs, matches in red and bold |
+| Escape (with a filter or search) | Clear it |
+| `k`, Ctrl-K | Kill the selected instance in the Instances tab, after a `[y/N]` prompt; it's an audited Smoker kill fault |
+| `+`, `-` | Scale the app in the Instances tab up or down by one, after a `[y/N]` prompt; the next apply of its file puts back the file's count |
 | `f` | Toggle log following |
 | Escape, `q` | Go back; quit from the dashboard |
 
@@ -1685,7 +1707,7 @@ The bun agent exposes a local HTTP API on port 9117:
 | `POST` | `/v1/stop/{app}/{namespace}` | Stop an app. In a cluster it answers `202 Accepted` with `{"status":"stopping"}` once the council records the stop; poll `/v1/status` for the instances to go. A standalone node answers `200` with `stopped` after the local stop completes |
 | `POST` | `/v1/delete/{app}/{namespace}` | Remove an app. In a cluster it answers `202 Accepted` with `{"status":"deleting"}`; cleanup on the workers follows asynchronously |
 | `GET` | `/v1/logs/{app}/{namespace}` | Captured stdout/stderr (`?tail=N&follow=true`) |
-| `POST` | `/v1/exec/{app}/{namespace}` | Execute a command (JSON body: `{"command":["..."]}`) |
+| `POST` | `/v1/exec/{app}/{namespace}` | Execute a command (JSON body: `{"command":["..."]}`, optional `"timeout_seconds"`, at most 300) |
 | `GET` | `/v1/cluster/nodes` | List cluster nodes (gossip membership, dead members included with state `dead`) |
 | `GET` | `/v1/cluster/summary` | The whole cluster at a glance: counts per section (nodes, council, gossip, versions, capacity, usage, apps, instances, jobs, logs, faults, alerts, certs, GitOps, agents: leases held and proposals waiting), each marked `complete`, `partial` or `missing` with the nodes that answered. A scoped token sees its own apps and jobs; the cluster-wide sections come back `missing` |
 | `GET` | `/v1/cluster/capacity` | Requested CPU, memory and GPUs against schedulable capacity per node, from the leader's state reports; unscoped tokens only |
@@ -1820,7 +1842,7 @@ and jobs the cluster's policies would now refuse (`relish policy audit` lists
 the same). Use `--app <name>` for application scope or `--watch` for a
 human refresh every 30 seconds (`--interval <secs>` changes the period). JSON and YAML use schema version 1. Exit status 0 means
 all selected evidence was observed and healthy, 1 means a critical finding,
-and 2 means warnings or unknown evidence. Bounded in-memory restart and deploy
+and 3 means warnings or unknown evidence (2 is a usage error). Bounded in-memory restart and deploy
 history is deliberately reported as degraded, not silently accepted as a
 complete historical record.
 
@@ -1843,9 +1865,9 @@ that gossip reports dead is named rather than silently left out.
 (`--app`, `--severity`, `--limit`). `relish exec <app> <cmd>` runs a command
 once, without stdin or a terminal, and exits with its exit code. `relish
 resolve <name> --namespace <ns>` picks a service whose name exists in several
-namespaces. `-o json` works on every command except the six interactive
+namespaces. `-o json` works on every command except the nine interactive
 ones (`tui`, `dashboard`, `manual`, `source`, the guided `setup`, `dev
-shell`), which refuse it with exit 2; `setup --quickstart` and `setup --ssh`
+shell`, `machines claim`, `machines logs`, `netboot`), which refuse it with exit 2; `setup --quickstart` and `setup --ssh`
 print what they built, for an agent to quote; `logs` and `batch watch` print one object per line,
 and a command that changes something reports what it did (manual chapter
 13). `relish fmt` keeps comments.
@@ -1939,7 +1961,7 @@ different name or namespace for the other kind.
 
 Release maintainers: see [the build, signing and publication procedure](releasing.md).
 
-Direct Apple Container is disabled for 0.2.8 while interrupted daemon-command
+Direct Apple Container is disabled for 0.3.2 while interrupted daemon-command
 recovery remains unfinished. Use the managed Linux/runc quickstart on macOS.
 
 Node chaos (kill, drain, pressure and council partitions) reserves one cluster-wide
@@ -2018,8 +2040,11 @@ machines.
   the first failure, writes the records and a rule-of-three summary
   (`DIR.md`), and deletes the VM and checkout (`--keep` keeps them). It
   refuses `reliaburger-test`, an existing VM and a dirty checkout.
-- `scripts/release/nightly-qualify.sh --train release-X-Y-Z`
-  runs the long tiers on a train's tip every night: the power-cut and reboot
+- `scripts/release/nightly-qualify.sh --once --train release-X-Y-Z`
+  arms one night, the evening before a planned freeze: a launchd job that
+  builds and stages the train's tip at the cut-off, runs the long tiers
+  overnight and disarms itself (`--disarm` cancels; `--dispatch` instead of
+  `--once` starts the same night now). A night runs the power-cut and reboot
   runs, then the V02 and jobs fast soaks against a staged build of the tip,
   then the job final when the release needs the full gate, which it works
   out with `release_tier.py` (`--gate full` can raise it, never lower it).
@@ -2043,14 +2068,17 @@ machines.
   a power cut and then checking retirement, explicit redeployment and same-boot
   adoption.
 - `scripts/release/qualify-storage-power-cut.sh --vm DISPOSABLE_LIMA_VM
-  --fixture exporter|leases|backups --iterations N` cuts the VM's power at a
+  --fixture exporter|leases|backups|volumes --iterations N` cuts the VM's power at a
   random moment while worker processes export Parquet files (three exporters
-  sharing one checkpoint and lock), mutate lease stores, or upload and prune
-  council backups, each logging finished operations to a synced ledger. After
+  sharing one checkpoint and lock), mutate lease stores, upload and prune
+  council backups, or snapshot, export and prune a loop-mounted Btrfs volume
+  that a writer keeps filling (as root), each logging finished operations to
+  a synced ledger. After
   the reboot it checks that every acknowledged export is at the destination
   byte for byte, that nothing was pruned before it was exported, that every
   acknowledged lease operation survived, that the newest acknowledged backups
-  are intact and restorable, and that the lock and stores are reusable. It writes a Markdown
+  are intact and restorable, that every acknowledged volume write and snapshot
+  archive survived whole, and that the lock and stores are reusable. It writes a Markdown
   record with a rule-of-three bound. It refuses the shared `reliaburger-test`
   VM.
 

@@ -1,4 +1,5 @@
 """The V02 soak checker judges evidence the way section 4 of the plan says."""
+import calendar
 import contextlib
 import hashlib
 import io
@@ -6,14 +7,26 @@ import json
 import os
 import re
 from pathlib import Path
+import subprocess
 import tempfile
+import textwrap
 import time
 import unittest
 
+import soak_slo
 import sustained_check as checker
 
 NOW = 1_790_000_000
 NODES = ["rb-a-1", "rb-a-2", "rb-a-3"]
+
+
+def quiet_slo_samples(evidence):
+    """A quiet cluster's API reads and one rollout. Every soak since 0.2.4
+    takes them, and the API and rollout SLOs are gated (#1405), so a run
+    without them would fail its tier on that alone."""
+    soak_slo.fold_reads(evidence, [dict(node=node, path="/v1/cluster/nodes", ms=40, ok=True) for node in NODES],
+                        None, set())
+    soak_slo.record_rollout(evidence, apply_ms=300, ready_ms=9000, starts=[2000, 2500, 3000])
 
 
 def wtf(critical=(), warnings=(), ok=("replicas",)):
@@ -236,6 +249,426 @@ class WriterAndRedis(Evidence):
         self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 41\n"}))
         code, verdict = self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 41\nERR Could not connect\nINCR 42\n"}))
         self.assertEqual(self.failures(verdict), [])
+
+
+class ResumePoints(Evidence):
+    """Where each writer and Redis client start resumed, against the highest
+    acknowledged value before it. The file and counter checks alone can't see
+    a loss after a power cut: by the next check the writer has appended past
+    the lost lines and the client has counted past them (found by the
+    power-cut endurance work, #2094)."""
+
+    def power_cut(self, *restarts):
+        arguments = ["power-cut", str(self.evidence)]
+        for kind in restarts:
+            arguments += ["--restarts", kind]
+        with contextlib.redirect_stdout(io.StringIO()):
+            checker.main(arguments)
+
+    def window(self, action, label="power-off", at=NOW):
+        with contextlib.redirect_stdout(io.StringIO()):
+            checker.main(["window", str(self.evidence), action] + ([label] if action == "open" else [])
+                         + ["--at", str(at)])
+
+    def mark(self, **files):
+        directory = self.snapshot(**files)
+        with contextlib.redirect_stdout(io.StringIO()):
+            checker.main(["resume-mark", str(self.evidence), str(directory)])
+
+    def lose_lines_across_a_cut(self, with_resumes):
+        """ACK 1000 logged, power cut, the writer comes back on a file ending
+        at 900 and appends on to 1500: 1..1500, whole, by the next check."""
+        resumes = {"writer__resumes_txt": "0\n"} if with_resumes else {}
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 999\nACK 1000\n"}, **resumes))
+        self.power_cut("writer")
+        resumes = {"writer__resumes_txt": "0\n900\n"} if with_resumes else {}
+        return self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1499\nACK 1500\n",
+                                              "writer__file_txt": "MAX 1500\nLAST 1500\n"}, **resumes))
+
+    def test_a_lost_write_passes_the_file_check_and_fails_the_resume_check(self):
+        # The old check: the file holds 1..1500 and 1500 >= every ACK seen.
+        self.assertEqual(checker.writer_file_findings("MAX 1500\nLAST 1500\n", 1500), [])
+        code, verdict = self.lose_lines_across_a_cut(with_resumes=False)
+        self.assertNotEqual(code, 1)
+        self.assertEqual(self.failures(verdict), [])
+        # The same run with the resume record fails it.
+        self.setUp()
+        code, verdict = self.lose_lines_across_a_cut(with_resumes=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.failures(verdict), ["writer-resume"])
+        detail = next(item["detail"] for item in verdict["findings"] if item["check"] == "writer-resume")
+        self.assertIn("resumed at 900", detail)
+        self.assertIn("ACK 1000", detail)
+
+    def test_a_start_at_or_past_the_last_ack_passes(self):
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1000\n", "writer__resumes_txt": "0\n"}))
+        self.power_cut("writer")
+        _, verdict = self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1400\n", "writer__resumes_txt": "0\n1000\n",
+                                                    "writer__file_txt": "MAX 1400\nLAST 1400\n"}))
+        self.assertEqual(self.failures(verdict), [])
+
+    def test_a_start_is_judged_against_the_acks_read_before_it_not_its_own(self):
+        # The tail is read before the record, so the new run's own ACKs in this
+        # snapshot's tail never count against its resume point.
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1000\n", "writer__resumes_txt": "0\n"}))
+        _, verdict = self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1001\nACK 1050\n",
+                                                    "writer__resumes_txt": "0\n1000\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        # Once judged, a start is not judged again against later ACKs.
+        _, verdict = self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1300\n", "writer__resumes_txt": "0\n1000\n"}))
+        self.assertEqual(self.failures(verdict), [])
+
+    def test_the_ack_just_before_a_cut_raises_the_bar(self):
+        # The last check saw ACK 1000; the mark taken just before the cut saw
+        # 1200. A start at 1100 lost a hundred acknowledged lines.
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1000\n", "writer__resumes_txt": "0\n"}))
+        self.mark(**{"writer__log_txt": "ACK 1199\nACK 1200\n", "writer__resumes_txt": "0\n"})
+        self.power_cut("writer")
+        _, verdict = self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1300\n", "writer__resumes_txt": "0\n1100\n"}))
+        self.assertIn("writer-resume", self.failures(verdict))
+
+    def test_a_power_cut_of_the_writers_node_needs_a_new_start_once_settled(self):
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1000\n", "writer__resumes_txt": "0\n"}))
+        self.window("open")
+        self.power_cut("writer")
+        # Inside the window the writer may not be back yet.
+        _, verdict = self.evaluate(self.snapshot(**{"writer__resumes_txt": "0\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        self.window("settled", at=NOW)
+        # Nothing restarted it, so nothing acknowledged past ACK 1000 either;
+        # past the grace period that's a start that never came.
+        _, verdict = self.evaluate(self.snapshot(ts=NOW + checker.RESTART_GRACE, **{
+            "writer__log_txt": "ACK 1000\n", "writer__resumes_txt": "0\n"}))
+        self.assertIn("writer-restart", self.failures(verdict))
+        _, verdict = self.evaluate(self.snapshot(ts=NOW + 200, **{
+            "writer__log_txt": "ACK 1200\n", "writer__resumes_txt": "0\n1000\n"}))
+        self.assertEqual(self.failures(verdict), [])
+
+    def test_a_start_late_after_the_window_closes_is_within_the_grace_period(self):
+        # The settle checks don't wait for the writer, so it may come back
+        # after the window closes; 120 s later it must have.
+        self.assertEqual(checker.RESTART_GRACE, 120)
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1000\n", "writer__resumes_txt": "0\n"}))
+        self.window("open")
+        self.power_cut("writer")
+        self.window("settled", at=NOW + 300)
+        _, verdict = self.evaluate(self.snapshot(ts=NOW + 330, **{"writer__resumes_txt": "0\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        _, verdict = self.evaluate(self.snapshot(ts=NOW + 419, **{"writer__resumes_txt": "0\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        _, verdict = self.evaluate(self.snapshot(ts=NOW + 330 + 120, **{"writer__resumes_txt": "0\n1000\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        # A start that came late still had to resume at or past ACK 1000.
+        self.assertEqual(checker.load_state(self.evidence)["resumes"]["writer"]["seen"], 2)
+
+    def test_a_redis_client_that_never_restarts_fails_after_the_grace_period(self):
+        self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 42\n", "redis__starts_txt": "0\n"}))
+        self.window("open")
+        self.power_cut("redis")
+        self.window("close", at=NOW + 100)
+        _, verdict = self.evaluate(self.snapshot(ts=NOW + 130, **{"redis__starts_txt": "0\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        _, verdict = self.evaluate(self.snapshot(ts=NOW + 230, **{"redis__starts_txt": "0\n"}))
+        self.assertIn("redis-restart", self.failures(verdict))
+
+    def test_a_cut_elsewhere_needs_no_new_start(self):
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1000\n", "writer__resumes_txt": "0\n"}))
+        self.power_cut()
+        _, verdict = self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1100\n", "writer__resumes_txt": "0\n"}))
+        self.assertEqual(self.failures(verdict), [])
+
+    def test_a_redis_client_start_below_the_last_incr_fails(self):
+        self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 41\nINCR 42\n", "redis__starts_txt": "0\n"}))
+        self.power_cut("redis")
+        code, verdict = self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 80\n", "redis__starts_txt": "0\n40\n"}))
+        self.assertEqual(code, 1)
+        self.assertIn("redis-resume", self.failures(verdict))
+
+    def test_a_counter_the_client_saw_go_back_fails_once(self):
+        self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 42\n", "redis__regressions_txt": ""}))
+        _, verdict = self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 90\n", "redis__regressions_txt": "42 38\n"}))
+        self.assertEqual(self.failures(verdict), ["redis-regression"])
+        detail = next(item["detail"] for item in verdict["findings"] if item["check"] == "redis-regression")
+        self.assertIn("from 42 to 38", detail)
+        _, verdict = self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 91\n", "redis__regressions_txt": "42 38\n"}))
+        self.assertEqual(self.failures(verdict), [])
+
+    def test_redis_loading_its_aof_is_an_unreadable_record_not_a_regression(self):
+        # Just after node 3 powers on, Redis replays its AOF and redis-cli
+        # prints this with exit status 0.
+        self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 42\n", "redis__regressions_txt": ""}))
+        _, verdict = self.evaluate(self.snapshot(**{
+            "redis__regressions_txt": "LOADING Redis is loading the dataset in memory\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        warnings = [item for item in verdict["findings"] if item["check"] == "redis-regression"]
+        self.assertEqual([item["severity"] for item in warnings], ["warn"])
+        self.assertIn("unreadable", warnings[0]["detail"])
+        self.assertEqual(checker.load_state(self.evidence)["resumes"]["redis"]["regressions"], 0)
+        # A mixed answer is unreadable too, and judges nothing.
+        _, verdict = self.evaluate(self.snapshot(**{"redis__regressions_txt": "42 38\nLOADING\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        self.assertEqual(checker.load_state(self.evidence)["resumes"]["redis"]["regressions"], 0)
+        # Once Redis answers, the entry is judged.
+        _, verdict = self.evaluate(self.snapshot(**{"redis__regressions_txt": "42 38\n"}))
+        self.assertEqual(self.failures(verdict), ["redis-regression"])
+
+    def test_an_unreadable_record_warns_and_judges_nothing(self):
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1000\n", "writer__resumes_txt": "0\n"}))
+        _, verdict = self.evaluate(self.snapshot(**{"writer__resumes_txt": "error: no such instance\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        self.assertIn("writer-resume", [item["check"] for item in verdict["findings"]])
+        # The next readable record is still judged against ACK 1000.
+        _, verdict = self.evaluate(self.snapshot(**{"writer__resumes_txt": "0\n950\n"}))
+        self.assertIn("writer-resume", self.failures(verdict))
+
+    def test_the_record_counts_the_starts_checked(self):
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 10\n", "writer__resumes_txt": "0\n",
+                                        "redis__log_txt": "INCR 3\n", "redis__starts_txt": "0\n",
+                                        "redis__regressions_txt": ""}))
+        self.evaluate(self.snapshot(**{"writer__resumes_txt": "0\n10\n", "redis__starts_txt": "0\n3\n"}))
+        lines = checker.resume_record_lines(checker.load_state(self.evidence))
+        self.assertIn("- Volume writer resumes: 2 starts, each checked against the highest ACK logged before it", lines)
+        self.assertIn("- Redis client starts: 2, each checked against the highest INCR logged before it; "
+                      "counter regressions the client saw: 0", lines)
+
+
+def workload_script(app):
+    """The shell script an app in soak-workloads.toml runs."""
+    import tomllib
+    command = tomllib.loads(SOAK_WORKLOADS_FILE.read_text())["app"][app]["command"]
+    assert command[:2] == ["/bin/sh", "-c"], command
+    return command[2]
+
+
+SOAK_WORKLOADS_FILE = Path(__file__).resolve().parent / "sustained" / "soak-workloads.toml"
+
+
+class WorkloadResumeRecords(unittest.TestCase):
+    """The writer and the Redis client record each start before their first
+    acknowledgement, which is what the resume checks above rely on."""
+
+    def run_for(self, script, seconds, env=None):
+        process = subprocess.Popen(["sh", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, env={**os.environ, **(env or {})})
+        time.sleep(seconds)
+        process.terminate()
+        output, _ = process.communicate(timeout=10)
+        return output
+
+    def test_the_writer_records_where_it_resumed_before_its_first_ack(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            # A torn last line in both files, as a power cut mid-append leaves.
+            (data / "seq").write_text("1\n2\n3\n4")
+            (data / "resumes").write_text("0\n2")
+            output = self.run_for(workload_script("soak-writer").replace("/data", directory), 0.5)
+            self.assertRegex(output, r"RESUME 3 after +3 lines")
+            self.assertEqual((data / "resumes").read_text(), "0\n3\n")
+            first_ack = int(re.search(r"ACK (\d+)", output).group(1))
+            self.assertEqual(first_ack, 4)
+
+    def fake_redis_cli(self, directory, incr_answers):
+        """A redis-cli on PATH that keeps lists in files and answers INCR from INCR_ANSWERS in turn."""
+        bin_directory = Path(directory) / "bin"
+        bin_directory.mkdir()
+        (Path(directory) / "incr").write_text("".join(f"{value}\n" for value in incr_answers))
+        script = bin_directory / "redis-cli"
+        script.write_text(textwrap.dedent(f"""\
+            #!/bin/sh
+            shift 4
+            state={directory}
+            case $1 in
+              GET) cat "$state/counter" 2>/dev/null || echo ;;
+              RPUSH) printf '%s\\n' "$3" >> "$state/$2"; wc -l < "$state/$2" | tr -d ' ' ;;
+              INCR) v=$(head -n 1 "$state/incr"); sed -i.bak 1d "$state/incr"; echo "${{v:-ERR done}}"; echo "$v" > "$state/counter" ;;
+            esac
+            """))
+        script.chmod(0o755)
+        return {"PATH": f"{bin_directory}:{os.environ['PATH']}"}
+
+    def test_the_redis_client_records_its_start_and_any_step_back(self):
+        script = workload_script("soak-redis-client").replace("sleep 1", "sleep 0.05")
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "counter").write_text("41\n")
+            env = self.fake_redis_cli(directory, [42, 43, 39, 40])
+            output = self.run_for(script, 1.5, env)
+            self.assertIn("START 41", output)
+            self.assertEqual((Path(directory) / "soak:starts").read_text(), "41\n")
+            self.assertIn("BACK 43 39", output)
+            self.assertEqual((Path(directory) / "soak:regressions").read_text(), "43 39\n")
+
+
+class HarnessResumeWiring(unittest.TestCase):
+    """qualify-sustained.sh reads the resume records the way the checks above assume."""
+
+    def functions(self):
+        source = (Path(__file__).resolve().parent / "qualify-sustained.sh").read_text()
+        bodies = {}
+        for header in re.finditer(r"\n([a-z_]+)\(\) \{\n", source):
+            body = source[header.end():]
+            bodies[header.group(1)] = body[:body.index("\n}\n")]
+        return bodies
+
+    def test_every_check_reads_the_records_after_the_tails(self):
+        body = self.functions()["collect_light"]
+        self.assertLess(body.index("log_tails"), body.index("resume_records"))
+        mark = self.functions()["resume_cut_mark"]
+        self.assertLess(mark.index("log_tails"), mark.index("resume_records"))
+        self.assertLess(mark.index("resume_records"), mark.index("check resume-mark"))
+
+    def test_every_power_cut_is_marked_first(self):
+        bodies = self.functions()
+        for name in ("slot_power_off", "special_all_off"):
+            with self.subTest(function=name):
+                self.assertLess(bodies[name].index("resume_cut_mark"), bodies[name].index("power_off "))
+
+    def test_a_cut_of_the_writers_node_expects_a_new_writer_start(self):
+        # power_off itself lives in sustained/power.sh; the soak's hook runs the check.
+        body = self.functions()["power_before_off"]
+        self.assertIn('[ "$node" != 2 ] || restarts+=(--restarts writer)', body)
+        self.assertIn('check power-cut "$evidence" ${restarts[@]+"${restarts[@]}"}', body)
+
+
+class FaultOverlapWiring(unittest.TestCase):
+    """#2105: the harness holds each gated fault for a run of every mode on
+    its node, right before it strikes, and records a wait that runs out."""
+
+    functions = HarnessResumeWiring.functions
+
+    def test_the_mark_before_each_gated_fault_waits(self):
+        bodies = self.functions()
+        # power_off (sustained/power.sh) calls this hook before it stops the VM.
+        self.assertIn('job_mark_fault "$node" "${current_slot:-power-off}" wait', bodies["power_before_off"])
+        self.assertIn('job_mark_fault "$node" "${current_slot:-agent-kill}" wait', bodies["kill_bun"])
+        self.assertLess(bodies["kill_bun"].index("job_mark_fault"), bodies["kill_bun"].index("kill -9"))
+        node_fault = bodies["slot_node_fault"]
+        first = node_fault.index('job_mark_fault "$node" "${current_slot%%:*}:$kind" wait')
+        self.assertLess(first, node_fault.index('node_fault_script "$kind" start'))
+        # The marks through the hold only record; they never hold the fault.
+        self.assertEqual(node_fault.count(" wait\n"), 1)
+
+    def test_a_wait_passes_the_flag_and_a_missed_overlap_is_an_event(self):
+        body = self.functions()["job_mark_fault"]
+        self.assertIn('${3:+--wait}', body)
+        self.assertIn("3) event --phase job-overlap", body)
+
+    def test_the_wait_fits_the_compressed_slot(self):
+        import job_soak
+        self.assertLess(job_soak.OVERLAP_WAIT_SECS, 600 // 6)
+
+
+class DayHookApply(unittest.TestCase):
+    """#1935: the day tier deploys once, so it applies the job fixtures again
+    every hour, and its deploy hooks and after jobs run while the controller
+    watches rather than only in the first seconds of the campaign."""
+
+    functions = HarnessResumeWiring.functions
+    release = Path(__file__).parent
+
+    def plan(self, script, tier):
+        import subprocess
+        return subprocess.run([str(self.release / script), "--tier", tier, "--plan"], capture_output=True, text=True,
+                              check=True, env=dict(os.environ, RELIABURGER_SOAK_CAFFEINATED="1")).stdout
+
+    def test_the_day_plan_applies_the_job_fixtures_every_hour(self):
+        self.assertIn("plan: hook-apply every 3600 s", self.plan("qualify-jobs-sustained.sh", "day"))
+
+    def test_no_tier_with_a_fault_schedule_plans_one(self):
+        # Their deploy-kill slots apply the fixtures with every rolling deploy.
+        for script in ("qualify-sustained.sh", "qualify-jobs-sustained.sh"):
+            for tier in ("fast", "final"):
+                with self.subTest(script=script, tier=tier):
+                    self.assertNotIn("hook-apply", self.plan(script, tier))
+
+    def test_the_wait_applies_them_outside_any_window(self):
+        body = self.functions()["wait_until"]
+        branch = body[body.index('[ "$hook_every" -gt 0 ]'):]
+        self.assertIn('[ -z "$window_label" ]', branch[:branch.index("then")])
+        self.assertIn("run_slot hook_apply", branch[:branch.index("elif")])
+
+    def run_hook_apply(self, stop=None, stop_at=None, installed=True):
+        import subprocess
+        bodies = self.functions()
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory)
+            (evidence / "jobs").mkdir()
+            (evidence / "snapshots").mkdir()
+            if installed: (evidence / "jobs" / "installed").touch()
+            if stop: (evidence / "jobs" / "stop").touch()
+            template = evidence / "template.toml"
+            template.write_text('[app.soak-identity]\nimage = "x"\n[app.soak-identity.env]\nSOAK_GENERATION = "0"\n'
+                                'SOAK_SLO_GENERATION = "0"\n[policy.deny]\nrule = "x"\n')
+            (evidence / "day.toml").write_text('[app.soak-quiet]\nimage = "x"\n')
+            functions = "".join(f"{name}() {{\n{bodies[name]}\n}}\n" for name in
+                                ("jobs_applied", "soak_workloads", "write_workloads", "apply_soak_manifests", "hook_apply"))
+            script = f"""set -eu
+evidence={evidence}; repository={self.release.parent.parent}; workloads_template={template}
+day_workloads={evidence / "day.toml"}; tier=day; generation=4; slo_generation=7; hook_applies=0
+rel() {{ echo "rel $*" >> {evidence}/calls; }}
+event() {{ echo "event $*" >> {evidence}/calls; }}
+meta_get() {{ echo "{stop_at or ''}"; }}
+{functions}
+hook_apply
+"""
+            subprocess.run(["bash", "-c", script], check=True, capture_output=True, text=True)
+            calls = (evidence / "calls").read_text() if (evidence / "calls").exists() else ""
+            workloads = (evidence / "workloads.toml").read_text() if (evidence / "workloads.toml").exists() else ""
+            return calls, workloads
+
+    def test_a_hook_apply_applies_the_policies_then_the_workloads_with_the_fixtures(self):
+        calls, workloads = self.run_hook_apply()
+        applies = [line for line in calls.splitlines() if line.startswith("rel apply")]
+        self.assertEqual(len(applies), 2)
+        self.assertIn("policies.toml", applies[0])
+        self.assertIn("workloads.toml", applies[1])
+        for mode in ("runc", "shared-runc", "process"):
+            self.assertIn(f"[job.soak-job-hook-{mode}]", workloads)
+        # The same generations: no app rolls, only the jobs run again.
+        self.assertIn('SOAK_GENERATION = "4"', workloads)
+        self.assertIn('SOAK_SLO_GENERATION = "7"', workloads)
+        self.assertIn("event --phase jobs:hook-apply --verdict ok", calls)
+
+    def test_no_hook_apply_once_the_drain_is_asked_for_or_due_within_a_minute(self):
+        import time
+        for case in (dict(stop=True), dict(stop_at=int(time.time()) + 30), dict(installed=False)):
+            with self.subTest(**case):
+                self.assertEqual(self.run_hook_apply(**case), ("", ""))
+
+
+class BoundedCommands(unittest.TestCase):
+    """with_timeout must stop a command that ignores SIGALRM, as Go's limactl
+    does: `perl -e 'alarm; exec'` left a `limactl shell` to a guest that went
+    away hanging for good (#2094's calibration run, 17 November 2026)."""
+
+    def run_bounded(self, seconds, command, stdin=None):
+        source = (Path(__file__).resolve().parent / "qualify-sustained.sh").read_text().splitlines()
+        start = next(i for i, line in enumerate(source) if line.startswith("with_timeout() {"))
+        end = start if source[start].endswith("}") else next(i for i in range(start, len(source)) if source[i] == "}")
+        function = "\n".join(source[start:end + 1]) + "\n"
+        started = time.monotonic()
+        result = subprocess.run(["bash", "-c", function + f'with_timeout {seconds} {command}\necho "status=$?"\n'],
+                                input=stdin, capture_output=True, text=True, timeout=30)
+        return result.stdout, time.monotonic() - started
+
+    def test_a_command_that_ignores_sigalrm_is_killed_at_the_deadline(self):
+        # A grandchild holding stdout must not keep the caller waiting either.
+        output, took = self.run_bounded(1, "sh -c 'trap \"\" ALRM TERM; (sleep 20; echo late) & sleep 20'")
+        self.assertIn("status=124", output)
+        self.assertNotIn("late", output)
+        self.assertLess(took, 10)
+
+    def test_a_command_that_finishes_keeps_its_status_and_output(self):
+        output, _ = self.run_bounded(5, "sh -c 'echo hello; exit 3'")
+        self.assertIn("hello\nstatus=3", output)
+
+    def test_a_command_still_reads_a_piped_standard_input(self):
+        # gsh_in feeds the guest its script on standard input.
+        output, _ = self.run_bounded(5, "cat", stdin="guest script\n")
+        self.assertIn("guest script\nstatus=0", output)
+
+    def test_a_command_killed_by_a_signal_reports_it(self):
+        output, _ = self.run_bounded(5, "sh -c 'kill -9 $$'")
+        self.assertIn("status=137", output)
 
 
 class Certificates(Evidence):
@@ -749,6 +1182,39 @@ class Recovery(Evidence):
         self.assertEqual(self.failures(five), ["wtf-critical"])
         self.assertEqual(self.failures(ten), ["wtf-warning"])
 
+    def crashloop(self, *lines):
+        return wtf(critical=[("crashloop", "app.frontend/default")]) | {"critical": [{
+            "id": "crashloop", "title": "app frontend/default restarted repeatedly",
+            "affected_resource": "app.frontend/default", "details": list(lines)}]}
+
+    def test_a_restart_the_harness_caused_does_not_hold_back_a_settle(self):
+        # #2197: since #2079 a chaos pause freezes the workload, so its health
+        # checks fail and Bun restarts it. That restart is the harness's own.
+        checker.main(["expect", str(self.evidence), "workload-restart", "default__frontend-0", "--at", str(NOW)])
+        report = self.crashloop("instance default__frontend-0 restarted 3 times in the last 15 minutes")
+        code, verdict = self.evaluate(self.snapshot(kind="settle", ts=NOW + 60, **{
+            "wtf_json": report, "nodes_json": nodes(), "http_txt": "200 0.01\n", "status_json": []}))
+        self.assertTrue(verdict["settle_clean"])
+        self.assertEqual(code, 0)
+        _, later = self.evaluate(self.snapshot(ts=NOW + 400, **{"wtf_json": report}))
+        self.assertEqual(self.failures(later), [])
+
+    def test_restarts_beyond_the_harness_ones_are_still_a_crashloop(self):
+        checker.main(["expect", str(self.evidence), "workload-restart", "default__frontend-0", "--at", str(NOW)])
+        for report in (self.crashloop("instance default__frontend-0 restarted 4 times in the last 15 minutes"),
+                       self.crashloop("instance default__frontend-1 restarted 3 times in the last 15 minutes"),
+                       self.crashloop("3 restarts that name no instance in the last 15 minutes")):
+            _, verdict = self.evaluate(self.snapshot(kind="settle", ts=NOW + 60, **{
+                "wtf_json": report, "nodes_json": nodes(), "http_txt": "200 0.01\n", "status_json": []}))
+            self.assertFalse(verdict["settle_clean"], report)
+
+    def test_an_expected_restart_older_than_the_crashloop_window_excuses_nothing(self):
+        checker.main(["expect", str(self.evidence), "workload-restart", "default__frontend-0", "--at", str(NOW)])
+        report = self.crashloop("instance default__frontend-0 restarted 3 times in the last 15 minutes")
+        _, verdict = self.evaluate(self.snapshot(kind="settle", ts=NOW + checker.CRASHLOOP_WINDOW + 1, **{
+            "wtf_json": report, "nodes_json": nodes(), "http_txt": "200 0.01\n", "status_json": []}))
+        self.assertFalse(verdict["settle_clean"])
+
     def test_a_cleared_wtf_finding_starts_counting_again(self):
         report = wtf(warnings=[("under-replicated", "app.y")])
         self.evaluate(self.snapshot(ts=NOW, **{"wtf_json": report}))
@@ -1110,9 +1576,10 @@ class SoakPolicies(Evidence):
 class GuestClock(Evidence):
     """One clock source per guest: Lima's guest agent, not timesyncd as well (#608)."""
 
-    def clock(self, ts=NOW, timesyncd="inactive", steps=0):
+    def clock(self, ts=NOW, timesyncd="inactive", chrony="inactive", steps=0):
         return self.snapshot(ts=ts, **{"inventory__rb-a-1_txt":
-                                       INVENTORY + f"timesyncd {timesyncd}\nclock_steps {steps}\n"})
+                                       INVENTORY + f"timesyncd {timesyncd}\nchrony {chrony}\n"
+                                       f"clock_steps {steps}\n"})
 
     def test_a_guest_with_only_the_lima_agent_passes(self):
         _, verdict = self.evaluate(self.clock())
@@ -1124,6 +1591,13 @@ class GuestClock(Evidence):
         failure = next(item for item in verdict["findings"] if item["check"] == "guest-clock")
         self.assertEqual(failure["target"], "rb-a-1")
         self.assertIn("systemd-timesyncd", failure["detail"])
+
+    def test_chrony_running_beside_the_guest_agent_fails(self):
+        # Ubuntu 26.04 guests sync time with chrony, not timesyncd.
+        code, verdict = self.evaluate(self.clock(chrony="active"))
+        self.assertEqual(code, 1)
+        failure = next(item for item in verdict["findings"] if item["check"] == "guest-clock")
+        self.assertIn("chrony", failure["detail"])
 
     def test_clock_steps_outside_a_fault_window_warn_and_are_counted(self):
         _, verdict = self.evaluate(self.clock(steps=6))
@@ -1156,6 +1630,7 @@ class Record(Evidence):
             "soak_bun": "not supplied: upgrade slots skipped", "deviations": ["provision_isolated_workloads"],
             "cycles": 4, "ingress_rotation_secs": 300,
             "teardown": "`relish local destroy --yes` and `relish uninstall --yes` succeeded"}))
+        quiet_slo_samples(self.evidence)
         for offset, seconds in ((0, 40), (100, 60)):
             checker.append_event(self.evidence, ts=NOW + offset, phase="fault:bun-kill-follower", target="rb-a-2")
             checker.append_event(self.evidence, ts=NOW + offset + seconds, phase="fault:bun-kill-follower",
@@ -1341,6 +1816,7 @@ class ExecutionInventory(unittest.TestCase):
                    node_faults=job_final, cycles=8, ingress_rotation_secs=None, quiet_tail=QUIET)
         run.update(metadata)
         (self.evidence / "metadata.json").write_text(json.dumps(run))
+        quiet_slo_samples(self.evidence)
         if candidate is not None and "candidate" not in drop:
             (self.evidence / "candidate.json").write_bytes(candidate)
         (self.evidence / "jobs").mkdir()
@@ -1976,6 +2452,136 @@ class TestFailures(unittest.TestCase):
         chaos = script[script.index("chaos_one() {"):script.index("catalogue_pulse() {")]
         self.assertIn('--timeout 600s > "$output" 2> "$output.err"', chaos)
         self.assertIn('record_failure "chaos-$kind" "$(check test-failures "$output" "$output.err")"', chaos)
+
+
+class CapturedState(Evidence):
+    """#2131: a `relish test` case that timed out was bundled after its
+    cleanup, so the bundle showed neither the app's instances nor where the
+    case was stuck. The case's report entry now carries the state captured
+    before its lease was released, and the bundle keeps it."""
+
+    STATE = {"captured_at": "2026-11-20T04:22:58Z", "step": "exec in registry-web",
+             "steps": [{"name": "exec in registry-web", "started_after_ms": 9800, "duration_ms": None}],
+             "apps": ["registry-web"],
+             "instances": [{"node": "rb-a-1", "id": "registry-web-0", "app": "registry-web",
+                            "state": "running", "restart_count": 0}],
+             "deployments": [], "events": [], "errors": [], "truncated": False}
+
+    def report(self):
+        return json.dumps({"schema_version": 2, "results": [
+            {"name": "deploy_from_cluster_registry", "group": "image-registry",
+             "started_at": "2026-11-20T04:17:43Z", "finished_at": "2026-11-20T04:22:58Z",
+             "outcome": {"status": "unknown", "kind": "timed_out",
+                         "reason": 'case exceeded its 300000 ms deadline during step "exec in registry-web"'},
+             "cleanup": {"status": "confirmed"}, "failure_state": self.STATE},
+            {"name": "push_and_pull_image_roundtrip", "outcome": {"status": "pass"}, "cleanup": {"status": "confirmed"}},
+        ]})
+
+    def test_only_failing_cases_with_a_capture_are_kept(self):
+        states = checker.test_failure_states(self.report())
+        self.assertEqual([state["name"] for state in states], ["deploy_from_cluster_registry"])
+        self.assertEqual(states[0]["failure_state"]["step"], "exec in registry-web")
+        self.assertEqual(checker.test_failure_states("not json"), [])
+
+    def test_the_states_file_names_itself_and_a_journal_start_before_the_case(self):
+        report = self.evidence / "pulse.json"
+        report.write_text(self.report())
+        out = self.evidence / "captured-state.json"
+        started = calendar.timegm(time.strptime("2026-11-20T04:17:43Z", "%Y-%m-%dT%H:%M:%SZ"))
+        self.assertEqual(checker.write_test_states(report, out), f"captured-state.json @{started - 60}")
+        self.assertEqual(json.loads(out.read_text())[0]["failure_state"], self.STATE)
+
+    def test_the_journal_window_never_shrinks_below_fifteen_minutes(self):
+        report = self.evidence / "pulse.json"
+        recent = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 120))
+        report.write_text(self.report().replace("2026-11-20T04:17:43Z", recent))
+        before = int(time.time())
+        name, since = checker.write_test_states(report, self.evidence / "captured-state.json").split()
+        self.assertEqual(name, "captured-state.json")
+        self.assertLessEqual(int(since.lstrip("@")), before - 900 + 5)
+
+    def test_a_report_without_captures_writes_nothing(self):
+        report = self.evidence / "pulse.json"
+        report.write_text(json.dumps({"results": [{"name": "x", "outcome": {"status": "pass"}}]}))
+        out = self.evidence / "captured-state.json"
+        self.assertEqual(checker.write_test_states(report, out), "")
+        self.assertFalse(out.exists())
+
+    def test_the_bundle_keeps_the_state_and_reaches_back_to_the_case(self):
+        release = Path(__file__).parent
+        script = (release / "qualify-sustained.sh").read_text()
+        bundle = script[script.index("record_failure() {"):script.index("setup_fail() {")]
+        report = self.evidence / "pulse-1795148235.json"
+        report.write_text(self.report())
+        calls = self.evidence / "gsh-calls.txt"
+        said = self.evidence / "said.txt"
+        stubs = f"""
+checker={release / 'sustained_check.py'}
+check() {{ python3 "$checker" "$@"; }}
+evidence={self.evidence}
+vm=([1]=rb-a-1 [2]=rb-a-2 [3]=rb-a-3)
+down=(0 0 1 1)
+gsh() {{ printf '%s\\n' "$2" >> {calls}; }}
+api_get() {{ :; }}
+memory_report() {{ :; }}
+rel() {{ :; }}
+event() {{ :; }}
+say() {{ printf '%s\\n' "$*" >> {said}; }}
+mkdir -p "$evidence/failures"
+"""
+        subprocess.run(["bash", "-c", stubs + bundle + f"\nrecord_failure pulse 'relish test exited 1' '' '' {report}"],
+                       check=True, timeout=60, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        failure = self.evidence / "failures" / "1"
+        self.assertEqual(json.loads((failure / "summary.json").read_text())["captured"], "captured-state.json")
+        self.assertEqual(json.loads((failure / "captured-state.json").read_text())[0]["failure_state"], self.STATE)
+        self.assertTrue((failure / "test-report.json").exists())
+        started = calendar.timegm(time.strptime("2026-11-20T04:17:43Z", "%Y-%m-%dT%H:%M:%SZ"))
+        self.assertIn(f"--since '@{started - 60}'", calls.read_text())
+        self.assertIn("state at failure: failures/1/captured-state.json", said.read_text())
+
+    def test_a_bundle_without_a_report_keeps_the_last_fifteen_minutes(self):
+        release = Path(__file__).parent
+        script = (release / "qualify-sustained.sh").read_text()
+        bundle = script[script.index("record_failure() {"):script.index("setup_fail() {")]
+        calls = self.evidence / "gsh-calls.txt"
+        stubs = f"""
+checker={release / 'sustained_check.py'}
+check() {{ python3 "$checker" "$@"; }}
+evidence={self.evidence}
+vm=([1]=rb-a-1 [2]=rb-a-2 [3]=rb-a-3)
+down=(0 0 1 1)
+gsh() {{ printf '%s\\n' "$2" >> {calls}; }}
+api_get() {{ :; }}
+memory_report() {{ :; }}
+rel() {{ :; }}
+event() {{ :; }}
+say() {{ :; }}
+mkdir -p "$evidence/failures"
+"""
+        subprocess.run(["bash", "-c", stubs + bundle + "\nrecord_failure settle 'did not settle'"],
+                       check=True, timeout=60, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        summary = json.loads((self.evidence / "failures" / "1" / "summary.json").read_text())
+        self.assertNotIn("captured", summary)
+        self.assertIn("--since '-15min'", calls.read_text())
+
+    def test_the_record_links_the_captured_state_from_the_failure_line(self):
+        Record.write_run(self, failures=["pulse: relish test exited 1"])
+        summary = self.evidence / "failures" / "1" / "summary.json"
+        summary.write_text(json.dumps(dict(json.loads(summary.read_text()), captured="captured-state.json")))
+        record = self.evidence / "record.md"
+        checker.render(self.evidence, record)
+        self.assertIn("relish test exited 1 (state at failure: `failures/1/captured-state.json`)", record.read_text())
+
+    def test_every_relish_test_check_hands_its_report_to_the_bundle(self):
+        script = (Path(__file__).parent / "qualify-sustained.sh").read_text()
+        chaos = script[script.index("chaos_one() {"):script.index("catalogue_pulse() {")]
+        pulse = script[script.index("catalogue_pulse() {"):]
+        pulse = pulse[:pulse.index("\n}\n")]
+        self.assertIn('"$(check test-failures "$output" "$output.err")" \'\' \'\' "$output"', chaos)
+        self.assertIn("'' '' \"$output\"", pulse)
+        self.assertIn('check test-failures "$output" "$output.err"', pulse)
+        # The bundle is taken before the chaos slot clears its faults.
+        self.assertLess(chaos.index("record_failure"), chaos.index("rel fault clear"))
 
 
 DAY = 24 * 3600
@@ -2698,7 +3304,7 @@ class LogStoreAB(Evidence):
         import subprocess
         script = (self.release / "qualify-sustained.sh").read_text()
         functions = ""
-        for name in ("log_tail() {", "collect_light() {"):
+        for name in ("log_tail() {", "log_tails() {", "collect_light() {"):
             function = script[script.index(name):]
             functions += function[:function.index("\n}\n") + 3]
         calls = self.evidence / "calls.txt"
@@ -2715,6 +3321,7 @@ api_get() {{ echo "api_get $*" >> {calls}; echo '{entries}'; }}
 rel() {{ echo "rel $*" >> {calls}; }}
 probe_forwards() {{ :; }}
 slo_reads() {{ :; }}
+resume_records() {{ :; }}
 """
         directory = self.evidence / "snap"
         directory.mkdir()

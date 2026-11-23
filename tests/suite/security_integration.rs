@@ -42,6 +42,7 @@ fn bootstrap_security_state() -> (SecurityState, String, [u8; 32]) {
         join_tokens: vec![join_token],
         next_serial: 6,
         oidc_signing_config: None,
+        retiring_oidc_keys: Vec::new(),
         crl: Crl::default(),
         secret_seals: std::collections::BTreeMap::new(),
         node_leaves: std::collections::BTreeMap::new(),
@@ -135,6 +136,7 @@ fn join_token_expiry_enforced() {
         join_tokens: vec![join_token],
         next_serial: 6,
         oidc_signing_config: None,
+        retiring_oidc_keys: Vec::new(),
         crl: Crl::default(),
         secret_seals: std::collections::BTreeMap::new(),
         node_leaves: std::collections::BTreeMap::new(),
@@ -613,7 +615,7 @@ async fn single_node_leader() -> std::sync::Arc<reliaburger::council::node::Coun
     )
     .await
     .unwrap();
-    router.register(1, node.raft().clone()).await;
+    router.register(1, &node).await;
     node.initialize(std::collections::BTreeMap::from([(
         1u64,
         CouncilNodeInfo::new("127.0.0.1:9001".parse().unwrap(), "node-1".to_string()),

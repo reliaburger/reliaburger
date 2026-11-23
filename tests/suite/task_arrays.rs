@@ -97,7 +97,7 @@ async fn single_node_leader() -> (Arc<CouncilNode>, MemLogStore) {
     )
     .await
     .unwrap();
-    router.register(1, node.raft().clone()).await;
+    router.register(1, &node).await;
     let mut members = BTreeMap::new();
     members.insert(
         1u64,
@@ -196,7 +196,6 @@ impl Harness {
                 policy: ProcessWorkloadsConfig {
                     allowed_binaries: options.allowed.iter().map(PathBuf::from).collect(),
                     mount_isolation: options.mount_isolation,
-                    ..ProcessWorkloadsConfig::default()
                 },
                 default_concurrency: options.slots,
                 backoff: (Duration::from_millis(1), Duration::from_millis(5)),

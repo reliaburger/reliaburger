@@ -4,6 +4,7 @@
 //! what it observed, including unavailable and unsupported sources, while the
 //! pure engine turns that evidence into a stable report.
 
+pub mod checks;
 mod collect;
 mod diagnose;
 pub mod findings;
@@ -13,13 +14,13 @@ pub use collect::collect;
 pub(crate) use collect::node_client;
 pub use diagnose::diagnose;
 pub use model::{
-    AlertObservation, ApplicationEvidence, BuildObservation, CertificateObservation,
-    ClusterEvidence, CorrelatedEvent, CouncilObservation, CpuThrottleObservation,
-    DeployObservation, DiskObservation, Evidence, FaultObservation, GitOpsObservation,
-    IsolationObservation, LaunchFailureObservation, LogObservation, NodeGitOpsDifference,
-    NodeGitOpsUnreadable, NodeIsolation, NodeObservation, RegistryObservation, ReplicaObservation,
-    RestartObservation, ServiceObservation, TokenObservation, WtfFinding, WtfInputs, WtfOk,
-    WtfReport, WtfSummary, WtfUnknown,
+    AlertObservation, ApplicationEvidence, BackupObservation, BuildObservation,
+    CertificateObservation, ClusterEvidence, CorrelatedEvent, CouncilObservation,
+    CpuThrottleObservation, DeployObservation, DiskObservation, Evidence, ExportHoldObservation,
+    FaultObservation, GitOpsObservation, IsolationObservation, LaunchFailureObservation,
+    LogObservation, NodeGitOpsDifference, NodeGitOpsUnreadable, NodeIsolation, NodeObservation,
+    RegistryObservation, ReplicaObservation, RestartObservation, ServiceObservation,
+    TokenObservation, WtfFinding, WtfInputs, WtfOk, WtfReport, WtfSummary, WtfUnknown,
 };
 
 /// Current serialised `wtf` report contract.

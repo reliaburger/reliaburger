@@ -78,7 +78,9 @@ sha256sum /usr/local/bin/rb-bun /usr/local/bin/rb-relish "$busybox" > "$out/bina
 progress() { echo "$(date -u +%FT%TZ) $*" >> "$out/progress.log"; }
 
 cd "$work"
-rb-relish init cluster --cluster-name bench --node-id node-01 > init.log 2>&1
+# The root CA backup and its passphrase stay in $work, which the next session
+# deletes; relish_init.py passes them only to a relish that takes them (#709).
+python3 "$tools/relish_init.py" rb-relish cluster bench node-01 "$work" > init.log 2>&1
 cp cluster/reliaburger.toml "$out/reliaburger.generated.toml"
 python3 "$tools/profile_config.py" cluster/reliaburger.toml "$busybox"
 cp cluster/reliaburger.toml "$out/reliaburger.toml"

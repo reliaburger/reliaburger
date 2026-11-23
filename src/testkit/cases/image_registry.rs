@@ -92,13 +92,11 @@ async fn deploy_from_cluster_registry(ctx: TestContext) -> Result<(), String> {
     let image = crate::grill::image::ImageReference::parse(PINNED_TEST_WORKLOAD_IMAGE)
         .map_err(|error| error.to_string())?;
     let digest = ctx
-        .deadline
-        .run(
+        .step(
             "stage pinned runnable image",
             oci::stage_upstream_image(&client, &base, &repo, lease, &upstream, &image),
         )
-        .await
-        .map_err(|error| error.to_string())??;
+        .await??;
     let app = "registry-web";
     let spec = ctx
         .container_http_spec(app, 1)
@@ -134,6 +132,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::ImageRegistry,
             requires: &[Capability::Registry],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(push_and_pull_image_roundtrip),
         },
         TestCase {
@@ -141,6 +140,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::ImageRegistry,
             requires: &[Capability::Registry],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(manifest_catalog_lists_pushed_image),
         },
         TestCase {
@@ -148,6 +148,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::ImageRegistry,
             requires: &[Capability::Registry, Capability::ContainerRuntime],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(deploy_from_cluster_registry),
         },
     ]

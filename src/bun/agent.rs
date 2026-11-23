@@ -91,6 +91,7 @@ mod discovery_ownership;
 mod discovery_recovery;
 mod egress_ownership;
 mod egress_resolution;
+mod exec_deadline;
 mod fault_coverage;
 mod faults;
 mod follow_ups;
@@ -126,6 +127,7 @@ pub use consumer::ConsumerUpdate;
 use deploy_ops::{DeployOp, DeployOps, PreparedInstance, RollingInstance};
 use deploy_worker::DeployWorker;
 use discovery_ownership::{DiscoveryOwnership, JournalReference};
+pub use exec_deadline::{MAX_EXEC_TIMEOUT, client_exec_wait, exec_timeout};
 use faults::{InstalledNetworkFaults, NodeFaultFence};
 use health_checks::wait_instance_healthy;
 pub use identity::workload_spiffe_uri;
@@ -139,11 +141,6 @@ pub use status_snapshot::{StatusReader, StatusUnavailable};
 use trace::MAX_CONCURRENT_TRACES;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use trace::backend_addresses;
-
-/// Deadline for an `exec` run off the command loop (H3). Bounds an orphaned
-/// task if the caller disconnects; the exec no longer blocks the loop, so this
-/// is generous — it only stops a truly runaway command from lingering forever.
-const EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Maximum time an init container may run before the deploy fails. Bounds the
 /// init wait so a hung init can't wedge the agent event loop indefinitely.
@@ -171,8 +168,26 @@ const HEALTH_TICK_STARVATION_BOUND: std::time::Duration = std::time::Duration::f
 /// two-second exit wait plus its cgroup removal, with room to spare.
 const SHUTDOWN_PRESSURE_CLEAR: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Grace period between SIGTERM and SIGKILL during shutdown.
-const SHUTDOWN_GRACE_SECS: u64 = 5;
+/// How long node shutdown may spend stopping instances gracefully, all told
+/// (#2118). Each instance stops as an ordinary stop would (its pre-stop
+/// command, its signal, its own `stop_grace`), every one at once, and
+/// whatever still runs when this runs out is killed. Counted from the start
+/// of shutdown, so it also covers reversing faults first.
+///
+/// Every systemd unit we ship gives Bun `TimeoutStopSec=30` before it is
+/// killed itself (`KillMode=process`, so its workloads would be orphaned).
+/// This budget plus two rounds of [`SHUTDOWN_KILL_BOUND`] leaves Bun 6 s of
+/// that for the rest of its exit. A test checks every unit against it.
+const SHUTDOWN_STOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long shutdown waits for its force-kills once a round's graceful time
+/// is up. There are two rounds: apps, then their sidecars.
+const SHUTDOWN_KILL_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The most of the shutdown budget the sidecars' round keeps back for
+/// itself when there are sidecars, so an app with a long grace can't leave
+/// its log shipper no time at all. The old fixed shutdown grace.
+const SHUTDOWN_SIDECAR_SHARE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long an ordinary stop waits for a container to exit after SIGTERM
 /// before it escalates to SIGKILL (DEP6).
@@ -213,6 +228,14 @@ const PENDING_RESTART_TICK_BUDGET: std::time::Duration = std::time::Duration::fr
 /// Callers that wait for a stop or retirement size their deadline from this.
 pub fn stop_completion_bound(confirmation_timeout: std::time::Duration) -> std::time::Duration {
     std::time::Duration::from_secs(STOP_GRACE_SECS) * 2 + confirmation_timeout * 3
+}
+
+/// The longest Bun's own shutdown spends stopping its instances: the
+/// graceful budget, then a kill round for the apps and one for their
+/// sidecars. A harness that SIGTERMs Bun and kills it sooner cuts the
+/// shutdown short and leaves workloads behind (#2118).
+pub fn shutdown_completion_bound() -> std::time::Duration {
+    SHUTDOWN_STOP_BUDGET + SHUTDOWN_KILL_BOUND * 2
 }
 
 /// Build a shared drain tracker for a new agent. The completion channel's
@@ -799,10 +822,13 @@ pub struct BunAgent<G: Grill> {
     retired_discovery_services: std::collections::HashSet<crate::onion::service_id::ServiceId>,
     /// Perimeter firewall config. Disabled in rootless mode.
     perimeter_config: crate::firewall::rules::PerimeterConfig,
-    /// Last applied cluster-node set for firewall reconciliation. `None`
-    /// until the first apply, so a standalone node (empty set) still gets
-    /// the firewall; comparing the set (not a count) catches node swaps (M18).
-    last_firewall_nodes: Option<crate::firewall::rules::ClusterNodes>,
+    /// Last applied cluster-node set and join windows for firewall
+    /// reconciliation. `None` until the first apply, so a standalone node
+    /// (empty set) still gets the firewall; comparing the set (not a count)
+    /// catches node swaps (M18).
+    last_firewall_inputs: Option<crate::firewall::rules::PerimeterInputs>,
+    /// Addresses let through the perimeter for a while to enrol (G2).
+    join_windows: crate::firewall::rules::JoinWindows,
     /// Deploy history (shared with API for query access).
     pub(crate) deploy_history:
         Arc<tokio::sync::RwLock<Vec<crate::meat::deploy_types::DeployHistoryEntry>>>,
@@ -924,8 +950,9 @@ pub struct BunAgent<G: Grill> {
     /// How long an ordinary stop waits after SIGTERM before SIGKILL.
     /// `STOP_GRACE_SECS` unless a test shortens it with `set_stop_grace`.
     stop_grace: std::time::Duration,
-    /// The same wait for node shutdown: `SHUTDOWN_GRACE_SECS` by default.
-    shutdown_grace: std::time::Duration,
+    /// How long node shutdown may spend stopping instances gracefully:
+    /// `SHUTDOWN_STOP_BUDGET` unless a test shortens it.
+    shutdown_budget: std::time::Duration,
     /// Operator stops and retirements whose exit is still being awaited.
     pending_stops: PendingStops,
     /// Their exit waits, off the command loop so a workload that ignores
@@ -947,6 +974,9 @@ pub struct BunAgent<G: Grill> {
     status_tx: watch::Sender<Arc<status_snapshot::StatusSnapshot>>,
     /// The health tick's runtime state reads, at most one sweep at a time.
     state_sweeps: tokio::task::JoinSet<state_sweep::StateSweep>,
+    /// Reads the last sweep was still waiting for at its deadline, for the
+    /// next sweep to collect instead of asking again (#2085).
+    unfinished_state_reads: state_sweep::UnfinishedReads,
     /// Restarts with a runtime step in flight, by instance.
     restarts: restarts::Restarts,
     /// Those steps' tasks.
@@ -1121,7 +1151,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 enabled: false,
                 ..Default::default()
             },
-            last_firewall_nodes: None,
+            last_firewall_inputs: None,
+            join_windows: Default::default(),
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
             initialisers: std::collections::HashMap::new(),
@@ -1154,7 +1185,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             health_inflight: std::collections::HashSet::new(),
             drains: new_shared_drains(),
             stop_grace: std::time::Duration::from_secs(STOP_GRACE_SECS),
-            shutdown_grace: std::time::Duration::from_secs(SHUTDOWN_GRACE_SECS),
+            shutdown_budget: SHUTDOWN_STOP_BUDGET,
             pending_stops: PendingStops::new(),
             stop_waits: tokio::task::JoinSet::new(),
             restart_rotation: RestartRotation::default(),
@@ -1162,6 +1193,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             identity_signing_tasks: tokio::task::JoinSet::new(),
             status_tx: watch::Sender::new(Arc::new(status_snapshot::StatusSnapshot::unpublished())),
             state_sweeps: tokio::task::JoinSet::new(),
+            unfinished_state_reads: state_sweep::UnfinishedReads::new(),
             restarts: restarts::Restarts::new(),
             restart_steps: tokio::task::JoinSet::new(),
             follow_ups: tokio::task::JoinSet::new(),
@@ -1292,7 +1324,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 host_port_range,
                 ..Default::default()
             },
-            last_firewall_nodes: None,
+            last_firewall_inputs: None,
+            join_windows: Default::default(),
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
             initialisers: std::collections::HashMap::new(),
@@ -1325,7 +1358,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             health_inflight: std::collections::HashSet::new(),
             drains: new_shared_drains(),
             stop_grace: std::time::Duration::from_secs(STOP_GRACE_SECS),
-            shutdown_grace: std::time::Duration::from_secs(SHUTDOWN_GRACE_SECS),
+            shutdown_budget: SHUTDOWN_STOP_BUDGET,
             pending_stops: PendingStops::new(),
             stop_waits: tokio::task::JoinSet::new(),
             restart_rotation: RestartRotation::default(),
@@ -1333,6 +1366,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             identity_signing_tasks: tokio::task::JoinSet::new(),
             status_tx: watch::Sender::new(Arc::new(status_snapshot::StatusSnapshot::unpublished())),
             state_sweeps: tokio::task::JoinSet::new(),
+            unfinished_state_reads: state_sweep::UnfinishedReads::new(),
             restarts: restarts::Restarts::new(),
             restart_steps: tokio::task::JoinSet::new(),
             follow_ups: tokio::task::JoinSet::new(),
@@ -1543,20 +1577,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Configure the actual protected listener ports, explicit enrolment peers
-    /// and operator networks allowed to the management port. This grants
-    /// network reachability only; protocol authentication still applies.
+    /// and operator networks allowed to the management port, and Bun's own
+    /// service ports, which keep their usual policy inside the host-port
+    /// range. This grants network reachability only; protocol authentication
+    /// still applies.
     pub fn configure_perimeter(
         &mut self,
         cluster_ports: Vec<u16>,
         management_port: u16,
-        bootstrap_peers: Vec<std::net::IpAddr>,
+        bootstrap_peers: Vec<String>,
         operator_cidrs: Vec<String>,
+        service_ports: Vec<u16>,
     ) {
         self.perimeter_config.cluster_ports = cluster_ports;
         self.perimeter_config.management_port = management_port;
         self.perimeter_config.bootstrap_peers = bootstrap_peers;
         self.perimeter_config.operator_cidrs = operator_cidrs;
-        self.last_firewall_nodes = None;
+        self.perimeter_config.service_ports = service_ports;
+        self.last_firewall_inputs = None;
     }
 
     /// Enable or disable the perimeter firewall. In-process multi-node tests
@@ -1667,10 +1705,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.stop_grace = grace;
     }
 
-    /// Override how long node shutdown waits after SIGTERM before SIGKILL.
-    /// Production keeps `SHUTDOWN_GRACE_SECS`, as with `set_stop_grace`.
-    pub fn set_shutdown_grace(&mut self, grace: std::time::Duration) {
-        self.shutdown_grace = grace;
+    /// Override how long node shutdown may spend stopping instances
+    /// gracefully before it kills what still runs. Production keeps
+    /// `SHUTDOWN_STOP_BUDGET`, as with `set_stop_grace`.
+    pub fn set_shutdown_budget(&mut self, budget: std::time::Duration) {
+        self.shutdown_budget = budget;
     }
 
     /// The loop's turn meter, for the metrics collector to export.

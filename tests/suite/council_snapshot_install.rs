@@ -43,7 +43,7 @@ async fn start(id: u64, router: &InMemoryRaftRouter) -> CouncilNode {
     )
     .await
     .unwrap();
-    router.register(id, node.raft().clone()).await;
+    router.register(id, &node).await;
     node
 }
 

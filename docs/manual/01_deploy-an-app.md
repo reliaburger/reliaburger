@@ -58,7 +58,15 @@ path = "/data"            # a managed volume; see `images-and-volumes`
 CPU follows Kubernetes: a bare number is cores (`cpu = "2"`, `cpu = "0.5-2"`)
 and the `m` suffix is millicores (`"250m"` is a quarter of a core). Memory takes
 `Ki`/`Mi`/`Gi`/`Ti`, and a bare number is bytes. A single value sets the request
-and the limit to the same thing.
+and the limit to the same thing. A CPU limit can't be more than 65,536 cores.
+
+The request only reserves memory on a node; the limit is the container's
+ceiling. An app with an `image`, and each of its sidecars, needs a memory limit
+of at least 16 MiB. runc starts every container with its own `runc init`
+process inside the container's cgroup, and runc 1.4 needs up to 13 MB for it,
+so `relish apply` refuses `memory = "8Mi"` instead of letting the start fail.
+The request can still be smaller (`memory = "4Mi-16Mi"`). Host apps (`exec` or
+`script`) have no floor.
 
 Names (apps, jobs, namespaces) are lowercase DNS labels. Secrets go in `env`
 encrypted; see `security`. Ingress, firewall and egress rules are in
@@ -83,10 +91,18 @@ initial_delay = 0         # seconds before the first probe (default 0)
 
 `health.port` works without an app `port`, so an app can probe a separate
 admin listener. `relish apply` refuses a health check with neither, a zero
-interval, timeout or threshold, and a `timeout` longer than the
-`interval`. Leave `timeout` out and it's 5 seconds or the interval,
-whichever is shorter, so `interval = 2` on its own is fine. A new instance that never passes is given up after 60 failed
-probes (about ten minutes at the default interval) and restarted.
+interval, timeout or threshold, an `interval` or `initial_delay` over a day
+(86400 seconds), and a `timeout` longer than the `interval`. Leave `timeout` out and it's 5 seconds or the interval,
+whichever is shorter, so `interval = 2` on its own is fine.
+
+A new instance that crashes before its first passing probe is restarted at
+once, with the usual backoff, and records a `restart` event, so `relish wtf`
+sees a crash loop. One whose process stays up but never passes (a wrong
+`path` or `port`, say) is given up after 60 failed probes in a row (about ten
+minutes at the default interval). The node stops its process and marks it
+`failed` instead of restarting it, and records why under
+`restart.never_healthy`. Restarting wouldn't help: the same probe fails the
+same way. Fix the check and apply again.
 
 ## Init containers
 
@@ -419,6 +435,7 @@ relish exec web env              # run a command once inside an instance; exits 
 relish events --app web          # the cluster's recent events for one app
 relish top                       # every workload on every node, with CPU and memory
 relish inspect web               # every instance on every node, desired vs running
+relish scale web --replicas 3    # set the count; the next apply of the file puts back its count
 relish stop web                  # scale to zero; `relish apply` starts it again
 relish delete web                # remove the app from the cluster
 ```
@@ -434,6 +451,40 @@ In a cluster, `relish stop` and `relish delete` return as soon as the council
 has recorded the change. Each node then retires its instances on its own, and
 a node that's unreachable does so when it comes back. Run `relish apps web` (or
 `relish inspect web`) to watch the instances go.
+
+### Scaling without editing the file
+
+`relish scale web --replicas 3` sets the app's count in the cluster. It
+changes the spec the council holds, the same one `relish apply` writes, and
+leaves the rest of the spec alone: the image stays the digest it was bound
+to. It isn't an override. Apply the file again and the file's count comes
+back, and until you do, `relish apply app.toml --dry-run` shows the app as
+changed. If the new count should stay, put it in the file.
+
+```sh
+relish scale web --replicas 3
+relish scale web --replicas 2 --current-replicas 3   # only if nobody changed it since you looked
+```
+
+A few things have no count to set, and `relish scale` refuses them:
+
+- **Zero.** An app runs at least 1 replica; `relish stop web` takes it to
+  zero and keeps its count for the next start. Scaling a stopped app starts
+  it again with the new count.
+- **An autoscaled app.** The autoscaler owns the count; change `min` and
+  `max` under `[app.web.autoscale]` instead.
+- **A daemon set** (`replicas = "*"`), which runs one replica on every node.
+- **An app GitOps manages**, unless you pass `--force`. The next sync puts
+  back the repository's count, so change the repository instead.
+
+A scale needs a `deployer` token with the `scale` permission on the app, the
+same as `relish stop`, and an agent's lease on the app refuses it, naming the
+holder, unless you pass `--break-lease`. It's audited as `app.scaled`, with
+the old and new counts. In the terminal UI (`relish tui`), the app's
+Instances tab does the same with `+` and `-`, after asking
+`Scale web from 2 to 3? Applying its file again puts back the file's count. [y/N]`.
+A standalone node has no cluster state to change, so there you edit
+`replicas` and apply.
 
 A delete followed straight away by an apply of the same file may not restart
 anything. A node that hasn't acted on the delete yet sees the app come back
@@ -641,7 +692,10 @@ Each node keeps its last 50 deploys per app.
 
 In a cluster, `relish rollback` takes its target from the council, which keeps
 the last ten versions of each app that rolled out healthy on every node, so it
-works from whichever node you ask and after every node has restarted. The
+works from whichever node you ask and after every node has restarted. A
+follower sends the rollback on to the leader, which picks the target from its
+own state, so a deploy that has just committed counts even on a node that
+hasn't caught up with it yet. The
 previous version is the newest one there that differs from what the app runs
 now. Without one (a single node, or an app that never finished a rollout) it
 falls back to the cluster-wide history. A rollback changes the version and
@@ -778,9 +832,13 @@ A stop then runs four steps, each with its own limit:
 
 Without `stop_grace`, a deploy gives each old instance its `drain_timeout`,
 and any other stop (`relish stop`, or the leader moving a replica off a node)
-gives it 10 s, as before. The signal travels with the instance, so when Bun
-itself shuts down and stops its workloads they get it too, though with Bun's
-own 5 s grace and no `pre_stop`.
+gives it 10 s, as before. When Bun itself shuts down (`systemctl stop`, or
+the OS rollout rebooting the node) it stops every instance on the node the
+same way, all at once, but within 20 s in total: the systemd units give Bun
+30 s before they kill it. Whatever hasn't exited by then gets SIGKILL. A
+database with a managed volume meets this on every rolling OS update, which
+can't move it off its node first, so make sure it can stop cleanly in well
+under 20 s.
 
 The longest a stop can now take is `pre_stop_timeout` plus `stop_grace` plus
 a few seconds for the runtime. That can outlast the placement loop's deadline

@@ -210,7 +210,12 @@ impl Drop for BunProcess {
             let pid = nix::unistd::Pid::from_raw(self.child.id() as i32);
             let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Bun stops every workload before it exits, for up to
+        // `shutdown_completion_bound()`. Killing it sooner would leave them
+        // running with nobody to stop them.
+        let deadline = Instant::now()
+            + reliaburger::bun::agent::shutdown_completion_bound()
+            + Duration::from_secs(5);
         while Instant::now() < deadline {
             if self.child.try_wait().ok().flatten().is_some() {
                 return;
@@ -466,6 +471,28 @@ pub fn run_relish(args: &[&str]) -> Output {
         .env_remove("RELIABURGER_CA_CERT")
         .output()
         .unwrap()
+}
+
+/// Run `relish init` into `cluster_dir`, writing the root CA backup beside
+/// it (never inside it, as an operator keeps it off the node) under a
+/// throwaway passphrase (#709).
+pub fn run_relish_init(cluster_dir: &std::path::Path, cluster: &str, node: &str) -> Output {
+    let parent = cluster_dir.parent().unwrap();
+    let passphrase = parent.join("root-backup-passphrase");
+    std::fs::write(&passphrase, "a throwaway test passphrase\n").unwrap();
+    let backup = parent.join(format!("{cluster}-root-backup.age"));
+    run_relish(&[
+        "init",
+        cluster_dir.to_str().unwrap(),
+        "--cluster-name",
+        cluster,
+        "--node-id",
+        node,
+        "--root-backup",
+        backup.to_str().unwrap(),
+        "--passphrase-file",
+        passphrase.to_str().unwrap(),
+    ])
 }
 
 /// Panic with Relish's stdout and stderr unless it succeeded.

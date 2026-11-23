@@ -59,6 +59,7 @@ mod logs;
 mod metrics;
 mod node_info;
 mod nodes;
+mod os;
 pub(crate) mod policies;
 pub(crate) mod proposals;
 mod registry;
@@ -76,9 +77,12 @@ pub(crate) use apply::{
     mark_leader_forwarded,
 };
 use apply::{apply_handler, cluster_apply};
-use apps::{delete_handler, exec_handler, release_handler, stop_handler};
+use apps::{delete_handler, exec_handler, release_handler, scale_handler, stop_handler};
 use audit::audit_handler;
-use ca::{ca_rotation_begin_handler, ca_rotation_finalize_handler, ca_rotation_prepare_handler};
+use ca::{
+    ca_rotation_begin_handler, ca_rotation_finalize_handler, ca_rotation_prepare_handler,
+    signing_key_rotate_handler,
+};
 use deploys::{
     cluster_deploy_history, deploy_cancel_handler, deploys_active_handler, deploys_history_handler,
     deploys_operations_handler, rollback_handler,
@@ -93,8 +97,9 @@ use faults::{
 pub use gitops::GitOpsLocalCheck;
 use gitops::{gitops_config_handler, gitops_status_handler, gitops_webhook_handler};
 use identity::{
-    identity_jwks_handler, identity_sign_handler, join_token_create_handler, token_create_handler,
-    token_list_handler, token_revoke_handler, token_rotate_handler,
+    identity_jwks_handler, identity_sign_handler, join_token_create_handler,
+    join_token_list_handler, join_token_revoke_handler, perimeter_admit_handler,
+    token_create_handler, token_list_handler, token_revoke_handler, token_rotate_handler,
 };
 use internal::{
     endpoint_withdrawal_receipt_handler, node_decommission_handler, placements_handler,
@@ -102,8 +107,8 @@ use internal::{
     workload_csr_handler,
 };
 use join::{
-    cluster_ca_handler, join_handler, node_renewal_handler, node_security_view_handler,
-    node_trust_ack_handler,
+    cluster_ca_handler, join_handler, master_key_handler, node_renewal_handler,
+    node_security_view_handler, node_trust_ack_handler,
 };
 use leases::{
     lease_break_handler, lease_release_handler, lease_renew_handler, lease_take_handler,
@@ -126,6 +131,10 @@ use node_info::{
 use nodes::{
     MAX_RELAY_REQUEST_BYTES, cluster_elect_handler, council_handler, node_relay_handler,
     nodes_handler,
+};
+use os::{
+    os_rollout_abort_handler, os_rollout_handler, os_rollout_resume_handler,
+    os_rollout_start_handler, os_stage_handler,
 };
 use policies::{policies_handler, policy_audit_handler, policy_delete_handler};
 use proposals::{
@@ -221,9 +230,14 @@ impl NodeMembershipInfo {
 /// rather than dropping it. `bun` attaches it as a layer; without it the relay
 /// reaches live members only.
 ///
-/// Remembering is bounded. A member that left on purpose, or whose identity
-/// the operator retired, is forgotten at once: nothing on it needs healing.
-/// A member unheard of for [`KNOWN_MEMBER_RETENTION`] is forgotten too.
+/// A member that shut down cleanly announced a graceful leave, so gossip
+/// calls it Left. That's a reboot as often as a departure, and a council
+/// voter that left still holds its seat, so it stays listed as `left` until
+/// it comes back (#2164).
+///
+/// Remembering is bounded. A member whose identity the operator retired is
+/// forgotten at once: nothing on it needs healing and it isn't coming back.
+/// A down member unheard of for [`KNOWN_MEMBER_RETENTION`] is forgotten too.
 #[derive(Clone, Default)]
 pub struct KnownMembers(Arc<RwLock<Vec<KnownMember>>>);
 
@@ -272,9 +286,10 @@ impl KnownMembers {
     /// really has gone just fails to connect, which is the honest answer for
     /// a reversal aimed at it.
     ///
-    /// Members gossip reports as Left, and those named in `retired`, are
-    /// dropped, as is any down member not heard from since
-    /// [`KNOWN_MEMBER_RETENTION`] before `now`.
+    /// A member gossip reaps after it left stays `Left`; one reaped after it
+    /// died stays `Dead`. Members named in `retired` are dropped, as is any
+    /// down member not heard from since [`KNOWN_MEMBER_RETENTION`] before
+    /// `now`.
     pub async fn refresh(
         &self,
         roster: Vec<RosterMember>,
@@ -292,7 +307,7 @@ impl KnownMembers {
         };
         let mut next = Vec::new();
         for member in &roster {
-            if member.state == NodeState::Left || retired.contains(&member.info.node_id.0) {
+            if retired.contains(&member.info.node_id.0) {
                 continue;
             }
             let last_heard = if member.state.is_down() {
@@ -312,10 +327,12 @@ impl KnownMembers {
             {
                 continue;
             }
-            // Gossip reaps only down members, and a Left one was forgotten
-            // the moment the roster showed it, so a reaped member was dead.
+            // Gossip reaps only down members. A Left one keeps its state;
+            // anything else gossip stopped listing died.
             let mut known = known.clone();
-            known.member.state = NodeState::Dead;
+            if known.member.state != NodeState::Left {
+                known.member.state = NodeState::Dead;
+            }
             next.push(known);
         }
         next.retain(|known| {
@@ -634,6 +651,9 @@ pub fn router_with_upgrade(
         .route("/ui/static/{*path}", get(static_asset_handler))
         .route("/v1/cluster/join", post(join_handler))
         .route("/v1/cluster/ca", get(cluster_ca_handler))
+        // Authenticated by the node's TLS client certificate inside the
+        // handler: a joiner has no bearer token until it has the master key.
+        .route("/v1/cluster/master-key", get(master_key_handler))
         // The GitOps webhook is public: real providers (GitHub, GitLab)
         // send `X-Hub-Signature-256`/`X-Gitlab-Token`, never a Reliaburger
         // bearer token, so it can't sit behind the bearer-auth middleware.
@@ -705,6 +725,7 @@ pub fn router_with_upgrade(
         .route("/v1/stop/{app}/{namespace}", post(stop_handler))
         .route("/v1/delete/{app}/{namespace}", post(delete_handler))
         .route("/v1/release/{app}/{namespace}", post(release_handler))
+        .route("/v1/scale/{app}/{namespace}", post(scale_handler))
         .route("/v1/logs/{app}/{namespace}", get(logs_handler))
         .route(
             "/v1/logs/entries/{app}/{namespace}",
@@ -776,6 +797,11 @@ pub fn router_with_upgrade(
             "/v1/upgrade/cluster-rollback",
             post(upgrade_cluster_rollback_handler),
         )
+        .route("/v1/os/stage", post(os_stage_handler))
+        .route("/v1/os/rollout", get(os_rollout_handler))
+        .route("/v1/os/rollout/start", post(os_rollout_start_handler))
+        .route("/v1/os/rollout/resume", post(os_rollout_resume_handler))
+        .route("/v1/os/rollout/abort", post(os_rollout_abort_handler))
         .route("/v1/cluster/elect", post(cluster_elect_handler))
         .route("/v1/chaos/reserve", post(node_fault_reserve_handler))
         .route("/v1/chaos/fence", post(node_fault_fence_handler))
@@ -928,6 +954,9 @@ pub fn router_with_upgrade(
         .route("/v1/token/revoke", post(token_revoke_handler))
         .route("/v1/token/rotate", post(token_rotate_handler))
         .route("/v1/join-token/create", post(join_token_create_handler))
+        .route("/v1/join-token/list", get(join_token_list_handler))
+        .route("/v1/join-token/revoke", post(join_token_revoke_handler))
+        .route("/v1/perimeter/admit", post(perimeter_admit_handler))
         .route("/v1/secret/public-key", get(secret_public_key_handler))
         .route("/v1/secret/rotate", post(secret_rotate_handler))
         .route("/v1/ca/rotation/prepare", post(ca_rotation_prepare_handler))
@@ -935,6 +964,10 @@ pub fn router_with_upgrade(
         .route(
             "/v1/ca/rotation/finalize",
             post(ca_rotation_finalize_handler),
+        )
+        .route(
+            "/v1/identity/signing-key/rotate",
+            post(signing_key_rotate_handler),
         )
         // Inside the auth layer, so it sees who the caller is (#685).
         .route_layer(axum::middleware::from_fn_with_state(
@@ -957,6 +990,7 @@ pub fn router_with_upgrade(
         .merge(auth_routes)
         .merge(protected)
         .layer(axum::middleware::map_response(ui::forbid_framing))
+        .layer(axum::middleware::from_fn(keep_node_routes_node_only))
         .layer(axum::middleware::from_fn_with_state(
             state,
             refuse_retired_tls_peer,
@@ -1398,12 +1432,24 @@ async fn known_node_api_url(
     }
 }
 
+/// Set on every request a node forwards or relays on a person's behalf.
+///
+/// Such a request goes out over the forwarding node's own TLS connection,
+/// so it presents that node's client certificate. A route that admits a
+/// node by its certificate alone would take the person for the node, so the
+/// node-only routes refuse any request that carries this header (see
+/// [`keep_node_routes_node_only`]). A client can set it too, but all it
+/// does is get the client refused.
+pub(crate) const FORWARDED_FOR_USER_HEADER: &str = "x-reliaburger-forwarded-for-user";
+
 /// Preserve the end user's credential so the target node repeats every
-/// authentication and server-policy check.
+/// authentication and server-policy check, and mark the request
+/// [`FORWARDED_FOR_USER_HEADER`] so node-only routes refuse it.
 pub(crate) fn copy_forwarded_auth(
-    mut request: reqwest::RequestBuilder,
+    request: reqwest::RequestBuilder,
     headers: &HeaderMap,
 ) -> reqwest::RequestBuilder {
+    let mut request = request.header(FORWARDED_FOR_USER_HEADER, "1");
     for name in [
         axum::http::header::AUTHORIZATION,
         axum::http::header::COOKIE,
@@ -1421,6 +1467,42 @@ pub(crate) fn copy_forwarded_auth(
         );
     }
     request
+}
+
+/// Refuse a request a node forwarded or relayed for a person when the route
+/// is node-only: one the matrix gives the system principal, or one that
+/// admits a node by its TLS certificate alone, like `/v1/cluster/master-key`.
+///
+/// The forwarding node presents its own certificate, so without this a
+/// person could borrow it. A node's own calls to these routes never carry
+/// [`FORWARDED_FOR_USER_HEADER`].
+pub(super) async fn keep_node_routes_node_only(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let node_only = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .is_some_and(|route| crate::bun::authz::is_node_only(request.method(), route.as_str()));
+    if node_only && request.headers().contains_key(FORWARDED_FOR_USER_HEADER) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "this route answers nodes only, not a request forwarded for a person"
+            })),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+/// The answer to a request whose values can't go into a peer URL.
+pub(crate) fn peer_path_refusal(error: &crate::cluster::http::PeerPathError) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": format!("can't forward this request: {error}") })),
+    )
+        .into_response()
 }
 
 /// Gather instance statuses from the agent.
@@ -1447,6 +1529,8 @@ mod owner_tests;
 mod policy_tests;
 #[cfg(test)]
 mod proposal_tests;
+#[cfg(test)]
+mod scale_tests;
 
 #[cfg(test)]
 mod cluster_view_tests;

@@ -375,7 +375,7 @@ async fn council() -> Arc<CouncilNode> {
     )
     .await
     .unwrap();
-    router.register(1, node.raft().clone()).await;
+    router.register(1, &node).await;
     node.initialize(std::collections::BTreeMap::from([(
         1u64,
         CouncilNodeInfo::new(
@@ -5026,7 +5026,7 @@ async fn deploy_completes(mut progress: mpsc::Receiver<ApplyEvent>) {
         while let Some(event) = progress.recv().await {
             match event {
                 ApplyEvent::Complete { .. } => return Ok(()),
-                ApplyEvent::Error { message } => return Err(message),
+                ApplyEvent::Error { message, .. } => return Err(message),
                 _ => {}
             }
         }
@@ -5322,6 +5322,7 @@ async fn a_signed_identity_is_stored_off_the_loop() {
             root_ca_cert_der: vec![2],
             ca_bundle_der: vec![vec![1], vec![2]],
             jwt_token: Some("jwt".into()),
+            api_jwt_token: Some("api-jwt".into()),
         }),
     );
     let task = agent

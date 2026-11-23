@@ -1165,6 +1165,7 @@ mod tests {
             .container_command(&["rm", "-f", &id.0], &id)
             .await;
         let spec = crate::grill::oci::OciSpec {
+            managed_volumes: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1252,6 +1253,7 @@ mod tests {
         let id = InstanceId("apple-slow-stop-0".to_string());
         let _ = grill.container_command(&["rm", "-f", &id.0], &id).await;
         let spec = crate::grill::oci::OciSpec {
+            managed_volumes: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1351,6 +1353,7 @@ mod tests {
 
         let id = InstanceId("apple-adopt-0".to_string());
         let spec = crate::grill::oci::OciSpec {
+            managed_volumes: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,

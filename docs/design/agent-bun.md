@@ -33,7 +33,7 @@ Bun's responsibilities on every node:
 
 Grill is Bun's container runtime interface -- the abstraction layer between Bun's workload management logic and the underlying runtime. Grill handles OCI image unpacking, container creation, network namespace setup, cgroup configuration, port mapping, and stdio stream attachment. The name follows the Reliaburger convention: Grill is where containers get cooked.
 
-> **Decision log — Grill drives runtimes directly, not via containerd.** An earlier draft (still visible in a few listings below, e.g. §2 and §4.1) had Grill talk to `containerd` over its gRPC socket. The shipped Grill has three concrete backends and no containerd dependency: `runc` on Linux (Grill writes the OCI bundle and drives foreground `runc run` plus the state/exec commands itself), Apple Container on macOS, and a `process` backend that runs a host binary with no OCI runtime at all. We dropped containerd because it duplicated the exact state Bun already keeps (which container is where, in what state) and added a socket, a gRPC dependency, and a second thing to keep alive under memory pressure — for a single-binary orchestrator that already reconciles container state on restart, the shim earned its keep nowhere. Where the text below says "containerd," read "the Grill backend for this node's runtime." References to state surviving Bun restarts still hold: `runc`'s own `state` and the Apple VM outlive Bun, and Grill re-adopts them on startup.
+> **Decision log — Grill drives runtimes directly, not via containerd.** An earlier draft had Grill talk to `containerd` over its gRPC socket. The shipped Grill has three concrete backends and no containerd dependency: `runc` on Linux (Grill writes the OCI bundle and drives foreground `runc run` plus the state/exec commands itself), Apple Container on macOS, and a `process` backend that runs a host binary with no OCI runtime at all. We dropped containerd because it duplicated the exact state Bun already keeps (which container is where, in what state) and added a socket, a gRPC dependency, and a second thing to keep alive under memory pressure — for a single-binary orchestrator that already reconciles container state on restart, the shim earned its keep nowhere. Where the text below says "containerd," read "the Grill backend for this node's runtime." References to state surviving Bun restarts still hold: `runc`'s own `state` and the Apple VM outlive Bun, and Grill re-adopts them on startup.
 
 **0.1.0 process-mode scope (20 September 2026):** Native process workloads must
 run in the foreground and keep all children in the supervised process group.
@@ -50,7 +50,7 @@ The broader process-isolation design below remains future work.
 
 1. **Single binary, no sidecar model.** Bun is not a separate process from the orchestrator -- it IS the orchestrator on this node. All subsystems (Grill, Onion, Ketchup, Mayo, Pickle, Mustard, Wrapper, Brioche) run as async tasks within the same Tokio runtime. This eliminates IPC overhead and version compatibility concerns between components.
 
-2. **Containers survive Bun restarts.** Containers are managed by containerd/runc, which is independent of Bun. When Bun restarts (including during self-upgrade), it reconnects to running containers by querying the container runtime. Applications are never interrupted by Bun lifecycle events.
+2. **Containers survive Bun restarts.** Containers run under runc (or the Apple VM), which is independent of Bun. When Bun restarts (including during self-upgrade), it reconnects to running containers by querying the container runtime. Applications are never interrupted by Bun lifecycle events.
 
 3. **Process workloads are first-class.** Process workloads (host binaries and inline scripts) receive the same isolation primitives as containers (cgroups, PID namespace, network namespace, mount namespace) minus the filesystem image. From the cluster's perspective, they are indistinguishable from container workloads in terms of scheduling, health checking, service discovery, and metrics.
 
@@ -133,10 +133,21 @@ process can only write what its mapped ids own. Before creating the container,
 Bun resolves the process user (image `USER`, or `run_as_user`/`run_as_group`),
 maps it into the node range and prepares every read-write volume:
 
-- **Managed volumes** (those with a `*.volume.json` provisioning sidecar,
-  whatever the backend: plain directory, loop-mounted ext4 or Btrfs subvolume)
-  are handed to that user. The sidecar records who the volume was last handed
-  to, and the plan follows from it:
+- **Managed volumes** (the ones the spec builder records in
+  `OciSpec::managed_volumes`, whatever the backend: plain directory,
+  loop-mounted ext4 or Btrfs subvolume) are handed to that user. A file found
+  beside a bind source never makes it managed. Before the hand-over, Bun walks
+  the path from the volumes directory one component at a time and refuses a
+  symlink, a non-directory, or a component that is itself a volume (or a
+  restore copy of one); provisioning applies the same walk, so a new volume
+  can't sit inside an older one or over one. The `*.volume.json` sidecar beside
+  the volume is written durably (file and directory synced), and one that
+  exists but can't be read stops the start rather than reading as "new
+  volume". A loop image that already holds data is never formatted; a first
+  provisioning that fails part-way unmounts and removes the image it made, so
+  the next start can try again. The volumes directory and its ancestors are
+  trusted as configured; only the path below it is checked. The sidecar
+  records who the volume was last handed to, and the plan follows from it:
 
   | Recorded owner | Volume root owner | Action |
   |---|---|---|
@@ -222,6 +233,42 @@ is a live owner, never replaced alongside. Rootless cgroup limits remain an admi
 doesn't create a delegated user scope, so the OCI rewrite removes the rootful
 cgroup path rather than fabricating a path runc cannot write.
 
+### 1.3 Layer whiteouts
+
+`unpack_layers` extracts ordinary entries with the `tar` crate's `unpack_in`,
+which keeps each entry's parent inside the rootfs. Whiteouts (`.wh.<name>` and
+the opaque `.wh..wh..opq`) are applied by `grill::whiteout`, under two rules:
+
+- **No symlink is followed.** The whiteout's parent directory is opened from
+  the rootfs one component at a time with `O_NOFOLLOW | O_DIRECTORY`, and
+  everything below it goes through `fstatat`, `openat` and `unlinkat` relative
+  to a directory descriptor. On Linux the walk uses `O_PATH`, which needs
+  only search (`x`) permission on each directory, as a path lookup does; a
+  directory is opened for reading only to list it. A whiteout whose parent is
+  a symlink, a file or missing removes nothing. A symlink inside a removed
+  tree is unlinked, never followed. A whiteout path with `..` is skipped, and
+  a leading `/` is read relative to the rootfs, as `tar` reads ordinary
+  entries.
+- **A parent reached through an in-image symlink is a no-op.** containerd
+  resolves symlinks that stay inside the root, so for an image with
+  `lib -> usr/lib`, `lib/.wh.foo` removes `usr/lib/foo` there and nothing
+  here. That errs on the safe side: builders write whiteouts at the real
+  path (`usr/lib/.wh.foo`), because that is where the overlay snapshot saw
+  the deletion.
+- **Permission errors keep the entry.** Root removes anything. A rootless
+  Bun unpacks as an ordinary user, and an image can make a lower directory
+  read-only (`0555`) or unreadable. When removing or listing an entry fails
+  with `EACCES` or `EPERM`, the entry stays in the rootfs, Bun logs a
+  warning, and the pull carries on, as it did before whiteouts went through
+  descriptors. The leftover is inside the rootfs, and failing would refuse an
+  image other runtimes run. Any other error (a full disk, an I/O error)
+  fails the unpack.
+- **Only lower layers are hidden** ([OCI image spec, whiteouts](https://github.com/opencontainers/image-spec/blob/main/layer.md#whiteouts)).
+  The unpacker records the paths the current layer has written, and a
+  whiteout leaves those, and any directory holding one of them, in place.
+  The result is the same whether the whiteout comes before or after its
+  siblings in the tar.
+
 ---
 
 ## 2. Dependencies
@@ -232,8 +279,8 @@ cgroup path rather than fabricating a path runc cannot write.
 | **Apple Container** | Runtime (external, macOS) | OCI container lifecycle on macOS. Grill re-adopts a running workload via `container inspect` after a Bun exec. |
 | **Linux kernel 5.8+** | Hard requirement | eBPF socket-level interception (`sock_ops`, `connect4`, `sk_msg`), cgroup v2, BPF CO-RE, the boot-time clock helper. Reusable job executors need `clone3(CLONE_INTO_CGROUP)` (5.7) and the cgroup v2 freezer (5.2), inside the same minimum; they use `cgroup.kill` (5.14) when present and otherwise freeze and kill each task. Bun turns the executor pools off on an older kernel, and the native host pool off without `CONFIG_PROC_CHILDREN` (`src/grill/kernel.rs`) |
 | **Mustard (gossip)** | Internal subsystem | Failure detection, leader discovery, cluster membership, metadata propagation (protocol version, node labels) |
-| **Meat (scheduler)** | Via leader node | Receives scheduling decisions (which workloads to run). On the leader node, Meat runs as a co-located async task. On worker nodes, scheduling decisions arrive via the reporting tree. |
-| **Raft (council)** | Via council members | Committed state (app specs, secrets, config). Worker nodes receive state via the reporting tree, not directly from Raft. |
+| **Meat (scheduler)** | Via leader node | Receives scheduling decisions (which workloads to run). On the leader node, Meat runs as a co-located async task. On other nodes, Bun polls the leader's `GET /v1/placements/{node}` for its assignments. |
+| **Raft (council)** | Via council members | Committed state (app specs, secrets, config). Nodes outside the council read it from the leader over the HTTP API, not directly from Raft. |
 | **Onion (eBPF)** | Internal subsystem | Bun loads and manages the Onion eBPF programs and kernel maps. Onion depends on Bun for map updates when workloads start/stop or health checks change state. |
 | **Pickle (image registry)** | Internal subsystem | Image pull/push, binary distribution during self-upgrade. Bun participates as a Pickle storage node. |
 | **Sesame (PKI)** | Via council members | Node certificate issuance (at join), workload certificate issuance (CSR model), CA trust chain distribution. |
@@ -293,11 +340,11 @@ Bun runs as a single Tokio async runtime with multiple subsystem tasks. Each sub
 
 ```
 Leader (Meat)
-  → Reporting tree (council member parent)
+  → GET /v1/placements/{node} (this node polls the leader)
     → Bun on this node
       → WorkloadSupervisor
         → Grill (container) or ProcessManager (process workload)
-          → containerd/runc or clone()/exec() with namespaces
+          → runc / Apple `container` CLI, or clone()/exec() with namespaces
 ```
 
 **Outbound (state reporting):**
@@ -306,8 +353,8 @@ Leader (Meat)
 Workload event (start, stop, health change, OOM, restart)
   → WorkloadSupervisor
     → Local event log
-    → Reporting tree parent (council member)
-      → Council → Raft state (for cluster-wide queries)
+    → Report to the leader (every node reports straight to it)
+      → Leader's aggregated view (for scheduling and cluster-wide queries)
     → Onion service map update (eBPF kernel map)
     → Ketchup log entry
     → Mayo metric update
@@ -319,7 +366,7 @@ Workload event (start, stop, health change, OOM, restart)
 HealthChecker (periodic per workload)
   → HTTP GET to workload's health endpoint (via container's network namespace)
   → Result → WorkloadSupervisor
-    → If state changed: update Onion service map, emit event, notify reporting tree
+    → If state changed: update Onion service map, emit event, include it in the next report to the leader
     → If unhealthy beyond threshold: trigger restart via Grill/ProcessManager
 ```
 
@@ -334,7 +381,7 @@ HealthChecker (periodic per workload)
 - Attaching to container stdio streams for log capture
 - Reconnecting to running containers after Bun restart
 
-**ProcessManager** handles non-container workloads. Today (the `process` Grill backend, `src/grill/process.rs`) it validates the binary against the allowlist and then starts the host process through a durable owner and activation gate, in its own process group, with the spec's environment and stdout/stderr captured for Ketchup. Auxiliary exec commands have child owners, and application retirement waits for their confirmed cleanup too. Writing inline scripts to temporary files and marking them executable is real. The namespace/seccomp/user-drop machinery below is the **planned** design, not current behaviour:
+**ProcessManager** handles non-container workloads. Today (the `process` Grill backend, `src/grill/process.rs`) it validates the binary against the allowlist and then starts the host process through a durable owner and activation gate, in its own process group, with the spec's environment and stdout/stderr captured for Ketchup. Auxiliary exec commands have child owners, and application retirement waits for their confirmed cleanup too. An inline script runs as `/bin/sh -c <script>`; no file is written. The namespace/seccomp/user-drop machinery below is the **planned** design, not current behaviour:
 
 - Validating binaries against the allowlist in `node.toml` *(shipped)*
 - Writing inline scripts to temporary files and marking them executable *(shipped)*
@@ -573,7 +620,7 @@ pub enum ContainerState {
     /// workload transitions to Failed.
     Initialising,
 
-    /// The main process is starting. For containers: containerd has
+    /// The main process is starting. For containers: runc has
     /// created the container and is executing the entrypoint. For
     /// process workloads: clone() has been called and the process
     /// is executing.
@@ -950,14 +997,16 @@ pub struct UpgradeConfig {
 
 **Bun <-> container runtime:** no daemon and no gRPC. Grill spawns the runtime CLI directly — `runc run`/`runc state`/`runc kill`/`runc delete` against an OCI bundle on Linux, and the Apple `container` CLI on macOS. The `process` backend spawns the host binary itself. State survives Bun restarts because runc's own on-disk state and the Apple VM outlive the agent; Grill re-adopts them on startup.
 
-**Bun <-> reporting tree parent:** postcard-framed messages over an mTLS TCP connection. Messages include:
+**Bun -> leader (reporting):** framed messages over an mTLS TCP connection to the leader's reporting port. Every node reports straight to the leader; a hierarchical tree with council members aggregating is planned (#364). The connection is upstream-only (`ReportingMessage` in `src/reporting/types.rs`):
 
-- `WorkloadStateReport` -- periodic batch of workload states (instance ID, state, health, resource usage)
-- `EventStream` -- real-time events (starts, stops, health changes, OOMs)
-- `SchedulingDirective` -- from parent to Bun: start/stop/update workloads
+- `Report` -- periodic state report (workload states, health, resource usage, events)
+- `MetricsRollup` -- the node's pre-aggregated metrics
+- `CapabilityReport` -- live scheduling capabilities and per-workload security evidence
 - `NodeReadinessReport` -- an independently expiring lease carrying
   the live `Starting`, `Ready`, `Degraded` or `Stopped` state of every critical
   long-lived subsystem, with transition and last-error times
+
+The leader acknowledges with `Ack`. Nothing travels down this connection: placements come from `GET /v1/placements/{node}`, and a node reports a failed rollout step with `POST /v1/rollouts/failed`, both on the HTTP API.
 
 **Bun <-> eBPF kernel maps:** Direct memory-mapped access via `libbpf` file descriptors. Map updates are atomic `bpf_map_update_elem()` calls. No serialisation protocol -- the map keys and values are C-compatible structs (`#[repr(C)]`).
 
@@ -1054,20 +1103,20 @@ before their Phase 15 cases can use this contract.
 
 **Start a container workload (full sequence):**
 
-1. Receive `AppSpec` from WorkloadSupervisor (originally from the scheduler via the reporting tree).
+1. Receive `AppSpec` from WorkloadSupervisor (originally from the scheduler, through the node's placements poll of the leader).
 2. Transition state to `Pending`.
 3. **Prepare image:** A digest-pinned image this node has already verified and unpacked resolves locally, with no registry or peer request (see §7.11). Otherwise, check Pickle local cache. If missing, fetch from Pickle peers (content-addressed, mTLS). If not in any Pickle node, pull from the external registry configured in `node.toml`. Transition to `Preparing`.
 4. **Allocate port:** Request a host port from PortAllocator. The allocator picks a random available port from the configured range (default 10000..32767), skips any port a TCP bind on the host shows is already taken, and marks it as in-use.
-5. **Create cgroup:** CgroupMgr creates a cgroup v2 hierarchy: `/sys/fs/cgroup/reliaburger/{namespace}/{app_name}/{instance}/`. The OCI spec carries the hard limits — `cpu.max` (from `cpu.limit`) and `memory.max` (from `memory.limit`) — and, when a workload declares a request, the request-derived soft controls `cpu.weight` and `memory.high` in the `linux.resources.unified` map (see §5.4). GPU device allow-listing via the cgroup `devices` controller is a follow-up (see §5.4 GPU note).
+5. **Create cgroup:** CgroupMgr creates a cgroup v2 hierarchy: `/sys/fs/cgroup/reliaburger/{namespace}/{app_name}/{instance}/`. The OCI spec carries the hard limits — `cpu.max` (from `cpu.limit`) and `memory.max` (from `memory.limit`) — and, when a workload declares a CPU request, the request-derived `cpu.weight` in the `linux.resources.unified` map (see §5.4). A memory request sets no cgroup file (#1955). GPU device allow-listing via the cgroup `devices` controller is a follow-up (see §5.4 GPU note).
 6. **Prepare network namespace:** Create a new network namespace. Configure the veth pair and port mapping (host port -> container internal port). Attach Onion eBPF programs to the namespace's sockets.
 7. **Decrypt secrets:** For any `EnvValue::Encrypted` in the env map, decrypt using the cluster's age private key in memory. Plaintext is never written to disk.
 8. **Prepare workload identity:** Generate a keypair, send CSR to the nearest council member, receive the signed X.509 certificate. Write cert, key, CA chain, and JWT to a tmpfs mount.
 9. **Mount volumes and config files:** Bind-mount declared volumes from the host filesystem (a host-path `source` was checked against `[storage] allowed_host_paths` at admission and again when the OCI spec was built, which mounts the resolved path that check approved). Write `ConfigFileSpec` contents to temp files and bind-mount them read-only at the declared paths.
 10. **Run init containers (Initialising):** For each init container in declaration order, create a container from its own image (the app's when it names none, trust-checked and digest-pinned like the app's) with the app's environment, decrypted secrets, cgroup and volume and config-file mounts, built from the app's finished OCI spec (`generate_init_oci_spec`, #701). It gets its own network namespace and leaves the volumes owned by the app's user. An `exec` or `script` app's init that names no image runs its command on the host instead: its spec carries `host_process` like the app's, so the mixed runtime routes it to the host backend and a switch from `--runtime process` to `mixed` mid-run adopts it there, and admission refuses it unless `[process_workloads] allowed_binaries` names the first word of its command (#935). Wait for exit code 0. If any fails, or none finishes within 300 s, transition to `Failed` and emit event.
 10a. **Start sidecars (#1120):** Register the instance's sidecar identities (`<id>__sidecar-<name>`) with the loop, then create and start each in declaration order from `generate_sidecar_oci_spec`: its own image or the app's, the app's env with its own on top (secret references resolved by `create_with_secrets` like any launch), the app's mounts, its own cgroup beside the app's (`<cgroup>-sidecar-<name>`, with its own limits, since two runc containers can't share one), and the instance's network namespace by path (`/var/run/netns/rb-<id>`) instead of one of its own. Rootful runc sees that path (`OciSpec::joined_network`), reserves no address and sets up no network for it. Apple Container, rootless runc and the process runtime can't share a namespace (`Grill::shares_network_namespaces` is false), so admission refuses an app with sidecars there and the node reports `shared_network: false`, which keeps the scheduler away. A sidecar that fails to start fails the instance, and any already started are killed.
-11. **Create and start the main container (Starting):** Call `containerd::containers::create()` with the OCI spec (rootfs, namespaces, cgroups, mounts, env, seccomp). Call `containerd::tasks::start()`. Attach to stdout/stderr streams and pipe to Ketchup.
-12. **Health wait (HealthWait):** After `initial_delay`, begin sending HTTP GET to `health` path via the container's network namespace IP and declared port. Continue at `interval` until `threshold_healthy` consecutive successes.
-13. **Running:** Register the instance in the Onion service map (eBPF kernel map). The workload now receives traffic via DNS resolution and connect() rewriting. Emit a `WorkloadRunning` event to the reporting tree.
+11. **Create and start the main container (Starting):** Write the OCI bundle (rootfs, namespaces, cgroups, mounts, env, seccomp) and start it with the runtime's own CLI: `runc run` on Linux, the `container` CLI on macOS. There's no daemon in between. Capture stdout/stderr and pipe them to Ketchup.
+12. **Health wait (HealthWait):** After `initial_delay`, begin sending HTTP GET to `health` path via the container's network namespace IP and declared port. Continue at `interval` until `threshold_healthy` consecutive successes. The state sweep reads a `HealthWait` instance's runtime state as it does a `Running` one's, so a process that exits before its first passing probe is restarted with backoff and records a `restart` event. After 60 consecutive failed probes (`STARTUP_FAILURE_LIMIT`) the instance goes to `Stopping` with cleanup owed; once the kill is confirmed it is marked `Failed`, not restarted, and a `restart.never_healthy` decision records why (#1999).
+13. **Running:** Register the instance in the Onion service map (eBPF kernel map). The workload now receives traffic via DNS resolution and connect() rewriting. Emit a `WorkloadRunning` event, which goes to the leader in the node's next report.
 14. **Ongoing health checking:** HealthChecker continues probing at `interval`. If `threshold_unhealthy` consecutive failures: transition to `Unhealthy`, remove from Onion service map, emit event. If the workload recovers (`threshold_healthy` consecutive passes), transition back to `Running` and re-add to service map.
 15. **Restart on persistent unhealthiness:** If the workload remains `Unhealthy` and the restart policy permits, transition to `Stopping`, send SIGTERM, wait `drain_timeout`, send SIGKILL if still alive, then loop back to step 2 with incremented `restart_count` and exponential backoff.
 
@@ -1086,13 +1135,12 @@ before their Phase 15 cases can use this contract.
 
 **Reconnect after Bun restart:**
 
-1. On startup, Grill queries containerd for all containers with the `reliaburger.managed=true` label.
-2. For each container, reconstruct the `WorkloadId` from container labels.
-3. Re-attach to stdout/stderr streams (Ketchup log capture resumes).
-4. Read the container's current state from containerd.
-5. Resume health checking.
-6. Re-populate the Onion service map from the discovered containers.
-7. Compare the discovered state against the expected state from the reporting tree and reconcile (start missing workloads, stop unexpected ones).
+1. On startup, Bun reads the instance records it wrote for each launch (`adopt_recorded_instances` in `src/bun/agent/records.rs`) and the runtime's durable launch inventory (the runc intent journal, the process records).
+2. For each record, the runtime backend adopts the instance only on positive evidence that it's still the same live launch (`runc state`, the Apple `container inspect`, or the process's pid, start time and boot id). A launch it can't prove is retired, never guessed at.
+3. Re-attach log capture (Ketchup resumes).
+4. Resume health checking.
+5. Re-populate the Onion service map from the adopted instances.
+6. Compare what's running with the placements the leader assigns this node and reconcile (start missing workloads, stop unexpected ones).
 
 ### 5.2 Process Workload Lifecycle
 
@@ -1123,7 +1171,7 @@ before their Phase 15 cases can use this contract.
 
 **Stop a process workload:**
 
-1. Identical to stopping a container, but signals are sent directly to the process PID rather than through containerd.
+1. Identical to stopping a container, but signals are sent directly to the process PID rather than through runc.
 2. Cleanup includes: removing the cgroup, removing the network namespace, deleting the temp script file (if Script), releasing the host port.
 
 ### 5.3 Health Checking
@@ -1221,13 +1269,19 @@ Bun uses cgroup v2 exclusively. The cgroup hierarchy is:
 
 - `memory.max` is the hard limit. When exceeded, the OOM killer activates. This maps to `memory.limit`. It is the only memory field written to the OCI spec (`OciMemoryResources { limit }`).
 
-> **Requests (`cpu.weight` / `memory.high`) — implemented.** When a workload
-> declares a request, Grill emits a `cpu.weight` (from `cpu.request`, via
-> `cpu_weight_from_millicores`) and a `memory.high` (from `memory.request`) into
-> the OCI `linux.resources.unified` map, so runc writes them to the container's
-> cgroup v2. This gives proportional CPU sharing under contention and graceful
-> memory-pressure reclaim before the hard `memory.max` OOM. A limit-only spec
-> (no request) emits no unified entries and is byte-identical to before.
+> **Requests (`cpu.weight`) — implemented.** When a workload declares a CPU
+> request, Grill emits a `cpu.weight` (from `cpu.request`, via
+> `cpu_weight_from_millicores`) into the OCI `linux.resources.unified` map, so
+> runc writes it to the container's cgroup v2. This gives proportional CPU
+> sharing under contention. A memory request is a scheduling reservation only
+> and sets no cgroup file. It used to become `memory.high`, which throttled
+> `runc init` itself (about 10 MiB of anonymous memory with runc 1.4) inside
+> the cgroup before the workload ran: with no swap the kernel can't reclaim
+> it, so an 8 MiB request held the start past Bun's 10 s deadline (#1955).
+> `memory.low` isn't used either, because our parent cgroups carry no
+> protection for it to draw on. A reusable executor's `task` cgroup, which
+> Bun writes itself rather than through runc, follows the same rule: its
+> `memory.high` is `max` and its limit is the only ceiling.
 
 **Process accounting (jobs, #741):**
 
@@ -1405,30 +1459,27 @@ $ relish upgrade rollback [version]
 
 ### 5.6 `node.toml` Parsing
 
-Bun parses `/etc/reliaburger/node.toml` at startup. The parsing sequence:
+Bun reads a node config only when you pass `--config PATH`. Without it, every field takes its default (suitable for a first node or a laptop). There's no default path that Bun looks in: `/etc/reliaburger/node.toml` is just where the quickstart and the systemd units we ship put the file, and they pass it with `--config`.
 
-1. Check for the file at `/etc/reliaburger/node.toml`. If absent, use all defaults (suitable for `relish init` on the first node).
-2. Deserialize the TOML using `serde` with `#[serde(default)]` on all fields.
-3. **Validate:**
-   - `cluster.join` addresses must be valid `host:port` pairs.
-   - `storage.*` paths must be absolute.
-   - `resources.reserved_cpu` must be a valid resource string (e.g. "500m").
-   - `resources.reserved_memory` must be a valid resource string (e.g. "512Mi").
-   - `network.port_range` must have `start < end` and both in 1024-65535.
-   - `process_workloads.allowed_binaries` entries must be absolute paths. If any contain glob characters (`*`, `?`, `[`) and `allow_globs` is false, fail with an error.
-   - `upgrades.external_signing_key` must be a valid `ed25519:` prefixed key if present.
-4. **Auto-detect missing values:**
-   - `node.name`: read from `gethostname()`.
-   - `network.advertise_address`: detect from the default route interface.
-   - GPU labels (`gpu = "true"`, `gpu_model = "a100"`): detect via `/dev/nvidia0` + `nvidia-smi` if `resources.gpu_enabled` is true.
-5. **Create storage directories** if they do not exist. Set ownership to the `reliaburger` system user.
-6. **Hot reload:** Bun watches `node.toml` via `inotify`. On change, it re-parses and applies non-disruptive changes (labels, image config, log retention, metrics intervals). Changes to `storage.*` paths, `network.port_range`, or `cluster.join` require a Bun restart and are logged as warnings.
+1. Deserialize the TOML with `serde`. Every section has `#[serde(default, deny_unknown_fields)]`, so a missing key takes its default and a misspelt or unknown key stops Bun at startup.
+2. **Validate** (`NodeConfig::validate`, `src/config/validate.rs`). Among other checks:
+   - `storage.*` paths and `storage.allowed_host_paths` entries must be absolute.
+   - `resources.reserved_cpu` and `resources.reserved_memory` must be valid resource strings (e.g. "500m", "512Mi").
+   - `network.port_range` must have `start < end`.
+   - `upgrades.external_signing_key`, if present, must parse as a key.
+   Bun doesn't check the form of `cluster.join` addresses; a bad one fails when Bun tries to reach it.
+3. **Fill in missing values:**
+   - `node.name`: `node-<gossip_port>`. It isn't read from the hostname.
+   - `network.advertise_address`: `127.0.0.1`. It isn't detected from the default route, so set it on every node another machine must reach.
+   - GPUs: counted at startup when `resources.gpu_enabled` is true.
+4. **Create storage directories** if they don't exist. When the configured data directory can't be created, Bun falls back to a per-user data directory.
+5. **No hot reload.** Bun doesn't watch `node.toml`. Every change takes effect at the next Bun restart.
 
 ---
 
 ## 6. Configuration
 
-All configuration is in `/etc/reliaburger/node.toml`. Every field has a default; the minimal configuration for joining a cluster is:
+Node configuration is the TOML file passed with `bun --config` (conventionally `/etc/reliaburger/node.toml`). Every field has a default; the minimal configuration for joining a cluster is:
 
 ```toml
 [cluster]
@@ -1438,9 +1489,11 @@ join = ["10.0.1.5:9443"]
 
 ### 6.1 Full Reference
 
+The table below covers the common keys, not all of them. The [manual's node config sections](../manual/13_reference.md#node-config-sections) and `src/config/node.rs` are the authority: every section refuses keys it doesn't know, so a key that isn't in the code stops Bun at startup.
+
 | Section | Key | Default | Valid Range / Type | Description |
 |---------|-----|---------|--------------------|-------------|
-| `[node]` | `name` | hostname | string | Human-readable node name. Must be unique in the cluster. |
+| `[node]` | `name` | `node-<gossip_port>` | string | Human-readable node name. Must be unique in the cluster. |
 | `[node.labels]` | (any key) | (none) | string key-value pairs | Arbitrary labels for placement constraints. `zone`, `rack`, `storage`, `role` are common. |
 | `[cluster]` | `name` | `default` | DNS-style name | Stable cluster identity and SPIFFE trust domain. Must match on every node. |
 | `[cluster]` | `join` | `[]` | list of `"host:port"` strings | Addresses of existing cluster members. Empty for first node. |
@@ -1453,25 +1506,19 @@ join = ["10.0.1.5:9443"]
 | `[runtime]` | `allowed_capabilities`, `allowed_sysctls`, `allowed_devices` | `[]` | capability names; namespaced sysctl names or `net.`/`fs.mqueue.` prefixes ending in `.*`; device paths under `/dev` | The runtime knobs an app's `[app.x.runtime]` may use on this node (#1122). Advertised to the scheduler only on rootful runc. See deployments 5.10. |
 | `[resources]` | `reserved_cpu` | `"500m"` | resource string (millicores) | CPU reserved for system + Bun. Not allocatable. |
 | `[resources]` | `reserved_memory` | `"512Mi"` | resource string (bytes) | Memory reserved for system + Bun. Not allocatable. |
-| `[resources]` | `reserved_disk` | `"10Gi"` | resource string (bytes) | Disk reserved for system. |
 | `[resources]` | `gpu_enabled` | `true` | bool | Auto-detect NVIDIA GPUs (probe `/dev/nvidia0`, parse `nvidia-smi`) at startup. When false, GPU workloads are refused on this node. |
-| `[network]` | `advertise_address` | auto-detect | IP address | IP address this node advertises to the cluster. |
-| `[network]` | `port_range` | `{ start = 10000, end = 32767 }` | `"start-end"`, both in 1024-65535 | Ephemeral port range for container port mapping. |
-| `[images]` | `max_storage` | `"50Gi"` | resource string (bytes) | Maximum disk space for Pickle image layers. |
-| `[images]` | `redundancy` | `2` | 1-10 | Number of peers to replicate pushed images to immediately. |
-| `[images]` | `gc_retain_tags` | `10` | 1-1000 | Keep this many most-recent tags per repository. |
-| `[images]` | `gc_retain_days` | `30` | 1-365 | Keep images accessed within this many days. |
-| `[images]` | `pre_pull` | `true` | bool | Pre-pull images referenced by scheduled workloads. |
+| `[network]` | `advertise_address` | `127.0.0.1` | IP address | IP address this node advertises to the cluster. Not auto-detected: set it on any node another machine must reach. |
+| `[network]` | `port_range` | `{ start = 10000, end = 32767 }` | table of `start` and `end` (end exclusive); `start` must be below `end` | Ephemeral port range for container port mapping. |
+| `[images]` | `max_storage` | `"0"` | resource string (bytes), `"0"` is unlimited | Maximum disk space for Pickle image layers. |
+| `[images]` | `redundancy` | `2` | integer | Number of copies of each pushed layer, the pusher's included. |
+| `[images]` | `gc_retain_days` | `7` | days | Keep images accessed within this many days. |
 | `[images]` | `external_registries` | `[]` | list of registry objects | External OCI registries for pulling images not in Pickle. |
 | `[images]` | `mirrors` | `{}` | map of upstream host to mirror `host[:port]` | Registries tried first for digest-pinned images; the upstream is the fallback. |
-| `[logs]` | `retention_days` | `7` | 1-365 | Days to retain uncompressed logs. |
-| `[logs]` | `compressed_retention_days` | `30` | 1-3650 | Days to retain compressed logs. |
-| `[logs]` | `max_storage` | `"20Gi"` | resource string (bytes) | Maximum disk space for logs. |
-| `[metrics]` | `collection_interval` | `"10s"` | duration, 1s-5m | How often to scrape workload metrics endpoints. |
-| `[metrics]` | `retention_full` | `"24h"` | duration, 1h-7d | Retention for full-resolution metrics. |
-| `[metrics]` | `retention_1m` | `"7d"` | duration, 1d-365d | Retention for 1-minute downsampled metrics. |
-| `[metrics]` | `retention_1h` | `"90d"` | duration, 7d-3650d | Retention for 1-hour downsampled metrics. |
-| `[metrics]` | `max_storage` | `"5Gi"` | resource string (bytes) | Maximum disk space for metrics. |
+| `[logs]` | `retention_days` | `7` | days | Days to keep log files. |
+| `[logs]` | `max_storage_mb` | `2048` | megabytes, `0` is unlimited | Maximum disk space for logs. |
+| `[metrics]` | `collection_interval_secs` | `10` | seconds, above 0 | How often Bun collects its node's metrics. |
+| `[metrics]` | `retention_days` | `7` | days | Days to keep metrics files. |
+| `[metrics]` | `max_storage_mb` | `1024` | megabytes, `0` is unlimited | Maximum disk space for metrics. |
 | `[ingress]` | `enabled` | `false` | bool | Whether this node serves external ingress traffic. |
 | `[ingress]` | `http_port` | `80` | 1-65535 | HTTP listen port for Wrapper. |
 | `[ingress]` | `https_port` | `443` | 1-65535 | HTTPS listen port for Wrapper. |
@@ -1482,9 +1529,8 @@ join = ["10.0.1.5:9443"]
 | `[testing]` | `allowed_operations` | `[]` | list of operation names | Server-owned permissions for diagnostics, isolated workloads, faults, node changes, capacity saturation and external probes. |
 | `[testing]` | `allow_protected_mutation` | `false` | bool | Additional server-side gate for mutation on unknown/production clusters. A client flag cannot change it. |
 | `[testing]` | `max_lease_seconds` | `3600` | positive integer seconds | Maximum lifetime of a server-owned test resource lease. |
-| `[process_workloads]` | `allow_globs` | `false` | bool | Allow glob patterns in `allowed_binaries`. |
 | `[upgrades]` | `external_signing_key` | (none) | `"ed25519:..."` | External signing key for dual-signature verification. Required for network upgrades. |
-| `[upgrades]` | `retain_versions` | `3` | 1-10 | Number of previous binary versions to keep on disk. |
+| `[upgrades]` | `retain_versions` | `3` | at least 1 | Number of previous binary versions to keep on disk. |
 | `[testing]` | `external_probe_allowlist` | `[]` | exact `host:port` strings | External destinations `relish path` may probe after its independent Admin, operation and protected-cluster checks; an empty list permits none. Wildcards and CIDRs do not match. |
 
 ---
@@ -1501,7 +1547,7 @@ workload at +500 (see "Node-wide OOM order").
 
 **Impact:**
 
-- Running containers are NOT affected. containerd/runc keeps them alive.
+- Running containers are NOT affected. runc's containers (and the Apple VMs) don't depend on Bun's process.
 - eBPF programs persist in the kernel. Onion service discovery and firewall rules continue functioning for existing connections.
 - No new containers can be started or stopped.
 - Health checking pauses. Unhealthy instances are not removed from the service map until Bun restarts and re-evaluates.
@@ -1509,29 +1555,29 @@ workload at +500 (see "Node-wide OOM order").
 - Metrics collection (Mayo) stops.
 - The Onion service map becomes stale (no updates for new workloads or health changes).
 
-**Recovery:** systemd restarts Bun. On startup, Bun reconnects to running containers (see 5.1 reconnect), resumes all operations, and reconciles state with the cluster via the reporting tree.
+**Recovery:** systemd restarts Bun. On startup, Bun reconnects to running containers (see 5.1 reconnect), resumes all operations, and reconciles state with the cluster: it polls the leader for its placements and reports to it.
 
 A restart may also change the runtime flag. When a node moves from `--runtime runc` or `--runtime process` to `mixed` (or to `auto`, which selects `mixed` where runc exists), its running workloads have no `runtime-routes` entry, because only the mixed runtime writes routes. Before startup recovery reads the launch inventory, and after the runtime has its workload DNS resolver (each runc launch records the resolver, and the runc journal refuses a live launch recorded under a different one, #839), Bun routes each launch that exactly one backend's ownership journal lists, and that fits that backend, to it, and logs the instances it routed. Without this step every `runc` to `mixed` restart with running containers failed and systemd restarted Bun in a loop (#823). A launch both backends list stays unrouted and recovery refuses it. An image app that the process runtime ran as a host process couldn't be routed either (#827), but the process runtime now refuses image apps (#914), and 0.2.1 starts from fresh state, so no such launch exists to route.
 
-### 7.2 Container Runtime (containerd) Crash
+### 7.2 Container Runtime Failure
 
-**What happens:** containerd exits unexpectedly.
+**What happens:** A runtime command (`runc run`, `runc state`, `runc kill`, or the Apple `container` CLI) fails or hangs.
 
-**Detection:** Bun's Grill layer detects the broken gRPC connection to the containerd socket.
+**Detection:** Grill runs each command as a child process with a deadline (a `runc` start gets 10 s) and reads its exit status. There's no runtime daemon to lose: no containerd and no gRPC socket.
 
 **Impact:**
 
-- Running containers continue (runc is the actual runtime; containerd is the management layer).
-- Bun cannot start, stop, or inspect containers until containerd restarts.
-- Health checks that probe the workload's network endpoint still work (they use the network namespace directly, not containerd).
+- Running containers continue: each is its own process tree, not a child of a daemon.
+- The one operation fails. A start that fails marks the instance failed, and the supervisor's restart path tries again with back-off.
+- Health checks that probe the workload's network endpoint still work.
 
-**Recovery:** systemd restarts containerd. containerd reconnects to running containers via shim processes. Bun's Grill layer re-establishes the gRPC connection and resumes operations.
+**Recovery:** Nothing to restart. The next command runs a fresh runtime process.
 
 ### 7.3 Node Disk Full
 
 **What happens:** A storage path runs out of space.
 
-**Detection:** Bun monitors disk usage for each configured storage path. Alerts fire at 80% utilisation (warning) and 90% (critical). `relish wtf` reports disk pressure.
+**Detection:** Bun monitors disk usage for each configured storage path. The one built-in disk alert, `disk_high`, fires as a warning when node disk usage stays above 80% for 5 minutes (`src/mayo/alert.rs`). `relish wtf` reports disk pressure.
 
 **Impact:** Depends on which path is full:
 
@@ -1551,7 +1597,7 @@ A restart may also change the runtime flag. When a node moves from `--runtime ru
 - The leader prunes finished runs an hour after they finish with a replicated `Prune` write on its one-second tick, not only on the next registration, and each worker deletes a run's directory once the leader stops listing it. An idle cluster therefore returns to its baseline disk use.
 - Task data counts toward disk pressure, and so does the audit log under `{data}/audit` (#798; `disk_pressure::node_data_bytes`). When they pass a quarter of the filesystem, or less than 1 GiB of it is free (absolute, since 5% of a large disk is tens of gigabytes), the worker keeps running and reporting the chunks it holds but advertises zero free slots, so the leader grants it nothing new until retention frees space.
 - Executor metadata is collected. Every reusable executor runs under a stable identity per namespace and slot, and each identity used to leave a runc intent record and lock, a bundle directory, a host owner directory and, on mixed nodes, a `runtime-routes/<id>.{json,lock}` pair behind for good, so metadata grew with every namespace that had ever run a job. Once retirement is proven (helper stopped, task cgroup empty, no published address), `Grill::forget_retired` deletes all of them. It refuses, and deletes nothing, while anything the identity owns might still be live, and lock files are unlinked only while held, so a failure can only leave metadata behind. Forgets of different identities run concurrently and share one garbage directory; a deletion another forget finished counts as done, so concurrent forgets never leave a route behind. Inventory snapshots list, then read: a host owner directory, a runc intent record or a mixed route that a concurrent forget removed in between has left, and the snapshot leaves it out. A mixed launch the backend still lists without its route is still refused (#924). At startup Bun sweeps this node's retired executor identities and any route file with no launch behind it. The same sweep removes this node's executor slot cgroups (`<namespace>/executor-<prefix>[-reuse|-host]/<slot>`) that no launch in a complete runtime inventory owns (#952). A slot's group belongs to the executor pool that ran it, and a killed Bun's pool dies with it: startup retirement removes the runtime's `helper` and `task` leaves, but nothing else removed the empty slot until a task needed that slot again, minutes later under a light load. Only empty groups can go, since the kernel refuses to remove a populated cgroup.
-- App instance metadata is collected too (#738). App instances share none of the executor path: the agent asks the runtime to forget an instance once the supervisor has let it go, which happens when its app is deleted, when a scale-down or a rollout retires it (including a retirement that waited for remote release), and when startup retires a launch it doesn't adopt. A plain `relish stop` forgets nothing, because its stopped replicas stay owned until an apply rolls over them, and an adopted instance keeps everything. The deletion runs in a task, so no agent turn waits on its fsyncs, and the same refusal rules apply, including against a successor generation of a reused identity. Anything a refusal or a crash leaves behind is a retired launch with no adoption record, which the next start retires and forgets. Because the forget is spawned, it can rename a record away while an inventory read (startup adoption's, for one) is between listing the records and reading them; the inventory leaves out a record that vanished that way, since only a forget removes a published record and only a retired one, while a record directory that's still there without a readable intent still refuses (#877). An instance's init containers (`<id>__init-<n>`) go with it (#850). The deploy worker reads each initialiser's runtime generation straight after creating it and hands it to the loop, and retirement asks the runtime to forget exactly that generation (`Grill::forget_retired_generation`). An immediate redeploy reuses the same initialiser identity, so the runtime refuses while any other generation owns it: a forget that lands after the redeploy's initialiser launched can't delete the journal holding that initialiser's exit code. An initialiser a live or pending parent has registered again is skipped outright. One whose generation the runtime couldn't report, or that an adopted instance ran before a restart, is a launch without an adoption record, which the next start forgets. The process runtime's `prepare` starts again from nothing if a forget removed the retired generation while it waited for the identity's locks, so a redeploy can't fail on a journal that vanished under it.
+- App instance metadata is collected too (#738). App instances share none of the executor path: the agent asks the runtime to forget an instance once the supervisor has let it go, which happens when its app is deleted, when a scale-down or a rollout retires it (including a retirement that waited for remote release), and when startup retires a launch it doesn't adopt. A plain `relish stop` forgets nothing, because its stopped replicas stay owned until an apply rolls over them, and an adopted instance keeps everything. The deletion runs in a task, so no agent turn waits on its fsyncs, and the same refusal rules apply, including against a successor generation of a reused identity. Anything a refusal or a crash leaves behind is a retired launch with no adoption record, which the next start retires and forgets. Because the forget is spawned, it can rename a record away while an inventory read (startup adoption's, for one) is between listing the records and reading them; the inventory leaves out a record that vanished that way, since only a forget removes a published record and only a retired one, while a record directory that's still there without a readable intent still refuses (#877). The process runtime's single-instance status read follows the same rule: a journal lost because its whole directory was forgotten reads as not found, while a directory still there without its journal refuses (#2032). An instance's init containers (`<id>__init-<n>`) go with it (#850). The deploy worker reads each initialiser's runtime generation straight after creating it and hands it to the loop, and retirement asks the runtime to forget exactly that generation (`Grill::forget_retired_generation`). An immediate redeploy reuses the same initialiser identity, so the runtime refuses while any other generation owns it: a forget that lands after the redeploy's initialiser launched can't delete the journal holding that initialiser's exit code. An initialiser a live or pending parent has registered again is skipped outright. One whose generation the runtime couldn't report, or that an adopted instance ran before a restart, is a launch without an adoption record, which the next start forgets. The process runtime's `prepare` starts again from nothing if a forget removed the retired generation while it waited for the identity's locks, so a redeploy can't fail on a journal that vanished under it.
 
 ### 7.4 Process Workload Binary Missing
 
@@ -1579,7 +1625,7 @@ A restart may also change the runtime flag. When a node moves from `--runtime ru
 
 **Detection:** The new Bun exits within 30 seconds (`boot_grace_secs`), or fails to rejoin gossip within 60 seconds (`gossip_rejoin_secs`). Both clocks start once the new Bun can answer `/v1/version`, that is once its own binary hash is ready, and no later than one rejoin period after its upgrade task starts ([#771](https://github.com/reliaburger/reliaburger/issues/771)). Bun starts that hash at boot on a detached thread, not Tokio's blocking pool, because dropping the runtime waits for blocking-pool tasks: a start-up error exits at once rather than after the hash of a large binary finishes ([#816](https://github.com/reliaburger/reliaburger/issues/816)).
 
-**Impact:** This node is temporarily unable to accept new work. Running containers are unaffected (containerd manages them independently).
+**Impact:** This node is temporarily unable to accept new work. Running containers are unaffected: they don't depend on Bun's process.
 
 **Recovery:** Automatic rollback. Bun reverts the symlink to the previous version, execs the old binary, and reports the failure to the leader. The leader pauses the cluster-wide upgrade. The operator can fix the issue and resume, or roll back the entire cluster.
 
@@ -1587,16 +1633,16 @@ A restart may also change the runtime flag. When a node moves from `--runtime ru
 
 **What happens:** This node loses connectivity to the gossip mesh.
 
-**Detection:** Mustard detects the absence of heartbeats from peers. The reporting tree parent detects the node as unreachable.
+**Detection:** Mustard detects the absence of heartbeats from peers. The leader's aggregator marks the node's reports stale.
 
 **Impact:**
 
 - The node continues running its workloads normally.
-- The cluster stops routing new traffic to this node's workloads (the service map on other nodes is updated by their respective Bun agents based on gossip/reporting tree state, not by this node).
+- The cluster stops routing new traffic to this node's workloads (the service map on other nodes is updated by their own Bun agents from the leader's endpoint catalogue, not by this node).
 - The node cannot receive new scheduling decisions.
 - If the node was a council member, it may fall behind on Raft.
 
-**Recovery:** When connectivity is restored, Mustard's gossip protocol converges within seconds. The reporting tree re-establishes. The node reconciles its state and resumes normal operation.
+**Recovery:** When connectivity is restored, Mustard's gossip protocol converges within seconds. The node's reports to the leader resume. The node reconciles its state and resumes normal operation.
 
 ### 7.8 OOM Kill of a Workload
 
@@ -1716,7 +1762,7 @@ The scenarios count work rather than timing turns against the host's disk (#508,
 | **Self-upgrade replaces the Bun binary** | A compromised upgrade could replace the orchestrator | Dual-signature verification (embedded key set + external key), no auto-update, admin role required, binary verified twice (leader + each node) |
 | **Secret decryption in Bun's memory** | Bun process memory contains plaintext secrets | Secrets are decrypted in memory only, never written to disk. `mlock()` the decryption buffer to prevent swapping. Zero the buffer after injection. |
 | **eBPF programs run in kernel space** | A malicious eBPF program could compromise the kernel | eBPF programs are compiled into the Bun binary (not loaded from external files). The kernel's BPF verifier rejects unsafe programs. |
-| **containerd socket access** | Access to the containerd socket allows arbitrary container operations | The socket is owned by root and the `reliaburger` group. Only Bun has access. It is NOT mounted into any workload's namespace. |
+| **Runtime state access** | Write access to runc's state directory or Bun's OCI bundles allows arbitrary container operations | There is no runtime daemon or socket. runc's state and the bundles live under root-owned directories that only Bun uses, and none is mounted into any workload's namespace. |
 | **Smoker fault injection** | Faults could disrupt production | Workload faults require Deployer plus the server's `inject_workload_faults` grant and acknowledgement; node/council and pressure faults require Admin plus their matching server grants. Duration limits, no persistence across restarts and blast-radius guards still apply. |
 | **`node.toml` contains external signing key** | Compromise of `node.toml` reveals the external key | File permissions 0600, owned by root. The external key is a public-key-like verification key, not a signing private key -- it verifies signatures, it cannot create them. |
 | **Inline script execution** | Arbitrary code execution via git push | Lettuce enforces `require_signed_commits` for any config containing `script` fields. Scripts must be signed by a trusted key. |
@@ -1752,7 +1798,7 @@ The scenarios count work rather than timing turns against the host's disk (#508,
 │    Isolated PID, network, mount, UTS, user namespace│
 │    Seccomp profile applied                           │
 │    Cgroup resource limits enforced                   │
-│    No access to containerd socket, Bun state, or    │
+│    No access to runtime state, Bun state, or        │
 │    other workloads' volumes/tmp                      │
 └─────────────────────────────────────────────────────┘
                          │
@@ -1808,13 +1854,13 @@ The default seccomp profile blocks the following syscall families (identical for
 | Apps per node | 500 | Design goal from Section 2 |
 | Per-app overhead (Bun tracking) | < 1ms | Sub-millisecond at 500 apps |
 | Memory per app (Bun tracking) | ~1.2 MB | Measured: 312 MB at 500 apps vs 48 MB idle = ~528 KB tracking + workload overhead |
-| Bun agent memory (idle) | ~48 MB | Baseline: Tokio runtime, eBPF management, gRPC channels, config |
+| Bun agent memory (idle) | ~48 MB | Baseline: Tokio runtime, eBPF management, gossip and Raft, config |
 | Bun agent memory (500 apps) | ~312 MB | Scales linearly with app count |
 | eBPF service map entries | 500/node, 5M cluster-wide (10K nodes) | One entry per workload instance |
 | eBPF map memory (kernel) | ~0.8 MB per node | Measured at ~5,800 entries |
 | Health check latency (per probe) | < 5ms p99 (same node) | HTTP GET via network namespace; no proxy hop |
 | Port allocation | O(1) | Bitmap-based allocator, random selection |
-| Container start time (image cached) | < 1.2s to first healthy | Measured: containerd create + task start + health pass |
+| Container start time (image cached) | < 1.2s to first healthy | Measured: bundle write + `runc run` + health pass |
 | Self-upgrade per node | ~40s | Drain + stage + exec + reconnect + health verify |
 | Self-upgrade full cluster (12 nodes) | ~8 min | Sequential workers + sequential council + leader |
 
@@ -1822,7 +1868,7 @@ The default seccomp profile blocks the following syscall families (identical for
 
 **500 apps per node:** At 500 apps, Bun manages 500 cgroups, 500 network namespaces, 500 health check loops, and 500 entries in the Onion service map. The HealthChecker processes ~50 health checks per second (500 apps / 10s interval). Each check is a non-blocking HTTP GET that completes in microseconds to milliseconds. The Tokio runtime handles this without thread-per-check overhead.
 
-**10,000 nodes:** Bun itself is not affected by cluster size. The reporting tree ensures that each Bun instance communicates only with its parent (a council member), not with all other nodes. The Onion service map on each node contains entries for all workloads in the cluster (~5M at max density), which fits comfortably in kernel memory (~80 bytes per entry = ~400 MB, well within typical server memory).
+**10,000 nodes:** Bun's own work doesn't grow with cluster size, but today every Bun reports straight to the leader, and the leader refuses report connections from about 500 nodes up (#1411). The planned reporting tree (#364) would have each Bun talk only to its parent council member. The Onion service map on each node contains entries for all workloads in the cluster (~5M at max density), which fits comfortably in kernel memory (~80 bytes per entry = ~400 MB, well within typical server memory).
 
 **Port allocation at density:** The default port range of 10000..32767 provides about 22,700 ports, all below Linux's ephemeral range (32768-60999). At 500 apps with rolling deploys (briefly 2x ports during transitions), this is 1,000 ports maximum, about 4% utilisation. Port exhaustion is not a concern.
 
@@ -1831,7 +1877,7 @@ The default seccomp profile blocks the following syscall families (identical for
 ```
 Bun process:
   Tokio runtime + core:                 ~15 MB
-  Grill (containerd client, state):     ~8 MB
+  Grill (runtime state, records):       ~8 MB
   Onion (eBPF management, userspace):   ~5 MB
   Ketchup (log buffers):                ~5 MB
   Mayo (local metrics state):           ~5 MB
@@ -1850,9 +1896,8 @@ Bun process:
     Per-workload:                       ~5 KB
     500 workloads:                      ~2.5 MB
 
-  Majority of the 312 MB at 500 apps is containerd client state,
-  cached container metadata, and Ketchup log buffers for active
-  streams.
+  Majority of the 312 MB at 500 apps is cached container metadata
+  and Ketchup log buffers for active streams.
 ```
 
 ---
@@ -1869,13 +1914,12 @@ Unit tests cover individual components in isolation using mocked dependencies.
 - Port allocation and release (no leaks, no duplicates, correct range enforcement)
 - Cgroup path construction and parameter calculation (millicores to `cpu.max` conversion, memory limit encoding)
 - Container state machine transitions (all valid transitions, rejection of invalid transitions)
-- Reconnect logic (mock containerd returning containers with Reliaburger labels)
+- Reconnect logic (a mock runtime adopting recorded instances, and refusing ones it can't prove live)
 
 **ProcessManager unit tests:**
 
 - Binary allowlist validation (exact match, glob match, glob rejection when `allow_globs = false`)
 - Mount namespace construction (default visible paths, blocked paths, `allow_paths` with `:rw` suffix)
-- Script temp file creation and hash computation
 - Isolation config derivation from `AppSpec`
 
 **HealthChecker unit tests:**
@@ -1986,7 +2030,7 @@ Bun Restart
 
 **What we do differently:**
 
-- kubelet communicates with the API server directly; Bun uses a hierarchical reporting tree to avoid all-to-all communication.
+- kubelet communicates with the API server directly. So, today, does Bun: it reports to the leader. A hierarchical reporting tree is planned (#364).
 - kubelet manages Pods (groups of containers with shared namespaces); Bun manages individual workloads (one process per isolation boundary). The Pod abstraction adds complexity that is rarely needed.
 - kubelet has no concept of process workloads. Running host binaries under orchestrator control requires workarounds (hostPath volumes, privileged containers, or DaemonSets with host networking).
 - kubelet does not manage its own upgrades. Cluster upgrades require external tooling (kubeadm, kops, EKS/GKE managed control plane).
@@ -2022,7 +2066,7 @@ Bun Restart
 **What we do differently:**
 
 - Docker is a general-purpose container runtime; Grill is purpose-built for Reliaburger's specific needs (eBPF integration, Onion service map updates, Ketchup log capture, Mayo metrics).
-- Docker uses its own runtime; Grill uses containerd (which Docker also uses internally, but we skip the Docker daemon layer).
+- Docker runs containers through the dockerd and containerd daemons; Grill calls runc (or the Apple `container` CLI) directly, with no daemon at all.
 - Docker has no concept of cluster scheduling, health-check-aware service discovery, or process workloads.
 
 ### 11.4 containerd
@@ -2033,14 +2077,12 @@ Bun Restart
 
 **What we borrow:**
 
-- containerd is our actual container runtime. Grill is an abstraction layer on top of containerd's gRPC API.
-- containerd's shim model (shim processes that outlive the daemon) is what enables containers to survive Bun restarts.
 - Content-addressed storage for image layers (Pickle extends this pattern to cluster-wide distribution).
+- The idea that containers outlive their manager. containerd gets it from shim processes; we get it from runc's own state, which survives Bun restarts, plus Bun's launch records.
 
 **What we do differently:**
 
-- We use containerd as a library/service, not as a user-facing tool. Operators never interact with containerd directly.
-- We do not use containerd's built-in CRI plugin (which is designed for Kubernetes). We use the lower-level containerd API directly via Grill.
+- We don't use containerd at all. An early draft of this doc did; the shipped Grill drives runc directly (see the decision log in §1). containerd would have kept a second copy of the state Bun already keeps, and added a socket and a daemon to keep alive.
 
 ### 11.5 systemd
 
@@ -2062,7 +2104,7 @@ Bun Restart
 
 | Crate | Purpose | Version | License | Maturity | Notes |
 |-------|---------|---------|---------|----------|-------|
-| `tokio` | Async runtime | 1.x | MIT | Mature, production-grade | The foundation for all async operations. Multi-threaded runtime with work-stealing scheduler. Pin Bun's critical tasks (health checker, reporting tree) to dedicated threads at high density. |
+| `tokio` | Async runtime | 1.x | MIT | Mature, production-grade | The foundation for all async operations. Multi-threaded runtime with work-stealing scheduler. Pin Bun's critical tasks (health checker, report worker) to dedicated threads at high density. |
 | `nix` | Safe Rust bindings for Unix APIs | 0.29+ | MIT | Mature | `clone()`, `unshare()`, `mount()`, `pivot_root()`, `setns()`, `prctl()`, signal handling. Essential for process workload namespace setup. |
 | `toml` + `serde` | TOML parsing and serialisation | latest | MIT/Apache-2.0 | Mature | For `node.toml` parsing and all TOML-based configuration. `serde` provides `#[serde(default)]` for optional fields with defaults. |
 | `age` | age encryption/decryption | 0.10+ | MIT/Apache-2.0 | Stable | For decrypting `ENC[AGE:...]` secrets. The `age` crate is the canonical Rust implementation of the age encryption format. |
@@ -2077,7 +2119,7 @@ Bun Restart
 
 **`nftnl` GPL concern:** The `nftnl` crate has a GPL-2.0 license. If this is incompatible with the project's licensing, the alternative is to invoke the `nft` CLI as a subprocess for nftables management. This is slightly less performant (process spawn per rule change) but avoids the license issue. Atomic rule application is still possible via `nft -f <file>`.
 
-**`containerd-client` vs raw gRPC:** Using the official `containerd-client` crate saves effort and ensures API compatibility. The trade-off is a dependency on the containerd project's release cadence. If the crate lags behind containerd releases, we can fall back to raw `tonic` gRPC with protobuf definitions generated from containerd's `.proto` files.
+**`containerd-client` vs raw gRPC:** Settled by not using containerd (see the §1 decision log). Grill runs the runtime CLIs as child processes.
 
 ---
 
@@ -2089,7 +2131,7 @@ Bun Restart
 
 3. **HealthChecker concurrency model:** At 500 apps with 10-second intervals, the HealthChecker issues ~50 probes/second. This is easily handled by a single async task. But if health check timeouts are long (e.g., 30 seconds for a slow backend), many probes may be in-flight simultaneously. Should health checks have a per-node concurrency limit? Or should we rely on Tokio's task scheduling and the timeout mechanism?
 
-4. **containerd version pinning:** Should Bun pin to a specific containerd version (and potentially bundle it), or should it support a range of containerd versions? Bundling ensures compatibility but increases the binary size and maintenance burden. Supporting a range requires version detection and conditional code paths.
+4. **containerd version pinning:** Moot: Bun doesn't use containerd. The live version of this question is which runc versions Grill supports.
 
 5. **Process workload restart backoff ceiling:** What should the maximum restart backoff be for a persistently failing process workload? Container orchestrators typically cap at 5 minutes. Should process workloads have a different ceiling, given that they are often system-level daemons that the operator expects to keep trying?
 

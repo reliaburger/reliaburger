@@ -179,7 +179,7 @@ async fn leader() -> Arc<CouncilNode> {
     )
     .await
     .unwrap();
-    router.register(1, node.raft().clone()).await;
+    router.register(1, &node).await;
     node.initialize(BTreeMap::from([(1, CouncilNodeInfo::default())]))
         .await
         .unwrap();

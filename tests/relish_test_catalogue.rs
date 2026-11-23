@@ -12,8 +12,8 @@ mod bun_process;
 #[cfg(target_os = "linux")]
 use bun_process::spawn_bun_with_runtime_port_retry;
 use bun_process::{
-    WAIT, assert_success, reserve_address, reserve_ports, run_relish, spawn_bun_with_port_retry,
-    wait_for_relish,
+    WAIT, assert_success, reserve_address, reserve_ports, run_relish, run_relish_init,
+    spawn_bun_with_port_retry, wait_for_relish,
 };
 
 #[test]
@@ -51,14 +51,7 @@ struct SecureNode {
 fn start_secure_process_node(root: &std::path::Path) -> SecureNode {
     let cluster_dir = root.join("cluster");
     assert_success(
-        &run_relish(&[
-            "init",
-            cluster_dir.to_str().unwrap(),
-            "--cluster-name",
-            "token-lease",
-            "--node-id",
-            "node-01",
-        ]),
+        &run_relish_init(&cluster_dir, "token-lease", "node-01"),
         "initialise scoped-token fixture",
     );
     let node_path = cluster_dir.join("reliaburger.toml");
@@ -164,8 +157,11 @@ fn qualify_process_catalogue(filter: &str) {
         "--timeout",
         match filter {
             "jobs" => "90s",
-            // The job cases take about 5 s; a passing case ends early.
-            PROCESS_JOB_CASES => "30s",
+            // The job cases take about 5 s idle. A failing job's three
+            // attempts each start and retire a process owner through
+            // fsync'd journal writes, which ran past 30 s at load 25
+            // (#2035). A passing case ends early.
+            PROCESS_JOB_CASES => "60s",
             _ => "15s",
         },
     ]);
@@ -391,14 +387,7 @@ fn qualify_runc_catalogue(group: &str) {
     let root = tempfile::tempdir().unwrap();
     let cluster_dir = root.path().join("cluster");
     assert_success(
-        &run_relish(&[
-            "init",
-            cluster_dir.to_str().unwrap(),
-            "--cluster-name",
-            "identity-catalogue",
-            "--node-id",
-            "node-01",
-        ]),
+        &run_relish_init(&cluster_dir, "identity-catalogue", "node-01"),
         "initialise catalogue fixture",
     );
     let node_path = cluster_dir.join("reliaburger.toml");

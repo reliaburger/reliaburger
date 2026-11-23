@@ -215,6 +215,217 @@ pub(super) async fn release_handler(
     .await
 }
 
+/// The body of `POST /v1/scale/{app}/{namespace}`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ScaleRequest {
+    /// The new replica count, at least 1.
+    replicas: u32,
+    /// The count the caller saw in the app's spec, as `kubectl scale
+    /// --current-replicas` takes it: when the spec has another count now,
+    /// the scale is refused rather than overwriting whoever changed it.
+    /// `None` skips the check.
+    #[serde(default)]
+    current_replicas: Option<u32>,
+}
+
+/// `POST /v1/scale/{app}/{namespace}`: set an app's replica count (#2176).
+///
+/// The count goes into the app's spec in the council, through the same
+/// path as `relish apply` (`cluster_apply`): policy, owners, agent leases,
+/// the audit record and the Raft write are all the apply's. The rest of
+/// the spec is the one the council holds, so the scale changes nothing
+/// else, and the image stays the bytes it was bound to. It isn't an
+/// override: the next apply of the app's file puts back the file's count,
+/// and a plan against the file shows the difference until then.
+///
+/// Refused: zero (that's `relish stop`), an autoscaled app, a daemon set,
+/// an app GitOps manages without `?force=true`, and a `current_replicas`
+/// that isn't the count now. A follower forwards the whole request to the
+/// leader, which reads the spec from its own state. A standalone node has
+/// no desired state to change.
+pub(super) async fn scale_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    binder: Option<axum::Extension<crate::pickle::binding::ImageBinder>>,
+    State(state): State<ApiState>,
+    Path((app, namespace)): Path<(String, String)>,
+    Query(query): Query<ForceQuery>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
+    {
+        return resp;
+    }
+    if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
+    if let Err(resp) = enforce_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Scale,
+        &app,
+        &namespace,
+    )
+    .await
+    {
+        return resp;
+    }
+    // Parsed after the checks above, so a caller who may not scale the app
+    // learns that, not what's wrong with their body.
+    let request: ScaleRequest = match serde_json::from_str(&body) {
+        Ok(request) => request,
+        Err(error) => {
+            return scale_refused(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "the body is {{\"replicas\": N}}, optionally with \"current_replicas\": {error}"
+                ),
+            );
+        }
+    };
+    let Some(council) = state.council.clone() else {
+        return scale_refused(
+            StatusCode::BAD_REQUEST,
+            "a standalone node keeps no desired state to scale; change `replicas` in the \
+             app's file and run `relish apply`"
+                .to_string(),
+        );
+    };
+    if !crate::bun::leadership::leads(&council).await {
+        return super::deploys::forward_streamed_to_leader(
+            &state,
+            &council,
+            super::deploys::StreamedChange {
+                verb: "scale",
+                app: &app,
+                namespace: &namespace,
+                force: query.force,
+                body,
+            },
+            &headers,
+        )
+        .await;
+    }
+    let app_id = crate::meat::AppId::new(&app, &namespace);
+    if let Some(refusal) =
+        super::apply::owner_command_refusal(&council, auth.as_deref(), &app_id, "scale").await
+    {
+        return refusal;
+    }
+    if let Some(refusal) =
+        gitops_managed_refusal(&council, &app, &namespace, "scale", query.force).await
+    {
+        return refusal;
+    }
+    let config = match scaled_config(
+        &council.desired_state().await,
+        &app_id,
+        request.replicas,
+        request.current_replicas,
+    ) {
+        Ok(config) => config,
+        Err((status, message)) => return scale_refused(status, message),
+    };
+    let raw = toml::to_string(&config).unwrap_or_default();
+    cluster_apply(
+        state.clone(),
+        council,
+        config,
+        raw,
+        None,
+        headers,
+        None,
+        binder.map(|extension| extension.0),
+        auth.map(|extension| extension.0),
+    )
+    .await
+}
+
+/// The one-app config a scale applies: the app's stored spec with
+/// `replicas` in place of its count, or why there's none. The stored spec
+/// is the effective one, images bound to digests, so re-applying it runs
+/// the same bytes; a tag isn't resolved again.
+fn scaled_config(
+    desired: &crate::council::types::DesiredState,
+    app_id: &crate::meat::AppId,
+    replicas: u32,
+    current_replicas: Option<u32>,
+) -> Result<Config, (StatusCode, String)> {
+    use crate::config::app::ScaleRefusal;
+    let Some(spec) = desired.apps.get(app_id) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("there's no app {app_id} to scale"),
+        ));
+    };
+    if let Some(refusal) = spec.scale_refusal(replicas) {
+        return Err(match refusal {
+            ScaleRefusal::ToZero => (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "an app runs at least 1 replica; `relish stop {}` scales it to zero and \
+                     keeps its count for the next start",
+                    app_id.name
+                ),
+            ),
+            ScaleRefusal::Autoscaled => (
+                StatusCode::CONFLICT,
+                format!(
+                    "{app_id} is autoscaled, so the autoscaler sets its count; change \
+                     [autoscale] min and max in its file instead"
+                ),
+            ),
+            ScaleRefusal::DaemonSet => (
+                StatusCode::CONFLICT,
+                format!("{app_id} runs one replica on every node, so it has no count to set"),
+            ),
+        });
+    }
+    // The count in the spec, which a scale changes. A stopped app keeps
+    // it, and a scale starts the app again with the new one, as an apply
+    // does.
+    let current = match spec.replicas {
+        crate::config::Replicas::Fixed(count) => count,
+        // `scale_refusal` refused a daemon set above.
+        crate::config::Replicas::DaemonSet => 0,
+    };
+    if let Some(expected) = current_replicas
+        && expected != current
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "{app_id} has {current} replicas in its spec now, not {expected}: someone \
+                 changed it since you looked; look again, then scale"
+            ),
+        ));
+    }
+    crate::bun::audit::annotate(crate::bun::audit::AuditNote {
+        app: Some(app_id.name.clone()),
+        namespace: Some(app_id.namespace.clone()),
+        details: [
+            ("replicas_from".to_string(), current.to_string()),
+            ("replicas_to".to_string(), replicas.to_string()),
+        ]
+        .into(),
+    });
+    let mut spec = spec.clone();
+    spec.replicas = crate::config::Replicas::Fixed(replicas);
+    spec.namespace = Some(app_id.namespace.clone());
+    // Ordinals belong to the placement, not the spec; an apply refuses
+    // them, and the leader numbers the replicas again (#398).
+    spec.ordinals = None;
+    let mut config = Config::default();
+    config.app.insert(app_id.name.clone(), spec);
+    Ok(config)
+}
+
+fn scale_refused(status: StatusCode, message: String) -> Response {
+    (status, Json(serde_json::json!({ "error": message }))).into_response()
+}
+
 /// Whether `relish stop`, `relish delete` or `relish release` is changing
 /// an app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,26 +510,25 @@ pub(super) async fn cluster_app_change(
         } else {
             ""
         };
-        let url = format!("{leader_url}/v1/{}/{app}/{namespace}{force}", change.verb());
+        let path = match crate::cluster::http::peer_path(&[
+            "v1",
+            change.verb(),
+            app.as_str(),
+            namespace.as_str(),
+        ]) {
+            Ok(path) => path,
+            Err(error) => return peer_path_refusal(&error),
+        };
+        let url = format!("{leader_url}{path}{force}");
         let request = copy_forwarded_auth(
             mark_leader_forwarded(state.cluster_http.client().post(url)),
             caller_headers,
         );
-        return match request.send().await {
-            Ok(response) => {
-                let status = StatusCode::from_u16(response.status().as_u16())
-                    .unwrap_or(StatusCode::BAD_GATEWAY);
-                let body = response.bytes().await.unwrap_or_default();
-                (status, body).into_response()
-            }
-            Err(e) => (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({
-                    "error": format!("failed to forward {} to the leader: {e}", change.verb())
-                })),
-            )
-                .into_response(),
-        };
+        return crate::bun::batch::relay_leader_answer(
+            request,
+            crate::bun::batch::LEADER_FORWARD_TIMEOUT,
+        )
+        .await;
     }
 
     // Only the owner's token or an admin changes an owned app (#1125),
@@ -393,13 +603,22 @@ pub(super) async fn cluster_app_change(
             )
                 .into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("failed to update desired state: {e}")
-            })),
-        )
-            .into_response(),
+        // A council that can't commit in time is unavailable, not broken.
+        Err(e) => {
+            let status = match e {
+                crate::council::CouncilError::WriteTimedOut { .. } => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (
+                status,
+                Json(serde_json::json!({
+                    "error": format!("failed to update desired state: {e}")
+                })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -433,6 +652,10 @@ pub(super) async fn stop_local(state: &ApiState, app: String, namespace: String)
 #[derive(Deserialize)]
 pub(super) struct ExecRequest {
     pub(super) command: Vec<String>,
+    /// How long the command may run, in seconds. Absent means the
+    /// agent's cap; a larger value is held to it.
+    #[serde(default)]
+    pub(super) timeout_seconds: Option<u64>,
 }
 
 /// Execute a command inside a running instance.
@@ -465,6 +688,7 @@ pub(super) async fn exec_handler(
         app_name: app,
         namespace,
         command: body.command,
+        timeout: crate::bun::agent::exec_timeout(body.timeout_seconds),
         response,
     })
     .await

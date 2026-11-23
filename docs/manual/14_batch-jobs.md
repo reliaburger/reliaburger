@@ -76,6 +76,22 @@ which it is, it retries, because the command never ran. Either way the reason
 is the failed task's output, so `relish batch logs ID --index N` shows it, and Bun
 logs it on stderr with the batch ID, task index and attempt (at most 20 lines a
 minute per run; the next line says how many it left out).
+
+A stopping node starts no new attempts. Once Bun gets SIGTERM, it launches no
+task it hadn't started and no retry still waiting out its backoff. Those tasks
+end as not run, without using up their attempts. Their chunks aren't reported
+to the leader as done, so the restarted node runs them again, with no
+`relish batch replay` even under the default `replay_unknown = false`: the
+ledger shows those tasks weren't running. A task keeps the attempts it had
+already used, so `max_attempts` still bounds the total. A node that doesn't
+come back is different: the leader can't read its ledger, so its chunks are
+`Unknown` like any lost worker's. An attempt
+already running carries on and isn't stopped. If Bun exits before it finishes,
+the restart treats it like any other interrupted attempt: an `Unknown` outcome,
+or a replay when the job sets `replay_unknown = true`. Before this, a task
+whose first attempt failed during a stop spent its retries while the rest of
+the cluster was shutting down too, and could fail for good (#1965).
+
 A successful launch isn't evidence of successful work. Explicit bulk
 submissions retain at-least-once replay, including a one-element array. This is
 a retry policy on the common engine.
@@ -119,7 +135,8 @@ relish stop cleanup
 includes dormant schedules and revisions. Stop disables future occurrences and
 cancels retained runs. Deleting a definition doesn't erase uncertain ownership.
 Deployment inventory and cancellation use `/v1/deploys/operations` and
-`/v1/deploys/cancel/OPERATION_ID`. Cancellation is durable; capacity and gates
+`POST /v1/deploys/operations/OPERATION_ID/cancel` (`relish cancel-deploy
+OPERATION_ID`). Cancellation is durable; capacity and gates
 remain held until workers positively retire their launches.
 
 Inspect an `Unknown` summary's owner and grant digest before deciding to repeat
@@ -167,7 +184,10 @@ relish run --batch render --count 10000 --image renderer:v1 --cpu 250m-500m --me
 
 CPU and memory use the same request–limit syntax as apps. Requests govern local
 packing; rootful Linux container and native process jobs enforce limits. Omitted values mean 1 CPU and
-64 MiB, including the limits. A profile that cannot run is shown as refused in
+64 MiB, including the limits. A fresh `runc` job or template needs a memory
+limit of at least 16 MiB, because `runc init` runs inside the container's cgroup
+first; a smaller one is refused at submission. `shared-runc` tasks and
+`process` jobs have no such floor. A profile that cannot run is shown as refused in
 status. Images are bound to a digest at submission and must pass the cluster's Pickle
 and upstream trust policies, including required cosign signatures.
 
@@ -594,8 +614,9 @@ containers when that stronger separation matters. Reuse does not keep your
 Python interpreter, model or application process alive between commands.
 Resident inference workers are a separate feature (#641).
 
-An idle container retains its profile request plus 10 millicores and 8 MiB for
-the helper. It yields to waiting requests and expires after one idle second.
+An idle container retains its profile request plus 10 millicores and 24 MiB for
+the helper: 8 MiB for the helper and 16 MiB for `runc init`, which runs in the
+helper's cgroup before the helper starts. It yields to waiting requests and expires after one idle second.
 A timeout, cancellation, lost policy or uncertain receipt retires the whole
 container before its resources can be used again. Waiting for a compatible
 slot or resource admission does not consume the command's attempt timeout;

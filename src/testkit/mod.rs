@@ -12,8 +12,10 @@
 //! - [`runner`] — parallelism, timeouts and teardown around a selection.
 //! - [`cases`] — the integration catalogue.
 //! - [`chaos`] — the chaos scenarios, selected by `--chaos`.
+//! - [`bun_binary`] — the Bun binary the runtime tests run as their owner.
 
 pub mod bench;
+pub mod bun_binary;
 pub mod cases;
 pub mod chaos;
 pub mod context;
@@ -30,7 +32,7 @@ pub mod safety;
 pub use context::{PINNED_TEST_WORKLOAD_IMAGE, TestContext};
 pub use registry::{TestCase, TestFn, all_cases, chaos_cases, select, unknown};
 pub use report::{
-    CleanupOutcome, EvidenceKind, TestCaseResult, TestEvidence, TestGroup, TestOutcome,
-    TestProfile, TestReport, UnknownKind,
+    CapturedEvent, CapturedInstance, CaseStep, CleanupOutcome, EvidenceKind, FailureState,
+    TestCaseResult, TestEvidence, TestGroup, TestOutcome, TestProfile, TestReport, UnknownKind,
 };
 pub use runner::{RunConfig, run};

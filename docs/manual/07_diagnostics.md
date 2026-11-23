@@ -7,27 +7,103 @@ its exit code, so you can wire them straight into CI or an alert.
 ## `relish wtf`: what's broken and why
 
 `wtf` fans authenticated requests across the expected nodes, correlates the
-evidence, and prints a categorised report: CRITICAL, WARNING, UNKNOWN and OK.
+evidence, and sorts every result into CRITICAL, WARNING, UNKNOWN or OK.
 It doesn't just list problems. It links a crashloop to the recent deploy and
 the error log line behind it. A crashloop is three `restart` events for one
 app inside 15 minutes; Bun records one for every restart, so `relish events`
 shows the same history `wtf` read. A high lifetime restart count in
 `relish apps` on its own isn't one.
 
-You only need to reach one node. `wtf`, `inspect` and `path` send every
-per-node request through the node you're connected to (`/v1/nodes/<node>/relay/...`), carrying
-your own credential, so they work from a laptop whose VMs sit behind Lima's
-private network. The relay forwards only the handful of read-only diagnostic
-calls these commands make, plus the path probe itself, and each target
-repeats every authentication and authorisation check.
+You only need to reach one node. `wtf`, `inspect`, `path`, `test` and `exec`
+send every per-node request through the node you're connected to
+(`/v1/nodes/<node>/relay/...`), carrying your own credential, so they work
+from a laptop whose VMs sit behind Lima's private network. The relay forwards
+only the handful of read-only diagnostic calls these commands make, plus two
+`POST`s: the path probe (`POST /v1/path`) and `relish exec` into an instance
+on another node (`POST /v1/exec/<app>/<namespace>`). Each target repeats every
+authentication and authorisation check, so an exec through the relay needs
+the same Deployer role and `exec` permission as one sent straight to the
+node. The relay builds the target's path one segment at a time and refuses a
+path that would need any percent-encoding, and a node-only route on the
+target refuses a relayed request.
 
 ```sh
-relish wtf                       # diagnose the whole cluster
+relish wtf                       # diagnose the whole cluster: one row per check
+relish wtf --short               # just the counts and what isn't OK
+relish wtf --explain             # every check, what it tests, and where to read more
 relish wtf --app payments        # scope to one app for a faster, deeper look
 relish wtf --watch               # re-run every 30s until Ctrl-C (human output only)
 relish wtf --watch --interval 5  # re-run every 5s instead
 relish --output json wtf         # one exact report for machines
 ```
+
+### Three ways to read it
+
+By default `wtf` prints a table with one row per check, the worst first. A
+check that isn't OK gets a one-line summary of its first problem, and `(+2
+more)` when there are others:
+
+```text
+Reliaburger diagnosis: test (2 nodes)
+collected at unix 10
+
+CHECK       STATUS    SUMMARY
+crashloops  critical  app api/default restarted repeatedly
+disks       warning   node node-1 filesystem for images is 88.0% full (+1 more)
+alerts      unknown   node node-2: alerts: timed out after 5s
+nodes       ok
+council     ok
+
+Summary: 1 critical, 2 warning, 1 unknown, 2 OK
+```
+
+A check that had nothing to look at gives no row: `gitops` without a GitOps
+configuration, `policies` without a policy, `os` on nodes that aren't
+appliances. `exports` and `rollouts` show up only when something is wrong.
+
+`--short` prints the counts and then only what isn't OK, each finding with its
+`next:` step. When everything is OK, it's the counts line alone, which suits a
+prompt or a status bar:
+
+```text
+Summary: 1 critical, 2 warning, 1 unknown, 2 OK
+CRITICAL [crashloop] app api/default restarted repeatedly (app.api/default)
+  next: app api is crashlooping; inspect its recent logs and run `relish rollback api` if this started after a deploy
+WARNING [disk-high] node node-1 filesystem for images is 88.0% full (node.node-1)
+  next: node node-1 disk is at 88.0%; prune images (`relish pickle gc`) or logs
+WARNING [disk-high] node node-2 filesystem for images is 90.5% full (node.node-2)
+  next: node node-2 disk is at 90.5%; prune images (`relish pickle gc`) or logs
+UNKNOWN [alerts] cluster: node node-2: alerts: timed out after 5s
+```
+
+`--explain` is for when you want to know what a green row actually checked.
+Every check gets several lines: each finding with its evidence and next step
+(or the OK row's own words), what exactly the check reads and the rule it
+applies, the numbers that decide it, a link to the manual section and the
+`relish manual` chapter that covers it:
+
+```text
+crashloops: critical
+  CRITICAL [crashloop] app api/default restarted repeatedly (app.api/default)
+    instance api-0 restarted 3 times in the last 15 minutes
+    related restart at 9: exit code 1
+    next: app api is crashlooping; inspect its recent logs and run `relish rollback api` if this started after a deploy
+  tests: Counts each instance's `restart` events in every node's event ring (the
+         same ones `relish events` shows) inside a recent window. Enough of them
+         for one instance is critical, with any recent deploy and the app's
+         first error log line attached. Replicas that restarted once each are
+         not a crash loop, and a lifetime restart count is not an input.
+  threshold: 3 (CRASHLOOP_RESTARTS): restarts of one instance inside the window that make a crash loop
+  threshold: 15 minutes (CRASHLOOP_WINDOW_SECONDS): the window restarts are counted in
+  threshold: 30 minutes (RECENT_DEPLOY_SECONDS): a deploy started this recently is named as the likely cause
+  docs: https://github.com/reliaburger/reliaburger/blob/main/docs/manual/07_diagnostics.md#relish-wtf-whats-broken-and-why
+  manual: relish manual diagnostics
+```
+
+`--short` and `--explain` can't be combined, and both work with `--app` and
+`--watch`. They change only the human report: with `--output json` or `yaml`
+they're refused, because the machine report always carries every finding, and
+its shape doesn't change.
 
 `relish status` runs the same checks with a 2 s budget and counts what they
 find on its `wtf` line, naming the worst finding, so a glance at status tells
@@ -39,7 +115,7 @@ is the contract:
 
 - `0`: every selected check was observed and healthy.
 - `1`: at least one CRITICAL finding.
-- `2`: warnings or unknown evidence only, nothing critical.
+- `3`: warnings or unknown evidence only, nothing critical.
 
 `wtf` also asks every node which `bun` it runs: the version, the commit it was
 built from and the binary's SHA-256. When they all match, the OK row names the
@@ -71,6 +147,17 @@ that can't unseal the cluster's GitOps credentials (no master key) gets a
 of these, the `gitops` OK row says so. See
 [GitOps](12_operations.md#gitops).
 
+`wtf` asks every node what its council backup loop is doing. A node with
+`[cluster.backup]` set whose loop can't run (no master key, or a destination
+the object store can't open) is a critical `backup-disabled` finding with the
+reason. The leader's last export failing, or no node having exported for three
+intervals, is a `backup-failing` warning. One council member without
+`[cluster.backup]` while others have it is a `backup-not-configured` warning.
+With no member configured, the `backups` OK row says backups aren't
+configured; otherwise it says the leader is exporting. With no leader
+observed, there's no `backups` row. See
+[Backing up the council](12_operations.md#backing-up-the-council).
+
 `wtf` also asks every node for its own view of the council, because a split
 brain looks healthy from either half. It reports CRITICAL when a node is
 fenced out of a council `relish council recover` replaced, when nodes serve
@@ -86,7 +173,10 @@ the same comparison as a table.
 For the image registry, `wtf` warns (`registry-redundancy`) when a node's
 registry isn't listening, peers can't reach it, or some layers have fewer live
 copies than `[images] redundancy` asks for. Heal fixes the last on its own
-within a minute or two. A *lost* image is worse: some layer it needs has no
+within a minute or two. A one-node cluster can't hold a second copy of
+anything, so there `wtf` says so under OK instead (`one node: Pickle keeps one
+copy of each layer; add a node for redundancy`), and `relish status` doesn't
+count it as a problem. A *lost* image is worse: some layer it needs has no
 live copy anywhere, so nothing can pull it. That's a CRITICAL
 `registry-lost-images` finding listing each `repository:tag`, and the only fix
 is to push the image again (or bring back the node that held it). `relish
@@ -131,6 +221,8 @@ means, the numbers that decide it and the line of code that does (see
 | `unreachable-nodes` | critical | A node's Bun API didn't answer |
 | `node-dead` | critical | Gossip marks a node dead or suspect |
 | `version-skew` | warning | Nodes run different `bun` builds |
+| `os-update-failed` | warning | An appliance couldn't update its OS; the rollout stopped there |
+| `os-skew` | warning | Appliances run different OS versions |
 | `council-recovery-split` | critical | Two recoveries claimed one epoch; both councils fenced themselves |
 | `council-fence-unpersisted` | warning | A recovery fence couldn't be written to disk |
 | `council-fenced` | critical | Nodes belong to a council `relish council recover` replaced |
@@ -142,6 +234,7 @@ means, the numbers that decide it and the line of code that does (see
 | `council-member-down` | warning | A council member is missing, quorum holds |
 | `active-faults` | warning | Smoker faults are active |
 | `disk-high` | warning, critical | A filesystem is 85% full (critical at 95%) |
+| `export-failing` | warning | A node can't export its logs or metrics, so their caps and retention are on hold |
 | `cert-expired` | critical | A certificate has expired |
 | `cert-expiring` | warning | A certificate expires within 14 days without healthy rotation |
 | `registry-lost-images` | critical | No live node holds every layer of an image |
@@ -154,6 +247,9 @@ means, the numbers that decide it and the line of code that does (see
 | `gitops-plaintext-secret` | warning | A secret is plaintext in the GitOps repository |
 | `gitops-local-config` | warning | A node's own `[gitops]` is ignored |
 | `gitops-config-unreadable` | warning | A node can't unseal the GitOps credentials |
+| `backup-disabled` | critical | A node has `[cluster.backup]` but its backup loop can't run |
+| `backup-not-configured` | warning | One council member lacks `[cluster.backup]` while others have it |
+| `backup-failing` | warning | The leader's last backup failed, or none for 3 intervals |
 | `policy-broken` | warning | A policy in force can't be evaluated |
 | `policy-would-deny` | warning | A committed app or job breaks a deny policy |
 | `policy-audit` | warning | A committed app or job breaks an audit policy |
@@ -227,6 +323,7 @@ far back the records reach: unknown, not "it didn't happen".
 | `restart.start_failed` | The runtime couldn't start the instance, so the node cleaned up and tried again |
 | `restart.health_failed` | The instance failed `threshold` health probes in a row, so the node restarted it |
 | `restart.budget_exhausted` | The instance used its whole restart budget, so the node gave up and marked it failed |
+| `restart.never_healthy` | The instance never passed its health check in its startup grace, so the node stopped it and marked it failed instead of restarting it |
 | `restart.sidecar_exited` | A sidecar exited and was restarted on its own |
 | `deploy.refused.policy` | An enforcing policy denied the apply |
 | `deploy.refused.owner` | The apply named an owner the caller can't speak for |
@@ -414,6 +511,12 @@ and each cause has its own fix:
   laptop cluster's `~/.reliaburger/context.json`, then
   `http://127.0.0.1:9117`. An explicit endpoint doesn't borrow the saved
   context's credentials: pass `--token` and `--ca-cert` too.
+- "the relish context for … can't be used: its CA certificate … is gone"
+  means `context.json` still points at a cluster whose directory was
+  deleted. Remove `~/.reliaburger/context.json` if that cluster is gone,
+  or create a new cluster with `relish setup` or
+  `relish machines claim --create`, which replaces it. To reach another
+  cluster meanwhile, pass `--endpoint`, `--ca-cert` and `--token`.
 - Plain `http://` works only to a loopback address. Anything remote needs
   HTTPS and the cluster CA (`--ca-cert` or `RELIABURGER_CA_CERT`).
 - On a laptop cluster, `relish local status` checks every VM and its API. Node

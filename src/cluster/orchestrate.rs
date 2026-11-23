@@ -34,6 +34,11 @@ use crate::reporting::aggregator::AggregatedState;
 /// assignments.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 const RECONCILE_IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long one scheduler or autoscaler write may wait to commit before
+/// the loop moves on. The loop replans from committed state next tick, so a
+/// write that later commits is picked up then, and one that never does
+/// can't hold up every other app's placement.
+const SCHEDULER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How many retirements one reconcile cycle has in flight at once.
 const MAX_CONCURRENT_RETIREMENTS: usize = 4;
 
@@ -396,10 +401,13 @@ pub fn spawn_leader_scheduler(
                 )
             {
                 match council
-                    .write(RaftRequest::PublishEndpoints {
-                        expected_generation: desired.endpoint_withdrawals.generation,
-                        catalog: Box::new(catalog),
-                    })
+                    .write_within(
+                        SCHEDULER_WRITE_TIMEOUT,
+                        RaftRequest::PublishEndpoints {
+                            expected_generation: desired.endpoint_withdrawals.generation,
+                            catalog: Box::new(catalog),
+                        },
+                    )
                     .await
                 {
                     // A committed request can still be refused by the state
@@ -421,7 +429,10 @@ pub fn spawn_leader_scheduler(
                     app_id: app_id.clone(),
                     spec: Box::new(spec),
                 };
-                match council.write(released).await {
+                match council
+                    .write_within(SCHEDULER_WRITE_TIMEOUT, released)
+                    .await
+                {
                     Ok(CouncilResponse::Refused { reason }) => {
                         eprintln!("scheduler: rollout of {app_id} not recorded: {reason}");
                     }
@@ -471,6 +482,7 @@ pub fn spawn_leader_scheduler(
                 continue;
             }
             crate::meat::filter::apply_upgrade_cordon(&mut cache, desired.active_upgrade.as_ref());
+            crate::meat::filter::apply_os_rollout_cordon(&mut cache, desired.os_rollout.as_ref());
 
             let pass_members = PassMembers {
                 unheard: unheard_nodes(&alive, &reports, stale_node_grace),
@@ -575,7 +587,7 @@ pub fn spawn_leader_scheduler(
                 })
             {
                 match tokio::time::timeout(
-                    Duration::from_secs(5),
+                    SCHEDULER_WRITE_TIMEOUT,
                     council.write(RaftRequest::SchedulingDecisions {
                         expected_log_id: desired.last_applied_log,
                         decisions,
@@ -603,7 +615,7 @@ pub fn spawn_leader_scheduler(
             // Why an app isn't placed is durable council state, so any node
             // can answer `relish status`. Written only when it changes.
             if let Some(update) = quota_blocked_update(&desired.quota_blocked, &quota_blocked) {
-                match council.write(update).await {
+                match council.write_within(SCHEDULER_WRITE_TIMEOUT, update).await {
                     Ok(_) => {
                         let blocked = quota_blocked_events(&desired.quota_blocked, &quota_blocked);
                         record_placement_events(blocked, events.as_ref()).await
@@ -615,7 +627,7 @@ pub fn spawn_leader_scheduler(
             // starts, changes or clears, not every tick (#702).
             let changes = shortfall_changes(&desired.unschedulable, &unschedulable, &desired);
             if let Some(update) = unschedulable_update(&desired.unschedulable, &unschedulable) {
-                match council.write(update).await {
+                match council.write_within(SCHEDULER_WRITE_TIMEOUT, update).await {
                     Ok(_) => {
                         record_placement_events(shortfall_events(&changes), events.as_ref()).await
                     }
@@ -1100,12 +1112,24 @@ pub fn plan_pass(
         .keys()
         .map(NodeId::new)
         .collect();
+    let os_rollout_cordoned: HashSet<NodeId> = desired
+        .os_rollout
+        .iter()
+        .flat_map(|rollout| {
+            rollout
+                .nodes
+                .iter()
+                .filter(|node| rollout.is_node_cordoned(&node.node_id))
+                .map(|node| NodeId::new(node.node_id.as_str()))
+        })
+        .collect();
     let liveness = Liveness {
         alive,
         suspect,
         unheard,
         lapsed,
         retired: &retired,
+        os_rollout_cordoned: &os_rollout_cordoned,
         dns_required,
     };
     let mut decisions = Vec::new();
@@ -1597,6 +1621,9 @@ impl VolumeHome<'_> {
             .map(|p| crate::meat::scheduler::parse_label_list(&p.required))
             .unwrap_or_default();
         let mut homes = Vec::new();
+        // What this app already asks of each home: two replicas can share a
+        // node, and each fitting alone doesn't mean both fit (#2052).
+        let mut demand: HashMap<&NodeId, Resources> = HashMap::new();
         // The leader records an app's nodes in ordinal order, so each home
         // gets back the ordinal its replica had (#398).
         for (ordinal, node_id) in (0u32..).zip(last_nodes.iter().take(want)) {
@@ -1622,7 +1649,9 @@ impl VolumeHome<'_> {
             if !node_can_run(node, spec, self.dns_required) {
                 return wait(HomeWait::NotReady);
             }
-            if !node.can_fit(&resources) {
+            let asked = demand.entry(node_id).or_default();
+            *asked = asked.saturating_add(&resources);
+            if !node.can_fit(asked) {
                 return wait(HomeWait::NoRoom);
             }
             homes.push(crate::meat::types::Placement {
@@ -1689,6 +1718,9 @@ struct Liveness<'a> {
     lapsed: &'a HashSet<NodeId>,
     /// Decommissioned nodes, whose volumes the operator has written off.
     retired: &'a HashSet<NodeId>,
+    /// Nodes an OS rollout is draining or updating. A host-path app's
+    /// replica stays on one through the reboot (#2120).
+    os_rollout_cordoned: &'a HashSet<NodeId>,
     dns_required: bool,
 }
 
@@ -1698,7 +1730,8 @@ impl Liveness<'_> {
     /// A changed hard selector is the one spec change that moves a replica,
     /// volume or not: the operator asked for other nodes. Otherwise a
     /// managed-volume app stays on its home whatever its node is doing
-    /// (#423), even when its new request no longer fits there. Any other
+    /// (#423), even when its new request no longer fits there, and a
+    /// host-path app stays on a node an OS rollout is updating (#2120). Any other
     /// replica stays while its node holds it and still has room for the
     /// request it makes now (#434), unless the node reported it couldn't
     /// start this replica: job leases may have taken the room since it was
@@ -1724,6 +1757,9 @@ impl Liveness<'_> {
             return false;
         }
         if keeps_volume_home(placement, spec, self.retired) {
+            return true;
+        }
+        if has_host_path_volume(spec) && self.os_rollout_cordoned.contains(&placement.node_id) {
             return true;
         }
         if cache.capacity_refused(&placement.node_id, app_id, placement.ordinal) {
@@ -1841,9 +1877,24 @@ pub(crate) fn volume_homes(
 /// Whether a fixed-size app keeps state in a managed volume, which lives on
 /// the node it runs on. A daemon set runs on every eligible node anyway, so
 /// there is nowhere else for its volume to be.
-fn has_managed_volume(spec: &AppSpec) -> bool {
+pub(crate) fn has_managed_volume(spec: &AppSpec) -> bool {
     matches!(spec.replicas, Replicas::Fixed(_))
         && spec.volumes.iter().any(|volume| volume.source.is_none())
+}
+
+/// Whether an app bind-mounts a path from its node's own disk (a volume
+/// with a `source`). Its data may be on that node, so an OS rollout leaves
+/// it there to wait out the reboot (#2120). Outside a rollout it can move:
+/// the path may be shared storage every node mounts.
+pub(crate) fn has_host_path_volume(spec: &AppSpec) -> bool {
+    spec.volumes.iter().any(|volume| volume.source.is_some())
+}
+
+/// Whether an app stays on its node while an OS rollout updates that node,
+/// rather than moving elsewhere: its data lives there, in a managed volume
+/// or a host path.
+pub(crate) fn stays_through_os_rollout(spec: &AppSpec) -> bool {
+    has_managed_volume(spec) || has_host_path_volume(spec)
 }
 
 /// Whether a reported node is ready and can enforce what `spec` needs.
@@ -2030,23 +2081,46 @@ pub fn spawn_autoscaler(
                     // and thus started the cooldown — before the Raft write,
                     // so a failed write would suppress the next real attempt
                     // for a whole cooldown while nothing actually scaled.
-                    match council
-                        .write(RaftRequest::AutoscaleOverride {
-                            app_id: app_id.clone(),
-                            replicas: decision.to,
-                            reason: decision.reason.clone(),
-                        })
-                        .await
-                    {
-                        Ok(_) => tracker.apply_decision(&decision, now),
-                        Err(e) => {
-                            eprintln!("autoscaler: failed to commit override for {app_id}: {e}")
-                        }
-                    }
+                    let written = council
+                        .write_within(
+                            SCHEDULER_WRITE_TIMEOUT,
+                            RaftRequest::AutoscaleOverride {
+                                app_id: app_id.clone(),
+                                replicas: decision.to,
+                                reason: decision.reason.clone(),
+                            },
+                        )
+                        .await;
+                    record_autoscale_write(&mut tracker, &decision, now, written);
                 }
             }
         }
     });
+}
+
+/// Start the autoscaler's cooldown for `decision` once its override write
+/// has come back. The state machine refuses an override for an app that
+/// stopped autoscaling between the read and the write; that refusal is an
+/// answer, not a scale, so only `Applied` starts the cooldown.
+fn record_autoscale_write(
+    tracker: &mut crate::meat::autoscaler::AutoscaleTracker,
+    decision: &crate::meat::autoscaler::AutoscaleDecision,
+    now: std::time::Instant,
+    written: Result<CouncilResponse, crate::council::CouncilError>,
+) {
+    let app_id = &decision.app_id;
+    match written {
+        Ok(CouncilResponse::Applied { .. }) => tracker.apply_decision(decision, now),
+        Ok(CouncilResponse::Refused { reason }) => {
+            eprintln!("autoscaler: council refused the override for {app_id}: {reason}")
+        }
+        Ok(other) => {
+            eprintln!(
+                "autoscaler: unexpected council answer to the override for {app_id}: {other:?}"
+            )
+        }
+        Err(e) => eprintln!("autoscaler: failed to commit override for {app_id}: {e}"),
+    }
 }
 
 /// Average utilisation of the app's resource request over the app's
@@ -2231,9 +2305,25 @@ fn build_endpoint_catalog(
             .values()
             .map(|service| service.vip),
     );
-    desired
+    let mut catalog = desired
         .endpoint_catalog
-        .reconcile_reserving(grouped.into_values(), reserved)
+        .reconcile_reserving(grouped.into_values(), reserved)?;
+    // Each caller's node enforces a service's `allow_from` in its connect
+    // hook, so every node needs the list, not only the nodes running the
+    // service (#2216). It comes from the spec, so a changed list reaches
+    // the other nodes with the next catalogue, before the rollout finishes.
+    for (qualified, service) in &mut catalog.services {
+        service.allow_from = ServiceId::parse(qualified)
+            .and_then(|id| {
+                desired
+                    .apps
+                    .get(&crate::meat::types::AppId::new(&id.name, &id.namespace))
+            })
+            .and_then(|spec| spec.firewall.as_ref())
+            .filter(|firewall| !firewall.allow_from.is_empty())
+            .map(|firewall| firewall.allow_from.clone());
+    }
+    Ok(catalog)
 }
 
 /// Build the scheduler's view of the cluster from gossip membership
@@ -3292,7 +3382,7 @@ async fn deploy_outcome(
                     reason,
                 });
             }
-            ApplyEvent::Error { message } if failure.is_none() => {
+            ApplyEvent::Error { message, .. } if failure.is_none() => {
                 failure = Some(DeployWaitError::Failed(message));
             }
             _ => {}
@@ -3729,6 +3819,7 @@ mod tests {
                     counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let _ = events
                         .send(ApplyEvent::Error {
+                            status: None,
                             message: "cluster discovery publication failed: local service \
                                       requires its committed cluster allocation"
                                 .into(),
@@ -4129,6 +4220,8 @@ mod tests {
                             runtime_unknown: false,
                             status_age_ms: None,
                             age_seconds: None,
+                            image: None,
+                            data_on_node: false,
                             reason: None,
                         }]);
                     }
@@ -4654,6 +4747,7 @@ command = ["false"]
                         deploys.push(std::time::Instant::now());
                         let _ = events
                             .send(ApplyEvent::Error {
+                                status: None,
                                 message: "replacement exited before its identity was recorded"
                                     .into(),
                             })
@@ -4750,6 +4844,8 @@ image = "busybox:latest"
             runtime_unknown: false,
             status_age_ms: None,
             age_seconds: None,
+            image: None,
+            data_on_node: false,
             reason: None,
         };
         let mut asked = Vec::new();
@@ -5073,6 +5169,8 @@ image = "busybox:latest"
                 runtime_unknown: false,
                 status_age_ms: None,
                 age_seconds: None,
+                image: None,
+                data_on_node: false,
                 reason: None,
             },
             crate::bun::agent::InstanceStatus {
@@ -5087,6 +5185,8 @@ image = "busybox:latest"
                 runtime_unknown: false,
                 status_age_ms: None,
                 age_seconds: None,
+                image: None,
+                data_on_node: false,
                 reason: None,
             },
         ];
@@ -5132,6 +5232,7 @@ image = "busybox:latest"
         let message = "init container 0 failed for instance default__web-0: \
                        exited with code 1: runc run failed: container's cgroup is not empty";
         tx.send(ApplyEvent::Error {
+            status: None,
             message: message.to_string(),
         })
         .await
@@ -5160,6 +5261,7 @@ image = "busybox:latest"
         let (tx, rx) = mpsc::channel(4);
         for event in [
             ApplyEvent::Error {
+                status: None,
                 message: "default__web-g1-0 failed its health check".into(),
             },
             ApplyEvent::RolloutAborted {
@@ -5168,6 +5270,7 @@ image = "busybox:latest"
                 reason: "rolled back — old instances preserved".into(),
             },
             ApplyEvent::Error {
+                status: None,
                 message: "rolled back — old instances preserved".into(),
             },
         ] {
@@ -5189,9 +5292,11 @@ image = "busybox:latest"
         let (tx, rx) = mpsc::channel(8);
         for event in [
             ApplyEvent::Error {
+                status: None,
                 message: "node capacity cannot admit cpu=100m mem=32Mi".into(),
             },
             ApplyEvent::Error {
+                status: None,
                 message: "a later error".into(),
             },
             ApplyEvent::RolloutAborted {
@@ -5200,6 +5305,7 @@ image = "busybox:latest"
                 reason: "rolled back — old instances preserved".into(),
             },
             ApplyEvent::Error {
+                status: None,
                 message: "rolled back — old instances preserved".into(),
             },
         ] {
@@ -5762,6 +5868,65 @@ image = "busybox:latest"
             svc.backends
                 .iter()
                 .any(|b| b.node_id == "node-b" && !b.healthy)
+        );
+    }
+
+    /// Every node enforces a target's `allow_from` for its own callers, so
+    /// the catalogue carries it from the spec, and a changed list changes
+    /// the catalogue (#2216). An empty list asks for nothing, like none.
+    #[test]
+    fn build_endpoint_catalog_carries_each_services_allow_from() {
+        use crate::onion::service_id::ServiceId;
+
+        let members = vec![member("node-a", 5001)];
+        let reports = AggregatedState {
+            leadership_epoch: None,
+            receive_deadlines: Default::default(),
+            reports: HashMap::new(),
+            stale_nodes: vec![],
+            stale_since: Default::default(),
+            capabilities: HashMap::new(),
+            readiness: HashMap::new(),
+        };
+        let mut desired = crate::council::types::DesiredState::default();
+        desired.apps.insert(
+            crate::meat::types::AppId::new("db", "backend"),
+            spec_from_toml(
+                "[app.db]\nimage = \"x:1\"\nport = 5432\n\
+                 [app.db.firewall]\nallow_from = [\"shop/api\"]\n",
+            ),
+        );
+        desired.apps.insert(
+            crate::meat::types::AppId::new("web", "shop"),
+            spec_from_toml(
+                "[app.web]\nimage = \"x:1\"\nport = 80\n[app.web.firewall]\nallow_from = []\n",
+            ),
+        );
+
+        let catalog = build_endpoint_catalog(&members, &reports, &desired).unwrap();
+        let db = catalog.resolve(&ServiceId::new("backend", "db")).unwrap();
+        assert_eq!(db.allow_from, Some(vec!["shop/api".to_string()]));
+        let web = catalog.resolve(&ServiceId::new("shop", "web")).unwrap();
+        assert_eq!(web.allow_from, None);
+
+        // Widening the list changes the committed catalogue, so every node
+        // is sent the new one.
+        desired.endpoint_catalog = catalog.clone();
+        desired.apps.insert(
+            crate::meat::types::AppId::new("db", "backend"),
+            spec_from_toml(
+                "[app.db]\nimage = \"x:1\"\nport = 5432\n\
+                 [app.db.firewall]\nallow_from = [\"shop/api\", \"shop/web\"]\n",
+            ),
+        );
+        let widened = build_endpoint_catalog(&members, &reports, &desired).unwrap();
+        assert_ne!(widened, catalog);
+        assert_eq!(
+            widened
+                .resolve(&ServiceId::new("backend", "db"))
+                .unwrap()
+                .allow_from,
+            Some(vec!["shop/api".to_string(), "shop/web".to_string()])
         );
     }
 
@@ -6679,6 +6844,70 @@ image = "busybox:latest"
         assert!(decisions.is_empty(), "{decisions:?}");
     }
 
+    /// Two replicas whose volumes both live on one node that now has room
+    /// for only one: each fits alone, but not together. Placing both would
+    /// over-commit the node, which then refuses one replica for good. The
+    /// app waits for room instead.
+    #[test]
+    fn a_volume_app_with_two_replicas_on_one_home_waits_until_both_fit() {
+        let mut spec = app_with_volume(100);
+        spec.replicas = Replicas::Fixed(2);
+        let (mut desired, mut cache) = stopped_and_applied_again(spec);
+        desired.last_placed_nodes.insert(
+            AppId::new("db", "default"),
+            vec![NodeId::new("home"), NodeId::new("home")],
+        );
+        let mut tight = sched_node("home", 4000, BTreeMap::new());
+        tight.allocated = Resources::new(3850, 0, 0);
+        cache.set_node(tight);
+        let alive = HashSet::from([NodeId::new("busy"), NodeId::new("home")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert!(decisions.is_empty(), "{decisions:?}");
+    }
+
+    /// A deploy that drops `[autoscale]` between the autoscaler's read and
+    /// its write makes the council refuse the override. Nothing scaled, so
+    /// the tracker must not start a cooldown or record the new count.
+    #[test]
+    fn a_refused_autoscale_override_starts_no_cooldown() {
+        use crate::meat::autoscaler::{AutoscaleDecision, AutoscaleTracker};
+        let app = AppId::new("web", "default");
+        let mut tracker = AutoscaleTracker::default();
+        tracker.get_or_insert(&app, 2);
+        let decision = AutoscaleDecision {
+            app_id: app.clone(),
+            from: 2,
+            to: 4,
+            reason: "cpu".into(),
+        };
+        let now = std::time::Instant::now();
+
+        record_autoscale_write(
+            &mut tracker,
+            &decision,
+            now,
+            Ok(CouncilResponse::Refused {
+                reason: "app web doesn't autoscale".into(),
+            }),
+        );
+        let state = tracker.get_or_insert(&app, 2);
+        assert_eq!(state.current_replicas, 2);
+        assert_eq!(state.last_scale_event, None);
+
+        record_autoscale_write(
+            &mut tracker,
+            &decision,
+            now,
+            Ok(CouncilResponse::Applied { log_index: 9 }),
+        );
+        let state = tracker.get_or_insert(&app, 2);
+        assert_eq!(state.current_replicas, 4);
+        assert_eq!(state.last_scale_event, Some(now));
+    }
+
     /// Retire `node` the way `relish decommission-node` does.
     fn decommission(desired: &mut DesiredState, node: &str) {
         desired.security_state.crl.retired_nodes.insert(
@@ -7193,6 +7422,83 @@ image = "busybox:latest"
         let decisions =
             plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
         assert!(decisions.is_empty(), "{decisions:?}");
+    }
+
+    fn app_with_host_path(cpu_request: u64) -> AppSpec {
+        let mut spec = app_spec(cpu_request, 1);
+        spec.volumes.push(crate::config::types::VolumeSpec {
+            path: "/data".into(),
+            source: Some("/srv/data".into()),
+            size: None,
+        });
+        spec
+    }
+
+    /// An OS rollout working on `node`: cordoned while it drains or updates.
+    fn os_rollout_on(
+        node: &str,
+        phase: crate::os::rollout::OsNodePhase,
+    ) -> crate::os::rollout::OsRollout {
+        let mut rollout = crate::os::rollout::plan(
+            "r1",
+            "2026.42.0",
+            "https://example/os-channel.json",
+            "leader",
+            vec![(
+                node.into(),
+                "10.0.0.2:9117".into(),
+                false,
+                "2026.41.0".into(),
+            )],
+            0,
+        );
+        rollout.nodes[0].phase = phase;
+        rollout
+    }
+
+    /// #2120: an app that keeps its data in a host path stays on a node the
+    /// OS rollout cordons, through the drain and the reboot, as a managed-
+    /// volume app does. Moving it would start it away from its data.
+    #[test]
+    fn a_host_path_app_stays_on_its_node_through_an_os_rollout() {
+        use crate::os::rollout::OsNodePhase;
+
+        let (mut desired, mut cache) = stopped_and_applied_again(app_with_host_path(100));
+        let app = AppId::new("db", "default");
+        desired.scheduling.insert(app, placed_on(&["home"]));
+        let alive = HashSet::from([NodeId::new("busy"), NodeId::new("home")]);
+
+        desired.os_rollout = Some(os_rollout_on("home", OsNodePhase::Draining));
+        crate::meat::filter::apply_os_rollout_cordon(&mut cache, desired.os_rollout.as_ref());
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+        assert!(decisions.is_empty(), "draining: {decisions:?}");
+
+        // Rebooting into the new version: out of gossip for a while.
+        desired.os_rollout = Some(os_rollout_on("home", OsNodePhase::Updating));
+        let alive = HashSet::from([NodeId::new("busy")]);
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+        assert!(decisions.is_empty(), "updating: {decisions:?}");
+    }
+
+    /// Outside an OS rollout a host-path app moves off a node that can't
+    /// run it, as before: the path may be shared storage every node mounts.
+    #[test]
+    fn a_host_path_app_leaves_a_node_that_is_not_ready_outside_an_os_rollout() {
+        let (mut desired, mut cache) = stopped_and_applied_again(app_with_host_path(100));
+        let app = AppId::new("db", "default");
+        desired.scheduling.insert(app, placed_on(&["home"]));
+        let mut unready = sched_node("home", 4000, BTreeMap::new());
+        unready.ready = false;
+        cache.set_node(unready);
+        let alive = HashSet::from([NodeId::new("busy"), NodeId::new("home")]);
+
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert_eq!(nodes_of(&decisions[0]), ["busy"]);
     }
 
     /// The operator moving an app with `placement.required` is on purpose.

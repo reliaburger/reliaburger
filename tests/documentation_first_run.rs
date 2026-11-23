@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 mod bun_process;
 use bun_process::{
     WAIT, assert_success, enable_phase_diagnostics, fixture_phase, reserve_address, reserve_ports,
-    run_relish, spawn_bun_with_port_retry, wait_for_relish, wait_for_relish_output,
-    write_portable_node_config, write_portable_node_config_with_ports,
+    run_relish, run_relish_init, spawn_bun_with_port_retry, wait_for_relish,
+    wait_for_relish_output, write_portable_node_config, write_portable_node_config_with_ports,
 };
 
 #[test]
@@ -149,14 +149,7 @@ fn secure_cluster_first_run_initialises_authenticates_and_deploys() {
     let _test_phase = fixture_phase("secure-first-run");
     let root = tempfile::tempdir().unwrap();
     let cluster_dir = root.path().join("cluster");
-    let init = run_relish(&[
-        "init",
-        cluster_dir.to_str().unwrap(),
-        "--cluster-name",
-        "first-run",
-        "--node-id",
-        "node-01",
-    ]);
+    let init = run_relish_init(&cluster_dir, "first-run", "node-01");
     assert_success(&init, "documented cluster init");
 
     let node_path = cluster_dir.join("reliaburger.toml");
@@ -289,14 +282,7 @@ fn post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed() {
     let _test_phase = fixture_phase("secure-enrolment-first-run");
     let root = tempfile::tempdir().unwrap();
     let cluster_dir = root.path().join("cluster");
-    let init = run_relish(&[
-        "init",
-        cluster_dir.to_str().unwrap(),
-        "--cluster-name",
-        "join-token-test",
-        "--node-id",
-        "node-01",
-    ]);
+    let init = run_relish_init(&cluster_dir, "join-token-test", "node-01");
     assert_success(&init, "cluster init for join-token test");
 
     let node_path = cluster_dir.join("reliaburger.toml");

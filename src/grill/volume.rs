@@ -99,6 +99,13 @@ pub enum VolumeError {
     /// recovered yet, so the live name may not hold a complete volume.
     #[error("volume {0} has an interrupted snapshot restore awaiting recovery")]
     RestorePending(String),
+    /// A provisioning record exists but can't be read. Bun won't treat the
+    /// volume as new, since provisioning it again could format its data.
+    #[error(
+        "volume record {path} can't be read ({reason}); Bun won't provision over it. \
+         Repair the record, or remove it and the volume if they hold nothing you need"
+    )]
+    UnreadableRecord { path: String, reason: String },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -106,12 +113,33 @@ pub enum VolumeError {
 #[cfg(test)]
 type ProvisionFault = fn(&Path, &Path) -> Result<(), VolumeError>;
 
+/// A point in a loop volume's first provisioning where a test can make it
+/// fail.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Only Linux makes loop volumes, so other targets never reach two of these.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum LoopStep {
+    /// Just before `mkfs.ext4`.
+    Format,
+    /// Just after the image is mounted.
+    Mounted,
+    /// Just before the provisioning record is written.
+    Record,
+}
+
+/// Returns true to fail at that step.
+#[cfg(test)]
+type LoopFault = fn(LoopStep) -> bool;
+
 /// Manages volume creation and size enforcement.
 pub struct VolumeManager {
     /// Base directory for managed volumes.
     volumes_dir: PathBuf,
     #[cfg(test)]
     before_test_provision: Option<ProvisionFault>,
+    #[cfg(test)]
+    loop_fault: Option<LoopFault>,
 }
 
 impl VolumeManager {
@@ -121,6 +149,8 @@ impl VolumeManager {
             volumes_dir: volumes_dir.into(),
             #[cfg(test)]
             before_test_provision: None,
+            #[cfg(test)]
+            loop_fault: None,
         }
     }
 
@@ -160,22 +190,12 @@ impl VolumeManager {
         mount_path: &Path,
         size_limit: Option<&str>,
     ) -> Result<PathBuf, VolumeError> {
-        // Defence in depth (config validation also rejects this): a `..`
-        // component in the mount path would escape `volumes_dir` once joined,
-        // giving a deploy a read-write bind mount of an arbitrary host
-        // directory as root. Refuse rather than provision.
-        if mount_path
-            .components()
-            .any(|c| c == std::path::Component::ParentDir)
-        {
-            return Err(VolumeError::PathTraversal(mount_path.display().to_string()));
-        }
-        let relative_path = mount_path.strip_prefix("/").unwrap_or(mount_path);
-        let host_path = self
-            .volumes_dir
-            .join(namespace)
-            .join(app_name)
-            .join(relative_path);
+        // Resolve the path one component at a time, never through a
+        // symlink and never inside another volume: everything below a
+        // volume belongs to the container that mounts it, so a path through
+        // one could lead anywhere on the host.
+        let relative = managed_relative_path(namespace, app_name, mount_path)?;
+        let host_path = resolve_volume_path(&self.volumes_dir, &relative, PathWalk::Create)?;
 
         // Until recovery settles which copy owns the live name, handing the
         // path to a container could mount nothing, or the wrong data.
@@ -187,7 +207,7 @@ impl VolumeManager {
             .map(|s| parse_byte_size(s).map_err(|e| VolumeError::InvalidSize(format!("{s}: {e}"))))
             .transpose()?;
 
-        if let Some(sidecar) = read_sidecar(&host_path) {
+        if let Some(sidecar) = read_sidecar(&host_path)? {
             let existing = recorded_size(&host_path, &sidecar);
             if existing != size_bytes {
                 return Err(VolumeError::SizeChanged {
@@ -212,11 +232,8 @@ impl VolumeManager {
         );
         refuse_unenforced_size(backend, mount_path, size_limit)?;
 
-        // Parents are always plain directories; only the leaf differs.
-        if let Some(parent) = host_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
+        // The walk above made the parents, as plain directories; only the
+        // leaf differs.
         match backend {
             super::btrfs::VolumeBackend::BtrfsSubvolume => {
                 super::btrfs::create_subvolume(&host_path, size_bytes, &self.volumes_dir).map_err(
@@ -241,8 +258,26 @@ impl VolumeManager {
         // Only a Btrfs qgroup lives on the subvolume itself; a restore swaps
         // in a new subvolume and must set the same limit again.
         let quota = size_bytes.filter(|_| backend == super::btrfs::VolumeBackend::BtrfsSubvolume);
-        self.write_backend(&host_path, backend, quota, size_bytes)?;
+        let recorded = self.record_new_volume(&host_path, backend, quota, size_bytes);
+        if recorded.is_err() && backend == super::btrfs::VolumeBackend::LoopMount {
+            // A mounted image with no record would refuse every retry.
+            self.abandon_loop(&host_path);
+        }
+        recorded?;
         Ok(host_path)
+    }
+
+    /// Write a new volume's provisioning record.
+    fn record_new_volume(
+        &self,
+        host_path: &Path,
+        backend: super::btrfs::VolumeBackend,
+        quota_bytes: Option<u64>,
+        size_bytes: Option<u64>,
+    ) -> Result<(), VolumeError> {
+        #[cfg(test)]
+        self.inject_loop_fault(LoopStep::Record)?;
+        self.write_backend(host_path, backend, quota_bytes, size_bytes)
     }
 
     /// Container mount paths of every provisioned managed volume for
@@ -333,13 +368,22 @@ impl VolumeManager {
     }
 
     /// The recorded backend of a provisioned volume, if any.
+    ///
+    /// An unreadable record reads as `None` here: callers only use it to
+    /// decide what a snapshot may do, never whether to provision.
     pub fn backend_of(&self, host_path: &Path) -> Option<super::btrfs::VolumeBackend> {
-        read_sidecar(host_path).map(|sidecar| sidecar.backend)
+        read_sidecar(host_path)
+            .ok()
+            .flatten()
+            .map(|sidecar| sidecar.backend)
     }
 
     /// The Btrfs qgroup limit a provisioned volume was created with, if any.
     pub fn quota_of(&self, host_path: &Path) -> Option<u64> {
-        read_sidecar(host_path).and_then(|sidecar| sidecar.quota_bytes)
+        read_sidecar(host_path)
+            .ok()
+            .flatten()
+            .and_then(|sidecar| sidecar.quota_bytes)
     }
 
     fn write_backend(
@@ -374,18 +418,37 @@ impl VolumeManager {
 
     /// Set up a loop-mounted ext4 filesystem (Linux only).
     ///
-    /// Creates a sparse file, formats it with ext4, and loop-mounts it.
-    /// Writes beyond the quota fail with ENOSPC.
+    /// Creates a new image file, formats it with ext4, and loop-mounts it.
+    /// Writes beyond the quota fail with ENOSPC. An image that already
+    /// exists is never formatted unless it's still blank: with no readable
+    /// provisioning record it may hold an app's data.
     #[cfg(target_os = "linux")]
     fn setup_loop_mount(&self, path: &Path, size_bytes: u64) -> Result<(), VolumeError> {
+        let img_path = loop_image_path(path);
+        claim_loop_image(&img_path)?;
+        // This call made the image, so a failure from here on is this call's
+        // to undo. Left behind, an image with no record refuses every retry.
+        if let Err(error) = self.format_and_mount(path, &img_path, size_bytes) {
+            self.abandon_loop(path);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Format a freshly claimed image and mount it at `path`.
+    #[cfg(target_os = "linux")]
+    fn format_and_mount(
+        &self,
+        path: &Path,
+        img_path: &Path,
+        size_bytes: u64,
+    ) -> Result<(), VolumeError> {
         use std::process::Command;
 
-        let img_path = loop_image_path(path);
-
-        // Create sparse file
+        // Reserve the blocks, so a full disk fails now rather than later.
         let status = Command::new("fallocate")
             .args(["-l", &size_bytes.to_string()])
-            .arg(&img_path)
+            .arg(img_path)
             .status()
             .map_err(|e| VolumeError::CreateFailed {
                 path: path.display().to_string(),
@@ -398,10 +461,14 @@ impl VolumeManager {
             });
         }
 
-        // Format with ext4
+        // `-F` formats without asking, so only ever over an image this call
+        // created and that is still blank.
+        refuse_formatted_image(img_path)?;
+        #[cfg(test)]
+        self.inject_loop_fault(LoopStep::Format)?;
         let status = Command::new("mkfs.ext4")
             .args(["-F", "-q"])
-            .arg(&img_path)
+            .arg(img_path)
             .status()
             .map_err(|e| VolumeError::CreateFailed {
                 path: path.display().to_string(),
@@ -417,7 +484,7 @@ impl VolumeManager {
         // Loop mount
         let status = Command::new("mount")
             .args(["-o", "loop"])
-            .arg(&img_path)
+            .arg(img_path)
             .arg(path)
             .status()
             .map_err(|e| VolumeError::CreateFailed {
@@ -430,6 +497,8 @@ impl VolumeManager {
                 reason: "loop mount failed (requires root)".to_string(),
             });
         }
+        #[cfg(test)]
+        self.inject_loop_fault(LoopStep::Mounted)?;
 
         // A fresh ext4 filesystem has `lost+found`, so the app would not see
         // an empty volume. Redis's entrypoint then refuses to take its data
@@ -438,6 +507,54 @@ impl VolumeManager {
         std::fs::remove_dir(path.join("lost+found"))?;
 
         Ok(())
+    }
+
+    /// Undo a loop volume's first provisioning: unmount it if it got that
+    /// far and remove the image. Only for an image this provisioning made
+    /// and never recorded, so no app has written to it.
+    #[cfg(target_os = "linux")]
+    fn abandon_loop(&self, path: &Path) {
+        if super::rootfs::is_mountpoint(path) {
+            let unmounted = std::process::Command::new("umount")
+                .arg(path)
+                .status()
+                .is_ok_and(|status| status.success());
+            if !unmounted {
+                // Removing the image under a live mount would let a retry
+                // mount a second image over it. Keep it, and say so.
+                eprintln!(
+                    "warning: couldn't unmount {} after its first provisioning failed; \
+                     unmount it and remove {} before the next start",
+                    path.display(),
+                    loop_image_path(path).display()
+                );
+                return;
+            }
+        }
+        match std::fs::remove_file(loop_image_path(path)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => eprintln!(
+                "warning: couldn't remove {} after its first provisioning failed: {error}",
+                loop_image_path(path).display()
+            ),
+        }
+    }
+
+    /// No-op on non-Linux platforms, which never make loop volumes.
+    #[cfg(not(target_os = "linux"))]
+    fn abandon_loop(&self, _path: &Path) {}
+
+    /// Fail at `step` when a test asked for it.
+    #[cfg(test)]
+    fn inject_loop_fault(&self, step: LoopStep) -> Result<(), VolumeError> {
+        match self.loop_fault {
+            Some(fault) if fault(step) => Err(VolumeError::CreateFailed {
+                path: "loop volume".to_string(),
+                reason: format!("injected failure at {step:?}"),
+            }),
+            _ => Ok(()),
+        }
     }
 
     /// No-op on non-Linux platforms.
@@ -567,22 +684,256 @@ pub(crate) fn refuse_unenforced_size(
     }
 }
 
-fn read_sidecar(host_path: &Path) -> Option<VolumeSidecar> {
-    let bytes = std::fs::read(VolumeManager::sidecar_path(host_path)).ok()?;
-    serde_json::from_slice(&bytes).ok()
+/// Largest sidecar Bun reads. A real one is a few hundred bytes.
+const SIDECAR_LIMIT: u64 = 64 * 1024;
+
+/// The provisioning record of `host_path`.
+///
+/// `Ok(None)` only when there is no record at all. A record that exists
+/// but can't be read or parsed is an error, never "not provisioned":
+/// provisioning again would format a loop image that still holds data.
+fn read_sidecar(host_path: &Path) -> Result<Option<VolumeSidecar>, VolumeError> {
+    let path = VolumeManager::sidecar_path(host_path);
+    crate::durable::read_json_if_exists(&path, SIDECAR_LIMIT, crate::durable::Access::Regular)
+        .map_err(|error| VolumeError::UnreadableRecord {
+            path: path.display().to_string(),
+            reason: error.to_string(),
+        })
 }
 
-/// Replace the sidecar atomically: a torn sidecar reads as "never
-/// provisioned", and provisioning again would stack loop mounts.
+/// Replace the sidecar atomically and durably: the file and its directory
+/// are synced before this returns, so a power cut can't leave a torn or
+/// empty record behind a volume that holds data.
 fn write_sidecar(host_path: &Path, sidecar: &VolumeSidecar) -> Result<(), VolumeError> {
     let json = serde_json::to_vec_pretty(sidecar).map_err(|e| VolumeError::CreateFailed {
         path: host_path.display().to_string(),
         reason: format!("sidecar serialise: {e}"),
     })?;
-    let path = VolumeManager::sidecar_path(host_path);
-    let staged = path.with_extension("json.tmp");
-    std::fs::write(&staged, json)?;
-    std::fs::rename(&staged, &path)?;
+    crate::sesame::identity::atomic_write(&VolumeManager::sidecar_path(host_path), &json)?;
+    Ok(())
+}
+
+/// The path of a managed volume below the volumes directory:
+/// `namespace/app/<mount path>`. Every component must be a plain name.
+fn managed_relative_path(
+    namespace: &str,
+    app_name: &str,
+    mount_path: &Path,
+) -> Result<PathBuf, VolumeError> {
+    use std::path::Component;
+
+    let single_name = |name: &str| {
+        let mut components = Path::new(name).components();
+        matches!(
+            (components.next(), components.next()),
+            (Some(Component::Normal(_)), None)
+        )
+    };
+    if !single_name(namespace) || !single_name(app_name) {
+        return Err(VolumeError::PathTraversal(format!(
+            "{namespace}/{app_name}"
+        )));
+    }
+    // Defence in depth (config validation also refuses these): a `..`
+    // would leave the volumes directory once joined, and `/` alone would
+    // make the app's whole directory one volume.
+    let relative = mount_path.strip_prefix("/").unwrap_or(mount_path);
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(VolumeError::PathTraversal(mount_path.display().to_string()));
+    }
+    Ok(Path::new(namespace).join(app_name).join(relative))
+}
+
+/// What [`resolve_volume_path`] does with missing directories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathWalk {
+    /// Make missing parents, as plain directories. The leaf is left for
+    /// the backend to create.
+    Create,
+    /// Change nothing: every component, the leaf included, must exist.
+    Check,
+}
+
+/// Resolve `relative` under `volumes_dir` one component at a time.
+///
+/// A component that is a symlink, isn't a directory, or is (or is a
+/// restore copy of) a provisioned volume is refused: the contents of a
+/// volume belong to its container, which can plant a symlink to `/` there.
+/// The leaf must not hold a provisioned volume of its own either, or the
+/// container would mount that volume's provisioning record.
+///
+/// Every directory this accepts is one only Bun writes, so the path still
+/// means the same thing when the caller uses it a moment later.
+///
+/// `volumes_dir` itself and its ancestors are trusted as the operator
+/// configured them: a symlink there (the directory on another disk, say)
+/// is followed. Only the components below it are checked.
+fn resolve_volume_path(
+    volumes_dir: &Path,
+    relative: &Path,
+    walk: PathWalk,
+) -> Result<PathBuf, VolumeError> {
+    use std::path::Component;
+
+    let refuse = |path: &Path, why: &str| VolumeError::CreateFailed {
+        path: path.display().to_string(),
+        reason: format!("volume path {why}"),
+    };
+    if walk == PathWalk::Create {
+        std::fs::create_dir_all(volumes_dir)?;
+    }
+    let components: Vec<_> = relative.components().collect();
+    let Some(last) = components.len().checked_sub(1) else {
+        return Err(VolumeError::PathTraversal(relative.display().to_string()));
+    };
+    let mut current = volumes_dir.to_path_buf();
+    for (index, component) in components.into_iter().enumerate() {
+        let Component::Normal(name) = component else {
+            return Err(VolumeError::PathTraversal(relative.display().to_string()));
+        };
+        current.push(name);
+        let leaf = index == last;
+        // Below `namespace/app`, a directory may be a volume.
+        if index >= 2 && !leaf && is_volume_or_restore_copy(&current)? {
+            return Err(refuse(&current, "lies inside another managed volume"));
+        }
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(refuse(&current, "is a symlink"));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(refuse(&current, "is not a directory"));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if walk == PathWalk::Check {
+                    return Err(refuse(&current, "does not exist"));
+                }
+                if !leaf {
+                    // `create_dir` makes one name in a directory checked
+                    // just above, and refuses (rather than follows) one
+                    // that appeared in between.
+                    match std::fs::create_dir(&current) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                            if !std::fs::symlink_metadata(&current)?.is_dir() {
+                                return Err(refuse(&current, "is not a directory"));
+                            }
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    // A new volume over a directory that already holds one would hand the
+    // older volume, provisioning record and all, to this container.
+    if walk == PathWalk::Create
+        && read_sidecar(&current)?.is_none()
+        && current.is_dir()
+        && holds_a_volume(&current)
+    {
+        return Err(refuse(&current, "already holds another managed volume"));
+    }
+    Ok(current)
+}
+
+/// Whether `path` is a provisioned volume or a snapshot restore's copy of
+/// one, judged from Bun's own files beside it.
+fn is_volume_or_restore_copy(path: &Path) -> Result<bool, VolumeError> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if name.ends_with(".restore-staged") || name.ends_with(".restore-old") {
+        return Ok(true);
+    }
+    for record in [
+        VolumeManager::sidecar_path(path),
+        super::snapshot::restore_journal_path(path),
+    ] {
+        match std::fs::symlink_metadata(record) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(false)
+}
+
+/// Whether any provisioned volume lives below `directory`.
+fn holds_a_volume(directory: &Path) -> bool {
+    let mut found = Vec::new();
+    VolumeManager::walk_sidecars(directory, directory, &mut found);
+    !found.is_empty()
+}
+
+/// Create a loop volume's image file, refusing one that holds data.
+///
+/// An existing image with no readable record is what a crash between
+/// formatting and recording leaves, or what a lost record leaves behind a
+/// volume full of data. Either way it isn't Bun's to format again. A
+/// blank one is the exception: it has no filesystem, so no data, and is
+/// what a crash before formatting leaves. It's emptied and claimed again.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn claim_loop_image(image: &Path) -> Result<(), VolumeError> {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(image)
+    {
+        Ok(file) => {
+            file.sync_all()?;
+            Ok(())
+        }
+        Err(error)
+            if error.kind() == std::io::ErrorKind::AlreadyExists
+                && std::fs::symlink_metadata(image).is_ok_and(|metadata| metadata.is_file())
+                && refuse_formatted_image(image).is_ok() =>
+        {
+            let file = std::fs::OpenOptions::new().write(true).open(image)?;
+            file.set_len(0)?;
+            file.sync_all()?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(VolumeError::CreateFailed {
+                path: image.display().to_string(),
+                reason: "loop volume image already exists but has no provisioning record; \
+                         Bun won't format it. Restore its .volume.json, or remove the image \
+                         if it holds nothing you need"
+                    .to_string(),
+            })
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// How much of a new image is checked for an existing filesystem: ext4's
+/// superblock and most other signatures sit in the first megabyte.
+const SIGNATURE_WINDOW: u64 = 1024 * 1024;
+
+/// Refuse an image whose first megabyte isn't blank, so `mkfs -F` never
+/// writes over a filesystem.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn refuse_formatted_image(image: &Path) -> Result<(), VolumeError> {
+    use std::io::Read as _;
+
+    let mut head = Vec::new();
+    std::fs::File::open(image)?
+        .take(SIGNATURE_WINDOW)
+        .read_to_end(&mut head)?;
+    if head.iter().any(|byte| *byte != 0) {
+        return Err(VolumeError::CreateFailed {
+            path: image.display().to_string(),
+            reason: "loop volume image already holds data; Bun won't format over it".to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -645,18 +996,32 @@ const HANDED_OVER_MODE: u32 = 0o755;
 
 /// Give a managed volume to the container user about to mount it.
 ///
-/// Returns `Ok(None)` when `host_path` has no provisioning sidecar, i.e.
-/// it isn't a volume Bun manages: host directories are never chowned.
+/// The caller names `host_path` from its own record of the managed volumes
+/// it mounts ([`super::oci::OciSpec::managed_volumes`]), never from a
+/// file it found beside a mount source: host directories are never
+/// chowned. `host_path` must lie below `volumes_dir`, reached without a
+/// symlink and outside every other volume, and have a provisioning record;
+/// anything else is refused before an owner changes.
+///
 /// The new owner is recorded only after the walk finishes, so an
 /// interrupted hand-over runs again on the next start.
 pub fn hand_to_container_user(
+    volumes_dir: &Path,
     host_path: &Path,
     wanted: VolumeOwner,
-) -> Result<Option<OwnershipPlan>, VolumeError> {
+) -> Result<OwnershipPlan, VolumeError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    let Some(mut sidecar) = read_sidecar(host_path) else {
-        return Ok(None);
+    let relative = host_path
+        .strip_prefix(volumes_dir)
+        .map_err(|_| VolumeError::PathTraversal(host_path.display().to_string()))?;
+    let host_path = resolve_volume_path(volumes_dir, relative, PathWalk::Check)?;
+    let host_path = host_path.as_path();
+    let Some(mut sidecar) = read_sidecar(host_path)? else {
+        return Err(VolumeError::CreateFailed {
+            path: host_path.display().to_string(),
+            reason: "managed volume has no provisioning record".to_string(),
+        });
     };
     let metadata = std::fs::symlink_metadata(host_path)?;
     if !metadata.is_dir() {
@@ -671,7 +1036,7 @@ pub fn hand_to_container_user(
     };
     let plan = plan_ownership(sidecar.owner, root, wanted);
     match plan {
-        OwnershipPlan::Keep => return Ok(Some(plan)),
+        OwnershipPlan::Keep => return Ok(plan),
         OwnershipPlan::HandOver => {
             chown_tree(host_path, &|_| Some(wanted))?;
             std::fs::set_permissions(host_path, std::fs::Permissions::from_mode(HANDED_OVER_MODE))?;
@@ -696,7 +1061,7 @@ pub fn hand_to_container_user(
     }
     sidecar.owner = Some(wanted);
     write_sidecar(host_path, &sidecar)?;
-    Ok(Some(plan))
+    Ok(plan)
 }
 
 /// Change the owner of `root` and everything under it to whatever
@@ -1106,21 +1471,329 @@ mod tests {
         );
     }
 
+    /// Who this test process is: the only owner an unprivileged test can
+    /// hand a volume to, which still runs the whole hand-over.
+    fn me(path: &Path) -> VolumeOwner {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(path).unwrap();
+        VolumeOwner {
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+        }
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(path).unwrap().permissions())
+            & 0o7777
+    }
+
+    /// A provisioning record copied beside a host directory doesn't make
+    /// it a managed volume: only a path below the volumes directory is.
     #[test]
-    fn host_directories_are_never_chowned() {
+    fn a_directory_outside_the_volumes_directory_is_never_handed_over() {
         let dir = tempfile::tempdir().unwrap();
-        let data = dir.path().join("data");
-        std::fs::create_dir(&data).unwrap();
-        std::fs::set_permissions(&data, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        let vm = VolumeManager::new(dir.path().join("volumes"));
+        let managed = vm
+            .create_managed_volume("default", "app", Path::new("/data"), None)
+            .unwrap();
+        let host = dir.path().join("srv");
+        std::fs::create_dir(&host).unwrap();
+        std::fs::set_permissions(&host, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        std::fs::copy(
+            VolumeManager::sidecar_path(&managed),
+            VolumeManager::sidecar_path(&host),
+        )
+        .unwrap();
+
+        let result = hand_to_container_user(vm.volumes_dir(), &host, me(&host));
+
+        assert!(result.is_err(), "handed over a host directory: {result:?}");
+        assert_eq!(mode_of(&host), 0o700);
+    }
+
+    /// v1 of an app owns `/data`, and its container plants `/data/sub ->
+    /// <host dir>`. v2 asks for `/data/sub/etc`. Resolving that path must
+    /// not follow the container's symlink out of the volume.
+    #[cfg(unix)]
+    #[test]
+    fn a_volume_under_an_older_volume_is_refused_and_its_symlink_never_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(dir.path());
+        let data = vm
+            .create_managed_volume("default", "db", Path::new("/data"), None)
+            .unwrap();
+        std::os::unix::fs::symlink(host.path(), data.join("sub")).unwrap();
+
+        let result = vm.create_managed_volume("default", "db", Path::new("/data/sub/etc"), None);
+
+        assert!(result.is_err(), "provisioned through a symlink: {result:?}");
+        assert!(!host.path().join("etc").exists());
+        assert!(!host.path().join("etc.volume.json").exists());
+    }
+
+    /// Without any symlink, a path inside an older volume is still the
+    /// older container's to rearrange, so it can't hold a new volume.
+    #[test]
+    fn a_volume_inside_an_older_volume_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(dir.path());
+        let data = vm
+            .create_managed_volume("default", "db", Path::new("/data"), None)
+            .unwrap();
+        std::fs::create_dir(data.join("sub")).unwrap();
+
+        let result = vm.create_managed_volume("default", "db", Path::new("/data/sub"), None);
+
+        assert!(result.is_err(), "nested a volume: {result:?}");
+        assert!(!data.join("sub.volume.json").exists());
+    }
+
+    /// The reverse nesting: a new `/data` would hand the older `/data/sub`
+    /// volume, its provisioning record included, to the new container.
+    #[test]
+    fn a_volume_over_an_older_volume_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(dir.path());
+        vm.create_managed_volume("default", "db", Path::new("/data/sub"), None)
             .unwrap();
 
-        let plan = hand_to_container_user(&data, mapped(999)).unwrap();
+        let result = vm.create_managed_volume("default", "db", Path::new("/data"), None);
 
-        assert_eq!(plan, None, "no sidecar, so not a managed volume");
-        let mode = std::os::unix::fs::PermissionsExt::mode(
-            &std::fs::metadata(&data).unwrap().permissions(),
+        assert!(result.is_err(), "nested a volume: {result:?}");
+        assert!(!dir.path().join("default/db/data.volume.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_anywhere_on_the_volume_path_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(dir.path());
+        std::fs::create_dir_all(dir.path().join("default/db")).unwrap();
+        std::os::unix::fs::symlink(host.path(), dir.path().join("default/db/parent")).unwrap();
+        std::os::unix::fs::symlink(host.path(), dir.path().join("default/db/leaf")).unwrap();
+        std::os::unix::fs::symlink(host.path(), dir.path().join("linked")).unwrap();
+
+        for (namespace, mount) in [
+            ("default", "/parent/data"),
+            ("default", "/leaf"),
+            ("linked", "/data"),
+        ] {
+            let result = vm.create_managed_volume(namespace, "db", Path::new(mount), None);
+            assert!(result.is_err(), "{namespace} {mount}: {result:?}");
+        }
+        assert_eq!(std::fs::read_dir(host.path()).unwrap().count(), 0);
+        assert!(!dir.path().join("default/db/leaf.volume.json").exists());
+    }
+
+    /// A volume reached through a symlink isn't handed over, even when
+    /// the path below it is a real, provisioned volume.
+    #[cfg(unix)]
+    #[test]
+    fn hand_over_refuses_a_volume_reached_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(dir.path());
+        let data = vm
+            .create_managed_volume("default", "db", Path::new("/data"), None)
+            .unwrap();
+        std::fs::set_permissions(&data, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("default/db"),
+            dir.path().join("default/alias"),
+        )
+        .unwrap();
+
+        let result = hand_to_container_user(
+            vm.volumes_dir(),
+            &dir.path().join("default/alias/data"),
+            me(&data),
         );
-        assert_eq!(mode & 0o777, 0o700);
+
+        assert!(result.is_err(), "followed a symlink: {result:?}");
+        assert_eq!(mode_of(&data), 0o700);
+    }
+
+    /// A torn or hand-edited record must never read as "not provisioned":
+    /// provisioning again formats a loop image that still holds data.
+    #[test]
+    fn an_unreadable_volume_record_is_an_error_not_a_new_volume() {
+        for torn in [&b""[..], &b"{\"schema\":1,\"back"[..]] {
+            let dir = tempfile::tempdir().unwrap();
+            let vm = VolumeManager::new(dir.path());
+            let data = vm
+                .create_managed_volume("default", "db", Path::new("/data"), None)
+                .unwrap();
+            std::fs::write(data.join("rows"), b"keep").unwrap();
+            let record = VolumeManager::sidecar_path(&data);
+            std::fs::write(&record, torn).unwrap();
+
+            let result = vm.create_managed_volume("default", "db", Path::new("/data"), None);
+
+            assert!(
+                matches!(result, Err(VolumeError::UnreadableRecord { .. })),
+                "{result:?}"
+            );
+            assert_eq!(std::fs::read(&record).unwrap(), torn, "record rewritten");
+            assert_eq!(std::fs::read(data.join("rows")).unwrap(), b"keep");
+            assert!(
+                hand_to_container_user(vm.volumes_dir(), &data, me(&data)).is_err(),
+                "handed over a volume with a torn record"
+            );
+        }
+    }
+
+    #[test]
+    fn an_existing_loop_image_is_never_claimed_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("data.img");
+        std::fs::write(&image, b"an ext4 filesystem full of rows").unwrap();
+
+        assert!(claim_loop_image(&image).is_err());
+        assert_eq!(
+            std::fs::read(&image).unwrap(),
+            b"an ext4 filesystem full of rows"
+        );
+
+        let fresh = dir.path().join("fresh.img");
+        claim_loop_image(&fresh).unwrap();
+        assert_eq!(std::fs::metadata(&fresh).unwrap().len(), 0);
+    }
+
+    /// A blank image with no record (what a crash between claiming and
+    /// formatting leaves) holds no filesystem, so claiming it again is
+    /// safe, and refusing it would leave the volume stuck for good.
+    #[test]
+    fn a_blank_image_with_no_record_is_claimed_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("data.img");
+        std::fs::File::create(&image)
+            .unwrap()
+            .set_len(2 * 1024 * 1024)
+            .unwrap();
+
+        claim_loop_image(&image).unwrap();
+
+        assert_eq!(std::fs::metadata(&image).unwrap().len(), 0);
+    }
+
+    /// The volumes directory itself is the operator's choice, and a
+    /// symlink there (say `/var/lib/reliaburger` on another disk) is
+    /// trusted. Only the path below it is resolved without symlinks.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_volumes_root_is_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("disk");
+        std::fs::create_dir(&real).unwrap();
+        let root = dir.path().join("volumes");
+        std::os::unix::fs::symlink(&real, &root).unwrap();
+        let vm = VolumeManager::new(&root);
+
+        let data = vm
+            .create_managed_volume("default", "db", Path::new("/data"), None)
+            .unwrap();
+        std::fs::set_permissions(&data, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        let plan = hand_to_container_user(&root, &data, me(&data)).unwrap();
+
+        assert_eq!(plan, OwnershipPlan::HandOver);
+        assert!(real.join("default/db/data").is_dir());
+        assert_eq!(mode_of(&data), 0o755);
+    }
+
+    /// A first provisioning that fails part-way removes the image it made
+    /// (unmounting it first if it got that far), so the next start can
+    /// provision the volume, rather than finding an image with no record
+    /// and refusing it for good.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux root with mkfs.ext4 and loop devices; run with make test-linux"]
+    fn a_failed_first_loop_provisioning_can_be_retried() {
+        assert!(nix::unistd::geteuid().is_root());
+        for step in [LoopStep::Format, LoopStep::Mounted, LoopStep::Record] {
+            let scratch = tempfile::tempdir().unwrap();
+            let mut vm = VolumeManager::new(scratch.path());
+            vm.loop_fault = Some(match step {
+                LoopStep::Format => |step| step == LoopStep::Format,
+                LoopStep::Mounted => |step| step == LoopStep::Mounted,
+                LoopStep::Record => |step| step == LoopStep::Record,
+            });
+            let path = scratch.path().join("default/db/data");
+
+            let failed =
+                vm.create_managed_volume("default", "db", Path::new("/data"), Some("16Mi"));
+
+            assert!(failed.is_err(), "{step:?}: {failed:?}");
+            assert!(
+                !crate::grill::rootfs::is_mountpoint(&path),
+                "{step:?}: left mounted"
+            );
+            assert!(!loop_image_path(&path).exists(), "{step:?}: image left");
+            vm.loop_fault = None;
+            let again = vm.create_managed_volume("default", "db", Path::new("/data"), Some("16Mi"));
+            let mounted = crate::grill::rootfs::is_mountpoint(&path);
+            let _ = std::process::Command::new("umount").arg(&path).status();
+            assert_eq!(again.unwrap(), path, "{step:?}");
+            assert!(mounted, "{step:?}: retry didn't mount");
+        }
+    }
+
+    #[test]
+    fn only_a_blank_image_may_be_formatted() {
+        let dir = tempfile::tempdir().unwrap();
+        let blank = dir.path().join("blank.img");
+        let file = std::fs::File::create(&blank).unwrap();
+        file.set_len(4 * 1024 * 1024).unwrap();
+        refuse_formatted_image(&blank).unwrap();
+
+        // ext4's magic number, where its superblock keeps it.
+        let formatted = dir.path().join("formatted.img");
+        let mut bytes = vec![0u8; 4096];
+        bytes[1080] = 0x53;
+        bytes[1081] = 0xef;
+        std::fs::write(&formatted, bytes).unwrap();
+        assert!(refuse_formatted_image(&formatted).is_err());
+    }
+
+    /// A loop volume whose record is gone (lost in a power cut) keeps its
+    /// data: provisioning again refuses rather than formatting the image.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux root with mkfs.ext4 and loop devices; run with make test-linux"]
+    fn a_loop_image_without_its_record_is_never_formatted() {
+        assert!(nix::unistd::geteuid().is_root());
+        let scratch = tempfile::tempdir().unwrap();
+        let vm = VolumeManager::new(scratch.path());
+        let path = vm
+            .create_managed_volume("default", "db", Path::new("/data"), Some("16Mi"))
+            .unwrap();
+        assert_eq!(
+            vm.backend_of(&path),
+            Some(crate::grill::btrfs::VolumeBackend::LoopMount)
+        );
+        std::fs::write(path.join("acknowledged"), b"36318").unwrap();
+        run_cmd("umount", &[path.to_str().unwrap()]);
+        std::fs::remove_file(VolumeManager::sidecar_path(&path)).unwrap();
+
+        let again = vm.create_managed_volume("default", "db", Path::new("/data"), Some("16Mi"));
+        assert!(again.is_err(), "provisioned over a live image: {again:?}");
+
+        let image = loop_image_path(&path);
+        run_cmd(
+            "mount",
+            &[
+                "-o",
+                "loop",
+                image.to_str().unwrap(),
+                path.to_str().unwrap(),
+            ],
+        );
+        let data = std::fs::read(path.join("acknowledged"));
+        let _ = std::process::Command::new("umount").arg(&path).status();
+        assert_eq!(data.unwrap(), b"36318");
     }
 
     #[test]
@@ -1145,10 +1818,10 @@ mod tests {
             gid: me.gid(),
         };
 
-        let plan = hand_to_container_user(&path, me).unwrap();
+        let plan = hand_to_container_user(vm.volumes_dir(), &path, me).unwrap();
 
-        assert_eq!(plan, Some(OwnershipPlan::HandOver));
-        assert_eq!(read_sidecar(&path).unwrap().owner, Some(me));
+        assert_eq!(plan, OwnershipPlan::HandOver);
+        assert_eq!(read_sidecar(&path).unwrap().unwrap().owner, Some(me));
         let mode = std::os::unix::fs::PermissionsExt::mode(
             &std::fs::metadata(&path).unwrap().permissions(),
         );
@@ -1157,7 +1830,7 @@ mod tests {
         // Provisioning again (every instance start) keeps the record.
         vm.create_managed_volume("default", "redis", Path::new("/data"), None)
             .unwrap();
-        assert_eq!(read_sidecar(&path).unwrap().owner, Some(me));
+        assert_eq!(read_sidecar(&path).unwrap().unwrap().owner, Some(me));
         assert_eq!(
             vm.backend_of(&path),
             Some(crate::grill::btrfs::VolumeBackend::Plain)
@@ -1251,8 +1924,8 @@ mod tests {
         std::fs::create_dir(path.join("sub")).unwrap();
         std::fs::write(path.join("sub/mine"), b"x").unwrap();
 
-        let plan = hand_to_container_user(&path, mapped(0)).unwrap();
-        assert_eq!(plan, Some(OwnershipPlan::HandOver));
+        let plan = hand_to_container_user(vm.volumes_dir(), &path, mapped(0)).unwrap();
+        assert_eq!(plan, OwnershipPlan::HandOver);
         assert_eq!(owner_of(&path.join("sub/mine")), mapped(0));
         // What the entrypoint would do: give a file to a service user,
         // and plant links out of the volume.
@@ -1273,13 +1946,13 @@ mod tests {
         container_made("dirlink", mapped(0));
 
         assert_eq!(
-            hand_to_container_user(&path, mapped(0)).unwrap(),
-            Some(OwnershipPlan::Keep)
+            hand_to_container_user(vm.volumes_dir(), &path, mapped(0)).unwrap(),
+            OwnershipPlan::Keep
         );
         assert_eq!(owner_of(&path.join("service")).uid, mapped(999).uid);
 
-        let plan = hand_to_container_user(&path, mapped(1000)).unwrap();
-        assert_eq!(plan, Some(OwnershipPlan::Rehome { from: mapped(0) }));
+        let plan = hand_to_container_user(vm.volumes_dir(), &path, mapped(1000)).unwrap();
+        assert_eq!(plan, OwnershipPlan::Rehome { from: mapped(0) });
         assert_eq!(owner_of(&path), mapped(1000));
         assert_eq!(owner_of(&path.join("sub/mine")), mapped(1000));
         assert_eq!(
@@ -1297,7 +1970,10 @@ mod tests {
             HOST_ROOT,
             "linked directory untouched"
         );
-        assert_eq!(read_sidecar(&path).unwrap().owner, Some(mapped(1000)));
+        assert_eq!(
+            read_sidecar(&path).unwrap().unwrap().owner,
+            Some(mapped(1000))
+        );
     }
 
     /// Btrfs snapshots carry ownership with the data, and the sidecar
@@ -1329,7 +2005,8 @@ mod tests {
             if vm.backend_of(&live) != Some(crate::grill::btrfs::VolumeBackend::BtrfsSubvolume) {
                 return Err("expected the btrfs subvolume backend".to_string());
             }
-            hand_to_container_user(&live, mapped(0)).map_err(|e| e.to_string())?;
+            hand_to_container_user(vm.volumes_dir(), &live, mapped(0))
+                .map_err(|e| e.to_string())?;
             std::fs::write(live.join("state"), b"v1").map_err(|e| e.to_string())?;
             std::os::unix::fs::lchown(live.join("state"), Some(mapped(999).uid), None)
                 .map_err(|e| e.to_string())?;
@@ -1342,8 +2019,9 @@ mod tests {
                 .restore("default", "db", &meta.name, None)
                 .map_err(|e| format!("restore: {e}"))?;
 
-            let plan = hand_to_container_user(&live, mapped(0)).map_err(|e| e.to_string())?;
-            if plan != Some(OwnershipPlan::Keep) {
+            let plan = hand_to_container_user(vm.volumes_dir(), &live, mapped(0))
+                .map_err(|e| e.to_string())?;
+            if plan != OwnershipPlan::Keep {
                 return Err(format!("restored volume re-planned as {plan:?}"));
             }
             if owner_of(&live) != mapped(0) || owner_of(&live.join("state")).uid != mapped(999).uid

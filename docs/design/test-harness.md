@@ -87,12 +87,13 @@ Pull requests stacked on another branch skip the acceptance suites (wall-clock,
 cluster, upgrade and privileged Linux) unless labelled `full-ci`; they run once the
 PR targets `main`, and `ci-retarget.yml` reruns CI as soon as GitHub retargets one.
 Pull requests into a release's merge-train branch (`release-*`) run the light set:
-lint, minimum Rust, portable Linux with coverage, the demo app and the optimised
-contract boundaries. Labelled `full-ci`, they run every heavy owner but not
-portable macOS (the `train-full` selection), which is also what a code PR into
-`main` runs. The merge queue on the train, the push to it, pushes to `main`,
+lint, minimum Rust, portable Linux with coverage, CI policy (with the demo app)
+and the optimised contract boundaries. Labelled `full-ci`, they run every heavy
+owner but not portable macOS (the `train-full` selection), which is also what a
+code PR into `main` runs. The merge queue on the train, pushes to `main`,
 the nightly and the gate PR into `main` labelled `release-gate` run
-everything, portable macOS included; any other PR runs it only
+everything, portable macOS included; a push to the train reuses the queue's
+run on the same commit when it passed every job (#1723); any other PR runs it only
 when it touches macOS-specific code or carries a `macos` label
 ([which jobs run](../testing.md#which-jobs-a-pull-request-runs)). Portable
 macOS runs `make test-macos`, relish's tests and the tests only macOS
@@ -119,13 +120,38 @@ are `#[ignore]`d with a reason naming the target or script that runs them:
 | `grill::apple::tests::*` | Apple silicon with Apple Container | `make test-apple` |
 | `bun::gpu::tests::nvidia_detector_finds_hardware` | An NVIDIA GPU and `nvidia-smi` | `make test-gpu` |
 | `owned_runc::actual_host_reboot_*`, `oci_crash::actual_bun_kernel_discovery_host_reboot` | A Linux VM that can be rebooted mid-test | `scripts/release/qualify-oci-reboot.sh`, `scripts/release/qualify-discovery-reboot.sh` |
-| `power_cut::actual_power_cut_*` | A disposable Linux VM whose power can be cut while workers write | `scripts/release/qualify-storage-power-cut.sh --vm VM --fixture exporter\|leases\|backups --iterations N` |
+| `power_cut::actual_power_cut_*` | A disposable Linux VM whose power can be cut while workers write | `scripts/release/qualify-storage-power-cut.sh --vm VM --fixture exporter\|leases\|backups\|volumes --iterations N` |
 | All of the above, for a release candidate | Lima on the host; it creates and deletes the VM | `scripts/release/qualify-power-cut-reboot.sh --commit SHA --iterations N --record-dir DIR` |
+
+One more script cuts power without a Rust test behind it.
+`scripts/release/power_cut/calibrate.sh` measures what each way of cutting a
+Lima VM's power loses (`--kind stop|kill|sysrq --cuts N`, with `--raw` for
+unflushed writes alone on a second, unformatted disk), and whether the guest
+kernel can record and replay a `dm-log-writes` log (`--logwrites`), on a
+disposable VM it creates and deletes. Its decisions (the record scan, the
+refusal of a cut that never rebooted the guest, the raw-disk flush counting,
+the tally, the log parser, its walk past the entry count, and the replay) are
+tested against fixtures in `scripts/release/test_power_cut_calibrate.py`, part
+of `make test-ci-scripts`, along with `quiet.py`'s gate check. The
+[calibration record](../qualification/2026-11-18-power-cut-calibration.md)
+says what each cut was shown to lose and what's still untested.
+`scripts/release/qualify-power-cut-endurance.sh` cuts a one-node quickstart
+cluster's power again and again and checks invariants I1, I2, I4, I6 and I7
+after each cut ([testing guide](../testing.md#power-cut-endurance)); its
+decisions live in `scripts/release/power_cut/endurance.py`, tested by
+`scripts/release/test_power_cut_endurance.py`, which also runs its shell
+functions (powering back on, the start bookkeeping, stopping early) against a
+fake `limactl` and `relish`. It shares `power_off` and `settle` with the soak
+through `scripts/release/sustained/power.sh`, but powers back on with
+`limactl start` alone.
 
 `.github/workflows/v02-loops.yml` is the other long-running lane. It runs only when
 someone pushes the `v02-loops` branch or dispatches it by hand, and loops the upgrade,
 council, lease-recovery and exporter-lock suites for hours on Linux x86-64, Linux
 arm64 and macOS, then reports each lane's runs, failures and rule-of-three bound.
+Its build job archives only the seven test binaries the loops select, so a
+cold macOS build fits its 90 minutes; `V02LoopArchiveTests` in
+`scripts/ci/test_ci_workflow.py` keeps that list in step with the loops' filters.
 `scripts/release/loop_summary.py` gives every test a status (pass, fail, skip or
 incomplete) and checks the combined record against
 `scripts/release/v02-loop-lanes.json`: a lane or named test with no results, a
@@ -385,6 +411,41 @@ failure and one separately labelled diagnostic without retries or increased
 production deadlines. Subprocess readiness/capture controls should name the
 bounded phase, observe the owned child and distinguish an empty readable log
 from a log read/decode error. Never include secrets to improve a diagnostic.
+
+## Evidence before cleanup
+
+A check that fails must leave enough behind to diagnose it from the record,
+without a rerun (#2131). Cleanup is the enemy here: it removes the very
+instances a failure is about. So evidence is taken at the moment of failure
+and before anything cleans up.
+
+- **`relish test`.** The runner records a failing or timed-out case's state
+  before it releases the case's lease: the named step it was in, every step
+  with its duration, its applications and their instances on every reachable
+  node (state, restarts, exit code, reason), the newest deployment of each,
+  recent events about them and what the server says of the lease. It goes
+  in the case's report entry as `failure_state`, so `-o json` and the soak's
+  pulse snapshots carry it. Every list and text field is bounded (16 steps,
+  8 apps, 32 instances, 20 events, 300 characters each), and a read that
+  fails is listed in `errors` rather than left out: each node's status is
+  its own read, so a partitioned node costs only its own instances, and
+  events another namespace crowded out of the server's page are noted too.
+  Event messages are wrapped as untrusted text, as `relish events -o json`
+  wraps them, because they can quote an app. `step_open` says whether the
+  named step was still running or the case failed after finishing it. The
+  capture gets 15 s, 3 s per read, and the case's lease is that much longer.
+- **Named steps.** Cases run their waits through `TestContext::step` or a
+  wait helper, which opens a named step and closes it when it ends. A step
+  the runner cancelled at its deadline stays open, so a timeout reads
+  `case exceeded its 300000 ms deadline during step "exec in registry-web"`
+  rather than just the deadline. Name a step for what it waits on.
+- **The soak harness.** `record_failure` runs before the caller's own
+  cleanup (fault clear, settle). A `relish test` check passes its JSON
+  report too: the bundle keeps it as `test-report.json`, writes the failing
+  cases' captured states to `captured-state.json`, and takes the journals
+  from a minute before the earliest failing case started, or the last 15
+  minutes if that reaches further back. The failure line in the log and in the rendered record links
+  `failures/<n>/captured-state.json`.
 
 ## Adding a test
 

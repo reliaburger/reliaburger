@@ -81,6 +81,16 @@ mirror, `mirrors` now covers every image you apply.
   not answer`). The registry gets 20 seconds to answer.
 - **Pickle images** bind to the digest the cluster's registry holds for the
   tag, without asking anyone else.
+- **Not built yet?** A name with no registry (`burger:v1`) that Pickle doesn't
+  hold falls through to Docker Hub. When Docker Hub hasn't got it either, the
+  apply fails with `burger:v1 isn't in this cluster's registry (Pickle); build
+  it with relish build <file> or push it, or name the registry that has it`.
+  Run `relish build` (or push the image) and apply again. An image whose own
+  registry says it doesn't exist (`ghcr.io/acme/burger:v1`) fails with
+  `doesn't exist or isn't visible to this node`: check the name, the tag and
+  the node's registry credentials. Neither is worth retrying, so `relish
+  apply` reports `404`, not the `502` of a registry that's down, on a
+  standalone node and on a cluster alike.
 - **Where you see it:** `relish history` shows the bound reference in its
   `IMAGE` column, one row per version. `relish rollback`
   restores the bound reference of the version before, so it runs the bytes
@@ -228,7 +238,10 @@ Relish uploads the context to the registry: through the quickstart's registry
 forward (`127.0.0.1:15050`) on a laptop cluster, otherwise at `localhost:5050`,
 so run it on a node or through a forward to one (`--registry-port` names the
 port on this host). A node then builds it with Buildah, which must be installed
-there (the quickstart's VMs have it). The five-minute tour builds
+there (the quickstart's VMs have it; the bare-metal appliance doesn't, so on
+an appliance cluster build elsewhere and push, below). A node without
+Buildah hands the build to one that has it, and with none the build stops
+with `no builder available` and these two ways out. The five-minute tour builds
 `examples/demo/burger` this way. A build has 15 minutes per stage
 (`[images] build_timeout_secs`) and a 256 MiB context. Refer to the result by
 its bare name, as `api:v1.2.3`, and nodes find it in Pickle. Built images are
@@ -425,6 +438,26 @@ one). A bigger `cpu` or `memory` request doesn't move it, even when its node is
 now short of room. A host-path volume is never chowned: make it readable (or writable) by
 the container's mapped user yourself.
 
+Two managed volumes of one app can't nest: an app that asks for both `/data`
+and `/data/sub` is refused at deploy time.
+
+Everything inside a managed volume belongs to the app, so a new volume can't
+live inside an older one. A deploy that asks for `/data/cache` while the node
+still holds the app's `/data` volume (or the reverse) fails, naming the path.
+Pick a mount path beside the old one instead, such as `/cache`. A volume path
+that runs through a symlink below the volumes directory is refused the same
+way. The volumes directory itself, and the directories above it, are yours:
+Bun follows a symlink there, so you can point it at another disk.
+
+Bun keeps a small record beside each managed volume
+(`<volumes>/<namespace>/<app>/data.volume.json` for `/data`) and syncs it to
+disk on every write. If that record is damaged, the app fails to start with a
+message naming it, and Bun leaves the volume alone: it never treats a volume
+with a damaged record as new, and never formats a loop image that already
+holds data. If a sized volume's first set-up fails part-way, Bun removes the
+image it made, so the next start tries again from scratch. Restore the record from a backup, or delete the volume and its record
+if they hold nothing you need.
+
 `size` is a hard limit. A node running as root enforces it with a Btrfs quota
 when the volumes directory is on Btrfs, or a loop-mounted ext4 file elsewhere.
 A node that can do neither (rootless, or macOS) refuses a sized volume and
@@ -453,8 +486,8 @@ container. Two gates stand in the way:
   ```
 
   The node's own directories are refused even under a listed prefix: the five
-  `[storage]` directories, the identity directory, the script directory and
-  the directories holding the master key and the security bootstrap. So is a
+  `[storage]` directories, the identity directory and the directories
+  holding the master key and the security bootstrap. So is a
   path that contains one of them, such as `/var/lib`. A refused app fails its
   deploy on that node, and `relish apply` names the path and the reason.
 

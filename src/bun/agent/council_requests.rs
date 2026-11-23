@@ -291,7 +291,7 @@ mod tests {
                 .await
                 .unwrap(),
             );
-            network.register(id, node.raft().clone()).await;
+            network.register(id, &node).await;
             nodes.push(node);
         }
         nodes[0].initialize(members).await.unwrap();

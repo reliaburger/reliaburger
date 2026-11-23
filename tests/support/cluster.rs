@@ -201,7 +201,7 @@ pub async fn build_council() -> (Vec<Arc<CouncilNode>>, InMemoryRaftRouter) {
         )
         .await
         .unwrap();
-        router.register(rid(index), node.raft().clone()).await;
+        router.register(rid(index), &node).await;
         nodes.push(Arc::new(node));
     }
 
@@ -422,6 +422,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             seeds,
             wrapping_ikm: None,
             bootstrap_security_state: None,
+            bootstrap_council_size: None,
             data_dir,
             mayo: mayo.clone(),
             rollup_interval: metrics_rollup.unwrap_or(Duration::from_secs(60)),
@@ -489,7 +490,6 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             .map(Into::into)
             .collect(),
             mount_isolation: false,
-            ..Default::default()
         },
     );
     agent.set_node_capacity(8000, 16384);
@@ -748,6 +748,10 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
     let app = app.layer(axum::Extension(known_members));
     // Gossip's own counters, read by `/v1/cluster/summary`, as `bun` wires them.
     let app = app.layer(axum::Extension(cluster_runtime.gossip_stats.clone()));
+    // The council backup loop's state, read by `/v1/diagnostics` (#2016).
+    let app = app.layer(axum::Extension(
+        reliaburger::council::backup::BackupMonitor(cluster_runtime.backup_rx.clone()),
+    ));
     // Like `bun`, every node finds the leader through the gossip directory,
     // which also names it to workers outside Raft.
     let app = app.layer(axum::Extension(api::LeaderDirectory(directory_rx.clone())));

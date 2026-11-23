@@ -119,6 +119,33 @@ The `::<RECORD_BYTES>` is a *turbofish*, the syntax for passing a generic parame
 
 A block cut short by a crash at the very end is truncated before new records are appended: nobody was told those records were durable. Damage anywhere earlier is an error, not a skip, because skipping would silently re-run or lose finished tasks. Anything in a held chunk without a terminal record runs again. That's at-least-once execution, and it's a deliberate trade for tasks this short.
 
+#### A stopping node starts no new attempts
+
+The 0.3.0 rehearsal's soak stops the whole cluster gracefully and starts it again. During one of those stops, an ordinary task used all three of its attempts and failed for good: `wget: download timed out` ([#1965](https://github.com/reliaburger/reliaburger/issues/1965)). Its node's Bun took 9 seconds to shut down. Its peers' VMs were already off by then, and the soak's verifier on the same node was stopping too, so every attempt the task started in that window failed. Bun got SIGTERM and then went on retrying.
+
+Nothing told the pool to stop. Bun cancels one `CancellationToken`, `shutdown`, when the signal arrives, and almost every long-lived task watches it. The task arrays didn't. Each array has its own token, but it fires only when the leader stops the array, or when the ledger can't be written, and it does more than stop new work: the runner SIGTERMs every attempt it's running. We didn't want that on a node stop. A running attempt already has its way through a restart: it ends as `Unknown`, or replays when the job allows it.
+
+So the pool takes a second token, `draining`, which it checks but never hands to the runner:
+
+```rust
+let node_permit = tokio::select! {
+    biased;
+    () = self.cancel.cancelled() => None,
+    () = self.draining.cancelled() => None,
+    permit = Arc::clone(&self.node_slots).acquire_owned() => permit.ok(),
+};
+```
+
+The same branch sits in front of the retry backoff, the per-array slot and the resource budget, and an `is_cancelled()` check comes last, just before the launch. Once the token fires, the task ends as not run, and `attempts` counts only the attempts that really started. Bun's `main` hands the node `shutdown.child_token()`. A *child token* is cancelled when its parent is, but cancelling the child leaves the parent alone, so the task-array code can never stop the rest of Bun by mistake.
+
+There's one more step. A chunk with not-run tasks counts as finished, and the leader would retire it, with those tasks counted as not run for good. That's right when the user stopped the array, and wrong here. So a chunk that the drain cut short doesn't report itself. It stays held, its not-run records go to the ledger, and the restarted node runs every task without an outcome there. It doesn't count those tasks' durations either: the restarted node's result counts the chunk's finished tasks from the ledger, so counting them before the stop too would count them twice.
+
+Our first version had two gaps, and a review found both. A job's default is `replay_unknown = false`. For those jobs, a restarted node runs an interrupted chunk only if every task in it has a record at its grant. Anything else might have been running when the node died, so the node refuses the chunk until an operator replays it. That check read the ledger through `group_by_chunk`, which dropped not-run records. So every chunk a stop drained looked unknown, and a graceful stop parked a default job until someone ran `relish batch replay`. A not-run record is safe to count: the node writes one only when the task has nothing running. `group_by_chunk` now keeps the last record per index, with a terminal record always beating a not-run one. Only a task with no record at all is unknown.
+
+The second gap was the attempt count. A drained task that had failed once was recorded as not run with `attempts = 1`, and the restart counted from zero again, so `max_attempts = 3` could mean five attempts in all. `resume_chunk_streaming` now splits the records it's given with `Iterator::partition`, which sorts one collection into two by a predicate. Terminal records skip their task. Not-run records seed its attempt counter, so the restart carries on from attempt 2. The attempt before the restart left no cause behind, so the summary counts it under `unrecorded`, as it does for any attempt count read back from a ledger.
+
+`a_draining_pool_retries_nothing_and_leaves_the_task_not_run` in `src/bun/task_executor.rs` fails a task's first attempt and fires the token inside it. The task must end not run after one attempt. Without the token it failed after three. `a_draining_pool_launches_no_task_that_had_not_started` and `draining_lets_a_running_attempt_finish` check the other two edges. `a_stopping_node_retries_nothing_and_its_restart_runs_the_task` in `src/bun/task_array_node.rs` goes through the node: the drained chunk isn't reported, and a node restarted on the same directory runs the task and succeeds. `a_drained_chunk_of_a_default_job_restarts_without_a_replay` does the same with `replay_unknown = false`. `a_drained_task_keeps_its_attempts_across_the_restart` and `a_resumed_not_run_record_continues_the_tasks_attempt_count` check the attempt count, and `a_drained_chunk_counts_no_durations_until_it_is_reported` checks the durations. The soak harness got a fix as well: its verifier's systemd unit now starts `Before=reliaburger.service`, and systemd stops units in the reverse order, so the verifier outlives Bun.
+
 ### Putting it together, in one process
 
 The acceptance test in the portable suite wires three simulated nodes (each a real pool with a fake runner and a real ledger on disk) to the real leader state and grant policy. One task in a hundred fails its first attempt and succeeds on retry. A third of the way through, node n3 is lost: its chunks go back to the queue at the next attempt, and its late reports are refused by the fence. At the end every index has exactly one accepted outcome, exactly one retry is counted per failing index, and the three ledgers between them hold a terminal record for all of them. The suite runs 100,000 tasks, which takes about three seconds in a debug build. With the full million it took 30.6 seconds on the laptop, about 32,700 tasks a second, and the leader changed its state in 422 ticks. Real processes will be far slower than a fake; the Criterion suite (`make bench-task-arrays`) measures the machine's fork/exec floor through the real runner, so we'll know by how much before promising anyone a number.
@@ -279,6 +306,18 @@ The lint looked for `.is_leader()`, and the next 503 came from a call it didn't 
 The new lint works the other way round from the first. A second test in `src/bun/leadership.rs` reads every production file under `src/`, not just `src/bun/`, and fails on any `_linearizable(` outside a short allowlist. It matches the open bracket rather than `()`, so a call written as `CouncilNode::security_state_linearizable(&council)` is caught as well. Each allowlist entry names a file, how many such calls it holds and why. There are two: `src/council/node.rs` with five (the two read functions it defines and the three `ensure_linearizable` rounds underneath everything), and `src/council/backup.rs` with one, an export loop that tries again on its next tick. The count is exact, so a sixth in `node.rs` fails the test just as a call in a new file does. An allowlist keeps the exceptions in one place, where a reviewer sees them all at once, and the count stops an entry from quietly covering more than it was written for. `a_settled_leader_prepares_begins_and_finalises_a_ca_rotation_after_a_missed_heartbeat_round` puts a whole rotation through the lagging-heartbeat harness. It prepares, signs the CSR with a root key only the test holds, then begins and finalises. Before the fix, prepare got the 503.
 
 A review found that both lints had been skipping code. Each stops reading a file at its inline test module, which it recognised as `#[cfg(test)]` followed by a line starting with `mod `. That also matches `mod tests;`, which only declares a test module kept in another file, and `src/bun/api.rs`, `src/bun/agent.rs`, `src/lib.rs` and the MCP and fuzz modules all have one partway down. Everything below it went unscanned. The scan now stops only when the `mod` line ends in `{`. A unit test writes a small file with one of each and checks that the scan reports the call after `mod tests;` but not the one inside `mod inline {`. Reading the skipped code found nothing new, but it does get read now.
+
+#### A forward needs a deadline too
+
+Forwarding fixed who answers, but not how long the follower waits for the answer ([#2055](https://github.com/reliaburger/reliaburger/issues/2055)). `forward_to_leader` called `send()` and then read the body with no timeout, and the cluster's HTTP client has no default one. A leader that accepts the connection and never answers, because its process has stalled or its replies are dropped, held every forwarded request for as long as the TCP connection lived. That's 17 call sites: job apply, the batch and array submissions, job runs, deploy cancel and the identity token routes. An app's stop, delete and release had their own copy of the same code, and so did the build runner's tracking request.
+
+They now share one exchange in `src/bun/batch.rs`. `relay_leader_answer` sends the request and reads the leader's whole answer inside one `tokio::time::timeout`. Past `LEADER_FORWARD_TIMEOUT` it answers 504 and says the outcome is unknown, because the leader may still finish the request. The deadline is 60 seconds. That sounds long, but the leader's own work has to fit inside it. A job apply can bind images against an upstream registry, which gives up only after 20 seconds, and then make a council write, which gives up after 10. A merely slow leader should still get its real answer through.
+
+A job apply is the exception. Its answer is an event stream that runs until the deployment settles, which can take minutes. Bounding the whole exchange would cut every long deployment off at 60 seconds. So `relay_leader_stream` bounds only `send()`, which resolves when the leader's status line and headers arrive. The body then streams through untouched. The app apply forward in `cluster_apply` already worked this way, with 5 seconds for the headers.
+
+Even the headers can take a while. Before the leader starts the stream, it binds every image in the manifest against its upstream registry, one after another, and each bind can take 20 seconds. Then it proves it leads and writes the deployment to the council. Three slow registries put the headers past 60 seconds, so the follower would answer 504 while the leader went on and committed the apply. A review caught this before the change merged. Sending the headers before the binding would have turned every binding refusal (a bad reference, a registry that refuses) from a 400 or a 502 into an event inside a 200 stream, which changes what every client sees. So the follower budgets for the work instead. `job_apply_header_deadline` counts the manifest's distinct images, allows 20 seconds for each, adds the leadership proof and two council writes, and caps the total at 280 seconds, just under the five minutes `relish` itself waits. `a_forwarded_job_apply_waits_for_the_leader_to_bind_each_image` gives a fake leader three binds and a write to sit through before it answers, which is 70 seconds, and the follower has to wait for it.
+
+`a_follower_answers_504_when_the_leader_never_answers`, in `src/bun/api/tests.rs`, binds a listener and never accepts from it. The kernel completes the TCP handshake and holds the request, so the follower's request goes out and nothing ever comes back. A batch submission, a job apply, a batch read and an app stop each have to answer 504. `a_forwarded_job_apply_streams_past_the_forward_timeout` is the other half. Its fake leader sends one event at once and the next one only after twice the forward timeout, and the follower has to relay both. Both tests run on a paused clock, so the 60 seconds cost nothing. And the leader forwards that already had deadlines kept them: upgrades, GitOps webhooks, test leases, node faults, summaries and the join-token routes.
 
 ### Definitions, runs and durable trigger identities
 
@@ -1898,6 +1937,14 @@ refuses. The mock runtime can now answer one inventory read from before a
 change, which makes that test exact: it failed with the error from the VM
 before the fix. The host and runc tests race many forgets against a reader
 and failed every run or most runs before.
+The runc one does real durable work to get there: 128 generations claimed,
+published, retired and forgotten, about nine full syncs each. On macOS every
+`sync_all` is an `F_FULLFSYNC`, which waits for the drive's whole cache, so
+the test takes about 3 s alone and 32 s beside twelve processes doing the
+same. Inside a `make ci` on a busy Mac Studio it once ran out of nextest's
+60 s ([#2009](https://github.com/reliaburger/reliaburger/issues/2009)). Its
+verdict is an error, not a time, so `.config/nextest.toml` gives it 180 s as a
+hang guard rather than fewer rounds.
 
 The test now waits for the real end state while the nodes still run: no
 launch in the inventory and no route files left. The lost leader's pool went
@@ -2752,6 +2799,98 @@ doesn't count until the task cgroup is really gone, and setup creates it with
 `create_dir`, which fails rather than adopting an existing one. A root-gated
 test plants a killed cgroup at the next executor's path and checks the command
 runs in a fresh directory. A mocked launch would never have found any of this.
+
+### Two numbers read at the wrong moment
+
+The 0.3.0 review found two values taken from the right place at the wrong
+time. The shared-runc and host executor pools sized themselves from the
+node's slots the first time a shared task arrived, and they counted the
+*free* slots ([#2043](https://github.com/reliaburger/reliaburger/issues/2043)).
+The pool lives in a `OnceLock`, a cell the standard library fills once and
+then only reads, so a first task that arrived while fresh runc attempts held
+nearly all 256 slots built a pool of one executor, and it stayed that size
+until Bun restarted. `OwnedRunner` now keeps `slot_total`, the number of
+slots it was configured with, and `executor_pool_size` sizes the pool from
+that (still at most 32 executors). Its test takes seven of eight slots before
+asking.
+
+The other was a timestamp. A deployment operation's
+`cancellation_requested_at` was filled with its *submission* time, because
+`DeploymentRecord` kept a `cancelled: bool` and nothing else, even though
+the `DeployCancel` write carries the leader's clock
+([#2047](https://github.com/reliaburger/reliaburger/issues/2047)). The flag is
+now `cancelled_at: Option<u64>`, and `cancelled()` is a method that asks
+whether it's set. A bool and a time side by side could disagree; one
+`Option` can't. A second cancel keeps the first time: `get_or_insert` only
+writes when the `Option` is `None`. The record is council state, so this
+changes the durable format, which 0.3.0's compatibility bump already covers.
+
+### Room for runc to start
+
+The helper's cgroup had an 8 MiB `memory.max`, and for months that was
+plenty. The helper is a small static binary that waits on a socket. Then the
+0.3.0 rehearsal's soaks all failed at the same step: a `run_before` hook on the
+`shared-runc` runtime never ran, so the deploy it guarded was cancelled (#1957).
+Bun's log said `helper connection timed out`, and the guest's kernel log said
+why: `runc:[2:INIT]` was OOM-killed in the helper's cgroup.
+
+`runc init` is the process runc starts inside the new container's namespaces
+and cgroup to set it up, before it `exec`s the container's own program. Its
+memory is charged to the container's cgroup, not to Bun. 0.3.0 moved the
+quickstart guest from Ubuntu 24.04 to 26.04. Ubuntu 26.04's runc 1.4.0
+keeps a copy of its own 10.9 MB binary in that memory. (runc copies itself
+so that a container can't overwrite the host's runc through
+`/proc/self/exe`.) On a soak node, a bundle shaped like the helper peaked at
+13,266,944 bytes before the helper ran. With an 8, 10 or 12 MiB limit,
+runc refused with `container init was OOM-killed`. The runc 1.5.2 on our test
+VM needs about 4 MiB, which is why 0.2.8 and CI never saw it.
+
+This is the same trap as #1955, where an 8 MiB `memory.high` throttled an
+app's `runc init` (see Chapter 1). A container's limit covers the
+runtime's setup as well as the workload. So a shared-runc helper now gets
+`CONTAINER_HELPER_MEMORY_BYTES`, the helper's own 8 MiB plus 16 MiB for
+runc init, and the executor's reservation counts all of it. A
+reservation that left the 16 MiB out would let a node promise memory it
+doesn't have. A host executor's helper is a process Bun starts itself, with no
+runc involved, so it keeps the 8 MiB and the host job slots that buys.
+`ExecutorProfile` carries the value as `helper_memory`, and both places that
+set the limit read it from there: the OCI spec runc writes into the cgroup,
+and `prepare_cgroups`, which writes the cgroup before runc does. The helper's
+`memory.high` is now `max`, so nothing throttles runc init below the limit.
+The 16 MiB is `RUNC_INIT_MEMORY_BYTES` in `src/grill/oci.rs`, the same
+constant that sets the smallest memory limit an app may ask for (Chapter 1),
+so one measurement of runc init feeds both rules.
+
+The task cgroup next to the helper had the #1955 mistake too. It wrote the
+job's memory request to `memory.high`, after Chapter 1 had stopped doing that
+for every container. runc init never runs there (commands are cloned straight
+into it), so nothing stalled at start, but a command that grew past its
+request was throttled long before its limit. A request is a reservation, so
+the task cgroup's `memory.high` is now `max` as well, and its limit is its
+only ceiling. `ExecutorProfile::task_cgroup_files` lists every file and value
+the task cgroup gets, so a unit test can check them on any machine, where
+`prepare_cgroups` itself needs root and a cgroup filesystem.
+
+With the fix in place, the soak's job campaign failed next, for the same
+reason. Its memory-limit fixture runs an `awk` that grows until the limit
+kills it, and expects exit 137. A fresh `runc` job's limit covers runc init
+as well, and the fixture asked for 8 MiB, so the container never started and
+the job failed as a launch, not a kill. That was the harness's mistake, not
+Bun's: a user who gives a job less memory than its runtime needs to start
+should see it fail. The fixture now asks for 32 MiB, which runc can start in
+and `awk` still outgrows.
+
+The bigger helper cost room elsewhere. At target load the soak runs eight
+shared-runc executors a node, and each now reserves 56 MiB, not 40. That's
+128 MiB more a node, on guests with 1,438 MiB to give. The next rehearsal's
+jobs tier powered off two nodes, and when they came back the executors had
+taken nearly every free MiB on all three. `redis` asks for 32 MiB and
+couldn't be placed anywhere for ten minutes. An app's admission refuses
+straight away, while a job waits its turn and gets every MiB that's freed, so
+batch work wins a full node. The soak now runs five shared-runc executors a
+node, under 0.2.8's reservation, and a test fails if a reservation change
+eats that room again. Giving apps first claim on freed memory is a product
+change of its own ([#1967](https://github.com/reliaburger/reliaburger/issues/1967)).
 
 ### Native host executors
 
@@ -4065,9 +4204,22 @@ and counts a hook from either place. A failed outcome in that history fails
 the campaign, just as a failed row does (#1935). That history survives a
 re-apply, so on a cluster adopted with `--home` it can still hold the last
 campaign's runs; only outcomes that started after this campaign did, give or
-take five minutes of clock skew, count either way. One gap remains: a one-off
-`after` job has no definition, so its coverage still depends on catching its
-row before it's pruned.
+take five minutes of clock skew, count either way.
+
+That fixed what the checker could see, not what the day tier did. A day
+run still deployed once, in the campaign's first seconds, so its hooks ran
+once, and a one-off `after` job, which has no definition to keep a history,
+still had to be caught in a summary row before it was pruned. The 0.3.0
+rehearsal's day run covered both. That says the race went our way that day.
+It doesn't say it always will. So the day tier now applies the job fixtures
+again every hour, with the workloads at the generations they already run.
+No app changes, so nothing rolls, but an apply is the desired state: every
+`run_before` hook and every plain job runs once more, with the controller
+long since scanning every 30 seconds. That's 23 more chances a day instead
+of one lucky one. `hook_apply` goes through `jobs_applied` like every other
+apply, so none lands once the drain is asked for or within the minute before
+it, and `test_no_hook_apply_once_the_drain_is_asked_for_or_due_within_a_minute`
+runs the real function in bash, with `rel` stubbed out, to show it (#1935).
 
 ### Soak jobs while the apps keep running
 
@@ -4306,6 +4458,45 @@ the controller's last look showed it drained, it did. Anything else, including
 a run last seen nearly finished, is an unknown outcome and fails the record.
 "Probably finished" is exactly the guess the soak exists to refuse (#989).
 
+0.3.0's candidate 4 failed its fast tier on a single line: "runc missing
+coverage: active power-off overlap". Everything else passed. The soak had cut
+power three times, and each time only `shared-runc` and `process` runs were
+active on the node. The gate is right to ask for that evidence, since a fault
+no job lived through proves nothing about jobs. But the harness asked the
+controller what was running at the instant of the cut, once. A runc task
+sleeps 20 seconds and then spends a while starting its next container, so a
+node is between runc commands for a good part of every minute. Three cuts, three
+coin tosses, and the seed lost all three. The next run of the same candidate
+would probably have passed, which is exactly what's wrong with it: a red tier
+that a rerun turns green teaches everyone to rerun.
+
+So the harness now waits for its witnesses. Before a power-off, a Bun kill or
+a node fault, `job_soak.py mark --wait` reads the controller's snapshot every
+two seconds until a run of each mode is active on the target node, and only
+then lets the fault strike, for at most 90 seconds. The kinds it waits for
+are the ones the gate owes, `GATED_KINDS`; a deploy kill, which has to land a
+set number of seconds into its rollout, marks at once. A wait that runs out
+doesn't hold up the schedule. It records a `job-overlap` event naming the
+mode it never saw, and the fault goes ahead, so if the gate fails after that,
+a mode really had no work on that node for a minute and a half. That's worth
+a look. The check itself didn't change at all.
+
+`mark` takes the clock and the sleep as parameters, `clock=time.time` and
+`pause=time.sleep` by default, so a test can drive it on a fake clock
+without waiting. Python lets a default be any object, functions included,
+and evaluates it once, when the `def` runs. That's the classic trap with a
+mutable default like `[]`, but for a function it's what you want. Two tests
+lean on it. `test_a_power_off_waits_for_a_runc_run_on_its_node` replays
+candidate 4's cut: runc starts on the node six seconds after the fault was
+due, and the mark lands then. `OverlapEverySeed` reads each tier's schedule
+from the harness's own `--plan`, then, for each of 150 seeds, places every
+gated fault in its slot, picks its node and draws every mode's activity on
+every node. Every fault in every tier must overlap all three modes. The
+activity model has gaps of up to four seconds between tasks of 20 to 30,
+which means some moment in any 90-second wait has all three running; that's
+the part of the run the harness can't choose. The same seeds without the
+wait leave faults uncovered, so the test can fail (#2105).
+
 This machinery still needs the normal staged fast and final qualification on
 the integrated candidate. It records reliability under app load and faults;
 the hourly saturation measurements and #668's retained-storage work answer
@@ -4404,6 +4595,16 @@ attempt counts but not reasons (22 bytes a record, and #678 is busy shrinking
 that), so a chunk resumed after a restart reports the retries it can't explain
 as exactly that. The node only counts a cause once the next attempt has really
 started, which keeps the sum equal to `attempts - 1` on every early return.
+
+The duration buckets get the same treatment. The state's decoder refuses any
+array whose buckets hold more samples than tasks that ran, so a report that
+broke that rule would be applied live and then fail on the next snapshot
+install, and no new follower could load the state. `complete` now sums the
+report's buckets with `checked_add` and refuses the report, before it changes
+anything, when the total exceeds `succeeded + failed_count`. The live apply
+and the decoder now enforce one invariant, not two, and
+`accepted_duration_counts_survive_a_snapshot_round_trip` checks that what one
+accepts the other can read.
 
 The other was start lag. The reusable pools already time the command itself,
 so the gap between the pool taking an attempt and the command starting falls

@@ -53,6 +53,8 @@ pub const ALLOWLIST: &[&str] = &[
     "README.md",
     "docs/README.md",
     "docs/linux-servers.md",
+    // The shutdown budget is checked against the appliance's unit (#2118).
+    "image/mkosi.extra/usr/lib/systemd/system/reliaburger.service",
     "Makefile",
     ".config",
     // The read set.

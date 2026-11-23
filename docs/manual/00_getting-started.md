@@ -13,7 +13,7 @@ laptop, running real OCI containers with runc:
 relish setup --quickstart
 ```
 
-Relish installs a private copy of Lima, downloads a signed Ubuntu guest image
+Relish installs a private copy of Lima, downloads a signed Ubuntu 26.04 guest image
 and signed Linux binaries, forms an mTLS cluster, deploys a sample app and
 checks it answers on <http://localhost:18080/>. Rerun the same command to
 resume if it stops. It needs a Mac with Apple silicon, or Linux with QEMU and
@@ -79,7 +79,7 @@ It verifies `bun` against the release signatures, asks a few questions and
 writes a starter `reliaburger.toml`. Pass `--yes` to accept every default.
 Real containers need runc on Linux, and a cluster needs rootful runc with eBPF
 (see `cluster-basics`). On macOS, use the quickstart above: it runs the same
-runc path inside Linux VMs. Apple Container isn't supported in 0.2.8.
+runc path inside Linux VMs. Apple Container isn't supported in 0.3.2.
 
 ## From source, without containers
 

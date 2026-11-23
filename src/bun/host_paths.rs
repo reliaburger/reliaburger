@@ -82,7 +82,7 @@ impl HostPathPolicy {
 
     /// The policy `node.toml` describes: `[storage] allowed_host_paths`, with
     /// the storage directories, the identity directory, the directories holding
-    /// the master key and security bootstrap, and the script directory protected.
+    /// the master key and security bootstrap protected.
     pub fn from_node_config(config: &crate::config::NodeConfig) -> Self {
         let storage = &config.storage;
         let security = &config.security;
@@ -96,7 +96,6 @@ impl HostPathPolicy {
                 .identity_dir
                 .clone()
                 .unwrap_or_else(|| crate::sesame::identity_store::identity_dir(&storage.data)),
-            config.process_workloads.script_dir.clone(),
         ];
         // The key files live in an operator-chosen directory. Protect the
         // file and that directory, unless the directory is the filesystem

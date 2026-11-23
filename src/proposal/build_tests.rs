@@ -360,6 +360,113 @@ fn cancelling_a_rollout_goes_back_to_the_last_released_spec() {
     ));
 }
 
+/// `web` running `current` with `released` as the last spec that finished
+/// rolling out, for the summaries that name both ends (#1875), with each
+/// spec's short revision.
+fn rolled_out(current: &str, released: &str) -> (DesiredState, String, String) {
+    let mut state = desired();
+    let web = AppId::new("web", "shop");
+    let current = spec(current);
+    let released = spec(released);
+    let short =
+        |spec: &AppSpec| super::super::revision::revision_of(Some(spec), false)[..12].to_string();
+    let names = (short(&current), short(&released));
+    state.apps.insert(web.clone(), current);
+    let mut rollouts = crate::meat::deploy_types::AppRollouts::default();
+    rollouts.release(&released);
+    state.rollouts.insert(web, rollouts);
+    (state, names.0, names.1)
+}
+
+fn built_from(state: &DesiredState, kind: RequestKind) -> Proposal {
+    let mut proposal = build(
+        state,
+        &request(kind, Some("web")),
+        &holmes(),
+        NOW,
+        as_declared,
+    )
+    .unwrap();
+    number(&mut proposal, ProposalId(17));
+    proposal
+}
+
+/// An app with no image (a host `exec` workload) names each end of a
+/// rollback by its revision, not "its previous spec" twice (#1875).
+#[test]
+fn a_rollback_of_an_app_with_no_image_names_each_end_by_its_revision() {
+    let (state, now, then) = rolled_out(
+        "exec = \"/usr/bin/web\"\ncommand = [\"--v2\"]\nreplicas = 1",
+        "exec = \"/usr/bin/web\"\ncommand = [\"--v1\"]\nreplicas = 1",
+    );
+    let proposal = built_from(&state, RequestKind::Rollback);
+    assert_eq!(
+        proposal.summary[0],
+        format!("Roll shop/web back from revision {now} to revision {then}.")
+    );
+    assert_eq!(
+        proposal.undo.effect,
+        format!("puts web back on revision {now}")
+    );
+}
+
+/// Two specs with the same image (only the env changed) name each end by
+/// image and revision, so the two ends never read the same.
+#[test]
+fn a_rollback_between_specs_with_one_image_names_each_end_by_its_revision() {
+    let (state, now, then) = rolled_out(
+        "image = \"web:1.5\"\n[env]\nLOG_LEVEL = \"debug\"",
+        "image = \"web:1.5\"\n[env]\nLOG_LEVEL = \"info\"",
+    );
+    let proposal = built_from(&state, RequestKind::Rollback);
+    assert_eq!(
+        proposal.summary[0],
+        format!("Roll shop/web back from web:1.5 at revision {now} to web:1.5 at revision {then}.")
+    );
+}
+
+/// Cancelling a rollout of an app with no image names the spec rolling out
+/// and the one it goes back to by revision.
+#[test]
+fn cancelling_a_rollout_of_an_app_with_no_image_names_each_end_by_its_revision() {
+    let (state, now, then) = rolled_out(
+        "exec = \"/usr/bin/web\"\ncommand = [\"--v2\"]\nreplicas = 1",
+        "exec = \"/usr/bin/web\"\ncommand = [\"--v1\"]\nreplicas = 1",
+    );
+    let proposal = built_from(&state, RequestKind::CancelDeploy);
+    assert_eq!(
+        proposal.summary[0],
+        format!(
+            "Cancel the rollout of shop/web to revision {now}: put it back on revision \
+             {then}, the last spec that finished rolling out; nodes already on the new spec \
+             roll back."
+        )
+    );
+    assert_eq!(
+        proposal.undo.effect,
+        format!("puts web back on revision {now}, which starts its rollout again")
+    );
+}
+
+/// Cancelling a rollout that only changes the env names each end by image
+/// and revision.
+#[test]
+fn cancelling_a_rollout_with_one_image_names_each_end_by_its_revision() {
+    let (state, now, then) = rolled_out(
+        "image = \"web:1.5\"\n[env]\nLOG_LEVEL = \"debug\"",
+        "image = \"web:1.5\"\n[env]\nLOG_LEVEL = \"info\"",
+    );
+    let proposal = built_from(&state, RequestKind::CancelDeploy);
+    assert!(
+        proposal.summary[0].starts_with(&format!(
+            "Cancel the rollout of shop/web to web:1.5 at revision {now}: put it back on \
+             web:1.5 at revision {then}, "
+        )),
+        "{}",
+        proposal.summary[0]
+    );
+}
+
 /// An apply keeps the stored restart stamp, as `relish apply` does, so
 /// applying the same file after a restart restarts nothing.
 #[test]

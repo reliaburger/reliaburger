@@ -364,7 +364,7 @@ pub async fn run(options: &SourceOptions, max_bytes: usize, rerun: &str) -> Rend
     let cluster = if options.offline {
         ClusterSource::Offline
     } else {
-        nodes::check(&BunClient::default_local(), bundle.build.commit.as_deref()).await
+        nodes::check(&BunClient::local().await, bundle.build.commit.as_deref()).await
     };
     answer(&bundle, &options.command, &cluster, max_bytes, rerun)
 }

@@ -33,13 +33,14 @@ For book, manual or website prose, follow [docs/book/STYLE.md](docs/book/STYLE.m
 - `tests/suite/` — the single portable integration binary; `tests/*.rs` — gated, heavy or process-isolated suites
 - `examples/` — `phase-1/` and `phase-8/` workload configs, `kubernetes/` YAML
 - `scripts/release/` — packaging, staging and `qualify-*.sh` release qualification
-- `.github/workflows/` — `ci.yml`, `security.yml`, `build.yml`, `stage.yml`, `promote.yml`, `soak.yml`, `v02-loops.yml`, `static.yml`
+- `image/` — the appliance OS (mkosi), its netboot installer, its script tests (`image/tests/`) and `image/lab/` (the QEMU lab, the Mac as the Wyse lab's router and `fleet-measure.sh`)
+- `.github/workflows/` — `ci.yml`, `security.yml`, `build.yml`, `stage.yml`, `promote.yml`, `soak.yml`, `v02-loops.yml`, `static.yml`, `appliance.yml`
 
 ## How We Work
 
 ### 1. Follow the Plan
 
-Every roadmap phase is done; 0.1.0 was released on 29 September 2026, 0.1.1 on 30 September, 0.1.2 on 1 October, 0.1.3 and 0.1.4 on 3 October, 0.1.5 on 6 October, 0.1.6 on 7 October, 0.2.0 ("A million jobs") on 16 October, 0.2.1 (cluster safety) on 21 October, 0.2.2 (UX polish) on 25 October, 0.2.3 (two billion a day) on 28 October, 0.2.4 (extension points) on 30 October, 0.2.5 (bugs an outside evaluation found) on 3 November, 0.2.6 (setup over SSH) on 6 November, 0.2.7 ("Built for humans and their agents") on 7 November and 0.2.8 ("Agents you can trust, built faster") on 12 November 2026. Status lives in [docs/roadmap.md](docs/roadmap.md) plus the GitHub milestones and issues it links: read its release list and "Known gaps" before starting. Releases after 0.1.0 follow its [release order](docs/roadmap.md#releases-after-010): one headline feature per minor release. 0.3.0 ("Bare metal in an hour") is next. Releases go out as soon as they're ready and verified, with no target dates before 1.0 (maintainer decision, 6 November 2026). New work goes through a dated plan in `docs/plans/`; the plans that led to 0.1.0 are history in `docs/plans/archive/`. Releases follow [docs/releasing.md](docs/releasing.md).
+Every roadmap phase is done; 0.1.0 was released on 29 September 2026, 0.1.1 on 30 September, 0.1.2 on 1 October, 0.1.3 and 0.1.4 on 3 October, 0.1.5 on 6 October, 0.1.6 on 7 October, 0.2.0 ("A million jobs") on 16 October, 0.2.1 (cluster safety) on 21 October, 0.2.2 (UX polish) on 25 October, 0.2.3 (two billion a day) on 28 October, 0.2.4 (extension points) on 30 October, 0.2.5 (bugs an outside evaluation found) on 3 November, 0.2.6 (setup over SSH) on 6 November, 0.2.7 ("Built for humans and their agents") on 7 November, 0.2.8 ("Agents you can trust, built faster") on 12 November and 0.3.0 ("Bare metal in an hour") on 20 November, 0.3.1 (gate follow-ups) on 21 November and 0.3.2 (Wyse lab fixes) on 23 November 2026. Status lives in [docs/roadmap.md](docs/roadmap.md) plus the GitHub milestones and issues it links: read its release list and "Known gaps" before starting. Releases after 0.1.0 follow its [release order](docs/roadmap.md#releases-after-010): one headline feature per minor release. 0.4.0 ("Planned maintenance") is next. Releases go out as soon as they're ready and verified, with no target dates before 1.0 (maintainer decision, 6 November 2026). New work goes through a dated plan in `docs/plans/`; the plans that led to 0.1.0 are history in `docs/plans/archive/`. Releases follow [docs/releasing.md](docs/releasing.md).
 
 ### 2. Tests First
 
@@ -87,6 +88,7 @@ Fixes and hardening update the existing chapter for that subsystem; they don't g
 | 13 | `13-a-room-with-a-view.md` | "A Room with a View" |
 | 14 | `14-changing-the-tyres.md` | "Changing the Tyres at Full Speed" |
 | 15 | `15-ready-for-production.md` | "Ready for Production" |
+| Appliance spike | `15a-becoming-the-os.md` | "Becoming the Operating System" |
 | 0.2.0 | `17-a-million-jobs.md` | "A Million Jobs" |
 | 0.2.4 | `18-bending-without-forking.md` | "Bending Without Forking" |
 | 0.2.7 | `19-built-for-agents.md` | "Built for Humans and Their Agents" |
@@ -162,8 +164,8 @@ Lessons from running many agents on one machine (6–7 November 2026, #1724):
 Example configs in `examples/phase-N/` use a runtime prefix so it's immediately clear what runtime they target:
 
 - **`proc-*`** — ProcessGrill (`--runtime process`; runs local processes, no container runtime needed). Host `exec` or `script` workloads with no `image`: ProcessGrill refuses an image app (#914). Use `exec = "target/debug/testapp"` (arguments in `command`) or an absolute host binary, and start Bun with `--config examples/node/process-runtime.toml` (or a node config whose `[process_workloads] allowed_binaries` names the binary, with `mount_isolation = false`).
-- **`container-*`** — Real OCI images pulled from Docker Hub. Works with runc (`--runtime runc`) or Apple Container (`--runtime apple`).
-- **`apple-*`** — Tests Apple Container-specific features (macOS only).
+- **`container-*`** — Real OCI images pulled from Docker Hub. Runs on runc (`--runtime runc`, Linux), or on macOS in the managed Linux VM that `relish setup --quickstart` provisions. Bun refuses `--runtime apple`: direct Apple Container is disabled.
+- **`apple-*`** — Apple Container-specific features (macOS only). There are none today: the Apple adapter is deferred development code, which only `make test-apple` exercises.
 - **`runc-*`** — Tests runc-specific features (Linux only).
 
 When adding a new example, pick the prefix that matches its runtime requirement.

@@ -41,6 +41,9 @@ pub struct WorkloadCsrResponse {
     pub ca_bundle_der: Vec<String>,
     /// OIDC JWT, when the cluster issues them.
     pub jwt_token: Option<String>,
+    /// The workload's JWT for the cluster API alone, when the cluster
+    /// issues them.
+    pub api_jwt_token: Option<String>,
 }
 
 /// A signed workload certificate, decoded.
@@ -56,6 +59,9 @@ pub struct SignedWorkload {
     pub ca_bundle_der: Vec<Vec<u8>>,
     /// OIDC JWT, when the cluster issues them.
     pub jwt_token: Option<String>,
+    /// The workload's JWT for the cluster API alone, when the cluster
+    /// issues them.
+    pub api_jwt_token: Option<String>,
 }
 
 impl WorkloadCsrResponse {
@@ -71,6 +77,7 @@ impl WorkloadCsrResponse {
                 .map(|der| BASE64.encode(der))
                 .collect(),
             jwt_token: signed.jwt_token.clone(),
+            api_jwt_token: signed.api_jwt_token.clone(),
         }
     }
 
@@ -91,6 +98,7 @@ impl WorkloadCsrResponse {
                 .map(|value| decode("CA bundle", value))
                 .collect::<io::Result<_>>()?,
             jwt_token: self.jwt_token,
+            api_jwt_token: self.api_jwt_token,
         })
     }
 }
@@ -265,6 +273,7 @@ mod tests {
             root_ca_cert_der: vec![5, 6],
             ca_bundle_der: vec![vec![4], vec![5, 6]],
             jwt_token: Some("jwt".into()),
+            api_jwt_token: Some("api-jwt".into()),
         };
         assert_eq!(
             WorkloadCsrResponse::encode(&signed).decode().unwrap(),
@@ -286,6 +295,7 @@ mod tests {
             root_ca_cert_der: vec![5, 6],
             ca_bundle_der: vec![vec![1, 2, 3], vec![]],
             jwt_token: None,
+            api_jwt_token: None,
         };
         let wire = WorkloadCsrResponse::encode(&signed);
         assert_eq!(wire.cert_der, "+/+/");
@@ -302,6 +312,7 @@ mod tests {
             root_ca_cert_der: vec![4],
             ca_bundle_der: vec![],
             jwt_token: None,
+            api_jwt_token: None,
         };
         for cert in ["BA", "BB=="] {
             let mut wire = WorkloadCsrResponse::encode(&signed);

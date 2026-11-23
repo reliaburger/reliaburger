@@ -41,7 +41,7 @@ async fn api_with_capacity(capacity: bool) -> (Arc<CouncilNode>, Router) {
         .await
         .unwrap(),
     );
-    network.register(1, council.raft().clone()).await;
+    network.register(1, &council).await;
     council
         .initialize(BTreeMap::from([(1, CouncilNodeInfo::default())]))
         .await
@@ -424,7 +424,7 @@ async fn follower_batch_submission_preserves_the_callers_credential_for_leader_a
             .await
             .unwrap(),
         );
-        network.register(id, council.raft().clone()).await;
+        network.register(id, &council).await;
         nodes.push(council);
     }
     nodes[0]
@@ -1489,6 +1489,358 @@ async fn a_join_token_created_through_a_follower_commits_on_the_leader() {
     assert_eq!(stored[0].node_id, "node-7");
 }
 
+/// #1893 W3: `relish image seed` against a running council. It adds a
+/// machine to a bare-metal cluster's directory: the council mints a join
+/// token bound to the new node's name, the seed carries it, and the fleet
+/// lists the machine, so a second seed for it is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn image_seed_writes_a_join_seed_whose_token_the_council_accepts_for_that_node() {
+    use reliaburger::appliance::seed::{Seed, SeedRole};
+    use reliaburger::relish::bare_metal;
+
+    let cluster = TokenCluster::start().await;
+    let parent = tempfile::tempdir().unwrap();
+    let directory = parent.path().join("home-cluster");
+    let machine = |text: &str| bare_metal::parse_machine(text).unwrap();
+    bare_metal::create(&bare_metal::CreateOptions {
+        directory: directory.clone(),
+        cluster: "home".into(),
+        machines: vec![machine("d8:9e:f3:00:00:01@192.168.1.51")],
+        operators: vec!["192.168.1.10".into()],
+        network: Some("192.168.1.0/24".into()),
+        faults: false,
+        ssh_key: None,
+        token_ttl: Duration::from_secs(3600),
+        external_signing_key: None,
+        council_size: reliaburger::council::CouncilSize::APPLIANCE,
+        root_backup_keys: parent.path().join("operator-keys"),
+    })
+    .unwrap();
+    let relish = reliaburger::relish::client::BunClient::new_with_token(
+        &cluster.leader_url,
+        Some(&cluster.admin),
+    );
+    let new = machine("d8:9e:f3:00:00:02@192.168.1.52");
+
+    let added = bare_metal::add_with(
+        &relish,
+        &directory,
+        std::slice::from_ref(&new),
+        Duration::from_secs(3600),
+        Some(b"ssh-ed25519 AAAA operator".to_vec()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(added.len(), 1);
+    let (node, seed_path) = &added[0];
+    assert_eq!(node.name, "home-2");
+    assert_eq!(
+        seed_path,
+        &directory.join("stick/seeds/d8-9e-f3-00-00-02.seed")
+    );
+    let Seed::V1 { config, files } = Seed::from_tar_gz(&std::fs::read(seed_path).unwrap()).unwrap()
+    else {
+        panic!("not a v1 seed");
+    };
+    assert_eq!(config.role, SeedRole::Join);
+    assert_eq!(config.node, "home-2");
+    assert!(
+        !files.contains_key("master.key"),
+        "a join seed holds no master key"
+    );
+    assert_eq!(files["authorized_keys"], b"ssh-ed25519 AAAA operator");
+    let join = config.join.expect("a join seed has [join]");
+    assert_eq!(
+        join.members,
+        ["192.168.1.51".parse::<std::net::IpAddr>().unwrap()]
+    );
+    let security = cluster.leader.security_state().await;
+    reliaburger::sesame::join::check_join_token(&join.token, "home-2", &security)
+        .expect("the council accepts the seed's token for home-2");
+    assert!(
+        reliaburger::sesame::join::check_join_token(&join.token, "home-1", &security).is_err(),
+        "the token is bound to home-2 alone"
+    );
+
+    let fleet: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("fleet.json")).unwrap()).unwrap();
+    let names: Vec<&str> = fleet["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|node| node["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["home-1", "home-2"]);
+
+    let tokens = security.join_tokens.len();
+    let error = bare_metal::add_with(&relish, &directory, &[new], Duration::from_secs(3600), None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("clashes with home-2"), "{error}");
+    assert_eq!(
+        cluster.leader.security_state().await.join_tokens.len(),
+        tokens,
+        "a refused seed mints no token"
+    );
+}
+
+/// A join seed sent again by `relish machines claim` gets a token the
+/// running council mints then, bound to its node, in place of the one it
+/// was written with (which expires `--ttl` after `create`). Node 1's create
+/// seed is left alone and mints nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_join_seed_sent_again_carries_a_token_the_council_minted_for_that_node() {
+    use reliaburger::appliance::seed::Seed;
+    use reliaburger::relish::bare_metal;
+
+    let cluster = TokenCluster::start().await;
+    let parent = tempfile::tempdir().unwrap();
+    let directory = parent.path().join("home-cluster");
+    let machine = |text: &str| bare_metal::parse_machine(text).unwrap();
+    let created = bare_metal::create(&bare_metal::CreateOptions {
+        directory: directory.clone(),
+        cluster: "home".into(),
+        machines: vec![
+            machine("d8:9e:f3:00:00:01@192.168.1.51"),
+            machine("d8:9e:f3:00:00:02@192.168.1.52"),
+        ],
+        operators: vec!["192.168.1.10".into()],
+        network: Some("192.168.1.0/24".into()),
+        faults: false,
+        ssh_key: None,
+        token_ttl: Duration::from_secs(3600),
+        external_signing_key: None,
+        council_size: reliaburger::council::CouncilSize::APPLIANCE,
+        root_backup_keys: parent.path().join("operator-keys"),
+    })
+    .unwrap();
+    let relish = reliaburger::relish::client::BunClient::new_with_token(
+        &cluster.leader_url,
+        Some(&cluster.admin),
+    );
+    let node_1 = std::fs::read(&created.seeds[0]).unwrap();
+    let token = |path: &std::path::Path| {
+        let Seed::V1 { config, .. } = Seed::from_tar_gz(&std::fs::read(path).unwrap()).unwrap()
+        else {
+            panic!("not a v1 seed");
+        };
+        config.join.expect("a join seed has [join]").token
+    };
+    let old = token(&created.seeds[1]);
+
+    let create_refreshed = bare_metal::refresh_join_token_with(
+        &relish,
+        "home-1",
+        &created.seeds[0],
+        Duration::from_secs(3600),
+    )
+    .await
+    .unwrap();
+    let join_refreshed = bare_metal::refresh_join_token_with(
+        &relish,
+        "home-2",
+        &created.seeds[1],
+        Duration::from_secs(3600),
+    )
+    .await
+    .unwrap();
+
+    assert!(!create_refreshed);
+    assert_eq!(std::fs::read(&created.seeds[0]).unwrap(), node_1);
+    assert!(join_refreshed);
+    let new = token(&created.seeds[1]);
+    assert_ne!(new, old);
+    let security = cluster.leader.security_state().await;
+    assert_eq!(security.join_tokens.len(), 1, "only home-2's seed minted");
+    reliaburger::sesame::join::check_join_token(&new, "home-2", &security)
+        .expect("the council accepts the new token for home-2");
+}
+
+/// #1893: `relish join-token list` and `revoke` through relish's own client
+/// against a running council. The list shows a token without its secret; a
+/// revoke spends every unused token for that node through Raft, so the
+/// token can no longer enrol it, and a second revoke finds nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listed_join_token_shows_no_secret_and_a_revoke_stops_it_enrolling() {
+    let cluster = TokenCluster::start().await;
+    let mut plaintexts = Vec::new();
+    for node_id in ["node-7", "node-7", "node-8"] {
+        let created: serde_json::Value = cluster
+            .post(
+                &cluster.leader_url,
+                "/v1/join-token/create",
+                serde_json::json!({"node_id": node_id, "ttl_seconds": 900}),
+            )
+            .await
+            .json()
+            .await
+            .unwrap();
+        plaintexts.push(created["token"].as_str().unwrap().to_string());
+    }
+    let relish = reliaburger::relish::client::BunClient::new_with_token(
+        &cluster.leader_url,
+        Some(&cluster.admin),
+    );
+
+    let listed = relish.join_token_list().await.unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|token| (token.node_id.as_str(), token.consumed))
+            .collect::<Vec<_>>(),
+        [("node-7", false), ("node-7", false), ("node-8", false)]
+    );
+    let shown = serde_json::to_string(&listed).unwrap();
+    for (token, plaintext) in listed.iter().zip(&plaintexts) {
+        assert_eq!(token.id.len(), 8, "{shown}");
+        assert!(
+            !shown.contains(plaintext.as_str()),
+            "the list shows a token: {shown}"
+        );
+    }
+
+    assert_eq!(relish.join_token_revoke("node-7").await.unwrap(), 2);
+
+    let listed = relish.join_token_list().await.unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|token| (token.node_id.as_str(), token.consumed))
+            .collect::<Vec<_>>(),
+        [("node-7", true), ("node-7", true), ("node-8", false)]
+    );
+    let security = cluster.leader.security_state().await;
+    for plaintext in &plaintexts[..2] {
+        assert!(matches!(
+            reliaburger::sesame::join::check_join_token(plaintext, "node-7", &security),
+            Err(reliaburger::sesame::join::JoinError::TokenConsumed)
+        ));
+    }
+    reliaburger::sesame::join::check_join_token(&plaintexts[2], "node-8", &security)
+        .expect("revoking node-7 left node-8's token alone");
+    assert_eq!(relish.join_token_revoke("node-7").await.unwrap(), 0);
+}
+
+/// Create a join token for `node_id` on the leader and return its plaintext.
+async fn join_token_on_the_leader(cluster: &TokenCluster, node_id: &str) -> String {
+    let response = cluster
+        .post(
+            &cluster.leader_url,
+            "/v1/join-token/create",
+            serde_json::json!({"node_id": node_id, "ttl_seconds": 900}),
+        )
+        .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let created: serde_json::Value = response.json().await.unwrap();
+    created["token"].as_str().unwrap().to_string()
+}
+
+/// A join-token revoke sent to a follower reaches the leader, as a create
+/// does: only the leader writes, so the follower forwards rather than
+/// answering from its own replica.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_join_token_revoked_through_a_follower_is_spent_on_the_leader() {
+    let cluster = TokenCluster::start().await;
+    let plaintext = join_token_on_the_leader(&cluster, "node-7").await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while cluster
+            .follower
+            .security_state()
+            .await
+            .join_tokens
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the follower never applied the join token");
+
+    let response = cluster
+        .post(
+            &cluster.follower_url,
+            "/v1/join-token/revoke",
+            serde_json::json!({"node_id": "node-7"}),
+        )
+        .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.headers()[reqwest::header::CONTENT_TYPE],
+        "application/json"
+    );
+    let answer: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(answer["revoked"], 1, "{answer}");
+    let security = cluster.leader.security_state().await;
+    assert!(matches!(
+        reliaburger::sesame::join::check_join_token(&plaintext, "node-7", &security),
+        Err(reliaburger::sesame::join::JoinError::TokenConsumed)
+    ));
+}
+
+/// A follower whose replica hasn't applied a new join token yet still
+/// revokes it, because the leader decides which tokens to spend. Answering
+/// from the replica would find none and leave the token able to enrol.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_join_token_revoke_through_a_lagging_node_spends_what_the_leader_holds() {
+    let cluster = TokenCluster::start_with_learner().await;
+    cluster.stop_replicating_to_the_follower().await;
+    let plaintext = join_token_on_the_leader(&cluster, "node-7").await;
+    assert!(
+        cluster
+            .follower
+            .security_state()
+            .await
+            .join_tokens
+            .is_empty(),
+        "the cut-off learner can't have the token"
+    );
+
+    let response = cluster
+        .post(
+            &cluster.follower_url,
+            "/v1/join-token/revoke",
+            serde_json::json!({"node_id": "node-7"}),
+        )
+        .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let answer: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(answer["revoked"], 1, "{answer}");
+    let security = cluster.leader.security_state().await;
+    assert!(matches!(
+        reliaburger::sesame::join::check_join_token(&plaintext, "node-7", &security),
+        Err(reliaburger::sesame::join::JoinError::TokenConsumed)
+    ));
+}
+
+/// The list comes from the leader too, so a lagging node shows a token it
+/// hasn't applied yet, with no secret.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_join_token_list_through_a_lagging_node_shows_what_the_leader_holds() {
+    let cluster = TokenCluster::start_with_learner().await;
+    cluster.stop_replicating_to_the_follower().await;
+    let plaintext = join_token_on_the_leader(&cluster, "node-7").await;
+
+    let relish = reliaburger::relish::client::BunClient::new_with_token(
+        &cluster.follower_url,
+        Some(&cluster.admin),
+    );
+    let listed = relish.join_token_list().await.unwrap();
+
+    assert_eq!(
+        listed
+            .iter()
+            .map(|token| (token.node_id.as_str(), token.consumed))
+            .collect::<Vec<_>>(),
+        [("node-7", false)]
+    );
+    let shown = serde_json::to_string(&listed).unwrap();
+    assert!(!shown.contains(plaintext.as_str()), "{shown}");
+}
+
 /// Refusals are the leader's to give, and they come back as it gave them,
 /// with no secret and nothing written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1517,7 +1869,7 @@ async fn writes_the_leader_refuses_come_back_through_the_follower_unchanged() {
             .text()
             .await
             .unwrap()
-            .contains("last Admin token")
+            .contains("only Admin token")
     );
     assert_eq!(
         cluster
@@ -1634,8 +1986,9 @@ async fn a_follower_refuses_token_writes_another_node_already_forwarded() {
 async fn a_forwarded_write_that_times_out_says_what_it_may_have_cost() {
     let cluster = TokenCluster::start().await;
     let _silent = cluster.point_the_follower_at_a_silent_leader().await;
+    // Past the follower's 20 s backstop, so its 504 arrives first.
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(40))
         .build()
         .unwrap();
     let ask = |path: &'static str, body: serde_json::Value| {

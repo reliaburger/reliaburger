@@ -44,7 +44,11 @@ refuses to start and names `[dns] upstream`.
 Apps in the same namespace can reach each other; other namespaces can't. That
 holds for every address a workload has, not just its VIP: a backend's
 container address (any port), and a published host port on any node, which is
-what `relish resolve` prints. Open a specific cross-namespace path with
+what `relish resolve` prints. Those host ports are for traffic inside the
+cluster: on a node running the perimeter, they answer cluster members and the
+node's own containers only, so `curl node:port` from a laptop outside the
+cluster times out. Reach an app from outside through [ingress](#ingress). Open
+a specific cross-namespace path with
 `allow_from`, naming apps as `namespace/app`:
 
 ```toml
@@ -62,6 +66,21 @@ the same namespace. One grant covers the VIP and the real addresses alike.
 A source can be a job as well as an app: `allow_from = ["reports/nightly"]`
 admits every task of the `nightly` job in `reports`, including tasks that
 haven't started yet.
+
+The caller's node enforces `allow_from`, wherever the target runs: the leader
+sends every service's list to every node with the service catalogue, which
+each node fetches every two seconds. A changed list doesn't take effect
+everywhere at once, in either direction. Until it does, a caller you've just
+added is still refused and one you've just removed can still connect:
+
+- on nodes that don't run the target, a couple of seconds after
+  `relish apply` (1 to 4 s on a three-node Lima cluster);
+- on a node that runs the target, once the rolled-out instance has started
+  and registered: up to about 9 s on Lima, and up to about 45 s on a
+  Wyse 3040, where a rollout is slower.
+
+So after narrowing `allow_from`, wait for `relish apps` to show the rollout
+finished before you count on the removed caller being refused everywhere.
 
 The eBPF hooks enforce all of this, so isolation needs `[ebpf]`. `relish init`
 turns `[ebpf]` and `[dns]` on when it runs as root on Linux with `runc`
@@ -141,9 +160,28 @@ own ingress CA, which renew themselves; your clients need to trust that CA.
 `examples/phase-1/container-tls-ingress.toml` serves podinfo this way.
 `explicit` uses the `tls_cert` and `tls_key` PEM files from this node's
 `[ingress]` section, reloaded when they change; Bun rejects a half-configured
-pair. There's no ACME: `relish apply` and `relish lint` refuse `auto` and
+pair. Both kinds of route can share a node: the ingress picks the certificate
+by the hostname the client asks for. Routes on one host share a certificate,
+and `explicit` wins if they disagree. A node missing what a route's mode needs
+(no pair for `explicit`, no cluster CA for `cluster`) serves that host the
+self-signed fallback and logs a warning, rather than the other mode's
+certificate. A host whose routes are all plain HTTP, reached over HTTPS, gets
+the node's `tls_cert` pair if it has one and the self-signed fallback if not;
+it never gets a cluster certificate. There's no ACME: `relish apply` and `relish lint` refuse `auto` and
 `acme`, as they do any other unknown mode. The listener's self-signed fallback
 is for development, not a substitute for either mode.
+
+Several apps can share a host on different paths; the longest matching path
+wins. A host belongs to whoever serves it, though: a token scoped with
+`--namespaces` or `--apps` can't put a route on a host that an app outside its
+scope already serves, at any path, and `relish apply` answers 403. The rule
+holds for an app in a manifest with jobs, and for a proposal when it's made,
+approved or undone. A proposal a policy approves later is checked again as
+its author at that moment, and fails with the reason if the host has been
+taken since. An unscoped
+token can share a host across namespaces on purpose. Each app on it keeps its
+route through later applies, but adding another app to a shared host takes an
+unscoped token.
 
 Each node keeps its own rate limiter. Behind an L4 load balancer spreading a
 client over N nodes, that client gets up to N times `rate_limit_rps`. A zero
@@ -155,7 +193,17 @@ written before them), every node skips that one route, logs it with its app and
 namespace, and keeps serving discovery and ingress for every other app.
 
 Streaming responses pass through, and so do WebSockets on routes that allow
-them. A stopping instance drains its connections before it goes.
+them. A stopping instance drains its connections before it goes. A WebSocket
+still open when the drain timeout ends gets a Close frame with code 1001
+(Going Away), so a well-behaved client reconnects to another instance rather
+than reporting an error.
+
+Your app sees the client's address in `X-Forwarded-For` and `X-Real-IP`, and
+`X-Forwarded-Proto` says whether the client came over HTTPS. The ingress sets
+all three itself and drops any a client sent, so your app can trust them. Each
+request also carries an `X-Request-ID`: the client's own, or a new random one,
+for matching your app's logs to the client's. WebSocket upgrades get the same
+headers.
 
 ## Fault injection lives nearby
 

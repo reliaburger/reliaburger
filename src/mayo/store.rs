@@ -142,13 +142,73 @@ pub(crate) fn write_batch_parquet(
     file.sync_all().map_err(MayoError::Io)?;
     std::fs::rename(&tmp, path).map_err(MayoError::Io)?;
     if let Some(dir) = path.parent() {
-        // A dir fsync makes the rename itself durable. Best-effort: not every
-        // filesystem supports it, and the file bytes are already synced.
-        if let Ok(dir_file) = std::fs::File::open(dir) {
-            let _ = dir_file.sync_all();
+        // A dir fsync makes the rename itself durable. Ok means the batch
+        // survives a power cut, and the caller drops its rows on Ok (#2060).
+        // A filesystem that can't sync directories at all has nothing to
+        // retry. Any other failure is the caller's to retry, and it keeps its
+        // rows, so the file comes out first: left in place, queries would
+        // count those rows twice until the retry.
+        match std::fs::File::open(dir).and_then(|dir_file| dir_file.sync_all()) {
+            Ok(()) => {}
+            Err(error) if directory_sync_unsupported(&error) => {}
+            Err(error) => {
+                if let Err(removal) = std::fs::remove_file(path) {
+                    eprintln!(
+                        "mayo: cannot remove unconfirmed {}: {removal}",
+                        path.display()
+                    );
+                }
+                return Err(MayoError::Io(error));
+            }
         }
     }
     Ok(())
+}
+
+/// Whether a failed directory sync means the filesystem can't sync
+/// directories at all, rather than that this sync failed.
+fn directory_sync_unsupported(error: &std::io::Error) -> bool {
+    // ENOTSUP and EOPNOTSUPP are one value on Linux and two on macOS, so
+    // they can't share a pattern without one arm being unreachable.
+    error.kind() == std::io::ErrorKind::Unsupported
+        || error.raw_os_error().is_some_and(|code| {
+            [
+                nix::libc::EINVAL,
+                nix::libc::ENOTSUP,
+                nix::libc::EOPNOTSUPP,
+                nix::libc::ENOSYS,
+            ]
+            .contains(&code)
+        })
+}
+
+/// Prefix of the temporary file a local Mayo flush writes before renaming
+/// it into place.
+const PENDING_PREFIX: &str = ".mayo-pending-";
+
+/// Delete the temporary files of flushes a crash interrupted. They are
+/// never renamed into place, nothing else removes them, and the size cap
+/// doesn't count them (#2059). Best effort: a file that can't be removed
+/// costs disk space, not data.
+fn remove_interrupted_flushes(data_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(data_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(PENDING_PREFIX)
+        {
+            continue;
+        }
+        if let Err(error) = std::fs::remove_file(entry.path()) {
+            eprintln!(
+                "mayo: cannot remove interrupted flush {}: {error}",
+                entry.path().display()
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -569,7 +629,7 @@ fn write_owned_local_mayo(
         pending.creation_confirmation_fault.as_deref(),
     )?;
     let mut temporary = tempfile::Builder::new()
-        .prefix(".mayo-pending-")
+        .prefix(PENDING_PREFIX)
         .tempfile_in(data_dir)
         .map_err(MayoError::Io)?;
     for bytes in &encoded.payload {
@@ -800,8 +860,10 @@ impl MayoStore {
     ///
     /// Existing `metrics_NNNNNN.parquet` files are left in place and remain
     /// queryable; the flush counter resumes past the highest one so restarts
-    /// don't overwrite them.
+    /// don't overwrite them. Temporary files a crashed flush left are
+    /// deleted: one process owns a store's directory.
     pub fn new(data_dir: PathBuf) -> Self {
+        remove_interrupted_flushes(&data_dir);
         let flush_counter = next_flush_counter(&data_dir, "metrics");
         Self {
             pending: None,
@@ -1124,53 +1186,18 @@ impl MayoStore {
         since: Option<u64>,
     ) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
         let ctx = self.session_since(since).await?;
-        let df = ctx
-            .sql(sql)
-            .await
-            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
+        rows_from(&ctx, sql).await
+    }
 
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
-
-        let mut results = Vec::new();
-        for batch in &batches {
-            if batch.num_columns() < 4 {
-                continue;
-            }
-            let timestamps = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| MayoError::Arrow("timestamp column type mismatch".into()))?;
-            let names = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| MayoError::Arrow("metric_name column type mismatch".into()))?;
-            let labels = batch
-                .column(2)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| MayoError::Arrow("labels column type mismatch".into()))?;
-            let values = batch
-                .column(3)
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| MayoError::Arrow("value column type mismatch".into()))?;
-
-            for i in 0..batch.num_rows() {
-                results.push((
-                    timestamps.value(i),
-                    names.value(i).to_string(),
-                    labels.value(i).to_string(),
-                    values.value(i),
-                ));
-            }
-        }
-
-        Ok(results)
+    /// A snapshot of the store for a query that only wants samples at or
+    /// after `since`: the archive files and unflushed samples as they are
+    /// now. Query it with [`MetricsSnapshot::query_sql`] after releasing the
+    /// store's lock, so a slow query doesn't hold up writers or the readers
+    /// queued behind them (#2215).
+    pub async fn snapshot_since(&self, since: u64) -> Result<MetricsSnapshot, MayoError> {
+        Ok(MetricsSnapshot {
+            ctx: self.session_since(Some(since)).await?,
+        })
     }
 
     /// One app's samples in `[start, end]`, oldest first, newest kept.
@@ -1552,10 +1579,128 @@ pub(crate) fn file_max_timestamp(path: &Path) -> Option<u64> {
     max
 }
 
+/// What [`MayoStore::snapshot_since`] captured: the files and samples one
+/// query reads, independent of the store's lock.
+pub struct MetricsSnapshot {
+    ctx: SessionContext,
+}
+
+impl MetricsSnapshot {
+    /// Run `sql` over the snapshot. Returns (timestamp, name, labels, value)
+    /// tuples, as [`MayoStore::query_sql`] does.
+    pub async fn query_sql(&self, sql: &str) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
+        rows_from(&self.ctx, sql).await
+    }
+}
+
+/// Run `sql` against `ctx` and read the four metric columns back.
+async fn rows_from(
+    ctx: &SessionContext,
+    sql: &str,
+) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
+    let df = ctx
+        .sql(sql)
+        .await
+        .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
+
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
+
+    let mut results = Vec::new();
+    for batch in &batches {
+        if batch.num_columns() < 4 {
+            continue;
+        }
+        let timestamps = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| MayoError::Arrow("timestamp column type mismatch".into()))?;
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| MayoError::Arrow("metric_name column type mismatch".into()))?;
+        let labels = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| MayoError::Arrow("labels column type mismatch".into()))?;
+        let values = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or_else(|| MayoError::Arrow("value column type mismatch".into()))?;
+
+        for i in 0..batch.num_rows() {
+            results.push((
+                timestamps.value(i),
+                names.value(i).to_string(),
+                labels.value(i).to_string(),
+                values.value(i),
+            ));
+        }
+    }
+
+    Ok(results)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mayo::types::MetricKey;
+
+    /// #2215: a snapshot is what a slow query reads once the store's lock is
+    /// released. It answers from the files and samples it captured, while the
+    /// store goes on taking writes.
+    #[tokio::test]
+    async fn a_snapshot_answers_after_the_store_lock_is_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = tokio::sync::RwLock::new(MayoStore::new(dir.path().to_path_buf()));
+        {
+            let mut writer = store.write().await;
+            writer.insert(&MetricKey::simple("cpu"), Sample::at(100, 1.0));
+            writer.flush().await.unwrap();
+            writer.insert(&MetricKey::simple("cpu"), Sample::at(110, 2.0));
+        }
+
+        let snapshot = store.read().await.snapshot_since(0).await.unwrap();
+        // The lock is free: a writer gets in while the snapshot is unread.
+        {
+            let mut writer = store.write().await;
+            writer.insert(&MetricKey::simple("cpu"), Sample::at(120, 3.0));
+            writer.flush().await.unwrap();
+        }
+
+        let rows = snapshot
+            .query_sql(
+                "SELECT timestamp, metric_name, labels, value FROM metrics ORDER BY timestamp",
+            )
+            .await
+            .unwrap();
+        let values: Vec<f64> = rows.iter().map(|row| row.3).collect();
+        assert_eq!(values, vec![1.0, 2.0]);
+    }
+
+    /// A query that selects fewer than the four columns the row reader
+    /// takes gets no rows back, not a panic on the missing column.
+    #[tokio::test]
+    async fn a_query_without_the_four_metric_columns_returns_no_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = MayoStore::new(dir.path().to_path_buf());
+        store.insert(&MetricKey::simple("cpu"), Sample::at(100, 1.0));
+
+        let rows = store
+            .snapshot_since(0)
+            .await
+            .unwrap()
+            .query_sql("SELECT timestamp, metric_name, labels FROM metrics")
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "{rows:?}");
+    }
 
     #[test]
     fn the_store_keeps_the_newest_node_sample_for_the_summary() {
@@ -1581,6 +1726,73 @@ mod tests {
             Some(Sample::at(200, 40.0))
         );
         assert_eq!(store.newest_node_sample_time(), Some(200));
+    }
+
+    /// A crash between creating a flush's temp file and publishing it left
+    /// the file behind for good: nothing removed it and the size cap didn't
+    /// count it. Opening the store sweeps the leftovers.
+    #[test]
+    fn opening_the_store_removes_temp_files_a_crashed_flush_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let orphan = dir.path().join(".mayo-pending-abc123");
+        std::fs::write(&orphan, b"half a batch").unwrap();
+        let published = dir.path().join("metrics_000000.parquet");
+        std::fs::write(&published, b"keep").unwrap();
+        let unrelated = dir.path().join("notes.txt");
+        std::fs::write(&unrelated, b"keep").unwrap();
+
+        let _store = MayoStore::new(dir.path().to_path_buf());
+
+        assert!(!orphan.exists(), "the crashed flush's temp file survived");
+        assert!(published.exists());
+        assert!(unrelated.exists());
+    }
+
+    /// A rename is only durable once its directory is synced. The rollup
+    /// writer ignored a failed directory sync and reported success, so the
+    /// caller cleared its buffer while the file could still vanish.
+    #[cfg(unix)]
+    #[test]
+    fn writing_a_batch_reports_a_failed_directory_sync() {
+        use std::os::unix::fs::PermissionsExt;
+        if nix::unistd::geteuid().is_root() {
+            return; // root opens the directory whatever its mode
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::UInt64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(UInt64Array::from(vec![1u64]))]).unwrap();
+        // Write and search, but no read: the file and the rename succeed and
+        // only opening the directory to sync it fails.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o300)).unwrap();
+        let path = dir.path().join("rollup_000000.parquet");
+        let result = write_batch_parquet(&path, &batch);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            result.is_err(),
+            "a failed directory sync was reported as Ok"
+        );
+        // The caller keeps the rows for its next flush, so a file left in
+        // place would count them twice until then.
+        assert!(!path.exists(), "the unconfirmed file was left in place");
+    }
+
+    /// Some filesystems can't sync a directory at all. That isn't a failed
+    /// flush: the file bytes are synced, and there's nothing to retry.
+    #[test]
+    fn a_directory_sync_the_filesystem_does_not_support_is_not_a_failure() {
+        for errno in [nix::libc::EINVAL, nix::libc::ENOTSUP, nix::libc::ENOSYS] {
+            assert!(
+                directory_sync_unsupported(&std::io::Error::from_raw_os_error(errno)),
+                "errno {errno}"
+            );
+        }
+        for errno in [nix::libc::EIO, nix::libc::EACCES, nix::libc::ENOSPC] {
+            assert!(
+                !directory_sync_unsupported(&std::io::Error::from_raw_os_error(errno)),
+                "errno {errno}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -6,7 +6,6 @@
 /// The `apply` endpoint returns Server-Sent Events, which the client
 /// reads incrementally — printing progress to stderr and collecting
 /// the final result.
-use futures_util::StreamExt;
 use rustls::pki_types::{CertificateDer, pem::PemObject};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
@@ -116,6 +115,12 @@ pub struct AgentVersion {
     /// its self-upgrade manager, which is what hashes it.
     #[serde(default)]
     pub binary_sha256: Option<String>,
+    /// The appliance OS version; absent off an appliance.
+    #[serde(default)]
+    pub os_version: Option<String>,
+    /// The node's OS update in progress, or how the last one ended.
+    #[serde(default)]
+    pub os_update: crate::os::rollout::OsUpdateState,
     /// `{os}-{arch}` the agent runs on: which release artefact fits it.
     #[serde(default)]
     pub platform: Option<String>,
@@ -129,6 +134,11 @@ pub struct AgentVersion {
 pub struct BunClient {
     base_url: String,
     client: Result<reqwest::Client, String>,
+    /// The client for streaming responses. It sets no deadline of its own:
+    /// [`StreamBody`] applies [`ClientTimeouts`] as it reads.
+    stream_client: Result<reqwest::Client, String>,
+    /// The deadlines requests through this client get.
+    timeouts: ClientTimeouts,
     websocket_tls: Option<std::sync::Arc<rustls::ClientConfig>>,
     token: Option<String>,
     ca_pem: Option<Vec<u8>>,
@@ -253,6 +263,9 @@ impl LogOptions {
     pub(crate) fn line_filter(&self) -> LineFilter {
         let grep = self.grep.as_deref().map(|pattern| {
             regex::Regex::new(pattern).unwrap_or_else(|_| {
+                // An escaped pattern is a plain literal. It compiles unless it
+                // is past regex's size limit, megabytes longer than any
+                // command line.
                 regex::Regex::new(&regex::escape(pattern)).expect("an escaped pattern compiles")
             })
         });
@@ -342,6 +355,20 @@ pub fn lease_release_budget() -> std::time::Duration {
 /// the owning node (its agent's answer plus the release wait).
 pub const FAULT_CLEAR_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 /// Pause between those attempts.
+/// The status relish reports for a stream's `Error` event that names none:
+/// one from a server before #2157, or a failure with no status of its own.
+const STREAM_ERROR_STATUS: u16 = 500;
+
+/// The error an apply or rollback stream ended with. The stream answered
+/// `200` before the failure, so the event carries the status the failure
+/// answers on its own (404 for an image nobody built, #2157).
+fn stream_error(message: String, status: Option<u16>) -> RelishError {
+    RelishError::ApiError {
+        status: status.unwrap_or(STREAM_ERROR_STATUS),
+        body: message,
+    }
+}
+
 const FAULT_CLEAR_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Attach an `Idempotency-Key` header when the caller has one.
@@ -480,6 +507,200 @@ static CLI_CA_CERT: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync:
 
 /// How long a command waits for the agent to accept a connection.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What a name in a request path names, for the error that refuses a bad one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameKind {
+    /// An app's (or job's) name.
+    App,
+    /// A namespace's name.
+    Namespace,
+}
+
+impl std::fmt::Display for NameKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            NameKind::App => "app",
+            NameKind::Namespace => "namespace",
+        })
+    }
+}
+
+/// `name`, if it's a name the cluster could hold: a lowercase DNS label.
+///
+/// Such a name needs no escaping in a URL. Anything else is refused before
+/// it reaches one, where `..` would climb to another route and `?` would
+/// start a query: `relish stop ../delete/web` must not delete `web`.
+fn checked_name(kind: NameKind, name: &str) -> Result<&str, RelishError> {
+    if crate::config::validate::valid_workload_label(name) {
+        Ok(name)
+    } else {
+        Err(RelishError::InvalidName {
+            kind,
+            name: name.to_string(),
+        })
+    }
+}
+
+/// `{route}/{app}/{namespace}`, with both names checked.
+fn app_path(route: &str, app: &str, namespace: &str) -> Result<String, RelishError> {
+    Ok(format!(
+        "{route}/{}/{}",
+        checked_name(NameKind::App, app)?,
+        checked_name(NameKind::Namespace, namespace)?
+    ))
+}
+
+/// `/v1/snapshots/{namespace}/{app}`, with both names checked.
+fn snapshots_path(app: &str, namespace: &str) -> Result<String, RelishError> {
+    Ok(format!(
+        "/v1/snapshots/{}/{}",
+        checked_name(NameKind::Namespace, namespace)?,
+        checked_name(NameKind::App, app)?
+    ))
+}
+
+/// Free text (a snapshot's, service's or policy's name) as one path
+/// segment: every byte outside
+/// RFC 3986's unreserved set is percent-encoded, and the dot segments,
+/// which a URL parser resolves even when encoded, are refused.
+fn path_segment(text: &str) -> Result<String, RelishError> {
+    if text.is_empty() || text == "." || text == ".." {
+        return Err(RelishError::InvalidFlag {
+            flag: "name".to_string(),
+            reason: format!("{text:?} can't be one segment of a request path"),
+        });
+    }
+    Ok(text
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+                char::from(byte).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect())
+}
+
+/// How long an ordinary request may take from start to finish.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long a streaming response may stay silent before the command gives up.
+/// The agent sends an SSE keep-alive every 15 s, so this is four missed ones.
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long `relish apply` or `rollback` follows a deploy's progress before
+/// it gives up. Keep-alives hold a stream open, so without this a wedged
+/// deploy would hold an unattended script for ever.
+const DEPLOY_STREAM_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// The deadlines a [`BunClient`] applies.
+#[derive(Debug, Clone, Copy)]
+struct ClientTimeouts {
+    /// Total deadline for a request that answers in one go, and for the
+    /// wait until a stream's headers arrive.
+    request: std::time::Duration,
+    /// Longest silence a streaming response may have.
+    stream_idle: std::time::Duration,
+    /// Total deadline for following a deploy's progress stream.
+    deploy_stream: std::time::Duration,
+}
+
+impl Default for ClientTimeouts {
+    fn default() -> Self {
+        Self {
+            request: REQUEST_TIMEOUT,
+            stream_idle: STREAM_IDLE_TIMEOUT,
+            deploy_stream: DEPLOY_STREAM_DEADLINE,
+        }
+    }
+}
+
+/// A streaming response's body, read chunk by chunk under the client's
+/// deadlines: a silence of `idle` ends it, and so does `deadline`.
+struct StreamBody {
+    response: reqwest::Response,
+    idle: std::time::Duration,
+    /// When to stop, and the deadline's length for the error.
+    deadline: Option<(tokio::time::Instant, std::time::Duration)>,
+}
+
+impl StreamBody {
+    /// The next chunk, `None` when the body ends.
+    async fn next(&mut self) -> Option<Result<Vec<u8>, RelishError>> {
+        let mut wait = self.idle;
+        let mut deadline_first = None;
+        if let Some((at, length)) = self.deadline {
+            let left = at.saturating_duration_since(tokio::time::Instant::now());
+            if left <= wait {
+                wait = left;
+                deadline_first = Some(length);
+            }
+        }
+        match tokio::time::timeout(wait, self.response.chunk()).await {
+            Ok(Ok(Some(chunk))) => Some(Ok(chunk.to_vec())),
+            Ok(Ok(None)) => None,
+            Ok(Err(error)) => Some(Err(classify_error(error))),
+            Err(_) => Some(Err(match deadline_first {
+                Some(length) => RelishError::DeployStreamDeadline {
+                    seconds: length.as_secs(),
+                },
+                None => RelishError::RequestTimeout,
+            })),
+        }
+    }
+}
+
+/// The rustls config that trusts the cluster CA, when one is configured.
+fn cluster_tls(
+    ca_pem: Option<&[u8]>,
+) -> Result<Option<std::sync::Arc<rustls::ClientConfig>>, String> {
+    let Some(pem) = ca_pem else {
+        return Ok(None);
+    };
+    let certificates = CertificateDer::pem_slice_iter(pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("invalid cluster CA PEM: {error}"))?;
+    if certificates.is_empty() {
+        return Err("cluster CA PEM contains no certificates".to_string());
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    for certificate in certificates {
+        roots
+            .add(certificate)
+            .map_err(|error| format!("invalid cluster CA certificate: {error}"))?;
+    }
+    Ok(Some(super::tls::cluster_config(roots)?))
+}
+
+/// An HTTP client for the agent API, with the token and cluster TLS applied
+/// and `deadlines` adding its timeouts.
+fn http_client(
+    token: Option<&str>,
+    tls: Option<std::sync::Arc<rustls::ClientConfig>>,
+    deadlines: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
+) -> Result<reqwest::Client, String> {
+    let mut builder = deadlines(crate::http_client::builder())
+        // A firewall that drops packets would otherwise hold every
+        // command for the operating system's own connect timeout.
+        .connect_timeout(CONNECT_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(token) = token {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| "invalid bearer token header".to_string())?;
+        value.set_sensitive(true);
+        headers.insert(reqwest::header::AUTHORIZATION, value);
+        builder = builder.default_headers(headers);
+    }
+    if let Some(tls) = tls {
+        builder = builder.use_preconfigured_tls((*tls).clone());
+    }
+    builder
+        .build()
+        .map_err(|error| format!("failed to create HTTP client: {error}"))
+}
 
 /// The `--endpoint` CLI override, set once from `main` before dispatch.
 static CLI_ENDPOINT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
@@ -725,19 +946,19 @@ impl BunClient {
     /// Create a client with an explicit token (or none). Used by tests; `new`
     /// resolves the token from the flag/env instead.
     pub fn new_with_token(base_url: &str, token: Option<&str>) -> Self {
-        let ca_pem = match resolve_ca_cert().map(std::fs::read).transpose() {
-            Ok(pem) => pem,
-            Err(error) => {
-                return Self {
-                    base_url: base_url.trim_end_matches('/').to_string(),
-                    client: Err(format!("failed to read cluster CA: {error}")),
-                    websocket_tls: None,
-                    ca_pem: None,
-                    service_endpoints: None,
-                    break_lease: false,
-                    token: token.map(str::to_string),
-                };
-            }
+        let ca_pem = match resolve_ca_cert() {
+            None => None,
+            // BLOCKING-OK: relish CLI: a one-shot read of the `--ca-cert` file before the command does anything long-lived, as the old `map(std::fs::read)` was
+            Some(path) => match std::fs::read(&path) {
+                Ok(pem) => Some(pem),
+                Err(error) => {
+                    return Self::unusable(
+                        base_url,
+                        token,
+                        format!("can't read the CA certificate {}: {error}", path.display()),
+                    );
+                }
+            },
         };
         Self::build(base_url, token, ca_pem.as_deref())
     }
@@ -754,47 +975,49 @@ impl BunClient {
         Ok(client)
     }
 
+    /// A client every request through which fails with `reason`, so a
+    /// broken configuration surfaces when the command first talks to the
+    /// agent.
+    fn unusable(base_url: &str, token: Option<&str>, reason: String) -> Self {
+        Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            client: Err(reason.clone()),
+            stream_client: Err(reason),
+            timeouts: ClientTimeouts::default(),
+            websocket_tls: None,
+            ca_pem: None,
+            service_endpoints: None,
+            break_lease: false,
+            token: token.map(str::to_string),
+        }
+    }
+
     fn build(base_url: &str, token: Option<&str>, ca_pem: Option<&[u8]>) -> Self {
-        let mut websocket_tls = None;
-        let client = (|| -> Result<reqwest::Client, String> {
-            let mut builder = crate::http_client::builder()
-                .timeout(std::time::Duration::from_secs(300))
-                // A firewall that drops packets would otherwise hold every
-                // command for the operating system's own connect timeout.
-                .connect_timeout(CONNECT_TIMEOUT)
-                .redirect(reqwest::redirect::Policy::none());
-            if let Some(token) = token {
-                let mut headers = reqwest::header::HeaderMap::new();
-                let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
-                    .map_err(|_| "invalid bearer token header".to_string())?;
-                value.set_sensitive(true);
-                headers.insert(reqwest::header::AUTHORIZATION, value);
-                builder = builder.default_headers(headers);
-            }
-            if let Some(pem) = ca_pem {
-                let certificates = CertificateDer::pem_slice_iter(pem)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| format!("invalid cluster CA PEM: {error}"))?;
-                if certificates.is_empty() {
-                    return Err("cluster CA PEM contains no certificates".to_string());
-                }
-                let mut roots = rustls::RootCertStore::empty();
-                for certificate in certificates {
-                    roots
-                        .add(certificate)
-                        .map_err(|error| format!("invalid cluster CA certificate: {error}"))?;
-                }
-                let tls = super::tls::cluster_config(roots)?;
-                builder = builder.use_preconfigured_tls((*tls).clone());
-                websocket_tls = Some(tls);
-            }
-            builder
-                .build()
-                .map_err(|error| format!("failed to create HTTP client: {error}"))
-        })();
+        Self::build_with_timeouts(base_url, token, ca_pem, ClientTimeouts::default())
+    }
+
+    fn build_with_timeouts(
+        base_url: &str,
+        token: Option<&str>,
+        ca_pem: Option<&[u8]>,
+        timeouts: ClientTimeouts,
+    ) -> Self {
+        let tls = cluster_tls(ca_pem);
+        let websocket_tls = tls.clone().ok().flatten();
+        // Ordinary requests answer in one go, so a total deadline bounds them.
+        let client = tls
+            .clone()
+            .and_then(|tls| http_client(token, tls, |builder| builder.timeout(timeouts.request)));
+        // A followed log or a deploy's progress stream runs for as long as
+        // the work behind it does, so its client has no deadline; `StreamBody`
+        // ends it on silence (the agent sends an SSE keep-alive every 15 s)
+        // or, for a deploy, at `deploy_stream`.
+        let stream_client = tls.and_then(|tls| http_client(token, tls, |builder| builder));
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             client,
+            stream_client,
+            timeouts,
             websocket_tls,
             ca_pem: ca_pem.map(<[u8]>::to_vec),
             service_endpoints: None,
@@ -835,6 +1058,8 @@ impl BunClient {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             client: self.client.clone(),
+            stream_client: self.stream_client.clone(),
+            timeouts: self.timeouts,
             websocket_tls: self.websocket_tls.clone(),
             ca_pem: self.ca_pem.clone(),
             service_endpoints: None,
@@ -961,9 +1186,59 @@ impl BunClient {
     pub fn http(&self) -> Result<&reqwest::Client, RelishError> {
         self.client
             .as_ref()
-            .map_err(|reason| RelishError::ApiError {
-                status: 0,
-                body: reason.clone(),
+            .map_err(|reason| RelishError::ClientConfig(reason.clone()))
+    }
+
+    /// The HTTP client for a response that streams for as long as the work
+    /// behind it runs (a followed log, a deploy's progress). Send through
+    /// [`Self::start_stream`] and read through [`StreamBody`], which apply
+    /// the deadlines.
+    fn streaming_http(&self) -> Result<&reqwest::Client, RelishError> {
+        self.stream_client
+            .as_ref()
+            .map_err(|reason| RelishError::ClientConfig(reason.clone()))
+    }
+
+    /// Send a request whose answer streams. The work before the first byte
+    /// (binding images, a job's apply) gets the ordinary request deadline.
+    async fn start_stream(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, RelishError> {
+        tokio::time::timeout(self.timeouts.request, request.send())
+            .await
+            .map_err(|_| RelishError::RequestTimeout)?
+            .map_err(classify_error)
+    }
+
+    /// A streamed body that ends on a silence, and for a deploy at the
+    /// deploy deadline.
+    fn stream_body(&self, response: reqwest::Response, deploy: bool) -> StreamBody {
+        StreamBody {
+            response,
+            idle: self.timeouts.stream_idle,
+            deadline: deploy.then(|| {
+                (
+                    tokio::time::Instant::now() + self.timeouts.deploy_stream,
+                    self.timeouts.deploy_stream,
+                )
+            }),
+        }
+    }
+
+    /// [`default_local`](Self::default_local), read off the runtime: the
+    /// context file and the cluster CA are files, and `relish mcp`, which
+    /// serves the agent commands, is long-lived and answers calls side by
+    /// side. Every `relish agent` command starts here.
+    pub async fn local() -> Self {
+        tokio::task::spawn_blocking(Self::default_local)
+            .await
+            .unwrap_or_else(|error| {
+                Self::unusable(
+                    "https://127.0.0.1:19117",
+                    None,
+                    format!("failed to read the local context: {error}"),
+                )
             })
     }
 
@@ -978,7 +1253,7 @@ impl BunClient {
             // An explicit endpoint picks the node; the managed context's host
             // forwards still describe how this host reaches the cluster's
             // registry and ingress, when it is the same cluster.
-            // BLOCKING-OK: relish CLI: a one-shot read of the local context before the command does anything long-lived; `relish mcp` calls this off the runtime
+            // BLOCKING-OK: relish CLI: a one-shot read of the local context before the command does anything long-lived; the agent commands, which `relish mcp` serves, call it off the runtime through `BunClient::local`
             let forwards = super::local_context::default_path()
                 .and_then(|path| super::local_context::LocalContext::load(&path))
                 .ok()
@@ -989,33 +1264,19 @@ impl BunClient {
                 None => client,
             };
         }
-        // BLOCKING-OK: relish CLI: a one-shot read of the local context before the command does anything long-lived; `relish mcp` calls this off the runtime
+        // BLOCKING-OK: relish CLI: a one-shot read of the local context before the command does anything long-lived; the agent commands, which `relish mcp` serves, call it off the runtime through `BunClient::local`
         let context = super::local_context::default_path()
             .and_then(|path| super::local_context::LocalContext::load(&path));
         match context {
             Ok(Some(context)) => {
                 return context
                     .client(resolve_token().as_deref(), resolve_ca_cert().as_deref())
-                    .unwrap_or_else(|error| Self {
-                        base_url: context.endpoint,
-                        client: Err(error.to_string()),
-                        websocket_tls: None,
-                        ca_pem: None,
-                        service_endpoints: None,
-                        break_lease: false,
-                        token: None,
+                    .unwrap_or_else(|error| {
+                        Self::unusable(&context.endpoint, None, error.to_string())
                     });
             }
             Err(error) => {
-                return Self {
-                    base_url: "https://127.0.0.1:19117".to_string(),
-                    client: Err(error.to_string()),
-                    websocket_tls: None,
-                    ca_pem: None,
-                    service_endpoints: None,
-                    break_lease: false,
-                    token: None,
-                };
+                return Self::unusable("https://127.0.0.1:19117", None, error.to_string());
             }
             Ok(None) => {}
         }
@@ -1131,7 +1392,7 @@ impl BunClient {
             body: format!("failed to serialise config: {e}"),
         })?;
 
-        let mut request = self.lease_header(self.http()?.post(&url).body(toml_str));
+        let mut request = self.lease_header(self.streaming_http()?.post(&url).body(toml_str));
         if rerun_jobs {
             request = request.header("x-reliaburger-rerun-jobs", "acknowledged");
         }
@@ -1141,7 +1402,7 @@ impl BunClient {
         if capacity_probe {
             request = request.header("x-reliaburger-capacity-probe", "acknowledged");
         }
-        let response = request.send().await.map_err(classify_error)?;
+        let response = self.start_stream(request).await?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -1168,12 +1429,12 @@ impl BunClient {
         }
 
         // Read the SSE stream
-        let mut stream = response.bytes_stream();
+        let mut stream = self.stream_body(response, true);
         let mut buffer = Vec::new();
         let mut result = None;
 
         while let Some(chunk) = stream.next().await {
-            let bytes = chunk.map_err(classify_error)?;
+            let bytes = chunk?;
             buffer.extend_from_slice(&bytes);
 
             // Decode only complete frames: a UTF-8 character can span network chunks.
@@ -1213,11 +1474,8 @@ impl BunClient {
                                 instances: instances.clone(),
                             });
                         }
-                        ApplyEvent::Error { message } => {
-                            return Err(RelishError::ApiError {
-                                status: 500,
-                                body: message.clone(),
-                            });
+                        ApplyEvent::Error { message, status } => {
+                            return Err(stream_error(message.clone(), *status));
                         }
                     }
                 }
@@ -1234,11 +1492,8 @@ impl BunClient {
                 ApplyEvent::Complete { created, instances } => {
                     result = Some(ApplyResult { created, instances });
                 }
-                ApplyEvent::Error { message } => {
-                    return Err(RelishError::ApiError {
-                        status: 500,
-                        body: message,
-                    });
+                ApplyEvent::Error { message, status } => {
+                    return Err(stream_error(message, status));
                 }
                 _ => {}
             }
@@ -1267,26 +1522,58 @@ impl BunClient {
         force: bool,
     ) -> Result<(), RelishError> {
         let url = format!(
-            "{}/v1/rollback/{app}/{namespace}{}",
+            "{}{}{}",
             self.base_url,
+            app_path("/v1/rollback", app, namespace)?,
             force_query(force)
         );
         let response = self
-            .lease_header(self.http()?.post(&url))
-            .send()
-            .await
-            .map_err(classify_error)?;
+            .start_stream(self.lease_header(self.streaming_http()?.post(&url)))
+            .await?;
+        self.follow_apply_events(response).await
+    }
 
+    /// Set an app's replica count (`POST /v1/scale/{app}/{namespace}`),
+    /// printing the leader's progress on stderr as an apply does. With
+    /// `current_replicas`, the scale is refused if the app has another
+    /// count now; with `force`, it changes an app GitOps manages.
+    pub async fn scale(
+        &self,
+        app: &str,
+        namespace: &str,
+        replicas: u32,
+        current_replicas: Option<u32>,
+        force: bool,
+    ) -> Result<(), RelishError> {
+        let url = format!(
+            "{}{}{}",
+            self.base_url,
+            app_path("/v1/scale", app, namespace)?,
+            force_query(force)
+        );
+        let mut body = serde_json::json!({ "replicas": replicas });
+        if let Some(current) = current_replicas {
+            body["current_replicas"] = current.into();
+        }
+        let response = self
+            .start_stream(self.lease_header(self.streaming_http()?.post(&url).json(&body)))
+            .await?;
+        self.follow_apply_events(response).await
+    }
+
+    /// Read an apply-shaped progress stream to its end: progress on stderr,
+    /// and the first error as the result.
+    async fn follow_apply_events(&self, response: reqwest::Response) -> Result<(), RelishError> {
         let status = response.status().as_u16();
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
             return Err(RelishError::ApiError { status, body });
         }
 
-        let mut stream = response.bytes_stream();
+        let mut stream = self.stream_body(response, true);
         let mut buffer = Vec::new();
         while let Some(chunk) = stream.next().await {
-            let bytes = chunk.map_err(classify_error)?;
+            let bytes = chunk?;
             buffer.extend_from_slice(&bytes);
             while let Some(end) = buffer.windows(2).position(|pair| pair == b"\n\n") {
                 let event_text = String::from_utf8_lossy(&buffer[..end]).into_owned();
@@ -1296,11 +1583,8 @@ impl BunClient {
                 {
                     match event {
                         ApplyEvent::Progress { message } => eprintln!("  {message}"),
-                        ApplyEvent::Error { message } => {
-                            return Err(RelishError::ApiError {
-                                status: 500,
-                                body: message,
-                            });
+                        ApplyEvent::Error { message, status } => {
+                            return Err(stream_error(message, status));
                         }
                         _ => {}
                     }
@@ -1551,7 +1835,8 @@ impl BunClient {
         start: u64,
     ) -> Result<crate::ketchup::types::LogQueryResult, RelishError> {
         self.get_typed_json(&format!(
-            "/v1/logs/query/{app}/{namespace}?tail={tail}&start={start}"
+            "{}?tail={tail}&start={start}",
+            app_path("/v1/logs/query", app, namespace)?
         ))
         .await
     }
@@ -1569,14 +1854,12 @@ impl BunClient {
         namespace: &str,
         options: &LogOptions,
     ) -> Result<crate::ketchup::types::LogQueryResult, RelishError> {
-        let app_segment: String = url::form_urlencoded::byte_serialize(app.as_bytes()).collect();
-        let namespace_segment: String =
-            url::form_urlencoded::byte_serialize(namespace.as_bytes()).collect();
         let response = self
             .http()?
             .get(format!(
-                "{}/v1/logs/query/{app_segment}/{namespace_segment}",
-                self.base_url
+                "{}{}",
+                self.base_url,
+                app_path("/v1/logs/query", app, namespace)?
             ))
             .query(&options.query_params())
             .send()
@@ -1603,15 +1886,10 @@ impl BunClient {
         app: &str,
         namespace: &str,
     ) -> Result<crate::bun::cluster_view::ClusterDeployHistory, RelishError> {
-        // Encode both: an app or namespace carrying `/`, `&` or a space would
-        // otherwise split into extra path segments or query parameters.
-        let app_segment: String = url::form_urlencoded::byte_serialize(app.as_bytes()).collect();
-        let namespace_value: String =
-            url::form_urlencoded::byte_serialize(namespace.as_bytes()).collect();
-        self.get_typed_json(&format!(
-            "/v1/deploys/history/{app_segment}?namespace={namespace_value}"
-        ))
-        .await
+        let app = checked_name(NameKind::App, app)?;
+        let namespace = checked_name(NameKind::Namespace, namespace)?;
+        self.get_typed_json(&format!("/v1/deploys/history/{app}?namespace={namespace}"))
+            .await
     }
 
     /// Fetch live deploy operations and bounded terminal history.
@@ -1766,7 +2044,7 @@ impl BunClient {
         app: &str,
         namespace: &str,
     ) -> Result<crate::mayo::rollup::MetricsQueryResult, RelishError> {
-        self.get_typed_json(&format!("/v1/metrics/app/{app}/{namespace}"))
+        self.get_typed_json(&app_path("/v1/metrics/app", app, namespace)?)
             .await
     }
 
@@ -1790,7 +2068,8 @@ impl BunClient {
             query.append_pair("per_series", &per_series.to_string());
         }
         self.get_typed_json(&format!(
-            "/v1/metrics/app/{app}/{namespace}?{}",
+            "{}?{}",
+            app_path("/v1/metrics/app", app, namespace)?,
             query.finish()
         ))
         .await
@@ -1878,8 +2157,11 @@ impl BunClient {
         >,
         RelishError,
     > {
-        self.ws_connect(&format!("/v1/ws/logs/{app}/{namespace}?tail={tail}"))
-            .await
+        self.ws_connect(&format!(
+            "{}?tail={tail}",
+            app_path("/v1/ws/logs", app, namespace)?
+        ))
+        .await
     }
 
     /// Follow cluster events over WebSocket.
@@ -1897,7 +2179,7 @@ impl BunClient {
     /// Request a stop. In cluster mode, success means accepted desired state;
     /// workers retire asynchronously and may still be unreachable.
     pub async fn stop(&self, app: &str, namespace: &str) -> Result<(), RelishError> {
-        let url = format!("{}/v1/stop/{}/{}", self.base_url, app, namespace);
+        let url = format!("{}{}", self.base_url, app_path("/v1/stop", app, namespace)?);
         let response = self
             .lease_header(self.http()?.post(&url))
             .send()
@@ -1928,10 +2210,9 @@ impl BunClient {
         force: bool,
     ) -> Result<(), RelishError> {
         let url = format!(
-            "{}/v1/delete/{}/{}{}",
+            "{}{}{}",
             self.base_url,
-            app,
-            namespace,
+            app_path("/v1/delete", app, namespace)?,
             force_query(force)
         );
         let response = self
@@ -1953,7 +2234,11 @@ impl BunClient {
     /// handing it back to `relish apply` and GitOps. Only the owner's token
     /// or an admin may.
     pub async fn release(&self, app: &str, namespace: &str) -> Result<(), RelishError> {
-        let url = format!("{}/v1/release/{}/{}", self.base_url, app, namespace);
+        let url = format!(
+            "{}{}",
+            self.base_url,
+            app_path("/v1/release", app, namespace)?
+        );
         let response = self
             .lease_header(self.http()?.post(&url))
             .send()
@@ -1976,7 +2261,7 @@ impl BunClient {
         volume: Option<&str>,
         name: Option<&str>,
     ) -> Result<serde_json::Value, RelishError> {
-        let url = format!("{}/v1/snapshots/{}/{}", self.base_url, namespace, app);
+        let url = format!("{}{}", self.base_url, snapshots_path(app, namespace)?);
         let body = serde_json::json!({ "volume": volume, "name": name });
         let response = self
             .http()?
@@ -2000,7 +2285,7 @@ impl BunClient {
         app: &str,
         namespace: &str,
     ) -> Result<serde_json::Value, RelishError> {
-        let url = format!("{}/v1/snapshots/{}/{}", self.base_url, namespace, app);
+        let url = format!("{}{}", self.base_url, snapshots_path(app, namespace)?);
         let response = self
             .http()?
             .get(&url)
@@ -2027,8 +2312,9 @@ impl BunClient {
         volume: Option<&str>,
     ) -> Result<(), RelishError> {
         let url = format!(
-            "{}/v1/snapshots/{}/{}/restore",
-            self.base_url, namespace, app
+            "{}{}/restore",
+            self.base_url,
+            snapshots_path(app, namespace)?
         );
         let response = self
             .http()?
@@ -2056,8 +2342,10 @@ impl BunClient {
         volume: Option<&str>,
     ) -> Result<(), RelishError> {
         let url = format!(
-            "{}/v1/snapshots/{}/{}/{}",
-            self.base_url, namespace, app, name
+            "{}{}/{}",
+            self.base_url,
+            snapshots_path(app, namespace)?,
+            path_segment(name)?
         );
         let mut request = self.http()?.delete(&url);
         if let Some(volume) = volume {
@@ -2104,7 +2392,11 @@ impl BunClient {
         // Try the cross-node query endpoint first.
         // In cluster mode this fans out to all nodes running the app.
         // In single-node mode it queries the local LogStore.
-        let url = format!("{}/v1/logs/query/{}/{}", self.base_url, app, namespace);
+        let url = format!(
+            "{}{}",
+            self.base_url,
+            app_path("/v1/logs/query", app, namespace)?
+        );
 
         let mut store_answered = false;
         if let Ok(response) = self
@@ -2175,7 +2467,7 @@ impl BunClient {
         namespace: &str,
         options: &LogOptions,
     ) -> Result<Vec<String>, RelishError> {
-        let url = format!("{}/v1/logs/{}/{}", self.base_url, app, namespace);
+        let url = format!("{}{}", self.base_url, app_path("/v1/logs", app, namespace)?);
 
         let response = self
             .http()?
@@ -2215,17 +2507,13 @@ impl BunClient {
         namespace: &str,
         options: &LogOptions,
     ) -> Result<String, RelishError> {
-        let url = format!("{}/v1/logs/{}/{}", self.base_url, app, namespace);
+        let url = format!("{}{}", self.base_url, app_path("/v1/logs", app, namespace)?);
         let mut params = options.query_params();
         params.push(("follow".to_string(), "true".to_string()));
 
         let response = self
-            .http()?
-            .get(&url)
-            .query(&params)
-            .send()
-            .await
-            .map_err(classify_error)?;
+            .start_stream(self.streaming_http()?.get(&url).query(&params))
+            .await?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -2234,10 +2522,10 @@ impl BunClient {
         }
 
         let filter = options.line_filter();
-        let mut stream = response.bytes_stream();
+        let mut stream = self.stream_body(response, false);
         let mut decoder = crate::ketchup::sse::SseDecoder::default();
         while let Some(chunk) = stream.next().await {
-            let bytes = chunk.map_err(classify_error)?;
+            let bytes = chunk?;
             for event in decoder.push(&bytes) {
                 print_followed_event(&event, &filter);
             }
@@ -2258,11 +2546,31 @@ impl BunClient {
         namespace: &str,
         command: &[String],
     ) -> Result<crate::grill::ExecOutput, RelishError> {
-        let url = format!("{}/v1/exec/{}/{}", self.base_url, app, namespace);
+        self.exec_with_timeout(app, namespace, command, None).await
+    }
+
+    /// [`Self::exec`], asking the agent to give up after `timeout` (held to
+    /// [`crate::bun::agent::MAX_EXEC_TIMEOUT`]). The agent then answers `504`
+    /// naming the app, and this waits long enough to hear it (#2128).
+    pub async fn exec_with_timeout(
+        &self,
+        app: &str,
+        namespace: &str,
+        command: &[String],
+        timeout: Option<std::time::Duration>,
+    ) -> Result<crate::grill::ExecOutput, RelishError> {
+        let url = format!("{}{}", self.base_url, app_path("/v1/exec", app, namespace)?);
+        let mut body = serde_json::json!({ "command": command });
+        if let Some(timeout) = timeout {
+            body["timeout_seconds"] = timeout.as_secs().max(1).into();
+        }
+        // The ordinary request deadline would race the agent's own: wait
+        // past it, so the caller hears the agent's named `504`.
         let response = self
             .http()?
             .post(&url)
-            .json(&serde_json::json!({ "command": command }))
+            .timeout(crate::bun::agent::client_exec_wait(timeout))
+            .json(&body)
             .send()
             .await
             .map_err(classify_error)?;
@@ -2503,13 +2811,12 @@ impl BunClient {
         service: &str,
         namespace: Option<&str>,
     ) -> Result<String, RelishError> {
-        let url = match namespace {
-            Some(namespace) => format!(
-                "{}/v1/fault?service={}&namespace={}",
-                self.base_url, service, namespace
-            ),
-            None => format!("{}/v1/fault?service={}", self.base_url, service),
-        };
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query.append_pair("service", service);
+        if let Some(namespace) = namespace {
+            query.append_pair("namespace", namespace);
+        }
+        let url = format!("{}/v1/fault?{}", self.base_url, query.finish());
         let response = self
             .http()?
             .delete(&url)
@@ -2571,7 +2878,7 @@ impl BunClient {
         &self,
         name: &str,
     ) -> Result<crate::onion::types::ResolveResponse, RelishError> {
-        let url = format!("{}/v1/resolve/{name}", self.base_url);
+        let url = format!("{}/v1/resolve/{}", self.base_url, path_segment(name)?);
         let response = self
             .http()?
             .get(&url)
@@ -2888,6 +3195,78 @@ impl BunClient {
             .to_string())
     }
 
+    /// The join tokens the council holds, without the tokens themselves.
+    pub async fn join_token_list(
+        &self,
+    ) -> Result<Vec<crate::sesame::join::JoinTokenSummary>, RelishError> {
+        let url = format!("{}/v1/join-token/list", self.base_url);
+        let response = self
+            .http()?
+            .get(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+        #[derive(serde::Deserialize)]
+        struct Listing {
+            join_tokens: Vec<crate::sesame::join::JoinTokenSummary>,
+        }
+        let listing: Listing = response.json().await.map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse join-token list: {e}"),
+        })?;
+        Ok(listing.join_tokens)
+    }
+
+    /// Revoke a node id's unused join tokens; returns how many.
+    pub async fn join_token_revoke(&self, node_id: &str) -> Result<u64, RelishError> {
+        let url = format!("{}/v1/join-token/revoke", self.base_url);
+        let response = self
+            .http()?
+            .post(&url)
+            .json(&serde_json::json!({ "node_id": node_id }))
+            .send()
+            .await
+            .map_err(classify_error)?;
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+        let json: serde_json::Value = response.json().await.map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse join-token revoke response: {e}"),
+        })?;
+        Ok(json["revoked"].as_u64().unwrap_or(0))
+    }
+
+    /// Open a join window (G2) on this node: let `address` through its
+    /// perimeter firewall for `minutes` (at most 60).
+    pub async fn perimeter_admit(
+        &self,
+        address: std::net::IpAddr,
+        minutes: u64,
+    ) -> Result<(), RelishError> {
+        let url = format!("{}/v1/perimeter/admit", self.base_url);
+        let response = self
+            .http()?
+            .post(&url)
+            .json(&serde_json::json!({ "address": address, "minutes": minutes }))
+            .send()
+            .await
+            .map_err(classify_error)?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(RelishError::ApiError { status, body });
+        }
+        Ok(())
+    }
+
     /// Create a single-use node join token. The server commits only its hash
     /// to Raft and returns the plaintext once.
     pub async fn join_token_create(
@@ -2895,11 +3274,32 @@ impl BunClient {
         node_id: &str,
         ttl_seconds: u64,
     ) -> Result<String, RelishError> {
+        self.join_token_create_with(node_id, ttl_seconds, false)
+            .await
+    }
+
+    /// A join token for a seed: like [`Self::join_token_create`], but it
+    /// may last up to a week.
+    pub async fn join_token_create_for_seed(
+        &self,
+        node_id: &str,
+        ttl_seconds: u64,
+    ) -> Result<String, RelishError> {
+        self.join_token_create_with(node_id, ttl_seconds, true)
+            .await
+    }
+
+    async fn join_token_create_with(
+        &self,
+        node_id: &str,
+        ttl_seconds: u64,
+        seed: bool,
+    ) -> Result<String, RelishError> {
         let url = format!("{}/v1/join-token/create", self.base_url);
         let response = self
             .http()?
             .post(&url)
-            .json(&serde_json::json!({ "ttl_seconds": ttl_seconds, "node_id": node_id }))
+            .json(&serde_json::json!({ "ttl_seconds": ttl_seconds, "node_id": node_id, "seed": seed }))
             .send()
             .await
             .map_err(classify_error)?;
@@ -3259,6 +3659,48 @@ impl BunClient {
         Ok(response["upgrade_id"].as_str().unwrap_or("?").to_string())
     }
 
+    /// This node's `/v1/version`, as JSON (it carries the appliance OS
+    /// fields `os_version` and `os_update`).
+    pub async fn version_json(&self) -> Result<serde_json::Value, RelishError> {
+        self.get_json("/v1/version").await
+    }
+
+    /// The OS rollout in progress and the finished ones.
+    pub async fn os_rollout(&self) -> Result<serde_json::Value, RelishError> {
+        self.get_json("/v1/os/rollout").await
+    }
+
+    /// Start rolling `version` across the cluster.
+    pub async fn os_rollout_start(
+        &self,
+        version: &str,
+        channel_url: &str,
+        allow_downgrade: bool,
+    ) -> Result<serde_json::Value, RelishError> {
+        self.post_json(
+            "/v1/os/rollout/start",
+            serde_json::json!({
+                "version": version,
+                "channel_url": channel_url,
+                "allow_downgrade": allow_downgrade,
+            })
+            .to_string(),
+        )
+        .await
+    }
+
+    /// Resume a paused OS rollout.
+    pub async fn os_rollout_resume(&self) -> Result<serde_json::Value, RelishError> {
+        self.post_json("/v1/os/rollout/resume", "{}".to_string())
+            .await
+    }
+
+    /// Abort the OS rollout.
+    pub async fn os_rollout_abort(&self) -> Result<serde_json::Value, RelishError> {
+        self.post_json("/v1/os/rollout/abort", "{}".to_string())
+            .await
+    }
+
     /// Ask the council for a CSR for `role`'s next intermediate (F04 R4).
     pub async fn ca_rotation_prepare(
         &self,
@@ -3308,6 +3750,20 @@ impl BunClient {
             .as_str()
             .unwrap_or("rotation finalised")
             .to_string())
+    }
+
+    /// Sign workload JWTs with a new key (#709). The leader answers; a
+    /// follower refuses with 421.
+    pub async fn identity_rotate_signing_key(
+        &self,
+    ) -> Result<crate::sesame::oidc::RotatedSigningKey, RelishError> {
+        let response = self
+            .post_json("/v1/identity/signing-key/rotate", "{}".to_string())
+            .await?;
+        serde_json::from_value(response).map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("unexpected answer to a signing key rotation: {e}"),
+        })
     }
 
     async fn get_json(&self, path: &str) -> Result<serde_json::Value, RelishError> {
@@ -3514,10 +3970,12 @@ impl BunClient {
 
     /// Delete a policy (admin only).
     pub async fn delete_policy(&self, name: &str) -> Result<(), RelishError> {
-        let name: String = url::form_urlencoded::byte_serialize(name.as_bytes()).collect();
-        self.post_json(&format!("/v1/policies/{name}/delete"), String::new())
-            .await
-            .map(|_| ())
+        self.post_json(
+            &format!("/v1/policies/{}/delete", path_segment(name)?),
+            String::new(),
+        )
+        .await
+        .map(|_| ())
     }
 
     pub async fn gitops_status(&self) -> Result<crate::lettuce::types::GitOpsStatus, RelishError> {
@@ -3596,7 +4054,25 @@ fn audit_path(filter: &crate::bun::audit::AuditFilter, cluster: bool) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
     use std::sync::{Arc, Mutex};
+
+    /// A client relish couldn't set up says why, not "API error (status
+    /// 0)", which reads as if the cluster answered (#2162).
+    #[tokio::test]
+    async fn an_unusable_client_reports_its_reason_not_an_api_error() {
+        let client = BunClient::unusable(
+            "https://127.0.0.1:9",
+            None,
+            "the relish context for lab can't be used".to_string(),
+        );
+        let error = client.nodes().await.unwrap_err();
+        assert!(matches!(error, RelishError::ClientConfig(_)), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            "the relish context for lab can't be used"
+        );
+    }
 
     #[test]
     fn the_audit_query_carries_the_app_filter() {
@@ -3618,6 +4094,193 @@ mod tests {
             secret_public_key_path(Some("a&b")),
             "/v1/secret/public-key?namespace=a%26b"
         );
+    }
+
+    /// Serve `/v1/rollback/web/default` as an SSE stream of `beats`
+    /// keep-alive comments, `interval` apart, then end it.
+    async fn trickling_rollback_server(beats: usize, interval: std::time::Duration) -> String {
+        slow_rollback_server(std::time::Duration::ZERO, beats, interval).await
+    }
+
+    /// [`trickling_rollback_server`], answering only after `before_headers`,
+    /// as the agent does while it binds images ahead of the stream.
+    async fn slow_rollback_server(
+        before_headers: std::time::Duration,
+        beats: usize,
+        interval: std::time::Duration,
+    ) -> String {
+        let app = axum::Router::new().route(
+            "/v1/rollback/web/default",
+            axum::routing::post(move || async move {
+                tokio::time::sleep(before_headers).await;
+                let stream = futures_util::stream::unfold(0, move |sent| async move {
+                    if sent == beats {
+                        return None;
+                    }
+                    tokio::time::sleep(interval).await;
+                    Some((
+                        Ok::<_, std::convert::Infallible>(": keep-alive\n\n".to_string()),
+                        sent + 1,
+                    ))
+                });
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from_stream(stream))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    fn client_with_timeouts(url: &str, request_ms: u64, stream_idle_ms: u64) -> BunClient {
+        client_with_deadline(url, request_ms, stream_idle_ms, 60_000)
+    }
+
+    fn client_with_deadline(
+        url: &str,
+        request_ms: u64,
+        stream_idle_ms: u64,
+        deploy_ms: u64,
+    ) -> BunClient {
+        BunClient::build_with_timeouts(
+            url,
+            None,
+            None,
+            ClientTimeouts {
+                request: std::time::Duration::from_millis(request_ms),
+                stream_idle: std::time::Duration::from_millis(stream_idle_ms),
+                deploy_stream: std::time::Duration::from_millis(deploy_ms),
+            },
+        )
+    }
+
+    /// The work before the stream starts (binding images, a job's apply)
+    /// gets the ordinary request time, not the stream's silence limit.
+    #[tokio::test]
+    async fn the_wait_for_a_stream_to_start_gets_the_request_timeout() {
+        let url = slow_rollback_server(
+            std::time::Duration::from_millis(600),
+            1,
+            std::time::Duration::from_millis(10),
+        )
+        .await;
+        let client = client_with_timeouts(&url, 5_000, 200);
+        client.rollback("web", "default").await.unwrap();
+    }
+
+    /// Keep-alives can't hold a wedged deploy's stream open for ever: the
+    /// command stops at the deploy deadline, and says so.
+    #[tokio::test]
+    async fn a_deploy_stream_stops_at_its_deadline() {
+        let url = trickling_rollback_server(100, std::time::Duration::from_millis(50)).await;
+        let client = client_with_deadline(&url, 5_000, 2_000, 400);
+        let started = std::time::Instant::now();
+        let error = client.rollback("web", "default").await.unwrap_err();
+        assert!(
+            matches!(error, RelishError::DeployStreamDeadline { .. }),
+            "{error:?}"
+        );
+        assert!(
+            error.to_string().contains("may still be running"),
+            "{error}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    /// A deploy's progress stream (and a followed log) runs past the request
+    /// deadline as long as the agent keeps talking.
+    #[tokio::test]
+    async fn a_stream_that_keeps_talking_outlives_the_request_timeout() {
+        let url = trickling_rollback_server(8, std::time::Duration::from_millis(100)).await;
+        let client = client_with_timeouts(&url, 300, 2_000);
+        client.rollback("web", "default").await.unwrap();
+    }
+
+    /// An agent that goes quiet mid-stream still ends the command.
+    #[tokio::test]
+    async fn a_silent_stream_times_out() {
+        let url = trickling_rollback_server(1, std::time::Duration::from_secs(30)).await;
+        let client = client_with_timeouts(&url, 60_000, 300);
+        let started = std::time::Instant::now();
+        let error = client.rollback("web", "default").await.unwrap_err();
+        assert!(matches!(error, RelishError::RequestTimeout), "{error:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    /// A name that isn't a DNS label never reaches a URL: `..` would climb
+    /// to another route and `?` would start a query.
+    #[tokio::test]
+    async fn names_that_would_reroute_a_request_are_refused() {
+        // Nothing listens here: a refused name must fail before any request.
+        let client = BunClient::new_with_token("http://127.0.0.1:1", None);
+        let error = client.stop("../delete/web", "default").await.unwrap_err();
+        assert!(
+            matches!(&error, RelishError::InvalidName { kind: NameKind::App, name } if name == "../delete/web"),
+            "{error:?}"
+        );
+        let error = client
+            .delete("web", "default?force=true")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                RelishError::InvalidName {
+                    kind: NameKind::Namespace,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        for (app, namespace) in [("web", ".."), ("", "default"), ("Web", "default")] {
+            assert!(
+                app_path("/v1/stop", app, namespace).is_err(),
+                "{app}/{namespace}"
+            );
+        }
+        assert_eq!(
+            app_path("/v1/stop", "web-2", "team-a").unwrap(),
+            "/v1/stop/web-2/team-a"
+        );
+    }
+
+    /// A service or policy name goes into its path as one segment too.
+    #[tokio::test]
+    async fn service_and_policy_names_stay_one_path_segment() {
+        let client = BunClient::new_with_token("http://127.0.0.1:1", None);
+        for name in ["..", "."] {
+            assert!(
+                matches!(
+                    client.resolve(name).await,
+                    Err(RelishError::InvalidFlag { .. })
+                ),
+                "{name}"
+            );
+            assert!(
+                matches!(
+                    client.delete_policy(name).await,
+                    Err(RelishError::InvalidFlag { .. })
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_snapshot_name_is_one_encoded_segment() {
+        assert_eq!(
+            path_segment("nightly 1/2?x").unwrap(),
+            "nightly%201%2F2%3Fx"
+        );
+        assert_eq!(path_segment("v1.2_a~b").unwrap(), "v1.2_a~b");
+        for dots in ["", ".", ".."] {
+            assert!(path_segment(dots).is_err(), "{dots:?}");
+        }
     }
 
     /// D34: a command that ran and failed is an answer, not an HTTP error.
@@ -3644,6 +4307,45 @@ mod tests {
                 exit_code: 3,
             }
         );
+    }
+
+    /// #2128: a caller's exec timeout travels in the request, in whole
+    /// seconds, and a caller without one sends none.
+    #[tokio::test]
+    async fn exec_with_timeout_sends_the_timeout_in_seconds() {
+        let bodies = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorded = bodies.clone();
+        let app = axum::Router::new().route(
+            "/v1/exec/web/default",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let recorded = recorded.clone();
+                async move {
+                    recorded.lock().await.push(body);
+                    axum::Json(serde_json::json!({"output": "", "exit_code": 0}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client =
+            BunClient::new_with_token(&format!("http://{}", listener.local_addr().unwrap()), None);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let command = ["true".to_string()];
+        client
+            .exec_with_timeout(
+                "web",
+                "default",
+                &command,
+                Some(std::time::Duration::from_secs(60)),
+            )
+            .await
+            .unwrap();
+        client.exec("web", "default", &command).await.unwrap();
+        server.abort();
+        let bodies = bodies.lock().await;
+        assert_eq!(bodies[0]["timeout_seconds"], 60);
+        assert!(bodies[1].get("timeout_seconds").is_none(), "{}", bodies[1]);
     }
 
     #[test]
@@ -3729,7 +4431,7 @@ mod tests {
     async fn malformed_bearer_is_an_error_instead_of_an_anonymous_request() {
         let client = BunClient::new_with_token("http://127.0.0.1:9", Some("bad\nheader"));
         let error = client.health().await.unwrap_err();
-        assert!(matches!(error, RelishError::ApiError { body, .. } if body.contains("bearer")));
+        assert!(matches!(error, RelishError::ClientConfig(reason) if reason.contains("bearer")));
     }
 
     #[tokio::test]
@@ -3739,6 +4441,7 @@ mod tests {
         let event = format!(
             "data: {}\n\n",
             serde_json::to_string(&ApplyEvent::Error {
+                status: None,
                 message: message.to_string(),
             })
             .unwrap()
@@ -3770,6 +4473,116 @@ mod tests {
         server.abort();
         for error in [applied, rolled_back] {
             assert!(matches!(error, RelishError::ApiError { body, .. } if body == message));
+        }
+    }
+
+    /// `scale` posts the count (and the one the caller saw, when given) as
+    /// JSON, with `force` as the query, and reads the answer as an apply's
+    /// stream: an error event is the result (#2176).
+    #[tokio::test]
+    async fn scale_posts_the_count_and_reads_the_stream() {
+        use axum::{Router, routing::post};
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+        let recorder = Arc::clone(&seen);
+        let handler = move |uri: axum::http::Uri, body: String| {
+            let recorder = Arc::clone(&recorder);
+            async move {
+                let refuse = body.contains("\"replicas\":9");
+                recorder.lock().unwrap().push((uri.to_string(), body));
+                let event = if refuse {
+                    ApplyEvent::Error {
+                        message: "refused by the cluster".into(),
+                        status: None,
+                    }
+                } else {
+                    ApplyEvent::Progress {
+                        message: "app web: committed to the cluster".into(),
+                    }
+                };
+                format!("data: {}\n\n", serde_json::to_string(&event).unwrap())
+            }
+        };
+        let app = Router::new().route("/v1/scale/web/default", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = BunClient::new_with_token(&format!("http://{address}"), None);
+
+        client
+            .scale("web", "default", 3, None, false)
+            .await
+            .unwrap();
+        client
+            .scale("web", "default", 4, Some(3), true)
+            .await
+            .unwrap();
+        let refused = client
+            .scale("web", "default", 9, None, false)
+            .await
+            .unwrap_err();
+        server.abort();
+        assert!(
+            matches!(&refused, RelishError::ApiError { body, .. } if body == "refused by the cluster"),
+            "{refused:?}"
+        );
+        let seen = seen.lock().unwrap().clone();
+        let bodies: Vec<serde_json::Value> = seen
+            .iter()
+            .map(|(_, body)| serde_json::from_str(body).unwrap())
+            .collect();
+        assert_eq!(seen[0].0, "/v1/scale/web/default");
+        assert_eq!(bodies[0], serde_json::json!({ "replicas": 3 }));
+        assert_eq!(seen[1].0, "/v1/scale/web/default?force=true");
+        assert_eq!(
+            bodies[1],
+            serde_json::json!({ "replicas": 4, "current_replicas": 3 })
+        );
+    }
+
+    /// Serve `data` as the one event of every apply and rollback stream, and
+    /// return the errors `relish apply` and `relish rollback` end with.
+    async fn stream_errors_for(data: &str) -> Vec<RelishError> {
+        use axum::{Router, routing::post};
+        let event = format!("data: {data}\n\n");
+        let handler = move || {
+            let event = event.clone();
+            async move { event }
+        };
+        let app = Router::new()
+            .route("/v1/apply", post(handler.clone()))
+            .route("/v1/rollback/web/default", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = BunClient::new_with_token(&format!("http://{address}"), None);
+        let applied = client.apply(&Config::default()).await.unwrap_err();
+        let rolled_back = client.rollback("web", "default").await.unwrap_err();
+        server.abort();
+        vec![applied, rolled_back]
+    }
+
+    /// #2157: a stream's error names the status the server gave it, not 500.
+    #[tokio::test]
+    async fn a_streamed_error_reports_the_status_it_carries() {
+        let data = serde_json::to_string(&ApplyEvent::Error {
+            message: "burger:v1 isn't in this cluster's registry (Pickle)".into(),
+            status: Some(404),
+        })
+        .unwrap();
+
+        for error in stream_errors_for(&data).await {
+            assert_eq!(
+                error.to_string(),
+                "API error (status 404): burger:v1 isn't in this cluster's registry (Pickle)"
+            );
+        }
+    }
+
+    /// A server from before #2157 sends no status: relish says 500, as it did.
+    #[tokio::test]
+    async fn a_streamed_error_with_no_status_still_reports_500() {
+        for error in stream_errors_for(r#"{"type":"Error","message":"boom"}"#).await {
+            assert_eq!(error.to_string(), "API error (status 500): boom");
         }
     }
 

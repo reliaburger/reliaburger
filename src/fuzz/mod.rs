@@ -15,6 +15,7 @@
 //! This module is compiled for the crate's own tests and under the `fuzzing`
 //! feature, which only the `fuzz/` crate turns on. No binary carries it.
 
+use std::net::SocketAddr;
 use std::sync::OnceLock;
 
 use crate::council::fence::RecoveryFence;
@@ -93,6 +94,46 @@ pub const TARGETS: &[Target] = &[
         name: "node_config",
         decoder: "config::node::NodeConfig::parse",
         run: node_config,
+    },
+    Target {
+        name: "task_manifest",
+        decoder: "bun::task_array_api::TaskManifestRequest (POST /v1/batch/manifest)",
+        run: task_manifest,
+    },
+    Target {
+        name: "chaos_scenario",
+        decoder: "smoker::types::ScriptedScenario (relish fault scenario)",
+        run: chaos_scenario,
+    },
+    Target {
+        name: "council_backup_state",
+        decoder: "council::types::DesiredState, as a restore parses an unsealed backup",
+        run: council_backup_state,
+    },
+    Target {
+        name: "api_bearer",
+        decoder: "sesame::auth::authenticate and sesame::oidc::verify_jwt_with_keys",
+        run: api_bearer,
+    },
+    Target {
+        name: "ingress_request",
+        decoder: "wrapper::proxy::request_host and wrapper::routing::RoutingTable::lookup",
+        run: ingress_request,
+    },
+    Target {
+        name: "tftp_packet",
+        decoder: "relish::netboot::tftp::Packet::parse",
+        run: tftp_packet,
+    },
+    Target {
+        name: "dhcp_request",
+        decoder: "relish::netboot::dhcp::decode",
+        run: dhcp_request,
+    },
+    Target {
+        name: "netboot_disk_report",
+        decoder: "relish::netboot::wipe::DiskReport::parse (POST /disk)",
+        run: netboot_disk_report,
     },
 ];
 
@@ -191,11 +232,15 @@ pub fn dns_query(data: &[u8]) -> Outcome {
     Outcome::Accepted
 }
 
+/// The master key `council_backup` unseals with. Its seed is sealed under
+/// it, so a seed gets as far as the snapshot inside.
+const BACKUP_FUZZ_KEY: [u8; 32] = [7u8; 32];
+
 /// A council backup file, as an operator hands it to `relish council restore`.
 ///
-/// A decoded envelope must re-encode and decode to an equal envelope. The
-/// fuzzer can't forge the GCM tag, so unsealing under any key must fail
-/// cleanly rather than panic.
+/// A decoded envelope must re-encode and decode to an equal envelope, and
+/// unsealing it must not panic. The fuzzer can't forge a GCM tag, so only
+/// the seed and inputs that keep its ciphertext whole unseal.
 pub fn council_backup(data: &[u8]) -> Outcome {
     use crate::council::backup::{decode_backup, encode_backup, unseal_snapshot};
 
@@ -205,7 +250,7 @@ pub fn council_backup(data: &[u8]) -> Outcome {
     let encoded = encode_backup(&sealed).expect("a decoded backup re-encodes");
     let again = decode_backup(&encoded).expect("a re-encoded backup decodes");
     assert_eq!(sealed, again, "a backup changed on its round trip");
-    let _ = unseal_snapshot(&[7u8; 32], &sealed);
+    let _ = unseal_snapshot(&BACKUP_FUZZ_KEY, &sealed);
     Outcome::Accepted
 }
 
@@ -371,5 +416,582 @@ pub fn node_config(data: &[u8]) -> Outcome {
     let encoded = toml::to_string(&config).expect("a parsed node config re-encodes");
     let again = NodeConfig::parse(&encoded).expect("a re-encoded node config parses");
     assert_eq!(config, again, "a node config changed on its round trip");
+    Outcome::Accepted
+}
+
+/// The JSON of `value` as a `serde_json::Value`, whose maps are ordered, so
+/// two encodings compare equal whatever order a `HashMap` iterated in.
+fn as_json<T: serde::Serialize>(value: &T, what: &str) -> serde_json::Value {
+    serde_json::to_value(value)
+        .unwrap_or_else(|error| panic!("a decoded {what} re-encodes: {error}"))
+}
+
+/// A task-array manifest, as `POST /v1/batch/manifest` reads it (#1414).
+///
+/// An accepted manifest must survive a JSON round trip, and each cohort then
+/// goes through the same check the handler runs before it admits anything.
+pub fn task_manifest(data: &[u8]) -> Outcome {
+    use crate::bun::task_array_api::{
+        TaskArraySubmitRequest, TaskManifestRequest, validate_submission,
+    };
+
+    let Ok(manifest) = serde_json::from_slice::<TaskManifestRequest>(data) else {
+        return Outcome::Refused;
+    };
+    let encoded = serde_json::to_vec(&manifest).expect("a decoded manifest re-encodes");
+    let again: TaskManifestRequest =
+        serde_json::from_slice(&encoded).expect("a re-encoded manifest decodes");
+    assert_eq!(
+        as_json(&manifest, "manifest"),
+        as_json(&again, "manifest"),
+        "a manifest changed on its round trip"
+    );
+    for cohort in &manifest.cohort {
+        let mut array = TaskArraySubmitRequest {
+            name: manifest.name.clone(),
+            namespace: Some(manifest.namespace.clone()),
+            template: cohort.template.clone(),
+            spec: cohort.spec.clone(),
+        };
+        let _ = validate_submission(&mut array);
+    }
+    Outcome::Accepted
+}
+
+/// A chaos scenario file, as `relish fault scenario` reads it (#1414).
+///
+/// An accepted scenario must survive a TOML round trip, and building its
+/// timeline, which parses every duration and fault, must not panic.
+pub fn chaos_scenario(data: &[u8]) -> Outcome {
+    use crate::smoker::types::ScriptedScenario;
+
+    let Ok(text) = std::str::from_utf8(data) else {
+        return Outcome::Refused;
+    };
+    let Ok(scenario) = toml::from_str::<ScriptedScenario>(text) else {
+        return Outcome::Refused;
+    };
+    let encoded = toml::to_string(&scenario).expect("a parsed scenario re-encodes");
+    let again: ScriptedScenario = toml::from_str(&encoded).expect("a re-encoded scenario parses");
+    assert_eq!(
+        as_json(&scenario, "scenario"),
+        as_json(&again, "scenario"),
+        "a scenario changed on its round trip"
+    );
+    let _ = crate::smoker::scenario::build_timeline(&scenario, 1.0);
+    Outcome::Accepted
+}
+
+/// The council state inside a backup, as a restore parses it once the
+/// backup is unsealed (#1414). The `council_backup` target can't reach this:
+/// random bytes never unseal.
+///
+/// An accepted state must survive a JSON round trip, and the backup name
+/// worked out from it must parse back to the same position, since a restore
+/// refuses a state that doesn't sit where its name says.
+pub fn council_backup_state(data: &[u8]) -> Outcome {
+    use crate::council::backup::BackupKey;
+    use crate::council::types::DesiredState;
+
+    let Ok(state) = serde_json::from_slice::<DesiredState>(data) else {
+        return Outcome::Refused;
+    };
+    let encoded = serde_json::to_vec(&state).expect("a decoded state re-encodes");
+    let again: DesiredState = serde_json::from_slice(&encoded).expect("a re-encoded state decodes");
+    assert_eq!(
+        as_json(&state, "state"),
+        as_json(&again, "state"),
+        "a council state changed on its round trip"
+    );
+    let key = BackupKey::for_state(&state, std::time::UNIX_EPOCH);
+    let parsed = BackupKey::parse(&key.object_name()).expect("a backup's own name parses");
+    assert_eq!(parsed, key, "a backup name didn't parse back to its key");
+    Outcome::Accepted
+}
+
+/// True for a character that changes a terminal rather than printing on
+/// it: the C0 and C1 controls, and the bidirectional overrides that reorder
+/// the text around them.
+fn moves_the_terminal(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// The routes every fuzzed ingress request is matched against: a plain
+/// route under `/api` on one host and a TLS route for all of another.
+fn ingress_table() -> &'static crate::wrapper::routing::RoutingTable {
+    use crate::config::app::IngressSpec;
+    use crate::onion::service_map::ServiceMap;
+    use crate::wrapper::routing::RoutingTable;
+
+    static TABLE: OnceLock<RoutingTable> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut map = ServiceMap::new();
+        let mut ingress = std::collections::HashMap::new();
+        for (app, host, path, tls) in [
+            ("api", "app.example", "/api", None),
+            ("shop", "tls.example", "/", Some("cluster")),
+        ] {
+            map.register_app(app, "default", 8080, None)
+                .expect("a fuzz app registers");
+            ingress.insert(
+                ("default".to_string(), app.to_string()),
+                IngressSpec {
+                    host: host.to_string(),
+                    path: Some(path.to_string()),
+                    tls: tls.map(str::to_string),
+                    websocket: None,
+                    rate_limit_rps: None,
+                    rate_limit_burst: None,
+                },
+            );
+        }
+        let mut table = RoutingTable::new();
+        table
+            .rebuild(&map, &ingress)
+            .expect("the fuzz routes are valid");
+        table
+    })
+}
+
+/// An HTTP request's `Host` header, request target and `Cookie` header, as
+/// any client on the internet sends them to the ingress proxy, one per
+/// line.
+///
+/// Each part must be something hyper would hand the proxy, or the input is
+/// refused. A request that routes must match its route's prefix on a
+/// segment boundary; a TLS route's redirect must name the routed host and
+/// nothing else; the upstream URI must name the backend; and the
+/// dashboard's session cookie must never be passed on.
+pub fn ingress_request(data: &[u8]) -> Outcome {
+    use crate::wrapper::proxy::{
+        build_upstream_uri, redirect_to_https, request_host, without_session_cookie,
+    };
+    use axum::body::Body;
+    use axum::http::{HeaderValue, Request, Uri, header};
+
+    let mut parts = data.splitn(3, |b| *b == b'\n');
+    let (Some(host), Some(target)) = (parts.next(), parts.next()) else {
+        return Outcome::Refused;
+    };
+    // hyper trims a header value's surrounding whitespace.
+    let Ok(host) = HeaderValue::from_bytes(host.trim_ascii()) else {
+        return Outcome::Refused;
+    };
+    let Ok(uri) = Uri::try_from(target) else {
+        return Outcome::Refused;
+    };
+    if let Some(cookie) = parts.next().and_then(|c| std::str::from_utf8(c).ok())
+        && let Some(kept) = without_session_cookie(cookie)
+    {
+        let session = crate::sesame::session::SESSION_COOKIE;
+        assert!(
+            kept.split(';')
+                .all(|pair| pair.split_once('=').map_or(pair, |(name, _)| name).trim() != session),
+            "the session cookie was passed on: {kept:?}"
+        );
+    }
+    let Ok(request) = Request::builder()
+        .uri(uri.clone())
+        .header(header::HOST, host)
+        .body(Body::empty())
+    else {
+        return Outcome::Refused;
+    };
+    let Ok(host) = request_host(&request) else {
+        return Outcome::Refused;
+    };
+    let path = uri.path();
+    let Some(route) = ingress_table().lookup(&host, path) else {
+        return Outcome::Accepted;
+    };
+    let prefix = route.path_prefix.trim_end_matches('/');
+    assert!(
+        prefix.is_empty() || path == prefix || path.starts_with(&format!("{prefix}/")),
+        "{path:?} routed to the {prefix:?} route"
+    );
+
+    if route.tls_mode.requires_tls() {
+        let response = redirect_to_https(&host, &uri);
+        if let Some(location) = response.headers().get(header::LOCATION) {
+            // As bytes: the redirect repeats the request's query, which may
+            // hold bytes past ASCII, as hyper and the http crate allow.
+            let location = Uri::try_from(location.as_bytes())
+                .unwrap_or_else(|_| panic!("an unparseable redirect: {location:?}"));
+            assert_eq!(
+                location.host().map(str::to_ascii_lowercase).as_deref(),
+                Some(route.host.as_str()),
+                "the redirect for {host:?} leaves the routed host: {location}"
+            );
+        }
+    }
+
+    let backend = SocketAddr::from(([10, 0, 2, 2], 30001));
+    if let Some(upstream) = build_upstream_uri(&backend, &uri) {
+        assert_eq!(
+            upstream.authority().map(|a| a.as_str()),
+            Some(backend.to_string().as_str()),
+            "the upstream URI names another authority: {upstream}"
+        );
+    }
+    Outcome::Accepted
+}
+
+/// The files the fuzzed TFTP server hands out: the chain script and a
+/// stand-in iPXE binary, both small enough to send whole on every input.
+fn tftp_files() -> &'static crate::relish::netboot::tftp::TftpFiles {
+    static FILES: OnceLock<crate::relish::netboot::tftp::TftpFiles> = OnceLock::new();
+    FILES.get_or_init(|| {
+        let script = b"#!ipxe\nchain http://192.168.1.20:8080/boot.ipxe?mac=${netX/mac}\n";
+        let binary: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
+        [
+            ("boot.ipxe".to_string(), script.to_vec().into()),
+            ("ipxe-x86_64.efi".to_string(), binary.into()),
+        ]
+        .into_iter()
+        .collect()
+    })
+}
+
+/// A TFTP datagram, as any host on the LAN sends it to `relish netboot`.
+///
+/// A parsed packet must survive an encode and parse. A read request for a
+/// served file is then sent to an honest client: whatever options it
+/// asked for, the agreed block size and timeout must be in range, every
+/// block must come in order and fit the block size, and the client must
+/// end up with the whole file. The packet itself, arriving mid-transfer,
+/// must not upset the sender, and an ERROR's text must log as plain text.
+pub fn tftp_packet(data: &[u8]) -> Outcome {
+    use crate::relish::netboot::tftp::{
+        self, Packet, Request, Step, TftpSettings, Transfer, route,
+    };
+
+    let parsed = Packet::parse(data);
+    if let Ok(packet) = &parsed {
+        let again = Packet::parse(&packet.encode()).expect("an encoded packet parses");
+        assert_eq!(&again, packet, "a TFTP packet changed on its round trip");
+        if let Packet::Error { message, .. } = packet {
+            let peer = SocketAddr::from(([192, 168, 1, 50], 1024));
+            let aborted = tftp::Outcome::Aborted {
+                message: message.clone(),
+            };
+            let line = aborted
+                .describe(peer, "boot.ipxe")
+                .expect("an aborted transfer is logged");
+            assert!(
+                !line.chars().any(moves_the_terminal),
+                "a client's error text reached the log raw: {line:?}"
+            );
+        }
+    }
+
+    let settings = TftpSettings::default();
+    let (file, negotiated) = match route(data, tftp_files(), &settings) {
+        Request::Send {
+            data, negotiated, ..
+        } => (data, negotiated),
+        Request::Refuse(error) => {
+            assert!(
+                matches!(error, Packet::Error { .. }),
+                "a refusal: {error:?}"
+            );
+            return Outcome::Accepted;
+        }
+        Request::Ignore => {
+            assert!(
+                !matches!(
+                    parsed,
+                    Ok(Packet::ReadRequest { .. } | Packet::WriteRequest { .. })
+                ),
+                "a request was ignored"
+            );
+            return match parsed {
+                Ok(_) => Outcome::Accepted,
+                Err(_) => Outcome::Refused,
+            };
+        }
+    };
+    let block_size = usize::from(negotiated.block_size);
+    assert!(
+        (8..=usize::from(settings.max_block_size)).contains(&block_size),
+        "a block size of {block_size} was agreed"
+    );
+    assert!(
+        !negotiated.timeout.is_zero() && negotiated.timeout <= tftp::MAX_TIMEOUT,
+        "a timeout of {:?} was agreed",
+        negotiated.timeout
+    );
+
+    if let Ok(packet) = &parsed {
+        let (mut stray, _) = Transfer::start(file.clone(), &negotiated, 1);
+        let _ = stray.on_packet(packet);
+        let _ = stray.on_timeout();
+    }
+
+    let (mut transfer, first) = Transfer::start(file.clone(), &negotiated, 1);
+    let mut next = Packet::parse(&first).expect("the first packet parses");
+    if !negotiated.acknowledged.is_empty() {
+        assert_eq!(
+            next,
+            Packet::OptionAck {
+                options: negotiated.acknowledged.clone()
+            }
+        );
+        next = match transfer.on_packet(&Packet::Ack { block: 0 }) {
+            Step::Send(bytes) => Packet::parse(&bytes).expect("a block parses"),
+            other => panic!("the OACK's acknowledgement got {other:?}"),
+        };
+    }
+    let mut received = Vec::with_capacity(file.len());
+    let mut expected: u64 = 1;
+    loop {
+        let Packet::Data { block, data } = next else {
+            panic!("the sender sent {next:?} instead of block {expected}");
+        };
+        assert_eq!(block, expected as u16, "blocks came out of order");
+        assert!(data.len() <= block_size, "a block overflowed");
+        received.extend_from_slice(&data);
+        match transfer.on_packet(&Packet::Ack { block }) {
+            Step::Send(bytes) => next = Packet::parse(&bytes).expect("a block parses"),
+            Step::Done => break,
+            other => panic!("acknowledging block {block} got {other:?}"),
+        }
+        expected += 1;
+        assert!(
+            expected <= transfer.total_blocks(),
+            "the sender ran past its last block"
+        );
+    }
+    assert_eq!(
+        received.as_slice(),
+        &file[..],
+        "the client got another file"
+    );
+    Outcome::Accepted
+}
+
+/// The ProxyDHCP every fuzzed request is answered by.
+fn dhcp_context() -> &'static crate::relish::netboot::dhcp::DhcpContext {
+    use crate::relish::netboot::Arch;
+    use crate::relish::netboot::dhcp::DhcpContext;
+
+    static CONTEXT: OnceLock<DhcpContext> = OnceLock::new();
+    CONTEXT.get_or_init(|| DhcpContext {
+        server: std::net::Ipv4Addr::new(192, 168, 1, 20),
+        http_port: 8080,
+        architectures: [Arch::X86_64, Arch::Arm64].into(),
+        allowed: Vec::new(),
+    })
+}
+
+/// Run `decode` with the panic hook silenced. `dhcp::decode` catches the
+/// panics dhcproto can raise on a crafted packet and calls the packet "not
+/// DHCP", which is what the server does with it. libFuzzer's hook would
+/// abort the process before that catch ran, so it steps aside here, and
+/// only here: a panic anywhere else in the target is still a crash.
+fn without_panic_hook<T>(decode: impl FnOnce() -> T) -> T {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = decode();
+    std::panic::set_hook(hook);
+    result
+}
+
+/// A DHCP datagram, as any host on the LAN broadcasts it to `relish
+/// netboot`'s ProxyDHCP, on port 67 or 4011.
+///
+/// Whatever the request, a reply must never hand out an address, must
+/// answer the request's transaction, must encode to at least the BOOTP
+/// minimum, and must decode again to the same reply.
+pub fn dhcp_request(data: &[u8]) -> Outcome {
+    use crate::relish::netboot::dhcp::{ListenPort, answer, decode, destination, encode};
+    use dhcproto::v4::Opcode;
+
+    let Some(request) = without_panic_hook(|| decode(data)) else {
+        return Outcome::Refused;
+    };
+    let source = std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(192, 168, 1, 50), 68);
+    for port in [ListenPort::Dhcp, ListenPort::ProxyDhcp] {
+        let reply = match answer(&request, port, dhcp_context()) {
+            Ok(answer) => answer.reply,
+            Err(ignored) => {
+                let _ = ignored.describe();
+                continue;
+            }
+        };
+        assert_eq!(reply.opcode(), Opcode::BootReply);
+        assert_eq!(reply.xid(), request.xid(), "a reply to another transaction");
+        assert!(
+            reply.yiaddr().is_unspecified(),
+            "a reply handed out an address"
+        );
+        let _ = destination(&request, port, source);
+        // The server drops a reply that doesn't encode.
+        let Some(bytes) = encode(&reply) else {
+            continue;
+        };
+        assert!(bytes.len() >= 300, "a {}-byte reply", bytes.len());
+        let again = decode(&bytes).expect("an encoded reply decodes");
+        assert_eq!(again.xid(), reply.xid());
+        assert_eq!(again.opts().msg_type(), reply.opts().msg_type());
+        // The BOOTP field is NUL-padded on the wire, and dhcproto keeps a NUL.
+        let name =
+            |fname: Option<&[u8]>| fname.map(|f| f.split(|b| *b == 0).next().unwrap_or(f).to_vec());
+        assert_eq!(name(again.fname()), name(reply.fname()));
+        assert!(again.yiaddr().is_unspecified());
+    }
+    Outcome::Accepted
+}
+
+/// A disk report, as an installer posts it to `relish netboot`'s `POST
+/// /disk` before anyone checks its install ticket.
+///
+/// The summary the operator is asked about must print as plain text, and
+/// nothing in a report may turn the operator's "no" (or no answer) into a
+/// wipe.
+pub fn netboot_disk_report(data: &[u8]) -> Outcome {
+    use crate::relish::netboot::MacAddress;
+    use crate::relish::netboot::wipe::{
+        Answer, DiskReport, MAX_REPORT_BYTES, WipeDecision, decide,
+    };
+
+    if data.len() > MAX_REPORT_BYTES {
+        return Outcome::Refused;
+    }
+    let Ok(report) = DiskReport::parse(&String::from_utf8_lossy(data)) else {
+        return Outcome::Refused;
+    };
+    let summary = report.summary();
+    assert!(
+        !summary.chars().any(moves_the_terminal),
+        "a disk summary reached the operator raw: {summary:?}"
+    );
+    let mac = Some(MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]));
+    for answer in [Answer::No, Answer::NoAnswer, Answer::NoTerminal] {
+        let decision = decide(&report, mac, &[], answer);
+        assert_ne!(
+            decision,
+            WipeDecision::WipeAndInstall,
+            "{answer:?} wiped {summary:?}"
+        );
+    }
+    if report.is_blank() {
+        assert_eq!(decide(&report, mac, &[], Answer::No), WipeDecision::Install);
+    }
+    Outcome::Accepted
+}
+
+/// The plaintext of the person's token the API's store holds while fuzzing.
+const BEARER_HUMAN: &str = "rbrg_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+/// The plaintext of the agent's token the store holds.
+const BEARER_AGENT: &str = "rbrg_fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+/// The cluster's service token while fuzzing.
+const BEARER_SERVICE: &str =
+    "rbrg_5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e";
+/// The workload-identity key's `kid`, its issuer and the cluster it's for.
+const JWT_KEY_ID: &str = "fuzz-key";
+const JWT_ISSUER: &str = "https://fuzz.reliaburger.dev";
+const JWT_CLUSTER: &str = "fuzz";
+
+/// The workload-identity signing key, from a fixed seed so every seed JWT
+/// is the same bytes on every run. Ed25519 signatures are deterministic.
+fn jwt_signing_key() -> ring::signature::Ed25519KeyPair {
+    ring::signature::Ed25519KeyPair::from_seed_unchecked(&[7u8; 32])
+        .expect("a 32-byte seed is an Ed25519 key")
+}
+
+/// The API's token store while fuzzing: a person's deployer token and an
+/// agent's, both stored as the SHA-256 of their plaintext.
+fn bearer_tokens() -> &'static [crate::sesame::types::ApiToken] {
+    use crate::sesame::types::{ApiRole, ApiToken, TokenKind, TokenScope};
+
+    static TOKENS: OnceLock<Vec<ApiToken>> = OnceLock::new();
+    TOKENS.get_or_init(|| {
+        [
+            ("person", BEARER_HUMAN, TokenKind::Human),
+            ("agent", BEARER_AGENT, TokenKind::Agent),
+        ]
+        .into_iter()
+        .map(|(name, plaintext, kind)| ApiToken {
+            name: name.to_string(),
+            token_hash: crate::sesame::token::hash_secret(plaintext)
+                .expect("a fuzz token is shaped like a real one"),
+            role: ApiRole::Deployer,
+            kind,
+            scope: TokenScope {
+                apps: None,
+                namespaces: None,
+            },
+            expires_at: None,
+            created_at: std::time::UNIX_EPOCH,
+            previous_secret: None,
+        })
+        .collect()
+    })
+}
+
+/// An `Authorization` header, as any client that can reach the API sends
+/// it, before anything has authenticated it.
+///
+/// Only the exact plaintext of a stored token may authenticate, and only
+/// as that token, with an agent's always confined to reading. Only the
+/// exact service token is the system. No workload JWT may verify: the
+/// fuzzer can't sign one, and the seed JWTs are too old.
+pub fn api_bearer(data: &[u8]) -> Outcome {
+    use crate::sesame::auth::{authenticate, extract_bearer, tokens_equal};
+    use crate::sesame::oidc::{JwtConstraints, OidcVerifyingKey, verify_jwt_with_keys};
+    use crate::sesame::types::{ApiRole, TokenKind};
+    use axum::http::HeaderValue;
+
+    // The middleware reads the header with `to_str`, as this does.
+    let Ok(value) = HeaderValue::from_bytes(data) else {
+        return Outcome::Refused;
+    };
+    let Some(bearer) = value.to_str().ok().and_then(extract_bearer) else {
+        return Outcome::Refused;
+    };
+
+    if tokens_equal(bearer, BEARER_SERVICE) {
+        assert_eq!(
+            bearer, BEARER_SERVICE,
+            "another bearer passed as the system"
+        );
+    }
+
+    let key = OidcVerifyingKey {
+        key_id: JWT_KEY_ID.to_string(),
+        public_key_der: ring::signature::KeyPair::public_key(&jwt_signing_key())
+            .as_ref()
+            .to_vec(),
+    };
+    let constraints = JwtConstraints {
+        expected_issuer: JWT_ISSUER.to_string(),
+        expected_audience: crate::sesame::oidc::api_audience(JWT_CLUSTER),
+        expected_algorithm: "EdDSA".to_string(),
+        max_clock_skew_secs: crate::sesame::oidc::MAX_CLOCK_SKEW_SECS,
+        max_age_secs: crate::sesame::oidc::MAX_TOKEN_AGE_SECS,
+    };
+    if let Ok(claims) = verify_jwt_with_keys(bearer, &[key], &constraints) {
+        panic!("a JWT nobody signed today verified: {claims:?}");
+    }
+
+    let tokens = bearer_tokens();
+    if let Ok(context) = authenticate(bearer, tokens) {
+        let stored = tokens
+            .iter()
+            .find(|token| token.name == context.token_name)
+            .unwrap_or_else(|| panic!("{bearer:?} authenticated as {context:?}"));
+        let plaintext = match stored.kind {
+            TokenKind::Human => BEARER_HUMAN,
+            TokenKind::Agent => BEARER_AGENT,
+        };
+        assert_eq!(
+            bearer, plaintext,
+            "a bearer authenticated as {}",
+            stored.name
+        );
+        if stored.kind == TokenKind::Agent {
+            assert_eq!(context.role, ApiRole::ReadOnly, "an agent token can write");
+        }
+    }
     Outcome::Accepted
 }

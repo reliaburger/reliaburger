@@ -244,7 +244,8 @@ impl SuiteContext {
             timeout: self.timeout,
             deadline: self.deadline,
             peer_route: crate::testkit::context::PeerRoute::Direct,
-            wait_note: Default::default(),
+            trace: Default::default(),
+            peer: None,
         }
     }
 }
@@ -416,14 +417,15 @@ fn image_distribution_spec(app: &str, namespace: &str) -> String {
     )
 }
 
-/// One cluster-capacity app: the smallest request the scheduler accepts.
+/// One cluster-capacity app: the smallest request the scheduler accepts,
+/// under the smallest limit runc can start in (#1959).
 fn capacity_spec(app: &str, namespace: &str) -> String {
     format!(
         "[app.{app}]\n\
          image = \"{PINNED_TEST_WORKLOAD_IMAGE}\"\n\
          command = [\"sleep\", \"infinity\"]\n\
          cpu = \"1m\"\n\
-         memory = \"1Mi\"\n\
+         memory = \"1Mi-16Mi\"\n\
          namespace = \"{namespace}\"\n"
     )
 }

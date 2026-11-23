@@ -345,20 +345,31 @@ async fn forward_track_to_leader(
     if let Some(token) = &state.service_token {
         proxied = proxied.bearer_auth(token);
     }
-    let response = proxied
-        .send()
+    let exchange = async {
+        let response = proxied
+            .send()
+            .await
+            .map_err(|e| format!("leader forward failed: {e}"))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("leader refused the tracking op ({status}): {body}"));
+        }
+        let value: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| format!("leader track response unreadable: {e}"))?;
+        Ok(value["build_id"].as_u64())
+    };
+    let deadline = super::batch::LEADER_FORWARD_TIMEOUT;
+    tokio::time::timeout(deadline, exchange)
         .await
-        .map_err(|e| format!("leader forward failed: {e}"))?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("leader refused the tracking op ({status}): {body}"));
-    }
-    let value: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("leader track response unreadable: {e}"))?;
-    Ok(value["build_id"].as_u64())
+        .map_err(|_| {
+            format!(
+                "the leader didn't answer the tracking op within {}s",
+                deadline.as_secs()
+            )
+        })?
 }
 
 // ---------------------------------------------------------------------------
@@ -661,8 +672,22 @@ impl ScopedDir {
 }
 
 impl Drop for ScopedDir {
+    /// A build context can hold thousands of files, and the value is
+    /// dropped in async code, so inside a runtime the delete goes to the
+    /// blocking pool rather than stalling the worker it was dropped on
+    /// (#1871). Outside one there's no worker to stall.
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        let path = std::mem::take(&mut self.path);
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn_blocking(move || {
+                    let _ = std::fs::remove_dir_all(path);
+                });
+            }
+            Err(_) => {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+        }
     }
 }
 
@@ -779,6 +804,20 @@ async fn run_bounded(
         }
     }
 }
+
+/// Why a build was refused when neither this node nor any peer has
+/// Buildah, and what to do instead.
+///
+/// The appliance image ships no Buildah (`image/mkosi.conf`), so on an
+/// appliance cluster this is what `relish build` prints (#2144). The ways
+/// out are building elsewhere and pushing into Pickle, which takes any OCI
+/// client, or joining a node that can build: bun hands a build to any peer
+/// that reports Buildah.
+pub const NO_BUILDER_ERROR: &str = "no builder available: no node in this cluster has Buildah \
+     on its PATH (appliance nodes never do). Build the image on a machine with Docker, \
+     Podman or Buildah and push it into Pickle, as in `docker push <node>:5050/<name>:<tag>` \
+     with a deployer token (`relish manual images`, under Pushing with docker, podman, \
+     skopeo or crane), or add a Linux node with Buildah to the cluster to build here";
 
 /// Whether this node can build (probed per call — cheap, and the
 /// submit path is rare).
@@ -1612,10 +1651,7 @@ pub async fn build_submit_handler(
     if candidates.is_empty() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": "no builder available: buildah is not on this node's PATH \
-                          and no peer reports the capability"
-            })),
+            Json(serde_json::json!({ "error": NO_BUILDER_ERROR })),
         )
             .into_response();
     }
@@ -1975,7 +2011,7 @@ mod tests {
         )
         .await
         .unwrap();
-        router.register(1, node.raft().clone()).await;
+        router.register(1, &node).await;
         let members = std::collections::BTreeMap::from([(
             1u64,
             CouncilNodeInfo::new("127.0.0.1:9001".parse().unwrap(), "node-1".to_string()),
@@ -2010,6 +2046,7 @@ mod tests {
             join_tokens: vec![],
             next_serial: 10,
             oidc_signing_config: Some(oidc_config),
+            retiring_oidc_keys: Vec::new(),
             crl: crate::sesame::types::Crl::default(),
             secret_seals: std::collections::BTreeMap::new(),
             node_leaves: std::collections::BTreeMap::new(),
@@ -2137,7 +2174,7 @@ mod tests {
         )
         .await
         .unwrap();
-        router.register(1, node.raft().clone()).await;
+        router.register(1, &node).await;
         let members = std::collections::BTreeMap::from([(
             1u64,
             CouncilNodeInfo::new("127.0.0.1:9002".parse().unwrap(), "node-1".to_string()),
@@ -2232,6 +2269,36 @@ mod tests {
             path
         };
         assert!(!path.exists(), "ScopedDir should delete itself on drop");
+    }
+
+    /// #1871: dropping a build directory in async code mustn't stall the
+    /// worker it runs on while thousands of files are deleted, so the
+    /// delete goes to the blocking pool. The check is structural, not a
+    /// stopwatch (#1978): with the pool's only thread held, a delete sent
+    /// there can't have happened by the end of the first poll, while an
+    /// inline one has, whatever the tree's size or the disk's speed.
+    #[test]
+    fn dropping_a_scoped_dir_in_async_code_never_blocks_the_runtime() {
+        let base = std::env::temp_dir().join("reliaburger-build-test");
+        let dir = ScopedDir::new(&base, 1871).unwrap();
+        let path = dir.path().to_path_buf();
+        let sub = path.join("layer");
+        std::fs::create_dir(&sub).unwrap();
+        for f in 0..10 {
+            std::fs::write(sub.join(format!("f{f}")), b"x").unwrap();
+        }
+
+        let deleted = crate::off_runtime::assert_runs_on_blocking_pool(async move {
+            drop(dir);
+            for _ in 0..3000 {
+                if !path.exists() {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            false
+        });
+        assert!(deleted, "the dropped build directory was never deleted");
     }
 
     #[test]
@@ -2476,5 +2543,42 @@ mod tests {
         // The capable node itself is excluded — "peer" means peer.
         let builders = find_peer_builders(&members, &aggregated, Some("builder"), &http, 5050);
         assert!(builders.is_empty());
+    }
+
+    // An appliance cluster has no Buildah anywhere (#2144), so the refusal
+    // is all an operator running the tour on bare metal sees. It has to say
+    // why and name the two ways out.
+    #[test]
+    fn a_cluster_with_no_builder_names_the_ways_out() {
+        let message = NO_BUILDER_ERROR;
+        assert!(message.starts_with("no builder available: "), "{message}");
+        assert!(message.contains("Buildah"), "{message}");
+        assert!(message.contains("appliance nodes never do"), "{message}");
+        // Build elsewhere and push into Pickle...
+        assert!(message.contains("docker push <node>:5050/"), "{message}");
+        assert!(message.contains("`relish manual images`"), "{message}");
+        // ...or bring a node that can build.
+        assert!(
+            message.contains("add a Linux node with Buildah"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn the_manual_section_the_refusal_names_is_there() {
+        use crate::relish::manual::{assets, find_chapter};
+        let chapters = assets::chapters();
+        let chapter = &chapters[find_chapter(&chapters, "images").unwrap()];
+        assert!(
+            chapter
+                .markdown
+                .contains("## Pushing with docker, podman, skopeo or crane"),
+            "{}",
+            chapter.file
+        );
+        assert!(NO_BUILDER_ERROR.contains("under Pushing with docker, podman, skopeo or crane"));
+        // relish prints the body as it comes, JSON and all, where a double
+        // quote would show escaped.
+        assert!(!NO_BUILDER_ERROR.contains('"'));
     }
 }

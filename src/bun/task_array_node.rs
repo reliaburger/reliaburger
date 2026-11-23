@@ -532,6 +532,9 @@ pub struct TaskArrayNode {
     root_durable: Arc<std::sync::atomic::AtomicBool>,
     /// One permit, for [`SyncClaim`].
     sync_gate: Arc<Semaphore>,
+    /// Fires when Bun starts stopping: no array starts another attempt
+    /// (#1965).
+    draining: CancellationToken,
     /// Runs at the start of the control-fence check, so a test can make
     /// the disk hang there.
     #[cfg(test)]
@@ -562,6 +565,7 @@ impl TaskArrayNode {
             grant_syncs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             root_durable: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sync_gate: Arc::new(Semaphore::new(1)),
+            draining: CancellationToken::new(),
             runner: Arc::new(runner),
             arrays: Mutex::new(HashMap::new()),
             #[cfg(test)]
@@ -588,6 +592,15 @@ impl TaskArrayNode {
         telemetry: Arc<crate::mayo::job_metrics::JobTelemetry>,
     ) -> Self {
         self.telemetry = telemetry;
+        self
+    }
+
+    /// Start no new attempt once `draining` fires, which Bun does when it
+    /// starts stopping. Attempts already running carry on; tasks that
+    /// haven't started and retries still to come end as not run, and the
+    /// restarted node runs them (#1965).
+    pub fn with_draining(mut self, draining: CancellationToken) -> Self {
+        self.draining = draining;
         self
     }
 
@@ -1029,7 +1042,8 @@ impl TaskArrayNode {
                     config,
                     Arc::clone(&self.slots),
                 )
-                .with_budget(Arc::clone(&self.budget), assignment.resources),
+                .with_budget(Arc::clone(&self.budget), assignment.resources)
+                .with_draining(self.draining.child_token()),
             ),
             ledger: handle,
             writer,
@@ -1123,6 +1137,13 @@ impl TaskArrayNode {
                 continue;
             }
             if !assignment.replay_unknown {
+                // Every task has a record at this grant: an outcome, or a
+                // not-run record. The node writes a not-run record only
+                // once the task holds no running attempt: it was drained
+                // by a stop (#1965), or cancelled by an array stop or a
+                // take-back, which a restart never runs again at this
+                // grant. Only a task with no record at all may have been
+                // running when the node went, and needs a replay.
                 let complete = run.resumed.get(&chunk).is_some_and(|records| {
                     assignment
                         .spec
@@ -1587,11 +1608,16 @@ fn refused(batch_id: u64, reason: String) -> ArrayProgress {
     }
 }
 
-/// Last terminal record per index, grouped by chunk.
+/// The last record per index, grouped by chunk. A terminal record always
+/// wins over a not-run one, which only says how many attempts a drained
+/// task had used (#1965).
 fn group_by_chunk(spec: &TaskArraySpec, records: Vec<TaskRecord>) -> HashMap<u32, Vec<TaskRecord>> {
     let mut last: BTreeMap<u32, TaskRecord> = BTreeMap::new();
     for record in records {
-        if record.outcome != TaskFinal::NotRun {
+        let replaces = last.get(&record.index).is_none_or(|kept| {
+            record.outcome != TaskFinal::NotRun || kept.outcome == TaskFinal::NotRun
+        });
+        if replaces {
             last.insert(record.index, record);
         }
     }
@@ -1698,6 +1724,16 @@ async fn run_chunk(
         );
         return;
     }
+    // A chunk the node's stop cut short isn't finished (#1965). Reported,
+    // the leader would retire it with its unrun tasks counted as not run
+    // for good. Unreported, the chunk stays held, and the restarted node
+    // runs the tasks without an outcome. A stopping array's chunk is
+    // different: its unrun tasks are final.
+    if pool.draining() && !cancel.is_cancelled() && outcome.result.not_run > 0 {
+        return;
+    }
+    // Only a reported chunk counts its durations. The restart's result
+    // counts the drained chunk's finished tasks again, from the ledger.
     telemetry.record_durations(&labels, &outcome.result.duration_counts);
     // Keyed by attempt too: a taken-back run finishing late mustn't
     // overwrite the result of the chunk's newer grant on this node.
@@ -1771,7 +1807,6 @@ mod tests {
         ProcessWorkloadsConfig {
             allowed_binaries: allowed.iter().map(PathBuf::from).collect(),
             mount_isolation,
-            ..ProcessWorkloadsConfig::default()
         }
     }
 
@@ -2753,7 +2788,9 @@ mod tests {
     async fn reusable_advertisement_accounts_for_helper_overhead_and_pool_bound() {
         use crate::bun::reusable_executor::{DEFAULT_REUSABLE_CONCURRENCY, MAX_EXECUTOR_SLOTS};
         for (capacity, explicit, expected) in [
-            (crate::meat::Resources::new(300, 96 << 20, 0), None, 2),
+            // Two executors of 110m and 32 MiB plus the container helper's
+            // 24 MiB fit; a third doesn't (#1957).
+            (crate::meat::Resources::new(300, 128 << 20, 0), None, 2),
             (
                 crate::meat::Resources::new(256_000, 16 << 30, 0),
                 None,
@@ -2807,6 +2844,151 @@ mod tests {
         let progress = sync_until_finished(&node, &request(vec![array]), 2).await;
         let not_run: u32 = progress.finished.iter().map(|r| r.not_run).sum();
         assert_eq!(not_run, 20);
+    }
+
+    /// Run `array` on a node whose drain fires inside a failing attempt
+    /// when `drains` says so. Other attempts fail on odd indexes. Wait
+    /// until every task has a durable record, check the chunk is never
+    /// reported, and return the rows, how many attempts ran and the
+    /// node's job metrics (#1965).
+    async fn drain_a_chunk(
+        root: &Path,
+        array: &ArrayAssignment,
+        drains: impl Fn(&TaskInvocation) -> bool + Send + Sync + 'static,
+    ) -> (
+        Vec<TaskResultRow>,
+        u32,
+        Vec<crate::mayo::collector::CollectedMetric>,
+    ) {
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
+        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counted = Arc::clone(&attempts);
+        let node = fake_node(
+            root,
+            FakeRunner::new(Duration::ZERO, move |task| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                if drains(task) {
+                    stop.cancel();
+                    return AttemptOutcome::Exited { code: 1 };
+                }
+                AttemptOutcome::Exited {
+                    code: i32::from(task.index % 2 == 1),
+                }
+            }),
+        )
+        .with_draining(shutdown.child_token());
+        let sync = request(vec![array.clone()]);
+        node.sync(&sync).await.unwrap();
+        let expected = array.spec.count as usize;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let rows = loop {
+            if let Ok(rows) = node.results(array.batch_id, false, 100).await
+                && rows.len() == expected
+            {
+                break rows;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "no records");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        for _ in 0..5 {
+            let progress = node.sync(&sync).await.unwrap().arrays.remove(0);
+            assert!(
+                progress.finished.is_empty(),
+                "a drained chunk was reported finished: {progress:?}"
+            );
+            assert_eq!(progress.counters.failed, 0);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let samples = node.telemetry().samples("n1");
+        (rows, attempts.load(Ordering::SeqCst), samples)
+    }
+
+    #[tokio::test]
+    async fn a_stopping_node_retries_nothing_and_its_restart_runs_the_task() {
+        // #1965: the first attempt fails, and Bun starts stopping while it
+        // runs. The task must not use up its attempts in the stop window,
+        // and its chunk must not report the unrun task to the leader as
+        // done: the restarted node runs it.
+        let root = tempfile::tempdir().unwrap();
+        let array = assignment(1, 1, &[(0, 1)]);
+        let (rows, attempts, _) = drain_a_chunk(root.path(), &array, |_| true).await;
+        assert!(rows[0].not_run, "{rows:?}");
+        assert_eq!(rows[0].attempts, 1);
+        assert_eq!(attempts, 1);
+
+        let restarted = fake_node(root.path(), FakeRunner::always_succeeds());
+        let progress = sync_until_finished(&restarted, &request(vec![array]), 1).await;
+        assert_eq!(progress.finished[0].succeeded, 1);
+        assert_eq!(progress.finished[0].not_run, 0);
+    }
+
+    #[tokio::test]
+    async fn a_drained_chunk_of_a_default_job_restarts_without_a_replay() {
+        // A job's default is `replay_unknown = false`. The ledger shows
+        // the drained task launched nothing more, so the restart is no
+        // unknown execution and needs no operator.
+        let root = tempfile::tempdir().unwrap();
+        let mut array = assignment(1, 1, &[(0, 1)]);
+        array.replay_unknown = false;
+        drain_a_chunk(root.path(), &array, |_| true).await;
+
+        let restarted = fake_node(root.path(), FakeRunner::always_succeeds());
+        let sync = request(vec![array]);
+        let first = restarted.sync(&sync).await.unwrap().arrays.remove(0);
+        assert_eq!(first.refused, None);
+        let progress = sync_until_finished(&restarted, &sync, 1).await;
+        assert_eq!(progress.refused, None);
+        assert_eq!(progress.finished[0].succeeded, 1);
+    }
+
+    #[tokio::test]
+    async fn a_drained_task_keeps_its_attempts_across_the_restart() {
+        // One attempt ran before the stop, so the restart may run two
+        // more of `max_attempts = 3`, not three.
+        let root = tempfile::tempdir().unwrap();
+        let mut array = assignment(1, 1, &[(0, 1)]);
+        array.spec.max_attempts = 3;
+        drain_a_chunk(root.path(), &array, |_| true).await;
+
+        let restarted = fake_node(
+            root.path(),
+            FakeRunner::new(Duration::ZERO, |_| AttemptOutcome::Exited { code: 1 }),
+        );
+        let progress = sync_until_finished(&restarted, &request(vec![array]), 1).await;
+        let chunk = &progress.finished[0];
+        assert_eq!(chunk.failed_count, 1);
+        assert_eq!(chunk.retried, 2);
+        assert_eq!(progress.counters.attempts_started, 2);
+        let rows = restarted.results(1, true, 10).await.unwrap();
+        assert_eq!(rows[0].attempts, 3, "{rows:?}");
+    }
+
+    #[tokio::test]
+    async fn a_drained_chunk_counts_no_durations_until_it_is_reported() {
+        // Index 0 succeeds; index 1 fails until index 0 has, then fails
+        // once more as the drain fires. The restart counts index 0's
+        // duration again from the ledger, so the stopping node mustn't.
+        let root = tempfile::tempdir().unwrap();
+        let mut array = assignment(1, 2, &[(0, 1)]);
+        array.spec.max_attempts = 10;
+        let first_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::clone(&first_done);
+        let (rows, _, samples) = drain_a_chunk(root.path(), &array, move |task| {
+            if task.index == 0 {
+                seen.store(true, Ordering::SeqCst);
+                return false;
+            }
+            seen.load(Ordering::SeqCst)
+        })
+        .await;
+        assert!(rows[0].succeeded && rows[1].not_run, "{rows:?}");
+        let counted: f64 = samples
+            .iter()
+            .filter(|sample| sample.key.name.as_str() == "job_task_duration_ms_count")
+            .map(|sample| sample.value)
+            .sum();
+        assert_eq!(counted, 0.0, "the stopping node counted durations");
     }
 
     #[tokio::test]

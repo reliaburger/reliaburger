@@ -1,0 +1,44 @@
+---
+source: src/relish/tui/views/help.rs
+expression: output
+---
+ RELISH  3 nodes · 3 apps · leader node-1 · CONNECTED                                                                   
+                                                                                                                        
+┌app detail────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│web · default                                                                                                         │
+│ Overview  │ [Instances] │  Logs  │  Metrics  │  Deploys  │  Config                                                   │
+│←/→ or Tab: switch tabs · ↑/↓: select · k: kill · +/-: scale                                                          │
+│                                                                                                                      │
+│desired 2 · [+] scale up  [-] scale down                                                                              │
+│                                                                                                                      │
+│NODE         ID                       STATE         RESTARTS  HOST PORT  PID      IMAGE                               │
+│node-1       web-0                    running              0       8000  1000     registry.example/web:v1             │
+│node-2       web-1                    running              0       8000  1001     registry.example/web:v1             │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+└┌kill instance───────────────────────────────────────────────────────────────────────────────────────────────────────┐┘
+ │Kill instance web-1 on node-2? The scheduler starts a replacement. [y/N]                                            │ 
+ └────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
