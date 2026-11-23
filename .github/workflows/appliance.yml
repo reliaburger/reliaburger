@@ -52,6 +52,7 @@ on:
       - "src/os/**"
       - "src/appliance/**"
       - "src/relish/netboot/**"
+      - "scripts/demo/netboot.sh"
 
 concurrency:
   group: appliance-${{ github.event.pull_request.number || github.run_id }}
