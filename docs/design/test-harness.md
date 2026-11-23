@@ -120,7 +120,7 @@ are `#[ignore]`d with a reason naming the target or script that runs them:
 | `grill::apple::tests::*` | Apple silicon with Apple Container | `make test-apple` |
 | `bun::gpu::tests::nvidia_detector_finds_hardware` | An NVIDIA GPU and `nvidia-smi` | `make test-gpu` |
 | `owned_runc::actual_host_reboot_*`, `oci_crash::actual_bun_kernel_discovery_host_reboot` | A Linux VM that can be rebooted mid-test | `scripts/release/qualify-oci-reboot.sh`, `scripts/release/qualify-discovery-reboot.sh` |
-| `power_cut::actual_power_cut_*` | A disposable Linux VM whose power can be cut while workers write | `scripts/release/qualify-storage-power-cut.sh --vm VM --fixture exporter\|leases\|backups --iterations N` |
+| `power_cut::actual_power_cut_*` | A disposable Linux VM whose power can be cut while workers write | `scripts/release/qualify-storage-power-cut.sh --vm VM --fixture exporter\|leases\|backups\|volumes --iterations N` |
 | All of the above, for a release candidate | Lima on the host; it creates and deletes the VM | `scripts/release/qualify-power-cut-reboot.sh --commit SHA --iterations N --record-dir DIR` |
 
 One more script cuts power without a Rust test behind it.

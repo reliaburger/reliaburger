@@ -9864,6 +9864,50 @@ returns an iterator, a `Vec<(String, String)>` can become one, and the
 compiler generates a copy of `open_with_env` for each. It's the closest thing
 Rust has to Python's duck typing, checked at compile time.
 
+The fourth fixture, added in 0.3.2 for #287, cuts the power under volume
+snapshots. Bun snapshots every managed volume on a timer, ships each snapshot
+to an object store as a tarball, records a receipt in the snapshot's
+metadata, and prunes past the retention count. The receipt is another licence
+to prune, so it gets the same treatment as the exporter's checkpoint. But a
+snapshot needs Btrfs, and Bun only makes Btrfs subvolumes as root. So the
+harness runs this one fixture under `sudo`, and prepare makes its own
+filesystem: a 1 GiB file, `mkfs.btrfs`, and `mount -o loop` as the volumes
+directory. A loop device turns the filesystem's cache flushes into an
+`fsync` of its backing file, so a flush Btrfs relies on still reaches the
+VM's disk before the cut.
+
+Two workers share the volume. A writer fills it the way an application with
+durable writes would: each 4 KiB record goes to a temporary name, is synced,
+renamed into place, and the directory is synced too. Only then does the
+ledger get a line. A sweeper calls the real `snapshot_tick` in a loop, and
+after each sweep it records every snapshot whose metadata shows a receipt.
+A ledger line looks like this, and verify takes it apart with a slice
+pattern:
+
+```rust
+let fields: Vec<&str> = line.split(' ').collect();
+let ["exported", snapshot, sha256, archive, manifest] = fields.as_slice() else {
+    panic!("unexpected sweeper ledger line {line:?}");
+};
+```
+
+`fields.as_slice()` borrows the vector as a `&[&str]`, and the pattern
+matches only a slice of exactly five elements whose first is the literal
+`"exported"`. Each other name binds one element. It's the let-else from
+Chapter 1, with a pattern that checks the length and a word at the same time.
+
+After the cut, verify runs `btrfs check --readonly` on the image before it
+mounts it. Then it checks that every acknowledged record is in the live
+volume, whole. Every acknowledged archive must be at the destination, with
+the SHA-256 its receipt names and its manifest beside it. Each archive must
+unpack to records that run from 0 with no gap: a Btrfs snapshot is one
+instant of the volume, and the writer renames records in order, so a gap
+would mean the snapshot wasn't atomic. A snapshot still on disk must keep
+its receipt. Last, verify runs one more sweep, as Bun does when it boots. That
+sweep must settle any snapshot the cut interrupted (#695's intent files), find
+no subvolume without metadata, and leave everything exported and within
+retention.
+
 The unit tests never talk to a cloud. `make test-s3` does: it exports logs to
 a bucket and round-trips a council backup through it, put, list, prune and
 restore. Until 0.2.6 it needed real AWS credentials, and the
