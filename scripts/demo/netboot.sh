@@ -134,7 +134,7 @@ scene() {
 
 # The checks below run by name, through wait_for.
 installed() {
-    [[ "$(grep -c "has the installer" netboot.log 2>/dev/null)" -ge "$1" ]]
+    [[ "$(grep -c "installed; it gets exit from now on" netboot.log 2>/dev/null)" -ge "$1" ]]
 }
 
 # All three machines announce themselves as unclaimed over mDNS.
