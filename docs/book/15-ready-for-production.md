@@ -9908,6 +9908,11 @@ sweep must settle any snapshot the cut interrupted (#695's intent files), find
 no subvolume without metadata, and leave everything exported and within
 retention.
 
+It passed 20 cuts out of 20 on its first run
+([record](../qualification/2026-11-23-power-cut-volumes.md)). The record also
+says what the cuts didn't reach. A snapshot takes milliseconds, so no random
+cut landed inside one; that case stays with the unit tests.
+
 The unit tests never talk to a cloud. `make test-s3` does: it exports logs to
 a bucket and round-trips a council backup through it, put, list, prune and
 restore. Until 0.2.6 it needed real AWS credentials, and the

@@ -1120,7 +1120,7 @@ check that everything acknowledged is still there.
 
 | Fixture | Driver | Record |
 |---|---|---|
-| Log and metrics exporters, council backups, lease stores, volume snapshots on Btrfs | [`tests/power_cut.rs`](../tests/power_cut.rs), [`qualify-storage-power-cut.sh`](../scripts/release/qualify-storage-power-cut.sh) | [2026-10-16](qualification/2026-10-16-power-cut-reboot.md) (first run: [2026-09-25](qualification/2026-09-25-v02-power-cut.md)) |
+| Log and metrics exporters, council backups, lease stores, volume snapshots on Btrfs | [`tests/power_cut.rs`](../tests/power_cut.rs), [`qualify-storage-power-cut.sh`](../scripts/release/qualify-storage-power-cut.sh) | [2026-10-16](qualification/2026-10-16-power-cut-reboot.md) (first run: [2026-09-25](qualification/2026-09-25-v02-power-cut.md); volume snapshots: [2026-11-23](qualification/2026-11-23-power-cut-volumes.md)) |
 | Container and network ownership across a reboot | [`qualify-oci-reboot.sh`](../scripts/release/qualify-oci-reboot.sh), [`qualify-discovery-reboot.sh`](../scripts/release/qualify-discovery-reboot.sh) | same |
 
 The first run of these found two real data-loss bugs, both now fixed. They need
