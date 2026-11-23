@@ -14,8 +14,13 @@
 # relish sees both nodes alive, node 1 says its seed came from the stick and
 # was wiped from it, and no byte run of that seed is left on the stick
 # (seed_wiped.py), since it carried the master key.
-# Needs root (the bridge), qemu-system-x86, qemu-utils, mtools, ovmf, dnsmasq
-# and /dev/kvm.
+#
+# Then the pair builds the tour's burger (examples/demo/burger) with the
+# image's own Buildah, for both platforms, and pushes it into Pickle (#2144).
+# Its base images come from public.ecr.aws, so the runner routes and
+# masquerades the LAN, and dnsmasq hands out the runner's upstream DNS server.
+# Needs root (the bridge and NAT), qemu-system-x86, qemu-utils, mtools, ovmf,
+# dnsmasq, iptables and /dev/kvm.
 set -euo pipefail
 # shellcheck source=image/tests/disk.sh
 . "$(dirname "$0")/disk.sh"
@@ -30,15 +35,29 @@ ips=(10.42.0.11 10.42.0.12)
 sudo ip link add rbbr0 type bridge
 sudo ip addr add 10.42.0.1/24 dev rbbr0
 sudo ip link set rbbr0 up
+# The way out, for the build's base images. Docker on the runner leaves the
+# FORWARD policy at drop, so the bridge's traffic is let through by name.
+nat=(-t nat POSTROUTING -s 10.42.0.0/24 ! -o rbbr0 -j MASQUERADE)
+forward_out=(FORWARD -i rbbr0 -j ACCEPT)
+forward_back=(FORWARD -o rbbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT)
+sudo sysctl -q -w net.ipv4.ip_forward=1
+sudo iptables -A "${nat[@]}"
+sudo iptables -I "${forward_out[@]}"
+sudo iptables -I "${forward_back[@]}"
+dns=$(awk '/^nameserver/ { print $2; exit }' /run/systemd/resolve/resolv.conf 2>/dev/null || true)
 cleanup() {
     for pid in "${pids[@]:-}"; do kill "$pid" 2>/dev/null || true; done
     sudo pkill -f "dnsmasq.*rbbr0" || true
     for i in 0 1; do sudo ip link del "rbtap$i" 2>/dev/null || true; done
     sudo ip link del rbbr0 2>/dev/null || true
+    sudo iptables -D "${nat[@]}" 2>/dev/null || true
+    sudo iptables -D "${forward_out[@]}" 2>/dev/null || true
+    sudo iptables -D "${forward_back[@]}" 2>/dev/null || true
 }
 trap cleanup EXIT
 sudo dnsmasq --interface=rbbr0 --bind-interfaces --port=0 \
     --dhcp-range=10.42.0.100,10.42.0.200,12h --dhcp-option=3,10.42.0.1 \
+    --dhcp-option=6,"${dns:-1.1.1.1}" \
     --dhcp-host="${macs[0]},${ips[0]}" --dhcp-host="${macs[1]},${ips[1]}" \
     --pid-file="$work/dnsmasq.pid" --log-facility="$work/dnsmasq.log"
 
@@ -110,6 +129,20 @@ if [ "$result" = pass ]; then
         result=fail
     fi
 fi
+# The tour's first step, on the appliances' own Buildah.
+build=skipped
+build_elapsed=0
+if [ "$result" = pass ]; then
+    build_start=$(date +%s)
+    burger="$(dirname "$0")/../../examples/demo/burger/burger.toml"
+    if "$relish" build "$burger" 2>&1 | tee "$work/build.log"; then
+        build=pass
+    else
+        build=fail
+        result=fail
+    fi
+    build_elapsed=$(( $(date +%s) - build_start ))
+fi
 for i in 0 1; do
     echo "--- node $((i + 1)) console ---"
     cat "$work/node$i.log" || true
@@ -130,8 +163,10 @@ if [ "$result" != pass ]; then
 fi
 {
     echo "### Seeded pair: $result after ${elapsed} s"
+    echo "Burger built on the pair: $build after ${build_elapsed} s"
     echo '```'
     "$relish" nodes 2>&1 || true
+    tail -n 20 "$work/build.log" 2>/dev/null || true
     grep -a -h "reliaburger:" "$work"/node*.log | grep -v "reliaburger: journal:" || true
     echo '```'
 } >> "$summary"

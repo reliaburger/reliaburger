@@ -1836,7 +1836,7 @@ A quickstart VM has exactly one NIC, so matching on the driver is enough. With i
 
 One more surprise was in our own build, not in Ubuntu. Building `bun` inside a 26.04 VM got us a binary whose eBPF objects kernel 7.0's verifier refused, and Chapter 3 tells that story. Release builds still compile on Ubuntu 22.04 with an older clang, so they weren't affected, but now the build pins the instruction set either way.
 
-What about one package list for the guest and the appliance? mkosi reads its `Packages=` from an INI-style file, not JSON, so generating one from the other would mean a build step for each. We kept the two files and made a test hold them together instead. `test_guest_images.py` parses `image/mkosi.conf` and fails if the guest's packages, less Buildah, aren't exactly the appliance's node packages. Buildah stays guest-only, because the five-minute tour builds images on the laptop cluster.
+What about one package list for the guest and the appliance? mkosi reads its `Packages=` from an INI-style file, not JSON, so generating one from the other would mean a build step for each. We kept the two files and made a test hold them together instead. `test_guest_images.py` parses `image/mkosi.conf` and fails if the guest's packages, less Buildah, aren't exactly the appliance's node packages. Buildah stayed guest-only, because the five-minute tour builds images on the laptop cluster, until the tour reached bare metal and the appliance got it too (chapter 15a, "A tour that couldn't build").
 
 ### Status from any node
 

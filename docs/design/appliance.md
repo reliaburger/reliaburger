@@ -45,11 +45,20 @@ On first boot `systemd-repart` grows the data partition and adds an empty
 everything a node changes lives on the data partition. That's also why an OS
 update never touches the cluster's state (§4.4).
 
-The image has no Buildah, so no appliance node can run `relish build`. bun
-refuses a build that no node can run with `NO_BUILDER_ERROR`
-(`src/bun/build_runner.rs`), which names the ways out: build elsewhere and
-push into Pickle, or add a Linux node with Buildah, which bun hands builds to
-(#2144).
+The image has Buildah, so every appliance node can run `relish build`
+(#2144). Its storage is `<storage.data>/buildah` on the data partition, where
+the `vfs` driver's layer copies are Btrfs reflinks, so a layer costs metadata
+rather than a second copy of its parent's blocks on the eMMC. The appliance
+profile keeps a 1 GiB build cache (`src/appliance/seed.rs`). mkosi installs no
+Recommends, so `mkosi.conf` names the two Buildah needs: `netavark`, the
+network stack for `RUN` steps, and `gpg`, which satisfies libgpgme's
+`gnupg | gpg` without GnuPG's agents. `RUN` steps use the image's runc. The
+package's test helpers in `/usr/libexec/buildah` (97 MB of the package's
+125 MB) are removed. Buildah adds about 55 MB to each `/usr` slot, which held
+667 MB of its 1,100 MB before it. `image/tests/builder_packages.py` checks the
+config and each built manifest, and CI's seeded pair builds the tour's burger
+on two appliances. With no node able to build, bun still refuses with
+`NO_BUILDER_ERROR` (`src/bun/build_runner.rs`), which names the ways out.
 
 Lab builds add `openssh-server` for debugging. Published images don't have
 it, and `image/tests/no_ssh_server.py` checks it twice. Its unit test reads

@@ -11,9 +11,17 @@ This file is the short version. The longer records are:
 - [docs/releasing.md](docs/releasing.md#compatibility-before-100), for the full upgrade steps between each pair of releases;
 - the [GitHub release pages](https://github.com/reliaburger/reliaburger/releases), for the binaries and every merged pull request.
 
-## [Unreleased] - 0.3.2
+## [Unreleased] - 0.3.3
 
-Fixes from the Wyse 3040 lab that need a new appliance image. Not released yet: this is what the train carries, and it can change before the tag.
+Not released yet: this is what the train carries, and it can change before the tag.
+
+### Changed
+
+- The appliance image has Buildah, so `relish build` and the five-minute tour's burger build on a cluster of appliances. Its storage is on the data partition, where Btrfs reflinks the `vfs` driver's layer copies; the image adds `netavark` and `gpg` for it, drops Buildah's 97 MB of test helpers, and grows each `/usr` slot by about 55 MB. A multi-platform build can't emulate the other architecture's `RUN` steps on an appliance, so cross-compile or name one `platform`. With no node able to build, the refusal no longer says appliances never can ([#2144](https://github.com/reliaburger/reliaburger/issues/2144)).
+
+## [0.3.2] - 2026-11-23
+
+Fixes from the Wyse 3040 lab that need a new appliance image. [Release page](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.2), [release log](docs/release-log.md#032-wyse-lab-fixes).
 
 ### Upgrading
 
