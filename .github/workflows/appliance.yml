@@ -536,7 +536,9 @@ jobs:
       - name: Record the netboot demo (x86-64, KVM)
         # The homepage's netboot recording (scripts/demo/netboot.sh): three
         # blank VMs netboot from the commit's relish and are claimed into a
-        # cluster. Only on a pull request labelled record-netboot-demo.
+        # cluster. Only on a pull request labelled record-netboot-demo; the
+        # label must be on it before the push, because this workflow doesn't
+        # run on `labeled`.
         id: netboot_demo
         if: matrix.arch == 'x86_64' && env.BROKEN_BUN != '1' && hashFiles('source-bin/relish-linux-x86_64') != '' && contains(github.event.pull_request.labels.*.name, 'record-netboot-demo')
         timeout-minutes: 30
