@@ -232,6 +232,9 @@ cluster's leader refuses it
 cluster's leader refuses it; its fresh cluster also keeps the root CA
 offline
 ([upgrading from 0.2.8](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-028)).
+0.3.1 keeps 0.3.0's pair. 0.3.2 moves the protocol to 61 and keeps state
+format 76, and a 0.3.1 cluster's leader refuses it
+([upgrading from 0.3.1](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-031)).
 
 A laptop cluster says the same thing when you rerun the quickstart installer
 from a newer release over it. Its saved record names the release that set it
@@ -464,8 +467,8 @@ GitOps owns:
 - `relish apply` of a GitOps-managed resource goes ahead and warns:
   `warning: namespace 'production' is managed by GitOps; manual changes are
   reverted on the next sync`.
-- `relish delete` and `relish rollback` of a GitOps-managed app are refused,
-  because the next sync would undo them. Change the repository instead, or
+- `relish delete`, `relish rollback` and `relish scale` of a GitOps-managed
+  app are refused, because the next sync would undo them. Change the repository instead, or
   pass `--force` when you really want the cluster to differ for a poll.
 - A forced delete also forgets the ownership. While the repository still
   declares the app, the next sync recreates it and owns it again.

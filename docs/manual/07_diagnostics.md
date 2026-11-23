@@ -85,14 +85,15 @@ applies, the numbers that decide it, a link to the manual section and the
 ```text
 crashloops: critical
   CRITICAL [crashloop] app api/default restarted repeatedly (app.api/default)
-    3 timestamped restarts in the last 15 minutes
+    instance api-0 restarted 3 times in the last 15 minutes
     related restart at 9: exit code 1
     next: app api is crashlooping; inspect its recent logs and run `relish rollback api` if this started after a deploy
-  tests: Counts each app's `restart` events in every node's event ring (the same
-         ones `relish events` shows) inside a recent window. Enough of them is
-         critical, with any recent deploy and the app's first error log line
-         attached. A lifetime restart count is not an input.
-  threshold: 3 (CRASHLOOP_RESTARTS): restarts inside the window that make a crash loop
+  tests: Counts each instance's `restart` events in every node's event ring (the
+         same ones `relish events` shows) inside a recent window. Enough of them
+         for one instance is critical, with any recent deploy and the app's
+         first error log line attached. Replicas that restarted once each are
+         not a crash loop, and a lifetime restart count is not an input.
+  threshold: 3 (CRASHLOOP_RESTARTS): restarts of one instance inside the window that make a crash loop
   threshold: 15 minutes (CRASHLOOP_WINDOW_SECONDS): the window restarts are counted in
   threshold: 30 minutes (RECENT_DEPLOY_SECONDS): a deploy started this recently is named as the likely cause
   docs: https://github.com/reliaburger/reliaburger/blob/main/docs/manual/07_diagnostics.md#relish-wtf-whats-broken-and-why

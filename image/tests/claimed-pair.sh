@@ -12,7 +12,11 @@
 # window relish opens on node 1's firewall. The test passes when relish
 # found both machines over mDNS, sees both nodes alive, and the council
 # reports the default appliance size, five voters, which --create recorded
-# in fleet.json and node 1 committed when it bootstrapped.
+# in fleet.json and node 1 committed when it bootstrapped. Before any claim,
+# each machine's screen (tty1, read over the lab image's SSH as /dev/vcs1)
+# must show the claim key its port 9119 serves: the operator compares the
+# two, and for a while the screen showed nothing until after the claim
+# (#2161).
 # Needs root (the bridge), qemu-system-x86, ovmf, dnsmasq and /dev/kvm.
 set -euo pipefail
 # shellcheck source=image/tests/disk.sh
@@ -43,6 +47,11 @@ sudo dnsmasq --interface=rbbr0 --bind-interfaces --port=0 \
 
 export RELIABURGER_HOME="$work/home"
 mkdir -p "$RELIABURGER_HOME"
+# A throwaway key for the lab image's sshd, to read each screen. An
+# unclaimed machine has no seed to carry one, so it goes in as the
+# ssh.authorized_keys.root credential.
+ssh-keygen -q -t ed25519 -N "" -C claimed-pair -f "$work/ssh-key"
+ssh_credential="io.systemd.credential.binary:ssh.authorized_keys.root=$(base64 -w0 < "$work/ssh-key.pub")"
 
 pids=()
 for i in 0 1; do
@@ -57,6 +66,7 @@ for i in 0 1; do
         -drive if=virtio,format=raw,file="$work/disk$i.raw" \
         -netdev "tap,id=n0,ifname=rbtap$i,script=no,downscript=no" \
         -device "virtio-net-pci,netdev=n0,mac=${macs[$i]}" \
+        -smbios "type=11,value=$ssh_credential" \
         -display none -serial "file:$work/node$i.log" &
     pids+=($!)
 done
@@ -65,6 +75,7 @@ start=$(date +%s)
 deadline=$((start + 900))
 result=fail
 discovery=fail
+screens=fail
 # Wait until $1 succeeds, or $deadline passes. relish's errors are kept.
 wait_for() {
     until "$@" >/dev/null 2>>"$work/relish.err"; do
@@ -73,6 +84,25 @@ wait_for() {
     done
 }
 answering() { curl -fsSk --max-time 3 "https://$1:9119/v1/claim"; }
+on_node() {
+    timeout 30 ssh -i "$work/ssh-key" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=10 -o LogLevel=ERROR "root@$1" "${@:2}"
+}
+# The short claim key, as the screen and relish show it: the first 16 hex
+# digits of the fingerprint the claim API serves, in groups of four.
+claim_key() {
+    answering "$1" | python3 -c 'import json, sys
+hex = json.load(sys.stdin)["fingerprint"].removeprefix("sha256:")
+print("-".join(hex[i:i + 4] for i in range(0, 16, 4)))'
+}
+# tty1 shows $1's claim key. /dev/vcs1 is the text on tty1, whatever
+# draws it: no framebuffer capture or OCR needed.
+shows_claim_key() {
+    local key
+    key=$(claim_key "$1") && [ -n "$key" ] || return 1
+    on_node "$1" cat /dev/vcs1 >"$work/screen-$1.txt" || return 1
+    tr -s ' ' <"$work/screen-$1.txt" | grep -q "Claim key $key"
+}
 alive() { [ "$("$relish" nodes 2>>"$work/relish.err" | grep -c alive)" = "$1" ]; }
 # Both MACs, each with its IPv4 address: claiming by MAC connects to the
 # announced address, and an IPv6 link-local one can't be reached.
@@ -94,6 +124,12 @@ if wait_for answering "${ips[0]}" && wait_for answering "${ips[1]}"; then
         discovery=pass
     fi
     echo "mDNS discovery: $discovery after $(($(date +%s) - start)) s"
+    # The console redraws every 5 s; give sshd and a redraw a minute.
+    deadline=$(($(date +%s) + 60))
+    if wait_for shows_claim_key "${ips[0]}" && wait_for shows_claim_key "${ips[1]}"; then
+        screens=pass
+    fi
+    echo "claim keys on the screens: $screens after $(($(date +%s) - start)) s"
     deadline=$full
 fi
 if "$relish" machines claim "$work/cluster" --create --name pair --operator 10.42.0.1 \
@@ -105,9 +141,13 @@ if "$relish" machines claim "$work/cluster" --create --name pair --operator 10.4
     result=pass
 fi
 elapsed=$(($(date +%s) - start))
-verdict="claims $result, mDNS discovery $discovery, after ${elapsed} s"
+verdict="claims $result, mDNS discovery $discovery, claim keys on screen $screens, after ${elapsed} s"
 echo "Claimed pair: $verdict"
-if [ "$result" != pass ] || [ "$discovery" != pass ]; then
+if [ "$result" != pass ] || [ "$discovery" != pass ] || [ "$screens" != pass ]; then
+    for ip in "${ips[@]}"; do
+        echo "--- tty1 of $ip (claim key $(claim_key "$ip" 2>/dev/null || echo unknown)) ---"
+        fold -w 80 "$work/screen-$ip.txt" 2>/dev/null | grep -v '^ *$' || true
+    done
     echo "--- relish machines ---"
     cat "$work/machines.txt" 2>/dev/null || true
     echo "--- relish stderr ---"
@@ -132,4 +172,4 @@ done
     grep -a -h "reliaburger:" "$work"/node*.log | grep -v "reliaburger: journal:" || true
     echo '```'
 } >>"$summary"
-[ "$result" = pass ] && [ "$discovery" = pass ]
+[ "$result" = pass ] && [ "$discovery" = pass ] && [ "$screens" = pass ]

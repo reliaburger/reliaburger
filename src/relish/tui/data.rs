@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::bun::agent::{ClusterInstanceStatus, CouncilStatus};
 use crate::bun::cluster_view::{ClusterDeployHistory, ClusterEvents, ClusterJobs};
+use crate::bun::diagnostics::DesiredAppEvidence;
 use crate::bun::summary::ClusterSummary;
 use crate::mayo::rollup::MetricsQueryResult;
 use crate::relish::client::BunClient;
@@ -73,6 +74,18 @@ pub trait DataProvider: Send + Sync + 'static {
         app: &str,
         namespace: &str,
     ) -> impl Future<Output = Result<MetricsQueryResult, ProviderError>> + Send;
+    fn desired_apps(
+        &self,
+    ) -> impl Future<Output = Result<Vec<DesiredAppEvidence>, ProviderError>> + Send;
+    /// Set an app's replica count to `to`, if its spec still asks for
+    /// `from` (#2176).
+    fn scale(
+        &self,
+        app: &str,
+        namespace: &str,
+        from: u32,
+        to: u32,
+    ) -> impl Future<Output = Result<(), ProviderError>> + Send;
     /// Kill one instance with Smoker's kill fault, as `relish fault kill`
     /// does with `--instance` and `--node`.
     fn kill_instance(
@@ -144,6 +157,21 @@ impl DataProvider for HttpDataProvider {
     ) -> Result<MetricsQueryResult, ProviderError> {
         self.client
             .app_metrics(app, namespace)
+            .await
+            .map_err(Into::into)
+    }
+    async fn desired_apps(&self) -> Result<Vec<DesiredAppEvidence>, ProviderError> {
+        self.client.desired_apps().await.map_err(Into::into)
+    }
+    async fn scale(
+        &self,
+        app: &str,
+        namespace: &str,
+        from: u32,
+        to: u32,
+    ) -> Result<(), ProviderError> {
+        self.client
+            .scale(app, namespace, to, Some(from), false)
             .await
             .map_err(Into::into)
     }
@@ -248,6 +276,18 @@ impl DataProvider for MockDataProvider {
                 warnings: Vec::new(),
             }))
     }
+    async fn desired_apps(&self) -> Result<Vec<DesiredAppEvidence>, ProviderError> {
+        Ok(self.scenario.data().desired_apps)
+    }
+    async fn scale(
+        &self,
+        _app: &str,
+        _namespace: &str,
+        _from: u32,
+        _to: u32,
+    ) -> Result<(), ProviderError> {
+        Ok(())
+    }
     async fn kill_instance(&self, target: &InstanceTarget) -> Result<FaultSummary, ProviderError> {
         Ok(FaultSummary {
             id: 1,
@@ -281,7 +321,7 @@ impl DataProvider for MockDataProvider {
 /// Spawn a complete fetch and send one message per result.
 pub fn spawn_refresh<P: DataProvider>(provider: Arc<P>, tx: mpsc::Sender<super::msg::Msg>) {
     tokio::spawn(async move {
-        let (summary, status, nodes, council, alerts, routes, jobs, events) = tokio::join!(
+        let (summary, status, nodes, council, alerts, routes, jobs, events, desired) = tokio::join!(
             provider.summary(),
             provider.status(),
             provider.nodes(),
@@ -289,7 +329,8 @@ pub fn spawn_refresh<P: DataProvider>(provider: Arc<P>, tx: mpsc::Sender<super::
             provider.alerts(),
             provider.routes(),
             provider.jobs(),
-            provider.recent_events(100)
+            provider.recent_events(100),
+            provider.desired_apps()
         );
         for update in [
             super::msg::DataUpdate::Summary(summary.map(Box::new)),
@@ -300,6 +341,7 @@ pub fn spawn_refresh<P: DataProvider>(provider: Arc<P>, tx: mpsc::Sender<super::
             super::msg::DataUpdate::Routes(routes),
             super::msg::DataUpdate::Jobs(jobs),
             super::msg::DataUpdate::EventsSeed(events),
+            super::msg::DataUpdate::DesiredApps(desired),
         ] {
             if tx.send(super::msg::Msg::Data(update)).await.is_err() {
                 return;

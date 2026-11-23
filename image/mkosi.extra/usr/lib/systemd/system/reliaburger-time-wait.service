@@ -5,8 +5,8 @@
 #
 # Bounded, unlike systemd-time-wait-sync.service, which waits forever
 # (TimeoutStartSec=infinity): a LAN with no NTP server must still start bun.
-# 30 s also leaves most of boot-check's 120 s on a counted boot, since bun
-# answers in 8 to 23 s. Once a boot's clock has synced, the wait returns at
+# 30 s plus bun's slowest measured start (38 s on a Wyse 3040) still leaves
+# 22 s of boot-check's 90 s on a counted boot. Once a boot's clock has synced, the wait returns at
 # once, and bun's own restarts don't run it again (RemainAfterExit=).
 [Unit]
 Description=Wait up to 30 s for the clock to sync before bun starts

@@ -171,6 +171,90 @@ Pressing `:` opens a small command palette. Its language is intentionally tiny:
 
 Search is similarly modest. It scans cached apps, nodes, jobs, routes and event messages case-insensitively. Prefix matches sort first. We didn't add a fuzzy-matching crate because substring matching solves the current problem and is easy to explain.
 
+## The first key that changes something
+
+For its first year the TUI only looked. The Wyse lab changed that twice in
+one release. `k` kills one instance, through Smoker's existing fault API
+(see "Killing from the Instances tab" below). And the maintainer wanted to
+press `+` on an app and get another replica (#2176). That one had no API at
+all: replicas lived in the app's spec, and only `relish apply` changed the
+spec.
+
+The interesting question isn't the key. It's what happens after. Say the
+file says `replicas = 1`, you scale to 3, and next week somebody runs
+`relish apply app.toml`. Should the cluster keep 3 or go back to 1?
+
+Kubernetes answers "it depends". `kubectl scale` writes the live object, and
+the next `kubectl apply` of a manifest that sets `replicas` writes it back;
+leave `replicas` out of the manifest and the scale sticks. GitOps tools then
+spot the difference and either revert it or learn to ignore it. That's three
+behaviours, chosen by whether a field is absent from a file.
+
+We picked one. A scale is an ordinary spec write, and the file wins. The new
+`POST /v1/scale/{app}/{namespace}` handler reads the app's stored spec from
+the council, sets `replicas`, and hands that one-app config to the same
+`cluster_apply` that `relish apply` uses. Policy, owners, agent leases, the
+audit record and the Raft write come along for free. There's no second
+number hiding beside the spec, so `relish apply --dry-run` against the file
+shows the app as changed until someone decides which count is right. Drift
+you can see beats drift you can't.
+
+Here's the heart of it:
+
+```rust
+let Some(spec) = desired.apps.get(app_id) else {
+    return Err((StatusCode::NOT_FOUND, format!("there's no app {app_id} to scale")));
+};
+if let Some(refusal) = spec.scale_refusal(replicas) {
+    // zero is `relish stop`; an autoscaled app and a daemon set have no
+    // count to set
+}
+let mut spec = spec.clone();
+spec.replicas = crate::config::Replicas::Fixed(replicas);
+```
+
+`desired.apps.get` returns `Option<&AppSpec>`, a borrow into the council's
+snapshot. We can't change something we only borrowed, so `spec.clone()`
+makes our own copy first; the compiler would refuse `spec.replicas = ...` on
+the borrow. `let ... else` is the Rust way to say "bind this or leave": the
+`else` block must end the function (here with `return`), so after it `spec`
+is known to exist.
+
+`scale_refusal` lives on `AppSpec` and returns `Option<ScaleRefusal>`, a
+three-variant enum. An agent's `relish agent propose scale` (Chapter 19)
+calls the same method, so a person and an agent are refused for exactly the
+same things, each with its own wording.
+
+Two smaller decisions are worth a sentence each. We re-apply the *stored*
+spec, whose images are already bound to digests, so a scale never quietly
+pulls a newer image behind a moving tag. And the body may carry
+`current_replicas`, borrowed from `kubectl scale --current-replicas`: the
+scale is refused when the spec's count is no longer the one you saw.
+
+In the TUI, `+` and `-` on the Instances tab don't do anything straight
+away. They fill `scale_prompt`, an `Option<ScalePrompt>`, and the next key
+answers it:
+
+```rust
+if self.scale_prompt.is_some() {
+    self.answer_scale_prompt(key);
+} else if self.confirm_kill.is_some() {
+    self.handle_confirm_kill_key(key);
+} else if self.palette.is_some() {
+    // ...
+```
+
+Putting the questions first means `q` says no instead of leaving the view, so
+you can't back out of a view with a question still hanging. The two
+questions are separate `Option` fields rather than one, because each holds
+a different thing to act on; since an open question swallows every key,
+they can never both be open. Only `y` pushes
+an `Effect::Scale`, carrying the count the question showed as
+`current_replicas`. The question says "from 2 to 3", so 3 mustn't land on top
+of someone else's 5. The count comes from `/v1/diagnostics/apps`, what the
+spec asks for, not from how many instances happen to be running. The
+reducer stays pure: it never makes the HTTP call, it only asks for one.
+
 ## Testing a screen
 
 Ratatui's `TestBackend` renders into an in-memory cell buffer. Tests render at 120 by 40 cells, concatenate the visible symbols and compare the result with an Insta snapshot. Styles are excluded deliberately. Changing a warning colour shouldn't rewrite twenty files.
@@ -566,3 +650,84 @@ refresh can reorder or shorten the list between `k` and `y`, and a prompt
 that names `web-1` must kill `web-1`, not whatever row slid under the
 cursor. It's the job-detail lesson again: carry the identity of the row,
 not where it was.
+
+### What runs on this node?
+
+The Wyse lab asked the k9s question next. You pick a node because you want
+to reboot it, or update its OS, or pull it out of the rack. What runs there,
+and what breaks if it goes?
+
+The node page had the answer's raw material and showed none of it. It listed
+the node's own numbers (version, CPU, memory, disk, allocation) and nothing
+about its workloads. Yet the TUI already polls the cluster status, and every
+row of it is a `ClusterInstanceStatus` that names its node. So the page grew
+tabs, as the app detail has, and `View::NodeDetail` gained a field:
+
+```rust
+NodeDetail {
+    node: String,
+    tab: NodeTab,
+},
+```
+
+`NodeTab` has three variants: Overview, Workloads and Maintenance. Adding the
+field broke every place that built or matched a `NodeDetail`, which is the
+point. The compiler listed them: the nodes list's Enter, the search results,
+the renderer and the tab cycling. No view could quietly forget it had tabs
+now.
+
+Workloads is the app detail's Instances tab turned on its side. The same
+instance list, filtered by node instead of by app, through
+`TuiApp::node_instances`. ↑ and ↓ select a row and Enter opens that app's
+detail, so "what's this thing on node-2?" is two keys away. There's no `k`
+here. The page is for looking before you act, and the kill lives where you
+can see the app's other replicas.
+
+Maintenance asks one question: if this node went away, what would we lose?
+`impact::node_impact` answers it from data the TUI already holds. For each
+app with an instance on the node, it counts the app's ready replicas on the
+other nodes that are still up. None left means the app goes down: a
+single-replica app, or one whose other replicas are failing anyway. One left
+means it keeps serving with no spare. More than one, and it barely notices.
+The table puts the worst first:
+
+```text
+council   a voter: the council loses quorum, only 1 of 3 voters would answer
+APP     NAMESPACE  HERE  READY ELSEWHERE  IMPACT            DATA
+cache   default       1                0  goes down         here
+app-2   default       1                1  loses redundancy  -
+web     default       1                2  keeps serving     -
+```
+
+The council line reuses the upgrade orchestrator's own check,
+`live_quorum_headroom_ok`, which asks before a bun upgrade restarts a voter
+whether the rest can still commit. The summary already says how many voters
+there are and how many answer. One wrinkle: that function waves a lone voter
+through, since a one-node council has no other way to upgrade. For the
+"what if it's gone" question, losing your only voter loses the council, so
+`council_impact` says so before it asks.
+
+The DATA column needed one thing the TUI didn't have. An OS rollout leaves an
+app on its node when it keeps data there, in a managed volume or a host-path
+mount (#2120), and the scheduler agrees. That's the replica you can't just
+move. Only the leader's desired state and the node itself know an app's
+volumes, so `InstanceStatus` grew one more optional field:
+
+```rust
+#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+pub data_on_node: bool,
+```
+
+The node fills it with `stays_through_os_rollout`, the very function the
+rollout uses, so the page and the rollout can't disagree about which apps
+stay. `skip_serializing_if` takes a path to a function that gets
+`&bool` and returns `bool`. `std::ops::Not::not` is the trait method behind
+the `!` operator, so the field is left out whenever it's `false` and the
+JSON of an app with no volumes doesn't change. As with `image`, `default`
+reads a missing key as `false`, so an older node's answer still parses.
+
+It's a forecast from the last refresh, not a promise. The scheduler decides
+where replacements go, and a replica that's starting now may be ready by the
+time you pull the plug. Still, a red `goes down` line before a reboot beats
+finding out from the pager after it.
+

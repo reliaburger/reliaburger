@@ -1,0 +1,3 @@
+NAME="/dev/mmcblk0" TYPE="disk" SIZE="7818182656" PTTYPE="gpt" FSTYPE="" LABEL="" PARTLABEL=""
+NAME="/dev/mmcblk0p1" TYPE="part" SIZE="536870912" PTTYPE="gpt" FSTYPE="vfat" LABEL="EFI" PARTLABEL="EFI System"
+NAME="/dev/mmcblk0p2" TYPE="part" SIZE="6442450944" PTTYPE="gpt" FSTYPE="ext4" LABEL="ThinOS" PARTLABEL=""

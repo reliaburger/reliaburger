@@ -1,5 +1,6 @@
 ---
 source: src/relish/agent/diagnose.rs
+assertion_line: 1056
 expression: value
 ---
 {
@@ -22,7 +23,7 @@ expression: value
           "path": "docs/manual/07_diagnostics.md",
           "read": "relish agent source show docs/manual/07_diagnostics.md:3-11"
         },
-        "meaning": "an app restarted repeatedly in a short window; a recent deploy and the app's first error line are attached when there are any",
+        "meaning": "one instance of an app restarted repeatedly in a short window; a recent deploy and the app's first error line are attached when there are any",
         "severities": [
           "critical"
         ],
@@ -36,7 +37,7 @@ expression: value
               "path": "src/relish/wtf/findings.rs",
               "permalink": "https://github.com/reliaburger/reliaburger/blob/a1b2c3d4e5f60718293a4b5c6d7e8f9012345678/src/relish/wtf/findings.rs#L2"
             },
-            "meaning": "restarts inside the window that make a crash loop",
+            "meaning": "restarts of one instance inside the window that make a crash loop",
             "unit": "count",
             "value": 3
           },

@@ -122,7 +122,7 @@ a read-only token of its own, so an agent never holds admin credentials.
 - **Self-upgrade:** `relish upgrade` rolls a signed `bun` across the cluster without restarting workloads, and `relish verify` checks every node runs the published release, byte for byte.
 - **Diagnostics for incidents:** `relish wtf` and `relish path` say what's wrong and where. `relish status` sums up the whole cluster on one screen, `relish apps` lists the apps, and `relish timeline` shows what changed before a failure, with the rule and evidence behind each decision.
 - **Built for agents:** `relish agent` answers in bounded JSON, and `relish mcp` serves it over MCP. An agent proposes a change, a person or a policy approves it with `relish proposal approve` or the web dashboard's buttons, `relish undo` puts it back, `relish lease` keeps two of them off the same app, and `relish gym run` tests your own agent on your own cluster.
-- **A terminal UI and a web dashboard:** run `relish` with no arguments, or `relish dashboard`.
+- **A terminal UI and a web dashboard:** run `relish` with no arguments, or `relish dashboard`. Scale an app with `+` and `-` on its Instances tab, or `relish scale web --replicas 3` (0.3.2, not in 0.3.1); the next apply of its file puts back the file's count.
 - **The manual and the source in the binary:** `relish manual` and `relish source` work offline.
 
 [Everything 0.3.1 does](docs/README.md#whats-in-the-binary), what you

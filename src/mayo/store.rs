@@ -1186,53 +1186,18 @@ impl MayoStore {
         since: Option<u64>,
     ) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
         let ctx = self.session_since(since).await?;
-        let df = ctx
-            .sql(sql)
-            .await
-            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
+        rows_from(&ctx, sql).await
+    }
 
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
-
-        let mut results = Vec::new();
-        for batch in &batches {
-            if batch.num_columns() < 4 {
-                continue;
-            }
-            let timestamps = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| MayoError::Arrow("timestamp column type mismatch".into()))?;
-            let names = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| MayoError::Arrow("metric_name column type mismatch".into()))?;
-            let labels = batch
-                .column(2)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| MayoError::Arrow("labels column type mismatch".into()))?;
-            let values = batch
-                .column(3)
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| MayoError::Arrow("value column type mismatch".into()))?;
-
-            for i in 0..batch.num_rows() {
-                results.push((
-                    timestamps.value(i),
-                    names.value(i).to_string(),
-                    labels.value(i).to_string(),
-                    values.value(i),
-                ));
-            }
-        }
-
-        Ok(results)
+    /// A snapshot of the store for a query that only wants samples at or
+    /// after `since`: the archive files and unflushed samples as they are
+    /// now. Query it with [`MetricsSnapshot::query_sql`] after releasing the
+    /// store's lock, so a slow query doesn't hold up writers or the readers
+    /// queued behind them (#2215).
+    pub async fn snapshot_since(&self, since: u64) -> Result<MetricsSnapshot, MayoError> {
+        Ok(MetricsSnapshot {
+            ctx: self.session_since(Some(since)).await?,
+        })
     }
 
     /// One app's samples in `[start, end]`, oldest first, newest kept.
@@ -1614,10 +1579,128 @@ pub(crate) fn file_max_timestamp(path: &Path) -> Option<u64> {
     max
 }
 
+/// What [`MayoStore::snapshot_since`] captured: the files and samples one
+/// query reads, independent of the store's lock.
+pub struct MetricsSnapshot {
+    ctx: SessionContext,
+}
+
+impl MetricsSnapshot {
+    /// Run `sql` over the snapshot. Returns (timestamp, name, labels, value)
+    /// tuples, as [`MayoStore::query_sql`] does.
+    pub async fn query_sql(&self, sql: &str) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
+        rows_from(&self.ctx, sql).await
+    }
+}
+
+/// Run `sql` against `ctx` and read the four metric columns back.
+async fn rows_from(
+    ctx: &SessionContext,
+    sql: &str,
+) -> Result<Vec<(u64, String, String, f64)>, MayoError> {
+    let df = ctx
+        .sql(sql)
+        .await
+        .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
+
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| MayoError::QueryFailed(e.to_string()))?;
+
+    let mut results = Vec::new();
+    for batch in &batches {
+        if batch.num_columns() < 4 {
+            continue;
+        }
+        let timestamps = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| MayoError::Arrow("timestamp column type mismatch".into()))?;
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| MayoError::Arrow("metric_name column type mismatch".into()))?;
+        let labels = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| MayoError::Arrow("labels column type mismatch".into()))?;
+        let values = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or_else(|| MayoError::Arrow("value column type mismatch".into()))?;
+
+        for i in 0..batch.num_rows() {
+            results.push((
+                timestamps.value(i),
+                names.value(i).to_string(),
+                labels.value(i).to_string(),
+                values.value(i),
+            ));
+        }
+    }
+
+    Ok(results)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mayo::types::MetricKey;
+
+    /// #2215: a snapshot is what a slow query reads once the store's lock is
+    /// released. It answers from the files and samples it captured, while the
+    /// store goes on taking writes.
+    #[tokio::test]
+    async fn a_snapshot_answers_after_the_store_lock_is_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = tokio::sync::RwLock::new(MayoStore::new(dir.path().to_path_buf()));
+        {
+            let mut writer = store.write().await;
+            writer.insert(&MetricKey::simple("cpu"), Sample::at(100, 1.0));
+            writer.flush().await.unwrap();
+            writer.insert(&MetricKey::simple("cpu"), Sample::at(110, 2.0));
+        }
+
+        let snapshot = store.read().await.snapshot_since(0).await.unwrap();
+        // The lock is free: a writer gets in while the snapshot is unread.
+        {
+            let mut writer = store.write().await;
+            writer.insert(&MetricKey::simple("cpu"), Sample::at(120, 3.0));
+            writer.flush().await.unwrap();
+        }
+
+        let rows = snapshot
+            .query_sql(
+                "SELECT timestamp, metric_name, labels, value FROM metrics ORDER BY timestamp",
+            )
+            .await
+            .unwrap();
+        let values: Vec<f64> = rows.iter().map(|row| row.3).collect();
+        assert_eq!(values, vec![1.0, 2.0]);
+    }
+
+    /// A query that selects fewer than the four columns the row reader
+    /// takes gets no rows back, not a panic on the missing column.
+    #[tokio::test]
+    async fn a_query_without_the_four_metric_columns_returns_no_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = MayoStore::new(dir.path().to_path_buf());
+        store.insert(&MetricKey::simple("cpu"), Sample::at(100, 1.0));
+
+        let rows = store
+            .snapshot_since(0)
+            .await
+            .unwrap()
+            .query_sql("SELECT timestamp, metric_name, labels FROM metrics")
+            .await
+            .unwrap();
+        assert!(rows.is_empty(), "{rows:?}");
+    }
 
     #[test]
     fn the_store_keeps_the_newest_node_sample_for_the_summary() {

@@ -42,6 +42,8 @@
 #   --evidence DIR          evidence directory (default: a new
 #                           /var/tmp/reliaburger-power-cut.XXXXXX)
 #   --seed N                seed for every random choice (default: a new one)
+#   --port-offset N         add N to the cluster's API, ingress and registry
+#                           ports, so several runs can share a host (default 0)
 #   --resume                carry on the run in --evidence: same cluster, seed
 #                           and counts
 #   --keep                  leave the cluster and the installation afterwards
@@ -101,6 +103,7 @@ seed=
 resume=false
 keep=false
 plan=false
+port_offset=0
 while [ "$#" -gt 0 ]; do
     case $1 in
         --release) release=${2:-}; shift 2 ;;
@@ -115,6 +118,7 @@ while [ "$#" -gt 0 ]; do
         --resume) resume=true; shift ;;
         --keep) keep=true; shift ;;
         --plan) plan=true; shift ;;
+        --port-offset) port_offset=${2:-}; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; fail "unknown argument: $1" ;;
     esac
@@ -127,6 +131,7 @@ esac
 read -r work_min work_max < <(range "$work")
 read -r off_min off_max < <(range "$off")
 [ -z "$seed" ] || [[ $seed =~ ^[0-9]+$ ]] || fail '--seed takes a whole number'
+[[ $port_offset =~ ^[0-9]+$ ]] && [ "$port_offset" -le 1000 ] || fail '--port-offset takes a whole number up to 1000'
 
 if [ "$plan" = true ]; then
     endurance plan --seed "${seed:-0}" --duration "$(seconds "$duration")" --min "$work_min" --max "$work_max"
@@ -177,9 +182,11 @@ PY
 
 # --- the cluster -----------------------------------------------------------------
 
-api_port=29217
-ingress_port=28180
-registry_port=25150
+# The ports are fixed at install, and the cluster keeps them, so --resume
+# needs no --port-offset.
+api_port=$(( 29217 + port_offset ))
+ingress_port=$(( 28180 + port_offset ))
+registry_port=$(( 25150 + port_offset ))
 
 install_cluster() {
     home=$(mktemp -d /tmp/rbpc.XXXXXX)
@@ -524,6 +531,7 @@ else
     run_set started "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     run_set paused_seconds 0
     run_set cuts_started 0
+    run_set port_offset "$port_offset"
     run_set host "$(sw_vers -productName 2> /dev/null || uname -s) $(sw_vers -productVersion 2> /dev/null || uname -r), $(sysctl -n machdep.cpu.brand_string 2> /dev/null || uname -m)"
     install_cluster
     discover

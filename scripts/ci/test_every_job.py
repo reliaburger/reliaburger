@@ -32,7 +32,7 @@ class EveryJob(unittest.TestCase):
                                  [f'lint finished as {result!r}'])
 
     def test_a_failed_job_outside_the_evidence_owners_still_fails(self):
-        # lint, MSRV, the demo app, the audit and the benchmarks own no
+        # lint, MSRV, CI policy and the benchmarks own no
         # evidence, but the merge queue requires this one check.
         problems = every_job.problems(needs(task_array_benchmarks='failure'), 'merge_group')
         self.assertEqual(problems, ["task-array-benchmarks finished as 'failure'"])
@@ -44,14 +44,43 @@ class EveryJob(unittest.TestCase):
         del found['changes']
         self.assertEqual(every_job.problems(found, 'pull_request'), ['select jobs did not run'])
 
-    def test_only_a_pull_request_may_skip_the_code_jobs(self):
+    def test_only_a_pull_request_or_a_merge_group_may_skip_the_code_jobs(self):
+        # Either one changing only documentation (select-jobs.sh).
         found = needs()
         found['changes']['outputs']['code'] = 'false'
         self.assertEqual(every_job.problems(found, 'pull_request'), [])
-        for event in ['push', 'merge_group', 'schedule', 'workflow_dispatch']:
+        self.assertEqual(every_job.problems(found, 'merge_group'), [])
+        for event in ['push', 'schedule', 'workflow_dispatch']:
             with self.subTest(event=event):
                 self.assertEqual(every_job.problems(found, event),
                                  [f'a {event} run must select the code jobs'])
+
+    def test_a_push_the_merge_queue_already_tested_may_skip_the_code_jobs(self):
+        found = needs()
+        found['changes']['outputs'].update(code='false', tested_by='44820647332')
+        self.assertEqual(every_job.problems(found, 'push'), [])
+        for event in ['schedule', 'workflow_dispatch']:
+            with self.subTest(event=event):
+                self.assertEqual(every_job.problems(found, event), [f'a {event} run must select the code jobs'])
+
+    def test_a_push_naming_no_queue_run_must_still_select_the_code_jobs(self):
+        for tested_by in ['', 'yes', '12a']:
+            with self.subTest(tested_by=tested_by):
+                found = needs()
+                found['changes']['outputs'].update(code='false', tested_by=tested_by)
+                self.assertEqual(every_job.problems(found, 'push'), ['a push run must select the code jobs'])
+
+    def test_a_skipped_push_says_which_queue_run_it_rests_on(self):
+        found = needs()
+        found['changes']['outputs'].update(code='false', tested_by='44820647332')
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / 'needs.json'
+            path.write_text(json.dumps(found))
+            done = subprocess.run([sys.executable, str(SCRIPT), '--needs', str(path), '--event', 'push'],
+                                  capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn('::notice::', done.stdout)
+        self.assertIn('44820647332', done.stdout)
 
     def test_a_linux_next_failure_leaves_the_gate_green_with_a_warning(self):
         # The Ubuntu 26.04 job keeps losing its runner (#1943): it runs and

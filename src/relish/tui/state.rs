@@ -4,6 +4,7 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::bun::agent::{ClusterInstanceStatus, CouncilStatus, JobStatus};
 use crate::bun::cluster_view::{ClusterDeployHistory, NodeTagged};
+use crate::bun::diagnostics::DesiredAppEvidence;
 use crate::bun::events::ClusterEvent;
 use crate::bun::summary::ClusterSummary;
 use crate::mayo::rollup::MetricsQueryResult;
@@ -38,6 +39,26 @@ impl DetailTab {
     }
 }
 
+/// Node detail tabs in display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeTab {
+    /// What the node is: state, council seat, version and load.
+    Overview,
+    /// Every app instance running on it.
+    Workloads,
+    /// What would stop or lose redundancy if the node went away.
+    Maintenance,
+}
+
+impl NodeTab {
+    pub const ALL: [Self; 3] = [Self::Overview, Self::Workloads, Self::Maintenance];
+
+    pub(super) fn offset(self, delta: isize) -> Self {
+        let index = Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0);
+        Self::ALL[(index as isize + delta).rem_euclid(Self::ALL.len() as isize) as usize]
+    }
+}
+
 /// A screen in the navigation stack.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum View {
@@ -51,6 +72,7 @@ pub enum View {
     Nodes,
     NodeDetail {
         node: String,
+        tab: NodeTab,
     },
     Jobs,
     /// One node's run of a job: several nodes can each run a job of the
@@ -97,6 +119,9 @@ pub struct ClusterData {
     /// name in different namespaces have separate histories (C3).
     pub deploy_history: HashMap<String, ClusterDeployHistory>,
     pub app_metrics: Option<MetricsQueryResult>,
+    /// Every app the council knows, with the replica count its spec asks
+    /// for: where the Instances tab's scale starts from.
+    pub desired_apps: Vec<DesiredAppEvidence>,
     pub last_updated: Option<u64>,
 }
 
@@ -171,6 +196,32 @@ pub enum Effect {
     /// Send Smoker's kill fault for one instance, as `relish fault kill`
     /// does. Only a `y` at the confirmation prompt queues it.
     KillInstance(InstanceTarget),
+    /// Set an app's replica count, if it's still `from` (#2176).
+    Scale {
+        app: String,
+        namespace: String,
+        from: u32,
+        to: u32,
+    },
+}
+
+/// A scale waiting for the person to say yes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScalePrompt {
+    pub app: String,
+    pub namespace: String,
+    pub from: u32,
+    pub to: u32,
+}
+
+impl ScalePrompt {
+    /// The question, with what undoes the answer.
+    pub fn question(&self) -> String {
+        format!(
+            "Scale {} from {} to {}? Applying its file again puts back the file's count. [y/N]",
+            self.app, self.from, self.to
+        )
+    }
 }
 
 /// Cache key for [`ClusterData::deploy_history`].
@@ -191,7 +242,8 @@ pub struct TuiApp {
     pub nodes_cursor: usize,
     pub jobs_cursor: usize,
     pub routes_cursor: usize,
-    /// The selected row in the app detail's Instances tab.
+    /// The selected row in the app detail's Instances tab, or in a node
+    /// detail's Workloads tab.
     pub instances_cursor: usize,
     /// The instance `k` asked to kill, while the `[y/N]` prompt is open.
     pub confirm_kill: Option<InstanceTarget>,
@@ -204,6 +256,8 @@ pub struct TuiApp {
     pub filter: Option<String>,
     pub filter_editing: bool,
     pub palette: Option<PaletteState>,
+    /// A scale asked for with `+` or `-`, until it's answered.
+    pub scale_prompt: Option<ScalePrompt>,
     pub status_message: Option<(String, Level)>,
     pub should_quit: bool,
     pub pending: Vec<Effect>,
@@ -240,6 +294,7 @@ impl TuiApp {
             filter: None,
             filter_editing: false,
             palette: None,
+            scale_prompt: None,
             status_message: None,
             should_quit: false,
             pending: Vec::new(),
@@ -278,6 +333,25 @@ impl TuiApp {
             .iter()
             .filter(|row| row.instance.app_name == app && row.instance.namespace == namespace)
             .collect()
+    }
+
+    /// The instances running on one node, by namespace, app and instance:
+    /// the rows of the node detail's Workloads tab.
+    pub fn node_instances(&self, node: &str) -> Vec<&ClusterInstanceStatus> {
+        let mut rows: Vec<_> = self
+            .data
+            .instances
+            .iter()
+            .filter(|row| row.node == node)
+            .collect();
+        rows.sort_by(|a, b| {
+            (&a.instance.namespace, &a.instance.app_name, &a.instance.id).cmp(&(
+                &b.instance.namespace,
+                &b.instance.app_name,
+                &b.instance.id,
+            ))
+        });
+        rows
     }
 
     /// The Instances tab's selected row, if that tab is showing and has

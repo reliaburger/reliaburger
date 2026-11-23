@@ -67,6 +67,21 @@ A source can be a job as well as an app: `allow_from = ["reports/nightly"]`
 admits every task of the `nightly` job in `reports`, including tasks that
 haven't started yet.
 
+The caller's node enforces `allow_from`, wherever the target runs: the leader
+sends every service's list to every node with the service catalogue, which
+each node fetches every two seconds. A changed list doesn't take effect
+everywhere at once, in either direction. Until it does, a caller you've just
+added is still refused and one you've just removed can still connect:
+
+- on nodes that don't run the target, a couple of seconds after
+  `relish apply` (1 to 4 s on a three-node Lima cluster);
+- on a node that runs the target, once the rolled-out instance has started
+  and registered: up to about 9 s on Lima, and up to about 45 s on a
+  Wyse 3040, where a rollout is slower.
+
+So after narrowing `allow_from`, wait for `relish apps` to show the rollout
+finished before you count on the removed caller being refused everywhere.
+
 The eBPF hooks enforce all of this, so isolation needs `[ebpf]`. `relish init`
 turns `[ebpf]` and `[dns]` on when it runs as root on Linux with `runc`
 installed, and Bun won't start a rootful runc node whose eBPF data path fails

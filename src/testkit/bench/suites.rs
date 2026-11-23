@@ -245,6 +245,7 @@ impl SuiteContext {
             deadline: self.deadline,
             peer_route: crate::testkit::context::PeerRoute::Direct,
             trace: Default::default(),
+            peer: None,
         }
     }
 }

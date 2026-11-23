@@ -2280,6 +2280,39 @@ async fn a_follower_forwards_a_rollback_to_the_leader_before_choosing_its_target
     }
 }
 
+/// A follower forwards a scale to the leader whole, body and `force`
+/// included, as the caller: the leader reads the spec it changes from its
+/// own state, which a follower's replica can lag (#2176).
+#[tokio::test]
+async fn a_follower_forwards_a_scale_to_the_leader_with_its_body() {
+    let (deployer, deployer_key) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+    let (follower, seen, nodes) = follower_of_a_recording_leader(deployer).await;
+    let body = r#"{"replicas":3}"#;
+    for path in ["/v1/scale/web/default", "/v1/scale/web/default?force=true"] {
+        let (status, reply) =
+            send_bounded(follower.clone(), "POST", path, &deployer_key, body, &[]).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{path}: {reply}");
+    }
+    let seen = seen.lock().await.clone();
+    assert_eq!(
+        seen.iter()
+            .map(|(path, ..)| path.as_str())
+            .collect::<Vec<_>>(),
+        ["/v1/scale/web/default", "/v1/scale/web/default?force=true"]
+    );
+    for (_, bearer, marked, forwarded) in &seen {
+        assert_eq!(
+            bearer.as_deref(),
+            Some(format!("Bearer {deployer_key}").as_str())
+        );
+        assert!(marked);
+        assert_eq!(forwarded, body);
+    }
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn a_follower_forwards_upgrade_control_calls_to_the_leader_with_the_callers_token() {
     let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);

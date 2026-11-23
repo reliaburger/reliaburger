@@ -1,3 +1,4 @@
 enable reliaburger-install.service
 enable systemd-networkd.service
 enable systemd-networkd-wait-online.service
+enable reliaburger-netlog.service

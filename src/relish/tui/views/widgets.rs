@@ -131,6 +131,23 @@ pub fn row(text: impl Into<String>, selected: bool) -> Line<'static> {
     }
 }
 
+/// A detail view's tab bar: every tab by name, the current one in
+/// brackets.
+pub fn tab_bar<T: std::fmt::Debug + PartialEq>(tabs: &[T], current: &T) -> Line<'static> {
+    let tabs = tabs
+        .iter()
+        .map(|item| {
+            if item == current {
+                format!("[{item:?}]")
+            } else {
+                format!(" {item:?} ")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" │ ");
+    Line::raw(tabs)
+}
+
 pub fn heading(text: impl Into<String>) -> Line<'static> {
     Line::styled(text.into(), theme::title())
 }

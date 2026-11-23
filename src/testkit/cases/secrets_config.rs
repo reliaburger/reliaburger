@@ -107,6 +107,7 @@ pub fn cases() -> Vec<TestCase> {
                 Capability::Council,
             ],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(encrypted_env_value_is_decrypted_in_workload),
         },
         TestCase {
@@ -114,6 +115,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::SecretsConfig,
             requires: &[Capability::ContainerRuntime],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(config_file_is_mounted_with_contents),
         },
         TestCase {
@@ -125,6 +127,7 @@ pub fn cases() -> Vec<TestCase> {
                 Capability::Council,
             ],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(cluster_pubkey_encrypt_roundtrip),
         },
     ]

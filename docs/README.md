@@ -213,6 +213,9 @@ never retries a failure. See [how Reliaburger is tested](testing.md).
 
 **A terminal UI and a web dashboard.** Run `relish` with no arguments for the
 TUI; `relish dashboard` opens the web UI through your authenticated CLI session.
+The TUI scales an app with `+` and `-` on its Instances tab, after asking, as
+`relish scale web --replicas 3` does from the shell. The count goes into the
+app's spec, so the next apply of its file puts back the file's count.
 
 **The manual ships in the binary.** `relish manual` is a searchable reader with
 runnable examples, and `relish source` fuzzy-searches the exact source the
@@ -723,10 +726,12 @@ for the audit, exact suite contracts and CI mapping.
 
 ### Fuzzing
 
-Every decoder that reads bytes from another machine (gossip, Raft frames, DNS,
-backups, OCI manifests, join CSRs, app and node TOML) has a
-[cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html) target in
-`fuzz/`. See [testing.md](testing.md#fuzzing).
+The decoders that read bytes from another machine (gossip, Raft frames, DNS,
+the API's bearer check, ingress requests, the netboot TFTP, DHCP and disk
+reports, backups, OCI manifests, join CSRs, app and node TOML) have
+[cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html) targets in
+`fuzz/`. See [testing.md](testing.md#fuzzing), which ranks the decoders still
+without one.
 
 ```sh
 make fuzz-corpus-check  # every target body over its checked-in corpus, on stable
@@ -952,7 +957,10 @@ already run, from packages and firewall rules to systemd units, see
 [Running Reliaburger on your own Linux servers](linux-servers.md).
 To turn spare mini PCs or thin clients into appliance nodes over the network
 instead, with no distro to install, see
-[Bare metal: the appliance and netboot](manual/17_appliance.md).
+[Bare metal: the appliance and netboot](manual/17_appliance.md). `relish
+netboot --stream-logs` prints each machine's kernel and boot logs as it
+installs and boots, so a machine with no serial port needn't be watched on its
+monitor.
 
 Keep `[cluster].name` identical on every node. `relish init`, `relish setup`
 and `relish dev create` write it for you; Bun validates it as a DNS-style SPIFFE trust domain.
@@ -1166,6 +1174,7 @@ TUI keys:
 | `/` | Filter the current list; search the logs or the Logs and Metrics tabs, matches in red and bold |
 | Escape (with a filter or search) | Clear it |
 | `k`, Ctrl-K | Kill the selected instance in the Instances tab, after a `[y/N]` prompt; it's an audited Smoker kill fault |
+| `+`, `-` | Scale the app in the Instances tab up or down by one, after a `[y/N]` prompt; the next apply of its file puts back the file's count |
 | `f` | Toggle log following |
 | Escape, `q` | Go back; quit from the dashboard |
 
@@ -1855,9 +1864,9 @@ that gossip reports dead is named rather than silently left out.
 (`--app`, `--severity`, `--limit`). `relish exec <app> <cmd>` runs a command
 once, without stdin or a terminal, and exits with its exit code. `relish
 resolve <name> --namespace <ns>` picks a service whose name exists in several
-namespaces. `-o json` works on every command except the eight interactive
+namespaces. `-o json` works on every command except the nine interactive
 ones (`tui`, `dashboard`, `manual`, `source`, the guided `setup`, `dev
-shell`, `machines claim`, `netboot`), which refuse it with exit 2; `setup --quickstart` and `setup --ssh`
+shell`, `machines claim`, `machines logs`, `netboot`), which refuse it with exit 2; `setup --quickstart` and `setup --ssh`
 print what they built, for an agent to quote; `logs` and `batch watch` print one object per line,
 and a command that changes something reports what it did (manual chapter
 13). `relish fmt` keeps comments.
@@ -2030,8 +2039,11 @@ machines.
   the first failure, writes the records and a rule-of-three summary
   (`DIR.md`), and deletes the VM and checkout (`--keep` keeps them). It
   refuses `reliaburger-test`, an existing VM and a dirty checkout.
-- `scripts/release/nightly-qualify.sh --train release-X-Y-Z`
-  runs the long tiers on a train's tip every night: the power-cut and reboot
+- `scripts/release/nightly-qualify.sh --once --train release-X-Y-Z`
+  arms one night, the evening before a planned freeze: a launchd job that
+  builds and stages the train's tip at the cut-off, runs the long tiers
+  overnight and disarms itself (`--disarm` cancels; `--dispatch` instead of
+  `--once` starts the same night now). A night runs the power-cut and reboot
   runs, then the V02 and jobs fast soaks against a staged build of the tip,
   then the job final when the release needs the full gate, which it works
   out with `release_tier.py` (`--gate full` can raise it, never lower it).

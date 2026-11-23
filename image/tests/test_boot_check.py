@@ -6,9 +6,9 @@ keeps, and bun's own stderr goes to the journal. So the failure path prints
 the tail of `reliaburger.service`'s journal to the console, where
 `seeded-pair.sh` and the other QEMU tests record it.
 
-A counted boot, a new OS version on trial, gets 120 s and then reboots, so
-three failed tries fall back in minutes. Any other boot gets 300 s and
-doesn't reboot. `BOOT_CHECK_EFIVARS` points the check at a stand-in for
+A counted boot, a new OS version on trial, gets 90 s and then reboots, so
+three failed tries fall back in minutes even on a Wyse 3040 (#2143). Any
+other boot gets 300 s and doesn't reboot. `BOOT_CHECK_EFIVARS` points the check at a stand-in for
 `/sys/firmware/efi/efivars`, where systemd-boot says a boot is counted.
 
 The budget is counted in seconds since boot, not by the wall clock: a
@@ -95,21 +95,38 @@ class BootCheckTests(unittest.TestCase):
         self.assertNotIn("reboot", calls)
         self.assertNotIn("counted boot failed", result.stdout)
 
-    def test_a_counted_boot_waits_two_minutes_then_reboots(self):
+    def test_a_counted_boot_waits_90_seconds_then_reboots(self):
         result, calls = self.run_boot_check(counted=True)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("reliaburger: bun not healthy after 120 s", result.stdout)
+        self.assertIn("reliaburger: bun not healthy after 90 s", result.stdout)
         self.assertIn("reliaburger: counted boot failed, rebooting", result.stdout)
         self.assertIn("reboot", calls)
 
     def test_a_clock_jumping_forward_leaves_a_counted_boot_its_budget(self):
         # bun answers on the third try, 20 s in, while the wall clock leaps
-        # a day per reading. Timed by `date`, the 120 s would be gone at the
+        # a day per reading. Timed by `date`, the 90 s would be gone at the
         # first leap and a good update would reboot and fall back.
         result, calls = self.run_boot_check(counted=True, healthy_after=5)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("reliaburger: bun healthy", result.stdout)
         self.assertNotIn("reboot", calls)
+
+    def test_a_slow_but_healthy_wyse_keeps_its_update(self):
+        # The slowest healthy start we know: a Wyse 3040 on a LAN with no
+        # NTP server spends the whole 30 s clock wait, then bun takes up to
+        # 38 s. Each failed poll is two curls and a 10 s sleep, so the 15th
+        # curl answers 70 s into the check.
+        result, calls = self.run_boot_check(counted=True, healthy_after=15)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("reliaburger: bun healthy", result.stdout)
+        self.assertNotIn("reboot", calls)
+
+    def test_a_bun_still_silent_after_90_seconds_fails_the_try(self):
+        # Answering 100 s in is too late for a counted boot.
+        result, calls = self.run_boot_check(counted=True, healthy_after=21)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("reliaburger: bun not healthy after 90 s", result.stdout)
+        self.assertIn("reboot", calls)
 
 
 class BootCheckUnitTests(unittest.TestCase):

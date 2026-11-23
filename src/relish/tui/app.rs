@@ -94,6 +94,8 @@ impl TuiApp {
                 }
                 Err(error) => self.mark_disconnected(error.to_string()),
             },
+            DataUpdate::DesiredApps(result) => set_data!(result, desired_apps),
+            DataUpdate::Scaled { app, to, result } => self.scaled(&app, to, result),
             DataUpdate::InstanceKilled { target, result } => self.killed(target, result),
         }
     }
@@ -241,6 +243,7 @@ mod tests {
                 status_age_ms: None,
                 age_seconds: None,
                 image: None,
+                data_on_node: false,
                 reason: None,
             },
         });
@@ -374,6 +377,72 @@ mod tests {
         app.update(key(KeyCode::Left));
         // Wraps round, as Shift-Tab does.
         assert_eq!(tab(&app), DetailTab::Config);
+    }
+
+    // Enter on a node opens its page; the arrows and Tab switch its tabs,
+    // and Esc goes back to the list (#2170).
+    #[test]
+    fn enter_opens_a_node_and_the_arrows_switch_its_tabs() {
+        let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);
+        app.update(key(KeyCode::Char('n')));
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Enter));
+        let tab = |app: &TuiApp| match app.view() {
+            View::NodeDetail { node, tab } => {
+                assert_eq!(node, "node-2");
+                *tab
+            }
+            other => panic!("left the node page for {other:?}"),
+        };
+        assert_eq!(tab(&app), NodeTab::Overview);
+        app.update(key(KeyCode::Right));
+        assert_eq!(tab(&app), NodeTab::Workloads);
+        app.update(key(KeyCode::Tab));
+        assert_eq!(tab(&app), NodeTab::Maintenance);
+        app.update(key(KeyCode::Right));
+        assert_eq!(tab(&app), NodeTab::Overview, "wraps round");
+        app.update(key(KeyCode::Left));
+        assert_eq!(tab(&app), NodeTab::Maintenance);
+        assert!(app.pending.is_empty(), "node tabs fetch nothing");
+        app.update(key(KeyCode::Esc));
+        assert_eq!(app.view(), &View::Nodes);
+    }
+
+    #[test]
+    fn enter_on_a_workload_opens_its_app() {
+        let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);
+        app.view_stack.push(View::NodeDetail {
+            node: "node-2".into(),
+            tab: NodeTab::Workloads,
+        });
+        // node-2 runs app-2-1, web-1 and worker-1, in that order.
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Down));
+        app.update(key(KeyCode::Down));
+        assert_eq!(app.instances_cursor, 2, "stops at the last row");
+        app.update(key(KeyCode::Up));
+        app.update(key(KeyCode::Enter));
+        assert_eq!(
+            app.view(),
+            &View::AppDetail {
+                app: "web".into(),
+                namespace: "default".into(),
+                tab: DetailTab::Overview,
+            }
+        );
+        app.update(key(KeyCode::Esc));
+        assert!(matches!(app.view(), View::NodeDetail { .. }));
+    }
+
+    #[test]
+    fn k_on_the_workloads_tab_does_nothing() {
+        let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);
+        app.view_stack.push(View::NodeDetail {
+            node: "node-1".into(),
+            tab: NodeTab::Workloads,
+        });
+        app.update(key(KeyCode::Char('k')));
+        assert_eq!(app.confirm_kill, None, "the node page is read-only");
     }
 
     #[test]

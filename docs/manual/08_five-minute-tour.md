@@ -43,6 +43,9 @@ builds the Dockerfile with Buildah, pushes the result into Pickle as
 laptop, no registry account, no `docker login`. The first build pulls the Go
 toolchain image, so give it a minute; after that it takes seconds.
 
+On a cluster of bare-metal appliances, no node has Buildah, so build the
+burger on your laptop and push it instead ([Bare metal](17_appliance.md#take-the-tour)).
+
 Builds target `linux/amd64` and `linux/arm64` by default. The Dockerfile
 cross-compiles: its Go stage runs on the builder's own architecture and tells
 the compiler which one to target, so neither platform needs an emulator.

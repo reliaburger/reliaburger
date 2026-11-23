@@ -942,7 +942,7 @@ fn retire_children(owner: &mut OwnedChild) -> io::Result<bool> {
 mod tests {
     use super::*;
 
-    fn record(boot_id: String) -> OwnerRecord {
+    pub(super) fn record(boot_id: String) -> OwnerRecord {
         use super::super::oci::{OciLinux, OciProcess, OciRoot, OciSpec, OciUser};
         OwnerRecord {
             schema: 3,

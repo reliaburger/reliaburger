@@ -4,11 +4,15 @@ use crossterm::event::{KeyCode, KeyEvent};
 
 use super::keys::key_to_action;
 use super::palette::{PaletteCommand, parse_command};
-use super::state::{DetailTab, Effect, Level, SearchHit, TuiApp, View};
+use super::state::{DetailTab, Effect, Level, NodeTab, SearchHit, TuiApp, View};
 
 impl TuiApp {
     pub(super) fn handle_key(&mut self, key: KeyEvent) {
-        if self.confirm_kill.is_some() {
+        // An open question takes the next key, whatever it is, so `q`
+        // there says no rather than leaving the view.
+        if self.scale_prompt.is_some() {
+            self.answer_scale_prompt(key);
+        } else if self.confirm_kill.is_some() {
             self.handle_confirm_kill_key(key);
         } else if self.palette.is_some() {
             self.handle_palette_key(key);
@@ -20,7 +24,9 @@ impl TuiApp {
             // Esc clears a search before it goes back, so the view you
             // searched in stays open.
             self.filter = None;
-        } else if let Some(action) = key_to_action(key) {
+        } else if !self.handle_scale_key(key)
+            && let Some(action) = key_to_action(key)
+        {
             let action = if action == super::keys::KeyAction::Refresh
                 && matches!(
                     self.view(),
@@ -183,6 +189,7 @@ impl TuiApp {
                         context: node.address.clone(),
                         target: View::NodeDetail {
                             node: node.node_id.clone(),
+                            tab: NodeTab::Overview,
                         },
                     });
                 }

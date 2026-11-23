@@ -14,6 +14,7 @@ use super::dhcp::{self, DhcpContext, ListenPort};
 use super::http::{self, HttpState};
 use super::installed::{InstallTickets, InstalledRecord, RECORD_FILE, chain_script};
 use super::interface::{self, Interface, udp_socket};
+use super::netlog::{self, NETLOG_PORT, SharedPeers};
 use super::tftp::{self, Outcome, TftpFiles, TftpSettings};
 use super::wipe::{self, DiskSession, Question};
 use super::{DhcpSetup, IpxeBuild, Log, MacAddress, NetbootError, NetbootOptions};
@@ -58,6 +59,15 @@ pub async fn run(options: NetbootOptions) -> Result<(), NetbootError> {
     let listener = TcpListener::bind(SocketAddrV4::new(server, options.http_port))
         .await
         .map_err(|e| interface::bind_error("HTTP", options.http_port, e))?;
+    let netlog_socket = if options.stream_logs {
+        Some(udp_socket(
+            "the boot log listener",
+            SocketAddrV4::new(server, NETLOG_PORT),
+            None,
+        )?)
+    } else {
+        None
+    };
     // BLOCKING-OK: relish netboot: read once at start, before it serves anything
     let record = InstalledRecord::load(&options.directory.join(RECORD_FILE))?;
 
@@ -82,19 +92,41 @@ pub async fn run(options: NetbootOptions) -> Result<(), NetbootError> {
         question_timeout: wipe::QUESTION_TIMEOUT,
         disks: Mutex::new(DiskSession::default()),
         installs: Mutex::new(InstallTickets::default()),
+        netlog: options
+            .stream_logs
+            .then_some(SocketAddrV4::new(server, NETLOG_PORT)),
         log: log.clone(),
     });
     let http_state = state.clone();
 
-    let (dhcp_context, dhcp_log) = (context.clone(), log.clone());
+    let peers = SharedPeers::default();
+    let (dhcp_context, dhcp_log, dhcp_peers) = (context.clone(), log.clone(), peers.clone());
     let dhcp_task = async move {
         match dhcp_socket {
-            Some(socket) => dhcp_loop(socket, ListenPort::Dhcp, dhcp_context, dhcp_log).await,
+            Some(socket) => {
+                dhcp_loop(socket, ListenPort::Dhcp, dhcp_context, dhcp_log, dhcp_peers).await
+            }
             // Never finishes, so the select! below never picks it.
             None => std::future::pending().await,
         }
     };
-    let proxy_task = dhcp_loop(proxy_socket, ListenPort::ProxyDhcp, context, log.clone());
+    let proxy_task = dhcp_loop(
+        proxy_socket,
+        ListenPort::ProxyDhcp,
+        context,
+        log.clone(),
+        peers.clone(),
+    );
+    // Its lines go through the same `log` as the servers' own, so they
+    // print the same way, among them.
+    let directory = options.directory.clone();
+    let netlog_log = log.clone();
+    let netlog_task = async move {
+        match netlog_socket {
+            Some(socket) => netlog::listen(socket, peers, Some(directory), netlog_log).await,
+            None => std::future::pending().await,
+        }
+    };
     let tftp_log = log.clone();
     let tftp_task = tftp::serve(
         tftp_socket,
@@ -113,6 +145,7 @@ pub async fn run(options: NetbootOptions) -> Result<(), NetbootError> {
         result = proxy_task => Err(failed("ProxyDHCP", result)),
         result = tftp_task => Err(failed("TFTP", result)),
         result = http_task => Err(failed("HTTP", result)),
+        result = netlog_task => Err(failed("boot log", result)),
     };
     log(format!("relish netboot: {}", stopped?));
     Ok(())
@@ -383,8 +416,16 @@ async fn dhcp_loop(
     port: ListenPort,
     context: Arc<DhcpContext>,
     log: Log,
+    peers: SharedPeers,
 ) -> std::io::Result<()> {
-    dhcp::serve(Arc::new(socket), port, context, move |line| log(line)).await
+    dhcp::serve(
+        Arc::new(socket),
+        port,
+        context,
+        move |line| log(line),
+        move |address, mac| netlog::learn(&peers, address, mac),
+    )
+    .await
 }
 
 /// What TFTP serves: iPXE for each architecture and the chain script.
@@ -538,6 +579,16 @@ fn print_summary(
         println!(
             "  --wipe: wiping the disk of {} without asking",
             macs.join(", ")
+        );
+    }
+    if options.stream_logs {
+        println!(
+            "  --stream-logs: installs send their boot logs to {server}:{NETLOG_PORT}; they print here as log <mac>: and go to {}",
+            options
+                .directory
+                .join(netlog::LOGS_DIRECTORY)
+                .join("<mac>.log")
+                .display()
         );
     }
     if std::io::stdin().is_terminal() {

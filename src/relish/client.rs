@@ -355,6 +355,20 @@ pub fn lease_release_budget() -> std::time::Duration {
 /// the owning node (its agent's answer plus the release wait).
 pub const FAULT_CLEAR_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 /// Pause between those attempts.
+/// The status relish reports for a stream's `Error` event that names none:
+/// one from a server before #2157, or a failure with no status of its own.
+const STREAM_ERROR_STATUS: u16 = 500;
+
+/// The error an apply or rollback stream ended with. The stream answered
+/// `200` before the failure, so the event carries the status the failure
+/// answers on its own (404 for an image nobody built, #2157).
+fn stream_error(message: String, status: Option<u16>) -> RelishError {
+    RelishError::ApiError {
+        status: status.unwrap_or(STREAM_ERROR_STATUS),
+        body: message,
+    }
+}
+
 const FAULT_CLEAR_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Attach an `Idempotency-Key` header when the caller has one.
@@ -1460,11 +1474,8 @@ impl BunClient {
                                 instances: instances.clone(),
                             });
                         }
-                        ApplyEvent::Error { message } => {
-                            return Err(RelishError::ApiError {
-                                status: 500,
-                                body: message.clone(),
-                            });
+                        ApplyEvent::Error { message, status } => {
+                            return Err(stream_error(message.clone(), *status));
                         }
                     }
                 }
@@ -1481,11 +1492,8 @@ impl BunClient {
                 ApplyEvent::Complete { created, instances } => {
                     result = Some(ApplyResult { created, instances });
                 }
-                ApplyEvent::Error { message } => {
-                    return Err(RelishError::ApiError {
-                        status: 500,
-                        body: message,
-                    });
+                ApplyEvent::Error { message, status } => {
+                    return Err(stream_error(message, status));
                 }
                 _ => {}
             }
@@ -1522,7 +1530,40 @@ impl BunClient {
         let response = self
             .start_stream(self.lease_header(self.streaming_http()?.post(&url)))
             .await?;
+        self.follow_apply_events(response).await
+    }
 
+    /// Set an app's replica count (`POST /v1/scale/{app}/{namespace}`),
+    /// printing the leader's progress on stderr as an apply does. With
+    /// `current_replicas`, the scale is refused if the app has another
+    /// count now; with `force`, it changes an app GitOps manages.
+    pub async fn scale(
+        &self,
+        app: &str,
+        namespace: &str,
+        replicas: u32,
+        current_replicas: Option<u32>,
+        force: bool,
+    ) -> Result<(), RelishError> {
+        let url = format!(
+            "{}{}{}",
+            self.base_url,
+            app_path("/v1/scale", app, namespace)?,
+            force_query(force)
+        );
+        let mut body = serde_json::json!({ "replicas": replicas });
+        if let Some(current) = current_replicas {
+            body["current_replicas"] = current.into();
+        }
+        let response = self
+            .start_stream(self.lease_header(self.streaming_http()?.post(&url).json(&body)))
+            .await?;
+        self.follow_apply_events(response).await
+    }
+
+    /// Read an apply-shaped progress stream to its end: progress on stderr,
+    /// and the first error as the result.
+    async fn follow_apply_events(&self, response: reqwest::Response) -> Result<(), RelishError> {
         let status = response.status().as_u16();
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -1542,11 +1583,8 @@ impl BunClient {
                 {
                     match event {
                         ApplyEvent::Progress { message } => eprintln!("  {message}"),
-                        ApplyEvent::Error { message } => {
-                            return Err(RelishError::ApiError {
-                                status: 500,
-                                body: message,
-                            });
+                        ApplyEvent::Error { message, status } => {
+                            return Err(stream_error(message, status));
                         }
                         _ => {}
                     }
@@ -4403,6 +4441,7 @@ mod tests {
         let event = format!(
             "data: {}\n\n",
             serde_json::to_string(&ApplyEvent::Error {
+                status: None,
                 message: message.to_string(),
             })
             .unwrap()
@@ -4434,6 +4473,116 @@ mod tests {
         server.abort();
         for error in [applied, rolled_back] {
             assert!(matches!(error, RelishError::ApiError { body, .. } if body == message));
+        }
+    }
+
+    /// `scale` posts the count (and the one the caller saw, when given) as
+    /// JSON, with `force` as the query, and reads the answer as an apply's
+    /// stream: an error event is the result (#2176).
+    #[tokio::test]
+    async fn scale_posts_the_count_and_reads_the_stream() {
+        use axum::{Router, routing::post};
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+        let recorder = Arc::clone(&seen);
+        let handler = move |uri: axum::http::Uri, body: String| {
+            let recorder = Arc::clone(&recorder);
+            async move {
+                let refuse = body.contains("\"replicas\":9");
+                recorder.lock().unwrap().push((uri.to_string(), body));
+                let event = if refuse {
+                    ApplyEvent::Error {
+                        message: "refused by the cluster".into(),
+                        status: None,
+                    }
+                } else {
+                    ApplyEvent::Progress {
+                        message: "app web: committed to the cluster".into(),
+                    }
+                };
+                format!("data: {}\n\n", serde_json::to_string(&event).unwrap())
+            }
+        };
+        let app = Router::new().route("/v1/scale/web/default", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = BunClient::new_with_token(&format!("http://{address}"), None);
+
+        client
+            .scale("web", "default", 3, None, false)
+            .await
+            .unwrap();
+        client
+            .scale("web", "default", 4, Some(3), true)
+            .await
+            .unwrap();
+        let refused = client
+            .scale("web", "default", 9, None, false)
+            .await
+            .unwrap_err();
+        server.abort();
+        assert!(
+            matches!(&refused, RelishError::ApiError { body, .. } if body == "refused by the cluster"),
+            "{refused:?}"
+        );
+        let seen = seen.lock().unwrap().clone();
+        let bodies: Vec<serde_json::Value> = seen
+            .iter()
+            .map(|(_, body)| serde_json::from_str(body).unwrap())
+            .collect();
+        assert_eq!(seen[0].0, "/v1/scale/web/default");
+        assert_eq!(bodies[0], serde_json::json!({ "replicas": 3 }));
+        assert_eq!(seen[1].0, "/v1/scale/web/default?force=true");
+        assert_eq!(
+            bodies[1],
+            serde_json::json!({ "replicas": 4, "current_replicas": 3 })
+        );
+    }
+
+    /// Serve `data` as the one event of every apply and rollback stream, and
+    /// return the errors `relish apply` and `relish rollback` end with.
+    async fn stream_errors_for(data: &str) -> Vec<RelishError> {
+        use axum::{Router, routing::post};
+        let event = format!("data: {data}\n\n");
+        let handler = move || {
+            let event = event.clone();
+            async move { event }
+        };
+        let app = Router::new()
+            .route("/v1/apply", post(handler.clone()))
+            .route("/v1/rollback/web/default", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = BunClient::new_with_token(&format!("http://{address}"), None);
+        let applied = client.apply(&Config::default()).await.unwrap_err();
+        let rolled_back = client.rollback("web", "default").await.unwrap_err();
+        server.abort();
+        vec![applied, rolled_back]
+    }
+
+    /// #2157: a stream's error names the status the server gave it, not 500.
+    #[tokio::test]
+    async fn a_streamed_error_reports_the_status_it_carries() {
+        let data = serde_json::to_string(&ApplyEvent::Error {
+            message: "burger:v1 isn't in this cluster's registry (Pickle)".into(),
+            status: Some(404),
+        })
+        .unwrap();
+
+        for error in stream_errors_for(&data).await {
+            assert_eq!(
+                error.to_string(),
+                "API error (status 404): burger:v1 isn't in this cluster's registry (Pickle)"
+            );
+        }
+    }
+
+    /// A server from before #2157 sends no status: relish says 500, as it did.
+    #[tokio::test]
+    async fn a_streamed_error_with_no_status_still_reports_500() {
+        for error in stream_errors_for(r#"{"type":"Error","message":"boom"}"#).await {
+            assert_eq!(error.to_string(), "API error (status 500): boom");
         }
     }
 

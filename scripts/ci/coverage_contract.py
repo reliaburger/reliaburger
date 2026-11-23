@@ -298,6 +298,26 @@ def workflow_context(row):
             'invalid current workflow identity',
         )
 
+def prebuild_order(stages):
+    """Return the build-only stages after checking they cannot add a profile.
+
+    The lib tests build alone before the run (#1723, #1943). cargo-llvm-cov
+    keeps --no-run for itself, so such a stage lists its tests and runs none,
+    and a profraw-only clean after it drops the listing's profile before the
+    one instrumented run, whose profiles alone the report then reads.
+    """
+    run = [i for i, command in enumerate(stages) if command[2:4] == ['--no-report', 'nextest']]
+    c.require(len(run) == 1, 'coverage must have exactly one instrumented portable execution')
+    builds = [i for i, command in enumerate(stages) if command[2:4] == ['--no-report', 'test']]
+    for i in builds:
+        c.require(stages[i][-2:] == ['--', '--list'], 'a coverage build stage may only list its tests')
+        c.require(i < run[0], 'a coverage build stage must come before the instrumented run')
+        c.require(
+            any(stages[j][2:] == ['clean', '--profraw-only'] for j in range(i + 1, run[0])),
+            'a coverage build stage must drop its listing profraw before the run',
+        )
+    return [stages[i] for i in builds]
+
 def owner_completion(receipt, expected, child_path):
     """Require one successful instrumented child and all original coverage stages.
 
@@ -373,6 +393,7 @@ def owner_completion(receipt, expected, child_path):
         sum((command[:4] in (['cargo', 'llvm-cov', '--no-report', 'nextest'], [expected['tools']['coverage']['path'], 'llvm-cov', '--no-report', 'nextest']) for command in expected['stages'])) == 1,
         'coverage must have exactly one instrumented portable execution',
     )
+    prebuild_order(expected['stages'])
     c.require(
         any(('--fail-under-lines=78.65' in command or ('--fail-under-lines' in command and command[command.index('--fail-under-lines') + 1:command.index('--fail-under-lines') + 2] == ['78.65']) for command in expected['stages'])),
         'existing line floor missing or changed',

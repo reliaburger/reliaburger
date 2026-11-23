@@ -105,3 +105,38 @@ path = "fuzz_targets/council_backup_state.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "ingress_request"
+path = "fuzz_targets/ingress_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tftp_packet"
+path = "fuzz_targets/tftp_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dhcp_request"
+path = "fuzz_targets/dhcp_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "netboot_disk_report"
+path = "fuzz_targets/netboot_disk_report.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_bearer"
+path = "fuzz_targets/api_bearer.rs"
+test = false
+doc = false
+bench = false

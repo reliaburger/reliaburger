@@ -459,6 +459,38 @@ async fn a_persons_write_meets_a_lease_and_breaks_it_only_when_asked() {
     assert_eq!(broken[0].details["token_name"], "alice");
 }
 
+/// Someone else's lease refuses a person's scale too, naming the holder,
+/// until they break it (#2176).
+#[tokio::test]
+async fn a_persons_scale_meets_a_lease_and_breaks_it_only_when_asked() {
+    let cluster = cluster("lease-fence-scale").await;
+    cluster.seed_web().await;
+    cluster.take(&cluster.holmes, WEB, "investigating").await;
+    let scale = r#"{"replicas":5}"#.to_string();
+    let (status, body) = cluster
+        .post_breaking("/v1/scale/web/shop", &cluster.alice, scale.clone(), false)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "lease_held");
+    assert_eq!(body["lease"]["holder"], "holmes");
+    let web = crate::meat::AppId::new("web", "shop");
+    assert_eq!(
+        cluster.council.desired_state().await.apps[&web].replicas,
+        crate::config::Replicas::Fixed(2)
+    );
+
+    let (status, body) = cluster
+        .post_breaking("/v1/scale/web/shop", &cluster.alice, scale, true)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let desired = cluster.council.desired_state().await;
+    assert_eq!(
+        desired.apps[&web].replicas,
+        crate::config::Replicas::Fixed(5)
+    );
+    assert!(desired.agent_leases.leases.is_empty());
+}
+
 /// A namespace lease holds back a write to any app in it, and a malformed
 /// break-lease header is refused rather than ignored.
 #[tokio::test]

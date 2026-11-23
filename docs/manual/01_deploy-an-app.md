@@ -435,6 +435,7 @@ relish exec web env              # run a command once inside an instance; exits 
 relish events --app web          # the cluster's recent events for one app
 relish top                       # every workload on every node, with CPU and memory
 relish inspect web               # every instance on every node, desired vs running
+relish scale web --replicas 3    # set the count; the next apply of the file puts back its count
 relish stop web                  # scale to zero; `relish apply` starts it again
 relish delete web                # remove the app from the cluster
 ```
@@ -450,6 +451,40 @@ In a cluster, `relish stop` and `relish delete` return as soon as the council
 has recorded the change. Each node then retires its instances on its own, and
 a node that's unreachable does so when it comes back. Run `relish apps web` (or
 `relish inspect web`) to watch the instances go.
+
+### Scaling without editing the file
+
+`relish scale web --replicas 3` sets the app's count in the cluster. It
+changes the spec the council holds, the same one `relish apply` writes, and
+leaves the rest of the spec alone: the image stays the digest it was bound
+to. It isn't an override. Apply the file again and the file's count comes
+back, and until you do, `relish apply app.toml --dry-run` shows the app as
+changed. If the new count should stay, put it in the file.
+
+```sh
+relish scale web --replicas 3
+relish scale web --replicas 2 --current-replicas 3   # only if nobody changed it since you looked
+```
+
+A few things have no count to set, and `relish scale` refuses them:
+
+- **Zero.** An app runs at least 1 replica; `relish stop web` takes it to
+  zero and keeps its count for the next start. Scaling a stopped app starts
+  it again with the new count.
+- **An autoscaled app.** The autoscaler owns the count; change `min` and
+  `max` under `[app.web.autoscale]` instead.
+- **A daemon set** (`replicas = "*"`), which runs one replica on every node.
+- **An app GitOps manages**, unless you pass `--force`. The next sync puts
+  back the repository's count, so change the repository instead.
+
+A scale needs a `deployer` token with the `scale` permission on the app, the
+same as `relish stop`, and an agent's lease on the app refuses it, naming the
+holder, unless you pass `--break-lease`. It's audited as `app.scaled`, with
+the old and new counts. In the terminal UI (`relish tui`), the app's
+Instances tab does the same with `+` and `-`, after asking
+`Scale web from 2 to 3? Applying its file again puts back the file's count. [y/N]`.
+A standalone node has no cluster state to change, so there you edit
+`replicas` and apply.
 
 A delete followed straight away by an apply of the same file may not restart
 anything. A node that hasn't acted on the delete yet sees the app come back

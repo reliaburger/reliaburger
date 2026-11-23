@@ -109,11 +109,15 @@ async fn collect(store: &mut MayoStore, keys: &[MetricKey], from: u64, minutes: 
 /// four hours of history takes tens of seconds on a loaded host, long enough
 /// for the newest samples to fall outside the alert read's 90-second
 /// freshness bound if it read the clock itself (#763).
-async fn periodic_cycle(store: &MayoStore, rollups: &RollupGenerator, now: u64) -> (usize, isize) {
+async fn periodic_cycle(
+    store: &tokio::sync::RwLock<MayoStore>,
+    rollups: &RollupGenerator,
+    now: u64,
+) -> (usize, isize) {
     let before = LIVE.load(Ordering::Relaxed);
     PEAK.store(before, Ordering::Relaxed);
     let latest = gather_latest_values(store, now).await;
-    let rollup = rollups.generate(store, now).await.unwrap();
+    let rollup = rollups.generate(&*store.read().await, now).await.unwrap();
     assert!(!latest.is_empty(), "the alert read found no fresh series");
     assert!(!rollup.entries.is_empty(), "the rollup found no samples");
     drop((latest, rollup));
@@ -128,7 +132,7 @@ async fn periodic_reads_stay_flat_as_history_grows() {
         return;
     }
     let directory = tempfile::tempdir().unwrap();
-    let mut store = MayoStore::new(directory.path().to_path_buf());
+    let mut store = tokio::sync::RwLock::new(MayoStore::new(directory.path().to_path_buf()));
     let keys = series_keys();
     let rollups = RollupGenerator::new(NodeId::new("node-1"));
 
@@ -146,7 +150,7 @@ async fn periodic_reads_stay_flat_as_history_grows() {
     let mut measured = Vec::new();
     for block in 0..BLOCKS {
         let from = current_minute - (block + 1) * BLOCK_MINUTES * 60;
-        collect(&mut store, &keys, from, BLOCK_MINUTES).await;
+        collect(store.get_mut(), &keys, from, BLOCK_MINUTES).await;
         let hours = block + 1;
         let (peak, retained) = periodic_cycle(&store, &rollups, now).await;
         println!(
@@ -392,9 +396,11 @@ async fn object_store_reads_stay_flat_as_history_grows() {
     let directory = tempfile::tempdir().unwrap();
     let bucket = tempfile::tempdir().unwrap();
     let url = url::Url::from_file_path(bucket.path()).unwrap().to_string();
-    let mut store = MayoStore::open(directory.path().to_path_buf(), Some(&url))
-        .await
-        .unwrap();
+    let mut store = tokio::sync::RwLock::new(
+        MayoStore::open(directory.path().to_path_buf(), Some(&url))
+            .await
+            .unwrap(),
+    );
     let keys = series_keys();
     let rollups = RollupGenerator::new(NodeId::new("node-1"));
     const BLOCK_MINUTES: u64 = 60;
@@ -412,7 +418,7 @@ async fn object_store_reads_stay_flat_as_history_grows() {
         // Newest first, as in the periodic test, so every block's reads find
         // the current minute's samples.
         let from = current_minute - (block + 1) * BLOCK_MINUTES * 60;
-        collect(&mut store, &keys, from, BLOCK_MINUTES).await;
+        collect(store.get_mut(), &keys, from, BLOCK_MINUTES).await;
         let hours = block + 1;
         let (peak, _) = periodic_cycle(&store, &rollups, now).await;
         cycles.push((hours, peak));
@@ -420,6 +426,7 @@ async fn object_store_reads_stay_flat_as_history_grows() {
         let since = now - 120;
         assert!(
             !store
+                .get_mut()
                 .query_names_since(&top_names, since)
                 .await
                 .unwrap()
@@ -427,7 +434,7 @@ async fn object_store_reads_stay_flat_as_history_grows() {
         );
         top.push((
             hours,
-            peak_of(store.query_names_since(&top_names, since)).await,
+            peak_of(store.get_mut().query_names_since(&top_names, since)).await,
         ));
     }
 

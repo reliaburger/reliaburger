@@ -6,19 +6,19 @@ expression: "render_to_string(&app, 120, 40)"
                                                                                                                         
 ┌node detail───────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │node-1                                                                                                                │
-│address          10.0.0.1:9118                                                                                        │
-│state            alive                                                                                                │
-│incarnation      1                                                                                                    │
-│council          true                                                                                                 │
-│leader           true                                                                                                 │
-│labels           zone=z1                                                                                              │
-│version          0.3.1                                                                                                │
-│cpu              12%                                                                                                  │
-│memory           25%                                                                                                  │
-│disk             30%                                                                                                  │
-│allocated        cpu 25% mem 25%                                                                                      │
-│council term     4                                                                                                    │
-│last applied     None                                                                                                 │
+│ Overview  │  Workloads  │ [Maintenance]                                                                              │
+│←/→ or Tab: switch tabs                                                                                               │
+│                                                                                                                      │
+│If node-1 went away (a reboot, an OS update, a decommission):                                                         │
+│                                                                                                                      │
+│council   a voter: 2 of 3 voters would still answer, enough for quorum                                                │
+│                                                                                                                      │
+│APP     NAMESPACE  HERE  READY ELSEWHERE  IMPACT            DATA                                                      │
+│app-2   default       1                1  loses redundancy  -                                                         │
+│web     default       1                1  loses redundancy  -                                                         │
+│worker  default       1                1  loses redundancy  -                                                         │
+│                                                                                                                      │
+│                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
