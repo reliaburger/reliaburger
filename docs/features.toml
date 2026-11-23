@@ -66,7 +66,7 @@ summary = "One command installs `relish` and builds a three-node cluster of Linu
 restrictions = "Needs a Mac with Apple silicon, or Linux with QEMU and KVM, plus about 8 GiB of free memory and 15 GiB of disk. For development and home labs, not production."
 issues = [1495]
 docs = ["docs/manual/00_getting-started.md#a-cluster-on-your-laptop", "docs/quickstart.md"]
-evidence = "Every gate run installs this way: two staged installs passed on 0.2.7 (qualification/2026-11-07-v0.2.7-staged-install-apple-silicon.md), and every soak runs on a quickstart cluster. #1495 (Lima QEMU abort with user-v2 networking) is open with no milestone."
+evidence = "Every gate run installs this way: two staged installs passed on 0.2.7 (qualification/2026-11-07-v0.2.7-staged-install-apple-silicon.md), and every soak runs on a quickstart cluster. On Linux, QEMU 10.2 and later abort under Lima's user-v2 network while io_uring is enabled (#1495, reproduced 23 Nov 2026 on Fedora with QEMU 10.2.2 and 11.1.3); setup refuses that combination and names the sysctl that avoids it."
 
 [[group.feature]]
 name = "Cluster on Linux machines over SSH"

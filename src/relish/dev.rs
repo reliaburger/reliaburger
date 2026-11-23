@@ -781,6 +781,11 @@ pub async fn create(
         eprintln!("  Linux:  https://lima-vm.io/docs/installation/");
         return Err(RelishError::LimaNotFound);
     }
+    // The nodes share Lima's user-v2 network, which some QEMU builds abort on (#1495).
+    #[cfg(target_os = "linux")]
+    crate::relish::quickstart::preflight::qemu()
+        .await
+        .map_err(|error| invalid_input(format!("{error:#}")))?;
 
     if state_path(name).exists() {
         return Err(RelishError::DevClusterAlreadyExists {

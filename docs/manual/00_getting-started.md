@@ -26,6 +26,22 @@ installer only explains the choices and installs nothing. A laptop cluster is
 for development: until 1.0.0, Reliaburger is good enough for home labs and dev
 clusters, not production.
 
+On Linux, QEMU 10.2 and later abort as soon as the VMs talk to each other
+over Lima's `user-v2` network, with `net_fill_rstate: Assertion 'size == 0'
+failed`, while io_uring is open to ordinary users
+([#1495](https://github.com/reliaburger/reliaburger/issues/1495)). Rolling
+distributions such as Arch and Fedora 45 ship QEMU 11.1. Setup, `relish local
+start` and `relish dev create` refuse that combination and say so. To get past
+it, keep io_uring for root, and QEMU quietly does without it:
+
+```sh
+sudo sysctl -w kernel.io_uring_disabled=1
+echo 'kernel.io_uring_disabled = 1' | sudo tee /etc/sysctl.d/90-io-uring.conf
+```
+
+The second line keeps the setting after a reboot. Installing QEMU 10.1 or
+older works too. Then rerun setup.
+
 On Linux machines you already have, 0.2.6 builds the cluster over
 SSH instead:
 
