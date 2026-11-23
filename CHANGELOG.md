@@ -11,9 +11,9 @@ This file is the short version. The longer records are:
 - [docs/releasing.md](docs/releasing.md#compatibility-before-100), for the full upgrade steps between each pair of releases;
 - the [GitHub release pages](https://github.com/reliaburger/reliaburger/releases), for the binaries and every merged pull request.
 
-## [Unreleased] - 0.3.2
+## [0.3.2] - 2026-11-23
 
-Fixes from the Wyse 3040 lab that need a new appliance image. Not released yet: this is what the train carries, and it can change before the tag.
+Fixes from the Wyse 3040 lab that need a new appliance image. [Release page](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.2), [release log](docs/release-log.md#032-wyse-lab-fixes).
 
 ### Upgrading
 
@@ -22,6 +22,7 @@ Fixes from the Wyse 3040 lab that need a new appliance image. Not released yet: 
 ### Added
 
 - `relish netboot --stream-logs` shows an appliance's kernel and boot logs as it installs and boots, so a machine with no serial port can be watched from the terminal, and `relish machines logs` listens for them on its own. Off by default, because the logs cross the LAN in cleartext ([#2149](https://github.com/reliaburger/reliaburger/issues/2149)).
+- `relish tui` has a node page showing what runs on a node and what maintenance would affect ([#2170](https://github.com/reliaburger/reliaburger/issues/2170)), and an app can be scaled from the terminal UI and from `relish` ([#2176](https://github.com/reliaburger/reliaburger/issues/2176)).
 
 ### Fixed
 
@@ -31,6 +32,10 @@ Fixes from the Wyse 3040 lab that need a new appliance image. Not released yet: 
 - `relish wtf` calls a crash loop only when one instance restarts three times in 15 minutes. Three replicas that restarted once each were a critical `crashloop` for 15 minutes, and the instance a restart named was never read ([#2197](https://github.com/reliaburger/reliaburger/issues/2197)).
 - `relish nodes` no longer reports a healthy node as not answering every so often: the alert check releases the metrics store's lock before its query, so the node summary doesn't wait seconds behind it ([#2215](https://github.com/reliaburger/reliaburger/issues/2215)).
 - `url` 2.5.9, for RUSTSEC-2026-0592 ([#2213](https://github.com/reliaburger/reliaburger/issues/2213)).
+
+### Known issues
+
+- [#2128](https://github.com/reliaburger/reliaburger/issues/2128): one registry deploy case stalled for five minutes after an injected disk fault in 0.3.0's gate. It didn't recur in 0.3.1's or 0.3.2's gates; 0.3.2 logs what the stalled helper is doing if it happens again, and the cause isn't proven.
 
 ## [0.3.1] - 2026-11-21
 
