@@ -21,7 +21,6 @@ Fixes from the Wyse 3040 lab that need a new appliance image. Not released yet: 
 
 ### Added
 
-- A power-cut fixture for volume snapshots: `qualify-storage-power-cut.sh --fixture volumes` cuts a disposable VM's power while Bun's snapshot sweep snapshots, exports and prunes a loop-mounted Btrfs volume that a writer keeps filling, then checks every acknowledged write and export survived ([#287](https://github.com/reliaburger/reliaburger/issues/287)).
 - `relish netboot --stream-logs` shows an appliance's kernel and boot logs as it installs and boots, so a machine with no serial port can be watched from the terminal, and `relish machines logs` listens for them on its own. Off by default, because the logs cross the LAN in cleartext ([#2149](https://github.com/reliaburger/reliaburger/issues/2149)).
 
 ### Fixed
