@@ -830,6 +830,13 @@ A stop then runs four steps, each with its own limit:
 3. `stop_grace`, while Bun waits for the instance to exit.
 4. SIGKILL, if it's still running.
 
+The grace counts from when Bun first asks for the signal. On the process
+runtime, a process owner stalled by a long disk flush can miss its 2 s
+request timeout; Bun then asks again until the grace runs out. The owner may
+have sent the signal before it stalled, so a workload can get its
+`stop_signal` twice. If a second one means "exit now" to your app, give it a
+`stop_grace` long enough to finish on the first.
+
 Without `stop_grace`, a deploy gives each old instance its `drain_timeout`,
 and any other stop (`relish stop`, or the leader moving a replica off a node)
 gives it 10 s, as before. When Bun itself shuts down (`systemctl stop`, or

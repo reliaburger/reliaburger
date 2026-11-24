@@ -752,3 +752,35 @@ async fn a_kill_never_answered_ends_the_stop_unconfirmed_within_its_bound() {
         begun.elapsed()
     );
 }
+
+/// #1902 review: the grace runs from the first ask, not from the answer.
+/// A stop answered near the end of its grace waits out only what's left
+/// of it before the kill, so the whole stop stays within grace plus
+/// confirmation, which `stop_completion_bound` relies on.
+#[tokio::test]
+async fn a_stop_answered_late_in_the_grace_still_kills_within_grace_and_confirmation() {
+    let id = InstanceId("default__stalled-4".into());
+    let grill = running_mock(&id).await;
+    grill.set_ignore_stop(true);
+    // Eight unanswered asks, 100 ms apart: the answer lands about 0.8 s
+    // into a 1 s grace.
+    grill.set_unanswered_times(crate::grill::mock::MockCall::Stop, &id, 8);
+    let grace = Duration::from_secs(1);
+    let confirmation = Duration::from_millis(300);
+
+    let begun = Instant::now();
+    let stop = InstanceStop::for_policy(None, grace);
+    stop_runtime_instance(&grill, &id, &stop, confirmation)
+        .await
+        .expect("the kill ends the instance");
+    let took = begun.elapsed();
+
+    assert!(
+        grill
+            .calls()
+            .iter()
+            .any(|(op, instance)| op == "kill" && instance == &id),
+        "the workload ignored its signal, so it's killed"
+    );
+    assert!(took < grace + confirmation, "{took:?}");
+}
