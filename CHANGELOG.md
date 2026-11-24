@@ -46,6 +46,10 @@ Not released yet: this is what the train carries, and it can change before the t
 
 - `node_pressure` no longer stays unavailable when Bun starts before systemd enables the cpu and memory cgroup controllers at the root. Bun prepares `/sys/fs/cgroup/reliaburger-chaos` again before each pressure fault and each capability report, enables the two controllers in the parent when it offers them, and says in `/v1/capabilities` what's missing when it can't ([#2242](https://github.com/reliaburger/reliaburger/issues/2242)).
 
+### Fixed
+
+- `make ci` no longer times out on a machine whose `relish` context names a cluster that's switched off. The examples dry-run test, and the other tests that run `relish` with no cluster of their own, read the developer's context and waited about 4 s per command for it; they now give each `relish` an empty `RELIABURGER_HOME` and drop the endpoint, token and CA variables ([#2290](https://github.com/reliaburger/reliaburger/issues/2290)).
+
 ## [0.3.2] - 2026-11-23
 
 Fixes from the Wyse 3040 lab that need a new appliance image. [Release page](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.2), [release log](docs/release-log.md#032-wyse-lab-fixes).

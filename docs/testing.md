@@ -163,6 +163,20 @@ marker, or a marker that isn't right before a fence, fails the test rather
 than skipping anything. Run the marker test with `--no-capture` to see every
 opt-out.
 
+### A `relish` that can't see your cluster
+
+A test that runs the compiled `relish` would otherwise ask the cluster your
+own context names, or the one `RELIABURGER_ENDPOINT` names. When that
+cluster is off, every command waits for it, and a test that runs dozens of
+them times out ([#2290](https://github.com/reliaburger/reliaburger/issues/2290)).
+Build the command with `relish_command(home)` from
+[`tests/support/isolated_relish.rs`](../tests/support/isolated_relish.rs),
+or pass an existing one to `isolate_relish`. Either gives it an empty
+`RELIABURGER_HOME` the test owns and drops `RELIABURGER_ENDPOINT`,
+`RELIABURGER_TOKEN` and `RELIABURGER_CA_CERT`. Set them per command, never
+for the whole of `make ci`: the installer tests in
+`scripts/release/test_package.py` need your real home.
+
 ## The agent loop's turn budget
 
 Each node's agent runs one loop that owns all of the node's state, one turn at
