@@ -739,11 +739,18 @@ The node reports the failure to the leader with the cluster's service token.
 A plaintext development cluster with no master key has no service token, and
 until its first API token exists nobody holds a credential at all, so there
 the leader takes the report without one. It takes it only for a node the app
-is placed on, and once any credential exists (a master key or a first token)
-it requires the service token again. If `bun` logs
-`the leader refused the rollout failure of default/web` with a 401 or 403,
-the cluster has a token but its nodes have no master key to sign with: set
-`[security] master_key_path` on every node.
+is placed on. A first API token would end that, and the nodes' placement polls
+and failure reports would get 401 from then on, so on such a cluster
+`relish token create` refuses:
+
+```text
+refusing to create the first API token: this plaintext cluster has no master key, so its nodes have no service token, and once a token exists the API answers their calls (placement polls, rollout reports) with 401. Set [security] master_key_path to the same key on every node, restart them, then create the token
+```
+
+Set `[security] master_key_path` on every node, restart them, and create the
+token again. If `bun` logs `the leader refused the rollout failure of
+default/web` with a 401 or 403 anyway (a node started without the key the
+others have, say), give that node the same `master_key_path`.
 
 `cancel-deploy` takes the operation id that `apply` prints and waits for the
 in-flight step to finish. It works on a single node only: a cluster `apply`
