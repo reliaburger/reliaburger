@@ -1436,6 +1436,60 @@ runner. The lib still compiles alone, since everything after it links it, so any
 would mean the targets built after it, four at a time with the suite among them, hold more
 than we think.
 
+The runners answered within a day. Over 80 train runs from 21 to 24 November, portable Linux
+took a median of 23.7 minutes, 20.4 to 30.2, with no memory stop and no lost runner. That's
+two minutes over the estimate's median, and the job's own resource log says where they went:
+about 2 minutes of setup, 7.5 of build (3.5 of them the lib tests alone, at a load of about
+1.3, because a single rustc type-checking one crate is mostly one thread), 8.5 running the
+suite and 3 writing the coverage report. The tests are 34 test-minutes on four slots, so nextest keeps every slot
+busy, yet the load sits between 2 and 5: many of the slow tests are waiting on timers, not
+burning CPU. More test threads would cut that phase, and that's the next lever for the light
+path. We haven't pulled it here, because the evidence owners strip `NEXTEST_*` from the
+environment on purpose and a timing-sensitive suite on a busier runner is exactly how a flake
+gets in.
+
+Portable macOS was the bigger target. It sets the length of every merge-queue group, and
+over 83 runs on the 0.3.2 and 0.3.3 trains it took a median of 58.4 minutes, anywhere from
+32 to 103. Its tests take under two minutes of that. The lint before them, which
+type-checks the same crate, takes about two. The rest was one line of `make test-macos`:
+
+```make
+$(CARGO) test --no-run --lib --bin relish --test suite --test runtime_selection
+```
+
+That one compile took 21 minutes in one run and 93 in another, for the same build from the
+same full cache hit. A build whose time swings by a factor of four with nothing changed
+isn't short of CPU. It's short of memory. The `macos-15` runner has three cores and 7 GB,
+and the line above compiles the lib tests (10 to 12 GB of rustc on Linux) beside the lib
+(about 7 GB): #1943's mechanism, on a host with less than half the memory. The fix was
+already in the Makefile twice, so `test-macos` got it too:
+
+```make
+test-macos:
+	$(CARGO) test --no-run --lib
+	$(CARGO) test --no-run --lib --bin relish --test suite --test runtime_selection
+```
+
+The second line rebuilds nothing the first built: same flags, same profile, so Cargo finds
+the lib tests' binary fresh and compiles the lib, the binaries and the two integration
+tests. `test_make_prebuilds.py` pins the order, as it does for the other two recipes.
+
+The job had no way to say whether a slow build paged, so it got a watcher too:
+`scripts/ci/watch-macos-memory` writes one line every 15 seconds with the load, free memory,
+swap in use, swap-outs so far and the biggest process. Linux's watcher reads `/proc`, which
+macOS doesn't have, so this one asks `sysctl`, `memory_pressure`, `vm_stat` and `ps`, each
+looked up on `PATH` so the tests can stand in fakes for them. It never stops anything. Its
+job is to leave evidence, and its tests check that a missing tool leaves a field empty
+rather than ending the log.
+
+The first run after the split took 34.8 minutes: 24:55 for the lib tests, 4:43 for the rest,
+under two for the tests. The log shows why the lib tests are still slow on their own. Free
+memory fell from 78% to 35% in the first six minutes, swap started two minutes later and grew
+for sixteen more, and by the time the binary linked about 4.6 GB had gone out to swap. One rustc of the lib
+tests is more than this runner holds. Splitting `relish` into its own crate, so macOS
+compiles only what it tests, is still the real fix.
+
+
 ### A release gate that fits in a week
 
 Pull requests were quick by 0.2.3. The release wasn't. From code freeze to ready-to-tag took
