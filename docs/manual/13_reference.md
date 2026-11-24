@@ -417,32 +417,54 @@ the host's root, read-write, except:
 
 - the storage directories (`data`, `images`, `logs`, `metrics`, `volumes`;
   their parent when it's Bun's own `reliaburger` directory, so
-  `/var/lib/reliaburger` by default), the identity directory, the master key
-  and the bootstrap file;
+  `/var/lib/reliaburger` by default), wherever Bun fell back to when it
+  couldn't create them (its local data directory's `reliaburger`), the
+  identity directory, the master key, the bootstrap file and the ingress TLS
+  certificate and key;
 - the directory of Bun's `--config` file when it's a `reliaburger`
   directory, or the file alone elsewhere, and `/etc/reliaburger`;
 - `/run/reliaburger`, `/sys/fs/bpf` and `/sys/fs/cgroup/reliaburger`, apart
   from the workload's own cgroup.
 
 Each of those is an empty, read-only directory (or `/dev/null`, for a file),
-whatever symlinks led there. `/tmp` and `/var/tmp` are one private 256 MiB
+whatever symlinks led there. A path that's missing when the workload starts
+has nothing to hide and is logged to its stderr; one that has become a
+symlink since Bun resolved it fails the launch rather than mask the wrong
+place. `/tmp` and `/var/tmp` are one private 256 MiB
 tmpfs, and `/dev/shm` a private 64 MiB one, empty at start and gone at exit,
 charged to the workload's memory cgroup. Mounts Bun makes or removes later,
 such as a volume, reach the namespace but stay under its masks. Before its
-command runs, the gate drops `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE`,
-`CAP_SYS_MODULE`, `CAP_BPF` and `CAP_SYS_BOOT` from the bounding set, so root
-in the view can't take a mask off, `setns` back to the host's namespace, or
-read Bun's files through `/proc/<pid>/root`. `relish exec` and stop hooks
-join the running workload's view.
+command runs, the gate takes `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE`,
+`CAP_SYS_MODULE`, `CAP_BPF` and `CAP_SYS_BOOT` out of its bounding,
+inheritable and ambient sets, so root in the view can't take a mask off,
+`setns` back to the host's namespace, or read Bun's files through Bun's
+`/proc/<pid>/root`. It also marks every inherited descriptor above standard
+error close-on-exec. `relish exec` and stop hooks join the running
+workload's view.
 
 The list is Bun's own layout and nothing else. A token in `/root`, or a
-`storage.data` pointed at a shared directory, gets no help from it. Isolation
-doesn't stop a workload opening a raw disk under `/dev`, reading the `/proc`
-files of a process with no more capabilities than it, or using the network:
-Bun's API on loopback, other nodes, the internet (`allow_from` and egress
-rules don't apply to host processes). It isn't a sandbox; if you don't trust
-the binary, give the workload an image. A workload that mounts things, traces
-other processes or loads BPF needs `mount_isolation = false`.
+`storage.data` pointed at a shared directory, gets no help from it.
+
+Isolation is not a sandbox. A host workload still runs as root, and it can:
+
+- reach every runc container on the node through `/proc/<pid>/root` and
+  `/proc/<pid>/environ`: their root filesystems, volumes, identities and
+  environments. It has the same uid and a superset of their capabilities, and
+  there's no PID namespace to stop it (that's
+  [#360](https://github.com/reliaburger/reliaburger/issues/360));
+- read the `/proc` files of any other process with no more capabilities than
+  it;
+- write itself back onto the host through the read-write root: a unit in
+  `/etc/systemd`, a cron entry, Bun's binary directory, `/proc/sys`;
+- open files by handle (`open_by_handle_at`, `CAP_DAC_READ_SEARCH` stays),
+  which needs no path through a mask, and open a raw disk under `/dev`;
+- use the network: Bun's API on loopback, other nodes, the internet
+  (`allow_from` and egress rules don't apply to host processes).
+
+What isolation stops is an honest or careless binary reading Bun's keys and
+other workloads' secrets by path, or clobbering their temp files. If you
+don't trust the binary, give the workload an image. A workload that mounts
+things, traces other processes or loads BPF needs `mount_isolation = false`.
 
 Building the view needs Linux and a root Bun. macOS has no mount namespaces,
 so isolation is off there by default, and a node that sets it on anyway (or a

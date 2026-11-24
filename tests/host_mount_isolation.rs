@@ -505,34 +505,48 @@ async fn an_isolated_root_workload_cannot_unmount_a_mask_or_setns() {
     let fixture = Fixture::new();
     let data = fixture.path("data");
     let script = format!(
-        r#"umount {data} 2>/dev/null && {{ echo "unmounted a mask"; exit 1; }}
+        r#"for tool in umount nsenter unshare; do
+  command -v $tool >/dev/null || {{ echo "missing tool: $tool"; exit 9; }}
+done
+umount {data} 2>/dev/null && {{ echo "unmounted a mask"; exit 1; }}
 umount -l {data} 2>/dev/null && {{ echo "lazily unmounted a mask"; exit 2; }}
 nsenter -t 1 -m true 2>/dev/null && {{ echo "setns into PID 1's namespace"; exit 3; }}
 cat /proc/1/root{data}/secret 2>/dev/null && {{ echo "read through PID 1's root"; exit 4; }}
 cat /proc/{test}/root{data}/secret 2>/dev/null && {{ echo "read through Bun's root"; exit 5; }}
 unshare -Urm sh -c "umount {data} 2>/dev/null; cat {data}/secret" 2>/dev/null && {{ echo "a user namespace undid the mask"; exit 6; }}
-grep CapBnd /proc/self/status
+grep -E '^Cap(Inh|Prm|Eff|Bnd|Amb):' /proc/self/status
 exit 0"#,
         test = std::process::id(),
     );
     let (code, output) = fixture.run("escape", &script).await;
     assert_eq!(code, Some(0), "{output}");
-    let bounding = output
-        .lines()
-        .find_map(|line| line.strip_prefix("CapBnd:"))
-        .map(|value| u64::from_str_radix(value.trim(), 16).unwrap())
-        .unwrap_or_else(|| panic!("no CapBnd in {output}"));
-    for (bit, name) in [
-        (21, "CAP_SYS_ADMIN"),
-        (19, "CAP_SYS_PTRACE"),
-        (16, "CAP_SYS_MODULE"),
-        (39, "CAP_BPF"),
-        (22, "CAP_SYS_BOOT"),
-    ] {
-        assert_eq!(bounding & (1 << bit), 0, "{name} is still in {bounding:x}");
+    let set = |name: &str| {
+        output
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}:")))
+            .map(|value| u64::from_str_radix(value.trim(), 16).unwrap())
+            .unwrap_or_else(|| panic!("no {name} in {output}"))
+    };
+    // An exec by root takes bounding plus inheritable plus ambient, so the
+    // five must be in none of them, and so in neither set it runs with.
+    for name in ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"] {
+        let capabilities = set(name);
+        for (bit, capability) in [
+            (21, "CAP_SYS_ADMIN"),
+            (19, "CAP_SYS_PTRACE"),
+            (16, "CAP_SYS_MODULE"),
+            (39, "CAP_BPF"),
+            (22, "CAP_SYS_BOOT"),
+        ] {
+            assert_eq!(
+                capabilities & (1 << bit),
+                0,
+                "{capability} is still in {name} {capabilities:x}"
+            );
+        }
     }
     // Everything else root had is still there.
-    assert_ne!(bounding & (1 << 0), 0, "CAP_CHOWN was dropped too");
+    assert_ne!(set("CapEff") & (1 << 0), 0, "CAP_CHOWN was dropped too");
     assert!(!output.contains(SECRET), "{output}");
 }
 

@@ -1016,11 +1016,16 @@ async fn prepare_storage_directory(
     }
 }
 
-async fn storage_directory(configured: &std::path::Path, label: &str) -> anyhow::Result<PathBuf> {
-    let fallback = dirs::data_local_dir()
+/// Where Bun keeps its storage when it can't create the directories
+/// `node.toml` names: the user's local data directory, `reliaburger`.
+fn storage_fallback_root() -> PathBuf {
+    dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp/reliaburger"))
         .join("reliaburger")
-        .join(label);
+}
+
+async fn storage_directory(configured: &std::path::Path, label: &str) -> anyhow::Result<PathBuf> {
+    let fallback = storage_fallback_root().join(label);
     prepare_storage_directory(configured, &fallback, label).await
 }
 
@@ -1157,9 +1162,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let data_base = if std::fs::create_dir_all(&config.storage.data).is_ok() {
         config.storage.data.clone()
     } else {
-        let fallback = dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp/reliaburger"))
-            .join("reliaburger");
+        let fallback = storage_fallback_root();
         // BLOCKING-OK: startup, before the agent loop or any workload runs
         std::fs::create_dir_all(&fallback)
             .map_err(|e| anyhow::anyhow!("failed to create data directory: {e}"))?;
@@ -1264,7 +1267,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         &config.images.mirrors,
     )
     .await?
-    .with_mount_view(host_mount_view(&config, cli.config.as_deref())?);
+    .with_mount_view(host_mount_view(
+        &config,
+        cli.config.as_deref(),
+        &[data_base.clone(), pickle_dir.clone()],
+    )?);
     #[cfg(target_os = "linux")]
     let (durable_discovery, durable_kernel) = match &runtime {
         AnyGrill::Runc(runtime) if runtime.is_rootless() => {
@@ -4269,9 +4276,13 @@ fn create_runc_runtime(
 /// `/run/reliaburger` is created here when it's missing: a hidden path
 /// that doesn't exist when a workload starts can't be masked, and Bun
 /// creates its sockets there later.
+///
+/// `resolved` is the storage Bun settled on, which differs from
+/// `node.toml`'s when it fell back; see [`hidden_storage`].
 fn host_mount_view(
     config: &reliaburger::config::NodeConfig,
     config_file: Option<&std::path::Path>,
+    resolved: &[PathBuf],
 ) -> anyhow::Result<Option<reliaburger::grill::mount_view::MountView>> {
     use reliaburger::grill::mount_view::{self, MountView};
     if !config.process_workloads.mount_isolation || !mount_view::mount_isolation_available() {
@@ -4280,7 +4291,21 @@ fn host_mount_view(
     // BLOCKING-OK: startup, before the agent loop or any workload runs
     std::fs::create_dir_all(mount_view::RUN_DIRECTORY)
         .with_context(|| format!("cannot create {}", mount_view::RUN_DIRECTORY))?;
-    Ok(Some(MountView::for_node(config, config_file)))
+    Ok(Some(
+        MountView::for_node(config, config_file)
+            .with_hidden_directories(&hidden_storage(config, resolved)),
+    ))
+}
+
+/// Storage the view hides beyond what `node.toml` names: the directories
+/// Bun actually resolved (data and images, which may have fallen back), the
+/// identity directory as Bun computes it, and the fallback root itself,
+/// where the logs and metrics stores land if they fall back later.
+fn hidden_storage(config: &reliaburger::config::NodeConfig, resolved: &[PathBuf]) -> Vec<PathBuf> {
+    let mut hidden = resolved.to_vec();
+    hidden.push(node_identity_dir(config));
+    hidden.push(storage_fallback_root());
+    hidden
 }
 
 /// Whether this node advertises host workloads: a runtime that runs host
@@ -4783,12 +4808,27 @@ mod tests {
     }
 
     #[test]
+    fn the_view_hides_the_storage_bun_fell_back_to() {
+        let config = reliaburger::config::NodeConfig::default();
+        let fallback_data = storage_fallback_root();
+        let fallback_images = storage_fallback_root().join("images");
+        let hidden = hidden_storage(&config, &[fallback_data.clone(), fallback_images.clone()]);
+        assert!(hidden.contains(&fallback_data), "{hidden:?}");
+        assert!(hidden.contains(&fallback_images), "{hidden:?}");
+        assert!(hidden.contains(&node_identity_dir(&config)), "{hidden:?}");
+        let view = reliaburger::grill::mount_view::MountView::for_node(&config, None)
+            .with_hidden_directories(&hidden);
+        assert!(view.hides(&fallback_data.join("instances/a/owner.json")));
+        assert!(view.hides(&storage_fallback_root().join("logs/app.log")));
+    }
+
+    #[test]
     fn no_mount_view_is_built_where_isolation_is_off_or_unavailable() {
         let mut config = reliaburger::config::NodeConfig::default();
         config.process_workloads.mount_isolation = false;
-        assert!(host_mount_view(&config, None).unwrap().is_none());
+        assert!(host_mount_view(&config, None, &[]).unwrap().is_none());
         config.process_workloads.mount_isolation = true;
-        let view = host_mount_view(&config, None).unwrap();
+        let view = host_mount_view(&config, None, &[]).unwrap();
         assert_eq!(
             view.is_some(),
             reliaburger::grill::mount_view::mount_isolation_available()

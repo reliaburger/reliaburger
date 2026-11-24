@@ -127,6 +127,8 @@ impl MountView {
         for file in [
             security.master_key_path.as_deref(),
             security.bootstrap_path.as_deref(),
+            config.ingress.tls_cert.as_deref(),
+            config.ingress.tls_key.as_deref(),
             config_file,
         ]
         .into_iter()
@@ -151,6 +153,19 @@ impl MountView {
             tmp_bytes: TMP_BYTES,
             shm_bytes: SHM_BYTES,
         }
+    }
+
+    /// This view with `directories` hidden as well: the storage Bun actually
+    /// settled on when it fell back from `node.toml`'s, and the fallback
+    /// root it may use later.
+    pub fn with_hidden_directories(mut self, directories: &[PathBuf]) -> Self {
+        let mut hidden = std::mem::take(&mut self.hidden);
+        hidden.extend(directories.iter().map(|path| HiddenPath {
+            path: path.clone(),
+            kind: PathKind::Directory,
+        }));
+        self.hidden = collapse(hidden);
+        self
     }
 
     /// This view with `extra` bound back as well, for one launch.
@@ -279,9 +294,41 @@ mod linux {
 
     use super::{BindBack, MountView, PathKind};
 
-    // From <linux/mount.h>; the libc crate doesn't name them on every target.
+    // From <linux/mount.h>, <linux/openat2.h>, <linux/prctl.h> and
+    // <linux/capability.h>; the libc crate doesn't name them on every target.
     const OPEN_TREE_CLONE: nix::libc::c_uint = 1;
     const MOVE_MOUNT_F_EMPTY_PATH: nix::libc::c_uint = 0x4;
+    const MOVE_MOUNT_T_EMPTY_PATH: nix::libc::c_uint = 0x40;
+    const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+    const PR_CAP_AMBIENT: nix::libc::c_int = 47;
+    const PR_CAP_AMBIENT_CLEAR_ALL: nix::libc::c_ulong = 4;
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    const TMPFS_MAGIC: i64 = 0x0102_1994;
+
+    /// `struct open_how` for `openat2(2)`.
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+
+    /// `struct __user_cap_header_struct`.
+    #[repr(C)]
+    struct CapabilityHeader {
+        version: u32,
+        pid: nix::libc::c_int,
+    }
+
+    /// One half of `struct __user_cap_data_struct[2]`: capabilities 0-31
+    /// in the first, 32-63 in the second.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct CapabilityData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
 
     /// The capabilities the gate drops from the bounding set before `exec`,
     /// from <linux/capability.h>: without them root can't unmount a mask,
@@ -317,17 +364,21 @@ mod linux {
         Ok(())
     }
 
-    /// A detached copy of the mount at `path`, for attaching elsewhere.
+    /// A detached copy of the mount at `path`, for attaching elsewhere. The
+    /// source is opened without following symlinks first.
     fn open_tree_clone(path: &Path) -> io::Result<OwnedFd> {
-        let path = c_path(path)?;
-        // SAFETY: open_tree reads a NUL-terminated path that outlives the
-        // call and returns a new descriptor or -1; nothing else is touched.
+        use std::os::fd::AsRawFd;
+        let source = open_exact(path)?;
+        // SAFETY: open_tree reads the empty NUL-terminated path, a static,
+        // and the open descriptor; it returns a new descriptor or -1.
         let fd = unsafe {
             nix::libc::syscall(
                 nix::libc::SYS_open_tree,
-                nix::libc::AT_FDCWD,
-                path.as_ptr(),
-                OPEN_TREE_CLONE | nix::libc::O_CLOEXEC as nix::libc::c_uint,
+                source.as_raw_fd(),
+                c"".as_ptr(),
+                OPEN_TREE_CLONE
+                    | nix::libc::O_CLOEXEC as nix::libc::c_uint
+                    | nix::libc::AT_EMPTY_PATH as nix::libc::c_uint,
             )
         };
         if fd < 0 {
@@ -338,20 +389,19 @@ mod linux {
         Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
     }
 
-    /// Attach a detached mount at `target`.
-    fn move_mount(tree: &OwnedFd, target: &Path) -> io::Result<()> {
+    /// Attach a detached mount on the object `target` holds.
+    fn move_mount(tree: &OwnedFd, target: &OwnedFd) -> io::Result<()> {
         use std::os::fd::AsRawFd;
-        let target = c_path(target)?;
-        // SAFETY: both strings are NUL-terminated and outlive the call; the
-        // descriptor is open for its duration.
+        // SAFETY: both paths are the static empty string; both descriptors
+        // are open for the call.
         let result = unsafe {
             nix::libc::syscall(
                 nix::libc::SYS_move_mount,
                 tree.as_raw_fd(),
                 c"".as_ptr(),
-                nix::libc::AT_FDCWD,
-                target.as_ptr(),
-                MOVE_MOUNT_F_EMPTY_PATH,
+                target.as_raw_fd(),
+                c"".as_ptr(),
+                MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
             )
         };
         if result < 0 {
@@ -364,19 +414,62 @@ mod linux {
         mount(Some("tmpfs"), target, Some("tmpfs"), flags, Some(options)).map_err(io::Error::from)
     }
 
-    fn remount_read_only(target: &Path) -> io::Result<()> {
-        mount(
-            None::<&str>,
-            target,
-            None::<&str>,
-            MsFlags::MS_REMOUNT
-                | MsFlags::MS_BIND
-                | MsFlags::MS_RDONLY
-                | MsFlags::MS_NOSUID
-                | MsFlags::MS_NODEV,
-            None::<&str>,
-        )
-        .map_err(io::Error::from)
+    /// Open `path` as an `O_PATH` descriptor, refusing a symlink in any
+    /// component (`openat2` with `RESOLVE_NO_SYMLINKS`, Linux 5.6). Every
+    /// recorded path was resolved when Bun computed the view, so a symlink
+    /// here now means a renamed ancestor or a decoy, and we refuse it
+    /// rather than mask the wrong place.
+    fn open_exact(path: &Path) -> io::Result<OwnedFd> {
+        let path = c_path(path)?;
+        let how = OpenHow {
+            flags: (nix::libc::O_PATH | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC) as u64,
+            mode: 0,
+            resolve: RESOLVE_NO_SYMLINKS,
+        };
+        // SAFETY: openat2 reads the NUL-terminated path and the `open_how`
+        // of the size we pass, both alive for the call, and returns a new
+        // descriptor or -1.
+        let fd = unsafe {
+            nix::libc::syscall(
+                nix::libc::SYS_openat2,
+                nix::libc::AT_FDCWD,
+                path.as_ptr(),
+                &how as *const OpenHow,
+                std::mem::size_of::<OpenHow>(),
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the kernel just returned this descriptor and nothing else
+        // owns it.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+    }
+
+    /// The path that names exactly the object `fd` holds, for the system
+    /// calls (`mount`) that only take a path.
+    fn fd_path(fd: &OwnedFd) -> PathBuf {
+        use std::os::fd::AsRawFd;
+        PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+    }
+
+    fn device_of(fd: &OwnedFd) -> io::Result<u64> {
+        Ok(nix::sys::stat::fstat(fd).map_err(io::Error::from)?.st_dev)
+    }
+
+    /// Flags for read-only remounts. Masks and hidden files keep
+    /// `MS_NOEXEC`; a bind-back may hold a binary (the host helper's
+    /// directory), so it doesn't.
+    fn remount_read_only(target: &Path, noexec: bool) -> io::Result<()> {
+        let mut flags = MsFlags::MS_REMOUNT
+            | MsFlags::MS_BIND
+            | MsFlags::MS_RDONLY
+            | MsFlags::MS_NOSUID
+            | MsFlags::MS_NODEV;
+        if noexec {
+            flags |= MsFlags::MS_NOEXEC;
+        }
+        mount(None::<&str>, target, None::<&str>, flags, None::<&str>).map_err(io::Error::from)
     }
 
     fn is_directory(path: &Path) -> bool {
@@ -416,48 +509,75 @@ mod linux {
 
         private_temp(view).map_err(failed("cannot make a private /tmp"))?;
 
-        let mut masked = Vec::new();
+        // Each mask is mounted on the exact object its path named, opened
+        // without symlinks, and remembered by its own root descriptor, so
+        // later steps act on the mask and not on whatever the path names
+        // by then.
+        let mut masks: Vec<(PathBuf, OwnedFd)> = Vec::new();
         for hidden in &view.hidden {
-            let Ok(metadata) = std::fs::symlink_metadata(&hidden.path) else {
-                continue;
+            let target = match open_exact(&hidden.path) {
+                Ok(target) => target,
+                Err(error) if error.raw_os_error() == Some(nix::libc::ENOENT) => {
+                    eprintln!(
+                        "mount isolation: {} doesn't exist, so there's nothing to hide there",
+                        hidden.path.display()
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    return Err(failed(format!("cannot hide {}", hidden.path.display()))(
+                        error,
+                    ));
+                }
             };
             let step = failed(format!("cannot hide {}", hidden.path.display()));
+            let metadata = nix::sys::stat::fstat(&target).map_err(io::Error::from);
+            let is_directory = metadata
+                .as_ref()
+                .is_ok_and(|stat| stat.st_mode & nix::libc::S_IFMT == nix::libc::S_IFDIR);
             match hidden.kind {
-                PathKind::Directory if metadata.is_dir() => {
+                PathKind::Directory if is_directory => {
                     let traversable = backs.iter().any(|back| back.path.starts_with(&hidden.path));
                     // Mode 000 keeps out everyone but root; a mask that
                     // bind-backs sit under lets others walk to them, as the
                     // host helper's unprivileged user must.
                     let mode = if traversable { "0711" } else { "000" };
                     mount_tmpfs(
-                        &hidden.path,
+                        &fd_path(&target),
                         MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
                         &format!("mode={mode},size=64k"),
                     )
+                    .and_then(|()| mounted_mask(&hidden.path, &target))
+                    .map(|mask| masks.push((hidden.path.clone(), mask)))
                     .map_err(step)?;
-                    masked.push(hidden.path.clone());
                 }
                 _ => {
                     mount(
                         Some("/dev/null"),
-                        &hidden.path,
+                        &fd_path(&target),
                         None::<&str>,
                         MsFlags::MS_BIND,
                         None::<&str>,
                     )
                     .map_err(io::Error::from)
-                    .and_then(|()| remount_read_only(&hidden.path))
+                    .and_then(|()| {
+                        let mask = open_exact(&hidden.path)?;
+                        if device_of(&mask)? == device_of(&target)? {
+                            return Err(io::Error::other("the mask isn't where it was mounted"));
+                        }
+                        remount_read_only(&fd_path(&mask), true)
+                    })
                     .map_err(step)?;
                 }
             }
         }
 
         for (back, copy, directory) in &copies {
-            attach(back, copy, *directory)
+            attach(back, copy, *directory, &masks)
                 .map_err(failed(format!("cannot keep {}", back.path.display())))?;
         }
-        for path in masked {
-            remount_read_only(&path).map_err(failed(format!(
+        for (path, mask) in &masks {
+            remount_read_only(&fd_path(mask), true).map_err(failed(format!(
                 "cannot seal the mask on {}",
                 path.display()
             )))?;
@@ -465,8 +585,27 @@ mod linux {
         Ok(())
     }
 
-    /// Make a mountpoint for `back` inside its mask and attach the copy.
-    fn attach(back: &BindBack, copy: &OwnedFd, directory: bool) -> io::Result<()> {
+    /// The root of the mask just mounted over `target`, checked to be a
+    /// fresh tmpfs on top of it.
+    fn mounted_mask(path: &Path, target: &OwnedFd) -> io::Result<OwnedFd> {
+        let mask = open_exact(path)?;
+        let filesystem = nix::sys::statfs::fstatfs(&mask).map_err(io::Error::from)?;
+        if device_of(&mask)? == device_of(target)?
+            || filesystem.filesystem_type().0 as i64 != TMPFS_MAGIC
+        {
+            return Err(io::Error::other("the mask isn't where it was mounted"));
+        }
+        Ok(mask)
+    }
+
+    /// Make a mountpoint for `back` inside its mask and attach the copy. The
+    /// mountpoint must be on one of the masks, never on the host.
+    fn attach(
+        back: &BindBack,
+        copy: &OwnedFd,
+        directory: bool,
+        masks: &[(PathBuf, OwnedFd)],
+    ) -> io::Result<()> {
         if let Some(parent) = back.path.parent() {
             std::fs::DirBuilder::new()
                 .recursive(true)
@@ -481,9 +620,22 @@ mod linux {
                 .create_new(true)
                 .open(&back.path)?;
         }
-        move_mount(copy, &back.path)?;
+        let target = open_exact(&back.path)?;
+        let device = device_of(&target)?;
+        let mut on_a_mask = false;
+        for (_, mask) in masks {
+            on_a_mask |= device_of(mask)? == device;
+        }
+        if !on_a_mask {
+            return Err(io::Error::other("its mountpoint isn't inside a mask"));
+        }
+        move_mount(copy, &target)?;
         if !back.writable {
-            remount_read_only(&back.path)?;
+            let attached = open_exact(&back.path)?;
+            if device_of(&attached)? != device_of(copy)? {
+                return Err(io::Error::other("the copy isn't where it was attached"));
+            }
+            remount_read_only(&fd_path(&attached), false)?;
         }
         Ok(())
     }
@@ -511,7 +663,7 @@ mod linux {
         }
         umount2(staging, MntFlags::MNT_DETACH)?;
         for (target, copy) in &copies {
-            move_mount(copy, target)?;
+            move_mount(copy, &open_exact(target)?)?;
         }
         let shm = Path::new("/dev/shm");
         if is_directory(shm) {
@@ -546,11 +698,58 @@ mod linux {
             .map_err(failed("cannot join the workload's mount namespace"))
     }
 
-    /// Drop the capabilities that would undo the view from the bounding
-    /// set. They stay in this process until it `exec`s; root's next program
-    /// can't regain them. A kernel that doesn't know one (`CAP_BPF` before
-    /// 5.8) never grants it either.
+    /// Drop the capabilities that would undo the view so that root's next
+    /// program can't hold them. An `exec` by root gives it every capability
+    /// in the bounding set plus every one in its inheritable and ambient
+    /// sets, so the five go from all three. They stay in this process's
+    /// effective set until it `exec`s. A kernel that doesn't know one
+    /// (`CAP_BPF` before 5.8) never grants it either.
     pub(crate) fn drop_capabilities() -> io::Result<()> {
+        // SAFETY: PR_CAP_AMBIENT_CLEAR_ALL changes only this thread's
+        // ambient set; the trailing arguments must be zero.
+        if unsafe { nix::libc::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(nix::libc::EINVAL) {
+                return Err(failed("cannot clear the ambient capabilities")(error));
+            }
+        }
+        let mut header = CapabilityHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let mut data = [CapabilityData::default(); 2];
+        // SAFETY: capget writes one header and two data structs, which is
+        // what version 3 of the interface uses; both live for the call.
+        if unsafe {
+            nix::libc::syscall(
+                nix::libc::SYS_capget,
+                &mut header as *mut CapabilityHeader,
+                data.as_mut_ptr(),
+            )
+        } != 0
+        {
+            return Err(failed("cannot read the capabilities")(
+                io::Error::last_os_error(),
+            ));
+        }
+        for (capability, _) in DROPPED_CAPABILITIES {
+            let index = (capability / 32) as usize;
+            data[index].inheritable &= !(1u32 << (capability % 32));
+        }
+        // SAFETY: as for capget; capset only reads them, and only lowers
+        // this thread's inheritable set.
+        if unsafe {
+            nix::libc::syscall(
+                nix::libc::SYS_capset,
+                &mut header as *mut CapabilityHeader,
+                data.as_ptr(),
+            )
+        } != 0
+        {
+            return Err(failed("cannot clear the inheritable capabilities")(
+                io::Error::last_os_error(),
+            ));
+        }
         for (capability, name) in DROPPED_CAPABILITIES {
             // SAFETY: PR_CAPBSET_DROP takes a capability number and changes
             // only this thread's bounding set.
@@ -722,6 +921,33 @@ mod tests {
         let view = MountView::for_node(&config, None);
         assert!(view.hides(&home.path().join("master.key")));
         assert!(!view.hides(&home.path().join("notes.txt")));
+    }
+
+    #[test]
+    fn ingress_keys_outside_etc_reliaburger_are_hidden_alone() {
+        let keys = tempfile::tempdir().unwrap();
+        let mut config = NodeConfig::default();
+        config.ingress.tls_cert = Some(keys.path().join("ingress.crt"));
+        config.ingress.tls_key = Some(keys.path().join("ingress.key"));
+        let view = MountView::for_node(&config, None);
+        assert!(view.hides(&keys.path().join("ingress.key")));
+        assert!(view.hides(&keys.path().join("ingress.crt")));
+        assert!(!view.hides(&keys.path().join("other.pem")));
+    }
+
+    #[test]
+    fn storage_bun_fell_back_to_is_hidden_too() {
+        let fallback = tempfile::tempdir().unwrap();
+        let data = fallback.path().join("reliaburger");
+        let view = MountView::for_node(&NodeConfig::default(), None)
+            .with_hidden_directories(&[data.clone(), data.join("images")]);
+        assert!(view.hides(&data.join("instances/a/owner.json")));
+        let hidden = paths(&view);
+        assert!(hidden.contains(&resolved(&data)), "{hidden:?}");
+        assert!(
+            !hidden.contains(&resolved(&data.join("images"))),
+            "{hidden:?}"
+        );
     }
 
     #[test]

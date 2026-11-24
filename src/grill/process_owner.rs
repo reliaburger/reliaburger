@@ -559,7 +559,10 @@ pub fn run_execution_gate(directory: &Path) -> io::Result<()> {
         .try_clone_to_owned()
         .map(UnixStream::from)
         .ok();
-    let (error, errno) = match activate_execution(directory) {
+    let (error, errno) = match activate_execution(directory).and_then(|record| {
+        close_inherited_descriptors()?;
+        Ok(record)
+    }) {
         Ok(record) => {
             let error = Command::new(&record.command[0])
                 .args(&record.command[1..])
@@ -581,6 +584,41 @@ pub fn run_execution_gate(directory: &Path) -> io::Result<()> {
         let _ = serde_json::to_writer(&mut report, &failure);
     }
     Err(error)
+}
+
+/// Mark every descriptor above standard error close-on-exec, so nothing
+/// the gate inherited reaches the workload. `close_range(3, ~0U,
+/// CLOSE_RANGE_CLOEXEC)` (Linux 5.11) rather than closing them: the gate's
+/// report channel must stay open until `exec`, so a failed `exec` can still
+/// say why (#905). Older kernels get the same by walking `/proc/self/fd`.
+fn close_inherited_descriptors() -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        const CLOSE_RANGE_CLOEXEC: nix::libc::c_uint = 1 << 2;
+        // SAFETY: close_range takes two descriptor numbers and flags and only
+        // sets the close-on-exec flag on this process's descriptors.
+        let result = unsafe {
+            nix::libc::syscall(
+                nix::libc::SYS_close_range,
+                3 as nix::libc::c_uint,
+                nix::libc::c_uint::MAX,
+                CLOSE_RANGE_CLOEXEC,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let descriptors: Vec<i32> = std::fs::read_dir("/proc/self/fd")?
+            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+            .filter(|fd| *fd > 2)
+            .collect();
+        for fd in descriptors {
+            // SAFETY: F_SETFD only changes the descriptor's flags; one that
+            // closed meanwhile (the directory walk's own) answers EBADF.
+            unsafe { nix::libc::fcntl(fd, nix::libc::F_SETFD, nix::libc::FD_CLOEXEC) };
+        }
+    }
+    Ok(())
 }
 
 /// Wait for activation and check it against the durable record, joining the
@@ -1114,6 +1152,29 @@ mod tests {
         assert!(read.launch.mount_isolation.is_none());
         // No view means the gate leaves mounts and capabilities alone.
         isolate_mounts(&read.launch).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_gate_leaves_no_inherited_descriptor_open_across_exec() {
+        use std::os::fd::AsRawFd;
+        let inherited = File::open("/dev/null").unwrap();
+        nix::fcntl::fcntl(
+            &inherited,
+            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+        )
+        .unwrap();
+        close_inherited_descriptors().unwrap();
+        let flags = nix::fcntl::fcntl(&inherited, nix::fcntl::FcntlArg::F_GETFD).unwrap();
+        assert_ne!(
+            flags & nix::libc::FD_CLOEXEC,
+            0,
+            "fd {}",
+            inherited.as_raw_fd()
+        );
+        // Standard input, output and error stay as they are.
+        let stdin = nix::fcntl::fcntl(std::io::stdin(), nix::fcntl::FcntlArg::F_GETFD).unwrap();
+        assert_eq!(stdin & nix::libc::FD_CLOEXEC, 0);
     }
 
     #[test]

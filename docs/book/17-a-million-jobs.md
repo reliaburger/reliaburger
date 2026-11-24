@@ -1741,9 +1741,19 @@ The gate runs the steps in order, each a Linux system call:
    `/dev/null` on each hidden file.
 6. `move_mount` attaches each detached copy back where it was, and the
    read-only ones are remounted read-only.
-7. `PR_CAPBSET_DROP` removes `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE`,
-   `CAP_SYS_MODULE`, `CAP_BPF` and `CAP_SYS_BOOT` from the bounding set.
-8. `exec`.
+7. `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE`, `CAP_SYS_MODULE`, `CAP_BPF` and
+   `CAP_SYS_BOOT` go from the bounding, inheritable and ambient sets.
+8. Every descriptor above standard error is marked close-on-exec, then
+   `exec`.
+
+Steps 5 and 6 never act on a path as written. Each target is opened with
+`openat2` and `RESOLVE_NO_SYMLINKS`, which fails if any component is a
+symlink: the paths were resolved when Bun computed the view, so a symlink
+now means someone renamed an ancestor or planted a decoy. The mask is then
+mounted on that descriptor (through its `/proc/self/fd/N` name) and checked
+to be a fresh tmpfs where we put it, and the read-only remounts and
+`move_mount`s use descriptors too. A target that doesn't exist is logged and
+skipped: there's nothing to hide there.
 
 Step 3 solves a chicken-and-egg problem. Once a mask covers
 `/var/lib/reliaburger`, the helper's own directory under it is gone too, so a
@@ -1844,11 +1854,19 @@ call, or `setns` into `/proc/1/ns/mnt` and be back on the host. With
 which walks Bun's own view.
 
 Capabilities are Linux's split of root's powers into about forty bits. Each
-process has several sets of them; the *bounding set* is the ceiling on what
-any program it `exec`s can have, even root's. `prctl(PR_CAPBSET_DROP, cap)`
-lowers the ceiling and can never raise it again. The gate keeps its own
-capabilities until `exec`, because it still needs them to finish the view,
-and the command starts without the five. A workload that needs them (one that
+process has several sets of them, and `exec` computes the new program's from
+the old one's. For root the rule is short: the program it `exec`s is
+*permitted* every capability in the old process's *bounding* set, plus every
+one in its *inheritable* set, plus its *ambient* set. So dropping a
+capability from the bounding set alone isn't enough; a stray inheritable bit
+would bring it straight back. The gate takes the five out of all three:
+`prctl(PR_CAPBSET_DROP, cap)` lowers the bounding set, which can never be
+raised again; `capset` clears them from the inheritable set; and
+`PR_CAP_AMBIENT_CLEAR_ALL` empties the ambient set. The gate keeps its own
+effective capabilities until `exec`, because it still needs them to finish
+the view, and the command starts without the five. The gated test reads
+`CapInh`, `CapPrm`, `CapEff`, `CapBnd` and `CapAmb` from the workload's
+`/proc/self/status` and checks all five bits are clear in each. A workload that needs them (one that
 mounts things, traces other processes or loads BPF) needs
 `mount_isolation = false`, and the manual says so.
 
@@ -1859,10 +1877,22 @@ precisely so a mask can't come off that way. The gated test tries `umount`,
 `umount -l`, `nsenter -t 1 -m`, both `/proc/<pid>/root` routes and
 `unshare -Urm`, and expects all six to fail.
 
-This still isn't a sandbox. Root can open the raw disk under `/dev` and read
-the filesystem underneath, read the `/proc` files of any process with no more
-capabilities than it, and use the network as Bun does. Manual 13 lists both
-sides. If you don't trust the binary, give the workload an image.
+This still isn't a sandbox, and it's worth being blunt about how far from one
+it is. Root can open the raw disk under `/dev` and read the filesystem
+underneath. It keeps `CAP_DAC_READ_SEARCH`, so `open_by_handle_at` can reach a
+file by its handle without a path through any mask. There's no PID
+namespace, so it can read the `/proc/<pid>/root` and `/proc/<pid>/environ` of
+every process with no more capabilities than it has. That includes every runc
+container on the node: same uid, and the workload's capabilities are a
+superset of the container's, so their root filesystems, volumes, identities
+and environments are all one path away. And the host's root is read-write, so
+root can write itself back in: a systemd unit under `/etc/systemd`, a cron
+entry, Bun's own binary directory, a knob under `/proc/sys`. The view stops
+an honest binary from tripping over Bun's secrets and a careless one from
+deleting its neighbours' `/tmp`. It doesn't stop a hostile one.
+PID namespaces ([#360](https://github.com/reliaburger/reliaburger/issues/360))
+close the `/proc` route; the rest is what containers are for. Manual 13
+lists both sides. If you don't trust the binary, give the workload an image.
 
 #### Joining instead of building
 
