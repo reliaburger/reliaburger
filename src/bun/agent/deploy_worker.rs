@@ -621,19 +621,36 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             // no longer wedges the loop at all — this poll is off it).
             let deadline =
                 std::time::Instant::now() + std::time::Duration::from_secs(INIT_TIMEOUT_SECS);
+            // A read the runtime didn't answer (`StateUnavailable`: a process
+            // owner past its request timeout, or busy) is asked again within
+            // the same bound, not a failed deploy (#2288).
             let failure = loop {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                let state = self.grill.state(&init_id).await?;
-                if state == ContainerState::Stopped {
-                    break match self.grill.exit_code(&init_id).await? {
-                        Some(0) => None,
-                        Some(code) => Some(format!("exited with code {code}")),
-                        None => Some("stopped without an exit code".to_string()),
-                    };
-                }
+                let read = match self.grill.state(&init_id).await {
+                    Ok(ContainerState::Stopped) => self.grill.exit_code(&init_id).await.map(Some),
+                    Ok(_) => Ok(None),
+                    Err(error) => Err(error),
+                };
+                let unanswered = match read {
+                    Ok(Some(code)) => {
+                        break match code {
+                            Some(0) => None,
+                            Some(code) => Some(format!("exited with code {code}")),
+                            None => Some("stopped without an exit code".to_string()),
+                        };
+                    }
+                    Ok(None) => None,
+                    Err(error @ crate::grill::GrillError::StateUnavailable { .. }) => Some(error),
+                    Err(error) => return Err(error.into()),
+                };
                 if std::time::Instant::now() >= deadline {
                     let _ = self.grill.kill(&init_id).await;
-                    break Some(format!("did not finish within {INIT_TIMEOUT_SECS}s"));
+                    break Some(match unanswered {
+                        Some(error) => {
+                            format!("runtime gave no answer within {INIT_TIMEOUT_SECS}s: {error}")
+                        }
+                        None => format!("did not finish within {INIT_TIMEOUT_SECS}s"),
+                    });
                 }
             };
 

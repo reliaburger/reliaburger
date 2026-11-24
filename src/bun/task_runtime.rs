@@ -103,6 +103,56 @@ impl Drop for AttemptListing<'_> {
 /// How many executor slots a node has unless configured otherwise.
 const DEFAULT_SLOTS: u32 = 256;
 
+/// How long a running attempt's exit polls may go unanswered in a row
+/// (`StateUnavailable`: a process owner past its 2 s request timeout, or
+/// busy) before the attempt's outcome is Unknown (#2288). A disk stall has
+/// held an owner for 27 s (#1902); this is twice that, with room to spare.
+const EXIT_POLL_PATIENCE: Duration = Duration::from_secs(60);
+
+/// The fewest unanswered exit polls in a row that make an attempt Unknown,
+/// so one read that hangs past the patience can't do it alone.
+const EXIT_POLL_MIN_MISSES: u32 = 3;
+
+/// A running attempt's exit polls the runtime hasn't answered, in a row.
+struct UnansweredPolls {
+    patience: Duration,
+    since: Option<tokio::time::Instant>,
+    misses: u32,
+}
+
+impl UnansweredPolls {
+    fn new(patience: Duration) -> Self {
+        Self {
+            patience,
+            since: None,
+            misses: 0,
+        }
+    }
+
+    /// The runtime answered: the next miss starts a new run.
+    fn answered(&mut self) {
+        self.since = None;
+        self.misses = 0;
+    }
+
+    /// Count a poll the runtime didn't answer. `Err` with the outcome's
+    /// reason once the misses have lasted the patience, and there have
+    /// been at least [`EXIT_POLL_MIN_MISSES`] of them.
+    fn missed(&mut self, error: &crate::grill::GrillError) -> Result<(), String> {
+        let since = *self.since.get_or_insert_with(tokio::time::Instant::now);
+        self.misses = self.misses.saturating_add(1);
+        let waited = since.elapsed();
+        if self.misses < EXIT_POLL_MIN_MISSES || waited < self.patience {
+            return Ok(());
+        }
+        Err(format!(
+            "no exit poll answered for {:.1}s ({} in a row); last: {error}",
+            waited.as_secs_f64(),
+            self.misses
+        ))
+    }
+}
+
 /// Owned execution backend; host execution retains its separate admission policy.
 pub struct OwnedRunner<G: Grill + Clone> {
     runtime: G,
@@ -133,6 +183,9 @@ pub struct OwnedRunner<G: Grill + Clone> {
     capture_offsets: std::sync::Arc<crate::ketchup::types::CaptureOffsets>,
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     namespace_policy: Option<std::sync::Arc<super::task_namespace::TaskNamespacePolicy>>,
+    /// How long an attempt's exit polls may go unanswered in a row before
+    /// its outcome is Unknown: [`EXIT_POLL_PATIENCE`], shorter in tests.
+    exit_poll_patience: Duration,
 }
 impl<G: Grill + Clone> OwnedRunner<G> {
     /// Share the exact runtime, ownership inventory and image cache of the agent.
@@ -170,6 +223,7 @@ impl<G: Grill + Clone> OwnedRunner<G> {
             capture_offsets: Default::default(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             namespace_policy: None,
+            exit_poll_patience: EXIT_POLL_PATIENCE,
         }
     }
     /// Sweep `root` instead of the kernel's cgroup tree, so a test can stand
@@ -1095,7 +1149,12 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
         let outcome = if let Some(outcome) = launch_outcome {
             outcome
         } else {
+            // A poll the runtime didn't answer (`StateUnavailable`: a process
+            // owner past its request timeout, or busy) is "not known yet",
+            // and the next poll asks again. Only polls unanswered for the
+            // runner's patience make the outcome Unknown (#2288).
             let observe = async {
+                let mut unanswered = UnansweredPolls::new(self.exit_poll_patience);
                 loop {
                     #[cfg(all(feature = "ebpf", target_os = "linux"))]
                     if namespace_enforced && let Some(policy) = &self.namespace_policy {
@@ -1104,12 +1163,27 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                                 instance: id.clone(),
                                 reason: error.to_string(),
                             }
+                            .to_string()
                         })?;
                     }
-                    if self.runtime.has_exited(&id).await? {
-                        return self.runtime.exit_code(&id).await;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let read = match self.runtime.has_exited(&id).await {
+                        Ok(true) => self.runtime.exit_code(&id).await.map(Some),
+                        Ok(false) => Ok(None),
+                        Err(error) => Err(error),
+                    };
+                    let pause = match read {
+                        Ok(Some(status)) => return Ok(status),
+                        Ok(None) => {
+                            unanswered.answered();
+                            Duration::from_millis(10)
+                        }
+                        Err(error @ crate::grill::GrillError::StateUnavailable { .. }) => {
+                            unanswered.missed(&error)?;
+                            Duration::from_millis(100)
+                        }
+                        Err(error) => return Err(error.to_string()),
+                    };
+                    tokio::time::sleep(pause).await;
                 }
             };
             tokio::select! {
@@ -1119,7 +1193,7 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                 result = observe => match result {
                     Ok(Some(code)) => AttemptOutcome::Exited { code },
                     Ok(None) => AttemptOutcome::Unknown { reason: "runtime confirmed exit but has no exit status".into() },
-                    Err(error) => AttemptOutcome::Unknown { reason: error.to_string() },
+                    Err(reason) => AttemptOutcome::Unknown { reason },
                 },
             }
         };
@@ -1660,6 +1734,98 @@ mod tests {
         };
         assert!(String::from_utf8_lossy(&result.output.head).contains(&reason));
         assert_eq!(runner.slots.lock().unwrap().len(), 256);
+    }
+
+    /// Start `runner` on an attempt the mock runtime keeps running, and
+    /// return the attempt's task and its instance once it polls its exit.
+    async fn start_mock_attempt(
+        runner: &std::sync::Arc<OwnedRunner<crate::grill::mock::MockGrill>>,
+    ) -> (tokio::task::JoinHandle<Attempt>, crate::grill::InstanceId) {
+        let worker = runner.clone();
+        let work = tokio::spawn(async move {
+            worker
+                .run(&invocation(), Duration::ZERO, &CancellationToken::new())
+                .await
+        });
+        let id = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let polled = runner
+                    .runtime
+                    .calls()
+                    .into_iter()
+                    .find_map(|(call, id)| (call == "state").then_some(id));
+                if let Some(id) = polled {
+                    break id;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the attempt never polled its exit");
+        (work, id)
+    }
+
+    /// #2288: an exit poll the runtime doesn't answer (a process owner past
+    /// its 2 s request timeout under load) isn't an unknown outcome. The
+    /// next poll asks again, and the attempt ends with its exit code.
+    #[tokio::test]
+    async fn an_exit_poll_the_runtime_did_not_answer_is_asked_again() {
+        let runtime = crate::grill::mock::MockGrill::new();
+        let runner = std::sync::Arc::new(OwnedRunner::new(runtime.clone()));
+        let (work, id) = start_mock_attempt(&runner).await;
+        runtime.set_state_unavailable_times(&id, 4);
+        runtime.set_exit_code(&id, Some(3));
+        runtime.set_state(&id, ContainerState::Stopped);
+        let result = tokio::time::timeout(Duration::from_secs(10), work)
+            .await
+            .expect("the attempt never finished")
+            .unwrap();
+        assert_eq!(result.outcome, AttemptOutcome::Exited { code: 3 });
+    }
+
+    /// #2288: an exit code read the runtime doesn't answer is asked again
+    /// too, once the runtime has said the workload exited.
+    #[tokio::test]
+    async fn an_exit_code_read_the_runtime_did_not_answer_is_asked_again() {
+        let runtime = crate::grill::mock::MockGrill::new();
+        let runner = std::sync::Arc::new(OwnedRunner::new(runtime.clone()));
+        let (work, id) = start_mock_attempt(&runner).await;
+        runtime.set_instance_exit_code_failure(&id, true);
+        runtime.set_exit_code(&id, Some(0));
+        runtime.set_state(&id, ContainerState::Stopped);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!work.is_finished(), "an unanswered read ended the attempt");
+        runtime.set_instance_exit_code_failure(&id, false);
+        let result = tokio::time::timeout(Duration::from_secs(10), work)
+            .await
+            .expect("the attempt never finished")
+            .unwrap();
+        assert_eq!(result.outcome, AttemptOutcome::Exited { code: 0 });
+    }
+
+    /// #2288: exit polls that go unanswered past the runner's patience end
+    /// the attempt Unknown, saying for how long and why.
+    #[tokio::test]
+    async fn exit_polls_unanswered_past_the_patience_end_the_attempt_unknown() {
+        let runtime = crate::grill::mock::MockGrill::new();
+        let mut runner = OwnedRunner::new(runtime.clone());
+        runner.exit_poll_patience = Duration::from_millis(200);
+        let runner = std::sync::Arc::new(runner);
+        let (work, id) = start_mock_attempt(&runner).await;
+        // Polls after a miss are at least 100 ms apart, so ten misses
+        // outlast the patience. The cleanup reads any left over, and the
+        // Stopped behind them lets it retire the attempt.
+        runtime.set_state_unavailable_times(&id, 10);
+        runtime.set_state(&id, ContainerState::Stopped);
+        let result = tokio::time::timeout(Duration::from_secs(10), work)
+            .await
+            .expect("the attempt never finished")
+            .unwrap();
+        let AttemptOutcome::Unknown { reason } = &result.outcome else {
+            panic!("sustained unanswered polls didn't end Unknown: {result:?}");
+        };
+        assert!(reason.contains("no exit poll answered for"), "{reason}");
+        assert!(reason.contains("process owner is busy"), "{reason}");
     }
 
     /// The shared pools are sized from every slot the node has, not the
