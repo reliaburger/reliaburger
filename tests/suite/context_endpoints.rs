@@ -93,14 +93,11 @@ async fn stand_in_node(
     endpoint
 }
 
-/// An endpoint on this host that refuses connections, as a node whose Bun
-/// has stopped does.
-fn refusing_endpoint() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = format!("https://{}", listener.local_addr().unwrap());
-    drop(listener);
-    endpoint
-}
+/// Endpoints on this host that refuse connections, as a node whose Bun has
+/// stopped does. Privileged ports nothing here listens on, rather than a
+/// port bound and dropped, which a parallel test could take and answer on
+/// (#2156). Two, because a context lists an endpoint once.
+const REFUSING: [&str; 2] = ["https://127.0.0.1:1", "https://127.0.0.1:2"];
 
 /// Save a bare-metal context in `home` that trusts `hierarchy`'s root CA
 /// and lists `endpoints`, the first one first.
@@ -158,9 +155,9 @@ async fn with_its_first_node_down_relish_answers_through_the_next_and_remembers_
     let home = tempfile::tempdir().unwrap();
     let shutdown = CancellationToken::new();
     let hierarchy = ca::generate_ca_hierarchy("lab", b"ikm").unwrap();
-    let dead = refusing_endpoint();
+    let dead = REFUSING[0];
     let live = stand_in_node(&hierarchy, "wyse-2", &shutdown).await;
-    save_context(home.path(), &hierarchy, &[&dead, &live]);
+    save_context(home.path(), &hierarchy, &[dead, &live]);
 
     let (ok, stdout, stderr) = relish_nodes(home.path()).await;
 
@@ -188,9 +185,8 @@ async fn with_its_first_node_down_relish_answers_through_the_next_and_remembers_
 async fn when_no_node_answers_the_error_lists_every_endpoint_tried() {
     let home = tempfile::tempdir().unwrap();
     let hierarchy = ca::generate_ca_hierarchy("lab", b"ikm").unwrap();
-    let first = refusing_endpoint();
-    let second = refusing_endpoint();
-    save_context(home.path(), &hierarchy, &[&first, &second]);
+    let [first, second] = REFUSING;
+    save_context(home.path(), &hierarchy, &[first, second]);
 
     let (ok, _, stderr) = relish_nodes(home.path()).await;
 

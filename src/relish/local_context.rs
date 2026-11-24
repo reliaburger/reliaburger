@@ -830,9 +830,6 @@ mod tests {
     #[test]
     fn a_context_whose_first_node_refuses_connects_to_the_next_that_listens() {
         let root = tempfile::tempdir().unwrap();
-        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let dead_port = dead.local_addr().unwrap().port();
-        drop(dead);
         let live = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let live_port = live.local_addr().unwrap().port();
         let hierarchy = crate::sesame::ca::generate_ca_hierarchy("probe", b"ikm").unwrap();
@@ -842,7 +839,9 @@ mod tests {
         )
         .unwrap();
         let mut context = context(root.path(), "bare-metal/lab");
-        context.endpoint = format!("https://127.0.0.1:{dead_port}");
+        // A privileged port nothing here listens on, not one bound and
+        // dropped, which a parallel test could take (#2156).
+        context.endpoint = "https://127.0.0.1:1".to_string();
         context.other_endpoints = vec![format!("https://127.0.0.1:{live_port}")];
 
         let (client, choice) = context.connect(None, None, probe_endpoint).unwrap();
