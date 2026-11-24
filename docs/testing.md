@@ -1776,6 +1776,55 @@ wider window to catch the same bug.
 The same check for job outcomes (exactly one completion per task-array chunk)
 is later work.
 
+## How tests get ports
+
+Several test processes share one host: two agents' `make test` and
+`make test-cluster`, or the V02 loop lanes beside them. They must never bind
+each other's ports, so every port a fixture picks comes from one place,
+[`tests/support/bun_process.rs`](../tests/support/bun_process.rs):
+
+- Fixture ports come from `TEST_PORTS`, 27000 to 29999. That's below every
+  ephemeral range (Linux 32768–60999, macOS 49152–65535), so no `bind(0)` or
+  outgoing connection lands there, and clear of the fixed ports the
+  in-process cluster suites use (15000–26999, 30000 and up). Never use
+  `bind(0)` for a port Bun binds later: on macOS the next outgoing
+  connection anywhere on the host gets it.
+- Each port is leased: a file lock under
+  `$TMPDIR/reliaburger-test-ports-<uid>/` that every helper checks before it
+  hands the port out. `reserve_port_block_lease` returns the lease as a
+  guard; keep it for as long as anything may bind the port, restarts and
+  upgrade execs included. `reserve_address`, `reserve_ports` and
+  `reserve_port_block` keep theirs until the test process exits, which under
+  nextest is the end of the test. They used to drop it as they returned, so
+  another test could lease the same port before this test's Bun bound it
+  ([#2261](https://github.com/reliaburger/reliaburger/issues/2261)).
+- A port a test's workload serves on is leased the same way.
+  `tests/self_upgrade.rs` used fixed ports 46011–46071, inside Linux's
+  ephemeral range; `deploy_testapp` now leases one.
+- Every test Bun gets `[network] port_range` 10000–14999
+  (`TEST_WORKLOAD_PORTS`), so the host ports it hands workloads never come
+  from the lease range. Bun's default, 10000–32767, covers all of it, and a
+  workload could take a port whose owner's Bun was down for a restart.
+  `BunProcess` and the shared spawn helpers set it; a test that starts Bun
+  itself calls `use_test_workload_ports` on its config first, as
+  `oci_crash`, `owned_rootless`, `job_recovery`, the self-upgrade fixtures
+  and the suite's start-up tests do. The helper also replaces a range that
+  overlaps the lease range, because a config that went through `NodeConfig`
+  and back, like every one built from `relish init`'s output, writes Bun's
+  default out. The demos get the range through `DEMO_WORKLOAD_PORTS`.
+  `ebpf` starts no Bun process: its in-process agents take ports from fixed
+  allocators at 41100 and up.
+
+A lease only keeps out processes that take one. The agent gym's
+`GYM_PORT_BASE` (default 29400) sits inside the lease range, and its nodes
+keep Bun's default `port_range`, so their workloads can land there too.
+Moving the gym takes both a new block and a gym `port_range` clear of every
+range above; until then, don't run `make test-gym` or anything else outside
+the test suites beside a test run.
+[`tests/suite/test_ports.rs`](../tests/suite/test_ports.rs) checks that the
+helpers keep their leases and that test configs keep workloads out of the
+lease range.
+
 ## When a test flakes
 
 CI runs with `retries = 0`. A test that passes on a re-run still failed once,
