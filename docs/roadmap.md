@@ -558,12 +558,23 @@ migration and no feature gate
   ([closure](qualification/2026-11-21-v0.3.1-release-closure.md),
   [release log](release-log.md#031-gate-follow-ups)). 0.3.1 keeps 0.3.0's
   cluster formats, so a 0.3.0 cluster rolls onto it in place.
-- [ ] **0.3.2: Wyse lab fixes**
+- [x] **0.3.2: Wyse lab fixes.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.2)
+  on 23 November 2026
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/34)).
   A patch release: the Wyse 3040 lab's fixes that need a new appliance
   image, such as boot logs over the network
-  ([#2149](https://github.com/reliaburger/reliaburger/issues/2149)), and the
-  fix for #2197. Next.
+  ([#2149](https://github.com/reliaburger/reliaburger/issues/2149)),
+  `allow_from` enforced on every node
+  ([#2216](https://github.com/reliaburger/reliaburger/issues/2216)) and
+  containers reaching other nodes from a node that publishes no port
+  ([#2219](https://github.com/reliaburger/reliaburger/issues/2219)), the fix
+  for #2197, and a node page and scaling in the terminal UI. Candidate 1
+  passed the full gate clean, with no known issue accepted; #2128's cause is
+  still unproven
+  ([closure](qualification/2026-11-23-v0.3.2-release-closure.md),
+  [release log](release-log.md#032-wyse-lab-fixes)). 0.3.2 moves the wire
+  protocol from 60 to 61, so a 0.3.1 cluster starts afresh
+  ([upgrading from 0.3.1](releasing.md#upgrading-from-031)).
 - [ ] **0.4.0: "Planned maintenance"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/7),
   [review](plans/2026-11-19-review-0.4.x.md),
@@ -578,7 +589,7 @@ migration and no feature gate
   rolling OS update of three appliance nodes, where a volume app keeps every
   acknowledged write and no instance dies without its stop hook. The
   [0.4.x review](plans/2026-11-19-review-0.4.x.md) of 19 November 2026 set
-  this order for 0.4.0 to 0.4.5.
+  this order for 0.4.0 to 0.4.5. Next.
 - [ ] **0.4.1: "The front door"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/13)). ACME certificates for the ingress ([#1667](https://github.com/reliaburger/reliaburger/issues/1667),
   [plan](plans/2026-11-06-plan-f08-acme.md)), an ingress address that fails

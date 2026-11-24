@@ -520,10 +520,13 @@ mod tests {
             "exec-tree",
             &helper_record(&["sh"], OwnerPhase::Running { pid: shell.id() }),
         );
+        // Wait until both are asleep, not just present: a `sleep` the shell
+        // has only just forked is still running (`R`) for a moment.
         let deadline = Instant::now() + Duration::from_secs(5);
         let report = loop {
             let report = describe_helpers(parent.path());
-            if report.contains("(sleep)") || Instant::now() >= deadline {
+            let asleep = report.contains("(sh) S") && report.contains("(sleep) S");
+            if asleep || Instant::now() >= deadline {
                 break report;
             }
             std::thread::sleep(Duration::from_millis(20));

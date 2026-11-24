@@ -1,13 +1,16 @@
 //! Power-cut qualification for storage that promises durability.
 //!
-//! Two fixtures, each run in two phases by
+//! Four fixtures, each run in two phases by
 //! `scripts/release/qualify-storage-power-cut.sh` on a disposable Lima VM:
 //!
 //! - the log/metrics exporter (its `_export_checkpoint.json`, the
 //!   cross-process `_export_checkpoint.lock`, and export-then-prune);
 //! - the standalone `LocalLeaseStore` (private unique temporaries plus file
 //!   and directory syncs);
-//! - council backups, which upload a new backup and then prune older ones.
+//! - council backups, which upload a new backup and then prune older ones;
+//! - volume snapshots: Bun's snapshot sweep over a loop-mounted Btrfs
+//!   volume (snapshot, export to an object store, prune) while a writer
+//!   keeps filling the volume. It needs root, for the mount.
 //!
 //! `prepare` starts worker processes (re-executions of this test binary) that
 //! keep mutating durable state. Every operation they finish is appended to an
@@ -25,16 +28,21 @@ use std::time::Duration;
 
 use rand::RngExt;
 use reliaburger::bun::disk_pressure::check_and_relieve;
+use reliaburger::bun::snapshot_worker::{SnapshotUploader, snapshot_tick};
 use reliaburger::council::backup::{
     BackupConfig, BackupKey, BackupStore, decode_backup, encode_backup, seal_snapshot,
     unseal_snapshot,
 };
+use reliaburger::grill::btrfs::VolumeBackend;
+use reliaburger::grill::snapshot::SnapshotManager;
+use reliaburger::grill::volume::VolumeManager;
 use reliaburger::ketchup::export::{CHECKPOINT_FILENAME, ExportCheckpoint, export_logs};
 use reliaburger::ketchup::log_store::LogStore;
 use reliaburger::ketchup::remote_query::query_remote;
 use reliaburger::ketchup::types::LogStream;
 use reliaburger::testkit::lease::{LocalLeaseStore, TestLease, TestLeaseState, now_unix_millis};
 use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
 
 const DIRECTORY: &str = "RELIABURGER_POWER_CUT_DIRECTORY";
 const PHASE: &str = "RELIABURGER_REBOOT_PHASE";
@@ -1085,6 +1093,432 @@ async fn actual_power_cut_preserves_acknowledged_council_backups() {
     match phase().as_str() {
         "prepare" => prepare_backups(&root).await,
         "verify" => verify_backups(&root).await,
+        other => panic!("invalid power-cut phase {other}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Volume snapshots: snapshot a Btrfs volume, export it, prune
+// ---------------------------------------------------------------------------
+
+const VOLUME_TEST: &str = "actual_power_cut_preserves_acknowledged_volume_snapshots";
+const VOLUME_NAMESPACE: &str = "default";
+const VOLUME_APP: &str = "db";
+const VOLUME_PATH: &str = "/data";
+/// Small, so the sweep prunes a snapshot on almost every tick.
+const SNAPSHOT_RETAIN: usize = 3;
+/// Each record is one 4 KiB file, the size of a filesystem block.
+const RECORD_LINE_REPEATS: usize = 256;
+
+/// The fixture's files: a Btrfs image, loop-mounted as Bun's volumes
+/// directory, and the `file://` export destination on the VM's own disk.
+struct VolumeLayout {
+    image: PathBuf,
+    volumes: PathBuf,
+    destination: PathBuf,
+    ledgers: PathBuf,
+}
+
+impl VolumeLayout {
+    fn new(root: &Path) -> Self {
+        Self {
+            image: root.join("btrfs.img"),
+            volumes: root.join("volumes"),
+            destination: root.join("destination"),
+            ledgers: root.join("ledgers"),
+        }
+    }
+
+    /// The live volume the writer fills, where Bun would provision it.
+    fn live(&self) -> PathBuf {
+        self.volumes
+            .join(VOLUME_NAMESPACE)
+            .join(VOLUME_APP)
+            .join(VOLUME_PATH.trim_start_matches('/'))
+    }
+
+    fn destination_url(&self) -> String {
+        format!("file://{}", self.destination.display())
+    }
+
+    fn mount(&self) {
+        run_tool(
+            "mount",
+            &[
+                "-o",
+                "loop",
+                self.image.to_str().unwrap(),
+                self.volumes.to_str().unwrap(),
+            ],
+        );
+    }
+}
+
+/// Run a system tool and return its output, failing the fixture if it fails.
+fn run_tool(program: &str, args: &[&str]) -> String {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .unwrap_or_else(|error| panic!("run {program}: {error}"));
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{program} {args:?} failed: {text}");
+    text
+}
+
+fn record_name(sequence: u64) -> String {
+    format!("record-{sequence:08}")
+}
+
+fn record_payload(sequence: u64) -> Vec<u8> {
+    format!("record {sequence:08}\n")
+        .repeat(RECORD_LINE_REPEATS)
+        .into_bytes()
+}
+
+/// The sequence a record file holds, from its name.
+fn record_sequence(name: &str) -> Option<u64> {
+    name.strip_prefix("record-")?.parse().ok()
+}
+
+/// Fill the live volume as an application with durable writes would: write
+/// a record to a temporary name, sync it, rename it into place and sync the
+/// directory, then acknowledge it.
+async fn run_volume_writer(layout: &VolumeLayout) {
+    let live = layout.live();
+    let mut ledger = Ledger::open(&layout.ledgers.join("writer.ledger"));
+    let mut sequence = 0u64;
+    loop {
+        let staged = live.join(format!(".{}.tmp", record_name(sequence)));
+        let mut file = std::fs::File::create(&staged).unwrap();
+        file.write_all(&record_payload(sequence)).unwrap();
+        file.sync_all().unwrap();
+        std::fs::rename(&staged, live.join(record_name(sequence))).unwrap();
+        sync_directory(&live);
+        ledger.record(&format!("write {sequence}"));
+        sequence += 1;
+        let pause = rand::rng().random_range(5..30);
+        tokio::time::sleep(Duration::from_millis(pause)).await;
+    }
+}
+
+/// Run Bun's snapshot sweep over and over, acknowledging each export once
+/// the sweep has filed its receipt.
+async fn run_snapshot_sweeper(layout: &VolumeLayout) {
+    let uploader =
+        SnapshotUploader::from_url(&layout.destination_url(), NODE, Duration::from_secs(60))
+            .unwrap();
+    let cancel = CancellationToken::new();
+    let snapshots = SnapshotManager::new(&layout.volumes);
+    let mut ledger = Ledger::open(&layout.ledgers.join("sweeper.ledger"));
+    let mut acknowledged = BTreeSet::new();
+    loop {
+        let report = snapshot_tick(
+            &layout.volumes,
+            SNAPSHOT_RETAIN,
+            Some(&uploader),
+            std::time::SystemTime::now(),
+            &cancel,
+        )
+        .await;
+        for error in &report.errors {
+            ledger.record(&format!("error {error}"));
+        }
+        for meta in snapshots.list(VOLUME_NAMESPACE, VOLUME_APP).unwrap() {
+            let Some(receipt) = meta
+                .exports
+                .iter()
+                .find(|receipt| receipt.destination == uploader.destination())
+            else {
+                continue;
+            };
+            if acknowledged.insert(meta.name.clone()) {
+                ledger.record(&format!(
+                    "exported {} {} {} {}",
+                    meta.name, receipt.sha256, receipt.archive, receipt.manifest
+                ));
+            }
+        }
+        // Snapshot names are Unix seconds, so a tick a second apart never
+        // reuses the last one's name.
+        let pause = rand::rng().random_range(1_000..1_500);
+        tokio::time::sleep(Duration::from_millis(pause)).await;
+    }
+}
+
+/// An export the sweeper acknowledged.
+struct AcknowledgedExport {
+    snapshot: String,
+    sha256: String,
+    archive: PathBuf,
+    manifest: PathBuf,
+}
+
+/// Acknowledged writes, and the exports and errors the sweeper recorded.
+fn volume_ledgers(layout: &VolumeLayout) -> (u64, Vec<AcknowledgedExport>, Vec<String>) {
+    let mut writes = 0;
+    for line in ledger_lines(&layout.ledgers.join("writer.ledger")) {
+        let sequence: u64 = line
+            .strip_prefix("write ")
+            .and_then(|sequence| sequence.parse().ok())
+            .unwrap_or_else(|| panic!("unexpected writer ledger line {line:?}"));
+        assert_eq!(sequence, writes, "writer ledger skipped a record");
+        writes += 1;
+    }
+    let mut exports = Vec::new();
+    let mut errors = Vec::new();
+    for line in ledger_lines(&layout.ledgers.join("sweeper.ledger")) {
+        if let Some(error) = line.strip_prefix("error ") {
+            errors.push(error.to_string());
+            continue;
+        }
+        let fields: Vec<&str> = line.split(' ').collect();
+        let ["exported", snapshot, sha256, archive, manifest] = fields.as_slice() else {
+            panic!("unexpected sweeper ledger line {line:?}");
+        };
+        // Object keys are relative to the local store's root, `/`.
+        exports.push(AcknowledgedExport {
+            snapshot: snapshot.to_string(),
+            sha256: sha256.to_string(),
+            archive: Path::new("/").join(archive),
+            manifest: Path::new("/").join(manifest),
+        });
+    }
+    (writes, exports, errors)
+}
+
+/// The records in an exported archive, each checked whole. A snapshot is
+/// one instant of the volume, and the writer renames records into place in
+/// order, so they must run from 0 without a gap.
+fn archived_records(path: &Path) -> u64 {
+    let file = std::fs::File::open(path).unwrap();
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    let mut sequences = BTreeSet::new();
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap_or_else(|error| panic!("{} is torn: {error}", path.display()));
+        let name = entry.path().unwrap().to_string_lossy().into_owned();
+        let Some(sequence) = record_sequence(name.trim_start_matches("./")) else {
+            continue;
+        };
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut bytes).unwrap();
+        assert_eq!(
+            bytes,
+            record_payload(sequence),
+            "record {sequence} in {} is torn",
+            path.display()
+        );
+        sequences.insert(sequence);
+    }
+    let count = sequences.len() as u64;
+    assert!(
+        sequences.iter().copied().eq(0..count),
+        "{} holds records with a gap: {sequences:?}",
+        path.display()
+    );
+    count
+}
+
+async fn prepare_volumes(root: &Path, layout: &VolumeLayout) {
+    assert!(
+        nix::unistd::geteuid().is_root(),
+        "the volumes fixture mounts a Btrfs image and needs root: run it through {SCRIPT}"
+    );
+    begin_prepare(root);
+    for directory in [&layout.volumes, &layout.destination, &layout.ledgers] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    run_tool("truncate", &["-s", "1G", layout.image.to_str().unwrap()]);
+    run_tool("mkfs.btrfs", &["-q", layout.image.to_str().unwrap()]);
+    layout.mount();
+    let live = VolumeManager::new(&layout.volumes)
+        .create_managed_volume(VOLUME_NAMESPACE, VOLUME_APP, Path::new(VOLUME_PATH), None)
+        .unwrap();
+    assert_eq!(live, layout.live());
+    assert_eq!(
+        VolumeManager::new(&layout.volumes).backend_of(&live),
+        Some(VolumeBackend::BtrfsSubvolume)
+    );
+    // The image, its filesystem and the volume must outlive the first cut.
+    // No worker is running yet, so a global sync weakens nothing under test.
+    run_tool("sync", &[]);
+    spawn_worker(VOLUME_TEST, root, "writer");
+    spawn_worker(VOLUME_TEST, root, "sweeper");
+    wait_until("acknowledged exports", || {
+        let (writes, exports, _) = volume_ledgers(layout);
+        writes > 50 && exports.len() > SNAPSHOT_RETAIN + 1
+    })
+    .await;
+    finish_prepare(root);
+}
+
+async fn verify_volumes(root: &Path, layout: &VolumeLayout) {
+    let boot = assert_rebooted(root);
+    // The filesystem itself: checked unmounted, then mounted again, as Bun's
+    // volumes directory would be on boot.
+    run_tool(
+        "btrfs",
+        &["check", "--readonly", layout.image.to_str().unwrap()],
+    );
+    layout.mount();
+    let (writes, exports, errors) = volume_ledgers(layout);
+    assert!(
+        errors.is_empty(),
+        "the sweep failed before the cut: {errors:?}"
+    );
+
+    // Every acknowledged write is in the live volume, whole. Only the write
+    // in flight may have landed without its acknowledgement.
+    let mut landed_unacknowledged = 0;
+    for entry in std::fs::read_dir(layout.live()).unwrap() {
+        let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+        if let Some(sequence) = record_sequence(&name) {
+            assert!(sequence <= writes, "record {sequence} was never written");
+            landed_unacknowledged += u64::from(sequence == writes);
+        }
+    }
+    for sequence in 0..writes {
+        let bytes = std::fs::read(layout.live().join(record_name(sequence)))
+            .unwrap_or_else(|error| panic!("acknowledged record {sequence} is missing: {error}"));
+        assert_eq!(bytes, record_payload(sequence), "record {sequence} is torn");
+    }
+
+    // Every acknowledged export is at the destination with the bytes its
+    // receipt names, beside its manifest, and holds an intact snapshot.
+    let mut largest_archive = 0;
+    for export in &exports {
+        assert!(
+            export.archive.starts_with(&layout.destination),
+            "{} is outside the destination",
+            export.archive.display()
+        );
+        let bytes = std::fs::read(&export.archive).unwrap_or_else(|error| {
+            panic!(
+                "acknowledged archive of snapshot {} is missing: {error}",
+                export.snapshot
+            )
+        });
+        assert_eq!(
+            sha256(&bytes),
+            export.sha256,
+            "archive of snapshot {} changed",
+            export.snapshot
+        );
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&export.manifest).unwrap_or_else(|error| {
+                panic!(
+                    "manifest of snapshot {} is missing: {error}",
+                    export.snapshot
+                )
+            }))
+            .unwrap_or_else(|error| {
+                panic!("manifest of snapshot {} is torn: {error}", export.snapshot)
+            });
+        assert_eq!(manifest["sha256"], export.sha256.as_str());
+        let records = archived_records(&export.archive);
+        assert!(
+            records <= writes + 1,
+            "snapshot {} holds records never written",
+            export.snapshot
+        );
+        largest_archive = largest_archive.max(records);
+    }
+
+    // A snapshot still on disk keeps the receipt it was acknowledged with,
+    // or it would ship again and pruning would hold it.
+    let uploader =
+        SnapshotUploader::from_url(&layout.destination_url(), NODE, Duration::from_secs(60))
+            .unwrap();
+    let snapshots = SnapshotManager::new(&layout.volumes);
+    let listed = snapshots
+        .list(VOLUME_NAMESPACE, VOLUME_APP)
+        .expect("the snapshot inventory is unreadable after the power cut");
+    let acknowledged: BTreeSet<&str> = exports.iter().map(|e| e.snapshot.as_str()).collect();
+    for meta in &listed {
+        if acknowledged.contains(meta.name.as_str()) {
+            assert!(
+                meta.exported_to(uploader.destination()),
+                "snapshot {} lost its export receipt",
+                meta.name
+            );
+        }
+    }
+
+    // The next sweep, as Bun runs on boot: it settles an interrupted
+    // snapshot, finds nothing unexplained, and ships and prunes as before.
+    let cancel = CancellationToken::new();
+    let report = snapshot_tick(
+        &layout.volumes,
+        SNAPSHOT_RETAIN,
+        Some(&uploader),
+        std::time::SystemTime::now(),
+        &cancel,
+    )
+    .await;
+    assert!(
+        report.errors.is_empty(),
+        "the first sweep after the cut failed: {:?}",
+        report.errors
+    );
+    assert!(
+        report.unexplained.is_empty(),
+        "subvolumes with no metadata and no intent: {:?}",
+        report.unexplained
+    );
+    assert_eq!(
+        report.created, 1,
+        "the first sweep after the cut made no snapshot"
+    );
+    let after = snapshots.list(VOLUME_NAMESPACE, VOLUME_APP).unwrap();
+    assert!(
+        after
+            .iter()
+            .all(|meta| meta.exported_to(uploader.destination())),
+        "a snapshot is still unexported after the recovery sweep"
+    );
+    assert!(
+        after.len() <= SNAPSHOT_RETAIN,
+        "{} snapshots kept, retention is {SNAPSHOT_RETAIN}",
+        after.len()
+    );
+
+    finish_verify(
+        root,
+        &boot,
+        serde_json::json!({
+            "fixture": "volumes",
+            "writes": writes,
+            "write_landed_unacknowledged": landed_unacknowledged,
+            "exports": exports.len(),
+            "largest_archive_records": largest_archive,
+            "listed_before_sweep": listed.len(),
+            "interrupted_removed": report.interrupted_removed,
+            "uploaded_by_sweep": report.uploaded,
+        }),
+    );
+    let _ = Command::new("umount").arg(&layout.volumes).status();
+}
+
+/// Two-phase fixture: the driver must actually cut the disposable VM's power.
+#[tokio::test]
+#[ignore = "run only through scripts/release/qualify-storage-power-cut.sh on a disposable VM"]
+async fn actual_power_cut_preserves_acknowledged_volume_snapshots() {
+    let root = fixture_directory();
+    let layout = VolumeLayout::new(&root);
+    if let Ok(role) = std::env::var(ROLE) {
+        match role.as_str() {
+            "writer" => run_volume_writer(&layout).await,
+            "sweeper" => run_snapshot_sweeper(&layout).await,
+            other => panic!("unknown volume worker role {other}"),
+        }
+        return;
+    }
+    match phase().as_str() {
+        "prepare" => prepare_volumes(&root, &layout).await,
+        "verify" => verify_volumes(&root, &layout).await,
         other => panic!("invalid power-cut phase {other}"),
     }
 }
