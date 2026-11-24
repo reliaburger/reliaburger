@@ -1540,7 +1540,9 @@ refuses to start while
 gate holds the host (exit 75), and holds the quiet lock while it runs, so the
 power-cut endurance run pauses. Nothing else should build or test on the Mac
 or in the VMs meanwhile: lanes that each had a runner to themselves on GitHub
-share a host here. The evidence (each lane's `loop.log`, `junit.xml`,
+share a host here. The [first local record](qualification/2026-11-24-v02-loops-local.md)
+ran beside other agents' `make ci` runs and lost runs to port collisions in the
+leased range. The evidence (each lane's `loop.log`, `junit.xml`,
 `summary.md` and the `lane.sh` that ran it, the build logs, `environment.txt`,
 `schedule.log` and `v02-loops-summary.md`) goes to
 `/var/tmp/reliaburger-v02-loops-SHORTSHA`, or `--evidence DIR`.
