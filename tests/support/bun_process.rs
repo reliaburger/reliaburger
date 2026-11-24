@@ -460,12 +460,15 @@ require_mtls = false
     config
 }
 
-/// Run the compiled `relish` with no endpoint, token or CA inherited from
-/// the environment.
+/// Run the compiled `relish` with no endpoint, token, CA or context
+/// inherited from the environment: an empty `RELIABURGER_HOME` keeps the
+/// developer's cluster out of it (#2290).
 pub fn run_relish(args: &[&str]) -> Output {
     let _phase = fixture_phase(safe_relish_phase(args));
+    let home = tempfile::tempdir().unwrap();
     Command::new(env!("CARGO_BIN_EXE_relish"))
         .args(args)
+        .env("RELIABURGER_HOME", home.path())
         .env_remove("RELIABURGER_ENDPOINT")
         .env_remove("RELIABURGER_TOKEN")
         .env_remove("RELIABURGER_CA_CERT")
