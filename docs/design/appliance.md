@@ -70,8 +70,11 @@ With no login, the local keyboard reaches only tty1's status screen
 (`reliaburger-console.service`, #2279). A logind drop-in sets `NAutoVTs=0`
 and `ReserveVT=0`, so tty2 to tty6 get no getty, and Ubuntu's
 `getty-static.service`, which starts them when logind is missing, is masked.
-`ctrl-alt-del.target` is masked and `CtrlAltDelBurstAction=none` stops PID 1
-forcing a reboot on seven quick presses. `kernel.sysrq = 176` keeps only
+`ctrl-alt-del.target` is masked, and the image's preset disables
+`reboot.target`: the target is its alias, and systemd's 90-systemd.preset
+enabling it made `preset-all` replace the mask with the alias in the first CI
+build. `CtrlAltDelBurstAction=none` stops PID 1 forcing a reboot on seven
+quick presses. `kernel.sysrq = 176` keeps only
 SysRq's sync (16), read-only remount (32) and reboot (128): the gentlest way
 to restart a hung node with no login, and nothing the power button doesn't
 already give someone at the keyboard. Killing processes (64) and dumping

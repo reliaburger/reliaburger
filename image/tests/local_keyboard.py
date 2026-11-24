@@ -10,7 +10,8 @@ else the keyboard could do is off, or deliberately limited:
 - no gettys on tty2-tty6: logind's NAutoVTs=0 and ReserveVT=0, and Ubuntu's
   getty-static.service masked, and nothing enables a getty or an autovt on
   any VT but tty1;
-- Ctrl-Alt-Del does nothing: ctrl-alt-del.target masked, and PID 1's
+- Ctrl-Alt-Del does nothing: ctrl-alt-del.target masked or absent (a
+  preset disables reboot.target, whose alias it is), and PID 1's
   CtrlAltDelBurstAction=none, so seven quick presses don't force a reboot;
 - magic SysRq is 176: sync, remount read-only and reboot only.
 
@@ -28,7 +29,12 @@ from pathlib import Path
 
 # 16 sync, 32 remount read-only, 128 reboot and power off.
 SYSRQ = "176"
-MASKED = ("ctrl-alt-del.target", "getty-static.service")
+MASKED = ("getty-static.service",)
+CTRL_ALT_DEL = "ctrl-alt-del.target"
+# systemd's 90-systemd.preset enables reboot.target, whose Alias= is
+# ctrl-alt-del.target, and preset-all replaces a mask with that alias. An
+# earlier preset file has to disable it.
+PRESET = "disable reboot.target"
 CONSOLE = "reliaburger-console.service"
 VT_UNIT = re.compile(r"^(?:getty|autovt)@tty(\d+)\.service$")
 
@@ -128,6 +134,35 @@ def vt_units_wanted(tree):
     return found
 
 
+def masked(path):
+    return path.is_symlink() and str(path.readlink()) == "/dev/null"
+
+
+def found(path):
+    if path.is_symlink():
+        return f", it links to {path.readlink()}"
+    return ", it's a file" if path.exists() else ", it's missing"
+
+
+def ctrl_alt_del(tree):
+    """ctrl-alt-del.target either masked in /etc or nowhere at all: with no
+    unit by that name, PID 1 has nothing to start."""
+    problems = []
+    etc = tree.etc / "systemd" / "system" / CTRL_ALT_DEL
+    usr = tree.usr / "lib" / "systemd" / "system" / CTRL_ALT_DEL
+    if not masked(etc):
+        for path in (etc, usr):
+            if path.exists() or path.is_symlink():
+                problems.append(f"{path}: Ctrl-Alt-Del reboots; mask it or remove it{found(path)}")
+    presets = tree.usr / "lib" / "systemd" / "system-preset"
+    lines = [line.strip() for f in sorted(presets.glob("*.preset")) if f.name < "90-"
+             for line in (tree.read(f) or "").splitlines()] if presets.is_dir() else []
+    if PRESET not in lines:
+        problems.append(f"no preset before 90-systemd.preset says {PRESET!r}: "
+                        f"preset-all would make {CTRL_ALT_DEL} reboot.target's alias again")
+    return problems
+
+
 def check(tree, built):
     problems = []
     logind = conf_d(tree, "systemd/logind.conf", "systemd/logind.conf.d")
@@ -142,8 +177,9 @@ def check(tree, built):
                         "seven quick Ctrl-Alt-Dels force a reboot")
     for unit in MASKED:
         mask = tree.etc / "systemd" / "system" / unit
-        if not (mask.is_symlink() and str(mask.readlink()) == "/dev/null"):
-            problems.append(f"{mask}: not masked (a symlink to /dev/null)")
+        if not masked(mask):
+            problems.append(f"{mask}: not masked (a symlink to /dev/null){found(mask)}")
+    problems += ctrl_alt_del(tree)
     value, where = sysctl(tree, "kernel.sysrq")
     if value != SYSRQ:
         problems.append(f"kernel.sysrq is {value or 'the kernel default'}"
@@ -171,7 +207,7 @@ def main(args):
     for problem in problems:
         print(problem)
     if not problems:
-        print(f"{args[1]}: no gettys on tty2-tty6, Ctrl-Alt-Del masked, kernel.sysrq = {SYSRQ}, "
+        print(f"{args[1]}: no gettys on tty2-tty6, Ctrl-Alt-Del starts nothing, kernel.sysrq = {SYSRQ}, "
               f"{CONSOLE} on tty1")
     return 1 if problems else 0
 

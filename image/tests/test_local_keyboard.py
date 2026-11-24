@@ -65,6 +65,8 @@ class BuiltUsr(unittest.TestCase):
         write(self.usr / "lib" / "sysctl.d" / "60-reliaburger-sysrq.conf", "kernel.sysrq = 176\n")
         for unit in ("ctrl-alt-del.target", "getty-static.service"):
             link(self.etc / "systemd" / "system" / unit, "/dev/null")
+        write(self.usr / "lib" / "systemd" / "system-preset" / "80-reliaburger.preset",
+              "enable reliaburger-console.service\ndisable reboot.target\n")
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -95,9 +97,30 @@ class BuiltUsr(unittest.TestCase):
         write(self.etc / "systemd" / "logind.conf.d" / "50-reliaburger-keyboard.conf", "[Login]\n")
         self.assert_fails_with("NAutoVTs", "ReserveVT")
 
-    def test_ctrl_alt_del_unmasked_fails(self):
+    def test_ctrl_alt_del_target_absent_everywhere_passes(self):
+        # Without reboot.target's alias, PID 1 finds no ctrl-alt-del.target.
         (self.etc / "systemd" / "system" / "ctrl-alt-del.target").unlink()
+        done = self.check()
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+    def test_preset_all_turning_the_mask_into_reboot_target_s_alias_fails(self):
+        # What the first CI build found: systemd's 90-systemd.preset enables
+        # reboot.target, whose Alias= is ctrl-alt-del.target, and preset-all
+        # replaced the mask with that alias.
+        mask = self.etc / "systemd" / "system" / "ctrl-alt-del.target"
+        mask.unlink()
+        link(mask, "/usr/lib/systemd/system/reboot.target")
+        self.assert_fails_with("ctrl-alt-del.target", "reboot.target")
+
+    def test_the_alias_shipped_in_usr_without_a_mask_fails(self):
+        (self.etc / "systemd" / "system" / "ctrl-alt-del.target").unlink()
+        link(self.usr / "lib" / "systemd" / "system" / "ctrl-alt-del.target", "reboot.target")
         self.assert_fails_with("ctrl-alt-del.target")
+
+    def test_reboot_target_left_to_systemd_s_preset_fails(self):
+        (self.usr / "lib" / "systemd" / "system-preset" / "80-reliaburger.preset").write_text(
+            "enable reliaburger-console.service\n")
+        self.assert_fails_with("disable reboot.target")
 
     def test_a_mask_pointing_anywhere_but_dev_null_fails(self):
         (self.etc / "systemd" / "system" / "getty-static.service").unlink()
