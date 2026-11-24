@@ -17,6 +17,7 @@ Not released yet: this is what the train carries, and it can change before the t
 
 ### Changed
 
+- On Linux with glibc, Bun calls `malloc_trim(0)` on its blocking pool every ten minutes, so its resident memory follows what it holds instead of climbing with the free memory glibc keeps. Under hours of load that kept memory had looked like a leak in `relish nodes`, `relish top` and `top`. A trim that takes 100 ms or more is logged. macOS and musl builds are unchanged ([#1936](https://github.com/reliaburger/reliaburger/issues/1936)).
 - The appliance image has Buildah, so `relish build` and the five-minute tour's burger build on a cluster of appliances. Its storage is on the data partition, where Btrfs reflinks the `vfs` driver's layer copies; the image adds `netavark` and `gpg` for it, drops Buildah's 97 MB of test helpers, and grows each `/usr` slot by 54 MB (667 MB to 721 MB of 1,100 MB on x86-64). A multi-platform build can't emulate the other architecture's `RUN` steps on an appliance, so cross-compile or name one `platform`. With no node able to build, the refusal no longer says appliances never can ([#2144](https://github.com/reliaburger/reliaburger/issues/2144)).
 
 ## [0.3.2] - 2026-11-23

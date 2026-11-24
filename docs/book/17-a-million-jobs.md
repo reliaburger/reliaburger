@@ -4179,6 +4179,122 @@ stopped growing at hour 20. Getting there also took one trick: `relish
 logs` fans out to every node, so even "node 2's" tail had queried node 3's
 store, and the day tier now asks each node's own `/v1/logs/entries`.
 
+"Not a leak" is a fine answer for us and a poor one for someone watching
+`top` on a 2 GB appliance for a week. To them, a Bun that climbs by
+200–330 MiB is leaking, whoever holds the bytes. The gdb trick already said
+what fixes it, so from 0.3.3 Bun does it itself
+([#1936](https://github.com/reliaburger/reliaburger/issues/1936)): every ten
+minutes it calls `malloc_trim(0)`. There were cheaper-looking options. Bun
+already caps glibc at two arenas, so fewer arenas has little left to give.
+glibc's automatic trim threshold (`M_TRIM_THRESHOLD`) only ever returns the
+free space at the very top of the main heap, and long-running Bun's free
+space is scattered through the middle, between blocks still in use. A
+different allocator, such as jemalloc with background threads, returns
+memory on its own, but it adds a C dependency to every build, including the
+static musl ones and the appliance image, to do what one glibc call already
+does. `malloc_trim` walks every arena and hands each whole free page back
+with `madvise(MADV_DONTNEED)`, wherever it sits.
+
+The code is in `src/bun/malloc_trim.rs`. The FFI is one call:
+
+```rust
+pub fn trim_now() -> bool {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // SAFETY: malloc_trim takes no pointers and touches only malloc's
+        // own state, under the same per-arena locks malloc and free take, so
+        // it is safe to call from any thread at any time. The argument is
+        // the padding to leave at the top of the heap; 0 keeps none.
+        let released = unsafe { libc::malloc_trim(0) };
+        released != 0
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        false
+    }
+}
+```
+
+`libc::malloc_trim` is a declaration of glibc's C function, written out by
+the `libc` crate: an `extern "C"` signature, `fn malloc_trim(pad: size_t)
+-> c_int`, with nothing behind it in Rust. The linker finds the symbol in
+glibc, exactly as it would for a C program; Go's cgo does the same with a
+`// #include` comment and generated stubs. Rust calls every such foreign
+function `unsafe`, because the compiler can't see into C and can't promise
+it upholds Rust's rules about pointers, aliasing and threads. `unsafe { ... }`
+doesn't switch any checks off for the code around it. It marks the one place
+where a human made that promise, and the `// SAFETY:` comment, which this
+project requires on every such block, is where they say why. Here the
+argument is easy to make: no pointers cross, and glibc takes its own locks.
+
+The two `#[cfg]` blocks are the function body for each kind of build, and
+the compiler sees only one of them. On macOS and musl, `libc::malloc_trim`
+doesn't exist at all, so naming it outside a `cfg` would fail to compile
+there, not just do nothing. The block's last expression is its value, and
+the function's, so each build returns a `bool` with no `return` keyword. The
+loop that calls it checks the compile-time `cfg!` boolean `SUPPORTED` first
+and returns at once where there is no glibc.
+
+`malloc_trim` locks each arena while it walks it, and any thread that
+allocates in the meantime waits. That's fine for a sliver of a second, but
+not on one of Tokio's async worker threads, where it would stall every task
+queued behind it. So the loop sends the call to the blocking pool:
+
+```rust
+pub async fn run_trim_loop<F>(interval: Duration, shutdown: CancellationToken, trim: F)
+where
+    F: Fn() -> bool + Clone + Send + 'static,
+{
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // The first tick completes at once; skip it.
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = ticker.tick() => {}
+        }
+        let trim = trim.clone();
+        let started = Instant::now();
+        // A join error means the runtime is shutting down.
+        if tokio::task::spawn_blocking(trim).await.is_err() {
+            return;
+        }
+        if let Some(warning) = slow_trim_warning(started.elapsed()) {
+            eprintln!("{warning}");
+        }
+    }
+}
+```
+
+The trim is a parameter so the tests can pass a fake. `F` is a generic type
+with bounds in the `where` clause: anything callable with no arguments that
+returns a `bool` (`Fn() -> bool`), that can be copied for each tick
+(`Clone`), moved to another thread (`Send`), and holds no borrowed
+references (`'static`), because the blocking pool may run it after this
+function's stack frame has moved on. Production passes `trim_now`, a plain
+function, which meets all four for free. A test passes a closure that
+sends on a channel each time it's called. With `start_paused = true`, Tokio's
+clock stands still and jumps straight to the next timer whenever every task
+is waiting, so the test sees trims at exactly 600, 1,200 and 1,800 virtual
+seconds without waiting ten minutes. Two more tests cancel the token, before
+the first tick and halfway between two, and check that the loop returns at
+the cancel and never trims again. A trim slower than 100 ms goes to stderr,
+so a long pause on a big heap shows up in the journal.
+
+We measured it before trusting it, on a one-node Bun in a VM, with host
+job arrays and a loop of `relish nodes`, `top`, `metrics` and `logs`
+([the 24 November record](../qualification/2026-11-24-bun-malloc-trim.md)).
+After a 15-minute burst of load, the old Bun went quiet at 114 MiB of
+anonymous memory and stayed there; the first trim took the new one from 104
+to 77 MiB, and twelve minutes in it was at 92. Under steady load the two
+builds were the same, 113 MiB on average over 40 minutes. That's the honest
+limit of the fix: a trim returns what is free at that moment, and under
+load the free pages are the next second's allocations, so they come straight
+back. What it's for is the slow build-up of free memory that nobody reuses,
+which #1417's day run saw over hours. A 40-minute run can't show that, so
+the next day tier's malloc points will. Each trim took 2 to 41 ms.
+
 The run before that one taught a lesson about the test bed rather than
 Bun. Installing `gdb` meant an `apt-get update` in each guest, which gave
 Ubuntu's daily unattended upgrade something to install, and at 06:00 it
