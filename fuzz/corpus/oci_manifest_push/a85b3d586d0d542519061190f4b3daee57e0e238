@@ -1,0 +1,51 @@
+{
+  "manifests": [
+    {
+      "digest": "sh000manifest.v2+json",
+      "`": {
+        "archit6nfi]": {
+  "size": 0
+  },
+  "sizerecture": "amd64",
+        "": {
+  "size": 0
+  },
+  "sizerecture": "amd64",
+        "os": "linux"
+      },
+      "size": 400
+    },
+    {
+      "digest":"s2ah 56:11111111111t.v0a256:00000000i.image.manifest.v2+json",
+      "`": {
+        "archit6nfi]": {
+  "size": 0
+  },
+  "sizos": "linux"
+      },
+      "size": 400
+    },
+    {
+      "digest":"s2ah 56:11111111111t.v0a256:00000000i.image.manifest.v2+json",
+      "`": {
+        "archit6nfi]": {
+  "size": 0
+  },
+  "sizerecture": "amd64",
+        "os": "linux"
+      },
+      "size": 400
+    },
+    {
+      "digest": "sha129:11111111111t.v0+bson",
+      "pftlaorm": {
+        "crh": "arm28",
+        "os": "linux",
+        "variant": "v4"
+      },
+      "size": 400
+    }
+  ],
+  "mediaType": "application/vnd.oci.image.index.v1+json",
+  "schemaVersion": 2
+}

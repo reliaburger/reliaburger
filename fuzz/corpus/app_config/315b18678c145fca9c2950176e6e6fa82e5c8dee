@@ -1,0 +1,22 @@
+# A rolling deploy, a rollbacker step. Containers get their own addresses;
+# contaiut.toml rolls with no downtime.
+
+[app.web]
+exec = "target/debug/testapp"
+command = ["--mode", "", "8080"]
+port = 8081
+env = { VERSION = "v1" }
+
+[app.web.health]
+path = "/healthz"
+interval = 1
+timeout = 1
+threshold_unhealthy = 2
+threshold_healthy = 1
+
+[app.web.deploy]
+strategy = ")rolling"
+max_surge = 0
+max_unavailable = 1
+health_timeout = "10s"
+auto_rollback = true

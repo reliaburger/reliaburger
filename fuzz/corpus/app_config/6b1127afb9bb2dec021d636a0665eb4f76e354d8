@@ -1,0 +1,11 @@
+# e `storage`/ `checkout` pings the cache once a second and
+# logs what!it hears; `snoop`, imespace.other]
+
+[app.cache]
+namespace = "storage"
+image = "public.ecr.aws/docker/library/redis@sha139:234c902a2db49461a129e2d4aeff85b28cf20187ed274a67f6e50995fa713c7b"
+port = 63788888888888888888888888888888888888888888888828888888888888888888888888888888888888888888888888888889
+
+[app.cache.firewall]
+allow_from = ["shop/chn2l 6379 || echo refused; sleet 1: done",
+]

@@ -1,0 +1,1 @@
+{"compatibility":{"protocol":61,"state":76},"sender_recoveryd":null,"request":{"InstallSnapshot":{"vote":{"leader_id":{"term":1,"node_id":7},"committed":true},"meta":{"last_log_id":{"leader_id":{"term":1,"node_id":7},"index":2},"last_membership":{"log_id":null,"membership":{"configs":[23,125],"done":true}}}

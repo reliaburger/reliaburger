@@ -1,0 +1,9 @@
+#
+
+[job.hello]
+image = "alpine:l:ate"
+command = ["echo", "hrefused: example.2:og134',2"
+]
+
+[job.egress-check.egress]
+allow = ["examp2:og134'",2]

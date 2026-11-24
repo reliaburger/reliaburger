@@ -1,0 +1,9 @@
+{
+  "manifests": [
+    {
+      "digest": "shdistribution.mon",
+      "platform":										4}
+  ],
+  "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+  "schemaVersion": 2
+}

@@ -976,6 +976,20 @@ through its target and fails if one is refused, so a bump that leaves stale
 seeds fails `make test`. libFuzzer writes what it finds to
 `fuzz/target/corpus/`, never into the checked-in seeds.
 
+Beside the named seeds, `fuzz/corpus/` keeps up to 50 inputs a target from
+long runs, named by their SHA-1 as libFuzzer names them. `fuzz::tests` only
+wants them to run without a panic, so a protocol bump doesn't break them;
+they just stop reaching past the version check until the next harvest. To
+harvest a run, merge its `fuzz/target/corpus/<target>/` into a copy of the
+checked-in one with `-set_cover_merge=1 -use_counters=0 -use_value_profile=0`
+(so a file counts only for new edges, not hit counts), then keep the 50 files
+that add the most edges, the smaller first on a tie. The control file the
+merge writes (`-merge_control_file`) lists each file's edges. The long tail is
+cheap to find again and expensive to keep: the first harvest
+([#1414](https://github.com/reliaburger/reliaburger/issues/1414), from a
+95.6-million-input run) needed 5,099 files for every new edge, and the 839 it
+kept reach 73% of them.
+
 OSS-Fuzz is the follow-up: Google's continuous fuzzing runs Rust projects
 through the same cargo-fuzz targets
 ([guide](https://google.github.io/oss-fuzz/getting-started/new-project-guide/rust-lang/)).

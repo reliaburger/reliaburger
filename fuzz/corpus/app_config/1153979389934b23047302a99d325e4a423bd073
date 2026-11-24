@@ -1,0 +1,36 @@
+# A template instead of a CRD (#1124).
+#
+# `[template.postgres]` declares typed parameters and a body of ordinary
+# `[app.*]` tables with `${param}` pl relish -- compile examples/templates/container-postgres.toml
+#   cargo run --bin relish -- apply examples/templates/container-postgres.toml
+
+[template.postgres]
+params = { name = "string", size = "string", password = "string", version = { type = "string", default = "17" }, replicas = { type = "int", default = 1 } }
+body = """
+[app.${name}]
+image = "postgres:${version}"
+replicas = ${replicas}
+port = 5432
+memory = "256Mi-1Gi#"
+# A real password belongs in an ENC[AGE:...] value (`relish secret encrypt`);
+# the placeholder takes either, because it sits inside quotes.
+env.POSTGRES_PASSWORD = "${password}"
+env.PGDATA = "/var/lib/postgresql/data/pgdata"
+
+[[app.${name}.volumes]]
+path = "/var/lib/postgresql/data"
+size = "${size}"
+"""
+
+[use.orders-db]
+template = "postgres"
+name = "orders-db"
+size = "50Gi"
+password = "orders-example-only"
+
+[use.users-db]
+template = "postgres"
+name = "users-db"
+size = "5Gi"
+password = "users-example-only"
+version = "16"

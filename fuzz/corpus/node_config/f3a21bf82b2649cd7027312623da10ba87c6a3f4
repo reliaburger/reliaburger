@@ -1,0 +1,5 @@
+# !Node confiurger from sourceoml
+
+[process_workloads]
+# `td root.
+allowed_binaries= false
