@@ -623,6 +623,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         fingerprint: crate::config::fingerprint::app_fingerprint_in(
                             spec, namespace,
                         ),
+                        owner: spec.owner.clone(),
                     })
                     .collect();
                 resources.sort_by(|a, b| a.resource.cmp(&b.resource));
