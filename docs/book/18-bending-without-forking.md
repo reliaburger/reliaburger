@@ -2347,6 +2347,70 @@ rootful runc). A Mac on Apple Container with a generous `[runtime]` section
 advertises nothing, so the scheduler never sends it an app it would have to
 refuse.
 
+#### Asking again at restart
+
+A gate that's checked once can be walked around. When a container exits,
+Bun doesn't deploy it again: it restarts it from the `OciSpec` it stored
+when the deploy passed, so the gates a deploy goes through never run. That
+was fine until someone narrowed a node's `node.toml` and restarted Bun. The
+containers it adopted carried on, and the next time one crashed, it came
+back with the knob the node had just stopped allowing (#1316). Host paths
+had the same hole, so we closed both together.
+
+The restart already runs in steps: kill what's left, create, start, publish.
+Create is the one that matters, and it runs in a task off the agent loop,
+because a runtime call can take seconds. The knob check is cheap and reads
+the supervisor's allowlist, which lives on the loop, so the loop takes the
+verdict when it hands Create to its task. The host-path check resolves
+symlinks, and a source on NFS can take seconds to answer, so the task does
+that one itself with a copy of the policy. Both travel in `CreateInput`:
+
+```rust
+/// The node gate's verdict on the stored spec's runtime knobs, taken
+/// on the loop from this node's allowlist as it is now (#1316).
+knobs: Result<(), crate::grill::knobs::KnobRefusal>,
+/// The node's host-path policy, to approve the app's sources again
+/// off the loop: resolving them can block (#797, #1316).
+host_paths: crate::bun::host_paths::HostPathPolicy,
+```
+
+A field of type `Result<(), E>` looks odd if you know `Result` only as a
+return type. It's an ordinary enum, so a struct can hold one: here it's a
+verdict that was reached in one place and is acted on in another. The task
+asks before it calls the runtime:
+
+```rust
+async fn admit(&self) -> Result<(), String> {
+    self.knobs.clone().map_err(|refusal| refusal.to_string())?;
+    if let Some(spec) = &self.app_spec {
+        self.host_paths
+            .approve_app_off_runtime(spec)
+            .await
+            .map_err(|refusal| format!("host path refused: {refusal}"))?;
+    }
+    Ok(())
+}
+```
+
+`self.knobs` is borrowed (`&self`), and `map_err` takes its `Result` by
+value, so we `clone` it first; Rust won't let us move a field out of a value
+we only borrowed. The knob check reads the knobs in the stored spec, not the
+app's config, because the spec is what runc will apply.
+
+A refusal comes back as a new `StepResult::Refused(String)`, and the loop
+records it the way it records a binary that's gone: the instance is
+`Failed` with the reason, and the restart budget isn't spent. Retrying
+would fail the same way each time and only bury the reason. We didn't make
+it stop a running container the moment Bun starts with a narrower list.
+Killing work because of a config edit is a bigger decision than refusing to
+start it again, and an operator who wants that can redeploy.
+
+`WorkloadSupervisor::check_runtime_knobs` is the deploy's own check with the
+`AppSpec` taken out: it takes an `Option<&RuntimeKnobs>`, so the deploy
+passes `spec.runtime.as_ref()` and the restart passes the stored spec's
+knobs. `as_ref` turns a `&Option<T>` into an `Option<&T>`, which borrows
+what's inside instead of moving it out.
+
 #### Parsing is the validation, again
 
 Some values must never reach any node, whatever its `node.toml` says.
@@ -3643,6 +3707,17 @@ whose halves are never tested apart can quietly become a single gate.
   `rwm` and `mr`. `a_capability_checked_against_the_node_is_refused_in_an_app_and_in_a_node`
   does the same for all 22 host capabilities, and pins the 15 that are
   left, so a capability can't drift from one list to the other unnoticed.
+- **Restarts** (#1316): `a_restart_after_the_node_drops_a_knob_is_refused_with_the_reason`
+  deploys an app with two knobs the node allows, empties the allowlist the
+  way a restarted Bun with a shorter `node.toml` would, crashes the
+  instance and drives its restart. The instance must be `Failed`, its
+  reason must name both knobs, it mustn't be waiting to retry, and the mock
+  runtime must have been asked to create it only once, at deploy.
+  `a_restart_after_the_node_drops_a_host_path_is_refused_with_the_reason` does
+  the same with a volume `source` and the host-path policy, and
+  `a_restart_the_node_still_allows_creates_the_instance_again` checks the
+  re-check refuses only what changed. The two refusal tests failed before
+  the fix: the instance came back `Running`.
 
 None of those run runc. The first version said the runc half was
 "exercised by `make test-linux`", and it wasn't: no Linux test ran a knob.
@@ -3650,6 +3725,17 @@ None of those run runc. The first version said the runc half was
 is the first, and it's the one that proved #1427 before we touched the
 code. `runc_capability_knobs_work_only_where_the_container_owns_the_check`
 is the second, and it ends by checking the parser agrees with the kernel.
+Neither set a sysctl or passed a device, so the third,
+`runc_sysctl_and_device_knobs_take_effect_inside_the_container` (#1316),
+does both. It starts Alpine with `CAP_IPC_OWNER`, `net.core.somaxconn` at
+4321, `kernel.shmmni` at 2345 and `/dev/fuse`, then reads each sysctl from
+`/proc/sys` inside the container, opens the device read-write with the
+shell's `exec 3<>/dev/fuse`, and checks the capability's bit in `CapEff`.
+The values are ones no kernel picks by default, so reading them back
+proves the knob, not the host. The two sysctls take different roads, the
+node writing the network one and runc the IPC one, so the test checks each.
+It ends by reading the host's own values again: a namespaced sysctl that
+leaked would show there.
 
 ### Testing templates
 

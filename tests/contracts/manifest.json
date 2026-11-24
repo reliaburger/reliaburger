@@ -5448,6 +5448,17 @@
           "sources": [
             "src/grill/runc.rs"
           ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-grill-runc-tests-runc_sysctl_and_device_knobs_take_effect_inside_the_container",
+          "binary": "reliaburger",
+          "test": "grill::runc::tests::runc_sysctl_and_device_knobs_take_effect_inside_the_container",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/grill/runc.rs"
+          ]
         }
       ]
     },

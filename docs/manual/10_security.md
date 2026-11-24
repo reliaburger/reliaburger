@@ -781,6 +781,15 @@ runtime.devices /dev/fuse refused by the node gate: this node's [runtime] allowe
 The refusal names every knob the node doesn't allow, each with its key, so
 you can fix them all in one go.
 
+The node asks again each time an instance restarts, because a restart builds
+the container from what was approved at deploy. So if you take a knob out of
+`node.toml` and restart Bun, a container that's still running keeps the knob
+until it next exits. Then its restart is refused, the instance is `Failed`,
+and `relish apps` and `relish wtf` show the refusal. The node doesn't retry
+it, so redeploy once the app and the node agree. A volume or config-file
+`source` that `[storage] allowed_host_paths` no longer covers is refused the
+same way.
+
 Only rootful runc applies knobs. A node on the process runtime, Apple
 Container or rootless runc advertises none, whatever its `[runtime]` says,
 and refuses an app that has them rather than running it without them. An
