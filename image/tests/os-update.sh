@@ -38,11 +38,12 @@
 # link goes down (QEMU's set_link) the moment <version> reboots into it, as
 # a Wyse's did in the 0.3.2 lab (#2245). The boot check doesn't wait for the
 # network and wants an address on a counted boot, so both tries of <target>
-# fail and systemd-boot falls back to <version>, still with no link. Once
-# bun is healthy there, the link comes back, and the rollout must pause on
-# the fallback bun reports. Nothing streams with the link down, so this
-# mode doesn't stream; it records the fallback's time without holding it
-# to the 10 minutes, since the fallback boot waits out the network too.
+# fail and systemd-boot falls back to <version>. bun can't start without an
+# address (its DNS responder has nothing to bind), so the link comes back as
+# the fallback boot starts; then bun must be healthy on <version> and the
+# rollout must pause on the fallback bun reports. Nothing streams with the
+# link down, so this mode doesn't stream, and it records the fallback's
+# time without holding it to the 10 minutes.
 # Needs root (the bridge), qemu-system-x86, ovmf, dnsmasq, mtools and
 # /dev/kvm.
 set -euo pipefail
@@ -195,7 +196,8 @@ if [ "$mode" = update ]; then
     title="OS update $version → $target"
 elif [ "$mode" = no-link ]; then
     # The kernel's last line before the firmware: cut the link there, so
-    # <target>'s boot never sees one.
+    # <target>'s boots never see one. The fourth kernel banner is the
+    # fallback boot (one before the update, two tries).
     rebooting() { at_least "reboot: Restarting system" 1; }
     t_upgrade='' t_reboot='' t_back=''
     if wait_for healthy_on "$version" \
@@ -205,9 +207,10 @@ elif [ "$mode" = no-link ]; then
         && wait_closely rebooting \
         && link off \
         && t_reboot=$(date +%s) \
+        && wait_for at_least "Linux version" 4 \
+        && link on \
         && wait_for healthy_on "$version" 2 \
         && t_back=$(date +%s) \
-        && link on \
         && wait_for paused; then
         result=pass
     fi
@@ -220,7 +223,7 @@ elif [ "$mode" = no-link ]; then
         detail="$detail, not the two failed tries and the fallback"
     fi
     if [ -n "$t_back" ]; then
-        detail="$detail, back on $version with no link $((t_back - t_reboot)) s after the reboot into $target"
+        detail="$detail, healthy on $version again $((t_back - t_reboot)) s after the reboot into $target"
     fi
     outcome="$result: $detail"
     title="OS update with no link $version → $target → $version"
