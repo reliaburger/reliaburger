@@ -161,7 +161,7 @@ The fast loop: aim for under 30 minutes a pass, and use the shortcuts freely.
 
   You want one node alive, `Size: up to 5 voters`, and nothing for `wtf` to fix. If `relish machines` sees nothing, run `dns-sd -B _rb-unclaimed._tcp`, or claim by address (`<ip-1>`) instead of MAC.
 
-- [ ] **1.6 Run a workload.** The ingress is on port 80 of the node, not `localhost:18080`. Note how long the image pull took compared with the laptop quickstart. The burger demo needs `relish build` first, and the appliance has no Buildah to build with (#2144), so use an image from Docker Hub. Save this as `~/wyse-lab/nginx.toml`:
+- [ ] **1.6 Run a workload.** The ingress is on port 80 of the node, not `localhost:18080`. Note how long the image pull took compared with the laptop quickstart. Until an image with Buildah (#2144, 0.3.3) is on the node, use an image from Docker Hub. Save this as `~/wyse-lab/nginx.toml`:
 
   ```toml
   [app.nginx]
@@ -183,6 +183,14 @@ The fast loop: aim for under 30 minutes a pass, and use the shortcuts freely.
   $R apply ~/wyse-lab/nginx.toml
   $R apps
   curl -H 'Host: nginx.localhost' http://<ip-1>/
+  ```
+
+  On an image with Buildah (#2144), build the burger on the node too, from the repository's `examples/demo`, and note how long it took, the node's free memory during the build, and how much it wrote to the eMMC, over the lab image's SSH (`free -m` during it; `cat /sys/block/mmcblk0/stat` before and after, whose seventh field is sectors written):
+
+  ```sh
+  cd examples/demo && time $R build burger/burger.toml
+  $R apply burger/burger.toml
+  curl -H 'Host: burger.localhost' http://<ip-1>/
   ```
 
 - [ ] **1.7 Test the fallback on this one node.** This is the riskiest Wyse-specific part: whether the firmware keeps counting boot tries. Serve `next/` in a terminal of its own, stage the broken version and reboot. The node is down while it tries, which is fine for the dry run.
