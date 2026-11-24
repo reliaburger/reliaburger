@@ -14,6 +14,7 @@ HEADROOM = HERE / "assert-headroom"
 FREE_DISK = HERE / "free-runner-disk"
 GIVE_SWAP = HERE / "give-swap"
 SNAPSHOT = HERE / "runner-snapshot"
+WATCH_MACOS = HERE / "watch-macos-memory"
 
 
 class FakeHost:
@@ -472,6 +473,60 @@ class WatchRunnerSnapshotTests(unittest.TestCase):
                 time.sleep(0.3)
                 self.assertEqual(list(snapshots.iterdir()), [])
                 self.assertNotIn("snapshot:", out)
+
+class WatchMacosMemoryTests(unittest.TestCase):
+    """watch-macos-memory says whether portable macOS's build paged (#1723)."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.host = FakeHost(self.directory.name)
+        self.host.write_tool("sysctl", 'case "$2" in\n'
+                             '  vm.loadavg) echo "{ 2.75 2.10 1.50 }" ;;\n'
+                             '  vm.swapusage) echo "total = 3072.00M  used = 1203.25M  free = 1868.75M  (encrypted)" ;;\n'
+                             'esac\n')
+        self.host.write_tool("memory_pressure", 'echo "The system has 7516192768 (1835008 pages with a page size of 4096)."\n'
+                             'echo "System-wide memory free percentage: 12%"\n')
+        self.host.write_tool("vm_stat", 'echo "Pageouts:                                    10."\n'
+                             'echo "Swapouts:                                  4242."\n')
+        self.host.write_tool("ps", 'echo "  10240 /usr/bin/python3"\n'
+                             'echo "9437184 /Users/runner/.rustup/toolchains/1.98.0/bin/rustc"\n')
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def test_each_line_says_the_load_free_memory_swap_and_the_biggest_process(self):
+        result = self.host.run(WATCH_MACOS, "0", "2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertRegex(lines[0], r"^\d\d:\d\d:\d\d load=2.75 free=12% swap_used=1203.25M "
+                                   r"swapouts=4242 top=rustc:9216M$")
+
+    def test_a_missing_tool_leaves_its_field_empty_and_never_stops_it(self):
+        for tool in ("sysctl", "memory_pressure", "vm_stat"):
+            self.host.write_tool(tool, "exit 1\n")
+        result = self.host.run(WATCH_MACOS, "0", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout, r"load= free= swap_used= swapouts= top=rustc:9216M\n$")
+
+    def test_the_summary_names_the_lines_with_the_most_swap_and_the_biggest_process(self):
+        log = Path(self.directory.name) / "macos.log"
+        log.write_text("10:00:00 load=1.0 free=40% swap_used=0.00M swapouts=0 top=rustc:4000M\n"
+                       "10:00:15 load=2.9 free=3% swap_used=2950.50M swapouts=900 top=rustc:9000M\n"
+                       "10:00:30 load=2.1 free=9% swap_used=1500.00M swapouts=950 top=rustc:11000M\n")
+        result = self.host.run(WATCH_MACOS, "--summary", str(log))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [
+            "samples: 3",
+            "most swap: 10:00:15 load=2.9 free=3% swap_used=2950.50M swapouts=900 top=rustc:9000M",
+            "biggest process: 10:00:30 load=2.1 free=9% swap_used=1500.00M swapouts=950 top=rustc:11000M",
+        ])
+
+    def test_the_summary_of_a_missing_log_reports_nothing_and_passes(self):
+        result = self.host.run(WATCH_MACOS, "--summary", str(Path(self.directory.name) / "absent.log"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["samples: 0", "most swap: ", "biggest process: "])
+
 
 class GiveSwapTests(unittest.TestCase):
     """Swap for the build's peak, but never through a device-mapper snapshot."""

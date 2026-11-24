@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Log the macos-15 runner's memory while portable macOS builds and tests (#1723).
+#
+# The runner has 3 cores and 7 GB. The same build, from the same cache, took
+# 21 to 93 minutes there, and nothing in the job's log said why. One line
+# every INTERVAL seconds: the load, the share of memory free, the swap in use,
+# the pages swapped out so far, and the biggest process with its resident
+# size, so a slow build shows whether it was paging.
+#
+# Usage: watch-macos-memory [INTERVAL] [COUNT]
+#        watch-macos-memory --summary LOG
+# COUNT stops it after that many lines (the tests); without it, it runs until
+# it is killed. Each tool is looked up on PATH, so the tests can stand in for
+# them. A tool that's missing or fails leaves its field empty, never stops it.
+# --summary prints a log's line count and its lines with the most swap in use
+# and the biggest process, and always exits 0: it reports, it doesn't gate.
+set -uo pipefail
+
+if [ "${1:-}" = --summary ]; then
+    log=${2:?usage: watch-macos-memory --summary LOG}
+    samples=0
+    [ -r "$log" ] && samples=$(awk '/ load=/ {n++} END {print n + 0}' "$log")
+    echo "samples: $samples"
+    peak() {
+        awk -v field="$1" '{
+            for (i = 1; i <= NF; i++) if (index($i, field "=") == 1) {
+                value = substr($i, length(field) + 2)
+                sub(/^[^:]*:/, "", value)
+                value += 0
+                if (!seen || value > best) { best = value; line = $0; seen = 1 }
+            }
+        } END { if (seen) print line }' "$log" 2>/dev/null
+    }
+    echo "most swap: $(peak swap_used)"
+    echo "biggest process: $(peak top)"
+    exit 0
+fi
+
+interval=${1:-15}
+count=${2:-0}
+
+sample() {
+    local load free swap swapouts top
+    load=$(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}')
+    free=$(memory_pressure -Q 2>/dev/null | awk -F': *' '/free percentage/ {print $2}')
+    # total = 2048.00M  used = 1203.25M  free = 844.75M  (encrypted)
+    swap=$(sysctl -n vm.swapusage 2>/dev/null | awk '{print $6}')
+    swapouts=$(vm_stat 2>/dev/null | awk '/^Swapouts:/ {gsub(/\./, "", $2); print $2}')
+    # ps reports resident sizes in KiB.
+    top=$(ps -axo rss=,comm= 2>/dev/null | sort -rn | awk 'NR == 1 {n = split($2, path, "/"); printf "%s:%dM", path[n], $1 / 1024}')
+    echo "$(date -u +%T) load=${load} free=${free} swap_used=${swap} swapouts=${swapouts} top=${top}"
+}
+
+lines=0
+while :; do
+    sample
+    lines=$((lines + 1))
+    if [ "$count" -gt 0 ] && [ "$lines" -ge "$count" ]; then
+        exit 0
+    fi
+    sleep "$interval"
+done

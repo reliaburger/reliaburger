@@ -98,11 +98,14 @@ class MacosJob(unittest.TestCase):
         self.assertEqual(targets, TARGETS)
         self.assertEqual(expression, FILTER)
         # It builds what it runs and warms those binaries first, so macOS's
-        # first-exec assessment never lands inside a timed test (#722).
+        # first-exec assessment never lands inside a timed test (#722). The
+        # lib tests build alone before the rest, so they never compile
+        # beside the lib on the 7 GB runner (#1723).
         recipe = workflow_assembly.recipe(self.makefile, m.TARGET)
-        self.assertEqual(recipe[0], '$(CARGO) test --no-run ' + ' '.join(TARGETS))
-        self.assertEqual(recipe[1], 'python3 scripts/ci/warm_executables.py')
-        self.assertEqual(len(recipe), 3)
+        self.assertEqual(recipe[0], '$(CARGO) test --no-run --lib')
+        self.assertEqual(recipe[1], '$(CARGO) test --no-run ' + ' '.join(TARGETS))
+        self.assertEqual(recipe[2], 'python3 scripts/ci/warm_executables.py')
+        self.assertEqual(len(recipe), 4)
 
     def test_no_bun_or_linux_suite_runs_on_macos(self):
         selected = m.compile_filter(FILTER)
