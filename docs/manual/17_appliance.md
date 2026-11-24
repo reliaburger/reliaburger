@@ -622,6 +622,30 @@ It replaced the context for bare-metal/lab, which no longer worked: /Users/you/l
 
 `relish cluster create --bare-metal` and `relish setup` do the same.
 
+The context lists every machine's API, node 1 first, so relish keeps
+working when a node is down. Pull node 1's power and the next command
+waits up to 1.5 seconds for it, then asks the next node, says so on stderr,
+and remembers which node answered:
+
+```
+warning: https://192.168.1.51:9117 didn't answer (no answer before the connect timeout; the host may be down, or a firewall may drop packets to that port); trying the cluster's next node
+relish is using https://192.168.1.52:9117
+```
+
+Later commands ask that node first, without the wait, until it stops
+answering in turn. Every node gets the same CA and token, so a machine
+that answers with a certificate the cluster's CA didn't sign fails the
+command, as it always did: relish only passes over nodes that don't accept
+a connection. When none answer, the error lists each endpoint and why.
+Machines you add later with `relish machines claim` or `relish image seed`
+join the list. `relish setup --ssh` lists every machine it set up, the
+same way. `--endpoint` still means exactly that node, with no fallback.
+
+A context saved by 0.3.2 or earlier lists only node 1. Create the cluster
+again, or add the other nodes yourself as
+`"other_endpoints": ["https://192.168.1.52:9117", ...]` in
+`~/.reliaburger/context.json`.
+
 The claim uses each machine's current address as its node address, so
 reserve those addresses for their MACs in your router first. mDNS doesn't
 cross routers; if relish can't see a machine, give its address instead of
@@ -739,7 +763,9 @@ relish machines claim ~/home-cluster d8:9e:f3:12:34:59
 The new machine becomes `home-4`, with a join token the cluster mints for
 it. relish also asks every node to let the new machine's address through its
 firewall for 15 minutes, so it can enrol even outside the `--network` you
-created the cluster with. Once it has joined, the cluster knows it.
+created the cluster with. Once it has joined, the cluster knows it, and
+relish's context lists it, so relish can reach the cluster through it when
+other nodes are down.
 
 Or, with the stick:
 

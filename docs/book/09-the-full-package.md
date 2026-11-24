@@ -1480,6 +1480,41 @@ before its script printed a byte. The fix runs each fake once, right after
 writing it and before the clock starts. A file that has been checked starts
 in a few milliseconds from then on.
 
+Two months later the watchdog earned its keep, and showed what it cost. In
+0.3.2's release gate, three of four staged installs on the Mac Studio had a
+VM restarted, each one adding 45 to 70 seconds to a 66-second install
+(#2229). Was 0.3.2 to blame? We ran the published 0.3.1 and 0.3.2 side by
+side, eight and nine fresh installs each. 0.3.1 hit it twice, 0.3.2 not at
+all. That's about one VM start in 25, the same Lima and vz bug as before,
+and nothing to do with the release.
+
+We did learn two new things. First, the serial log never had firmware in it.
+Ubuntu's kernel writes to `tty1` and `ttyAMA0`, and a vz VM has neither, so
+the first byte in `serialv.log` is the login prompt, about 9 seconds after
+the VM starts. Second, the stuck VM wasn't idle. Its Virtualization process
+burned exactly one CPU-second per second for the whole minute: one vCPU
+spinning before userspace, where a healthy VM spends about 9 CPU-seconds
+booting and then goes quiet.
+
+The waste was in the timing. The 60 seconds ran from `limactl start`, and
+Lima spends the first five (more on a slow disk) unpacking the image before
+the VM even exists. Healthy consoles came up within 9.3 seconds of the VM
+starting in all 49 we measured; the stuck ones stayed empty for the whole
+minute. So `start_watched` now waits for the host agent's `ha.pid` (Lima
+writes it once the disk is ready, right before it boots the VM), and only
+then starts its clock. On a Mac that clock is 30 seconds, so a stuck VM
+costs about 30 seconds less, and a slow disk can no longer eat into a
+healthy boot's allowance. On Linux, Lima runs QEMU, which boots more slowly
+and which we didn't measure, so it keeps the full minute. `boot_silence`
+takes the VM type, a two-variant enum, and returns the right `Duration`.
+It's a `const fn`, a function the compiler can run while it builds, so
+`BOOT_SILENCE` is still a plain constant: `cfg!(target_os = "macos")` picks
+this host's VM type at compile time, the same way the VM config does.
+`disk_preparation_does_not_count_towards_the_boot_silence` pins the order: a
+fake `limactl` prepares its disk for 1.5 seconds, then prints its console
+line and writes `ha.pid`. A watchdog timed from the command would fire at 1
+second into an empty console; the one timed from the host agent never fires.
+
 ### Bake the image, don't install at boot
 
 The measurements had one more thing to say. The kernel reached a login prompt

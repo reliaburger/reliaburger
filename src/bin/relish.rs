@@ -4366,7 +4366,7 @@ fn report(error: &reliaburger::relish::RelishError) {
         RelishError::AgentUnreachable {
             cause: UnreachableCause::Refused | UnreachableCause::TimedOut,
             ..
-        }
+        } | RelishError::NoEndpointAnswered { .. }
     ) && !reliaburger::relish::client::endpoint_overridden()
         && let Some(hint) = reliaburger::relish::quickstart::server_runner::unreachable_hint()
     {

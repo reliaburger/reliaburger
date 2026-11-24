@@ -10,11 +10,15 @@ A job writes summary.md plus summary.json beside it. The combined mode reads
 every summary.json below DIRECTORY and checks it against the lane manifest:
 a lane or test the manifest expects but no job reported is incomplete, a lane
 the manifest doesn't name is a failure, and so is a row for another candidate.
+A manifest lane with a "skip" reason (the local runner's x86-64 lanes, which
+the Studio can't run) is reported as skipped when nothing ran it, not as
+missing.
 
-Every row has a status: pass, fail, skip (only skipped results) or incomplete
-(missing results, or fewer runs than the loop's iterations). Only a record
-where every row passes is a PASS, and the exit status says the same thing as
-the verdict: 0 for PASS, 1 otherwise. A passing row reports the rule-of-three
+Every row has a status: pass, fail, skip (only skipped results, or a lane the
+manifest skips) or incomplete (missing results, or fewer runs than the loop's
+iterations). Only a record where every row passes, apart from the lanes the
+manifest skips, is a PASS, and the exit status says the same thing as the
+verdict: 0 for PASS, 1 otherwise. A passing row reports the rule-of-three
 bound: zero failures in n independent runs bounds the true failure rate below
 3/n at 95 % confidence.
 """
@@ -132,8 +136,10 @@ def missing(lane: str, test: str, note: str) -> dict:
 
 def check_against_manifest(rows: list[dict], manifest: dict, candidate: str) -> list[dict]:
     """Rows plus an incomplete row for every expected lane or test with no
-    evidence; rows for unknown lanes or other candidates become failures."""
+    evidence, or a skip row for a lane the manifest skips that nothing ran;
+    rows for unknown lanes or other candidates become failures."""
     expected = {entry["lane"]: entry.get("tests", []) for entry in manifest["lanes"]}
+    skipped = {entry["lane"]: entry["skip"] for entry in manifest["lanes"] if entry.get("skip")}
     checked = []
     for row in rows:
         row = dict(row)
@@ -145,6 +151,11 @@ def check_against_manifest(rows: list[dict], manifest: dict, candidate: str) -> 
         checked.append(row)
     for lane, tests in expected.items():
         reported = {row["test"] for row in rows if row["lane"] == lane}
+        if not reported and lane in skipped:
+            row = missing(lane, "(lane skipped)", f"skipped by the manifest: {skipped[lane]}")
+            row["status"], row["manifest_skip"] = SKIP, True
+            checked.append(row)
+            continue
         if not reported:
             checked.append(missing(lane, "(lane missing)", "no summary for this lane"))
             continue
@@ -168,6 +179,20 @@ def render(rows: list[dict]) -> str:
     if not rows:
         lines.append("| (none) | | incomplete | 0 | 0 | no runs | no lanes |")
     return "\n".join(lines) + "\n"
+
+
+def judge(rows: list[dict]) -> tuple[bool, str]:
+    """Whether the record passes, and the verdict line. A lane the manifest
+    skips doesn't fail it, but the verdict says how many there were, and a
+    record where nothing ran never passes."""
+    planned = sum(1 for row in rows if row.get("manifest_skip"))
+    passed = any(row["status"] == PASS for row in rows) and all(
+        row["status"] == PASS or row.get("manifest_skip") for row in rows
+    )
+    verdict = f"Verdict: **{'PASS' if passed else 'FAIL'}**."
+    if planned:
+        verdict += f" {planned} lane{'s' if planned != 1 else ''} skipped by the manifest."
+    return passed, verdict
 
 
 def main(argv: list[str]) -> int:
@@ -204,12 +229,11 @@ def main(argv: list[str]) -> int:
     else:
         parser.error("pass --lane and --junit, or --combine")
 
-    passed = bool(rows) and all(row["status"] == PASS for row in rows)
-    verdict = "PASS" if passed else "FAIL"
+    passed, verdict = judge(rows)
     arguments.output.write_text(
         heading
         + render(rows)
-        + f"\nVerdict: **{verdict}**. The bound is the rule of three: 0 failures in n runs "
+        + f"\n{verdict} The bound is the rule of three: 0 failures in n runs "
         "means a failure rate below 3/n at 95% confidence.\n"
     )
     print(arguments.output.read_text())

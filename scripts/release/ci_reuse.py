@@ -17,10 +17,7 @@ passed:
   a re-run's green says nothing about the attempts before it;
 - every job in `REQUIRED_JOBS` is there and succeeded, `ignored-test
   evidence` included, and every other job in the run succeeded too, apart
-  from the closed-PR no-op, which a real run always skips. A job in
-  `ADVISORY_JOBS` must be there, but its failure only adds a warning to the
-  build log and the job summary: ci.yml gives it continue-on-error, so the
-  run itself still succeeds.
+  from the closed-PR no-op, which a real run always skips.
 
 A candidate is normally dispatched minutes after the push to `main` that it
 builds, while that push's CI is still running. So while a run from one of
@@ -96,18 +93,12 @@ REQUIRED_JOBS = (
     "S3 round trip",
 )
 
-# {check name: issue}: jobs that run on every full run but whose failure
-# doesn't stop a candidate reusing it. The Ubuntu 26.04 privileged job keeps
-# losing its runner mid-test (#1943); making it required again is part of
-# closing #1943. ADVISORY in scripts/ci/every_job.py is the gate's own list.
-ADVISORY_JOBS = {"privileged Linux (Ubuntu 26.04)": 1943}
 
-
-def run_problems(run, jobs, commit, repository, warnings=None):
+def run_problems(run, jobs, commit, repository):
     """Why this ci.yml run can't stand in for the candidate's own, or an empty list.
 
     `jobs` is a callable returning the run's jobs, called only when the run
-    itself passed. A failed advisory job adds a line to `warnings` instead.
+    itself passed.
     """
     found = []
     if run.get("head_sha") != commit:
@@ -134,13 +125,7 @@ def run_problems(run, jobs, commit, repository, warnings=None):
         if not seen:
             found.append(f"required job {name!r} is missing")
         elif any(conclusion != "success" for conclusion in seen):
-            finished = f"{name!r} finished as {', '.join(map(str, seen))}"
-            if name in ADVISORY_JOBS:
-                if warnings is not None:
-                    warnings.append(f"advisory job {finished}; it doesn't block a candidate until "
-                                    f"#{ADVISORY_JOBS[name]} closes")
-            else:
-                found.append(f"required job {finished}")
+            found.append(f"required job {name!r} finished as {', '.join(map(str, seen))}")
     for name, seen in sorted(conclusions.items(), key=lambda item: str(item[0])):
         if name in REQUIRED_JOBS:
             continue
@@ -163,8 +148,6 @@ def still_going(runs, commit, events=FULL_EVENTS):
 def decide(commit, repository, runs, jobs_for, events=FULL_EVENTS):
     """Return (run id or None, reasons): the first finished run on `commit` that passed everything.
 
-    With a run id, the reasons are warnings about its advisory jobs, if any.
-
     `jobs_for(run_id)` returns that run's jobs; it's only called for a run on
     the right commit, from a full event, that succeeded, so a build doesn't
     page through every pull request run. Runs still going are left to
@@ -174,10 +157,9 @@ def decide(commit, repository, runs, jobs_for, events=FULL_EVENTS):
     for run in candidates(runs, commit, events):
         if run.get("status") != "completed":
             continue
-        warnings = []
-        problems = run_problems(run, lambda: jobs_for(run["id"]), commit, repository, warnings)
+        problems = run_problems(run, lambda: jobs_for(run["id"]), commit, repository)
         if not problems:
-            return run["id"], warnings
+            return run["id"], []
         reasons.append(f"run {run.get('id')}: " + "; ".join(problems))
     return None, reasons or [f"no completed {'/'.join(events)} run of ci.yml on {commit}"]
 
@@ -186,8 +168,6 @@ def wait_for_evidence(commit, repository, fetch_runs, jobs_for, *, wait_seconds,
                       poll_seconds=POLL_SECONDS, grace_seconds=GRACE_SECONDS,
                       now=time.monotonic, sleep=time.sleep, events=FULL_EVENTS):
     """Return (run id or None, reasons, seconds waited), waiting for a run still going.
-
-    With a run id, the reasons are `decide`'s warnings about its advisory jobs.
 
     Polls `fetch_runs()` until a finished run passes, or nothing is left to
     wait for, or `wait_seconds` have gone by. With no run on the commit at
@@ -201,7 +181,7 @@ def wait_for_evidence(commit, repository, fetch_runs, jobs_for, *, wait_seconds,
         run_id, reasons = decide(commit, repository, runs, jobs_for, events)
         waited = now() - start
         if run_id is not None:
-            return run_id, reasons, waited
+            return run_id, [], waited
         going = still_going(runs, commit, events)
         if going:
             if waited >= wait_seconds:
@@ -275,9 +255,6 @@ def main(argv=None, runs_for=fetch_runs, jobs_for=fetch_jobs, now=time.monotonic
                    f"attempt {FIRST_ATTEMPT}, which passed every job on `{args.commit}`{after}\n")
         print(f"CI reuse: ci.yml run {run_id} passed every job on {args.commit} at attempt {FIRST_ATTEMPT}"
               f"{after}", file=sys.stderr)
-        for warning in reasons:
-            summary += f"\n- Warning: {warning}\n"
-            print(f"::warning::CI reuse: {warning}")
     reused = run_id is not None
     lines = (f"reuse={'true' if reused else 'false'}\nci_run={run_id or ''}\n"
              f"ci_run_attempt={FIRST_ATTEMPT if reused else ''}\n")

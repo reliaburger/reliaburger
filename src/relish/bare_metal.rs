@@ -417,7 +417,50 @@ pub async fn add(
     ssh_key: Option<Vec<u8>>,
 ) -> Result<Vec<(FleetNode, PathBuf)>, RelishError> {
     let client = super::client::BunClient::default_local();
-    add_with(&client, directory, machines, token_ttl, ssh_key).await
+    let added = add_with(&client, directory, machines, token_ttl, ssh_key).await?;
+    let fleet_path = directory.join("fleet.json");
+    let fleet: Fleet = serde_json::from_slice(&tokio::fs::read(&fleet_path).await?)
+        .map_err(|e| failed(&format!("{}: {e}", fleet_path.display())))?;
+    // BLOCKING-OK: relish CLI: a one-shot update of the local context after the seeds are written
+    let refreshed =
+        super::local_context::default_path().and_then(|path| refresh_context_at(&path, &fleet));
+    if let Err(error) = refreshed {
+        eprintln!("warning: relish's context doesn't list the new nodes: {error}");
+    }
+    Ok(added)
+}
+
+/// Every node's API endpoint, node 1 first: what a bare-metal context
+/// lists, so relish reaches the cluster through any node that's up (#2241).
+fn api_endpoints(fleet: &Fleet) -> Vec<String> {
+    fleet
+        .nodes
+        .iter()
+        .map(|node| format!("https://{}", std::net::SocketAddr::new(node.address, 9117)))
+        .collect()
+}
+
+/// List every node in `fleet` in the relish context at `path`, when that
+/// context is this fleet's cluster's, so a node added after the claim is
+/// one relish can reach the cluster through. Answers whether it changed
+/// anything; another cluster's context is left alone.
+pub fn refresh_context_at(path: &Path, fleet: &Fleet) -> Result<bool, RelishError> {
+    let Some(mut context) = super::local_context::LocalContext::load(path)? else {
+        return Ok(false);
+    };
+    if context.owner != format!("bare-metal/{}", fleet.cluster) {
+        return Ok(false);
+    }
+    let others: Vec<String> = api_endpoints(fleet)
+        .into_iter()
+        .filter(|endpoint| *endpoint != context.endpoint)
+        .collect();
+    if others == context.other_endpoints {
+        return Ok(false);
+    }
+    context.other_endpoints = others;
+    context.save(path)?;
+    Ok(true)
 }
 
 /// [`add`], asking `client`'s cluster for the join tokens, so a test can
@@ -614,8 +657,9 @@ pub async fn run_add(
     print_output(&Seeds { nodes }, output)
 }
 
-/// The relish context for a bare-metal cluster: node 1's API with the admin
-/// token, trusting the cluster's root CA.
+/// The relish context for a bare-metal cluster: node 1's API, then every
+/// other node's to fall over to, with the admin token, trusting the
+/// cluster's root CA.
 pub fn context(
     fleet: &Fleet,
     directory: &Path,
@@ -632,6 +676,8 @@ pub fn context(
         schema: 1,
         owner: format!("bare-metal/{}", fleet.cluster),
         endpoint: origin("https", 9117),
+        other_endpoints: api_endpoints(fleet).into_iter().skip(1).collect(),
+        last_answered: None,
         token: admin_token.to_string(),
         ca_cert: std::fs::canonicalize(directory.join("root-ca.crt"))?,
         service_endpoints: crate::bun::capabilities::ServiceEndpoints {
@@ -1442,6 +1488,74 @@ mod tests {
     }
 
     #[test]
+    fn the_claim_writes_every_node_into_the_context_node_one_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = create(&options(
+            dir.path(),
+            &[
+                "d8:9e:f3:00:00:01@10.77.0.11",
+                "d8:9e:f3:00:00:02@10.77.0.12",
+                "d8:9e:f3:00:00:03@10.77.0.13",
+            ],
+        ))
+        .unwrap();
+        let context = context(&created.fleet, dir.path(), &created.admin_token).unwrap();
+        assert_eq!(context.endpoint, "https://10.77.0.11:9117");
+        assert_eq!(
+            context.other_endpoints,
+            vec!["https://10.77.0.12:9117", "https://10.77.0.13:9117"]
+        );
+        assert_eq!(context.last_answered, None);
+    }
+
+    #[test]
+    fn a_node_added_later_joins_this_clusters_context_and_no_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut created = create(&options(
+            dir.path(),
+            &[
+                "d8:9e:f3:00:00:01@10.77.0.11",
+                "d8:9e:f3:00:00:02@10.77.0.12",
+            ],
+        ))
+        .unwrap();
+        let path = dir.path().join("relish").join("context.json");
+        context(&created.fleet, dir.path(), &created.admin_token)
+            .unwrap()
+            .save(&path)
+            .unwrap();
+        let mut third = created.fleet.nodes[1].clone();
+        third.address = "10.77.0.13".parse().unwrap();
+        created.fleet.nodes.push(third);
+
+        assert!(refresh_context_at(&path, &created.fleet).unwrap());
+        let saved = crate::relish::local_context::LocalContext::load(&path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved.other_endpoints,
+            vec!["https://10.77.0.12:9117", "https://10.77.0.13:9117"]
+        );
+        assert!(
+            !refresh_context_at(&path, &created.fleet).unwrap(),
+            "nothing new"
+        );
+
+        created.fleet.cluster = "another".to_string();
+        created.fleet.nodes.pop();
+        assert!(!refresh_context_at(&path, &created.fleet).unwrap());
+        assert_eq!(
+            crate::relish::local_context::LocalContext::load(&path)
+                .unwrap()
+                .unwrap()
+                .other_endpoints
+                .len(),
+            2,
+            "another cluster's fleet leaves the context alone"
+        );
+    }
+
+    #[test]
     fn the_create_report_names_the_seeds_the_root_backup_and_how_to_connect() {
         let dir = tempfile::tempdir().unwrap();
         let options = options(
@@ -1534,6 +1648,8 @@ mod tests {
             schema: 1,
             owner: "bare-metal/old".to_string(),
             endpoint: "https://192.168.1.99:9117".to_string(),
+            other_endpoints: Vec::new(),
+            last_answered: None,
             token: "rbrg_old".to_string(),
             ca_cert,
             service_endpoints: Default::default(),

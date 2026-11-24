@@ -12,8 +12,11 @@ The flags, variables, files and ports you'll reach for. `relish help COMMAND`
 | `--ca-cert PATH` | `RELIABURGER_CA_CERT` | cluster root CA; switches the default to HTTPS |
 | `-o`, `--output FORMAT` | | `human` (default), `json` or `yaml`; every command takes it except the eight interactive ones ([machine output](#machine-output)) |
 
-A flag beats its variable. With neither, `relish` uses the laptop cluster's
-saved context, then `http://127.0.0.1:9117`.
+A flag beats its variable. With neither, `relish` uses the saved context,
+then `http://127.0.0.1:9117`. A context that lists several nodes asks the
+one that last answered, then the rest in order, passing over any that
+don't accept a connection within 1.5 seconds ([the appliance
+chapter](17_appliance.md#claim-them) shows it).
 
 ## Machine output
 
@@ -227,7 +230,7 @@ Everything the installer and the quickstart write lives in `~/.reliaburger`
 | Path | What |
 |------|------|
 | `bin/relish` | the CLI (`~/.local/bin/relish` links here if that's on your `PATH`) |
-| `context.json` | the current cluster's endpoint, CA path and admin token (mode 0600): the laptop cluster's, or a bare-metal cluster's node 1 once `relish cluster create --bare-metal` or `relish machines claim --create` saves it (they leave another cluster's working context in place, and replace one whose CA certificate is gone) |
+| `context.json` | the current cluster's endpoints, CA path and admin token (mode 0600): the laptop cluster's, or a bare-metal or `setup --ssh` cluster's, node 1 first and every other node after it to fall over to, with the node that last answered, once `relish cluster create --bare-metal`, `relish machines claim --create` or `relish setup --ssh` saves it (they leave another cluster's working context in place, and replace one whose CA certificate is gone) |
 | `root-backup-keys/` | the age identities that open each cluster's root CA backup; keep a copy offline, since the root CA key has no other copy |
 | `clusters/NAME/` | a laptop cluster's state, node configs and `timings.json` |
 | `clusters/NAME/security/` | its master key, admin token and CA (`identity/root-ca.crt`) |
