@@ -7912,6 +7912,8 @@ async fn trust_changing_routes_record_who_called_them() {
 async fn token_create_writes_to_raft_and_returns_plaintext() {
     let (cmd_tx, _cmd_rx) = mpsc::channel(32);
     let council = seeded_council("tokencreate").await;
+    // The nodes have a service token (a master key), so the first API
+    // token doesn't lock them out (#1248).
     let app = router(
         cmd_tx,
         None,
@@ -7921,7 +7923,7 @@ async fn token_create_writes_to_raft_and_returns_plaintext() {
         None,
         Some(Arc::clone(&council)),
         None,
-        None,
+        Some("rbrg_service".into()),
         None,
         None,
         None,
@@ -7953,6 +7955,51 @@ async fn token_create_writes_to_raft_and_returns_plaintext() {
     let stored = council.security_state().await.api_tokens;
     let token = stored.iter().find(|t| t.name == "ci-bot").unwrap();
     assert!(crate::sesame::token::validate_token(plaintext, token).is_ok());
+}
+
+/// #1248: on a plaintext cluster with no master key, the nodes have no
+/// service token and get in only while no credential exists. The first
+/// API token would end that, and every placement poll and rollout report
+/// after it would get 401, so the API refuses to create it and names the
+/// setting that fixes it. Nothing reaches Raft.
+#[tokio::test]
+async fn the_first_token_is_refused_while_the_nodes_have_no_service_token() {
+    let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+    let council = seeded_council("tokencreate-no-key").await;
+    let app = router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::clone(&council)),
+        Some(crate::sesame::auth::new_token_store()),
+        None,
+        None,
+        None,
+        None,
+        9117,
+        None,
+    );
+
+    let response = app
+        .oneshot(
+            axum::http::Request::post("/v1/token/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "name": "first-admin", "role": "admin" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let message = String::from_utf8_lossy(&body);
+    assert!(message.contains("[security] master_key_path"), "{message}");
+    assert!(message.contains("401"), "{message}");
+    assert!(council.security_state().await.api_tokens.is_empty());
 }
 
 #[tokio::test]
@@ -10676,16 +10723,19 @@ async fn dry_run_endpoint_preserves_namespace_identity_and_caller_scope() {
                     resource: "app.team/web".into(),
                     image: Some("web:v1".into()),
                     fingerprint: Some("team-spec".into()),
+                    owner: None,
                 },
                 CurrentResourceStatus {
                     resource: "app.other/web".into(),
                     image: Some("web:v1".into()),
                     fingerprint: Some("other-spec".into()),
+                    owner: None,
                 },
                 CurrentResourceStatus {
                     resource: "job.team/migrate".into(),
                     image: Some("web:v1".into()),
                     fingerprint: None,
+                    owner: None,
                 },
             ])
             .unwrap();

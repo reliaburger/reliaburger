@@ -402,6 +402,23 @@ pub(super) async fn token_create_handler(
             .into_response();
     };
 
+    // The nodes of a plaintext cluster with no master key have no service
+    // token, and get in only while no credential exists anywhere. The first
+    // API token would shut them out (#1248).
+    if super::internal::credential_free_development_cluster(None, &state).await {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "refusing to create the first API token: this plaintext cluster has no \
+                          master key, so its nodes have no service token, and once a token exists \
+                          the API answers their calls (placement polls, rollout reports) with 401. \
+                          Set [security] master_key_path to the same key on every node, restart \
+                          them, then create the token"
+            })),
+        )
+            .into_response();
+    }
+
     let lease_owner = if req.lease_id.is_some() {
         let user =
             match authenticated_test_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin) {

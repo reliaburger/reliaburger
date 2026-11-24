@@ -457,19 +457,13 @@ async fn build(
         .await;
         demo_step.record(result)?;
     }
-    let endpoint = format!("https://{}:{API_PORT}", first.host);
-    let context = LocalContext {
-        schema: 1,
-        owner: operation.state.id.clone(),
-        endpoint: endpoint.clone(),
-        token: tokio::fs::read_to_string(bootstrap.directory.join("admin.token")).await?,
-        ca_cert: bootstrap.directory.join("identity/root-ca.crt"),
-        service_endpoints: crate::bun::capabilities::ServiceEndpoints {
-            registry: Some(format!("https://{}:{REGISTRY_PORT}", first.host)),
-            ingress_http: Some(format!("http://{}", first.host)),
-            ingress_https: None,
-        },
-    };
+    let context = machines_context(
+        &operation.state.id,
+        &spec.ssh,
+        tokio::fs::read_to_string(bootstrap.directory.join("admin.token")).await?,
+        bootstrap.directory.join("identity/root-ca.crt"),
+    )?;
+    let endpoint = context.endpoint.clone();
     save_context(context, root.join("context.json")).await?;
     let direct = bootstrap.client(&endpoint)?;
     let reachable = tokio::time::timeout(Duration::from_secs(5), direct.node_version()).await;
@@ -481,6 +475,33 @@ async fn build(
          and every relish command needs it.\n{}",
         unreachable_api_advice(first, spec.api_port, &bootstrap.directory, setup.operator)
     )))
+}
+
+/// The relish context for the cluster on `machines`: the first machine's
+/// API, then every other machine's, which relish tries in order when the
+/// first doesn't answer (#2241).
+fn machines_context(
+    owner: &str,
+    machines: &[SshTarget],
+    token: String,
+    ca_cert: PathBuf,
+) -> Result<LocalContext> {
+    let (first, others) = machines.split_first().context("no machines")?;
+    let api = |machine: &SshTarget| format!("https://{}:{API_PORT}", machine.host);
+    Ok(LocalContext {
+        schema: 1,
+        owner: owner.to_string(),
+        endpoint: api(first),
+        other_endpoints: others.iter().map(api).collect(),
+        last_answered: None,
+        token,
+        ca_cert,
+        service_endpoints: crate::bun::capabilities::ServiceEndpoints {
+            registry: Some(format!("https://{}:{REGISTRY_PORT}", first.host)),
+            ingress_http: Some(format!("http://{}", first.host)),
+            ingress_https: None,
+        },
+    })
 }
 
 /// How an operator gets `relish` through to the API on `first`, once setup's
@@ -674,6 +695,33 @@ mod tests {
             security: directory,
         };
         server_files(&sources, 0, directory.join("node.toml"), &version())
+    }
+
+    #[test]
+    fn the_context_setup_writes_lists_every_machines_api_first_one_first() {
+        let machines: Vec<SshTarget> = ["root@203.0.113.1", "203.0.113.2", "u@203.0.113.3:2222"]
+            .iter()
+            .map(|text| text.parse().unwrap())
+            .collect();
+
+        let context = machines_context(
+            "ssh-lab",
+            &machines,
+            "rbrg_admin".into(),
+            PathBuf::from("/ca.crt"),
+        )
+        .unwrap();
+
+        assert_eq!(context.endpoint, "https://203.0.113.1:9117");
+        assert_eq!(
+            context.other_endpoints,
+            vec!["https://203.0.113.2:9117", "https://203.0.113.3:9117"]
+        );
+        assert_eq!(context.last_answered, None);
+        assert_eq!(
+            context.service_endpoints.registry.as_deref(),
+            Some("https://203.0.113.1:5050")
+        );
     }
 
     #[test]
@@ -1160,6 +1208,8 @@ exit 0
             schema: 1,
             owner: operation.state.id.clone(),
             endpoint: "https://a:9117".into(),
+            other_endpoints: Vec::new(),
+            last_answered: None,
             token: "rbrg_private".into(),
             ca_cert: operation.directory.join("security/identity/root-ca.crt"),
             service_endpoints: Default::default(),
