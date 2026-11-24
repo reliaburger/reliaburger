@@ -32,6 +32,10 @@ Not released yet: this is what the train carries, and it can change before the t
 - A node checks an app's runtime knobs and host-path sources again each time one of its instances restarts. A restart builds the container from what the deploy approved, so a node restarted with a shorter `[runtime]` or `[storage] allowed_host_paths` list in `node.toml` brought crashed containers back with what it no longer allowed. Now the restart is refused, the instance is `Failed` with the refusal as its reason in `relish apps` and `relish wtf`, and it isn't retried. A `make test-linux` test starts a real runc container with a capability, a network and an IPC sysctl and `/dev/fuse`, and checks each from inside it ([#1316](https://github.com/reliaburger/reliaburger/issues/1316)).
 - A Bun restart or self-upgrade adopts running sidecars with their app instead of restarting them. Sidecars had no adoption records, so every Bun restart killed them and started them again about a second later. Each now has a record of its own, checked against the runtime like an app's ([#1315](https://github.com/reliaburger/reliaburger/issues/1315)).
 
+### Fixed
+
+- A quickstart VM no longer upgrades itself or restarts Bun without warning. Ubuntu's `apt-daily` timers and unattended-upgrades are masked in the guest image and at first boot, which covers stock and older guest images too, and needrestart, where installed, only lists what it would restart. An automatic libc upgrade had restarted Bun mid-run. Security updates arrive with releases, in each release's guest image ([#2274](https://github.com/reliaburger/reliaburger/issues/2274)).
+
 ## [0.3.2] - 2026-11-23
 
 Fixes from the Wyse 3040 lab that need a new appliance image. [Release page](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.2), [release log](docs/release-log.md#032-wyse-lab-fixes).
