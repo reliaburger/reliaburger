@@ -47,6 +47,9 @@ const PREPARE_ATTEMPTS: usize = 3;
 pub(crate) struct ProcessControl {
     root: PathBuf,
     executable: PathBuf,
+    /// The node's mount view, written into every launch it prepares, or
+    /// `None` when host launches see the host as Bun does (#714).
+    mount_view: Option<super::mount_view::MountView>,
     inventory_reader: super::inventory::InventoryReader,
     /// Blocking owner operations still running, shared by every clone.
     in_flight: Arc<AtomicUsize>,
@@ -74,9 +77,21 @@ impl ProcessControl {
         Self {
             root,
             executable,
+            mount_view: None,
             inventory_reader: Default::default(),
             in_flight: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Write `view` into every launch from now on.
+    pub(crate) fn with_mount_view(mut self, view: Option<super::mount_view::MountView>) -> Self {
+        self.mount_view = view;
+        self
+    }
+
+    /// Whether launches build a mount view.
+    pub(crate) fn isolates_mounts(&self) -> bool {
+        self.mount_view.is_some()
     }
 
     /// Blocking owner operations that have not finished, including ones
@@ -239,6 +254,7 @@ impl ProcessControl {
             return Err(io::Error::other("process launch has no command to run"));
         }
         let spec = spec.clone();
+        let mount_isolation = self.mount_isolation(&spec);
         self.run(id, move |this, id| {
             let directory = this.directory(&id)?;
             if let Some(parent) = this.root.parent() {
@@ -250,7 +266,7 @@ impl ProcessControl {
                 .fill(&mut nonce)
                 .map_err(|_| io::Error::other("cannot generate process capability"))?;
             let record = OwnerRecord {
-                schema: 3,
+                schema: process_owner::RECORD_SCHEMA,
                 boot_id: process_owner::current_boot_id()?
                     .ok_or_else(|| io::Error::other("kernel boot identity unavailable"))?,
                 nonce: hex::encode(nonce),
@@ -260,6 +276,7 @@ impl ProcessControl {
                 launch: ProcessLaunch {
                     instance_id: id.clone(),
                     spec,
+                    mount_isolation,
                 },
                 gate: None,
             };
@@ -309,6 +326,14 @@ impl ProcessControl {
             }
         })
         .await
+    }
+
+    /// The view one launch builds: the node's, plus what its spec keeps.
+    fn mount_isolation(&self, spec: &OciSpec) -> Option<super::mount_view::MountIsolation> {
+        let view = self.mount_view.clone()?;
+        Some(super::mount_view::MountIsolation::Build {
+            view: view.with_bind_backs(&spec.mount_bind_backs),
+        })
     }
 
     /// Launch the prepared generation's owner. Returns its record once the
@@ -1101,6 +1126,7 @@ mod tests {
         use super::super::oci::{OciLinux, OciProcess, OciRoot, OciUser};
         OciSpec {
             managed_volumes: Vec::new(),
+            mount_bind_backs: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,

@@ -81,6 +81,12 @@ pub struct OciSpec {
     /// is the operator's and is never chowned, whatever files sit beside it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub managed_volumes: Vec<ManagedVolumeMount>,
+    /// Paths a host launch keeps under mount isolation although Bun's
+    /// view hides them (#714): the native host executor's binary and
+    /// control socket, and its cgroup. Not part of the OCI runtime spec;
+    /// only the owned process runtime reads it. Empty for everything else.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mount_bind_backs: Vec<super::mount_view::BindBack>,
 }
 
 /// A managed volume a spec mounts, as the spec builder named it.
@@ -486,6 +492,7 @@ pub fn generate_oci_spec_with_decryptor(
 
     Ok(OciSpec {
         managed_volumes,
+        mount_bind_backs: Vec::new(),
         reusable_executor: false,
         host_process: spec.exec.is_some() || spec.script.is_some(),
         initialiser: false,
@@ -987,6 +994,7 @@ pub fn generate_job_oci_spec(
 
     OciSpec {
         managed_volumes: Vec::new(),
+        mount_bind_backs: Vec::new(),
         reusable_executor: false,
         host_process: spec.is_host(),
         initialiser: false,
@@ -1089,6 +1097,7 @@ pub fn generate_init_oci_spec(
     let from_image = init.image.is_some() || app.process.overrides.is_some();
     OciSpec {
         managed_volumes: Vec::new(),
+        mount_bind_backs: Vec::new(),
         reusable_executor: false,
         // A host app's init that names no image runs on the host like its
         // app, so the mixed runtime routes it there too (#935).
@@ -1181,6 +1190,7 @@ pub fn generate_sidecar_oci_spec(
     }
     OciSpec {
         managed_volumes: Vec::new(),
+        mount_bind_backs: Vec::new(),
         reusable_executor: false,
         host_process: false,
         // A sidecar borrows the app's volumes as an init does, so a runtime

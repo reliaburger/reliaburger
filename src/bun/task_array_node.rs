@@ -228,15 +228,8 @@ pub fn capability_refusal(
             assignment.program.display()
         ));
     }
-    if capabilities.mount_isolation {
-        // TODO(#714): run tasks inside the mount namespace the ordinary
-        // process workloads use.
-        return Some(
-            "host jobs don't run under [process_workloads] mount_isolation yet \
-             (on by default on Linux); set mount_isolation = false to run them \
-             unisolated on the host, or give the job an image"
-                .to_string(),
-        );
+    if capabilities.mount_isolation_unavailable {
+        return Some(crate::grill::mount_view::UNAVAILABLE.to_string());
     }
     None
 }
@@ -253,7 +246,8 @@ pub struct ArrayProgress {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refused: Option<String>,
     /// Whether `refused` comes from this node's configuration or runtime
-    /// (its allowlist, `mount_isolation`, what it can enforce), so it will
+    /// (its allowlist, a `mount_isolation` it can't build, what it can
+    /// enforce), so it will
     /// refuse the array every time, rather than from a passing fault. The
     /// leader fails a run every node refuses this way (#777).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -867,7 +861,7 @@ impl TaskArrayNode {
     /// `admit` reaches, so the leader can judge a run without asking.
     pub fn job_capabilities(&self) -> crate::meat::job_capability::JobCapabilities {
         use crate::meat::job_capability::JobCapabilities;
-        let mount_isolation = self.config.policy.mount_isolation;
+        let isolation = self.config.policy.mount_isolation;
         let binaries = !self.config.policy.allowed_binaries.is_empty();
         match self.runner.as_ref() {
             NodeRunner::Owned(runner) => JobCapabilities {
@@ -878,11 +872,12 @@ impl TaskArrayNode {
                 singleton_image_limits: runner.supports_singleton_images(true),
                 encrypted_env: true,
                 network_policy: runner.enforces_container_network_policy(),
-                mount_isolation,
+                mount_isolation_unavailable: isolation && !runner.isolates_host_mounts(),
                 binaries,
             },
             // The plain process runner takes host limits without enforcing
-            // them, as it always has; it never runs containers.
+            // them, as it always has; it never runs containers, and spawns
+            // straight from Bun, so it never builds a mount view.
             NodeRunner::Process(_) => JobCapabilities {
                 host: true,
                 host_limits: true,
@@ -891,11 +886,11 @@ impl TaskArrayNode {
                 singleton_image_limits: false,
                 encrypted_env: false,
                 network_policy: false,
-                mount_isolation,
+                mount_isolation_unavailable: isolation,
                 binaries,
             },
             // The fake runs anything except what needs the owned runtime's
-            // keys.
+            // keys, as a capable owned node would, mount view included.
             NodeRunner::Fake(_) => JobCapabilities {
                 host: true,
                 host_limits: true,
@@ -904,7 +899,7 @@ impl TaskArrayNode {
                 singleton_image_limits: true,
                 encrypted_env: false,
                 network_policy: true,
-                mount_isolation,
+                mount_isolation_unavailable: false,
                 binaries,
             },
         }
@@ -1948,18 +1943,34 @@ mod tests {
             let owned = super::super::task_runtime::OwnedRunner::new(
                 crate::grill::AnyGrill::Process(crate::grill::ProcessGrill::new()),
             );
+            let isolating = super::super::task_runtime::OwnedRunner::new(
+                crate::grill::AnyGrill::Process(isolating_grill(root.path())),
+            );
             let runners = [
-                ("owned", NodeRunner::Owned(Box::new(owned))),
-                ("fake", NodeRunner::Fake(FakeRunner::always_succeeds())),
-                ("process", NodeRunner::Process(ProcessRunner::default())),
+                ("owned", NodeRunner::Owned(Box::new(owned)), false),
+                ("isolating", NodeRunner::Owned(Box::new(isolating)), true),
+                (
+                    "fake",
+                    NodeRunner::Fake(FakeRunner::always_succeeds()),
+                    true,
+                ),
+                (
+                    "process",
+                    NodeRunner::Process(ProcessRunner::default()),
+                    false,
+                ),
             ];
-            for (runner_name, runner) in runners {
+            for (runner_name, runner, isolates) in runners {
                 let node = TaskArrayNode::new(
                     config(root.path(), policy(allowed, mount_isolation)),
                     runner,
                 );
                 let advertised = node.job_capabilities();
-                assert_eq!(advertised.mount_isolation, mount_isolation);
+                assert_eq!(
+                    advertised.mount_isolation_unavailable,
+                    mount_isolation && !isolates,
+                    "{runner_name}"
+                );
                 assert_eq!(advertised.binaries, !allowed.is_empty());
                 for (run, task) in judged_runs() {
                     let binary_allowed = node.config.policy.is_binary_allowed(&task.program);
@@ -2748,12 +2759,41 @@ mod tests {
         assert!(progress.finished.is_empty());
     }
 
+    /// An owner-backed process runtime with the default node's mount view,
+    /// as a root Bun on Linux builds one (#714).
+    fn isolating_grill(root: &Path) -> crate::grill::ProcessGrill {
+        crate::grill::ProcessGrill::with_owner(root.join("owners"), "/unused".into())
+            .with_mount_view(Some(crate::grill::mount_view::MountView::for_node(
+                &crate::config::NodeConfig::default(),
+                None,
+            )))
+    }
+
+    #[test]
+    fn capability_refusal_runs_host_tasks_under_available_isolation() {
+        let capabilities = crate::meat::job_capability::JobCapabilities {
+            host: true,
+            host_limits: true,
+            containers: false,
+            singleton_images: false,
+            singleton_image_limits: false,
+            encrypted_env: false,
+            network_policy: false,
+            mount_isolation_unavailable: false,
+            binaries: true,
+        };
+        assert_eq!(
+            capability_refusal(&capabilities, &assignment(1, 20, &[]), true),
+            None
+        );
+    }
+
     #[tokio::test]
-    async fn mount_isolation_keeps_task_arrays_off_the_node() {
+    async fn capability_refusal_refuses_when_isolation_is_unavailable() {
         let root = tempfile::tempdir().unwrap();
         let node = TaskArrayNode::new(
             config(root.path(), policy(&[BINARY], true)),
-            NodeRunner::Fake(FakeRunner::always_succeeds()),
+            NodeRunner::Process(ProcessRunner::default()),
         );
         let progress = node
             .sync(&request(vec![assignment(1, 20, &[])]))
@@ -2766,7 +2806,9 @@ mod tests {
             progress.unrunnable,
             "the node's configuration refuses it every time"
         );
-        assert!(progress.refused.unwrap().contains("mount_isolation"));
+        let refused = progress.refused.unwrap();
+        assert!(refused.contains("can't provide"), "{refused}");
+        assert!(refused.contains("mount_isolation"), "{refused}");
     }
 
     #[tokio::test]

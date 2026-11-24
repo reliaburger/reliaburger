@@ -572,6 +572,14 @@ impl ProcessGrill {
         }
     }
 
+    /// Build `view` around every launch of this owner-backed runtime
+    /// (`[process_workloads] mount_isolation`, #714). `None`, the default,
+    /// launches see the host as Bun does. Ignored without an owner.
+    pub fn with_mount_view(mut self, view: Option<super::mount_view::MountView>) -> Self {
+        self.control = self.control.map(|control| control.with_mount_view(view));
+        self
+    }
+
     #[cfg(target_os = "linux")]
     pub(crate) fn executor_directory(&self) -> Result<PathBuf, GrillError> {
         self.log_dir
@@ -711,6 +719,13 @@ impl Default for ProcessGrill {
 }
 
 impl super::Grill for ProcessGrill {
+    /// Owner-backed launches build the node's view when Bun gave it one.
+    fn isolates_host_mounts(&self) -> bool {
+        self.control
+            .as_ref()
+            .is_some_and(ProcessControl::isolates_mounts)
+    }
+
     /// The owned execution gate joins the spec's cgroup before it runs the
     /// command, on rootful cgroup v2 Linux.
     fn places_host_processes(&self) -> bool {
@@ -1597,6 +1612,7 @@ mod tests {
     fn spec_with_args(args: Vec<String>) -> OciSpec {
         OciSpec {
             managed_volumes: Vec::new(),
+            mount_bind_backs: Vec::new(),
             reusable_executor: false,
             host_process: true,
             initialiser: false,

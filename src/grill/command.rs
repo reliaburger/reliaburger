@@ -129,6 +129,7 @@ impl OwnedCommands {
         let id = CommandId(InstanceId(format!("command-{}", hex::encode(nonce))));
         let spec = OciSpec {
             managed_volumes: Vec::new(),
+            mount_bind_backs: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,

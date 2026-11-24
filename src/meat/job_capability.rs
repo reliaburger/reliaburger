@@ -1,7 +1,8 @@
 //! What kinds of job a node can run, as it advertises them over gossip.
 //!
 //! A node refuses a job run it can never take: a host command under mount
-//! isolation, a container on a node without the rootful runtime, an
+//! isolation it can't build, a container on a node without the rootful
+//! runtime, an
 //! allowlist it can't enforce (#777). The leader learns each node's answer
 //! from this summary, which rides every gossip datagram, so it can refuse a
 //! run no live node could take at submission instead of a tick later (#788).
@@ -34,9 +35,10 @@ pub struct JobCapabilities {
     /// Enforces a container task's egress allowlist and `allow_from` before
     /// it starts. A host-process task's never are.
     pub network_policy: bool,
-    /// `[process_workloads] mount_isolation` is on, which host tasks can't
-    /// run under yet (#714).
-    pub mount_isolation: bool,
+    /// `[process_workloads] mount_isolation` is on and this node can't
+    /// build the mount view (#714): macOS, a non-root Bun, or the plain
+    /// process runner. Such a node refuses every host task.
+    pub mount_isolation_unavailable: bool,
     /// `[process_workloads] allowed_binaries` names at least one binary. An
     /// empty allowlist refuses every host task.
     pub binaries: bool,

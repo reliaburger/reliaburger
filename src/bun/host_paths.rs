@@ -215,7 +215,7 @@ impl HostPathPolicy {
 /// Resolve symlinks in the longest prefix of `path` that exists, keeping the
 /// rest as written. A source may not exist yet, but a symlinked directory
 /// above it must still count as the place it points at.
-fn resolve(path: &Path) -> PathBuf {
+pub(crate) fn resolve(path: &Path) -> PathBuf {
     let mut existing = path;
     let mut rest = Vec::new();
     loop {

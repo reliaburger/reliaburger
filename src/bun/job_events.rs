@@ -378,7 +378,7 @@ mod tests {
         let mut tracker = JobEventTracker::default();
         register(&mut arrays, 1, 4, 4);
         assert!(tracker.observe(&arrays).is_empty(), "still running");
-        let reason = "no node can run it: host jobs don't run under mount_isolation yet";
+        let reason = "no node can run it: this node can't provide [process_workloads] mount_isolation (it needs Linux and a root Bun)";
         arrays
             .apply(
                 &TaskArrayWrite::Unrunnable {

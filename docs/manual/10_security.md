@@ -778,6 +778,9 @@ shortened its list) refuses the deploy and names the key it's missing:
 runtime.devices /dev/fuse refused by the node gate: this node's [runtime] allowed_devices in node.toml doesn't list it
 ```
 
+The refusal names every knob the node doesn't allow, each with its key, so
+you can fix them all in one go.
+
 Only rootful runc applies knobs. A node on the process runtime, Apple
 Container or rootless runc advertises none, whatever its `[runtime]` says,
 and refuses an app that has them rather than running it without them. An

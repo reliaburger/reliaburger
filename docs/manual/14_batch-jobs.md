@@ -492,33 +492,46 @@ Jobs select `runtime = "runc"` (the default), `runtime = "process"`, or
 On Linux, `bun --runtime mixed` enables both owned backends. `--runtime auto`
 can detect both when runc is available. Explicit `--runtime runc` is
 container-only and refuses host jobs; `--runtime process` is host-only.
-Host commands still need the executable allowlist and
-`mount_isolation = false`. On rootful Linux, process batches (`relish run
+Host commands still need the executable allowlist. On rootful Linux, process batches (`relish run
 --batch`) use native executors and enforce CPU/memory limits before execution.
 Ordinary `[job]` host commands, and every host command on other platforms, use
 the original owned process backend and refuse explicit limits. Containers and native jobs
 keep separate execution capabilities.
 
 Linux turns `[process_workloads] mount_isolation` on by default, and host jobs
-don't run under it yet (#714). Until they do, every node that should run host
-jobs needs this in its config:
+run under it. Each one starts in a mount namespace of its own: the host's
+filesystem, minus Bun's storage, configuration, sockets, cgroups and pinned
+eBPF maps, with a private `/tmp`, `/var/tmp` and `/dev/shm`. Manual 13 lists
+exactly what's hidden and what isolation doesn't stop.
+
+The tasks of one native executor share one `/tmp`. An executor only ever
+serves one job, so that's tasks of the same job, which trust each other
+already; another job's executor, and every fresh attempt, gets its own. The
+`/tmp` and `/var/tmp` of one executor share 256 MiB, and `/dev/shm` has
+64 MiB, charged to the executor's memory cgroup.
+
+Building the view needs Linux and a root Bun. A node that can't build it
+(macOS with `mount_isolation = true`, a non-root Bun) refuses host jobs rather
+than run them without it, and the cluster says so straight away. A standalone
+node refuses the submission (`relish run`, `relish apply`,
+`POST /v1/jobs/runs`) with HTTP 422 and the reason. So does a cluster: every
+node advertises over gossip what kinds of job it runs (host commands,
+containers, limits it can enforce, whether it can build the mount view,
+whether its `allowed_binaries` names anything), and the leader refuses a run
+that every live node says it can't take, with HTTP 422 and a reason such as:
+
+```text
+no node can run job default/hello: this node can't provide
+[process_workloads] mount_isolation (it needs Linux and a root Bun); ...
+```
+
+A host job that mounts things, traces other processes or loads BPF can't do it
+under isolation: the view drops those capabilities. Run it on a node with this
+in its config:
 
 ```toml
 [process_workloads]
 mount_isolation = false
-```
-
-Forget it and the cluster says so straight away. A standalone node refuses the
-submission (`relish run`, `relish apply`, `POST /v1/jobs/runs`) with HTTP 422
-and the reason. So does a cluster: every node advertises over gossip what
-kinds of job it runs (host commands, containers, limits it can enforce,
-`mount_isolation`, whether its `allowed_binaries` names anything), and the
-leader refuses a run that every live node says it can't take, with HTTP 422
-and a reason such as:
-
-```text
-no node can run job default/hello: host jobs don't run under
-[process_workloads] mount_isolation yet (on by default on Linux); ...
 ```
 
 The leader refuses only when it's sure. It checks the binary against each
@@ -687,14 +700,16 @@ latency alongside launch rates; container reuse alone does not qualify the
 
 Authorised scripts and encrypted environment values use the common path. Workers
 decrypt with live keys for the job's namespace. Decrypted configuration stays
-execution-local; captured output uses normal scoped retention. Host jobs require the owned process runtime, an absolute
-allowlisted binary (or `/bin/sh` for scripts) and disabled mount isolation.
+execution-local; captured output uses normal scoped retention. Host jobs require the owned process runtime and an absolute
+allowlisted binary (or `/bin/sh` for scripts).
 Rootful Linux process jobs use bounded native executors and accept explicit
 CPU/memory ranges and `pids`. Each fresh command is born inside its limited task cgroup;
 helper overhead stays reserved while its executor is idle. Commands retain
-Bun's user, privileges and host filesystem access: under a root Bun they run
-as root with every capability, and nothing sets `no_new_privs`. Use trusted
-allowlisted workloads.
+Bun's user and the host's filesystem, minus what mount isolation hides: under
+a root Bun they run as root with every capability except the five isolation
+drops (`CAP_SYS_ADMIN`, `CAP_SYS_PTRACE`, `CAP_SYS_MODULE`, `CAP_BPF`,
+`CAP_SYS_BOOT`), and nothing sets `no_new_privs`. Use trusted allowlisted
+workloads.
 Every host command, on every backend, starts with only `PATH`, `HOME`, `LANG`,
 `LANGUAGE`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR` and `LC_*` from Bun's
 environment, then the job's own `env`. Other Bun variables, such as cloud
@@ -869,7 +884,9 @@ The three public scenarios use your normal endpoint, token and CA context. Bun
 must support the selected runtime: `auto`/`mixed` allows both; explicit `runc`
 refuses host processes. Host jobs execute an explicitly allowlisted BusyBox
 binary, defaulting to `/bin/busybox`. They require the supported rootful Linux
-native backend and `mount_isolation = false`. The benchmark doesn't change the
+native backend. The published runs used `mount_isolation = false`; with it on,
+each executor start also builds the mount view, which the jobs soak measures
+from 0.4.0. The benchmark doesn't change the
 node's allowlist or grant itself host execution. Use `--exec /absolute/busybox`
 or set `RELIABURGER_BENCH_EXEC` for a different allowed path.
 
@@ -963,8 +980,8 @@ python3 scripts/demo/record-job-bench.py \
 ```
 
 Provide CLI credentials privately. Enable `mixed` or supported Linux `auto` on
-Bun, allowlist the matching host binary, and set `mount_isolation = false` for
-trusted native host commands. The observer selects that same executable for the
+Bun, allowlist the matching host binary, and set `mount_isolation = false` to
+compare with the published recordings, which ran without the mount view. The observer selects that same executable for the
 local baseline through `RELIABURGER_BENCH_EXEC`. Relish's raw baseline doesn't
 start a second Bun or allocate another node subnet.
 

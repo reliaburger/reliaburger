@@ -380,8 +380,17 @@ next scheduling pass places the rest.
 
 An `exec` or `script` app only goes to nodes that would run it: the node's
 `[process_workloads] allowed_binaries` must name the `exec` path (`/bin/sh` for
-a script), and `mount_isolation` must be off. A node whose allowlist stops
-covering the binary loses the replica to one that still does.
+a script), and a node with `mount_isolation` on (the Linux default) must be
+able to build the mount view, which takes Linux and a root Bun. A node whose
+allowlist stops covering the binary loses the replica to one that still does.
+
+Under `mount_isolation`, an isolated host app sees the host's filesystem with
+Bun's own directories hidden: its storage (`/var/lib/reliaburger` by default),
+`/etc/reliaburger`, `/run/reliaburger`, `/sys/fs/bpf` and every other
+workload's cgroup. Its `/tmp` and `/var/tmp` are private and share 256 MiB, and
+`/dev/shm` has 64 MiB, all charged to its memory limit. `relish exec` and the
+stop hook join the app's view, so they see its `/tmp`. Manual 13 says what
+isolation doesn't stop.
 
 ## When the binary isn't there
 
@@ -739,11 +748,18 @@ The node reports the failure to the leader with the cluster's service token.
 A plaintext development cluster with no master key has no service token, and
 until its first API token exists nobody holds a credential at all, so there
 the leader takes the report without one. It takes it only for a node the app
-is placed on, and once any credential exists (a master key or a first token)
-it requires the service token again. If `bun` logs
-`the leader refused the rollout failure of default/web` with a 401 or 403,
-the cluster has a token but its nodes have no master key to sign with: set
-`[security] master_key_path` on every node.
+is placed on. A first API token would end that, and the nodes' placement polls
+and failure reports would get 401 from then on, so on such a cluster
+`relish token create` refuses:
+
+```text
+refusing to create the first API token: this plaintext cluster has no master key, so its nodes have no service token, and once a token exists the API answers their calls (placement polls, rollout reports) with 401. Set [security] master_key_path to the same key on every node, restart them, then create the token
+```
+
+Set `[security] master_key_path` on every node, restart them, and create the
+token again. If `bun` logs `the leader refused the rollout failure of
+default/web` with a 401 or 403 anyway (a node started without the key the
+others have, say), give that node the same `master_key_path`.
 
 `cancel-deploy` takes the operation id that `apply` prints and waits for the
 in-flight step to finish. It works on a single node only: a cluster `apply`
@@ -933,8 +949,9 @@ Use the ID returned by submission. Each task has its own retry, timeout and
 stable identity. Applications and actual batch attempts share CPU and memory
 requests; a queued chunk does not consume its full task count's resources.
 Image tasks use rootful Linux isolation and runtime limits. Host tasks require
-an allowlisted binary, disabled mount isolation and the owned process runtime;
-that backend refuses explicit resource limits it cannot enforce.
+an allowlisted binary and the owned process runtime, and run in the same mount
+view as host apps; that backend refuses explicit resource limits it cannot
+enforce.
 
 Mixed-profile manifests, rates, duration distributions, indexed pages,
 retention and at-least-once effects are covered in `relish manual batch`.

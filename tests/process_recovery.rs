@@ -26,6 +26,7 @@ fn runtime(directory: &Path) -> ProcessGrill {
 fn spec(script: &str) -> OciSpec {
     OciSpec {
         managed_volumes: Vec::new(),
+        mount_bind_backs: Vec::new(),
         reusable_executor: false,
         host_process: true,
         initialiser: false,

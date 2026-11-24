@@ -325,6 +325,12 @@
   },
   {
     "source": "tests/cluster_failover.rs",
+    "function": "a_context_whose_first_node_is_down_reaches_the_cluster_through_the_next",
+    "binary": "reliaburger::cluster_failover",
+    "test": "a_context_whose_first_node_is_down_reaches_the_cluster_through_the_next"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
     "function": "an_agent_lease_survives_a_leader_change_and_the_new_leader_expires_it",
     "binary": "reliaburger::cluster_failover",
     "test": "an_agent_lease_survives_a_leader_change_and_the_new_leader_expires_it"
@@ -2050,5 +2056,65 @@
     "function": "gitops_demo_syncs_a_repository_and_leaves_applied_apps_alone",
     "binary": "reliaburger::demos",
     "test": "gitops_demo_syncs_a_repository_and_leaves_applied_apps_alone"
+  },
+  {
+    "source": "tests/host_mount_isolation.rs",
+    "function": "a_host_app_cannot_see_buns_storage_or_another_workloads_tmp",
+    "binary": "reliaburger::host_mount_isolation",
+    "test": "a_host_app_cannot_see_buns_storage_or_another_workloads_tmp"
+  },
+  {
+    "source": "tests/host_mount_isolation.rs",
+    "function": "a_fresh_host_job_cannot_see_a_hidden_path",
+    "binary": "reliaburger::host_mount_isolation",
+    "test": "a_fresh_host_job_cannot_see_a_hidden_path"
+  },
+  {
+    "source": "tests/host_mount_isolation.rs",
+    "function": "a_native_host_task_cannot_see_a_hidden_path",
+    "binary": "reliaburger::host_mount_isolation",
+    "test": "a_native_host_task_cannot_see_a_hidden_path"
+  },
+  {
+    "source": "tests/host_mount_isolation.rs",
+    "function": "tasks_of_one_native_executor_share_one_tmp_and_another_jobs_do_not",
+    "binary": "reliaburger::host_mount_isolation",
+    "test": "tasks_of_one_native_executor_share_one_tmp_and_another_jobs_do_not"
+  },
+  {
+    "source": "tests/host_mount_isolation.rs",
+    "function": "relish_exec_into_a_host_app_sees_the_apps_tmp",
+    "binary": "reliaburger::host_mount_isolation",
+    "test": "relish_exec_into_a_host_app_sees_the_apps_tmp"
+  },
+  {
+    "source": "tests/host_mount_isolation.rs",
+    "function": "a_volume_bun_mounts_after_the_workload_starts_stays_hidden",
+    "binary": "reliaburger::host_mount_isolation",
+    "test": "a_volume_bun_mounts_after_the_workload_starts_stays_hidden"
+  },
+  {
+    "source": "tests/host_mount_isolation.rs",
+    "function": "bun_can_unmount_a_volume_while_a_host_workload_runs",
+    "binary": "reliaburger::host_mount_isolation",
+    "test": "bun_can_unmount_a_volume_while_a_host_workload_runs"
+  },
+  {
+    "source": "tests/host_mount_isolation.rs",
+    "function": "a_workload_writes_to_the_host_root_outside_the_hidden_list",
+    "binary": "reliaburger::host_mount_isolation",
+    "test": "a_workload_writes_to_the_host_root_outside_the_hidden_list"
+  },
+  {
+    "source": "tests/host_mount_isolation.rs",
+    "function": "an_isolated_root_workload_cannot_unmount_a_mask_or_setns",
+    "binary": "reliaburger::host_mount_isolation",
+    "test": "an_isolated_root_workload_cannot_unmount_a_mask_or_setns"
+  },
+  {
+    "source": "tests/host_mount_isolation.rs",
+    "function": "a_workloads_tmp_and_var_tmp_share_one_256_mib_cap",
+    "binary": "reliaburger::host_mount_isolation",
+    "test": "a_workloads_tmp_and_var_tmp_share_one_256_mib_cap"
   }
 ]

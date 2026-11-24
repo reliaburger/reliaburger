@@ -3,11 +3,13 @@
 # `exec` names a binary on the node; no container image is involved. Host
 # execution is deny-by-default: the node runs only binaries listed in its
 # `[process_workloads] allowed_binaries`, and an empty list refuses
-# everything. On Linux it also needs `mount_isolation = false`, because host
-# workloads can't run under mount isolation yet (#714).
+# everything. On Linux a root Bun runs it inside a mount view that hides
+# Bun's own paths (`mount_isolation`, on by default, #714); a Bun started as
+# an ordinary user can't build that view, so it needs
+# `mount_isolation = false`.
 #
 # examples/node/process-runtime.toml allows target/debug/testapp and turns
-# mount isolation off. From the repository root:
+# mount isolation off, since you run it from source as yourself. From the repository root:
 #
 #   cargo build --locked --bins
 #   target/debug/bun --runtime process --config examples/node/process-runtime.toml

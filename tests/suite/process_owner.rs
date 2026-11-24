@@ -26,7 +26,7 @@ fn owner_record(
     phase: serde_json::Value,
 ) -> serde_json::Value {
     serde_json::json!({
-        "schema": 3,
+        "schema": 4,
         "boot_id": process_owner::current_boot_id().unwrap().unwrap(),
         "nonce": nonce,
         "command": command,

@@ -53,9 +53,13 @@ fn service(data: &std::path::Path) -> Arc<TaskArrayService> {
     let node = TaskArrayNode::new(
         TaskArrayNodeConfig {
             root: data.join("task-arrays"),
+            // Linux's default. The fake runner advertises that it can build
+            // the mount view (#714), so this checks that a run under the
+            // default is admitted and scheduled; it builds no view itself,
+            // and tests/host_mount_isolation.rs proves the view.
             policy: ProcessWorkloadsConfig {
                 allowed_binaries: vec![PathBuf::from(BINARY)],
-                mount_isolation: false,
+                mount_isolation: true,
             },
             default_concurrency: 16,
             backoff: (Duration::from_millis(1), Duration::from_millis(5)),

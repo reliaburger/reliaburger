@@ -12,8 +12,11 @@ The flags, variables, files and ports you'll reach for. `relish help COMMAND`
 | `--ca-cert PATH` | `RELIABURGER_CA_CERT` | cluster root CA; switches the default to HTTPS |
 | `-o`, `--output FORMAT` | | `human` (default), `json` or `yaml`; every command takes it except the eight interactive ones ([machine output](#machine-output)) |
 
-A flag beats its variable. With neither, `relish` uses the laptop cluster's
-saved context, then `http://127.0.0.1:9117`.
+A flag beats its variable. With neither, `relish` uses the saved context,
+then `http://127.0.0.1:9117`. A context that lists several nodes asks the
+one that last answered, then the rest in order, passing over any that
+don't accept a connection within 1.5 seconds ([the appliance
+chapter](17_appliance.md#claim-them) shows it).
 
 ## Machine output
 
@@ -187,8 +190,10 @@ systemd service (`relish manual appliance`):
 | `bun appliance prepare` | prepare the node from its seed: install a create seed's files, or enrol and fetch the master key, then write `node.toml`. With no seed, wait to be claimed |
 | `bun appliance console [--tty PATH]` | draw the node's status, and its claim key while it's unclaimed, on `/dev/tty1`, refreshed every five seconds |
 
-Host workloads require an explicit allowlist and `mount_isolation = false`;
-CPU/memory limits and container egress enforcement remain unavailable to them.
+Host workloads require an explicit allowlist, and under `mount_isolation` (on
+by default on Linux) a root Bun on Linux, which builds their mount view (see
+"Mount isolation for host workloads" below); container egress enforcement
+remains unavailable to them.
 While no API token exists, Bun refuses any `--listen` address that isn't a
 loopback IP.
 
@@ -227,7 +232,7 @@ Everything the installer and the quickstart write lives in `~/.reliaburger`
 | Path | What |
 |------|------|
 | `bin/relish` | the CLI (`~/.local/bin/relish` links here if that's on your `PATH`) |
-| `context.json` | the current cluster's endpoint, CA path and admin token (mode 0600): the laptop cluster's, or a bare-metal cluster's node 1 once `relish cluster create --bare-metal` or `relish machines claim --create` saves it (they leave another cluster's working context in place, and replace one whose CA certificate is gone) |
+| `context.json` | the current cluster's endpoints, CA path and admin token (mode 0600): the laptop cluster's, or a bare-metal or `setup --ssh` cluster's, node 1 first and every other node after it to fall over to, with the node that last answered, once `relish cluster create --bare-metal`, `relish machines claim --create` or `relish setup --ssh` saves it (they leave another cluster's working context in place, and replace one whose CA certificate is gone) |
 | `root-backup-keys/` | the age identities that open each cluster's root CA backup; keep a copy offline, since the root CA key has no other copy |
 | `clusters/NAME/` | a laptop cluster's state, node configs and `timings.json` |
 | `clusters/NAME/security/` | its master key, admin token and CA (`identity/root-ca.crt`) |
@@ -398,10 +403,83 @@ startup instead of being ignored.
 | `[metrics]`, `[logs]`, `[alerts]` | observability (see `observability`) |
 | `[gitops]`, `[upgrades]` | see `operations` |
 | `[smoker]`, `[testing]` | fault durations, `default_duration_secs` (600) and `max_duration_secs` (3600), where `0 < default <= max <= 86400`, and the fault and test policy (see `chaos`) |
-| `[process_workloads]` | `allowed_binaries` for `exec` workloads (empty: none; a `script` needs `/bin/sh`), which the scheduler also places by; host commands inherit only `PATH`, `HOME`, `LANG`, `LANGUAGE`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR` and `LC_*` from Bun |
+| `[process_workloads]` | `allowed_binaries` for `exec` workloads (empty: none; a `script` needs `/bin/sh`), which the scheduler also places by; `mount_isolation` (default `true` on Linux, `false` elsewhere: host workloads start in a mount view that hides Bun's paths, below); host commands inherit only `PATH`, `HOME`, `LANG`, `LANGUAGE`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR` and `LC_*` from Bun |
 | `[secret_providers.NAME]` | `binary` (absolute), `timeout_secs` (5, at most 60), `max_output_bytes` (64 KiB, at most 1 MiB), `env`: the exec secret providers this node runs for `PROVIDER[NAME:path]` values, which the scheduler also places by (see `security`) |
 | `[reporting_tree]` | `report_interval_secs` (5, not 0), `stale_report_timeout_secs` (30: more than `report_interval_secs`, at most 86400), `stale_node_grace_secs` (300, not 0: how long a live node whose reports stopped keeps its replicas before they move; see `deploy-an-app`) |
 | `[runtime]` | `stop_confirmation_timeout_secs`; `allowed_capabilities`, `allowed_sysctls` and `allowed_devices`, the runtime knobs apps may use here, which the scheduler also places by (empty: none; see `security`) |
+
+### Mount isolation for host workloads
+
+With `[process_workloads] mount_isolation` on, every host workload (an `exec`
+or `script` app, its image-less init containers, a host job, a native
+executor and the tasks it runs) starts in a mount namespace of its own. It sees
+the host's root, read-write, except:
+
+- the storage directories (`data`, `images`, `logs`, `metrics`, `volumes`;
+  their parent when it's Bun's own `reliaburger` directory, so
+  `/var/lib/reliaburger` by default), wherever Bun fell back to when it
+  couldn't create them (its local data directory's `reliaburger`), the
+  identity directory, the master key, the bootstrap file and the ingress TLS
+  certificate and key;
+- the directory of Bun's `--config` file when it's a `reliaburger`
+  directory, or the file alone elsewhere, and `/etc/reliaburger`;
+- `/run/reliaburger`, `/sys/fs/bpf` and `/sys/fs/cgroup/reliaburger`, apart
+  from the workload's own cgroup.
+
+Each of those is an empty, read-only directory (or `/dev/null`, for a file),
+whatever symlinks led there. A path that's missing when the workload starts
+has nothing to hide and is logged to its stderr; one that has become a
+symlink since Bun resolved it fails the launch rather than mask the wrong
+place. `/tmp` and `/var/tmp` are one private 256 MiB
+tmpfs, and `/dev/shm` a private 64 MiB one, empty at start and gone at exit,
+charged to the workload's memory cgroup. Mounts Bun makes or removes later,
+such as a volume, reach the namespace but stay under its masks. Before its
+command runs, the gate takes `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE`,
+`CAP_SYS_MODULE`, `CAP_BPF` and `CAP_SYS_BOOT` out of its bounding,
+inheritable and ambient sets, so root in the view can't take a mask off,
+`setns` back to the host's namespace, or read Bun's files through Bun's
+`/proc/<pid>/root`. It also marks every inherited descriptor above standard
+error close-on-exec. `relish exec` and stop hooks join the running
+workload's view.
+
+The list is Bun's own layout and nothing else. A token in `/root`, or a
+`storage.data` pointed at a shared directory, gets no help from it.
+
+Isolation is not a sandbox. A host workload still runs as root, and it can:
+
+- reach every runc container on the node through `/proc/<pid>/root` and
+  `/proc/<pid>/environ`: their root filesystems, volumes, identities and
+  environments. It has the same uid and a superset of their capabilities, and
+  there's no PID namespace to stop it (that's
+  [#360](https://github.com/reliaburger/reliaburger/issues/360));
+- read the `/proc` files of any other process with no more capabilities than
+  it;
+- write itself back onto the host through the read-write root: a unit in
+  `/etc/systemd`, a cron entry, Bun's binary directory, `/proc/sys`;
+- open files by handle (`open_by_handle_at`, `CAP_DAC_READ_SEARCH` stays),
+  which needs no path through a mask, and open a raw disk under `/dev`;
+- use the network: Bun's API on loopback, other nodes, the internet
+  (`allow_from` and egress rules don't apply to host processes).
+
+What isolation stops is an honest or careless binary reading Bun's keys and
+other workloads' secrets by path, or clobbering their temp files. If you
+don't trust the binary, give the workload an image. A workload that mounts
+things, traces other processes or loads BPF needs `mount_isolation = false`.
+
+Building the view needs Linux and a root Bun. macOS has no mount namespaces,
+so isolation is off there by default, and a node that sets it on anyway (or a
+non-root Linux Bun) refuses host workloads and doesn't advertise them.
+
+`relish setup --ssh` writes nodes that run containers only: `bun --runtime
+runc` and an empty allowlist, with isolation on. To run host work on one, change
+`--runtime runc` to `--runtime mixed` on the `ExecStart` line of
+`/etc/systemd/system/reliaburger.service`, and name the binary in its
+`node.toml`:
+
+```toml
+[process_workloads]
+allowed_binaries = ["/usr/bin/restic"]
+```
 
 ### Shorter certificates for soak runs
 

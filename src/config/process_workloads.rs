@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 /// Configuration for process workloads (exec/script apps and jobs).
 ///
 /// Process workloads run host binaries or inline scripts as first-class
-/// workloads with optional isolation (mount namespace, cgroup limits).
+/// workloads, in a mount view that hides Bun's paths unless
+/// `mount_isolation` is off.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProcessWorkloadsConfig {
@@ -22,12 +23,16 @@ pub struct ProcessWorkloadsConfig {
     /// unaffected — this list gates only ProcessGrill host execution.
     pub allowed_binaries: Vec<PathBuf>,
 
-    /// Request mount namespace isolation for process workloads (Linux only).
+    /// Start host workloads in a mount view of their own (Linux only, #714).
     ///
-    /// Not implemented yet (#360). When true, Bun refuses `exec` and
-    /// `script` workloads rather than run them without the isolation, and
-    /// doesn't advertise host workloads to the scheduler. On by default on
-    /// Linux, so a node that runs them sets it to `false`.
+    /// When true, every `exec` and `script` app, host job and native host
+    /// executor sees the host's root minus Bun's own paths, with a private
+    /// `/tmp`, `/var/tmp` and `/dev/shm`, and runs without `CAP_SYS_ADMIN`,
+    /// `CAP_SYS_PTRACE`, `CAP_SYS_MODULE`, `CAP_BPF` and `CAP_SYS_BOOT`
+    /// (see [`crate::grill::mount_view`]). A node that can't build the view
+    /// (not Linux, or a non-root Bun) refuses host workloads instead and
+    /// doesn't advertise them. On by default on Linux; a host workload that
+    /// mounts, traces or loads BPF needs it `false`.
     #[serde(skip_serializing_if = "is_default_mount_isolation")]
     pub mount_isolation: bool,
 }

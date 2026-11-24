@@ -1476,9 +1476,10 @@ budget of three Raft entries a second (#668).
 
 ### A run nobody can take
 
-Linux turns `[process_workloads] mount_isolation` on by default, and host
-tasks don't run under it yet (that's #714). So what happened when you
-submitted `runtime = "process"` work to a default Linux node? The node said
+Linux turns `[process_workloads] mount_isolation` on by default, and until
+0.4.0 host tasks didn't run under it (that was #714, and "Building the view"
+below is how it ended). So what happened when you submitted
+`runtime = "process"` work to a default Linux node? The node said
 no, politely, every second, in its sync answer. The leader noted the refusal,
 granted nothing, and moved on. The run sat in `Running` with every task
 queued until its deadline, or for ever if it had none. `relish test`'s job
@@ -1490,8 +1491,8 @@ missing was anyone asking the obvious question: can *any* node run this?
 
 Not every refusal answers that question, though. A node that can't open its
 task ledger because the disk hiccuped might be fine next second. A node whose
-allowlist lacks the binary, or whose `mount_isolation` is on, will say the
-same thing until someone edits its config. So the node's answer now says
+allowlist lacks the binary, or whose `mount_isolation` it can't honour, will
+say the same thing until someone edits its config. So the node's answer now says
 which kind it is:
 
 ```rust
@@ -1563,7 +1564,7 @@ pub struct JobCapabilities {
     pub singleton_image_limits: bool,
     pub encrypted_env: bool,
     pub network_policy: bool,
-    pub mount_isolation: bool,
+    pub mount_isolation_unavailable: bool,
     pub binaries: bool,
 }
 ```
@@ -1623,9 +1624,12 @@ might allow the binary. In each of those cases the tick from #777 stays the back
 for the races: a node that leaves, or changes its configuration, after
 admission. When admission does refuse, it quotes the reasons through the same
 `quote_reasons` helper the tick uses, so `relish run` prints `no node can run
-job default/render: host jobs don't run under [process_workloads]
-mount_isolation yet …` whether the leader caught it at the door or a tick
-later.
+job default/render: this node can't provide [process_workloads]
+mount_isolation …` whether the leader caught it at the door or a tick later.
+(Until 0.4.0 the flag was `mount_isolation`, the setting itself, and the
+reason said host jobs didn't run under it "yet". When the view arrived the
+flag flipped to what the leader actually needs to know, and renaming a
+gossiped field bumped the wire protocol.)
 
 The node publishes its summary through a `tokio::sync::watch` channel, because
 gossip starts long before the task executor exists. Gossip reads the latest
@@ -1635,10 +1639,309 @@ to it over the wire.
 
 One more thing was quietly wrong. A node's capability report said it ran
 process workloads whenever its allowlist wasn't empty, even with
-`mount_isolation` on, when it refuses every one of them. `relish test`
-believed it and ran the host cases into the wall. The report now says no
-unless the allowlist is set *and* isolation is off, so those cases skip with a
-reason instead. A capability report that lies is worse than none.
+`mount_isolation` on, when it refused every one of them. `relish test`
+believed it and ran the host cases into the wall. The report then said no
+unless the allowlist was set *and* isolation was off, so those cases skipped
+with a reason instead. A capability report that lies is worse than none.
+
+### Building the view
+
+That refusal was the right call and a poor place to stay. On a default Linux
+node no host workload ran at all: not an app, not a job, not a task array.
+The operator's way out was `mount_isolation = false`, which hands an
+allowlisted binary everything Bun can see, as root: the node's identity key,
+every other workload's `owner.json` (its whole resolved environment, decrypted
+secrets included) and the volumes of the containers next to it. 0.4.0 builds
+the view instead (#714).
+
+What should the view be? We looked at two answers. One is an allowlisted
+filesystem: `/usr`, `/lib`, `/etc/ssl` read-only, plus whatever the operator
+grants, the way Nomad's `exec` driver builds a chroot and bubblewrap builds a
+sandbox. The other is the host's root minus Bun's own paths, the way systemd's
+`InaccessiblePaths=` and `PrivateTmp=` work. We took the second. A workload
+that's happy in an allowlisted view is happy in a container, and we already
+have containers. Host workloads exist for work that needs the host: the log
+shipper reading `/var/log`, the backup agent writing to `/srv/backups`. What
+the operator who allowlisted `/usr/bin/restic` hasn't said is that it may read
+Bun's keys.
+
+So the view hides a list Bun computes from its own `node.toml`: the storage
+directories (their parent when it's Bun's own `reliaburger` directory), the
+identity directory, the key files, the config directory, `/run/reliaburger`,
+`/sys/fs/bpf` and Bun's cgroup tree. `/tmp`, `/var/tmp` and `/dev/shm` become
+private. Everything else stays where it was, read-write.
+
+#### Who builds it
+
+Every production host launch already went through one place: the process
+owner's execution gate, the tiny pre-Tokio process that waits for
+activation, checks the durable record, joins the workload's cgroup and
+`exec`s the command. The native host helper from later in this chapter is a
+launch like any other, and its tasks are its `CLONE_VM|CLONE_VFORK` children,
+which inherit its mount namespace. Build the view in the gate before it
+`exec`s the helper, and every task the helper ever starts runs in it, without
+a line of the helper's C changing.
+
+We could have built it in `helper.c` instead, next to the container helper's
+private scratch mounts. Three things argued against that. The host helper
+drops `CAP_SYS_ADMIN` on purpose, because on the host it's a real privilege,
+and giving it back to a long-lived process that talks to a socket would undo
+that. The helper's child shares the helper's memory until it `exec`s, so it
+may only make async-signal-safe calls; resolving paths and reporting errors
+there is the hardest code in the project to get right. And a namespace per
+task costs every task, where a namespace per executor costs once per
+thousands of tasks. The price is that tasks of one executor share one `/tmp`.
+An executor only ever serves one job, so that's tasks that already trust each
+other.
+
+#### Eight steps in one process
+
+The record carries the view. `ProcessLaunch` grew one field:
+
+```rust
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub mount_isolation: Option<super::mount_view::MountIsolation>,
+```
+
+and `MountIsolation` is an enum with data in its variants:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MountIsolation {
+    Build { view: MountView },
+    Join { pid: u32 },
+}
+```
+
+`#[serde(tag = "mode")]` makes serde write the variant's name as a field next
+to its data, `{"mode":"build","view":{…}}`, the shape you'd design by hand for
+a Go struct with a `Mode string` and optional fields. The difference is that
+Rust won't let you read `view` from a `Join`: the `match` that unpacks the
+enum gives you only the fields that variant has.
+
+The gate runs the steps in order, each a Linux system call:
+
+1. `unshare(CLONE_NEWNS)` gives the gate a mount namespace of its own: a copy
+   of the host's mount table that it can change without the host seeing.
+   It's Go's `syscall.Unshare` or Python's `os.unshare`. The kernel refuses it
+   with `EINVAL` in a process whose threads share a filesystem context, which
+   is every multi-threaded process. The gate runs before Tokio starts its
+   worker threads, and it checks `/proc/self/task` first, so a regression
+   fails with "the execution gate has 5 threads" instead of a bare `EINVAL`.
+2. `mount(NULL, "/", NULL, MS_REC | MS_SLAVE, NULL)` sets how mounts flow
+   between the namespaces. More on this choice below; it's the one that
+   matters.
+3. `open_tree(OPEN_TREE_CLONE)` takes a detached copy of each path the
+   workload must keep although its parent is about to vanish: its own cgroup,
+   and, for the native helper, its binary, control socket and cgroup subtree.
+4. One 256 MiB tmpfs, its two directories bound at `/tmp` and `/var/tmp` so
+   they share the cap, and a 64 MiB tmpfs on `/dev/shm`.
+5. An empty, read-only, mode-000 tmpfs on each hidden directory, and a bind of
+   `/dev/null` on each hidden file.
+6. `move_mount` attaches each detached copy back where it was, and the
+   read-only ones are remounted read-only.
+7. `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE`, `CAP_SYS_MODULE`, `CAP_BPF` and
+   `CAP_SYS_BOOT` go from the bounding, inheritable and ambient sets.
+8. Every descriptor above standard error is marked close-on-exec, then
+   `exec`.
+
+Steps 5 and 6 never act on a path as written. Each target is opened with
+`openat2` and `RESOLVE_NO_SYMLINKS`, which fails if any component is a
+symlink: the paths were resolved when Bun computed the view, so a symlink
+now means someone renamed an ancestor or planted a decoy. The mask is then
+mounted on that descriptor (through its `/proc/self/fd/N` name) and checked
+to be a fresh tmpfs where we put it, and the read-only remounts and
+`move_mount`s use descriptors too. A target that doesn't exist is logged and
+skipped: there's nothing to hide there.
+
+Step 3 solves a chicken-and-egg problem. Once a mask covers
+`/var/lib/reliaburger`, the helper's own directory under it is gone too, so a
+plain bind mount after the mask has no source to bind. `open_tree(2)` (Linux
+5.2, under our 5.8 floor) returns a file descriptor for a mount that isn't
+attached anywhere yet, and `move_mount(2)` attaches it later. The descriptor
+holds the copy alive in between, the way an open file keeps an unlinked file's
+data.
+
+`nix`, the crate that wraps POSIX calls in Rust types, has `unshare`, `mount`
+and `setns`, each returning a `Result` instead of `-1` and `errno`. It doesn't
+wrap `open_tree` or `move_mount`, so the module calls them through
+`libc::syscall`, the same `syscall(SYS_..., …)` you'd write in C:
+
+```rust
+fn open_tree_clone(path: &Path) -> io::Result<OwnedFd> {
+    let path = c_path(path)?;
+    // SAFETY: open_tree reads a NUL-terminated path that outlives the
+    // call and returns a new descriptor or -1; nothing else is touched.
+    let fd = unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_open_tree,
+            nix::libc::AT_FDCWD,
+            path.as_ptr(),
+            OPEN_TREE_CLONE | nix::libc::O_CLOEXEC as nix::libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the kernel just returned this descriptor and nothing else
+    // owns it.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+}
+```
+
+Two `unsafe` blocks, each with its reason. The first is there because the
+compiler can't check what a system call does with a pointer. `c_path` builds a
+`CString`, Rust's owned, NUL-terminated C string, and it lives until the end of
+the function, so the pointer stays valid for the call. The second is there
+because `from_raw_fd` trusts us that nobody else will close the descriptor.
+`OwnedFd` then closes it when it goes out of scope, which is Go's
+`defer f.Close()` without the line you can forget. Everything that isn't Linux
+sits in `#[cfg(target_os = "linux")] mod linux`, so the macOS build never sees
+it, and the portable part (what to hide, which bind-backs to attach) is plain
+code with plain unit tests.
+
+Errors carry the step. A helper builds the `map_err` closure:
+
+```rust
+fn failed(step: impl std::fmt::Display) -> impl FnOnce(io::Error) -> io::Error {
+    move |error| io::Error::other(format!("mount isolation: {step}: {error}"))
+}
+```
+
+`impl FnOnce(io::Error) -> io::Error` is a return type that says "some closure
+you can call once", without naming its type (every Rust closure has its own,
+unnameable type). `move` puts `step` inside the closure, so it outlives the
+call to `failed`. The gate's report then reads `mount isolation: cannot hide
+/var/lib/reliaburger: …`, and `relish inspect` shows that instead of an exit
+code.
+
+#### Slave, not private
+
+The container helper already had private scratch mounts, with
+`mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)`. Copying it was the
+obvious move, and it's wrong for the host's root. Every mount has a
+*propagation type* that says whether mounts and unmounts under it spread to
+other namespaces. A private mount shares nothing: the namespace keeps a copy
+of every mount that existed when it was made, and nothing the host does later
+reaches it.
+
+Inside a container that's what you want. On a `runc+process` node, Bun keeps
+mounting and unmounting container root filesystems and volumes. A host app
+started under `MS_PRIVATE` would keep its own copy of every one that existed
+at its start; Bun's unmount would succeed in Bun's namespace and leave the
+filesystem busy in the app's. The Btrfs subvolume wouldn't delete, and the
+volume's size couldn't be applied again. A slave mount receives the host's
+mounts and unmounts and sends nothing back, which is what systemd does for its
+sandboxed units. The test `bun_can_unmount_a_volume_while_a_host_workload_runs`
+mounts a tmpfs under the volumes directory, starts a workload, unmounts it on
+the host and waits for it to leave the workload's `/proc/<pid>/mountinfo`.
+Under `MS_PRIVATE` it waits for ever, and we watched it fail once to be sure.
+
+Doesn't a slave then show the workload a volume Bun mounts under a hidden
+directory? No. The propagated mount lands on the namespace's copy of the
+directory underneath, below the mask, so a lookup through the mask never
+reaches it. `a_volume_bun_mounts_after_the_workload_starts_stays_hidden`
+checks exactly that.
+
+#### Root is still root
+
+A mount namespace changes what paths resolve to. It doesn't change who you
+are. A host workload runs as root, and in the initial user namespace root
+holds `CAP_SYS_ADMIN`, so without step 7 it could `umount` any mask in one
+call, or `setns` into `/proc/1/ns/mnt` and be back on the host. With
+`CAP_SYS_PTRACE` it could read `/proc/<bun's pid>/root/var/lib/reliaburger`,
+which walks Bun's own view.
+
+Capabilities are Linux's split of root's powers into about forty bits. Each
+process has several sets of them, and `exec` computes the new program's from
+the old one's. For root the rule is short: the program it `exec`s is
+*permitted* every capability in the old process's *bounding* set, plus every
+one in its *inheritable* set, plus its *ambient* set. So dropping a
+capability from the bounding set alone isn't enough; a stray inheritable bit
+would bring it straight back. The gate takes the five out of all three:
+`prctl(PR_CAPBSET_DROP, cap)` lowers the bounding set, which can never be
+raised again; `capset` clears them from the inheritable set; and
+`PR_CAP_AMBIENT_CLEAR_ALL` empties the ambient set. The gate keeps its own
+effective capabilities until `exec`, because it still needs them to finish
+the view, and the command starts without the five. The gated test reads
+`CapInh`, `CapPrm`, `CapEff`, `CapBnd` and `CapAmb` from the workload's
+`/proc/self/status` and checks all five bits are clear in each. A workload that needs them (one that
+mounts things, traces other processes or loads BPF) needs
+`mount_isolation = false`, and the manual says so.
+
+Could the workload create a user namespace, where it's root with every
+capability, and unmount from there? Not usefully. Mounts a namespace inherits
+from a more privileged one are *locked*: they can't be unmounted on their own,
+precisely so a mask can't come off that way. The gated test tries `umount`,
+`umount -l`, `nsenter -t 1 -m`, both `/proc/<pid>/root` routes and
+`unshare -Urm`, and expects all six to fail.
+
+This still isn't a sandbox, and it's worth being blunt about how far from one
+it is. Root can open the raw disk under `/dev` and read the filesystem
+underneath. It keeps `CAP_DAC_READ_SEARCH`, so `open_by_handle_at` can reach a
+file by its handle without a path through any mask. There's no PID
+namespace, so it can read the `/proc/<pid>/root` and `/proc/<pid>/environ` of
+every process with no more capabilities than it has. That includes every runc
+container on the node: same uid, and the workload's capabilities are a
+superset of the container's, so their root filesystems, volumes, identities
+and environments are all one path away. And the host's root is read-write, so
+root can write itself back in: a systemd unit under `/etc/systemd`, a cron
+entry, Bun's own binary directory, a knob under `/proc/sys`. The view stops
+an honest binary from tripping over Bun's secrets and a careless one from
+deleting its neighbours' `/tmp`. It doesn't stop a hostile one.
+PID namespaces ([#360](https://github.com/reliaburger/reliaburger/issues/360))
+close the `/proc` route; the rest is what containers are for. Manual 13
+lists both sides. If you don't trust the binary, give the workload an image.
+
+#### Joining instead of building
+
+`relish exec` into a host app starts a nested owner whose gate reads the
+app's recorded launch. Had it built a fresh view, the command would have had
+its own empty `/tmp`, and `relish exec api -- cat /tmp/app.pid` would find
+nothing. That's not what `docker exec` does. So the nested record carries
+`MountIsolation::Join { pid }`, the app's root process, and its gate joins the
+running namespace:
+
+```rust
+let fd = unsafe { nix::libc::syscall(nix::libc::SYS_pidfd_open, pid, 0) };
+// ...
+setns(&pidfd, CloneFlags::CLONE_NEWNS)
+```
+
+A *pidfd* is a file descriptor that names one process, not a number that a
+new process could reuse. `setns` has taken one since Linux 5.8, so the gate
+never opens `/proc/<pid>/ns/mnt` by a path that could point at someone else.
+The parent owner holds the app's root unreaped, so even the PID can't be
+recycled before the pidfd exists. Stop hooks run through the same exec path,
+so they see what their app sees too.
+
+#### Refusing less
+
+The refusals didn't go away; they changed meaning. One question now decides
+them all: is isolation on, and can this node build the view? The process
+runtime knows, because Bun hands it the view at start-up only when it's on
+Linux and running as root, and the `Grill` trait grew one method to ask:
+
+```rust
+fn isolates_host_mounts(&self) -> bool {
+    false
+}
+```
+
+A default method on a trait is one that implementations get for free and may
+override, like an embedded struct's method in Go. Every runtime says no;
+the owned process runtime says yes when it has a view, and the mixed runtime
+asks its host half. The supervisor's `admit_app`, the scheduler's
+`ProcessWorkloadCapability`, `relish test`'s capability report and the task
+executor's gossiped `mount_isolation_unavailable` all read it. A Mac with
+`mount_isolation = true` still refuses, with "this node can't provide
+[process_workloads] mount_isolation (it needs Linux and a root Bun)" rather
+than "not implemented yet".
+
+The owner record's format went from 3 to 4 and the gossiped field changed
+meaning, so `CURRENT` in `src/compatibility.rs` bumped both numbers: a 0.3
+cluster starts afresh on its upgrade to 0.4.0, as the pre-1.0 policy says.
 
 ## Short jobs without fresh containers
 
@@ -2912,7 +3215,8 @@ original one-owner-per-attempt backend and refuse explicit CPU or memory
 limits, since they can't enforce them.
 
 What's different is that this is *trusted* host execution with resource
-controls, not a sandbox. Commands run as Bun's user, with the host filesystem.
+controls, not a sandbox. Commands run as Bun's user, with the host filesystem
+(from 0.4.0 minus Bun's own paths: see "Building the view" above).
 That made us look hard at what the helper itself is allowed to do, and the
 answer was "too much" in three places:
 
@@ -5511,6 +5815,13 @@ command's children are gone. An empty cgroup isn't proof the kernel has
 forgotten it was killed. A missing directory record isn't proof nothing was
 published. Positive retirement, acting only on a receipt or an observed empty
 state, is slower to write and much faster to debug.
+
+**Copy the obvious flag carefully.** The container helper's `MS_PRIVATE` was
+right for a container and would have been wrong for a host app: every volume
+that existed when the app started would have stayed busy until it exited.
+Nothing in a unit test would have shown it. The gated test that unmounts a
+volume under a running workload did, the one time we tried it with the
+copied flag.
 
 **Mocks can't see the kernel.** The `kill_seq` bug, the swap that let a
 memory-limited command survive, the racing image mountpoint and the oversized

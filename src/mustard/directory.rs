@@ -375,7 +375,7 @@ mod tests {
             singleton_image_limits: true,
             encrypted_env: true,
             network_policy: false,
-            mount_isolation: true,
+            mount_isolation_unavailable: true,
             binaries: true,
         }
     }
@@ -391,7 +391,7 @@ mod tests {
         assert!(!dir.observe(&extension_with_jobs("n1", Some(isolated))));
 
         let open = JobCapabilities {
-            mount_isolation: false,
+            mount_isolation_unavailable: false,
             ..isolated
         };
         assert!(dir.observe(&extension_with_jobs("n1", Some(open))));

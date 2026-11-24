@@ -3071,7 +3071,7 @@ mod tests {
         );
     }
 
-    fn job_summary(mount_isolation: bool) -> crate::meat::job_capability::JobCapabilities {
+    fn job_summary(isolation_unavailable: bool) -> crate::meat::job_capability::JobCapabilities {
         crate::meat::job_capability::JobCapabilities {
             host: true,
             host_limits: true,
@@ -3080,7 +3080,7 @@ mod tests {
             singleton_image_limits: false,
             encrypted_env: true,
             network_policy: false,
-            mount_isolation,
+            mount_isolation_unavailable: isolation_unavailable,
             binaries: true,
         }
     }
@@ -4388,7 +4388,7 @@ mod tests {
             singleton_image_limits: true,
             encrypted_env: true,
             network_policy: true,
-            mount_isolation: true,
+            mount_isolation_unavailable: true,
             binaries: true,
         };
         let (_jobs_tx, jobs_rx) = watch::channel(Some(every));

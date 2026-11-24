@@ -1024,6 +1024,7 @@ mod tests {
         let id = InstanceId("rootless-writable".to_string());
         let spec = crate::grill::oci::OciSpec {
             managed_volumes: Vec::new(),
+            mount_bind_backs: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1094,6 +1095,7 @@ mod tests {
         let id = InstanceId(format!("capacity-{}", std::process::id()));
         let spec = crate::grill::oci::OciSpec {
             managed_volumes: Vec::new(),
+            mount_bind_backs: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1167,6 +1169,7 @@ mod tests {
         let id = InstanceId("runc-test-0".to_string());
         let spec = crate::grill::oci::OciSpec {
             managed_volumes: Vec::new(),
+            mount_bind_backs: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1269,6 +1272,7 @@ mod tests {
         let _network_cleanup = TestNetworkCleanup(ids.to_vec());
         let spec = crate::grill::oci::OciSpec {
             managed_volumes: Vec::new(),
+            mount_bind_backs: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1437,6 +1441,7 @@ mod tests {
         let spec_for =
             |value: &str, initial_delay: u64, final_delay: u64| crate::grill::oci::OciSpec {
                 managed_volumes: Vec::new(),
+                mount_bind_backs: Vec::new(),
                 reusable_executor: false,
                 host_process: false,
                 initialiser: false,
@@ -1611,6 +1616,7 @@ mod tests {
         .unwrap();
         let spec = crate::grill::oci::OciSpec {
             managed_volumes: Vec::new(),
+            mount_bind_backs: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1679,6 +1685,7 @@ mod tests {
         let _network_cleanup = TestNetworkCleanup(vec![id.clone()]);
         let spec = crate::grill::oci::OciSpec {
             managed_volumes: Vec::new(),
+            mount_bind_backs: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1882,6 +1889,7 @@ mod tests {
         let id = InstanceId("runc-pinned-workload".to_string());
         let spec = crate::grill::oci::OciSpec {
             managed_volumes: Vec::new(),
+            mount_bind_backs: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,

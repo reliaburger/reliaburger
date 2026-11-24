@@ -1282,14 +1282,16 @@ The allowlist is configured per node:
 ```toml
 [process_workloads]
 allowed_binaries = ["/usr/local/bin/metrics-exporter", "/usr/bin/python3"]
-mount_isolation = false
 ```
 
 An empty or omitted allowlist refuses host `exec`/`script` workloads. Scripts
 need their interpreter (`/bin/sh`) on the list. `mount_isolation` defaults to
-`true` on Linux, but process mode doesn't implement a mount namespace, so a host
-workload is refused until you set it to `false` and accept running unisolated.
-Use Linux containers when the workload needs that boundary.
+`true` on Linux. For a long time process mode didn't implement a mount
+namespace, so a host workload was refused until you set it to `false` and
+accepted running unisolated. From 0.4.0 a root Bun on Linux builds one: the
+host's filesystem minus Bun's own paths, with a private `/tmp`. Chapter 17's
+"Building the view" tells that story. It's still not a container boundary, so
+use Linux containers when the workload needs one.
 
 The phase-8 example used to say the opposite: an empty allowlist "allows all".
 It never did. `examples/phase-8/proc-exec-app.toml` now says deny-by-default,
@@ -1494,6 +1496,71 @@ with `waitid(…, WNOWAIT)` until the exit is visible *without* reaping it, then
 runs the signalling step that `stop` and `kill` share. Before the fix it failed
 on every run on macOS with `Operation not permitted`; afterwards the original
 test passed 400 loaded iterations in a row.
+
+### Answer everyone who's waiting
+
+The owner is single-threaded on purpose: one loop does everything, so nothing
+in it needs a lock. Each turn it accepts a client, checks whether the workload
+has exited, polls its exec helpers and sleeps 10 ms. For a long time "accepts
+a client" meant exactly one, and that was the bug behind
+[#2236](https://github.com/reliaburger/reliaburger/issues/2236).
+
+`job_recovery::killed_bun_retires_api_exec_and_adopts_the_original_workload`
+failed now and then on a loaded Mac. It polls `/v1/status` until the job's
+pid is known, once before it kills Bun and once after Bun recovers, and for a
+full minute every answer said `runtime_unknown: true`. Either wait could fail,
+so the crash had nothing to do with it. We looped the test under six busy
+loops with a temporary log line in the status reader. Every read of the pid,
+the exit code and the liveness check ran into its 500 ms deadline, poll after
+poll.
+
+A status answer asks the owner three questions at once, one connection each.
+On a quiet machine a turn takes about 10 ms, so the third answer comes back in
+30. On a busy one, a background-priority helper's 10 ms sleep can last far
+longer, and the third question waited out the deadline. The status reader
+moved on, but the blocking thread it had started didn't: it kept its
+connection in the owner's queue for up to two seconds. The next poll's three
+questions queued behind those. Once the owner fell behind, every later request
+waited behind abandoned ones, and the pid stayed unknown while anyone kept
+asking. It's a small congestion collapse: the load that caused it went on
+long after the slow moment had passed.
+
+`relish status` would have shown the same `?` for the pid on a real node, so
+we fixed the owner rather than the test. Each turn now answers every client
+already waiting, up to 32:
+
+```rust
+fn serve_waiting_clients(
+    listener: &UnixListener,
+    mut serve: impl FnMut(UnixStream),
+) -> io::Result<usize> {
+    let mut served = 0;
+    while served < CLIENTS_PER_TURN {
+        match listener.accept() {
+            Ok((connection, _)) => {
+                serve(connection);
+                served += 1;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(served)
+}
+```
+
+The listener is non-blocking, so `accept` returns `WouldBlock` as soon as the
+queue is empty, and the turn goes back to watching the workload. The cap keeps
+a flood of clients from starving that watch. `impl FnMut(UnixStream)` takes
+any closure that can be called repeatedly and may change what it captures.
+The owner passes one that borrows its exec list mutably and calls `respond`.
+That indirection is what makes the change testable. The unit tests connect
+three clients, or 34, to a real socket and call the function once with a
+counting closure. Before the fix they got one answer per turn, every time.
+Under six busy loops, with the Studio's load average between 17 and 55, the
+integration test had failed 21 times in 200 runs. With the fix it passed 300
+of 300, at loads up to 58, and the median run got quicker too, from 9.5 s to
+3.2 s in the first pair of loops.
 
 ### Kill the shell before its children
 

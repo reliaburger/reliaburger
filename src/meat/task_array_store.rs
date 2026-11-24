@@ -292,7 +292,8 @@ pub enum TaskArrayWrite {
         reason: Option<crate::meat::quota::QuotaError>,
     },
     /// Every node the leader can reach refused the array for good (its
-    /// allowlist, runtime or `mount_isolation`): fail it now, every queued
+    /// allowlist, runtime or a `mount_isolation` it can't build): fail it
+    /// now, every queued
     /// task not run, instead of leaving it queued until someone notices.
     /// A run that has already stopped is left as it is.
     Unrunnable {
@@ -2292,7 +2293,7 @@ mod tests {
     fn a_run_no_node_can_run_fails_with_the_reason_in_one_tick() {
         let mut arrays = TaskArrays::default();
         let id = registered(&mut arrays, &register(4, 4, 1), 1);
-        let reason = "no node can run it: task arrays don't run under mount_isolation yet";
+        let reason = "no node can run it: this node can't provide [process_workloads] mount_isolation (it needs Linux and a root Bun)";
         let applied = arrays
             .apply(
                 &TaskArrayWrite::Tick {

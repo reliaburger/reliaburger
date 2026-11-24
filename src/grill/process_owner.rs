@@ -133,7 +133,16 @@ pub struct ProcessLaunch {
     pub instance_id: super::InstanceId,
     /// Runtime specification retained across Bun death.
     pub spec: super::oci::OciSpec,
+    /// The mount view the gate builds or joins before `exec` (#714). `None`
+    /// when `[process_workloads] mount_isolation` is off: the command sees
+    /// the host as Bun does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount_isolation: Option<super::mount_view::MountIsolation>,
 }
+
+/// The owner record format this build writes and reads. 4 added
+/// [`ProcessLaunch::mount_isolation`] (#714).
+pub(crate) const RECORD_SCHEMA: u32 = 4;
 
 /// Short private socket location independent of the node's data path length.
 pub fn socket_path(record: &OwnerRecord) -> PathBuf {
@@ -151,7 +160,7 @@ pub(crate) fn load(directory: &Path) -> io::Result<OwnerRecord> {
         RECORD_LIMIT,
         crate::durable::Access::Regular,
     )?;
-    if record.schema != 3
+    if record.schema != RECORD_SCHEMA
         || record
             .command
             .first()
@@ -376,14 +385,10 @@ fn run_locked_owner(directory: &Path, record: &mut OwnerRecord, _lock: FileLock)
         if exec::cancelled() {
             owned.signal(Signal::SIGKILL)?;
         }
-        match listener.accept() {
-            Ok((connection, _)) => {
-                // An abandoned or malformed client must not end the owner.
-                let _ = respond(connection, directory, record, &owned, &mut executions);
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(error),
-        }
+        serve_waiting_clients(&listener, |connection| {
+            // An abandoned or malformed client must not end the owner.
+            let _ = respond(connection, directory, record, &owned, &mut executions);
+        })?;
         reap_orphans(owned.child.id(), &executions)?;
         if exit_code.is_none() {
             exit_code = observe_exit(owned.child.id())?;
@@ -554,7 +559,10 @@ pub fn run_execution_gate(directory: &Path) -> io::Result<()> {
         .try_clone_to_owned()
         .map(UnixStream::from)
         .ok();
-    let (error, errno) = match activate_execution(directory) {
+    let (error, errno) = match activate_execution(directory).and_then(|record| {
+        close_inherited_descriptors()?;
+        Ok(record)
+    }) {
         Ok(record) => {
             let error = Command::new(&record.command[0])
                 .args(&record.command[1..])
@@ -578,6 +586,41 @@ pub fn run_execution_gate(directory: &Path) -> io::Result<()> {
     Err(error)
 }
 
+/// Mark every descriptor above standard error close-on-exec, so nothing
+/// the gate inherited reaches the workload. `close_range(3, ~0U,
+/// CLOSE_RANGE_CLOEXEC)` (Linux 5.11) rather than closing them: the gate's
+/// report channel must stay open until `exec`, so a failed `exec` can still
+/// say why (#905). Older kernels get the same by walking `/proc/self/fd`.
+fn close_inherited_descriptors() -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        const CLOSE_RANGE_CLOEXEC: nix::libc::c_uint = 1 << 2;
+        // SAFETY: close_range takes two descriptor numbers and flags and only
+        // sets the close-on-exec flag on this process's descriptors.
+        let result = unsafe {
+            nix::libc::syscall(
+                nix::libc::SYS_close_range,
+                3 as nix::libc::c_uint,
+                nix::libc::c_uint::MAX,
+                CLOSE_RANGE_CLOEXEC,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let descriptors: Vec<i32> = std::fs::read_dir("/proc/self/fd")?
+            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+            .filter(|fd| *fd > 2)
+            .collect();
+        for fd in descriptors {
+            // SAFETY: F_SETFD only changes the descriptor's flags; one that
+            // closed meanwhile (the directory walk's own) answers EBADF.
+            unsafe { nix::libc::fcntl(fd, nix::libc::F_SETFD, nix::libc::FD_CLOEXEC) };
+        }
+    }
+    Ok(())
+}
+
 /// Wait for activation and check it against the durable record, joining the
 /// workload's cgroup and taking the workload's OOM score. Returns the record
 /// whose command the gate runs.
@@ -597,7 +640,33 @@ fn activate_execution(directory: &Path) -> io::Result<OwnerRecord> {
     }
     enter_workload_cgroup(&record.launch.spec)?;
     raise_oom_score(&record.launch.spec)?;
+    isolate_mounts(&record.launch)?;
     Ok(record)
+}
+
+/// Build or join the launch's mount view, then drop the capabilities that
+/// would undo it (#714). After the cgroup join, so the view's tmpfs pages
+/// are charged to the workload from the first byte. Nothing without a view.
+fn isolate_mounts(launch: &ProcessLaunch) -> io::Result<()> {
+    let Some(isolation) = &launch.mount_isolation else {
+        return Ok(());
+    };
+    #[cfg(target_os = "linux")]
+    {
+        use super::mount_view::MountIsolation;
+        match isolation {
+            MountIsolation::Build { view } => {
+                super::mount_view::build(view, workload_cgroup(&launch.spec).as_deref())?
+            }
+            MountIsolation::Join { pid } => super::mount_view::join(*pid)?,
+        }
+        super::mount_view::drop_capabilities()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = isolation;
+        Err(io::Error::other(super::mount_view::UNAVAILABLE))
+    }
 }
 
 struct OwnedChild {
@@ -723,6 +792,30 @@ enum Action {
     Exec,
     Terminate,
     Kill,
+}
+
+/// Most clients one turn of the owner's loop answers before it goes back
+/// to watching its workload and exec helpers.
+const CLIENTS_PER_TURN: usize = 32;
+
+/// Answer the clients waiting on `listener`, up to [`CLIENTS_PER_TURN`],
+/// and return how many there were.
+fn serve_waiting_clients(
+    listener: &UnixListener,
+    mut serve: impl FnMut(UnixStream),
+) -> io::Result<usize> {
+    let mut served = 0;
+    while served < CLIENTS_PER_TURN {
+        match listener.accept() {
+            Ok((connection, _)) => {
+                serve(connection);
+                served += 1;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(served)
 }
 
 fn respond(
@@ -942,10 +1035,47 @@ fn retire_children(owner: &mut OwnedChild) -> io::Result<bool> {
 mod tests {
     use super::*;
 
+    /// #2236: the owner answered one client per 10 ms turn. Status asks it
+    /// three questions at once, so on a loaded host every status waited
+    /// past its 500 ms deadline behind the others, and the abandoned
+    /// requests kept the queue full: the workload's pid stayed unknown.
+    #[test]
+    fn one_turn_answers_every_waiting_client() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("owner.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let clients: Vec<_> = (0..3)
+            .map(|_| UnixStream::connect(&path).unwrap())
+            .collect();
+        let mut answered = 0;
+        let served = serve_waiting_clients(&listener, |_| answered += 1).unwrap();
+        assert_eq!((served, answered), (3, 3));
+        assert_eq!(serve_waiting_clients(&listener, |_| {}).unwrap(), 0);
+        drop(clients);
+    }
+
+    #[test]
+    fn one_turn_answers_at_most_its_share_of_clients() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("owner.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let clients: Vec<_> = (0..CLIENTS_PER_TURN + 2)
+            .map(|_| UnixStream::connect(&path).unwrap())
+            .collect();
+        assert_eq!(
+            serve_waiting_clients(&listener, |_| {}).unwrap(),
+            CLIENTS_PER_TURN
+        );
+        assert_eq!(serve_waiting_clients(&listener, |_| {}).unwrap(), 2);
+        drop(clients);
+    }
+
     pub(super) fn record(boot_id: String) -> OwnerRecord {
         use super::super::oci::{OciLinux, OciProcess, OciRoot, OciSpec, OciUser};
         OwnerRecord {
-            schema: 3,
+            schema: RECORD_SCHEMA,
             boot_id,
             nonce: "0".repeat(32),
             command: vec!["true".into()],
@@ -956,6 +1086,7 @@ mod tests {
                 instance_id: super::super::InstanceId("default__web-0".into()),
                 spec: OciSpec {
                     managed_volumes: Vec::new(),
+                    mount_bind_backs: Vec::new(),
                     reusable_executor: false,
                     host_process: false,
                     initialiser: false,
@@ -988,8 +1119,71 @@ mod tests {
                     stop: None,
                     runtime_knobs: None,
                 },
+                mount_isolation: None,
             },
         }
+    }
+
+    #[test]
+    fn owner_record_round_trips_its_mount_view() {
+        use super::super::mount_view::{BindBack, MountIsolation, MountView};
+        let directory = tempfile::tempdir().unwrap();
+        let mut written = record(current_boot_id().unwrap().unwrap());
+        let view = MountView::for_node(&crate::config::NodeConfig::default(), None)
+            .with_bind_backs(&[BindBack {
+                path: "/run/reliaburger/host-executors/abc".into(),
+                writable: true,
+            }]);
+        written.launch.mount_isolation = Some(MountIsolation::Build { view });
+        persist(directory.path(), &written).unwrap();
+        let read = load(directory.path()).unwrap();
+        assert_eq!(read.schema, 4);
+        assert_eq!(read.launch.mount_isolation, written.launch.mount_isolation);
+    }
+
+    #[test]
+    fn an_owner_record_without_a_view_launches_as_before() {
+        let directory = tempfile::tempdir().unwrap();
+        let written = record(current_boot_id().unwrap().unwrap());
+        persist(directory.path(), &written).unwrap();
+        let bytes = std::fs::read_to_string(directory.path().join("owner.json")).unwrap();
+        assert!(!bytes.contains("mount_isolation"), "{bytes}");
+        let read = load(directory.path()).unwrap();
+        assert!(read.launch.mount_isolation.is_none());
+        // No view means the gate leaves mounts and capabilities alone.
+        isolate_mounts(&read.launch).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_gate_leaves_no_inherited_descriptor_open_across_exec() {
+        use std::os::fd::AsRawFd;
+        let inherited = File::open("/dev/null").unwrap();
+        nix::fcntl::fcntl(
+            &inherited,
+            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+        )
+        .unwrap();
+        close_inherited_descriptors().unwrap();
+        let flags = nix::fcntl::fcntl(&inherited, nix::fcntl::FcntlArg::F_GETFD).unwrap();
+        assert_ne!(
+            flags & nix::libc::FD_CLOEXEC,
+            0,
+            "fd {}",
+            inherited.as_raw_fd()
+        );
+        // Standard input, output and error stay as they are.
+        let stdin = nix::fcntl::fcntl(std::io::stdin(), nix::fcntl::FcntlArg::F_GETFD).unwrap();
+        assert_eq!(stdin & nix::libc::FD_CLOEXEC, 0);
+    }
+
+    #[test]
+    fn an_owner_record_from_the_previous_schema_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut written = record(current_boot_id().unwrap().unwrap());
+        written.schema = 3;
+        persist(directory.path(), &written).unwrap();
+        assert!(load(directory.path()).is_err());
     }
 
     #[test]

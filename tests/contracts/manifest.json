@@ -6093,6 +6093,17 @@
           ]
         },
         {
+          "id": "legacy-ci-reliaburger-cluster_failover-a_context_whose_first_node_is_down_reaches_the_cluster_through_the_next",
+          "binary": "reliaburger::cluster_failover",
+          "test": "a_context_whose_first_node_is_down_reaches_the_cluster_through_the_next",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
+          ]
+        },
+        {
           "id": "legacy-ci-reliaburger-cluster_failover-an_agent_lease_survives_a_leader_change_and_the_new_leader_expires_it",
           "binary": "reliaburger::cluster_failover",
           "test": "an_agent_lease_survives_a_leader_change_and_the_new_leader_expires_it",
@@ -7194,6 +7205,132 @@
       ],
       "boundaries": [
         "These cases need root and cgroup v2 in the Linux gate; portable runs cannot substitute."
+      ]
+    },
+    {
+      "id": "issue-714-host-workloads-run-in-a-mount-view",
+      "issue": 714,
+      "promise": "Under mount_isolation, host apps, fresh host jobs and native host executors run in a mount view that hides Bun's paths and other workloads' /tmp, can't take a mask off or setns back, and don't pin volumes Bun unmounts.",
+      "supported_paths": [
+        "Rootful Linux process nodes with cgroup v2 and mount_isolation on"
+      ],
+      "refused_paths": [
+        "A node that can't build the view (not Linux, or a non-root Bun) refuses host workloads under mount_isolation."
+      ],
+      "boundaries": [
+        "These cases need root and cgroup v2 in the Linux gate; the view isn't a sandbox and doesn't stop raw-disk, /proc or network access."
+      ],
+      "cases": [
+        {
+          "id": "mount-view-a_host_app_cannot_see_buns_storage_or_another_workloads_tmp",
+          "binary": "reliaburger::host_mount_isolation",
+          "test": "a_host_app_cannot_see_buns_storage_or_another_workloads_tmp",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/host_mount_isolation.rs"
+          ]
+        },
+        {
+          "id": "mount-view-a_fresh_host_job_cannot_see_a_hidden_path",
+          "binary": "reliaburger::host_mount_isolation",
+          "test": "a_fresh_host_job_cannot_see_a_hidden_path",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/host_mount_isolation.rs"
+          ]
+        },
+        {
+          "id": "mount-view-a_native_host_task_cannot_see_a_hidden_path",
+          "binary": "reliaburger::host_mount_isolation",
+          "test": "a_native_host_task_cannot_see_a_hidden_path",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/host_mount_isolation.rs"
+          ]
+        },
+        {
+          "id": "mount-view-tasks_of_one_native_executor_share_one_tmp_and_another_jobs_do_not",
+          "binary": "reliaburger::host_mount_isolation",
+          "test": "tasks_of_one_native_executor_share_one_tmp_and_another_jobs_do_not",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/host_mount_isolation.rs"
+          ]
+        },
+        {
+          "id": "mount-view-relish_exec_into_a_host_app_sees_the_apps_tmp",
+          "binary": "reliaburger::host_mount_isolation",
+          "test": "relish_exec_into_a_host_app_sees_the_apps_tmp",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/host_mount_isolation.rs"
+          ]
+        },
+        {
+          "id": "mount-view-a_volume_bun_mounts_after_the_workload_starts_stays_hidden",
+          "binary": "reliaburger::host_mount_isolation",
+          "test": "a_volume_bun_mounts_after_the_workload_starts_stays_hidden",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/host_mount_isolation.rs"
+          ]
+        },
+        {
+          "id": "mount-view-bun_can_unmount_a_volume_while_a_host_workload_runs",
+          "binary": "reliaburger::host_mount_isolation",
+          "test": "bun_can_unmount_a_volume_while_a_host_workload_runs",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/host_mount_isolation.rs"
+          ]
+        },
+        {
+          "id": "mount-view-a_workload_writes_to_the_host_root_outside_the_hidden_list",
+          "binary": "reliaburger::host_mount_isolation",
+          "test": "a_workload_writes_to_the_host_root_outside_the_hidden_list",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/host_mount_isolation.rs"
+          ]
+        },
+        {
+          "id": "mount-view-an_isolated_root_workload_cannot_unmount_a_mask_or_setns",
+          "binary": "reliaburger::host_mount_isolation",
+          "test": "an_isolated_root_workload_cannot_unmount_a_mask_or_setns",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/host_mount_isolation.rs"
+          ]
+        },
+        {
+          "id": "mount-view-a_workloads_tmp_and_var_tmp_share_one_256_mib_cap",
+          "binary": "reliaburger::host_mount_isolation",
+          "test": "a_workloads_tmp_and_var_tmp_share_one_256_mib_cap",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/host_mount_isolation.rs"
+          ]
+        }
       ]
     },
     {

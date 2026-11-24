@@ -11,6 +11,7 @@
 [process_workloads]
 # `target/debug/testapp` is relative, so start Bun from the repository root.
 allowed_binaries = ["target/debug/testapp", "/bin/echo", "/bin/false"]
-# Host workloads can't run under mount isolation yet (#714). It's on by
-# default on Linux, so turn it off: these processes aren't isolated.
+# Mount isolation is on by default on Linux, and building the view needs a
+# root Bun (#714). From source you run Bun as yourself, so turn it off: these
+# processes see everything you can.
 mount_isolation = false

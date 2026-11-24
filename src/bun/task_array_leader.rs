@@ -912,9 +912,10 @@ const MAX_UNRUNNABLE_REASONS: usize = 3;
 /// while some node still might. That is when nothing holds its chunks,
 /// something is still queued, and every node in `eligible` answered about
 /// it this tick with a refusal from its own configuration
-/// ([`ArrayProgress::unrunnable`]), such as a host array on nodes with
-/// `mount_isolation` on (#714). Without this the run would stay queued
-/// until its deadline, or for ever if it has none.
+/// ([`ArrayProgress::unrunnable`]), such as a host array on nodes that
+/// can't build the view their `mount_isolation` asks for (#714). Without
+/// this the run would stay queued until its deadline, or for ever if it
+/// has none.
 pub fn unrunnable_reason(
     record: &TaskArrayRecord,
     answers: &[(NodeId, &ArrayProgress)],
@@ -2299,7 +2300,7 @@ mod tests {
         }
     }
 
-    const ISOLATION: &str = "task arrays don't run under [process_workloads] mount_isolation yet";
+    const ISOLATION: &str = crate::grill::mount_view::UNAVAILABLE;
 
     #[test]
     fn a_run_every_eligible_node_refuses_for_good_fails_with_the_reason() {
@@ -2382,14 +2383,14 @@ mod tests {
             singleton_image_limits: true,
             encrypted_env: true,
             network_policy: true,
-            mount_isolation: false,
+            mount_isolation_unavailable: false,
             binaries: true,
         }
     }
 
     fn isolated() -> JobCapabilities {
         JobCapabilities {
-            mount_isolation: true,
+            mount_isolation_unavailable: true,
             ..capable()
         }
     }
@@ -2418,7 +2419,9 @@ mod tests {
         ];
         let reason = admission_refusal(&record, &nodes).expect("no node can take it");
         assert_eq!(
-            reason.matches("host jobs don't run under").count(),
+            reason
+                .matches("can't provide [process_workloads] mount_isolation")
+                .count(),
             1,
             "{reason}"
         );

@@ -83,8 +83,9 @@ impl Execution {
         launch.spec.process.args = command.clone();
         launch.spec.process.env.clear();
         launch.spec.port_mapping = None;
+        launch.mount_isolation = joined_isolation(parent_record)?;
         let record = OwnerRecord {
-            schema: 3,
+            schema: RECORD_SCHEMA,
             boot_id: super::current_boot_id()?
                 .ok_or_else(|| io::Error::other("kernel boot identity unavailable"))?,
             nonce: hex::encode(nonce),
@@ -273,6 +274,25 @@ impl Execution {
 impl Drop for Execution {
     fn drop(&mut self) {
         let _ = self.cancel();
+    }
+}
+
+/// What an exec does about mounts: an isolated workload's exec joins the
+/// workload's own namespace, as `docker exec` does, so it sees the app's
+/// `/tmp` rather than a fresh one. Its owner holds the workload's root
+/// unreaped, so that PID can't be recycled while the exec starts.
+fn joined_isolation(
+    parent: &OwnerRecord,
+) -> io::Result<Option<crate::grill::mount_view::MountIsolation>> {
+    use crate::grill::mount_view::MountIsolation;
+    if parent.launch.mount_isolation.is_none() {
+        return Ok(None);
+    }
+    match parent.phase {
+        OwnerPhase::Running { pid } => Ok(Some(MountIsolation::Join { pid })),
+        _ => Err(io::Error::other(
+            "the workload isn't running, so there's no mount namespace to join",
+        )),
     }
 }
 
@@ -488,6 +508,22 @@ mod tests {
             "{report}"
         );
         assert!(!report.contains("owner.json"), "{report}");
+    }
+
+    #[test]
+    fn an_exec_into_an_isolated_workload_joins_its_namespace() {
+        use crate::grill::mount_view::{MountIsolation, MountView};
+        let mut parent = helper_record(&["sleep", "30"], OwnerPhase::Running { pid: 4242 });
+        assert_eq!(joined_isolation(&parent).unwrap(), None);
+        parent.launch.mount_isolation = Some(MountIsolation::Build {
+            view: MountView::for_node(&crate::config::NodeConfig::default(), None),
+        });
+        assert_eq!(
+            joined_isolation(&parent).unwrap(),
+            Some(MountIsolation::Join { pid: 4242 })
+        );
+        parent.phase = OwnerPhase::Retired { exit_code: Some(0) };
+        assert!(joined_isolation(&parent).is_err());
     }
 
     #[test]

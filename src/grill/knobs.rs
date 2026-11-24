@@ -702,26 +702,65 @@ impl RuntimeKnobs {
     }
 }
 
-/// Why a node refused an app's runtime knobs.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+/// Why a node refused an app's runtime knobs. Each variant names every
+/// knob it refuses, so one deploy shows the whole list to fix (#1316).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KnobRefusal {
-    /// The node's `[runtime]` allowlist doesn't list the value.
-    #[error(
-        "{knob} refused by the node gate: this node's [runtime] {allowlist} in node.toml \
-         doesn't list it",
-        allowlist = knob.kind.allowlist_key()
-    )]
-    NotAllowed { knob: KnobUse },
+    /// The node's `[runtime]` allowlist doesn't list these values.
+    NotAllowed { knobs: Vec<KnobUse> },
     /// The node's runtime can't apply runtime knobs at all.
-    #[error(
-        "{knob} refused: this node's runtime ({runtime}) can't apply runtime knobs; \
-         only rootful runc can"
-    )]
     Unsupported {
-        knob: KnobUse,
+        knobs: Vec<KnobUse>,
         runtime: &'static str,
     },
 }
+
+impl KnobRefusal {
+    /// Every knob refused, in the order the app lists them.
+    pub fn knobs(&self) -> &[KnobUse] {
+        match self {
+            KnobRefusal::NotAllowed { knobs } | KnobRefusal::Unsupported { knobs, .. } => knobs,
+        }
+    }
+}
+
+impl fmt::Display for KnobRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            // Each knob gets its own clause, because each kind lives under
+            // its own allowlist key.
+            KnobRefusal::NotAllowed { knobs } => {
+                for (index, knob) in knobs.iter().enumerate() {
+                    if index > 0 {
+                        write!(f, "; ")?;
+                    }
+                    write!(
+                        f,
+                        "{knob} refused by the node gate: this node's [runtime] {} in \
+                         node.toml doesn't list it",
+                        knob.kind.allowlist_key()
+                    )?;
+                }
+                Ok(())
+            }
+            KnobRefusal::Unsupported { knobs, runtime } => {
+                for (index, knob) in knobs.iter().enumerate() {
+                    if index > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{knob}")?;
+                }
+                write!(
+                    f,
+                    " refused: this node's runtime ({runtime}) can't apply runtime knobs; \
+                     only rootful runc can"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for KnobRefusal {}
 
 /// A node's `[runtime]` allowlist, as it's advertised to the scheduler.
 ///
@@ -747,35 +786,30 @@ impl RuntimeAllowlist {
         self.capabilities.is_empty() && self.sysctls.is_empty() && self.devices.is_empty()
     }
 
-    /// Admit `knobs`, or name the first one this allowlist doesn't list.
+    /// Admit `knobs`, or name every one this allowlist doesn't list.
     pub fn check(&self, knobs: &RuntimeKnobs) -> Result<(), KnobRefusal> {
-        let refuse = |kind, value| {
-            Err(KnobRefusal::NotAllowed {
-                knob: KnobUse { kind, value },
-            })
-        };
-        if let Some(capability) = knobs
+        let use_of = |kind, value: String| KnobUse { kind, value };
+        let capabilities = knobs
             .capabilities
             .iter()
-            .find(|capability| !self.capabilities.contains(capability))
-        {
-            return refuse(KnobKind::Capability, capability.to_string());
-        }
-        if let Some(name) = knobs
+            .filter(|capability| !self.capabilities.contains(capability))
+            .map(|capability| use_of(KnobKind::Capability, capability.to_string()));
+        let sysctls = knobs
             .sysctls
             .keys()
-            .find(|name| !self.sysctls.iter().any(|pattern| pattern.matches(name)))
-        {
-            return refuse(KnobKind::Sysctl, name.to_string());
-        }
-        if let Some(device) = knobs
+            .filter(|name| !self.sysctls.iter().any(|pattern| pattern.matches(name)))
+            .map(|name| use_of(KnobKind::Sysctl, name.to_string()));
+        let devices = knobs
             .devices
             .iter()
-            .find(|device| !self.devices.contains(&device.path))
-        {
-            return refuse(KnobKind::Device, device.path.to_string());
+            .filter(|device| !self.devices.contains(&device.path))
+            .map(|device| use_of(KnobKind::Device, device.path.to_string()));
+        let refused: Vec<KnobUse> = capabilities.chain(sysctls).chain(devices).collect();
+        if refused.is_empty() {
+            Ok(())
+        } else {
+            Err(KnobRefusal::NotAllowed { knobs: refused })
         }
-        Ok(())
     }
 
     /// Whether this allowlist admits every one of `knobs`.
