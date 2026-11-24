@@ -63,7 +63,9 @@ install the appliance, and are claimed into a cluster.
 with a router in a network namespace, as `image/tests/relish-netboot-install.sh`
 does. It needs root, so CI records it: label a pull request that changes
 `image/**` or the appliance workflow `record-netboot-demo`, and the lab
-build's "Record the netboot demo" step uploads `netboot-demo-cast`. Then:
+build's "Record the netboot demo" step uploads `netboot-demo-cast`. The
+workflow doesn't run on `labeled`, so add the label before the push you want
+recorded. Then:
 
 ```sh
 gh run download <run> -R reliaburger/reliaburger -n netboot-demo-cast -D /tmp/netboot
@@ -126,7 +128,7 @@ so it can't touch yours:
 
 ```sh
 RELIABURGER_HOME=~/.rbtour scripts/demo/tour.sh \
-  --record docs/website/assets/tour.cast --install v0.3.1
+  --record docs/website/assets/tour.cast --install v0.3.2
 RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish local destroy --yes
 RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish uninstall --yes
 rm -rf ~/.rbtour
@@ -163,7 +165,7 @@ published tarball holds exactly that directory. Until a promotion's site
 change deploys, the live tarball is the previous release's, so a re-record
 always shows the repository copy, and says so on screen. The build step runs in a scratch directory, so
 `burger/` never lands in the checkout. The published recording was made with
-`--install v0.3.1` on the default ports.
+`--install v0.3.2` on the default ports.
 `asciinema play docs/website/assets/tour.cast` plays the result in a terminal.
 
 After `relish wtf` the script adds one step the page's tour list doesn't
@@ -173,7 +175,7 @@ can read the JSON. They aren't `data-tour` commands, because the agent
 section has its own steps. Without `jq` the script skips the step.
 
 `--record` writes the installed version into the cast's title (`Reliaburger
-0.3.1: the five-minute tour`), and the caption under the player names it too.
+0.3.2: the five-minute tour`), and the caption under the player names it too.
 `tests/suite/website.rs` checks that both match `install.sh`'s default, so a
 promotion that forgets the re-record fails CI.
 
@@ -242,7 +244,7 @@ byte copies of a recording's `jobs.cast` and `report.json` in
 `docs/qualification/`, and `scripts/ci/test_job_demo.py` names that
 directory (`RECORDING`), checks the copies, and checks that the caption
 says which release ran and that the chapter buttons and poster match the
-report. The [0.3.1 recording's README](../qualification/2026-11-21-v0.3.1-job-throughput-recording/README.md)
+report. The [0.3.2 recording's README](../qualification/2026-11-23-v0.3.2-job-throughput-recording/README.md)
 is the method: on the quiet Studio, install the published release into a
 throwaway `RELIABURGER_HOME`, `relish setup --quickstart --nodes 1 --yes`,
 resize the VM to the section's 4 vCPU / 8 GiB with `limactl edit`, allowlist
@@ -456,7 +458,7 @@ link when you promote a release. The source quickstart intentionally matches
 Both it and the generated installer are POSIX sh, so `curl … | sh` works where
 `sh` is dash or busybox, not only bash. `scripts/release/test_package.py` runs
 them under every POSIX shell it finds and under `shellcheck -s sh` when present.
-It installs `v0.3.1` unless `RELIABURGER_VERSION` names another release; bump
+It installs `v0.3.2` unless `RELIABURGER_VERSION` names another release; bump
 that default when you promote a newer one. Every line the site shows names a
 mode (`sh -s -- --laptop`): with no arguments both scripts only explain the
 choices and exit 2, and the bootstrap does it before downloading anything.
