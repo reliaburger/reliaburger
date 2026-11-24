@@ -376,14 +376,10 @@ fn run_locked_owner(directory: &Path, record: &mut OwnerRecord, _lock: FileLock)
         if exec::cancelled() {
             owned.signal(Signal::SIGKILL)?;
         }
-        match listener.accept() {
-            Ok((connection, _)) => {
-                // An abandoned or malformed client must not end the owner.
-                let _ = respond(connection, directory, record, &owned, &mut executions);
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(error),
-        }
+        serve_waiting_clients(&listener, |connection| {
+            // An abandoned or malformed client must not end the owner.
+            let _ = respond(connection, directory, record, &owned, &mut executions);
+        })?;
         reap_orphans(owned.child.id(), &executions)?;
         if exit_code.is_none() {
             exit_code = observe_exit(owned.child.id())?;
@@ -725,6 +721,30 @@ enum Action {
     Kill,
 }
 
+/// Most clients one turn of the owner's loop answers before it goes back
+/// to watching its workload and exec helpers.
+const CLIENTS_PER_TURN: usize = 32;
+
+/// Answer the clients waiting on `listener`, up to [`CLIENTS_PER_TURN`],
+/// and return how many there were.
+fn serve_waiting_clients(
+    listener: &UnixListener,
+    mut serve: impl FnMut(UnixStream),
+) -> io::Result<usize> {
+    let mut served = 0;
+    while served < CLIENTS_PER_TURN {
+        match listener.accept() {
+            Ok((connection, _)) => {
+                serve(connection);
+                served += 1;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(served)
+}
+
 fn respond(
     mut socket: UnixStream,
     directory: &Path,
@@ -942,7 +962,44 @@ fn retire_children(owner: &mut OwnedChild) -> io::Result<bool> {
 mod tests {
     use super::*;
 
-    fn record(boot_id: String) -> OwnerRecord {
+    /// #2236: the owner answered one client per 10 ms turn. Status asks it
+    /// three questions at once, so on a loaded host every status waited
+    /// past its 500 ms deadline behind the others, and the abandoned
+    /// requests kept the queue full: the workload's pid stayed unknown.
+    #[test]
+    fn one_turn_answers_every_waiting_client() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("owner.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let clients: Vec<_> = (0..3)
+            .map(|_| UnixStream::connect(&path).unwrap())
+            .collect();
+        let mut answered = 0;
+        let served = serve_waiting_clients(&listener, |_| answered += 1).unwrap();
+        assert_eq!((served, answered), (3, 3));
+        assert_eq!(serve_waiting_clients(&listener, |_| {}).unwrap(), 0);
+        drop(clients);
+    }
+
+    #[test]
+    fn one_turn_answers_at_most_its_share_of_clients() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("owner.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let clients: Vec<_> = (0..CLIENTS_PER_TURN + 2)
+            .map(|_| UnixStream::connect(&path).unwrap())
+            .collect();
+        assert_eq!(
+            serve_waiting_clients(&listener, |_| {}).unwrap(),
+            CLIENTS_PER_TURN
+        );
+        assert_eq!(serve_waiting_clients(&listener, |_| {}).unwrap(), 2);
+        drop(clients);
+    }
+
+    pub(super) fn record(boot_id: String) -> OwnerRecord {
         use super::super::oci::{OciLinux, OciProcess, OciRoot, OciSpec, OciUser};
         OwnerRecord {
             schema: 3,

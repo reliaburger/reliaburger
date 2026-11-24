@@ -87,12 +87,13 @@ Pull requests stacked on another branch skip the acceptance suites (wall-clock,
 cluster, upgrade and privileged Linux) unless labelled `full-ci`; they run once the
 PR targets `main`, and `ci-retarget.yml` reruns CI as soon as GitHub retargets one.
 Pull requests into a release's merge-train branch (`release-*`) run the light set:
-lint, minimum Rust, portable Linux with coverage, the demo app and the optimised
-contract boundaries. Labelled `full-ci`, they run every heavy owner but not
-portable macOS (the `train-full` selection), which is also what a code PR into
-`main` runs. The merge queue on the train, the push to it, pushes to `main`,
+lint, minimum Rust, portable Linux with coverage, CI policy (with the demo app)
+and the optimised contract boundaries. Labelled `full-ci`, they run every heavy
+owner but not portable macOS (the `train-full` selection), which is also what a
+code PR into `main` runs. The merge queue on the train, pushes to `main`,
 the nightly and the gate PR into `main` labelled `release-gate` run
-everything, portable macOS included; any other PR runs it only
+everything, portable macOS included; a push to the train reuses the queue's
+run on the same commit when it passed every job (#1723); any other PR runs it only
 when it touches macOS-specific code or carries a `macos` label
 ([which jobs run](../testing.md#which-jobs-a-pull-request-runs)). Portable
 macOS runs `make test-macos`, relish's tests and the tests only macOS
@@ -119,7 +120,7 @@ are `#[ignore]`d with a reason naming the target or script that runs them:
 | `grill::apple::tests::*` | Apple silicon with Apple Container | `make test-apple` |
 | `bun::gpu::tests::nvidia_detector_finds_hardware` | An NVIDIA GPU and `nvidia-smi` | `make test-gpu` |
 | `owned_runc::actual_host_reboot_*`, `oci_crash::actual_bun_kernel_discovery_host_reboot` | A Linux VM that can be rebooted mid-test | `scripts/release/qualify-oci-reboot.sh`, `scripts/release/qualify-discovery-reboot.sh` |
-| `power_cut::actual_power_cut_*` | A disposable Linux VM whose power can be cut while workers write | `scripts/release/qualify-storage-power-cut.sh --vm VM --fixture exporter\|leases\|backups --iterations N` |
+| `power_cut::actual_power_cut_*` | A disposable Linux VM whose power can be cut while workers write | `scripts/release/qualify-storage-power-cut.sh --vm VM --fixture exporter\|leases\|backups\|volumes --iterations N` |
 | All of the above, for a release candidate | Lima on the host; it creates and deletes the VM | `scripts/release/qualify-power-cut-reboot.sh --commit SHA --iterations N --record-dir DIR` |
 
 One more script cuts power without a Rust test behind it.

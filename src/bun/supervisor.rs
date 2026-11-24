@@ -337,9 +337,10 @@ impl<G: Grill> WorkloadSupervisor<G> {
             app_name: app_name.to_string(),
             reason: refusal.to_string(),
         };
-        let Some(knob) = spec.runtime_knob_uses().next() else {
+        let knobs: Vec<_> = spec.runtime_knob_uses().collect();
+        if knobs.is_empty() {
             return Ok(());
-        };
+        }
         if !self.grill.applies_runtime_knobs() {
             let runtime = match self.grill.runtime_kind_for_host(false) {
                 crate::grill::records::RuntimeKind::Process => "the process runtime",
@@ -347,7 +348,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
                 crate::grill::records::RuntimeKind::Runc => "rootless runc",
             };
             return Err(refused(crate::grill::knobs::KnobRefusal::Unsupported {
-                knob,
+                knobs,
                 runtime,
             }));
         }
@@ -1347,6 +1348,28 @@ mod tests {
         assert!(error.contains("the process runtime"), "{error}");
         assert!(error.contains("can't apply runtime knobs"), "{error}");
         assert!(sup.runtime_knob_capability().is_empty());
+    }
+
+    /// #1316: a runtime that can't apply knobs names every knob the app
+    /// asks for, not only the first.
+    #[tokio::test]
+    async fn a_runtime_that_cannot_apply_knobs_names_every_knob() {
+        let sup = WorkloadSupervisor::new(MockGrill::new(), PortAllocator::new(30000, 31000));
+        let error = sup
+            .admit_app(
+                "fs",
+                &app_with_knobs(
+                    "capabilities = [\"IPC_OWNER\"]\ndevices = [{ path = \"/dev/fuse\" }]\n",
+                ),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("runtime.capabilities CAP_IPC_OWNER"),
+            "{error}"
+        );
+        assert!(error.contains("runtime.devices /dev/fuse"), "{error}");
+        assert!(error.contains("the process runtime"), "{error}");
     }
 
     fn app_spec_with_health(port: u16) -> AppSpec {

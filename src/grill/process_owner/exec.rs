@@ -297,3 +297,244 @@ pub(super) fn poll(pending: &mut Vec<Execution>, parent_stopped: bool) -> io::Re
     }
     Ok(pending.is_empty())
 }
+
+/// Most processes one helper's report describes, so a runaway tree can't
+/// flood the log line it goes into.
+#[cfg(target_os = "linux")]
+const REPORT_PROCESS_LIMIT: usize = 16;
+
+/// What every exec helper under `parent`, a workload owner's directory, is
+/// doing: its phase, its command and, while it runs, the processes under its
+/// gate. Each process is `pid N (name) S wchan`, its scheduler state and the
+/// kernel function it sleeps in where the system says. Bun logs this when an
+/// exec goes unanswered, so a wedged one says where it's stuck (#2128).
+///
+/// Best-effort and read-only: a helper it can't read is reported as such,
+/// and a process that has gone is just missing.
+pub(crate) fn describe_helpers(parent: &Path) -> String {
+    let mut helpers: Vec<(String, PathBuf)> = match std::fs::read_dir(parent) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                let is_directory = entry.file_type().ok()?.is_dir();
+                (is_directory && name.starts_with("exec-")).then(|| (name, entry.path()))
+            })
+            .collect(),
+        Err(error) => return format!("exec helpers unreadable ({error})"),
+    };
+    if helpers.is_empty() {
+        return "no exec helper".to_string();
+    }
+    helpers.sort();
+    helpers
+        .iter()
+        .map(|(name, directory)| match load(directory) {
+            Ok(record) => format!("{name}: {}", describe_helper(&record)),
+            Err(error) => format!("{name}: unreadable ({error})"),
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// One helper's phase and command, and for a running one its processes.
+fn describe_helper(record: &OwnerRecord) -> String {
+    let command = format!("`{}`", record.command.join(" "));
+    match &record.phase {
+        OwnerPhase::Prepared => format!("prepared {command}, its owner hasn't started it"),
+        OwnerPhase::Cancelled => format!("cancelled {command}"),
+        OwnerPhase::Running { pid } => {
+            let gate = match &record.gate {
+                None => "no gate report yet",
+                Some(GateReport::Closed) => "gate handed over",
+                Some(GateReport::Unanswered) => "gate never answered",
+                Some(GateReport::Failed { .. }) => "gate failed",
+            };
+            format!("running {command} ({gate}): {}", describe_processes(*pid))
+        }
+        OwnerPhase::Retiring { exit_code } => {
+            format!("retiring {command} after exit {exit_code:?}")
+        }
+        OwnerPhase::Retired { exit_code } => format!("retired {command} with exit {exit_code:?}"),
+    }
+}
+
+/// `root` and everything under it, breadth first, up to
+/// [`REPORT_PROCESS_LIMIT`] processes.
+#[cfg(target_os = "linux")]
+fn describe_processes(root: u32) -> String {
+    let mut described = Vec::new();
+    let mut queue = std::collections::VecDeque::from([root]);
+    while let Some(pid) = queue.pop_front() {
+        if described.len() == REPORT_PROCESS_LIMIT {
+            described.push("…".to_string());
+            break;
+        }
+        match describe_process(pid) {
+            Some(process) => described.push(process),
+            None if pid == root => described.push(format!("pid {pid} gone")),
+            None => continue,
+        }
+        queue.extend(child_processes(pid));
+    }
+    described.join(", ")
+}
+
+/// Without procfs there's no portable way to read another process's state,
+/// so the report names the gate and stops there.
+#[cfg(not(target_os = "linux"))]
+fn describe_processes(root: u32) -> String {
+    format!("pid {root}")
+}
+
+/// `pid N (name) S wchan` from procfs, or `None` once the process has gone.
+#[cfg(target_os = "linux")]
+fn describe_process(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The name sits in parentheses and may hold spaces or parentheses
+    // itself, so it ends at the last `)`; the state is the field after it.
+    let open = stat.find('(')?;
+    let close = stat.rfind(')')?;
+    let name = stat.get(open + 1..close)?;
+    let state = stat.get(close + 1..)?.split_whitespace().next()?;
+    let wchan = std::fs::read_to_string(format!("/proc/{pid}/wchan")).unwrap_or_default();
+    let wchan = match wchan.trim() {
+        "" | "0" => String::new(),
+        function => format!(" {function}"),
+    };
+    Some(format!("pid {pid} ({name}) {state}{wchan}"))
+}
+
+/// The children of every thread of `pid`: a Go program like runc starts
+/// processes from whichever thread it's on.
+#[cfg(target_os = "linux")]
+fn child_processes(pid: u32) -> Vec<u32> {
+    let Ok(threads) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return Vec::new();
+    };
+    let mut children: Vec<u32> = threads
+        .filter_map(Result::ok)
+        .filter_map(|thread| std::fs::read_to_string(thread.path().join("children")).ok())
+        .flat_map(|listed| {
+            listed
+                .split_whitespace()
+                .filter_map(|value| value.parse().ok())
+                .collect::<Vec<u32>>()
+        })
+        .collect();
+    children.sort_unstable();
+    children.dedup();
+    children
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A helper directory under `parent` holding `record`, as `launch`
+    /// leaves one.
+    fn helper(parent: &Path, name: &str, record: &OwnerRecord) {
+        use std::os::unix::fs::DirBuilderExt;
+        let directory = parent.join(name);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        persist(&directory, record).unwrap();
+    }
+
+    fn helper_record(command: &[&str], phase: OwnerPhase) -> OwnerRecord {
+        let mut record = super::super::tests::record(current_boot_id().unwrap().unwrap());
+        record.command = command.iter().map(|value| value.to_string()).collect();
+        record.phase = phase;
+        record
+    }
+
+    #[test]
+    fn a_report_names_each_helper_its_phase_command_and_process() {
+        let parent = tempfile::tempdir().unwrap();
+        let mut sleeper = Command::new("sleep").arg("30").spawn().unwrap();
+        helper(
+            parent.path(),
+            "exec-running",
+            &helper_record(&["sleep", "30"], OwnerPhase::Running { pid: sleeper.id() }),
+        );
+        helper(
+            parent.path(),
+            "exec-prepared",
+            &helper_record(&["true"], OwnerPhase::Prepared),
+        );
+        // The owner's own files sit beside its helpers and aren't helpers.
+        std::fs::write(parent.path().join("owner.json"), "{}").unwrap();
+
+        let report = describe_helpers(parent.path());
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+
+        assert!(
+            report.contains("exec-running: running `sleep 30`"),
+            "{report}"
+        );
+        assert!(
+            report.contains(&format!("pid {}", sleeper.id())),
+            "{report}"
+        );
+        // The scheduler state and the kernel function it waits in are what
+        // tell a sleeping command from one stuck on the disk.
+        #[cfg(target_os = "linux")]
+        assert!(report.contains("(sleep) S"), "{report}");
+        assert!(
+            report.contains("exec-prepared: prepared `true`"),
+            "{report}"
+        );
+        assert!(!report.contains("owner.json"), "{report}");
+    }
+
+    #[test]
+    fn a_report_without_helpers_says_so() {
+        let parent = tempfile::tempdir().unwrap();
+        assert_eq!(describe_helpers(parent.path()), "no exec helper");
+    }
+
+    #[test]
+    fn an_unreadable_helper_is_reported_not_skipped() {
+        let parent = tempfile::tempdir().unwrap();
+        std::fs::create_dir(parent.path().join("exec-broken")).unwrap();
+        let report = describe_helpers(parent.path());
+        assert!(report.starts_with("exec-broken: unreadable ("), "{report}");
+    }
+
+    /// `runc exec` runs its command as a grandchild, so the report follows
+    /// the whole tree under the gate, not just the gate.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_report_follows_the_helpers_process_tree() {
+        let parent = tempfile::tempdir().unwrap();
+        let mut shell = Command::new("sh")
+            .args(["-c", "sleep 30 & wait"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        helper(
+            parent.path(),
+            "exec-tree",
+            &helper_record(&["sh"], OwnerPhase::Running { pid: shell.id() }),
+        );
+        // Wait until both are asleep, not just present: a `sleep` the shell
+        // has only just forked is still running (`R`) for a moment.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let report = loop {
+            let report = describe_helpers(parent.path());
+            let asleep = report.contains("(sh) S") && report.contains("(sleep) S");
+            if asleep || Instant::now() >= deadline {
+                break report;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let _ = nix::sys::signal::killpg(Pid::from_raw(shell.id() as i32), Signal::SIGKILL);
+        let _ = shell.kill();
+        let _ = shell.wait();
+        assert!(report.contains("(sh) S"), "{report}");
+        assert!(report.contains("(sleep) S"), "{report}");
+    }
+}

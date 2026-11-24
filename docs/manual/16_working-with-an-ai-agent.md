@@ -48,8 +48,9 @@ If you're an agent operating or debugging a Reliaburger cluster:
   A warning starting `source_mismatch:` means a node runs another commit, and
   links that commit's code.
 - **Use `-o json` for everything else.** Every `relish` command takes it
-  except the eight interactive ones: `tui`, `dashboard`, `manual`, `source`,
-  `dev shell`, the guided `setup`, `machines claim` and `netboot`. `setup
+  except the nine interactive ones: `tui`, `dashboard`, `manual`, `source`,
+  `dev shell`, the guided `setup`, `machines claim`, `machines logs` and
+  `netboot`. `setup
   --quickstart` and `setup --ssh` take it.
 - **Never post, change or file anything without your human.** Draft it, show
   it, and let them send it.
@@ -370,7 +371,9 @@ commands such as `relish agent explain crashloop`). An app's log line, or an
 event message quoting one, travels only inside `untrusted`; where `wtf`'s own
 sentence quoted it, `diagnose` says `<the app's log line, in events as
 untrusted text>` instead. The `suggestion` can name commands that change the
-cluster, such as `relish rollback`: those are for you to run, not your agent.
+cluster, such as `relish rollback` or `relish scale`: those are for you to
+run, not your agent. An agent asks for a scale with `relish agent propose
+scale`, which refuses the same things `relish scale` does.
 
 `diagnose` exits `0` whatever it finds; `relish wtf`'s exit codes don't apply.
 

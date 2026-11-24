@@ -325,6 +325,12 @@
   },
   {
     "source": "tests/cluster_failover.rs",
+    "function": "a_context_whose_first_node_is_down_reaches_the_cluster_through_the_next",
+    "binary": "reliaburger::cluster_failover",
+    "test": "a_context_whose_first_node_is_down_reaches_the_cluster_through_the_next"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
     "function": "an_agent_lease_survives_a_leader_change_and_the_new_leader_expires_it",
     "binary": "reliaburger::cluster_failover",
     "test": "an_agent_lease_survives_a_leader_change_and_the_new_leader_expires_it"
@@ -1432,6 +1438,12 @@
     "function": "cluster_stop_scales_to_zero_until_apply_and_delete_removes_the_app",
     "binary": "reliaburger::placement",
     "test": "cluster_stop_scales_to_zero_until_apply_and_delete_removes_the_app"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "a_scale_through_a_follower_converges_until_the_file_is_applied_again",
+    "binary": "reliaburger::placement",
+    "test": "a_scale_through_a_follower_converges_until_the_file_is_applied_again"
   },
   {
     "source": "tests/placement.rs",

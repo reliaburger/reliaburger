@@ -3292,3 +3292,88 @@ async fn a_voter_that_shut_down_cleanly_stays_listed_as_left() {
     );
     fixture.root.cancel();
 }
+
+/// #2241: relish's context lists every node's API. In the 0.3.2 Wyse lab
+/// the node it asked, which also led, lost power, and every command failed
+/// until it came back, though the survivors had elected a new leader. With
+/// that node killed here, the context passes over it to the next node that
+/// listens, and that node answers `relish nodes` and `relish council` with
+/// the new leader.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
+async fn a_context_whose_first_node_is_down_reaches_the_cluster_through_the_next() {
+    assert!(
+        cluster_tests_enabled(),
+        "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
+    );
+    let mut fixture = Fixture::new();
+    let operator = admin_token("context-endpoints");
+    let mut nodes = vec![
+        fixture
+            .start_node(500, vec![], true, Some(operator.token.clone()))
+            .await,
+    ];
+    for index in 501..503 {
+        let seed = fixture.gossip(500);
+        nodes.push(
+            fixture
+                .start_node(index, vec![seed], true, Some(operator.token.clone()))
+                .await,
+        );
+    }
+    let (leader, others) = settled_roles(&nodes).await;
+    let api = |index: usize| format!("http://127.0.0.1:{}", nodes[index].api_port);
+    // The managed context insists on HTTPS; these in-process nodes serve
+    // plain HTTP on loopback, and choosing an endpoint doesn't look at the
+    // scheme, so the context here is only ever asked to choose.
+    let context = reliaburger::relish::local_context::LocalContext {
+        schema: 1,
+        owner: "bare-metal/failover".to_string(),
+        endpoint: api(leader),
+        other_endpoints: others.iter().map(|&index| api(index)).collect(),
+        last_answered: None,
+        token: operator.plaintext.clone(),
+        ca_cert: fixture.data.path().join("root-ca.crt"),
+        service_endpoints: Default::default(),
+    };
+
+    kill(&nodes[leader]).await;
+    let successor = wait_for_leader(&nodes, &others, Duration::from_secs(60)).await;
+
+    let choice = tokio::task::spawn_blocking(move || {
+        context.choose_endpoint(reliaburger::relish::local_context::probe_endpoint)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(choice.endpoint, api(others[0]));
+    assert_eq!(choice.passed_over.len(), 1);
+    assert_eq!(choice.passed_over[0].endpoint, api(leader));
+
+    let client = reliaburger::relish::client::BunClient::new_with_token(
+        &choice.endpoint,
+        Some(&operator.plaintext),
+    );
+    let successor_name = nodes[successor].name.clone();
+    wait_until(
+        "the node relish fell over to names the new leader",
+        Duration::from_secs(30),
+        async || {
+            client
+                .council()
+                .await
+                .is_ok_and(|council| council.leader.as_deref() == Some(successor_name.as_str()))
+        },
+    )
+    .await;
+    let listed = client.nodes().await.unwrap();
+    for &survivor in &others {
+        assert!(
+            listed
+                .iter()
+                .any(|node| node.node_id == nodes[survivor].name && node.state == "alive"),
+            "{listed:?}"
+        );
+    }
+    fixture.root.cancel();
+}

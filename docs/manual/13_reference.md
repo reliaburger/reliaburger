@@ -12,8 +12,11 @@ The flags, variables, files and ports you'll reach for. `relish help COMMAND`
 | `--ca-cert PATH` | `RELIABURGER_CA_CERT` | cluster root CA; switches the default to HTTPS |
 | `-o`, `--output FORMAT` | | `human` (default), `json` or `yaml`; every command takes it except the eight interactive ones ([machine output](#machine-output)) |
 
-A flag beats its variable. With neither, `relish` uses the laptop cluster's
-saved context, then `http://127.0.0.1:9117`.
+A flag beats its variable. With neither, `relish` uses the saved context,
+then `http://127.0.0.1:9117`. A context that lists several nodes asks the
+one that last answered, then the rest in order, passing over any that
+don't accept a connection within 1.5 seconds ([the appliance
+chapter](17_appliance.md#claim-them) shows it).
 
 ## Machine output
 
@@ -227,7 +230,7 @@ Everything the installer and the quickstart write lives in `~/.reliaburger`
 | Path | What |
 |------|------|
 | `bin/relish` | the CLI (`~/.local/bin/relish` links here if that's on your `PATH`) |
-| `context.json` | the current cluster's endpoint, CA path and admin token (mode 0600): the laptop cluster's, or a bare-metal cluster's node 1 once `relish cluster create --bare-metal` or `relish machines claim --create` saves it (they leave another cluster's working context in place, and replace one whose CA certificate is gone) |
+| `context.json` | the current cluster's endpoints, CA path and admin token (mode 0600): the laptop cluster's, or a bare-metal or `setup --ssh` cluster's, node 1 first and every other node after it to fall over to, with the node that last answered, once `relish cluster create --bare-metal`, `relish machines claim --create` or `relish setup --ssh` saves it (they leave another cluster's working context in place, and replace one whose CA certificate is gone) |
 | `root-backup-keys/` | the age identities that open each cluster's root CA backup; keep a copy offline, since the root CA key has no other copy |
 | `clusters/NAME/` | a laptop cluster's state, node configs and `timings.json` |
 | `clusters/NAME/security/` | its master key, admin token and CA (`identity/root-ca.crt`) |
@@ -482,8 +485,11 @@ these keys inside it too.
 | `/` | lists | filter; Esc clears it |
 | `/` | logs, app detail Logs and Metrics tabs | search: show only the lines (or metrics, by name and labels) containing the text, ignoring case, each match in red and bold; Enter keeps it, Esc clears it |
 | → or Tab, ← or Shift-Tab | app detail | next or previous tab (Overview, Instances, Logs, Metrics, Deploys, Config) |
+| → or Tab, ← or Shift-Tab | node detail | next or previous tab (Overview, Workloads, Maintenance); Maintenance lists what would go down or lose redundancy if the node went away, and whether the council keeps quorum |
+| ↑/↓, Enter | node detail Workloads tab | select an instance on the node; Enter opens its app |
 | ↑/↓ | app detail Instances tab | select an instance |
 | `k` or Ctrl-K | app detail Instances tab | kill the selected instance, after a `[y/N]` prompt (only `y` kills); it sends the same audited kill as `relish fault kill APP --instance ID --node NODE --acknowledge --reason "relish tui"`, and the scheduler starts a replacement |
+| `+`, `-` | app detail Instances tab | scale the app up or down by one, after a `[y/N]` prompt (only `y` scales); it's `relish scale APP --replicas N --current-replicas M`, and the next apply of the app's file puts back the file's count |
 | `f` | logs | follow the newest lines, or stop |
 | PgUp/PgDn | logs, events | scroll |
 
@@ -510,6 +516,7 @@ See [getting started](00_getting-started.md) and [cluster basics](02_cluster-bas
   - `relish image delete <REFERENCE>`: Delete a registry tag: the same as `relish images delete`
 - `relish machines`: Unclaimed appliances on the LAN: list them, or claim them with seeds over the network
   - `relish machines claim <DIRECTORY> <MACHINES>...`: Claim machines: compare each one's claim key with its console, then send it a seed, joining it to the cluster in DIRECTORY (or, with --create, making a new cluster there from them)
+  - `relish machines logs`: Print the kernel and boot logs machines send over the network (UDP 6666), as `relish netboot --stream-logs` does, without serving anything. Runs until Ctrl-C
 - `relish netboot <DIR>`: Install appliances over the network: ProxyDHCP, TFTP and HTTP for the OS that `relish image download` saved
 - `relish os`: The appliance OS across the cluster: what each node runs, and rolling a new version out node by node
   - `relish os list`: Each node's OS version, and the newest release
@@ -544,6 +551,7 @@ See [deploy an app](01_deploy-an-app.md) and [writing a controller](15_writing-a
 - `relish cancel-deploy <OPERATION_ID>`: Cancel a node-local deploy and wait for its current work to finish
 - `relish history <APP>`: Show deploy history for an app, from every node
 - `relish rollback <APP>`: Rollback an app to the previous version
+- `relish scale --replicas <REPLICAS> <APP>`: Set an app's replica count. It lasts until the app's file is applied again, which puts back the file's count
 - `relish stop <APP>`: Scale an app to zero, keeping its configuration; `relish apply` starts it again
 - `relish delete <APP>`: Remove an app from the cluster; each node then stops its instances
 - `relish release <APP>`: Take an app back from the controller that owns it, so `relish apply` and GitOps manage it again (owner or admin)

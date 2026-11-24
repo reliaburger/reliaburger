@@ -577,6 +577,127 @@ async fn cluster_stop_scales_to_zero_until_apply_and_delete_removes_the_app() {
     }
 }
 
+/// #2176: `relish scale` through a follower changes the spec on the
+/// leader, the cluster converges on the new count, and an apply of the
+/// file puts back the file's count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn a_scale_through_a_follower_converges_until_the_file_is_applied_again() {
+    let shutdown = CancellationToken::new();
+
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_node("sc1", base, vec![], &shutdown).await;
+    let n2 = start_node("sc2", base + 4, vec![local(base)], &shutdown).await;
+    let n3 = start_node("sc3", base + 8, vec![local(base)], &shutdown).await;
+    let nodes = [&n1, &n2, &n3];
+
+    let ready = wait_until(Duration::from_secs(30), || {
+        nodes.iter().any(|n| *n.thinks_leader.borrow())
+    })
+    .await;
+    assert!(ready, "no leader elected");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let config = reliaburger::config::Config::parse(
+        r#"
+        [app.web]
+        script = "exec sleep 600"
+        replicas = 1
+    "#,
+    )
+    .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let mut last_apply: Option<tokio::time::Instant> = None;
+    while tokio::time::Instant::now() < deadline && live_web_instances(&nodes).await < 1 {
+        if last_apply.is_none_or(|t| t.elapsed() >= Duration::from_secs(8)) {
+            let _ = tokio::time::timeout(Duration::from_secs(15), n1.client.apply(&config)).await;
+            last_apply = Some(tokio::time::Instant::now());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert_eq!(live_web_instances(&nodes).await, 1, "app never came up");
+
+    // Scale through a node that doesn't lead, so the request is forwarded
+    // whole, and the leader's progress stream is relayed back.
+    let follower = nodes
+        .iter()
+        .find(|n| !*n.thinks_leader.borrow())
+        .expect("a follower");
+    // A follower without gossip learns the leader's API a moment after the
+    // election, and says 503 until then, having forwarded nothing.
+    let leader_known_by = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let scaled = tokio::time::timeout(
+            Duration::from_secs(30),
+            follower.client.scale("web", "default", 3, Some(1), false),
+        )
+        .await
+        .expect("scale did not hang");
+        match scaled {
+            Ok(()) => break,
+            Err(reliaburger::relish::RelishError::ApiError { status: 503, .. })
+                if tokio::time::Instant::now() < leader_known_by =>
+            {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(error) => panic!("scale failed: {error:?}"),
+        }
+    }
+    let app = reliaburger::meat::AppId::new("web", "default");
+    let scaled_by = tokio::time::Instant::now() + Duration::from_secs(60);
+    while tokio::time::Instant::now() < scaled_by && live_web_instances(&nodes).await != 3 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert_eq!(
+        live_web_instances(&nodes).await,
+        3,
+        "the cluster didn't converge on the scaled count"
+    );
+
+    // A stale precondition is refused and changes nothing.
+    let stale = tokio::time::timeout(
+        Duration::from_secs(30),
+        follower.client.scale("web", "default", 5, Some(1), false),
+    )
+    .await
+    .expect("scale did not hang");
+    assert!(stale.is_err(), "a stale current count must be refused");
+
+    // The file's count comes back with the next apply.
+    tokio::time::timeout(Duration::from_secs(15), n1.client.apply(&config))
+        .await
+        .expect("apply did not hang")
+        .expect("apply succeeded");
+    let back_by = tokio::time::Instant::now() + Duration::from_secs(60);
+    while tokio::time::Instant::now() < back_by && live_web_instances(&nodes).await != 1 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert_eq!(
+        live_web_instances(&nodes).await,
+        1,
+        "apply didn't put back the file's count"
+    );
+    for n in &nodes {
+        if let Some(council) = &n.handle.council {
+            let ds = council.desired_state().await;
+            assert_eq!(
+                ds.apps[&app].replicas,
+                reliaburger::config::Replicas::Fixed(1),
+                "node {}",
+                n.name
+            );
+        }
+    }
+
+    shutdown.cancel();
+    for n in nodes {
+        if let Some(c) = &n.handle.council {
+            c.shutdown().await.ok();
+        }
+    }
+}
+
 /// Every instance of `apps` on `nodes`, as `node/id:state`, or why a node
 /// didn't answer.
 async fn app_instances(nodes: &[&Node], apps: &[&str]) -> Result<Vec<String>, String> {

@@ -49,6 +49,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::ProcessWorkloads,
             requires: &[Capability::ProcessRuntime],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(process_workload_reports_running),
         },
         TestCase {
@@ -57,6 +58,7 @@ pub fn cases() -> Vec<TestCase> {
             requires: &[Capability::ProcessRuntime],
             // An Applications lease refuses jobs (#742).
             lease: LeaseScope::NodeJobs,
+            peer_namespace: false,
             run: testkit_case!(process_job_with_exit_zero_succeeds),
         },
         TestCase {
@@ -64,6 +66,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::ProcessWorkloads,
             requires: &[Capability::ProcessRuntime],
             lease: LeaseScope::NodeJobs,
+            peer_namespace: false,
             run: testkit_case!(failing_job_retries_then_fails),
         },
     ]

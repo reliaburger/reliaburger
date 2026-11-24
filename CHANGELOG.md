@@ -11,6 +11,40 @@ This file is the short version. The longer records are:
 - [docs/releasing.md](docs/releasing.md#compatibility-before-100), for the full upgrade steps between each pair of releases;
 - the [GitHub release pages](https://github.com/reliaburger/reliaburger/releases), for the binaries and every merged pull request.
 
+## [Unreleased] - 0.3.3
+
+Not released yet: this is what the train carries, and it can change before the tag.
+
+### Changed
+
+- The appliance image has Buildah, so `relish build` and the five-minute tour's burger build on a cluster of appliances. Its storage is on the data partition, where Btrfs reflinks the `vfs` driver's layer copies; the image adds `netavark` and `gpg` for it, drops Buildah's 97 MB of test helpers, and grows each `/usr` slot by 54 MB (667 MB to 721 MB of 1,100 MB on x86-64). A multi-platform build can't emulate the other architecture's `RUN` steps on an appliance, so cross-compile or name one `platform`. With no node able to build, the refusal no longer says appliances never can ([#2144](https://github.com/reliaburger/reliaburger/issues/2144)).
+
+## [0.3.2] - 2026-11-23
+
+Fixes from the Wyse 3040 lab that need a new appliance image. [Release page](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.2), [release log](docs/release-log.md#032-wyse-lab-fixes).
+
+### Upgrading
+
+- 0.3.2 moves the wire protocol from 60 to 61, because an apply error now carries its real status instead of 500 ([#2157](https://github.com/reliaburger/reliaburger/issues/2157)). Start a fresh 0.3.2 cluster: 0.3.1 and 0.3.2 nodes refuse each other, so there's no rolling upgrade ([compatibility before 1.0.0](docs/releasing.md#compatibility-before-100)).
+
+### Added
+
+- `relish netboot --stream-logs` shows an appliance's kernel and boot logs as it installs and boots, so a machine with no serial port can be watched from the terminal, and `relish machines logs` listens for them on its own. Off by default, because the logs cross the LAN in cleartext ([#2149](https://github.com/reliaburger/reliaburger/issues/2149)).
+- `relish tui` has a node page showing what runs on a node and what maintenance would affect ([#2170](https://github.com/reliaburger/reliaburger/issues/2170)), and an app can be scaled from the terminal UI and from `relish` ([#2176](https://github.com/reliaburger/reliaburger/issues/2176)).
+
+### Fixed
+
+- Containers on a node where nothing publishes a port can reach services on other nodes. The node's masquerade rule was created only with the first published port, so a node running only workers or jobs sent their calls out with container source addresses, and they timed out. Network setup now creates it for every container ([#2219](https://github.com/reliaburger/reliaburger/issues/2219)).
+- `relish test`'s firewall cases test what `allow_from` does: callers from another namespace, named as `namespace/app`. They put every app in one namespace, where `allow_from` doesn't apply, so on a cluster with eBPF they failed although the firewall worked. A fourth case checks that callers in the target's own namespace aren't restricted, and the case that widens `allow_from` waits until the target's rollout brings the new rule ([#2206](https://github.com/reliaburger/reliaburger/issues/2206)).
+- `allow_from` admits listed callers on every node, not only on the node running the target. Each caller's node enforces the list, but only the target's own node knew it, so a listed caller anywhere else was refused (`Operation not permitted`) for as long as it ran. The leader now puts each service's `allow_from` in the service catalogue, which every node fetches every 2 s, and `relish test` has a case with the callers on another node ([#2216](https://github.com/reliaburger/reliaburger/issues/2216)).
+- `relish wtf` calls a crash loop only when one instance restarts three times in 15 minutes. Three replicas that restarted once each were a critical `crashloop` for 15 minutes, and the instance a restart named was never read ([#2197](https://github.com/reliaburger/reliaburger/issues/2197)).
+- `relish nodes` no longer reports a healthy node as not answering every so often: the alert check releases the metrics store's lock before its query, so the node summary doesn't wait seconds behind it ([#2215](https://github.com/reliaburger/reliaburger/issues/2215)).
+- `url` 2.5.9, for RUSTSEC-2026-0592 ([#2213](https://github.com/reliaburger/reliaburger/issues/2213)).
+
+### Known issues
+
+- [#2128](https://github.com/reliaburger/reliaburger/issues/2128): one registry deploy case stalled for five minutes after an injected disk fault in 0.3.0's gate. It didn't recur in 0.3.1's or 0.3.2's gates; 0.3.2 logs what the stalled helper is doing if it happens again, and the cause isn't proven.
+
 ## [0.3.1] - 2026-11-21
 
 Fixes from 0.3.0's gate and the first Wyse lab, and a terminal UI you can act from. [Release page](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.1), [release log](docs/release-log.md#031-gate-follow-ups).

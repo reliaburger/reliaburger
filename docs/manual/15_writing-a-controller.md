@@ -140,7 +140,18 @@ the outcome is the last event.
 |--------|--------|-------|
 | `Progress` | `message` | A step: a write committed, a skipped app, a policy warning, a bound image |
 | `Complete` | `created`, `instances` | Done; `created` counts the writes committed |
-| `Error` | `message` | Stopped here; earlier writes stay committed |
+| `Error` | `message`, `status` | Stopped here; earlier writes stay committed |
+
+The stream has already answered `200` by the time it fails, so an `Error`
+carries the status the same failure answers before a stream starts: `404`
+for an image nobody built or that its registry doesn't have, `403` for one
+the node's trust rules refuse, `502` for a registry that didn't answer.
+`status` is absent when the failure has no status of its own; treat that as
+`500`.
+
+```json
+{"type": "Error", "message": "burger:v1 isn't in this cluster's registry (Pickle); build it with `relish build <file>` or push it, or name the registry that has it", "status": 404}
+```
 
 Applying the same spec again changes nothing and starts no rollout, so a
 controller can apply what it wants on every check.

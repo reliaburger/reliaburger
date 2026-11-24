@@ -5796,6 +5796,17 @@
           ]
         },
         {
+          "id": "legacy-ci-reliaburger-placement-a_scale_through_a_follower_converges_until_the_file_is_applied_again",
+          "binary": "reliaburger::placement",
+          "test": "a_scale_through_a_follower_converges_until_the_file_is_applied_again",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/placement.rs"
+          ]
+        },
+        {
           "id": "legacy-ci-reliaburger-placement-an_image_app_is_never_placed_on_a_process_only_node",
           "binary": "reliaburger::placement",
           "test": "an_image_app_is_never_placed_on_a_process_only_node",
@@ -6074,6 +6085,17 @@
           "id": "legacy-ci-reliaburger-cluster_failover-a_lease_history_through_a_leader_partition_is_linearizable",
           "binary": "reliaburger::cluster_failover",
           "test": "a_lease_history_through_a_leader_partition_is_linearizable",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-cluster_failover-a_context_whose_first_node_is_down_reaches_the_cluster_through_the_next",
+          "binary": "reliaburger::cluster_failover",
+          "test": "a_context_whose_first_node_is_down_reaches_the_cluster_through_the_next",
           "requires": [
             "cluster-tests"
           ],

@@ -519,8 +519,14 @@ pub fn latest_series_values(
 /// [`RollupGenerator::generate`](crate::mayo::rollup_generator::RollupGenerator::generate),
 /// so a caller that wrote its samples against one instant judges them
 /// against that same instant (#763).
+///
+/// It holds `store`'s lock only to take a snapshot, not through the query.
+/// The query reads a footer from every Parquet file in the directory, which
+/// took seconds on a Wyse 3040, and a writer queued meanwhile would hold up
+/// every other reader, such as the node summary `relish nodes` asks for
+/// (#2215).
 pub async fn gather_latest_values(
-    store: &crate::mayo::store::MayoStore,
+    store: &tokio::sync::RwLock<crate::mayo::store::MayoStore>,
     now: u64,
 ) -> HashMap<MetricKey, f64> {
     let window_start = now.saturating_sub(QUERY_WINDOW_SECS);
@@ -532,7 +538,13 @@ pub async fn gather_latest_values(
          WHERE timestamp >= {window_start} \
          ORDER BY timestamp DESC"
     );
-    if let Ok(rows) = store.query_sql_since(&sql, window_start).await {
+    // One statement, so the read guard is dropped before the query runs.
+    let snapshot = store.read().await.snapshot_since(window_start).await;
+    let rows = match snapshot {
+        Ok(snapshot) => snapshot.query_sql(&sql).await,
+        Err(error) => Err(error),
+    };
+    if let Ok(rows) = rows {
         for (timestamp, name, labels, value) in rows {
             // DESC order means the first row per series is its newest.
             series.entry((name, labels)).or_insert((timestamp, value));
@@ -628,6 +640,25 @@ mod tests {
         );
     }
 
+    /// #2215: gathering takes the store's lock only to snapshot it, and
+    /// leaves it free afterwards.
+    #[tokio::test]
+    async fn gathering_reads_through_the_lock_and_leaves_it_free() {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            tokio::sync::RwLock::new(crate::mayo::store::MayoStore::new(directory.path().into()));
+        let key = MetricKey::simple("cpu");
+        store.write().await.insert_now(&key, 42.0);
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let values = gather_latest_values(&store, now).await;
+        assert_eq!(values.get(&key), Some(&42.0));
+        assert!(store.try_write().is_ok());
+    }
+
     #[tokio::test]
     async fn real_store_preserves_two_labelled_series_for_evaluation() {
         let directory = tempfile::tempdir().unwrap();
@@ -643,6 +674,7 @@ mod tests {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_secs();
+        let store = tokio::sync::RwLock::new(store);
         let values = gather_latest_values(&store, now).await;
         assert_eq!(values.len(), 2);
         assert_eq!(
@@ -679,6 +711,7 @@ mod tests {
         );
         store.flush().await.unwrap();
 
+        let store = tokio::sync::RwLock::new(store);
         let fresh = gather_latest_values(&store, stamped + MAX_VALUE_AGE_SECS).await;
         assert_eq!(fresh.get(&key), Some(&42.0));
         let stale = gather_latest_values(&store, stamped + MAX_VALUE_AGE_SECS + 1).await;

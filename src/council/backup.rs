@@ -34,11 +34,11 @@ use crate::sesame::crypto::{self, CryptoError};
 /// HKDF info string that scopes the backup-sealing key. Binding the derived
 /// key to this purpose prevents a sealed backup from being decrypted with, or
 /// mistaken for, any other key derived from the same master secret.
-const BACKUP_SEAL_INFO: &str = "reliaburger-council-backup-seal-v2";
+pub(crate) const BACKUP_SEAL_INFO: &str = "reliaburger-council-backup-seal-v2";
 
 /// Format version of the sealed-backup envelope. Bump when the on-disk shape
 /// changes so an older binary refuses a newer blob rather than mis-parsing it.
-const BACKUP_ENVELOPE_VERSION: u32 = crate::compatibility::CURRENT.state;
+pub(crate) const BACKUP_ENVELOPE_VERSION: u32 = crate::compatibility::CURRENT.state;
 
 /// Configuration for the council backup loop (`[cluster.backup]`).
 ///

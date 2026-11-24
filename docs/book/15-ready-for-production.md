@@ -708,7 +708,7 @@ parallel build starts them together. In the Lima VM, under a runner's 14 GiB and
 swap, four jobs and three jobs ran out and the kernel killed the lib tests' rustc. Two jobs
 didn't help: the same pair still overlapped, filled the swap and stalled for minutes. On the
 runner nobody dies. We'd shielded it from the OOM killer, so the host pages instead, the
-runner's heartbeat stops, and GitHub gives up on it. So the coverage build now runs one job
+runner's heartbeat stops, and GitHub gives up on it. So the coverage build went to one job
 at a time: the peak is 12 GB and nothing swaps. It costs time, about three times as long to
 build in the VM. The watcher also logs swap and the kernel's memory-stall figure, and stops
 the build if available memory stays under 512 MiB for a minute while swap is in use. Paging
@@ -1097,7 +1097,7 @@ floor. Portable Linux does all of that in about 15 minutes. macOS, the privilege
 suites, upgrades and benchmarks still have to pass, but on what lands, not on every draft of
 it. `select-jobs.sh` now gives a pull request into `release-*` a fourth output, `macos=false`,
 along with `heavy=false`. The full set runs in GitHub's merge queue, on the batch merged onto
-the train before any of it lands, and again on the push to the train. A `full-ci` label still
+the train before any of it lands (and, until November, again on the push to the train). A `full-ci` label still
 buys the whole set on the pull request, and the gate PR into `main` (its head is a train) gets
 it too.
 
@@ -1171,7 +1171,7 @@ to do with macOS ([#1443](https://github.com/reliaburger/reliaburger/issues/1443
 The rule now is that macOS runs where it can find something Linux can't. Every push, to a
 train or to `main`, and the nightly still run all three shards, so no commit lands without
 them, and the candidate build demands them. The gate PR gets the light set on each push,
-because the push to the train has just run everything; at code freeze the maintainer labels
+because the train's commit has just passed everything; at code freeze the maintainer labels
 it `release-gate`, and from then on it runs everything and the evidence gate refuses it
 without every owner. Any other pull request gets macOS only if it touches macOS-specific
 code, or someone labels it `macos`. "macOS-specific" is a list of paths (the Apple runtime,
@@ -1291,6 +1291,151 @@ caches saved on its base branch, so now the train's own pushes save that cache t
 request and merge-queue refs still never save one, so nothing a PR builds ends up in a cache
 another run trusts.
 
+That fixed the build. It didn't fix the wait. On the evening of 20 November the 0.3.1 train
+had five groups in the merge queue, and jobs sat for up to 96 minutes before a runner picked
+them up. A train PR whose own jobs took 30 minutes took 70 to 110 to go green. The account
+runs a fixed number of hosted jobs at once, so the question wasn't how fast a job ran. It was
+who else wanted a runner.
+
+So we counted. Over the 194 `ci.yml` runs from 18 to 20 November, 22,120 runner-minutes, a
+queue group starts 20 jobs and burns about 280 runner-minutes, and the queue builds up to
+eight groups at once. Three kinds of run were waste.
+
+The biggest was the push to the train. The merge queue pushes exactly the commit its group
+tested, and the run IDs prove it: in 15 of the window's 18 train pushes, a merge-group run with the
+same `head_sha` had already passed every job. The push then ran all 20 again, about 4,100
+runner-minutes for answers we already had. We already had a function that decides whether one
+run can stand in for another: the candidate build's `ci_reuse.py`, which demands the exact
+commit, the first attempt and every job green. It gained one option, `--event merge_group`,
+and select jobs calls it on a train push. When it finds the queue's run, the push runs only CI
+policy and the gate, and `every_job.py` accepts a push that skipped the code jobs only when
+select jobs names the run it rests on, in a `tested_by` output. Anything doubtful, an API error
+or a re-run that went green, runs everything, as before.
+
+One thing that push still did was save the dependency cache from the paragraph above. So
+when the train's `Cargo.lock`, `Cargo.toml` or `.cargo/config.toml` differs from `main`'s,
+the push still runs portable Linux alone, for its cache. That's one job instead of twenty.
+
+The second was groups the queue had already thrown away. When an entry fails, the queue
+re-forms: it drops the groups behind the failure, deletes their `gh-readonly-queue/...`
+branches and starts new ones. It doesn't cancel the dropped groups' runs. Our `concurrency`
+block couldn't either: a merge-group run's group is its own run ID. Could a better key fix
+it? A dropped group and its replacement share the PR number, but the number lives inside the
+branch name, and workflow expressions have no way to cut a string. The base SHA in the name
+changes with every re-formation. So five superseded runs kept 78 jobs and about 1,100
+runner-minutes going after the queue stopped caring, two of them for over an hour.
+
+The branch is the signal. If `gh-readonly-queue/release-1-3-1/pr-2154-09de86c7...` is gone, the
+queue will never read that run's checks. `queue_sweep.py` lists the unfinished merge-group
+runs and cancels each whose branch has gone. Like the cache trimmer, the rule is a pure
+function over API rows and a lookup, tested on fixtures taken from that evening:
+
+```python
+def superseded(runs, branch_exists, now):
+    found = []
+    for run in runs:
+        branch = run.get("head_branch") or ""
+        if run.get("event") != "merge_group" or not branch.startswith(QUEUE_PREFIX):
+            continue
+        if run.get("status") == FINISHED:
+            continue
+        if now - parse_time(run["created_at"]) < GRACE:
+            continue
+        if branch_exists(branch) is False:
+            found.append(run)
+    return found
+```
+
+`branch_exists` answers `True`, `False` or `None`, and only a definite `False` cancels: a 502
+from the API keeps the run. A finished run is skipped because a group that merged loses its
+branch too.
+
+When should it run? Every re-formation either starts a new group, a `merge_group` event, or
+merges one, a push to the train, so a small workflow listening to both catches each dropped
+run within a minute or so. It's its own workflow, `queue-sweep.yml`, for the same reason the
+cache trimmer is: cancelling a run needs `actions: write`, and `ci.yml` is also called by
+`build.yml` and `ci-retarget.yml`, which grant it `actions: read`. GitHub refuses a called
+workflow that asks for more than its caller grants, whatever the job's `if` says.
+
+The third was small jobs. The dependency audit and the demo app's Go tests each take under a
+minute, but a job is a job: each waited for its own runner, and the gate waits for the last.
+That evening `demo app` waited 96 minutes to run for 30 seconds. They're steps of `CI policy`
+now, which runs on every change anyway, so a train PR asks for 9 runners instead of 11 and a
+queue group for 18 instead of 20. A queue group that changes only documentation now skips the
+code jobs as a pull request does, since its code is the code of the group in front of it.
+Two of the window's 32 groups would have.
+
+Together that's about a quarter of the window's runner-minutes, 5,700 of 22,120, that no
+longer compete with the PRs an author is waiting for. What we didn't do matters as much.
+Portable macOS, 52 to 57 minutes with a warm cache, still sets the length of every queue
+group. And the queue builds up to eight groups at once, 160 jobs, a setting in the
+repository ruleset that only the maintainer can change.
+
+That left portable Linux, which builds the crate for 13 of its 25 to 31 minutes, one
+compile at a time. Every train PR waits for it. Did the build really have to be that slow?
+The problem was never parallelism as such. It was two particular rustc processes running at
+the same time: the lib tests at 12 GB and the lib at 7 GB. Why do they even start together?
+Because `cargo test --lib` doesn't link against the library at all. It compiles
+`src/lib.rs` a second time, as a different crate, with `cfg(test)` switched on, so every
+`#[cfg(test)] mod tests` block and every `#[test]` function is in it. The two compiles
+share the dependencies and nothing else, so the moment the dependencies are done Cargo
+starts both.
+
+`CARGO_BUILD_JOBS=1` kept them apart, but it costs more than it looks. Cargo hands its
+rustc processes tokens from a jobserver, one per job, and rustc uses those tokens for its
+own codegen threads too. At one job, the lib tests' rustc type-checks over half a million lines and then
+generates code on one thread, while three of the runner's four cores sit idle.
+
+`make test-linux` already had the fix: build the lib tests on their own, then the rest. So
+the coverage recipe does the same, inside cargo-llvm-cov:
+
+```make
+coverage:
+	$(CARGO) llvm-cov clean --workspace
+	$(CARGO) llvm-cov --no-report test --lib -- --list
+	$(CARGO) llvm-cov clean --profraw-only
+	$(CARGO) llvm-cov --no-report nextest --profile $(NEXTEST_PROFILE) --no-tests=fail
+	mkdir -p target/coverage
+	$(COVERAGE_REPORT) --lcov --output-path target/coverage/lcov.info --fail-under-lines $(COVERAGE_MIN_LINES)
+```
+
+The second line builds the instrumented lib tests and nothing else, at full parallelism.
+Then nextest's own build compiles what's left, and the lib comes first, because every
+binary and integration test links it. The big two never overlap, so the peak is still one
+12 GB rustc, and every phase gets all four cores.
+
+Two details are less obvious than they look. First, why not `--no-run`? Because
+cargo-llvm-cov claims that flag for itself (it's a deprecated way of asking for a report)
+and never passes it to Cargo. So the build runs the lib tests' binary with `--list`
+instead, which prints the test names and runs none of them. The binary is instrumented, so
+even that listing writes a `.profraw` file on exit, and the third line deletes it before
+the real run. Second, does nextest really reuse what `cargo llvm-cov test` built? Only if
+Cargo sees the same compiler, flags and environment, and cargo-llvm-cov sets those the same
+way for both subcommands. The only thing that differs is `LLVM_PROFILE_FILE`, which matters
+when a test runs, not when it compiles. We checked on a throwaway crate: after the split,
+nextest left the lib tests' binary untouched and compiled only the lib, the binary and the
+integration test.
+
+The coverage owner that runs `make coverage` in CI pins the recipe line for line, so it
+learned the new stages, and its contract learned what a build stage may do. A stage of the
+form `--no-report test` must end in `-- --list`, must come before the one instrumented run,
+and must be followed by a `clean --profraw-only` before that run. The owner still accepts
+the nextest handshake only during the run stage, so a build stage that tried to pose as the
+run is refused. The report reads the run's profiles and nothing else.
+
+How much does it buy? We can't know until a runner says so, and the first CI run is the
+measurement. In the Lima VM, under a runner's memory and four cores, the uncapped build
+(both big compiles together) took 5:51, two jobs took 10:51 and one job 17:35. The split
+should land between the first two: the big two run one after the other, but each with four
+codegen threads. Scaled to the runner's 13 minutes at one job, that's about 4.5 to 8
+minutes, call it 6, which takes portable Linux from 25 to 31 minutes to about 18 to 24, a
+median near 21. That's close to the 19 we were after, not at it, and the job's limit drops
+from 85 minutes back to 62. What should the first runs be watched for? The watcher's
+`mem_floor:` and memory-stall stops, any kernel OOM line in the report step, and a lost
+runner. The lib still compiles alone, since everything after it links it, so any of those
+would mean the targets built after it, four at a time with the suite among them, hold more
+than we think.
+
 ### A release gate that fits in a week
 
 Pull requests were quick by 0.2.3. The release wasn't. From code freeze to ready-to-tag took
@@ -1400,6 +1545,36 @@ the point it matters, so `run` and `freeze-check` now work out the gate themselv
 release is the version in the commit's `Cargo.toml`, the previous release the nearest `v*`
 tag behind it, and the rest is `release_tier.decide`. `--gate` survives only to raise the
 gate; asking for less than the rule says is refused, with the rule's reasons.
+
+**Then it ran one night, not every night.** The nightly was built, tested and installable for
+weeks, and it never ran every night. The Studio had better things to do with its nights:
+agents, the power-cut endurance run, the odd 24-hour memory run. And a train in the middle of
+its week is still taking merges, so a green night on Tuesday says little about the candidate on
+Friday. What `freeze-check` needs is one green night on the code that becomes the candidate,
+which is the train the evening before the freeze. So that's when it runs (maintainer decision,
+20 November 2026, [#1721](https://github.com/reliaburger/reliaburger/issues/1721)):
+`nightly-qualify.sh --once` arms a single night. At the cut-off the night dispatches
+`build.yml` on the train and `stage.yml` on the nightly channel, waits for both, runs the long
+tiers and disarms itself.
+
+"Runs once" turned out to need three locks on the same door, because launchd thinks in
+calendars, not in dates. A calendar entry has no year, so a job for 24 November would fire
+again next year. A Mac asleep at the cut-off runs the missed job when it wakes, perhaps the
+next day. And unloading a launchd job from inside it stops it. So the job is named for its
+date and marked `LaunchOnlyOnce`; the night deletes its own job file before it does anything
+else, refuses to run on any other date, and asks a detached shell to unload the job a few
+seconds after it exits. Kill it halfway and the job file is already gone. Every night also
+asks `power_cut/quiet.py` whether a release gate holds the host, and holds the quiet lock
+while its tiers run, so the endurance run pauses instead of booting VMs beside a soak.
+
+Staging a train's build hit one more wall in 0.3.0. GitHub won't let a workflow's
+token create a release on a commit whose `.github/workflows/` differ from the default
+branch's: that needs the `workflow` scope, which no workflow token can have. 0.3.0's candidate
+4 was the first train build whose `ci.yml` had moved on from `main`'s, and `stage.yml` failed
+with a bare 403. The tag was never the evidence, though. The digest-pinned `candidate.json`
+names the commit, and the nightly checks it against the tip, so a nightly's tag now points at
+the `main` commit `stage.yml` runs on. If staging still fails, the night stages the build
+itself with the same `candidate.py` and the operator's own login, and says so in its log.
 
 **Publish performance after the tag.** Benchmarks, the profile and the day run don't decide
 whether a release works, so they no longer stand between it and its users. A regression they
@@ -2731,7 +2906,7 @@ cluster.
 
 ### The cases are the tests
 
-The ordinary catalogue is now 39 cases across 13 groups: scheduling, service
+The ordinary catalogue is now 41 cases across 13 groups: scheduling, service
 discovery, deployments, health checks, secrets and config, firewall, workload
 identity, ingress, volumes, process workloads, jobs, image registry and cluster
 coordination. Each name is a behaviour sentence
@@ -3035,6 +3210,275 @@ harness to speak the raw `/v2` protocol from *on* a node — a genuinely differe
 piece of plumbing, left for its own day. Twelve of thirteen groups, and the
 thirteenth's absence is written down rather than papered over.
 
+The firewall cases waited a long time for a cluster that could run them, and
+when one did, they failed. In November 2026 the Wyse 3040 lab gave the
+catalogue three real machines with eBPF on (#286), and all three firewall cases
+came back red: an unlisted app reached the target, and a listed one couldn't.
+That reads like a firewall that doesn't work. It wasn't. Since 0.2.0, namespaces
+are the isolation boundary, and `allow_from` only opens paths *into* a
+namespace from another one; it never restricts callers in the target's own
+namespace. The connect hook says so in its first line: a source in the
+target's namespace is let through before `firewall_map` is even consulted. The
+cases still put every app in the case's single namespace, as they had before
+0.2.0, so they were testing a rule the product no longer has. Nothing had run
+them against eBPF since, so nothing had noticed (#2206).
+
+The fix is a second namespace. A case's resources live under a server-owned
+lease, and a lease covers exactly one namespace, so a case that needs callers
+somewhere else needs a second lease. That lease has to belong to the runner,
+not the case, for the same reason the first one does: the runner is what
+proves cleanup after a pass, a failure, a timeout or a panic. So `TestCase`
+gained a `peer_namespace: bool`, and for a case that sets it the runner leases
+`<namespace>-peer` alongside the case's own, releases both at teardown, and
+reports `Unknown`, after releasing the first, if the second is refused. The
+case asks its context for the peer:
+
+```rust
+pub fn peer(&self) -> Option<TestContext> {
+    let peer = self.peer.as_ref()?;
+    Some(TestContext {
+        namespace: peer.namespace.clone(),
+        lease_id: peer.lease_id.clone(),
+        peer: None,
+        ..self.clone()
+    })
+}
+```
+
+`..self.clone()` is Chapter 1's struct update syntax: every field not named
+comes from a clone of this context, so the peer shares the connection, the
+deadline and the fault guard, and only its namespace and lease differ. The
+`?` after `as_ref()` works on `Option` as it does on `Result`: no peer, and the
+function returns `None` at once.
+
+We didn't add a variant to `LeaseScope`, though it looked like the natural
+home. `LeaseScope` is the server's type: it crosses the wire and sits in the
+council's state, so a new variant would have been a protocol change for the
+sake of a test. The flag lives on `TestCase`, which only the client sees.
+
+The rewritten cases name their callers as `namespace/app`, wait for the target
+to have a healthy backend rather than just a running instance (on the Atom x5
+the service map lagged the instance), and put the probe's source, address and
+`wget` output in any failure. A fourth case pins the rule the old ones got
+wrong: an unlisted app in the target's own namespace still connects.
+
+On the Wyses three of the four passed at once. The fourth, which adds a
+caller to `allow_from` and redeploys, still saw the connection refused. Probing
+by hand found the change did arrive, up to about 40 seconds after the apply.
+The new rule comes with the target's new instance, and until the rollout
+replaces the old one, the old instance and its old rule keep the VIP healthy.
+Waiting for a healthy backend therefore proves nothing here. So the case now
+probes every two seconds until the caller gets through or the deadline ends,
+and a failure still shows the last probe.
+
+The same probing found something worse. The scheduler had put every app on
+one node, so the callers always shared the target's node. With callers forced
+onto the other two, a listed caller was refused for good: the grant existed
+only on the target's node (#2216). These cases can't see that while the
+scheduler packs them together, which is why #2216 adds one that places its
+callers elsewhere.
+
+### Whose node decides
+
+We first read that 40 seconds as propagation: a slow catalogue carrying the
+new rule to the other nodes. We wrote it up that way (#2216) and went to
+measure the other direction, a caller *removed* from the list, on a
+three-node Lima cluster with one copy of each caller on every node.
+
+The first probe made the question moot. The listed caller on the target's own
+node connected. The same caller on the other two nodes got `Operation not
+permitted` and kept getting it, minutes later, whatever we applied. `bpftool
+map dump name firewall_map` on one of those nodes printed `[]`: no grant at
+all. The Wyse lab confirmed it within the hour. With callers forced apart by a
+CPU request, the one beside the target got through every round and the ones on
+the other two Wyses never did.
+
+Here's why. The connect hook runs in the *caller's* kernel: it decides before
+the packet leaves, which is the point of doing it in `connect()`. So the
+caller's node has to know the target's `allow_from`. Each node builds its
+`firewall_map` from its merged service view: its own services, plus everyone
+else's from the leader's service catalogue. But `allow_from` reached that view
+only through `register_service_app`, which runs on the node that deploys the
+target. The catalogue had a VIP, a port and backends per service, and nothing
+else, so the merge filled in `firewall_allow_from: None` for every remote
+service, and `None` means "same namespace only". A listed caller was admitted
+on the target's node and refused everywhere else. The 40 seconds on the Wyses
+was the rollout, the redeployed target registering its new list on the one
+node that read it, with the caller that happened to share it.
+
+Why did nothing catch it? Every firewall case let the scheduler place its
+apps, and the scheduler packs apps with no CPU request onto one node. The
+cases were single-node tests running on a three-node cluster.
+
+The fix puts the list where every node already looks. `CatalogService` gains
+a field:
+
+```rust
+#[serde(default)]
+pub allow_from: Option<Vec<String>>,
+```
+
+`#[serde(default)]` lets a catalogue written before the field existed
+deserialise, with `None`. That isn't a compatibility promise (0.3.2 already
+moved the wire protocol to 61), just the cheapest way to keep old test
+fixtures loading. The leader's `build_endpoint_catalog` fills the field from
+each service's committed spec, after it has allocated the VIPs:
+
+```rust
+for (qualified, service) in &mut catalog.services {
+    service.allow_from = ServiceId::parse(qualified)
+        .and_then(|id| {
+            desired
+                .apps
+                .get(&crate::meat::types::AppId::new(&id.name, &id.namespace))
+        })
+        .and_then(|spec| spec.firewall.as_ref())
+        .filter(|firewall| !firewall.allow_from.is_empty())
+        .map(|firewall| firewall.allow_from.clone());
+}
+```
+
+That's one chain of `Option` steps. `and_then` runs the next step only if the
+last one found something, `filter` turns a `Some` into `None` when the
+predicate says no (an empty list asks for nothing, so it becomes `None`), and
+`map` transforms whatever is left. A Go programmer would write four `if`
+statements with early `continue`s; here a missing app, a spec with no
+`[firewall]` table and an empty list all land on `None` without a branch in
+sight. `&mut catalog.services` iterates the map by mutable reference, so we
+change each entry in place, and the borrow checker makes sure nothing else
+reads the map while we do.
+
+The merge on each node then copies the field into the service view instead of
+writing `None`. Since the field is part of `CatalogService`'s `PartialEq`, a
+changed list makes the freshly built catalogue differ from the committed one,
+so the leader publishes a new generation without any extra trigger. Each node
+fetches it with its next placement poll, every two seconds, and reconciles its
+`firewall_map`.
+
+So a changed list now reaches the caller's node from the *spec*, not from the
+rollout. The node running the target was still the exception: its own entry
+for the service won over the catalogue's, so it switched only when the new
+instance registered. That's the rollout time again, and the next section
+deals with it.
+
+We measured both directions on the same three-node Lima cluster before and
+after, probing from a copy of the caller on every node about once a second,
+three runs each, timed from `relish apply`:
+
+| Change | Node | 0.3.1 | With the fix |
+|--------|------|-------|--------------|
+| Add a caller | the target's | 6–8 s | 6–9 s |
+| Add a caller | the other two | never | 1–3 s |
+| Remove a caller | the target's | 2–5 s | 2–3 s |
+| Remove a caller | the other two | refused anyway | 1–4 s |
+
+On the Wyses, where only the target's node ever enforced the change, an add
+took 10 to 42 s and a removal 7 to 41 s: a rollout on an Atom x5 is that much
+slower. The probes turned up something else, too. While a one-replica target
+rolls, even a caller that was listed all along gets `Operation not permitted`
+for a few seconds, because the connect hook refuses a VIP with no backend in
+exactly the way it refuses a forbidden caller. Read a firewall probe with that
+in mind.
+
+The fifth firewall case, `allow_from_reaches_callers_on_other_nodes`, closes
+the hole that let this through. It runs both callers with one replica per
+node, finds a node that runs both and not the target, and probes from there
+through that node's own API, since `exec` runs in an instance on the node it's
+asked. If no such node exists it fails and says where everything landed,
+rather than quietly testing one node again. A single-node cluster gets
+`unknown`: there's nowhere else to put a caller.
+
+Two details came from running it. The callers serve HTTP, though nothing
+calls them, because a node whose containers publish no port has no masquerade
+rule yet, and its containers can't reach another node at all (#2219, its own
+fix). And the listed caller probes until it gets through, the same loop as
+the case above: the target is healthy on the node we asked, but the caller's
+node learns its backend from the next catalogue, and until then the hook
+refuses a VIP with no backend.
+
+### Two copies of one list
+
+On the target's own node the merge kept the local entry whole and took only
+backends from the catalogue (#2223). The obvious fix is to let the
+catalogue's `allow_from` win there too: the leader builds it from the
+committed spec, so surely it's at least as new as the spec the node deployed.
+
+It isn't always. The catalogue and the placements reach a node by different
+roads. The leader publishes a catalogue only when the withdrawal ledger has
+room for it: while consumers still owe confirmations for old publications,
+`plan_publication` answers `CapacityReached` and the leader skips the write,
+tick after tick. The placements keep flowing. So a node can deploy a spec
+that *removes* a caller while its catalogue still carries the old list. Let
+the catalogue win and the caller the spec just removed gets back in on the
+target's own node, for as long as the ledger stays full. Before the fix that
+node at least enforced the new list once the rollout finished.
+
+Neither copy carries anything that says which is newer, so the merge doesn't
+guess. While they differ it admits only the callers both lists admit:
+
+```rust
+fn stricter_allow_from(
+    namespace: &str,
+    name: &str,
+    local: Option<&[String]>,
+    catalogue: Option<&[String]>,
+) -> Option<Vec<String>> {
+    let callers = |list: &[String]| -> BTreeSet<(String, String)> {
+        list.iter()
+            .map(|caller| {
+                let (ns, app) = caller.split_once('/').unwrap_or((namespace, caller));
+                (ns.to_string(), app.to_string())
+            })
+            .collect()
+    };
+    let admitted: BTreeSet<_> = match (local, catalogue) {
+        (None, None) => return None,
+        (Some(local), Some(catalogue)) => {
+            let (ours, theirs) = (callers(local), callers(catalogue));
+            if ours == theirs {
+                return Some(local.to_vec());
+            }
+            ours.intersection(&theirs).cloned().collect()
+        }
+        // `None` admits the target's own namespace, so the stricter list
+        // keeps only the named callers from there.
+        (Some(list), None) | (None, Some(list)) => callers(list)
+            .into_iter()
+            .filter(|(ns, app)| ns == namespace && app != name)
+            .collect(),
+    };
+    Some(
+        admitted
+            .into_iter()
+            .map(|(ns, app)| format!("{ns}/{app}"))
+            .collect(),
+    )
+}
+```
+
+The `match` on a tuple of two `Option`s is Rust's way of writing a truth
+table: the compiler checks that the four cases are all covered, and the last
+arm uses `|` to bind `list` from whichever side holds it. `as_deref()` at the
+call site turns an `Option<Vec<String>>` into an `Option<&[String]>`, a
+borrowed view of the same list, so nothing is copied unless the lists differ.
+Two lists that name the same callers, one as `worker` and the other as
+`backend/worker`, compare equal as sets of `(namespace, app)` pairs, and the
+local spelling stays.
+
+An empty `Some(vec![])` comes out of two disjoint lists, and it means "nobody",
+not the namespace default. The kernel never sees the difference for callers in
+the target's own namespace, which the connect hook admits before it looks at
+`firewall_map`; for everyone else, nobody is the right answer while the two
+copies disagree.
+
+What this buys is asymmetric, on purpose. A caller removed from the list is
+refused on the target's node as soon as the catalogue arrives, like everywhere
+else: a removal is in the stricter list from the moment either copy has it. A
+caller *added* to the list waits on that node until its own spec agrees,
+which is still the rollout. That's the direction where being late is merely
+annoying, and the other direction is the one an operator is counting on when
+they narrow a list after an incident.
+
 ## The thirteenth group
 
 That last group — image-registry — is the one we said needed its own day. The
@@ -3069,7 +3513,7 @@ Pickle under the lease's namespace, deploys it by digest and checks that its
 HTTP server answers from inside the container. A successful upload alone can't
 pass it.
 
-That completes the catalogue: thirteen groups, thirty-nine cases. Not all of
+That completes the catalogue: thirteen groups, thirty-nine cases (forty-one since #2206 and #2216, below). Not all of
 them run everywhere — the process-runtime cases skip on runc and the container
 cases skip on a process cluster; firewall wants eBPF, ingress wants the proxy,
 the registry cases need a declared reachable endpoint. But every skip names its reason, every
@@ -3732,10 +4176,10 @@ time window deterministic in a unit test.
 
 Take crashloops. A workload with a lifetime restart count of 30 may have run
 perfectly for six months since its last failure. Calling that a current
-crashloop is nonsense. We require three timestamped restart events inside the
-last 15 minutes. When that pattern fires, the engine looks for a deploy of the
-same application and namespace in the preceding 30 minutes, then attaches the
-first recent error log. One finding now answers three questions: what failed,
+crashloop is nonsense. We require three timestamped restart events of one
+instance inside the last 15 minutes. When that pattern fires, the engine looks
+for a deploy of the same application and namespace in the preceding 30
+minutes, then attaches the first recent error log. One finding now answers three questions: what failed,
 what changed, and what did the process say?
 
 That rule is only as good as the events behind it, and in 0.2.7 the agent gym
@@ -3749,6 +4193,41 @@ history. The fix is to have one door: `observe_app_exit` now calls
 `retry_restart` too, so whichever tick moves the instance back to Pending
 records the event, exactly once, and an exhausted budget fails the instance
 with the same `exhausted its restart budget` event either way (#1652).
+
+"Of one instance" came later, from 0.3.1's soak (#2197). Until then the rule
+counted an app's restarts together. The soak's chaos scenario restarted two of
+a three-replica app's instances on purpose, and a moment later its pause froze
+the third, whose health checks failed, so Bun restarted that one too. Three
+restarts, one app, inside 15 minutes: `wtf` called it a crash loop and kept
+saying so for the whole window. Each replica had restarted once, for its own
+reason. A crash loop is one process that keeps dying, so the check now groups
+restarts by instance, and each instance needs three of its own.
+
+Grouping by instance turned up a second bug. Bun records the instance as the
+restart decision's `instance` evidence, but the collector read a key called
+`instance_id`, which no event has ever carried. Every restart reached
+`diagnose` with no instance, and no unit test noticed, because the tests built
+their `RestartObservation`s by hand. The new test records a real decision in an
+`EventStore` and reads it back through the collector. Restarts that still name
+no instance, such as a restart that failed before it got going, are counted
+together, as the old rule counted all of them.
+
+The grouping is a map of maps. Spelled out, its type is:
+
+```rust
+BTreeMap<(&str, &str), BTreeMap<Option<&str>, Vec<&RestartObservation>>>
+```
+
+The outer key is the app and namespace, borrowed from the observations as
+`&str` rather than copied into new `String`s; the borrow checker makes sure
+the map doesn't outlive the inputs it points into. The inner key is the
+instance, `Option<&str>`, so "no instance" is a key of its own, `None`, rather
+than an empty string that might collide with a real name. `BTreeMap` rather
+than `HashMap` keeps the report's order the same on every run. Clippy calls
+a type this deep "very complex", so the code names the inner map
+`RestartsByInstance<'a>`, a `type` alias: a second name for the same type, as
+`typedef` is in C, carrying the lifetime `'a` that ties its borrows to the
+inputs.
 
 The same rule keeps the other checks honest. Disk pressure needs used capacity
 with a node and storage-domain attribution. CPU throttling needs an increase in
@@ -4554,6 +5033,108 @@ before the case deadline; `an_exec_the_agent_timed_out_names_the_app_and_node`
 answers `504` and checks the timeout the test kit asked for. All four failed
 before the change: the first two because every layer was 300 s, the test kit
 pair because the case deadline fired first with nothing to say.
+
+### What the port forwarder saw
+
+The bounded exec makes the next occurrence say where it was. We went back
+to the first one anyway, because one witness had been there all along. The
+soak keeps each VM's Lima host-agent log, and at debug level that log
+records every forwarded TCP connection as it closes. It writes "closing
+write" first when the client on the Mac hangs up, and "closing read" first
+when Bun inside the VM does.
+
+The pulse's connections to node 1's API port tell the story. The ones the
+test kit had pooled and finished with closed from the Bun side 75 to 120 s
+after their last use: that's the `request_head` idle limit, doing its job.
+One, opened at 04:17:20 as the pulse started, stayed open until 04:22:43,
+the case's deadline to the second, and the Mac's side closed it. So a
+request was in flight on it for minutes. Bun had the whole request head,
+or its 75 s head timer would have closed the connection first, and Bun
+never answered.
+
+That rules out more than it rules in:
+
+- **Not the test kit's wait.** It would have left its note.
+- **Not a lost connection in the forwarder.** Bun held its end open.
+- **Not the apply.** A later apply through node 1 committed and its case
+  passed at 04:18:08.
+- **Not the instance's lifecycle lock or its runtime claim.** The teardown
+  had to stop this same container, confirm it had exited and release its
+  address, and node 1 logged that last step at 04:22:55, twelve seconds
+  after the deadline. A queue in front of the exec 270 s long would have
+  held the stop too.
+
+What's left is `POST /v1/exec` itself, past the point where it takes those
+locks: the process owner running `runc exec`, `runc init` and `busybox wget`
+through an exec helper, all of which the teardown's kill released. There is
+a less likely reading too. If the forwarder delivered the request head but
+sat on the body, Bun would wait for the body for ever, because nothing in
+Hyper bounds a request body that stops arriving. The 504 and "no answer"
+messages tell those two apart.
+
+They don't say what the exec helper was doing, though, so Bun now writes
+that down. When an exec has had no answer from its owner for 30 s, Bun logs
+every exec helper under that owner: its phase, its command, and on Linux
+each process under it with its scheduler state and the kernel function it
+sleeps in, read from `/proc/<pid>/stat` and `/proc/<pid>/wchan`. A line
+looks something like this (shortened by hand):
+
+```text
+bun: exec through owner command-3f… has had no answer for 30 s:
+exec-Xk2b: running `runc --root … exec -- … /bin/busybox wget …` (gate handed over):
+pid 4121 (runc) S do_wait, pid 4127 (runc:[2:INIT]) S pipe_read
+```
+
+The wait that does this is a small generic function:
+
+```rust
+async fn report_if_slow<T, R>(
+    work: impl std::future::Future<Output = T>,
+    after: Duration,
+    report: impl FnOnce() -> R,
+) -> T
+where
+    R: std::future::Future<Output = ()>,
+{
+    tokio::pin!(work);
+    tokio::select! {
+        output = &mut work => return output,
+        () = tokio::time::sleep(after) => {}
+    }
+    let report = report();
+    tokio::pin!(report);
+    let mut reporting = true;
+    loop {
+        tokio::select! {
+            output = &mut work => return output,
+            () = &mut report, if reporting => reporting = false,
+        }
+    }
+}
+```
+
+`select!` polls several futures and runs the branch of whichever finishes
+first, dropping the rest. That's a problem when the one you want to keep is
+in the losing branch, so we poll `&mut work`, a borrow, instead of `work`
+itself: the timer's branch wins, and `work` is still there, half done, for
+the loop. Borrowing a future to poll it needs it pinned, which is what
+`tokio::pin!` does. It fixes the future at one place on the stack, because a
+future that's been polled may hold pointers into itself and mustn't move.
+The `if reporting` guard switches a branch off once its future has
+finished, as polling a finished future again would panic. The report reads
+procfs and the helpers' records off the runtime, on a blocking thread, and
+the answer never waits for it: an exec stuck on a slow disk shouldn't be
+held up by a report stuck on the same disk.
+
+The tests run under Tokio's paused clock. An exec answered at 15 s is never
+reported; one answered at 90 s is reported exactly once, at 30 s, and still
+answered; and a report that never finishes doesn't delay an answer at 31 s.
+`a_report_names_each_helper_its_phase_command_and_process` writes helper
+records the way `Execution::launch` does, around a real `sleep`, and checks
+the line names the phase, the command and, on Linux, `(sleep) S`; a second
+Linux test checks it follows a shell's child as well, since `runc exec` runs
+its command as a grandchild. We still can't make an exec wedge on purpose,
+so #2128 stays open until the next one tells us where.
 
 ### Busy isn't dead
 
@@ -9367,6 +9948,55 @@ returns an iterator, a `Vec<(String, String)>` can become one, and the
 compiler generates a copy of `open_with_env` for each. It's the closest thing
 Rust has to Python's duck typing, checked at compile time.
 
+The fourth fixture, added in 0.3.2 for #287, cuts the power under volume
+snapshots. Bun snapshots every managed volume on a timer, ships each snapshot
+to an object store as a tarball, records a receipt in the snapshot's
+metadata, and prunes past the retention count. The receipt is another licence
+to prune, so it gets the same treatment as the exporter's checkpoint. But a
+snapshot needs Btrfs, and Bun only makes Btrfs subvolumes as root. So the
+harness runs this one fixture under `sudo`, and prepare makes its own
+filesystem: a 1 GiB file, `mkfs.btrfs`, and `mount -o loop` as the volumes
+directory. A loop device turns the filesystem's cache flushes into an
+`fsync` of its backing file, so a flush Btrfs relies on still reaches the
+VM's disk before the cut.
+
+Two workers share the volume. A writer fills it the way an application with
+durable writes would: each 4 KiB record goes to a temporary name, is synced,
+renamed into place, and the directory is synced too. Only then does the
+ledger get a line. A sweeper calls the real `snapshot_tick` in a loop, and
+after each sweep it records every snapshot whose metadata shows a receipt.
+A ledger line looks like this, and verify takes it apart with a slice
+pattern:
+
+```rust
+let fields: Vec<&str> = line.split(' ').collect();
+let ["exported", snapshot, sha256, archive, manifest] = fields.as_slice() else {
+    panic!("unexpected sweeper ledger line {line:?}");
+};
+```
+
+`fields.as_slice()` borrows the vector as a `&[&str]`, and the pattern
+matches only a slice of exactly five elements whose first is the literal
+`"exported"`. Each other name binds one element. It's the let-else from
+Chapter 1, with a pattern that checks the length and a word at the same time.
+
+After the cut, verify runs `btrfs check --readonly` on the image before it
+mounts it. Then it checks that every acknowledged record is in the live
+volume, whole. Every acknowledged archive must be at the destination, with
+the SHA-256 its receipt names and its manifest beside it. Each archive must
+unpack to records that run from 0 with no gap: a Btrfs snapshot is one
+instant of the volume, and the writer renames records in order, so a gap
+would mean the snapshot wasn't atomic. A snapshot still on disk must keep
+its receipt. Last, verify runs one more sweep, as Bun does when it boots. That
+sweep must settle any snapshot the cut interrupted (#695's intent files), find
+no subvolume without metadata, and leave everything exported and within
+retention.
+
+It passed 20 cuts out of 20 on its first run
+([record](../qualification/2026-11-23-power-cut-volumes.md)). The record also
+says what the cuts didn't reach. A snapshot takes milliseconds, so no random
+cut landed inside one; that case stays with the unit tests.
+
 The unit tests never talk to a cloud. `make test-s3` does: it exports logs to
 a bucket and round-trips a council backup through it, put, list, prune and
 restore. Until 0.2.6 it needed real AWS credentials, and the
@@ -10147,6 +10777,82 @@ recover` refuses a state that doesn't sit where its name says. None of the three
 derives `PartialEq`, and `DesiredState` holds `HashMap`s that re-encode in a different order
 each time. So each round trip compares `serde_json::Value`s, whose maps are ordered, rather
 than the structs.
+
+### Ranking what's left
+
+Twelve targets is a list, not a policy. Which decoder gets the next one? We
+listed every place the code reads bytes it didn't make and ranked them by
+who can send those bytes: anyone on the internet first, then anyone on the
+LAN, then any workload, then authenticated clients and peers, then
+operators. The table is in [`docs/testing.md`](../testing.md#which-decoders-have-targets).
+Of the six decoders at the top, only gossip had a target. The other five are
+the API's bearer check, the ingress proxy's request handling, and the three
+netboot servers, which answer anyone on the LAN while `relish netboot` runs.
+So 0.3.2 adds five targets:
+
+- `api_bearer`: the `Authorization` header, before anything has
+  authenticated it. Only a stored token's exact plaintext may authenticate,
+  only as that token, and an agent's token only ever reads.
+- `ingress_request`: the `Host` header, request target and `Cookie` header a
+  client sends the ingress proxy. A request must match its route on a segment
+  boundary, the HTTPS redirect must name the routed host, and the
+  dashboard's session cookie never reaches a backend.
+- `tftp_packet`, `dhcp_request` and `netboot_disk_report`: the three things a
+  machine on the LAN can send `relish netboot`.
+
+The TFTP target is the first one that runs a protocol rather than a parse. A
+read request that names a served file goes to a real `Transfer`, the
+sender's state machine, and the target plays an honest client against it:
+acknowledge each block, collect the data, check it's the whole file in
+order. Whatever options the request asked for, a `blksize` of 7 or 65,464,
+a `timeout` of 0 or 255, the agreed values must be in range and the file
+must arrive intact.
+
+What did they find? The ingress target, run against the code as it stood,
+found in under a minute that a `Host` header whose "port" wasn't digits
+routed as the host in front of it. `tls.example:>0` routed to
+`tls.example`, and the HTTPS redirect, which repeats the `Host` header, sent
+the client to `https://tls.example:>0/`, which isn't a URL at all. A port is
+digits; anything else after the colon now stays on the host and matches no
+route. Writing the TFTP target's assertions turned up a second bug before
+the fuzzer ran: the netboot log printed a client's ERROR text as it came,
+control characters and all, while the disk report's labels next door were
+already escaped. Both fixes went in with a failing unit test first.
+
+The DHCP target needed a trick. `dhcp::decode` wraps dhcproto in
+`std::panic::catch_unwind`, which runs a closure and turns a panic inside it
+into an `Err` instead of unwinding further (C has nothing like it; it's
+closest to a `recover()` in a Go `defer`). A crafted packet can make
+dhcproto panic, and the server should call that "not DHCP" and carry on. But libFuzzer installs a *panic hook*, a function Rust calls the
+moment anything panics, before unwinding starts, and its hook aborts the
+process. So the catch never runs, and every dhcproto panic would look like
+our crash. The target steps the hook aside for the decode alone:
+
+```rust
+fn without_panic_hook<T>(decode: impl FnOnce() -> T) -> T {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = decode();
+    std::panic::set_hook(hook);
+    result
+}
+```
+
+`impl FnOnce() -> T` takes any closure that can be called once and returns
+a `T`, and the generic `T` lets one helper wrap a call of any type. A panic
+anywhere else in the target, in our `answer` or `encode`, still aborts.
+
+One more fix came out of the seeds. A seed is supposed to be the same bytes
+every time `make fuzz-corpus-seed` writes it, but two weren't. The join CSRs
+came from fresh ECDSA keys, and ECDSA signs with a random nonce, so even a
+fixed key gives new bytes each time. The backup was sealed with a random
+salt and nonce, as a real backup must be. Every run of the seeder changed
+three files in git for nothing. Ed25519 signatures are deterministic, so the
+CSR and JWT seeds are now signed with Ed25519 keys made from fixed seeds,
+and the backup seed is sealed by hand with a fixed salt and nonce, under the
+key the target unseals with, so the target now gets past the GCM tag too.
+With nothing random left, the corpus test compares each checked-in seed's
+bytes, not just its name.
 
 ## Did it happen in some order?
 

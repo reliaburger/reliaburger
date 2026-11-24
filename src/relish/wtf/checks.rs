@@ -217,10 +217,11 @@ pub const CHECKS: &[CheckKind] = &[
         id: "crashloops",
         findings: &["crashloop"],
         sources: &["restarts", "recent_logs"],
-        tests: "Counts each app's `restart` events in every node's event ring (the same \
-                ones `relish events` shows) inside a recent window. Enough of them is \
-                critical, with any recent deploy and the app's first error log line \
-                attached. A lifetime restart count is not an input.",
+        tests: "Counts each instance's `restart` events in every node's event ring (the \
+                same ones `relish events` shows) inside a recent window. Enough of them \
+                for one instance is critical, with any recent deploy and the app's first \
+                error log line attached. Replicas that restarted once each are not a crash \
+                loop, and a lifetime restart count is not an input.",
         docs: "07_diagnostics.md#relish-wtf-whats-broken-and-why",
         manual: "diagnostics",
     },

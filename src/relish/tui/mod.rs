@@ -3,12 +3,14 @@
 pub mod app;
 pub mod data;
 pub mod fixtures;
+mod impact;
 mod input;
 pub mod keys;
 mod matching;
 pub mod msg;
 mod navigation;
 pub mod palette;
+mod scale;
 mod state;
 mod stream;
 pub mod terminal;
@@ -147,6 +149,21 @@ async fn event_loop<P: DataProvider, B: Backend>(
                                 namespace,
                                 result,
                             }))
+                            .await;
+                    });
+                }
+                Effect::Scale {
+                    app,
+                    namespace,
+                    from,
+                    to,
+                } => {
+                    let provider = Arc::clone(&provider);
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let result = provider.scale(&app, &namespace, from, to).await;
+                        let _ = tx
+                            .send(Msg::Data(DataUpdate::Scaled { app, to, result }))
                             .await;
                     });
                 }

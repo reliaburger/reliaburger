@@ -584,6 +584,7 @@ pub fn all() -> Vec<TestCase> {
                 Capability::NodeKill,
             ],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: crate::testkit_case!(leader_failure_elects_new_leader_and_cluster_recovers),
         },
         TestCase {
@@ -596,6 +597,7 @@ pub fn all() -> Vec<TestCase> {
                 Capability::NodeKill,
             ],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: crate::testkit_case!(dead_worker_node_has_workloads_rescheduled),
         },
         TestCase {
@@ -608,6 +610,7 @@ pub fn all() -> Vec<TestCase> {
                 Capability::NodeKill,
             ],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: crate::testkit_case!(minority_partition_degrades_and_heals),
         },
         TestCase {
@@ -620,6 +623,7 @@ pub fn all() -> Vec<TestCase> {
                 Capability::NodePressure,
             ],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: crate::testkit_case!(resource_exhaustion_degrades_gracefully),
         },
         TestCase {
@@ -632,6 +636,7 @@ pub fn all() -> Vec<TestCase> {
                 Capability::NodeKill,
             ],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: crate::testkit_case!(node_death_during_deploy_ends_clean),
         },
     ]
@@ -703,6 +708,7 @@ mod tests {
             deadline: crate::testkit::deadline::Deadline::after(timeout).unwrap(),
             peer_route: crate::testkit::context::PeerRoute::Relay,
             trace: Default::default(),
+            peer: None,
         };
         let relayed_worker = context.client.via_node("worker-2").unwrap();
 
@@ -745,6 +751,7 @@ mod tests {
             deadline: crate::testkit::deadline::Deadline::after(timeout).unwrap(),
             peer_route: crate::testkit::context::PeerRoute::Relay,
             trace: Default::default(),
+            peer: None,
         }
     }
 

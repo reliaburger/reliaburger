@@ -10,7 +10,7 @@
 /// collide (D3/codex-M1). Internally we store the canonical qualified
 /// string (`{namespace}__{name}`) as the `HashMap` key so lookups stay a
 /// plain string hash.
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use super::service_id::ServiceId;
 #[cfg(test)]
@@ -278,7 +278,8 @@ impl ServiceMap {
     ///   added wholesale, using the catalogue's cluster-agreed VIP;
     /// - a service present both locally and in the catalogue keeps the
     ///   local entry (and its VIP) and gains any catalogue backends that
-    ///   aren't already local, deduplicated by `instance_id`.
+    ///   aren't already local, deduplicated by `instance_id`. Its
+    ///   `allow_from` becomes the stricter of the two lists.
     ///
     /// The catalogue is the leader's aggregate, which already includes this
     /// node's own backends, so the dedupe keeps a local instance from
@@ -298,6 +299,17 @@ impl ServiceMap {
         for (qualified, service) in &catalog.services {
             match merged.entries.get_mut(qualified) {
                 Some(local) => {
+                    // The leader's list can be newer than the one this node
+                    // registered at its last rollout, or older, when a
+                    // publication is held back at withdrawal capacity. Admit
+                    // only what both allow, so neither can loosen the other
+                    // (#2223).
+                    local.firewall_allow_from = stricter_allow_from(
+                        &local.namespace,
+                        &local.app_name,
+                        local.firewall_allow_from.as_deref(),
+                        service.allow_from.as_deref(),
+                    );
                     for backend in service
                         .backends
                         .iter()
@@ -339,7 +351,9 @@ impl ServiceMap {
                                 local: false,
                             })
                             .collect(),
-                        firewall_allow_from: None,
+                        // The caller's node enforces the target's grants,
+                        // wherever the target runs (#2216).
+                        firewall_allow_from: service.allow_from.clone(),
                     };
                     merged.entries.insert(qualified.clone(), entry);
                     merged.allocated_vips.insert(service.vip);
@@ -358,6 +372,48 @@ impl ServiceMap {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+}
+
+/// The callers both `allow_from` lists admit, for a service `name` in
+/// `namespace`. `None` is the namespace default. Lists that name the same
+/// callers return `local` as it is; two disjoint lists return an empty list,
+/// which grants nobody.
+fn stricter_allow_from(
+    namespace: &str,
+    name: &str,
+    local: Option<&[String]>,
+    catalogue: Option<&[String]>,
+) -> Option<Vec<String>> {
+    let callers = |list: &[String]| -> BTreeSet<(String, String)> {
+        list.iter()
+            .map(|caller| {
+                let (ns, app) = caller.split_once('/').unwrap_or((namespace, caller));
+                (ns.to_string(), app.to_string())
+            })
+            .collect()
+    };
+    let admitted: BTreeSet<_> = match (local, catalogue) {
+        (None, None) => return None,
+        (Some(local), Some(catalogue)) => {
+            let (ours, theirs) = (callers(local), callers(catalogue));
+            if ours == theirs {
+                return Some(local.to_vec());
+            }
+            ours.intersection(&theirs).cloned().collect()
+        }
+        // `None` admits the target's own namespace, so the stricter list
+        // keeps only the named callers from there.
+        (Some(list), None) | (None, Some(list)) => callers(list)
+            .into_iter()
+            .filter(|(ns, app)| ns == namespace && app != name)
+            .collect(),
+    };
+    Some(
+        admitted
+            .into_iter()
+            .map(|(ns, app)| format!("{ns}/{app}"))
+            .collect(),
+    )
 }
 
 /// Separate successive executions even when they share a node and host port.
@@ -837,6 +893,7 @@ mod tests {
                 vip: assigned,
                 port: 6379,
                 backends: Vec::new(),
+                allow_from: None,
             },
         );
         let merged = ServiceMap::new().with_cluster_catalog(&catalog);
@@ -1043,6 +1100,109 @@ mod tests {
         let entry = merged.resolve(&sid("default", "web")).unwrap();
         assert_eq!(entry.backends.len(), 1, "shared backend was duplicated");
     }
+    /// A local service the catalogue doesn't name (not yet published, or
+    /// already removed from it) keeps its own `allow_from` (#2223).
+    #[test]
+    fn a_local_service_the_catalogue_does_not_name_keeps_its_list() {
+        let mut local = ServiceMap::new();
+        local
+            .register(
+                &sid("backend", "db"),
+                8080,
+                Some(vec!["frontend/api".to_string()]),
+            )
+            .unwrap();
+        let merged = local.with_cluster_catalog_excluding_node(
+            &super::super::catalog::EndpointCatalog::new(),
+            None,
+        );
+        assert_eq!(
+            merged
+                .resolve(&sid("backend", "db"))
+                .unwrap()
+                .firewall_allow_from,
+            Some(vec!["frontend/api".to_string()])
+        );
+    }
+
+    /// Lists that name the same callers, one by bare name and one
+    /// qualified, agree, so the local spelling stays.
+    #[test]
+    fn agreeing_lists_keep_the_local_spelling() {
+        use crate::onion::catalog::EndpointCatalog;
+
+        let mut local = ServiceMap::new();
+        local
+            .register(
+                &sid("backend", "db"),
+                8080,
+                Some(vec!["worker".to_string()]),
+            )
+            .unwrap();
+        let mut catalog = EndpointCatalog::rebuild([(
+            sid("backend", "db"),
+            8080,
+            vec![crate::onion::catalog::CatalogBackend {
+                execution: None,
+                node_id: "node-b".to_string(),
+                node_ip: Ipv4Addr::new(10, 0, 0, 2),
+                host_port: 30002,
+                healthy: true,
+            }],
+        )])
+        .unwrap();
+        for service in catalog.services.values_mut() {
+            service.allow_from = Some(vec!["backend/worker".to_string()]);
+        }
+        let merged = local.with_cluster_catalog_excluding_node(&catalog, None);
+        assert_eq!(
+            merged
+                .resolve(&sid("backend", "db"))
+                .unwrap()
+                .firewall_allow_from,
+            Some(vec!["worker".to_string()])
+        );
+    }
+
+    /// Two restrictions with no caller in common grant nobody, rather than
+    /// falling back to the namespace default.
+    #[test]
+    fn disjoint_lists_grant_nobody() {
+        use crate::onion::catalog::EndpointCatalog;
+
+        let mut local = ServiceMap::new();
+        local
+            .register(
+                &sid("backend", "db"),
+                8080,
+                Some(vec!["frontend/api".to_string()]),
+            )
+            .unwrap();
+        let mut catalog = EndpointCatalog::rebuild([(
+            sid("backend", "db"),
+            8080,
+            vec![crate::onion::catalog::CatalogBackend {
+                execution: None,
+                node_id: "node-b".to_string(),
+                node_ip: Ipv4Addr::new(10, 0, 0, 2),
+                host_port: 30002,
+                healthy: true,
+            }],
+        )])
+        .unwrap();
+        for service in catalog.services.values_mut() {
+            service.allow_from = Some(vec!["frontend/web".to_string()]);
+        }
+        let merged = local.with_cluster_catalog_excluding_node(&catalog, None);
+        assert_eq!(
+            merged
+                .resolve(&sid("backend", "db"))
+                .unwrap()
+                .firewall_allow_from,
+            Some(vec![])
+        );
+    }
+
     #[test]
     fn thirty_three_local_replicas_survive_snapshot_validation() {
         let id = sid("default", "crowded");

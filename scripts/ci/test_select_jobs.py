@@ -55,19 +55,31 @@ class Repository:
     def branch(self, name):
         self.git("checkout", "-q", "-b", name)
 
-    def select(self, event="pull_request", base_ref="main", base_sha="", full_ci=False,
-               head_ref="feature", release_gate=False, macos=False):
+    def outputs(self, event="pull_request", base_ref="main", base_sha="", full_ci=False,
+                head_ref="feature", release_gate=False, macos=False, ref="refs/pull/1/merge",
+                queue_run="", main_ref="main"):
+        """Every output the script writes, as the strings it wrote."""
         with tempfile.TemporaryDirectory() as scratch:
             output = Path(scratch) / "output"
             env = {**os.environ, **GIT_ENV, "GITHUB_OUTPUT": str(output), "EVENT": event,
                    "BASE_REF": base_ref, "BASE_SHA": base_sha, "HEAD_REF": head_ref,
                    "FULL_CI": "true" if full_ci else "false",
                    "RELEASE_GATE": "true" if release_gate else "false",
-                   "MACOS_LABEL": "true" if macos else "false"}
+                   "MACOS_LABEL": "true" if macos else "false",
+                   "GITHUB_REF": ref, "QUEUE_RUN": queue_run, "MAIN_REF": main_ref}
             subprocess.run(["bash", str(SCRIPT)], cwd=self.root, env=env, check=True,
                            capture_output=True, text=True)
-            pairs = (line.split("=", 1) for line in output.read_text().split())
-            return {key: value == "true" for key, value in pairs}
+            return dict(line.split("=", 1) for line in output.read_text().splitlines())
+
+    def select(self, **kwargs):
+        """The six job groups, as booleans. Without a queue run, portable follows code."""
+        found = self.outputs(**kwargs)
+        assert found["portable"] == found["code"] and found["tested_by"] == "", found
+        return {key: found[key] == "true" for key in ("code", "gossip", "heavy", "task_arrays", "macos", "s3")}
+
+
+ALL = {"code": True, "gossip": True, "heavy": True, "task_arrays": True, "macos": True, "s3": True}
+NOTHING = {key: False for key in ALL}
 
 
 class SelectJobsTests(unittest.TestCase):
@@ -96,7 +108,7 @@ class SelectJobsTests(unittest.TestCase):
         return self.repo.commit("base fix")
 
     def test_pushes_schedules_and_manual_runs_select_everything(self):
-        for event in ["push", "schedule", "workflow_dispatch", "merge_group"]:
+        for event in ["push", "schedule", "workflow_dispatch"]:
             with self.subTest(event=event):
                 self.assertEqual(self.repo.select(event=event),
                                  {"code": True, "gossip": True, "heavy": True, "task_arrays": True, "macos": True, "s3": True})
@@ -373,9 +385,31 @@ class SelectJobsTests(unittest.TestCase):
                                                   head_ref=head_ref)["macos"])
 
     def test_the_merge_queue_runs_everything(self):
-        # merge_group carries no pull_request fields: no base, no label.
-        self.assertEqual(self.repo.select(event="merge_group", base_ref="", head_ref=""),
-                         {"code": True, "gossip": True, "heavy": True, "task_arrays": True, "macos": True, "s3": True})
+        # merge_group carries no pull_request fields: no base ref, no label.
+        # Its base is the commit the group sits on.
+        self.pull_request("src/lib.rs")
+        self.assertEqual(self.repo.select(event="merge_group", base_ref="", head_ref="", base_sha=self.main),
+                         ALL)
+
+    def test_the_merge_queue_runs_every_benchmark_whatever_the_group_touches(self):
+        # A candidate build reuses a queue run only when every job ran.
+        self.pull_request("src/grill/process.rs")
+        self.assertEqual(self.repo.select(event="merge_group", base_sha=self.main), ALL)
+
+    def test_a_documentation_only_merge_group_runs_no_code_job(self):
+        # Its code is its base's, which the run before it tests (#1723).
+        self.pull_request("docs/design/gossip.md", "docs/book/07-ship-it.md")
+        self.assertEqual(self.repo.select(event="merge_group", base_ref="", head_ref="", base_sha=self.main),
+                         NOTHING)
+
+    def test_a_merge_group_with_documentation_that_tests_read_runs_everything(self):
+        self.pull_request("docs/manual/intro.md")
+        self.assertEqual(self.repo.select(event="merge_group", base_sha=self.main), ALL)
+
+    def test_a_merge_group_without_a_base_runs_everything(self):
+        self.pull_request("docs/design/gossip.md")
+        self.assertEqual(self.repo.select(event="merge_group", base_sha=""), ALL)
+
 
     def test_documentation_into_a_release_train_skips_every_rust_job(self):
         base = self.stacked_base()
@@ -402,6 +436,56 @@ class SelectJobsTests(unittest.TestCase):
         after = self.repo.select(base_ref="main", base_sha=self.main)
         self.assertEqual(before, {"code": False, "gossip": False, "heavy": False, "task_arrays": False, "macos": False, "s3": False})
         self.assertEqual(after, {"code": True, "gossip": False, "heavy": True, "task_arrays": False, "macos": False, "s3": False})
+
+
+class TrainPushTests(unittest.TestCase):
+    """A train push the merge queue already tested runs nothing (#1723)."""
+
+    TRAIN = "refs/heads/release-1-3-1"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Repository(self.tmp.name)
+        self.repo.write("Cargo.lock", "[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n")
+        self.repo.write("Cargo.toml", "[package]\nname = \"reliaburger\"\n")
+        self.repo.commit("dependencies")
+        self.repo.branch("release-1-3-1")
+        self.repo.write("src/lib.rs", "fn train() {}\n")
+        self.repo.commit("a train merge")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def push(self, **kwargs):
+        return self.repo.outputs(**dict(dict(event="push", base_ref="", head_ref="", ref=self.TRAIN), **kwargs))
+
+    def test_a_push_the_queue_passed_runs_no_job(self):
+        found = self.push(queue_run="44820647332")
+        self.assertEqual(found, dict({key: "false" for key in ALL}, portable="false", tested_by="44820647332"))
+
+    def test_a_train_whose_dependencies_differ_from_mains_still_saves_its_cache(self):
+        self.repo.write("Cargo.lock", "[[package]]\nname = \"serde\"\nversion = \"1.0.1\"\n")
+        self.repo.commit("bump serde")
+        found = self.push(queue_run="7")
+        self.assertEqual((found["code"], found["portable"], found["tested_by"]), ("false", "true", "7"))
+
+    def test_the_cargo_config_counts_as_part_of_the_dependency_graph(self):
+        self.repo.write(".cargo/config.toml", "[build]\n")
+        self.repo.commit("config")
+        self.assertEqual(self.push(queue_run="7")["portable"], "true")
+
+    def test_an_unreadable_main_counts_as_different(self):
+        self.assertEqual(self.push(queue_run="7", main_ref="origin/absent")["portable"], "true")
+
+    def test_a_push_the_queue_did_not_test_runs_everything(self):
+        for queue_run in ["", "not-a-run"]:
+            with self.subTest(queue_run=queue_run):
+                found = self.push(queue_run=queue_run)
+                self.assertEqual(found, dict({key: "true" for key in ALL}, portable="true", tested_by=""))
+
+    def test_a_push_to_main_runs_everything_whatever_it_is_told(self):
+        found = self.push(queue_run="7", ref="refs/heads/main")
+        self.assertEqual((found["code"], found["tested_by"]), ("true", ""))
 
 
 if __name__ == "__main__":

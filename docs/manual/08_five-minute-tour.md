@@ -7,7 +7,7 @@ bad one back, scale one up, let an AI agent propose a change and undo it, set a 
 `relish manual tour`.
 
 It needs a Mac with Apple silicon, or Linux with QEMU and KVM, plus about 8 GiB
-of free memory and 15 GiB of disk. The one-line install fetches the signed 0.3.1 release.
+of free memory and 15 GiB of disk. The one-line install fetches the signed 0.3.2 release.
 
 ## Install and build the cluster
 
@@ -42,6 +42,10 @@ builds the Dockerfile with Buildah, pushes the result into Pickle as
 `burger:v1` and signs it with the cluster's build key. No Docker on your
 laptop, no registry account, no `docker login`. The first build pulls the Go
 toolchain image, so give it a minute; after that it takes seconds.
+
+On a cluster of bare-metal appliances the build runs on an appliance, which
+has Buildah too. The first one takes a few minutes on a small machine
+([Bare metal](17_appliance.md#take-the-tour)).
 
 Builds target `linux/amd64` and `linux/arm64` by default. The Dockerfile
 cross-compiles: its Go stage runs on the builder's own architecture and tells
@@ -224,7 +228,7 @@ guardrails, leases between agents and setting up an agent client.
 ## Set a house rule
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.1/examples/policies/platform.toml
+curl -fsSLO https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.2/examples/policies/platform.toml
 relish policy test -f platform.toml -f burger/burger.toml
 ```
 

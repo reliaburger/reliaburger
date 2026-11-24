@@ -83,6 +83,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::Jobs,
             requires: &[Capability::ProcessRuntime],
             lease: LeaseScope::NodeJobs,
+            peer_namespace: false,
             run: testkit_case!(job_runs_to_completion_and_reports_exit),
         },
         TestCase {
@@ -90,6 +91,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::Jobs,
             requires: &[Capability::ProcessRuntime],
             lease: LeaseScope::NodeJobs,
+            peer_namespace: false,
             run: testkit_case!(scheduled_job_fires_on_its_schedule),
         },
         TestCase {
@@ -97,6 +99,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::Jobs,
             requires: &[Capability::Logs, Capability::ProcessRuntime],
             lease: LeaseScope::NodeJobs,
+            peer_namespace: false,
             run: testkit_case!(job_logs_are_retrievable_after_completion),
         },
     ]
@@ -160,6 +163,7 @@ mod tests {
             deadline: crate::testkit::deadline::Deadline::after(timeout).unwrap(),
             peer_route: crate::testkit::context::PeerRoute::Direct,
             trace: Default::default(),
+            peer: None,
         };
         let result = tokio::time::timeout(
             Duration::from_secs(2),
@@ -251,6 +255,7 @@ mod tests {
             deadline: crate::testkit::deadline::Deadline::after(timeout).unwrap(),
             peer_route: crate::testkit::context::PeerRoute::Direct,
             trace: Default::default(),
+            peer: None,
         };
         let result = tokio::time::timeout(
             Duration::from_secs(2),

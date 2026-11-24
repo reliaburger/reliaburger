@@ -398,7 +398,7 @@ pub(super) async fn history_rollback_target(
 }
 
 /// How long a follower waits for the leader to start answering a
-/// forwarded rollback, as a forwarded apply does.
+/// forwarded rollback or scale, as a forwarded apply does.
 const ROLLBACK_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// `POST /v1/rollback/{app}/{namespace}` — redeploy the app's previous
@@ -605,20 +605,63 @@ async fn forward_rollback_to_leader(
     force: bool,
     caller_headers: &HeaderMap,
 ) -> Response {
+    forward_streamed_to_leader(
+        state,
+        council,
+        StreamedChange {
+            verb: "rollback",
+            app,
+            namespace,
+            force,
+            body: String::new(),
+        },
+        caller_headers,
+    )
+    .await
+}
+
+/// A change to one app that a follower forwards to the leader whole, and
+/// whose answer streams back as an apply's does: a rollback or a scale.
+pub(super) struct StreamedChange<'a> {
+    /// The route's first segment after `/v1/`: `rollback` or `scale`.
+    pub(super) verb: &'a str,
+    pub(super) app: &'a str,
+    pub(super) namespace: &'a str,
+    /// `?force=true`: change an app GitOps manages anyway.
+    pub(super) force: bool,
+    /// The request body, sent on unchanged.
+    pub(super) body: String,
+}
+
+/// Forward `change` to the leader as the caller, and relay the leader's
+/// answer back as it streams.
+pub(super) async fn forward_streamed_to_leader(
+    state: &ApiState,
+    council: &crate::council::CouncilNode,
+    change: StreamedChange<'_>,
+    caller_headers: &HeaderMap,
+) -> Response {
     let leader_url = match leader_api_url(state, council, caller_headers).await {
         Ok(url) => url,
         Err(refusal) => return refusal.into_response(),
     };
-    let force = if force { "?force=true" } else { "" };
-    let request = copy_forwarded_auth(
-        mark_leader_forwarded(
-            state
-                .cluster_http
-                .client()
-                .post(format!("{leader_url}/v1/rollback/{app}/{namespace}{force}")),
-        ),
-        caller_headers,
-    );
+    let path =
+        match crate::cluster::http::peer_path(&["v1", change.verb, change.app, change.namespace]) {
+            Ok(path) => path,
+            Err(error) => return peer_path_refusal(&error),
+        };
+    let force = if change.force { "?force=true" } else { "" };
+    let mut request = state
+        .cluster_http
+        .client()
+        .post(format!("{leader_url}{path}{force}"));
+    if !change.body.is_empty() {
+        request = request
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(change.body);
+    }
+    let request = copy_forwarded_auth(mark_leader_forwarded(request), caller_headers);
+    let verb = change.verb;
     match tokio::time::timeout(ROLLBACK_FORWARD_TIMEOUT, request.send()).await {
         Ok(Ok(response)) => {
             let mut builder = Response::builder().status(response.status());
@@ -632,13 +675,13 @@ async fn forward_rollback_to_leader(
         Ok(Err(error)) => (
             StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({
-                "error": format!("failed to forward rollback to the leader: {error}")
+                "error": format!("failed to forward {verb} to the leader: {error}")
             })),
         )
             .into_response(),
         Err(_) => (
             StatusCode::GATEWAY_TIMEOUT,
-            Json(serde_json::json!({"error": "leader rollback request timed out"})),
+            Json(serde_json::json!({"error": format!("leader {verb} request timed out")})),
         )
             .into_response(),
     }

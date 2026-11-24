@@ -73,8 +73,9 @@ The sequence:
 4. Assign IPs to both ends
 5. Bring everything up
 6. Set the default route inside the namespace to point at the gateway
-7. Enable IP forwarding on the host
-8. Accept the containers' traffic in the host's iptables FORWARD chain, because Docker and ufw set its policy to DROP (chapter 9 has the story)
+7. Make sure the node's `reliaburger` nftables table exists, with its masquerade rule (more on that below)
+8. Enable IP forwarding on the host
+9. Accept the containers' traffic in the host's iptables FORWARD chain, because Docker and ufw set its policy to DROP (chapter 9 has the story)
 
 The `rb-` prefix on namespace names avoids collisions with other tools that might create network namespaces.
 
@@ -143,6 +144,10 @@ nft add rule ip reliaburger prerouting tcp dport {host_port} dnat to {container_
 ```
 
 This is kernel-level forwarding. Zero copies, zero userspace overhead. The perimeter firewall, later in this chapter, gets a table of its own, `reliaburger_fw`, so that rebuilding it never touches these NAT chains.
+
+The same table carries the other half of NAT. A `postrouting` chain rewrites the source of anything leaving from `10.0.0.0/8` to the node's own address (`ip saddr 10.0.0.0/8 masquerade`). Without it, a container calling a service on another node sends packets from `10.0.N.C`, an address the other node couldn't route a reply to. In practice the packet never gets that far: the other node's perimeter drops it before it reaches the backend.
+
+For a long time that rule came into being as a side effect: `ensure_nft_table` ran only when a container published a port. Most nodes ran something with a port, so nobody noticed. A node running only workers, jobs or test callers never got the table, and every call those containers made to another node timed out ([#2219](https://github.com/reliaburger/reliaburger/issues/2219)). Now network setup ensures the table for every rootful container, port or not. Each step is idempotent (`add table` and `add chain` don't fail on what exists, and the masquerade rule is added only if listing the chain doesn't show one), so the thousandth container costs a few `nft` calls and changes nothing. The table is node-wide and nothing tears it down: a container's teardown removes its own namespace, veth and port map element, never the rule its neighbours still need. Port mapping still ensures the table too, which also repairs it after a host firewall reload has flushed the ruleset. The unit test runs the whole setup against a recording command executor and checks that a container with no port gets the masquerade rule.
 
 **Rootless mode uses a Rust TCP proxy.** We can't touch nftables without root, so we spawn a tokio task that binds the host port and forwards connections to the container:
 

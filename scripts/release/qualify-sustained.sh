@@ -1787,9 +1787,12 @@ chaos_one() {
         partition) rel fault partition soak-redis --from soak-redis-client --duration 60s --acknowledge --reason v02 > "$output" 2>&1 || result=$? ;;
         # One frontend instance: the replica-minimum rail counts an unscoped
         # pause as freezing every replica, and refuses it whatever the count.
+        # The pause freezes the workload (#2079), its health checks fail and
+        # Bun restarts it: that restart is the harness's own (#2197).
         pause)
             instance=$(one_of_several frontend)
             if [ -n "$instance" ]; then
+                check expect "$evidence" workload-restart "$instance"
                 rel fault pause frontend --instance "$instance" --duration 60s --acknowledge --reason v02 > "$output" 2>&1 || result=$?
             else
                 printf 'fewer than two running frontend instances to pause one of\n' > "$output"; result=1

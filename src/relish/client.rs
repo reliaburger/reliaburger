@@ -133,10 +133,10 @@ pub struct AgentVersion {
 #[derive(Clone)]
 pub struct BunClient {
     base_url: String,
-    client: Result<reqwest::Client, String>,
+    client: Result<reqwest::Client, Unusable>,
     /// The client for streaming responses. It sets no deadline of its own:
     /// [`StreamBody`] applies [`ClientTimeouts`] as it reads.
-    stream_client: Result<reqwest::Client, String>,
+    stream_client: Result<reqwest::Client, Unusable>,
     /// The deadlines requests through this client get.
     timeouts: ClientTimeouts,
     websocket_tls: Option<std::sync::Arc<rustls::ClientConfig>>,
@@ -146,6 +146,27 @@ pub struct BunClient {
     /// Ask writes to break any agent lease in their way (`--break-lease`,
     /// #1686).
     break_lease: bool,
+}
+
+/// Why a [`BunClient`] can't send anything, reported when a command first
+/// talks to the cluster.
+#[derive(Debug, Clone)]
+enum Unusable {
+    /// Its configuration is broken: an unreadable CA certificate, say.
+    Config(String),
+    /// None of the context's endpoints answered (#2241).
+    NoEndpointAnswered(Vec<super::EndpointAttempt>),
+}
+
+impl Unusable {
+    fn error(&self) -> RelishError {
+        match self {
+            Unusable::Config(reason) => RelishError::ClientConfig(reason.clone()),
+            Unusable::NoEndpointAnswered(attempts) => RelishError::NoEndpointAnswered {
+                attempts: attempts.clone(),
+            },
+        }
+    }
 }
 
 /// Options for fetching or streaming logs.
@@ -355,6 +376,20 @@ pub fn lease_release_budget() -> std::time::Duration {
 /// the owning node (its agent's answer plus the release wait).
 pub const FAULT_CLEAR_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 /// Pause between those attempts.
+/// The status relish reports for a stream's `Error` event that names none:
+/// one from a server before #2157, or a failure with no status of its own.
+const STREAM_ERROR_STATUS: u16 = 500;
+
+/// The error an apply or rollback stream ended with. The stream answered
+/// `200` before the failure, so the event carries the status the failure
+/// answers on its own (404 for an image nobody built, #2157).
+fn stream_error(message: String, status: Option<u16>) -> RelishError {
+    RelishError::ApiError {
+        status: status.unwrap_or(STREAM_ERROR_STATUS),
+        body: message,
+    }
+}
+
 const FAULT_CLEAR_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Attach an `Idempotency-Key` header when the caller has one.
@@ -965,10 +1000,15 @@ impl BunClient {
     /// broken configuration surfaces when the command first talks to the
     /// agent.
     fn unusable(base_url: &str, token: Option<&str>, reason: String) -> Self {
+        Self::unusable_because(base_url, token, Unusable::Config(reason))
+    }
+
+    /// A client every request through which fails because of `why`.
+    fn unusable_because(base_url: &str, token: Option<&str>, why: Unusable) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            client: Err(reason.clone()),
-            stream_client: Err(reason),
+            client: Err(why.clone()),
+            stream_client: Err(why),
             timeouts: ClientTimeouts::default(),
             websocket_tls: None,
             ca_pem: None,
@@ -993,12 +1033,15 @@ impl BunClient {
         // Ordinary requests answer in one go, so a total deadline bounds them.
         let client = tls
             .clone()
-            .and_then(|tls| http_client(token, tls, |builder| builder.timeout(timeouts.request)));
+            .and_then(|tls| http_client(token, tls, |builder| builder.timeout(timeouts.request)))
+            .map_err(Unusable::Config);
         // A followed log or a deploy's progress stream runs for as long as
         // the work behind it does, so its client has no deadline; `StreamBody`
         // ends it on silence (the agent sends an SSE keep-alive every 15 s)
         // or, for a deploy, at `deploy_stream`.
-        let stream_client = tls.and_then(|tls| http_client(token, tls, |builder| builder));
+        let stream_client = tls
+            .and_then(|tls| http_client(token, tls, |builder| builder))
+            .map_err(Unusable::Config);
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             client,
@@ -1170,9 +1213,7 @@ impl BunClient {
     /// different port (M21) — so they, too, are authenticated and TLS-trusting.
     /// Invalid client configuration returns an error before any request is sent.
     pub fn http(&self) -> Result<&reqwest::Client, RelishError> {
-        self.client
-            .as_ref()
-            .map_err(|reason| RelishError::ClientConfig(reason.clone()))
+        self.client.as_ref().map_err(Unusable::error)
     }
 
     /// The HTTP client for a response that streams for as long as the work
@@ -1180,9 +1221,7 @@ impl BunClient {
     /// [`Self::start_stream`] and read through [`StreamBody`], which apply
     /// the deadlines.
     fn streaming_http(&self) -> Result<&reqwest::Client, RelishError> {
-        self.stream_client
-            .as_ref()
-            .map_err(|reason| RelishError::ClientConfig(reason.clone()))
+        self.stream_client.as_ref().map_err(Unusable::error)
     }
 
     /// Send a request whose answer streams. The work before the first byte
@@ -1251,15 +1290,31 @@ impl BunClient {
             };
         }
         // BLOCKING-OK: relish CLI: a one-shot read of the local context before the command does anything long-lived; the agent commands, which `relish mcp` serves, call it off the runtime through `BunClient::local`
-        let context = super::local_context::default_path()
-            .and_then(|path| super::local_context::LocalContext::load(&path));
+        let path = super::local_context::default_path();
+        // BLOCKING-OK: relish CLI: the same one-shot read of the local context, from the path above
+        let context = path
+            .as_ref()
+            .map_err(|error| RelishError::InitFailed(error.to_string()))
+            .and_then(|path| super::local_context::LocalContext::load(path));
         match context {
             Ok(Some(context)) => {
-                return context
-                    .client(resolve_token().as_deref(), resolve_ca_cert().as_deref())
-                    .unwrap_or_else(|error| {
-                        Self::unusable(&context.endpoint, None, error.to_string())
-                    });
+                let connected = context.connect(
+                    resolve_token().as_deref(),
+                    resolve_ca_cert().as_deref(),
+                    super::local_context::probe_endpoint,
+                );
+                return match connected {
+                    Ok((client, choice)) => {
+                        Self::report_fallover(&context, &choice, path.ok().as_deref());
+                        client
+                    }
+                    Err(RelishError::NoEndpointAnswered { attempts }) => Self::unusable_because(
+                        &context.endpoint,
+                        None,
+                        Unusable::NoEndpointAnswered(attempts),
+                    ),
+                    Err(error) => Self::unusable(&context.endpoint, None, error.to_string()),
+                };
             }
             Err(error) => {
                 return Self::unusable("https://127.0.0.1:19117", None, error.to_string());
@@ -1272,6 +1327,29 @@ impl BunClient {
             "http"
         };
         Self::new(&format!("{scheme}://127.0.0.1:9117"))
+    }
+
+    /// Say which node answered when the ones tried before it didn't, and
+    /// remember it in the context at `path` so the next command asks it
+    /// first (#2241). Remembering is best effort: a busy or unwritable
+    /// context only costs the next command the same wait.
+    fn report_fallover(
+        context: &super::local_context::LocalContext,
+        choice: &super::local_context::EndpointChoice,
+        path: Option<&std::path::Path>,
+    ) {
+        for skipped in &choice.passed_over {
+            eprintln!(
+                "warning: {} didn't answer ({}); trying the cluster's next node",
+                skipped.endpoint, skipped.cause
+            );
+        }
+        if !choice.passed_over.is_empty() {
+            eprintln!("relish is using {}", choice.endpoint);
+        }
+        if let Some(path) = path {
+            let _ = context.remember_answered(path, &choice.endpoint);
+        }
     }
 
     /// Check if the agent is reachable.
@@ -1460,11 +1538,8 @@ impl BunClient {
                                 instances: instances.clone(),
                             });
                         }
-                        ApplyEvent::Error { message } => {
-                            return Err(RelishError::ApiError {
-                                status: 500,
-                                body: message.clone(),
-                            });
+                        ApplyEvent::Error { message, status } => {
+                            return Err(stream_error(message.clone(), *status));
                         }
                     }
                 }
@@ -1481,11 +1556,8 @@ impl BunClient {
                 ApplyEvent::Complete { created, instances } => {
                     result = Some(ApplyResult { created, instances });
                 }
-                ApplyEvent::Error { message } => {
-                    return Err(RelishError::ApiError {
-                        status: 500,
-                        body: message,
-                    });
+                ApplyEvent::Error { message, status } => {
+                    return Err(stream_error(message, status));
                 }
                 _ => {}
             }
@@ -1522,7 +1594,40 @@ impl BunClient {
         let response = self
             .start_stream(self.lease_header(self.streaming_http()?.post(&url)))
             .await?;
+        self.follow_apply_events(response).await
+    }
 
+    /// Set an app's replica count (`POST /v1/scale/{app}/{namespace}`),
+    /// printing the leader's progress on stderr as an apply does. With
+    /// `current_replicas`, the scale is refused if the app has another
+    /// count now; with `force`, it changes an app GitOps manages.
+    pub async fn scale(
+        &self,
+        app: &str,
+        namespace: &str,
+        replicas: u32,
+        current_replicas: Option<u32>,
+        force: bool,
+    ) -> Result<(), RelishError> {
+        let url = format!(
+            "{}{}{}",
+            self.base_url,
+            app_path("/v1/scale", app, namespace)?,
+            force_query(force)
+        );
+        let mut body = serde_json::json!({ "replicas": replicas });
+        if let Some(current) = current_replicas {
+            body["current_replicas"] = current.into();
+        }
+        let response = self
+            .start_stream(self.lease_header(self.streaming_http()?.post(&url).json(&body)))
+            .await?;
+        self.follow_apply_events(response).await
+    }
+
+    /// Read an apply-shaped progress stream to its end: progress on stderr,
+    /// and the first error as the result.
+    async fn follow_apply_events(&self, response: reqwest::Response) -> Result<(), RelishError> {
         let status = response.status().as_u16();
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -1542,11 +1647,8 @@ impl BunClient {
                 {
                     match event {
                         ApplyEvent::Progress { message } => eprintln!("  {message}"),
-                        ApplyEvent::Error { message } => {
-                            return Err(RelishError::ApiError {
-                                status: 500,
-                                body: message,
-                            });
+                        ApplyEvent::Error { message, status } => {
+                            return Err(stream_error(message, status));
                         }
                         _ => {}
                     }
@@ -4403,6 +4505,7 @@ mod tests {
         let event = format!(
             "data: {}\n\n",
             serde_json::to_string(&ApplyEvent::Error {
+                status: None,
                 message: message.to_string(),
             })
             .unwrap()
@@ -4434,6 +4537,116 @@ mod tests {
         server.abort();
         for error in [applied, rolled_back] {
             assert!(matches!(error, RelishError::ApiError { body, .. } if body == message));
+        }
+    }
+
+    /// `scale` posts the count (and the one the caller saw, when given) as
+    /// JSON, with `force` as the query, and reads the answer as an apply's
+    /// stream: an error event is the result (#2176).
+    #[tokio::test]
+    async fn scale_posts_the_count_and_reads_the_stream() {
+        use axum::{Router, routing::post};
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+        let recorder = Arc::clone(&seen);
+        let handler = move |uri: axum::http::Uri, body: String| {
+            let recorder = Arc::clone(&recorder);
+            async move {
+                let refuse = body.contains("\"replicas\":9");
+                recorder.lock().unwrap().push((uri.to_string(), body));
+                let event = if refuse {
+                    ApplyEvent::Error {
+                        message: "refused by the cluster".into(),
+                        status: None,
+                    }
+                } else {
+                    ApplyEvent::Progress {
+                        message: "app web: committed to the cluster".into(),
+                    }
+                };
+                format!("data: {}\n\n", serde_json::to_string(&event).unwrap())
+            }
+        };
+        let app = Router::new().route("/v1/scale/web/default", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = BunClient::new_with_token(&format!("http://{address}"), None);
+
+        client
+            .scale("web", "default", 3, None, false)
+            .await
+            .unwrap();
+        client
+            .scale("web", "default", 4, Some(3), true)
+            .await
+            .unwrap();
+        let refused = client
+            .scale("web", "default", 9, None, false)
+            .await
+            .unwrap_err();
+        server.abort();
+        assert!(
+            matches!(&refused, RelishError::ApiError { body, .. } if body == "refused by the cluster"),
+            "{refused:?}"
+        );
+        let seen = seen.lock().unwrap().clone();
+        let bodies: Vec<serde_json::Value> = seen
+            .iter()
+            .map(|(_, body)| serde_json::from_str(body).unwrap())
+            .collect();
+        assert_eq!(seen[0].0, "/v1/scale/web/default");
+        assert_eq!(bodies[0], serde_json::json!({ "replicas": 3 }));
+        assert_eq!(seen[1].0, "/v1/scale/web/default?force=true");
+        assert_eq!(
+            bodies[1],
+            serde_json::json!({ "replicas": 4, "current_replicas": 3 })
+        );
+    }
+
+    /// Serve `data` as the one event of every apply and rollback stream, and
+    /// return the errors `relish apply` and `relish rollback` end with.
+    async fn stream_errors_for(data: &str) -> Vec<RelishError> {
+        use axum::{Router, routing::post};
+        let event = format!("data: {data}\n\n");
+        let handler = move || {
+            let event = event.clone();
+            async move { event }
+        };
+        let app = Router::new()
+            .route("/v1/apply", post(handler.clone()))
+            .route("/v1/rollback/web/default", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = BunClient::new_with_token(&format!("http://{address}"), None);
+        let applied = client.apply(&Config::default()).await.unwrap_err();
+        let rolled_back = client.rollback("web", "default").await.unwrap_err();
+        server.abort();
+        vec![applied, rolled_back]
+    }
+
+    /// #2157: a stream's error names the status the server gave it, not 500.
+    #[tokio::test]
+    async fn a_streamed_error_reports_the_status_it_carries() {
+        let data = serde_json::to_string(&ApplyEvent::Error {
+            message: "burger:v1 isn't in this cluster's registry (Pickle)".into(),
+            status: Some(404),
+        })
+        .unwrap();
+
+        for error in stream_errors_for(&data).await {
+            assert_eq!(
+                error.to_string(),
+                "API error (status 404): burger:v1 isn't in this cluster's registry (Pickle)"
+            );
+        }
+    }
+
+    /// A server from before #2157 sends no status: relish says 500, as it did.
+    #[tokio::test]
+    async fn a_streamed_error_with_no_status_still_reports_500() {
+        for error in stream_errors_for(r#"{"type":"Error","message":"boom"}"#).await {
+            assert_eq!(error.to_string(), "API error (status 500): boom");
         }
     }
 

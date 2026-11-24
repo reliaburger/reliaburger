@@ -5,8 +5,8 @@ laptop, see the [quickstart guide](quickstart.md). For the architectural vision,
 see the [whitepaper](whitepaper.md); for status and what's next, see the
 [roadmap](roadmap.md).
 
-0.3.1 was released on 21 November 2026. Its signed binaries, guest images and
-installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.1),
+0.3.2 was released on 23 November 2026. Its signed binaries, guest images and
+installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.2),
 and `curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop` installs it
 and builds a laptop cluster; without a flag the installer explains the choices.
 Until 1.0.0 Reliaburger is good enough for home labs and dev clusters, not production. Every
@@ -14,7 +14,7 @@ release follows the same [build, staging and promotion procedure](releasing.md#m
 From 0.2.7, every release file also carries a build provenance
 attestation that anyone can check with `gh attestation verify`, and the macOS `relish` can be
 notarised ([checks a stranger can run](releasing.md#checks-a-stranger-can-run)).
-The limits below are the ones 0.3.1 ships with; the [changelog](../CHANGELOG.md)
+The limits below are the ones 0.3.2 ships with; the [changelog](../CHANGELOG.md)
 says what changed in each release, and the [roadmap](roadmap.md) tracks
 what comes after it. The [feature status page](https://reliaburger.com/features)
 rates every feature Ready, Beta, Alpha or Planned, with its restrictions and open
@@ -35,7 +35,7 @@ and trade-offs against other projects, with dated evidence and explicit release 
 
 ## What's in the binary
 
-This is what 0.3.1, the release the installer fetches, does. Each node runs
+This is what 0.3.2, the release the installer fetches, does. Each node runs
 one agent, `bun`; you drive the cluster with one CLI, `relish`. Scheduling,
 clustering, service discovery, ingress, PKI, secrets, an image registry,
 metrics, logs, GitOps, jobs and fault injection are compiled into that agent,
@@ -184,8 +184,9 @@ each node's platform. Until 1.0 it works only between builds with the same
 cluster formats. 0.2.3 kept 0.2.2's, and a 0.2.2 cluster rolled onto it in
 place ([record](qualification/2026-10-29-rolling-walk-0.2.2-to-0.2.3.md));
 0.2.4, 0.2.5 and 0.2.6 each change them again, 0.2.7 kept 0.2.6's, and 0.2.8
-and 0.3.0 each change them again, so a 0.2.8 cluster starts afresh on 0.3.0,
-and 0.3.1 keeps 0.3.0's, so a 0.3.0 cluster rolls onto it in place
+and 0.3.0 each change them again, so a 0.2.8 cluster starts afresh on 0.3.0;
+0.3.1 keeps 0.3.0's, so a 0.3.0 cluster rolls onto it in place, and 0.3.2
+moves the protocol to 61, so a 0.3.1 cluster starts afresh on 0.3.2
 ([compatibility before 1.0.0](releasing.md#compatibility-before-100)). A release with other cluster formats, or a
 rollback to a version some node doesn't hold, is refused before anything is
 recorded.
@@ -213,6 +214,9 @@ never retries a failure. See [how Reliaburger is tested](testing.md).
 
 **A terminal UI and a web dashboard.** Run `relish` with no arguments for the
 TUI; `relish dashboard` opens the web UI through your authenticated CLI session.
+The TUI scales an app with `+` and `-` on its Instances tab, after asking, as
+`relish scale web --replicas 3` does from the shell. The count goes into the
+app's spec, so the next apply of its file puts back the file's count.
 
 **The manual ships in the binary.** `relish manual` is a searchable reader with
 runnable examples, and `relish source` fuzzy-searches the exact source the
@@ -563,7 +567,7 @@ xcode-select --install
 
 ## Container runtimes (optional)
 
-For 0.3.1, Bun selects Linux runc or the built-in process runtime. macOS containers run through managed Linux VMs. **ProcessGrill** (plain OS processes) is the built-in fallback that works everywhere without extra software — you don't need to install anything else to get started.
+For 0.3.2, Bun selects Linux runc or the built-in process runtime. macOS containers run through managed Linux VMs. **ProcessGrill** (plain OS processes) is the built-in fallback that works everywhere without extra software — you don't need to install anything else to get started.
 
 ### runc (Linux)
 
@@ -602,7 +606,7 @@ or operator firewall rules when diagnosing direct-host connectivity.
 
 ### macOS containers: managed Linux VMs
 
-For 0.3.1, run containers through the [managed laptop quickstart](quickstart.md):
+For 0.3.2, run containers through the [managed laptop quickstart](quickstart.md):
 
 ```sh
 relish setup --quickstart --nodes 3
@@ -613,7 +617,7 @@ foreground process workloads. Direct Apple Container selection is disabled,
 even when its CLI is installed: interrupted CLI requests can outlive Bun and
 mutate the Apple daemon, and their recovery guarantees are not yet complete.
 The adapter and its manual development tests remain in the repository for future
-work; they are outside the 0.3.1 runtime profile.
+work; they are outside the 0.3.2 runtime profile.
 
 ### ProcessGrill (built-in fallback)
 
@@ -633,7 +637,7 @@ sixteen concurrent exec requests, with a five-minute deadline, 64 KiB request
 limit and 1 MiB combined stdout/stderr response limit. Commands inherit the host
 environment and run without container isolation.
 
-**0.3.1 contract: foreground workloads only.** The main process stays under Bun's
+**0.3.2 contract: foreground workloads only.** The main process stays under Bun's
 supervision and children must remain in its supervised process group. A service
 can run unattended and spawn workers; foreground does not mean an open terminal.
 Use the application's foreground/no-daemon option. A shell wrapper should `exec`
@@ -723,10 +727,12 @@ for the audit, exact suite contracts and CI mapping.
 
 ### Fuzzing
 
-Every decoder that reads bytes from another machine (gossip, Raft frames, DNS,
-backups, OCI manifests, join CSRs, app and node TOML) has a
-[cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html) target in
-`fuzz/`. See [testing.md](testing.md#fuzzing).
+The decoders that read bytes from another machine (gossip, Raft frames, DNS,
+the API's bearer check, ingress requests, the netboot TFTP, DHCP and disk
+reports, backups, OCI manifests, join CSRs, app and node TOML) have
+[cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html) targets in
+`fuzz/`. See [testing.md](testing.md#fuzzing), which ranks the decoders still
+without one.
 
 ```sh
 make fuzz-corpus-check  # every target body over its checked-in corpus, on stable
@@ -952,7 +958,10 @@ already run, from packages and firewall rules to systemd units, see
 [Running Reliaburger on your own Linux servers](linux-servers.md).
 To turn spare mini PCs or thin clients into appliance nodes over the network
 instead, with no distro to install, see
-[Bare metal: the appliance and netboot](manual/17_appliance.md).
+[Bare metal: the appliance and netboot](manual/17_appliance.md). `relish
+netboot --stream-logs` prints each machine's kernel and boot logs as it
+installs and boots, so a machine with no serial port needn't be watched on its
+monitor.
 
 Keep `[cluster].name` identical on every node. `relish init`, `relish setup`
 and `relish dev create` write it for you; Bun validates it as a DNS-style SPIFFE trust domain.
@@ -1166,6 +1175,7 @@ TUI keys:
 | `/` | Filter the current list; search the logs or the Logs and Metrics tabs, matches in red and bold |
 | Escape (with a filter or search) | Clear it |
 | `k`, Ctrl-K | Kill the selected instance in the Instances tab, after a `[y/N]` prompt; it's an audited Smoker kill fault |
+| `+`, `-` | Scale the app in the Instances tab up or down by one, after a `[y/N]` prompt; the next apply of its file puts back the file's count |
 | `f` | Toggle log following |
 | Escape, `q` | Go back; quit from the dashboard |
 
@@ -1855,9 +1865,9 @@ that gossip reports dead is named rather than silently left out.
 (`--app`, `--severity`, `--limit`). `relish exec <app> <cmd>` runs a command
 once, without stdin or a terminal, and exits with its exit code. `relish
 resolve <name> --namespace <ns>` picks a service whose name exists in several
-namespaces. `-o json` works on every command except the eight interactive
+namespaces. `-o json` works on every command except the nine interactive
 ones (`tui`, `dashboard`, `manual`, `source`, the guided `setup`, `dev
-shell`, `machines claim`, `netboot`), which refuse it with exit 2; `setup --quickstart` and `setup --ssh`
+shell`, `machines claim`, `machines logs`, `netboot`), which refuse it with exit 2; `setup --quickstart` and `setup --ssh`
 print what they built, for an agent to quote; `logs` and `batch watch` print one object per line,
 and a command that changes something reports what it did (manual chapter
 13). `relish fmt` keeps comments.
@@ -1951,7 +1961,7 @@ different name or namespace for the other kind.
 
 Release maintainers: see [the build, signing and publication procedure](releasing.md).
 
-Direct Apple Container is disabled for 0.3.1 while interrupted daemon-command
+Direct Apple Container is disabled for 0.3.2 while interrupted daemon-command
 recovery remains unfinished. Use the managed Linux/runc quickstart on macOS.
 
 Node chaos (kill, drain, pressure and council partitions) reserves one cluster-wide
@@ -2030,8 +2040,11 @@ machines.
   the first failure, writes the records and a rule-of-three summary
   (`DIR.md`), and deletes the VM and checkout (`--keep` keeps them). It
   refuses `reliaburger-test`, an existing VM and a dirty checkout.
-- `scripts/release/nightly-qualify.sh --train release-X-Y-Z`
-  runs the long tiers on a train's tip every night: the power-cut and reboot
+- `scripts/release/nightly-qualify.sh --once --train release-X-Y-Z`
+  arms one night, the evening before a planned freeze: a launchd job that
+  builds and stages the train's tip at the cut-off, runs the long tiers
+  overnight and disarms itself (`--disarm` cancels; `--dispatch` instead of
+  `--once` starts the same night now). A night runs the power-cut and reboot
   runs, then the V02 and jobs fast soaks against a staged build of the tip,
   then the job final when the release needs the full gate, which it works
   out with `release_tier.py` (`--gate full` can raise it, never lower it).
@@ -2055,14 +2068,17 @@ machines.
   a power cut and then checking retirement, explicit redeployment and same-boot
   adoption.
 - `scripts/release/qualify-storage-power-cut.sh --vm DISPOSABLE_LIMA_VM
-  --fixture exporter|leases|backups --iterations N` cuts the VM's power at a
+  --fixture exporter|leases|backups|volumes --iterations N` cuts the VM's power at a
   random moment while worker processes export Parquet files (three exporters
-  sharing one checkpoint and lock), mutate lease stores, or upload and prune
-  council backups, each logging finished operations to a synced ledger. After
+  sharing one checkpoint and lock), mutate lease stores, upload and prune
+  council backups, or snapshot, export and prune a loop-mounted Btrfs volume
+  that a writer keeps filling (as root), each logging finished operations to
+  a synced ledger. After
   the reboot it checks that every acknowledged export is at the destination
   byte for byte, that nothing was pruned before it was exported, that every
   acknowledged lease operation survived, that the newest acknowledged backups
-  are intact and restorable, and that the lock and stores are reusable. It writes a Markdown
+  are intact and restorable, that every acknowledged volume write and snapshot
+  archive survived whole, and that the lock and stores are reusable. It writes a Markdown
   record with a rule-of-three bound. It refuses the shared `reliaburger-test`
   VM.
 

@@ -2305,9 +2305,25 @@ fn build_endpoint_catalog(
             .values()
             .map(|service| service.vip),
     );
-    desired
+    let mut catalog = desired
         .endpoint_catalog
-        .reconcile_reserving(grouped.into_values(), reserved)
+        .reconcile_reserving(grouped.into_values(), reserved)?;
+    // Each caller's node enforces a service's `allow_from` in its connect
+    // hook, so every node needs the list, not only the nodes running the
+    // service (#2216). It comes from the spec, so a changed list reaches
+    // the other nodes with the next catalogue, before the rollout finishes.
+    for (qualified, service) in &mut catalog.services {
+        service.allow_from = ServiceId::parse(qualified)
+            .and_then(|id| {
+                desired
+                    .apps
+                    .get(&crate::meat::types::AppId::new(&id.name, &id.namespace))
+            })
+            .and_then(|spec| spec.firewall.as_ref())
+            .filter(|firewall| !firewall.allow_from.is_empty())
+            .map(|firewall| firewall.allow_from.clone());
+    }
+    Ok(catalog)
 }
 
 /// Build the scheduler's view of the cluster from gossip membership
@@ -3366,7 +3382,7 @@ async fn deploy_outcome(
                     reason,
                 });
             }
-            ApplyEvent::Error { message } if failure.is_none() => {
+            ApplyEvent::Error { message, .. } if failure.is_none() => {
                 failure = Some(DeployWaitError::Failed(message));
             }
             _ => {}
@@ -3803,6 +3819,7 @@ mod tests {
                     counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let _ = events
                         .send(ApplyEvent::Error {
+                            status: None,
                             message: "cluster discovery publication failed: local service \
                                       requires its committed cluster allocation"
                                 .into(),
@@ -4204,6 +4221,7 @@ mod tests {
                             status_age_ms: None,
                             age_seconds: None,
                             image: None,
+                            data_on_node: false,
                             reason: None,
                         }]);
                     }
@@ -4729,6 +4747,7 @@ command = ["false"]
                         deploys.push(std::time::Instant::now());
                         let _ = events
                             .send(ApplyEvent::Error {
+                                status: None,
                                 message: "replacement exited before its identity was recorded"
                                     .into(),
                             })
@@ -4826,6 +4845,7 @@ image = "busybox:latest"
             status_age_ms: None,
             age_seconds: None,
             image: None,
+            data_on_node: false,
             reason: None,
         };
         let mut asked = Vec::new();
@@ -5150,6 +5170,7 @@ image = "busybox:latest"
                 status_age_ms: None,
                 age_seconds: None,
                 image: None,
+                data_on_node: false,
                 reason: None,
             },
             crate::bun::agent::InstanceStatus {
@@ -5165,6 +5186,7 @@ image = "busybox:latest"
                 status_age_ms: None,
                 age_seconds: None,
                 image: None,
+                data_on_node: false,
                 reason: None,
             },
         ];
@@ -5210,6 +5232,7 @@ image = "busybox:latest"
         let message = "init container 0 failed for instance default__web-0: \
                        exited with code 1: runc run failed: container's cgroup is not empty";
         tx.send(ApplyEvent::Error {
+            status: None,
             message: message.to_string(),
         })
         .await
@@ -5238,6 +5261,7 @@ image = "busybox:latest"
         let (tx, rx) = mpsc::channel(4);
         for event in [
             ApplyEvent::Error {
+                status: None,
                 message: "default__web-g1-0 failed its health check".into(),
             },
             ApplyEvent::RolloutAborted {
@@ -5246,6 +5270,7 @@ image = "busybox:latest"
                 reason: "rolled back — old instances preserved".into(),
             },
             ApplyEvent::Error {
+                status: None,
                 message: "rolled back — old instances preserved".into(),
             },
         ] {
@@ -5267,9 +5292,11 @@ image = "busybox:latest"
         let (tx, rx) = mpsc::channel(8);
         for event in [
             ApplyEvent::Error {
+                status: None,
                 message: "node capacity cannot admit cpu=100m mem=32Mi".into(),
             },
             ApplyEvent::Error {
+                status: None,
                 message: "a later error".into(),
             },
             ApplyEvent::RolloutAborted {
@@ -5278,6 +5305,7 @@ image = "busybox:latest"
                 reason: "rolled back — old instances preserved".into(),
             },
             ApplyEvent::Error {
+                status: None,
                 message: "rolled back — old instances preserved".into(),
             },
         ] {
@@ -5840,6 +5868,65 @@ image = "busybox:latest"
             svc.backends
                 .iter()
                 .any(|b| b.node_id == "node-b" && !b.healthy)
+        );
+    }
+
+    /// Every node enforces a target's `allow_from` for its own callers, so
+    /// the catalogue carries it from the spec, and a changed list changes
+    /// the catalogue (#2216). An empty list asks for nothing, like none.
+    #[test]
+    fn build_endpoint_catalog_carries_each_services_allow_from() {
+        use crate::onion::service_id::ServiceId;
+
+        let members = vec![member("node-a", 5001)];
+        let reports = AggregatedState {
+            leadership_epoch: None,
+            receive_deadlines: Default::default(),
+            reports: HashMap::new(),
+            stale_nodes: vec![],
+            stale_since: Default::default(),
+            capabilities: HashMap::new(),
+            readiness: HashMap::new(),
+        };
+        let mut desired = crate::council::types::DesiredState::default();
+        desired.apps.insert(
+            crate::meat::types::AppId::new("db", "backend"),
+            spec_from_toml(
+                "[app.db]\nimage = \"x:1\"\nport = 5432\n\
+                 [app.db.firewall]\nallow_from = [\"shop/api\"]\n",
+            ),
+        );
+        desired.apps.insert(
+            crate::meat::types::AppId::new("web", "shop"),
+            spec_from_toml(
+                "[app.web]\nimage = \"x:1\"\nport = 80\n[app.web.firewall]\nallow_from = []\n",
+            ),
+        );
+
+        let catalog = build_endpoint_catalog(&members, &reports, &desired).unwrap();
+        let db = catalog.resolve(&ServiceId::new("backend", "db")).unwrap();
+        assert_eq!(db.allow_from, Some(vec!["shop/api".to_string()]));
+        let web = catalog.resolve(&ServiceId::new("shop", "web")).unwrap();
+        assert_eq!(web.allow_from, None);
+
+        // Widening the list changes the committed catalogue, so every node
+        // is sent the new one.
+        desired.endpoint_catalog = catalog.clone();
+        desired.apps.insert(
+            crate::meat::types::AppId::new("db", "backend"),
+            spec_from_toml(
+                "[app.db]\nimage = \"x:1\"\nport = 5432\n\
+                 [app.db.firewall]\nallow_from = [\"shop/api\", \"shop/web\"]\n",
+            ),
+        );
+        let widened = build_endpoint_catalog(&members, &reports, &desired).unwrap();
+        assert_ne!(widened, catalog);
+        assert_eq!(
+            widened
+                .resolve(&ServiceId::new("backend", "db"))
+                .unwrap()
+                .allow_from,
+            Some(vec!["shop/api".to_string(), "shop/web".to_string()])
         );
     }
 

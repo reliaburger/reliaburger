@@ -1,0 +1,28 @@
+---
+source: src/relish/tui/views/help.rs
+expression: "render_to_string(&app, 80, 25)"
+---
+ RELISH  3 nodes · 3 apps · leader node-1 · CONNECTED                           
+                                                                                
+┌node detail───────────────────────────────────────────────────────────────────┐
+│node-1                                                                        │
+│ Overview  │  Workloads  │ [Maintenance]                                      │
+│←/→ or Tab: switch tabs                                                       │
+│                                                                              │
+│If node-1 went away (a reboot, an OS update, a decommission):                 │
+│                                                                              │
+│council   a voter: the council loses quorum, only 1 of 3 voters would answer  │
+│                                                                              │
+│APP     NAMESPACE  HERE  READY ELSEWHERE  IMPACT            DATA              │
+│cache   default       1                0  goes down         here              │
+│app-2   default       1                1  loses redundancy  -                 │
+│worker  default       1                1  loses redundancy  -                 │
+│web     default       1                2  keeps serving     -                 │
+│                                                                              │
+│DATA here: a managed volume or host path on this node. That replica waits for │
+│the node to come back rather than moving.                                     │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+ [a]pps [n]odes [j]obs [e]vents [l]ogs [r]outes [s]earch [?]help [:]cmd [q]uit

@@ -132,6 +132,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::ImageRegistry,
             requires: &[Capability::Registry],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(push_and_pull_image_roundtrip),
         },
         TestCase {
@@ -139,6 +140,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::ImageRegistry,
             requires: &[Capability::Registry],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(manifest_catalog_lists_pushed_image),
         },
         TestCase {
@@ -146,6 +148,7 @@ pub fn cases() -> Vec<TestCase> {
             group: TestGroup::ImageRegistry,
             requires: &[Capability::Registry, Capability::ContainerRuntime],
             lease: LeaseScope::Applications,
+            peer_namespace: false,
             run: testkit_case!(deploy_from_cluster_registry),
         },
     ]

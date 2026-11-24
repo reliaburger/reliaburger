@@ -1160,6 +1160,88 @@ with a `default`; without one, required) and a `body` string of ordinary
 - **Not done.** No registry: templates come from files or git. No logic in
   templates, and no nesting.
 
+### 5.13 Scaling Outside the File (#2176)
+
+`relish scale web --replicas 3`, and `+` and `-` on the terminal UI's
+Instances tab, set an app's replica count without editing its file. The
+question that shapes the design is what a later `relish apply` of the file,
+or a GitOps sync, does with that count.
+
+**Decision: a scale is a spec write, and the file wins.** `POST
+/v1/scale/{app}/{namespace}` with `{"replicas": N}` reads the app's stored
+spec from the council, sets `replicas`, and re-applies that one-app config
+through `cluster_apply`, as `relish rollback` does. Policy admission, the
+owner rules (5.11), agent leases, the audit record (`app.scaled`, with
+`replicas_from` and `replicas_to`) and the Raft write are all the apply's,
+so nothing about who may change what is new. The count lives in exactly one
+place, the spec. Nothing undoes it except another write, and the next apply
+of the file is one: it writes the file's count back. That's the honest
+answer to drift. The cluster never pretends the file says 3, and `relish
+apply --dry-run` against the file shows the app as changed until someone
+either puts 3 in the file or applies the file and accepts its count. It's
+also what `kubectl scale` followed by `kubectl apply` does when the manifest
+sets `replicas`, so a Kubernetes user isn't surprised.
+
+- **The stored spec, not the declared one.** The re-applied spec is the
+  effective one (5.11's `declared_apps` holds the declared one beside it):
+  its images are already bound to digests, so a scale never resolves a tag
+  again and quietly changes the bytes that run. The policy defaults it
+  carries are judged again and fill nothing. `ordinals` is cleared, as
+  rollback clears it; `owner` stays, so only the owner's token or an admin
+  can scale an owned app.
+- **GitOps.** An app GitOps manages is refused with 409 unless
+  `?force=true` (`relish scale --force`), as `delete` and `rollback` are
+  (#693). A forced scale moves the declared spec too, so the next sync sees
+  git and the cluster differ and puts back git's count, within a poll. The
+  apply's own warning says so in the progress stream.
+- **What has no count.** Zero is refused (400): a spec's `replicas` is at
+  least 1, and `relish stop` is how an app goes to zero while keeping its
+  count for the next start. An autoscaled app (409) belongs to the
+  autoscaler between its `[autoscale]` bounds, and a daemon set (409) has
+  no count. `AppSpec::scale_refusal` holds these rules, and an agent's
+  `relish agent propose scale` uses the same function, so a person and an
+  agent are refused for the same things.
+- **A stopped app** keeps its count in the spec. Scaling it starts it with
+  the new count, as an apply starts it.
+- **The precondition.** The body may carry `current_replicas`, the count
+  the caller saw in the spec, like `kubectl scale --current-replicas`. When
+  the spec has another count now, the scale is refused (409) rather than
+  overwriting whoever scaled in between. The terminal UI always sends it:
+  its question says "from 2 to 3", and 3 must not land on top of someone
+  else's 5. Without it the last writer wins, as with apply.
+- **Where.** A follower forwards the request whole, body and `force`
+  included, as the caller (`forward_streamed_to_leader`, shared with
+  rollback), so the leader reads the spec from its own state. A standalone
+  node keeps no desired state, so it answers 400 and says to change the
+  file. The answer is the apply's progress stream (SSE), so `relish scale`
+  prints the same lines `relish apply` does. The scope is `scale`, the
+  same permission `relish stop` needs, on a `deployer` token.
+
+**Alternatives we didn't take.**
+
+- *An override beside the spec*, like the autoscaler's
+  `autoscale_overrides`, which an apply clears. It keeps the file's count
+  visible as "declared", but then two numbers describe one app, every
+  reader has to know which wins, and an apply that clears it is the same
+  behaviour as ours with more state. We'd want it only if scales had to
+  survive applies, and that is exactly the silent drift we don't want.
+- *An override that survives applies* (what Kubernetes users get by
+  leaving `replicas` out of the manifest so `kubectl scale` and an HPA own
+  it). That makes the file lie about the app, and GitOps could never
+  converge it. If an app's count should be someone else's, that's what
+  `[autoscale]` or a controller's `owner` (5.11) is for.
+- *A narrow Raft entry* (`AppScale { app_id, replicas }`) that changes only
+  the count inside the state machine. It would close the small window in
+  which an apply landing between our read and our write is overwritten by
+  the old spec with the new count. But it would skip policy admission or
+  need its own, and it's a wire change for a race that the precondition and
+  rollback already live with. Rollback re-applies a read spec the same way.
+- *Scaling through a proposal* that the person approves at once. Proposals
+  are how agents change things (`relish agent propose scale`); a person
+  with a deployer token doesn't need to ask themselves for permission.
+- *`relish scale <app> <N>`* with a positional count. `--replicas` is what
+  `kubectl scale` takes, and a flag can't be mistaken for an app name.
+
 ## 6. Configuration
 
 All deploy configuration lives under the `[app.<name>.deploy]` TOML section. Defaults are set per-directory in a `_defaults.toml` file, merged into each app by `relish compile`. There is no cluster-level `[defaults.app.deploy]` section — the block shown below is planned, not implemented.
@@ -1262,7 +1344,7 @@ In a cluster either outcome marks the app `RolloutFailed` (Section 5.2), so the 
 
 **Trigger:** An operator manually sets `replicas = 5` while the autoscaler's current evaluation says the app needs 3 replicas.
 
-**Behaviour:** Manual scale operations (via `relish scale` or a git push changing the `replicas` field) reset the autoscaler's runtime override. The autoscaler respects the new base count and re-evaluates from there. However, if the autoscaler's evaluation window still shows low utilisation, it may scale back down to 3 on the next evaluation cycle.
+**Behaviour:** `relish scale` refuses an autoscaled app (5.13): the autoscaler owns its count between `min` and `max`, so a manual count would only be undone. A git push or an apply that changes the `replicas` field resets the autoscaler's runtime override. The autoscaler respects the new base count and re-evaluates from there. However, if the autoscaler's evaluation window still shows low utilisation, it may scale back down to 3 on the next evaluation cycle.
 
 **Mitigation:** To temporarily override the autoscaler, operators can:
 
