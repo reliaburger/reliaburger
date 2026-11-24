@@ -334,6 +334,17 @@ which is less than an anonymous caller can already do in that window. The
 moment the cluster has a master key or a first token, both need the service
 token again.
 
+That same cluster refuses its first token. Once a token exists the API
+answers every call without a credential with 401, so the nodes, which have
+no service token, would be shut out. `relish token create` answers 409:
+
+```text
+refusing to create the first API token: this plaintext cluster has no master key, so its nodes have no service token, and once a token exists the API answers their calls (placement polls, rollout reports) with 401. Set [security] master_key_path to the same key on every node, restart them, then create the token
+```
+
+Give every node the same master key first, as the message says, then make
+the token.
+
 ## Agent tokens and proposals
 
 An AI agent should have its own token, never yours. Make one with `--agent`:

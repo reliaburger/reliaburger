@@ -12573,6 +12573,35 @@ async fn a_follower_forwards_the_rollouts_read_to_the_leader() {
     }
 }
 
+/// #2302: a 0.3.2 leader doesn't serve the rollouts read and answers 404.
+/// A follower passes the 404 on, saying why, so relish sees what it would
+/// see asking the old node itself, not a 503 that fails the whole look.
+#[tokio::test]
+async fn a_follower_passes_on_its_leaders_rollouts_404() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let leader_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let leader_port = leader_listener.local_addr().unwrap().port();
+    // An old release's router: no rollouts route, so axum's empty 404.
+    let leader = axum::Router::new();
+    tokio::spawn(async move { axum::serve(leader_listener, leader).await.unwrap() });
+    let (follower, nodes) = follower_of_the_leader_api_on(admin, None, leader_port).await;
+
+    let (status, reply) = send_bounded(
+        follower,
+        "GET",
+        "/v1/diagnostics/rollouts",
+        &admin_key,
+        "",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{reply}");
+    assert!(reply.contains("may run an older release"), "{reply}");
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
 /// #2240: a node with no council has no rollouts to report: an empty list,
 /// so `relish apply --wait` goes by the instance count.
 #[tokio::test]

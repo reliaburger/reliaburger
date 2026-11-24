@@ -42,6 +42,11 @@ Not released yet: this is what the train carries, and it can change before the t
 - `make ci` no longer times out on a machine whose `relish` context names a cluster that's switched off. The examples dry-run test, and the other tests that run `relish` with no cluster of their own, read the developer's context and waited about 4 s per command for it; they now give each `relish` an empty `RELIABURGER_HOME` and drop the endpoint, token and CA variables ([#2290](https://github.com/reliaburger/reliaburger/issues/2290)).
 - A token scoped to some namespaces no longer misses its own events on a busy cluster. `GET /v1/events` took the newest `limit` of every node's events merged and only then kept the token's, so another namespace's traffic on one node could push the rest out. Each node's events are now trimmed to the token's scope before the merge ([#1322](https://github.com/reliaburger/reliaburger/issues/1322)).
 
+### Fixed
+
+- `relish apply --wait` works against a cluster whose leader still runs 0.3.2, as it does for most of a rolling `relish upgrade`. A follower passes the old leader's 404 for the rollouts read on as a 404 instead of a 503, and `relish` treats a failed rollouts read as none rather than as a failed look, so the wait no longer times out with no progress. With no rollouts read it counts only the instances running the applied image, so an image update isn't ready while the old version serves, and where it can't tell images apart it warns once that it counts running replicas only ([#2302](https://github.com/reliaburger/reliaburger/issues/2302)).
+- The security manual and the `[security]` reference say a plaintext cluster with no master key refuses its first API token, and quote the refusal ([#2303](https://github.com/reliaburger/reliaburger/issues/2303)).
+
 ## [0.3.2] - 2026-11-23
 
 Fixes from the Wyse 3040 lab that need a new appliance image. [Release page](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.2), [release log](docs/release-log.md#032-wyse-lab-fixes).

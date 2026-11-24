@@ -17,7 +17,12 @@
 //! apps (`GET /v1/diagnostics/apps`) and every node's instances, plus one
 //! leader read, `GET /v1/diagnostics/rollouts`, which says whether each
 //! app's current spec has rolled out. A node that predates that read
-//! answers 404, and the wait then goes by the instance count alone.
+//! answers 404, and a follower whose leader predates it passes that 404 on.
+//! Without the read, an update looks ready at once, since the old version's
+//! instances run every replica, so the wait counts only the instances that
+//! run the applied image. Where it can't tell the images apart (a process
+//! workload, or a node that pinned the image to its digest) it counts every
+//! running replica and warns once that it does (#2302).
 //!
 //! [`assess`] is pure, and [`wait_until_ready`] takes its observations from a
 //! closure, so the unit tests drive both without a cluster.
@@ -180,7 +185,13 @@ pub fn assess(targets: &[WaitTarget], observation: &Observation) -> Vec<AppReadi
                     .map(|app| app.rolled_out)
             });
             match evidence {
-                Some(evidence) => assess_app(target, evidence, rolled_out, &observation.instances),
+                Some(evidence) => assess_app(
+                    target,
+                    evidence,
+                    rolled_out,
+                    observation.rollouts.is_some(),
+                    &observation.instances,
+                ),
                 None => AppReadiness {
                     namespace: target.namespace.clone(),
                     app: target.app.clone(),
@@ -201,20 +212,29 @@ fn assess_app(
     target: &WaitTarget,
     evidence: &DesiredAppEvidence,
     rolled_out: Option<bool>,
+    rollouts_known: bool,
     instances: &Instances,
 ) -> AppReadiness {
-    let own: Vec<&ClusterInstanceStatus> = instances
+    let all: Vec<&ClusterInstanceStatus> = instances
         .rows
         .iter()
         .filter(|row| {
             row.instance.app_name == target.app && row.instance.namespace == target.namespace
         })
         .collect();
-    let running_count = own
-        .iter()
-        .filter(|row| row.instance.state == "running")
-        .count();
-    let running = u32::try_from(running_count).unwrap_or(u32::MAX);
+    // With no rollouts read, the old version's instances would count as
+    // the new one's: keep only those on the applied image, where that can
+    // be told.
+    let own = if rollouts_known {
+        all.clone()
+    } else {
+        on_applied_image(target, &all).unwrap_or_else(|| all.clone())
+    };
+    let is_running = |row: &&&ClusterInstanceStatus| row.instance.state == "running";
+    let running = u32::try_from(own.iter().filter(is_running).count()).unwrap_or(u32::MAX);
+    let older = u32::try_from(all.iter().filter(is_running).count())
+        .unwrap_or(u32::MAX)
+        .saturating_sub(running);
     let wanted = wanted(target.count, evidence);
     // An app that wants no replicas never rolls out anywhere, so there's
     // nothing to wait for.
@@ -230,7 +250,14 @@ fn assess_app(
         nodes: nodes.into_iter().map(str::to_string).collect(),
         rolled_out,
         phase: phase(
-            target, evidence, rolled_out, wanted, &own, running, ready, instances,
+            target,
+            evidence,
+            rolled_out,
+            wanted,
+            &own,
+            (running, older),
+            ready,
+            instances,
         ),
         reason: if ready {
             None
@@ -238,6 +265,105 @@ fn assess_app(
             apps_cmd::reason(evidence, &own)
         },
     }
+}
+
+/// The instances in `own` that run the image `target` applies, or `None`
+/// when that can't be told for every one of them: the app runs no image, a
+/// node didn't report an instance's image, or pinning replaced its tag.
+fn on_applied_image<'a>(
+    target: &WaitTarget,
+    own: &[&'a ClusterInstanceStatus],
+) -> Option<Vec<&'a ClusterInstanceStatus>> {
+    let applied = target.image.as_deref()?;
+    let mut current = Vec::new();
+    for row in own {
+        if runs_image(applied, row.instance.image.as_deref()?)? {
+            current.push(*row);
+        }
+    }
+    Some(current)
+}
+
+/// Whether an instance that reports `running` runs the image reference
+/// `applied`, or `None` when that can't be told. A node reports the
+/// reference bound to its digest (`nginx:1.27@sha256:…`) when apply pinned
+/// one, or with the tag replaced (`nginx@sha256:…`), which no longer says
+/// which tag it was.
+fn runs_image(applied: &str, running: &str) -> Option<bool> {
+    if running == applied
+        || running
+            .strip_prefix(applied)
+            .is_some_and(|rest| rest.starts_with('@'))
+    {
+        return Some(true);
+    }
+    match (
+        crate::pickle::types::image_pin_digest(applied),
+        crate::pickle::types::image_pin_digest(running),
+    ) {
+        (Some(applied), Some(running)) => Some(applied == running),
+        (None, Some(_)) => None,
+        _ => Some(false),
+    }
+}
+
+/// What `relish apply --wait` says when the cluster can't report whether a
+/// rollout finished, with why it can't.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RolloutsNotice {
+    /// Every app's instances can be told apart by image, so the wait counts
+    /// only those on the applied image.
+    ByImage(String),
+    /// Some app's can't, so the wait counts every running replica, and an
+    /// update may look ready while the old version still runs.
+    CountOnly(String),
+}
+
+impl std::fmt::Display for RolloutsNotice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ByImage(reason) => write!(
+                f,
+                "note: the cluster can't report rollouts ({reason}); \
+                 --wait counts only instances running the applied image"
+            ),
+            Self::CountOnly(reason) => write!(
+                f,
+                "warning: the cluster can't report rollouts ({reason}), \
+                 so --wait counts running replicas only"
+            ),
+        }
+    }
+}
+
+/// What to tell people about `observation`, if it has no rollouts read.
+pub fn rollouts_notice(
+    targets: &[WaitTarget],
+    observation: &Observation,
+) -> Option<RolloutsNotice> {
+    if observation.rollouts.is_some() {
+        return None;
+    }
+    let reason = observation
+        .rollouts_error
+        .clone()
+        .unwrap_or_else(|| "no rollouts read".to_string());
+    let by_image = targets.iter().all(|target| {
+        let own: Vec<&ClusterInstanceStatus> = observation
+            .instances
+            .rows
+            .iter()
+            .filter(|row| {
+                row.instance.app_name == target.app && row.instance.namespace == target.namespace
+            })
+            .collect();
+        on_applied_image(target, &own).is_some()
+    });
+    Some(if by_image {
+        RolloutsNotice::ByImage(reason)
+    } else {
+        RolloutsNotice::CountOnly(reason)
+    })
 }
 
 /// How many running replicas make the app whole. A daemon set or an
@@ -274,7 +400,7 @@ fn phase(
     rolled_out: Option<bool>,
     desired: u32,
     own: &[&ClusterInstanceStatus],
-    running: u32,
+    (running, older): (u32, u32),
     ready: bool,
     instances: &Instances,
 ) -> String {
@@ -312,6 +438,28 @@ fn phase(
         };
         let on: Vec<&str> = on.iter().copied().collect();
         parts.push(format!("{count} {words} on {}", on.join(", ")));
+    }
+    if older > 0 {
+        // Only the instances the wait set aside run an older image.
+        let mut on: Vec<&str> = instances
+            .rows
+            .iter()
+            .filter(|row| {
+                row.instance.app_name == target.app
+                    && row.instance.namespace == target.namespace
+                    && row.instance.state == "running"
+                    && !own
+                        .iter()
+                        .any(|kept| kept.node == row.node && kept.instance.id == row.instance.id)
+            })
+            .map(|row| row.node.as_str())
+            .collect();
+        on.sort_unstable();
+        on.dedup();
+        parts.push(format!(
+            "{older} still on an older image on {}",
+            on.join(", ")
+        ));
     }
     let restarts: u32 = own.iter().map(|row| row.instance.restart_count).sum();
     if restarts > 0 {
@@ -351,8 +499,11 @@ pub struct Observation {
     /// Every node's instances.
     pub instances: Instances,
     /// Whether each app's current spec rolled out, from the leader; `None`
-    /// from a node that predates `GET /v1/diagnostics/rollouts`.
+    /// when the read failed, as it does on a node, or behind a leader, that
+    /// predates `GET /v1/diagnostics/rollouts`.
     pub rollouts: Option<Vec<RolloutEvidence>>,
+    /// Why `rollouts` is `None`.
+    pub rollouts_error: Option<String>,
 }
 
 /// Look at the cluster once, the way `relish apps` does.
@@ -362,16 +513,20 @@ pub async fn observe(client: &BunClient) -> Result<Observation, RelishError> {
         apps_cmd::collect_instances(client),
         client.rollouts()
     );
-    let rollouts = match rollouts {
-        Ok(rollouts) => Some(rollouts),
-        // A node from before the read: go by the instance count.
-        Err(RelishError::ApiError { status: 404, .. }) => None,
-        Err(error) => return Err(error),
+    // A failed rollouts read is no rollouts read, never a failed look: the
+    // wait then goes by the image each instance runs (#2302).
+    let (rollouts, rollouts_error) = match rollouts {
+        Ok(rollouts) => (Some(rollouts), None),
+        Err(RelishError::ApiError { status: 404, .. }) => {
+            (None, Some("it may run an older release".to_string()))
+        }
+        Err(error) => (None, Some(error.to_string())),
     };
     Ok(Observation {
         desired: desired?,
         instances: instances?,
         rollouts,
+        rollouts_error,
     })
 }
 
@@ -393,7 +548,9 @@ pub struct WaitReport {
 
 /// Watch `targets` until each is ready, a rollout fails, or `timeout`
 /// passes, looking every `poll` with `observe`. `progress` hears each app
-/// whose phase changed, with the time since the wait started.
+/// whose phase changed, with the time since the wait started. `notice`
+/// hears, once each, that the cluster can't report rollouts and how the
+/// wait counts instead.
 ///
 /// A look that fails (a leader election, a node that didn't answer in time)
 /// doesn't end the wait: the next one may succeed. Its error is kept for
@@ -404,6 +561,7 @@ pub async fn wait_until_ready<F, Fut>(
     poll: Duration,
     mut observe: F,
     mut progress: impl FnMut(Duration, &AppReadiness),
+    mut notice: impl FnMut(&RolloutsNotice),
 ) -> WaitReport
 where
     F: FnMut() -> Fut,
@@ -412,6 +570,7 @@ where
     let started = tokio::time::Instant::now();
     let deadline = started + timeout;
     let mut seen: HashMap<(String, String), String> = HashMap::new();
+    let (mut noted, mut warned) = (false, false);
     let mut apps: Vec<AppReadiness> = targets
         .iter()
         .map(|target| AppReadiness {
@@ -435,6 +594,17 @@ where
         match tokio::time::timeout(budget, observe()).await {
             Ok(Ok(observation)) => {
                 last_error = None;
+                match rollouts_notice(targets, &observation) {
+                    Some(told @ RolloutsNotice::ByImage(_)) if !noted => {
+                        noted = true;
+                        notice(&told);
+                    }
+                    Some(told @ RolloutsNotice::CountOnly(_)) if !warned => {
+                        warned = true;
+                        notice(&told);
+                    }
+                    _ => {}
+                }
                 apps = assess(targets, &observation);
                 let elapsed = started.elapsed();
                 for app in &apps {
@@ -766,6 +936,9 @@ pub async fn apply_and_wait(
                 eprintln!("{}", progress_line(elapsed, app));
             }
         },
+        // Every output gets this on stderr: an agent reading the JSON on
+        // stdout needs to know `ready` may be early.
+        |notice| eprintln!("{notice}"),
     )
     .await;
     let applied = Applied {
@@ -836,6 +1009,9 @@ mod tests {
         Observation {
             desired: apps.into_iter().map(|app| app.desired).collect(),
             instances: instances(rows),
+            rollouts_error: rollouts
+                .is_none()
+                .then(|| "it may run an older release".to_string()),
             rollouts,
         }
     }
@@ -924,6 +1100,96 @@ mod tests {
         );
         assert!(!seen[0].ready);
         assert_eq!(seen[0].phase, "1/1 running; finishing the rollout");
+    }
+
+    /// One running instance of `app` from `image`.
+    fn running_image(node: &str, app: &str, id: &str, image: &str) -> ClusterInstanceStatus {
+        let mut row = instance(node, app, id, "running");
+        row.instance.image = Some(image.to_string());
+        row
+    }
+
+    /// #2302: a 0.3.2 node has no rollouts read. Its old version's
+    /// instances still run every replica, so counting them would say ready
+    /// at once; only the instances on the applied image count.
+    #[test]
+    fn an_image_update_without_a_rollouts_read_isnt_ready_while_the_old_image_runs() {
+        let apps = [evidence("web", 1, None)];
+        let old = instances(vec![running_image("node-1", "web", "web-0", "nginx:1.26")]);
+        let seen = assessed(&[target("web")], &apps, &old);
+        assert!(!seen[0].ready, "{seen:?}");
+        assert_eq!(seen[0].running, 0);
+        assert_eq!(
+            seen[0].phase,
+            "0/1 running; 1 still on an older image on node-1; 1 placed"
+        );
+
+        let new = instances(vec![running_image("node-2", "web", "web-1", "nginx:1.27")]);
+        let seen = assessed(&[target("web")], &apps, &new);
+        assert!(seen[0].ready, "{seen:?}");
+        // A node binds the image to its digest when apply pinned one.
+        let pinned = instances(vec![running_image(
+            "node-2",
+            "web",
+            "web-1",
+            &format!("nginx:1.27@sha256:{}", "a".repeat(64)),
+        )]);
+        assert!(assessed(&[target("web")], &apps, &pinned)[0].ready);
+    }
+
+    #[test]
+    fn images_compare_by_reference_and_by_digest() {
+        let digest = |c: char| format!("sha256:{}", c.to_string().repeat(64));
+        assert_eq!(runs_image("nginx:1.27", "nginx:1.27"), Some(true));
+        assert_eq!(runs_image("nginx:1.27", "nginx:1.26"), Some(false));
+        assert_eq!(
+            runs_image("nginx:1.27", &format!("nginx:1.27@{}", digest('a'))),
+            Some(true)
+        );
+        assert_eq!(
+            runs_image(
+                &format!("nginx@{}", digest('a')),
+                &format!("nginx@{}", digest('b'))
+            ),
+            Some(false)
+        );
+        // Pinning replaced the tag: which tag it was can't be told.
+        assert_eq!(
+            runs_image("nginx:1.27", &format!("nginx@{}", digest('a'))),
+            None
+        );
+    }
+
+    /// #2302: with no rollouts read and nothing to tell versions apart by,
+    /// the wait counts every running replica, and says so.
+    #[test]
+    fn without_rollouts_or_images_the_wait_counts_replicas_and_warns() {
+        let process = WaitTarget {
+            image: None,
+            ..target("web")
+        };
+        let observation = look(
+            vec![evidence("web", 1, None)],
+            vec![instance("node-1", "web", "web-0", "running")],
+        );
+        assert!(assess(std::slice::from_ref(&process), &observation)[0].ready);
+        let notice = rollouts_notice(&[process], &observation).unwrap();
+        assert!(matches!(notice, RolloutsNotice::CountOnly(_)), "{notice:?}");
+        assert_eq!(
+            notice.to_string(),
+            "warning: the cluster can't report rollouts (it may run an older release), \
+             so --wait counts running replicas only"
+        );
+        // Images that tell the versions apart: a note, not a warning.
+        let observation = look(
+            vec![evidence("web", 1, None)],
+            vec![running_image("node-1", "web", "web-0", "nginx:1.26")],
+        );
+        let notice = rollouts_notice(&[target("web")], &observation).unwrap();
+        assert!(matches!(notice, RolloutsNotice::ByImage(_)), "{notice:?}");
+        // A cluster that reports rollouts needs neither.
+        let observation = look(vec![evidence("web", 1, Some(true))], Vec::new());
+        assert_eq!(rollouts_notice(&[target("web")], &observation), None);
     }
 
     #[test]
@@ -1150,6 +1416,7 @@ mod tests {
             Duration::from_secs(1),
             script(looks),
             |elapsed, app| lines.push(progress_line(elapsed, app)),
+            |_| {},
         )
         .await;
         assert!(report.ready, "{report:?}");
@@ -1168,6 +1435,92 @@ mod tests {
         );
     }
 
+    /// #2302: the warning that the cluster can't report rollouts is
+    /// printed once, not on every look.
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_warns_once_when_the_cluster_cant_report_rollouts() {
+        let process = WaitTarget {
+            image: None,
+            ..target("web")
+        };
+        let looks = vec![
+            Ok(look(vec![evidence("web", 1, None)], Vec::new())),
+            Ok(look(vec![evidence("web", 1, None)], Vec::new())),
+            Ok(look(
+                vec![evidence("web", 1, None)],
+                vec![instance("node-1", "web", "web-0", "running")],
+            )),
+        ];
+        let mut notices = Vec::new();
+        let report = wait_until_ready(
+            &[process],
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+            script(looks),
+            |_, _| {},
+            |notice| notices.push(notice.to_string()),
+        )
+        .await;
+        assert!(report.ready, "{report:?}");
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].starts_with("warning: the cluster can't report rollouts"));
+    }
+
+    /// A stub node: no other nodes, one running `web` instance on the
+    /// applied image, the council's desired apps, and a rollouts read
+    /// answering `rollouts_status`.
+    async fn stub_node(rollouts_status: u16) -> String {
+        use axum::routing::get;
+        let row = running_image("local", "web", "web-0", "nginx:1.27");
+        let desired = evidence("web", 1, None).desired;
+        let app = axum::Router::new()
+            .route(
+                "/v1/cluster/nodes",
+                get(|| async { axum::Json(Vec::<serde_json::Value>::new()) }),
+            )
+            .route(
+                "/v1/status",
+                get(move || async move { axum::Json(vec![row]) }),
+            )
+            .route(
+                "/v1/diagnostics/apps",
+                get(move || async move { axum::Json(vec![desired]) }),
+            )
+            .route(
+                "/v1/diagnostics/rollouts",
+                get(move || async move {
+                    (
+                        axum::http::StatusCode::from_u16(rollouts_status).unwrap(),
+                        axum::Json(serde_json::json!({"error": "the leader answered 404"})),
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{address}")
+    }
+
+    /// #2302: a failed rollouts read (a 0.3.3 follower of a 0.3.2 leader
+    /// answered 503 before the fix) is no rollouts read, not a failed look:
+    /// the apps and instances still come back.
+    #[tokio::test]
+    async fn a_failed_rollouts_read_still_reports_the_apps() {
+        for status in [404, 503, 500] {
+            let client = BunClient::new_with_token(&stub_node(status).await, None);
+            let observation = observe(&client).await.unwrap();
+            assert_eq!(observation.desired.len(), 1, "{status}");
+            assert_eq!(observation.instances.rows.len(), 1, "{status}");
+            assert!(observation.rollouts.is_none(), "{status}");
+            let reason = observation.rollouts_error.unwrap();
+            if status == 404 {
+                assert_eq!(reason, "it may run an older release");
+            } else {
+                assert!(reason.contains(&status.to_string()), "{reason}");
+            }
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn the_wait_times_out_with_the_last_look_and_error() {
         let looks = vec![
@@ -1180,6 +1533,7 @@ mod tests {
             Duration::from_secs(1),
             script(looks),
             |_, _| {},
+            |_| {},
         )
         .await;
         assert!(!report.ready);
@@ -1208,6 +1562,7 @@ mod tests {
             Duration::from_secs(1),
             script(looks),
             |_, _| {},
+            |_| {},
         )
         .await;
         assert!(!report.ready);

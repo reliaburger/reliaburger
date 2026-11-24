@@ -627,6 +627,11 @@ async fn read_from_leader_or_missing<T: serde::de::DeserializeOwned>(
 /// to it, as `/v1/diagnostics/apps` does. A node with no council has no
 /// rollouts and answers an empty list. A token sees only the apps in its
 /// scope.
+///
+/// A leader that doesn't serve the read (an older release during a rolling
+/// upgrade) answers 404, and the follower passes the 404 on (#2302): relish
+/// then sees what it would see asking the old node itself, and waits on the
+/// instances alone.
 pub(super) async fn rollouts_handler(
     State(state): State<ApiState>,
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
@@ -639,11 +644,13 @@ pub(super) async fn rollouts_handler(
         return Json(Vec::<crate::bun::diagnostics::RolloutEvidence>::new()).into_response();
     };
     let rollouts = if confirmed_lease_leader(council).await {
-        Ok(council_rollout_evidence(&council.desired_state().await))
+        Ok(LeaderAnswer::Found(council_rollout_evidence(
+            &council.desired_state().await,
+        )))
     } else if forwarded {
         Err("this node was named the leader but isn't; retry once the election settles".into())
     } else {
-        read_from_leader(
+        read_from_leader_or_missing(
             &state,
             council,
             directory.as_deref(),
@@ -656,7 +663,14 @@ pub(super) async fn rollouts_handler(
         .await
     };
     match rollouts {
-        Ok(mut rollouts) => {
+        Ok(LeaderAnswer::Missing(_)) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "the leader doesn't serve rollouts; it may run an older release"
+            })),
+        )
+            .into_response(),
+        Ok(LeaderAnswer::Found(mut rollouts)) => {
             rollouts.retain(|rollout: &crate::bun::diagnostics::RolloutEvidence| {
                 crate::sesame::auth::authorize_scoped(
                     auth.as_deref(),
