@@ -10,6 +10,7 @@
 //! whole release, and nothing is trusted on its name alone.
 
 pub mod channel;
+pub mod netlog;
 pub mod rollout;
 pub mod slot;
 

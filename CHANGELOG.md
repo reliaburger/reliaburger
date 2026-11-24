@@ -17,6 +17,7 @@ Not released yet: this is what the train carries, and it can change before the t
 
 ### Added
 
+- `relish os boot-logs` shows where each appliance sends its kernel and boot logs, and `--to <address>[:<port>]` or `--off` changes it on a claimed cluster, so turning them on or off no longer means editing a file on the node's EFI partition. It needs a cluster-wide admin token and is audited with the target ([#2149](https://github.com/reliaburger/reliaburger/issues/2149)).
 - `relish apply --wait` returns once every app in the file runs its replicas, passes its health checks and has finished rolling out, printing each step (placed, pulling, waiting for the health check, ready). `--timeout` bounds it (5 minutes by default); when it runs out, `apply` names each app that isn't ready and why, and exits 1, while a failed apply exits 3, 4 or 5. With `-o json` it answers in the `relish.agent/v1` envelope. A daemon set or an autoscaled app counts the replicas the scheduler placed ([#2240](https://github.com/reliaburger/reliaburger/issues/2240)).
 
 ### Changed

@@ -33,7 +33,7 @@ use super::interface::{self, udp_socket};
 use super::{InterfaceChoice, Log, MacAddress, NetbootError};
 
 /// The UDP port boot logs arrive on: netconsole's usual one.
-pub const NETLOG_PORT: u16 = 6666;
+pub const NETLOG_PORT: u16 = crate::os::netlog::DEFAULT_PORT;
 
 /// The directory under the netboot directory the raw lines go to.
 pub const LOGS_DIRECTORY: &str = "logs";

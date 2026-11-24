@@ -49,6 +49,102 @@ pub(super) async fn os_stage_handler(
     }
 }
 
+/// Where this node's `netlog.conf` lives: the ESP on an appliance, `None`
+/// on any other node. Tests mount the router with an
+/// `Extension<NetlogPaths>` naming a temporary directory instead; bun
+/// itself never adds one.
+// `Response` is the reply to send as-is.
+#[allow(clippy::result_large_err)]
+fn netlog_paths(
+    paths: Option<axum::Extension<crate::os::netlog::NetlogPaths>>,
+) -> Result<crate::os::netlog::NetlogPaths, Response> {
+    match paths {
+        Some(axum::Extension(paths)) => Ok(paths),
+        None if crate::os::slot::installed().is_some() => {
+            Ok(crate::os::netlog::NetlogPaths::default())
+        }
+        None => Err(refuse(StatusCode::CONFLICT, NOT_AN_APPLIANCE)),
+    }
+}
+
+/// `GET /v1/os/boot-logs`: where this node's boot logs go (#2149), as its
+/// next boot will read `reliaburger/netlog.conf` on the ESP.
+pub(super) async fn os_boot_logs_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    paths: Option<axum::Extension<crate::os::netlog::NetlogPaths>>,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::ReadOnly)
+    {
+        return resp;
+    }
+    let paths = match netlog_paths(paths) {
+        Ok(paths) => paths,
+        Err(resp) => return resp,
+    };
+    match tokio::task::spawn_blocking(move || crate::os::netlog::read(&paths)).await {
+        Ok(Ok(target)) => Json(crate::os::netlog::BootLogs { target }).into_response(),
+        Ok(Err(reason)) => refuse(StatusCode::INTERNAL_SERVER_ERROR, reason),
+        Err(e) => refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// `POST /v1/os/boot-logs {"target": "<address>:<port>" | null}`: send this
+/// node's boot logs there from now on, or stop (cluster admin: the lines
+/// carry the whole node's kernel log, in cleartext). `target` must be there,
+/// as `null` for off, and nothing else may be. Answers the setting as it
+/// now stands, with a `warning` if it only takes effect at the next boot.
+/// The audit record names the target, or `off`.
+pub(super) async fn os_boot_logs_set_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    paths: Option<axum::Extension<crate::os::netlog::NetlogPaths>>,
+    body: String,
+) -> Response {
+    if let Err(resp) = authorize_cluster_admin(&state, auth.as_deref()).await {
+        return resp;
+    }
+    let paths = match netlog_paths(paths) {
+        Ok(paths) => paths,
+        Err(resp) => return resp,
+    };
+    let wanted: crate::os::netlog::BootLogs = match serde_json::from_str(&body) {
+        Ok(wanted) => wanted,
+        Err(e) => {
+            return refuse(
+                StatusCode::BAD_REQUEST,
+                format!("invalid boot log setting: {e}"),
+            );
+        }
+    };
+    let target = wanted.target;
+    crate::bun::audit::annotate(crate::bun::audit::AuditNote {
+        app: None,
+        namespace: None,
+        details: [(
+            "target".to_string(),
+            target.map_or_else(|| "off".to_string(), |target| target.to_string()),
+        )]
+        .into(),
+    });
+    let written = {
+        let paths = paths.clone();
+        tokio::task::spawn_blocking(move || crate::os::netlog::write(&paths, target)).await
+    };
+    match written {
+        Ok(Ok(())) => {}
+        Ok(Err(reason)) => return refuse(StatusCode::INTERNAL_SERVER_ERROR, reason),
+        Err(e) => return refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+    let warning = crate::os::netlog::apply_now(&paths, target).await;
+    if let Some(warning) = &warning {
+        eprintln!("bun: boot logs: {warning}");
+    }
+    Json(serde_json::json!({ "target": target, "warning": warning })).into_response()
+}
+
+const NOT_AN_APPLIANCE: &str = "this node isn't an appliance, so it has no boot logs to send";
+
 /// `POST /v1/os/rollout/start {"version", "channel_url", "allow_downgrade"}`:
 /// roll an OS version across the cluster (admin, on the leader).
 pub(super) async fn os_rollout_start_handler(

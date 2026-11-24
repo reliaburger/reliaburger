@@ -581,6 +581,32 @@ Nothing on this port is authenticated. Anyone on the LAN can send it lines, so t
 
 The script's unit tests run it against stubs for `ip`, `modprobe` and `dmesg`, with a temporary directory standing in for configfs, and a UDP socket on loopback as the operator's machine. They check what the script writes, not what systemd and the kernel make of it, which is how `journal+kmsg` got through, and a second slip with it: the installer's copy of the unit had no `[Install]` section, so the preset line `enable reliaburger-netlog.service` enabled nothing, and the installer never streamed. A preset enables a unit through the `WantedBy=` in that section, and a unit without one is "static". So the QEMU tests now run with streaming on. The netboot install test passes `--stream-logs` and wants the installer's lines and the installed system's boot check among relish's, under the VM's MAC. The fallback test writes `netlog.conf` onto the disk's ESP with mtools before the first boot, runs `relish machines logs` beside it, and wants the three failed tries and the fallback in what arrived.
 
+**Changing it later.** `--stream-logs` decides at install time. After that, a lab moves: the laptop gets a new address, or you want the logs off once the machines are in a cupboard. Unplugging a disk to delete a file from its ESP isn't an answer, so `relish os boot-logs --to <address>[:<port>]` and `--off` change it on a claimed cluster. The file stays the only state. relish asks each node's bun (`POST /v1/os/boot-logs`), and bun rewrites or deletes `netlog.conf` on its own ESP, so the next boot, and every boot after an OS update, reads what you set. Nothing goes through Raft: each node's setting lives on that node's disk, which is also the only place its boot can read it before bun starts.
+
+The target is a small type in `src/os/netlog.rs`, shared by bun and relish:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetlogTarget {
+    pub address: Ipv4Addr,
+    pub port: u16,
+}
+
+impl FromStr for NetlogTarget {
+    type Err = NetlogError;
+
+    fn from_str(value: &str) -> Result<Self, NetlogError> { … }
+}
+```
+
+`FromStr` is Rust's "parse me from a string" trait: implementing it is what makes `"10.42.0.1:7000".parse::<NetlogTarget>()` work, and it's also all clap needs to take the type as a flag's value. `to: Option<NetlogTarget>` in the `BootLogs` subcommand means a bad address is refused while the command line is parsed, with clap's usual error, before relish dials anything. The rules are the boot script's: IPv4 only, since netconsole takes nothing else, and 6666 when no port is given. The Rust side is stricter in one way: it refuses a broadcast, multicast, unspecified or loopback address, which the script would accept and which would send a node's kernel log to every machine on the LAN, or to nowhere. The parser for `netlog.conf` itself follows the script line for line, and its tests feed it the same kinds of input the script's tests use: comments, carriage returns, unknown keys and a second `target=`. So `relish os boot-logs` shows what the next boot will do, not what we hope it will.
+
+On the wire, the target is the string `"10.42.0.1:6666"`, not an object with two fields. Deriving `Serialize` would have given the object, so the type implements it by hand, in one line: `serializer.collect_str(self)` writes whatever `Display` prints. `Deserialize` goes the other way through `FromStr`, so a node also refuses a bad target in a request body, whoever sent it. The request body is read strictly, too. serde treats a missing `Option` field as `None`, so `{}`, or a misspelt `{"too": …}`, would have meant "off". `#[serde(deny_unknown_fields)]` refuses the misspelling, and a `deserialize_with` function on `target` turns off the missing-means-`None` rule, so off has to be asked for as `"target": null`.
+
+Writing the file is the easy half. A change should also take effect without a reboot, or turning logs on to watch a misbehaving node is no use. So after writing a target, bun restarts `reliaburger-netlog.service` with `systemctl restart --no-block`. The script was already written to run twice: it disables a netconsole target before changing it, and its `/run` marker stops it resending the `dmesg` backlog. The restart's hello line reaches the listener within a second. For `--off`, bun deletes the file and writes `0` to the target's `enabled` in configfs. Both are best effort: the file is what matters, so if either fails, the node answers with a `warning` saying the change waits for the next boot, rather than an error that would make you think nothing changed. The file system work runs under `tokio::task::spawn_blocking`, because the ESP is an automount and the first touch may wait for the kernel to mount a FAT partition, which an async task mustn't block on.
+
+The routes are guarded differently. Anyone with a token may read where a node sends its logs. Changing it sends the node's whole kernel log, in cleartext, to any address on the LAN, so it takes an unscoped admin, like an OS rollout, and it's audited as `os.boot_logs_set`, with the target (or `off`) in the record's details. The handler adds it with `crate::bun::audit::annotate` once the body has parsed, so the record says where the logs went, not only that something changed. The QEMU OS update test drives it end to end: it turns boot logs on with `relish os boot-logs --to` on the running node, waits for the hello, rolls the update, and wants the new version's boot to stream from the same file, then turns them off and reads `off` back.
+
 What it isn't is log shipping. It's UDP, with no retries and no order beyond the network's, and the lines cross the LAN in cleartext, with addresses and bun's errors in them. That's why it's off unless you ask. A claimed node's logs already go through the cluster's own pipeline.
 
 ## Updating a read-only system

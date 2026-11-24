@@ -266,6 +266,10 @@ pub const ROUTE_MATRIX: &[Route] = &[
     // Appliance OS updates: the leader stages on each node as the system
     // principal; operators start and steer the rollout.
     gated(Post, "/v1/os/stage", Admin, Cluster(ADMIN)),
+    // Boot logs (#2149): where a node sends them is no secret; changing it
+    // sends the node's whole kernel log somewhere, so it acts on the cluster.
+    route(Get, "/v1/os/boot-logs", AnyToken),
+    gated(Post, "/v1/os/boot-logs", Admin, Cluster(ADMIN)),
     route(Get, "/v1/os/rollout", AnyToken),
     gated(Post, "/v1/os/rollout/start", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/os/rollout/resume", Admin, Cluster(ADMIN)),
