@@ -294,6 +294,131 @@ async fn runc_owned_adoption_validates_generation_and_restores_live_network() {
     assert_absent(root.path(), &id);
 }
 
+/// #1315: a restarted Bun adopts a sidecar beside its instance. The sidecar
+/// keeps its process, and it's still in its instance's network namespace,
+/// which it holds no address of its own in: there's no network of its own
+/// to adopt, so adoption mustn't look for one.
+#[tokio::test]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
+async fn a_bun_restart_adopts_a_sidecar_with_its_process_and_its_instances_network() {
+    let root = tempfile::tempdir().unwrap();
+    let parent = instance(root.path());
+    let sidecar = reliaburger::grill::oci::sidecar_instance_id(&parent, "probe");
+    let app = spec(root.path(), "exec /bin/busybox sleep 60");
+    let mut beside = spec(root.path(), "exec /bin/busybox sleep 60");
+    let shared = reliaburger::grill::oci::network_namespace_path(&parent);
+    beside.linux.namespaces = reliaburger::grill::oci::standard_namespaces(Some(shared.as_str()));
+    let first = runtime(root.path());
+    // Bun's order: the instance's create makes the namespace the sidecar
+    // joins, and the sidecar starts first.
+    first.create(&parent, &app).await.unwrap();
+    install_fixture(root.path(), &parent);
+    first.create(&sidecar, &beside).await.unwrap();
+    install_fixture(root.path(), &sidecar);
+    first.start(&sidecar).await.unwrap();
+    first.start(&parent).await.unwrap();
+    let parent_pid = first.pid(&parent).await.unwrap().unwrap();
+    let sidecar_pid = first.pid(&sidecar).await.unwrap().unwrap();
+    let parent_record = adoption_record(&parent, parent_pid, first.log_stem(&parent).await, app);
+    let sidecar_record = adoption_record(
+        &sidecar,
+        sidecar_pid,
+        first.log_stem(&sidecar).await,
+        beside,
+    );
+    drop(first);
+
+    let recovered = runtime(root.path());
+    assert!(recovered.adopt(&parent, &parent_record).await.unwrap());
+    let adopted = recovered.adopt(&sidecar, &sidecar_record).await;
+    assert!(matches!(adopted, Ok(true)), "{adopted:?}");
+    assert_eq!(recovered.pid(&sidecar).await.unwrap(), Some(sidecar_pid));
+    assert_eq!(
+        recovered.state(&sidecar).await.unwrap(),
+        ContainerState::Running
+    );
+    assert_eq!(recovered.container_ip(&sidecar).await, None);
+    let network_of = |pid: u32| std::fs::read_link(format!("/proc/{pid}/ns/net")).unwrap();
+    let workload = |pids: Vec<u32>| *pids.first().expect("no workload process");
+    let parent_workload = workload(recovered.workload_pids(&parent).await.unwrap());
+    let sidecar_workload = workload(recovered.workload_pids(&sidecar).await.unwrap());
+    assert_eq!(
+        network_of(sidecar_workload),
+        network_of(parent_workload),
+        "the adopted sidecar left its instance's namespace"
+    );
+
+    recovered.kill(&sidecar).await.unwrap();
+    recovered.kill(&parent).await.unwrap();
+    assert_absent(root.path(), &sidecar);
+    assert_absent(root.path(), &parent);
+}
+
+/// Review of #2269: a sidecar that died while Bun was down. Its record names
+/// a process that's gone, so adoption refuses it, and once its retirement
+/// has made the runtime forget it, the runtime answers `NotFound`: what the
+/// agent must not kill a second time.
+#[tokio::test]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
+async fn a_sidecar_that_died_before_adoption_is_refused_and_then_forgotten() {
+    let root = tempfile::tempdir().unwrap();
+    let parent = instance(root.path());
+    let sidecar = reliaburger::grill::oci::sidecar_instance_id(&parent, "probe");
+    let app = spec(root.path(), "exec /bin/busybox sleep 60");
+    let mut beside = spec(root.path(), "exec /bin/busybox sleep 60");
+    let shared = reliaburger::grill::oci::network_namespace_path(&parent);
+    beside.linux.namespaces = reliaburger::grill::oci::standard_namespaces(Some(shared.as_str()));
+    let first = runtime(root.path());
+    first.create(&parent, &app).await.unwrap();
+    install_fixture(root.path(), &parent);
+    first.create(&sidecar, &beside).await.unwrap();
+    install_fixture(root.path(), &sidecar);
+    first.start(&sidecar).await.unwrap();
+    first.start(&parent).await.unwrap();
+    let sidecar_pid = first.pid(&sidecar).await.unwrap().unwrap();
+    let parent_record = adoption_record(
+        &parent,
+        first.pid(&parent).await.unwrap().unwrap(),
+        first.log_stem(&parent).await,
+        app,
+    );
+    let sidecar_record = adoption_record(
+        &sidecar,
+        sidecar_pid,
+        first.log_stem(&sidecar).await,
+        beside,
+    );
+    for pid in first.workload_pids(&sidecar).await.unwrap() {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while first.state(&sidecar).await.unwrap() != ContainerState::Stopped {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the killed sidecar never stopped");
+    drop(first);
+
+    let recovered = runtime(root.path());
+    assert!(recovered.adopt(&parent, &parent_record).await.unwrap());
+    let refused = recovered.adopt(&sidecar, &sidecar_record).await;
+    assert!(matches!(refused, Ok(false)), "{refused:?}");
+    recovered.forget_retired(&sidecar).await.unwrap();
+    let again = recovered.kill(&sidecar).await;
+    assert!(
+        matches!(again, Err(reliaburger::grill::GrillError::NotFound { .. })),
+        "{again:?}"
+    );
+
+    recovered.kill(&parent).await.unwrap();
+    assert_absent(root.path(), &sidecar);
+    assert_absent(root.path(), &parent);
+}
+
 fn adoption_record(
     id: &InstanceId,
     pid: u32,

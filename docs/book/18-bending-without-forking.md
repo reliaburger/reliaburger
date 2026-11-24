@@ -2276,11 +2276,115 @@ retirement step already says "ask me again".
 #### What a Bun restart does
 
 A restarted Bun adopts the instances it has records for and retires every
-other launch. Sidecars have no records, because the record format names
-replicas, so they're retired. Adoption then registers each adopted
-instance's sidecars as due, and the next tick starts them. That's a second
-or so without a sidecar on every Bun restart. Giving sidecars records of
-their own would close the gap, and it's the obvious next step.
+other launch. At first sidecars had no records, so they were retired with
+the rest, and adoption registered each adopted instance's sidecars as due
+for the next tick to start. That was a second or so without a proxy or a
+log shipper on every Bun restart and every self-upgrade. An outside tester
+upgrading a cluster would see every sidecar restart and wonder why the app
+didn't ([#1315](https://github.com/reliaburger/reliaburger/issues/1315)).
+
+So now each sidecar gets a record of its own. It's the same
+`InstanceRecord` an instance gets, with the sidecar's pid, its process
+start time, its log files and the spec it was launched from, but it goes in
+a `sidecars/` directory beside the instances' records. Why not the same
+directory? Startup checks every record there as a replica of an app
+(`web-0`, or a canary's `web-g3-0`) and refuses to start at all on one
+that isn't, because a record it can't account for is a record it can't
+safely ignore. `default__web-0__sidecar-proxy` isn't a replica. The
+subdirectory has no `.json` name, so `load_records` already skips it.
+
+The record is written when its instance's own record lands, in
+`persist_instance_record` and `persist_rolling_instance`, because the
+sidecars started just before the instance did. A sidecar restarted on its
+own writes its record again, since its process changed. Retirement removes
+them. The writes are best effort, from a task, and that's a deliberate
+asymmetry with an instance's record. An instance with no record can't be
+told apart from a launch that never finished, so its write holds up the
+deploy. A sidecar with no record, or a stale one, gets what every sidecar
+got before: it's retired and started again. Nothing worse can happen,
+because adoption never trusts a record without asking the runtime.
+
+Startup does the asking in two places. `reconcile_runtime_launches`, which
+retires every launch nobody recorded, now also takes the sidecar records,
+and keeps a sidecar's launch only if its record names the spec the runtime
+launched and its instance has a record that survived the same checks. Then,
+after an instance is adopted, `adopt_sidecars` hands each kept sidecar's
+record to `Grill::adopt`, which on runc checks the launcher's pid, start
+time and log files, exactly as it does for an instance. Adopted sidecars
+run on, and the rest are retired and due:
+
+```rust
+pub(super) fn register_adopted(
+    &mut self,
+    parent: &InstanceId,
+    specs: &[SidecarSpec],
+    adopted: &HashSet<InstanceId>,
+    now: Instant,
+) -> Result<Vec<InstanceId>, BunError> {
+    self.register_with(parent, specs, |id| (!adopted.contains(id)).then_some(now))
+}
+```
+
+`register_with` used to take a single `due: Option<Instant>` for every
+sidecar. It now takes `due_of: impl Fn(&InstanceId) -> Option<Instant>`, a
+closure it calls once per sidecar. `impl Fn` in argument position means
+"any type that can be called like this", and the compiler generates a copy
+of `register_with` for each closure passed in, so there's no allocation and
+no dynamic dispatch, unlike a function pointer in C or a callback in Go.
+`bool::then_some(now)` is `Some(now)` when the bool is true and `None` when
+it isn't.
+
+Last, `finish_sidecar_adoption` kills every kept sidecar that nobody
+adopted (its instance's own adoption failed, say), so no sidecar runs
+beside nothing, and removes every sidecar record but the adopted ones'.
+
+Review caught two ways this stopped Bun starting at all, and the mock
+runtime hid both. First, a sidecar that died while Bun was down is refused
+by the runtime and retired, and retirement makes runc forget it: the
+launch's intent journal goes, and from then on runc answers `NotFound` for
+that identity. It was still "kept", though, so `finish_sidecar_adoption`
+killed it a second time, the `NotFound` came back as an error, and startup
+failed. `MockGrill::forget_retired` remembered nothing, so every kill
+succeeded. Now the mock can forget for real, `adopt_sidecars` returns what
+it retired as well as what it adopted, and the sweep skips both. The same
+`NotFound` met the sidecar's restart a moment later, since a restart begins
+by killing what's left of the last launch. `kill_unless_forgotten` treats
+it as nothing to kill, because a runtime with no intent for an identity
+has no launch under it. That one was older than #1315: before sidecars had
+records, every Bun restart retired them this way, and their restart then
+failed the same way.
+
+Second, an error or a timeout from the runtime while adopting a sidecar
+went up through `??` and refused startup, exactly as it does for an
+instance. That's the right call for an instance, whose record is the only
+proof of what runs. It's the wrong one for a sidecar, whose record is an
+optimisation. So a sidecar the runtime can't vouch for either way is killed
+and retired like one it refused, and starts again.
+
+One change was in the runtime. Runc's adoption of an instance ends by
+finding its network: the address it reserved and the veth it plugged in.
+A sidecar has neither, because it lives in its instance's namespace, so
+adoption looked up a reservation that didn't exist and failed. Now a spec
+that joins another's namespace stops before that step: its instance's
+adoption restores the network they share.
+
+#### Seeing them
+
+For a while the only trace of a sidecar in `relish` was a Restart event.
+Now each instance's status carries a `sidecars` list, built from the same
+registry the restarts use: a sidecar with a restart in flight is
+`restarting`, one waiting out its backoff is `backoff`, one beside an
+instance that isn't running is `stopped`, and the rest are `running`, each
+with its restart count. `relish apps NAME` prints them under their
+instance, and `-o json` carries the list as it is. The list is skipped when
+it's empty, so an app without sidecars answers as it did before.
+
+`SidecarState` is an enum, not a string, so a new state can't be added
+without every `match` on it being updated. Its `Display` uses
+`Formatter::pad` rather than `write_str`. The difference shows in a table:
+`format!("{:<10}", state)` asks for a width, and only `pad` honours it.
+With `write_str` the state column came out one word wide and everything
+after it shifted left, which the snapshot test caught on its first run.
 
 ### Runtime knobs
 
@@ -3638,8 +3742,53 @@ two sidecars, `proxy` and `logs`:
   cover the Apple, rootless and process case: the deploy fails before the
   runtime sees a create, and the node reports `shared_network: false`.
 - `an_adopted_instance_gets_its_sidecars_started_again`: an instance adopted
-  from its record gets both sidecars back on the next tick, joined to its
-  namespace, without the instance itself being touched.
+  from a record with no sidecar records beside it gets both sidecars back
+  on the next tick, joined to its namespace, without the instance itself
+  being touched.
+- `a_started_sidecar_is_recorded_for_adoption`: a deploy writes one record
+  per sidecar into `sidecars/`, naming its process, its image and the spec
+  its launch was created from, and leaves the instance's own record alone
+  in the main directory.
+- `a_bun_restart_adopts_running_sidecars_instead_of_restarting_them` is
+  #1315's own test. A second agent on a fresh runtime handle starts over the
+  first one's records, and the only runtime call either sidecar sees is
+  `adopt`: no kill, no create, no start, no restart counted.
+- `a_sidecar_the_runtime_will_not_adopt_starts_again`: the runtime vouches
+  for `proxy` but not `logs`, so `proxy` runs on and `logs` is killed,
+  created and started, and recorded again.
+- `the_sidecars_of_an_instance_that_is_not_adopted_are_retired`: the
+  runtime would adopt both sidecars but not their instance, so neither is
+  even asked about, both are killed, and their records go.
+- `startup_keeps_recorded_sidecar_launches_and_retires_the_rest` gives the
+  runtime a launch inventory, as runc has, with one extra sidecar launch
+  beside an instance nobody recorded. The recorded sidecars are adopted and
+  never killed; the stray one is killed and never adopted.
+- `a_restarted_sidecar_is_recorded_again_and_a_stop_removes_the_records`
+  deletes `proxy`'s record, crashes it, and waits for the restart to write
+  the record back. Stopping the app removes both.
+- `a_sidecar_that_died_while_bun_was_down_is_retired_once_and_bun_starts`
+  turns on the mock's real forgetting and refuses `logs`'s adoption: startup
+  must succeed, forget `logs` once and never kill it after, and the next
+  tick must start it again.
+- `a_sidecar_whose_adoption_fails_starts_again_and_bun_still_starts`: the
+  runtime errors on `logs`'s adoption, and the node still starts, with
+  `logs` killed, retired and started again.
+- `an_instances_status_lists_its_sidecars_with_their_restarts`: the
+  instance's status carries its sidecars, `running` with no restarts, then
+  `backoff` after `proxy` exits, then `running` with one restart.
+
+On Linux, `a_bun_restart_adopts_a_sidecar_with_its_process_and_its_instances_network`
+in `tests/owned_runc.rs` (run with `make test-linux`) does it with real
+runc: an instance and a busybox sidecar in its namespace, the runtime handle
+dropped as a Bun restart drops it, and a new one adopting both. The sidecar
+keeps its pid, has no address of its own, and its process is still in the
+same network namespace as its instance's.
+`a_sidecar_that_died_before_adoption_is_refused_and_then_forgotten` kills
+the sidecar's process first: adoption refuses it, and after
+`forget_retired` a kill answers `NotFound`, which is what the mock now
+models. To check that the agent tests
+check something, we made startup adopt no sidecar at all: the restart, the
+refused-adoption and the inventory tests failed.
 
 Around them, unit tests pin the pieces. `grill::oci` checks the generated
 spec: the joined namespace, the image and argv, the env with the sidecar's

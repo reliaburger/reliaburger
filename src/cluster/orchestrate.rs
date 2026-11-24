@@ -4299,6 +4299,7 @@ mod tests {
                             age_seconds: None,
                             image: None,
                             data_on_node: false,
+                            sidecars: Vec::new(),
                             reason: None,
                         }]);
                     }
@@ -4923,6 +4924,7 @@ image = "busybox:latest"
             age_seconds: None,
             image: None,
             data_on_node: false,
+            sidecars: Vec::new(),
             reason: None,
         };
         let mut asked = Vec::new();
@@ -5248,6 +5250,7 @@ image = "busybox:latest"
                 age_seconds: None,
                 image: None,
                 data_on_node: false,
+                sidecars: Vec::new(),
                 reason: None,
             },
             crate::bun::agent::InstanceStatus {
@@ -5264,6 +5267,7 @@ image = "busybox:latest"
                 age_seconds: None,
                 image: None,
                 data_on_node: false,
+                sidecars: Vec::new(),
                 reason: None,
             },
         ];

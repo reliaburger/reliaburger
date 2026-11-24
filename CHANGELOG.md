@@ -18,6 +18,7 @@ Not released yet: this is what the train carries, and it can change before the t
 ### Added
 
 - `relish os boot-logs` shows where each appliance sends its kernel and boot logs, and `--to <address>[:<port>]` or `--off` changes it on a claimed cluster, so turning them on or off no longer means editing a file on the node's EFI partition. It needs a cluster-wide admin token and is audited with the target ([#2149](https://github.com/reliaburger/reliaburger/issues/2149)).
+- `relish apps NAME` lists each instance's sidecars under it, with their state (`running`, `backoff`, `restarting` or `stopped`) and how often each has restarted on its own, and `-o json` carries them on each instance as `sidecars`. They used to show up only as Restart events ([#1315](https://github.com/reliaburger/reliaburger/issues/1315)).
 - `relish apply --wait` returns once every app in the file runs its replicas, passes its health checks and has finished rolling out, printing each step (placed, pulling, waiting for the health check, ready). `--timeout` bounds it (5 minutes by default); when it runs out, `apply` names each app that isn't ready and why, and exits 1, while a failed apply exits 3, 4 or 5. With `-o json` it answers in the `relish.agent/v1` envelope. A daemon set or an autoscaled app counts the replicas the scheduler placed ([#2240](https://github.com/reliaburger/reliaburger/issues/2240)).
 
 ### Changed
@@ -29,6 +30,7 @@ Not released yet: this is what the train carries, and it can change before the t
 ### Fixed
 
 - A node checks an app's runtime knobs and host-path sources again each time one of its instances restarts. A restart builds the container from what the deploy approved, so a node restarted with a shorter `[runtime]` or `[storage] allowed_host_paths` list in `node.toml` brought crashed containers back with what it no longer allowed. Now the restart is refused, the instance is `Failed` with the refusal as its reason in `relish apps` and `relish wtf`, and it isn't retried. A `make test-linux` test starts a real runc container with a capability, a network and an IPC sysctl and `/dev/fuse`, and checks each from inside it ([#1316](https://github.com/reliaburger/reliaburger/issues/1316)).
+- A Bun restart or self-upgrade adopts running sidecars with their app instead of restarting them. Sidecars had no adoption records, so every Bun restart killed them and started them again about a second later. Each now has a record of its own, checked against the runtime like an app's ([#1315](https://github.com/reliaburger/reliaburger/issues/1315)).
 
 ## [0.3.2] - 2026-11-23
 

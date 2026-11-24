@@ -1149,6 +1149,15 @@ pub fn sidecar_instance_id(
     crate::grill::InstanceId(format!("{}__sidecar-{name}", parent.0))
 }
 
+/// The instance a sidecar's runtime identity runs beside, and the
+/// sidecar's name: the inverse of [`sidecar_instance_id`]. `None` for an
+/// identity that isn't a sidecar's.
+pub fn sidecar_parent(id: &crate::grill::InstanceId) -> Option<(crate::grill::InstanceId, &str)> {
+    id.0.rsplit_once("__sidecar-")
+        .filter(|(parent, name)| !parent.is_empty() && !name.is_empty())
+        .map(|(parent, name)| (crate::grill::InstanceId(parent.to_string()), name))
+}
+
 /// Generate the OCI spec for `sidecar`, which runs beside instance `parent`
 /// of an app whose own spec is `app` (#1120).
 ///
@@ -2548,6 +2557,9 @@ mod tests {
             sidecar_instance_id(&parent, "proxy").0,
             "default__web-0__sidecar-proxy"
         );
+        let sidecar = sidecar_instance_id(&parent, "proxy");
+        assert_eq!(sidecar_parent(&sidecar), Some((parent.clone(), "proxy")));
+        assert_eq!(sidecar_parent(&parent), None, "an instance is no sidecar");
     }
 
     /// #1122: the gates admitted the app's runtime knobs for the app's own
