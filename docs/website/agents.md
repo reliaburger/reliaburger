@@ -263,6 +263,17 @@ with lines cut at 16 KiB (512 bytes for an event). `relish events` and
 `details` into `author_text`, the same as the timeline. Their plain output
 for people is unchanged.
 
+Two commands outside `relish agent` answer in the envelope itself, and
+`relish agent schema` describes their `data` too: `relish status -o json`,
+and `relish apply --wait -o json`. The second applies a file and returns
+once its apps run and pass their health checks. `ok` is `true` whenever the
+apply went through; `data.ready` says whether every app got there before
+`--timeout` (5 minutes by default), and `data.apps` gives each one's
+replicas, what it's doing and, when the cluster knows, why it isn't ready.
+The process exits 1 when an app wasn't ready, and 3, 4 or 5, with `ok:
+false` and an `error.code`, when the apply itself failed. An apply changes
+the cluster, so ask your human first.
+
 ## Commands
 
 | Command | What it does |

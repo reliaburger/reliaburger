@@ -1815,6 +1815,15 @@ impl BunClient {
         self.get_typed_json("/v1/version").await
     }
 
+    /// Whether each app's current spec has finished rolling out, from the
+    /// leader (`GET /v1/diagnostics/rollouts`). A node that predates the
+    /// read answers 404.
+    pub async fn rollouts(
+        &self,
+    ) -> Result<Vec<crate::bun::diagnostics::RolloutEvidence>, RelishError> {
+        self.get_typed_json("/v1/diagnostics/rollouts").await
+    }
+
     /// Fetch desired application replicas and current scheduler coverage.
     pub async fn desired_apps(
         &self,
