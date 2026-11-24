@@ -232,11 +232,27 @@ impl ExecutionBudget {
         );
         CapacityRefusalKind::Yielding
     }
-    /// Forget `app`'s claim and cooldown: it was admitted here, or it left
-    /// this node.
+    /// Forget `app`'s claim and cooldown: it was admitted here. Admission is
+    /// the only thing that clears a cooldown; leaving the node uses
+    /// [`Self::withdraw_app_claim`].
     pub fn release_app_claim(&self, app: &AppId) {
         let mut state = self.lock();
         state.cooldowns.remove(app);
+        let released = state.claims.remove(app).is_some();
+        drop(state);
+        if released {
+            self.changed.notify_waiters();
+        }
+    }
+    /// Drop `app`'s claim because it left this node, keeping any cooldown.
+    /// A full refusal makes the leader move the app, so the node retires
+    /// it; clearing the cooldown here would let the yield pass put it
+    /// straight back with a fresh claim, and job work would rotate through
+    /// minute-long holds for ever. A claim that has lapsed becomes its
+    /// cooldown first, even if nothing read the ledger since.
+    pub fn withdraw_app_claim(&self, app: &AppId) {
+        let mut state = self.lock();
+        state.expire(Instant::now());
         let released = state.claims.remove(app).is_some();
         drop(state);
         if released {
@@ -590,11 +606,50 @@ mod tests {
         drop(executor);
     }
 
+    /// Review of #2250: every full refusal makes the leader move the app,
+    /// so the node retires it. Retiring used to clear the cooldown too, and
+    /// the yield pass could put the replica straight back with a fresh
+    /// claim, rotating job work through minute-long holds for ever.
+    #[tokio::test(start_paused = true)]
+    async fn leaving_the_node_keeps_a_lapsed_claims_cooldown() {
+        let budget = ExecutionBudget::new(of(1000, 1024));
+        let executor = budget.try_acquire_executor(of(1000, 1000)).unwrap();
+        budget.claim_for_app(&web(), of(500, 500));
+        tokio::time::advance(CLAIM_PATIENCE).await;
+        budget.withdraw_app_claim(&web());
+        assert_eq!(
+            budget.claim_for_app(&web(), of(500, 500)),
+            CapacityRefusalKind::Full,
+            "the app came back within its cooldown and claimed again"
+        );
+        tokio::time::advance(CLAIM_COOLDOWN).await;
+        assert_eq!(
+            budget.claim_for_app(&web(), of(500, 500)),
+            CapacityRefusalKind::Yielding
+        );
+        drop(executor);
+    }
+
+    /// Admission is the one thing that forgives a cooldown.
+    #[tokio::test(start_paused = true)]
+    async fn admission_clears_a_cooldown() {
+        let budget = ExecutionBudget::new(of(1000, 1024));
+        let executor = budget.try_acquire_executor(of(1000, 1000)).unwrap();
+        budget.claim_for_app(&web(), of(500, 500));
+        tokio::time::advance(CLAIM_PATIENCE).await;
+        budget.release_app_claim(&web());
+        assert_eq!(
+            budget.claim_for_app(&web(), of(500, 500)),
+            CapacityRefusalKind::Yielding
+        );
+        drop(executor);
+    }
+
     #[test]
     fn removing_an_app_drops_its_claim() {
         let budget = ExecutionBudget::new(of(1000, 1024));
         budget.claim_for_app(&web(), of(600, 600));
-        budget.release_app_claim(&web());
+        budget.withdraw_app_claim(&web());
         assert_eq!(budget.job_available(), budget.available());
     }
 

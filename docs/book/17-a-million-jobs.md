@@ -5370,7 +5370,7 @@ A yielding refusal isn't reported to the leader. That's the important one:
 since #967, a reported refusal makes the leader move the replica, and here it
 would move it away from room being freed for it. So `note_admission` records
 only `Full` refusals, and an admission drops the claim. So does the app
-leaving the node.
+leaving the node, through `withdraw_app_claim`.
 
 **Claims run out.** A claim lasts `CLAIM_PATIENCE`, 60 s from the *first*
 refusal; a second refusal updates the share but keeps the deadline. A quarantined
@@ -5380,6 +5380,19 @@ has moved elsewhere never retries here, so something has to end the wait.
 apps on a five-minute `CLAIM_COOLDOWN`: their next refusal on this node is
 `Full`, reported, and the leader moves them on. Without the cooldown, an app
 whose room never comes back would hold a rolling minute's claim for ever.
+
+Our first version had exactly that hole, and review caught it. Leaving the
+node called the same `release_app_claim` as admission, which forgot the
+cooldown along with the claim. But a full refusal *makes* the app leave: the
+leader moves it, and the node retires it. So the cooldown was gone seconds
+after it started, and the yield pass could put the replica straight back with
+a fresh 60 s claim. Now there are two calls. `release_app_claim`, on
+admission, forgets both; `withdraw_app_claim`, on leaving, drops only the
+claim, and turns a lapsed claim into its cooldown first, in case nothing has
+read the ledger since it ran out. The test,
+`leaving_the_node_keeps_a_lapsed_claims_cooldown`, lets a claim lapse,
+withdraws the app, and checks that it gets `Full` until the cooldown has
+passed.
 
 A lapsing claim isn't a release, though, so nothing notifies the attempts
 waiting behind it. The wait in `acquire` gets a third branch that sleeps until

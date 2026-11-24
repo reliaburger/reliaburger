@@ -1567,7 +1567,8 @@ start into claimed room. Nothing running is stopped. A yielding refusal isn't
 reported to the leader, so the placement stays, and the node's reconciler
 retries it every 5 s. The claim ends when the app is admitted or leaves the
 node, or lapses 60 s after the first refusal; a lapsed app gets *full*
-refusals on that node for 5 minutes. A full refusal is reported as above, and
+refusals on that node for 5 minutes, which leaving the node doesn't clear
+(only admission does). A full refusal is reported as above, and
 the reconciler backs it off to at most 30 s, where other deploy failures back
 off to 300 s. The leader places apps on free room first. Only when no node has
 free room for a replica does its yield pass count job reservations as free,
