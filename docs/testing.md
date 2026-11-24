@@ -443,7 +443,7 @@ jobs. What else runs depends on where the change is going:
 | The gate PR labelled `release-gate` | Everything, portable macOS included; the evidence gate refuses less | about 45 minutes, plus any wait for macOS runners |
 | Any other pull request into `main` | The light set plus the heavy suites and the benchmarks the change touches | about 45 minutes |
 | Pull request stacked on any other branch | The light set; the heavy suites only with `full-ci` | about 17 minutes |
-| Merge-queue group | Everything; only CI policy and the gate when the group changes nothing but documentation | about 60 minutes from 21 to 24 November, set by portable macOS (median 59.8 over 17 green groups); about 35 since the macOS build split (#1723), plus any wait for runners |
+| Merge-queue group | Everything; only CI policy and the gate when the group changes nothing but documentation | about 60 minutes from 21 to 24 November, set by portable macOS (median 59.8 over 17 green groups); about 35 to 47 since the macOS build split (#1723, two runs), plus any wait for runners |
 | Push to a train | Nothing but CI policy and the gate when the merge queue's run on that commit passed every job at its first attempt; portable Linux too when the train's `Cargo.lock`, `Cargo.toml` or `.cargo/config.toml` differs from `main`'s, to save its cache; everything otherwise | a few minutes; about 25 with portable Linux |
 | Push to `main`, nightly, manual, `build.yml`'s candidate build | Everything | about 45 minutes, plus any wait for macOS runners |
 
@@ -607,7 +607,7 @@ testing. Scripts are code here, since the jobs run them.
 What's left is mostly the queue's own settings, which only the maintainer can
 change: building eight groups at once (`max_entries_to_build` in the "release
 trains merge queue" ruleset) means up to 160 jobs, and portable macOS sets
-every group's length: 52 to 57 minutes with a warm cache then, about 35 once
+every group's length: 52 to 57 minutes with a warm cache then, 35 to 47 once
 its lib tests built alone ([below](#portable-macos-in-one-job)).
 
 ### What runs on macOS and what runs on Linux
@@ -708,11 +708,15 @@ The rest was `cargo test --no-run`, which took 21 to 93 minutes for the same
 build from the same full cache hit. It compiled the lib tests and the lib side
 by side on a 3-core, 7 GB runner, [#1943](https://github.com/reliaburger/reliaburger/issues/1943)'s
 mechanism on a smaller host, so `make test-macos` now builds the lib tests on
-their own first, as `test-linux` does, then the rest (#1723). In the first run
-([45338026382](https://github.com/reliaburger/reliaburger/actions/runs/45338026382))
-the lib tests took 24:55, the rest 4:43 and the job 34.8 minutes. The lib
-tests still page on their own: swap in use peaked at 1.3 GB, and about 4.6 GB
-went out to swap while they compiled.
+their own first, as `test-linux` does, then the rest (#1723). In its first
+two runs
+([45338026382](https://github.com/reliaburger/reliaburger/actions/runs/45338026382),
+[45348952470](https://github.com/reliaburger/reliaburger/actions/runs/45348952470))
+the lib tests took 24:55 and 33:35, the rest 4:43 and 6:43, and the job 34.8
+and 46.5 minutes. The lib tests still page on their own: swap in use peaked
+at 1.3 GB both times, and 3.6 to 4.6 GB went out to swap while they compiled.
+Splitting `relish` into its own crate, so macOS compiles only what it tests,
+is what would end the paging.
 
 The job logs the runner's memory every 15 seconds from before the lint
 ([`watch-macos-memory`](../scripts/ci/watch-macos-memory)): the load, free

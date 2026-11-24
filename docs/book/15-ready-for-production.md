@@ -1493,8 +1493,9 @@ looked up on `PATH` so the tests can stand in fakes for them. It never stops any
 job is to leave evidence, and its tests check that a missing tool leaves a field empty
 rather than ending the log.
 
-The first run after the split took 34.8 minutes: 24:55 for the lib tests, 4:43 for the rest,
-under two for the tests. The log shows why the lib tests are still slow on their own. Free
+The first two runs after the split took 34.8 and 46.5 minutes, against the 58.4 median: 24:55
+and 33:35 for the lib tests, 4:43 and 6:43 for the rest, under two for the tests. Better, and
+still a wide spread. The first run's log shows why the lib tests are slow on their own. Free
 memory fell from 78% to 35% in the first six minutes, swap started two minutes later and grew
 for sixteen more, and by the time the binary linked about 4.6 GB had gone out to swap. One rustc of the lib
 tests is more than this runner holds. Splitting `relish` into its own crate, so macOS
