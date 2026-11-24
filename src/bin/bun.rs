@@ -1338,6 +1338,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let shutdown = CancellationToken::new();
     // Startup failures must also stop the tasks already launched.
     let _shutdown_guard = shutdown.clone().drop_guard();
+    // Give glibc's kept free memory back every ten minutes, so resident
+    // memory follows the live heap (#1936). A no-op off glibc.
+    tokio::spawn(reliaburger::bun::malloc_trim::run_malloc_trim_loop(
+        shutdown.clone(),
+    ));
     let readiness = reliaburger::bun::readiness::ReadinessTracker::new();
     for name in ["agent", "api", "registry"] {
         readiness.register(name, true).await;

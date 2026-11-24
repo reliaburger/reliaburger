@@ -33,6 +33,7 @@ pub mod lease_reaper;
 pub mod live_attempts;
 pub mod loop_meter;
 pub mod loop_watchdog;
+pub mod malloc_trim;
 pub mod namespace_keys;
 pub mod probe;
 pub mod proposals;
