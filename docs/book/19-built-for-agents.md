@@ -2711,10 +2711,15 @@ runs against whatever this build carries:
   paths were relative to `src/`, which made every path an agent quoted subtly
   wrong.
 - `the_digest_is_the_tarballs`: the recorded digest matches the bytes.
-- `the_bundle_stays_under_six_megabytes_at_release_level`: a debug build
+- `the_bundle_stays_under_seven_megabytes_at_release_level`: a debug build
   compresses at level 3, so the test compresses the tarball at 19 itself and
   checks what a release would embed. The failure message says what to do: drop
-  something from the list, or raise the ceiling on purpose.
+  something from the list, or raise the ceiling on purpose. The ceiling was
+  6 MiB until 0.3.3, when the tree had grown to 6.22 MB and the release's
+  queued pull requests together took it to 6.33 MB. Each passed alone; only
+  the merge queue, testing them together, crossed the line. The biggest single
+  addition was a fuzz corpus, 67 KB compressed, and the fuzz tests read it, so
+  it stays: we raised the ceiling to 7 MiB on purpose instead.
 
 The second kind packs a small tree in a temporary directory, so the result is
 known exactly: two packs of the same files give the same digest and the same
