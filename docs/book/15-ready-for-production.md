@@ -3934,6 +3934,39 @@ fault, then drops the controller and proves a restarted owner removes the
 stale cgroup. On macOS, rootless Linux or a cgroup hierarchy without both
 controllers, capability evidence says `Unavailable`. Honest again.
 
+Honest, but for a while not *current*. The Wyse lab in 0.3.2 refused the
+chaos suite on all three nodes with `node_pressure (unavailable)`, although
+every node ran rootful with both ceilings at 80% (#2242). A cgroup only offers
+the controllers its parent switched on in the parent's
+`cgroup.subtree_control`, and systemd switches cpu and memory on at the root
+lazily, when a unit or container first asks. Bun started first, found an empty
+`cgroup.controllers` in `reliaburger-chaos`, and recorded `false` once, at
+startup. Nothing asked again, and nothing said why. Restarting Bun after the
+containers were up "fixed" it, which is the kind of fix you don't want an
+operator to need.
+
+So preparation stopped being a startup event. `ensure_controllers` makes the
+cgroup ready and is cheap to repeat: two reads when it's already right, and
+it writes only the controllers that are missing, so it never touches a control
+a live helper relies on. If the parent offers cpu and memory but hasn't
+delegated them, it enables them there itself, which is what runc does for every
+container's ancestors anyway. `NodePressureController::apply` calls it (on the
+blocking pool, through the public `probe`) before each fault, and so does
+`/v1/capabilities` before it reports `node_pressure`. The startup result is
+now only a fallback for a report built without a fresh probe. Startup keeps the
+one job that must happen once: sweeping `fault-*` cgroups a crashed Bun left
+behind. A probe can't sweep, because a sweep would kill a running helper.
+
+The failure now says what's missing, in the capability's details and in the
+refusal: `cgroup v2 cpu controller is unavailable: /sys/fs/cgroup doesn't offer
+it`. The tests drive `ensure_controllers` against a fake hierarchy in a
+temporary directory: one starts with nothing delegated, fails, gains the
+controllers and then succeeds with `+cpu +memory` written; another checks that
+the parent's `cgroup.subtree_control` gets the delegation; a third proves a
+ready cgroup isn't rewritten. Because the function is plain `std::fs`, it's
+compiled for tests on macOS too (`#[cfg(any(target_os = "linux", test))]`), so
+the logic is checked on every laptop and not only under `make test-linux`.
+
 ## Chaos with a safety catch
 
 We had five recovery scenarios on paper. Running them wasn't the difficult
