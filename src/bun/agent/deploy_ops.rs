@@ -1222,6 +1222,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// off this node (#971). A refusal is kept until an admission of the
     /// same app succeeds; any other failure says nothing about capacity, so
     /// it leaves the record as it was.
+    ///
+    /// A refusal job work is yielding room for isn't recorded (#1967): the
+    /// app holds a claim here and its retry will fit, so the leader must
+    /// keep the replica here rather than move it away from room being
+    /// freed for it. Admission drops the claim.
     fn note_admission<T>(
         &mut self,
         app_name: &str,
@@ -1231,12 +1236,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     ) {
         let key = (app_name.to_string(), namespace.to_string());
         match result {
-            Err(BunError::Capacity { .. }) => {
+            Err(BunError::Capacity {
+                kind: crate::bun::execution_budget::CapacityRefusalKind::Full,
+                ..
+            }) => {
                 ordinals.sort_unstable();
                 ordinals.dedup();
                 self.capacity_refusals.insert(key, ordinals);
             }
             Ok(_) => {
+                self.execution_budget()
+                    .release_app_claim(&crate::meat::AppId::new(app_name, namespace));
                 self.capacity_refusals.remove(&key);
             }
             Err(_) => {}

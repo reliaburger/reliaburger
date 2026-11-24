@@ -182,6 +182,9 @@ For an image in the cluster's registry:
 relish run --batch render --count 10000 --image renderer:v1 --cpu 250m-500m --memory 256Mi-512Mi -- /renderer --frame {index}
 ```
 
+A host command, with `--exec` and no image, also needs each Linux node's
+mount isolation turned off first; see "Host commands" below.
+
 CPU and memory use the same request–limit syntax as apps. Requests govern local
 packing; rootful Linux container and native process jobs enforce limits. Omitted values mean 1 CPU and
 64 MiB, including the limits. A fresh `runc` job or template needs a memory
@@ -483,6 +486,27 @@ identities; every attempt gets a fresh launch. Singleton container roots are
 writable. Larger arrays use a read-only root, temporary scratch and a 1 MiB limit
 per regular output or scratch file (`RLIMIT_FSIZE`).
 
+### Host commands
+
+**Before you run host commands on Linux, turn mount isolation off.** Linux
+turns `[process_workloads] mount_isolation` on by default, including on nodes
+`relish setup --ssh` installs, and no host workload runs under it yet: not an
+array, not a single `[job]`, not an `exec` or `script` app (#714). A node with
+it on refuses every host command it's given. Each node that should run host
+jobs needs mount isolation off and the job's binary on its allowlist:
+
+```toml
+[process_workloads]
+allowed_binaries = ["/usr/bin/printf"]
+mount_isolation = false
+```
+
+Restart Bun after the change. With isolation off, host commands run
+unisolated: they see the node's whole filesystem as Bun's user. If that's
+more than you want to give them, leave mount isolation on and give the job
+an image instead; image tasks run in containers and don't need either
+setting.
+
 On Linux, Bun's `auto` and `mixed` modes select the backend per workload.
 Jobs select `runtime = "runc"` (the default), `runtime = "process"`, or
 `runtime = "shared-runc"`. Process jobs use `exec` or `script` and refuse
@@ -492,23 +516,14 @@ Jobs select `runtime = "runc"` (the default), `runtime = "process"`, or
 On Linux, `bun --runtime mixed` enables both owned backends. `--runtime auto`
 can detect both when runc is available. Explicit `--runtime runc` is
 container-only and refuses host jobs; `--runtime process` is host-only.
-Host commands still need the executable allowlist and
-`mount_isolation = false`. On rootful Linux, process batches (`relish run
+Host commands need the allowlist and `mount_isolation = false` shown
+above. On rootful Linux, process batches (`relish run
 --batch`) use native executors and enforce CPU/memory limits before execution.
 Ordinary `[job]` host commands, and every host command on other platforms, use
 the original owned process backend and refuse explicit limits. Containers and native jobs
 keep separate execution capabilities.
 
-Linux turns `[process_workloads] mount_isolation` on by default, and host jobs
-don't run under it yet (#714). Until they do, every node that should run host
-jobs needs this in its config:
-
-```toml
-[process_workloads]
-mount_isolation = false
-```
-
-Forget it and the cluster says so straight away. A standalone node refuses the
+Forget mount isolation and the cluster says so straight away. A standalone node refuses the
 submission (`relish run`, `relish apply`, `POST /v1/jobs/runs`) with HTTP 422
 and the reason. So does a cluster: every node advertises over gossip what
 kinds of job it runs (host commands, containers, limits it can enforce,
@@ -562,11 +577,20 @@ task attempts and executors hold, separately from its app requests, and the
 leader counts both when it places an app replica. A node full of job work
 looks full, so the replica goes to a node with room.
 
-Placement and attempts can still race: jobs may take a node's room between the
-leader placing a replica and the node starting it. The agent doesn't wait or
-preempt running attempts. It reports the refusal, and the leader moves that
-replica to another node. Capacity a job held returns to the budget only once
-its attempt has positively retired.
+When no node has free room, apps come first. The leader places the replica on
+the node with the most room after apps, and `relish agent explain` names the
+decision `placement.jobs_yield_to_apps`. That node refuses the replica once and
+holds a claim on the room for up to a minute: idle executors retire, busy ones
+retire when their command ends, and no new attempt or executor starts into the
+claimed room. Its placement reconciler retries every five seconds, and the
+replica starts as soon as the room is free. Running attempts are never stopped.
+
+If job work can't free enough (other apps hold the room, or the claim lapses
+after a minute), the agent reports the refusal and the leader moves the
+replica to another node; that node won't claim for the same app again for five
+minutes. The same report covers a replica that loses the race: jobs taking a
+node's room between the leader placing it and the node starting it. Capacity a
+job held returns to the budget only once its attempt has positively retired.
 
 
 ## Reusable containers
@@ -747,8 +771,10 @@ after old executors retire at startup. Losing the source binding stops its
 original runtime owner.
 
 Local packing is non-preemptive. Existing applications have reserved requests;
-new deployments and rolling replacements also need free capacity. There is no
-DRF tenant fairness or automatic app pre-emption of running jobs. Batch admission uses FIFO waiting so smaller tasks cannot repeatedly overtake
+rolling replacements also need free capacity. A refused new replica makes job
+work yield its room at the next task boundary (see "Apps and jobs share each
+node"), but nothing running is stopped for it, and there's no DRF tenant
+fairness. Batch admission uses FIFO waiting so smaller tasks cannot repeatedly overtake
 a larger waiting request. This can leave capacity idle behind a large request. Reserve service capacity and allow
 rollout headroom when planning a mixed cluster.
 

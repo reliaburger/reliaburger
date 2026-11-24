@@ -133,10 +133,10 @@ pub struct AgentVersion {
 #[derive(Clone)]
 pub struct BunClient {
     base_url: String,
-    client: Result<reqwest::Client, String>,
+    client: Result<reqwest::Client, Unusable>,
     /// The client for streaming responses. It sets no deadline of its own:
     /// [`StreamBody`] applies [`ClientTimeouts`] as it reads.
-    stream_client: Result<reqwest::Client, String>,
+    stream_client: Result<reqwest::Client, Unusable>,
     /// The deadlines requests through this client get.
     timeouts: ClientTimeouts,
     websocket_tls: Option<std::sync::Arc<rustls::ClientConfig>>,
@@ -146,6 +146,27 @@ pub struct BunClient {
     /// Ask writes to break any agent lease in their way (`--break-lease`,
     /// #1686).
     break_lease: bool,
+}
+
+/// Why a [`BunClient`] can't send anything, reported when a command first
+/// talks to the cluster.
+#[derive(Debug, Clone)]
+enum Unusable {
+    /// Its configuration is broken: an unreadable CA certificate, say.
+    Config(String),
+    /// None of the context's endpoints answered (#2241).
+    NoEndpointAnswered(Vec<super::EndpointAttempt>),
+}
+
+impl Unusable {
+    fn error(&self) -> RelishError {
+        match self {
+            Unusable::Config(reason) => RelishError::ClientConfig(reason.clone()),
+            Unusable::NoEndpointAnswered(attempts) => RelishError::NoEndpointAnswered {
+                attempts: attempts.clone(),
+            },
+        }
+    }
 }
 
 /// Options for fetching or streaming logs.
@@ -979,10 +1000,15 @@ impl BunClient {
     /// broken configuration surfaces when the command first talks to the
     /// agent.
     fn unusable(base_url: &str, token: Option<&str>, reason: String) -> Self {
+        Self::unusable_because(base_url, token, Unusable::Config(reason))
+    }
+
+    /// A client every request through which fails because of `why`.
+    fn unusable_because(base_url: &str, token: Option<&str>, why: Unusable) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            client: Err(reason.clone()),
-            stream_client: Err(reason),
+            client: Err(why.clone()),
+            stream_client: Err(why),
             timeouts: ClientTimeouts::default(),
             websocket_tls: None,
             ca_pem: None,
@@ -1007,12 +1033,15 @@ impl BunClient {
         // Ordinary requests answer in one go, so a total deadline bounds them.
         let client = tls
             .clone()
-            .and_then(|tls| http_client(token, tls, |builder| builder.timeout(timeouts.request)));
+            .and_then(|tls| http_client(token, tls, |builder| builder.timeout(timeouts.request)))
+            .map_err(Unusable::Config);
         // A followed log or a deploy's progress stream runs for as long as
         // the work behind it does, so its client has no deadline; `StreamBody`
         // ends it on silence (the agent sends an SSE keep-alive every 15 s)
         // or, for a deploy, at `deploy_stream`.
-        let stream_client = tls.and_then(|tls| http_client(token, tls, |builder| builder));
+        let stream_client = tls
+            .and_then(|tls| http_client(token, tls, |builder| builder))
+            .map_err(Unusable::Config);
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             client,
@@ -1184,9 +1213,7 @@ impl BunClient {
     /// different port (M21) — so they, too, are authenticated and TLS-trusting.
     /// Invalid client configuration returns an error before any request is sent.
     pub fn http(&self) -> Result<&reqwest::Client, RelishError> {
-        self.client
-            .as_ref()
-            .map_err(|reason| RelishError::ClientConfig(reason.clone()))
+        self.client.as_ref().map_err(Unusable::error)
     }
 
     /// The HTTP client for a response that streams for as long as the work
@@ -1194,9 +1221,7 @@ impl BunClient {
     /// [`Self::start_stream`] and read through [`StreamBody`], which apply
     /// the deadlines.
     fn streaming_http(&self) -> Result<&reqwest::Client, RelishError> {
-        self.stream_client
-            .as_ref()
-            .map_err(|reason| RelishError::ClientConfig(reason.clone()))
+        self.stream_client.as_ref().map_err(Unusable::error)
     }
 
     /// Send a request whose answer streams. The work before the first byte
@@ -1265,15 +1290,31 @@ impl BunClient {
             };
         }
         // BLOCKING-OK: relish CLI: a one-shot read of the local context before the command does anything long-lived; the agent commands, which `relish mcp` serves, call it off the runtime through `BunClient::local`
-        let context = super::local_context::default_path()
-            .and_then(|path| super::local_context::LocalContext::load(&path));
+        let path = super::local_context::default_path();
+        // BLOCKING-OK: relish CLI: the same one-shot read of the local context, from the path above
+        let context = path
+            .as_ref()
+            .map_err(|error| RelishError::InitFailed(error.to_string()))
+            .and_then(|path| super::local_context::LocalContext::load(path));
         match context {
             Ok(Some(context)) => {
-                return context
-                    .client(resolve_token().as_deref(), resolve_ca_cert().as_deref())
-                    .unwrap_or_else(|error| {
-                        Self::unusable(&context.endpoint, None, error.to_string())
-                    });
+                let connected = context.connect(
+                    resolve_token().as_deref(),
+                    resolve_ca_cert().as_deref(),
+                    super::local_context::probe_endpoint,
+                );
+                return match connected {
+                    Ok((client, choice)) => {
+                        Self::report_fallover(&context, &choice, path.ok().as_deref());
+                        client
+                    }
+                    Err(RelishError::NoEndpointAnswered { attempts }) => Self::unusable_because(
+                        &context.endpoint,
+                        None,
+                        Unusable::NoEndpointAnswered(attempts),
+                    ),
+                    Err(error) => Self::unusable(&context.endpoint, None, error.to_string()),
+                };
             }
             Err(error) => {
                 return Self::unusable("https://127.0.0.1:19117", None, error.to_string());
@@ -1286,6 +1327,29 @@ impl BunClient {
             "http"
         };
         Self::new(&format!("{scheme}://127.0.0.1:9117"))
+    }
+
+    /// Say which node answered when the ones tried before it didn't, and
+    /// remember it in the context at `path` so the next command asks it
+    /// first (#2241). Remembering is best effort: a busy or unwritable
+    /// context only costs the next command the same wait.
+    fn report_fallover(
+        context: &super::local_context::LocalContext,
+        choice: &super::local_context::EndpointChoice,
+        path: Option<&std::path::Path>,
+    ) {
+        for skipped in &choice.passed_over {
+            eprintln!(
+                "warning: {} didn't answer ({}); trying the cluster's next node",
+                skipped.endpoint, skipped.cause
+            );
+        }
+        if !choice.passed_over.is_empty() {
+            eprintln!("relish is using {}", choice.endpoint);
+        }
+        if let Some(path) = path {
+            let _ = context.remember_answered(path, &choice.endpoint);
+        }
     }
 
     /// Check if the agent is reachable.
@@ -1751,6 +1815,15 @@ impl BunClient {
         self.get_typed_json("/v1/version").await
     }
 
+    /// Whether each app's current spec has finished rolling out, from the
+    /// leader (`GET /v1/diagnostics/rollouts`). A node that predates the
+    /// read answers 404.
+    pub async fn rollouts(
+        &self,
+    ) -> Result<Vec<crate::bun::diagnostics::RolloutEvidence>, RelishError> {
+        self.get_typed_json("/v1/diagnostics/rollouts").await
+    }
+
     /// Fetch desired application replicas and current scheduler coverage.
     pub async fn desired_apps(
         &self,
@@ -1771,6 +1844,7 @@ impl BunClient {
                 resource: row.resource,
                 image: row.image,
                 fingerprint: row.fingerprint,
+                owner: row.owner,
             })
             .collect())
     }

@@ -44,6 +44,7 @@ mod cloud_init;
 mod cluster_fixtures;
 mod compatibility;
 mod container_runtime_required;
+mod context_endpoints;
 mod controller_example;
 mod council_persistence;
 mod council_snapshot_install;

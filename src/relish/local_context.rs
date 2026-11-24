@@ -19,8 +19,18 @@ pub struct LocalContext {
     pub schema: u32,
     /// Stable cluster operation identifier, protecting another cluster's context.
     pub owner: String,
-    /// Host-accessible HTTPS API endpoint.
+    /// Host-accessible HTTPS API endpoint of the node relish asks first:
+    /// the first node set up.
     pub endpoint: String,
+    /// The other nodes' API endpoints, which relish tries in order when
+    /// `endpoint` doesn't answer (#2241). Empty for a cluster this host
+    /// reaches through one forward, such as a laptop cluster.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub other_endpoints: Vec<String>,
+    /// The endpoint that answered last time, when it wasn't `endpoint`, so
+    /// the next command asks it first instead of waiting on a dead node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_answered: Option<String>,
     /// Administrator bearer, stored only in an owner-readable file.
     pub token: String,
     /// Absolute path to the cluster's public CA certificate.
@@ -127,6 +137,23 @@ impl LocalContext {
         token: Option<&str>,
         ca_cert: Option<&Path>,
     ) -> Result<super::client::BunClient, RelishError> {
+        self.connect(token, ca_cert, probe_endpoint)
+            .map(|(client, _)| client)
+    }
+
+    /// [`client`](Self::client), aimed at the first of this context's
+    /// endpoints that `probe` says answers, and that choice.
+    ///
+    /// Every endpoint gets the same pinned CA and bearer, so a node that
+    /// answers but doesn't prove it belongs to this cluster's CA still fails
+    /// the command on its TLS handshake: falling over never weakens the
+    /// identity check.
+    pub fn connect(
+        &self,
+        token: Option<&str>,
+        ca_cert: Option<&Path>,
+        probe: impl FnMut(&str) -> Result<(), super::UnreachableCause>,
+    ) -> Result<(super::client::BunClient, EndpointChoice), RelishError> {
         self.validate()?;
         let ca = match ca_cert {
             Some(path) => std::fs::read(path).map_err(|error| {
@@ -137,12 +164,118 @@ impl LocalContext {
             })?,
             None => self.read_ca()?,
         };
-        super::client::BunClient::new_with_ca(
-            &self.endpoint,
+        let choice = self.choose_endpoint(probe)?;
+        let client = super::client::BunClient::new_with_ca(
+            &choice.endpoint,
             Some(token.unwrap_or(&self.token)),
             &ca,
-        )
-        .map(|client| client.with_service_endpoints(self.service_endpoints.clone()))
+        )?
+        .with_service_endpoints(self.service_endpoints_for(&choice.endpoint));
+        Ok((client, choice))
+    }
+
+    /// Every endpoint relish may try, in the order it tries them: the one
+    /// that answered last time, then `endpoint`, then `other_endpoints`.
+    pub fn endpoints(&self) -> Vec<&str> {
+        let listed = std::iter::once(self.endpoint.as_str())
+            .chain(self.other_endpoints.iter().map(String::as_str));
+        // A remembered endpoint the list no longer holds is ignored, not
+        // trusted: someone edited the list since.
+        let last = self
+            .last_answered
+            .as_deref()
+            .filter(|last| listed.clone().any(|endpoint| endpoint == *last));
+        let mut order: Vec<&str> = Vec::new();
+        for endpoint in last.into_iter().chain(listed) {
+            if !order.contains(&endpoint) {
+                order.push(endpoint);
+            }
+        }
+        order
+    }
+
+    /// The first endpoint, in [`endpoints`](Self::endpoints) order, that
+    /// `probe` says accepts a connection, with the ones before it that
+    /// didn't. A context with one endpoint isn't probed: the command's own
+    /// request says why it can't connect. When none answers, the error lists
+    /// every endpoint tried and why.
+    pub fn choose_endpoint(
+        &self,
+        mut probe: impl FnMut(&str) -> Result<(), super::UnreachableCause>,
+    ) -> Result<EndpointChoice, RelishError> {
+        let candidates = self.endpoints();
+        if let [only] = candidates.as_slice() {
+            return Ok(EndpointChoice {
+                endpoint: only.to_string(),
+                passed_over: Vec::new(),
+            });
+        }
+        let mut passed_over = Vec::new();
+        for endpoint in candidates {
+            match probe(endpoint) {
+                Ok(()) => {
+                    return Ok(EndpointChoice {
+                        endpoint: endpoint.to_string(),
+                        passed_over,
+                    });
+                }
+                Err(cause) => passed_over.push(super::EndpointAttempt {
+                    endpoint: endpoint.to_string(),
+                    cause,
+                }),
+            }
+        }
+        Err(RelishError::NoEndpointAnswered {
+            attempts: passed_over,
+        })
+    }
+
+    /// Remember that `endpoint` answered, in the context at `path`, so the
+    /// next command asks it first. Leaves the file alone when nothing
+    /// changes, or when it now holds another cluster's context or no longer
+    /// lists `endpoint`.
+    pub fn remember_answered(&self, path: &Path, endpoint: &str) -> Result<(), RelishError> {
+        let last = (endpoint != self.endpoint).then(|| endpoint.to_string());
+        if last == self.last_answered {
+            return Ok(());
+        }
+        let _lock = lock_context(path)?;
+        let Some(mut current) = Self::load(path)? else {
+            return Ok(());
+        };
+        if current.owner != self.owner || !current.endpoints().contains(&endpoint) {
+            return Ok(());
+        }
+        current.last_answered = last;
+        let bytes = serde_json::to_vec_pretty(&current).map_err(RelishError::SerialiseJson)?;
+        crate::sesame::identity::atomic_write_mode(path, &bytes, Some(0o600))?;
+        Ok(())
+    }
+
+    /// The host forwards for a connection to `endpoint`. A forward on the
+    /// same host as `endpoint` (a bare-metal node's registry and ingress)
+    /// moves with the API to the node that answered; one on another host
+    /// (a laptop's own forwards) stays.
+    fn service_endpoints_for(&self, endpoint: &str) -> crate::bun::capabilities::ServiceEndpoints {
+        let mut forwards = self.service_endpoints.clone();
+        let (Some(home), Some(chosen)) = (url_host(&self.endpoint), url_host(endpoint)) else {
+            return forwards;
+        };
+        if home == chosen {
+            return forwards;
+        }
+        for forward in [
+            &mut forwards.registry,
+            &mut forwards.ingress_http,
+            &mut forwards.ingress_https,
+        ] {
+            if let Some(origin) = forward
+                && let Some(moved) = with_host(origin, home, chosen)
+            {
+                *origin = moved;
+            }
+        }
+        forwards
     }
 
     /// This context's host forwards, for a connection pinned to the same
@@ -204,8 +337,89 @@ impl LocalContext {
                 "managed context requires HTTPS".to_string(),
             ));
         }
+        for endpoint in &self.other_endpoints {
+            super::client::validate_endpoint(endpoint).map_err(|error| {
+                RelishError::InitFailed(format!("invalid context endpoint {endpoint}: {error}"))
+            })?;
+            if !endpoint.starts_with("https://") {
+                return Err(RelishError::InitFailed(format!(
+                    "managed context requires HTTPS, and {endpoint} isn't"
+                )));
+            }
+        }
         Ok(())
     }
+}
+
+/// How long relish waits for each of a context's endpoints to accept a TCP
+/// connection before it tries the next (#2241). A node on the same LAN
+/// answers in milliseconds; one whose power is off never does.
+pub const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Which of a context's endpoints a command uses, and the ones it tried
+/// first that didn't answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointChoice {
+    /// The endpoint that accepted a connection.
+    pub endpoint: String,
+    /// The endpoints tried before it, and why each didn't answer.
+    pub passed_over: Vec<super::EndpointAttempt>,
+}
+
+/// Whether `endpoint` accepts a TCP connection within [`PROBE_TIMEOUT`].
+///
+/// It's only a connect: the command's own request still does the TLS
+/// handshake against the cluster CA, so a probe that reaches the wrong
+/// server can't let it through. It blocks, like the rest of reading the
+/// context; `relish mcp` builds its clients off the runtime.
+pub fn probe_endpoint(endpoint: &str) -> Result<(), super::UnreachableCause> {
+    use super::UnreachableCause;
+    let url = reqwest::Url::parse(endpoint)
+        .map_err(|error| UnreachableCause::Other(format!("invalid endpoint: {error}")))?;
+    let addresses = url
+        .socket_addrs(|| None)
+        .map_err(|_| UnreachableCause::NameResolution)?;
+    let mut cause = UnreachableCause::NameResolution;
+    for address in addresses {
+        match std::net::TcpStream::connect_timeout(&address, PROBE_TIMEOUT) {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                cause = match error.kind() {
+                    std::io::ErrorKind::ConnectionRefused => UnreachableCause::Refused,
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+                        UnreachableCause::TimedOut
+                    }
+                    _ => UnreachableCause::Other(error.to_string()),
+                }
+            }
+        }
+    }
+    Err(cause)
+}
+
+/// The host of an `scheme://host[:port][/path]` URL, brackets and all for
+/// IPv6, or `None` when it isn't one.
+fn url_host(url: &str) -> Option<&str> {
+    let (_, rest) = url.split_once("://")?;
+    let authority = rest.split('/').next()?;
+    let host = if authority.ends_with(']') {
+        authority
+    } else {
+        authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _)| host)
+    };
+    (!host.is_empty()).then_some(host)
+}
+
+/// `url` with its host `from` replaced by `to`, or `None` when its host
+/// isn't `from`.
+fn with_host(url: &str, from: &str, to: &str) -> Option<String> {
+    if url_host(url)? != from {
+        return None;
+    }
+    let (scheme, rest) = url.split_once("://")?;
+    Some(format!("{scheme}://{to}{}", &rest[from.len()..]))
 }
 
 /// Another cluster's context that [`LocalContext::save`] replaced because a
@@ -411,10 +625,233 @@ mod tests {
             schema: 1,
             owner: owner.to_string(),
             endpoint: "https://127.0.0.1:19117".to_string(),
+            other_endpoints: Vec::new(),
+            last_answered: None,
             token: "rbrg_private".to_string(),
             ca_cert: root.join("root-ca.crt"),
             service_endpoints: Default::default(),
         }
+    }
+
+    const NODE_1: &str = "https://10.77.0.11:9117";
+    const NODE_2: &str = "https://10.77.0.12:9117";
+    const NODE_3: &str = "https://10.77.0.13:9117";
+
+    /// A bare-metal context for three nodes, node 1 first.
+    fn three_nodes(root: &std::path::Path) -> LocalContext {
+        let mut three = context(root, "bare-metal/lab");
+        three.endpoint = NODE_1.to_string();
+        three.other_endpoints = vec![NODE_2.to_string(), NODE_3.to_string()];
+        three
+    }
+
+    /// A probe that answers only for `up`, recording what it was asked.
+    fn only_up<'a>(
+        up: &'a [&'a str],
+        asked: &'a std::cell::RefCell<Vec<String>>,
+    ) -> impl FnMut(&str) -> Result<(), crate::relish::UnreachableCause> + 'a {
+        move |endpoint| {
+            asked.borrow_mut().push(endpoint.to_string());
+            if up.contains(&endpoint) {
+                Ok(())
+            } else {
+                Err(crate::relish::UnreachableCause::TimedOut)
+            }
+        }
+    }
+
+    #[test]
+    fn with_its_first_endpoint_down_a_three_node_context_still_answers() {
+        let root = tempfile::tempdir().unwrap();
+        let asked = std::cell::RefCell::new(Vec::new());
+
+        let choice = three_nodes(root.path())
+            .choose_endpoint(only_up(&[NODE_2, NODE_3], &asked))
+            .unwrap();
+
+        assert_eq!(choice.endpoint, NODE_2);
+        assert_eq!(
+            choice.passed_over,
+            vec![crate::relish::EndpointAttempt {
+                endpoint: NODE_1.to_string(),
+                cause: crate::relish::UnreachableCause::TimedOut,
+            }]
+        );
+        assert_eq!(
+            *asked.borrow(),
+            vec![NODE_1, NODE_2],
+            "stops at the first that answers"
+        );
+    }
+
+    #[test]
+    fn when_no_endpoint_answers_the_error_lists_every_endpoint_tried() {
+        let root = tempfile::tempdir().unwrap();
+        let asked = std::cell::RefCell::new(Vec::new());
+
+        let error = three_nodes(root.path())
+            .choose_endpoint(only_up(&[], &asked))
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            RelishError::NoEndpointAnswered { attempts } if attempts.len() == 3
+        ));
+        let message = error.to_string();
+        for endpoint in [NODE_1, NODE_2, NODE_3] {
+            assert!(message.contains(endpoint), "{message}");
+        }
+        assert!(
+            message.contains("no answer before the connect timeout"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_context_with_one_endpoint_is_not_probed() {
+        let root = tempfile::tempdir().unwrap();
+        let asked = std::cell::RefCell::new(Vec::new());
+
+        let choice = context(root.path(), "cluster-a")
+            .choose_endpoint(only_up(&[], &asked))
+            .unwrap();
+
+        assert_eq!(choice.endpoint, "https://127.0.0.1:19117");
+        assert!(asked.borrow().is_empty());
+    }
+
+    #[test]
+    fn the_endpoint_that_answered_last_is_tried_first_then_the_rest_in_order() {
+        let root = tempfile::tempdir().unwrap();
+        let mut context = three_nodes(root.path());
+        assert_eq!(context.endpoints(), vec![NODE_1, NODE_2, NODE_3]);
+
+        context.last_answered = Some(NODE_3.to_string());
+        assert_eq!(context.endpoints(), vec![NODE_3, NODE_1, NODE_2]);
+
+        // An endpoint the list no longer holds is ignored.
+        context.last_answered = Some("https://10.77.0.99:9117".to_string());
+        assert_eq!(context.endpoints(), vec![NODE_1, NODE_2, NODE_3]);
+    }
+
+    #[test]
+    fn the_node_that_answered_is_remembered_for_the_next_command() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("context.json");
+        let context = three_nodes(root.path());
+        context.save(&path).unwrap();
+
+        context.remember_answered(&path, NODE_2).unwrap();
+        let saved = LocalContext::load(&path).unwrap().unwrap();
+        assert_eq!(saved.last_answered.as_deref(), Some(NODE_2));
+        assert_eq!(saved.endpoints()[0], NODE_2);
+
+        // Node 1 answering again puts it back first.
+        saved.remember_answered(&path, NODE_1).unwrap();
+        let saved = LocalContext::load(&path).unwrap().unwrap();
+        assert_eq!(saved.last_answered, None);
+        assert_eq!(saved.endpoints()[0], NODE_1);
+    }
+
+    #[test]
+    fn remembering_leaves_another_clusters_context_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("context.json");
+        context(root.path(), "cluster-a").save(&path).unwrap();
+
+        three_nodes(root.path())
+            .remember_answered(&path, NODE_2)
+            .unwrap();
+
+        let saved = LocalContext::load(&path).unwrap().unwrap();
+        assert_eq!(saved.owner, "cluster-a");
+        assert_eq!(saved.last_answered, None);
+    }
+
+    #[test]
+    fn forwards_on_the_first_nodes_host_move_to_the_node_that_answered() {
+        let root = tempfile::tempdir().unwrap();
+        let mut context = three_nodes(root.path());
+        context.service_endpoints = crate::bun::capabilities::ServiceEndpoints {
+            registry: Some("https://10.77.0.11:5050".to_string()),
+            ingress_http: Some("http://10.77.0.11:80".to_string()),
+            ingress_https: Some("https://127.0.0.1:8443".to_string()),
+        };
+
+        let forwards = context.service_endpoints_for(NODE_2);
+
+        assert_eq!(
+            forwards.registry.as_deref(),
+            Some("https://10.77.0.12:5050")
+        );
+        assert_eq!(
+            forwards.ingress_http.as_deref(),
+            Some("http://10.77.0.12:80")
+        );
+        assert_eq!(
+            forwards.ingress_https.as_deref(),
+            Some("https://127.0.0.1:8443"),
+            "a forward on another host stays"
+        );
+        assert_eq!(
+            context.service_endpoints_for(NODE_1),
+            context.service_endpoints
+        );
+    }
+
+    #[test]
+    fn hosts_are_found_in_ipv4_ipv6_and_named_urls() {
+        assert_eq!(url_host("https://10.0.0.1:9117"), Some("10.0.0.1"));
+        assert_eq!(url_host("https://[fd00::1]:9117/v1"), Some("[fd00::1]"));
+        assert_eq!(url_host("http://[fd00::1]"), Some("[fd00::1]"));
+        assert_eq!(url_host("http://wyse-1.lan"), Some("wyse-1.lan"));
+        assert_eq!(url_host("not a url"), None);
+        assert_eq!(
+            with_host("https://[fd00::1]:5050", "[fd00::1]", "[fd00::2]").as_deref(),
+            Some("https://[fd00::2]:5050")
+        );
+        assert_eq!(
+            with_host("https://10.0.0.1:5050", "10.0.0.9", "10.0.0.2"),
+            None
+        );
+    }
+
+    #[test]
+    fn every_endpoint_of_a_context_must_be_https() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("context.json");
+        let mut plaintext = three_nodes(root.path());
+        plaintext
+            .other_endpoints
+            .push("http://10.77.0.14:9117".to_string());
+        assert!(plaintext.save(&path).is_err());
+    }
+
+    #[test]
+    fn a_context_whose_first_node_refuses_connects_to_the_next_that_listens() {
+        let root = tempfile::tempdir().unwrap();
+        let live = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let live_port = live.local_addr().unwrap().port();
+        let hierarchy = crate::sesame::ca::generate_ca_hierarchy("probe", b"ikm").unwrap();
+        std::fs::write(
+            root.path().join("root-ca.crt"),
+            crate::sesame::cert::der_to_pem(&hierarchy.root.ca.certificate_der, "CERTIFICATE"),
+        )
+        .unwrap();
+        let mut context = context(root.path(), "bare-metal/lab");
+        // A privileged port nothing here listens on, not one bound and
+        // dropped, which a parallel test could take (#2156).
+        context.endpoint = "https://127.0.0.1:1".to_string();
+        context.other_endpoints = vec![format!("https://127.0.0.1:{live_port}")];
+
+        let (client, choice) = context.connect(None, None, probe_endpoint).unwrap();
+
+        assert_eq!(client.base_url(), format!("https://127.0.0.1:{live_port}"));
+        assert_eq!(choice.passed_over.len(), 1);
+        assert_eq!(
+            choice.passed_over[0].cause,
+            crate::relish::UnreachableCause::Refused
+        );
     }
 
     #[test]

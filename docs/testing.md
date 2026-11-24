@@ -293,6 +293,7 @@ record goes in [`qualification/`](qualification):
 | `make test-gym` (the agent gym's scenarios on throwaway local clusters, [below](#an-agent-gym)) | macOS or Linux, about ten minutes and the ports from `GYM_PORT_BASE` (default 29400) to 29413 free; nothing else. `GYM_SOLVER=command:PROGRAM` runs an agent instead of the scripted baseline, which costs API spend | The maintainer, before any release that changes `relish wtf`, `relish agent` or a scenario; the 0.2.7 exit test ([#1093](https://github.com/reliaburger/reliaburger/issues/1093)) runs it with an agent. The record goes in [`qualification/`](qualification) |
 | `make test-gym-user` (`relish gym run` on a throwaway local cluster: the baseline, then Ctrl-C mid-run, [below](#on-a-users-cluster-relish-gym-run)) | macOS or Linux, about ten minutes, and the ports from `GYM_PORT_BASE` free; no API spend | The maintainer, before any release that changes `relish gym`, Smoker's workload faults or token scoping |
 | `qualify-profile.sh` (the release profile: where the time goes, against the previous release) | A quiet Mac with Lima: no build or soak beside it. It creates and deletes a disposable VM, and runs `perf` on each version's never-shipped profiling build from `build.yml` | The maintainer, on every release from 0.2.4, after the tag ([release step 9](releasing.md#staging-a-candidate)). Its rules report what they would flag and don't gate yet. `make test-ci-scripts` tests its parsing, medians, rules and README ([`test_profile.py`](../scripts/release/test_profile.py)) |
+| `qualify-v02-loops-local.sh` (the loop lanes of `v02-loops.yml` on one Mac, [below](#loops-on-one-mac)) | A quiet Apple-silicon Mac with `cargo-nextest`, and a running arm64 Lima VM with Rust, `cargo-nextest`, `make`, `btrfs-progs` and passwordless `sudo` (`reliaburger-test` by default), with 40 GiB free on each | The maintainer, when the loop record is taken on the Mac Studio instead of GitHub ([#287](https://github.com/reliaburger/reliaburger/issues/287)). `make test-ci-scripts` checks its lanes, filters and archive against the workflow ([`test_loop_summary.py`](../scripts/release/test_loop_summary.py)) |
 
 ### Benchmarks in CI
 
@@ -466,18 +467,6 @@ portable macOS only when
 Dependabot's PRs never get macOS otherwise; the nightly covers them. Every
 push to a train or to `main`, the merge queue, the nightly and the candidate
 build still run it, so no commit reaches a train or `main` without it.
-
-**Privileged Linux on Ubuntu 26.04 is advisory** until
-[#1943](https://github.com/reliaburger/reliaburger/issues/1943) closes
-(maintainer decision of 16 November 2026). The job keeps losing its runner
-mid-test, though every run that finished its tests passed them. It runs and
-reports wherever privileged Linux does, and keeps its log and JUnit in the
-`linux-next-evidence` artefact, but its failure only puts a warning on
-`ignored-test evidence` (`ADVISORY` in
-[`every_job.py`](../scripts/ci/every_job.py)) and doesn't stop a candidate
-reusing the run. The 24.04 `privileged Linux` job stays required. Taking
-`linux-next` off that list, and the job's `continue-on-error` with it, is part
-of closing #1943.
 
 Both privileged Linux jobs guard their hosted runner the way the 26.04 job
 learned to (#1943). The runner's own processes run at `oom_score_adj` -1000
@@ -1457,7 +1446,7 @@ candidate's commit ([`ci_reuse.py`](../scripts/release/ci_reuse.py)).
 | Job qualification, fast tier (0.2.0 exit gate, D18-C) | The same soak with jobs at the #668 target (1,390 accepted a second by default) and a node-level fault every cycle: inter-node delay, a full disk, slow fsync. About an hour compressed; every job mode overlaps every fault kind | [`qualify-jobs-sustained.sh --tier fast`](../scripts/release/qualify-jobs-sustained.sh), [plan](plans/archive/2026-10-10-plan-release-job-soak.md#job-qualification-tiers-686-decision-d18-c) |
 | Final soak | 8 hours of faults on the hourly schedule, then a 2¼-hour quiet tail that arms every leak checker on every node ([#1062](https://github.com/reliaburger/reliaburger/issues/1062)), once per final candidate of a release that needs the full gate (a minor release, or one that changes formats or the agent loop): the job soak above on the full schedule, so it checks everything the V02 final does as well as the jobs, and it's the only final soak the gate runs (maintainer decision, 17 October 2026, [#991](https://github.com/reliaburger/reliaburger/issues/991)). It's there for slow accumulation: bun memory growth, a registry 503 and a memory alert first showed up between 4.8 and 6.2 hours into the 12-hour run of 25 September. Only a clean final-tier run whose execution inventory is complete passes: every upgrade walk, fault kind, node fault and special its 8-hour schedule owes, the final job drain and the candidate bytes it verified, counted from what ran rather than from the run's labels ([#1061](https://github.com/reliaburger/reliaburger/issues/1061)). Fault and node choices come from a logged seed that `--seed` repeats, and every leak checker must be armed for 60 minutes on every node, with one unbroken 30-minute window, which the final's quiet tail makes possible ([#1062](https://github.com/reliaburger/reliaburger/issues/1062)). Records the September plan's measurements without gating on them, against targets restated for a soak (maintainer decision, 15 October 2026, [#668](https://github.com/reliaburger/reliaburger/issues/668)). `qualify-sustained.sh --tier final` still runs the V02 final alone, outside the gate | [`qualify-jobs-sustained.sh --tier final`](../scripts/release/qualify-jobs-sustained.sh), [plans](plans/2026-09-25-v02-sustained.md), [runbook](releasing.md#staging-a-candidate) |
 | Day run (0.2.3's record, [#1032](https://github.com/reliaburger/reliaburger/issues/1032)) | One real 24-hour day of host jobs on the three-node cluster, each node resized to 4 vCPU / 6 GiB first and host jobs running the scale-out record's `busybox-static`, with no faults, walks or specials, then cancellation and the drain. The job fixtures are applied again every hour, so the deploy hooks and `after` jobs run while the job controller watches ([#1935](https://github.com/reliaburger/reliaburger/issues/1935)). It fails unless host jobs average the day rate (23,149 a second, 2 billion a day, by default; never below 11,575, a billion), no node takes more than 20% over its slot-weighted fair share (as `relish bench` allows, [#1362](https://github.com/reliaburger/reliaburger/pull/1362)), the last full hour runs within 10% of the first, and every soak check holds for the whole day, with every leak checker armed. The record has each node's total and every hour's rate. A one-off record for 0.2.3, not a gate tier; whether it becomes one is the maintainer's later decision | [`qualify-jobs-sustained.sh --tier day`](../scripts/release/qualify-jobs-sustained.sh), [runbook](releasing.md#staging-a-candidate) |
-| Loops | Upgrade, council recovery and lease tests repeated for hours on Linux x86, Linux Arm and macOS | [`v02-loops.yml`](../.github/workflows/v02-loops.yml) |
+| Loops | Upgrade, council recovery and lease tests repeated for hours on Linux x86, Linux Arm and macOS | [`v02-loops.yml`](../.github/workflows/v02-loops.yml), or on one Mac with [`qualify-v02-loops-local.sh`](../scripts/release/qualify-v02-loops-local.sh) ([below](#loops-on-one-mac)) |
 | Power cut and reboot | A disposable VM forced off mid-write for each storage path (exporters, leases, council backups), and rebooted with containers and eBPF network rules in place, 10 times per lane, or 25 when the release changes storage, locking or ownership (0.2.0, 0.2.1 and 0.2.2 ran 25); every acknowledged write and every owned resource must survive ([above](#pulling-the-plug)) | [`qualify-storage-power-cut.sh`](../scripts/release/qualify-storage-power-cut.sh), [`qualify-oci-reboot.sh`](../scripts/release/qualify-oci-reboot.sh), [`qualify-discovery-reboot.sh`](../scripts/release/qualify-discovery-reboot.sh), [0.2.2 record](qualification/2026-10-25-power-cut-reboot.md) |
 | Task-array benchmarks | Nightly on `main`, failing on a regression of more than 2x against the last baseline | [Benchmarks in CI](#benchmarks-in-ci) |
 
@@ -1496,6 +1485,55 @@ time axis. `sustained_check.py render` draws them beside the record, and
 evidence directory ([plan](plans/archive/2026-10-17-soak-charts.md)). The
 homepage shows the released version's final soak charts
 ([how](website/README.md#soak-charts)).
+
+### Loops on one Mac
+
+[`qualify-v02-loops-local.sh`](../scripts/release/qualify-v02-loops-local.sh)
+runs the loop lanes of [`v02-loops.yml`](../.github/workflows/v02-loops.yml)
+on a Mac Studio instead of GitHub's runners
+([#287](https://github.com/reliaburger/reliaburger/issues/287)): the macOS
+lanes natively, the arm64 Linux lanes in a running Lima VM
+(`reliaburger-test` unless you name others with `--vm`). It builds one
+nextest archive per platform from `HEAD`, with the workflow's `--test` list,
+then gives every lane its own copy of the source to extract the archive into,
+as the workflow does in its checkout, so each lane writes its own JUnit
+report. The filters and options are the workflow's, word for word, and
+[`test_loop_summary.py`](../scripts/release/test_loop_summary.py) keeps them so.
+
+The nextest groups `upgrade-heavy` and `cluster-heavy` only serialise inside
+one nextest process, and `tests/self_upgrade.rs` binds fixed ports, so each
+host (the Mac, each VM) runs three queues: upgrade-heavy lanes, cluster-heavy
+lanes and the rest. Each queue runs one lane at a time, counted lanes first.
+That's what stops the workflow's 5h30m fitting in 5½ hours: the Mac's two
+upgrade lanes run back to back, 11 hours at the workflow's length, and one VM
+puts four cluster-heavy lanes in a row. `--window` fits the run into a
+wall-clock window instead, builds included: each time-boxed lane gets an equal
+share of what its queue has left when it starts. Shorter loops mean fewer
+runs and a weaker bound, and the record says how long each lane looped.
+A second VM halves the Linux queues.
+
+```sh
+scripts/release/qualify-v02-loops-local.sh --parallel --window 5h30m --plan
+scripts/release/qualify-v02-loops-local.sh --parallel --window 5h30m
+```
+
+`--plan` prints the queues and touches nothing. The Studio has no x86-64
+host, so [`v02-loop-lanes-local.json`](../scripts/release/v02-loop-lanes-local.json)
+lists those lanes with a `skip` reason, and `loop_summary.py --combine`
+reports them as skipped rather than missing; the verdict says how many. The
+lanes are named `macos-studio` and `linux-arm64-lima`, and the council lanes
+run on arm64 Linux here, where the workflow runs them on x86-64. The script
+refuses to start while
+[`power_cut/quiet.py`](../scripts/release/power_cut/quiet.py) says a release
+gate holds the host (exit 75), and holds the quiet lock while it runs, so the
+power-cut endurance run pauses. Nothing else should build or test on the Mac
+or in the VMs meanwhile: lanes that each had a runner to themselves on GitHub
+share a host here. The [first local record](qualification/2026-11-24-v02-loops-local.md)
+ran beside other agents' `make ci` runs and lost runs to port collisions in the
+leased range. The evidence (each lane's `loop.log`, `junit.xml`,
+`summary.md` and the `lane.sh` that ran it, the build logs, `environment.txt`,
+`schedule.log` and `v02-loops-summary.md`) goes to
+`/var/tmp/reliaburger-v02-loops-SHORTSHA`, or `--evidence DIR`.
 
 ### Latency SLOs
 

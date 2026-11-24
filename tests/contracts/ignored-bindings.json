@@ -325,6 +325,12 @@
   },
   {
     "source": "tests/cluster_failover.rs",
+    "function": "a_context_whose_first_node_is_down_reaches_the_cluster_through_the_next",
+    "binary": "reliaburger::cluster_failover",
+    "test": "a_context_whose_first_node_is_down_reaches_the_cluster_through_the_next"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
     "function": "an_agent_lease_survives_a_leader_change_and_the_new_leader_expires_it",
     "binary": "reliaburger::cluster_failover",
     "test": "an_agent_lease_survives_a_leader_change_and_the_new_leader_expires_it"
@@ -1441,6 +1447,12 @@
   },
   {
     "source": "tests/placement.rs",
+    "function": "apply_wait_returns_once_the_apps_run_and_names_what_never_does",
+    "binary": "reliaburger::placement",
+    "test": "apply_wait_returns_once_the_apps_run_and_names_what_never_does"
+  },
+  {
+    "source": "tests/placement.rs",
     "function": "deleted_apps_reapplied_at_once_converge_every_cycle",
     "binary": "reliaburger::placement",
     "test": "deleted_apps_reapplied_at_once_converge_every_cycle"
@@ -1828,6 +1840,12 @@
     "function": "app_replica_lands_on_the_idle_node_while_another_runs_an_array",
     "binary": "reliaburger::cluster_task_arrays",
     "test": "app_replica_lands_on_the_idle_node_while_another_runs_an_array"
+  },
+  {
+    "source": "tests/cluster_task_arrays.rs",
+    "function": "app_is_placed_while_job_work_fills_every_node",
+    "binary": "reliaburger::cluster_task_arrays",
+    "test": "app_is_placed_while_job_work_fills_every_node"
   },
   {
     "source": "tests/owned_task_arrays.rs",
