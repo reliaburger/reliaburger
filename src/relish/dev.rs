@@ -631,6 +631,8 @@ fn guest_context(cluster_name: &str, token: &str) -> LocalContext {
         schema: 1,
         owner: format!("dev-{cluster_name}"),
         endpoint: "https://127.0.0.1:9117".to_string(),
+        other_endpoints: Vec::new(),
+        last_answered: None,
         token: token.to_string(),
         ca_cert: PathBuf::from(GUEST_ROOT_CA),
         service_endpoints: Default::default(),

@@ -439,6 +439,13 @@ impl From<&RelishError> for AgentError {
                 agent_error.endpoint = Some(endpoint.clone());
                 agent_error
             }
+            RelishError::NoEndpointAnswered { attempts } => {
+                let mut agent_error = AgentError::new(ErrorCode::Unreachable, message).with_hint(
+                    "no node in the context answered: check this machine's network, or pass --endpoint for a node that is up",
+                );
+                agent_error.endpoint = attempts.first().map(|attempt| attempt.endpoint.clone());
+                agent_error
+            }
             RelishError::AgentRequired { .. }
             | RelishError::ContextFileMissing { .. }
             | RelishError::ClientConfig(_) => AgentError::new(ErrorCode::NoEndpoint, message),
