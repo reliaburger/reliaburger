@@ -11,8 +11,6 @@ HERE = Path(__file__).resolve().parent
 PINS = json.loads((HERE / "guest-images.json").read_text())
 BUILD = HERE / "build_guest_image.sh"
 APPLIANCE = HERE.parent.parent / "image" / "mkosi.conf"
-# Guest-only packages. The appliance builds no images, so it has no Buildah.
-GUEST_ONLY = {"buildah"}
 
 
 def appliance_packages():
@@ -57,13 +55,13 @@ class GuestImagePinTests(unittest.TestCase):
 
     def test_guest_and_appliance_share_the_node_packages(self):
         # Both run Ubuntu 26.04 and the same bun, so a node package added to
-        # one and not the other is a node that works in one place only.
+        # one and not the other is a node that works in one place only. That
+        # includes Buildah: an appliance cluster builds the tour's burger
+        # too (#2144).
         appliance = appliance_packages()
         self.assertIn("linux-image-generic", appliance)
-        node = [package for package in PINS["packages"] if package not in GUEST_ONLY]
+        node = PINS["packages"]
         self.assertEqual(node, appliance[-len(node):])
-        for package in GUEST_ONLY:
-            self.assertNotIn(package, appliance)
 
 
 class BuildScriptTests(unittest.TestCase):
