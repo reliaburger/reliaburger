@@ -1171,6 +1171,143 @@ When relish does pass over a node, it says which ones on stderr and which node i
 
 The unit tests in `local_context.rs` drive `choose_endpoint` with a probe closure: three endpoints with the first down still answer, and the probe stops at the first that does; none up gives an error listing all three; one endpoint is never probed; the remembered endpoint goes first and is ignored once it's no longer listed. One test uses the real probe against a port that refuses and one that listens. `tests/suite/context_endpoints.rs` runs the real `relish nodes` against a context whose first node refuses and whose second is a TLS stand-in for the cluster, and checks the warning, the answer and the remembered node, then that the next command says nothing. And `make test-cluster` has the lab's case in `cluster_failover.rs`: three wired nodes, the context's first node the leader, killed; the context passes over it, and the node it picks names the new leader.
 
+## A screen with no login
+
+On the Wyse lab's first evening the monitor was the only view of a node that didn't need the laptop, and it showed five lines: name, cluster, address, MAC, and whether bun answered. When a node misbehaved, the next step was always the laptop. So the console grew into a dashboard (#2150), with six tabs: status, metrics, workloads, the cluster, versions and logs.
+
+### Reuse the pattern, not the views
+
+`relish tui` (chapter 13) already has an app loop, a reducer and a test harness, and the plan said to reuse it. We reused the *pattern* and the pieces underneath it, and gave the console its own small state and views. The TUI's views are about a cluster seen from a laptop: lists of apps, a kill key, a scale prompt, a command palette. The console has none of that and must never have the kill key. Bolting a "console mode" onto `TuiApp` would put an `if console` into every view. What the two do share, they share for real: `section_lines` and `assess` (the lines `relish status` prints), `run_wtf`, `council_view::survey`, `BunClient`, and the summary fixtures the TUI's snapshot tests already use.
+
+The console lives in `src/appliance/console/`, in five files:
+
+- `state.rs`: `ConsoleState` and the reducer, `ConsoleState::update(Msg)`;
+- `view.rs`: `render(frame, &state)`, and every snapshot test;
+- `local.rs`: what the machine says without bun (versions, `/proc`, the journal);
+- `remote.rs`: what bun says, through relish's client;
+- `mod.rs`: the event loop and the pollers.
+
+### The reducer, again
+
+If you skipped chapter 13: a ratatui program redraws the whole screen from its state on every frame. There's no widget tree that lives between frames, as there would be in GTK or a browser's DOM. Each frame, `render` builds `Paragraph`s and `Block`s, ratatui draws them into a buffer of cells, and compares that buffer with the previous frame's. Only the cells that changed go to the terminal. That's *immediate mode*, and it makes the state the only thing worth testing.
+
+So every input is a message:
+
+```rust
+pub enum Msg {
+    Key(KeyEvent),
+    Tick(u64),
+    Local(LocalStatus),
+    Summary(Result<ClusterSummary, String>),
+    Wtf(WtfCheck),
+    // ...
+    Logs(Result<Vec<String>, String>),
+}
+```
+
+A Rust `enum` is a tagged union, like a C `union` with the tag built in, or a Go interface whose implementations the compiler knows all of. `Result<ClusterSummary, String>` is "a summary or an error message", carried as data, because a failed fetch is something the screen shows, not something to unwind the program over. `update` is one `match`, and the compiler refuses a `match` that forgets a variant, so a new message can't silently do nothing.
+
+Each panel's answer lands in a `Fetched<T>`:
+
+```rust
+pub struct Fetched<T> {
+    pub value: Option<T>,
+    pub at: Option<u64>,
+    pub error: Option<String>,
+}
+```
+
+`<T>` makes it generic: one struct for the summary, the workloads, the council and the logs. A failure records the error and keeps the last good value, so a panel says `can't refresh the workloads: no answer within 10 s (showing 15:06:40)` above the list it still has, rather than going blank whenever the network hiccups.
+
+### Laying out a screen
+
+The screen is four rows: a header, the tab bar, the current tab, a key line.
+
+```rust
+let [header, tabs, body, footer] = Layout::vertical([
+    Constraint::Length(1),
+    Constraint::Length(1),
+    Constraint::Min(3),
+    Constraint::Length(1),
+])
+.areas(frame.area());
+```
+
+`areas` returns an array whose length is the number of constraints, checked at compile time: ask for four areas and bind three names and it doesn't compile. That's a *const generic*, a type parameterised by a number, like `[Rect; 4]`. Go has nothing like it (a slice's length is a run-time fact); C++'s `std::array<T, N>` is the nearest relative.
+
+Each tab is a function from the state to `Vec<Line<'static>>`. A `Line` is a row of `Span`s, each a piece of text with a style. The `'static` lifetime says the lines own their text, so they don't borrow from the state and outlive nothing they shouldn't. That costs a few string copies per frame, and buys views that never fight the borrow checker.
+
+### The Linux console
+
+tty1 isn't a terminal emulator. It has 16 colours and the kernel's font, which covers the PC's old character set and little else. So `view.rs` uses only ASCII, box drawing and the full block `█`. The history under each gauge is ASCII too, one character per sample from ` .:-=+*#`, where a laptop TUI would use braille or eighth-blocks. The colours are the eight named ones, never RGB. A test renders every tab and fails on any other character, which is how the old fallback's `…` got caught: it isn't in the font.
+
+Every state with a colour has a word too. The current tab is in brackets as well as reverse video, and bun is `running` or `not answering` as well as green or red. That's for a monochrome monitor, a photo of the screen, and `/dev/vcs1`, which the CI tests read and which carries no colour at all.
+
+Two more things are different on a VT. There's no alternate screen, so nothing is restored on exit, and nothing needs to be. And kernel messages print straight onto tty1. ratatui only rewrites cells it thinks changed, so a kernel line over a cell the dashboard didn't touch would stay. Every ten seconds the loop calls `terminal.clear()`, which forgets the previous buffer and repaints every cell.
+
+### Where the keys come from
+
+The old console only wrote to `/dev/tty1`. A dashboard reads keys, so the unit now hands tty1 to the process as its standard input:
+
+```ini
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+TTYPath=/dev/tty1
+```
+
+`StandardInput=tty` also makes tty1 the process's *controlling terminal*, the one `/dev/tty` names. crossterm, which ratatui drives, reads keys and the screen size from standard input when it's a terminal, and the console draws on `/dev/tty`. Standard output stays the journal's: with `StandardInput=tty`, systemd would otherwise send it to the terminal too, and the launcher's install messages would vanish under the dashboard. `test_console_unit.py` pins all four lines. One bonus of `/dev/tty`: over `ssh -t`, the controlling terminal is your SSH session, so `bun appliance console` draws the dashboard on a laptop.
+
+### Asking only for what's on screen
+
+A Wyse 3040 has a four-core Atom, and bun is busy enough. So each source has a poller that asks only while a tab that shows it is on screen, and at once when one comes on:
+
+```rust
+struct Poller {
+    every: Duration,
+    wanted: fn(Tab) -> bool,
+    tab: watch::Receiver<Tab>,
+    cancel: CancellationToken,
+    tx: mpsc::Sender<Msg>,
+}
+```
+
+`fn(Tab) -> bool` is a plain function pointer, as in C. The `|tab| tab == Tab::Logs` passed for it is a closure that captures nothing, and Rust turns those into function pointers for free. A closure that captured something would need a generic or a `Box<dyn Fn>`, which we don't need for a question about the tab alone.
+
+The event loop sends the current tab down a `watch` channel, which holds only its latest value: a poller that missed two tab switches wants to know where we are, not where we've been. In the poller, `*tab.borrow()` copies the `Tab` out in the same statement that borrows it. `Tab` is `Copy`, a few bytes, and the copy means the read lock the borrow holds ends right there (the rule from #1273). The loop itself is a `tokio::select!` over the cancellation token, the interval, and the tab changing. Each fetch races the cancellation token too, and has its own timeout inside (10 s for a request, 30 s for `wtf`, 5 s for a command), so no poller waits for ever.
+
+The machine's load comes from a different kind of source. `sysinfo` reads `/proc` with ordinary blocking calls, and a CPU percentage is the difference between two readings, so the reader keeps state between samples. That's a plain thread, `std::thread::spawn`, sleeping two seconds between samples and handing each one to the async side with `blocking_send`. When the console goes, the channel closes, `blocking_send` fails, and the thread returns. Everything else that touches a file uses `tokio::fs`, `tokio::process` or `spawn_blocking`, which is what the blocking rule (chapter 15) checks.
+
+### A read-only identity nobody has to make
+
+The console has no login, so it can't carry a token a person made, and it shouldn't carry the service token, which is the cluster's own admin. The plan left two options: a root-only Unix socket, or a read-only token minted when the node is seeded. We took a third that needs no minting: derive it.
+
+```rust
+pub fn derive_console_token(service_token: &str) -> Result<String, TokenError> {
+    let bytes = super::crypto::hkdf_derive_key(
+        service_token.as_bytes(),
+        &CONSOLE_TOKEN_SALT,
+        "reliaburger-console-token-v1",
+    )
+    .map_err(|e| TokenError::GenerationFailed(e.to_string()))?;
+    Ok(format!("rbrg_{}", hex::encode(bytes)))
+}
+```
+
+The service token is already derived from the master key with HKDF, and every node holds it. `AuthState::new` derives the console token from it once, and the auth middleware accepts it as `__console`: read-only and unscoped, a principal no stored token can be named after. The console, running as root beside bun, reads `master.key` and takes the same two steps. HKDF is one-way, so the console token gives nothing towards the service token. Every node derives the same value, so `wtf`'s per-node checks work from the console as they do from a laptop. Nothing is stored, rotated or revoked. A Unix socket would have been as safe, but `wtf` and the council survey talk to every node over TCP, and a socket only reaches one.
+
+The console talks to its own bun at the node's LAN address, not loopback. The node's certificate names that address and never loopback (#1508), and the console checks it against the cluster's root CA from the identity directory. Only `/v1/health`, which is public and carries no token, goes to loopback without checking.
+
+### Bun down, old screen
+
+The Status tab asks one question first: does bun answer, and is the machine a node yet? If not, it's the screen the console always had, built only from local reads. That's the screen a boot, a fallback through three bad tries, or a claim needs, and it can't depend on the API it's reporting on. An unclaimed machine's key appears twice: on the `Claim key` line, which `claimed-pair.sh` greps out of `/dev/vcs1`, and in letters five rows tall from a 3 by 5 font in `bigtext.rs`, for reading from across a room full of Wyses.
+
+### Testing a screen you can't see
+
+ratatui's `TestBackend` is a terminal in memory. The tests draw a state into an 80 by 25 one, the Linux console's size, read the cells back as text, and compare them with `insta` snapshots: every tab, and the degraded states (bun down, no cluster yet, an unclaimed machine, a node gossip reports dead, a summary missing a node, a refresh that failed, `journalctl` missing). One more renders at 240 by 67, which is what a 1080p monitor gives the kernel's 8 by 16 font. A reviewer reads a snapshot diff as a screen, which is the point. `state.rs` tests the reducer (keys, scrolling, a failed fetch keeping its last value), and `mod.rs` checks that a poller doesn't ask while its tab is hidden and asks at once when it appears. In CI, `seeded-pair.sh` reads node 1's tty1 after the pair forms and waits for `Cluster HEALTHY` or a worse verdict: that line only appears once the console has reached its bun over TLS as `__console`.
+
+What none of this sees is a real monitor: the font, the colours, whether a 3040's framebuffer gives 80 columns or 240. That check is on the Wyse.
+
 ## A LAN on a laptop
 
 We had no KVM machine and no spare PCs, only CI and one Apple silicon Mac without root. Everything had to run virtualised until the last step.
@@ -1335,7 +1472,7 @@ The console's unit said `After=reliaburger-seed.service`, which reads as harmles
 
 The seed unit's own line, `no seed: unclaimed, claim key … on port 9119`, didn't help either. It goes to `/dev/console`, and that's the last `console=` on the command line, the serial port the 3040 doesn't have. The installer had already met this (see "Booting from a wire" above) and writes to `/dev/tty1` itself.
 
-The fix is to order the console after nothing of ours. It redraws every five seconds and already says "waiting for DHCP" or "not answering" on its own, so starting early costs nothing. We didn't also copy the seed's line to tty1: the console clears tty1 on every redraw, so the line would last five seconds at most.
+The fix is to order the console after nothing of ours. It redrew every five seconds (the dashboard that replaced it polls on the same beat) and already said "waiting for DHCP" or "not answering" on its own, so starting early costs nothing. We didn't also copy the seed's line to tty1: the console cleared tty1 on every redraw, so the line would have lasted five seconds at most.
 
 Starting early did expose something. The console, prepare and bun all start through the same launcher, `/usr/lib/reliaburger/start`, which copies the image's bun into `/var/lib/reliaburger/bin` when it's newer. With the console beside prepare, two launchers could now write the same temporary file at once on a first boot. (The console and bun already started together on a claimed node after an OS update, so the race wasn't entirely new.) So the launcher takes a lock first:
 

@@ -130,7 +130,7 @@ pub fn no_answer_exit_code(error: &RelishError) -> u8 {
 }
 
 /// Run `wtf`'s checks within `budget`.
-async fn run_wtf(client: &BunClient, budget: Duration) -> WtfCheck {
+pub async fn run_wtf(client: &BunClient, budget: Duration) -> WtfCheck {
     match tokio::time::timeout(budget, super::wtf::collect(client, None)).await {
         Err(_) => WtfCheck::Late {
             budget_seconds: budget.as_secs(),

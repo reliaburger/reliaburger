@@ -455,13 +455,31 @@ class WorkloadResumeRecords(unittest.TestCase):
         output, _ = process.communicate(timeout=10)
         return output
 
+    def run_until(self, script, pattern, deadline=30):
+        """Run `script` until its output matches `pattern`, or `deadline`
+        seconds pass. A fixed sleep failed on a loaded host: the shell hadn't
+        printed its first line in 0.5 s."""
+        process = subprocess.Popen(["sh", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True)
+        self.addCleanup(process.kill)
+        output = ""
+        end = time.monotonic() + deadline
+        while time.monotonic() < end and not re.search(pattern, output):
+            line = process.stdout.readline()
+            if not line:
+                break
+            output += line
+        process.terminate()
+        rest, _ = process.communicate(timeout=10)
+        return output + rest
+
     def test_the_writer_records_where_it_resumed_before_its_first_ack(self):
         with tempfile.TemporaryDirectory() as directory:
             data = Path(directory)
             # A torn last line in both files, as a power cut mid-append leaves.
             (data / "seq").write_text("1\n2\n3\n4")
             (data / "resumes").write_text("0\n2")
-            output = self.run_for(workload_script("soak-writer").replace("/data", directory), 0.5)
+            output = self.run_until(workload_script("soak-writer").replace("/data", directory), r"ACK \d+")
             self.assertRegex(output, r"RESUME 3 after +3 lines")
             self.assertEqual((data / "resumes").read_text(), "0\n3\n")
             first_ack = int(re.search(r"ACK (\d+)", output).group(1))

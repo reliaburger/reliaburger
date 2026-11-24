@@ -185,12 +185,10 @@ enum ApplianceCommand {
     /// enrol and fetch the master key, then write node.toml. Run by
     /// reliaburger-seed.service before the agent.
     Prepare,
-    /// Show this node's status on a console, refreshed every five seconds.
-    Console {
-        /// The terminal to draw on.
-        #[arg(long, default_value = "/dev/tty1")]
-        tty: PathBuf,
-    },
+    /// Show this node's dashboard on the terminal it runs on: status,
+    /// metrics, workloads, the cluster, versions and logs. Read-only.
+    /// reliaburger-console.service runs it on tty1.
+    Console,
 }
 
 /// The address `[network] advertise_address` names, as an address or the
@@ -1045,9 +1043,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 .await
                 .map(|_| ())
                 .map_err(|e| anyhow::anyhow!("reliaburger: {e}")),
-            ApplianceCommand::Console { tty } => reliaburger::appliance::console::run(&paths, tty)
+            ApplianceCommand::Console => reliaburger::appliance::console::run(&paths)
                 .await
-                .map_err(|e| anyhow::anyhow!("console {}: {e}", tty.display())),
+                .map_err(|e| anyhow::anyhow!("console: {e}")),
         };
     }
 

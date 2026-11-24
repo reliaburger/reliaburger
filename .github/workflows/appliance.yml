@@ -528,8 +528,10 @@ jobs:
         # Two appliances form a cluster from their seeds alone, with the
         # bun and relish of the commit under test (lab builds only). Node 1
         # reads its seed from an RBSEED stick: qemu-img and mtools make it.
-        # Then the pair builds the tour's burger with the image's Buildah,
-        # pulling its base images through the runner's NAT (#2144).
+        # Node 1's console dashboard must show the cluster's verdict on
+        # tty1 (#2150). Then the pair builds the tour's burger with the
+        # image's Buildah, pulling its base images through the runner's NAT
+        # (#2144).
         if: matrix.arch == 'x86_64' && env.BROKEN_BUN != '1' && hashFiles('source-bin/relish-linux-x86_64') != ''
         timeout-minutes: 40
         run: |
