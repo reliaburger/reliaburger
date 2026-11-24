@@ -1639,6 +1639,98 @@ async fn app_replica_lands_on_the_idle_node_while_another_runs_an_array() {
     );
 }
 
+/// #1967: the 0.3.0 rehearsal's job campaign filled every node's budget,
+/// and the leader left an app unplaced ("no node that can run it has
+/// room") until a fault killed a Bun. With job work on every node, the app
+/// is placed on room job work holds: the node that gets it claims that
+/// room, and its attempts and executors yield it at their next boundary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a real multi-node cluster; run with make test-cluster"]
+async fn app_is_placed_while_job_work_fills_every_node() {
+    assert!(cluster_tests_enabled());
+    let root = CancellationToken::new();
+    let data: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let ports = lease_node_ports(3);
+    let mut nodes = Vec::new();
+    for (index, directory) in data.iter().enumerate() {
+        let seeds = if index == 0 {
+            vec![]
+        } else {
+            vec![local(ports[0].base)]
+        };
+        nodes.push(
+            shared_budget_node(&ports[index], index, seeds, &root, directory.path(), true).await,
+        );
+    }
+    wait_until(
+        "three settled voters",
+        Duration::from_secs(60),
+        async || settled_voters(&nodes).is_some_and(|voters| voters.len() == 3),
+    )
+    .await;
+    let leader = nodes
+        .iter()
+        .position(|node| *node.thinks_leader.borrow())
+        .expect("a leader");
+
+    // Eight 1000m attempts fill each node's 8000m, with more queued.
+    let http = reqwest::Client::new();
+    let answer: Value = http
+        .post(format!(
+            "http://127.0.0.1:{}/v1/batch/array",
+            nodes[leader].api_port
+        ))
+        .json(&json!({
+            "name": "campaign",
+            "template": { "runtime": "process", "exec": BINARY, "cpu": "1000m" },
+            // Small chunks, so the grant loop spreads them over every node.
+            "spec": { "count": 256, "chunk_size": 8 },
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(answer["batch_id"].is_u64(), "{answer}");
+    wait_until(
+        "the leader sees every node's budget held by jobs",
+        Duration::from_secs(90),
+        async || {
+            let reports = &nodes[leader].aggregated_rx.borrow().reports;
+            (0..3).all(|index| {
+                reports
+                    .get(&reliaburger::meat::NodeId::new(format!("shared{index}")))
+                    .is_some_and(|report| report.job_reservations.cpu_millicores >= 8000)
+            })
+        },
+    )
+    .await;
+
+    let app = reliaburger::meat::AppId::new("redis", "default");
+    nodes[leader]
+        .council
+        .write(reliaburger::council::RaftRequest::AppSpec {
+            app_id: app.clone(),
+            spec: Box::new(
+                toml::from_str("script = 'exec sleep 600'\ncpu = '100m'\nreplicas = 1").unwrap(),
+            ),
+        })
+        .await
+        .unwrap();
+    wait_until("the app is placed", Duration::from_secs(60), async || {
+        nodes[leader]
+            .council
+            .desired_state()
+            .await
+            .scheduling
+            .get(&app)
+            .is_some_and(|placements| placements.len() == 1)
+    })
+    .await;
+    root.cancel();
+}
+
 /// A node whose executor runs real host processes through an owned runner on
 /// its agent's runtime, listing each attempt in the agent's live attempts as
 /// Bun does, and which serves fault injection (#704).

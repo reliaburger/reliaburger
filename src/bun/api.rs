@@ -126,7 +126,7 @@ use metrics::{
 use node_info::{
     DesiredAppsSource, capabilities_handler, cluster_capabilities_handler, desired_apps_handler,
     diagnostics_handler, gather_desired_apps, health_handler, path_handler, readiness_handler,
-    version_handler,
+    rollouts_handler, version_handler,
 };
 use nodes::{
     MAX_RELAY_REQUEST_BYTES, cluster_elect_handler, council_handler, node_relay_handler,
@@ -766,6 +766,7 @@ pub fn router_with_upgrade(
         )
         .route("/v1/diagnostics", get(diagnostics_handler))
         .route("/v1/diagnostics/apps", get(desired_apps_handler))
+        .route("/v1/diagnostics/rollouts", get(rollouts_handler))
         .route("/v1/path", post(path_handler))
         .route("/v1/test/leases", post(test_lease_create_handler))
         .route("/v1/test/leases/{id}", get(test_lease_get_handler))

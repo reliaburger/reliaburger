@@ -24,7 +24,10 @@ async fn registry_query_response_refuses_an_oversized_catalogue() {
 }
 
 use super::faults::NODE_REQUEST_TIMEOUT;
-use super::node_info::{council_app_evidence, filter_desired_apps_for_scope, valid_path_label};
+use super::node_info::{
+    DESIRED_APPS_FORWARDED_HEADER, council_app_evidence, filter_desired_apps_for_scope,
+    valid_path_label,
+};
 use super::ui::statuses_to_dashboard_apps;
 use super::upgrade::{UPGRADE_FORWARDED_HEADER, check_council_can_roll};
 use super::*;
@@ -2635,6 +2638,7 @@ const LEADER_ONLY_CALLS: &[(&str, &str, &str)] = &[
     ),
     ("POST", "/v1/upgrade/abort", ""),
     ("GET", "/v1/diagnostics/apps", ""),
+    ("GET", "/v1/diagnostics/rollouts", ""),
     ("POST", "/v1/batch/1/cancel", ""),
     ("GET", "/v1/batch/1/results", ""),
     ("GET", "/v1/batch/1/tasks/0/logs", ""),
@@ -12400,4 +12404,161 @@ fn the_token_forward_backstop_outlasts_the_leaders_own_deadlines() {
                 + crate::council::node::WRITE_TIMEOUT
                 + super::identity::TOKEN_REPLICATION_WAIT
     );
+}
+
+/// GET `path` from `app` as `bearer`, and decode the JSON answer.
+async fn get_rollouts(
+    app: &Router,
+    bearer: &str,
+) -> (StatusCode, Vec<crate::bun::diagnostics::RolloutEvidence>) {
+    let (status, body) = send_bounded(
+        app.clone(),
+        "GET",
+        "/v1/diagnostics/rollouts",
+        bearer,
+        "",
+        &[],
+    )
+    .await;
+    let rollouts = if status == StatusCode::OK {
+        serde_json::from_str(&body).unwrap()
+    } else {
+        Vec::new()
+    };
+    (status, rollouts)
+}
+
+/// #2240: the leader says whether each app's current spec has rolled out,
+/// for `relish apply --wait`: not until a `RolloutReleased` names that
+/// spec. An app nobody applied isn't listed, and a scoped token sees only
+/// its own namespace.
+#[tokio::test]
+async fn the_leader_says_whether_each_apps_current_spec_rolled_out() {
+    let council = seeded_council("rollouts-leader").await;
+    let (admin, admin_key) = named_user_token("operator", crate::sesame::types::ApiRole::Admin);
+    let scoped = crate::sesame::token::create_token(
+        "shop-only",
+        crate::sesame::types::ApiRole::ReadOnly,
+        crate::sesame::types::TokenScope {
+            apps: None,
+            namespaces: Some(vec!["shop".to_string()]),
+        },
+        None,
+    )
+    .unwrap();
+    let (app, _shutdown) = setup_with_auth_leases_events_and_council(
+        vec![admin, scoped.token],
+        None,
+        crate::bun::readiness::ReadinessTracker::new(),
+        crate::bun::capabilities::StaticCapabilities::default(),
+        None,
+        None,
+        Some(Arc::clone(&council)),
+    )
+    .await;
+    let (status, body) = send_bounded(
+        app.clone(),
+        "POST",
+        "/v1/apply",
+        &admin_key,
+        "[namespace.shop]\n[app.web]\nimage = 'web:v1'\n[app.cart]\nimage = 'cart:v1'\nnamespace = 'shop'\n",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, rollouts) = get_rollouts(&app, &admin_key).await;
+    assert_eq!(status, StatusCode::OK);
+    let seen: Vec<(&str, &str, bool)> = rollouts
+        .iter()
+        .map(|r| (r.namespace.as_str(), r.app.as_str(), r.rolled_out))
+        .collect();
+    // Sorted by namespace and name; `ghost` was never applied.
+    assert_eq!(seen, [("default", "web", false), ("shop", "cart", false)]);
+
+    let web = crate::meat::AppId::new("web", "default");
+    let spec = council.desired_state().await.apps[&web].clone();
+    assert_eq!(
+        rollouts[0].fingerprint,
+        crate::meat::deploy_types::rollout_fingerprint(&spec)
+    );
+    council
+        .write(crate::council::types::RaftRequest::RolloutReleased {
+            app_id: web,
+            spec: Box::new(spec),
+        })
+        .await
+        .unwrap();
+    let (_, rollouts) = get_rollouts(&app, &admin_key).await;
+    assert!(rollouts[0].rolled_out, "{rollouts:?}");
+    assert!(!rollouts[1].rolled_out, "{rollouts:?}");
+
+    let (status, rollouts) = get_rollouts(&app, &scoped.plaintext).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rollouts.len(), 1, "{rollouts:?}");
+    assert_eq!(rollouts[0].app, "cart");
+}
+
+/// #2240: a follower forwards the rollouts read to the leader, marked so
+/// the leader never forwards it again, and answers with the leader's list.
+#[tokio::test]
+async fn a_follower_forwards_the_rollouts_read_to_the_leader() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let leader_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let leader_port = leader_listener.local_addr().unwrap().port();
+    let marked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = Arc::clone(&marked);
+    let leader = axum::Router::new().route(
+        "/v1/diagnostics/rollouts",
+        axum::routing::get(move |headers: HeaderMap| {
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.store(
+                    headers.contains_key(DESIRED_APPS_FORWARDED_HEADER)
+                        && headers.contains_key(LEADER_FORWARDED_HEADER),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                Json(vec![crate::bun::diagnostics::RolloutEvidence {
+                    app: "web".into(),
+                    namespace: "default".into(),
+                    fingerprint: "f".into(),
+                    rolled_out: true,
+                }])
+            }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(leader_listener, leader).await.unwrap() });
+    let (follower, nodes) = follower_of_the_leader_api_on(admin, None, leader_port).await;
+
+    let (status, rollouts) = get_rollouts(&follower, &admin_key).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rollouts.len(), 1);
+    assert!(rollouts[0].rolled_out);
+    assert!(
+        marked.load(std::sync::atomic::Ordering::SeqCst),
+        "the forward carries both forwarded marks"
+    );
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// #2240: a node with no council has no rollouts to report: an empty list,
+/// so `relish apply --wait` goes by the instance count.
+#[tokio::test]
+async fn a_node_without_a_council_reports_no_rollouts() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (app, _shutdown) = setup_with_auth_leases_events_and_council(
+        vec![admin],
+        None,
+        crate::bun::readiness::ReadinessTracker::new(),
+        crate::bun::capabilities::StaticCapabilities::default(),
+        None,
+        None,
+        None,
+    )
+    .await;
+    let (status, rollouts) = get_rollouts(&app, &admin_key).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(rollouts.is_empty());
 }

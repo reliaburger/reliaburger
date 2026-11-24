@@ -244,6 +244,16 @@ pub enum GrillError {
         reason: String,
     },
 
+    /// The runtime didn't answer a stop or kill request in time: a process
+    /// owner stalled past its request timeout, or busy with another
+    /// operation (#1902). It may or may not have sent the signal, and
+    /// sending it again is harmless, so the caller may ask again.
+    #[error("container {instance} stop request got no answer: {reason}")]
+    StopUnanswered {
+        instance: InstanceId,
+        reason: String,
+    },
+
     /// Runtime inspection could not establish the instance's current state.
     #[error("container {instance} state unavailable: {reason}")]
     StateUnavailable {

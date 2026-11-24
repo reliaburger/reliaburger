@@ -144,6 +144,9 @@ pub struct ClusterStateCache {
     accounted_instances: HashMap<(NodeId, AppId, u32), Resources>,
     /// The replica ordinals each node reported it couldn't start, per app.
     capacity_refusals: HashMap<(NodeId, AppId), BTreeSet<u32>>,
+    /// What task attempts and executors hold on each node, already counted
+    /// in its `allocated` total.
+    job_reservations: HashMap<NodeId, Resources>,
 }
 
 impl ClusterStateCache {
@@ -153,6 +156,72 @@ impl ClusterStateCache {
             nodes: HashMap::new(),
             accounted_instances: HashMap::new(),
             capacity_refusals: HashMap::new(),
+            job_reservations: HashMap::new(),
+        }
+    }
+
+    /// Record what job work holds on `node_id`. The caller has already
+    /// added it to the node's `allocated` total.
+    pub fn record_job_reservations(&mut self, node_id: &NodeId, held: Resources) {
+        if held.is_zero() {
+            self.job_reservations.remove(node_id);
+        } else {
+            self.job_reservations.insert(node_id.clone(), held);
+        }
+    }
+
+    /// Count what job work holds as free, since a node makes job work
+    /// yield to an app it refused (#1967). Returns what was taken off each
+    /// node, for [`Self::restore_job_reservations`]; empty when no job work
+    /// holds anything.
+    pub fn credit_job_reservations(&mut self) -> HashMap<NodeId, Resources> {
+        let mut credited = HashMap::new();
+        for (node_id, held) in &self.job_reservations {
+            let Some(node) = self.nodes.get_mut(node_id) else {
+                continue;
+            };
+            let before = node.allocated;
+            node.allocated = before.saturating_sub(held);
+            credited.insert(node_id.clone(), before.saturating_sub(&node.allocated));
+        }
+        credited
+    }
+
+    /// Mark not ready, for one pass, every ready node that reported it
+    /// couldn't start `app_id` at all, and return them for
+    /// [`Self::restore_readiness`].
+    pub fn sit_out_refusing_nodes(&mut self, app_id: &AppId) -> Vec<NodeId> {
+        let refusing: Vec<NodeId> = self
+            .capacity_refusals
+            .keys()
+            .filter(|(_, app)| app == app_id)
+            .map(|(node, _)| node.clone())
+            .filter(|node| self.nodes.get(node).is_some_and(|state| state.ready))
+            .collect();
+        for node in &refusing {
+            if let Some(state) = self.nodes.get_mut(node) {
+                state.ready = false;
+            }
+        }
+        refusing
+    }
+
+    /// Make the nodes [`Self::sit_out_refusing_nodes`] set aside ready again.
+    pub fn restore_readiness(&mut self, nodes: Vec<NodeId>) {
+        for node in nodes {
+            if let Some(state) = self.nodes.get_mut(&node) {
+                state.ready = true;
+            }
+        }
+    }
+
+    /// Count job work's reservations as allocated again, after
+    /// [`Self::credit_job_reservations`].
+    pub fn restore_job_reservations(&mut self, credited: HashMap<NodeId, Resources>) {
+        for (node_id, held) in credited {
+            if let Some(node) = self.nodes.get_mut(&node_id) {
+                node.allocated = node.allocated.saturating_add(&held);
+            }
         }
     }
 

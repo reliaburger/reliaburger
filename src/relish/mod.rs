@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod apply_wait;
 pub mod apps_cmd;
 pub mod audit_cmd;
 pub mod bare_metal;

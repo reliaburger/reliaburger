@@ -193,7 +193,8 @@ expression: listed_for_snapshot(server.tools())
             "proposals",
             "withdraw",
             "undo",
-            "status"
+            "status",
+            "apply"
           ],
           "type": "string"
         },
