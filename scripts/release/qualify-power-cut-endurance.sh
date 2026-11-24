@@ -8,11 +8,14 @@
 #
 # After each cut the harness only powers the VM on (`limactl start`) and
 # reads; it never repairs anything. The checks (numbered as in the plan):
-#   I1  /data/seq holds 1..N, and the writer, at every start since the
-#       previous check, resumed at or past the last ACK read before the cut
-#   I2  the Redis counter never goes backwards, and the client, at every
-#       start since the previous check, found it at or past the last INCR
-#       read before the cut
+#   I1  /data/seq holds 1..N; the writer started again after the cut and
+#       each start since then resumed at or past the last ACK read before
+#       the cut; a start between the cuts resumed at or past the previous
+#       cut's ACK
+#   I2  the Redis counter never goes backwards; the client started again
+#       after the cut and each start since then found it at or past the last
+#       INCR read before the cut; a start between the cuts found it at or
+#       past the previous cut's INCR
 #   I4  Bun started once since boot, never exited, logged no panic or store error
 #   I6  Bun answered within 120 s of power-on; the cluster settled within 300 s
 #   I7  every workload runs exactly once
@@ -42,10 +45,14 @@
 #   --evidence DIR          evidence directory (default: a new
 #                           /var/tmp/reliaburger-power-cut.XXXXXX)
 #   --seed N                seed for every random choice (default: a new one)
-#   --port-offset N         add N to the cluster's API, ingress and registry
-#                           ports, so several runs can share a host (default 0)
+#   --port-offset N         add N (up to 500) to the cluster's API, ingress
+#                           and registry ports, 31000, 31600 and 32200, so
+#                           several runs can share a host (default 0)
 #   --resume                carry on the run in --evidence: same cluster, seed
-#                           and counts
+#                           and counts; refused once a cut has violated
+#                           something, so the kept state stays as it was
+#   --rejudge DIR           run today's checker over the cuts recorded in DIR,
+#                           offline, print the verdicts and exit; writes nothing
 #   --keep                  leave the cluster and the installation afterwards
 #   --plan                  print the cut schedule these options give and exit
 set -euo pipefail
@@ -104,6 +111,7 @@ resume=false
 keep=false
 plan=false
 port_offset=0
+rejudge=
 while [ "$#" -gt 0 ]; do
     case $1 in
         --release) release=${2:-}; shift 2 ;;
@@ -119,10 +127,15 @@ while [ "$#" -gt 0 ]; do
         --keep) keep=true; shift ;;
         --plan) plan=true; shift ;;
         --port-offset) port_offset=${2:-}; shift 2 ;;
+        --rejudge) rejudge=${2:-}; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; fail "unknown argument: $1" ;;
     esac
 done
+if [ -n "$rejudge" ]; then
+    [ -f "$rejudge/cuts.jsonl" ] || fail "no cuts.jsonl in $rejudge"
+    exec python3 "$here/endurance.py" rejudge --evidence "$rejudge"
+fi
 case $tier in
     quick) duration=${duration:-60m} ;;
     custom) [ -n "$duration" ] || [ "$resume" = true ] || fail 'a custom tier needs --duration' ;;
@@ -131,7 +144,7 @@ esac
 read -r work_min work_max < <(range "$work")
 read -r off_min off_max < <(range "$off")
 [ -z "$seed" ] || [[ $seed =~ ^[0-9]+$ ]] || fail '--seed takes a whole number'
-[[ $port_offset =~ ^[0-9]+$ ]] && [ "$port_offset" -le 1000 ] || fail '--port-offset takes a whole number up to 1000'
+[[ $port_offset =~ ^[0-9]+$ ]] && [ "$port_offset" -le 500 ] || fail '--port-offset takes a whole number up to 500'
 
 if [ "$plan" = true ]; then
     endurance plan --seed "${seed:-0}" --duration "$(seconds "$duration")" --min "$work_min" --max "$work_max"
@@ -140,6 +153,12 @@ fi
 
 if [ "$resume" = true ]; then
     [ -f "$evidence/run.json" ] || fail "--resume needs --evidence with a run.json"
+    # Carrying on would power the kept VM on and overwrite what the
+    # violation left (run 10 did, after cut 13).
+    if ! violated=$(endurance violations --evidence "$evidence"); then
+        fail "not resuming: $(echo "$violated" | paste -sd ';' - | sed 's/;/; /g'); the cluster and evidence" \
+            "stay as the violation left them. Diagnose it (--rejudge $evidence re-checks the recorded cuts) and start a new run"
+    fi
 else
     [ -n "$release" ] || [ -n "$base_url" ] || { usage >&2; fail 'give --release or --base-url'; }
     [ -z "$release" ] || [ -z "$base_url" ] || fail 'give --release or --base-url, not both'
@@ -183,10 +202,10 @@ PY
 # --- the cluster -----------------------------------------------------------------
 
 # The ports are fixed at install, and the cluster keeps them, so --resume
-# needs no --port-offset.
-api_port=$(( 29217 + port_offset ))
-ingress_port=$(( 28180 + port_offset ))
-registry_port=$(( 25150 + port_offset ))
+# needs no --port-offset. endurance.py's PORT_BASES says why they sit in
+# 31000-32767: clear of the test suites' ports and every ephemeral range.
+read -r api_port ingress_port registry_port < <(endurance ports --offset "$port_offset") \
+    || fail "no ports for --port-offset $port_offset"
 
 install_cluster() {
     home=$(mktemp -d /tmp/rbpc.XXXXXX)
@@ -230,6 +249,25 @@ rel() { with_timeout 330 "$relish" "$@"; }
 gsh() { with_timeout 120 "$limactl" shell --workdir / "${vm[1]}" sudo bash -c "$1"; }
 
 workloads=$here/workloads.toml
+
+# Turn off the guest's automatic updates. A cut mid-dpkg can leave the guest
+# broken, which isn't Reliaburger's to answer for, and in run 8
+# unattended-upgrades upgraded libc and needrestart restarted Bun between
+# two cuts. Masked, so nothing starts them again; needrestart only lists what
+# it would restart, should anything run apt. Idempotent, so a resume runs it
+# again on a cluster made before it existed.
+hold_guest_updates() {
+    gsh 'for unit in apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service; do
+             systemctl cat "$unit" > /dev/null 2>&1 || continue
+             systemctl disable --now "$unit" && systemctl mask "$unit" || exit 1
+         done
+         systemctl stop apt-daily.service apt-daily-upgrade.service 2> /dev/null || true
+         if [ -d /etc/needrestart ]; then
+             mkdir -p /etc/needrestart/conf.d
+             echo "\$nrconf{restart} = \"l\";" > /etc/needrestart/conf.d/90-reliaburger-power-cut.conf
+         fi' > "$evidence/logs/guest-updates.log" 2>&1
+}
+
 want='soak-writer=1,soak-redis=1,soak-redis-client=1'
 
 apply_workloads() {
@@ -372,22 +410,50 @@ power_back() {
     done
 }
 
+# How long verify waits for each workload's start to reach its resume
+# record. "Settled" means every instance runs, but the Redis client still
+# has to reach Redis before it can push its start onto soak:starts; reading
+# the list straight away found no new start (run 12 cut 4, run 10 cuts 13
+# and 33).
+start_wait=60
+
+# await_start writer|redis FILE BEFORE: read the resume record into FILE
+# until it holds more than BEFORE starts, for at most start_wait seconds.
+await_start() {
+    local deadline=$(( $(now) + start_wait )) count
+    while true; do
+        read_resumes "$1" "$2"
+        count=$(starts_in "$2")
+        [ -z "$3" ] || { [ -n "$count" ] && [ "$count" -gt "$3" ]; } && return 0
+        [ "$(now)" -lt "$deadline" ] || return 1
+        sleep 3
+    done
+}
+
+# verify WRITER_ACKED REDIS_ACKED [WRITER_BEFORE REDIS_BEFORE WRITER_PREVIOUS REDIS_PREVIOUS]:
+# the checks after a cut. The BEFOREs are the starts each record held just
+# before the power-off, and the PREVIOUSes the ACK and INCR read before the
+# previous cut: a start between the cuts is held to those.
 verify() {
-    local writer_acked=$1 redis_acked=$2 previous starts
+    local writer_acked=$1 redis_acked=$2 writer_before=${3:-} redis_before=${4:-} previous starts
+    local writer_previous=${5:-} redis_previous=${6:-}
     rel exec soak-writer awk '$0 != NR && bad == "" { bad = NR ": " $0 } { if (count[$0]++ == 1) { dups++; if (first_dup == "") first_dup = $0 } if ($0 + 0 > max) max = $0 + 0 } END { if (bad != "") print "BAD " bad; missing = 0; for (i = 1; i <= max; i++) if (!(i in count)) { if (!missing) first_missing = i; missing++ } if (dups) print "DUP " dups " first " first_dup; if (missing) print "MISSING " missing " first " first_missing; print "MAX " max + 0; print "LAST " NR }' /data/seq \
         > "$cut_dir/seq.txt" 2>&1 || true
-    read_resumes writer "$cut_dir/resumes-writer.txt"
     starts=$(run_get writer_starts)
+    await_start writer "$cut_dir/resumes-writer.txt" "${writer_before:-$starts}" || true
     endurance seq "$cut_dir/seq.txt" --acked "$writer_acked" --resumes "$cut_dir/resumes-writer.txt" \
-        ${starts:+--starts "$starts"} > "$cut_dir/I1.json" || true
+        ${starts:+--starts "$starts"} ${writer_before:+--before-cut "$writer_before"} \
+        ${writer_previous:+--previous-acked "$writer_previous"} > "$cut_dir/I1.json" || true
     starts=$(starts_in "$cut_dir/resumes-writer.txt")
     [ -z "$starts" ] || run_set writer_starts "$starts"
     rel exec soak-redis redis-cli GET soak:counter > "$cut_dir/counter.txt" 2>&1 || true
-    read_resumes redis "$cut_dir/resumes-redis.txt"
     previous=$(run_get counter)
     starts=$(run_get redis_starts)
+    await_start redis "$cut_dir/resumes-redis.txt" "${redis_before:-$starts}" || true
     endurance counter "$cut_dir/counter.txt" --acked "$redis_acked" ${previous:+--previous "$previous"} \
-        --resumes "$cut_dir/resumes-redis.txt" ${starts:+--starts "$starts"} > "$cut_dir/I2.json" || true
+        --resumes "$cut_dir/resumes-redis.txt" ${starts:+--starts "$starts"} \
+        ${redis_before:+--before-cut "$redis_before"} ${redis_previous:+--previous-acked "$redis_previous"} \
+        > "$cut_dir/I2.json" || true
     starts=$(starts_in "$cut_dir/resumes-redis.txt")
     [ -z "$starts" ] || run_set redis_starts "$starts"
     python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(r.get("counter", ""))' "$cut_dir/I2.json" > "$cut_dir/counter-value"
@@ -400,6 +466,7 @@ verify() {
 
 one_cut() {
     local cut=$1 hold off writer_acked redis_acked cut_at api_seconds result=0
+    local writer_previous redis_previous writer_before redis_before environment=
     cut_dir=$evidence/cuts/$(printf '%05d' "$cut")
     mkdir -p "$cut_dir"
     hold=$(endurance hold --seed "$seed" --cut "$cut" --what work --min "$work_min" --max "$work_max")
@@ -408,8 +475,18 @@ one_cut() {
     sleep "$hold"
     # With no last ACK and INCR, I1 and I2 would hold whatever the cut did,
     # while the cut still counted towards the bound: don't make it.
+    writer_previous=$(run_get writer_acked)
+    redis_previous=$(run_get redis_acked)
     writer_acked=$(read_acked writer) && redis_acked=$(read_acked redis) \
         || abort_run "cut $cut wasn't made: no last ACK or INCR to hold it to ($(acked_problems))"
+    # Each record's starts just before the power-off, read after the ACKs: a
+    # start after this point is the cut's and must resume past them. When a
+    # record can't be read, every start since the previous check is held to
+    # this cut's ACK, as before.
+    read_resumes writer "$cut_dir/resumes-writer-before.txt"
+    read_resumes redis "$cut_dir/resumes-redis-before.txt"
+    writer_before=$(starts_in "$cut_dir/resumes-writer-before.txt")
+    redis_before=$(starts_in "$cut_dir/resumes-redis-before.txt")
     cut_at=$(now)
     run_set cuts_started "$cut"
     power_off 1
@@ -422,20 +499,30 @@ one_cut() {
         settle "cut-$cut" 300 || true
     else
         api_seconds=
+        # Lima's host agent says why a forward failed: in run 6 a test binary
+        # held the API port, so Bun "never came back".
+        cp "$LIMA_HOME/${vm[1]}/ha.stderr.log" "$cut_dir/ha.stderr.log" 2> /dev/null || true
+        ! grep -qi 'address already in use' "$cut_dir/ha.stderr.log" 2> /dev/null || environment='host port taken'
     fi
-    verify "$writer_acked" "$redis_acked"
+    verify "$writer_acked" "$redis_acked" "$writer_before" "$redis_before" "$writer_previous" "$redis_previous"
     local detail
     detail=$(python3 -c '
 import json, sys
 def number(text):
     return int(text) if text.strip() else None
-print(json.dumps({"topology": "1", "kind": "site", "cut_at": int(sys.argv[1]), "work_seconds": int(sys.argv[2]),
+detail = {"topology": "1", "kind": "site", "cut_at": int(sys.argv[1]), "work_seconds": int(sys.argv[2]),
     "off_seconds": int(sys.argv[3]), "acked": {"writer": int(sys.argv[4]), "redis": int(sys.argv[5])},
     "recovery": {"api_seconds": number(sys.argv[6]), "settled_seconds": number(sys.argv[7]),
                  "start_retries": int(sys.argv[8])},
-    "cycle_seconds": int(sys.argv[9])}))' \
+    "cycle_seconds": int(sys.argv[9]),
+    "starts_before_cut": {"writer": number(sys.argv[10]), "redis": number(sys.argv[11])},
+    "previous_acked": {"writer": number(sys.argv[12]), "redis": number(sys.argv[13])}}
+if sys.argv[14]:
+    detail["environment"] = [sys.argv[14]]
+print(json.dumps(detail))' \
         "$cut_at" "$hold" "$off" "$writer_acked" "$redis_acked" "${api_seconds:-}" "${settled_seconds:-}" \
-        "$start_retries" "$(( $(now) - cut_at + hold ))")
+        "$start_retries" "$(( $(now) - cut_at + hold ))" "${writer_before:-}" "${redis_before:-}" \
+        "${writer_previous:-}" "${redis_previous:-}" "$environment")
     endurance record --evidence "$evidence" --cut "$cut" --detail "$detail" > "$cut_dir/verdict.json" || result=$?
     say "cut $cut: Bun back in ${api_seconds:-never} s, settled in ${settled_seconds:-never} s; $(cat "$cut_dir/verdict.json")"
     return "$result"
@@ -518,6 +605,7 @@ if [ "$resume" = true ]; then
     say "resuming in $evidence"
     with_timeout 600 "$relish" local start > "$evidence/logs/resume-start.log" 2>&1 \
         || abort_run "relish local start failed on resume"
+    hold_guest_updates || abort_run "couldn't turn off the guest's automatic updates; see $evidence/logs/guest-updates.log"
     take_baseline
 else
     seed=${seed:-$(python3 -c 'import random; print(random.randrange(2**31))')}
@@ -538,6 +626,7 @@ else
     run_set hypervisor "lima $("$limactl" --version | awk '{print $NF}') $("$limactl" list --format '{{.VMType}}' "${vm[1]}")"
     run_set relish "$("$relish" --version)"
     run_set bun "$(gsh '/usr/local/bin/bun --version 2>/dev/null || bun --version 2>/dev/null' | tail -n 1)"
+    hold_guest_updates || abort_run "couldn't turn off the guest's automatic updates; see $evidence/logs/guest-updates.log"
     say "applying the workloads"
     apply_workloads
 fi

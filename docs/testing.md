@@ -1189,8 +1189,8 @@ with `limactl stop --force`, waits 5–60 s and powers it back on with
 
 | # | Invariant | Pass means |
 |---|---|---|
-| I1 | Acknowledged volume writes | `/data/seq` holds 1..N with no gap or duplicate, and the writer started again, and at every start since the previous check resumed at or past the last `ACK` read before the cut |
-| I2 | Redis counter | Never goes backwards, and the client started again, and at every start since the previous check found it at or past the last `INCR` read before the cut |
+| I1 | Acknowledged volume writes | `/data/seq` holds 1..N with no gap or duplicate; the writer started again after the cut, and every start since then resumed at or past the last `ACK` read before the cut; a start between the cuts resumed at or past the previous cut's `ACK` |
+| I2 | Redis counter | Never goes backwards; the client started again after the cut, and every start since then found it at or past the last `INCR` read before the cut; a start between the cuts found it at or past the previous cut's `INCR` |
 | I4 | Stores open cleanly | Bun started once since boot, never exited, and logged no panic or store error |
 | I6 | Recovery in time | Bun answered an API read within 120 s of power-on, and every workload ran within 300 s |
 | I7 | Desired = running | Each workload runs exactly once |
@@ -1206,13 +1206,29 @@ writes. If the harness can't read a last `ACK` and `INCR` before a cut (the
 log is unreadable, holds none, or went below the last one read), it doesn't
 make the cut: I1 and I2 would hold whatever happened.
 
+Two timings matter here. Just before each power-off the harness records how
+many starts each record holds, so a start between two cuts (in run 8
+needrestart restarted Bun after an unattended libc upgrade) is held to the
+previous cut's `ACK`, the last one before it, not to this cut's. And
+"settled" only means every instance runs: the Redis client still has to
+reach Redis before it can push its start, so after a cut the harness polls
+both records for up to 60 s for a new start before it calls the cut "no new
+start". The guest's automatic updates (`apt-daily*.timer` and
+unattended-upgrades) are masked at install and on every resume, since a cut
+mid-dpkg can damage the guest.
+
 ```sh
 scripts/release/qualify-power-cut-endurance.sh --release 0.2.8 --tier quick
 ```
 
 `--tier quick` cuts for an hour; `--duration 6h` sets any other length.
-`--plan` prints the seeded schedule and exits. `--port-offset N` adds N to the cluster's
-ports, so several runs can share a host, each in its own checkout. Each cut writes a line to
+`--plan` prints the seeded schedule and exits. The cluster's API, ingress and
+registry ports are 31000, 31600 and 32200 on the host, and `--port-offset N`
+(up to 500) adds N to each, so several runs can share a host, each in its own
+checkout. That block sits above the test suites' ports (the crash fixtures'
+27000–29999, which once took a run's API port, and the 15000–26999 and
+30000–30999 the in-process suites hard-code) and below every ephemeral range
+(Linux's from 32768, macOS's from 49152). Each cut writes a line to
 `cuts.jsonl` and a directory of evidence; the run ends with `summary.json`
 (schema `reliaburger.power-cut-endurance/1`) holding the cuts, violations,
 recovery percentiles and the rule-of-three bound. A violation powers the VM
@@ -1223,7 +1239,12 @@ a cut that was made has no line in `cuts.jsonl`. Between cuts, such as when
 the last `ACK` couldn't be read three times running, it stops the cluster
 cleanly with `relish local stop` and `--resume` carries on: forcing the VM
 off there would be a cut nobody recorded. Mid-cut, or if the clean stop
-fails, it forces the VM off and the run can't resume. It never touches `reliaburger-test`
+fails, it forces the VM off and the run can't resume. Nor can a run with a
+violation in `cuts.jsonl`: carrying on would overwrite the state kept for
+diagnosing it. `--rejudge DIR` runs today's checker over the cuts a run
+recorded, offline, without writing anything; for older evidence it infers
+which starts came before a cut and finds a late start in the next cut's
+record, and calls a cut it can't decide `undecided`. It never touches `reliaburger-test`
 or your own `~/.reliaburger`, and when a release gate holds the host it
 powers the cluster off cleanly and exits 75; `--resume --evidence DIR`
 carries on. [`test_power_cut_endurance.py`](../scripts/release/test_power_cut_endurance.py)
