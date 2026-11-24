@@ -1382,6 +1382,58 @@ Portable macOS, 52 to 57 minutes with a warm cache, still sets the length of eve
 group. And the queue builds up to eight groups at once, 160 jobs, a setting in the
 repository ruleset that only the maintainer can change.
 
+Should it be one? We'd meant to find out by queueing a compatible pair of PRs and a
+conflicting pair on purpose. The 0.3.3 train did it for us on 24 November, 27 times, so we
+read the answer back from the API instead of spending runners on a staged one. The first
+surprise was that a "group" is never a group. Every one of the 53 merge-group commits on
+the last two trains has, as its first parent, the head of the entry ahead of it: each PR is
+built alone, stacked on the one in front. The ruleset's `max_entries_to_merge` of 8 only
+lets several entries that have all passed land in one push. Builds don't combine.
+
+That makes concurrency a question of waiting, not of cost. Each entry is built once
+whatever the setting, so the queue's runner-minutes stay the same; only a failure makes it
+rebuild the entries behind. At eight groups, a group's jobs waited a median 633
+job-minutes for a runner and ran for 276, and the slowest took the whole 240-minute
+timeout. At one, an uncontended group takes 70 to 80 minutes, so the queue would land under
+one PR an hour against the 2.25 an hour that arrived. Little's law, the number in flight
+equals the arrival rate times the time each one spends, puts the answer near three.
+
+The second surprise was the conflicts. Four PRs that day edited the same rows of
+`docs/flakes.md` or `CHANGELOG.md` as a PR queued ahead of them. The queue spotted each one
+at once and marked it `UNMERGEABLE`, built the entries behind it past it, and said nothing
+until the PR reached the head, between one and a half and two and a half hours later, when
+it dropped it. All four merged cleanly onto the train, so checking against the train would
+have missed every one. `queue_conflicts.py` checks against the queue's tip instead, with
+`git merge-tree`, and walks back to the entry that brought the conflict in:
+
+```python
+def find_blocker(head, train_tip, ahead, conflicts):
+    bases = [(None, train_tip)]
+    bases += [(entry["pullRequest"]["number"], entry["headCommit"]["oid"])
+              for entry in ahead if entry.get("headCommit")]
+    tip_paths = conflicts(bases[-1][1], head)
+    if not tip_paths:
+        return None
+    for number, base in bases[:-1]:
+        paths = conflicts(base, head)
+        if paths:
+            return number, paths
+    return bases[-1][0], tip_paths
+```
+
+`bases[-1]` is Python's last element, and the list comprehension skips the entries the
+queue never built, which have no head commit. One merge decides the common case, a clean
+PR; only a conflict pays for the walk. Replayed on the day's four, it names #2249, #2234,
+#2234 and #2253, the PRs each one had collided with.
+
+Why not make the conflicts go away with `merge=union` in `.gitattributes`, which keeps both
+sides' lines? We tried it on the same pairs with `git merge-file --union`. One of them,
+#2234 against #2249, carried the same flake row on both sides, "Open" on one and "Fixed" on
+the other, and union kept both. On the changelog, a bullet appended to one subsection while
+another PR added a new subsection after it landed under the wrong heading. A conflict a
+person resolves in a minute beats a register that lies quietly. The settings went to the
+maintainer as a recommendation: three groups at once and a 360-minute timeout.
+
 That left portable Linux, which builds the crate for 13 of its 25 to 31 minutes, one
 compile at a time. Every train PR waits for it. Did the build really have to be that slow?
 The problem was never parallelism as such. It was two particular rustc processes running at
