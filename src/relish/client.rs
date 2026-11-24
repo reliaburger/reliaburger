@@ -1835,6 +1835,7 @@ impl BunClient {
                 resource: row.resource,
                 image: row.image,
                 fingerprint: row.fingerprint,
+                owner: row.owner,
             })
             .collect())
     }
