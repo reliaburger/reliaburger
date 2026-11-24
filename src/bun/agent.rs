@@ -146,6 +146,15 @@ use trace::backend_addresses;
 /// init wait so a hung init can't wedge the agent event loop indefinitely.
 const INIT_TIMEOUT_SECS: u64 = 300;
 
+/// How long an init container's wait keeps asking a runtime that doesn't
+/// answer its state or exit code reads before it fails the deploy (#2293).
+/// A process owner under load misses a 2 s request timeout now and then and
+/// answers the next one: that is slow. One that hasn't answered for 15 s,
+/// seven of its own timeouts in a row, has lost the init. A failed deploy
+/// says why and can be applied again, so this is far shorter than the 60 s a
+/// batch attempt's exit poll waits, where giving up means an unknown outcome.
+const INIT_ANSWER_PATIENCE: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Most bytes of an init container's captured stderr carried into its failure.
 /// Runc prints why it refused to start (an occupied cgroup, a missing binary)
 /// in its last line or two, so a short tail says why without flooding logs.
@@ -334,11 +343,15 @@ async fn drain_instance(
 /// Stop one instance, requiring observed exit even after force-kill.
 ///
 /// Four explicit steps, each with its own bound: the pre-stop command
-/// (`stop.pre_stop`, within its timeout), the stop signal (accepted within
-/// `confirmation_timeout`), the grace (`stop.grace`) and, if the workload is
-/// still running, the force-kill and its confirmation. A pre-stop command
-/// that fails, can't run or overruns costs at most its bound: the signal and
-/// the kill still follow.
+/// (`stop.pre_stop`, within its timeout), the stop signal, the grace
+/// (`stop.grace`) and, if the workload is still running, the force-kill and
+/// its confirmation. The grace runs from the first ask for the stop signal.
+/// A runtime that doesn't answer is asked again until the grace ends, each
+/// ask waiting at most `confirmation_timeout`, and the exit is awaited only
+/// for what's left of the grace (#1902). So the signal and the grace
+/// together take at most the grace plus one `confirmation_timeout`. A
+/// pre-stop command that fails, can't run or overruns costs at most its
+/// bound: the signal and the kill still follow.
 ///
 /// `confirmation_timeout` (`[runtime] stop_confirmation_timeout_secs`) bounds
 /// the runtime's own work: accepting the stop request, accepting a kill, and
@@ -379,16 +392,62 @@ async fn stop_instance_alone<G: Grill>(
     if let Some(pre_stop) = &stop.pre_stop {
         run_pre_stop(grill, id, pre_stop).await;
     }
-    tokio::time::timeout(confirmation_timeout, grill.stop(id))
-        .await
-        .map_err(|_| BunError::StopUnconfirmed {
-            instance_id: id.clone(),
-            reason: "graceful stop request timed out",
-        })??;
-    if observe_runtime_exit(grill, id, stop.grace).await? {
+    let grace_ends = tokio::time::Instant::now() + stop.grace;
+    let signalled = ask_until_answered(grace_ends, |_left| async {
+        tokio::time::timeout(confirmation_timeout, grill.stop(id))
+            .await
+            .map_err(|_| BunError::StopUnconfirmed {
+                instance_id: id.clone(),
+                reason: "graceful stop request timed out",
+            })?
+            .map_err(BunError::from)
+    })
+    .await?;
+    // The grace started at the first ask, so a late answer leaves only
+    // what's left of it, and a grace spent asking goes straight to the kill.
+    let grace_left = grace_ends.saturating_duration_since(tokio::time::Instant::now());
+    if signalled && observe_runtime_exit(grill, id, grace_left).await? {
         return Ok(());
     }
     kill_runtime_instance(grill, id, confirmation_timeout).await
+}
+
+/// Send a stop or kill request, asking again while the runtime answers
+/// that it didn't get to it (`StopUnanswered`: a process owner stalled
+/// past its request timeout, #1902), until `deadline`.
+///
+/// `send` gets the time left before `deadline`, so an ask can be capped to
+/// it. No ask starts at or after `deadline`. `Ok(true)` once the runtime
+/// answers, `Ok(false)` when `deadline` passed with no answer. Any other
+/// error ends it at once. The runtime may have sent the signal before it
+/// stalled, so a workload can see it twice; that beats failing a stop
+/// while the workload is fine.
+async fn ask_until_answered<F, Fut>(
+    deadline: tokio::time::Instant,
+    mut send: F,
+) -> Result<bool, BunError>
+where
+    F: FnMut(std::time::Duration) -> Fut,
+    Fut: std::future::Future<Output = Result<(), BunError>>,
+{
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match send(left).await {
+            Ok(()) => return Ok(true),
+            Err(BunError::Grill(crate::grill::GrillError::StopUnanswered { instance, reason })) => {
+                eprintln!("bun: {instance}: stop request got no answer ({reason}); asking again");
+            }
+            Err(error) => return Err(error),
+        }
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return Ok(false);
+        }
+        tokio::time::sleep(left.min(std::time::Duration::from_millis(100))).await;
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+    }
 }
 
 /// Run an instance's pre-stop command inside it, within its bound.
@@ -421,12 +480,27 @@ async fn kill_runtime_instance<G: Grill>(
     id: &InstanceId,
     confirmation_timeout: std::time::Duration,
 ) -> Result<(), BunError> {
-    tokio::time::timeout(confirmation_timeout, grill.kill(id))
-        .await
-        .map_err(|_| BunError::StopUnconfirmed {
+    // Every ask shares one `confirmation_timeout`, so retries can't stretch
+    // the kill past the bound callers size their deadlines from.
+    let killed = ask_until_answered(
+        tokio::time::Instant::now() + confirmation_timeout,
+        |left| async move {
+            tokio::time::timeout(left, grill.kill(id))
+                .await
+                .map_err(|_| BunError::StopUnconfirmed {
+                    instance_id: id.clone(),
+                    reason: "force-kill request timed out",
+                })?
+                .map_err(BunError::from)
+        },
+    )
+    .await?;
+    if !killed {
+        return Err(BunError::StopUnconfirmed {
             instance_id: id.clone(),
-            reason: "force-kill request timed out",
-        })??;
+            reason: "the runtime never answered the force-kill request",
+        });
+    }
     if observe_runtime_exit(grill, id, confirmation_timeout).await? {
         return Ok(());
     }
@@ -944,6 +1018,9 @@ pub struct BunAgent<G: Grill> {
     /// Per-step deadline for the runtime to confirm a stop or force-kill
     /// (`[runtime] stop_confirmation_timeout_secs`).
     stop_confirmation_timeout: std::time::Duration,
+    /// How long an init container's wait asks a runtime that doesn't answer
+    /// again before it fails the deploy ([`INIT_ANSWER_PATIENCE`]).
+    init_answer_patience: std::time::Duration,
     /// The `[secret_providers.*]` this node runs for `PROVIDER[...]` env
     /// values, resolved off the loop just before a launch (#1123).
     secret_providers: crate::sesame::secret_provider::SecretProviders,
@@ -1087,6 +1164,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             node_leaf_lifetime: crate::sesame::ca::NODE_LEAF_LIFETIME,
             stop_confirmation_timeout: crate::config::node::RuntimeSection::default()
                 .stop_confirmation_timeout(),
+            init_answer_patience: INIT_ANSWER_PATIENCE,
             secret_providers: Default::default(),
             node_fault_fence: crate::smoker::reservation::NodeFaultFence::default(),
             node_drain_gate: crate::smoker::node_fault::NodeDrainGate::new(),
@@ -1249,6 +1327,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             node_leaf_lifetime: crate::sesame::ca::NODE_LEAF_LIFETIME,
             stop_confirmation_timeout: crate::config::node::RuntimeSection::default()
                 .stop_confirmation_timeout(),
+            init_answer_patience: INIT_ANSWER_PATIENCE,
             secret_providers: Default::default(),
             node_fault_fence: crate::smoker::reservation::NodeFaultFence::default(),
             node_drain_gate: crate::smoker::node_fault::NodeDrainGate::new(),
@@ -1540,6 +1619,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// step of a stop or force-kill may wait for the runtime to confirm it.
     pub fn set_stop_confirmation_timeout(&mut self, timeout: std::time::Duration) {
         self.stop_confirmation_timeout = timeout;
+    }
+
+    /// Shorten how long an init container's wait asks a silent runtime
+    /// again, so a test of a lost init doesn't wait the full patience.
+    #[cfg(test)]
+    pub(crate) fn set_init_answer_patience(&mut self, patience: std::time::Duration) {
+        self.init_answer_patience = patience;
     }
 
     /// Configure the opt-in node-pressure helper and clean owned crash

@@ -107,12 +107,7 @@ treats the three kinds of run differently ([which jobs run](testing.md#which-job
   candidate build reuses.
 
 So nothing reaches a train, or `main`, without the full set having passed on
-that exact commit. The one exception is privileged Linux on Ubuntu 26.04,
-which is advisory until
-[#1943](https://github.com/reliaburger/reliaburger/issues/1943) closes: it
-runs and reports, but its failure only warns, in `ignored-test evidence` and
-in a candidate's `find passing CI`, and making it required again is part of
-closing #1943 ([advisory jobs](testing.md#which-jobs-a-pull-request-runs)). macOS runs on every push and on the nightly, on the
+that exact commit. macOS runs on every push and on the nightly, on the
 release gate PR and on the candidate build, but not on ordinary pull
 requests: the organisation's plan runs at most five macOS jobs at once, and
 each full run takes one ([portable macOS in one job](testing.md#portable-macos-in-one-job)).
@@ -123,29 +118,54 @@ covers them.
 
 ### Opening a train
 
-A train opens in one sitting, in this order:
+A train opens with one command, run by a repository admin, because step 2
+edits a ruleset and only an admin can
+([#1053](https://github.com/reliaburger/reliaburger/issues/1053)):
 
-1. **Create the branch** `release-X-Y-Z` from the previous train's frozen
-   tip, or from `main` once the previous release is out.
-2. **Bump the version first.** The first PR into the train sets the
-   version in `Cargo.toml` (and its lockfile entries), so everything built
-   from the train says which release it's heading for.
-3. **Add the branch to the merge-queue ruleset** by its exact name. Only a
-   repository admin can:
+```
+python3 scripts/release/open_train.py release-X-Y-Z --milestone X.Y.Z --dry-run
+python3 scripts/release/open_train.py release-X-Y-Z --milestone X.Y.Z [--from release-X-Y-W]
+```
 
-   ```
-   gh api repos/reliaburger/reliaburger/rulesets/25015244 > ruleset.json
-   # add "refs/heads/release-X-Y-Z" to .conditions.ref_name.include, then
-   gh api -X PUT repos/reliaburger/reliaburger/rulesets/25015244 --input ruleset.json
-   ```
+The dry run reads what it needs and prints every write it would make,
+including the ruleset's new body, and makes none. Without `--dry-run`, the
+script does the four steps in order and skips any that's already done, so
+running it again finishes what a failed run started:
 
-   Then check it took:
-   `gh api repos/reliaburger/reliaburger/rules/branches/release-X-Y-Z`
-   must list `merge_queue` and `required_status_checks`. An empty list
-   means the train has no queue ([merging through the queue](#merging-through-the-queue)).
+1. **Create the branch** `release-X-Y-Z` from `--from`: the previous
+   train's frozen tip, or `main` (the default) once the previous release is
+   out.
+2. **Add the branch to the merge-queue ruleset** (25015244) by its exact
+   name, then check that `rules/branches/release-X-Y-Z` lists
+   `merge_queue` and `required_status_checks`. The script stops if it
+   doesn't, because a train without them has no queue
+   ([merging through the queue](#merging-through-the-queue)). A pattern such
+   as `refs/heads/release-*` would make this step unnecessary, but GitHub
+   refuses it in a ruleset with a merge queue: "Wildcard ref names are not
+   supported when merge queue is enabled" (HTTP 422). So every train is
+   named, and the list keeps the old trains, which is harmless.
+3. **Create the milestone** `X.Y.Z`.
 4. **Open the gate PR** from the train into `main`, with an empty list of
    `Fixes` lines that grows as PRs merge
-   ([every issue closes itself](#every-issue-closes-itself)).
+   ([every issue closes itself](#every-issue-closes-itself)). GitHub won't
+   open a PR with no commits, so on a fresh branch the script prints the
+   `gh pr create` command instead. Run it, or the script again, once the
+   first PR has merged.
+
+The first PR into the train **bumps the version**: it sets the version in
+`Cargo.toml` (and its lockfile entries), so everything built from the train
+says which release it's heading for.
+
+Without the script, step 2 by hand is:
+
+```
+gh api repos/reliaburger/reliaburger/rulesets/25015244 > ruleset.json
+# add "refs/heads/release-X-Y-Z" to .conditions.ref_name.include, then
+gh api -X PUT repos/reliaburger/reliaburger/rulesets/25015244 --input ruleset.json
+gh api repos/reliaburger/reliaburger/rules/branches/release-X-Y-Z
+```
+
+and the last command must list `merge_queue` and `required_status_checks`.
 
 ### Every issue closes itself
 
@@ -1086,9 +1106,7 @@ to `main`, so the build reuses that run instead of running the suite again
 for a `ci.yml` run on exactly this commit, from a push, the merge queue or the
 nightly schedule (a pull request's run tests a merge commit and may skip
 jobs). The run counts only if it succeeded on its first attempt and every
-job in it succeeded, `ignored-test evidence` included, apart from the
-advisory Ubuntu 26.04 job, whose failure only puts a warning in the build log
-until #1943 closes. A run that went green
+job in it succeeded, `ignored-test evidence` included. A run that went green
 only when someone re-ran it doesn't count: a failure that passes on a re-run
 is a flake, retries are 0, and the candidate runs its own suite instead
 ([#1436](https://github.com/reliaburger/reliaburger/issues/1436)); the script's list of required jobs is kept

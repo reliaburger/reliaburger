@@ -2,6 +2,7 @@
 //! the loop, asking the loop through [`DeployOps`] for every change of state.
 
 use super::*;
+use crate::grill::GrillError;
 
 /// How many instances of one batch retire at once (#1440). Each one's
 /// wait for other nodes to drop it asks the leader every 500 ms through
@@ -28,6 +29,9 @@ pub(super) struct DeployWorker<G: Grill> {
     pub(super) operation: Option<crate::bun::deploy_operations::DeployOperationHandle>,
     /// The agent's `[runtime] stop_confirmation_timeout_secs`.
     pub(super) stop_confirmation_timeout: std::time::Duration,
+    /// How long an init container's wait asks a runtime that doesn't answer
+    /// again before it fails the deploy (#2293).
+    pub(super) init_answer_patience: std::time::Duration,
     /// Resolves an instance's egress allowlist before the loop programs
     /// it, so the loop never waits on DNS (#419).
     pub(super) egress: launch_evidence::EgressResolver,
@@ -97,6 +101,89 @@ pub(super) async fn captured_stderr_tail(stem: &std::path::Path) -> Option<Strin
         .filter(|line| !line.is_empty())
         .collect();
     (!lines.is_empty()).then(|| lines.join("; "))
+}
+
+/// What one look at a running init container found.
+enum InitProgress {
+    Running,
+    /// It stopped: `None` if it succeeded, or why it failed.
+    Finished(Option<String>),
+}
+
+/// Read an init container's state, and its exit code once it has stopped.
+async fn poll_initialiser<G: Grill>(
+    grill: &G,
+    init_id: &InstanceId,
+) -> Result<InitProgress, GrillError> {
+    if grill.state(init_id).await? != ContainerState::Stopped {
+        return Ok(InitProgress::Running);
+    }
+    Ok(InitProgress::Finished(
+        match grill.exit_code(init_id).await? {
+            Some(0) => None,
+            Some(code) => Some(format!("exited with code {code}")),
+            None => Some("stopped without an exit code".to_string()),
+        },
+    ))
+}
+
+/// The pause between an init's reads while the runtime answers them.
+const INIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The pause after a read the runtime didn't answer: a busy process owner
+/// isn't helped by being asked twenty times a second.
+const INIT_UNANSWERED_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The fewest unanswered reads in a row that can fail an init, so one read
+/// that hangs past the patience on its own can't (#2293).
+const INIT_MIN_UNANSWERED_READS: u32 = 3;
+
+/// An init container's reads the runtime didn't answer, in a row (#2293).
+#[derive(Debug, Default)]
+struct UnansweredReads {
+    /// When the first of them came back unanswered.
+    since: Option<std::time::Instant>,
+    count: u32,
+}
+
+impl UnansweredReads {
+    fn pause(&self) -> std::time::Duration {
+        if self.count == 0 {
+            INIT_POLL_INTERVAL
+        } else {
+            INIT_UNANSWERED_POLL_INTERVAL
+        }
+    }
+
+    /// The runtime answered: whatever went before was slowness.
+    fn answered(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Count one more unanswered read. Once they have lasted `patience`, and
+    /// there have been enough of them, the init is lost: hand back the same
+    /// `StateUnavailable`, saying how long nothing answered.
+    fn missed(
+        &mut self,
+        instance: InstanceId,
+        reason: String,
+        patience: std::time::Duration,
+    ) -> Result<(), GrillError> {
+        let since = *self.since.get_or_insert_with(std::time::Instant::now);
+        self.count += 1;
+        let waited = since.elapsed();
+        if waited < patience || self.count < INIT_MIN_UNANSWERED_READS {
+            return Ok(());
+        }
+        Err(GrillError::StateUnavailable {
+            instance,
+            reason: format!(
+                "no state read answered for {:.1}s ({} in a row); last: {reason}",
+                waited.as_secs_f64(),
+                self.count
+            ),
+        })
+    }
 }
 
 impl<G: Grill + Clone + 'static> DeployWorker<G> {
@@ -408,7 +495,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 Err(e) => {
                     let _ = events
                         .send(ApplyEvent::Error {
-                            status: None,
+                            status: e.apply_status(),
                             message: e.to_string(),
                         })
                         .await;
@@ -621,15 +708,18 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             // no longer wedges the loop at all — this poll is off it).
             let deadline =
                 std::time::Instant::now() + std::time::Duration::from_secs(INIT_TIMEOUT_SECS);
+            // A read the runtime didn't answer is asked again, for a while:
+            // a process owner under load misses one now and then (#2293).
+            let mut unanswered = UnansweredReads::default();
             let failure = loop {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                let state = self.grill.state(&init_id).await?;
-                if state == ContainerState::Stopped {
-                    break match self.grill.exit_code(&init_id).await? {
-                        Some(0) => None,
-                        Some(code) => Some(format!("exited with code {code}")),
-                        None => Some("stopped without an exit code".to_string()),
-                    };
+                tokio::time::sleep(unanswered.pause()).await;
+                match poll_initialiser(&self.grill, &init_id).await {
+                    Ok(InitProgress::Running) => unanswered.answered(),
+                    Ok(InitProgress::Finished(outcome)) => break outcome,
+                    Err(GrillError::StateUnavailable { instance, reason }) => {
+                        unanswered.missed(instance, reason, self.init_answer_patience)?
+                    }
+                    Err(error) => return Err(error.into()),
                 }
                 if std::time::Instant::now() >= deadline {
                     let _ = self.grill.kill(&init_id).await;
@@ -937,7 +1027,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     .await;
                 let _ = events
                     .send(ApplyEvent::Error {
-                        status: None,
+                        status: error.apply_status(),
                         message: error.to_string(),
                     })
                     .await;

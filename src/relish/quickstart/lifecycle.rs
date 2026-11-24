@@ -500,6 +500,9 @@ pub async fn run(
             }
         }
         Action::Start => {
+            // QEMU may have been upgraded since setup checked it (#1495).
+            #[cfg(target_os = "linux")]
+            super::preflight::qemu().await?;
             boot(&lima, &operation, selection).await?;
             let bootstrap = bootstrap.as_ref().context("cluster bootstrap is missing")?;
             for index in selection.indexes(operation.state.nodes.len()) {

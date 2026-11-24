@@ -12,8 +12,11 @@ The flags, variables, files and ports you'll reach for. `relish help COMMAND`
 | `--ca-cert PATH` | `RELIABURGER_CA_CERT` | cluster root CA; switches the default to HTTPS |
 | `-o`, `--output FORMAT` | | `human` (default), `json` or `yaml`; every command takes it except the eight interactive ones ([machine output](#machine-output)) |
 
-A flag beats its variable. With neither, `relish` uses the laptop cluster's
-saved context, then `http://127.0.0.1:9117`.
+A flag beats its variable. With neither, `relish` uses the saved context,
+then `http://127.0.0.1:9117`. A context that lists several nodes asks the
+one that last answered, then the rest in order, passing over any that
+don't accept a connection within 1.5 seconds ([the appliance
+chapter](17_appliance.md#claim-them) shows it).
 
 ## Machine output
 
@@ -54,6 +57,7 @@ Changing it:
 | `stop`, `delete`, `release` | `action` (`stop_requested`, `delete_requested`, `released`), `app`, `namespace`, `forced` |
 | `rollback` | the `app`, its `namespace`, and whether it was `forced` |
 | `apply`, `apply --rerun-jobs`, `batch`, `run` | the node's answer: `created` and `instances`, or `batch_id` and its counts; `apply --dry-run` prints the plan |
+| `apply --wait` | the `relish.agent/v1` envelope with `command: "apply"`: `data.ready`, each app's counts, phase and `reason` under `data.apps`, and `next`; exit 1 when an app wasn't ready in time |
 | `batch replay`, `batch cancel` | `run` and the `change` (`replay_acknowledged`, `cancelled`) |
 | `fault <type>` | the fault, with any it created on other nodes under `routed` |
 | `fault list`, `fault clear` | `faults` and `warnings`; the node's `message` |
@@ -227,7 +231,7 @@ Everything the installer and the quickstart write lives in `~/.reliaburger`
 | Path | What |
 |------|------|
 | `bin/relish` | the CLI (`~/.local/bin/relish` links here if that's on your `PATH`) |
-| `context.json` | the current cluster's endpoint, CA path and admin token (mode 0600): the laptop cluster's, or a bare-metal cluster's node 1 once `relish cluster create --bare-metal` or `relish machines claim --create` saves it (they leave another cluster's working context in place, and replace one whose CA certificate is gone) |
+| `context.json` | the current cluster's endpoints, CA path and admin token (mode 0600): the laptop cluster's, or a bare-metal or `setup --ssh` cluster's, node 1 first and every other node after it to fall over to, with the node that last answered, once `relish cluster create --bare-metal`, `relish machines claim --create` or `relish setup --ssh` saves it (they leave another cluster's working context in place, and replace one whose CA certificate is gone) |
 | `root-backup-keys/` | the age identities that open each cluster's root CA backup; keep a copy offline, since the root CA key has no other copy |
 | `clusters/NAME/` | a laptop cluster's state, node configs and `timings.json` |
 | `clusters/NAME/security/` | its master key, admin token and CA (`identity/root-ca.crt`) |
@@ -611,7 +615,7 @@ See [working with an AI agent](16_working-with-an-ai-agent.md).
 - `relish agent`: Commands for LLM agents: one JSON envelope, bounded, never interactive
   - `relish agent guide`: How to use relish as an agent: the manual chapter, as Markdown sections
   - `relish agent version`: This binary's version, commit, target and cluster formats
-  - `relish agent schema [guide|version|schema|source-version|source-tree|source-grep|source-show|source-extract|logs|manual-search|manual-show|context|diagnose|explain|timeline|upgrade-check|verify|report|patch-init|patch-build|patch-test|patch-try|patch-diff|patch-apply|patch-destroy|setup|lease-take|lease-renew|lease-release|propose|proposals|withdraw|undo|status]`: The JSON Schema of the envelope and of each command's data
+  - `relish agent schema [guide|version|schema|source-version|source-tree|source-grep|source-show|source-extract|logs|manual-search|manual-show|context|diagnose|explain|timeline|upgrade-check|verify|report|patch-init|patch-build|patch-test|patch-try|patch-diff|patch-apply|patch-destroy|setup|lease-take|lease-renew|lease-release|propose|proposals|withdraw|undo|status|apply]`: The JSON Schema of the envelope and of each command's data
   - `relish agent source`: The source this binary was built from: search it, read it, extract it
     - `relish agent source version`: This binary's source: version, commit, digest, file count, and the commit every node runs
     - `relish agent source tree [PREFIX]`: Files with their size in bytes and their line count

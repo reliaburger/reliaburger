@@ -2289,26 +2289,36 @@ The node half is `WorkloadSupervisor::admit_runtime_knobs`, which `admit_app`
 calls beside `admit_host_paths`, and which a rolling replacement calls before
 it prepares anything, because a replacement never goes through `admit_app`.
 It refuses in one of two ways: the runtime can't apply knobs at all, or the
-allowlist doesn't list one. The check itself is a walk over the three kinds:
+allowlist doesn't list one. The check itself is a walk over the three kinds
+that keeps every knob the allowlist doesn't name:
 
 ```rust
 pub fn check(&self, knobs: &RuntimeKnobs) -> Result<(), KnobRefusal> {
-    let refuse = |kind, value| {
-        Err(KnobRefusal::NotAllowed {
-            knob: KnobUse { kind, value },
-        })
-    };
-    if let Some(capability) = knobs
+    let use_of = |kind, value: String| KnobUse { kind, value };
+    let capabilities = knobs
         .capabilities
         .iter()
-        .find(|capability| !self.capabilities.contains(capability))
-    {
-        return refuse(KnobKind::Capability, capability.to_string());
-    }
+        .filter(|capability| !self.capabilities.contains(capability))
+        .map(|capability| use_of(KnobKind::Capability, capability.to_string()));
     // ... the same for sysctls (by pattern) and devices (by path)
-    Ok(())
+    let refused: Vec<KnobUse> = capabilities.chain(sysctls).chain(devices).collect();
+    if refused.is_empty() {
+        Ok(())
+    } else {
+        Err(KnobRefusal::NotAllowed { knobs: refused })
+    }
 }
 ```
+
+The first version returned at the first knob it didn't like. That was
+shorter, but an app with three missing knobs took three deploys to find
+them all (#1316). Iterators are lazy in Rust: `filter` and `map` only
+describe the work, and nothing runs until `collect` pulls the values
+through, so building three of them and `chain`ing them costs one pass.
+`collect` works out what to build from the type we ask for, here
+`Vec<KnobUse>`. The refusal carries the whole list, and its `Display`
+gives each knob its own clause, because each kind is fixed under its own
+node key. A runtime that can't apply knobs at all names every one too.
 
 `KnobKind` is a three-variant enum, not a `&str` like `"capabilities"`.
 The refusal's message needs both the app-side field name and the node-side
@@ -2956,6 +2966,19 @@ the template refused the whole apply, every re-apply would fail, and GitOps
 would fail every sync and never advance its commit. Skipping with a note is
 what Lettuce already does with what it didn't write, and the note means it
 isn't silent.
+
+The plan has to tell the same story. At first `relish apply --dry-run`
+showed an owned app as an update (`~`), because
+`GET /v1/apps` carried only an image and a fingerprint, and the file's spec
+differed from the controller's (#1322). The apply would then skip it. Now each
+row carries the app's `owner`, and an app with an owner the file doesn't
+declare gets its own plan action, `owned_skipped` (shown as `!`, "owned by
+'db-failover', skipped"). Adding a variant to `PlanAction` made the compiler
+list every `match` that needed an answer for it: the symbol, the JSON name,
+and nothing else, because the counts filter on `==`. The plan applies the
+same rule as `judge_apply` without the caller's token, so it can't tell you
+that a file which declares the owner will be refused for the wrong token;
+the apply still does.
 
 *Why tie the owner to a token's name?* The first sketch let any string be an
 owner, and treated it as a label. Then anyone allowed to deploy in `pg` could

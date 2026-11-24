@@ -1705,6 +1705,145 @@ first four come from each node's share of the summary
 `/v1/cluster/capacity`. `--unhealthy` keeps the nodes that aren't alive, are
 cordoned, are under disk pressure or didn't answer.
 
+### Waiting for an apply: `relish apply --wait`
+
+On a cluster, `relish apply` returns once the council has recorded the
+change, with "the scheduler places them now (watch with `relish apps`)".
+That's honest, and it's annoying. In the 0.3.2 Wyse lab nginx took three
+`relish apps` to come up: down with no node, down on `wyse-1` at 17 s,
+running at 27 s. Every script and checklist that applies something and then
+curls it needs the same loop, and each one writes its own (#2240).
+`--wait` is that loop, once. On the lab's nginx it prints something like
+this:
+
+```text
+$ relish apply --wait nginx.toml
+applied 1 app(s); waiting up to 5m for them to run
+[   1s] nginx: 0/1 running; placed on wyse-1
+[   2s] nginx: 0/1 running; 1 pulling nginx:alpine on wyse-1
+[  21s] nginx: 0/1 running; 1 waiting for the health check on wyse-1
+[  27s] nginx: ready, 1/1 running on wyse-1
+1 app(s) ready in 27s
+```
+
+What does "ready" mean? The first two parts were easy. The app runs as many
+replicas as it wants, and each one has passed its health check: an instance
+only reports `running` after `health-wait`, so counting `running` instances
+is enough. Both come from what `relish apps` already reads, the council's
+desired apps and every node's instances, and the rollup's `reason` helper
+supplies the "why" when the scheduler or a node gave one.
+
+The third part needed the server. Apply a new image to an app that's
+already running, and every one of the old instances is still `running` when
+`apply` returns. Count them and the update is "ready" before it starts. We
+looked for a way to tell old instances from new on the client: the image
+reference misses an env change, and "created after the apply" misses a
+scale change, which keeps its instances. The leader already knows the
+answer, though. Rollouts go node by node (Chapter 7), and when the current
+spec runs healthy on every node it's placed on, the leader commits a
+`RolloutReleased` with it. So the leader answers one more read,
+`GET /v1/diagnostics/rollouts`: for each app, the fingerprint of its
+current spec and whether that's its newest released one.
+
+The first version added a `rolled_out` field to the desired-app evidence
+instead. That looked smaller, but the struct refuses unknown fields
+(`#[serde(deny_unknown_fields)]`) and a non-leader forwards the leader's
+answer, so a 0.3.2 node would have failed to read a 0.3.3 leader's. One
+field would have moved the wire protocol and made every 0.3.2 cluster start
+afresh, just as outside testers were upgrading. A new route breaks no
+decoder: an old node answers it 404, and `relish` reads that as "this
+cluster can't say", going by the instance count alone, as it does on a
+standalone node, whose answer is an empty list. The forwarding code that
+`/v1/diagnostics/apps` had became `read_from_leader`, generic over what it
+decodes:
+
+```rust
+async fn read_from_leader<T: serde::de::DeserializeOwned>(
+    state: &ApiState,
+    council: &crate::council::CouncilNode,
+    directory: Option<&LeaderDirectory>,
+    path: &str,
+    names: LeaderRead,
+) -> Result<T, String> {
+```
+
+`DeserializeOwned` is serde's bound for "a type that can be built from
+JSON without borrowing from the input", which is what you need when the
+bytes go away once the response is read. The caller picks `T` with the
+type it expects back, a list of desired apps or a list of rollouts, and the
+compiler writes a decoder for each.
+
+Counting the replicas had two traps of its own, which the review found.
+The council counts a daemon set (`replicas = "*"`) as one per live node,
+but a node its `placement` rules out never gets one, so `running >=
+desired` never held. An autoscaled app has the same shape from the other
+side: the autoscaler can hold it below the file's `replicas`. Both now go by
+what the scheduler placed, once it placed everything it could. The
+manifest says which kind each app is, so the wait keeps that beside the
+app's name as a small enum, `Count::Fixed`, `Count::PerNode` or
+`Count::Autoscaled`.
+
+A failed rollout ends the wait early. The leader doesn't hand a spec that
+failed to any more nodes until someone applies a different one, so waiting
+out the timeout would only delay the bad news.
+
+The loop takes its observations from a closure, so the tests can feed it a
+script of answers without a cluster:
+
+```rust
+pub async fn wait_until_ready<F, Fut>(
+    targets: &[WaitTarget],
+    timeout: Duration,
+    poll: Duration,
+    mut observe: F,
+    mut progress: impl FnMut(Duration, &AppReadiness),
+) -> WaitReport
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Observation, RelishError>>,
+```
+
+`F: FnMut() -> Fut` says `observe` is something you can call with no
+arguments, more than once, that may change its own captured state as it
+goes (`FnMut`, as opposed to `Fn`, which can't, and `FnOnce`, which can be
+called only once). What it returns is `Fut`, any future that resolves to an
+observation or an error. That's how Rust spells "a callback that returns a
+promise": the function never names the future's concrete type, because
+every `async` block has its own anonymous one. `impl FnMut(...)` in argument
+position is shorthand for the same kind of bound, for `progress`. In
+production `observe` is `|| observe(client)`; in the tests it pops the next
+canned answer off a `VecDeque`. The tests run with
+`#[tokio::test(start_paused = true)]`, so the loop's one-second sleeps take
+no time at all, and `the_wait_returns_once_every_app_is_ready` can assert
+that it returned after exactly three.
+
+A look that fails doesn't end the wait. During a leader election the
+desired apps answer 503 for a second or two, and a node can miss its three
+seconds; the next look usually works, and the last error goes in the
+report if it doesn't.
+
+`--wait` is a flag, not `--wait 5m` as the issue suggested. A flag with an
+optional value would read `relish apply --wait app.toml` as a wait of
+"app.toml", so the duration went into its own `--timeout`, which clap makes
+require `--wait`. `--wait` conflicts with `--dry-run`, which applies
+nothing, and with `--rerun-jobs`. Jobs have nothing to wait for: the apply
+submits them, and `relish jobs` follows their runs.
+
+The exit codes follow `relish status --check`. 0 when every app is ready, 1
+when the apply went through but an app wasn't ready in time, and the
+envelope's 3, 4 and 5 when the apply itself failed, in every output format.
+So a script can tell "applied, still converging" from "not applied". With
+`-o json` it answers in the agent envelope with `command: "apply"`, and,
+like `status`, `ok` is `true` whenever the apply happened. An agent that
+read `ok: false` for a timeout would think nothing changed, and the change
+is the one thing it must know about.
+
+The Wyse lab checklist uses it now, and so does the page the quickstart
+opens, which ships inside the same `relish`. The five-minute tour has to
+wait: its commands may only be ones the release `install.sh` installs has,
+and a test holds it to that, so the tour's first apply trades "give it half
+a minute" for `--wait` once 0.3.3 is out, when the tour is recorded again.
+
 ### What else moved
 
 Changing what `status` prints broke everything that read it. The tour's

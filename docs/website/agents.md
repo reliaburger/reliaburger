@@ -263,6 +263,17 @@ with lines cut at 16 KiB (512 bytes for an event). `relish events` and
 `details` into `author_text`, the same as the timeline. Their plain output
 for people is unchanged.
 
+Two commands outside `relish agent` answer in the envelope itself, and
+`relish agent schema` describes their `data` too: `relish status -o json`,
+and `relish apply --wait -o json`. The second applies a file and returns
+once its apps run and pass their health checks. `ok` is `true` whenever the
+apply went through; `data.ready` says whether every app got there before
+`--timeout` (5 minutes by default), and `data.apps` gives each one's
+replicas, what it's doing and, when the cluster knows, why it isn't ready.
+The process exits 1 when an app wasn't ready, and 3, 4 or 5, with `ok:
+false` and an `error.code`, when the apply itself failed. An apply changes
+the cluster, so ask your human first.
+
 ## Commands
 
 | Command | What it does |
@@ -616,7 +627,7 @@ relish agent upgrade-check
 |---------|---------|
 | `ready` | A newer release exists and nothing stands in its way. `next` has the plan and the start command. |
 | `up_to_date` | Every node already runs the latest release or newer. |
-| `needs_fresh_cluster` | The release changes a cluster format, so it can't roll onto this cluster ([cluster compatibility](https://github.com/reliaburger/reliaburger/blob/v0.3.2/docs/manual/12_operations.md)). |
+| `needs_fresh_cluster` | The release changes a cluster format, so it can't roll onto this cluster ([cluster compatibility](https://github.com/reliaburger/reliaburger/blob/v0.3.3/docs/manual/12_operations.md)). |
 | `blocked` | Something has to be fixed first. |
 | `unknown` | A question went unanswered, so no verdict is safe. |
 
@@ -647,7 +658,7 @@ a person the same question, without the `wtf`, quorum and skew checks.
 
 `relish agent verify` checks that every node's `bun`, and this `relish`, is
 the published, signed build of one version: `verified`, `mismatch` or
-`unknown`. Offline, pass the release's files ([how](https://github.com/reliaburger/reliaburger/blob/v0.3.2/docs/manual/12_operations.md#is-this-the-release)).
+`unknown`. Offline, pass the release's files ([how](https://github.com/reliaburger/reliaburger/blob/v0.3.3/docs/manual/12_operations.md#is-this-the-release)).
 
 ## Proving a fix
 

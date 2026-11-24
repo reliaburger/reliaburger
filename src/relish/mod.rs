@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod apply_wait;
 pub mod apps_cmd;
 pub mod audit_cmd;
 pub mod bare_metal;
@@ -196,6 +197,24 @@ pub enum UnreachableCause {
     Other(String),
 }
 
+/// One of a context's endpoints that didn't accept a connection, and why
+/// (#2241).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointAttempt {
+    /// The API endpoint relish tried (`https://10.0.0.5:9117`).
+    pub endpoint: String,
+    /// Why it didn't answer.
+    pub cause: UnreachableCause,
+}
+
+/// One line per endpoint tried, for [`RelishError::NoEndpointAnswered`].
+fn attempt_lines(attempts: &[EndpointAttempt]) -> String {
+    attempts
+        .iter()
+        .map(|attempt| format!("\n  {}: {}", attempt.endpoint, attempt.cause))
+        .collect()
+}
+
 /// Errors from Relish CLI operations.
 #[derive(Debug, thiserror::Error)]
 pub enum RelishError {
@@ -227,6 +246,18 @@ pub enum RelishError {
         endpoint: String,
         /// What went wrong, with what to do about it.
         cause: UnreachableCause,
+    },
+
+    /// None of the current context's endpoints accepted a connection, so
+    /// no node of the cluster was reachable from here (#2241).
+    #[error(
+        "cannot reach the cluster: none of the context's {} endpoints answered{}",
+        .attempts.len(),
+        attempt_lines(.attempts)
+    )]
+    NoEndpointAnswered {
+        /// Every endpoint relish tried, in the order it tried them.
+        attempts: Vec<EndpointAttempt>,
     },
 
     /// A full-screen command ran without a terminal (#1569).

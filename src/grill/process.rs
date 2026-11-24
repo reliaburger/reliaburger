@@ -1006,10 +1006,7 @@ impl super::Grill for ProcessGrill {
             return control
                 .signal(instance, false)
                 .await
-                .map_err(|error| GrillError::StopFailed {
-                    instance: instance.clone(),
-                    reason: error.to_string(),
-                });
+                .map_err(|error| owner_signal_error(instance, error));
         }
         let mut procs = self.processes.lock().await;
         let entry = procs
@@ -1060,10 +1057,7 @@ impl super::Grill for ProcessGrill {
             return control
                 .signal(instance, true)
                 .await
-                .map_err(|error| GrillError::StopFailed {
-                    instance: instance.clone(),
-                    reason: error.to_string(),
-                });
+                .map_err(|error| owner_signal_error(instance, error));
         }
         let mut procs = self.processes.lock().await;
         let entry = procs
@@ -1586,12 +1580,58 @@ impl super::Grill for ProcessGrill {
     }
 }
 
+/// A process owner's failure to signal `instance`, as the stop sees it.
+///
+/// An owner that didn't answer in time (its request timeout, `TimedOut`) or
+/// was busy with another operation (`WouldBlock`) has said nothing about the
+/// workload, so that's `StopUnanswered`, which the stop asks again (#1902).
+/// Anything else is a real failure.
+fn owner_signal_error(instance: &InstanceId, error: std::io::Error) -> GrillError {
+    let reason = error.to_string();
+    match error.kind() {
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+            GrillError::StopUnanswered {
+                instance: instance.clone(),
+                reason,
+            }
+        }
+        _ => GrillError::StopFailed {
+            instance: instance.clone(),
+            reason,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::grill::Grill;
     use crate::grill::oci::{OciLinux, OciProcess, OciRoot, OciSpec, OciUser};
     use crate::grill::records::{self, InstanceRecord, RuntimeKind};
+
+    /// #1902: an owner that timed out or was busy hasn't refused the
+    /// signal, so the stop may ask again; any other failure is final.
+    #[test]
+    fn an_owner_that_timed_out_or_was_busy_left_the_signal_unanswered() {
+        let id = InstanceId("default__web-0".into());
+        let error =
+            |kind, message: &str| owner_signal_error(&id, std::io::Error::new(kind, message));
+        assert!(matches!(
+            error(
+                std::io::ErrorKind::TimedOut,
+                "process owner request timed out"
+            ),
+            GrillError::StopUnanswered { .. }
+        ));
+        assert!(matches!(
+            error(std::io::ErrorKind::WouldBlock, "process operation is busy"),
+            GrillError::StopUnanswered { .. }
+        ));
+        assert!(matches!(
+            error(std::io::ErrorKind::Other, "owner did not accept signal"),
+            GrillError::StopFailed { .. }
+        ));
+    }
 
     /// A host workload's spec: the only kind the process runtime runs.
     fn spec_with_args(args: Vec<String>) -> OciSpec {

@@ -66,7 +66,7 @@ Packages=
         iproute2
 ```
 
-`resolute` is 26.04's codename. `Format=disk` produces a whole partitioned disk image, and `SplitArtifacts=` also writes the pieces an update needs as separate files. The boot artefact is a UKI (Unified Kernel Image): the kernel, the initrd and the kernel command line glued into one EFI executable, which systemd-boot starts like any other EFI program. `%i_%v` names it `reliaburger-os_<version>.efi`, a name that matters later. The locked root password means there's no console login at all. The last six packages match the quickstart guest's list, `scripts/release/guest-images.json`, less Buildah, which the guest needs for `relish build`. An appliance cluster builds nothing itself: you build elsewhere and push into Pickle ("A tour that couldn't build", below). From 0.3.0 the quickstart guest runs Ubuntu 26.04 too, so the two channels install the same packages from the same archive and test the same userland. mkosi can't read a JSON file, so rather than generate one list from the other we let a test hold them together: `test_guest_images.py` parses the `Packages=` block and fails if its tail and the guest's list drift apart.
+`resolute` is 26.04's codename. `Format=disk` produces a whole partitioned disk image, and `SplitArtifacts=` also writes the pieces an update needs as separate files. The boot artefact is a UKI (Unified Kernel Image): the kernel, the initrd and the kernel command line glued into one EFI executable, which systemd-boot starts like any other EFI program. `%i_%v` names it `reliaburger-os_<version>.efi`, a name that matters later. The locked root password means there's no console login at all. The last seven packages match the quickstart guest's list, `scripts/release/guest-images.json`, Buildah included, so an appliance cluster can run `relish build` too. It didn't always ("A tour that couldn't build", below). From 0.3.0 the quickstart guest runs Ubuntu 26.04 too, so the two channels install the same packages from the same archive and test the same userland. mkosi can't read a JSON file, so rather than generate one list from the other we let a test hold them together: `test_guest_images.py` parses the `Packages=` block and fails if its tail and the guest's list drift apart.
 
 The kernel package drags in the full `linux-firmware` set, hundreds of megabytes, unless something else provides it. `linux-firmware-minimal` does, and we add back only the Wyse's Realtek NIC firmware (and its Intel graphics firmware on x86-64, in `mkosi.conf.d/10-x86-64.conf`, a drop-in whose `[Match] Architecture=` line applies it to one architecture only).
 
@@ -1122,6 +1122,55 @@ It replaced the context for bare-metal/lab, which no longer worked: /Users/you/l
 
 `relish setup` refused a dead context too ("another cluster owns the active context"), so it got the same check. Only a *missing* file counts. A certificate relish can't read for another reason, say a permissions slip, still marks a context someone may want back, so relish keeps it and says what it couldn't read. `adopt` became a thin wrapper around `adopt_at`, which takes the context's path, because the default path comes from `RELIABURGER_HOME` and changing the environment in a test races every other test in the process. The three tests for `adopt_at` cover no context, a working one (kept) and the lab's case, a context whose cluster directory is gone (replaced, with the line above). In `local_context.rs`, `a_context_whose_ca_is_gone_says_which_context_and_file_and_what_to_do` checks the new error names the cluster, the file and `relish machines claim --create`, and never says "status 0".
 
+### One endpoint is a single point of failure
+
+The 0.3.2 lab found the next one (#2241) the moment we pulled a power cord. The node we pulled, wyse-1, led the council and was also the node relish's context named. wyse-2 won the election in a couple of seconds, term 1 to 2, exactly as Raft promises. And for the next minute and a half, until wyse-1 came back, every `relish nodes` and `relish council` printed this:
+
+```
+error: cannot reach the bun agent at https://10.77.0.11:9117: no answer before the connect timeout; the host may be down, or a firewall may drop packets to that port
+```
+
+The cluster was fine. relish wasn't. A context held one `endpoint`, and that was the end of relish's knowledge of the cluster. So the one moment an operator most wants to watch, a failover, was the one moment relish went blind. A council of three that survives losing any node is worth very little if the tool you drive it with can't.
+
+The fix keeps `endpoint` (node 1, the one relish asks by default) and adds two fields to `LocalContext`:
+
+```rust
+#[serde(default, skip_serializing_if = "Vec::is_empty")]
+pub other_endpoints: Vec<String>,
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub last_answered: Option<String>,
+```
+
+`#[serde(default)]` lets a file without the field load with an empty `Vec` or `None`, and `skip_serializing_if` leaves it out of the file when there's nothing to say, so a laptop cluster's context, which reaches the cluster through one forward, looks exactly as it did. That isn't a compatibility shim: we keep none before 1.0. It's just what "optional" means in serde. A 0.3.2 context still loads and lists one node; the manual says how to add the rest.
+
+`bare_metal::context` fills `other_endpoints` from `fleet.json`, every node after node 1, and `relish setup --ssh` from every machine it set up. Machines added later go in too: `bare_metal::add`, behind both `machines claim` without `--create` and `image seed`, calls `refresh_context_at`, which rewrites the list from the fleet when the saved context is this fleet's cluster's, and leaves any other cluster's alone.
+
+Picking a node happens where the client is built. `BunClient` has about a hundred request methods, each formatting its own URL from `base_url`, so retrying inside every one of them would mean touching all of them. Instead `LocalContext::connect` chooses the endpoint once, before any request:
+
+```rust
+pub fn choose_endpoint(
+    &self,
+    mut probe: impl FnMut(&str) -> Result<(), super::UnreachableCause>,
+) -> Result<EndpointChoice, RelishError> {
+```
+
+`impl FnMut(&str) -> ...` in argument position means "any closure or function the caller likes that takes a `&str`"; the compiler makes one copy of `choose_endpoint` for each type it's called with, so there's no indirection. `FnMut` rather than `Fn` because a test's probe records what it was asked, which mutates its captured state. In production it's `probe_endpoint`, which opens a TCP connection with `TcpStream::connect_timeout` and a 1.5 second limit. A node on the same LAN answers in a millisecond; one with no power never does. `endpoints()` orders the candidates: the one that last answered, then node 1, then the rest. A context with one endpoint isn't probed at all, so nothing changes for it.
+
+A TCP connect proves only that something listens. It doesn't prove the node belongs to our cluster, and it doesn't need to. The command's real request still does the TLS handshake against the cluster's CA, with the same token, so a node that answers with a certificate the CA didn't sign fails the command as before. relish never goes looking for a node it trusts past one it doesn't. Only a node that refuses, or never answers, gets passed over. The suite test `a_node_signed_by_another_ca_is_refused_not_passed_over` holds that line.
+
+When none answer, the error says so and names every endpoint it tried. That needed one more change. A `BunClient` that can't be used keeps its reason and returns it from the first request, and that reason was a `String`, which can only become `RelishError::ClientConfig`. It's now a small enum, `Unusable`, whose second variant carries the attempts, so the first request returns `RelishError::NoEndpointAnswered` and `relish agent` maps it to the `unreachable` code, like a single dead endpoint:
+
+```
+error: cannot reach the cluster: none of the context's 3 endpoints answered
+  https://10.77.0.11:9117: no answer before the connect timeout; ...
+  https://10.77.0.12:9117: connection refused; ...
+  https://10.77.0.13:9117: connection refused; ...
+```
+
+When relish does pass over a node, it says which ones on stderr and which node it used, and `remember_answered` writes that node to `last_answered`, under the context's lock, only if the file still holds the same cluster's context. So only the first command after a node dies pays the 1.5 seconds. Remembering is best effort: a context that's busy just costs the next command the same wait. The registry and ingress forwards follow the API: a bare-metal context points them at node 1's address, which is just as dead, so a forward on the old node's host moves to the host that answered.
+
+The unit tests in `local_context.rs` drive `choose_endpoint` with a probe closure: three endpoints with the first down still answer, and the probe stops at the first that does; none up gives an error listing all three; one endpoint is never probed; the remembered endpoint goes first and is ignored once it's no longer listed. One test uses the real probe against a port that refuses and one that listens. `tests/suite/context_endpoints.rs` runs the real `relish nodes` against a context whose first node refuses and whose second is a TLS stand-in for the cluster, and checks the warning, the answer and the remembered node, then that the next command says nothing. And `make test-cluster` has the lab's case in `cluster_failover.rs`: three wired nodes, the context's first node the leader, killed; the context passes over it, and the node it picks names the new leader.
+
 ## A LAN on a laptop
 
 We had no KVM machine and no spare PCs, only CI and one Apple silicon Mac without root. Everything had to run virtualised until the last step.
@@ -1313,7 +1362,19 @@ That was no surprise to the image. `mkosi.conf` lists the quickstart guest's pac
 
 We could have added Buildah. Its cost isn't only megabytes. Every package goes into both 1.1 GB `/usr` slots, a build pulls a toolchain image and writes layers to an eMMC we're counting writes on, and a multi-platform build on a 2 GB Atom is slow at best. A build also runs whatever `RUN` steps a Dockerfile holds, on the machines that keep the cluster's state. The appliance's whole pitch is that it does one job.
 
-So the appliance stays without it, and the refusal now names the ways out. bun keeps the message in one constant, `NO_BUILDER_ERROR`, rather than inline in the handler, so a test can hold it to its promises: it says appliance nodes never have Buildah, shows `docker push <node>:5050/<name>:<tag>`, points at `relish manual images`, and suggests adding a Linux node with Buildah, since bun hands a build to any peer that reports it. A second test checks that the manual section it names exists, so a renamed heading can't leave the error pointing at nothing. Manual 17 now walks through building the burger on a laptop and pushing it into Pickle before the tour's `relish apply`.
+So for 0.3.2 the appliance stayed without it, and the refusal learnt to name the ways out. bun keeps the message in one constant, `NO_BUILDER_ERROR`, rather than inline in the handler, so a test can hold it to its promises: it shows `docker push <node>:5050/<name>:<tag>`, points at `relish manual images`, and suggests adding a node with Buildah, since bun hands a build to any peer that reports it. A second test checks that the manual section it names exists, so a renamed heading can't leave the error pointing at nothing.
+
+That was the interim fix. A tour whose first step needs a laptop with Docker isn't much of a tour, though, so in 0.3.3 we went back and priced Buildah properly, file by file rather than by reputation.
+
+Ubuntu's `buildah` package says it installs 125 MB. Unpack it and the `buildah` binary is 31 MB. The other 97 MB is `/usr/libexec/buildah`: `imgtype`, `copy`, `tutorial` and five more, Buildah's test helpers, which Debian ships for its own package tests. `strings` on the binary finds no path into that directory, so Buildah never runs them, and one `RemoveFiles=` line drops them from the image. Then there are the dependencies. mkosi installs no Recommends, which is what keeps the image small, but it means we have to name what Buildah can't work without. `containers-common` depends on a virtual package, `container-network-stack`, and we name `netavark` so apt doesn't pick a provider for us; a `RUN` step that uses the network needs it. libgpgme depends on `gnupg | gpg`, and apt takes the first alternative, which is a metapackage that brings GnuPG's agent, key server client and S/MIME tool. Naming `gpg` satisfies the dependency with the bare tool. The rest of the recommends stay out: bun builds with the `vfs` driver (no `fuse-overlayfs`), runs `RUN` steps with the runc the node already has (no `crun`), and never preprocesses a Containerfile (no `cpp`).
+
+The first CI build measured it: the x86-64 `/usr` went from 667 MB to 721 MB, so 54 MB in each 1,100 MB slot. The slot has room, and an OS update still writes only one of them.
+
+The eMMC was the other worry, and it turned out better than feared. Buildah's storage lives in `<storage.data>/buildah`, on the data partition, which is Btrfs. The `vfs` driver makes each layer by copying the layer below it, which sounds like the worst possible thing to do to flash. But containers/storage copies with `FICLONE` first, and on Btrfs that's a reflink: the new layer gets new metadata and shares its parent's blocks. The layers that really get written are the ones pulled and the ones a build makes. The appliance profile already capped the build cache at 1 GiB, so base images stay between builds without filling the disk.
+
+Two things the price doesn't change. A build still runs the Dockerfile's `RUN` steps on a machine that holds the cluster's state, as it does on any node, and manual 17 says so. And an appliance has no emulator, so a multi-platform build can only run `RUN` steps for its own architecture. The burger's Dockerfile cross-compiles (its Go stage runs on `$BUILDPLATFORM` and only `COPY`s into the arm64 image), so the tour doesn't notice.
+
+`test_guest_images.py` used to hold the appliance to "the guest's packages less Buildah"; now it holds it to the guest's packages, full stop. A new check, `image/tests/builder_packages.py`, reads `mkosi.conf` in the unit tests and each built image's manifest in CI: Buildah, its configuration, `netavark`, `gpg` and runc have to be there, the test helpers gone, and GnuPG's agents, `fuse-overlayfs`, `crun` and `cpp` absent, so a dependency change upstream can't quietly bring them back. The manifest check proves the packages are there, not that they work. For that, CI's seeded-pair test, which already boots two appliances into a cluster, now runs the tour's `relish build burger/burger.toml` against them. The runner masquerades the test's bridge so the appliances can pull the Go toolchain image, and the build has to push both platforms into Pickle. The refusal stays for a cluster where no node has Buildah, minus its claim that appliances never do.
 
 ### Reading it all again
 

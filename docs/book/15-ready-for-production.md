@@ -752,6 +752,17 @@ its own file, so a later one can't overwrite the one taken before a kill, and th
 step uploads them all. A host that freezes outright still keeps nothing, but a hung step now
 leaves a picture of itself from a few minutes before it died.
 
+In the worst week we'd made the 26.04 job advisory: it still ran, but its failure only
+warned, so a lost runner couldn't block the merge queue. Once these guards reached the trains
+on the evening of 20 November, we counted again. Up to 23 November the 26.04 job ran 59 times
+on `main` and the trains without being cancelled for a newer push, and passed all 59 in 23 to
+34 minutes; the 24.04 job passed 58 of 58 in 25 to 37. Thirty-one of those runners came up
+with `/` on the device-mapper snapshot that had frozen a host, so `give-swap` added nothing,
+and they ran on the image's 3 GiB of zram or on no swap at all. No run came near a stop: the
+lowest free memory in any of the 117 was 0.7 GiB, and the kernel killed nothing outside the
+tests' own memory-limited cgroups. No 26.04 snapshot has fired yet, because no passing run
+reached minute 36. So the job is required again.
+
 Coverage finds unvisited code. It does not tell us whether an assertion is useful, whether a
 webhook test accidentally exercised startup, or whether a five-second performance limit is
 portable. The audit found all three in a suite with lots of coverage. Read the uncovered
@@ -3356,9 +3367,10 @@ fetches it with its next placement poll, every two seconds, and reconciles its
 `firewall_map`.
 
 So a changed list now reaches the caller's node from the *spec*, not from the
-rollout. The node running the target is still the exception: its own entry
-for the service wins over the catalogue's, so it switches when the new
-instance registers. That's the rollout time again, and it's a follow-up.
+rollout. The node running the target was still the exception: its own entry
+for the service won over the catalogue's, so it switched only when the new
+instance registered. That's the rollout time again, and the next section
+deals with it.
 
 We measured both directions on the same three-node Lima cluster before and
 after, probing from a copy of the caller on every node about once a second,
@@ -3394,6 +3406,89 @@ fix). And the listed caller probes until it gets through, the same loop as
 the case above: the target is healthy on the node we asked, but the caller's
 node learns its backend from the next catalogue, and until then the hook
 refuses a VIP with no backend.
+
+### Two copies of one list
+
+On the target's own node the merge kept the local entry whole and took only
+backends from the catalogue (#2223). The obvious fix is to let the
+catalogue's `allow_from` win there too: the leader builds it from the
+committed spec, so surely it's at least as new as the spec the node deployed.
+
+It isn't always. The catalogue and the placements reach a node by different
+roads. The leader publishes a catalogue only when the withdrawal ledger has
+room for it: while consumers still owe confirmations for old publications,
+`plan_publication` answers `CapacityReached` and the leader skips the write,
+tick after tick. The placements keep flowing. So a node can deploy a spec
+that *removes* a caller while its catalogue still carries the old list. Let
+the catalogue win and the caller the spec just removed gets back in on the
+target's own node, for as long as the ledger stays full. Before the fix that
+node at least enforced the new list once the rollout finished.
+
+Neither copy carries anything that says which is newer, so the merge doesn't
+guess. While they differ it admits only the callers both lists admit:
+
+```rust
+fn stricter_allow_from(
+    namespace: &str,
+    name: &str,
+    local: Option<&[String]>,
+    catalogue: Option<&[String]>,
+) -> Option<Vec<String>> {
+    let callers = |list: &[String]| -> BTreeSet<(String, String)> {
+        list.iter()
+            .map(|caller| {
+                let (ns, app) = caller.split_once('/').unwrap_or((namespace, caller));
+                (ns.to_string(), app.to_string())
+            })
+            .collect()
+    };
+    let admitted: BTreeSet<_> = match (local, catalogue) {
+        (None, None) => return None,
+        (Some(local), Some(catalogue)) => {
+            let (ours, theirs) = (callers(local), callers(catalogue));
+            if ours == theirs {
+                return Some(local.to_vec());
+            }
+            ours.intersection(&theirs).cloned().collect()
+        }
+        // `None` admits the target's own namespace, so the stricter list
+        // keeps only the named callers from there.
+        (Some(list), None) | (None, Some(list)) => callers(list)
+            .into_iter()
+            .filter(|(ns, app)| ns == namespace && app != name)
+            .collect(),
+    };
+    Some(
+        admitted
+            .into_iter()
+            .map(|(ns, app)| format!("{ns}/{app}"))
+            .collect(),
+    )
+}
+```
+
+The `match` on a tuple of two `Option`s is Rust's way of writing a truth
+table: the compiler checks that the four cases are all covered, and the last
+arm uses `|` to bind `list` from whichever side holds it. `as_deref()` at the
+call site turns an `Option<Vec<String>>` into an `Option<&[String]>`, a
+borrowed view of the same list, so nothing is copied unless the lists differ.
+Two lists that name the same callers, one as `worker` and the other as
+`backend/worker`, compare equal as sets of `(namespace, app)` pairs, and the
+local spelling stays.
+
+An empty `Some(vec![])` comes out of two disjoint lists, and it means "nobody",
+not the namespace default. The kernel never sees the difference for callers in
+the target's own namespace, which the connect hook admits before it looks at
+`firewall_map`; for everyone else, nobody is the right answer while the two
+copies disagree.
+
+What this buys is asymmetric, on purpose. A caller removed from the list is
+refused on the target's node as soon as the catalogue arrives, like everywhere
+else: a removal is in the stricter list from the moment either copy has it. A
+caller *added* to the list waits on that node until its own spec agrees,
+which is still the rollout. That's the direction where being late is merely
+annoying, and the other direction is the one an operator is counting on when
+they narrow a list after an incident.
 
 ## The thirteenth group
 
@@ -5806,6 +5901,64 @@ propagated a failed `state()` read with `?`, and now they do the same for the
 exit code. Changing the trait's return type was the whole fix in a sense: the
 compiler then listed every call site that had been quietly treating an error
 as an answer.
+
+Propagating with `?` was right for an error that means "this went wrong",
+but `StateUnavailable` doesn't always mean that. The runc runtime asks its
+process owner for `runc state` and gives each request 2 seconds. Under heavy
+host load the owner sometimes misses that, and the next request gets an
+answer. A batch attempt's exit poll turned one such miss into an unknown
+outcome (#2288), and the init container's wait failed the whole deploy on
+one (#2293).
+
+Fixing the init wait wasn't a matter of copying the batch fix, which keeps
+asking for 60 seconds. The first try did that, and it showed a test the
+answer it expected: `uncertain_initialiser_preserves_parent_policy_until_confirmed_retirement`
+in `tests/ebpf.rs` injects an init the runtime never answers about, and
+expects the deploy to fail. With the change, it waited out the init's whole
+300-second bound. The real question was how long to wait for a runtime that
+might never answer, and the two callers answer it differently because
+giving up costs them different things. Giving up on a batch attempt makes
+its outcome unknown, and an operator has to acknowledge a replay. Giving up
+on an init fails a deploy, which says why and can simply be run again, while
+waiting holds the deploy and everyone watching it. So the init wait asks
+again for 15 seconds (`INIT_ANSWER_PATIENCE` in `src/bun/agent.rs`), seven of
+the owner's own timeouts in a row, and the batch poll keeps its 60.
+
+```rust
+match poll_initialiser(&self.grill, &init_id).await {
+    Ok(InitProgress::Running) => unanswered.answered(),
+    Ok(InitProgress::Finished(outcome)) => break outcome,
+    Err(GrillError::StateUnavailable { instance, reason }) => {
+        unanswered.missed(instance, reason, self.init_answer_patience)?
+    }
+    Err(error) => return Err(error.into()),
+}
+```
+
+`GrillError::StateUnavailable { instance, reason }` is a pattern that both
+picks the variant and takes its two fields apart, moving them into new
+variables for that arm. Any other error, such as an inspection that failed
+outright, still fails the deploy at once, as it should. `missed` counts the
+misses in a row and remembers when the first came back, and any answer
+resets both. It gives up only once the misses have lasted the patience *and*
+there have been at least three, so one read that hangs for half a minute
+can't fail an init on its own. Then it hands back the same
+`StateUnavailable` it was given, with a reason that says how long nothing
+answered: `no state read answered for 15.1s (61 in a row); last: process
+owner request timed out`. The variant matters more than the words. Retiring
+the parent and recovering after a crash both treat an initialiser they
+couldn't read as possibly still running, and keep its network policy, which
+is exactly what the eBPF test checks. The init's 300-second bound and its
+kill still apply on top.
+
+The eBPF test didn't need changing. It never asserted how fast the deploy
+fails, only that it fails and that the policy stays put, and it now takes 15
+seconds longer. Three agent tests in `src/bun/agent/tests/mod.rs` pin the
+rest down with the mock runtime: one unanswered state read, then a stopped
+init, and the deploy completes; an exit code read the runtime doesn't answer
+for 300 ms, and the deploy completes with the real code; and an init it
+never answers about, with the patience cut to 300 ms, fails the deploy no
+sooner than the patience and well inside ten seconds.
 
 Making the exit code honest brought the rootless test back once more (#456),
 this time with a pid but `runtime_unknown: true` for fifteen seconds

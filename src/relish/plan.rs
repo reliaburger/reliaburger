@@ -25,6 +25,9 @@ pub enum PlanAction {
     Unchanged,
     /// The live endpoint lacks complete desired-spec evidence.
     Unknown,
+    /// A controller owns the app and this config doesn't declare that
+    /// owner, so apply leaves it as it is (#1125, #1322).
+    OwnedSkipped,
 }
 
 impl fmt::Display for PlanAction {
@@ -35,6 +38,7 @@ impl fmt::Display for PlanAction {
             PlanAction::NotInConfig => write!(f, "*"),
             PlanAction::Unchanged => write!(f, " "),
             PlanAction::Unknown => write!(f, "?"),
+            PlanAction::OwnedSkipped => write!(f, "!"),
         }
     }
 }
@@ -47,6 +51,7 @@ impl Serialize for PlanAction {
             PlanAction::NotInConfig => serializer.serialize_str("not_in_config"),
             PlanAction::Unchanged => serializer.serialize_str("unchanged"),
             PlanAction::Unknown => serializer.serialize_str("unknown"),
+            PlanAction::OwnedSkipped => serializer.serialize_str("owned_skipped"),
         }
     }
 }
@@ -79,6 +84,8 @@ pub struct ApplyPlan {
     pub unchanged: usize,
     /// Resources with incomplete live evidence.
     pub unknown: usize,
+    /// Apps a controller owns, which apply will skip.
+    pub owned_skipped: usize,
     /// Whether any live state was available for comparison.
     pub comparison_available: bool,
 }
@@ -95,6 +102,8 @@ pub struct CurrentResource {
     pub image: Option<String>,
     /// Complete effective desired-spec fingerprint, when known.
     pub fingerprint: Option<String>,
+    /// The controller that owns this app, if one does.
+    pub owner: Option<String>,
 }
 
 /// The policy section of a plan: one line per filled field, per denial
@@ -184,6 +193,14 @@ pub fn generate_plan(config: &Config, current: Option<&[CurrentResource]>) -> Ap
 
         let action = match current_map.get(resource_key.as_str()) {
             None => PlanAction::Create,
+            // The apply skips an owned app unless the config declares its
+            // owner (`council::owner::judge_apply`), so a diff would mislead.
+            Some(existing) if app.owner.is_none() && existing.owner.is_some() => {
+                if let Some(owner) = &existing.owner {
+                    summary.push(("owner".to_string(), owner.clone()));
+                }
+                PlanAction::OwnedSkipped
+            }
             Some(existing) => compare_spec(
                 existing,
                 crate::config::fingerprint::app_fingerprint(app),
@@ -337,8 +354,13 @@ pub fn generate_plan(config: &Config, current: Option<&[CurrentResource]>) -> Ap
         .iter()
         .filter(|entry| entry.action == PlanAction::Unknown)
         .count();
+    let owned_skipped = entries
+        .iter()
+        .filter(|entry| entry.action == PlanAction::OwnedSkipped)
+        .count();
     ApplyPlan {
         unknown,
+        owned_skipped,
         comparison_available: current.is_some(),
         policy: PolicyPlan::default(),
         entries,
@@ -387,7 +409,16 @@ impl fmt::Display for ApplyPlan {
                 continue;
             }
             writeln!(f)?;
-            writeln!(f, "  {} {}", entry.action, entry.resource)?;
+            write!(f, "  {} {}", entry.action, entry.resource)?;
+            if entry.action == PlanAction::OwnedSkipped {
+                let owner = entry
+                    .summary
+                    .iter()
+                    .find(|(key, _)| key == "owner")
+                    .map_or("a controller", |(_, owner)| owner.as_str());
+                write!(f, " (owned by '{owner}', skipped)")?;
+            }
+            writeln!(f)?;
             for (key, value) in &entry.summary {
                 writeln!(f, "      {key:9} {value}")?;
             }
@@ -416,6 +447,13 @@ impl fmt::Display for ApplyPlan {
                 f,
                 "\n{} running resource(s) not in this config (apply leaves them; `relish stop` removes).",
                 self.not_in_config
+            )?;
+        }
+        if self.owned_skipped > 0 {
+            write!(
+                f,
+                "\n{} app(s) owned by a controller; apply skips them (`relish release` hands one back).",
+                self.owned_skipped
             )?;
         }
         self.fmt_policy(f)
@@ -477,11 +515,13 @@ apps = ["web"]
                 resource: "app.web".into(),
                 image: Some("web:v1".into()),
                 fingerprint: crate::config::fingerprint::app_fingerprint(&original.app["web"]),
+                owner: None,
             },
             CurrentResource {
                 resource: "job.migrate".into(),
                 image: Some("web:v1".into()),
                 fingerprint: crate::config::fingerprint::job_fingerprint(&original.job["migrate"]),
+                owner: None,
             },
             CurrentResource {
                 resource: "namespace.team".into(),
@@ -489,6 +529,7 @@ apps = ["web"]
                 fingerprint: crate::config::fingerprint::spec_fingerprint(
                     &original.namespace["team"],
                 ),
+                owner: None,
             },
             CurrentResource {
                 resource: "permission.reader".into(),
@@ -496,6 +537,7 @@ apps = ["web"]
                 fingerprint: crate::config::fingerprint::spec_fingerprint(
                     &original.permission["reader"],
                 ),
+                owner: None,
             },
         ];
         assert_eq!(generate_plan(&original, Some(&current)).unchanged, 4);
@@ -512,6 +554,61 @@ apps = ["web"]
         let plan = generate_plan(&changed, Some(&current));
         assert_eq!(plan.to_update, 4, "{plan:?}");
         assert_eq!(plan.unchanged, 0);
+    }
+
+    /// #1322: an app a controller owns, which this config doesn't claim, is
+    /// one the apply will skip, so the plan says so instead of showing an
+    /// update. Declaring the owner makes it an ordinary diff again.
+    #[test]
+    fn an_app_a_controller_owns_is_owned_and_skipped_not_updated() {
+        let config = parse_config(
+            r#"
+[app.db]
+image = "postgres:18"
+namespace = "pg"
+[app.web]
+image = "web:v2"
+"#,
+        );
+        let current = [
+            CurrentResource {
+                resource: "app.pg/db".into(),
+                image: Some("postgres:17".into()),
+                fingerprint: Some("theirs".into()),
+                owner: Some("pg-failover".into()),
+            },
+            CurrentResource {
+                resource: "app.web".into(),
+                image: Some("web:v1".into()),
+                fingerprint: Some("old".into()),
+                owner: None,
+            },
+        ];
+        let plan = generate_plan(&config, Some(&current));
+        let action = |resource: &str| {
+            plan.entries
+                .iter()
+                .find(|entry| entry.resource == resource)
+                .unwrap()
+                .action
+        };
+        assert_eq!(action("app.pg/db"), PlanAction::OwnedSkipped);
+        assert_eq!(action("app.web"), PlanAction::Update);
+        assert_eq!(plan.owned_skipped, 1);
+        assert_eq!(plan.to_update, 1);
+
+        let text = plan.to_string();
+        assert!(text.contains("owned by 'pg-failover', skipped"), "{text}");
+        assert!(text.contains("1 app(s) owned by a controller"), "{text}");
+        let json = serde_json::to_value(&plan).unwrap();
+        assert_eq!(json["entries"][0]["action"], "owned_skipped", "{json}");
+        assert_eq!(json["owned_skipped"], 1);
+
+        let mut claimed = config.clone();
+        claimed.app.get_mut("db").unwrap().owner = Some("pg-failover".into());
+        let plan = generate_plan(&claimed, Some(&current));
+        assert_eq!(plan.owned_skipped, 0);
+        assert_eq!(plan.to_update, 2, "{plan:?}");
     }
 
     /// #1117: the plan names every denial and warning, judged by the
@@ -574,6 +671,7 @@ namespace = "payments"
             resource: "app.payments/web".into(),
             image: Some("web:v1".into()),
             fingerprint: crate::config::fingerprint::app_fingerprint(&config.app["web"]),
+            owner: None,
         }];
         let mut plan = generate_plan(&config, Some(&current));
         plan.policy = crate::relish::commands::plan_policies(&committed, &config);
@@ -635,6 +733,7 @@ message = "a database needs a standby"
                 resource: format!("app.{name}"),
                 image: app.image.clone(),
                 fingerprint: crate::config::fingerprint::app_fingerprint(app),
+                owner: None,
             })
             .collect();
         let again = generate_plan(&config, Some(&current));
@@ -660,6 +759,7 @@ message = "a database needs a standby"
                 resource: "app.web".into(),
                 image: Some("web:v1".into()),
                 fingerprint: None,
+                owner: None,
             }]),
         );
         assert_eq!(partial.unknown, 1);
@@ -678,6 +778,7 @@ message = "a database needs a standby"
             resource: "app.web".into(),
             image: Some("web:v1".into()),
             fingerprint: None,
+            owner: None,
         }];
         let plan = generate_plan(&config, Some(&current));
         assert_ne!(plan.entries[0].action, PlanAction::Unchanged);
@@ -690,6 +791,7 @@ message = "a database needs a standby"
             resource: "app.web".into(),
             image: Some("web:v1".into()),
             fingerprint: None,
+            owner: None,
         }];
         let plan = generate_plan(&config, Some(&current));
         assert_ne!(plan.entries[0].action, PlanAction::Unchanged);
@@ -991,6 +1093,7 @@ message = "a database needs a standby"
             resource: "app.web".to_string(),
             image: Some("myapp:v1".to_string()),
             fingerprint: None,
+            owner: None,
         }];
         let plan = generate_plan(&config, Some(&current));
         assert_eq!(plan.entries[0].action, PlanAction::Update);
@@ -1010,6 +1113,7 @@ message = "a database needs a standby"
             resource: "app.web".to_string(),
             image: Some("myapp:v1".to_string()),
             fingerprint: crate::config::fingerprint::app_fingerprint(&config.app["web"]),
+            owner: None,
         }];
         let plan = generate_plan(&config, Some(&current));
         assert_eq!(plan.entries[0].action, PlanAction::Unchanged);
@@ -1030,11 +1134,13 @@ message = "a database needs a standby"
                 resource: "app.web".to_string(),
                 image: Some("myapp:v1".to_string()),
                 fingerprint: None,
+                owner: None,
             },
             CurrentResource {
                 resource: "app.old-service".to_string(),
                 image: Some("old:v3".to_string()),
                 fingerprint: None,
+                owner: None,
             },
         ];
         let plan = generate_plan(&config, Some(&current));
@@ -1064,16 +1170,19 @@ message = "a database needs a standby"
                 resource: "app.web".to_string(),
                 image: Some("myapp:v1".to_string()),
                 fingerprint: None,
+                owner: None,
             },
             CurrentResource {
                 resource: "app.api".to_string(),
                 image: Some("api:v1".to_string()),
                 fingerprint: crate::config::fingerprint::app_fingerprint(&config.app["api"]),
+                owner: None,
             },
             CurrentResource {
                 resource: "app.removed".to_string(),
                 image: Some("old:v1".to_string()),
                 fingerprint: None,
+                owner: None,
             },
         ];
         let plan = generate_plan(&config, Some(&current));
@@ -1096,6 +1205,7 @@ message = "a database needs a standby"
             resource: "app.web".to_string(),
             image: Some("myapp:v1".to_string()),
             fingerprint: None,
+            owner: None,
         }];
         let plan = generate_plan(&config, Some(&current));
         let output = plan.to_string();
@@ -1109,6 +1219,7 @@ message = "a database needs a standby"
             resource: "app.old".to_string(),
             image: Some("old:v1".to_string()),
             fingerprint: None,
+            owner: None,
         }];
         let plan = generate_plan(&config, Some(&current));
         let output = plan.to_string();
@@ -1133,6 +1244,7 @@ message = "a database needs a standby"
             resource: "app.web".to_string(),
             image: Some("myapp:v1".to_string()),
             fingerprint: crate::config::fingerprint::app_fingerprint(&config.app["web"]),
+            owner: None,
         }];
         let plan = generate_plan(&config, Some(&current));
         let output = plan.to_string();
