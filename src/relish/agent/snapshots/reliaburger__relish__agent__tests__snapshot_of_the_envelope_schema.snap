@@ -274,6 +274,11 @@ expression: "schema_of::<Envelope<Value>>()"
           "const": "status",
           "description": "`relish status -o json`: not under `relish agent`, but it answers in\nthe same envelope, so `relish agent schema status` describes it.",
           "type": "string"
+        },
+        {
+          "const": "apply",
+          "description": "`relish apply --wait -o json`: like `status`, outside `relish agent`\nbut in the same envelope (#2240).",
+          "type": "string"
         }
       ]
     },

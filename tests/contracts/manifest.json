@@ -5785,6 +5785,17 @@
           ]
         },
         {
+          "id": "legacy-ci-reliaburger-placement-apply_wait_returns_once_the_apps_run_and_names_what_never_does",
+          "binary": "reliaburger::placement",
+          "test": "apply_wait_returns_once_the_apps_run_and_names_what_never_does",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/placement.rs"
+          ]
+        },
+        {
           "id": "legacy-ci-reliaburger-placement-deleted_apps_reapplied_at_once_converge_every_cycle",
           "binary": "reliaburger::placement",
           "test": "deleted_apps_reapplied_at_once_converge_every_cycle",

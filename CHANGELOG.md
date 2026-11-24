@@ -15,6 +15,10 @@ This file is the short version. The longer records are:
 
 Not released yet: this is what the train carries, and it can change before the tag.
 
+### Added
+
+- `relish apply --wait` returns once every app in the file runs its replicas, passes its health checks and has finished rolling out, printing each step (placed, pulling, waiting for the health check, ready). `--timeout` bounds it (5 minutes by default); when it runs out, `apply` names each app that isn't ready and why, and exits 1, while a failed apply exits 3, 4 or 5. With `-o json` it answers in the `relish.agent/v1` envelope. A daemon set or an autoscaled app counts the replicas the scheduler placed ([#2240](https://github.com/reliaburger/reliaburger/issues/2240)).
+
 ### Changed
 
 - The appliance image has Buildah, so `relish build` and the five-minute tour's burger build on a cluster of appliances. Its storage is on the data partition, where Btrfs reflinks the `vfs` driver's layer copies; the image adds `netavark` and `gpg` for it, drops Buildah's 97 MB of test helpers, and grows each `/usr` slot by 54 MB (667 MB to 721 MB of 1,100 MB on x86-64). A multi-platform build can't emulate the other architecture's `RUN` steps on an appliance, so cross-compile or name one `platform`. With no node able to build, the refusal no longer says appliances never can ([#2144](https://github.com/reliaburger/reliaburger/issues/2144)).

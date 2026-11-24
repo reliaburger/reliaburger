@@ -1447,6 +1447,12 @@
   },
   {
     "source": "tests/placement.rs",
+    "function": "apply_wait_returns_once_the_apps_run_and_names_what_never_does",
+    "binary": "reliaburger::placement",
+    "test": "apply_wait_returns_once_the_apps_run_and_names_what_never_does"
+  },
+  {
+    "source": "tests/placement.rs",
     "function": "deleted_apps_reapplied_at_once_converge_every_cycle",
     "binary": "reliaburger::placement",
     "test": "deleted_apps_reapplied_at_once_converge_every_cycle"
