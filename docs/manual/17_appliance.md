@@ -714,6 +714,29 @@ monitor shows its name, address and whether bun is running.
 A machine only looks for a seed until it has one, and waits up to ten
 seconds for the stick. So a stick left in later changes nothing.
 
+## The keyboard and the screen
+
+An appliance has no login. Its monitor, on tty1, shows the status screen:
+the node's name, cluster, address and MAC, whether bun is up and, until
+it's claimed, its claim key. A keyboard plugged into it can do very little:
+
+- **Other consoles are blank.** Alt-F2 to Alt-F6 still switch, but there's
+  no login prompt on any of them. Root's password is locked, so there was
+  never a shell to get, and now there's no prompt to try.
+- **Ctrl-Alt-Del does nothing**, however many times you press it.
+- **Magic SysRq** does three things: Alt-SysRq-S syncs the disks, -U
+  remounts them read-only and -B reboots at once (SysRq is Print Screen on
+  most keyboards). On a node that's hung, with no login to restart it from,
+  S, U, then B is gentler on its data than pulling the plug. Everything
+  else SysRq can do (killing processes, dumping memory or tasks onto the
+  screen) is off.
+- **The power button** shuts the node down cleanly.
+
+None of this is a security boundary. Anyone who can touch the machine can
+power it off, boot it from a USB stick or pull its disk, and read or change
+everything on it: physical access is still root. Keep the nodes somewhere
+only people you'd trust with the cluster can reach.
+
 ## Add machines later
 
 Claim them, without `--create`:

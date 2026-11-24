@@ -66,6 +66,21 @@ the mkosi configs, where only a `Profiles=lab` drop-in may name an SSH
 server. In CI it reads each built image's manifest, where a published build
 must list none and a lab build must list `openssh-server`.
 
+With no login, the local keyboard reaches only tty1's status screen
+(`reliaburger-console.service`, #2279). A logind drop-in sets `NAutoVTs=0`
+and `ReserveVT=0`, so tty2 to tty6 get no getty, and Ubuntu's
+`getty-static.service`, which starts them when logind is missing, is masked.
+`ctrl-alt-del.target` is masked and `CtrlAltDelBurstAction=none` stops PID 1
+forcing a reboot on seven quick presses. `kernel.sysrq = 176` keeps only
+SysRq's sync (16), read-only remount (32) and reboot (128): the gentlest way
+to restart a hung node with no login, and nothing the power button doesn't
+already give someone at the keyboard. Killing processes (64) and dumping
+tasks or memory (8) stay off. Physical access is still root. The drop-ins and
+the sysctl live in `/usr`, so an update brings them; the masks are in `/etc`,
+where etc-sync adds them on existing nodes. `image/tests/local_keyboard.py`
+checks the config in its unit test and each built image's `/usr` partition
+(with its factory `/etc`) in CI, settling every value as systemd would.
+
 ## 2. `relish netboot`
 
 ### 2.1 What it serves

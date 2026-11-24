@@ -1654,6 +1654,19 @@ class ApplianceTests(unittest.TestCase):
         self.assertTrue(uploads)
         self.assertTrue(all(position < i for i in uploads), uploads)
 
+    def test_every_build_checks_its_local_keyboard_before_uploading(self):
+        # #2279: no gettys on tty2-tty6, Ctrl-Alt-Del does nothing, SysRq is
+        # 176. The check reads the built /usr partition, so it must run after
+        # the build and before anything uploads the image.
+        check = self.step("The local keyboard reaches only the console")
+        self.assertIn("image/tests/local_keyboard.py usr", check)
+        self.assertIn("fsck.erofs --extract=", check)
+        position = self.image.index(check)
+        self.assertGreater(position, self.image.index(self.step("Build the image")))
+        uploads = [i for i, s in enumerate(self.image) if "actions/upload-artifact" in s]
+        self.assertTrue(uploads)
+        self.assertTrue(all(position < i for i in uploads), uploads)
+
     def test_only_main_publishes(self):
         plan = self.jobs["plan"]
         self.assertIn('if [ "$GITHUB_REF" = refs/heads/main ]', plan)

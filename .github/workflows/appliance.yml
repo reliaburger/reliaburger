@@ -329,6 +329,22 @@ jobs:
           python3 image/tests/builder_packages.py manifest \
             "image/mkosi.output/reliaburger-os_$IMAGE_VERSION.manifest"
 
+      - name: The local keyboard reaches only the console
+        # No gettys on tty2-tty6, Ctrl-Alt-Del does nothing and SysRq is 176
+        # (#2279). Reads the built /usr partition, with the image's /etc in
+        # its factory copy, and settles each value the way systemd would
+        # across every file the image ships, so a package's own drop-in or
+        # sysctl.d file can't quietly undo ours.
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq erofs-utils zstd
+          usr=(image/mkosi.output/reliaburger-os_"$IMAGE_VERSION".usr.*.raw.zst)
+          zstd -q -d "${usr[0]}" -o "$RUNNER_TEMP/usr.raw"
+          fsck.erofs --extract="$RUNNER_TEMP/usr-tree" "$RUNNER_TEMP/usr.raw"
+          python3 image/tests/local_keyboard.py usr "$RUNNER_TEMP/usr-tree"
+          rm -rf "$RUNNER_TEMP/usr.raw" "$RUNNER_TEMP/usr-tree"
+
       - name: Installer drivers
         # mkosi follows hard module dependencies but not soft ones, and the
         # Wyse 3040's installer shipped r8169 without the Realtek PHY driver
