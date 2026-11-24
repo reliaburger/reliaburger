@@ -6892,8 +6892,10 @@ the lock file and returns every other error. Change that match guard to
 `true`, so every error is ignored, and `file_lock::`'s tests still pass.
 Nothing checks that a real failure to remove the file gets reported.
 
-So a pull request that touches `src/`, into `main` or into a release's merge
-train, now gets a mutants job, and the job
+So a mutants job now runs every night on the newest release train,
+mutating what changed under `src/` that day. It ran on every pull request at
+first, until the runners it held made the train's own CI queue behind it.
+The job
 summary lists each mutant its tests missed, with a link that opens a
 pre-filled `missed-mutant` issue. A person files it. The job never does, for
 the same reason `relish agent report` only drafts: nothing posts to GitHub on
@@ -6903,16 +6905,16 @@ The cost shaped most of the design. The crate has about 27,000 mutants, and
 each one rebuilds the crate before its tests run, so a whole-crate run is a
 thousand runner-hours. Four limits keep it affordable:
 
-- **Only the change.** `--in-diff` mutates only the lines a pull request
-  touches, and the weekly run takes only the week's changes on `main`.
-- **A budget.** At most 12 mutants a pull request, as one round-robin shard
+- **Only the change.** `--in-diff` mutates only the lines that changed,
+  and each night's run takes only that day's changes on the newest train.
+- **A budget.** At most 60 mutants a night, as one round-robin shard
   of the list, so the sample spreads over every file instead of using up the
   budget on the first one.
 - **Only the nearby tests.** A mutant in `src/council/network.rs` runs
   `council::`'s unit tests, not the whole suite. A mutant that only an
   integration test catches then shows as missed, and the summary says so.
-- **A clock.** The test step stops itself after 60 minutes and reports what
-  it finished, so a slow run still produces a summary.
+- **A clock.** The test step stops itself after 300 minutes and reports
+  what it finished, so a slow run still produces a summary.
 
 The clock came from the first CI run, which had only the count. Each mutant
 took seven and a half minutes to build, the job hit its 90-minute limit
