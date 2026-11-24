@@ -425,8 +425,10 @@ answered no machine, so it names each line by its address, marked
 #### Turn boot logs on or off later
 
 Once the machines are a cluster, `relish os boot-logs` shows where each one
-sends its boot logs, and changes it. It needs an admin token, since the
-lines carry the node's whole kernel log:
+sends its boot logs, and changes it. Any token can show it. Changing it
+needs a cluster-wide admin token, since the lines carry the node's whole
+kernel log; an admin token scoped to namespaces gets 403. Each change is
+audited as `os.boot_logs_set`, with the target or `off`:
 
 ```sh
 relish os boot-logs                          # where each node sends them
@@ -453,7 +455,8 @@ kernel's netconsole off. If either step fails, the node says so in brackets,
 and the change starts at its next boot. A node that isn't an appliance shows
 as `not an appliance` and is left alone. The command fails if any node
 didn't make the change, or if no node is an appliance. The target must be
-an IPv4 address, as netconsole needs. With `-o json`, each node has a
+one machine's IPv4 address, as netconsole needs: not a broadcast,
+multicast, loopback or `0.0.0.0` address. With `-o json`, each node has a
 `state` of `on` (with its `target`), `off`, `not_an_appliance` or `failed`
 (with a `reason`).
 

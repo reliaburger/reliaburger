@@ -47,6 +47,8 @@ pub enum NetlogError {
     NotKeyValue { line: String },
     #[error("it has no target=")]
     NoTarget,
+    #[error("{address} isn't one machine on the LAN: use the listener's own address")]
+    NotOneMachine { address: Ipv4Addr },
 }
 
 impl FromStr for NetlogTarget {
@@ -64,6 +66,15 @@ impl FromStr for NetlogTarget {
             return Err(bad());
         }
         let address = address.parse::<Ipv4Addr>().map_err(|_| bad())?;
+        // One machine's listener, reachable over the LAN: not every machine
+        // on it, not a group, not nowhere and not the node itself.
+        if address.is_broadcast()
+            || address.is_multicast()
+            || address.is_unspecified()
+            || address.is_loopback()
+        {
+            return Err(NetlogError::NotOneMachine { address });
+        }
         Ok(Self { address, port })
     }
 }
@@ -120,10 +131,22 @@ pub fn render_config(target: NetlogTarget) -> String {
 }
 
 /// What a node says about its boot logs (`GET /v1/os/boot-logs`), and
-/// what a change asks for (`POST`): the target, or `None` for off.
+/// what a change asks for (`POST`): the target, or `None` for off. Read
+/// strictly: `target` must be there, as `null` for off, so a misspelt
+/// `{"too": …}` or an empty `{}` is an error rather than a quiet off.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BootLogs {
+    // `deserialize_with` turns off serde's "a missing Option is None".
+    #[serde(deserialize_with = "present")]
     pub target: Option<NetlogTarget>,
+}
+
+/// An `Option` field that must be in the input, even as `null`.
+fn present<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<NetlogTarget>, D::Error> {
+    Option::deserialize(deserializer)
 }
 
 /// Paths and commands, overridable for tests.
@@ -215,7 +238,11 @@ pub async fn apply_now(paths: &NetlogPaths, target: Option<NetlogTarget>) -> Opt
     match target {
         Some(_) => {
             let (program, args) = paths.restart.split_first()?;
-            let run = tokio::process::Command::new(program).args(args).output();
+            // Killed if the timeout below drops it, not left behind.
+            let run = tokio::process::Command::new(program)
+                .args(args)
+                .kill_on_drop(true)
+                .output();
             match tokio::time::timeout(std::time::Duration::from_secs(10), run).await {
                 Ok(Ok(output)) if output.status.success() => None,
                 Ok(Ok(output)) => Some(format!(
@@ -268,7 +295,17 @@ mod tests {
     }
 
     #[test]
-    fn a_target_refuses_what_the_boot_script_would_ignore() {
+    fn a_target_says_when_it_names_no_one_machine() {
+        assert_eq!(
+            "255.255.255.255".parse::<NetlogTarget>(),
+            Err(NetlogError::NotOneMachine {
+                address: Ipv4Addr::BROADCAST
+            })
+        );
+    }
+
+    #[test]
+    fn a_target_refuses_anything_but_one_ipv4_listener() {
         for value in [
             "",
             "laptop.local",
@@ -280,6 +317,12 @@ mod tests {
             "10.42.0.1:port",
             "::1",
             "[fe80::1]:6666",
+            "255.255.255.255",
+            "224.0.0.1",
+            "239.1.2.3:6666",
+            "0.0.0.0",
+            "127.0.0.1",
+            "127.1.2.3:6666",
         ] {
             assert!(
                 value.parse::<NetlogTarget>().is_err(),
@@ -323,6 +366,20 @@ mod tests {
         let off: BootLogs = serde_json::from_str(r#"{"target": null}"#).unwrap();
         assert_eq!(off.target, None);
         assert!(serde_json::from_str::<BootLogs>(r#"{"target": "laptop"}"#).is_err());
+    }
+
+    #[test]
+    fn off_has_to_be_asked_for_by_name() {
+        for body in [
+            "{}",
+            r#"{"too": "10.42.0.1"}"#,
+            r#"{"target": null, "off": true}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<BootLogs>(body).is_err(),
+                "{body} should be refused"
+            );
+        }
     }
 
     fn esps(dir: &Path) -> NetlogPaths {
