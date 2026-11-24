@@ -179,8 +179,10 @@ echo "$src" >"$nc/local_ip"
 echo "$address" >"$nc/remote_ip"
 echo "$port" >"$nc/remote_port"
 # Without the next hop's MAC, netconsole broadcasts, which reaches a target
-# on the same LAN.
-[ -n "$remote_mac" ] && echo "$remote_mac" >"$nc/remote_mac"
+# on the same LAN. Say so, rather than leave it unset: the target outlives a
+# restart of this unit, and `relish os boot-logs --to` restarts it with a new
+# target (#2255), so an unset MAC would keep the old next hop's.
+echo "${remote_mac:-ff:ff:ff:ff:ff:ff}" >"$nc/remote_mac"
 if ! echo 1 >"$nc/enabled"; then
     say "netconsole refused the target $address:$port on $dev; not streaming"
     exit 0

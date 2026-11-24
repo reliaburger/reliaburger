@@ -154,7 +154,7 @@ gh workflow run appliance.yml --ref main -f broken_bun=true
 NOWAIT=1 ./os-update.sh 192.168.105.105 <broken-version>
 ```
 
-`stage-artefacts.sh --update` serves the broken run's own key beside it, which `os-update.sh` hands to `os-stage`. Each of the three tries waits up to 90 s for bun before the boot check reboots it. After the third, systemd-boot falls back to the previous UKI and slot. Watch it with `./show.sh rb5.serial.log`.
+`stage-artefacts.sh --update` serves the broken run's own key beside it, which `os-update.sh` hands to `os-stage`. Each of the two tries has until 150 s after the kernel starts for bun to be healthy and the node to have an address, or the boot check reboots it. After the second, systemd-boot falls back to the previous UKI and slot. Watch it with `./show.sh rb5.serial.log`.
 
 On x86_64 there's no need for a second run: every lab build carries a broken version of its own in `appliance-x86_64-next`, signed with its key, and CI's "OS fallback" step rolls it out and times the fallback (`image/tests/os-update.sh --fallback`).
 
