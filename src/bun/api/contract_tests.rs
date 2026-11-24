@@ -94,6 +94,7 @@ fn desired_apps() {
         volume_homes: Vec::new(),
         rollout_failed: None,
         owner: Some("db-failover".into()),
+        rolled_out: None,
     }];
     insta::assert_json_snapshot!(rows);
 }

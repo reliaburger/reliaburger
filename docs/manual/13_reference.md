@@ -611,7 +611,7 @@ See [working with an AI agent](16_working-with-an-ai-agent.md).
 - `relish agent`: Commands for LLM agents: one JSON envelope, bounded, never interactive
   - `relish agent guide`: How to use relish as an agent: the manual chapter, as Markdown sections
   - `relish agent version`: This binary's version, commit, target and cluster formats
-  - `relish agent schema [guide|version|schema|source-version|source-tree|source-grep|source-show|source-extract|logs|manual-search|manual-show|context|diagnose|explain|timeline|upgrade-check|verify|report|patch-init|patch-build|patch-test|patch-try|patch-diff|patch-apply|patch-destroy|setup|lease-take|lease-renew|lease-release|propose|proposals|withdraw|undo|status]`: The JSON Schema of the envelope and of each command's data
+  - `relish agent schema [guide|version|schema|source-version|source-tree|source-grep|source-show|source-extract|logs|manual-search|manual-show|context|diagnose|explain|timeline|upgrade-check|verify|report|patch-init|patch-build|patch-test|patch-try|patch-diff|patch-apply|patch-destroy|setup|lease-take|lease-renew|lease-release|propose|proposals|withdraw|undo|status|apply]`: The JSON Schema of the envelope and of each command's data
   - `relish agent source`: The source this binary was built from: search it, read it, extract it
     - `relish agent source version`: This binary's source: version, commit, digest, file count, and the commit every node runs
     - `relish agent source tree [PREFIX]`: Files with their size in bytes and their line count

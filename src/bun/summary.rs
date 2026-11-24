@@ -1705,6 +1705,7 @@ mod tests {
             volume_homes: Vec::new(),
             rollout_failed: None,
             owner: None,
+            rolled_out: None,
         }
     }
 

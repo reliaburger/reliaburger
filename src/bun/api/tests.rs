@@ -50,6 +50,7 @@ fn desired_app_diagnostics_filter_to_the_token_scope() {
     };
     let evidence = |app: &str, namespace: &str| crate::bun::diagnostics::DesiredAppEvidence {
         owner: None,
+        rolled_out: None,
         app: app.to_string(),
         namespace: namespace.to_string(),
         desired_replicas: 1,
@@ -8721,6 +8722,37 @@ fn council_app_evidence_carries_the_quota_block() {
     assert_eq!(evidence[1].blocked, Some(reason));
 }
 
+/// #2240: `relish apply --wait` reads whether each app's current spec has
+/// rolled out, so an update isn't ready while the old version serves.
+#[test]
+fn council_app_evidence_says_whether_the_current_spec_rolled_out() {
+    let mut desired = crate::council::types::DesiredState::default();
+    let web = crate::meat::types::AppId::new("web", "default");
+    let v1: crate::config::app::AppSpec = toml::from_str(r#"image = "web:1""#).unwrap();
+    let v2: crate::config::app::AppSpec = toml::from_str(r#"image = "web:2""#).unwrap();
+    desired.apps.insert(web.clone(), v1.clone());
+    assert_eq!(
+        council_app_evidence(&desired, None)[0].rolled_out,
+        Some(false)
+    );
+
+    desired
+        .rollouts
+        .entry(web.clone())
+        .or_default()
+        .release(&v1);
+    assert_eq!(
+        council_app_evidence(&desired, None)[0].rolled_out,
+        Some(true)
+    );
+
+    desired.apps.insert(web, v2);
+    assert_eq!(
+        council_app_evidence(&desired, None)[0].rolled_out,
+        Some(false)
+    );
+}
+
 /// #423: a volume app whose home node is out of the cluster carries that
 /// node, so status, inspect, the dashboard and wtf can say what it waits
 /// for. A decommissioned home, a live one, or a stopped app carries none.
@@ -8860,6 +8892,7 @@ fn dashboard_states_come_from_the_shared_app_rollup() {
     let desired = vec![
         crate::bun::diagnostics::DesiredAppEvidence {
             owner: None,
+            rolled_out: None,
             app: "web".into(),
             namespace: "default".into(),
             desired_replicas: 3,
@@ -8874,6 +8907,7 @@ fn dashboard_states_come_from_the_shared_app_rollup() {
         },
         crate::bun::diagnostics::DesiredAppEvidence {
             owner: None,
+            rolled_out: None,
             app: "pending".into(),
             namespace: "default".into(),
             desired_replicas: 2,

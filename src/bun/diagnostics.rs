@@ -288,6 +288,15 @@ pub struct DesiredAppEvidence {
     /// A controller reads this to find the apps it claimed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    /// Whether the app's current spec has finished rolling out: it runs
+    /// healthy on every node it's placed on, and the leader has recorded it
+    /// as released. `false` while a changed spec is still rolling out, or
+    /// before a new app's first rollout finishes. `None` from a standalone
+    /// node, which has no council to record rollouts. `relish apply --wait`
+    /// waits for it, so an update isn't reported ready while the previous
+    /// version still serves (#2240).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rolled_out: Option<bool>,
 }
 
 /// Current diagnostics wire schema.

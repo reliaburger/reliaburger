@@ -88,6 +88,7 @@ impl TestScenario {
                 volume_homes: Vec::new(),
                 rollout_failed: None,
                 owner: None,
+                rolled_out: None,
             });
             for replica in 0..2 {
                 let degraded = matches!(self, Self::DegradedApp) && app_index == 0 && replica == 1;

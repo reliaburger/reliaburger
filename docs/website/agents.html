@@ -285,6 +285,15 @@ with lines cut at 16 KiB (512 bytes for an event). <code>relish events</code> an
 <code>relish audit</code> move a lease's purpose or a proposal's reason out of
 <code>details</code> into <code>author_text</code>, the same as the timeline. Their plain output
 for people is unchanged.</p>
+<p>Two commands outside <code>relish agent</code> answer in the envelope itself, and
+<code>relish agent schema</code> describes their <code>data</code> too: <code>relish status -o json</code>,
+and <code>relish apply --wait -o json</code>. The second applies a file and returns
+once its apps run and pass their health checks. <code>ok</code> is <code>true</code> whenever the
+apply went through; <code>data.ready</code> says whether every app got there before
+<code>--timeout</code> (5 minutes by default), and <code>data.apps</code> gives each one's
+replicas, what it's doing and, when the cluster knows, why it isn't ready.
+The process exits 1 when an app wasn't ready, and 3, 4 or 5, with <code>ok: false</code> and an <code>error.code</code>, when the apply itself failed. An apply changes
+the cluster, so ask your human first.</p>
 </section>
 <section class="agents-section" id="commands">
 <h2>Commands <a class="permalink" href="#commands" aria-label="Link to this section">#</a></h2>

@@ -1341,6 +1341,7 @@ mod tests {
         let evidence = collect_services(
             Ok(vec![crate::bun::diagnostics::DesiredAppEvidence {
                 owner: None,
+                rolled_out: None,
                 app: "api".to_string(),
                 namespace: "default".to_string(),
                 desired_replicas: 2,
@@ -1598,6 +1599,7 @@ mod tests {
         }];
         let desired = Ok(vec![crate::bun::diagnostics::DesiredAppEvidence {
             owner: None,
+            rolled_out: None,
             app: "web".to_string(),
             namespace: "default".to_string(),
             desired_replicas: 1,

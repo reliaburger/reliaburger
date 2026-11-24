@@ -414,6 +414,10 @@ pub(super) fn council_app_evidence(
                         .cloned()
                 }),
                 owner: spec.owner.clone(),
+                rolled_out: Some(crate::cluster::rollout::is_rolled_out(
+                    spec,
+                    desired.rollouts.get(app_id),
+                )),
             },
         )
         .collect::<Vec<_>>();

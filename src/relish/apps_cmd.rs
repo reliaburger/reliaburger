@@ -244,7 +244,10 @@ pub fn rollup(desired: &[DesiredAppEvidence], instances: &Instances) -> Vec<AppR
 
 /// Why an app isn't fully placed or running, as the council or a node's
 /// runtime says.
-fn reason(app: &DesiredAppEvidence, instances: &[&ClusterInstanceStatus]) -> Option<String> {
+pub(crate) fn reason(
+    app: &DesiredAppEvidence,
+    instances: &[&ClusterInstanceStatus],
+) -> Option<String> {
     if let Some(blocked) = &app.blocked {
         return Some(format!("not placed, blocked: {blocked}"));
     }
@@ -480,6 +483,7 @@ mod tests {
     fn evidence(app: &str, replicas: u32) -> DesiredAppEvidence {
         DesiredAppEvidence {
             owner: None,
+            rolled_out: None,
             app: app.to_string(),
             namespace: "prod".to_string(),
             desired_replicas: replicas,
