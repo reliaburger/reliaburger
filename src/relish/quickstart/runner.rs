@@ -781,17 +781,46 @@ async fn start_vm(
     Ok(())
 }
 
-/// How long a starting VM may print nothing at all on its console.
-///
-/// Measuring showed Apple's Virtualization.framework occasionally starts a VM
-/// that never runs its firmware: Lima reports it running, the console stays
-/// empty and SSH never answers, even with plain `limactl start` and no
-/// Reliaburger involved. A healthy guest prints its login prompt within
-/// seconds of starting, and disk preparation before that takes about ten.
-const BOOT_SILENCE: Duration = Duration::from_secs(60);
+/// The Lima VM driver a quickstart VM runs under (`vmType` in its config).
+#[derive(Debug, Clone, Copy)]
+enum VmType {
+    /// Apple's Virtualization.framework, on macOS.
+    Vz,
+    /// QEMU, everywhere else.
+    Qemu,
+}
 
-/// Run a Lima start command, and if the VM's console is still silent after
-/// `silence`, force it off and start it once more without the watchdog.
+/// The driver this host's quickstart VMs use; `provision::vm_config` picks
+/// the same one.
+const HOST_VM_TYPE: VmType = if cfg!(target_os = "macos") {
+    VmType::Vz
+} else {
+    VmType::Qemu
+};
+
+/// How long a VM may print nothing on its console once Lima has started it.
+///
+/// Apple's Virtualization.framework occasionally starts a VM that never
+/// boots, about one start in 25 on the Mac Studio (#2229): Lima reports it
+/// running, one vCPU spins at 100 %, the console stays empty and SSH never
+/// answers, even with plain `limactl start` and no Reliaburger involved. The
+/// first console output is the login prompt (the kernel writes to `tty1`
+/// and `ttyAMA0`, which a vz VM doesn't have), and in 49 healthy vz boots it
+/// came within 9.3 s of the VM starting; the stuck VMs stayed silent. QEMU
+/// boots more slowly and wasn't measured, so it keeps the original minute.
+const fn boot_silence(vm_type: VmType) -> Duration {
+    match vm_type {
+        VmType::Vz => Duration::from_secs(30),
+        VmType::Qemu => Duration::from_secs(60),
+    }
+}
+
+/// The boot silence for this host's VMs; see [`boot_silence`].
+const BOOT_SILENCE: Duration = boot_silence(HOST_VM_TYPE);
+
+/// Run a Lima start command, and if the VM's console is still silent
+/// `silence` after Lima's host agent started it, force it off and start it
+/// once more without the watchdog.
 async fn start_watched(
     lima: &Lima,
     name: &str,
@@ -801,6 +830,11 @@ async fn start_watched(
 ) -> Result<()> {
     let start = lima.command(args);
     let watchdog = async {
+        // Disk preparation comes first and its length depends on the disk,
+        // so the clock starts with the boot, not with the command.
+        while !lima.host_agent_started(name).await {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
         tokio::time::sleep(silence).await;
         if lima.console_started(name).await {
             std::future::pending::<()>().await;
@@ -1149,7 +1183,7 @@ mod tests {
         let console = if boots {
             "mkdir -p \"$LIMA_HOME/vm\"; echo login > \"$LIMA_HOME/vm/serialv.log\"; exit 0"
         } else {
-            "sleep 30"
+            "mkdir -p \"$LIMA_HOME/vm\"; : > \"$LIMA_HOME/vm/ha.pid\"; sleep 30"
         };
         std::fs::write(
             &script,
@@ -1202,6 +1236,7 @@ net="$LIMA_HOME/user-v2_fd.sock"
 case "$1" in
 start)
   case "$3" in --name=*)
+    mkdir -p "$LIMA_HOME/${3#--name=}"; : > "$LIMA_HOME/${3#--name=}/ha.pid"
     [ -e "$net" ] || echo $$ > "$net"
     echo Running > "$LIMA_HOME/${3#--name=}.status"; exec sleep 30;;
   esac
@@ -1264,6 +1299,58 @@ esac
         assert!(lima.console_started("vm").await);
         let calls = std::fs::read_to_string(home.path().join("calls")).unwrap();
         assert_eq!(calls.lines().count(), 1, "{calls}");
+    }
+
+    #[test]
+    fn a_vz_vm_gets_thirty_seconds_of_console_silence() {
+        assert_eq!(boot_silence(VmType::Vz), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_qemu_vm_keeps_a_minute_of_console_silence() {
+        assert_eq!(boot_silence(VmType::Qemu), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn the_boot_silence_follows_the_vm_type_this_host_runs() {
+        let expected = if cfg!(target_os = "macos") {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_secs(60)
+        };
+        assert_eq!(BOOT_SILENCE, expected);
+    }
+
+    #[tokio::test]
+    async fn disk_preparation_does_not_count_towards_the_boot_silence() {
+        let home = tempfile::tempdir().unwrap();
+        let script = home.path().join("limactl");
+        // Lima prepares the disk for 1.5 s, then its host agent starts the VM.
+        // The console line comes before `ha.pid`, so a watchdog timed from
+        // the host agent always finds it, while one timed from the command
+        // fires at 1 s into a silent console.
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho \"$*\" >> \"$LIMA_HOME/calls\"\n\
+             case \"$3\" in --name=*)\n\
+               sleep 1.5; mkdir -p \"$LIMA_HOME/vm\"\n\
+               echo login > \"$LIMA_HOME/vm/serialv.log\"; : > \"$LIMA_HOME/vm/ha.pid\"\n\
+               sleep 1; exit 0;;\n\
+             esac\n",
+        )
+        .unwrap();
+        let lima =
+            Lima::shell_script(script, Duration::from_secs(10)).with_home(home.path().into());
+        let step = super::super::progress::tests_support::detached_step();
+        let create = ["start", "--tty=false", "--name=vm", "vm.yaml"];
+        start_watched(&lima, "vm", &create, Duration::from_secs(1), &step)
+            .await
+            .unwrap();
+        let calls = std::fs::read_to_string(home.path().join("calls")).unwrap();
+        assert_eq!(
+            calls.lines().collect::<Vec<_>>(),
+            ["start --tty=false --name=vm vm.yaml"]
+        );
     }
 
     #[tokio::test]

@@ -168,6 +168,20 @@ impl Lima {
         false
     }
 
+    /// True once Lima has started the VM's host agent.
+    ///
+    /// Lima prepares the disk first (about five seconds on a fast Mac, more on
+    /// a slow disk) and only then starts the host agent, which writes `ha.pid`
+    /// and boots the VM straight away. A boot is timed from here.
+    pub async fn host_agent_started(&self, name: &str) -> bool {
+        let Some(home) = &self.home else {
+            return true;
+        };
+        tokio::fs::try_exists(home.join(name).join("ha.pid"))
+            .await
+            .unwrap_or(false)
+    }
+
     /// True once Lima's shared `user-v2` network daemon is running.
     ///
     /// The first `limactl start` launches it, again without re-checking under
