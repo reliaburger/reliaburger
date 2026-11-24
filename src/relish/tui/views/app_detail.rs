@@ -239,8 +239,13 @@ fn push_config(app: &TuiApp, name: &str, namespace: &str, lines: &mut Vec<Line<'
         .as_ref()
         .filter(|view| view.app == name && view.namespace == namespace);
     let Some(view) = view else {
-        lines.push(Line::raw(match &app.data.app_spec_error {
-            Some(error) => format!("spec unavailable: {error}"),
+        let error = app
+            .data
+            .app_spec_error
+            .as_ref()
+            .filter(|error| error.app == name && error.namespace == namespace);
+        lines.push(Line::raw(match error {
+            Some(error) => format!("spec unavailable: {}", error.message),
             None => "loading spec…".to_string(),
         }));
         return;
@@ -280,8 +285,25 @@ fn push_spec(spec: &crate::config::AppSpec, lines: &mut Vec<Line<'static>>) {
 #[cfg(test)]
 mod tests {
     use crate::relish::tui::app::{DetailTab, TuiApp, View};
+    use crate::relish::tui::data::ProviderError;
     use crate::relish::tui::fixtures::{TestScenario, render_to_string};
+    use crate::relish::tui::msg::{DataUpdate, Msg};
     use crate::relish::tui::state::Effect;
+
+    fn arrow(code: crossterm::event::KeyCode) -> Msg {
+        Msg::Key(crossterm::event::KeyEvent::new(
+            code,
+            crossterm::event::KeyModifiers::NONE,
+        ))
+    }
+
+    fn right() -> Msg {
+        arrow(crossterm::event::KeyCode::Right)
+    }
+
+    fn left() -> Msg {
+        arrow(crossterm::event::KeyCode::Left)
+    }
 
     fn on_config_tab() -> TuiApp {
         let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);
@@ -291,12 +313,7 @@ mod tests {
             tab: DetailTab::Deploys,
         });
         // Config follows Deploys.
-        app.update(crate::relish::tui::msg::Msg::Key(
-            crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Right,
-                crossterm::event::KeyModifiers::NONE,
-            ),
-        ));
+        app.update(right());
         app
     }
 
@@ -343,7 +360,13 @@ mod tests {
         let mut app = on_config_tab();
         app.data.app_spec = None;
         assert!(render_to_string(&app, 120, 40).contains("loading spec"));
-        app.data.app_spec_error = Some("403: token scope does not allow web".into());
+        app.update(spec_answer(
+            "web",
+            ProviderError::Api {
+                status: 403,
+                body: "token scope does not allow web".into(),
+            },
+        ));
         let screen = render_to_string(&app, 120, 40);
         assert!(
             screen.contains("spec unavailable: 403: token scope does not allow web"),
@@ -354,5 +377,65 @@ mod tests {
         other.app = "api".into();
         app.data.app_spec = Some(other);
         assert!(render_to_string(&app, 120, 40).contains("spec unavailable"));
+    }
+
+    fn spec_answer(app: &str, error: ProviderError) -> Msg {
+        Msg::Data(DataUpdate::AppSpec {
+            app: app.into(),
+            namespace: "default".into(),
+            result: Err(error),
+        })
+    }
+
+    #[test]
+    fn another_apps_refusal_is_not_shown_on_this_apps_config_tab() {
+        let mut app = on_config_tab();
+        app.data.app_spec = None;
+        app.update(spec_answer(
+            "api",
+            ProviderError::Api {
+                status: 403,
+                body: "token scope does not allow api".into(),
+            },
+        ));
+        let screen = render_to_string(&app, 120, 40);
+        assert!(screen.contains("loading spec"), "{screen}");
+        assert!(!screen.contains("does not allow api"), "{screen}");
+    }
+
+    #[test]
+    fn opening_the_config_tab_again_forgets_the_last_refusal() {
+        let mut app = on_config_tab();
+        app.data.app_spec = None;
+        app.update(spec_answer(
+            "web",
+            ProviderError::Api {
+                status: 503,
+                body: "no leader".into(),
+            },
+        ));
+        assert!(app.data.app_spec_error.is_some());
+        app.update(right());
+        app.update(left());
+        assert!(app.data.app_spec_error.is_none());
+        assert!(render_to_string(&app, 120, 40).contains("loading spec"));
+    }
+
+    #[test]
+    fn an_empty_404_says_the_node_does_not_serve_spec_reads() {
+        let mut app = on_config_tab();
+        app.data.app_spec = None;
+        app.update(spec_answer(
+            "web",
+            ProviderError::Api {
+                status: 404,
+                body: String::new(),
+            },
+        ));
+        let screen = render_to_string(&app, 120, 40);
+        assert!(
+            screen.contains("spec unavailable: this node's release doesn't serve spec reads"),
+            "{screen}"
+        );
     }
 }

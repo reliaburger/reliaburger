@@ -227,11 +227,19 @@ every token, admins included:
   names where a secret lives, not the secret;
 - every config file's inline `content` reads `"[redacted]"`;
 - commands, arguments, scripts and `pre_stop` keep their words, with any
-  token, key or URL password the redaction rules recognise taken out.
+  token, key or URL password the redaction rules recognise taken out. A
+  word after a flag or key that names a secret goes whole: the value in
+  `--password hunter2`, `--db-token abc` or `DB_PASSWORD hunter2` reads
+  `"[redacted]"`. A short flag with its value joined on, such as MySQL's
+  `-phunter2`, isn't recognised, so pass such secrets through env instead;
+- a health check's or ingress route's `path` loses any secret in its query
+  string, such as `?token=…`.
 
-So the answer is for reading, not for applying back as it stands: a
-controller that rewrites an app supplies the env values itself, from its own
-manifest. Memory reads as a byte count, as the cluster stores it.
+So the answer is for reading, not for applying back as it stands. Never
+apply a `[redacted]` value back: the cluster takes it as the literal text
+`[redacted]`, so an app applied from this answer would start with that as
+its password. A controller that rewrites an app supplies the env values
+itself, from its own manifest. Memory reads as a byte count, as the cluster stores it.
 
 A node that isn't the leader asks the leader, which redacts before it
 answers. During a rolling upgrade from 0.3.2 a leader still on 0.3.2 doesn't

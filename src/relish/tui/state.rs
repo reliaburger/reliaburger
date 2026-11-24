@@ -124,7 +124,7 @@ pub struct ClusterData {
     pub app_spec: Option<crate::bun::spec_read::AppSpecView>,
     /// Why the Config tab's last fetch failed, when the API answered with
     /// a refusal rather than going away.
-    pub app_spec_error: Option<String>,
+    pub app_spec_error: Option<AppSpecError>,
     /// Every app the council knows, with the replica count its spec asks
     /// for: where the Instances tab's scale starts from.
     pub desired_apps: Vec<DesiredAppEvidence>,
@@ -232,6 +232,34 @@ impl ScalePrompt {
             "Scale {} from {} to {}? Applying its file again puts back the file's count. [y/N]",
             self.app, self.from, self.to
         )
+    }
+}
+
+/// Why the spec read for one app failed (#1322). It names its app, so the
+/// Config tab never shows one app's refusal under another's name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppSpecError {
+    pub app: String,
+    pub namespace: String,
+    /// The refusal, for people.
+    pub message: String,
+}
+
+impl AppSpecError {
+    /// The error for an API answer of `status` with `body`. An empty 404 is
+    /// a node that doesn't know the route at all, which a node on a release
+    /// before 0.3.3 is.
+    pub fn from_answer(app: &str, namespace: &str, status: u16, body: &str) -> Self {
+        let message = if status == 404 && body.trim().is_empty() {
+            "this node's release doesn't serve spec reads".to_string()
+        } else {
+            format!("{status}: {body}")
+        };
+        Self {
+            app: app.to_string(),
+            namespace: namespace.to_string(),
+            message,
+        }
     }
 }
 

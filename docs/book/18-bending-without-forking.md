@@ -3114,6 +3114,16 @@ for (key, value) in env.iter_mut() {
 }
 ```
 
+Arguments needed one more rule after review. The text rules catch
+`--password=hunter2`, where key and value share a word, but not
+`--password hunter2`, where they arrive as two. So `redact_words`
+remembers whether the word before named a secret, by the same
+`is_secret_key` the diagnostics redaction uses with any leading `-`
+stripped, and redacts the next word whole if it did. MySQL's `-phunter2`
+still gets through: `p` means "password" only to MySQL, and a rule that
+redacted every `-p…` would take out `-port` too, so the manual says to
+pass such secrets through env.
+
 `iter_mut` on a `BTreeMap` yields each key by shared reference and each
 value by mutable reference, so the loop rewrites values in place while the
 keys, which decide the map's order, stay untouchable. `*value = ...` writes

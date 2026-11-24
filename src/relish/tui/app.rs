@@ -94,7 +94,11 @@ impl TuiApp {
                 }
                 Err(error) => self.mark_disconnected(error.to_string()),
             },
-            DataUpdate::AppSpec(result) => match result {
+            DataUpdate::AppSpec {
+                app,
+                namespace,
+                result,
+            } => match result {
                 Ok(value) => {
                     self.data.app_spec = Some(*value);
                     self.data.app_spec_error = None;
@@ -105,7 +109,9 @@ impl TuiApp {
                 // connection, so the tab says it.
                 Err(super::data::ProviderError::Api { status, body }) => {
                     self.data.app_spec = None;
-                    self.data.app_spec_error = Some(format!("{status}: {body}"));
+                    self.data.app_spec_error = Some(super::state::AppSpecError::from_answer(
+                        &app, &namespace, status, &body,
+                    ));
                 }
                 Err(error) => self.mark_disconnected(error.to_string()),
             },

@@ -84,6 +84,17 @@ fn redact_spec(spec: &AppSpec, prefix: &str, redacted: &mut Vec<String>) -> AppS
     if let Some(script) = &mut spec.script {
         redact_text(script, &format!("{prefix}.script"), redacted);
     }
+    // A probe or route path can carry a query string, `?token=…`.
+    if let Some(health) = &mut spec.health {
+        redact_text(&mut health.path, &format!("{prefix}.health.path"), redacted);
+    }
+    if let Some(path) = spec
+        .ingress
+        .as_mut()
+        .and_then(|ingress| ingress.path.as_mut())
+    {
+        redact_text(path, &format!("{prefix}.ingress.path"), redacted);
+    }
     for file in &mut spec.config_file {
         if file.content.is_some() {
             file.content = Some(REDACTED.to_string());
@@ -119,11 +130,33 @@ fn redact_env(env: &mut BTreeMap<String, EnvValue>, prefix: &str, redacted: &mut
     }
 }
 
-/// Take any secret the redaction rules recognise out of each word.
+/// Take any secret the redaction rules recognise out of each word, and
+/// redact a whole word when the word before it names a secret: the value
+/// of `--password hunter2`, `--db-token abc` or `DB_PASSWORD hunter2`.
+///
+/// A short flag with its value joined on, such as MySQL's `-phunter2`,
+/// isn't caught: `p` names a password only to MySQL, and redacting every
+/// word that starts with `-p` would take out `-port` too.
 fn redact_words(words: &mut [String], prefix: &str, redacted: &mut Vec<String>) {
+    let mut after_secret_flag = false;
     for (index, word) in words.iter_mut().enumerate() {
-        redact_text(word, &format!("{prefix}.{index}"), redacted);
+        let path = format!("{prefix}.{index}");
+        let names_secret = names_a_secret(word);
+        if after_secret_flag {
+            *word = REDACTED.to_string();
+            redacted.push(path);
+        } else {
+            redact_text(word, &path, redacted);
+        }
+        after_secret_flag = names_secret;
     }
+}
+
+/// Whether `word` is a flag or key naming a secret whose value is the next
+/// word: `--password`, `-token` or `DB_PASSWORD`, with no `=` (a word with
+/// one carries its own value, which [`redact_text`] takes out).
+fn names_a_secret(word: &str) -> bool {
+    !word.contains('=') && crate::redact::is_secret_key(word.trim_start_matches('-'))
 }
 
 /// Take any secret the redaction rules recognise out of `text`, naming
@@ -230,6 +263,84 @@ mod tests {
         let view = app_spec_view(&desired, &id).unwrap();
         assert!(view.spec.memory.is_some());
         assert_eq!(view.declared, Some(declared));
+    }
+
+    #[test]
+    fn a_secret_passed_as_the_next_argument_is_redacted() {
+        let (desired, id) = desired_with(
+            "[app.web]\nimage = 'web:v1'\n\
+             command = ['serve', '--password', 'hunter2', '--port', '8080']\n\
+             args = ['--db-token', 'abc123', 'DB_PASSWORD', 'hunter3']\n\
+             pre_stop = ['drain', '--api-key', 'k3y']\n\
+             [[app.web.init]]\nimage = 'migrate:v1'\ncommand = ['migrate', '--secret', 's3cret']\n\
+             [[app.web.sidecar]]\nname = 'proxy'\nimage = 'proxy:v1'\n\
+             command = ['proxy', '-token', 't0ken']\nargs = ['--access-key', 'AKIA']\n",
+        );
+        let view = app_spec_view(&desired, &id).unwrap();
+        assert_eq!(
+            view.spec.command,
+            ["serve", "--password", REDACTED, "--port", "8080"]
+        );
+        assert_eq!(
+            view.spec.args,
+            ["--db-token", REDACTED, "DB_PASSWORD", REDACTED]
+        );
+        assert_eq!(view.spec.pre_stop, ["drain", "--api-key", REDACTED]);
+        assert_eq!(view.spec.init[0].command, ["migrate", "--secret", REDACTED]);
+        assert_eq!(view.spec.sidecar[0].command, ["proxy", "-token", REDACTED]);
+        assert_eq!(view.spec.sidecar[0].args, ["--access-key", REDACTED]);
+        let json = serde_json::to_string(&view).unwrap();
+        for secret in [
+            "hunter2", "hunter3", "abc123", "k3y", "s3cret", "t0ken", "AKIA",
+        ] {
+            assert!(!json.contains(secret), "{secret} leaked: {json}");
+        }
+        assert!(view.redacted.contains(&"spec.command.2".to_string()));
+        assert!(view.redacted.contains(&"spec.args.1".to_string()));
+        assert!(
+            view.redacted
+                .contains(&"spec.sidecar.proxy.command.2".to_string())
+        );
+    }
+
+    #[test]
+    fn a_secret_joined_to_its_flag_is_redacted_and_the_next_word_kept() {
+        let (desired, id) = desired_with(
+            "[app.web]\nimage = 'web:v1'\n\
+             command = ['serve', '--password=hunter2', '--db-token=abc123', '--port', '8080']\n",
+        );
+        let view = app_spec_view(&desired, &id).unwrap();
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(
+            !json.contains("hunter2") && !json.contains("abc123"),
+            "{json}"
+        );
+        assert_eq!(view.spec.command[3..], ["--port", "8080"]);
+    }
+
+    #[test]
+    fn a_token_in_a_health_or_ingress_path_is_redacted() {
+        let token = format!("rbrg_{}", "b".repeat(40));
+        let (desired, id) = desired_with(&format!(
+            "[app.web]\nimage = 'web:v1'\nport = 8080\n\
+             [app.web.health]\npath = '/healthz?token={token}'\n\
+             [app.web.ingress]\nhost = 'web.example.com'\npath = '/hook?api_key=hunter2'\n"
+        ));
+        let view = app_spec_view(&desired, &id).unwrap();
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(
+            !json.contains(&token) && !json.contains("hunter2"),
+            "{json}"
+        );
+        assert!(
+            view.spec
+                .health
+                .unwrap()
+                .path
+                .starts_with("/healthz?token=")
+        );
+        assert!(view.redacted.contains(&"spec.health.path".to_string()));
+        assert!(view.redacted.contains(&"spec.ingress.path".to_string()));
     }
 
     #[test]
