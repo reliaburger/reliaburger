@@ -2542,6 +2542,87 @@ mod tests {
         }
     }
 
+    /// #1316: the sysctl and device knobs reach a real container, together
+    /// with a capability. The node writes the `net.*` sysctl into the
+    /// network namespace it made, runc writes the IPC one, and the device
+    /// appears with a cgroup rule that lets the container open it. Neither
+    /// sysctl changes the host's own value.
+    #[tokio::test]
+    #[ignore = "requires rootful runc, a pinned OCI image (local test mirror or registry access), /dev/fuse, and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
+    async fn runc_sysctl_and_device_knobs_take_effect_inside_the_container() {
+        assert!(runc_tests_enabled(), "set RELIABURGER_RUNC_TESTS=1");
+        assert!(nix::unistd::geteuid().is_root(), "rootful runc needs root");
+        assert!(
+            std::path::Path::new("/dev/fuse").exists(),
+            "the test host needs /dev/fuse"
+        );
+        let host_somaxconn = std::fs::read_to_string("/proc/sys/net/core/somaxconn").unwrap();
+        let host_shmmni = std::fs::read_to_string("/proc/sys/kernel/shmmni").unwrap();
+        // Values no default kernel picks, so seeing them proves the knob.
+        let (somaxconn, shmmni) = ("4321", "2345");
+        assert_ne!(host_somaxconn.trim(), somaxconn);
+        assert_ne!(host_shmmni.trim(), shmmni);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let id = InstanceId("default__knobs-0".to_string());
+        remove_test_network(&id);
+        let _network_cleanup = TestNetworkCleanup(vec![id.clone()]);
+        let (grill, spec) = image_app(
+            tmp.path(),
+            &id,
+            &format!(
+                "image = \"{ALPINE_IMAGE}\"\ncommand = [\"sleep\", \"3609\"]\n\
+                 [runtime]\ncapabilities = [\"IPC_OWNER\"]\n\
+                 sysctls = {{ \"net.core.somaxconn\" = \"{somaxconn}\", \
+                 \"kernel.shmmni\" = \"{shmmni}\" }}\n\
+                 devices = [{{ path = \"/dev/fuse\", permissions = \"rw\" }}]\n"
+            ),
+        );
+        grill.create(&id, &spec).await.unwrap();
+        grill.start(&id).await.unwrap();
+        let run = |command: &str| {
+            let argv = ["/bin/sh".to_string(), "-c".to_string(), command.to_string()];
+            let grill = &grill;
+            let id = &id;
+            async move { grill.exec(id, &argv).await.unwrap() }
+        };
+        let network = run("cat /proc/sys/net/core/somaxconn").await;
+        let ipc = run("cat /proc/sys/kernel/shmmni").await;
+        let device = run("test -c /dev/fuse && exec 3<>/dev/fuse && echo opened").await;
+        let status = run("cat /proc/self/status").await;
+        grill.kill(&id).await.unwrap();
+
+        assert_eq!(network.output.trim(), somaxconn, "{}", network.output);
+        assert_eq!(ipc.output.trim(), shmmni, "{}", ipc.output);
+        assert_eq!(
+            (device.exit_code, device.output.trim()),
+            (0, "opened"),
+            "the container couldn't open /dev/fuse read-write"
+        );
+        let effective = status
+            .output
+            .lines()
+            .find_map(|line| line.strip_prefix("CapEff:"))
+            .map(|hex| u64::from_str_radix(hex.trim(), 16).unwrap())
+            .unwrap();
+        assert_ne!(
+            effective & (1 << 15),
+            0,
+            "no CAP_IPC_OWNER: {}",
+            status.output
+        );
+        assert_eq!(
+            std::fs::read_to_string("/proc/sys/net/core/somaxconn").unwrap(),
+            host_somaxconn,
+            "the network sysctl leaked to the host"
+        );
+        assert_eq!(
+            std::fs::read_to_string("/proc/sys/kernel/shmmni").unwrap(),
+            host_shmmni,
+            "the IPC sysctl leaked to the host"
+        );
+    }
+
     async fn redis_cli(grill: &RuncGrill, id: &InstanceId, command: &[&str]) -> String {
         let mut argv = vec!["redis-cli".to_string()];
         argv.extend(command.iter().map(|part| part.to_string()));

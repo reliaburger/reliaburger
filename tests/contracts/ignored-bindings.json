@@ -108,6 +108,12 @@
     "test": "grill::runc::tests::runc_capability_knobs_work_only_where_the_container_owns_the_check"
   },
   {
+    "source": "src/grill/runc.rs",
+    "function": "runc_sysctl_and_device_knobs_take_effect_inside_the_container",
+    "binary": "reliaburger",
+    "test": "grill::runc::tests::runc_sysctl_and_device_knobs_take_effect_inside_the_container"
+  },
+  {
     "source": "src/grill/snapshot.rs",
     "function": "btrfs_snapshot_restore_recovers_corrupted_data",
     "binary": "reliaburger",
