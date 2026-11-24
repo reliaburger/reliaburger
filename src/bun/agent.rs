@@ -379,16 +379,54 @@ async fn stop_instance_alone<G: Grill>(
     if let Some(pre_stop) = &stop.pre_stop {
         run_pre_stop(grill, id, pre_stop).await;
     }
-    tokio::time::timeout(confirmation_timeout, grill.stop(id))
-        .await
-        .map_err(|_| BunError::StopUnconfirmed {
-            instance_id: id.clone(),
-            reason: "graceful stop request timed out",
-        })??;
-    if observe_runtime_exit(grill, id, stop.grace).await? {
+    let signalled = ask_until_answered(stop.grace, || async {
+        tokio::time::timeout(confirmation_timeout, grill.stop(id))
+            .await
+            .map_err(|_| BunError::StopUnconfirmed {
+                instance_id: id.clone(),
+                reason: "graceful stop request timed out",
+            })?
+            .map_err(BunError::from)
+    })
+    .await?;
+    // A grace spent asking leaves nothing to wait for: go straight to the
+    // kill.
+    if signalled && observe_runtime_exit(grill, id, stop.grace).await? {
         return Ok(());
     }
     kill_runtime_instance(grill, id, confirmation_timeout).await
+}
+
+/// Send a stop or kill request, asking again while the runtime answers
+/// that it didn't get to it (`StopUnanswered`: a process owner stalled
+/// past its request timeout, #1902), until `within` has passed.
+///
+/// `Ok(true)` once the runtime answers, `Ok(false)` when `within` ran out
+/// with no answer. Any other error ends it at once. The runtime may have
+/// sent the signal before it stalled, so a workload can see it twice; that
+/// beats failing a stop while the workload is fine.
+async fn ask_until_answered<F, Fut>(
+    within: std::time::Duration,
+    mut send: F,
+) -> Result<bool, BunError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), BunError>>,
+{
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        match send().await {
+            Ok(()) => return Ok(true),
+            Err(BunError::Grill(crate::grill::GrillError::StopUnanswered { instance, reason })) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Ok(false);
+                }
+                eprintln!("bun: {instance}: stop request got no answer ({reason}); asking again");
+            }
+            Err(error) => return Err(error),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 /// Run an instance's pre-stop command inside it, within its bound.
@@ -421,12 +459,22 @@ async fn kill_runtime_instance<G: Grill>(
     id: &InstanceId,
     confirmation_timeout: std::time::Duration,
 ) -> Result<(), BunError> {
-    tokio::time::timeout(confirmation_timeout, grill.kill(id))
-        .await
-        .map_err(|_| BunError::StopUnconfirmed {
+    let killed = ask_until_answered(confirmation_timeout, || async {
+        tokio::time::timeout(confirmation_timeout, grill.kill(id))
+            .await
+            .map_err(|_| BunError::StopUnconfirmed {
+                instance_id: id.clone(),
+                reason: "force-kill request timed out",
+            })?
+            .map_err(BunError::from)
+    })
+    .await?;
+    if !killed {
+        return Err(BunError::StopUnconfirmed {
             instance_id: id.clone(),
-            reason: "force-kill request timed out",
-        })??;
+            reason: "the runtime never answered the force-kill request",
+        });
+    }
     if observe_runtime_exit(grill, id, confirmation_timeout).await? {
         return Ok(());
     }

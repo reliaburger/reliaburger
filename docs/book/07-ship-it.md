@@ -1244,6 +1244,17 @@ match grill.state(id).await {
 
 `StateUnavailable` means "can't say yet", which is the same as "still running" as far as waiting goes: ask again in 100 ms. Any other error still ends the stop at once. The bound doesn't change, so a runtime that stays busy for good runs out the grace, gets the kill, and ends in `StopUnconfirmed` like any other unconfirmed stop. The `|` in a match arm accepts either pattern, and `{ .. }` ignores the variant's fields. Three tests cover it with a `MockGrill` that answers "busy" a set number of times: twice before the exit (a confirmed stop, no kill), for ever (unconfirmed within its bounds), and a different inspection failure (an error at once).
 
+The signal itself had the same problem one step earlier ([#1902](https://github.com/reliaburger/reliaburger/issues/1902)). Sending a stop or a kill is also a request to the owner, and the request gives up after 2 s (`OWNER_REQUEST_TIMEOUT`). One fsync stall of 27 s on macOS outlasted it, and the stop failed with "process owner request timed out". We had three choices: a longer timeout, a failure for the caller to retry, or asking again inside the stop. A longer timeout only moves the cliff, and a failed stop leaves the caller to guess what happened. So the process runtime now reports a request that timed out, or found the owner busy, as `GrillError::StopUnanswered`, and the stop asks again every 100 ms:
+
+```rust
+async fn ask_until_answered<F, Fut>(within: Duration, mut send: F) -> Result<bool, BunError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(), BunError>>,
+```
+
+`send` is a closure that builds a fresh request future each time it's called. A Rust future can only be awaited once, so a retry loop takes something that makes futures, not a future. `FnMut` says the closure may be called many times; the `where` clause spells out its return type, which we can't name because every `async` block has its own anonymous type. The graceful signal is asked again within the grace, and if the grace runs out unanswered the stop goes straight to the kill. The kill is asked again within the confirmation bound, and a kill nobody ever answers ends in `StopUnconfirmed`. Sending a signal twice is the price. The owner may have sent the first one before it stalled, and a workload that treats a second `SIGTERM` as "hurry up" will then hurry. A second `SIGKILL` changes nothing. We took that over a stop that fails while the workload is fine. Four `MockGrill` tests leave a stop or a kill unanswered once (asked again, confirmed) or for ever (the kill, or an unconfirmed stop, within the bound).
+
 When it fails, the deploy worker emits an error instead of `Complete`, and both generations stay in ordinary supervision. The same goes for everything after the process exits. Deleting the identity directory and the adoption record returns `Result<(), BunError>` over the command channel. `()` is Rust's unit type (think `void`, but as a real value), so success carries no payload and failure explains which instance still has work outstanding. Only when both deletions succeed do we release the port and forget the instance. Rollback follows the same rule, and history tells the truth about it: `RolledBack` only when every replacement is confirmed gone, `Halted` when some old instances had already retired, `Failed` when cleanup couldn't be confirmed.
 
 Several smaller races had the same flavour:
