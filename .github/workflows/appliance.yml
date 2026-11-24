@@ -52,6 +52,7 @@ on:
       - "src/os/**"
       - "src/appliance/**"
       - "src/relish/netboot/**"
+      - "scripts/demo/netboot.sh"
 
 concurrency:
   group: appliance-${{ github.event.pull_request.number || github.run_id }}
@@ -318,6 +319,16 @@ jobs:
           python3 image/tests/no_ssh_server.py manifest "${lab[@]}" \
             "image/mkosi.output/reliaburger-os_$IMAGE_VERSION.manifest"
 
+      - name: Buildah, and only what it needs
+        # An appliance cluster builds its own images (#2144). The manifest
+        # lists what was really installed: Buildah, its configuration, the
+        # network stack and runtime its RUN steps use, and none of the
+        # recommends the node never uses (GnuPG's agents, fuse-overlayfs,
+        # crun, cpp). The seeded pair below builds the tour's burger on it.
+        run: |
+          python3 image/tests/builder_packages.py manifest \
+            "image/mkosi.output/reliaburger-os_$IMAGE_VERSION.manifest"
+
       - name: Installer drivers
         # mkosi follows hard module dependencies but not soft ones, and the
         # Wyse 3040's installer shipped r8169 without the Realtek PHY driver
@@ -517,8 +528,10 @@ jobs:
         # Two appliances form a cluster from their seeds alone, with the
         # bun and relish of the commit under test (lab builds only). Node 1
         # reads its seed from an RBSEED stick: qemu-img and mtools make it.
+        # Then the pair builds the tour's burger with the image's Buildah,
+        # pulling its base images through the runner's NAT (#2144).
         if: matrix.arch == 'x86_64' && env.BROKEN_BUN != '1' && hashFiles('source-bin/relish-linux-x86_64') != ''
-        timeout-minutes: 25
+        timeout-minutes: 40
         run: |
           set -euo pipefail
           sudo apt-get install -y -qq dnsmasq-base qemu-utils mtools
@@ -536,7 +549,9 @@ jobs:
       - name: Record the netboot demo (x86-64, KVM)
         # The homepage's netboot recording (scripts/demo/netboot.sh): three
         # blank VMs netboot from the commit's relish and are claimed into a
-        # cluster. Only on a pull request labelled record-netboot-demo.
+        # cluster. Only on a pull request labelled record-netboot-demo; the
+        # label must be on it before the push, because this workflow doesn't
+        # run on `labeled`.
         id: netboot_demo
         if: matrix.arch == 'x86_64' && env.BROKEN_BUN != '1' && hashFiles('source-bin/relish-linux-x86_64') != '' && contains(github.event.pull_request.labels.*.name, 'record-netboot-demo')
         timeout-minutes: 30

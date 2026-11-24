@@ -1196,6 +1196,84 @@ mod tests {
         assert_eq!(rules[0].action, FIREWALL_ALLOW);
     }
 
+    /// Rules on the target's own node: `backend/db` runs here with `local`
+    /// as its registered list, and the catalogue says `catalogue` (#2223).
+    fn rules_on_the_targets_node(
+        local: Option<Vec<&str>>,
+        catalogue: Option<Vec<&str>>,
+    ) -> Vec<u64> {
+        let owned = |list: Option<Vec<&str>>| {
+            list.map(|names| names.into_iter().map(String::from).collect::<Vec<_>>())
+        };
+        let id = crate::onion::service_id::ServiceId::new("backend", "db");
+        let mut map = crate::onion::service_map::ServiceMap::new();
+        map.register(&id, 8080, owned(local)).unwrap();
+        let vip = map.resolve(&id).unwrap().vip.0;
+        let mut catalog = catalog_with(
+            "backend",
+            "db",
+            vip,
+            &[("this-node", Ipv4Addr::new(192, 168, 0, 1), 31001)],
+        );
+        for service in catalog.services.values_mut() {
+            service.allow_from = owned(catalogue.clone());
+        }
+        let merged = map.with_cluster_catalog_excluding_node(&catalog, Some("this-node"));
+        let services: Vec<ServiceEntry> = merged.resolve_all().into_iter().cloned().collect();
+        let cgroups: HashMap<(String, String), Vec<u64>> = [
+            cg("frontend", "api", vec![1001]),
+            cg("frontend", "web", vec![1002]),
+        ]
+        .into();
+        let mut sources: Vec<u64> = resolve_firewall_rules(&services, &cgroups)
+            .into_iter()
+            .map(|rule| rule.src_cgroup_id)
+            .collect();
+        sources.sort_unstable();
+        sources
+    }
+
+    /// A caller removed from `allow_from` loses its grant on the target's
+    /// own node as soon as the catalogue says so, not when the rolled-out
+    /// instance registers (#2223).
+    #[test]
+    fn the_targets_own_node_drops_a_caller_the_catalogue_no_longer_lists() {
+        let sources = rules_on_the_targets_node(
+            Some(vec!["frontend/api", "frontend/web"]),
+            Some(vec!["frontend/api"]),
+        );
+        assert_eq!(sources, vec![1001]);
+    }
+
+    /// The catalogue can lag the local spec (a publication held back at
+    /// withdrawal capacity), so a wider catalogue list must not reopen a
+    /// caller the local spec already removed.
+    #[test]
+    fn a_stale_catalogue_cannot_widen_the_targets_own_list() {
+        let sources = rules_on_the_targets_node(
+            Some(vec!["frontend/api"]),
+            Some(vec!["frontend/api", "frontend/web"]),
+        );
+        assert_eq!(sources, vec![1001]);
+    }
+
+    /// Dropping `allow_from` removes its cross-namespace callers, so the
+    /// target's node refuses them as soon as the catalogue says so.
+    #[test]
+    fn dropping_allow_from_refuses_its_callers_on_the_targets_node() {
+        let sources = rules_on_the_targets_node(Some(vec!["frontend/api"]), None);
+        assert_eq!(sources, Vec::<u64>::new());
+    }
+
+    /// An added caller is a widening, which the catalogue alone can't prove
+    /// is newer: the target's node grants it once its own spec agrees, when
+    /// the rolled-out instance registers.
+    #[test]
+    fn a_caller_only_the_catalogue_lists_waits_for_the_targets_rollout() {
+        let sources = rules_on_the_targets_node(None, Some(vec!["frontend/api"]));
+        assert_eq!(sources, Vec::<u64>::new());
+    }
+
     #[test]
     fn cgroup_namespace_entries_resolve_correctly() {
         let cgroups: HashMap<(String, String), Vec<u64>> = [

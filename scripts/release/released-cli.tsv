@@ -1,7 +1,7 @@
-# What relish v0.3.1 accepts, read from its -h pages by
+# What relish v0.3.2 accepts, read from its -h pages by
 # scripts/release/released_cli.py. Regenerate it when docs/website/install.sh's
 # default version changes; tests/suite/website.rs checks the two match.
-version	v0.3.1
+version	v0.3.2
 argument	relish agent explain	[ID]
 argument	relish agent lease release	<KIND>
 argument	relish agent lease release	<NAME>
@@ -130,6 +130,7 @@ argument	relish release	<APP>
 argument	relish resolve	<NAME>
 argument	relish rollback	<APP>
 argument	relish run	[ARGS]...
+argument	relish scale	<APP>
 argument	relish secret encrypt	<VALUE>
 argument	relish secret pubkey	[DIR]
 argument	relish sign	<IMAGE>
@@ -292,6 +293,7 @@ command	relish logs-export
 command	relish logs-search
 command	relish machines
 command	relish machines claim
+command	relish machines logs
 command	relish manual
 command	relish manual examples
 command	relish mcp
@@ -320,6 +322,7 @@ command	relish resolve
 command	relish rollback
 command	relish routes
 command	relish run
+command	relish scale
 command	relish secret
 command	relish secret encrypt
 command	relish secret pubkey
@@ -881,6 +884,8 @@ option	relish machines claim	Print	help
 option	relish machines claim	Public key for root SSH on lab	images	
 option	relish machines claim	The LAN machines added later join from (with	--create)	
 option	relish machines claim	The new cluster's name (with	--create)	
+option	relish machines logs	--dir	<DIR>	
+option	relish machines logs	--interface	<INTERFACE>	
 option	relish manual	--port	<PORT>	
 option	relish manual	--web		
 option	relish manual examples	--dir	<DIR>	
@@ -902,6 +907,7 @@ option	relish netboot	--key	<PEM>
 option	relish netboot	--mac	<MAC>	
 option	relish netboot	--mode-dhcp-proxy		
 option	relish netboot	--reinstall		
+option	relish netboot	--stream-logs		
 option	relish netboot	--wipe	<MAC>	
 option	relish nodes	--unhealthy		
 option	relish os list	--channel	<CHANNEL>	
@@ -943,6 +949,22 @@ option	relish run	--runtime	<RUNTIME>	runc,process,shared-runc
 option	relish run	--schedule	<SCHEDULE>	
 option	relish run	--timeout	<TIMEOUT>	
 option	relish run	-n,--namespace	<NAMESPACE>	
+option	relish scale	--break-lease		
+option	relish scale	--current-replicas	<CURRENT_REPLICAS>	
+option	relish scale	--force		
+option	relish scale	--namespace	<NAMESPACE>	
+option	relish scale	--replicas	<REPLICAS>	
+option	relish scale	-o,--output	<OUTPUT>	
+option	relish scale	API token for authenticating to the agent. Overrides	`RELIABURGER_TOKEN`	
+option	relish scale	Break any agent lease on the app in your way (audited); without it,someone else's lease refuses the change,naming	them	
+option	relish scale	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
+option	relish scale	Namespace the app lives in. Defaults to "default" [default:	default]	
+option	relish scale	Output format: human,json,or yaml. Every command takes json and yaml except the interactive ones,which refuse them [default: human] [possible values: human,json,yaml]		human,json,yaml
+option	relish scale	Path to the cluster CA certificate (PEM). When set,the CLI reaches the agent API over HTTPS. Overrides	`RELIABURGER_CA_CERT`	
+option	relish scale	Print	help	
+option	relish scale	Scale an app GitOps manages. The next sync puts back the repository's	count	
+option	relish scale	Scale only if the app has this many replicas now,so you don't overwrite someone else's	scale	
+option	relish scale	The new count,at least 1 (`relish stop` scales to	zero)	
 option	relish secret encrypt	--pubkey	<PUBKEY>	
 option	relish secret pubkey	--namespace	<NAMESPACE>	
 option	relish secret rotate	--finalize		
