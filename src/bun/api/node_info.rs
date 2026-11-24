@@ -767,9 +767,16 @@ pub(super) async fn app_spec_handler(
     .await
     {
         Ok(LeaderAnswer::Found(view)) => Json(view).into_response(),
-        Ok(LeaderAnswer::Missing(body)) if body.is_empty() => unavailable_response(
-            "the leader doesn't serve app spec reads; it may run an older release".into(),
-        ),
+        // A leader that doesn't know the route at all (an older release
+        // during a rolling upgrade) answers an empty 404. Pass the 404 on,
+        // saying why, rather than claim the app doesn't exist (#2302).
+        Ok(LeaderAnswer::Missing(body)) if body.is_empty() => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "the leader doesn't serve spec reads; it may run an older release"
+            })),
+        )
+            .into_response(),
         Ok(LeaderAnswer::Missing(_)) => not_found(),
         Err(error) => unavailable_response(error),
     }

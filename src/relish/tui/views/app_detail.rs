@@ -422,6 +422,27 @@ mod tests {
     }
 
     #[test]
+    fn a_followers_404_shows_the_reason_its_body_carries() {
+        let mut app = on_config_tab();
+        app.data.app_spec = None;
+        app.update(spec_answer(
+            "web",
+            ProviderError::Api {
+                status: 404,
+                body: r#"{"error":"the leader doesn't serve spec reads; it may run an older release"}"#
+                    .into(),
+            },
+        ));
+        let screen = render_to_string(&app, 120, 40);
+        assert!(
+            screen.contains(
+                "spec unavailable: 404: the leader doesn't serve spec reads; it may run an older release"
+            ),
+            "{screen}"
+        );
+    }
+
+    #[test]
     fn an_empty_404_says_the_node_does_not_serve_spec_reads() {
         let mut app = on_config_tab();
         app.data.app_spec = None;

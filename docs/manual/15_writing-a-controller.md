@@ -127,7 +127,7 @@ expect:
 | 400 | The body didn't parse or validate |
 | 401 | No token, or one the cluster doesn't know |
 | 403 | The token's role, scope or permission doesn't allow it, or it declared an owner it can't speak for |
-| 404 | The app named in the path doesn't exist |
+| 404 | The app named in the path doesn't exist, or (with an empty body, or an `error` saying so) the node or leader runs a release without that call |
 | 409 | Someone else owns the app, or (for a release) nobody does |
 | 422 | A policy denied the apply: `{"error", "policy_denials", "policy_warnings"}` |
 | 503 | No council leader right now; try again |
@@ -252,7 +252,9 @@ that rewrites an app supplies the env values itself, from its own manifest. Memo
 
 A node that isn't the leader asks the leader, which redacts before it
 answers. During a rolling upgrade from 0.3.2 a leader still on 0.3.2 doesn't
-serve this read, and the call answers 503 until it's upgraded. `relish tui`'s
+serve this read, and the call answers 404 with the error "the leader doesn't
+serve spec reads; it may run an older release" until it's upgraded; a 0.3.2
+node asked directly answers 404 with an empty body. `relish tui`'s
 Config tab shows the same answer.
 
 ### Instances
