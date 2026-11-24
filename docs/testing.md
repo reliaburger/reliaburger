@@ -497,6 +497,27 @@ cargo-llvm-cov keeps `--no-run` for itself (a deprecated alias for its report),
 hence `--list`. The first CI runs measure it: watch the resource log for
 `mem_floor:` and memory-stall stops, and the report step for kernel OOM lines.
 
+The instrumented run takes eight test threads, `--test-threads=8` in the
+recipe, where nextest's default is one per CPU, four on a hosted runner
+(#1723). Most of the suite waits on timers, sockets and child processes, not
+the CPU: at four threads the runner's load stayed at 2 to 5. It's a contract
+setting, not an override: `coverage_owner.py` pins the recipe and the exact
+nextest command line cargo-llvm-cov generates, so a run at any other count is
+refused, and the evidence owners still strip every `NEXTEST_*` variable.
+Heavy tests keep their nextest test groups, which cap them inside the eight.
+Other jobs, and `make test` on a laptop, keep nextest's default. It was
+measured in a 4-vCPU, 16 GB Lima VM on the Mac Studio, with CI's toolchain,
+flags and coverage, ten full runs at each count, alternating: the suite took
+a median of 469 s at four threads and 294 s at eight, with the host still
+44 to 58% idle at eight. Two runs failed at four threads and four at eight,
+seven failures from four tests in all; each was a test
+reading state once that the product publishes a moment later, or a timing
+bound tighter than what it proves, and each is fixed and in the [flakes
+register](flakes.md). After the fixes, ten more runs at eight threads all
+passed, at a median of 238 s on a quieter host. Two runs at twelve took 191
+and 212 s; twelve needs its own ten runs before anyone pins it. Portable
+macOS keeps the default: its tests take under two minutes on a 3-core runner.
+
 The light set exists because macOS was the critical path of almost every run:
 twelve runs before the change took 45–55 minutes of wall time, of which
 runner queueing was mostly under ten, portable macOS 35–49 and acceptance

@@ -372,7 +372,10 @@ jobs:
         # (docs/flakes.md). The coverage recipe builds the lib tests alone
         # first, then the rest, so each phase runs at full parallelism and
         # the peak stays one 12 GB rustc (#1723). No cap on build jobs:
-        # one job would also hold each rustc's codegen to one thread.
+        # one job would also hold each rustc's codegen to one thread. The
+        # run takes eight test threads on the runner's four vCPUs, set in
+        # the recipe the owner pins, not here: the owner strips NEXTEST_*
+        # (#1723, docs/testing.md).
         run: |
           choom -n 0 -- python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate portable-linux --host linux --directory target/contracts/linux/portable-linux --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
       - name: Report the coverage run's headroom

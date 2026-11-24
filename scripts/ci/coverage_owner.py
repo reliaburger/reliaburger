@@ -33,13 +33,20 @@ coverage: ## Run the portable suite once under line coverage, write the lcov rep
 	$(CARGO) llvm-cov clean --workspace
 	$(CARGO) llvm-cov --no-report test --lib -- --list
 	$(CARGO) llvm-cov clean --profraw-only
-	$(CARGO) llvm-cov --no-report nextest --profile $(NEXTEST_PROFILE) --no-tests=fail
+	$(CARGO) llvm-cov --no-report nextest --profile $(NEXTEST_PROFILE) --no-tests=fail --test-threads=8
 	mkdir -p target/coverage
 	$(COVERAGE_REPORT) --lcov --output-path target/coverage/lcov.info --fail-under-lines $(COVERAGE_MIN_LINES)
 """
 
 # The stage whose cargo-nextest child is the one instrumented run.
 RUN_STAGE = 3
+
+# The instrumented run's nextest threads, twice a hosted runner's four
+# vCPUs. Most of the suite waits on timers, sockets and child processes,
+# not the CPU: at four threads the runner's load stayed at 2 to 5 (#1723).
+# Heavy tests keep their own nextest test groups. A deliberate setting, so a
+# change here and in the Makefile goes through review with flake runs.
+TEST_THREADS = '8'
 
 def recipe_stages(profile, floor):
     """Return the five Makefile coverage operations in their original order.
@@ -55,7 +62,7 @@ def recipe_stages(profile, floor):
         ['clean', '--workspace'],
         ['--no-report', 'test', '--lib', '--', '--list'],
         ['clean', '--profraw-only'],
-        ['--no-report', 'nextest', '--profile', profile, '--no-tests=fail'],
+        ['--no-report', 'nextest', '--profile', profile, '--no-tests=fail', '--test-threads=' + TEST_THREADS],
         ['report', '--failure-mode', 'all', '--lcov', '--output-path', 'target/coverage/lcov.info',
          '--fail-under-lines', floor],
     ]
@@ -394,6 +401,7 @@ def execute(root, directory, context, source_files, run=subprocess.run, commands
         '--target-dir',
         target,
         '--no-tests=fail',
+        '--test-threads=' + TEST_THREADS,
         '--profile',
         profile,
     ]

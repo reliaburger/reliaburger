@@ -1447,6 +1447,76 @@ runner. The lib still compiles alone, since everything after it links it, so any
 would mean the targets built after it, four at a time with the suite among them, hold more
 than we think.
 
+#### Eight threads on four cores
+
+Once the build was quick, the suite was the biggest piece of portable Linux left: about 8.5
+of its 24 minutes. nextest runs one test per CPU by default, four on a hosted runner, and
+keeps all four slots busy. Yet the runner's load sat between 2 and 5. Why would a full
+queue leave cores idle? Because a lot of the suite isn't computing. It's a test waiting out a
+stop grace, a health check's interval or a proxy's 30-second timeout, holding a slot while
+the CPU does nothing. More slots than cores fills those gaps.
+
+The risk is the other way round. Every test that does burn CPU now shares a core with more
+neighbours, and a suite this full of deadlines is exactly where a busier host turns into
+flakes. So the number had to be measured, not guessed. We ran the whole portable suite under
+coverage, with CI's toolchain and flags, in a Lima VM cut to a runner's size: 4 vCPUs and
+16 GB, with swap. Ten full runs at four threads and ten at eight, alternating, so that
+whatever else the Mac Studio was doing landed on both. Every failure counted, and nothing
+was re-run.
+
+Eight threads took the suite from a median of 469 seconds to 294, 37% less, and even then
+the VM's CPUs were idle 44 to 58% of the time. Two of the ten runs at four threads failed
+one test each; four of the ten at eight failed, five failures in all. Four distinct tests,
+and none was a bug in Reliaburger. Every one was a test that asked too early or measured too
+tightly:
+
+- A rollout reports complete once its replacements run, but an old instance whose cleanup
+  outlasts the agent loop's turn stays listed, stopped, until a later turn retires it. The
+  test read the list once.
+- A test left a record write in flight with a 1.5-second stall, slept 1.8 seconds and
+  expected it to have landed. On a busy host the write's blocking task starts late.
+- Status answers from a snapshot the loop publishes at the end of each turn, so right after
+  a failed apply it can still say `preparing`.
+- Two stubborn stops that overlap should cost one 2-second grace, not two. The test allowed
+  1.8 graces and saw 3.65 and 3.86 seconds. But serial stops can't take less than two graces,
+  since each waits out its whole grace before the kill, so two graces is the bound that
+  proves the overlap, and it leaves the slack a loaded host needs.
+
+The first three now wait for the state they check, with a deadline, instead of reading it
+once or sleeping a fixed time. The fourth asserts what it means. The second reproduced on
+the Mac Studio too, 3 failures in 120 runs at a load of 22, and passed 240 of 240 after.
+With all four fixed, ten more runs at eight threads passed, every one, at a median of 238
+seconds; the host was quieter by then, so that number flatters eight a little. Two runs at
+twelve took 191 and 212 seconds. That's tempting, but two runs prove nothing about flakes,
+so twelve waits for its own ten.
+
+What does that buy on a runner? At four threads the suite was about 8.5 of portable Linux's
+24 minutes. If CI scales the way the VM did, eight threads make that about 5.4, and the job
+about 20.5 minutes. Closer to the 19, still not there; the pull request's own runs are the
+real measurement.
+
+Where does the number live? Not in the environment. The evidence owners strip every
+`NEXTEST_*` variable before they run anything, deliberately, so that nobody can change what a
+gate ran by setting one. A `NEXTEST_TEST_THREADS` in the workflow would be thrown away, and
+it should be. The setting goes in the recipe the owner already pins:
+
+```make
+	$(CARGO) llvm-cov --no-report nextest --profile $(NEXTEST_PROFILE) --no-tests=fail --test-threads=8
+```
+
+`coverage_owner.py` holds that line, the stage list and the exact command line
+cargo-llvm-cov generates for nextest, which puts `--test-threads=8` straight after
+`--no-tests=fail`. The adapter compares the child's arguments with that list before it lets
+the run start, so a run at sixteen threads, or at the default, is refused as a different
+selection. Changing the number is a reviewed change to the recipe and the owner together,
+and it should come with flake runs like these.
+
+Why only here? The thread count is a property of this job's runner and this suite. The
+`ci` profile in `.config/nextest.toml` is shared by the privileged Linux and cluster jobs,
+whose tests start real clusters, and they keep the default. So does portable macOS, whose
+tests take under two minutes on three cores. The heavy groups (`process-heavy`,
+`cluster-heavy` and the rest) still cap their members inside the eight.
+
 ### A release gate that fits in a week
 
 Pull requests were quick by 0.2.3. The release wasn't. From code freeze to ready-to-tag took

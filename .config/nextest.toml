@@ -13,6 +13,9 @@ status-level = "leak"
 final-status-level = "slow"
 slow-timeout = { period = "30s", terminate-after = 2 }
 
+# Portable Linux's coverage run passes --test-threads=8 on the command line
+# (the Makefile's coverage recipe, pinned by scripts/ci/coverage_owner.py);
+# every other job using this profile keeps one thread per CPU (#1723).
 [profile.ci]
 retries = 0
 leak-timeout = { period = "100ms", result = "fail" }

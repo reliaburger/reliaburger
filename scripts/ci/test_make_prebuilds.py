@@ -219,7 +219,7 @@ class MakefilePrebuilds(unittest.TestCase):
             "$(CARGO) llvm-cov clean --workspace",
             "$(CARGO) llvm-cov --no-report test --lib -- --list",
             "$(CARGO) llvm-cov clean --profraw-only",
-            "$(CARGO) llvm-cov --no-report nextest --profile $(NEXTEST_PROFILE) --no-tests=fail",
+            "$(CARGO) llvm-cov --no-report nextest --profile $(NEXTEST_PROFILE) --no-tests=fail --test-threads=8",
         ])
 
     def test_test_linux_names_bun_in_cargos_target_directory(self):
