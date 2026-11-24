@@ -13,10 +13,11 @@
 //! permissions, policies and builds are done once the apply returns, so
 //! there's nothing to wait for; a job's runs are followed with `relish jobs`.
 //!
-//! Everything it reads is what `relish apps` reads: the council's desired
-//! apps (`GET /v1/diagnostics/apps`) and every node's instances. The one
-//! thing it adds is the council's `rolled_out`, which the leader works out
-//! from the rollout it already records.
+//! Everything it reads is what `relish apps` reads, the council's desired
+//! apps (`GET /v1/diagnostics/apps`) and every node's instances, plus one
+//! leader read, `GET /v1/diagnostics/rollouts`, which says whether each
+//! app's current spec has rolled out. A node that predates that read
+//! answers 404, and the wait then goes by the instance count alone.
 //!
 //! [`assess`] is pure, and [`wait_until_ready`] takes its observations from a
 //! closure, so the unit tests drive both without a cluster.
@@ -34,7 +35,7 @@ use super::apps_cmd::{self, Instances};
 use super::client::BunClient;
 use super::{CommandOutcome, OutputFormat, RelishError};
 use crate::bun::agent::ClusterInstanceStatus;
-use crate::bun::diagnostics::DesiredAppEvidence;
+use crate::bun::diagnostics::{DesiredAppEvidence, RolloutEvidence};
 use crate::config::Config;
 
 /// How long `relish apply --wait` waits when `--timeout` isn't given. A
@@ -64,6 +65,23 @@ pub struct WaitTarget {
     pub app: String,
     /// The image it runs, if it runs one, to say what a node is pulling.
     pub image: Option<String>,
+    /// Where its replica count comes from.
+    pub count: Count,
+}
+
+/// Where an app's replica count comes from, which decides what "all its
+/// replicas" means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Count {
+    /// The file's `replicas`.
+    Fixed,
+    /// `replicas = "*"`: one per node that can run it. The council's count
+    /// is every live node, including ones its `placement` rules out, so the
+    /// placements say how many there are.
+    PerNode,
+    /// An `[autoscale]` block: the autoscaler moves the count between `min`
+    /// and `max`, so the placements say how many it wants now.
+    Autoscaled,
 }
 
 /// The apps `config` declares, in namespace and name order.
@@ -75,6 +93,13 @@ pub fn targets(config: &Config) -> Vec<WaitTarget> {
             namespace: app.namespace.clone().unwrap_or_else(default_namespace),
             app: name.clone(),
             image: app.image.clone(),
+            count: if app.replicas == crate::config::Replicas::DaemonSet {
+                Count::PerNode
+            } else if app.autoscale.is_some() {
+                Count::Autoscaled
+            } else {
+                Count::Fixed
+            },
         })
         .collect();
     targets.sort_by(|a, b| (&a.namespace, &a.app).cmp(&(&b.namespace, &b.app)));
@@ -95,7 +120,8 @@ pub struct AppReadiness {
     /// `true` when its replicas run, pass their health checks and run the
     /// spec just applied.
     pub ready: bool,
-    /// Replicas it wants.
+    /// Replicas it wants: the file's count, or for a daemon set or an
+    /// autoscaled app, how many the scheduler placed.
     pub desired: u32,
     /// Replicas running and passing their health checks.
     pub running: u32,
@@ -137,19 +163,24 @@ fn label(namespace: &str, app: &str) -> String {
 
 /// How every target is doing, given what the council wants and what the
 /// nodes run.
-pub fn assess(
-    targets: &[WaitTarget],
-    desired: &[DesiredAppEvidence],
-    instances: &Instances,
-) -> Vec<AppReadiness> {
+pub fn assess(targets: &[WaitTarget], observation: &Observation) -> Vec<AppReadiness> {
     targets
         .iter()
         .map(|target| {
-            let evidence = desired
+            let evidence = observation
+                .desired
                 .iter()
                 .find(|app| app.app == target.app && app.namespace == target.namespace);
+            // An app the leader didn't list, or no answer at all from a
+            // node that predates the read, is unknown, not "rolling out".
+            let rolled_out = observation.rollouts.as_ref().and_then(|rollouts| {
+                rollouts
+                    .iter()
+                    .find(|app| app.app == target.app && app.namespace == target.namespace)
+                    .map(|app| app.rolled_out)
+            });
             match evidence {
-                Some(evidence) => assess_app(target, evidence, instances),
+                Some(evidence) => assess_app(target, evidence, rolled_out, &observation.instances),
                 None => AppReadiness {
                     namespace: target.namespace.clone(),
                     app: target.app.clone(),
@@ -169,6 +200,7 @@ pub fn assess(
 fn assess_app(
     target: &WaitTarget,
     evidence: &DesiredAppEvidence,
+    rolled_out: Option<bool>,
     instances: &Instances,
 ) -> AppReadiness {
     let own: Vec<&ClusterInstanceStatus> = instances
@@ -183,27 +215,42 @@ fn assess_app(
         .filter(|row| row.instance.state == "running")
         .count();
     let running = u32::try_from(running_count).unwrap_or(u32::MAX);
-    let desired = evidence.desired_replicas;
-    let rolled_out = evidence.rolled_out;
+    let wanted = wanted(target.count, evidence);
     // An app that wants no replicas never rolls out anywhere, so there's
     // nothing to wait for.
-    let ready = desired == 0
-        || (running >= desired && rolled_out != Some(false) && evidence.rollout_failed.is_none());
+    let ready = evidence.desired_replicas == 0
+        || (running >= wanted && rolled_out != Some(false) && evidence.rollout_failed.is_none());
     let nodes: BTreeSet<&str> = own.iter().map(|row| row.node.as_str()).collect();
     AppReadiness {
         namespace: target.namespace.clone(),
         app: target.app.clone(),
         ready,
-        desired,
+        desired: wanted,
         running,
         nodes: nodes.into_iter().map(str::to_string).collect(),
         rolled_out,
-        phase: phase(target, evidence, &own, running, ready, instances),
+        phase: phase(
+            target, evidence, rolled_out, wanted, &own, running, ready, instances,
+        ),
         reason: if ready {
             None
         } else {
             apps_cmd::reason(evidence, &own)
         },
+    }
+}
+
+/// How many running replicas make the app whole. A daemon set or an
+/// autoscaled app wants what the scheduler placed, once it placed every
+/// replica it could; until then, and for a fixed count, the council's count.
+fn wanted(count: Count, evidence: &DesiredAppEvidence) -> u32 {
+    match count {
+        Count::PerNode | Count::Autoscaled
+            if evidence.scheduled_replicas > 0 && evidence.unschedulable.is_none() =>
+        {
+            evidence.scheduled_replicas
+        }
+        _ => evidence.desired_replicas,
     }
 }
 
@@ -220,16 +267,18 @@ const ON_THE_WAY: &[(&str, &str)] = &[
     ("failed", "failed"),
 ];
 
+#[allow(clippy::too_many_arguments)]
 fn phase(
     target: &WaitTarget,
     evidence: &DesiredAppEvidence,
+    rolled_out: Option<bool>,
+    desired: u32,
     own: &[&ClusterInstanceStatus],
     running: u32,
     ready: bool,
     instances: &Instances,
 ) -> String {
-    let desired = evidence.desired_replicas;
-    if desired == 0 {
+    if evidence.desired_replicas == 0 {
         return "wants no replicas".to_string();
     }
     let mut nodes: Vec<&str> = own
@@ -280,7 +329,7 @@ fn phase(
             format!("placed on {}", on.join(", "))
         });
     }
-    if running >= desired && evidence.rolled_out == Some(false) {
+    if running >= desired && rolled_out == Some(false) {
         parts.push("finishing the rollout".to_string());
     }
     if running < desired && !instances.unanswered.is_empty() {
@@ -301,15 +350,28 @@ pub struct Observation {
     pub desired: Vec<DesiredAppEvidence>,
     /// Every node's instances.
     pub instances: Instances,
+    /// Whether each app's current spec rolled out, from the leader; `None`
+    /// from a node that predates `GET /v1/diagnostics/rollouts`.
+    pub rollouts: Option<Vec<RolloutEvidence>>,
 }
 
 /// Look at the cluster once, the way `relish apps` does.
 pub async fn observe(client: &BunClient) -> Result<Observation, RelishError> {
-    let (desired, instances) =
-        tokio::join!(client.desired_apps(), apps_cmd::collect_instances(client));
+    let (desired, instances, rollouts) = tokio::join!(
+        client.desired_apps(),
+        apps_cmd::collect_instances(client),
+        client.rollouts()
+    );
+    let rollouts = match rollouts {
+        Ok(rollouts) => Some(rollouts),
+        // A node from before the read: go by the instance count.
+        Err(RelishError::ApiError { status: 404, .. }) => None,
+        Err(error) => return Err(error),
+    };
     Ok(Observation {
         desired: desired?,
         instances: instances?,
+        rollouts,
     })
 }
 
@@ -373,7 +435,7 @@ where
         match tokio::time::timeout(budget, observe()).await {
             Ok(Ok(observation)) => {
                 last_error = None;
-                apps = assess(targets, &observation.desired, &observation.instances);
+                apps = assess(targets, &observation);
                 let elapsed = started.elapsed();
                 for app in &apps {
                     let key = (app.namespace.clone(), app.app.clone());
@@ -723,11 +785,20 @@ mod tests {
             namespace: "default".to_string(),
             app: app.to_string(),
             image: Some("nginx:1.27".to_string()),
+            count: Count::Fixed,
         }
     }
 
-    fn evidence(app: &str, replicas: u32, rolled_out: Option<bool>) -> DesiredAppEvidence {
-        DesiredAppEvidence {
+    /// What the council says about one app, and whether the leader says it
+    /// rolled out (`None`: the leader didn't say).
+    #[derive(Clone)]
+    struct Evidence {
+        desired: DesiredAppEvidence,
+        rolled_out: Option<bool>,
+    }
+
+    fn evidence(app: &str, replicas: u32, rolled_out: Option<bool>) -> Evidence {
+        let desired = DesiredAppEvidence {
             app: app.to_string(),
             namespace: "default".to_string(),
             desired_replicas: replicas,
@@ -740,8 +811,41 @@ mod tests {
             volume_homes: Vec::new(),
             rollout_failed: None,
             owner: None,
+        };
+        Evidence {
+            desired,
             rolled_out,
         }
+    }
+
+    /// One look at the cluster. With no app's rollout known, the answer is
+    /// an old node's: no rollouts at all.
+    fn look(apps: Vec<Evidence>, rows: Vec<ClusterInstanceStatus>) -> Observation {
+        let rollouts = apps.iter().any(|app| app.rolled_out.is_some()).then(|| {
+            apps.iter()
+                .filter_map(|app| {
+                    app.rolled_out.map(|rolled_out| RolloutEvidence {
+                        app: app.desired.app.clone(),
+                        namespace: app.desired.namespace.clone(),
+                        fingerprint: "f".to_string(),
+                        rolled_out,
+                    })
+                })
+                .collect()
+        });
+        Observation {
+            desired: apps.into_iter().map(|app| app.desired).collect(),
+            instances: instances(rows),
+            rollouts,
+        }
+    }
+
+    fn assessed(
+        targets: &[WaitTarget],
+        apps: &[Evidence],
+        instances: &Instances,
+    ) -> Vec<AppReadiness> {
+        assess(targets, &look(apps.to_vec(), instances.rows.clone()))
     }
 
     fn instance(node: &str, app: &str, id: &str, state: &str) -> ClusterInstanceStatus {
@@ -775,7 +879,7 @@ mod tests {
 
     #[test]
     fn an_app_is_ready_when_every_replica_runs_its_rolled_out_spec() {
-        let seen = assess(
+        let seen = assessed(
             &[target("web")],
             &[evidence("web", 2, Some(true))],
             &instances(vec![
@@ -791,7 +895,7 @@ mod tests {
 
     #[test]
     fn an_app_short_of_replicas_says_what_the_rest_are_doing() {
-        let seen = assess(
+        let seen = assessed(
             &[target("web")],
             &[evidence("web", 3, Some(false))],
             &instances(vec![
@@ -812,7 +916,7 @@ mod tests {
     fn an_update_is_not_ready_while_the_old_version_still_serves() {
         // The old instances run every replica, but the new spec hasn't
         // rolled out yet.
-        let seen = assess(
+        let seen = assessed(
             &[target("web")],
             &[evidence("web", 1, Some(false))],
             &instances(vec![instance("node-1", "web", "web-0", "running")]),
@@ -823,7 +927,7 @@ mod tests {
 
     #[test]
     fn a_standalone_node_is_ready_on_its_instance_count_alone() {
-        let seen = assess(
+        let seen = assessed(
             &[target("web")],
             &[evidence("web", 1, None)],
             &instances(vec![instance("local", "web", "web-0", "running")]),
@@ -834,13 +938,13 @@ mod tests {
     #[test]
     fn an_unplaced_app_names_the_schedulers_reason() {
         let mut short = evidence("web", 2, Some(false));
-        short.scheduled_replicas = 0;
-        short.unschedulable = Some(crate::meat::types::Unschedulable {
+        short.desired.scheduled_replicas = 0;
+        short.desired.unschedulable = Some(crate::meat::types::Unschedulable {
             placed: 0,
             wanted: 2,
             reason: crate::meat::types::UnplacedReason::NoLabelMatch,
         });
-        let seen = assess(&[target("web")], &[short], &instances(Vec::new()));
+        let seen = assessed(&[target("web")], &[short], &instances(Vec::new()));
         assert!(!seen[0].ready);
         assert_eq!(seen[0].phase, "0/2 running; not placed yet");
         let reason = seen[0].reason.as_deref().unwrap();
@@ -852,7 +956,7 @@ mod tests {
         let mut crashing = instance("node-1", "web", "web-0", "starting");
         crashing.instance.restart_count = 4;
         crashing.instance.reason = Some("exited with status 1".to_string());
-        let seen = assess(
+        let seen = assessed(
             &[target("web")],
             &[evidence("web", 1, Some(false))],
             &instances(vec![crashing]),
@@ -867,16 +971,87 @@ mod tests {
         );
     }
 
+    /// Review of #2253: the council counts every live node for a daemon
+    /// set, but a node its `placement` rules out never gets a replica.
+    #[test]
+    fn a_daemon_set_is_ready_on_every_node_it_was_placed_on() {
+        let mut daemon = target("agent");
+        daemon.count = Count::PerNode;
+        let mut placed = evidence("agent", 3, Some(true));
+        placed.desired.scheduled_replicas = 2;
+        let rows = instances(vec![
+            instance("node-1", "agent", "agent-0", "running"),
+            instance("node-2", "agent", "agent-1", "running"),
+        ]);
+        let seen = assessed(&[daemon], &[placed.clone()], &rows);
+        assert!(seen[0].ready, "{seen:?}");
+        assert_eq!(seen[0].desired, 2);
+        assert_eq!(seen[0].phase, "ready, 2/2 running on node-1, node-2");
+        // A fixed count still wants every replica the council asks for.
+        let seen = assessed(&[target("agent")], &[placed], &rows);
+        assert!(!seen[0].ready, "{seen:?}");
+    }
+
+    #[test]
+    fn an_autoscaled_app_is_ready_at_the_count_the_autoscaler_holds() {
+        let mut scaled = target("api");
+        scaled.count = Count::Autoscaled;
+        let mut held = evidence("api", 4, Some(true));
+        held.desired.scheduled_replicas = 2;
+        let rows = instances(vec![
+            instance("node-1", "api", "api-0", "running"),
+            instance("node-2", "api", "api-1", "running"),
+        ]);
+        assert!(assessed(&[scaled.clone()], &[held.clone()], &rows)[0].ready);
+        // Not while some of its replicas found no node.
+        held.desired.unschedulable = Some(crate::meat::types::Unschedulable {
+            placed: 2,
+            wanted: 4,
+            reason: crate::meat::types::UnplacedReason::NoRoom,
+        });
+        assert!(!assessed(&[scaled], &[held], &rows)[0].ready);
+    }
+
+    #[test]
+    fn targets_know_where_their_count_comes_from() {
+        let config = Config::parse(
+            r#"
+            [app.agent]
+            image = "agent:1"
+            replicas = "*"
+            [app.api]
+            image = "api:1"
+            [app.api.autoscale]
+            metric = "cpu"
+            target = "70%"
+            min = 2
+            max = 10
+        "#,
+        )
+        .unwrap();
+        let counts: Vec<(String, Count)> = targets(&config)
+            .into_iter()
+            .map(|target| (target.app, target.count))
+            .collect();
+        assert_eq!(
+            counts,
+            [
+                ("agent".to_string(), Count::PerNode),
+                ("api".to_string(), Count::Autoscaled),
+            ]
+        );
+    }
+
     #[test]
     fn an_app_the_council_doesnt_list_yet_isnt_ready() {
-        let seen = assess(&[target("web")], &[], &instances(Vec::new()));
+        let seen = assessed(&[target("web")], &[], &instances(Vec::new()));
         assert!(!seen[0].ready);
         assert_eq!(seen[0].phase, "the council doesn't list it yet");
     }
 
     #[test]
     fn an_app_that_wants_no_replicas_is_ready_at_once() {
-        let seen = assess(
+        let seen = assessed(
             &[target("web")],
             &[evidence("web", 0, Some(false))],
             &instances(Vec::new()),
@@ -905,11 +1080,13 @@ mod tests {
                     namespace: "default".into(),
                     app: "web".into(),
                     image: Some("nginx:1.27".into()),
+                    count: Count::Fixed,
                 },
                 WaitTarget {
                     namespace: "shop".into(),
                     app: "api".into(),
                     image: None,
+                    count: Count::Fixed,
                 },
             ]
         );
@@ -930,13 +1107,6 @@ mod tests {
                 }
             };
             std::future::ready(look)
-        }
-    }
-
-    fn look(desired: Vec<DesiredAppEvidence>, rows: Vec<ClusterInstanceStatus>) -> Observation {
-        Observation {
-            desired,
-            instances: instances(rows),
         }
     }
 
@@ -1021,7 +1191,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_failed_rollout_ends_the_wait_at_once() {
         let mut failed = evidence("web", 1, Some(false));
-        failed.rollout_failed = Some(crate::meat::deploy_types::RolloutFailure {
+        failed.desired.rollout_failed = Some(crate::meat::deploy_types::RolloutFailure {
             fingerprint: "f".into(),
             node: "node-2".into(),
             reason: "web-g2-0 failed its health check".into(),

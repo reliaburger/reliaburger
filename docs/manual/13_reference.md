@@ -54,6 +54,7 @@ Changing it:
 | `stop`, `delete`, `release` | `action` (`stop_requested`, `delete_requested`, `released`), `app`, `namespace`, `forced` |
 | `rollback` | the `app`, its `namespace`, and whether it was `forced` |
 | `apply`, `apply --rerun-jobs`, `batch`, `run` | the node's answer: `created` and `instances`, or `batch_id` and its counts; `apply --dry-run` prints the plan |
+| `apply --wait` | the `relish.agent/v1` envelope with `command: "apply"`: `data.ready`, each app's counts, phase and `reason` under `data.apps`, and `next`; exit 1 when an app wasn't ready in time |
 | `batch replay`, `batch cancel` | `run` and the `change` (`replay_acknowledged`, `cancelled`) |
 | `fault <type>` | the fault, with any it created on other nodes under `routed` |
 | `fault list`, `fault clear` | `faults` and `warnings`; the node's `message` |

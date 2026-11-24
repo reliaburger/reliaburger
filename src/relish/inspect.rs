@@ -415,7 +415,6 @@ mod tests {
     fn desired(replicas: u32, placements: &[(&str, u32)]) -> DesiredAppEvidence {
         DesiredAppEvidence {
             owner: None,
-            rolled_out: None,
             app: "hello".to_string(),
             namespace: "default".to_string(),
             desired_replicas: replicas,

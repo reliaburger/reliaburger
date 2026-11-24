@@ -4797,6 +4797,39 @@ fn manifest(
     (file, source)
 }
 
+/// `relish apply --wait` through `client`, asked again while the node
+/// answers 503 because it doesn't know the leader yet: a follower learns
+/// the leader's API through gossip a moment after the election. An apply
+/// is idempotent, so asking again changes nothing.
+async fn apply_and_wait_once_routed(
+    source: &reliaburger::relish::manifest::ManifestSource,
+    timeout: Duration,
+    poll: Duration,
+    client: &BunClient,
+) -> reliaburger::relish::apply_wait::ApplyWaitData {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match reliaburger::relish::apply_wait::apply_and_wait(
+            source,
+            reliaburger::relish::OutputFormat::Json,
+            timeout,
+            poll,
+            client,
+        )
+        .await
+        {
+            Ok(data) => return data,
+            Err(reliaburger::relish::RelishError::ApiError { status: 503, body })
+                if tokio::time::Instant::now() < deadline =>
+            {
+                eprintln!("apply answered 503 ({body}); asking again");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(error) => panic!("apply --wait failed: {error}"),
+        }
+    }
+}
+
 /// #2240: `relish apply --wait` returns only once every app in the file
 /// runs all its replicas; an update only once the new spec replaced the old
 /// one's instances; and a file with an app no node can take times out,
@@ -4804,7 +4837,6 @@ fn manifest(
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn apply_wait_returns_once_the_apps_run_and_names_what_never_does() {
-    use reliaburger::relish::OutputFormat;
     use reliaburger::relish::apply_wait;
 
     let shutdown = CancellationToken::new();
@@ -4822,10 +4854,12 @@ async fn apply_wait_returns_once_the_apps_run_and_names_what_never_does() {
         "no leader elected"
     );
     tokio::time::sleep(Duration::from_secs(3)).await; // let reports land
-    let leader = nodes
+    // Through a follower, so the apply and both leader reads (desired
+    // apps and rollouts) are forwarded.
+    let follower = nodes
         .iter()
-        .find(|n| *n.thinks_leader.borrow())
-        .expect("a leader");
+        .find(|n| !*n.thinks_leader.borrow())
+        .expect("a follower");
     let poll = Duration::from_millis(250);
 
     // Two apps in one file: the wait covers both.
@@ -4840,15 +4874,8 @@ async fn apply_wait_returns_once_the_apps_run_and_names_what_never_does() {
         replicas = 1
     "#,
     );
-    let data = apply_wait::apply_and_wait(
-        &source,
-        OutputFormat::Json,
-        Duration::from_secs(90),
-        poll,
-        &leader.client,
-    )
-    .await
-    .unwrap();
+    let data =
+        apply_and_wait_once_routed(&source, Duration::from_secs(90), poll, &follower.client).await;
     assert!(data.ready, "{data:#?}");
     assert_eq!(apply_wait::exit_code(&data), 0);
     // Ready means running, there and then.
@@ -4874,15 +4901,8 @@ async fn apply_wait_returns_once_the_apps_run_and_names_what_never_does() {
         replicas = 1
     "#,
     );
-    let data = apply_wait::apply_and_wait(
-        &source,
-        OutputFormat::Json,
-        Duration::from_secs(120),
-        poll,
-        &leader.client,
-    )
-    .await
-    .unwrap();
+    let data =
+        apply_and_wait_once_routed(&source, Duration::from_secs(120), poll, &follower.client).await;
     assert!(data.ready, "{data:#?}");
     let web_v2 = running_instances(&nodes, "web").await;
     assert_eq!(web_v2.len(), 3, "{web_v2:?}");
@@ -4909,15 +4929,8 @@ async fn apply_wait_returns_once_the_apps_run_and_names_what_never_does() {
     "#,
     );
     let started = tokio::time::Instant::now();
-    let data = apply_wait::apply_and_wait(
-        &source,
-        OutputFormat::Json,
-        Duration::from_secs(8),
-        poll,
-        &leader.client,
-    )
-    .await
-    .unwrap();
+    let data =
+        apply_and_wait_once_routed(&source, Duration::from_secs(8), poll, &follower.client).await;
     assert!(
         started.elapsed() < Duration::from_secs(30),
         "the wait outlived its timeout"

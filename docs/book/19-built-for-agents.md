@@ -1741,20 +1741,47 @@ reference misses an env change, and "created after the apply" misses a
 scale change, which keeps its instances. The leader already knows the
 answer, though. Rollouts go node by node (Chapter 7), and when the current
 spec runs healthy on every node it's placed on, the leader commits a
-`RolloutReleased` with it. So the desired-app evidence grew one field:
+`RolloutReleased` with it. So the leader answers one more read,
+`GET /v1/diagnostics/rollouts`: for each app, the fingerprint of its
+current spec and whether that's its newest released one.
+
+The first version added a `rolled_out` field to the desired-app evidence
+instead. That looked smaller, but the struct refuses unknown fields
+(`#[serde(deny_unknown_fields)]`) and a non-leader forwards the leader's
+answer, so a 0.3.2 node would have failed to read a 0.3.3 leader's. One
+field would have moved the wire protocol and made every 0.3.2 cluster start
+afresh, just as outside testers were upgrading. A new route breaks no
+decoder: an old node answers it 404, and `relish` reads that as "this
+cluster can't say", going by the instance count alone, as it does on a
+standalone node, whose answer is an empty list. The forwarding code that
+`/v1/diagnostics/apps` had became `read_from_leader`, generic over what it
+decodes:
 
 ```rust
-#[serde(default, skip_serializing_if = "Option::is_none")]
-pub rolled_out: Option<bool>,
+async fn read_from_leader<T: serde::de::DeserializeOwned>(
+    state: &ApiState,
+    council: &crate::council::CouncilNode,
+    directory: Option<&LeaderDirectory>,
+    path: &str,
+    names: LeaderRead,
+) -> Result<T, String> {
 ```
 
-`Some(true)` when the app's current spec is its newest released one,
-`Some(false)` while a change rolls out, and `None` from a standalone node,
-which has no council and no rollouts; there the instance count alone
-decides. `None` also covers a node that predates the field, but that's a
-side effect rather than a promise. The struct refuses unknown fields, and a
-non-leader forwards this answer from the leader, so the field moved the
-protocol from 61 to 62.
+`DeserializeOwned` is serde's bound for "a type that can be built from
+JSON without borrowing from the input", which is what you need when the
+bytes go away once the response is read. The caller picks `T` with the
+type it expects back, a list of desired apps or a list of rollouts, and the
+compiler writes a decoder for each.
+
+Counting the replicas had two traps of its own, which the review found.
+The council counts a daemon set (`replicas = "*"`) as one per live node,
+but a node its `placement` rules out never gets one, so `running >=
+desired` never held. An autoscaled app has the same shape from the other
+side: the autoscaler can hold it below the file's `replicas`. Both now go by
+what the scheduler placed, once it placed everything it could. The
+manifest says which kind each app is, so the wait keeps that beside the
+app's name as a small enum, `Count::Fixed`, `Count::PerNode` or
+`Count::Autoscaled`.
 
 A failed rollout ends the wait early. The leader doesn't hand a spec that
 failed to any more nodes until someone applies a different one, so waiting

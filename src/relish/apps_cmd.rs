@@ -483,7 +483,6 @@ mod tests {
     fn evidence(app: &str, replicas: u32) -> DesiredAppEvidence {
         DesiredAppEvidence {
             owner: None,
-            rolled_out: None,
             app: app.to_string(),
             namespace: "prod".to_string(),
             desired_replicas: replicas,

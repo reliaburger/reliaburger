@@ -482,6 +482,13 @@ that the new spec runs healthy on every node it's placed on, after the
 rolling deploy. Each line goes to stderr when something changes, with the
 seconds since the apply.
 
+"As many replicas as it wants" is the file's `replicas`, with two
+exceptions. A daemon set (`replicas = "*"`) wants one on each node it can
+run on, so a node its `placement` rules out doesn't hold the wait up. An
+autoscaled app wants whatever count the autoscaler holds it at, which can
+be below or above the file's `replicas`. For both, `--wait` goes by what the
+scheduler placed, once it has placed them all.
+
 `--timeout` bounds the wait (`90s`, `5m`, `1h`; 5 minutes by default). When
 it runs out, `apply` names each app that isn't ready, what it was doing, and
 why when the cluster knows: a namespace quota, no node with room or the

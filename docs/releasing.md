@@ -760,20 +760,6 @@ before it records a run.
 The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
 same steps and the same losses.
 
-### Upgrading from 0.3.2
-
-0.3.3 can't roll onto a 0.3.2 cluster, which speaks protocol 61 and state
-format 76. The council's desired-app evidence (`GET /v1/diagnostics/apps`,
-which a node forwards from the leader) says whether each app's current spec
-has finished rolling out, for `relish apply --wait`
-([#2240](https://github.com/reliaburger/reliaburger/issues/2240)); the full
-list is in `src/compatibility.rs`. So the protocol moves from 61 to 62; the
-state format stays at 76. A 0.3.2 leader refuses `relish upgrade start
-v0.3.3` before it records a run.
-
-The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
-same steps and the same losses.
-
 ## Signing identity
 
 Configure `RELIABURGER_RELEASE_KEY` as a secret of the `release` GitHub

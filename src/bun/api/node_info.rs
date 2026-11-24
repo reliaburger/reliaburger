@@ -414,10 +414,6 @@ pub(super) fn council_app_evidence(
                         .cloned()
                 }),
                 owner: spec.owner.clone(),
-                rolled_out: Some(crate::cluster::rollout::is_rolled_out(
-                    spec,
-                    desired.rollouts.get(app_id),
-                )),
             },
         )
         .collect::<Vec<_>>();
@@ -508,6 +504,36 @@ async fn desired_apps_from_leader(
     council: &crate::council::CouncilNode,
     directory: Option<&LeaderDirectory>,
 ) -> Result<Vec<crate::bun::diagnostics::DesiredAppEvidence>, String> {
+    read_from_leader(
+        state,
+        council,
+        directory,
+        "/v1/diagnostics/apps",
+        LeaderRead {
+            read: "desired-apps",
+            what: "desired apps",
+        },
+    )
+    .await
+}
+
+/// How a leader read names itself in its errors.
+struct LeaderRead {
+    /// `the leader did not answer the {read} read in time`.
+    read: &'static str,
+    /// `could not read {what} from the leader`.
+    what: &'static str,
+}
+
+/// GET `path` from the leader's API, marked as forwarded so the leader
+/// never forwards it again, and decode the answer.
+async fn read_from_leader<T: serde::de::DeserializeOwned>(
+    state: &ApiState,
+    council: &crate::council::CouncilNode,
+    directory: Option<&LeaderDirectory>,
+    path: &str,
+    names: LeaderRead,
+) -> Result<T, String> {
     // A read another node forwarded never gets here (it is refused
     // first), so there's no inbound marker to check.
     let leader_url = super::upgrade::leader_base_url(state, council, directory, &HeaderMap::new())
@@ -522,7 +548,7 @@ async fn desired_apps_from_leader(
         state
             .cluster_http
             .client()
-            .get(format!("{leader_url}/v1/diagnostics/apps"))
+            .get(format!("{leader_url}{path}"))
             .header(DESIRED_APPS_FORWARDED_HEADER, "1"),
     );
     if let Some(token) = &state.service_token {
@@ -536,14 +562,84 @@ async fn desired_apps_from_leader(
             return Err(format!("the leader answered {status}: {body}"));
         }
         response
-            .json::<Vec<crate::bun::diagnostics::DesiredAppEvidence>>()
+            .json::<T>()
             .await
             .map_err(|error| format!("the leader's answer was unreadable: {error}"))
     };
     tokio::time::timeout(DESIRED_APPS_FORWARD_TIMEOUT, exchange)
         .await
-        .map_err(|_| "the leader did not answer the desired-apps read in time".to_string())?
-        .map_err(|error| format!("could not read desired apps from the leader: {error}"))
+        .map_err(|_| format!("the leader did not answer the {} read in time", names.read))?
+        .map_err(|error| format!("could not read {} from the leader: {error}", names.what))
+}
+
+/// `GET /v1/diagnostics/rollouts` — whether each app's current spec has
+/// finished rolling out, for `relish apply --wait` (#2240). The leader
+/// answers from the rollouts it records; any other node forwards the read
+/// to it, as `/v1/diagnostics/apps` does. A node with no council has no
+/// rollouts and answers an empty list. A token sees only the apps in its
+/// scope.
+pub(super) async fn rollouts_handler(
+    State(state): State<ApiState>,
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    directory: Option<axum::Extension<LeaderDirectory>>,
+    headers: HeaderMap,
+) -> Response {
+    let forwarded = headers.contains_key(DESIRED_APPS_FORWARDED_HEADER)
+        || headers.contains_key(LEADER_FORWARDED_HEADER);
+    let Some(council) = &state.council else {
+        return Json(Vec::<crate::bun::diagnostics::RolloutEvidence>::new()).into_response();
+    };
+    let rollouts = if confirmed_lease_leader(council).await {
+        Ok(council_rollout_evidence(&council.desired_state().await))
+    } else if forwarded {
+        Err("this node was named the leader but isn't; retry once the election settles".into())
+    } else {
+        read_from_leader(
+            &state,
+            council,
+            directory.as_deref(),
+            "/v1/diagnostics/rollouts",
+            LeaderRead {
+                read: "rollouts",
+                what: "rollouts",
+            },
+        )
+        .await
+    };
+    match rollouts {
+        Ok(mut rollouts) => {
+            rollouts.retain(|rollout: &crate::bun::diagnostics::RolloutEvidence| {
+                crate::sesame::auth::authorize_scoped(
+                    auth.as_deref(),
+                    &rollout.app,
+                    &rollout.namespace,
+                )
+                .is_ok()
+            });
+            Json(rollouts).into_response()
+        }
+        Err(error) => unavailable_response(error),
+    }
+}
+
+/// Every app the council knows, with whether its current spec rolled out,
+/// sorted by namespace and name.
+pub(super) fn council_rollout_evidence(
+    desired: &crate::council::types::DesiredState,
+) -> Vec<crate::bun::diagnostics::RolloutEvidence> {
+    let mut rollouts: Vec<_> = desired
+        .apps
+        .iter()
+        .map(|(app_id, spec)| crate::bun::diagnostics::RolloutEvidence {
+            app: app_id.name.clone(),
+            namespace: app_id.namespace.clone(),
+            fingerprint: crate::meat::deploy_types::rollout_fingerprint(spec),
+            rolled_out: crate::cluster::rollout::is_rolled_out(spec, desired.rollouts.get(app_id)),
+        })
+        .collect();
+    rollouts
+        .sort_by(|left, right| (&left.namespace, &left.app).cmp(&(&right.namespace, &right.app)));
+    rollouts
 }
 
 /// `POST /v1/path` — fixed DNS and TCP probes from a local source workload.
