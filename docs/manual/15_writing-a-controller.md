@@ -235,11 +235,20 @@ every token, admins included:
 - a health check's or ingress route's `path` loses any secret in its query
   string, such as `?token=…`.
 
-So the answer is for reading, not for applying back as it stands. Never
-apply a `[redacted]` value back: the cluster takes it as the literal text
-`[redacted]`, so an app applied from this answer would start with that as
-its password. A controller that rewrites an app supplies the env values
-itself, from its own manifest. Memory reads as a byte count, as the cluster stores it.
+So the answer is for reading, not for applying back as it stands, and the
+cluster refuses it if you try. `relish apply`, `POST /v1/apply` and a GitOps
+sync each refuse a spec in which an env value, an inline config file's
+content, or a word of a command, argument list, script or `pre_stop` is
+exactly `[redacted]`, and name the field:
+
+```
+app web: env DB_PASSWORD is the redaction placeholder "[redacted]"; supply the real value
+```
+
+The check is for a whole value or word only: `x[redacted]y`, or a
+`--password=[redacted]` that the redaction rules left inside a word, goes
+through as written, so a controller still mustn't apply what it read. One
+that rewrites an app supplies the env values itself, from its own manifest. Memory reads as a byte count, as the cluster stores it.
 
 A node that isn't the leader asks the leader, which redacts before it
 answers. During a rolling upgrade from 0.3.2 a leader still on 0.3.2 doesn't

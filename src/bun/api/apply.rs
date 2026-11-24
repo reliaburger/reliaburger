@@ -100,7 +100,8 @@ pub(super) async fn apply_handler(
         config.validate_intrinsic()
     } else {
         config.validate()
-    };
+    }
+    .and_then(|()| config.refuse_redaction_placeholders());
     if let Err(e) = validation {
         return (
             StatusCode::BAD_REQUEST,

@@ -8265,6 +8265,35 @@ async fn apply_invalid_config_returns_400() {
     shutdown.cancel();
 }
 
+/// #2296: the spec read's `[redacted]` placeholder, applied back, would
+/// replace the real value, so the apply endpoint refuses it by name.
+#[tokio::test]
+async fn apply_refuses_the_redaction_placeholder_as_a_value() {
+    let (app, shutdown) = test_setup();
+
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/apply")
+                .body(Body::from(
+                    "[app.web]\nimage = \"web:v1\"\n[app.web.env]\nDB_PASSWORD = \"[redacted]\"\n",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        body.contains("app web: env DB_PASSWORD is the redaction placeholder"),
+        "{body}"
+    );
+    shutdown.cancel();
+}
+
 #[tokio::test]
 async fn cluster_status_refuses_to_report_success_when_a_member_is_unreachable() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
