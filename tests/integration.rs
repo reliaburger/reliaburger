@@ -729,9 +729,19 @@ async fn a_volume_app_is_refused_for_want_of_a_container_runtime() {
         "{error}"
     );
 
-    let statuses = harness.client.status().await.unwrap();
-    assert_eq!(statuses[0].app_name, "volapp");
-    assert_eq!(statuses[0].state, "failed");
+    // The refusal reaches the client before the instance's state is
+    // recorded as failed, so wait for it rather than read it once (it read
+    // "preparing" once on a loaded CI runner, 24 November 2026).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let state = loop {
+        let statuses = harness.client.status().await.unwrap();
+        assert_eq!(statuses[0].app_name, "volapp");
+        if statuses[0].state == "failed" || tokio::time::Instant::now() >= deadline {
+            break statuses[0].state.clone();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(state, "failed");
 }
 
 /// X3 regression: `relish rollback` used to only print advice. The
