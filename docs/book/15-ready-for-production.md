@@ -10232,6 +10232,42 @@ refusal (the VM never booted then), and leaves a slow Bun to I6. The lesson isn'
 repeating every time you write an invariant: make it fail on purpose at least
 once, or you don't know what it checks.
 
+### And a check that fails when nothing's wrong
+
+Then the opposite happened. Nineteen runs and 968 cuts later, a handful of
+runs had stopped on a violation, and we went through every one. None had
+lost an acknowledged write. Every one was the checker or the environment:
+
+- **A start that hadn't happened yet.** "Settled" means every instance is
+  running. The Redis client still has to reach Redis before it can push its
+  start onto `soak:starts`, and the harness read the list a few seconds after
+  settling. Usually the client was a few `INCR`s ahead; three times it
+  wasn't, and the cut was "no new start". Now the harness polls both records
+  for up to 60 s before it says so.
+- **A start in the wrong window.** In one run, unattended-upgrades upgraded
+  libc in the guest during the work period and needrestart restarted Bun. The
+  writer started again between two cuts and resumed past the *previous* cut's
+  `ACK`, but the checker held it to this cut's, which came later. Now the
+  harness counts each record's starts just before the power-off: a start
+  before that is held to the previous `ACK`, a start after it to this one.
+  And the guest's automatic updates are masked, because cutting power
+  mid-dpkg can break the guest in ways that aren't ours to answer for.
+- **Somebody else's port.** Lima couldn't forward the API port because a
+  cargo test binary on the same host held it: the harness's ports sat in the
+  test suites' range. They now live in 31000–32767, above every port a test
+  takes and below the first ephemeral port Linux hands out. Why not 50000?
+  On a Mac that's inside the ephemeral range, where any outgoing connection
+  can grab it.
+
+One more: `--resume` carried a run on past a violation, powering the kept VM
+on and overwriting what we'd have diagnosed. It refuses now. And because
+the evidence of every old run was still on disk, `--rejudge` runs today's
+checker over it offline. Where the old evidence can't settle a cut, such as
+the last cut of a run whose late start nobody ever recorded, it says
+"undecided" rather than "pass". A checker that cries wolf is less dangerous
+than one that can't fail, but only just: after the third false alarm you
+stop reading the alarms.
+
 ## A thousand nodes that aren't there
 
 How big a cluster have we actually run? Three VMs. The whitepaper's 10,000-node
