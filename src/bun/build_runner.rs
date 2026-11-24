@@ -808,16 +808,17 @@ async fn run_bounded(
 /// Why a build was refused when neither this node nor any peer has
 /// Buildah, and what to do instead.
 ///
-/// The appliance image ships no Buildah (`image/mkosi.conf`), so on an
-/// appliance cluster this is what `relish build` prints (#2144). The ways
+/// The quickstart guest and the appliance image both ship Buildah (#2144),
+/// so this comes from a cluster of Linux servers set up without it. The ways
 /// out are building elsewhere and pushing into Pickle, which takes any OCI
 /// client, or joining a node that can build: bun hands a build to any peer
 /// that reports Buildah.
 pub const NO_BUILDER_ERROR: &str = "no builder available: no node in this cluster has Buildah \
-     on its PATH (appliance nodes never do). Build the image on a machine with Docker, \
-     Podman or Buildah and push it into Pickle, as in `docker push <node>:5050/<name>:<tag>` \
-     with a deployer token (`relish manual images`, under Pushing with docker, podman, \
-     skopeo or crane), or add a Linux node with Buildah to the cluster to build here";
+     on its PATH. Build the image on a machine with Docker, Podman or Buildah and push it \
+     into Pickle, as in `docker push <node>:5050/<name>:<tag>` with a deployer token \
+     (`relish manual images`, under Pushing with docker, podman, skopeo or crane), or add \
+     a node with Buildah (an appliance, or a Linux node with the buildah package) to the \
+     cluster to build here";
 
 /// Whether this node can build (probed per call — cheap, and the
 /// submit path is rare).
@@ -2545,21 +2546,21 @@ mod tests {
         assert!(builders.is_empty());
     }
 
-    // An appliance cluster has no Buildah anywhere (#2144), so the refusal
-    // is all an operator running the tour on bare metal sees. It has to say
-    // why and name the two ways out.
+    // The refusal only comes when no node has Buildah, which since #2144
+    // includes appliances: they ship it. So it mustn't blame the appliance,
+    // and it has to say why and name the two ways out.
     #[test]
     fn a_cluster_with_no_builder_names_the_ways_out() {
         let message = NO_BUILDER_ERROR;
         assert!(message.starts_with("no builder available: "), "{message}");
         assert!(message.contains("Buildah"), "{message}");
-        assert!(message.contains("appliance nodes never do"), "{message}");
+        assert!(!message.contains("never"), "{message}");
         // Build elsewhere and push into Pickle...
         assert!(message.contains("docker push <node>:5050/"), "{message}");
         assert!(message.contains("`relish manual images`"), "{message}");
-        // ...or bring a node that can build.
+        // ...or bring a node that can build, which an appliance is.
         assert!(
-            message.contains("add a Linux node with Buildah"),
+            message.contains("add a node with Buildah (an appliance, or a Linux node"),
             "{message}"
         );
     }
