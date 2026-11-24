@@ -146,9 +146,9 @@ status = "alpha"
 since = "0.3.0"
 summary = "An appliance OS, `relish netboot` and claiming machines over the LAN, with signed weekly OS builds and A/B updates; from 0.3.2 `relish netboot --stream-logs` shows an appliance's boot logs as it installs."
 restrictions = "x86_64 and arm64 machines with UEFI network boot and a wired card the installer has a driver for. Built for the Dell Wyse 3040; other firmware may still have surprises. New in 0.3.0, so its shape may still change."
-issues = [405, 407]
+issues = [407]
 docs = ["docs/manual/17_appliance.md"]
-evidence = "CI netboots, claims, seeds and updates QEMU appliances on every image change (x86_64; boot test only on aarch64). The release gate doesn't cover it. The Wyse lab exit test (#407) ran on candidate 4's artefacts in parallel with the release; #405 stays open for its findings, and `relish netboot` itself (#404) is done."
+evidence = "CI netboots, claims, seeds and updates QEMU appliances on every image change (x86_64; boot test only on aarch64). The release gate doesn't cover it. The Wyse lab exit test (#407) ran on candidate 4's artefacts in parallel with the release. Claiming over the LAN (#405) and `relish netboot` itself (#404) are done."
 needs_maintainer = "Alpha or Beta once the Wyse lab exit test has a record?"
 
 [[group.feature]]
@@ -426,10 +426,10 @@ name = "Virtual IPs and eBPF service routing"
 status = "ready"
 since = "0.1.0"
 summary = "Every app gets a stable virtual IP, and an eBPF hook on `connect()` sends each connection straight to a healthy backend."
-restrictions = "Needs rootful runc on Linux with eBPF. The full live catalogue hasn't been run on three independent runc nodes, only on the quickstart's VMs."
-issues = [286]
+restrictions = "Needs rootful runc on Linux with eBPF."
+issues = []
 docs = ["docs/manual/03_networking.md#service-discovery", "docs/design/discovery-onion.md"]
-evidence = "Gate: the V02 catalogue pulse and partition faults on runc nodes; the staged install runs `relish path`. V01 (#286, Later) is the open acceptance gate."
+evidence = "Gate: the V02 catalogue pulse and partition faults on runc nodes; the staged install runs `relish path`. V01 (#286) passed on three Wyse 3040s running 0.3.2 on 23 Nov 2026."
 
 [[group.feature]]
 name = "Internal DNS"
