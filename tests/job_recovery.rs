@@ -121,8 +121,9 @@ async fn wait_app_state(client: &BunClient, expected: &str) {
 /// retry has no runtime binding yet, even if an earlier job-summary read
 /// reported its run as active. A complete running answer with no pid is a
 /// running job reported without a process,
-/// the product bug #358 fixed, and fails at once.
-async fn job_pid(client: &BunClient) -> u32 {
+/// the product bug #358 fixed, and fails at once. A timeout prints Bun's
+/// `log`, whose lines say what the node was doing (#2236).
+async fn job_pid(client: &BunClient, log: &Path) -> u32 {
     let deadline = tokio::time::Instant::now() + STATE_DEADLINE;
     loop {
         let last_observed = match client.status().await {
@@ -139,7 +140,8 @@ async fn job_pid(client: &BunClient) -> u32 {
         };
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the runtime never answered for the job within {STATE_DEADLINE:?}; last observed {last_observed}"
+            "the runtime never answered for the job within {STATE_DEADLINE:?}; last observed {last_observed}\nBun log:\n{}",
+            std::fs::read_to_string(log).unwrap_or_default()
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -185,7 +187,7 @@ registry_port = 0
     let mut node = Node::start(&config_path, &log).await;
     node.client.apply(&config).await.unwrap();
     wait_app_state(&node.client, "running").await;
-    let main_pid = job_pid(&node.client).await;
+    let main_pid = job_pid(&node.client, &log).await;
     let marker = root.path().join("exec-pid");
     let client = BunClient::new(&node.endpoint);
     let command = vec![
@@ -218,7 +220,7 @@ registry_port = 0
     let _ = request.await;
     let mut recovered = Node::start(&config_path, &log).await;
     wait_app_state(&recovered.client, "running").await;
-    assert_eq!(job_pid(&recovered.client).await, main_pid);
+    assert_eq!(job_pid(&recovered.client, &log).await, main_pid);
     std::fs::write(release, "release").unwrap();
     recovered.client.stop("work", "default").await.unwrap();
     wait_app_state(&recovered.client, "stopped").await;
@@ -532,7 +534,7 @@ async fn pid_wait_accepts_a_pending_retry_before_its_running_process() {
         pid_status("running", Some(123), false),
     ])
     .await;
-    assert_eq!(job_pid(&fixture.client).await, 123);
+    assert_eq!(job_pid(&fixture.client, Path::new("")).await, 123);
 }
 
 #[tokio::test]
@@ -542,12 +544,12 @@ async fn pid_wait_keeps_unknown_runtime_evidence_pending() {
         pid_status("running", Some(123), false),
     ])
     .await;
-    assert_eq!(job_pid(&fixture.client).await, 123);
+    assert_eq!(job_pid(&fixture.client, Path::new("")).await, 123);
 }
 
 #[tokio::test]
 #[should_panic(expected = "a running job had no pid")]
 async fn pid_wait_still_refuses_a_known_running_process_without_a_pid() {
     let fixture = PidStatusFixture::start(vec![pid_status("running", None, false)]).await;
-    job_pid(&fixture.client).await;
+    job_pid(&fixture.client, Path::new("")).await;
 }
