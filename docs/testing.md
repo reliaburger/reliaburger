@@ -438,13 +438,13 @@ jobs. What else runs depends on where the change is going:
 
 | Run | Jobs | Typical wall time |
 |---|---|---|
-| Pull request into a merge train (`release-*`, e.g. `release-0-2-4`) | The light set: CI policy (with the dependency audit and the demo app's Go tests), lint and format, minimum Rust, the source bundle build, portable Linux (with coverage), the doctests and the nightly-signing key test, and the optimised contract boundaries | about 19 minutes of running, set by portable Linux, down from 30 (#1723, [measured](qualification/2026-11-09-v0.2.8-train-pr-timings.md)), then about 35 once the coverage build went to one job at a time (#2102; median 22.7 minutes in 13 green train PRs before, 34.8 in 14 after). From 18 to 20 November, with the train's dependency cache saved by its pushes, 22 green train PRs without macOS took a median of 31.3 minutes of running and 43.9 of wall time: portable Linux builds the crate for 13 of its 25 to 31 minutes, one compile at a time. Since 0.3.2 `make coverage` builds the lib tests alone and then the rest, both at full parallelism (#1723): estimated at about 6 minutes of build and 18 to 24 of portable Linux (median near 21), to be confirmed by the first CI runs |
+| Pull request into a merge train (`release-*`, e.g. `release-0-2-4`) | The light set: CI policy (with the dependency audit and the demo app's Go tests), lint and format, minimum Rust, the source bundle build, portable Linux (with coverage), the doctests and the nightly-signing key test, and the optimised contract boundaries | about 19 minutes of running, set by portable Linux, down from 30 (#1723, [measured](qualification/2026-11-09-v0.2.8-train-pr-timings.md)), then about 35 once the coverage build went to one job at a time (#2102; median 22.7 minutes in 13 green train PRs before, 34.8 in 14 after). From 18 to 20 November, with the train's dependency cache saved by its pushes, 22 green train PRs without macOS took a median of 31.3 minutes of running and 43.9 of wall time: portable Linux builds the crate for 13 of its 25 to 31 minutes, one compile at a time. Since 0.3.2 `make coverage` builds the lib tests alone and then the rest, both at full parallelism (#1723): over 80 train runs from 21 to 24 November portable Linux took a median of 23.7 minutes (20.4 to 30.2), about 2 of setup, 7.5 of build, 8.5 running the suite and 3 writing the coverage report, and 21 green train PRs without macOS took a median of 23.8 minutes of running and 40.0 of wall time |
 | The same, labelled `full-ci` | The light set plus privileged Linux, the cluster, acceptance and upgrade suites, and the benchmarks the change touches | about 45 minutes |
 | The gate PR (a train into `main`) | The light set on each push; with `full-ci`, the heavy suites too | as above |
 | The gate PR labelled `release-gate` | Everything, portable macOS included; the evidence gate refuses less | about 45 minutes, plus any wait for macOS runners |
 | Any other pull request into `main` | The light set plus the heavy suites and the benchmarks the change touches | about 45 minutes |
 | Pull request stacked on any other branch | The light set; the heavy suites only with `full-ci` | about 17 minutes |
-| Merge-queue group | Everything; only CI policy and the gate when the group changes nothing but documentation | about 60 minutes, set by portable macOS, plus any wait for runners |
+| Merge-queue group | Everything; only CI policy and the gate when the group changes nothing but documentation | about 60 minutes from 21 to 24 November, set by portable macOS (median 59.8 over 17 green groups); about 35 to 47 since the macOS build split (#1723, two runs), plus any wait for runners |
 | Push to a train | Nothing but CI policy and the gate when the merge queue's run on that commit passed every job at its first attempt; portable Linux too when the train's `Cargo.lock`, `Cargo.toml` or `.cargo/config.toml` differs from `main`'s, to save its cache; everything otherwise | a few minutes; about 25 with portable Linux |
 | Push to `main`, nightly, manual, `build.yml`'s candidate build | Everything | about 45 minutes, plus any wait for macOS runners |
 
@@ -607,8 +607,9 @@ testing. Scripts are code here, since the jobs run them.
 
 What's left is mostly the queue's own settings, which only the maintainer can
 change: building eight groups at once (`max_entries_to_build` in the "release
-trains merge queue" ruleset) means up to 160 jobs, and portable macOS (52 to
-57 minutes with a warm cache) sets every group's length.
+trains merge queue" ruleset) means up to 160 jobs, and portable macOS sets
+every group's length: 52 to 57 minutes with a warm cache then, 35 to 47 once
+its lib tests built alone ([below](#portable-macos-in-one-job)).
 
 ### What runs on macOS and what runs on Linux
 
@@ -700,6 +701,29 @@ ways to keep the merge honest.
 [`test_shard_partition.py`](../scripts/ci/test_shard_partition.py) checks the
 merge against what the pinned nextest really prints, on a throwaway crate.
 Coverage is unaffected: only the Linux portable job measures it.
+
+Its time goes on one compile. Over 83 runs on the 0.3.2 and 0.3.3 trains, 21
+to 24 November 2026, the job took a median of 58.4 minutes (31.7 to 102.5);
+the tests took under two and the lint, which checks the same crate, about two.
+The rest was `cargo test --no-run`, which took 21 to 93 minutes for the same
+build from the same full cache hit. It compiled the lib tests and the lib side
+by side on a 3-core, 7 GB runner, [#1943](https://github.com/reliaburger/reliaburger/issues/1943)'s
+mechanism on a smaller host, so `make test-macos` now builds the lib tests on
+their own first, as `test-linux` does, then the rest (#1723). In its first
+two runs
+([45338026382](https://github.com/reliaburger/reliaburger/actions/runs/45338026382),
+[45348952470](https://github.com/reliaburger/reliaburger/actions/runs/45348952470))
+the lib tests took 24:55 and 33:35, the rest 4:43 and 6:43, and the job 34.8
+and 46.5 minutes. The lib tests still page on their own: swap in use peaked
+at 1.3 GB both times, and 3.6 to 4.6 GB went out to swap while they compiled.
+Splitting `relish` into its own crate, so macOS compiles only what it tests,
+is what would end the paging.
+
+The job logs the runner's memory every 15 seconds from before the lint
+([`watch-macos-memory`](../scripts/ci/watch-macos-memory)): the load, free
+memory, swap in use, swap-outs so far and the biggest process. It prints the
+peaks after the tests and keeps the log as the `portable-macos-memory`
+artifact, pass or fail.
 
 ### Trimming the Actions caches
 

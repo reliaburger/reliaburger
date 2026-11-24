@@ -603,6 +603,23 @@ class TrainAndQueueTests(unittest.TestCase):
         cache = next(step for step in steps(macos) if "Swatinem/rust-cache@" in step)
         self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", cache)
 
+    def test_macos_logs_its_memory_from_before_the_build_and_always_keeps_the_log(self):
+        # The same build took 21 to 93 minutes on the 7 GB runner (#1723):
+        # the log has to cover the build, and a failed or cancelled-by-timeout
+        # test step must still leave it.
+        blocks = steps(self.jobs["macos"])
+        watch = next(index for index, step in enumerate(blocks) if "nohup scripts/ci/watch-macos-memory" in step)
+        lint = next(index for index, step in enumerate(blocks) if "run: make lint-macos" in step)
+        tests = next(index for index, step in enumerate(blocks) if "--gate portable-darwin " in step)
+        report = next(index for index, step in enumerate(blocks) if "watch-macos-memory --summary" in step)
+        keep = next(index for index, step in enumerate(blocks) if "name: portable-macos-memory" in step)
+        self.assertLess(watch, lint)
+        self.assertLess(lint, tests)
+        self.assertLess(tests, report)
+        self.assertLess(report, keep)
+        for index in (report, keep):
+            self.assertIn("if: always()", blocks[index])
+
     def test_the_lint_job_checks_formatting_before_restoring_or_building_anything(self):
         # rustfmt needs no build: run it before the cache restore and the
         # apt step, so a format slip fails the job within a minute (#1724).
