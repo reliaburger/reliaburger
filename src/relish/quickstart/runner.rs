@@ -779,6 +779,23 @@ async fn start_vm(
     Ok(())
 }
 
+/// The Lima VM driver a quickstart VM runs under (`vmType` in its config).
+#[derive(Debug, Clone, Copy)]
+enum VmType {
+    /// Apple's Virtualization.framework, on macOS.
+    Vz,
+    /// QEMU, everywhere else.
+    Qemu,
+}
+
+/// The driver this host's quickstart VMs use; `provision::vm_config` picks
+/// the same one.
+const HOST_VM_TYPE: VmType = if cfg!(target_os = "macos") {
+    VmType::Vz
+} else {
+    VmType::Qemu
+};
+
 /// How long a VM may print nothing on its console once Lima has started it.
 ///
 /// Apple's Virtualization.framework occasionally starts a VM that never
@@ -786,9 +803,18 @@ async fn start_vm(
 /// running, one vCPU spins at 100 %, the console stays empty and SSH never
 /// answers, even with plain `limactl start` and no Reliaburger involved. The
 /// first console output is the login prompt (the kernel writes to `tty1`
-/// and `ttyAMA0`, which a vz VM doesn't have), and in 49 healthy boots it
-/// came within 9.3 s of the VM starting; the stuck VMs stayed silent.
-const BOOT_SILENCE: Duration = Duration::from_secs(30);
+/// and `ttyAMA0`, which a vz VM doesn't have), and in 49 healthy vz boots it
+/// came within 9.3 s of the VM starting; the stuck VMs stayed silent. QEMU
+/// boots more slowly and wasn't measured, so it keeps the original minute.
+const fn boot_silence(vm_type: VmType) -> Duration {
+    match vm_type {
+        VmType::Vz => Duration::from_secs(30),
+        VmType::Qemu => Duration::from_secs(60),
+    }
+}
+
+/// The boot silence for this host's VMs; see [`boot_silence`].
+const BOOT_SILENCE: Duration = boot_silence(HOST_VM_TYPE);
 
 /// Run a Lima start command, and if the VM's console is still silent
 /// `silence` after Lima's host agent started it, force it off and start it
@@ -1269,6 +1295,26 @@ esac
         assert!(lima.console_started("vm").await);
         let calls = std::fs::read_to_string(home.path().join("calls")).unwrap();
         assert_eq!(calls.lines().count(), 1, "{calls}");
+    }
+
+    #[test]
+    fn a_vz_vm_gets_thirty_seconds_of_console_silence() {
+        assert_eq!(boot_silence(VmType::Vz), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_qemu_vm_keeps_a_minute_of_console_silence() {
+        assert_eq!(boot_silence(VmType::Qemu), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn the_boot_silence_follows_the_vm_type_this_host_runs() {
+        let expected = if cfg!(target_os = "macos") {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_secs(60)
+        };
+        assert_eq!(BOOT_SILENCE, expected);
     }
 
     #[tokio::test]

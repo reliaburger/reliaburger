@@ -1502,8 +1502,14 @@ the VM even exists. Healthy consoles came up within 9.3 seconds of the VM
 starting in all 49 we measured; the stuck ones stayed empty for the whole
 minute. So `start_watched` now waits for the host agent's `ha.pid` (Lima
 writes it once the disk is ready, right before it boots the VM), and only
-then starts a 30-second clock. A stuck VM now costs about 30 seconds less,
-and a slow disk can no longer eat into a healthy boot's allowance.
+then starts its clock. On a Mac that clock is 30 seconds, so a stuck VM
+costs about 30 seconds less, and a slow disk can no longer eat into a
+healthy boot's allowance. On Linux, Lima runs QEMU, which boots more slowly
+and which we didn't measure, so it keeps the full minute. `boot_silence`
+takes the VM type, a two-variant enum, and returns the right `Duration`.
+It's a `const fn`, a function the compiler can run while it builds, so
+`BOOT_SILENCE` is still a plain constant: `cfg!(target_os = "macos")` picks
+this host's VM type at compile time, the same way the VM config does.
 `disk_preparation_does_not_count_towards_the_boot_silence` pins the order: a
 fake `limactl` prepares its disk for 1.5 seconds, then prints its console
 line and writes `ha.pid`. A watchdog timed from the command would fire at 1
