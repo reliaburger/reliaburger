@@ -1447,6 +1447,92 @@ runner. The lib still compiles alone, since everything after it links it, so any
 would mean the targets built after it, four at a time with the suite among them, hold more
 than we think.
 
+### macOS leaves the queue
+
+None of that touched the job the count of waste left alone. On 24 November, with the 0.3.3
+train filling up, portable macOS took 50 minutes in a good merge-group run and over two hours
+in a bad one, much of it waiting for one of the five macOS runners the plan allows. It was
+cancelled or failed three times that day. Each time the queue dropped the group, re-formed
+everything behind it and started every job again. One PR's CI waited more than three hours
+for a runner at all.
+
+The fix is to ask the queue a smaller question. What must every commit on a train prove before
+it lands? That it builds, lints, and passes every Linux suite, portable and privileged, cluster
+and acceptance, because that's where Bun runs and where almost every change lives. What must a
+*release* prove? Everything, macOS included. Those don't have to be answered at the same
+moment.
+
+So `select-jobs.sh` now answers `macos=false` for every merge group:
+
+```bash
+if [ "${EVENT}" = merge_group ]; then
+    if [ "$code" = false ]; then
+        emit false false false false false false
+    else
+        emit true true true true false true
+    fi
+    exit 0
+fi
+```
+
+The fifth argument is `macos`. That one `false` isn't enough on its own, because three other
+places assumed the queue ran everything, and each had to learn the new rule without getting
+weaker anywhere else:
+
+- The evidence aggregator calls a heavy selection without macOS `train-full`. It used to
+  accept that only from a `pull_request` event. Now a `merge_group` may qualify with
+  `train-full` too, but never with the light set, and a push or a manual run still has to show
+  every owner.
+- `every_job.py` needed nothing: a job that select jobs skipped already counts as skipped, not
+  failed.
+- `ci_reuse.py` has two callers with different needs. The train push asks, with `--event
+  merge_group`, whether the queue already tested its commit. There a skipped `portable macOS`
+  is fine, or every train push would run all twenty jobs again. The candidate build asks
+  whether it can skip running `ci.yml` itself. There it isn't fine, so a merge-queue run no
+  longer counts for a candidate at all.
+
+Where does macOS run now? A new workflow, `macos-nightly.yml`, runs the same three commands as
+the CI job (`make lint-macos`, `make test-macos` and relish's doctests) every night on the
+newest `release-*` train with work `main` doesn't have. It picks the branch the way the nightly
+mutation run does:
+
+```bash
+train=$(git branch -r --list 'origin/release-*' | sed 's/^ *//' | sort -V | tail -n 1)
+if [ -n "$train" ] && [ -n "$(git rev-list -1 origin/main.."$train")" ]; then
+  ref=$train
+fi
+```
+
+`sort -V` sorts version numbers numerically, so `release-1-3-10` comes after `release-1-3-9`.
+Why a separate workflow and not a second `schedule` in `ci.yml`? GitHub runs every scheduled
+workflow from the default branch, at `main`'s commit, so `ci.yml`'s nightly tests `main`. A
+nightly that tests a train has to check the train out itself, and doing that inside `ci.yml`
+would have put a "which commit am I testing?" question into every job's evidence binding. A
+test in `tests/suite/toolchain_pins.rs` holds the two workflows to the same Rust, nextest,
+runner and commands, so the nightly can't drift from what the CI job would have run.
+
+The release keeps all of it. The gate PR, once labelled `release-gate`, runs portable macOS,
+and its evidence gate refuses it without. Merging it pushes to `main`, which runs everything.
+The candidate build rests only on a push or nightly run in which `portable macOS` passed, or
+runs `ci.yml` itself. What we gave up is a day: a macOS break can now sit on a train until the
+nightly finds it, instead of being refused at the door.
+
+What didn't we do? We didn't make the macOS job `continue-on-error` in the queue: it would
+still take a runner for an hour and still set each group's length, only without counting. We
+didn't shard it again: three shards each compiled the whole crate, which is why it became one
+job. And we kept the macOS-code rule for pull requests. A PR that changes the Apple runtime, a
+file with a `target_os = "macos"` cfg or the installers still runs portable macOS itself, where
+its author is watching.
+
+Two smaller changes went in the same day. A draft pull request, or one from a `0-4-0/` branch
+(work for a release whose train isn't open yet), now runs only select jobs, CI policy and lint,
+whatever its labels say. A new `lint` output carries "there's code to lint" on its own, since
+`code=true` would start every Linux suite. `ready_for_review` starts the full run, and
+`converted_to_draft` starts a cheap one which, being in the PR's concurrency group, cancels
+the expensive run still going. `appliance.yml` and `build.yml` follow the same rule. And the
+cargo-fuzz job no longer runs on pull requests. Its 14 to 33 minutes now run only nightly and
+by hand, while the portable suite still feeds every target its checked-in corpus on each PR.
+
 ### A release gate that fits in a week
 
 Pull requests were quick by 0.2.3. The release wasn't. From code freeze to ready-to-tag took

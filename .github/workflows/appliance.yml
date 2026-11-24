@@ -53,6 +53,10 @@ on:
       - "src/appliance/**"
       - "src/relish/netboot/**"
       - "scripts/demo/netboot.sh"
+    # A draft, or a 0-4-0/ branch, builds no image (24 November 2026):
+    # ready_for_review starts the build, and converted_to_draft cancels one
+    # still going.
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
 
 concurrency:
   group: appliance-${{ github.event.pull_request.number || github.run_id }}
@@ -64,6 +68,7 @@ permissions:
 jobs:
   # Whether this run publishes, and the version it builds.
   plan:
+    if: github.event_name != 'pull_request' || (!github.event.pull_request.draft && !startsWith(github.event.pull_request.head.ref, '0-4-0/'))
     runs-on: ubuntu-24.04
     outputs:
       publish: ${{ steps.plan.outputs.publish }}
@@ -146,6 +151,7 @@ jobs:
   # The image's shell scripts that have unit tests (image/tests): quick, and
   # Linux-only, since the scripts use GNU coreutils as the appliance does.
   scripts:
+    if: github.event_name != 'pull_request' || (!github.event.pull_request.draft && !startsWith(github.event.pull_request.head.ref, '0-4-0/'))
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4

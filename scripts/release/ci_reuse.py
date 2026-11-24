@@ -9,8 +9,9 @@ built, and says it can be reused only when that run, and every job in it,
 passed:
 
 - the run is on this commit, in this repository, from `ci.yml`, and from an
-  event that selects every job (`push`, `merge_group` or `schedule`; a pull
-  request's run tests a merge commit, not its head, and may skip jobs);
+  event that selects every job (`push` or `schedule`; a pull request's run
+  tests a merge commit, not its head, and may skip jobs, and the merge queue
+  skips portable macOS);
 - the run completed with `success` on its first attempt: a run re-run until
   it passed has a flaky failure behind it, and retries are 0 (#1436). The
   API reports a run's latest attempt, and its jobs with `filter=latest`, so
@@ -32,7 +33,9 @@ ci.yml asks the same question on a push to a merge train, with `--event
 merge_group`: the queue tested exactly the commit it then pushed, so a run
 that passed every job there leaves the push's own run nothing to do (#1723).
 The queue's run exists before the push, so that form never waits for one to
-appear.
+appear. The queue doesn't run portable macOS (maintainer decision of 24
+November 2026; macos-nightly.yml runs it on the newest train), so that form
+alone accepts a skipped `portable macOS`; a candidate never does.
 
 Anything else, an API error included, means "run the suite here": the build
 fails safe, never open. The decision goes to `$GITHUB_OUTPUT` as
@@ -53,10 +56,16 @@ import time
 WORKFLOW_PATH = ".github/workflows/ci.yml"
 
 # Events whose ci.yml run selects every job and checks out the commit itself.
-# scripts/ci/select-jobs.sh gives everything to anything but a pull request,
-# apart from a documentation-only merge group and a train push the queue has
-# already tested; those runs skip required jobs, so the job check refuses them.
-FULL_EVENTS = ("push", "merge_group", "schedule")
+# scripts/ci/select-jobs.sh gives everything to pushes and schedules, apart
+# from a train push the queue has already tested; that run skips required
+# jobs, so the job check refuses it.
+FULL_EVENTS = ("push", "schedule")
+
+# The merge queue's event. Only a train push asks for its run (--event
+# merge_group), and it may have skipped these jobs: select-jobs.sh leaves
+# portable macOS out of every merge group.
+QUEUE_EVENT = "merge_group"
+QUEUE_SKIPPED_JOBS = ("portable macOS",)
 
 # The job ci.yml starts only for a closed pull request; any real run skips it.
 SKIPPED_JOB = "closed pull request"
@@ -94,11 +103,12 @@ REQUIRED_JOBS = (
 )
 
 
-def run_problems(run, jobs, commit, repository):
+def run_problems(run, jobs, commit, repository, events=FULL_EVENTS):
     """Why this ci.yml run can't stand in for the candidate's own, or an empty list.
 
     `jobs` is a callable returning the run's jobs, called only when the run
-    itself passed.
+    itself passed. `events` are the events whose runs may stand in; for the
+    merge queue's, the jobs in QUEUE_SKIPPED_JOBS may have been skipped.
     """
     found = []
     if run.get("head_sha") != commit:
@@ -108,7 +118,7 @@ def run_problems(run, jobs, commit, repository):
     for key in ("repository", "head_repository"):
         if (run.get(key) or {}).get("full_name") != repository:
             found.append(f"run's {key} is not {repository}")
-    if run.get("event") not in FULL_EVENTS:
+    if run.get("event") not in events:
         found.append(f"a {run.get('event')} run doesn't run every job on this commit")
     if run.get("status") != "completed" or run.get("conclusion") != "success":
         found.append(f"run finished as {run.get('status')}/{run.get('conclusion')}")
@@ -122,9 +132,11 @@ def run_problems(run, jobs, commit, repository):
         conclusions.setdefault(job.get("name"), []).append(job.get("conclusion"))
     for name in REQUIRED_JOBS:
         seen = conclusions.get(name)
+        allowed = ("success", "skipped") if run.get("event") == QUEUE_EVENT and name in QUEUE_SKIPPED_JOBS \
+            else ("success",)
         if not seen:
             found.append(f"required job {name!r} is missing")
-        elif any(conclusion != "success" for conclusion in seen):
+        elif any(conclusion not in allowed for conclusion in seen):
             found.append(f"required job {name!r} finished as {', '.join(map(str, seen))}")
     for name, seen in sorted(conclusions.items(), key=lambda item: str(item[0])):
         if name in REQUIRED_JOBS:
@@ -157,7 +169,7 @@ def decide(commit, repository, runs, jobs_for, events=FULL_EVENTS):
     for run in candidates(runs, commit, events):
         if run.get("status") != "completed":
             continue
-        problems = run_problems(run, lambda: jobs_for(run["id"]), commit, repository)
+        problems = run_problems(run, lambda: jobs_for(run["id"]), commit, repository, events)
         if not problems:
             return run["id"], []
         reasons.append(f"run {run.get('id')}: " + "; ".join(problems))
@@ -225,7 +237,7 @@ def main(argv=None, runs_for=fetch_runs, jobs_for=fetch_jobs, now=time.monotonic
     parser.add_argument("--commit", required=True)
     parser.add_argument("--wait-minutes", type=int, default=120,
                         help="how long to wait for a run on the commit that's still going")
-    parser.add_argument("--event", choices=FULL_EVENTS,
+    parser.add_argument("--event", choices=FULL_EVENTS + (QUEUE_EVENT,),
                         help="count only runs from this event; with merge_group, don't wait for a "
                              "run that doesn't exist yet, since the queue's run comes before the push")
     parser.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))

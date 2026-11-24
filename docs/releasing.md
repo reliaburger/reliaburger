@@ -86,10 +86,13 @@ treats the three kinds of run differently ([which jobs run](testing.md#which-job
   Linux (on Ubuntu 24.04 and 26.04), cluster, acceptance,
   upgrades and benchmarks. Portable macOS runs on the PR only when it
   touches macOS-specific code or carries a `macos` label.
-- **The merge queue** runs every job, portable macOS and the heavy suites
+- **The merge queue** runs every job but portable macOS, the heavy suites
   included, on the batch merged onto the train, before any of it lands. The
   queue requires the single check `ignored-test evidence`, which waits for
-  every other job and demands every evidence owner. A group that changes
+  every other job and demands every evidence owner but macOS's. Portable
+  macOS runs on the newest train every night instead
+  ([`macos-nightly.yml`](../.github/workflows/macos-nightly.yml), maintainer
+  decision of 24 November 2026). A group that changes
   only documentation runs no code job: its code is its base's. When the
   queue drops a group, `queue-sweep.yml` cancels its run
   ([what a merge costs](testing.md#what-a-merge-costs-in-runners)).
@@ -106,11 +109,36 @@ treats the three kinds of run differently ([which jobs run](testing.md#which-job
   pushes to `main`, which runs everything again, and that run is the one the
   candidate build reuses.
 
-So nothing reaches a train, or `main`, without the full set having passed on
-that exact commit. macOS runs on every push and on the nightly, on the
-release gate PR and on the candidate build, but not on ordinary pull
-requests: the organisation's plan runs at most five macOS jobs at once, and
-each full run takes one ([portable macOS in one job](testing.md#portable-macos-in-one-job)).
+So nothing reaches a train without every Linux job having passed on that
+exact commit, and nothing reaches `main` without the full set. macOS runs on
+the push to `main` and on `main`'s nightly, on the newest train every night,
+on the release gate PR and on the candidate build, but not on ordinary pull
+requests or in the merge queue: the organisation's plan runs at most five
+macOS jobs at once, each full run takes one
+([portable macOS in one job](testing.md#portable-macos-in-one-job)), and in
+the queue it set every group's length.
+
+How the release still gets macOS:
+
+- **The gate PR labelled `release-gate`** runs portable macOS, and its
+  evidence gate refuses it without the `portable-darwin` owner.
+- **The push to `main`** when the gate PR merges runs everything, macOS
+  included.
+- **The candidate build** reuses a `ci.yml` run only from a push or the
+  nightly schedule, and only when `portable macOS` passed in it
+  ([`ci_reuse.py`](../scripts/release/ci_reuse.py)); a merge-queue run never
+  counts. Otherwise `validate-release` runs all of `ci.yml`, macOS included.
+  A train's nightly build therefore runs it too.
+- **The nightly on the newest train** shows a macOS break within a day, long
+  before code freeze. A red one gets an issue the same day, like a flake.
+
+The qualification scripts install staged builds on the hosts in the matrix
+and never read a merge-queue run, so nothing there relied on the queue's
+macOS job.
+
+Drafts, and pull requests from a `0-4-0/` branch, run only select jobs, CI
+policy and lint until they're marked ready for review
+([which jobs run](testing.md#which-jobs-a-pull-request-runs)).
 That job builds and tests `relish` and the macOS-only code; Bun's tests run
 on Linux only ([what runs on macOS](testing.md#what-runs-on-macos-and-what-runs-on-linux)).
 Dependabot's PRs never get macOS unless labelled; the nightly on `main`
@@ -226,18 +254,22 @@ the queue without saying so, so afterwards check that `isInMergeQueue` is
 true, and again after any queue event. The queue
 builds a temporary branch with the train plus the PR (and up to seven more
 waiting behind it: the ruleset's group size went from 4 to 8 on 7 November
-2026, #1724), and `ci.yml`'s `merge_group` trigger runs every job on it.
+2026, #1724), and `ci.yml`'s `merge_group` trigger runs every job but
+portable macOS on it.
 The PR lands only if `ignored-test evidence` passes on that exact commit. A
 batch that fails drops the PR that broke it, and the rest go round again.
 
 Why bother, when the push to the train runs everything anyway? Because the
 push runs after the merge. Without the queue, a PR that passed the light set
-could break the macOS or heavy suites, and the train would carry the break
+could break the heavy suites, and the train would carry the break
 until someone noticed the push run. Merges also landed faster than the push
 runs finished: each merge cancelled the previous push run, so in early
 November four of six pushes to `release-0-2-7` were cancelled 31 to 52
 minutes in, and those commits never had a finished full run. With the queue,
-every commit on a train has passed every job before it got there.
+every commit on a train has passed every Linux job before it got there.
+macOS is the one exception: the nightly on the newest train finds a macOS
+break within a day, and the release gate PR and the push to `main` run it
+before anything ships.
 
 ## Refreshing dependencies
 
@@ -1103,9 +1135,9 @@ to `main`, so the build reuses that run instead of running the suite again
 ([#1363](https://github.com/reliaburger/reliaburger/issues/1363)): its
 `find passing CI` job runs
 [`ci_reuse.py`](../scripts/release/ci_reuse.py), which asks the GitHub API
-for a `ci.yml` run on exactly this commit, from a push, the merge queue or the
-nightly schedule (a pull request's run tests a merge commit and may skip
-jobs). The run counts only if it succeeded on its first attempt and every
+for a `ci.yml` run on exactly this commit, from a push or the nightly
+schedule (a pull request's run tests a merge commit and may skip jobs, and the
+merge queue's skips portable macOS). The run counts only if it succeeded on its first attempt and every
 job in it succeeded, `ignored-test evidence` included. A run that went green
 only when someone re-ran it doesn't count: a failure that passes on a re-run
 is a flake, retries are 0, and the candidate runs its own suite instead
@@ -1118,7 +1150,7 @@ to about 50 minutes, the macOS `relish` build's time; most of the hour saved
 was spent waiting for hosted macOS runners.
 
 You don't have to wait for `main`'s CI before dispatching the build. If a
-push, merge-queue or nightly run on the commit is still queued or running,
+push or nightly run on the commit is still queued or running,
 `find passing CI` waits for it, asking again every minute for up to two hours,
 and then applies the same rules
 ([#1722](https://github.com/reliaburger/reliaburger/issues/1722)). Until 0.2.8
