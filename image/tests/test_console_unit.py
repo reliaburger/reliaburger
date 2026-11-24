@@ -85,6 +85,21 @@ class ConsoleUnitTests(unittest.TestCase):
         console = unit(CONSOLE)["Unit"]
         self.assertIn("getty@tty1.service", words(console, "Conflicts"))
 
+    def test_the_console_reads_the_keyboard_on_tty1(self):
+        # The dashboard (#2150) reads keys, so tty1 is its standard input
+        # and its controlling terminal; it draws on /dev/tty.
+        service = unit(CONSOLE)["Service"]
+        self.assertEqual(service["StandardInput"], ["tty"])
+        self.assertEqual(service["TTYPath"], ["/dev/tty1"])
+
+    def test_the_launchers_messages_still_reach_the_journal(self):
+        # With StandardInput=tty, standard output would default to the
+        # terminal too, and the launcher's install lines would vanish
+        # under the dashboard.
+        service = unit(CONSOLE)["Service"]
+        self.assertEqual(service["StandardOutput"], ["journal"])
+        self.assertEqual(service["StandardError"], ["journal"])
+
     def test_the_console_starts_on_every_boot_and_comes_back(self):
         self.assertIn(f"enable {CONSOLE}", PRESET.read_text().splitlines())
         self.assertIn("multi-user.target", words(unit(CONSOLE)["Install"], "WantedBy"))

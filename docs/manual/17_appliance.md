@@ -747,7 +747,7 @@ relish wtf
 ```
 
 All of them alive, in the council, and nothing to fix. Each machine's
-monitor shows its name, address and whether bun is running.
+monitor shows its dashboard ("The console", below).
 
 A machine only looks for a seed until it has one, and waits up to ten
 seconds for the stick. So a stick left in later changes nothing.
@@ -777,6 +777,85 @@ cp -R ~/home-cluster/stick/seeds /Volumes/RBSEED/
 A stick seed can sit in a drawer for up to a week, so nothing opens a
 firewall for it: if its address is outside `--network`, the existing nodes
 drop it until you add it to their `[security] bootstrap_peers`.
+
+## The console
+
+Each machine's monitor shows a small dashboard. There's no login, so it's
+read-only: anyone at the keyboard can look, and nothing they press changes
+the node. It never shows secrets, tokens or environment variables.
+
+```
+ Reliaburger OS 2026.47.228 | home-1 | cluster home                 bun running
+ [1 Status]  2 Metrics   3 Workloads   4 Cluster   5 Versions   6 Logs
+┌ 1 Status ────────────────────────────────────────────────────────────────────┐
+│Node       home-1                                                             │
+│Cluster    home                                                               │
+│Address    192.168.1.51                                                       │
+│MAC        d8:9e:f3:12:34:56                                                  │
+│bun        running (0.3.3)                                                    │
+│                                                                              │
+│Cluster HEALTHY, no problems (home-1 answered at 15:06:40)                    │
+│wtf        0 critical, 1 warning                                              │
+│nodes      3 alive, 0 suspect, 0 dead                                         │
+│council    leader home-1 (term 4), 3/3 voters, quorum ok, 0 lagging           │
+```
+
+| Key | Does |
+| --- | --- |
+| `1` to `6` | pick a tab |
+| `←` `→`, `Tab`, `h` `l` | the previous or next tab |
+| `↑` `↓`, `k` `j`, `PgUp` `PgDn` | scroll a list, or back through the logs |
+| `Home`, `End` | back to the top, or the newest log line |
+| `q` | quit, on any terminal but tty1 (an SSH session) |
+
+| Tab | Shows | From |
+| --- | --- | --- |
+| 1 Status | who the machine is, then `relish status`'s lines and `wtf`'s counts, the ones that need attention first | the machine, bun's summary, `wtf` every minute |
+| 2 Metrics | CPU, memory, the data partition and the network, with four minutes of history | the machine |
+| 3 Workloads | the instances on this node: state, restarts, CPU and memory | bun (`/v1/top`) |
+| 4 Cluster | gossip's members and Raft's leader, term and quorum, then every node's role, applied and log index and lag | bun's summary and every node's council view |
+| 5 Versions | the OS image, kernel, bun, runc, systemd and Buildah | the machine |
+| 6 Logs | the journal of `reliaburger` and `reliaburger-boot-check` | `journalctl` |
+
+A tab asks only while it's on screen: nothing runs `journalctl` while you
+read the Status tab. A panel that can't refresh keeps what it last showed
+and says when that was.
+
+**When bun doesn't answer**, the Status tab is the screen the appliance
+always had: name, cluster, address, MAC and bun's state. That's the one a
+boot, a fallback or a claim needs. Metrics, Versions and Logs read the
+machine itself, so they still work; Workloads and Cluster say bun isn't
+answering. An unclaimed machine shows its claim key twice, once as text and
+once in large letters you can read from across the room.
+
+The console reads bun as its own principal, `__console`: read-only, with
+a token derived from the cluster's master key, which the console reads as
+root. A monitor on one node shows the whole cluster, as `relish status`
+would. `wtf`'s token-lifetime check needs an admin, so the console leaves
+it out instead of counting it as unknown.
+
+Know what that token is before you rely on it:
+
+- **It's valid on every node for the life of the cluster.** Every node
+  derives the same value, and there's no master-key rotation, so it can't
+  be revoked or rotated on its own. `relish token list` doesn't show it,
+  and `relish token revoke` can't reach it.
+- **Only root on a node can derive it**, from `/etc/reliaburger/master.key`.
+  Root there already holds the master key, which is far more than this
+  read-only token gives.
+- **It only reads the API.** The dashboard's login (`/ui/session`) and the
+  image registry don't accept it.
+
+`bun appliance console` runs it on whatever terminal it's started from, so
+on a lab image, whose sshd runs, `ssh -t root@home-1
+/var/lib/reliaburger/bin/bun appliance console` shows the same dashboard in
+your own terminal. There, and on any terminal other than tty1, `q` quits.
+On tty1 nothing quits it: it's the only thing on the screen.
+
+A node that runs a newer bun on an OS image from before the dashboard
+(0.3.0 to 0.3.2) still shows it, but without keys: that image's unit gives
+the console no keyboard, so it stays on the Status tab until the OS is
+updated.
 
 ## Take the tour
 
@@ -997,6 +1076,9 @@ across a cluster you care about.
 - **No emulation for builds.** A multi-platform build's `RUN` steps for
   the other architecture can't run on an appliance. Cross-compile, or build
   for your nodes' architecture only ("Where builds run", above).
+- **The console's invaders game** isn't there yet: a game on the console
+  where each invader is a container on the node, planned with the dashboard
+  ([#2150](https://github.com/reliaburger/reliaburger/issues/2150)).
 - **Two machines can't roll a bun upgrade or an OS update.** Both are in
   the council, and taking one down would leave the other without a majority,
   so `relish upgrade start` and `relish os upgrade` refuse. Use three or more.

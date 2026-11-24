@@ -13,7 +13,8 @@
 # fetches the master key with its new certificate, and the test passes when
 # relish sees both nodes alive, node 1 says its seed came from the stick and
 # was wiped from it, and no byte run of that seed is left on the stick
-# (seed_wiped.py), since it carried the master key.
+# (seed_wiped.py), since it carried the master key. Node 1's console
+# dashboard must then show the cluster's verdict on tty1 (#2150).
 #
 # Then the pair builds the tour's burger (examples/demo/burger) with the
 # image's own Buildah, for both platforms, and pushes it into Pickle (#2144).
@@ -129,6 +130,35 @@ if [ "$result" = pass ]; then
         result=fail
     fi
 fi
+# The console dashboard on node 1's tty1 (#2150). The cluster's verdict is
+# what bun answers the console as its read-only principal, through the
+# node's TLS, so the line shows the console reaches its own bun. /dev/vcs1
+# is the text on tty1: no framebuffer capture needed.
+dashboard=skipped
+if [ "$result" = pass ]; then
+    dashboard=fail
+    dashboard_deadline=$(($(date +%s) + 90))
+    while [ "$(date +%s)" -lt "$dashboard_deadline" ]; do
+        if timeout 30 ssh -i "$work/ssh-key" -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o LogLevel=ERROR \
+                "root@${ips[0]}" cat /dev/vcs1 >"$work/screen.txt" 2>/dev/null \
+            && tr -s ' ' <"$work/screen.txt" | grep -qE "Cluster (HEALTHY|DEGRADED|DOWN)"; then
+            dashboard=pass
+            break
+        fi
+        sleep 5
+    done
+    if [ "$dashboard" != pass ]; then
+        echo "--- tty1 of node 1 ---"
+        fold -w 80 "$work/screen.txt" 2>/dev/null | grep -v '^ *$' || true
+        echo "--- node 1 console journal ---"
+        timeout 30 ssh -i "$work/ssh-key" -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o LogLevel=ERROR \
+            "root@${ips[0]}" journalctl -b --no-pager -u reliaburger-console.service \
+            2>&1 | tail -n 60 || true
+        result=fail
+    fi
+fi
 # The tour's first step, on the appliances' own Buildah.
 build=skipped
 build_elapsed=0
@@ -163,6 +193,7 @@ if [ "$result" != pass ]; then
 fi
 {
     echo "### Seeded pair: $result after ${elapsed} s"
+    echo "Console dashboard shows the cluster: $dashboard"
     echo "Burger built on the pair: $build after ${build_elapsed} s"
     echo '```'
     "$relish" nodes 2>&1 || true

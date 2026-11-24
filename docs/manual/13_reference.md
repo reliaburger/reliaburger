@@ -189,7 +189,7 @@ systemd service (`relish manual appliance`):
 | Command | What |
 |---------|------|
 | `bun appliance prepare` | prepare the node from its seed: install a create seed's files, or enrol and fetch the master key, then write `node.toml`. With no seed, wait to be claimed |
-| `bun appliance console [--tty PATH]` | draw the node's status, and its claim key while it's unclaimed, on `/dev/tty1`, refreshed every five seconds |
+| `bun appliance console` | the node's read-only dashboard on its terminal (tty1 on an appliance): status and the claim key while it's unclaimed, then metrics, workloads, the cluster, versions and logs |
 
 Host workloads require an explicit allowlist and `mount_isolation = false`;
 CPU/memory limits and container egress enforcement remain unavailable to them.

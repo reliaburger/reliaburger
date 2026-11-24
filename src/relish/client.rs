@@ -2935,6 +2935,12 @@ impl BunClient {
         })
     }
 
+    /// The answering node's own workloads with their latest CPU and memory
+    /// samples (`GET /v1/top`), for the appliance console's Workloads tab.
+    pub async fn node_top(&self) -> Result<Vec<crate::bun::top::TopRow>, RelishError> {
+        self.get_typed_json("/v1/top").await
+    }
+
     /// Every node's workloads with their latest CPU and memory samples.
     pub async fn cluster_top(&self) -> Result<crate::bun::top::ClusterTop, RelishError> {
         self.get_typed_json("/v1/top?cluster=true").await
