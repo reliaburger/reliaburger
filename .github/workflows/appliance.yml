@@ -189,7 +189,7 @@ jobs:
           df -h /
 
       - name: Set up mkosi v27
-        uses: systemd/mkosi@f2b04fcd671110e3a7372027162752f71de0c9b0 # v27
+        uses: systemd/mkosi@4736cd836108a97772142c461c49f1ddb4172348 # v27
 
       - uses: actions/download-artifact@v4
         if: needs.bun.result == 'success'
