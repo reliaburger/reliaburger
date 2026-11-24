@@ -137,6 +137,25 @@ fn preparing_a_config_adds_a_network_table_and_keeps_an_explicit_range() {
     assert_eq!(config.network.port_range.end, 40010);
 }
 
+/// A config that went through `NodeConfig` and back carries Bun's default
+/// range, 10000–32767, written out explicitly. That's not a range of the
+/// test's own choosing, and it covers the lease range, so it's replaced. The
+/// Linux fixtures build most of their configs this way, from
+/// `relish init`'s output.
+#[test]
+fn preparing_a_serialised_config_replaces_a_range_that_covers_the_lease_range() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("node.toml");
+    std::fs::write(&path, toml::to_string(&NodeConfig::default()).unwrap()).unwrap();
+    let before = NodeConfig::from_file(&path).unwrap();
+    assert!(before.network.port_range.start < TEST_PORTS.end);
+    assert!(before.network.port_range.end > TEST_PORTS.start);
+    use_test_workload_ports(&path);
+    let config = NodeConfig::from_file(&path).unwrap();
+    assert_eq!(config.network.port_range.start, TEST_WORKLOAD_PORTS.start);
+    assert_eq!(config.network.port_range.end, TEST_WORKLOAD_PORTS.end);
+}
+
 /// The shared spawn helpers prepare the config themselves, so a test that
 /// starts Bun through them can't forget.
 #[test]

@@ -254,11 +254,14 @@ pub const TEST_PORTS: std::ops::Range<u16> = 27000..30000;
 pub const TEST_WORKLOAD_PORTS: std::ops::Range<u16> = 10000..15000;
 
 /// Give the node config at `path` [`TEST_WORKLOAD_PORTS`] as its
-/// `[network] port_range`, unless it sets one already. Every helper here that
-/// starts Bun calls it; a test that starts Bun itself calls it on its config
-/// first. Edits in place and keeps the file's comments. A missing or
-/// malformed file is left alone, for the tests that start Bun on one to see
-/// it refused.
+/// `[network] port_range`, unless it sets one that stays out of
+/// [`TEST_PORTS`]. A range that overlaps the lease range is replaced: that's
+/// almost always Bun's default, written out by a config that went through
+/// `NodeConfig` and back, as every config built from `relish init`'s output
+/// does. Every helper here that starts Bun calls it; a test that starts Bun
+/// itself calls it on its config first. Edits in place and keeps the file's
+/// comments. A missing or malformed file is left alone, for the tests that
+/// start Bun on one to see it refused.
 pub fn use_test_workload_ports(path: &Path) {
     let Ok(text) = std::fs::read_to_string(path) else {
         return;
@@ -266,11 +269,13 @@ pub fn use_test_workload_ports(path: &Path) {
     let Ok(mut config) = text.parse::<toml_edit::DocumentMut>() else {
         return;
     };
-    let has_range = config
+    let range = config
         .get("network")
-        .and_then(|network| network.get("port_range"))
-        .is_some();
-    if has_range {
+        .and_then(|network| network.get("port_range"));
+    let bound = |key: &str| range.and_then(|range| range.get(key)?.as_integer());
+    if let (Some(start), Some(end)) = (bound("start"), bound("end"))
+        && (end <= i64::from(TEST_PORTS.start) || start >= i64::from(TEST_PORTS.end))
+    {
         return;
     }
     let mut range = toml_edit::InlineTable::new();

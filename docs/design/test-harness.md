@@ -520,8 +520,10 @@ fixture in another test could take the same port in that window. They now keep i
 the test process exits. And every test Bun ran with the default `[network] port_range`,
 10000–32767, so a workload could land on a leased port while its owner's Bun was down for a
 restart; test Buns now get `TEST_WORKLOAD_PORTS`, 10000–14999, through
-`use_test_workload_ports`. `self_upgrade`'s workloads lease their ports too, rather than
-serving on fixed ports inside Linux's ephemeral range. [`testing.md`](../testing.md#how-tests-get-ports)
+`use_test_workload_ports`, which also replaces the default range a config written back
+through `NodeConfig` carries, as the Linux runtime fixtures' configs from `relish init`
+do. `self_upgrade`'s workloads lease their ports too, rather than serving on fixed ports
+inside Linux's ephemeral range. [`testing.md`](../testing.md#how-tests-get-ports)
 has the rules in one place.
 
 Cleanup has to find everything a test started, including processes whose command lines

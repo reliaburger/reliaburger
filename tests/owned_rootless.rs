@@ -24,6 +24,8 @@ async fn rootless_cluster_refuses_before_ownership_recovery_for_every_selection(
                 root.path().display()
             ),
         ).unwrap();
+        // Every test Bun keeps workloads out of the lease range (#2261).
+        bun_process::use_test_workload_ports(&config);
         let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_bun"));
         command
             .args(["--cluster", "--runtime", runtime, "--listen", "127.0.0.1:0"])

@@ -1747,12 +1747,21 @@ each other's ports, so every port a fixture picks comes from one place,
   from the lease range. Bun's default, 10000–32767, covers all of it, and a
   workload could take a port whose owner's Bun was down for a restart.
   `BunProcess` and the shared spawn helpers set it; a test that starts Bun
-  itself calls `use_test_workload_ports` on its config first. The Linux
-  runtime fixtures (`oci_crash`, `owned_rootless`, `ebpf`) don't yet.
+  itself calls `use_test_workload_ports` on its config first, as
+  `oci_crash`, `owned_rootless`, `job_recovery`, the self-upgrade fixtures
+  and the suite's start-up tests do. The helper also replaces a range that
+  overlaps the lease range, because a config that went through `NodeConfig`
+  and back, like every one built from `relish init`'s output, writes Bun's
+  default out. The demos get the range through `DEMO_WORKLOAD_PORTS`.
+  `ebpf` starts no Bun process: its in-process agents take ports from fixed
+  allocators at 41100 and up.
 
 A lease only keeps out processes that take one. The agent gym's
-`GYM_PORT_BASE` (default 29400) and anything else outside the test suites
-can still take a leased port, so don't run them beside a test run.
+`GYM_PORT_BASE` (default 29400) sits inside the lease range, and its nodes
+keep Bun's default `port_range`, so their workloads can land there too.
+Moving the gym takes both a new block and a gym `port_range` clear of every
+range above; until then, don't run `make test-gym` or anything else outside
+the test suites beside a test run.
 [`tests/suite/test_ports.rs`](../tests/suite/test_ports.rs) checks that the
 helpers keep their leases and that test configs keep workloads out of the
 lease range.
