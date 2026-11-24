@@ -50,7 +50,9 @@ pub(crate) fn load_config_file(path: &Path) -> Result<Config, RelishError> {
 }
 
 /// Read a manifest for `apply`, printing any migration report to stderr.
-async fn load_manifest(source: &super::manifest::ManifestSource) -> Result<Config, RelishError> {
+pub(crate) async fn load_manifest(
+    source: &super::manifest::ManifestSource,
+) -> Result<Config, RelishError> {
     let loaded = super::manifest::load(source).await?;
     if let Some(report) = &loaded.migration_report {
         eprint!("{report}");

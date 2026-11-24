@@ -53,7 +53,10 @@ async fn api_with_capacity(capacity: bool) -> (Arc<CouncilNode>, Router) {
     })
     .await
     .unwrap();
-    let router = router_for_council(council.clone(), None, None, capacity);
+    // A cluster with a master key: its nodes hold a service token, so the
+    // API lets the first API token be created (#1248).
+    let service_token = format!("rbrg_{}", "7".repeat(64));
+    let router = router_for_council(council.clone(), None, Some(service_token), capacity);
     (council, router)
 }
 

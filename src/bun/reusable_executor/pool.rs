@@ -394,7 +394,8 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                     })
             })
             .count();
-        let available = self.budget.available();
+        // Room a refused app claims isn't offered to job work (#1967).
+        let available = self.budget.job_available();
         let cold = (available.cpu_millicores / reservation.cpu_millicores)
             .min(available.memory_bytes / reservation.memory_bytes)
             .min((idle - warm) as u64);
@@ -2546,6 +2547,21 @@ mod tests {
 
     fn key(byte: u8) -> ExecutorKey {
         ExecutorKey([byte; 32])
+    }
+
+    /// #1967: room an app was refused here is held for it, so the node
+    /// doesn't offer it to job work while the app's retry is pending.
+    #[tokio::test]
+    async fn a_node_offers_job_work_none_of_the_room_an_app_claims() {
+        let budget = ExecutionBudget::new(Resources::new(1000, 1 << 30, 0));
+        let pool = pool(&ProcessGrill::new(), HangingKill::default(), &budget);
+        let before = pool.available_slots(None, reservation()).await;
+        assert!(before > 0);
+        let web = crate::meat::AppId::new("web", "default");
+        budget.claim_for_app(&web, budget.capacity());
+        assert_eq!(pool.available_slots(None, reservation()).await, 0);
+        budget.release_app_claim(&web);
+        assert_eq!(pool.available_slots(None, reservation()).await, before);
     }
 
     #[tokio::test]

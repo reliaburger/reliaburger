@@ -2967,6 +2967,19 @@ would fail every sync and never advance its commit. Skipping with a note is
 what Lettuce already does with what it didn't write, and the note means it
 isn't silent.
 
+The plan has to tell the same story. At first `relish apply --dry-run`
+showed an owned app as an update (`~`), because
+`GET /v1/apps` carried only an image and a fingerprint, and the file's spec
+differed from the controller's (#1322). The apply would then skip it. Now each
+row carries the app's `owner`, and an app with an owner the file doesn't
+declare gets its own plan action, `owned_skipped` (shown as `!`, "owned by
+'db-failover', skipped"). Adding a variant to `PlanAction` made the compiler
+list every `match` that needed an answer for it: the symbol, the JSON name,
+and nothing else, because the counts filter on `==`. The plan applies the
+same rule as `judge_apply` without the caller's token, so it can't tell you
+that a file which declares the owner will be refused for the wrong token;
+the apply still does.
+
 *Why tie the owner to a token's name?* The first sketch let any string be an
 owner, and treated it as a label. Then anyone allowed to deploy in `pg` could
 write `owner = "db-failover"` by copying a file, and silently take part in the

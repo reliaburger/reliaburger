@@ -71,6 +71,11 @@ $ relish apply -f pg/
 app 'db-a' in namespace 'pg' is owned by 'db-failover'; skipped, so this apply doesn't fight it
 ```
 
+`relish apply --dry-run` says the same before you apply: an owned app the
+file doesn't claim shows as `! app.pg/db-a (owned by 'db-failover', skipped)`,
+with `"action": "owned_skipped"` in `-o json`, not as an update. `GET /v1/apps`
+carries each app's `owner` for this.
+
 To take an app back, release it. The owner's token or an admin can:
 
 ```sh

@@ -752,6 +752,17 @@ its own file, so a later one can't overwrite the one taken before a kill, and th
 step uploads them all. A host that freezes outright still keeps nothing, but a hung step now
 leaves a picture of itself from a few minutes before it died.
 
+In the worst week we'd made the 26.04 job advisory: it still ran, but its failure only
+warned, so a lost runner couldn't block the merge queue. Once these guards reached the trains
+on the evening of 20 November, we counted again. Up to 23 November the 26.04 job ran 59 times
+on `main` and the trains without being cancelled for a newer push, and passed all 59 in 23 to
+34 minutes; the 24.04 job passed 58 of 58 in 25 to 37. Thirty-one of those runners came up
+with `/` on the device-mapper snapshot that had frozen a host, so `give-swap` added nothing,
+and they ran on the image's 3 GiB of zram or on no swap at all. No run came near a stop: the
+lowest free memory in any of the 117 was 0.7 GiB, and the kernel killed nothing outside the
+tests' own memory-limited cgroups. No 26.04 snapshot has fired yet, because no passing run
+reached minute 36. So the job is required again.
+
 Coverage finds unvisited code. It does not tell us whether an assertion is useful, whether a
 webhook test accidentally exercised startup, or whether a five-second performance limit is
 portable. The audit found all three in a suite with lots of coverage. Read the uncovered

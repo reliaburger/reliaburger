@@ -684,6 +684,15 @@ enum Command {
         /// it, someone else's lease refuses the change, naming them.
         #[arg(long)]
         break_lease: bool,
+        /// Return once every app in the file runs its replicas, passes its
+        /// health checks and has finished rolling out, printing progress.
+        /// Exits 1 when one isn't ready in time, naming it and why; 3, 4 or
+        /// 5 when the apply itself failed.
+        #[arg(long, conflicts_with_all = ["dry_run", "rerun_jobs"])]
+        wait: bool,
+        /// How long --wait waits, as `90s`, `5m` or `1h` (default 5m).
+        #[arg(long, requires = "wait", value_name = "DURATION", value_parser = parse_wait_timeout)]
+        timeout: Option<std::time::Duration>,
     },
     /// Is the cluster all right? One screen: a verdict, then one line per part
     /// of the cluster with the command that lists the detail.
@@ -1725,6 +1734,18 @@ fn parse_ipxe(value: &str) -> Result<reliaburger::relish::netboot::IpxeBuild, St
         .map_err(|e: reliaburger::relish::netboot::NetbootError| e.to_string())
 }
 
+/// `relish apply --timeout`: `90s`, `5m`, `1h` or bare seconds, more than
+/// zero.
+fn parse_wait_timeout(value: &str) -> Result<std::time::Duration, String> {
+    match reliaburger::meat::deploy_types::parse_duration(value) {
+        Some(duration) if !duration.is_zero() => Ok(duration),
+        Some(_) => Err("must be longer than zero".to_string()),
+        None => Err(format!(
+            "{value:?} isn't a duration: write it as 90s, 5m or 1h"
+        )),
+    }
+}
+
 fn parse_netboot_duration(value: &str) -> Result<std::time::Duration, String> {
     reliaburger::relish::netboot::parse_duration(value).map_err(|e| e.to_string())
 }
@@ -2555,11 +2576,26 @@ async fn main() -> ExitCode {
             dry_run,
             rerun_jobs,
             break_lease,
+            wait,
+            timeout,
         } => match reliaburger::relish::manifest::ManifestSource::parse(
             // The ArgGroup makes exactly one of the two present.
             path.as_deref().or(file.as_deref()).unwrap_or_default(),
         ) {
             Err(error) => Err(error),
+            Ok(source) if wait => {
+                use reliaburger::relish::apply_wait;
+                let timeout = timeout.unwrap_or(apply_wait::DEFAULT_TIMEOUT);
+                // Like `status`: a failure exits 3, 4 or 5, never 1, which
+                // means "applied, not ready in time".
+                return match apply_wait::run(&source, cli.output, break_lease, timeout).await {
+                    Err(error) => {
+                        report(&error);
+                        ExitCode::from(apply_wait::failure_exit_code(&error))
+                    }
+                    outcome => finish_outcome(outcome),
+                };
+            }
             Ok(source) if rerun_jobs => commands::rerun_jobs(&source, cli.output).await,
             Ok(source) => commands::apply(&source, cli.output, dry_run, break_lease).await,
         },
@@ -4341,7 +4377,7 @@ fn report(error: &reliaburger::relish::RelishError) {
         RelishError::AgentUnreachable {
             cause: UnreachableCause::Refused | UnreachableCause::TimedOut,
             ..
-        }
+        } | RelishError::NoEndpointAnswered { .. }
     ) && !reliaburger::relish::client::endpoint_overridden()
         && let Some(hint) = reliaburger::relish::quickstart::server_runner::unreachable_hint()
     {
@@ -5584,7 +5620,7 @@ mod tests {
     fn parse_apply_command() {
         let cli = parse(&["relish", "apply", "config.toml"]).unwrap();
         assert!(
-            matches!(cli.command, Command::Apply { ref path, file: None, dry_run: false, rerun_jobs: false, break_lease: false } if path.as_deref() == Some("config.toml"))
+            matches!(cli.command, Command::Apply { ref path, file: None, dry_run: false, rerun_jobs: false, break_lease: false, wait: false, timeout: None } if path.as_deref() == Some("config.toml"))
         );
     }
 
@@ -5611,6 +5647,35 @@ mod tests {
             parse(&["relish", "apply", "a.toml", "-f", "b.yaml"]).is_err(),
             "one manifest at a time"
         );
+    }
+
+    /// #2240: `--wait` takes no value, so `apply --wait app.toml` reads
+    /// the file as the manifest; `--timeout` bounds it and needs it.
+    #[test]
+    fn parse_apply_wait_and_its_timeout() {
+        let cli = parse(&["relish", "apply", "--wait", "app.toml"]).unwrap();
+        assert!(
+            matches!(cli.command, Command::Apply { ref path, wait: true, timeout: None, .. } if path.as_deref() == Some("app.toml"))
+        );
+        let cli = parse(&["relish", "apply", "app.toml", "--wait", "--timeout", "90s"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Apply { wait: true, timeout: Some(timeout), .. } if timeout == std::time::Duration::from_secs(90)
+        ));
+        let cli = parse(&["relish", "apply", "app.toml", "--wait", "--timeout", "10m"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Apply { timeout: Some(timeout), .. } if timeout == std::time::Duration::from_secs(600)
+        ));
+        for refused in [
+            &["relish", "apply", "app.toml", "--timeout", "5m"][..],
+            &["relish", "apply", "app.toml", "--wait", "--timeout", "soon"],
+            &["relish", "apply", "app.toml", "--wait", "--timeout", "0s"],
+            &["relish", "apply", "app.toml", "--wait", "--dry-run"],
+            &["relish", "apply", "app.toml", "--wait", "--rerun-jobs"],
+        ] {
+            assert!(parse(refused).is_err(), "{refused:?}");
+        }
     }
 
     #[test]
