@@ -5958,13 +5958,20 @@ async fn workload_admission_fixture(
     (app, council, rx)
 }
 
+/// How long applied jobs get to settle through the common executor. On a
+/// quiet host it takes well under a second, but the path crosses several
+/// Raft writes and the task ledger's commits, and at 12 nextest threads
+/// with the host's disk busy it overran a 5 s bound once in ten runs
+/// (#2305). The wait ends as soon as every job succeeds.
+const SETTLEMENT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
 async fn assert_authorised_job_dispatch_and_settlement(
     commands: &mut mpsc::Receiver<WorkloadAdmissionTrace>,
     council: &crate::council::CouncilNode,
     expected: &crate::config::Config,
     _rerun: bool,
 ) {
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(SETTLEMENT_DEADLINE, async {
         loop {
             let desired = council.desired_state().await;
             if expected.job.iter().all(|(name, spec)| {

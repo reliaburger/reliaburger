@@ -3599,8 +3599,14 @@ mod tests {
 
     /// V02 soak: retirements of SIGTERM-ignoring apps ran one at a time, each
     /// timing out ("exceeded ten seconds") before its stop could finish. A
-    /// cycle's retirements now wait side by side, so three stops that each
-    /// take one grace finish in about one grace, all in the first cycle.
+    /// cycle's retirements now wait side by side: all three stops are in
+    /// flight at once, and each succeeds on its first attempt.
+    ///
+    /// The test measures the overlap itself, not the wall time. Wall time
+    /// also counts the checkpoint writes after each stop, and with the
+    /// host's disk busy those took 3.66 s against a 3 s bound although the
+    /// stops overlapped (#2305). Serial stops still fail: the next one
+    /// starts only after the last one ends.
     #[tokio::test]
     async fn a_cycles_retirements_wait_out_their_stops_side_by_side() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3629,8 +3635,11 @@ mod tests {
         let grace = Duration::from_millis(1500);
         let (commands, mut received) = mpsc::channel(8);
         let reconciler = reconciler_with_retire_deadline(address, root.path(), commands, grace * 2);
-        // A stand-in agent whose every stop waits out the grace, concurrently.
+        // A stand-in agent whose every stop waits out the grace, concurrently,
+        // recording when each stop starts and ends.
         let retirements = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stopped = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ended = stopped.clone();
         let recorded = retirements.clone();
         let agent = tokio::spawn(async move {
             while let Some(command) = received.recv().await {
@@ -3652,8 +3661,10 @@ mod tests {
                             .lock()
                             .unwrap()
                             .push((app_name, std::time::Instant::now()));
+                        let ended = ended.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(grace).await;
+                            ended.lock().unwrap().push(std::time::Instant::now());
                             let _ = response.send(Ok(()));
                         });
                     }
@@ -3662,14 +3673,13 @@ mod tests {
             }
         });
 
-        let retired = tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::time::timeout(Duration::from_secs(60), async {
             while !crate::cluster::applied::load(&checkpoint)
                 .unwrap()
                 .is_empty()
             {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            std::time::Instant::now()
         })
         .await
         .expect("retirements never completed");
@@ -3687,11 +3697,14 @@ mod tests {
             names, apps,
             "each retirement must succeed on its first attempt"
         );
-        let first = retirements.iter().map(|(_, at)| *at).min().unwrap();
-        let elapsed = retired - first;
+        // Every stop is in flight at one instant: the last to start began
+        // before the first to end finished.
+        let last_start = retirements.iter().map(|(_, at)| *at).max().unwrap();
+        let first_end = *stopped.lock().unwrap().iter().min().unwrap();
         assert!(
-            elapsed < grace * 2,
-            "retirements serialised: {elapsed:?} for three {grace:?} stops"
+            last_start < first_end,
+            "retirements serialised: the last stop started {:?} after the first ended",
+            last_start - first_end
         );
     }
 

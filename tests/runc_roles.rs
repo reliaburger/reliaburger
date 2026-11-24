@@ -80,6 +80,30 @@ async fn shell(commands: IntentCommands, role: RuntimeRole, script: &str) -> Int
         .unwrap()
 }
 
+/// Wait until a role exec's command has written `ready`, while the exec is
+/// still running.
+///
+/// The exec crosses the role owner's socket, its gate and a fresh shell, and
+/// at 12 nextest threads with the disk busy that took over 15 s once (#2305).
+/// A fixed deadline couldn't tell slow from refused, so this one is generous
+/// and an exec that ends first fails at once with its own answer.
+async fn wait_for_exec(
+    ready: &Path,
+    caller: &mut tokio::task::JoinHandle<std::io::Result<reliaburger::grill::ExecOutput>>,
+) {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        while !ready.exists() {
+            if caller.is_finished() {
+                let answer = (&mut *caller).await;
+                panic!("role exec ended before its command started: {answer:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("role exec's command never started");
+}
+
 async fn terminal(commands: &IntentCommands, role: RuntimeRole) -> CommandState {
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
@@ -432,15 +456,9 @@ async fn role_exec_does_not_hold_the_adapter_lock_while_cleanup_retires_it() {
         "exec-fixture".into(),
         ready.display().to_string(),
     ];
-    let caller =
+    let mut caller =
         tokio::spawn(async move { running.exec_role(RuntimeRole::Launcher, &arguments).await });
-    tokio::time::timeout(Duration::from_secs(15), async {
-        while !ready.exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    wait_for_exec(&ready, &mut caller).await;
     let cleanup = tokio::time::timeout(
         Duration::from_secs(10),
         executor.seal(Duration::from_secs(5)),
@@ -473,15 +491,9 @@ async fn cancelled_role_exec_cannot_complete_a_late_mutation() {
     let ready = root.path().join("exec-ready");
     let running = executor.clone();
     let arguments = vec!["/bin/sh".into(), "-c".into(), "touch \"$1/exec-ready\"; while [ ! -f \"$1/release\" ]; do sleep 0.02; done; touch \"$1/late-exec\"".into(), "exec-fixture".into(), root.path().display().to_string()];
-    let caller =
+    let mut caller =
         tokio::spawn(async move { running.exec_role(RuntimeRole::Launcher, &arguments).await });
-    tokio::time::timeout(Duration::from_secs(15), async {
-        while !ready.exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    wait_for_exec(&ready, &mut caller).await;
     caller.abort();
     let _ = caller.await;
     let cleanup = executor.seal(Duration::from_secs(15)).await.unwrap();
