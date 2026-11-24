@@ -842,6 +842,7 @@ mod tests {
             image: None,
             data_on_node: false,
             reason: None,
+            sidecars: Vec::new(),
         }
     }
 
