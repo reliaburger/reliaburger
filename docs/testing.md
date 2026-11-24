@@ -458,9 +458,11 @@ jobs. What else runs depends on where the change is going:
 | The gate PR labelled `release-gate` | Everything, portable macOS included; the evidence gate refuses less | about 45 minutes, plus any wait for macOS runners |
 | Any other pull request into `main` | The light set plus the heavy suites and the benchmarks the change touches | about 45 minutes |
 | Pull request stacked on any other branch | The light set; the heavy suites only with `full-ci` | about 17 minutes |
-| Merge-queue group | Everything; only CI policy and the gate when the group changes nothing but documentation | about 60 minutes from 21 to 24 November, set by portable macOS (median 59.8 over 17 green groups); about 35 to 47 since the macOS build split (#1723, two runs), plus any wait for runners |
+| Draft pull request, or one from a `0-4-0/` branch, whatever its labels | Select jobs, CI policy and lint; the full set for its base once it's marked ready for review | a few minutes |
+| Merge-queue group | Everything but portable macOS; only CI policy and the gate when the group changes nothing but documentation | set by acceptance and the privileged Linux jobs instead of portable macOS, plus any wait for runners |
 | Push to a train | Nothing but CI policy and the gate when the merge queue's run on that commit passed every job at its first attempt; portable Linux too when the train's `Cargo.lock`, `Cargo.toml` or `.cargo/config.toml` differs from `main`'s, to save its cache; everything otherwise | a few minutes; about 25 with portable Linux |
 | Push to `main`, nightly, manual, `build.yml`'s candidate build | Everything | about 45 minutes, plus any wait for macOS runners |
+| [`macos-nightly.yml`](../.github/workflows/macos-nightly.yml), nightly and by hand | Portable macOS alone (`make lint-macos`, `make test-macos`, relish's doctests) on the newest `release-*` train with work `main` doesn't have, else `main` | about an hour, plus any wait for a macOS runner |
 
 **macOS only where it adds something**
 ([#1443](https://github.com/reliaburger/reliaburger/issues/1443), maintainer
@@ -478,9 +480,33 @@ portable macOS only when
 - it carries the `macos` label (any code PR, Dependabot's included); or
 - it's the gate PR labelled `release-gate`.
 
-Dependabot's PRs never get macOS otherwise; the nightly covers them. Every
-push to a train or to `main`, the merge queue, the nightly and the candidate
-build still run it, so no commit reaches a train or `main` without it.
+Dependabot's PRs never get macOS otherwise; the nightly covers them.
+
+**macOS out of the merge queue** (maintainer decision of 24 November 2026).
+Portable macOS took 50 minutes to over 2 hours in merge-group runs and set
+every group's length, and on 24 November it was cancelled or failed three
+times, each time rebuilding the whole queue, while one PR's CI waited over 3
+hours for a runner. So select jobs leaves it out of every merge group, and the
+evidence gate accepts a merge group with every owner but `portable-darwin`
+(the `train-full` selection). A train push the queue already tested still
+runs nothing: `ci_reuse.py --event merge_group` accepts a skipped `portable
+macOS` there and nowhere else. Instead,
+[`macos-nightly.yml`](../.github/workflows/macos-nightly.yml) runs the same
+lint, tests and doctests every night on the newest train (picked the way
+[mutation testing](#mutation-testing) picks it), and by hand on any ref. A red
+nightly is handled like a flake: an issue the same day. So a train may carry a
+macOS break for up to a day, never into a release: the gate PR labelled
+`release-gate` runs portable macOS and its evidence gate refuses it without,
+the push to `main` runs it, and a candidate build only reuses a push or
+nightly run in which `portable macOS` passed; otherwise `validate-release`
+runs all of `ci.yml`, macOS included.
+
+**Drafts and 0.4.0 work run the cheap set** (same decision). A draft pull
+request, and one whose head branch starts with `0-4-0/`, runs select jobs, CI
+policy and lint (when it changes code) and nothing else, whatever its labels;
+`appliance.yml` builds no image for it and `build.yml` builds nothing.
+`ready_for_review` starts a run with the full set for its base, and
+`converted_to_draft` starts a cheap run that cancels the one still going.
 
 Both privileged Linux jobs guard their hosted runner the way the 26.04 job
 learned to (#1943). The runner's own processes run at `oom_score_adj` -1000
@@ -538,15 +564,16 @@ runner queueing was mostly under ten, portable macOS 35–49 and acceptance
 about 34; every other job finished in about 15. A pull request into a train
 only needs to show it compiles, lints and passes the portable suite on Linux,
 with the coverage floor (`COVERAGE_MIN_LINES`, which only the Linux job
-measures). Nothing is lost, only moved: the merge queue runs every job on the
-result before it lands, so every commit on a train has full coverage. The gate PR
+measures). Nothing is lost, only moved: the merge queue runs every job but
+portable macOS on the result before it lands, so every commit on a train has
+full coverage on Linux, and the macOS nightly covers the train's tip. The gate PR
 doesn't run it all again on each push, since the queue just did; it runs
 everything once it's labelled `release-gate` at code freeze. Label a pull
 request `full-ci` when you want the heavy suites on the PR itself, for
 example for a change to privileged Linux, cluster or acceptance code. The
 evidence gate calls a heavy selection without macOS `train-full` and accepts
-it, like the light set, only on a `pull_request` event, and never on a
-`release-gate` PR. For macOS-only code the PR runs portable macOS itself; for
+it only on a `pull_request` or `merge_group` event, and never on a
+`release-gate` PR; the light set only on a `pull_request`. For macOS-only code the PR runs portable macOS itself; for
 anything else, check it on a Mac with `make test`, or add the `macos` label.
 Either way the job runs relish and the macOS-only tests, not the whole suite
 ([what runs on macOS](#what-runs-on-macos-and-what-runs-on-linux)), so in CI a
@@ -560,8 +587,9 @@ train is named in the queue's ruleset when it opens
 The queue requires one check, `ignored-test evidence`. It waits for
 every other job, fails if any of them failed or was cancelled, and then runs
 the evidence aggregation below, so a skipped job can only count when select
-jobs left it out. On a merge-queue group, a push or a manual run the
-aggregation demands every owner; only a pull request may qualify with fewer.
+jobs left it out. On a push or a manual run the aggregation demands every
+owner, and on a merge-queue group every owner but portable macOS; only a pull
+request may qualify with fewer.
 Evidence there binds to the queue's temporary group commit
 (`github.event.merge_group.head_sha`), the commit it checked out.
 
@@ -619,8 +647,9 @@ to 110 to report (#1723). Three things wasted runners, and each now has a fix:
   ([`ci_reuse.py`](../scripts/release/ci_reuse.py) with `--event
   merge_group`: same commit, first attempt, every job green), and when it
   finds one the push runs only CI policy and the gate, which names the run
-  it rests on. A candidate build of that commit reuses the queue's run, not
-  the push's. Any doubt, an API error included, runs everything.
+  it rests on. That lookup accepts a skipped `portable macOS`, since the queue
+  no longer runs it; a candidate build never does, so it can't rest on the
+  queue's run or that push's. Any doubt, an API error included, runs everything.
 - **Groups the queue had dropped.** When the queue re-forms it deletes the
   dropped groups' `gh-readonly-queue/...` branches but leaves their runs
   going, and each merge-group run has a concurrency group of its own. Five
@@ -642,12 +671,14 @@ testing. Scripts are code here, since the jobs run them.
 
 What's left is mostly the queue's own settings, which only the maintainer can
 change: building eight groups at once (`max_entries_to_build` in the "release
-trains merge queue" ruleset) means up to 144 jobs, and portable macOS sets
-every group's length: 52 to 57 minutes with a warm cache then, 35 to 47 once
-its lib tests built alone ([below](#portable-macos-in-one-job)). On 24 November
-a group's jobs waited a median 633 job-minutes for runners against 276 running,
-and the recommendation is three groups at once
+trains merge queue" ruleset) meant up to 144 jobs; it builds three since 24
+November 2026, after a group's jobs waited a median 633 job-minutes for runners
+against 276 running
 ([merge queue experiments](qualification/2026-11-24-merge-queue-experiments.md)).
+Portable macOS (52 to 57 minutes with a warm cache, 35 to 47 once its lib tests
+built alone, and over 2 hours when its runners ran short) set every group's
+length until it left the queue the same day ([above](#which-jobs-a-pull-request-runs)),
+when fuzzing also stopped running on pull requests ([fuzzing](#fuzzing)).
 
 ### What runs on macOS and what runs on Linux
 
@@ -1012,16 +1043,17 @@ rebuilt reliaburger, twice a target: the nightly spent 25 minutes a target
 and hit its timeout.
 
 [`fuzz.yml`](../.github/workflows/fuzz.yml) runs `make fuzz-smoke` nightly at
-300 seconds a target, and for 30 seconds on a pull request that touches a
-decoder's file or the fuzzing set-up (or by hand, with any budget). A
-dependency bump, a Makefile change or the rest of `src/config/` waits for the
-nightly: the job takes 14 to 33 minutes. The job summary has each target's last
+300 seconds a target, and by hand with any budget. Until 24 November 2026 it
+also ran for 30 seconds a target on every pull request that touched a
+decoder's file, but the job takes 14 to 33 minutes and runners were short, so
+the maintainer took it off pull requests; the release gate never used it.
+The stable half, every target over its checked-in corpus, still runs in the
+portable suite on every pull request. The job summary has each target's last
 libFuzzer status line (executions, coverage, corpus size). A crash fails the
 job and its input is kept as the `fuzz-crashes` artefact. The workflow pins a
 dated nightly (`FUZZ_TOOLCHAIN`) and caches the sanitizer build under one
-rust-cache key for nightly and pull request runs, which only the nightly and
-runs by hand save, so pull requests don't eat into the cache quota `ci.yml`
-keeps for `main`; a floating nightly would change that key every day. Move the pin forward by hand when a newer nightly
+rust-cache key that the nightly and runs by hand save; a floating nightly
+would change that key every day. Move the pin forward by hand when a newer nightly
 is needed. Locally, `FUZZ_TOOLCHAIN` defaults to `nightly`.
 
 A crash is handled like a flake: an issue the same day. Then add the input as
