@@ -521,6 +521,7 @@ See [getting started](00_getting-started.md) and [cluster basics](02_cluster-bas
   - `relish os status`: The rollout in progress, or the last one
   - `relish os resume`: Carry on with a paused rollout, retrying the node that stopped it
   - `relish os abort`: Stop the rollout; nodes keep the version they're on
+  - `relish os boot-logs`: Where each appliance sends its kernel and boot logs over UDP, or change it: with --to, to that machine from now on, where `relish machines logs` or `relish netboot --stream-logs` shows them; with --off, nowhere. The lines cross the LAN in cleartext. Each node keeps the setting on its ESP, so it holds across reboots and OS updates *(0.3.3, not in 0.3.2)*
 - `relish join --node-id <NODE_ID> <ADDR>`: Join an existing cluster
 - `relish join-token`: Manage short-lived node-enrolment tokens
   - `relish join-token create --node-id <NODE_ID>`: Create a single-use token for enrolling one node

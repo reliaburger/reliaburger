@@ -3689,6 +3689,23 @@ impl BunClient {
         .await
     }
 
+    /// Where this node sends its boot logs (#2149): `{"target": …}`.
+    pub async fn os_boot_logs(&self) -> Result<serde_json::Value, RelishError> {
+        self.get_json("/v1/os/boot-logs").await
+    }
+
+    /// Send this node's boot logs to `target`, or stop for `None`.
+    pub async fn os_boot_logs_set(
+        &self,
+        target: Option<crate::os::netlog::NetlogTarget>,
+    ) -> Result<serde_json::Value, RelishError> {
+        self.post_json(
+            "/v1/os/boot-logs",
+            serde_json::json!({ "target": target }).to_string(),
+        )
+        .await
+    }
+
     /// Resume a paused OS rollout.
     pub async fn os_rollout_resume(&self) -> Result<serde_json::Value, RelishError> {
         self.post_json("/v1/os/rollout/resume", "{}".to_string())

@@ -411,9 +411,13 @@ ordinary join tokens up to an hour).
 | `relish os status` | the active rollout, and the last one |
 | `relish os resume` | restart a paused rollout |
 | `relish os abort` | stop a rollout |
+| `relish os boot-logs [--to ADDRESS[:PORT] \| --off] [--node NODE]…` | where each node streams its boot logs (#2149), or change it |
 
 The API is `POST /v1/os/stage` and `/v1/os/rollout/{start,resume,abort}`,
-all admin, and `GET /v1/os/rollout`, for any token. relish reads the channel
+all admin, and `GET /v1/os/rollout`, for any token. `GET /v1/os/boot-logs`
+(any token) and `POST /v1/os/boot-logs` (unscoped admin) read and rewrite
+`reliaburger/netlog.conf` on that node's own ESP (`src/os/netlog.rs`); relish
+asks each node in turn, as `relish os list` does. relish reads the channel
 only to pick a version. Each node checks what it downloads against the keys
 its own image carries.
 

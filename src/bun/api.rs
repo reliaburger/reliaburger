@@ -133,8 +133,8 @@ use nodes::{
     nodes_handler,
 };
 use os::{
-    os_rollout_abort_handler, os_rollout_handler, os_rollout_resume_handler,
-    os_rollout_start_handler, os_stage_handler,
+    os_boot_logs_handler, os_boot_logs_set_handler, os_rollout_abort_handler, os_rollout_handler,
+    os_rollout_resume_handler, os_rollout_start_handler, os_stage_handler,
 };
 use policies::{policies_handler, policy_audit_handler, policy_delete_handler};
 use proposals::{
@@ -798,6 +798,10 @@ pub fn router_with_upgrade(
             post(upgrade_cluster_rollback_handler),
         )
         .route("/v1/os/stage", post(os_stage_handler))
+        .route(
+            "/v1/os/boot-logs",
+            get(os_boot_logs_handler).post(os_boot_logs_set_handler),
+        )
         .route("/v1/os/rollout", get(os_rollout_handler))
         .route("/v1/os/rollout/start", post(os_rollout_start_handler))
         .route("/v1/os/rollout/resume", post(os_rollout_resume_handler))

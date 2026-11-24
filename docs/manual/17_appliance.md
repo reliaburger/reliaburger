@@ -409,7 +409,7 @@ line from a machine `relish netboot` didn't answer shows as
 - It's UDP: lines can be lost, and nothing is retried.
 - The lines cross your LAN unencrypted, and anyone on it can send lines to
   the listener. That's why it's off unless you ask for it. To stop a machine
-  sending, delete `reliaburger/netlog.conf` from its EFI partition.
+  sending, run `relish os boot-logs --off` (below).
 
 To listen without serving anything, say while an installed machine reboots,
 run only the listener. It doesn't need root:
@@ -421,6 +421,41 @@ relish machines logs --interface en7 --dir os
 It listens on UDP 6666 until Ctrl-C. Without `--dir` it only prints. It
 answered no machine, so it names each line by its address, marked
 `(not served)`.
+
+#### Turn boot logs on or off later
+
+Once the machines are a cluster, `relish os boot-logs` shows where each one
+sends its boot logs, and changes it. It needs an admin token, since the
+lines carry the node's whole kernel log:
+
+```sh
+relish os boot-logs                          # where each node sends them
+relish os boot-logs --to 192.168.1.20        # to this machine, UDP 6666
+relish os boot-logs --to 192.168.1.20:7000   # another port
+relish os boot-logs --off                    # stop
+relish os boot-logs --off --node home-3      # one node (repeat --node for more)
+```
+
+```
+Boot logs go to 192.168.1.20:6666 over UDP, in cleartext, from now on. `relish machines logs` on that machine shows them.
+
+NODE                 BOOT LOGS
+home-1               to 192.168.1.20:6666
+home-2               to 192.168.1.20:6666
+laptop               not an appliance
+```
+
+Each node's bun rewrites `reliaburger/netlog.conf` on its EFI partition, or
+deletes it for `--off`, so the setting holds across reboots and OS updates.
+It also takes effect now: with `--to` the node starts streaming straight
+away, saying hello to the listener, and with `--off` it switches the
+kernel's netconsole off. If either step fails, the node says so in brackets,
+and the change starts at its next boot. A node that isn't an appliance shows
+as `not an appliance` and is left alone. The command fails if any node
+didn't make the change, or if no node is an appliance. The target must be
+an IPv4 address, as netconsole needs. With `-o json`, each node has a
+`state` of `on` (with its `target`), `off`, `not_an_appliance` or `failed`
+(with a `reason`).
 
 ### Without network boot
 

@@ -961,7 +961,8 @@ instead, with no distro to install, see
 [Bare metal: the appliance and netboot](manual/17_appliance.md). `relish
 netboot --stream-logs` prints each machine's kernel and boot logs as it
 installs and boots, so a machine with no serial port needn't be watched on its
-monitor.
+monitor, and `relish os boot-logs --to <address>|--off` turns that on or off
+later on a claimed cluster.
 
 Keep `[cluster].name` identical on every node. `relish init`, `relish setup`
 and `relish dev create` write it for you; Bun validates it as a DNS-style SPIFFE trust domain.
