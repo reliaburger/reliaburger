@@ -48,8 +48,12 @@ warm-executables: ## Build the suite and its binaries, then run each binary once
 # links `bun` and `testapp`, because it builds every binary for an integration
 # test, but none of their tests run. scripts/ci/test_macos_selection.py pins
 # this filterset, and scripts/ci/macos_selection.py keeps the evidence
-# manifest's portable-darwin cases inside it.
+# manifest's portable-darwin cases inside it. The lib tests build alone
+# first, as test-linux's do, so their 10 to 12 GB rustc never runs beside
+# the lib's on the 7 GB macos-15 runner, where one build took 21 to 93
+# minutes from the same cache (#1723).
 test-macos: ## Run relish's tests and the macOS-only tests (the macOS CI job; `test` runs everything)
+	$(CARGO) test --no-run --lib
 	$(CARGO) test --no-run --lib --bin relish --test suite --test runtime_selection
 	python3 scripts/ci/warm_executables.py
 	$(NEXTEST) --lib --bin relish --test suite --test runtime_selection -E 'binary_id(reliaburger::bin/relish) | (binary_id(reliaburger) & (test(/^relish::/) | test(/^grill::apple::/) | test(/^grill::records::tests::absolute_start_time/))) | (binary_id(reliaburger::suite) & (test(/^relish_/) | test(/^user_directories::macos_/))) | binary_id(reliaburger::runtime_selection)'

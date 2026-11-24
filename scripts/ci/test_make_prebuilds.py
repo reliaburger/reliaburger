@@ -206,6 +206,14 @@ class MakefilePrebuilds(unittest.TestCase):
                                      "$(CARGO) test --no-run --features ebpf"])
         self.assertIn("--features ebpf", lines[2].split("$(NEXTEST)", 1)[1])
 
+    def test_test_macos_builds_the_lib_tests_on_their_own_first(self):
+        # The macos-15 runner has 7 GB. One build of the lib tests beside the
+        # lib and the suite took 21 to 93 minutes of portable macOS's 42 to
+        # 102 on the same cache (#1723), #1943's mechanism on a smaller host.
+        lines = workflow_assembly.recipe((ROOT / "Makefile").read_text(), "test-macos")
+        self.assertEqual(lines[0], "$(CARGO) test --no-run --lib")
+        self.assertTrue(lines[1].startswith("$(CARGO) test --no-run --lib --bin relish "))
+
     def test_coverage_builds_the_lib_tests_on_their_own_before_the_run(self):
         # #1723: one build job (#1943) made the instrumented build about 13
         # of portable Linux's 25 to 31 minutes. The lib tests (10 to 12 GB

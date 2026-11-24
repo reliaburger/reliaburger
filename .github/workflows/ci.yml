@@ -1124,6 +1124,12 @@ jobs:
           cache-on-failure: true
       - name: Clear restored execution envelopes
         run: rm -rf -- target/contracts
+      # The same build, from the same cache, took 21 to 93 minutes on this
+      # 7 GB runner (#1723). The log says whether a slow one paged.
+      - name: Watch memory during the build and the tests
+        run: |
+          nohup scripts/ci/watch-macos-memory 15 > "$RUNNER_TEMP/portable-macos-memory.log" 2>&1 < /dev/null &
+          echo $! > "$RUNNER_TEMP/portable-macos-memory.pid"
       # One pass, all features: the macOS-only code is in it, and the lint
       # job runs the no-features pass on Linux (see lint-macos in Makefile).
       - name: Lint the library, relish and bun (bun's compile check), all features
@@ -1139,6 +1145,20 @@ jobs:
           name: contract-darwin-portable-darwin-1
           path: target/contracts/darwin/portable-darwin-1
           if-no-files-found: error
+          retention-days: 14
+      - name: Report the build's memory
+        if: always()
+        timeout-minutes: 3
+        run: |
+          kill "$(cat "$RUNNER_TEMP/portable-macos-memory.pid")" 2>/dev/null || true
+          scripts/ci/watch-macos-memory --summary "$RUNNER_TEMP/portable-macos-memory.log"
+      - name: Keep the memory log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: portable-macos-memory
+          path: ${{ runner.temp }}/portable-macos-memory.log
+          if-no-files-found: warn
           retention-days: 14
       # Linux runs every doctest; this one compiles the crate's doctests and
       # runs relish's.
