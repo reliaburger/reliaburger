@@ -756,18 +756,43 @@ drop it until you add it to their `[security] bootstrap_peers`.
 
 The cluster is ready for the [five-minute tour](08_five-minute-tour.md).
 There are three differences:
-- **Build the burger on your laptop.** The appliance has no Buildah, so no
-  node can run `relish build`; it stops with `no builder available`. Build
-  the image where you have Docker and push it into the cluster's registry,
-  Pickle, as below. Then carry on from the tour's `relish apply`.
+- **The first build is slow.** Every appliance has Buildah, so
+  `relish build burger/burger.toml` works as it does on a laptop. On a
+  2 GB machine with eMMC, though, pulling the Go toolchain image and
+  compiling the burger takes a few minutes the first time. Later builds
+  reuse the cached base images.
 - The ingress listens on port 80 of every node, not on `localhost:18080`. So
   use `curl -H 'Host: podinfo.localhost' http://192.168.1.51/`, or put the
   name in your laptop's hosts file.
 - Instead of `relish local stop`, pull a node's power cord. Plug it back in
   later and it rejoins by itself.
 
-To push the burger, your laptop has to reach a node by its name and trust
-the cluster's CA ([Trusting the cluster CA](11_images-and-volumes.md#trusting-the-cluster-ca)).
+### Where builds run
+
+A build runs on the node that took the request, in its own Buildah storage
+under `/var/lib/reliaburger/data/buildah`, on the data partition. That partition
+is Btrfs, and Buildah's `vfs` driver makes each layer by copying the one
+below it, which Btrfs turns into a reflink: a new layer shares its parent's
+blocks instead of writing them to the eMMC again. After each build the node
+removes what the build made and keeps the base images, up to 1 GiB, so the
+next build doesn't pull them again. Over that, it drops them all. Nothing
+lands in `/usr`, which stays read-only.
+
+A `RUN` step runs on the node itself, under runc, with Buildah's own network
+(`podman0`, `10.88.0.0/16`) for steps that use one. So a Dockerfile's `RUN`
+steps run on the machines that hold the cluster's state, as on any other
+node. A multi-platform build runs a `RUN` step for the other architecture
+under emulation, which the appliance doesn't have. A Dockerfile that
+cross-compiles, as the burger's does, needs none. For one that doesn't, set
+`platform` to the architecture your nodes have
+([Images and volumes](11_images-and-volumes.md)).
+
+### Building elsewhere
+
+You can still build on a bigger machine and push into Pickle, which saves
+the appliances the work and the eMMC the writes. Your laptop has to reach a
+node by its name and trust the cluster's CA
+([Trusting the cluster CA](11_images-and-volumes.md#trusting-the-cluster-ca)).
 With Docker Desktop, and `home-1` at 192.168.1.51 in your hosts file:
 
 ```sh
@@ -782,13 +807,6 @@ Restart Docker Desktop after adding the CA. Name the platforms your nodes
 have: `linux/arm64` for Arm machines, or both, comma-separated. The pushed
 image isn't signed by the cluster as a built one is, which only matters if
 you turned `require_signatures` on.
-
-Why no Buildah? Every package goes into both 1.1 GB `/usr` slots, a build
-fills the data partition and wears the eMMC with layers, and it would run
-every Dockerfile's `RUN` steps on the machines that hold the cluster's state. If you want the
-cluster to build for itself, add a Linux node with Buildah
-([Linux servers](https://github.com/reliaburger/reliaburger/blob/main/docs/linux-servers.md)):
-bun hands every build to a node that can run it.
 
 ## Updating the OS
 
@@ -950,9 +968,9 @@ across a cluster you care about.
   you need" boots iPXE and the installer, which then can't reach the
   network: its screen shows `reliaburger-install: FAILED: can't fetch …`.
   A USB Ethernet adapter gets it going.
-- **No builds on the cluster.** The image has no Buildah, so `relish build`
-  needs a node that isn't an appliance. Build elsewhere and push into Pickle
-  ("Take the tour", above).
+- **No emulation for builds.** A multi-platform build's `RUN` steps for
+  the other architecture can't run on an appliance. Cross-compile, or build
+  for your nodes' architecture only ("Where builds run", above).
 - **Two machines can't roll a bun upgrade or an OS update.** Both are in
   the council, and taking one down would leave the other without a majority,
   so `relish upgrade start` and `relish os upgrade` refuse. Use three or more.

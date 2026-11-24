@@ -19,6 +19,10 @@ Not released yet: this is what the train carries, and it can change before the t
 
 - `relish os boot-logs` shows where each appliance sends its kernel and boot logs, and `--to <address>[:<port>]` or `--off` changes it on a claimed cluster, so turning them on or off no longer means editing a file on the node's EFI partition. It needs a cluster-wide admin token and is audited with the target ([#2149](https://github.com/reliaburger/reliaburger/issues/2149)).
 
+### Changed
+
+- The appliance image has Buildah, so `relish build` and the five-minute tour's burger build on a cluster of appliances. Its storage is on the data partition, where Btrfs reflinks the `vfs` driver's layer copies; the image adds `netavark` and `gpg` for it, drops Buildah's 97 MB of test helpers, and grows each `/usr` slot by 54 MB (667 MB to 721 MB of 1,100 MB on x86-64). A multi-platform build can't emulate the other architecture's `RUN` steps on an appliance, so cross-compile or name one `platform`. With no node able to build, the refusal no longer says appliances never can ([#2144](https://github.com/reliaburger/reliaburger/issues/2144)).
+
 ## [0.3.2] - 2026-11-23
 
 Fixes from the Wyse 3040 lab that need a new appliance image. [Release page](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.2), [release log](docs/release-log.md#032-wyse-lab-fixes).
