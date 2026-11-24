@@ -246,14 +246,21 @@ pub struct AppSpecError {
 }
 
 impl AppSpecError {
-    /// The error for an API answer of `status` with `body`. An empty 404 is
-    /// a node that doesn't know the route at all, which a node on a release
-    /// before 0.3.3 is.
+    /// The error for an API answer of `status` with `body`: the `error`
+    /// the body's JSON carries, or the body as it came. An empty 404 is a
+    /// node that doesn't know the route at all, which a node on a release
+    /// before 0.3.3 is; a follower whose leader is such a node says so in
+    /// its 404's `error`.
     pub fn from_answer(app: &str, namespace: &str, status: u16, body: &str) -> Self {
-        let message = if status == 404 && body.trim().is_empty() {
-            "this node's release doesn't serve spec reads".to_string()
-        } else {
-            format!("{status}: {body}")
+        let carried = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|json| json.get("error")?.as_str().map(String::from));
+        let message = match carried {
+            Some(error) => format!("{status}: {error}"),
+            None if status == 404 && body.trim().is_empty() => {
+                "this node's release doesn't serve spec reads".to_string()
+            }
+            None => format!("{status}: {body}"),
         };
         Self {
             app: app.to_string(),

@@ -12518,8 +12518,8 @@ async fn follower_of_a_stub_leader(
 }
 
 /// #1322: a leader that doesn't serve the spec read (an older release
-/// during a rolling upgrade) answers an empty 404. The follower says so
-/// with a 503 rather than claiming the app doesn't exist.
+/// during a rolling upgrade) answers an empty 404. The follower passes the
+/// 404 on and says why, rather than claiming the app doesn't exist.
 #[tokio::test]
 async fn a_follower_says_when_its_leader_does_not_serve_spec_reads() {
     let (follower, admin_key, nodes) = follower_of_a_stub_leader(Router::new()).await;
@@ -12532,8 +12532,11 @@ async fn a_follower_says_when_its_leader_does_not_serve_spec_reads() {
         &[],
     )
     .await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{reply}");
-    assert!(reply.contains("may run an older release"), "{reply}");
+    assert_eq!(status, StatusCode::NOT_FOUND, "{reply}");
+    assert!(
+        reply.contains("the leader doesn't serve spec reads; it may run an older release"),
+        "{reply}"
+    );
     for node in nodes {
         node.shutdown().await.unwrap();
     }

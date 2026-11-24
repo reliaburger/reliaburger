@@ -3140,8 +3140,10 @@ rolling upgrade, needed the leader read to report a 404 apart from other
 failures. `read_from_leader` grew a sibling that returns a two-variant enum,
 `Found(T)` or `Missing(body)`, rather than folding the 404 into its error
 string, and the old function is now a thin wrapper that turns `Missing` back
-into the error it always gave. Adding a route is additive, so the protocol
-version stays where it was.
+into the error it always gave. The follower passes an empty leader 404 on as
+a 404 whose `error` says the leader may run an older release, the rule
+#2302 settled for every forwarded read. Adding a route is additive, so the
+protocol version stays where it was.
 
 **A scoped token's events, filtered first.** A controller reads events
 through a token scoped to its namespace (#1125). The first version read
