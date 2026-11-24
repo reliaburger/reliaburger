@@ -359,6 +359,77 @@ async fn events_name_a_member_that_did_not_answer() {
     );
 }
 
+/// #1322: a scoped token's events are filtered before the newest `limit`
+/// are taken, on every node's answer. A busy namespace elsewhere in the
+/// cluster can't push this token's older events out of the window.
+#[tokio::test]
+async fn a_scoped_token_keeps_its_events_when_another_namespace_is_busy() {
+    let mut peer_store = EventStore::new();
+    for index in 0..crate::bun::events::EVENT_BUFFER_CAP {
+        peer_store.record(
+            100 + index as u64,
+            EventKind::Deploy,
+            EventSeverity::Info,
+            Some("noisy".into()),
+            Some("other".into()),
+            None,
+            format!("noisy {index}"),
+        );
+    }
+    let peer_events = peer_store.recent(crate::bun::events::EVENT_BUFFER_CAP, None, None);
+    let peer = serve_peer(Router::new().route(
+        "/v1/events",
+        axum::routing::get(move |Query(params): Params| {
+            let events = peer_events.clone();
+            async move {
+                require_local(&params)?;
+                Ok::<_, StatusCode>(Json(ClusterEvents {
+                    events,
+                    warnings: Vec::new(),
+                }))
+            }
+        }),
+    ))
+    .await;
+    let mut local_store = EventStore::new();
+    for (timestamp, message) in [(10, "db deployed"), (20, "db restarted")] {
+        local_store.record(
+            timestamp,
+            EventKind::Deploy,
+            EventSeverity::Info,
+            Some("db".into()),
+            Some("pg".into()),
+            None,
+            message.into(),
+        );
+    }
+    let controller = crate::sesame::token::create_token(
+        "pg-failover",
+        crate::sesame::types::ApiRole::Deployer,
+        crate::sesame::types::TokenScope {
+            apps: None,
+            namespaces: Some(vec!["pg".to_string()]),
+        },
+        None,
+    )
+    .unwrap();
+    let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new()));
+    setup.events = Some(Arc::new(RwLock::new(local_store)));
+    setup.members = Some(members(&[("peer", peer)]));
+    setup.tokens = vec![controller.token];
+    let app = setup.router().await;
+
+    let (status, body) = get(app, "/v1/events?limit=10", Some(&controller.plaintext)).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let view: ClusterEvents = serde_json::from_slice(&body).unwrap();
+    let messages: Vec<&str> = view
+        .events
+        .iter()
+        .map(|event| event.message.as_str())
+        .collect();
+    assert_eq!(messages, ["db deployed", "db restarted"]);
+}
+
 // ---------------------------------------------------------------------------
 // Dashboard node page
 // ---------------------------------------------------------------------------

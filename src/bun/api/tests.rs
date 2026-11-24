@@ -2639,6 +2639,7 @@ const LEADER_ONLY_CALLS: &[(&str, &str, &str)] = &[
     ("POST", "/v1/upgrade/abort", ""),
     ("GET", "/v1/diagnostics/apps", ""),
     ("GET", "/v1/diagnostics/rollouts", ""),
+    ("GET", "/v1/apps/web/default/spec", ""),
     ("POST", "/v1/batch/1/cancel", ""),
     ("GET", "/v1/batch/1/results", ""),
     ("GET", "/v1/batch/1/tasks/0/logs", ""),

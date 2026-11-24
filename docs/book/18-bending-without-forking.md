@@ -1455,6 +1455,22 @@ The handler builds the predicate from the caller's scope and moves it into
 `spawn_blocking`. The counts come from the filtered lists, so a scoped
 caller can't even tell how many other workloads there are.
 
+The job half of the audit went untested at first: building job definitions
+in desired state needs the task-array machinery, so #1119 covered it by
+review (#1322). The tests now go through the real router instead, which
+already has that machinery: they submit a job to `/v1/jobs/runs`, commit a
+jobs policy, and read the audit. One checks a scheduled job is judged with
+its schedule put back, by a rule that names `job.schedule`. Two pin
+decisions the review left open. A one-off job is judged while a run refers
+to it; once its last run is pruned its definition expires, and so does its
+place in the audit, because a job that will never run again has nothing
+left to refuse. And a job pinned as `report:latest@sha256:…` is judged as
+`report:latest`. Apps escape that because #1118 keeps the declared spec next
+to the stored one; jobs have no declared spec, so `unbound` can't tell a
+digest the caller wrote from one the leader bound. Keeping one means new
+fields in Raft state and job definitions, a protocol and state bump, so it
+waits for a release that bumps them anyway.
+
 ### The exec secret provider
 
 ([#1123](https://github.com/reliaburger/reliaburger/issues/1123)) The code
@@ -3067,6 +3083,79 @@ snapshot is a file committed next to the test. Change a field's name, and the
 test fails and shows the difference. The manual's "Writing a controller"
 chapter documents the same shapes field by field, and the test's comment says
 to update both.
+
+**Reading a spec back.** Desired apps answer "how many, and where", but a
+controller deciding whether to fail a database over also wants "what":
+which image, how much memory. The first contract had no read for that
+(#1322), and the terminal UI's Config tab said as much on screen. `GET
+/v1/apps/{app}/{namespace}/spec` now answers an `AppSpecView`, built in
+`src/bun/spec_read.rs`: the spec the cluster runs, the declared spec where
+#1118 kept a different one, and a list of every field it redacted.
+
+The spec is also where secrets live, and the answer goes to any token whose
+scope covers the app. So the view redacts on the way out, the same way for
+everyone: every env value, plain or encrypted, in the app and in each init
+container and sidecar; every inline config file; and anything the
+redaction rules recognise in a command, argument or script. A
+`PROVIDER[...]` reference stays, because it names where a secret lives, not
+the secret. We considered showing plain values to admins and decided
+against it: one rule is easier to trust than a rule per role, and an admin
+who wants the values has the manifest.
+
+`EnvValue` makes the env rule short:
+
+```rust
+for (key, value) in env.iter_mut() {
+    if matches!(value, EnvValue::Provider(_)) {
+        continue;
+    }
+    *value = EnvValue::Plain(REDACTED.to_string());
+    redacted.push(format!("{prefix}.{key}"));
+}
+```
+
+`iter_mut` on a `BTreeMap` yields each key by shared reference and each
+value by mutable reference, so the loop rewrites values in place while the
+keys, which decide the map's order, stay untouchable. `*value = ...` writes
+through the reference, much as `*p = x` does in C. `matches!` is a `match`
+that answers `true` or `false`, for when you only need to know which
+variant you have.
+
+Where to redact matters as much as what. A follower forwards the read to
+the leader under its service token, like the desired-apps read, and the
+leader builds the view and redacts before it answers, so no secret crosses
+between nodes for this read. Telling "no such app" from "this leader
+doesn't know the route", which an older leader would answer during a
+rolling upgrade, needed the leader read to report a 404 apart from other
+failures. `read_from_leader` grew a sibling that returns a two-variant enum,
+`Found(T)` or `Missing(body)`, rather than folding the 404 into its error
+string, and the old function is now a thin wrapper that turns `Missing` back
+into the error it always gave. Adding a route is additive, so the protocol
+version stays where it was.
+
+**A scoped token's events, filtered first.** A controller reads events
+through a token scoped to its namespace (#1125). The first version read
+each node's whole buffer, merged them, took the newest `limit` and only then
+dropped the events the token can't see. On a busy cluster that loses
+events: with three nodes the merge holds up to 3,072, the newest 1,024
+survive, and if another namespace made all of those, a controller asking for
+its last ten got none (#1322). The filter now runs on each node's answer
+before the merge:
+
+```rust
+for (_, events) in &mut answers {
+    events.retain(|event| event_visible(auth, event));
+}
+```
+
+`&mut answers` iterates the vector of `(node, events)` pairs by mutable
+reference, and the pattern `(_, events)` takes the tuple apart, ignoring the
+node name; `events` is then a `&mut Vec`, and `retain` keeps the elements
+for which the closure says `true`, in place. The test,
+`a_scoped_token_keeps_its_events_when_another_namespace_is_busy`, gives a
+fake peer 1,024 newer events from another namespace and the local node two
+older events from the token's own, and expects those two back. It failed
+against the old code with an empty list.
 
 **The example runs as a test.** `examples/controller/main.rs` imports nothing
 from `reliaburger`: it's `reqwest`, `serde_json` and `toml`, the way anyone's

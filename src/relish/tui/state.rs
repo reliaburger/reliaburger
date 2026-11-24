@@ -119,6 +119,12 @@ pub struct ClusterData {
     /// name in different namespaces have separate histories (C3).
     pub deploy_history: HashMap<String, ClusterDeployHistory>,
     pub app_metrics: Option<MetricsQueryResult>,
+    /// The last app spec the Config tab fetched (#1322), with its
+    /// secrets left out. The tab checks it names the app it shows.
+    pub app_spec: Option<crate::bun::spec_read::AppSpecView>,
+    /// Why the Config tab's last fetch failed, when the API answered with
+    /// a refusal rather than going away.
+    pub app_spec_error: Option<String>,
     /// Every app the council knows, with the replica count its spec asks
     /// for: where the Instances tab's scale starts from.
     pub desired_apps: Vec<DesiredAppEvidence>,
@@ -190,6 +196,11 @@ pub enum Effect {
         namespace: String,
     },
     FetchAppMetrics {
+        app: String,
+        namespace: String,
+    },
+    /// Fetch one app's spec for the Config tab (#1322).
+    FetchAppSpec {
         app: String,
         namespace: String,
     },

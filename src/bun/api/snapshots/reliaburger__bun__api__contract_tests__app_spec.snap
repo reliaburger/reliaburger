@@ -1,0 +1,38 @@
+---
+source: src/bun/api/contract_tests.rs
+expression: view
+---
+{
+  "app": "db-a",
+  "namespace": "pg",
+  "owner": "db-failover",
+  "gitops_owned": false,
+  "spec": {
+    "image": "postgres:17@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "replicas": 1,
+    "port": 5432,
+    "memory": "536870912",
+    "env": {
+      "PGPASSWORD": "[redacted]",
+      "VAULT": "PROVIDER[vault:kv/pg]"
+    },
+    "namespace": "pg",
+    "owner": "db-failover"
+  },
+  "declared": {
+    "image": "postgres:17",
+    "replicas": 1,
+    "port": 5432,
+    "memory": "536870912",
+    "env": {
+      "PGPASSWORD": "[redacted]",
+      "VAULT": "PROVIDER[vault:kv/pg]"
+    },
+    "namespace": "pg",
+    "owner": "db-failover"
+  },
+  "redacted": [
+    "spec.env.PGPASSWORD",
+    "declared.env.PGPASSWORD"
+  ]
+}

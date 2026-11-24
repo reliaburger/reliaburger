@@ -1085,7 +1085,11 @@ functions, one per kind of change:
   rollout. Claiming or releasing restarts nothing. A rollback keeps today's
   owner, whatever the old spec said.
 - **Reads.** `GET /v1/diagnostics/apps` carries `owner`, and a policy sees it
-  as `app.owner`. The JSON a controller reads and writes is documented in the
+  as `app.owner`. `GET /v1/apps/{app}/{namespace}/spec` reads one app's spec
+  back, as run and as declared, with every env value, config file content and
+  recognisable secret redacted on the leader before it answers
+  (`bun::spec_read`, #1322). `GET /v1/events` trims each node's events to a
+  scoped token's namespaces before the merge takes the newest `limit`. The JSON a controller reads and writes is documented in the
   manual's "Writing a controller" chapter and pinned by
   `src/bun/api/contract_tests.rs`.
 - **Scope.** A controller's token is a `deployer` scoped to its namespace; the

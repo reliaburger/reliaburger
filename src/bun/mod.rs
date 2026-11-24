@@ -40,6 +40,7 @@ pub mod readiness;
 pub mod restart;
 pub mod reusable_executor;
 pub mod snapshot_worker;
+pub mod spec_read;
 pub mod summary;
 pub mod supervisor;
 pub mod task_array_api;

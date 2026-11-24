@@ -48,6 +48,8 @@ pub enum DataUpdate {
         result: Result<ClusterDeployHistory, ProviderError>,
     },
     AppMetrics(Result<MetricsQueryResult, ProviderError>),
+    /// Boxed, like the summary: a spec is over two kilobytes.
+    AppSpec(Result<Box<crate::bun::spec_read::AppSpecView>, ProviderError>),
     DesiredApps(Result<Vec<crate::bun::diagnostics::DesiredAppEvidence>, ProviderError>),
     /// The answer to a scale the person confirmed.
     Scaled {

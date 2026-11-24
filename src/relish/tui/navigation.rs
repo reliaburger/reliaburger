@@ -118,6 +118,10 @@ impl TuiApp {
                 app: app.clone(),
                 namespace: namespace.clone(),
             }),
+            DetailTab::Config => self.pending.push(Effect::FetchAppSpec {
+                app: app.clone(),
+                namespace: namespace.clone(),
+            }),
             _ => {}
         }
     }
