@@ -224,11 +224,38 @@ the queue. Don't use `--auto` (maintainer decision of 17 November 2026): a
 PR queues only once a person has seen it green. GitHub can drop a PR from
 the queue without saying so, so afterwards check that `isInMergeQueue` is
 true, and again after any queue event. The queue
-builds a temporary branch with the train plus the PR (and up to seven more
-waiting behind it: the ruleset's group size went from 4 to 8 on 7 November
-2026, #1724), and `ci.yml`'s `merge_group` trigger runs every job on it.
-The PR lands only if `ignored-test evidence` passes on that exact commit. A
-batch that fails drops the PR that broke it, and the rest go round again.
+builds each PR alone on a temporary branch, `gh-readonly-queue/<train>/pr-<N>-<base>`,
+whose base is the entry ahead of it (or the train), and `ci.yml`'s
+`merge_group` trigger runs every job on it. The PR lands only if `ignored-test
+evidence` passes on that exact commit and on every entry ahead. Up to
+`max_entries_to_build` entries build at once, and up to
+`max_entries_to_merge` that have passed land in one push; neither puts two
+PRs in one build. An entry that fails drops out, and every entry behind it is
+rebuilt without it.
+
+**Check for a conflict with the queue first.** Run `python3
+scripts/ci/queue_conflicts.py <PR>` before queueing. A PR that conflicts with
+an entry ahead of it is never built: the queue marks it `UNMERGEABLE`, builds
+the entries behind it past it, and drops it for `merge_conflict` only when it
+reaches the head, an hour or two later, while the PR page still says it's
+queued. On 24 November 2026 four 0.3.3 PRs waited 1.6 to 2.6 hours like that,
+and all four merged cleanly onto the train: each conflicted with a PR still in
+the queue that edited the same rows of `docs/flakes.md` or `CHANGELOG.md`. The
+script merges the PR onto the last built entry, names the entry that brings in
+the conflict, and exits 1. Wait for that entry to land, merge the train in,
+and queue again. `merge=union` isn't the answer for those two files: it
+keeps a stale flake row beside its fixed copy and files changelog bullets
+under the wrong heading
+([the measurements](qualification/2026-11-24-merge-queue-experiments.md)).
+
+**Settings.** The same record measured the queue's runners: with eight
+groups building at once, a group's jobs waited more than twice as long for a
+runner as they ran, and the slowest group took the whole 240-minute timeout.
+Build concurrency doesn't change the runner-minutes the queue uses, since each
+entry is built once, but 1 would land under one PR an hour against the 2.25
+an hour that week. The recommendation for the maintainer is
+`max_entries_to_build` 3 and `check_response_timeout_minutes` 360, keeping
+"only merge non-failing pull requests" (`ALLGREEN`).
 
 Why bother, when the push to the train runs everything anyway? Because the
 push runs after the merge. Without the queue, a PR that passed the light set

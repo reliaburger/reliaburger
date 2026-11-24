@@ -607,8 +607,11 @@ testing. Scripts are code here, since the jobs run them.
 
 What's left is mostly the queue's own settings, which only the maintainer can
 change: building eight groups at once (`max_entries_to_build` in the "release
-trains merge queue" ruleset) means up to 160 jobs, and portable macOS (52 to
-57 minutes with a warm cache) sets every group's length.
+trains merge queue" ruleset) means up to 144 jobs, and portable macOS (52 to
+57 minutes with a warm cache) sets every group's length. On 24 November a
+group's jobs waited a median 633 job-minutes for runners against 276 running,
+and the recommendation is three groups at once
+([merge queue experiments](qualification/2026-11-24-merge-queue-experiments.md)).
 
 ### What runs on macOS and what runs on Linux
 
