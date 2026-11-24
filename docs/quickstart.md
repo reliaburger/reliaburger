@@ -1,7 +1,7 @@
 # A laptop cluster
 
-The command below installs the published, signed 0.3.1 release
-(21 November 2026) and builds a laptop cluster from it. A laptop cluster is a
+The command below installs the published, signed 0.3.2 release
+(23 November 2026) and builds a laptop cluster from it. A laptop cluster is a
 development cluster: until 1.0.0, Reliaburger is for developers and
 enthusiasts trying it out, not for production. The two cold installs of the
 0.1.0 release candidate on Apple silicon took 178 s and 282 s from the first `curl`
@@ -66,7 +66,11 @@ Ctrl-C stops the browser connection, leaving the cluster running. Use
 
 There is no Rust build and no repository checkout in the published path.
 Native macOS uses Apple's Virtualization.framework through Lima. Linux needs
-QEMU, KVM access and Lima's host prerequisites already installed. Allow at
+QEMU, KVM access and Lima's host prerequisites already installed. QEMU 10.2
+and later abort under Lima's `user-v2` network while io_uring is open to
+ordinary users ([#1495](https://github.com/reliaburger/reliaburger/issues/1495)),
+so setup refuses that combination; `sudo sysctl -w kernel.io_uring_disabled=1`,
+or QEMU 10.1 or older, gets you past it. Allow at
 least 8 GiB of available memory and 15 GiB of free disk for the default cluster;
 image download time also depends on your connection. The VMs don't install
 anything at first boot, so setup doesn't depend on Ubuntu's package mirrors. No host directories are mounted into the VMs. Managed Lima state lives under

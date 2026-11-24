@@ -10,6 +10,55 @@ in the [changelog](../CHANGELOG.md). A new
 paragraph goes at the top when a release is promoted
 ([release gate, step 9](releasing.md#staging-a-candidate)).
 
+## 0.3.2: Wyse lab fixes
+
+Promoted on 23 November 2026 as tag `v0.3.2` at `3edd5461`
+([promote run](https://github.com/reliaburger/reliaburger/actions/runs/45212658267)),
+two days after 0.3.1.
+A patch release: what the Wyse 3040 lab left that needs a new appliance
+image, such as boot logs over the network
+([#2149](https://github.com/reliaburger/reliaburger/issues/2149)), `allow_from`
+enforced on every node
+([#2216](https://github.com/reliaburger/reliaburger/issues/2216)) and
+containers reaching other nodes from a node that publishes no port
+([#2219](https://github.com/reliaburger/reliaburger/issues/2219)), plus the
+fix for 0.3.1's known issue
+([#2197](https://github.com/reliaburger/reliaburger/issues/2197)). It moves
+the wire protocol from 60 to 61 and changes the agent loop, so
+`release_tier.py` asked for the full gate. Candidate 1, `2aae7e2a`, ran it
+on the Mac Studio in one day, from 01:01 to 14:42 GMT on 23 November
+([closure record](qualification/2026-11-23-v0.3.2-release-closure.md)), and
+it was the first train build that `stage.yml` staged itself
+([#1721](https://github.com/reliaburger/reliaburger/issues/1721)). It passed
+both staged installs, in 134 s (one VM restarted after it didn't boot) and
+66 s
+([first](qualification/2026-11-23-v0.3.2-staged-install-apple-silicon.md),
+[second](qualification/2026-11-23-v0.3.2-staged-install-apple-silicon-2.md)),
+the power-cut and reboot lanes, 25 of 25 in every lane
+([record](qualification/2026-11-23-power-cut-reboot.md)), the V02 fast tier
+([record](qualification/2026-11-23-v0.3.2-sustained-v02-fast.md)) and the
+jobs fast tier at 9,110.7 accepted jobs a second
+([record](qualification/2026-11-23-v0.3.2-jobs-fast.md)). The 8-hour jobs
+final ran its whole schedule with no failures
+([record](qualification/2026-11-23-v0.3.2-jobs-final.md)): 9,650.4 accepted
+jobs a second against the 1,390 target, job-start p99 64 ms over 240
+million starts, a median 1,048,576-task array in 117 s, a council history
+linearizable over 202,245 operations, Bun's worst steady-state RSS
+235.21 MiB against 384 MiB, and no data lost. Every fault class settled
+every time, chaos pause and chaos drop included, and every tier was clean
+at the first attempt. One agent-loop turn ran 322 ms past its deadline
+during an upgrade walk, while the disk was busy with `fsync`, which no check
+gates. #2128, 0.3.0's registry deploy stall, didn't recur (the catalogue
+pulse passed all eight runs), but its cause is still unproven and it stays
+open ([#2128](https://github.com/reliaburger/reliaburger/issues/2128)).
+The tag is the merge of the train into `main`, byte for byte candidate 1's
+tree, so only the staged installs ran again on the release build, in
+87 s and 140 s, where the installer restarted two VMs that never booted
+([first](qualification/2026-11-23-v0.3.2-release-staged-install-apple-silicon.md),
+[second](qualification/2026-11-23-v0.3.2-release-staged-install-apple-silicon-2.md)). 0.3.2 moves the cluster protocol to 61
+and keeps state format 76, so a 0.3.1 cluster can't roll onto it: start a
+fresh 0.3.2 cluster.
+
 ## 0.3.1: gate follow-ups
 
 Promoted on 21 November 2026 as tag `v0.3.1` at `a0315dc1`
