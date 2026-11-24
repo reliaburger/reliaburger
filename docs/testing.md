@@ -1217,6 +1217,18 @@ start". The guest's automatic updates (`apt-daily*.timer` and
 unattended-upgrades) are masked at install and on every resume, since a cut
 mid-dpkg can damage the guest.
 
+Two Lima failures get one forced stop and one more `limactl start`, each
+counted under `environment_events` in `summary.json`: the VZ refusal straight
+after a forced stop, when the VM never booted, and Lima 2.2.1's host agent
+coming up with its vsock SSH forwarder spinning on `accept` (about 1 boot in
+1,500; the guest and Bun are fine, but SSH and the port forwards never come
+up). The harness spots the second in the start log within about 10 s, or by
+the start timing out. That guest had booted, so its forced stop is a second
+power cut: the line records it as an extra power-off, the summary counts
+them, and the invariants after it cover both. A spinning forwarder writes
+gigabytes of log a minute, so the power-on log and Lima's `ha.stderr.log`
+keep only their first and last 25 MB.
+
 ```sh
 scripts/release/qualify-power-cut-endurance.sh --release 0.2.8 --tier quick
 ```

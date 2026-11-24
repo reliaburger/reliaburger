@@ -70,14 +70,16 @@ quiet() { python3 "$here/quiet.py" check; }
 # a Go program, and Go catches SIGALRM and ignores it, so a `limactl shell`
 # to a guest that went away under it would hang for good (the calibration's
 # sysrq run did, 17 November 2026). The command gets its own process group,
-# so the ssh it starts dies with it and can't hold a pipe open. Nothing run
-# through it reads standard input.
+# so the ssh it starts dies with it and can't hold a pipe open. A SIGTERM to
+# it kills the group the same way (status 143). Nothing run through it reads
+# standard input.
 with_timeout() {
     perl -e '
         my $seconds = shift;
         my $pid = fork() // die "fork: $!\n";
         if ($pid == 0) { setpgrp(0, 0); exec(@ARGV) or die "exec: $!\n"; }
         $SIG{ALRM} = sub { kill("KILL", -$pid); waitpid($pid, 0); exit(124); };
+        $SIG{TERM} = sub { kill("KILL", -$pid); waitpid($pid, 0); exit(143); };
         alarm($seconds);
         waitpid($pid, 0);
         exit($? & 127 ? 128 + ($? & 127) : $? >> 8);' "$@" < /dev/null
@@ -385,24 +387,99 @@ settle_timed_out() { settled_seconds=; }
 # I6's bound on Bun answering after power-on (API_BOUND_SECONDS in endurance.py).
 api_bound=120
 
+# How long one `limactl start` may take, and the size above which a log
+# keeps only its head and tail.
+start_timeout=300
+log_cap=$(( 50 * 1024 * 1024 ))
+
+# Lima 2.2.1's host agent sometimes comes up with its vsock SSH forwarder's
+# accept loop spinning ("accept: bad file descriptor", later "socket
+# operation on non-socket"): SSH is refused, the port forwards never go in,
+# and `limactl start` runs into its timeout while the guest and Bun are fine.
+# Run 7 cut 108 lost it that way, about 1 boot in 1,500, and wrote 9 GB of
+# logs in 5 minutes.
+forwarder_spin='vsock forwarder accept error'
+
+# start_vm LOG: one `limactl start`, appending to LOG and watching it. 0 when
+# the VM started; 2 when the forwarder spun (seen in LOG, checked every 5 s,
+# so within about 10 s) or the start timed out without READY; 1 for any
+# other failure.
+start_vm() {
+    local log=$1 pid status=0 from
+    # Only this start's output: a retry appends to the same log.
+    from=$(( $(wc -c < "$log" 2> /dev/null || echo 0) + 1 ))
+    spun() { tail -c "+$from" "$log" 2> /dev/null | grep -q "$forwarder_spin"; }
+    with_timeout "$start_timeout" "$limactl" start --tty=false "${vm[1]}" >> "$log" 2>&1 &
+    pid=$!
+    while kill -0 "$pid" 2> /dev/null; do
+        if spun; then
+            kill -TERM "$pid" 2> /dev/null || true
+            wait "$pid" 2> /dev/null || true
+            return 2
+        fi
+        sleep 5
+    done
+    wait "$pid" || status=$?
+    [ "$status" -ne 0 ] || return 0
+    [ "$status" -ne 124 ] || return 2
+    ! spun || return 2
+    return 1
+}
+
+# cap_log FILE BYTES: when FILE is over BYTES, keep its head and tail and say
+# how much went from the middle. Rewritten in place, so a host agent still
+# appending to it keeps writing to the same file.
+cap_log() {
+    local file=$1 max=$2 size keep
+    [ -f "$file" ] || return 0
+    size=$(wc -c < "$file" | tr -d ' ')
+    [ "$size" -gt "$max" ] || return 0
+    keep=$(( max / 2 - 100 ))
+    {
+        head -c "$keep" "$file"
+        printf '\n... power-cut: cut %s bytes from the middle of this log ...\n' "$(( size - 2 * keep ))"
+        tail -c "$keep" "$file"
+    } > "$file.capped" && cat "$file.capped" > "$file"
+    rm -f "$file.capped"
+}
+
+# The power-on log and Lima's host agent log, capped.
+cap_power_logs() {
+    cap_log "$1" "$log_cap"
+    [ -z "${LIMA_HOME:-}" ] || cap_log "$LIMA_HOME/${vm[1]}/ha.stderr.log" "$log_cap"
+}
+
 # Power the VM back on with `limactl start` alone, then wait until Bun's API
 # answers a read, at most api_bound seconds after power-on. Not `relish local
 # start`: it also starts Bun's service, and it fails when Bun isn't ready
 # within its own 45 s, which a retry would turn into a second, unrecorded cut
-# mid-recovery. The one retry is Lima's known VZ refusal straight after a
-# forced stop ("storage device attachment is invalid"), when the VM never
-# booted; it counts as an environment event. Any other failure is left to I6
-# and I4 to judge.
+# mid-recovery. Two failures get one forced stop and one more start, each an
+# environment event:
+#   - Lima's known VZ refusal straight after a forced stop ("storage device
+#     attachment is invalid"), when the VM never booted (start_retries);
+#   - the spinning vsock forwarder, or a start that timed out (forwarder_retries).
+#     The guest had booted then, so that stop is a second power cut,
+#     recorded as an extra power-off; the invariants after it cover both.
+# Any other failure is left to I6 and I4 to judge.
 power_back() {
-    local log
+    local log result=0
     log=$power_log_dir/power-on-1-$(now).log
     start_retries=0
-    if ! with_timeout 300 "$limactl" start --tty=false "${vm[1]}" > "$log" 2>&1; then
-        grep -q 'storage device attachment is invalid' "$log" || return 1
+    forwarder_retries=0
+    start_vm "$log" || result=$?
+    if [ "$result" -eq 1 ] && grep -q 'storage device attachment is invalid' "$log"; then
         start_retries=1
-        with_timeout 120 "$limactl" stop --force "${vm[1]}" >> "$log" 2>&1 || true
-        with_timeout 300 "$limactl" start --tty=false "${vm[1]}" >> "$log" 2>&1 || return 1
+    elif [ "$result" -eq 2 ]; then
+        forwarder_retries=1
     fi
+    if [ "$result" -ne 0 ] && [ $(( start_retries + forwarder_retries )) -gt 0 ]; then
+        with_timeout 120 "$limactl" stop --force "${vm[1]}" >> "$log" 2>&1 || true
+        cap_power_logs "$log"
+        result=0
+        start_vm "$log" || result=$?
+    fi
+    cap_power_logs "$log"
+    [ "$result" -eq 0 ] || return 1
     down[1]=0
     until with_timeout 15 "$relish" --output json apps --instances > /dev/null 2>&1; do
         [ "$(now)" -lt $(( powered_on_at + api_bound )) ] || return 1
@@ -494,6 +571,7 @@ one_cut() {
     sleep "$off"
     powered_on_at=$(now)
     settled_seconds=
+    forwarder_retries=0
     if power_back; then
         api_seconds=$(( $(now) - powered_on_at ))
         settle "cut-$cut" 300 || true
@@ -513,16 +591,20 @@ def number(text):
 detail = {"topology": "1", "kind": "site", "cut_at": int(sys.argv[1]), "work_seconds": int(sys.argv[2]),
     "off_seconds": int(sys.argv[3]), "acked": {"writer": int(sys.argv[4]), "redis": int(sys.argv[5])},
     "recovery": {"api_seconds": number(sys.argv[6]), "settled_seconds": number(sys.argv[7]),
-                 "start_retries": int(sys.argv[8])},
+                 "start_retries": int(sys.argv[8]), "forwarder_retries": int(sys.argv[15])},
     "cycle_seconds": int(sys.argv[9]),
     "starts_before_cut": {"writer": number(sys.argv[10]), "redis": number(sys.argv[11])},
     "previous_acked": {"writer": number(sys.argv[12]), "redis": number(sys.argv[13])}}
-if sys.argv[14]:
-    detail["environment"] = [sys.argv[14]]
+environment = [sys.argv[14]] if sys.argv[14] else []
+if int(sys.argv[15]):
+    environment.append("lima vsock forwarder spun")
+    detail["extra_power_offs"] = int(sys.argv[15])
+if environment:
+    detail["environment"] = environment
 print(json.dumps(detail))' \
         "$cut_at" "$hold" "$off" "$writer_acked" "$redis_acked" "${api_seconds:-}" "${settled_seconds:-}" \
         "$start_retries" "$(( $(now) - cut_at + hold ))" "${writer_before:-}" "${redis_before:-}" \
-        "${writer_previous:-}" "${redis_previous:-}" "$environment")
+        "${writer_previous:-}" "${redis_previous:-}" "$environment" "${forwarder_retries:-0}")
     endurance record --evidence "$evidence" --cut "$cut" --detail "$detail" > "$cut_dir/verdict.json" || result=$?
     say "cut $cut: Bun back in ${api_seconds:-never} s, settled in ${settled_seconds:-never} s; $(cat "$cut_dir/verdict.json")"
     return "$result"

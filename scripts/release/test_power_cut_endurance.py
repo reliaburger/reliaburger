@@ -337,6 +337,16 @@ class Summary(unittest.TestCase):
         self.assertEqual(summary["topologies"]["1"]["recovery_seconds"], {"p50": 20, "p95": 100, "max": 100})
         self.assertEqual(summary["environment_events"]["vz_start_retries"], 2)
 
+    def test_a_forwarder_retry_is_an_environment_event_and_an_extra_power_off(self):
+        lines = [self.line(1), self.line(2)]
+        lines[1]["recovery"]["forwarder_retries"] = 1
+        lines[1]["extra_power_offs"] = 1
+        summary = endurance.summarise(self.run_with(2), lines)
+        self.assertEqual(summary["environment_events"]["lima_forwarder_retries"], 1)
+        self.assertEqual(summary["topologies"]["1"]["extra_power_offs"], 1)
+        self.assertEqual(summary["pooled"]["power_offs"], 3)
+        self.assertEqual(summary["verdict"], "pass")
+
     def test_no_cuts_is_not_a_pass(self):
         self.assertEqual(endurance.summarise(self.run_with(0), [])["verdict"], "no cuts")
 
@@ -745,7 +755,8 @@ class HarnessShell(unittest.TestCase):
 
     FUNCTIONS = ("with_timeout", "now", "endurance", "run_get", "run_set", "rel", "read_resumes", "starts_in",
                  "acked_now", "read_acked", "acked_problems", "abort_run", "take_baseline", "power_back", "await_start",
-                 "verify", "one_cut", "cuts_done", "cleanup", "hold_guest_updates")
+                 "verify", "one_cut", "cuts_done", "cleanup", "hold_guest_updates", "start_vm", "cap_log",
+                 "cap_power_logs")
 
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -761,6 +772,10 @@ class HarnessShell(unittest.TestCase):
             if [ "$1" = start ]; then
                 n=$(grep -c '^limactl start' "$FAKE/calls")
                 if [ -f "$FAKE/start-$n" ]; then cat "$FAKE/start-$n" >&2; exit 1; fi
+                # Lima 2.2.1's host agent spinning on its vsock forwarder: the
+                # start never returns.
+                if [ -f "$FAKE/spin-$n" ]; then cat "$FAKE/spin-$n" >&2; exec sleep 30; fi
+                if [ -f "$FAKE/hang-$n" ]; then exec sleep 30; fi
             fi
             """)
         self.fake("relish", """
@@ -805,12 +820,15 @@ class HarnessShell(unittest.TestCase):
             (self.evidence / "cuts.jsonl").write_text("".join(json.dumps({"cut": n, "violations": []}) + "\n"
                                                               for n in range(1, cuts + 1)))
         functions = "".join(shell_function(HARNESS, name) for name in self.FUNCTIONS)
+        # The harness's own pattern for Lima's spinning forwarder, not a copy.
+        functions += next(line for line in HARNESS.read_text().splitlines()
+                          if line.startswith("forwarder_spin=")) + "\n"
         prelude = textwrap.dedent(f"""
             set -uo pipefail
             export FAKE={self.path}
             here={HERE / "power_cut"}; evidence={self.evidence}; power_log_dir={self.evidence}/logs
             limactl={self.path}/limactl; relish={self.path}/relish; vm=(none node-a); down=(0 1)
-            api_bound=120; start_wait=60; want='soak-writer=1,soak-redis=1,soak-redis-client=1'
+            api_bound=120; start_wait=60; start_timeout=300; log_cap=52428800; want='soak-writer=1,soak-redis=1,soak-redis-client=1'
             fail() {{ printf 'power-cut: %s\\n' "$*" >&2; exit 1; }}
             say() {{ printf '%s\\n' "$*"; }}
             sleep() {{ :; }}
@@ -875,6 +893,72 @@ class HarnessShell(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), "failed", result.stderr)
         self.assertEqual([call for call in self.calls_made() if call.startswith("limactl")],
                          ["limactl start --tty=false node-a"])
+
+    # Lima's vsock forwarder spinning at boot (run 7 cut 108)
+
+    SPIN = ("level=error msg=\"vsock forwarder accept error: accept tcp 127.0.0.1:60022: "
+            "accept: bad file descriptor\"\n")
+
+    def test_a_spinning_vsock_forwarder_is_stopped_and_started_again(self):
+        self.answer("instances", "[]")
+        self.answer("spin-1", self.SPIN * 3)
+        started = time.monotonic()
+        result = self.run_shell("powered_on_at=$(now)\n"
+                                "power_back && echo \"back retries=$start_retries forwarder=$forwarder_retries\"\n")
+        self.assertEqual(result.stdout.strip(), "back retries=0 forwarder=1", result.stderr)
+        self.assertLess(time.monotonic() - started, 20, "it waited for the start to time out")
+        self.assertEqual([call for call in self.calls_made() if call.startswith("limactl")],
+                         ["limactl start --tty=false node-a", "limactl stop --force node-a",
+                          "limactl start --tty=false node-a"])
+
+    def test_a_start_that_times_out_is_treated_as_the_same_failure(self):
+        self.answer("instances", "[]")
+        self.answer("hang-1", "")
+        result = self.run_shell("start_timeout=2; powered_on_at=$(now)\n"
+                                "power_back && echo \"back forwarder=$forwarder_retries\"\n")
+        self.assertEqual(result.stdout.strip(), "back forwarder=1", result.stderr)
+        self.assertEqual([call for call in self.calls_made() if call.startswith("limactl")],
+                         ["limactl start --tty=false node-a", "limactl stop --force node-a",
+                          "limactl start --tty=false node-a"])
+
+    def test_a_forwarder_that_spins_twice_is_left_to_the_invariants(self):
+        self.answer("instances", "[]")
+        self.answer("spin-1", self.SPIN)
+        self.answer("spin-2", self.SPIN)
+        result = self.run_shell("powered_on_at=$(now)\n"
+                                "power_back || echo \"failed forwarder=$forwarder_retries\"\n")
+        self.assertEqual(result.stdout.strip(), "failed forwarder=1", result.stderr)
+        self.assertEqual(len([call for call in self.calls_made() if call.startswith("limactl start")]), 2)
+
+    def test_a_huge_log_keeps_its_head_and_tail(self):
+        log = self.path / "ha.stderr.log"
+        log.write_text("FIRST\n" + "x" * 5000 + "\nLAST\n")
+        result = self.run_shell(f"cap_log {log} 1000\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = log.read_text()
+        self.assertLess(len(text), 1200)
+        self.assertTrue(text.startswith("FIRST\n"))
+        self.assertTrue(text.endswith("LAST\n"))
+        self.assertIn("power-cut: cut", text)
+
+    def test_a_small_log_is_left_alone(self):
+        log = self.path / "ha.stderr.log"
+        log.write_text("short\n")
+        self.run_shell(f"cap_log {log} 1000\ncap_log {self.path}/missing.log 1000\n")
+        self.assertEqual(log.read_text(), "short\n")
+
+    def test_power_back_caps_the_start_log_and_lima_s_log(self):
+        self.answer("instances", "[]")
+        self.answer("spin-1", self.SPIN * 200)
+        lima = self.path / "lima" / "node-a"
+        lima.mkdir(parents=True)
+        (lima / "ha.stderr.log").write_text(self.SPIN * 200)
+        result = self.run_shell(f"LIMA_HOME={self.path}/lima; log_cap=2000; powered_on_at=$(now)\n"
+                                "power_back && echo back\n")
+        self.assertEqual(result.stdout.strip(), "back", result.stderr)
+        self.assertLessEqual((lima / "ha.stderr.log").stat().st_size, 2200)
+        for log in (self.evidence / "logs").glob("power-on-*.log"):
+            self.assertLessEqual(log.stat().st_size, 2200, log)
 
     # The last ACK and INCR (finding 3)
 
