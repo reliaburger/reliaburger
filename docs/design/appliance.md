@@ -54,8 +54,8 @@ Recommends, so `mkosi.conf` names the two Buildah needs: `netavark`, the
 network stack for `RUN` steps, and `gpg`, which satisfies libgpgme's
 `gnupg | gpg` without GnuPG's agents. `RUN` steps use the image's runc. The
 package's test helpers in `/usr/libexec/buildah` (97 MB of the package's
-125 MB) are removed. Buildah adds about 55 MB to each `/usr` slot, which held
-667 MB of its 1,100 MB before it. `image/tests/builder_packages.py` checks the
+125 MB) are removed. Buildah adds 54 MB to each `/usr` slot: on x86-64 the
+EROFS image went from 667 MB to 721 MB of the slot's 1,100 MB. `image/tests/builder_packages.py` checks the
 config and each built manifest, and CI's seeded pair builds the tour's burger
 on two appliances. With no node able to build, bun still refuses with
 `NO_BUILDER_ERROR` (`src/bun/build_runner.rs`), which names the ways out.

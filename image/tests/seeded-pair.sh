@@ -37,11 +37,11 @@ sudo ip addr add 10.42.0.1/24 dev rbbr0
 sudo ip link set rbbr0 up
 # The way out, for the build's base images. Docker on the runner leaves the
 # FORWARD policy at drop, so the bridge's traffic is let through by name.
-nat=(-t nat POSTROUTING -s 10.42.0.0/24 ! -o rbbr0 -j MASQUERADE)
+nat=(POSTROUTING -s 10.42.0.0/24 ! -o rbbr0 -j MASQUERADE)
 forward_out=(FORWARD -i rbbr0 -j ACCEPT)
 forward_back=(FORWARD -o rbbr0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT)
 sudo sysctl -q -w net.ipv4.ip_forward=1
-sudo iptables -A "${nat[@]}"
+sudo iptables -t nat -A "${nat[@]}"
 sudo iptables -I "${forward_out[@]}"
 sudo iptables -I "${forward_back[@]}"
 dns=$(awk '/^nameserver/ { print $2; exit }' /run/systemd/resolve/resolv.conf 2>/dev/null || true)
@@ -50,7 +50,7 @@ cleanup() {
     sudo pkill -f "dnsmasq.*rbbr0" || true
     for i in 0 1; do sudo ip link del "rbtap$i" 2>/dev/null || true; done
     sudo ip link del rbbr0 2>/dev/null || true
-    sudo iptables -D "${nat[@]}" 2>/dev/null || true
+    sudo iptables -t nat -D "${nat[@]}" 2>/dev/null || true
     sudo iptables -D "${forward_out[@]}" 2>/dev/null || true
     sudo iptables -D "${forward_back[@]}" 2>/dev/null || true
 }
