@@ -1490,7 +1490,7 @@ No external scheduling frameworks or orchestration libraries are used. The sched
 
 ### 13.1 Preemption
 
-Should Meat support preempting lower-priority batch jobs to make room for App placements when the cluster is at capacity? Borg does this. The argument for: it prevents Apps from being unschedulable when batch jobs have claimed all resources. The argument against: it adds complexity and makes batch job completion times unpredictable. **Current decision: deferred to v2.**
+Should Meat support preempting lower-priority batch jobs to make room for App placements when the cluster is at capacity? Borg does this. The argument for: it prevents Apps from being unschedulable when batch jobs have claimed all resources. The argument against: it adds complexity and makes batch job completion times unpredictable. **Current decision:** apps yield-first without killing (#1967): a refused app claims room on its node, and job work gives it back at the next task boundary (see "Delegated task-array implementation" below). Pre-empting *running* attempts, which needs priorities, a grace time and a requeue, stays deferred to the priority work.
 
 ### 13.2 Multi-Scheduler for Batch
 
@@ -1528,8 +1528,9 @@ must use the same budget; stopped owners retain requests until retirement.
 
 Batch requests wait FIFO without partial CPU or memory reservations. This
 prevents starvation by repeated small requests, with a head-of-line utilisation
-trade-off. It is not tenant DRF, and running jobs do not automatically yield to
-a new app deployment. Provision service/rollout headroom. A profile larger than
+trade-off. It is not tenant DRF, and running jobs are never stopped for a new
+app deployment, though job work yields room to a refused app at its next
+boundary (below). Provision service/rollout headroom. A profile larger than
 a node's allocatable capacity is refused; temporary fullness queues work.
 
 App placement sees what jobs hold. Each `StateReport` carries the node's
@@ -1556,6 +1557,22 @@ same replicas in place instead of rolling the app, which would need room for
 every new replica beside the old one. When the leader moves the refused
 replicas away, the node's share is the spec it already runs: that deploy adds
 nothing, rolls nothing, and its successful admission clears the refusal.
+
+Job work yields room to a refused app (#1967). When job work leaving would
+make an app's share fit beside other apps and their claims, the refusal is
+*yielding*: the app holds a claim in the node's `ExecutionBudget` for the
+share. While the free room doesn't cover the claims, idle executors retire and
+busy ones retire after their command; attempts, executors and other apps never
+start into claimed room. Nothing running is stopped. A yielding refusal isn't
+reported to the leader, so the placement stays, and the node's reconciler
+retries it every 5 s. The claim ends when the app is admitted or leaves the
+node, or lapses 60 s after the first refusal; a lapsed app gets *full*
+refusals on that node for 5 minutes. A full refusal is reported as above, and
+the reconciler backs it off to at most 30 s, where other deploy failures back
+off to 300 s. The leader places apps on free room first. Only when no node has
+free room for a replica does its yield pass count job reservations as free,
+skip nodes that refused the app outright, and place the replica on the node
+with the most room after apps (decision rule `placement.jobs_yield_to_apps`).
 
 Workers persist control provenance (recovery epoch, leadership term, committed
 log index) and highest chunk generation. Task outcomes stream into checksummed

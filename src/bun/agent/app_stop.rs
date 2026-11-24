@@ -94,6 +94,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // running) leaves the app, and the record, in place.
         if matches!(begun, Ok(_) | Err(BunError::AppNotFound { .. })) {
             self.capacity_refusals.remove(&key);
+            // Nor should job work keep making room for it (#1967).
+            self.execution_budget()
+                .release_app_claim(&crate::meat::AppId::new(app_name, namespace));
         }
         match begun {
             Ok(stop) => {

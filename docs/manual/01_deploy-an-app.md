@@ -971,9 +971,11 @@ executors all lease from it, and a queued task holds nothing until it starts.
 Each node's state report carries what its task attempts and executors hold,
 apart from its app requests, and the leader adds both together before it places
 a replica. So a node that jobs have filled looks full, and the leader puts the
-replica somewhere else. If jobs take the room after a replica was placed, the
-node can't start it: its agent reports the refusal, and the leader moves the
-replica to another node instead of waiting there. Running attempts are never
-stopped to make room for an app.
+replica somewhere else. When every node is full of job work, the replica goes
+where apps hold least, and that node's job work gives the room back as its
+tasks finish, within about a minute. When job work can't free enough, the
+node's agent reports the refusal, and the leader moves the replica to another
+node instead of waiting there. Running attempts are never stopped to make room
+for an app.
 
 Directory defaults support `image`, `memory`, `cpu`, `[env]` and `[deploy]`. Child directories override individual fields; environment and deployment tables merge by key, and explicit workload values win. Common fields apply to jobs too, while deployment strategies apply to apps. Unknown defaults keys fail compilation.

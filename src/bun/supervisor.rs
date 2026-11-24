@@ -182,9 +182,13 @@ impl<G: Grill> WorkloadSupervisor<G> {
     }
 
     /// Reserve an adopted execution before enabling new task admission.
+    ///
+    /// A rolling replacement that can't start rolls back, so a refusal
+    /// here is always a full one: it claims nothing.
     pub(crate) fn reserve_execution(
         &mut self,
         id: InstanceId,
+        app: &crate::meat::AppId,
         resources: crate::meat::Resources,
     ) -> Result<(), BunError> {
         if self.resource_leases.contains_key(&id) {
@@ -192,10 +196,11 @@ impl<G: Grill> WorkloadSupervisor<G> {
         }
         let lease = self
             .budget
-            .try_acquire(resources)
+            .try_acquire_app(app, resources)
             .ok_or(BunError::Capacity {
                 requested: resources,
                 available: self.budget.available(),
+                kind: super::execution_budget::CapacityRefusalKind::Full,
             })?;
         self.resource_leases.insert(id, lease);
         Ok(())
@@ -746,13 +751,26 @@ impl<G: Grill> WorkloadSupervisor<G> {
         // couldn't find them and their ports leaked until agent restart.
         // The app's own requests and its sidecars' (#1120).
         let request = crate::meat::admission::app_requests(spec);
+        let app = crate::meat::AppId::new(app_name, namespace);
         let mut leases = HashMap::new();
         for index in indices {
             let id = crate::grill::InstanceIdentity::new(namespace, app_name, *index).instance_id();
-            let lease = self.budget.try_acquire(request).ok_or(BunError::Capacity {
-                requested: request,
-                available: self.budget.available(),
-            })?;
+            let Some(lease) = self.budget.try_acquire_app(&app, request) else {
+                // Every replica is admitted at once, so a refusal claims room
+                // for all of them (#1967). Leases taken so far drop with
+                // `leases`.
+                let share = indices
+                    .iter()
+                    .fold(crate::meat::Resources::default(), |share, _| {
+                        share.saturating_add(&request)
+                    });
+                drop(leases);
+                return Err(BunError::Capacity {
+                    requested: request,
+                    available: self.budget.available(),
+                    kind: self.budget.claim_for_app(&app, share),
+                });
+            };
             leases.insert(id, lease);
         }
         let mut prepared: Vec<WorkloadInstance> = Vec::with_capacity(indices.len());

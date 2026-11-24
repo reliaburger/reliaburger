@@ -562,11 +562,20 @@ task attempts and executors hold, separately from its app requests, and the
 leader counts both when it places an app replica. A node full of job work
 looks full, so the replica goes to a node with room.
 
-Placement and attempts can still race: jobs may take a node's room between the
-leader placing a replica and the node starting it. The agent doesn't wait or
-preempt running attempts. It reports the refusal, and the leader moves that
-replica to another node. Capacity a job held returns to the budget only once
-its attempt has positively retired.
+When no node has free room, apps come first. The leader places the replica on
+the node with the most room after apps, and `relish agent explain` names the
+decision `placement.jobs_yield_to_apps`. That node refuses the replica once and
+holds a claim on the room for up to a minute: idle executors retire, busy ones
+retire when their command ends, and no new attempt or executor starts into the
+claimed room. Its placement reconciler retries every five seconds, and the
+replica starts as soon as the room is free. Running attempts are never stopped.
+
+If job work can't free enough (other apps hold the room, or the claim lapses
+after a minute), the agent reports the refusal and the leader moves the
+replica to another node; that node won't claim for the same app again for five
+minutes. The same report covers a replica that loses the race: jobs taking a
+node's room between the leader placing it and the node starting it. Capacity a
+job held returns to the budget only once its attempt has positively retired.
 
 
 ## Reusable containers
@@ -747,8 +756,10 @@ after old executors retire at startup. Losing the source binding stops its
 original runtime owner.
 
 Local packing is non-preemptive. Existing applications have reserved requests;
-new deployments and rolling replacements also need free capacity. There is no
-DRF tenant fairness or automatic app pre-emption of running jobs. Batch admission uses FIFO waiting so smaller tasks cannot repeatedly overtake
+rolling replacements also need free capacity. A refused new replica makes job
+work yield its room at the next task boundary (see "Apps and jobs share each
+node"), but nothing running is stopped for it, and there's no DRF tenant
+fairness. Batch admission uses FIFO waiting so smaller tasks cannot repeatedly overtake
 a larger waiting request. This can leave capacity idle behind a large request. Reserve service capacity and allow
 rollout headroom when planning a mixed cluster.
 
