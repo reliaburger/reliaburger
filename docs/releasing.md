@@ -2316,7 +2316,11 @@ free. It grows the root partition and filesystem into that space
 (`growpart`, `resize2fs`), loop-mounts the root and boot partitions, and runs `apt-get install` in a chroot, with
 package indexes and downloads on a tmpfs so they never reach the image and with
 service starts blocked. It disables chrony, Ubuntu 26.04's time daemon, because
-Lima's guest agent owns the guest clock (#608). It adds a systemd `.link` file
+Lima's guest agent owns the guest clock (#608). It masks `apt-daily.timer`,
+`apt-daily-upgrade.timer` and `unattended-upgrades.service`, fails unless the
+masks are in the image, and sets needrestart, if present, to list only, so
+nothing upgrades the guest or restarts Bun behind a tester's back (#2274);
+updates arrive with releases. It adds a systemd `.link` file
 naming the virtio NIC `eth0`: 26.04's initrd brings the NIC up as `enp0s1`,
 cloud-init can't rename an interface that's up, and without the file each new
 VM waited two minutes for an `eth0` that never appeared. Then it seals the image: an empty `/etc/machine-id`,

@@ -19,6 +19,10 @@ Not released yet: this is what the train carries, and it can change before the t
 
 - The appliance image has Buildah, so `relish build` and the five-minute tour's burger build on a cluster of appliances. Its storage is on the data partition, where Btrfs reflinks the `vfs` driver's layer copies; the image adds `netavark` and `gpg` for it, drops Buildah's 97 MB of test helpers, and grows each `/usr` slot by 54 MB (667 MB to 721 MB of 1,100 MB on x86-64). A multi-platform build can't emulate the other architecture's `RUN` steps on an appliance, so cross-compile or name one `platform`. With no node able to build, the refusal no longer says appliances never can ([#2144](https://github.com/reliaburger/reliaburger/issues/2144)).
 
+### Fixed
+
+- A quickstart VM no longer upgrades itself or restarts Bun without warning. Ubuntu's `apt-daily` timers and unattended-upgrades are masked in the guest image and at first boot, which covers stock and older guest images too, and needrestart, where installed, only lists what it would restart. An automatic libc upgrade had restarted Bun mid-run. Security updates arrive with releases, in each release's guest image ([#2274](https://github.com/reliaburger/reliaburger/issues/2274)).
+
 ## [0.3.2] - 2026-11-23
 
 Fixes from the Wyse 3040 lab that need a new appliance image. [Release page](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.2), [release log](docs/release-log.md#032-wyse-lab-fixes).

@@ -126,6 +126,24 @@ in_guest apt-get -o Acquire::Retries=3 install -y -qq $packages >&2
 # Disabling only removes symlinks, which works offline in the chroot.
 # Quickstart provisioning disables it on stock images too.
 in_guest systemctl disable chrony.service >&2
+# No updates behind the tester's back: unattended-upgrades upgraded libc in a
+# quickstart guest and needrestart restarted Bun with it (#2274). The VM is
+# disposable and rebuilt from this pinned image each release, so updates
+# arrive with releases. Masking works offline in the chroot, like disabling.
+# Quickstart provisioning does the same on stock and older images.
+automatic_updates="apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service"
+# shellcheck disable=SC2086
+in_guest systemctl mask $automatic_updates >&2
+# shellcheck disable=SC2086
+for unit in $automatic_updates; do
+  [ "$(readlink "$root/etc/systemd/system/$unit")" = /dev/null ] \
+    || { echo "$unit is not masked in the image" >&2; exit 1; }
+done
+# needrestart, where present, only lists the services it would restart.
+if [ -d "$root/etc/needrestart" ]; then
+  mkdir -p "$root/etc/needrestart/conf.d"
+  echo "\$nrconf{restart} = 'l';" >"$root/etc/needrestart/conf.d/50-reliaburger.conf"
+fi
 # One name for the NIC from the first boot. Ubuntu 26.04's initrd brings it
 # up as enp0s1, and Lima's network config wants eth0. cloud-init can't rename
 # an interface that is up, so a fresh VM waited two minutes for an eth0 that
