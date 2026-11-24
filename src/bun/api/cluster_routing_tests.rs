@@ -84,6 +84,7 @@ fn instance(id: &str, app: &str, state: &str) -> InstanceStatus {
         age_seconds: None,
         image: None,
         data_on_node: false,
+        sidecars: Vec::new(),
         reason: None,
     }
 }

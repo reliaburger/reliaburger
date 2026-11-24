@@ -91,6 +91,16 @@ pub struct InstanceRecord {
 /// The instance record format this build writes and reads.
 pub const RECORD_SCHEMA: u32 = 3;
 
+/// Where the sidecars' records live, beside their instances' (#1315).
+///
+/// A directory of their own, because a sidecar's identity
+/// (`{instance}__sidecar-{name}`) names no replica: startup validates every
+/// record in the main directory as a replica and refuses one that isn't.
+/// [`load_records`] skips the subdirectory, since it has no `.json` name.
+pub fn sidecar_records_dir(records_dir: &Path) -> PathBuf {
+    records_dir.join("sidecars")
+}
+
 /// Record path for an instance id within the records directory.
 pub fn record_path(records_dir: &Path, instance_id: &str) -> PathBuf {
     records_dir.join(format!("{instance_id}.json"))

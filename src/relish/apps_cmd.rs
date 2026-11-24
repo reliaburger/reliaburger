@@ -401,6 +401,21 @@ pub fn render_instances(
                 s.restart_count,
                 age_cell(s.age_seconds)
             );
+            // Each sidecar under its instance, with its own state and
+            // restarts (#1315).
+            for sidecar in &s.sidecars {
+                let _ = writeln!(
+                    output,
+                    "{:<24} {:<20} {:<15} {:<12} {:<10} {:<10} {:<8} -",
+                    "",
+                    format!("+ {}", sidecar.name),
+                    "sidecar",
+                    "",
+                    sidecar.state,
+                    "-",
+                    sidecar.restart_count,
+                );
+            }
         }
     }
     let blocked: Vec<_> = desired
@@ -511,6 +526,7 @@ mod tests {
                 age_seconds: Some(3_600 * u64::from(index + 1)),
                 image: None,
                 data_on_node: false,
+                sidecars: Vec::new(),
                 reason: None,
             },
         }
@@ -595,6 +611,41 @@ mod tests {
         assert!(filter_apps(rollup(&desired, &instances), &elsewhere).is_empty());
         assert_eq!(render_apps(&[], &desired), "no apps match\n");
         assert_eq!(render_apps(&[], &[]), "no apps deployed\n");
+    }
+
+    /// #1315: an instance's sidecars are listed under it, each with its
+    /// state and restarts, and `-o json` carries them on the instance.
+    #[test]
+    fn an_apps_sidecars_are_listed_under_each_instance() {
+        use crate::bun::agent::{SidecarState, SidecarStatus};
+        let sidecar = |name: &str, state, restart_count| SidecarStatus {
+            name: name.to_string(),
+            id: format!("prod__web-0__sidecar-{name}"),
+            state,
+            restart_count,
+        };
+        let mut web = instance("node-1", "web", 0, "running");
+        web.instance.sidecars = vec![
+            sidecar("proxy", SidecarState::Running, 0),
+            sidecar("logs", SidecarState::Backoff, 3),
+        ];
+        let rows = vec![web, instance("node-2", "api", 1, "running")];
+        insta::assert_snapshot!(render_instances(&rows, &[]));
+
+        let json = serde_json::to_value(&rows).unwrap();
+        assert_eq!(
+            json[0]["sidecars"][1],
+            serde_json::json!({
+                "name": "logs",
+                "id": "prod__web-0__sidecar-logs",
+                "state": "backoff",
+                "restart_count": 3
+            })
+        );
+        assert!(
+            json[1].get("sidecars").is_none(),
+            "an instance without sidecars says nothing about them"
+        );
     }
 
     #[test]

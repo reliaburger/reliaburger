@@ -14344,6 +14344,7 @@ fn runtime_unknown_is_serialised_only_when_set() {
         age_seconds: None,
         image: None,
         data_on_node: false,
+        sidecars: Vec::new(),
         reason: None,
     };
     let plain = serde_json::to_value(&status).unwrap();

@@ -81,6 +81,51 @@ pub struct InstanceStatus {
     /// that doesn't report it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub data_on_node: bool,
+    /// The sidecars running beside this instance, in the order the app
+    /// declares them (#1315). Empty for an app with none, and in an answer
+    /// from a node that doesn't report them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sidecars: Vec<SidecarStatus>,
+}
+
+/// One sidecar beside an instance, as `relish apps` lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SidecarStatus {
+    /// Its name in the app's `[[sidecar]]`.
+    pub name: String,
+    /// Its runtime identity, `{instance}__sidecar-{name}`.
+    pub id: String,
+    /// Where it is in its life.
+    pub state: SidecarState,
+    /// How many times it has restarted on its own since it last started
+    /// with its instance.
+    pub restart_count: u32,
+}
+
+/// Where a sidecar is in its life, as the node's agent last saw it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SidecarState {
+    /// Running beside its instance.
+    Running,
+    /// It exited and is waiting out its backoff before it starts again.
+    Backoff,
+    /// It's being started again.
+    Restarting,
+    /// Its instance isn't running, so neither is it.
+    Stopped,
+}
+
+impl std::fmt::Display for SidecarState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `pad`, not `write_str`, so a table's `{:<10}` widths apply.
+        f.pad(match self {
+            Self::Running => "running",
+            Self::Backoff => "backoff",
+            Self::Restarting => "restarting",
+            Self::Stopped => "stopped",
+        })
+    }
 }
 
 /// A workload status with the node that supplied it.
@@ -693,6 +738,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             .deployed_specs
                             .get(&(instance.app_name.clone(), instance.namespace.clone()))
                             .is_some_and(crate::cluster::orchestrate::stays_through_os_rollout),
+                        sidecars: self
+                            .sidecars
+                            .statuses(&instance.id, super::sidecars::runs_beside(instance.state)),
                     },
                     evidence,
                 }

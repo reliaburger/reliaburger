@@ -15,9 +15,17 @@ This file is the short version. The longer records are:
 
 Not released yet: this is what the train carries, and it can change before the tag.
 
+### Added
+
+- `relish apps NAME` lists each instance's sidecars under it, with their state (`running`, `backoff`, `restarting` or `stopped`) and how often each has restarted on its own, and `-o json` carries them on each instance as `sidecars`. They used to show up only as Restart events ([#1315](https://github.com/reliaburger/reliaburger/issues/1315)).
+
 ### Changed
 
 - The appliance image has Buildah, so `relish build` and the five-minute tour's burger build on a cluster of appliances. Its storage is on the data partition, where Btrfs reflinks the `vfs` driver's layer copies; the image adds `netavark` and `gpg` for it, drops Buildah's 97 MB of test helpers, and grows each `/usr` slot by 54 MB (667 MB to 721 MB of 1,100 MB on x86-64). A multi-platform build can't emulate the other architecture's `RUN` steps on an appliance, so cross-compile or name one `platform`. With no node able to build, the refusal no longer says appliances never can ([#2144](https://github.com/reliaburger/reliaburger/issues/2144)).
+
+### Fixed
+
+- A Bun restart or self-upgrade adopts running sidecars with their app instead of restarting them. Sidecars had no adoption records, so every Bun restart killed them and started them again about a second later. Each now has a record of its own, checked against the runtime like an app's ([#1315](https://github.com/reliaburger/reliaburger/issues/1315)).
 
 ## [0.3.2] - 2026-11-23
 

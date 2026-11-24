@@ -135,7 +135,8 @@ use restarts::RestartRotation;
 use runtime_inventory::{LOOP_RUNTIME_INVENTORY_TIMEOUT, RUNTIME_INVENTORY_TIMEOUT};
 pub use status::{
     ApplyResult, ClusterInstanceStatus, CouncilMemberInfo, CouncilRole, CouncilStatus,
-    CurrentResourceStatus, InstanceStatus, JobStatus, NodeStatus, council_role, council_status,
+    CurrentResourceStatus, InstanceStatus, JobStatus, NodeStatus, SidecarState, SidecarStatus,
+    council_role, council_status,
 };
 pub use status_snapshot::{StatusReader, StatusUnavailable};
 use trace::MAX_CONCURRENT_TRACES;

@@ -370,9 +370,9 @@ async fn the_capability_report_says_whether_the_runtime_can_run_sidecars() {
     assert!(!capabilities.shared_network);
 }
 
-/// Sidecars have no adoption records, so a Bun restart's startup retires
-/// them with every other unrecorded launch. The adopted instance gets them
-/// back on the next tick, joined to its namespace.
+/// Sidecars with no adoption records of their own (lost, or never written)
+/// are retired at startup with every other unrecorded launch. The adopted
+/// instance gets them back on the next tick, joined to its namespace.
 #[tokio::test]
 async fn an_adopted_instance_gets_its_sidecars_started_again() {
     let records = tempfile::tempdir().unwrap();
@@ -483,5 +483,303 @@ async fn a_sidecar_restarting_when_its_instance_is_given_up_does_not_survive() {
     assert!(
         last_start < last_kill,
         "the proxy was left running beside its failed instance: {proxy_operations:?}"
+    );
+}
+
+// --- Adoption across a Bun restart (#1315) ---
+
+/// The sidecar records under `records`, by instance id, once `count` of
+/// them have landed: a launch writes them from a task.
+async fn sidecar_records(
+    records: &std::path::Path,
+    count: usize,
+) -> Vec<crate::grill::records::InstanceRecord> {
+    let directory = crate::grill::records::sidecar_records_dir(records);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let mut found = crate::grill::records::load_records(&directory).unwrap();
+            if found.len() >= count {
+                found.sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
+                return found;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("fewer than {count} sidecar records landed"))
+}
+
+/// Deploy `web` with its two sidecars on an agent that keeps records in
+/// `records`, and wait for the sidecars' records.
+async fn deployed_with_records(
+    records: &std::path::Path,
+) -> (
+    TestAgent,
+    MockGrill,
+    Vec<crate::grill::records::InstanceRecord>,
+) {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    agent.set_records_dir(records.to_path_buf());
+    grill.set_pid(std::process::id());
+    with_finished_init(&grill, WEB);
+    expect_complete(&drain_deploy(&mut agent, web_with_sidecars("myapp:v1")).await);
+    let recorded = sidecar_records(records, 2).await;
+    (agent, grill, recorded)
+}
+
+/// A restarted Bun on the same node: a fresh agent and runtime handle over
+/// the records the last one left.
+fn restarted_agent(records: &std::path::Path) -> (TestAgent, MockGrill) {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    agent.set_records_dir(records.to_path_buf());
+    grill.set_pid(std::process::id());
+    (agent, grill)
+}
+
+/// Each started sidecar gets an adoption record of its own, beside its
+/// instance's, naming its process and the spec it was launched from.
+#[tokio::test]
+async fn a_started_sidecar_is_recorded_for_adoption() {
+    let records = tempfile::tempdir().unwrap();
+    let (agent, grill, recorded) = deployed_with_records(records.path()).await;
+
+    let ids: Vec<&str> = recorded.iter().map(|r| r.instance_id.as_str()).collect();
+    assert_eq!(ids, [LOGS, PROXY]);
+    for record in &recorded {
+        assert_eq!(record.app_name, "web");
+        assert_eq!(record.namespace, "default");
+        assert_eq!(record.pid, std::process::id());
+        assert_eq!(record.host_port, None, "a sidecar holds no port");
+        let sidecar = id(&record.instance_id);
+        assert!(
+            grill
+                .created_spec(&sidecar)
+                .unwrap()
+                .matches_journal(&record.oci_spec),
+            "{sidecar}: the record names another spec than its launch"
+        );
+    }
+    assert_eq!(recorded[1].image, "envoy:1.31");
+    assert_eq!(recorded[0].image, "myapp:v1", "logs runs the app's image");
+    // The instance's own record is still the only one in the main directory.
+    let main = crate::grill::records::load_records(records.path()).unwrap();
+    assert_eq!(main.len(), 1);
+    assert_eq!(main[0].instance_id, WEB);
+    drop(agent);
+}
+
+/// The gap #1315 closed: a Bun restart adopts the running sidecars with
+/// their instance, so nothing restarts and the sidecars keep their
+/// process. Before, startup retired them and the next tick started them
+/// again a second later.
+#[tokio::test]
+async fn a_bun_restart_adopts_running_sidecars_instead_of_restarting_them() {
+    let records = tempfile::tempdir().unwrap();
+    let (first, _grill, _) = deployed_with_records(records.path()).await;
+    drop(first);
+
+    let (mut agent, grill) = restarted_agent(records.path());
+    for instance in [WEB, PROXY, LOGS] {
+        grill.set_adopt_result(&id(instance), true);
+    }
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+
+    let (web, proxy, logs) = (id(WEB), id(PROXY), id(LOGS));
+    assert_eq!(agent.sidecars.of(&web), [proxy.clone(), logs.clone()]);
+    assert_eq!(
+        agent.sidecars.running_beside(&web),
+        [proxy.clone(), logs.clone()],
+        "adopted sidecars are running, not due"
+    );
+    agent.relaunch_due_sidecars_to_completion().await;
+    let calls = grill.calls();
+    for sidecar in [&proxy, &logs] {
+        let touched: Vec<String> = operations(&calls, sidecar)
+            .into_iter()
+            .filter(|op| op != "state")
+            .collect();
+        assert_eq!(touched, ["adopt"], "{sidecar}: {calls:?}");
+        assert_eq!(agent.sidecars.restarts(sidecar), 0);
+    }
+    // Their records stay, for the next restart.
+    assert_eq!(sidecar_records(records.path(), 2).await.len(), 2);
+}
+
+/// A sidecar whose record the runtime won't vouch for (its process is gone,
+/// or another runs under its name) is retired and starts again beside its
+/// adopted instance, as every sidecar did before #1315.
+#[tokio::test]
+async fn a_sidecar_the_runtime_will_not_adopt_starts_again() {
+    let records = tempfile::tempdir().unwrap();
+    let (first, _grill, _) = deployed_with_records(records.path()).await;
+    drop(first);
+
+    let (mut agent, grill) = restarted_agent(records.path());
+    grill.set_adopt_result(&id(WEB), true);
+    grill.set_adopt_result(&id(PROXY), true);
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+
+    let (web, proxy, logs) = (id(WEB), id(PROXY), id(LOGS));
+    assert_eq!(
+        agent.sidecars.running_beside(&web),
+        std::slice::from_ref(&proxy)
+    );
+    let from = grill.calls().len();
+    agent.relaunch_due_sidecars_to_completion().await;
+    let calls = grill.calls()[from..].to_vec();
+    let restarted: Vec<String> = operations(&calls, &logs)
+        .into_iter()
+        .filter(|op| op != "state")
+        .collect();
+    assert_eq!(restarted, ["kill", "create", "start"], "{calls:?}");
+    assert!(
+        operations(&calls, &proxy).iter().all(|op| op == "state"),
+        "the adopted sidecar was disturbed: {calls:?}"
+    );
+    // The restarted one is recorded again.
+    let recorded = sidecar_records(records.path(), 2).await;
+    assert!(recorded.iter().any(|record| record.instance_id == LOGS));
+}
+
+/// An instance that isn't adopted takes its recorded sidecars with it:
+/// they mustn't run beside nothing.
+#[tokio::test]
+async fn the_sidecars_of_an_instance_that_is_not_adopted_are_retired() {
+    let records = tempfile::tempdir().unwrap();
+    let (first, _grill, _) = deployed_with_records(records.path()).await;
+    drop(first);
+
+    let (mut agent, grill) = restarted_agent(records.path());
+    grill.set_adopt_result(&id(PROXY), true);
+    grill.set_adopt_result(&id(LOGS), true);
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 0);
+
+    let calls = grill.calls();
+    for sidecar in [id(PROXY), id(LOGS)] {
+        let touched = operations(&calls, &sidecar);
+        assert!(!touched.contains(&"adopt".to_string()), "{calls:?}");
+        assert!(touched.contains(&"kill".to_string()), "{calls:?}");
+    }
+    assert!(agent.sidecars.of(&id(WEB)).is_empty());
+    let directory = crate::grill::records::sidecar_records_dir(records.path());
+    assert!(
+        crate::grill::records::load_records(&directory)
+            .unwrap()
+            .is_empty(),
+        "the retired sidecars' records stayed"
+    );
+}
+
+/// A sidecar restarted on its own records its new process, and an instance
+/// stopped for good removes its sidecars' records.
+#[tokio::test]
+async fn a_restarted_sidecar_is_recorded_again_and_a_stop_removes_the_records() {
+    let records = tempfile::tempdir().unwrap();
+    let (mut agent, grill, _) = deployed_with_records(records.path()).await;
+    let directory = crate::grill::records::sidecar_records_dir(records.path());
+    crate::grill::records::remove_record(&directory, PROXY).unwrap();
+
+    grill.set_state(&id(PROXY), ContainerState::Stopped);
+    agent.check_apps().await;
+    grill.set_state(&id(PROXY), ContainerState::Running);
+    agent.relaunch_due_sidecars_to_completion().await;
+    assert_eq!(agent.sidecars.restarts(&id(PROXY)), 1);
+    sidecar_records(records.path(), 2).await;
+
+    agent.stop_app("web", "default").await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !crate::grill::records::load_records(&directory)
+            .unwrap()
+            .is_empty()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the stopped instance's sidecar records stayed");
+}
+
+/// #1315: the node's status carries each instance's sidecars, so `relish
+/// apps` can show them. Before, a sidecar showed up only as Restart events.
+#[tokio::test]
+async fn an_instances_status_lists_its_sidecars_with_their_restarts() {
+    use crate::bun::agent::SidecarState;
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    with_finished_init(&grill, WEB);
+    expect_complete(&drain_deploy(&mut agent, web_with_sidecars("myapp:v1")).await);
+    let sidecars_of_web = |agent: &TestAgent| {
+        agent
+            .status_entries()
+            .into_iter()
+            .find(|entry| entry.status.id == WEB)
+            .unwrap()
+            .status
+            .sidecars
+            .into_iter()
+            .map(|sidecar| (sidecar.id, sidecar.state, sidecar.restart_count))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        sidecars_of_web(&agent),
+        [
+            (PROXY.to_string(), SidecarState::Running, 0),
+            (LOGS.to_string(), SidecarState::Running, 0)
+        ]
+    );
+
+    grill.set_state(&id(PROXY), ContainerState::Stopped);
+    agent.check_apps().await;
+    assert_eq!(sidecars_of_web(&agent)[0].1, SidecarState::Backoff);
+    grill.set_state(&id(PROXY), ContainerState::Running);
+    agent.relaunch_due_sidecars_to_completion().await;
+    assert_eq!(
+        sidecars_of_web(&agent)[0],
+        (PROXY.to_string(), SidecarState::Running, 1)
+    );
+}
+
+/// On a runtime that lists its launches, as runc does, startup keeps a
+/// recorded sidecar's launch for adoption and still retires a sidecar
+/// launch beside no recorded instance.
+#[tokio::test]
+async fn startup_keeps_recorded_sidecar_launches_and_retires_the_rest() {
+    let records = tempfile::tempdir().unwrap();
+    let (first, _grill, sidecars) = deployed_with_records(records.path()).await;
+    drop(first);
+    let main = crate::grill::records::load_records(records.path()).unwrap();
+    let launch = |id: &str, spec: &crate::grill::oci::OciSpec| crate::grill::RuntimeLaunch {
+        instance_id: InstanceId(id.to_string()),
+        spec: spec.clone(),
+        generation: crate::grill::RuntimeGeneration::process(id),
+        network_reference: None,
+    };
+    const ORPHAN: &str = "default__gone-0__sidecar-proxy";
+    let mut launches = vec![launch(WEB, &main[0].oci_spec)];
+    launches.extend(
+        sidecars
+            .iter()
+            .map(|record| launch(&record.instance_id, &record.oci_spec)),
+    );
+    launches.push(launch(ORPHAN, &sidecars[0].oci_spec));
+
+    let (mut agent, grill) = restarted_agent(records.path());
+    grill.set_launch_inventory(launches).await;
+    for instance in [WEB, PROXY, LOGS, ORPHAN] {
+        grill.set_adopt_result(&id(instance), true);
+    }
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+
+    let calls = grill.calls();
+    for sidecar in [id(PROXY), id(LOGS)] {
+        let touched = operations(&calls, &sidecar);
+        assert!(!touched.contains(&"kill".to_string()), "{calls:?}");
+        assert!(touched.contains(&"adopt".to_string()), "{calls:?}");
+    }
+    let orphan = operations(&calls, &id(ORPHAN));
+    assert!(orphan.contains(&"kill".to_string()), "{calls:?}");
+    assert!(!orphan.contains(&"adopt".to_string()), "{calls:?}");
+    assert_eq!(
+        agent.sidecars.running_beside(&id(WEB)),
+        [id(PROXY), id(LOGS)]
     );
 }

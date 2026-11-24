@@ -243,9 +243,26 @@ Namespace isolation does cover sidecars: a sidecar belongs to its app's
 namespace, and its app's `allow_from` grants are its grants too. A sidecar
 reaches what its app may reach in other namespaces, and nothing else.
 
-A Bun restart adopts running apps but not their sidecars, which have no
-adoption records. Bun starts them again on its next tick, a second or so
-later.
+A Bun restart or self-upgrade adopts running sidecars along with their
+app: each sidecar has an adoption record of its own, and the new Bun checks
+that the process it names is still the one the runtime runs before it takes
+it over. A sidecar that can't be adopted this way, because it crashed while
+Bun was down, say, starts again on Bun's next tick, a second or so later.
+
+`relish apps NAME` lists each instance's sidecars under it, with their
+state and how often each has restarted on its own:
+
+```text
+NODE                     INSTANCE             APP             NAMESPACE    STATE      PID        RESTARTS AGE
+node-1                   default__api-0       api             default      running    4211       0        2h
+                         + proxy              sidecar                      running    -          0        -
+                         + logs               sidecar                      backoff    -          3        -
+```
+
+A sidecar is `running`, in `backoff` after it exited, `restarting`, or
+`stopped` while its app isn't running. `-o json` puts the same on each
+instance as `sidecars`, a list of `name`, `id`, `state` and
+`restart_count`.
 
 ## Config files
 

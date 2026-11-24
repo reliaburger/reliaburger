@@ -59,7 +59,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
         self.write_record_within_turn(key, incarnation, dir, record)
             .await?
-            .map_err(|reason| fail(&reason))
+            .map_err(|reason| fail(&reason))?;
+        // Its sidecars started before it did, so they're recorded now too.
+        if let Some(instance) = self.supervisor.get_instance(instance_id)
+            && let Some(spec) = instance.oci_spec.clone()
+        {
+            let owner = sidecars::SidecarOwner {
+                namespace: instance.namespace.clone(),
+                app_name: instance.app_name.clone(),
+                image: instance.image.clone(),
+            };
+            self.record_sidecars(instance_id, owner, &spec, None);
+        }
+        Ok(())
     }
 
     /// The adoption record for a fresh or restarted instance.
@@ -202,7 +214,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
         self.write_record_within_turn(key, incarnation, directory, record)
             .await?
-            .map_err(|reason| fail(format!("persist replacement record: {reason}")))
+            .map_err(|reason| fail(format!("persist replacement record: {reason}")))?;
+        let owner = sidecars::SidecarOwner {
+            namespace: instance.namespace.clone(),
+            app_name: instance.app_name.clone(),
+            image: instance.spec.image.clone().unwrap_or_default(),
+        };
+        self.record_sidecars(&instance.instance_id, owner, &instance.oci_spec, None);
+        Ok(())
     }
 
     /// The adoption record for a rolling replacement.
@@ -256,12 +275,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     ///
     /// Returns the records it retired as stale, which the caller mustn't
     /// adopt: a record from an earlier boot whose launch the runtime lost,
-    /// and a record that conflicts with the launch it names (#1852).
+    /// and a record that conflicts with the launch it names (#1852). Also
+    /// returns the sidecars it left running for adoption (#1315): those
+    /// whose record names the launch the runtime has, beside an instance
+    /// whose own record does. Every other sidecar launch is retired here.
     pub(super) async fn reconcile_runtime_launches(
         &mut self,
         records: &[crate::grill::records::InstanceRecord],
+        sidecar_records: &[crate::grill::records::InstanceRecord],
         launches: &[crate::grill::RuntimeLaunch],
-    ) -> Result<std::collections::HashSet<String>, BunError> {
+    ) -> Result<RuntimeReconciliation, BunError> {
         let inventory: std::collections::HashMap<_, _> = launches
             .iter()
             .map(|launch| (launch.instance_id.0.as_str(), launch))
@@ -307,6 +330,23 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         }
         recorded.retain(|id| !stale.contains(*id));
+        let kept: Vec<&crate::grill::records::InstanceRecord> = sidecar_records
+            .iter()
+            .filter(|record| {
+                let beside_recorded =
+                    crate::grill::oci::sidecar_parent(&InstanceId(record.instance_id.clone()))
+                        .is_some_and(|(parent, _)| recorded.contains(parent.0.as_str()));
+                let launched = inventory
+                    .get(record.instance_id.as_str())
+                    .is_some_and(|launch| launch.launched(&record.oci_spec));
+                beside_recorded && launched
+            })
+            .collect();
+        recorded.extend(kept.iter().map(|record| record.instance_id.as_str()));
+        let kept_sidecars: std::collections::HashSet<String> = kept
+            .iter()
+            .map(|record| record.instance_id.clone())
+            .collect();
         for id in &lost_launches {
             eprintln!(
                 "bun: {id}: adoption record from an earlier boot has no runtime launch; retiring it"
@@ -343,7 +383,86 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 self.retire_instance_artifacts_fully(&id).await?;
             }
         }
-        Ok(stale)
+        Ok(RuntimeReconciliation {
+            stale,
+            kept_sidecars,
+        })
+    }
+
+    /// Adopt the recorded sidecars of `parent`, an instance just adopted,
+    /// and register all its sidecars (#1315). A sidecar whose record the
+    /// runtime vouches for runs on; any other is retired and due at once,
+    /// to start again beside its instance from the spec it was launched
+    /// with (#1434). Returns the sidecars it adopted.
+    async fn adopt_sidecars(
+        &mut self,
+        parent: &InstanceId,
+        specs: &[crate::config::app::SidecarSpec],
+        records: &std::collections::HashMap<String, crate::grill::records::InstanceRecord>,
+        adoptable: impl Fn(&str) -> bool,
+        now: Instant,
+    ) -> Result<std::collections::HashSet<InstanceId>, BunError> {
+        let mut adopted = std::collections::HashSet::new();
+        for spec in specs {
+            let id = crate::grill::oci::sidecar_instance_id(parent, &spec.name);
+            let Some(record) = records.get(&id.0).filter(|_| adoptable(&id.0)) else {
+                continue;
+            };
+            let running = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                self.supervisor.grill().adopt(&id, record),
+            )
+            .await
+            .map_err(|_| {
+                BunError::AdoptionState(format!("runtime adoption timed out for {id}"))
+            })??;
+            if running {
+                adopted.insert(id);
+            } else if !self.defer_startup_retirement(&id).await? {
+                self.retire_instance_artifacts_fully(&id).await?;
+            }
+        }
+        self.sidecars
+            .register_adopted(parent, specs, &adopted, now)?;
+        if !adopted.is_empty() {
+            // Their cgroups are bound to their app's namespace on the next
+            // tick, as a restarted sidecar's is (#1426).
+            self.namespace_firewall_stale = true;
+        }
+        Ok(adopted)
+    }
+
+    /// After adoption: retire every sidecar startup left running that no
+    /// adopted instance took, and remove every sidecar record but the
+    /// adopted ones' (#1315).
+    async fn finish_sidecar_adoption(
+        &mut self,
+        directory: PathBuf,
+        kept: &std::collections::HashSet<String>,
+        adopted: &std::collections::HashSet<InstanceId>,
+    ) -> Result<(), BunError> {
+        for id in kept {
+            let id = InstanceId(id.clone());
+            if adopted.contains(&id) {
+                continue;
+            }
+            kill_runtime_instance(self.supervisor.grill(), &id, self.stop_confirmation_timeout)
+                .await?;
+            if !self.defer_startup_retirement(&id).await? {
+                self.retire_instance_artifacts_fully(&id).await?;
+            }
+        }
+        let keep: std::collections::HashSet<String> =
+            adopted.iter().map(|id| id.0.clone()).collect();
+        let swept =
+            tokio::task::spawn_blocking(move || remove_sidecar_records_except(&directory, &keep))
+                .await
+                .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+        if let Err(error) = swept {
+            // Only an optimisation is lost: a stale record is never adopted.
+            eprintln!("bun: stale sidecar adoption records kept: {error}");
+        }
+        Ok(())
     }
 
     /// Adopt still-running workloads recorded by a previous bun process.
@@ -370,6 +489,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .await
                 .map_err(|error| BunError::AdoptionState(error.to_string()))?
                 .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+        let sidecar_directory = crate::grill::records::sidecar_records_dir(&dir);
+        let sidecar_records = load_sidecar_records(sidecar_directory.clone()).await;
         self.require_discovery_recovery(!records.is_empty(), false)?;
         // Validate the entire inventory before adopting or deleting any owner.
         for record in &records {
@@ -431,10 +552,35 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.restore_egress_owners(&records, launch_inventory.as_deref())
             .await?;
         self.replay_discovery_releases().await?;
-        let stale = match &launch_inventory {
-            Some(launches) => self.reconcile_runtime_launches(&records, launches).await?,
-            None => std::collections::HashSet::new(),
+        let RuntimeReconciliation {
+            stale,
+            kept_sidecars,
+        } = match &launch_inventory {
+            Some(launches) => {
+                self.reconcile_runtime_launches(&records, &sidecar_records, launches)
+                    .await?
+            }
+            // A runtime that can't list its launches retired none, so every
+            // recorded sidecar beside a recorded instance may still run.
+            None => RuntimeReconciliation {
+                stale: std::collections::HashSet::new(),
+                kept_sidecars: sidecar_records
+                    .iter()
+                    .filter(|record| {
+                        crate::grill::oci::sidecar_parent(&InstanceId(record.instance_id.clone()))
+                            .is_some_and(|(parent, _)| {
+                                records.iter().any(|owner| owner.instance_id == parent.0)
+                            })
+                    })
+                    .map(|record| record.instance_id.clone())
+                    .collect(),
+            },
         };
+        let sidecar_records: std::collections::HashMap<_, _> = sidecar_records
+            .into_iter()
+            .map(|record| (record.instance_id.clone(), record))
+            .collect();
+        let mut adopted_sidecars = std::collections::HashSet::new();
         for record in records {
             if stale.contains(&record.instance_id) {
                 continue;
@@ -559,17 +705,23 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .or_default()
                 .push(instance_id.clone());
             self.note_adopted_instance(&key, &instance_id, record.app_spec.as_ref(), &record.image);
-            // Its sidecars have no records of their own, so startup retired
-            // them with the other unrecorded launches. They start again on
-            // the next tick, beside the adopted instance, from the spec it
-            // was launched with (#1120, #1434).
+            // Its sidecars come with it where their records prove they still
+            // run; the rest start again on the next tick (#1120, #1315).
             if let Some(spec) = record
                 .app_spec
                 .as_ref()
                 .filter(|spec| !spec.sidecar.is_empty())
             {
-                self.sidecars
-                    .register_down(&instance_id, &spec.sidecar, now)?;
+                let adopted = self
+                    .adopt_sidecars(
+                        &instance_id,
+                        &spec.sidecar,
+                        &sidecar_records,
+                        |id| kept_sidecars.contains(id),
+                        now,
+                    )
+                    .await?;
+                adopted_sidecars.extend(adopted);
             }
             if let Some(spec) = record.app_spec {
                 self.deployed_specs.insert(key, spec);
@@ -580,8 +732,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             adopted_count += 1;
         }
 
+        self.finish_sidecar_adoption(sidecar_directory, &kept_sidecars, &adopted_sidecars)
+            .await?;
         if adopted_count > 0 {
             println!("bun: adopted {adopted_count} running instance(s) from a previous process");
+        }
+        if !adopted_sidecars.is_empty() {
+            println!(
+                "bun: adopted {} running sidecar(s) with them",
+                adopted_sidecars.len()
+            );
         }
 
         // Identity dirs of instances that died while bun was down have no
@@ -591,6 +751,60 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         Ok(adopted_count)
     }
+}
+
+/// What reconciling the runtime's launches with the records found.
+pub(super) struct RuntimeReconciliation {
+    /// Records retired as stale, which mustn't be adopted.
+    pub(super) stale: std::collections::HashSet<String>,
+    /// Recorded sidecars left running for adoption beside their instance.
+    pub(super) kept_sidecars: std::collections::HashSet<String>,
+}
+
+/// The sidecars' adoption records in `directory` (#1315). Unreadable ones
+/// are reported and treated as absent: a sidecar with no record is retired
+/// and started again, as every sidecar was before they had records, so they
+/// never need to stop the node the way an instance's must.
+async fn load_sidecar_records(directory: PathBuf) -> Vec<crate::grill::records::InstanceRecord> {
+    let loaded =
+        tokio::task::spawn_blocking(move || crate::grill::records::load_records(&directory)).await;
+    match loaded {
+        Ok(Ok(records)) => records,
+        Ok(Err(error)) => {
+            eprintln!("bun: sidecar adoption records unreadable, so sidecars restart: {error}");
+            Vec::new()
+        }
+        Err(error) => {
+            eprintln!("bun: sidecar adoption records unread, so sidecars restart: {error}");
+            Vec::new()
+        }
+    }
+}
+
+/// Remove every record in the sidecar records `directory` but `keep`'s,
+/// readable or not. A missing directory is fine.
+fn remove_sidecar_records_except(
+    directory: &std::path::Path,
+    keep: &std::collections::HashSet<String>,
+) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json")
+            || keep.contains(stem)
+        {
+            continue;
+        }
+        crate::grill::records::remove_record(directory, stem)?;
+    }
+    Ok(())
 }
 
 /// Whether the record's process provably died with an earlier boot.
