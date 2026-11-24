@@ -232,32 +232,24 @@ fn the_mutants_job_stays_off_the_pull_request_s_critical_path() {
         job.get("timeout-minutes").is_some(),
         "a bounded job: {job:#}"
     );
-    let paths: Vec<&str> = mutants["on"]["pull_request"]["paths"]
-        .as_array()
-        .unwrap()
+    // Not on pull requests: a mutants job per train PR held a Linux runner
+    // for up to 75 minutes while the train's own CI queued behind it
+    // (24 November 2026). It runs nightly instead, on the newest train.
+    assert!(
+        mutants["on"].get("pull_request").is_none(),
+        "mutants runs nightly, not on pull requests: {:#}",
+        mutants["on"]
+    );
+    let cron = mutants["on"]["schedule"][0]["cron"].as_str().unwrap();
+    assert!(cron.ends_with(" * * *"), "every night: {cron}");
+    let choose = steps(job)
         .iter()
-        .filter_map(Value::as_str)
-        .collect();
+        .find(|step| step["name"] == "Choose what to mutate")
+        .unwrap();
+    let choose = choose["run"].as_str().unwrap();
     assert!(
-        paths.contains(&"src/**"),
-        "pull requests run it only for code: {paths:?}"
-    );
-    // Work lands on a release's merge train (`release-*`) before main, so a
-    // pull request into a train gets the job as one into main does: the
-    // branches are ci.yml's.
-    let branches = &mutants["on"]["pull_request"]["branches"];
-    assert_eq!(branches, &workflow(CI)["on"]["pull_request"]["branches"]);
-    assert!(
-        branches
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|branch| branch == "release-*"),
-        "{branches}"
-    );
-    assert_eq!(
-        mutants["concurrency"]["cancel-in-progress"],
-        "${{ github.event_name == 'pull_request' }}"
+        choose.contains("origin/release-") && choose.contains("1 day ago"),
+        "the nightly mutates the newest train's last day: {choose}"
     );
     // A missed mutant (2) or a timeout (3) is a finding, never a red check.
     let step = steps(job)
