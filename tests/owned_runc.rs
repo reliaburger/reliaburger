@@ -1593,7 +1593,7 @@ mod capacity_contract {
     use reliaburger::council::types::{CouncilConfig, CouncilNodeInfo};
     use reliaburger::grill::image::{ClusterFetchFuture, ClusterImageSource, LocalImageBlobs};
     use reliaburger::grill::runc::RuncGrill;
-    use reliaburger::grill::{ContainerState, Grill, ImageStore, PortAllocator};
+    use reliaburger::grill::{ContainerState, Grill, ImageStore, InstanceId, PortAllocator};
     use reliaburger::relish::client::BunClient;
     use sha2::{Digest, Sha256};
     use tokio::sync::{RwLock, mpsc};
@@ -1986,6 +1986,55 @@ mod capacity_contract {
         }
     }
 
+    /// How long one step of the capacity contract may take: an apply, an
+    /// executor's cold start or a batch's retirement. Each takes about a
+    /// second alone, but a cold owned-runc start runs some twenty supervised
+    /// `ip`, `nft` and `sysctl` commands and a synced image unpack, one
+    /// after another. Beside a full `make test-linux`, or in an 8-vCPU VM at
+    /// load 17 with two fsync writers, one start took 5 to 25 s and a single
+    /// `ip link` 7.5 s, so a 20 s wait failed while nothing was wrong
+    /// (#2267). The limit only has to catch a step that never comes.
+    const STEP_DEADLINE: Duration = Duration::from_secs(90);
+
+    /// Wait until the singleton's command has written `work/ready` inside
+    /// its rootfs. Fails at once if the runtime retires the instance first,
+    /// and says how far the start got if the deadline passes.
+    async fn wait_for_singleton_ready(
+        runtime: &RuncGrill,
+        root: &Path,
+        identity: &InstanceId,
+    ) -> Result<(), String> {
+        let rootfs = root.join("bundles").join(&identity.0).join("rootfs");
+        let started = std::time::Instant::now();
+        while started.elapsed() < STEP_DEADLINE {
+            if rootfs.join("work/ready").exists() {
+                return Ok(());
+            }
+            let launched = runtime
+                .launch_inventory()
+                .await
+                .map_err(|error| format!("launch inventory unavailable: {error}"))?
+                .unwrap_or_default()
+                .iter()
+                .any(|launch| launch.instance_id == *identity);
+            if !launched {
+                return Err(format!(
+                    "{} left the launch inventory after {:?} without writing work/ready",
+                    identity.0,
+                    started.elapsed()
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Err(format!(
+            "{} not ready after {STEP_DEADLINE:?}: network namespace {}, rootfs mounted {}, runc state {}",
+            identity.0,
+            reliaburger::grill::netns::namespace_path(identity).exists(),
+            rootfs.join("bin/busybox").exists(),
+            root.join("state").join(&identity.0).exists(),
+        ))
+    }
+
     fn fresh_capacity(harness: &Harness, term: u64) {
         harness._capacity_publisher.send_modify(|state| {
             state.leadership_epoch = Some(term);
@@ -2040,12 +2089,12 @@ mod capacity_contract {
             ordinary.job["ordinary"].memory.unwrap().request,
             128 * 1024 * 1024
         );
-        tokio::time::timeout(Duration::from_secs(20), harness.client.apply(&ordinary))
+        tokio::time::timeout(STEP_DEADLINE, harness.client.apply(&ordinary))
             .await
             .expect("real ordinary apply did not acknowledge")
             .unwrap();
         let mut identity = None;
-        tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::time::timeout(STEP_DEADLINE, async {
             while identity.is_none() {
                 identity = runtime
                     .launch_inventory()
@@ -2068,13 +2117,9 @@ mod capacity_contract {
         let identity = identity.unwrap();
         let rootfs = root.path().join("bundles").join(&identity.0).join("rootfs");
         let release = ReleaseOnDrop(rootfs.join("work/release"));
-        tokio::time::timeout(Duration::from_secs(20), async {
-            while !rootfs.join("work/ready").exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("owned singleton did not start");
+        if let Err(reason) = wait_for_singleton_ready(&runtime, root.path(), &identity).await {
+            panic!("owned singleton did not start: {reason}");
+        }
         assert_eq!(
             runtime.state(&identity).await.unwrap(),
             ContainerState::Running
@@ -2149,24 +2194,25 @@ mod capacity_contract {
         }
         std::fs::write(&release.0, b"release").unwrap();
         for id in std::iter::once(ordinary_id).chain(pending) {
-            tokio::time::timeout(Duration::from_secs(30), async {
-                loop {
-                    let summary = harness.client.batch_status(id).await.unwrap();
-                    if summary["done"] == true {
-                        assert_eq!(summary["succeeded"], 1, "{summary}");
-                        assert_eq!(summary["failed"], 0);
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+            let started = std::time::Instant::now();
+            let summary = loop {
+                let summary = harness.client.batch_status(id).await.unwrap();
+                if summary["done"] == true || started.elapsed() >= STEP_DEADLINE {
+                    break summary;
                 }
-            })
-            .await
-            .expect("positive owned retirement did not free waiting work");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            assert_eq!(
+                summary["done"], true,
+                "positive owned retirement did not free waiting work: {summary}"
+            );
+            assert_eq!(summary["succeeded"], 1, "{summary}");
+            assert_eq!(summary["failed"], 0, "{summary}");
         }
 
         fresh_capacity(&harness, council.current_term());
         let admitted = tokio::time::timeout(
-            Duration::from_secs(20),
+            STEP_DEADLINE,
             harness
                 .client
                 .submit_batch(&probe("full-after-terminal", "8", "16Gi"), None),
@@ -2177,7 +2223,7 @@ mod capacity_contract {
         assert_eq!(admitted["assigned"], 1, "{admitted}");
         assert_eq!(admitted["unschedulable"], serde_json::json!([]));
         let batch_id = admitted["batch_id"].as_u64().unwrap();
-        tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::time::timeout(STEP_DEADLINE, async {
             loop {
                 let summary = harness.client.batch_status(batch_id).await.unwrap();
                 if summary["done"] == true {
