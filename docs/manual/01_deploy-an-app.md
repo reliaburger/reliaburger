@@ -482,6 +482,24 @@ that the new spec runs healthy on every node it's placed on, after the
 rolling deploy. Each line goes to stderr when something changes, with the
 seconds since the apply.
 
+A cluster whose leader runs 0.3.2 or older, such as one halfway through
+`relish upgrade` (which upgrades the leader last), can't say whether a
+rollout finished. `--wait` then counts only the instances that run the image
+the file names, so the old version's instances don't make an update look
+ready, and prints a note once:
+
+```text
+note: the cluster can't report rollouts (it may run an older release); --wait counts only instances running the applied image
+```
+
+Where it can't tell the versions apart by image, for a process workload or
+an image a node pinned to its digest, it counts every running replica and
+warns once that it does:
+
+```text
+warning: the cluster can't report rollouts (it may run an older release), so --wait counts running replicas only
+```
+
 "As many replicas as it wants" is the file's `replicas`, with two
 exceptions. A daemon set (`replicas = "*"`) wants one on each node it can
 run on, so a node its `placement` rules out doesn't hold the wait up. An
