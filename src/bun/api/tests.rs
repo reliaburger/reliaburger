@@ -10676,16 +10676,19 @@ async fn dry_run_endpoint_preserves_namespace_identity_and_caller_scope() {
                     resource: "app.team/web".into(),
                     image: Some("web:v1".into()),
                     fingerprint: Some("team-spec".into()),
+                    owner: None,
                 },
                 CurrentResourceStatus {
                     resource: "app.other/web".into(),
                     image: Some("web:v1".into()),
                     fingerprint: Some("other-spec".into()),
+                    owner: None,
                 },
                 CurrentResourceStatus {
                     resource: "job.team/migrate".into(),
                     image: Some("web:v1".into()),
                     fingerprint: None,
+                    owner: None,
                 },
             ])
             .unwrap();

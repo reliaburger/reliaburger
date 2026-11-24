@@ -349,6 +349,39 @@ async fn desired_apps_name_the_owner_within_the_tokens_scope() {
     assert_eq!(seen, vec![("pg", "db", Some("pg-failover"))]);
 }
 
+/// #1322: the dry-run listing carries each app's owner, so `relish plan`
+/// can say an apply will skip it rather than show it as an update.
+#[tokio::test]
+async fn the_dry_run_listing_names_an_owned_apps_owner() {
+    let cluster = Cluster::claimed("owner-dry-run").await;
+    let (status, body) = cluster
+        .call(
+            "/v1/apply",
+            &cluster.human,
+            "[app.web]\nimage = 'web:v1'\nnamespace = 'pg'\n",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let request = axum::http::Request::get("/v1/apps")
+        .header("authorization", format!("Bearer {}", cluster.human))
+        .body(Body::empty())
+        .unwrap();
+    let response = cluster.app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let rows: Vec<crate::bun::agent::CurrentResourceStatus> =
+        serde_json::from_slice(&bytes).unwrap();
+    let owner_of = |resource: &str| {
+        rows.iter()
+            .find(|row| row.resource == resource)
+            .unwrap_or_else(|| panic!("no {resource} in {rows:?}"))
+            .owner
+            .clone()
+    };
+    assert_eq!(owner_of("app.pg/db").as_deref(), Some("pg-failover"));
+    assert_eq!(owner_of("app.pg/web"), None);
+}
+
 /// #1124: a template body that declares an `owner` is held to the same rule
 /// as a hand-written one, because the apply only ever sees the expanded
 /// app. And the expanded app keeps its provenance beside its owner, and in
