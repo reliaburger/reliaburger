@@ -496,6 +496,8 @@ async fn build_cluster(
         schema: 1,
         owner: operation.state.id.clone(),
         endpoint,
+        other_endpoints: Vec::new(),
+        last_answered: None,
         token: tokio::fs::read_to_string(bootstrap.directory.join("admin.token")).await?,
         ca_cert: bootstrap.directory.join("identity/root-ca.crt"),
         service_endpoints: crate::bun::capabilities::ServiceEndpoints {
@@ -999,6 +1001,8 @@ mod tests {
             schema: 1,
             owner: "bare-metal/old".into(),
             endpoint: "https://192.168.1.99:9117".into(),
+            other_endpoints: Vec::new(),
+            last_answered: None,
             token: "rbrg_old".into(),
             ca_cert,
             service_endpoints: Default::default(),

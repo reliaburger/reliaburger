@@ -325,6 +325,12 @@
   },
   {
     "source": "tests/cluster_failover.rs",
+    "function": "a_context_whose_first_node_is_down_reaches_the_cluster_through_the_next",
+    "binary": "reliaburger::cluster_failover",
+    "test": "a_context_whose_first_node_is_down_reaches_the_cluster_through_the_next"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
     "function": "an_agent_lease_survives_a_leader_change_and_the_new_leader_expires_it",
     "binary": "reliaburger::cluster_failover",
     "test": "an_agent_lease_survives_a_leader_change_and_the_new_leader_expires_it"
