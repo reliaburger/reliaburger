@@ -704,6 +704,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 .into_owned(),
         ];
         spec.process.overrides = None;
+        spec.mount_bind_backs = host_bind_backs(&context.directory, &socket, &context.base);
         let mut connection = self.launch(context, &spec, &listener, stop, None).await?;
         let peer = connection.peer_cred()?;
         let peer_pid = peer.pid().and_then(|pid| u32::try_from(pid).ok());
@@ -1675,6 +1676,33 @@ fn host_socket_directory() -> std::io::Result<PathBuf> {
     Ok(directory)
 }
 
+/// What a host helper keeps under mount isolation although the node's view
+/// hides it (#714): its own directory, read-only, which holds the binary;
+/// its control socket, to connect back to Bun; and its cgroup subtree,
+/// where it places itself and every task. Its tasks are its children and
+/// share its view, so nothing else changes for them.
+fn host_bind_backs(
+    directory: &Path,
+    socket: &Path,
+    cgroup: &Path,
+) -> Vec<crate::grill::mount_view::BindBack> {
+    use crate::grill::mount_view::BindBack;
+    vec![
+        BindBack {
+            path: directory.to_path_buf(),
+            writable: false,
+        },
+        BindBack {
+            path: socket.to_path_buf(),
+            writable: true,
+        },
+        BindBack {
+            path: cgroup.to_path_buf(),
+            writable: true,
+        },
+    ]
+}
+
 /// Bind the executor's `task` cgroup, where every command it runs lands, to
 /// its job's run identity. The executor key carries the job, so the binding
 /// holds for every command the executor will ever run.
@@ -2046,6 +2074,7 @@ mod tests {
         let id = InstanceId(name.into());
         let spec = OciSpec {
             managed_volumes: Vec::new(),
+            mount_bind_backs: Vec::new(),
             reusable_executor: false,
             host_process: true,
             initialiser: false,

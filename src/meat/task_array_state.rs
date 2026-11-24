@@ -55,8 +55,9 @@ pub enum StopReason {
     Cancelled,
     /// More indices failed for good than `max_failed_indexes` allows.
     TooManyFailures,
-    /// No node in the cluster can run it (its runtime, allowlist or
-    /// `mount_isolation` refuses the array), so it would never start.
+    /// No node in the cluster can run it (its runtime, allowlist or a
+    /// `mount_isolation` it can't build refuses the array), so it would
+    /// never start.
     Unrunnable,
 }
 

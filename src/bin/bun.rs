@@ -1263,7 +1263,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         &pickle_dir,
         &config.images.mirrors,
     )
-    .await?;
+    .await?
+    .with_mount_view(host_mount_view(&config, cli.config.as_deref())?);
     #[cfg(target_os = "linux")]
     let (durable_discovery, durable_kernel) = match &runtime {
         AnyGrill::Runc(runtime) if runtime.is_rootless() => {
@@ -1318,6 +1319,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // Under ProcessGrill an app's `image` is a placeholder nobody pulls, so
     // there's nothing to bind to a digest at apply (F03 U1, decision 5).
     let runtime_pulls_images = !matches!(runtime, AnyGrill::Process(_));
+    let isolates_host_mounts = {
+        use reliaburger::grill::Grill;
+        runtime.isolates_host_mounts()
+    };
     let runtime_version = runtime_version(runtime_kind).await;
     let host_kernel = host_kernel().await;
     // Image-store handle for installing the cluster P2P image source
@@ -3234,7 +3239,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             .is_some(),
         // Host execution is deny-by-default: an empty allowlist refuses
         // every process workload.
-        process_workloads: host_workloads_enabled(runtime_kind, &config.process_workloads),
+        process_workloads: host_workloads_enabled(
+            runtime_kind,
+            &config.process_workloads,
+            isolates_host_mounts,
+        ),
         // CPU/memory/disk faults need writable cgroup v2 control files.
         cgroup_faults: {
             #[cfg(target_os = "linux")]
@@ -4252,15 +4261,40 @@ fn create_runc_runtime(
     )?)
 }
 
-// Host workloads are refused under mount isolation until #714 implements it,
-// so a node with it on doesn't advertise them.
+/// The mount view host workloads start in, when `[process_workloads]
+/// mount_isolation` is on and this Bun can build it (#714): Linux, as root.
+/// Elsewhere `None`, and the supervisor and the task executor refuse host
+/// workloads under isolation instead.
+///
+/// `/run/reliaburger` is created here when it's missing: a hidden path
+/// that doesn't exist when a workload starts can't be masked, and Bun
+/// creates its sockets there later.
+fn host_mount_view(
+    config: &reliaburger::config::NodeConfig,
+    config_file: Option<&std::path::Path>,
+) -> anyhow::Result<Option<reliaburger::grill::mount_view::MountView>> {
+    use reliaburger::grill::mount_view::{self, MountView};
+    if !config.process_workloads.mount_isolation || !mount_view::mount_isolation_available() {
+        return Ok(None);
+    }
+    // BLOCKING-OK: startup, before the agent loop or any workload runs
+    std::fs::create_dir_all(mount_view::RUN_DIRECTORY)
+        .with_context(|| format!("cannot create {}", mount_view::RUN_DIRECTORY))?;
+    Ok(Some(MountView::for_node(config, config_file)))
+}
+
+/// Whether this node advertises host workloads: a runtime that runs host
+/// processes, a non-empty allowlist, and, under `mount_isolation`, a runtime
+/// that builds the mount view (#714). A node that would refuse them doesn't
+/// advertise them, so `relish test` skips their cases (#777).
 fn host_workloads_enabled(
     runtime: &str,
     policy: &reliaburger::config::process_workloads::ProcessWorkloadsConfig,
+    isolates_host_mounts: bool,
 ) -> bool {
     matches!(runtime, "process" | "runc+process")
         && !policy.allowed_binaries.is_empty()
-        && !policy.mount_isolation
+        && (!policy.mount_isolation || isolates_host_mounts)
 }
 
 async fn runtime_version(runtime: &str) -> Option<String> {
@@ -4637,8 +4671,8 @@ mod tests {
                 mount_isolation: false,
             };
             let name = if host { "runc+process" } else { "runc" };
-            assert_eq!(host_workloads_enabled(name, &policy), host);
-            assert!(!host_workloads_enabled(name, &Default::default()));
+            assert_eq!(host_workloads_enabled(name, &policy, false), host);
+            assert!(!host_workloads_enabled(name, &Default::default(), true));
         }
     }
 
@@ -4731,17 +4765,34 @@ mod tests {
     }
 
     #[test]
-    fn host_workloads_are_not_advertised_under_mount_isolation() {
-        // Host apps and jobs are refused under mount isolation (#714), so
-        // `relish test` must skip their cases instead of waiting on them (#777).
+    fn host_workloads_are_advertised_under_available_mount_isolation() {
+        // A node that builds the mount view runs host apps and jobs under
+        // isolation (#714); one that can't refuses them, so `relish test`
+        // must skip their cases instead of waiting on them (#777).
         let mut policy = reliaburger::config::process_workloads::ProcessWorkloadsConfig {
             allowed_binaries: vec!["/bin/true".into()],
             mount_isolation: false,
         };
-        assert!(host_workloads_enabled("process", &policy));
+        assert!(host_workloads_enabled("process", &policy, false));
         policy.mount_isolation = true;
-        assert!(!host_workloads_enabled("process", &policy));
-        assert!(!host_workloads_enabled("runc+process", &policy));
+        assert!(host_workloads_enabled("process", &policy, true));
+        assert!(host_workloads_enabled("runc+process", &policy, true));
+        assert!(!host_workloads_enabled("process", &policy, false));
+        assert!(!host_workloads_enabled("runc+process", &policy, false));
+        assert!(!host_workloads_enabled("runc", &policy, true));
+    }
+
+    #[test]
+    fn no_mount_view_is_built_where_isolation_is_off_or_unavailable() {
+        let mut config = reliaburger::config::NodeConfig::default();
+        config.process_workloads.mount_isolation = false;
+        assert!(host_mount_view(&config, None).unwrap().is_none());
+        config.process_workloads.mount_isolation = true;
+        let view = host_mount_view(&config, None).unwrap();
+        assert_eq!(
+            view.is_some(),
+            reliaburger::grill::mount_view::mount_isolation_available()
+        );
     }
 
     #[test]

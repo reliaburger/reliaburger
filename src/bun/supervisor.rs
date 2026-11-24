@@ -245,18 +245,25 @@ impl<G: Grill> WorkloadSupervisor<G> {
     }
 
     /// The host process workloads this node runs, as `admit_app` judges
-    /// them: the runtime must run host processes, mount isolation must be
-    /// off (#714), and only the allowlisted binaries run. The leader
-    /// places `exec` and `script` apps on this (#702).
+    /// them: the runtime must run host processes, and build the mount view
+    /// when `mount_isolation` is on (#714), and only the allowlisted
+    /// binaries run. The leader places `exec` and `script` apps on this
+    /// (#702).
     pub fn process_capability(&self) -> crate::meat::cluster_state::ProcessWorkloadCapability {
         let config = self.process_manager.config();
         crate::meat::cluster_state::ProcessWorkloadCapability {
             enabled: self
                 .grill
                 .supports_runtime(crate::grill::records::RuntimeKind::Process)
-                && !config.mount_isolation,
+                && !self.mount_isolation_unavailable(),
             allowed_binaries: config.allowed_binaries.clone(),
         }
+    }
+
+    /// Whether `[process_workloads] mount_isolation` is on and this node's
+    /// runtime can't build the view, so it refuses every host workload.
+    fn mount_isolation_unavailable(&self) -> bool {
+        self.process_manager.config().mount_isolation && !self.grill.isolates_host_mounts()
     }
 
     /// Whether this node's runtime runs containers, which an image app
@@ -504,24 +511,20 @@ impl<G: Grill> WorkloadSupervisor<G> {
                 },
             ));
         }
-        // Mount-namespace isolation for host `exec`/`script` workloads is
-        // documented and on by default (on Linux), but it is NOT implemented:
-        // the process is spawned with no namespace of its own. Refuse a host
-        // workload that requests isolation rather than run it unprotected while
-        // signalling that it's contained — such a process reads every other
-        // workload's volumes and the node's identity/secret material as root.
-        // An operator who accepts an unisolated host process must say so
-        // explicitly with `mount_isolation = false`.
+        // Under `mount_isolation` (on by default on Linux) a host workload
+        // runs in a mount view that hides Bun's paths (#714). A node that
+        // can't build one (macOS, a non-root Bun) refuses the workload
+        // rather than run it unprotected while signalling that it's
+        // contained: such a process reads every other workload's volumes and
+        // the node's identity and secret material as root.
         let is_host_workload = exec.is_some() || script.is_some();
-        if is_host_workload && self.process_manager.config().mount_isolation {
+        if is_host_workload && self.mount_isolation_unavailable() {
             return Err(BunError::DeployFailed {
                 app_name: app_name.to_string(),
-                reason: "process workload requests mount isolation \
-                         ([process_workloads] mount_isolation, on by default on Linux) but \
-                         mount-namespace isolation is not yet implemented; set \
-                         mount_isolation = false to run it unisolated on the host, or run it \
-                         as a container instead"
-                    .to_string(),
+                reason: format!(
+                    "process workload rejected: {}",
+                    crate::grill::mount_view::UNAVAILABLE
+                ),
             });
         }
         Ok(())
@@ -1848,24 +1851,42 @@ mod tests {
         assert_eq!(ids.len(), 1);
     }
 
-    #[tokio::test]
-    async fn host_workload_requesting_mount_isolation_is_refused() {
-        // Even with the binary allowlisted, a host workload that requests mount
-        // isolation (the Linux default) is refused: mount-namespace isolation
-        // is not implemented, so admitting it would run an unprotected host
-        // process while signalling it is contained. Only an explicit
-        // `mount_isolation = false` opt-out (see `allowlisted_host_exec_runs`)
-        // admits an unisolated host workload.
+    /// A supervisor with `/usr/bin/python3` allowlisted and mount isolation
+    /// on, over a runtime that can or can't build the view.
+    fn supervisor_under_isolation(isolates: bool) -> WorkloadSupervisor<MockGrill> {
         let grill = MockGrill::new();
-        let port_allocator = PortAllocator::new(30000, 31000);
-        let mut sup = WorkloadSupervisor::with_process_config(
+        grill.set_isolates_host_mounts(isolates);
+        WorkloadSupervisor::with_process_config(
             grill,
-            port_allocator,
+            PortAllocator::new(30000, 31000),
             crate::config::process_workloads::ProcessWorkloadsConfig {
                 allowed_binaries: vec![std::path::PathBuf::from("/usr/bin/python3")],
                 mount_isolation: true,
             },
-        );
+        )
+    }
+
+    #[tokio::test]
+    async fn host_workload_runs_under_available_mount_isolation() {
+        let mut sup = supervisor_under_isolation(true);
+        let spec = exec_app_spec("/usr/bin/python3");
+        let ids = sup
+            .deploy_app("runner", "default", &spec, Instant::now())
+            .await
+            .expect("an isolating runtime runs the host workload");
+        assert_eq!(ids.len(), 1);
+        assert!(sup.process_capability().enabled);
+    }
+
+    #[tokio::test]
+    async fn host_workload_is_refused_where_mount_isolation_is_unavailable() {
+        // Even with the binary allowlisted, a node that can't build the
+        // view (macOS, a non-root Bun) refuses a host workload under mount
+        // isolation, rather than run it unprotected while signalling that
+        // it's contained. Only an explicit `mount_isolation = false` opt-out
+        // (see `allowlisted_host_exec_runs`) admits an unisolated one.
+        let mut sup = supervisor_under_isolation(false);
+        assert!(!sup.process_capability().enabled);
         let spec = exec_app_spec("/usr/bin/python3");
         let err = sup
             .deploy_app("runner", "default", &spec, Instant::now())
@@ -1873,6 +1894,7 @@ mod tests {
             .unwrap_err();
         match err {
             BunError::DeployFailed { reason, .. } => {
+                assert!(reason.contains("can't provide"), "reason: {reason}");
                 assert!(reason.contains("mount_isolation"), "reason: {reason}");
             }
             other => panic!("expected DeployFailed, got {other:?}"),

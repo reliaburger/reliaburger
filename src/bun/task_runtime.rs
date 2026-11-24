@@ -642,6 +642,12 @@ impl OwnedRunner<AnyGrill> {
         self.runtime
             .supports_runtime(crate::grill::records::RuntimeKind::Process)
     }
+    /// Whether this runner's host tasks start in the node's mount view
+    /// (#714): fresh attempts and native executors both launch through
+    /// the runtime's owner, which builds it.
+    pub fn isolates_host_mounts(&self) -> bool {
+        self.runtime.isolates_host_mounts()
+    }
     /// Whether this runner runs a single container task, with CPU or memory
     /// `limits` or without. A singleton preserves the configured runtime's
     /// existing workload contract, so rootless runc runs one only without

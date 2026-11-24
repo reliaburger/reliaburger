@@ -380,8 +380,17 @@ next scheduling pass places the rest.
 
 An `exec` or `script` app only goes to nodes that would run it: the node's
 `[process_workloads] allowed_binaries` must name the `exec` path (`/bin/sh` for
-a script), and `mount_isolation` must be off. A node whose allowlist stops
-covering the binary loses the replica to one that still does.
+a script), and a node with `mount_isolation` on (the Linux default) must be
+able to build the mount view, which takes Linux and a root Bun. A node whose
+allowlist stops covering the binary loses the replica to one that still does.
+
+Under `mount_isolation`, an isolated host app sees the host's filesystem with
+Bun's own directories hidden: its storage (`/var/lib/reliaburger` by default),
+`/etc/reliaburger`, `/run/reliaburger`, `/sys/fs/bpf` and every other
+workload's cgroup. Its `/tmp` and `/var/tmp` are private and share 256 MiB, and
+`/dev/shm` has 64 MiB, all charged to its memory limit. `relish exec` and the
+stop hook join the app's view, so they see its `/tmp`. Manual 13 says what
+isolation doesn't stop.
 
 ## When the binary isn't there
 
@@ -940,8 +949,9 @@ Use the ID returned by submission. Each task has its own retry, timeout and
 stable identity. Applications and actual batch attempts share CPU and memory
 requests; a queued chunk does not consume its full task count's resources.
 Image tasks use rootful Linux isolation and runtime limits. Host tasks require
-an allowlisted binary, disabled mount isolation and the owned process runtime;
-that backend refuses explicit resource limits it cannot enforce.
+an allowlisted binary and the owned process runtime, and run in the same mount
+view as host apps; that backend refuses explicit resource limits it cannot
+enforce.
 
 Mixed-profile manifests, rates, duration distributions, indexed pages,
 retention and at-least-once effects are covered in `relish manual batch`.

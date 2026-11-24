@@ -59,9 +59,9 @@ impl NodeCapabilities {
 /// `script` app only where the node will start it (#702).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessWorkloadCapability {
-    /// The node runs host processes at all: its runtime can, and
-    /// `[process_workloads] mount_isolation` is off, since a node refuses
-    /// every host workload under mount isolation until #714 implements it.
+    /// The node runs host processes at all: its runtime can, and builds
+    /// the mount view when `[process_workloads] mount_isolation` is on
+    /// (#714). A node that can't build it refuses every host workload.
     pub enabled: bool,
     /// `[process_workloads] allowed_binaries`: the only absolute paths it
     /// runs. A `script` app runs the interpreter, `/bin/sh`.

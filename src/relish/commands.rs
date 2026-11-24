@@ -7237,8 +7237,7 @@ mod task_array_tests {
 
     #[test]
     fn status_says_why_no_node_could_run_a_failed_run() {
-        let reason =
-            "no node can run it: host jobs don't run under [process_workloads] mount_isolation yet";
+        let reason = "no node can run it: this node can't provide [process_workloads] mount_isolation (it needs Linux and a root Bun)";
         let run = serde_json::json!({"kind":"array","batch_id":4,"status":"Failed","not_run":20,"unrunnable_reason":reason});
         assert!(format_batch_watch(&run).contains(&format!("refused: {reason}")));
         assert!(format_array_summary(4, &run).contains(&format!("  refused: {reason}\n")));

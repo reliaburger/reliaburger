@@ -286,13 +286,19 @@ pub struct Compatibility {
 /// after the apply's stream has answered `200`, so `relish apply` on a
 /// cluster reports an image nobody built as `404`, not `500` (#2157).
 ///
+/// 0.4.0 (62/77): mount isolation for host workloads (#714). Gossip's
+/// `JobCapabilities::mount_isolation` became `mount_isolation_unavailable`,
+/// which means the opposite for a node that builds the view, and process
+/// owner records moved to schema 4 with `ProcessLaunch::mount_isolation`,
+/// which a 76 owner refuses. Start a fresh cluster.
+///
 /// Bumping either number makes the checked-in gossip and Raft fuzz seeds
 /// stale: run `make fuzz-corpus-seed` in the same change (#1941). Keep the
 /// two fields directly inside the braces: the release scripts read them with
 /// a regex.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 61,
-    state: 76,
+    protocol: 62,
+    state: 77,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

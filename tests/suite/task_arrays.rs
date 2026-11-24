@@ -58,8 +58,9 @@ struct Options {
     allowed: Vec<&'static str>,
     slots: u32,
     retention: Duration,
-    /// `[process_workloads] mount_isolation`, which keeps host arrays off
-    /// the node (#714). Off unless a test is about it.
+    /// `[process_workloads] mount_isolation`. The plain process runner
+    /// can't build the mount view (#714), so on it this keeps host arrays
+    /// off the node. Off unless a test is about it.
     mount_isolation: bool,
 }
 
@@ -608,11 +609,13 @@ async fn a_run_no_node_may_run_fails_with_the_nodes_reason() {
     );
 }
 
-/// Linux turns `mount_isolation` on by default and task arrays can't run
-/// host commands under it yet (#714). A host run must be refused at once,
-/// with the reason, instead of sitting "running" until its deadline (#777).
+/// Linux turns `mount_isolation` on by default, and a node that can't
+/// build the mount view (here the plain process runner, which spawns
+/// straight from Bun, #714) refuses host commands under it. A host run must
+/// be refused at once, with the reason, instead of sitting "running" until
+/// its deadline (#777).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn host_runs_under_mount_isolation_are_refused_with_the_reason() {
+async fn host_runs_where_mount_isolation_is_unavailable_are_refused_with_the_reason() {
     // Standalone: this node is the only one, so admission refuses outright.
     let standalone = Harness::start(Options {
         mount_isolation: true,
@@ -786,7 +789,7 @@ async fn a_cluster_refuses_a_run_no_live_node_can_take_at_submission() {
     )
     .await;
     let isolated = harness.job_capabilities;
-    assert!(isolated.mount_isolation);
+    assert!(isolated.mount_isolation_unavailable);
     let gossip = GossipPair::start(isolated, isolated).await;
     gossip
         .publish_once_peer_advertises(isolated, &members)
@@ -801,7 +804,9 @@ async fn a_cluster_refuses_a_run_no_live_node_can_take_at_submission() {
         "{error}"
     );
     assert_eq!(
-        error.matches("host jobs don't run under").count(),
+        error
+            .matches("can't provide [process_workloads] mount_isolation")
+            .count(),
         1,
         "both nodes give one reason, quoted once: {error}"
     );
@@ -815,9 +820,9 @@ async fn a_cluster_refuses_a_run_no_live_node_can_take_at_submission() {
         .unwrap();
     assert_eq!(response.status(), 422);
 
-    // The peer turns mount isolation off, so it could take the run.
+    // The peer can build the view, so it could take the run.
     let open = JobCapabilities {
-        mount_isolation: false,
+        mount_isolation_unavailable: false,
         ..isolated
     };
     gossip.peer_jobs.send(Some(open)).unwrap();

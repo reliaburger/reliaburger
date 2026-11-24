@@ -43,6 +43,11 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> MixedGrill<C, H> {
         self.container = container;
         self
     }
+    /// This router with its host backend replaced by `change(host)`.
+    pub fn map_host(mut self, change: impl FnOnce(H) -> H) -> Self {
+        self.host = change(self.host);
+        self
+    }
     fn error(id: &InstanceId, reason: impl std::fmt::Display) -> GrillError {
         GrillError::StateUnavailable {
             instance: id.clone(),
@@ -753,6 +758,9 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> Grill for MixedGril
     }
     fn places_host_processes(&self) -> bool {
         self.host.places_host_processes()
+    }
+    fn isolates_host_mounts(&self) -> bool {
+        self.host.isolates_host_mounts()
     }
     #[cfg(target_os = "linux")]
     fn host_executor_runtime(&self) -> Option<super::ProcessGrill> {

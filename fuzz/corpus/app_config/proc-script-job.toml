@@ -8,7 +8,8 @@
 # as it stands.
 #
 # The node must allow /bin/sh in `[process_workloads] allowed_binaries`
-# (scripts run under it) and, on Linux, set `mount_isolation = false`. Apply
+# (scripts run under it). On Linux a root Bun runs it in the mount view that
+# hides Bun's paths (#714); `pg_dump` and `gzip` are outside it. Apply
 # it with `relish apply`: GitOps refuses jobs.
 #
 # Deploy: relish apply examples/phase-8/proc-script-job.toml

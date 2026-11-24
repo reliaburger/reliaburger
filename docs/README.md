@@ -1555,7 +1555,7 @@ interval = 10
 timeout = 5
 ```
 
-An app runs a host binary (`exec`, or an inline `script` through `/bin/sh`) or an `image`. A host app runs on the node itself, and only when the node's `[process_workloads] allowed_binaries` names its binary. An image app needs a container runtime. The process runtime (ProcessGrill) runs host apps only, so it refuses an image app: `relish apply`, `relish apps` and `relish wtf` say it `needs a container runtime to run image ...`. In a cluster the scheduler places an image app only on nodes that run containers.
+An app runs a host binary (`exec`, or an inline `script` through `/bin/sh`) or an `image`. A host app runs on the node itself, and only when the node's `[process_workloads] allowed_binaries` names its binary. On Linux (from 0.4.0) a root Bun starts it in a mount view that hides Bun's own storage, configuration, sockets and other workloads' `/tmp` (`mount_isolation`, on by default); a node that can't build the view refuses host apps. An image app needs a container runtime. The process runtime (ProcessGrill) runs host apps only, so it refuses an image app: `relish apply`, `relish apps` and `relish wtf` say it `needs a container runtime to run image ...`. In a cluster the scheduler places an image app only on nodes that run containers.
 
 On runc, an image app runs the way Kubernetes would run it. Everything below is optional:
 

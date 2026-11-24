@@ -861,7 +861,7 @@ mod tests {
             singleton_image_limits: true,
             encrypted_env: true,
             network_policy: true,
-            mount_isolation: true,
+            mount_isolation_unavailable: true,
             binaries: true,
         }
     }

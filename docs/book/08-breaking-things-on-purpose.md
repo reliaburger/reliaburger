@@ -1282,14 +1282,16 @@ The allowlist is configured per node:
 ```toml
 [process_workloads]
 allowed_binaries = ["/usr/local/bin/metrics-exporter", "/usr/bin/python3"]
-mount_isolation = false
 ```
 
 An empty or omitted allowlist refuses host `exec`/`script` workloads. Scripts
 need their interpreter (`/bin/sh`) on the list. `mount_isolation` defaults to
-`true` on Linux, but process mode doesn't implement a mount namespace, so a host
-workload is refused until you set it to `false` and accept running unisolated.
-Use Linux containers when the workload needs that boundary.
+`true` on Linux. For a long time process mode didn't implement a mount
+namespace, so a host workload was refused until you set it to `false` and
+accepted running unisolated. From 0.4.0 a root Bun on Linux builds one: the
+host's filesystem minus Bun's own paths, with a private `/tmp`. Chapter 17's
+"Building the view" tells that story. It's still not a container boundary, so
+use Linux containers when the workload needs one.
 
 The phase-8 example used to say the opposite: an empty allowlist "allows all".
 It never did. `examples/phase-8/proc-exec-app.toml` now says deny-by-default,

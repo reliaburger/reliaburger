@@ -17,6 +17,7 @@ mod inventory;
 pub mod kernel;
 pub mod knobs;
 pub mod mixed;
+pub mod mount_view;
 // Also exposed under the `ebpf` feature: the Lima-gated integration
 // tests drive the agent's pre-start egress programming through a mock
 // grill (a runtime whose `pid()` is `None`), which unit tests can't.
@@ -634,6 +635,13 @@ pub trait Grill: Send + Sync {
         false
     }
 
+    /// Whether host commands start in the mount view `[process_workloads]
+    /// mount_isolation` asks for (#714): only the owned process runtime
+    /// of a root Bun on Linux, built with the node's view, does.
+    fn isolates_host_mounts(&self) -> bool {
+        false
+    }
+
     /// Owned rootful host backend capable of bounded native command executors.
     #[cfg(target_os = "linux")]
     fn host_executor_runtime(&self) -> Option<ProcessGrill> {
@@ -821,6 +829,19 @@ impl AnyGrill {
             Self::Runc(g) => Some(g),
             Self::Mixed(g) => Some(g.container()),
             _ => None,
+        }
+    }
+    /// This runtime with its host processes launched in `view`
+    /// (`[process_workloads] mount_isolation`, #714). Container runtimes
+    /// have no host processes and are returned as they are.
+    pub fn with_mount_view(self, view: Option<mount_view::MountView>) -> Self {
+        match self {
+            Self::Process(runtime) => Self::Process(runtime.with_mount_view(view)),
+            #[cfg(target_os = "linux")]
+            Self::Mixed(runtime) => {
+                Self::Mixed(runtime.map_host(|host| host.with_mount_view(view)))
+            }
+            other => other,
         }
     }
     #[cfg(target_os = "linux")]
@@ -1141,6 +1162,17 @@ impl Grill for AnyGrill {
             AnyGrill::Runc(_) => false,
             #[cfg(target_os = "linux")]
             AnyGrill::Mixed(g) => g.places_host_processes(),
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(_) => false,
+        }
+    }
+    fn isolates_host_mounts(&self) -> bool {
+        match self {
+            AnyGrill::Process(g) => g.isolates_host_mounts(),
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(_) => false,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Mixed(g) => g.isolates_host_mounts(),
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(_) => false,
         }

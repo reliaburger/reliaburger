@@ -53,9 +53,11 @@ fn service(data: &std::path::Path) -> Arc<TaskArrayService> {
     let node = TaskArrayNode::new(
         TaskArrayNodeConfig {
             root: data.join("task-arrays"),
+            // Linux's default (#714): each node builds the mount view, so a
+            // host array runs to the end with isolation on.
             policy: ProcessWorkloadsConfig {
                 allowed_binaries: vec![PathBuf::from(BINARY)],
-                mount_isolation: false,
+                mount_isolation: true,
             },
             default_concurrency: 16,
             backoff: (Duration::from_millis(1), Duration::from_millis(5)),

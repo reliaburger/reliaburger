@@ -47,6 +47,9 @@ pub struct MockGrill {
     /// What `shares_network_namespaces` answers: true unless a test models
     /// a runtime that can't run sidecars (#1120).
     shares_network: Arc<AtomicBool>,
+    /// What `isolates_host_mounts` answers: false unless a test models an
+    /// owned process runtime with a mount view (#714).
+    isolates_host_mounts: Arc<AtomicBool>,
     runtime_kind: Arc<Mutex<crate::grill::records::RuntimeKind>>,
     pid: Arc<Mutex<Option<u32>>>,
     /// The processes `workload_pids` names, when they differ from `pid`.
@@ -152,6 +155,7 @@ impl Default for MockGrill {
             honours_cgroup_path: Arc::default(),
             applies_runtime_knobs: Arc::default(),
             shares_network: Arc::new(AtomicBool::new(true)),
+            isolates_host_mounts: Arc::new(AtomicBool::new(false)),
             runtime_kind: Arc::new(Mutex::new(crate::grill::records::RuntimeKind::Process)),
             pid: Arc::default(),
             workload_pids: Arc::default(),
@@ -432,6 +436,12 @@ impl MockGrill {
             .lock()
             .unwrap()
             .insert(instance.clone());
+    }
+
+    /// Make `isolates_host_mounts()` report `value`, as the owned process
+    /// runtime of a root Linux Bun with a mount view would with `true`.
+    pub fn set_isolates_host_mounts(&self, value: bool) {
+        self.isolates_host_mounts.store(value, Ordering::SeqCst);
     }
 
     /// Make `shares_network_namespaces()` report `value`, as Apple Container
@@ -1009,6 +1019,10 @@ impl super::Grill for MockGrill {
 
     fn shares_network_namespaces(&self) -> bool {
         self.shares_network.load(Ordering::SeqCst)
+    }
+
+    fn isolates_host_mounts(&self) -> bool {
+        self.isolates_host_mounts.load(Ordering::SeqCst)
     }
 
     async fn workload_cgroup(&self, instance: &InstanceId) -> Result<Option<u64>, GrillError> {

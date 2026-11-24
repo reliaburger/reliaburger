@@ -433,10 +433,11 @@ Group names are `scheduling`, `service-discovery`, `deployments`,
 as the report prints it, to run one case on its own; groups and case names
 mix. The default `development` profile accepts a skip with
 a known reason, such as a capability this node lacks. A node with
-`[process_workloads] mount_isolation` on, the Linux default, doesn't advertise
-host workloads, because it refuses them until #714 lands; its host
-`process-workloads` and `jobs` cases skip with that reason rather than
-waiting for work that never starts. The workload cases launch
+`[process_workloads] mount_isolation` on (the Linux default) runs its host
+`process-workloads` and `jobs` cases inside the mount view. A node that can't
+build the view (macOS with isolation on, a non-root Bun) doesn't advertise
+host workloads, so those cases skip with that reason rather than waiting for
+work that never starts. The workload cases launch
 `bun testapp` as an `exec` app of `/usr/local/bin/bun`, so on the process
 runtime the node's `allowed_binaries` must name that path. Bun doesn't add it
 for you: that would let anyone who can deploy run the node agent's own binary
@@ -445,7 +446,6 @@ as root.
 ```toml
 [process_workloads]
 allowed_binaries = ["/usr/local/bin/bun"]
-mount_isolation = false
 ```
 
 The full profiles

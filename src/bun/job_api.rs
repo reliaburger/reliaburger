@@ -210,8 +210,9 @@ async fn judge_definition(
 
 /// Why this node would refuse the definition's host tasks, when it is the
 /// only node that could run them (standalone: no council, no gossip peers).
-/// Admitting host work nobody can run (most often under `mount_isolation`,
-/// #714) would only fail a second later; refusing it names the reason at
+/// Admitting host work nobody can run (an allowlist that doesn't name the
+/// binary, or a `mount_isolation` the node can't build, #714) would only
+/// fail a second later; refusing it names the reason at
 /// once. Container work is left to the tick, which fails a run once every
 /// node has refused it.
 fn sole_node_refusal(

@@ -14,7 +14,7 @@ Bun is the per-node agent that runs on every node in a Reliaburger cluster. It i
 Bun's responsibilities on every node:
 
 - **Container management (Grill):** Start, stop, health-check, and monitor OCI containers via the Grill abstraction layer. Grill drives the runtimes directly (runc on Linux, Apple Container on macOS, and a `process` mode with no runtime at all); it does not shell through containerd.
-- **Process workload management:** Start, stop, and health-check non-container workloads (host binaries and inline scripts), gated by a deny-by-default binary allowlist. (The namespace/cgroup isolation stack for these host processes is planned; see §5.2.)
+- **Process workload management:** Start, stop, and health-check non-container workloads (host binaries and inline scripts), gated by a deny-by-default binary allowlist and, under `mount_isolation`, started in a mount view that hides Bun's paths. (The rest of the namespace isolation stack for these host processes is planned; see §5.2.)
 - **Port allocation:** Allocate ephemeral host ports from a configurable range (default 10000 up to, not including, 32767: below Linux's ephemeral range) and map them to container-internal ports. Ports a host daemon already listens on are skipped.
 - **eBPF service discovery (Onion):** Load and maintain the Onion eBPF programs and kernel maps for socket-level service discovery and firewall enforcement.
 - **Log collection (Ketchup):** Capture stdout/stderr from all workloads and feed them into the structured log pipeline.
@@ -1144,22 +1144,28 @@ before their Phase 15 cases can use this contract.
 
 ### 5.2 Process Workload Lifecycle
 
-> **Status: the isolation stack (steps 7-12) is planned — not yet implemented.** What ships today is the admission gate in step 3 (deny-by-default binary allowlist plus honest refusal of isolation a node can't provide) followed by a direct host `spawn` of the binary, in its own process group, with the spec's environment and stdout/stderr captured (`src/grill/process.rs`). The mount/PID/network/UTS namespaces, the seccomp profile, and dropping to the `burger` user (steps 7-12 below) describe the target design; a process workload currently runs as a child of its durable foreground owner, without that isolation stack. Treat steps 7-12 as the roadmap, not a description of the running binary.
+> **Status: the mount namespace (step 8) ships from 0.4.0 (#714); the rest of the isolation stack (steps 7 and 9-12) is planned — not yet implemented ([#360](https://github.com/reliaburger/reliaburger/issues/360)).** What ships is the admission gate in step 3 (deny-by-default binary allowlist plus honest refusal of isolation a node can't provide), then the durable process owner's execution gate, which joins the workload cgroup, builds the mount view of step 8 under `[process_workloads] mount_isolation`, drops five capabilities from the bounding set and `exec`s the binary (`src/grill/process_owner.rs`, `src/grill/mount_view.rs`). The PID/network/UTS namespaces, the seccomp profile, and dropping to the `burger` user describe the target design; treat them as the roadmap, not a description of the running binary.
 
 **Start a process workload:**
 
 1. Receive `AppSpec` from WorkloadSupervisor. Verify `WorkloadSource` is `Exec` or `Script`.
 2. Transition to `Pending`.
-3. **Admission (deny-by-default):** Before anything is allocated, the WorkloadSupervisor refuses a workload this node can't honour. Host execution is **deny-by-default**: an `Exec` binary runs only if its absolute path appears in `node.toml`'s `[process_workloads] allowed_binaries`, and a `Script` runs only if the interpreter (`/bin/sh`) is allowlisted too — a script is just host execution of the shell, so an empty allowlist refuses it exactly like an un-listed binary. An empty or absent allowlist therefore denies every host workload, not allows it. (Container workloads via runc/apple are unaffected; the allowlist gates only ProcessGrill host execution.) The refusal is a `DeployFailed` error surfaced to the caller, not a silent drop. Mount isolation is enforced here too: if the config asks for it on a node that can't provide it (a non-Linux host), the deploy is refused rather than run with a host process that can see every workload's volumes.
+3. **Admission (deny-by-default):** Before anything is allocated, the WorkloadSupervisor refuses a workload this node can't honour. Host execution is **deny-by-default**: an `Exec` binary runs only if its absolute path appears in `node.toml`'s `[process_workloads] allowed_binaries`, and a `Script` runs only if the interpreter (`/bin/sh`) is allowlisted too — a script is just host execution of the shell, so an empty allowlist refuses it exactly like an un-listed binary. An empty or absent allowlist therefore denies every host workload, not allows it. (Container workloads via runc/apple are unaffected; the allowlist gates only ProcessGrill host execution.) The refusal is a `DeployFailed` error surfaced to the caller, not a silent drop. Mount isolation is enforced here too: if the config asks for it on a node that can't build the view (not Linux, or a non-root Bun: `Grill::isolates_host_mounts` is false), the deploy is refused rather than run with a host process that can see every workload's volumes.
 4. **Write inline script (Script only):** Write the script content to a temporary file in a Bun-managed temp directory (outside any workload's mount namespace). Mark it executable (`chmod 0755`). Compute and record the SHA-256 hash for the event log.
 5. **Allocate port:** Same as container workloads -- request from PortAllocator if the workload declares a port.
 6. **Create cgroup:** Identical to container workloads (step 5 of 5.1).
 7. **Create namespaces:** Use `clone()` with `CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWNS | CLONE_NEWUTS` to create a child process in isolated namespaces.
-8. **Set up mount namespace:** In the child, create a restricted filesystem view:
-   - **Default read-only mounts:** `/usr/bin`, `/usr/local/bin`, `/usr/lib`, `/usr/local/lib`, `/lib`, `/lib64`, `/etc/resolv.conf`, `/etc/hosts`, `/etc/ssl`
-   - **Default read-write mounts:** A per-workload tmpfs at `/tmp`; the volume path if declared
-   - **Blocked (not mounted):** `/etc/shadow`, `/etc/sudoers`, `/var/lib/reliaburger`, other workloads' paths, `/root`, `/home`, `/dev` (except granted GPU devices)
-   - **Explicitly granted:** Each `allow_paths` entry is bind-mounted (read-only by default, read-write if `:rw` suffix)
+8. **Set up mount namespace (shipped, 0.4.0, [plan](../plans/2026-11-24-plan-host-mount-isolation.md)):** Under `[process_workloads] mount_isolation`, the execution gate builds a denylist view of the host's root, after joining the workload cgroup and before `exec`, in a single-threaded process:
+   1. `unshare(CLONE_NEWNS)`, then `mount(NULL, "/", NULL, MS_REC | MS_SLAVE, NULL)`. Slave, not private, so Bun's later unmounts of volumes and container roots reach the namespace and a long-running host app doesn't pin them.
+   2. `open_tree(OPEN_TREE_CLONE)` of each bind-back (the workload's own cgroup; for the native host helper its directory, read-only, its control socket and its cgroup subtree).
+   3. One 256 MiB tmpfs whose two directories are bound at `/tmp` and `/var/tmp`, and a 64 MiB tmpfs on `/dev/shm`, charged to the workload's memory cgroup.
+   4. **Hidden:** an empty, read-only, mode-000 tmpfs on each of Bun's directories (the storage directories, or their parent when it's a `reliaburger` directory; the identity directory; the key files' and `--config` file's directory when it's a `reliaburger` directory, the file alone otherwise; `/etc/reliaburger`, `/run/reliaburger`, `/sys/fs/bpf`, `/sys/fs/cgroup/reliaburger`), and a read-only bind of `/dev/null` on each hidden file. `MountView::for_node` computes the list from `node.toml` with symlinks resolved.
+   5. `move_mount` of each bind-back to its path.
+   6. `PR_CAPBSET_DROP` of `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE`, `CAP_SYS_MODULE`, `CAP_BPF` and `CAP_SYS_BOOT`, so root in the view can't unmount a mask, `setns` back, or read Bun's paths through `/proc/<pid>/root`.
+
+   Everything else stays visible and writable. `relish exec` and stop hooks join the running workload's namespace through a pidfd and `setns` instead of building a fresh view. The native host helper's tasks inherit its view, so one executor's tasks (all of one job) share a `/tmp`.
+
+   **The option we didn't take:** an allowlisted view (`/usr/bin`, `/usr/lib`, `/lib`, `/etc/ssl` and similar read-only, a per-workload `/tmp`, everything else blocked, and per-workload `allow_paths` bound in with an optional `:rw`). It's the filesystem half of a sandbox, and a workload that's happy in it is happy in a container. Host workloads exist to see the host (decided by the maintainer on 24 November 2026, Q1 of the plan).
 9. **Set up network namespace:** Same as container workloads -- veth pair, port mapping, Onion eBPF attachment.
 10. **Decrypt secrets and prepare identity:** Identical to container workloads (steps 7-8 of 5.1).
 11. **Apply seccomp profile:** Load the default seccomp profile (blocks `mount`, `reboot`, `kexec_load`, `init_module`, etc.). Identical to the container seccomp profile.
@@ -1758,7 +1764,7 @@ The scenarios count work rather than timing turns against the host's disk (#508,
 
 | Surface | Risk | Mitigation |
 |---------|------|------------|
-| **Process workloads access host binaries** | Larger attack surface than containers (host filesystem access) | **Shipped:** binary allowlist in `node.toml` (deny-by-default) plus admission refusal of isolation a node can't honour. **Planned (not yet implemented):** restricted mount namespace, seccomp profile, `burger` unprivileged user — a process workload currently runs as an ordinary child of the Bun process with no namespace, seccomp, or user isolation |
+| **Process workloads access host binaries** | Larger attack surface than containers (host filesystem access) | **Shipped:** binary allowlist in `node.toml` (deny-by-default), admission refusal of isolation a node can't honour, and from 0.4.0 a mount view that hides Bun's paths and other workloads' `/tmp`, with `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE`, `CAP_SYS_MODULE`, `CAP_BPF` and `CAP_SYS_BOOT` dropped (§5.2 step 8). It doesn't stop raw disk access under `/dev`, `/proc` reads of processes with no more capabilities, or network access. **Planned (not yet implemented, #360):** PID, network and UTS namespaces, seccomp profile, `burger` unprivileged user |
 | **Self-upgrade replaces the Bun binary** | A compromised upgrade could replace the orchestrator | Dual-signature verification (embedded key set + external key), no auto-update, admin role required, binary verified twice (leader + each node) |
 | **Secret decryption in Bun's memory** | Bun process memory contains plaintext secrets | Secrets are decrypted in memory only, never written to disk. `mlock()` the decryption buffer to prevent swapping. Zero the buffer after injection. |
 | **eBPF programs run in kernel space** | A malicious eBPF program could compromise the kernel | eBPF programs are compiled into the Bun binary (not loaded from external files). The kernel's BPF verifier rejects unsafe programs. |
@@ -1817,7 +1823,7 @@ The scenarios count work rather than timing turns against the host's disk (#508,
 
 ### 8.3 Restricted Capabilities
 
-> **Status: planned — not yet implemented.** The capability model below describes the target isolation for process workloads. Today a process workload is a plain host `spawn` with no capability filtering, so this section is design intent, not current enforcement.
+> **Status: mostly planned — not yet implemented.** The capability model below describes the target isolation for process workloads. What ships (0.4.0, under `mount_isolation`) is narrower: the gate drops `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE`, `CAP_SYS_MODULE`, `CAP_BPF` and `CAP_SYS_BOOT` from the bounding set before `exec`, and a host workload keeps the rest of root's capabilities.
 
 The following capabilities are explicitly NOT available to process workloads:
 
