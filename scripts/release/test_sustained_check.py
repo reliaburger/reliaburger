@@ -447,31 +447,27 @@ class WorkloadResumeRecords(unittest.TestCase):
     """The writer and the Redis client record each start before their first
     acknowledgement, which is what the resume checks above rely on."""
 
-    def run_for(self, script, seconds, env=None):
-        process = subprocess.Popen(["sh", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                   text=True, env={**os.environ, **(env or {})})
-        time.sleep(seconds)
-        process.terminate()
-        output, _ = process.communicate(timeout=10)
-        return output
+    def run_until(self, script, pattern, env=None, deadline=30):
+        """Run SCRIPT until its output matches PATTERN, or DEADLINE seconds pass.
 
-    def run_until(self, script, pattern, deadline=30):
-        """Run `script` until its output matches `pattern`, or `deadline`
-        seconds pass. A fixed sleep failed on a loaded host: the shell hadn't
-        printed its first line in 0.5 s."""
-        process = subprocess.Popen(["sh", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                   text=True)
-        self.addCleanup(process.kill)
-        output = ""
-        end = time.monotonic() + deadline
-        while time.monotonic() < end and not re.search(pattern, output):
-            line = process.stdout.readline()
-            if not line:
-                break
-            output += line
-        process.terminate()
-        rest, _ = process.communicate(timeout=10)
-        return output + rest
+        A fixed run of half a second missed the writer's first ACK on a
+        loaded host (#2184), so wait for what the test checks instead.
+        """
+        with tempfile.TemporaryFile(mode="w+") as log:
+            process = subprocess.Popen(["sh", "-c", script], stdout=log, stderr=subprocess.STDOUT,
+                                       text=True, env={**os.environ, **(env or {})})
+            try:
+                give_up = time.monotonic() + deadline
+                while time.monotonic() < give_up and process.poll() is None:
+                    log.seek(0)
+                    if re.search(pattern, log.read()):
+                        break
+                    time.sleep(0.02)
+            finally:
+                process.terminate()
+                process.wait(timeout=10)
+            log.seek(0)
+            return log.read()
 
     def test_the_writer_records_where_it_resumed_before_its_first_ack(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -484,6 +480,14 @@ class WorkloadResumeRecords(unittest.TestCase):
             self.assertEqual((data / "resumes").read_text(), "0\n3\n")
             first_ack = int(re.search(r"ACK (\d+)", output).group(1))
             self.assertEqual(first_ack, 4)
+
+    def test_a_writer_slow_to_start_is_still_waited_for(self):
+        # A loaded host can take longer than any fixed wait to start the
+        # shell (#2184): the run lasts until the first ACK, not a set time.
+        with tempfile.TemporaryDirectory() as directory:
+            script = "sleep 1\n" + workload_script("soak-writer").replace("/data", directory)
+            output = self.run_until(script, r"ACK \d+")
+            self.assertRegex(output, r"ACK 1\b")
 
     def fake_redis_cli(self, directory, incr_answers):
         """A redis-cli on PATH that keeps lists in files and answers INCR from INCR_ANSWERS in turn."""
@@ -509,7 +513,7 @@ class WorkloadResumeRecords(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             (Path(directory) / "counter").write_text("41\n")
             env = self.fake_redis_cli(directory, [42, 43, 39, 40])
-            output = self.run_for(script, 1.5, env)
+            output = self.run_until(script, r"BACK 43 39", env)
             self.assertIn("START 41", output)
             self.assertEqual((Path(directory) / "soak:starts").read_text(), "41\n")
             self.assertIn("BACK 43 39", output)
