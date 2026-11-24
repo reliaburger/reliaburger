@@ -24,10 +24,6 @@ Not released yet: this is what the train carries, and it can change before the t
 - The batch-jobs manual opens its host commands section with what a Linux node needs first: mount isolation is on by default, including on nodes `relish setup --ssh` installs, and no host workload runs under it yet, so set `mount_isolation = false` and allowlist the binary, or give the job an image. Running host workloads under mount isolation stays open as [#714](https://github.com/reliaburger/reliaburger/issues/714).
 - The appliance image has Buildah, so `relish build` and the five-minute tour's burger build on a cluster of appliances. Its storage is on the data partition, where Btrfs reflinks the `vfs` driver's layer copies; the image adds `netavark` and `gpg` for it, drops Buildah's 97 MB of test helpers, and grows each `/usr` slot by 54 MB (667 MB to 721 MB of 1,100 MB on x86-64). A multi-platform build can't emulate the other architecture's `RUN` steps on an appliance, so cross-compile or name one `platform`. With no node able to build, the refusal no longer says appliances never can ([#2144](https://github.com/reliaburger/reliaburger/issues/2144)).
 
-### Fixed
-
-- A process workload's owner stops answering clients after 250 ms in each turn, as well as after 32, so a backlog of slow clients can't hold off a SIGKILL or the workload's exit for seconds. `relish mcp` falls over to another of the context's nodes to make or replace its read-only token when the node it started on stops answering, and says so on stderr, as other relish commands do ([#2304](https://github.com/reliaburger/reliaburger/issues/2304)).
-
 ## [0.3.2] - 2026-11-23
 
 Fixes from the Wyse 3040 lab that need a new appliance image. [Release page](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.2), [release log](docs/release-log.md#032-wyse-lab-fixes).
