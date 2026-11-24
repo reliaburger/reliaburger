@@ -159,6 +159,10 @@ pub(super) enum StepResult {
     Started(Box<LaunchEvidence>),
     /// The runtime refused or didn't confirm.
     Failed(BunError),
+    /// The node gate refused the replacement before the runtime saw it:
+    /// `node.toml` no longer allows a runtime knob or host path the stored
+    /// spec uses (#1316). Retrying can't help, so it fails with the reason.
+    Refused(String),
     /// A stop or retirement took the instance back before the step began.
     Cancelled,
 }
@@ -182,6 +186,30 @@ struct CreateInput {
     namespace: String,
     /// The node's secret providers: a restart asks them again (#1123).
     secrets: crate::sesame::secret_provider::SecretProviders,
+    /// The node gate's verdict on the stored spec's runtime knobs, taken
+    /// on the loop from this node's allowlist as it is now (#1316).
+    knobs: Result<(), crate::grill::knobs::KnobRefusal>,
+    /// The node's host-path policy, to approve the app's sources again
+    /// off the loop: resolving them can block (#797, #1316).
+    host_paths: crate::bun::host_paths::HostPathPolicy,
+}
+
+impl CreateInput {
+    /// Ask the node gate again whether the replacement may be created.
+    ///
+    /// The restart builds it from the OCI spec stored at deploy, which
+    /// skipped the gates a deploy passes. A node restarted with a narrower
+    /// `node.toml` must refuse what it no longer allows (#1316).
+    async fn admit(&self) -> Result<(), String> {
+        self.knobs.clone().map_err(|refusal| refusal.to_string())?;
+        if let Some(spec) = &self.app_spec {
+            self.host_paths
+                .approve_app_off_runtime(spec)
+                .await
+                .map_err(|refusal| format!("host path refused: {refusal}"))?;
+        }
+        Ok(())
+    }
 }
 
 /// What a restart step does to the instance's sidecars (#1120): the Clear
@@ -244,35 +272,40 @@ async fn run_step<G: Grill>(
             }
         }
         RestartStep::Create => match create {
-            Some(create) => match super::launch::create_with_secrets(
-                &grill,
-                &create.secrets,
-                super::launch::LaunchTarget {
-                    instance_id: &id,
-                    app_name: &create.app_name,
-                    namespace: &create.namespace,
-                },
-                &create.oci_spec,
-            )
-            .await
-            {
-                Ok(_) => {
-                    let retained = if retains_network(create.app_spec.as_ref()) {
-                        grill
-                            .retain_network_reference(&id)
-                            .await
-                            .map_err(BunError::from)
-                    } else {
-                        Ok(None)
-                    };
-                    let egress = create.egress.resolve(create.app_spec.as_ref()).await;
-                    return StepResult::Created {
-                        retained,
-                        egress: Box::new(egress),
-                    };
+            Some(create) => {
+                if let Err(reason) = create.admit().await {
+                    return StepResult::Refused(reason);
                 }
-                Err(error) => Err(error.into()),
-            },
+                match super::launch::create_with_secrets(
+                    &grill,
+                    &create.secrets,
+                    super::launch::LaunchTarget {
+                        instance_id: &id,
+                        app_name: &create.app_name,
+                        namespace: &create.namespace,
+                    },
+                    &create.oci_spec,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        let retained = if retains_network(create.app_spec.as_ref()) {
+                            grill
+                                .retain_network_reference(&id)
+                                .await
+                                .map_err(BunError::from)
+                        } else {
+                            Ok(None)
+                        };
+                        let egress = create.egress.resolve(create.app_spec.as_ref()).await;
+                        return StepResult::Created {
+                            retained,
+                            egress: Box::new(egress),
+                        };
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            }
             None => Err(BunError::DeployFailed {
                 app_name: id.0.clone(),
                 reason: "restart has no stored OCI spec".into(),
@@ -315,6 +348,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 app_name: launch.app_name.clone(),
                 namespace: launch.namespace.clone(),
                 secrets: self.secret_providers.clone(),
+                knobs: self
+                    .supervisor
+                    .check_runtime_knobs(launch.oci_spec.runtime_knobs.as_ref()),
+                host_paths: self.supervisor.host_path_policy(),
             }),
             _ => None,
         };
@@ -583,6 +620,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     }
                     None => self.record_failed_restart(&id, &error.to_string()).await,
                 }
+            }
+            (RestartStep::Create, StepResult::Refused(reason), _) => {
+                eprintln!("bun: restart of {id} refused by the node gate: {reason}");
+                self.record_launch_failure(&id, reason).await;
+            }
+            (step, StepResult::Refused(reason), _) => {
+                eprintln!("bun: restart of {id} got a refusal after {step:?}: {reason}");
             }
             (RestartStep::Refuse, StepResult::Done, _) => {
                 if let Some(instance) = self.supervisor.get_instance_mut(&id)

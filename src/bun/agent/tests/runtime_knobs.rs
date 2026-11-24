@@ -71,3 +71,106 @@ async fn a_node_advertises_its_knobs_only_when_its_runtime_applies_them() {
     let (capabilities, _) = agent.live_egress_report_state().await;
     assert_eq!(capabilities.runtime_knobs, allowing_both());
 }
+
+/// How many times the runtime was asked to create `id`.
+fn creates(grill: &MockGrill, id: &InstanceId) -> usize {
+    grill
+        .calls()
+        .iter()
+        .filter(|(call, instance)| call == "create" && instance == id)
+        .count()
+}
+
+/// Crash `id`, then drive its restart to completion.
+async fn crash_and_restart(agent: &mut TestAgent, grill: &MockGrill, id: &InstanceId) {
+    grill.set_state(id, ContainerState::Stopped);
+    agent.check_apps().await;
+    agent.drive_pending_restarts_to_completion().await;
+}
+
+/// #1316: a restart builds the container from the spec stored at deploy,
+/// so it used to skip the node gate. A node whose `[runtime]` allowlist
+/// no longer lists a knob must refuse the restart, with the reason, and
+/// not spend the restart budget retrying it.
+#[tokio::test]
+async fn a_restart_after_the_node_drops_a_knob_is_refused_with_the_reason() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    grill.set_applies_runtime_knobs(true);
+    agent.set_runtime_allowlist(allowing_both());
+    expect_complete(&drain_deploy(&mut agent, knobbed_app()).await);
+    let id = agent.supervisor.list_instances()[0].id.clone();
+
+    // The node restarts with a narrower `node.toml`.
+    agent.set_runtime_allowlist(Default::default());
+    crash_and_restart(&mut agent, &grill, &id).await;
+
+    let instance = agent.supervisor.get_instance(&id).unwrap();
+    assert_eq!(instance.state, ContainerState::Failed);
+    let reason = instance.launch_failure.clone().unwrap_or_default();
+    assert!(
+        reason.contains("runtime.capabilities CAP_IPC_OWNER refused by the node gate"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("runtime.sysctls net.core.somaxconn"),
+        "names every refused knob: {reason}"
+    );
+    assert!(!instance.retry_pending, "a refused restart is not retried");
+    assert_eq!(
+        creates(&grill, &id),
+        1,
+        "only the deploy reached the runtime"
+    );
+}
+
+/// The re-check refuses only what the node stopped allowing: a restart
+/// the allowlist still covers creates the instance again.
+#[tokio::test]
+async fn a_restart_the_node_still_allows_creates_the_instance_again() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    grill.set_applies_runtime_knobs(true);
+    agent.set_runtime_allowlist(allowing_both());
+    expect_complete(&drain_deploy(&mut agent, knobbed_app()).await);
+    let id = agent.supervisor.list_instances()[0].id.clone();
+
+    crash_and_restart(&mut agent, &grill, &id).await;
+
+    let instance = agent.supervisor.get_instance(&id).unwrap();
+    assert_ne!(instance.state, ContainerState::Failed);
+    assert_eq!(instance.launch_failure, None);
+    assert_eq!(creates(&grill, &id), 2);
+}
+
+/// #1316: host paths have the same double gate, and restarts skipped it
+/// the same way. A source `[storage] allowed_host_paths` no longer covers
+/// refuses the restart.
+#[tokio::test]
+async fn a_restart_after_the_node_drops_a_host_path_is_refused_with_the_reason() {
+    let source = tempfile::tempdir().unwrap();
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    agent.set_host_path_policy(crate::bun::host_paths::HostPathPolicy::new(
+        vec![source.path().to_path_buf()],
+        Vec::new(),
+    ));
+    let config = Config::parse(&format!(
+        "[app.web]\nimage = 'web:v1'\n[[app.web.volumes]]\npath = '/data'\nsource = '{}'\n",
+        source.path().display()
+    ))
+    .unwrap();
+    expect_complete(&drain_deploy(&mut agent, config).await);
+    let id = agent.supervisor.list_instances()[0].id.clone();
+
+    agent.set_host_path_policy(Default::default());
+    crash_and_restart(&mut agent, &grill, &id).await;
+
+    let instance = agent.supervisor.get_instance(&id).unwrap();
+    assert_eq!(instance.state, ContainerState::Failed);
+    let reason = instance.launch_failure.clone().unwrap_or_default();
+    assert!(reason.contains("host path refused"), "{reason}");
+    assert!(!instance.retry_pending, "a refused restart is not retried");
+    assert_eq!(
+        creates(&grill, &id),
+        1,
+        "only the deploy reached the runtime"
+    );
+}
