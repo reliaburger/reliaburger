@@ -114,10 +114,10 @@ name = "Clusters of hundreds of nodes"
 status = "alpha"
 since = "0.1.0"
 summary = "Nothing stops you adding more nodes, but every release is soaked on three, and measurements at 500 and 1,000 simulated nodes found limits."
-restrictions = "The leader refuses report connections from 500 nodes up, its API slows sharply between 500 and 1,000, and gossip at 1,000 doesn't settle within six minutes."
-issues = [1411, 1412, 1413]
+restrictions = "The leader's API slows sharply between 500 and 1,000 nodes, and gossip at 1,000 doesn't settle within six minutes."
+issues = [1412, 1413]
 docs = ["docs/qualification/2026-10-28-hollow-nodes.md"]
-evidence = "Hollow-node record of 28 October 2026 (measurements, not a gate) and #1411-#1413 in Later. Every soak is three nodes (docs/website/index.html, 'What the soaks don't prove')."
+evidence = "Hollow-node record of 28 October 2026 (measurements, not a gate) and #1412-#1413 in Later; since 0.4.0 the leader admits every report from 500 nodes instead of refusing thousands (#1411). Every soak is three nodes (docs/website/index.html, 'What the soaks don't prove')."
 
 [[group.feature]]
 name = "Contributor clusters from a checkout"

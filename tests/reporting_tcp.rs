@@ -311,3 +311,151 @@ async fn reporting_listener_refuses_a_plaintext_worker_when_mtls_is_required() {
         "a plaintext worker must not report to an mTLS aggregator"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Reporting at fleet scale (#1411)
+// ---------------------------------------------------------------------------
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use reliaburger::mustard::membership::MembershipSnapshot;
+use reliaburger::mustard::state::NodeState;
+use reliaburger::reporting::ReportingError;
+use reliaburger::reporting::transport::{InboundReport, ReportingTransport};
+use reliaburger::reporting::types::ReportingMessage;
+
+/// A worker's outbound transport that counts every send and every send the
+/// leader didn't admit, which is what a hollow node's log calls "admission
+/// at ... failed".
+struct CountingSender {
+    inner: TcpReportingSender,
+    sent: Arc<AtomicUsize>,
+    refused: Arc<AtomicUsize>,
+}
+
+impl ReportingTransport for CountingSender {
+    async fn send(
+        &self,
+        target: std::net::SocketAddr,
+        message: &ReportingMessage,
+    ) -> Result<(), ReportingError> {
+        self.sent.fetch_add(1, Ordering::Relaxed);
+        let result = self.inner.send(target, message).await;
+        if result.is_err() {
+            self.refused.fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    async fn recv(&self) -> Option<InboundReport> {
+        None
+    }
+}
+
+/// What a reporting storm measured.
+#[derive(Debug)]
+struct StormOutcome {
+    sent: usize,
+    refused: usize,
+    /// Nodes whose report the leader's aggregated view held at the end.
+    reported: usize,
+}
+
+/// `nodes` report workers, each with a fake agent, report to one leader
+/// over real TCP for `duration`. All of them start at once, so their report
+/// ticks line up, as they do after a leader change, when every worker
+/// re-points and reports at the same moment.
+async fn report_storm(nodes: usize, interval_secs: u64, duration: Duration) -> StormOutcome {
+    let shutdown = CancellationToken::new();
+    let config = ReportingTreeSection {
+        report_interval_secs: interval_secs,
+        ..fast_config()
+    };
+    let agg_transport = TcpReportingTransport::bind(local(0), shutdown.clone())
+        .await
+        .unwrap();
+    let agg_addr = agg_transport.local_addr();
+    // The leader's aggregator checks every report against gossip's member
+    // list, as it does in a cluster, so the list is as long as the fleet.
+    let members = (0..nodes)
+        .map(|index| MembershipSnapshot {
+            node_id: NodeId::new(format!("hollow-{index:04}")),
+            address: local(0),
+            state: NodeState::Alive,
+            incarnation: 1,
+            is_council: false,
+            is_leader: false,
+            labels: Default::default(),
+            first_seen: std::time::Instant::now(),
+            resources: None,
+        })
+        .collect();
+    let (_membership_tx, membership_rx) = watch::channel(members);
+    let (mut aggregator, watch_rx) = ReportAggregator::new(
+        agg_transport,
+        config.clone(),
+        shutdown.clone(),
+        None,
+        None,
+        Some(membership_rx),
+    );
+    let mut tasks = vec![tokio::spawn(async move { aggregator.run().await })];
+
+    let sent = Arc::new(AtomicUsize::new(0));
+    let refused = Arc::new(AtomicUsize::new(0));
+    let council = vec![(NodeId::new("leader"), agg_addr)];
+    for index in 0..nodes {
+        let transport = CountingSender {
+            inner: TcpReportingSender::new(None, Default::default()),
+            sent: Arc::clone(&sent),
+            refused: Arc::clone(&refused),
+        };
+        let (snap_tx, snap_rx) = mpsc::channel(16);
+        tasks.push(spawn_fake_agent(snap_rx, shutdown.clone()));
+        let (_council_tx, council_rx) = watch::channel(council.clone());
+        let mut worker = ReportWorker::new(
+            NodeId::new(format!("hollow-{index:04}")),
+            transport,
+            config.clone(),
+            snap_tx,
+            council_rx,
+            shutdown.clone(),
+        );
+        tasks.push(tokio::spawn(async move { worker.run().await }));
+    }
+
+    tokio::time::sleep(duration).await;
+    let reported = watch_rx.borrow().reports.len();
+    shutdown.cancel();
+    for task in tasks {
+        let _ = tokio::time::timeout(Duration::from_secs(15), task).await;
+    }
+    StormOutcome {
+        sent: sent.load(Ordering::Relaxed),
+        refused: refused.load(Ordering::Relaxed),
+        reported,
+    }
+}
+
+/// The hollow-node record of 28 October 2026 counted 15,310 refused report
+/// admissions at 500 nodes and about 600 a second at 1,000 (#1411). Five
+/// hundred workers whose ticks line up must all be admitted, every time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "run with make test-hollow"]
+async fn five_hundred_workers_report_to_one_leader_without_a_refusal() {
+    let outcome = report_storm(500, 5, Duration::from_secs(32)).await;
+    eprintln!("500 workers: {outcome:?}");
+    assert!(
+        outcome.sent >= 500 * 2 * 5,
+        "too few reports sent: {outcome:?}"
+    );
+    assert_eq!(
+        outcome.refused, 0,
+        "the leader refused reports: {outcome:?}"
+    );
+    assert_eq!(
+        outcome.reported, 500,
+        "a node's report is missing: {outcome:?}"
+    );
+}
