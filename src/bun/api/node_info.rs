@@ -136,6 +136,23 @@ pub(super) async fn local_capability_report(
             placement: Some(placement),
             cluster_id,
             council_quorum,
+            // Probe now rather than trust startup: the host may have enabled
+            // the cpu and memory controllers since (#2242).
+            node_pressure: Some(
+                crate::smoker::node_pressure::probe(
+                    crate::smoker::node_pressure::NodePressureLimits {
+                        max_cpu_percentage: state
+                            .static_capabilities
+                            .test_policy
+                            .max_node_pressure_cpu_percent,
+                        max_memory_percentage: state
+                            .static_capabilities
+                            .test_policy
+                            .max_node_pressure_memory_percent,
+                    },
+                )
+                .await,
+            ),
         },
     )
 }

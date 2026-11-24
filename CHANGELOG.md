@@ -41,6 +41,10 @@ Not released yet: this is what the train carries, and it can change before the t
 
 - A batch attempt no longer becomes Unknown, needing a replay, when one exit check misses the process owner's 2 s request timeout on a loaded node. The check asks again, and the attempt becomes Unknown only after 60 s of unanswered checks, with that in the reason. ([#2288](https://github.com/reliaburger/reliaburger/issues/2288)).
 
+### Fixed
+
+- `node_pressure` no longer stays unavailable when Bun starts before systemd enables the cpu and memory cgroup controllers at the root. Bun prepares `/sys/fs/cgroup/reliaburger-chaos` again before each pressure fault and each capability report, enables the two controllers in the parent when it offers them, and says in `/v1/capabilities` what's missing when it can't ([#2242](https://github.com/reliaburger/reliaburger/issues/2242)).
+
 ## [0.3.2] - 2026-11-23
 
 Fixes from the Wyse 3040 lab that need a new appliance image. [Release page](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.2), [release log](docs/release-log.md#032-wyse-lab-fixes).
