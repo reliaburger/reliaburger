@@ -114,6 +114,9 @@ pub struct MockGrill {
     fail_state: Arc<AtomicBool>,
     /// State queries still to answer `StateUnavailable`, per instance.
     state_unavailable: Arc<Mutex<HashMap<InstanceId, u32>>>,
+    /// Stop and kill requests still to answer `StopUnanswered`, per call
+    /// and instance.
+    unanswered: Arc<Mutex<HashMap<(MockCall, InstanceId), u32>>>,
     inspection_failures: Arc<Mutex<std::collections::HashSet<InstanceId>>>,
     /// Instances whose `adopt` fails, as an uncertain runtime's does.
     adopt_failures: Arc<Mutex<std::collections::HashSet<InstanceId>>>,
@@ -200,6 +203,7 @@ impl Default for MockGrill {
             fail_start: Arc::default(),
             fail_state: Arc::default(),
             state_unavailable: Arc::default(),
+            unanswered: Arc::default(),
             inspection_failures: Arc::default(),
             adopt_failures: Arc::default(),
             forget_for_real: Arc::default(),
@@ -338,6 +342,30 @@ impl MockGrill {
             });
         }
         Ok(())
+    }
+
+    /// Answer the next `times` `call`s (a stop or a kill) for `instance`
+    /// with `StopUnanswered`, as a process owner stalled past its request
+    /// timeout does (#1902).
+    pub fn set_unanswered_times(&self, call: MockCall, instance: &InstanceId, times: u32) {
+        self.unanswered
+            .lock()
+            .unwrap()
+            .insert((call, instance.clone()), times);
+    }
+
+    /// Whether this `call` for `instance` goes unanswered, counting it.
+    fn unanswered(&self, call: MockCall, instance: &InstanceId) -> Option<GrillError> {
+        let mut unanswered = self.unanswered.lock().unwrap();
+        let left = unanswered.get_mut(&(call, instance.clone()))?;
+        if *left == 0 {
+            return None;
+        }
+        *left -= 1;
+        Some(GrillError::StopUnanswered {
+            instance: instance.clone(),
+            reason: "process owner request timed out".into(),
+        })
     }
 
     /// Fail state inspection only for the named instance.
@@ -912,6 +940,9 @@ impl super::Grill for MockGrill {
             .unwrap()
             .push(("stop".to_string(), instance.clone()));
         self.delay(MockCall::Stop).await;
+        if let Some(error) = self.unanswered(MockCall::Stop, instance) {
+            return Err(error);
+        }
         if self.fail_stop.load(Ordering::SeqCst) {
             return Err(GrillError::StopFailed {
                 instance: instance.clone(),
@@ -939,6 +970,9 @@ impl super::Grill for MockGrill {
             .push(("kill".to_string(), instance.clone()));
         self.forgotten_error(instance)?;
         self.delay(MockCall::Kill).await;
+        if let Some(error) = self.unanswered(MockCall::Kill, instance) {
+            return Err(error);
+        }
         if self.block_kill.load(Ordering::SeqCst) {
             self.kill_started.add_permits(1);
             let permit = self.kill_release.acquire().await.unwrap();

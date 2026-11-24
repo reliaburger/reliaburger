@@ -790,9 +790,10 @@ async fn reporting_binds_a_retired_launch_whose_environment_values_were_scrubbed
     assert!(rx.await.unwrap().instances[0].execution.is_none());
 }
 
-/// Job leases and app replicas share one budget. When jobs hold it, a
-/// fresh deploy fails for capacity, and the state report says so (and how
-/// much the jobs hold) so the leader can place the replica elsewhere.
+/// Job leases and app replicas share one budget. When another app and job
+/// work hold it, and job work leaving wouldn't be enough, a fresh deploy
+/// fails for capacity, and the state report says so (and how much the jobs
+/// hold) so the leader can place the replica elsewhere.
 #[tokio::test]
 async fn capacity_refusal_and_job_reservations_reach_the_state_snapshot() {
     let (mut agent, _, _, grill) = test_agent_with_grill();
@@ -800,13 +801,14 @@ async fn capacity_refusal_and_job_reservations_reach_the_state_snapshot() {
     grill.set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
     let budget = agent.execution_budget();
     budget.set_capacity(crate::meat::Resources::new(1000, 1 << 30, 0));
-    let held = crate::meat::Resources::new(1000, 1 << 29, 0);
+    let held = crate::meat::Resources::new(500, 1 << 29, 0);
     let attempt = budget
         .acquire(held, &CancellationToken::new())
         .await
         .unwrap();
+    let other_app = budget.adopt(crate::meat::Resources::new(500, 0, 0));
     let config =
-        Config::parse("[app.web]\nimage = 'web:v1'\ncpu = '500m'\nmemory = '64Mi'\n").unwrap();
+        Config::parse("[app.web]\nimage = 'web:v1'\ncpu = '600m'\nmemory = '64Mi'\n").unwrap();
 
     let events = drain_deploy(&mut agent, config.clone()).await;
     assert!(
@@ -821,7 +823,7 @@ async fn capacity_refusal_and_job_reservations_reach_the_state_snapshot() {
     assert_eq!(
         snapshot.job_reservations,
         crate::reporting::types::JobReservations {
-            cpu_millicores: 1000,
+            cpu_millicores: 500,
             memory_bytes: 1 << 29,
         }
     );
@@ -834,7 +836,7 @@ async fn capacity_refusal_and_job_reservations_reach_the_state_snapshot() {
         }]
     );
 
-    drop(attempt);
+    drop((attempt, other_app));
     expect_complete(&drain_deploy(&mut agent, config).await);
     let (tx, rx) = oneshot::channel();
     agent
@@ -843,6 +845,50 @@ async fn capacity_refusal_and_job_reservations_reach_the_state_snapshot() {
     let snapshot = rx.await.unwrap();
     assert!(snapshot.capacity_refusals.is_empty());
     assert_eq!(snapshot.job_reservations, Default::default());
+}
+
+/// #1967: a refusal job work could make room for claims the room, with
+/// the status that tells the placement reconciler to retry soon, and isn't
+/// reported to the leader, so the replica stays here. Admission drops the
+/// claim so job work can have the rest of the node back.
+#[tokio::test]
+async fn a_yielding_refusal_claims_room_and_is_not_reported_to_the_leader() {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    grill.set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
+    let budget = agent.execution_budget();
+    budget.set_capacity(crate::meat::Resources::new(2000, 1 << 30, 0));
+    let attempt = budget
+        .acquire(
+            crate::meat::Resources::new(2000, 1 << 29, 0),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let config =
+        Config::parse("[app.web]\nimage = 'web:v1'\ncpu = '500m'\nmemory = '64Mi'\nreplicas = 2\n")
+            .unwrap();
+
+    let events = drain_deploy(&mut agent, config.clone()).await;
+    assert!(
+        matches!(
+            events.last(),
+            Some(ApplyEvent::Error {
+                status: Some(crate::bun::CAPACITY_YIELDING_STATUS),
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+    assert!(
+        reported_refusals(&mut agent).await.is_empty(),
+        "a yielding refusal must not move the replica away"
+    );
+    drop(attempt);
+    // Both replicas' requests are held back from job work.
+    assert_eq!(budget.job_available().cpu_millicores, 1000);
+
+    expect_complete(&drain_deploy(&mut agent, config).await);
+    assert_eq!(budget.job_available(), budget.available());
 }
 
 /// The apps the agent's next state report says it refused for capacity,
@@ -860,9 +906,11 @@ async fn reported_refusals(agent: &mut TestAgent) -> Vec<(String, String, Vec<u3
         .collect()
 }
 
-/// An agent whose 1000m budget runs one 500m replica of `web`, with a job
-/// lease holding the other 500m. Returns the lease, which frees the room.
-async fn agent_with_web_beside_a_job_lease() -> (
+/// An agent whose 1000m budget runs one 500m replica of `web`, with another
+/// app's lease holding the other 500m. Returns the lease, which frees the
+/// room. It's an app's, not job work's, so a refusal is full and reported:
+/// job work would yield its room to `web` instead (#1967).
+async fn agent_with_web_beside_another_apps_lease() -> (
     TestAgent,
     MockGrill,
     crate::bun::execution_budget::ResourceLease,
@@ -873,18 +921,12 @@ async fn agent_with_web_beside_a_job_lease() -> (
     let budget = agent.execution_budget();
     budget.set_capacity(crate::meat::Resources::new(1000, 1 << 30, 0));
     expect_complete(&drain_deploy(&mut agent, budgeted_web("web:v1", 1)).await);
-    let job = budget
-        .acquire(
-            crate::meat::Resources::new(500, 1 << 29, 0),
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap();
+    let job = budget.adopt(crate::meat::Resources::new(500, 1 << 29, 0));
     (agent, grill, job)
 }
 
-/// An agent whose 1000m budget a job lease holds whole, so a fresh deploy
-/// of `web` is refused. Returns the lease.
+/// An agent whose 1000m budget another app's lease holds whole, so a fresh
+/// deploy of `web` is refused outright. Returns the lease.
 async fn agent_with_a_full_budget() -> (
     TestAgent,
     MockGrill,
@@ -894,13 +936,7 @@ async fn agent_with_a_full_budget() -> (
     grill.set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
     let budget = agent.execution_budget();
     budget.set_capacity(crate::meat::Resources::new(1000, 1 << 30, 0));
-    let job = budget
-        .acquire(
-            crate::meat::Resources::new(1000, 1 << 29, 0),
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap();
+    let job = budget.adopt(crate::meat::Resources::new(1000, 1 << 29, 0));
     (agent, grill, job)
 }
 
@@ -917,12 +953,12 @@ fn web_refused(ordinals: &[u32]) -> Vec<(String, String, Vec<u32>)> {
 }
 
 /// #967: a replica added beside running ones leases from the same budget as
-/// a fresh deploy. When job leases fill it, the leader must hear about the
+/// a fresh deploy. When the budget is full, the leader must hear about the
 /// refusal, or it keeps the replica on a node that can never start it. The
 /// refusal names only the replica the scale-up tried to add (#971).
 #[tokio::test]
 async fn capacity_refusal_while_adding_replicas_reaches_the_state_snapshot() {
-    let (mut agent, _grill, job) = agent_with_web_beside_a_job_lease().await;
+    let (mut agent, _grill, job) = agent_with_web_beside_another_apps_lease().await;
 
     let events = drain_deploy(&mut agent, budgeted_web("web:v1", 2)).await;
     assert!(
@@ -944,7 +980,7 @@ async fn capacity_refusal_while_adding_replicas_reaches_the_state_snapshot() {
 /// old one: more than the scale-up ever asked for.
 #[tokio::test]
 async fn a_refused_scale_up_retries_in_place_with_the_room_it_needed() {
-    let (mut agent, _grill, job) = agent_with_web_beside_a_job_lease().await;
+    let (mut agent, _grill, job) = agent_with_web_beside_another_apps_lease().await;
     let before = live_web_ids(&agent);
     drain_deploy(&mut agent, budgeted_web("web:v1", 2)).await;
     assert_eq!(reported_refusals(&mut agent).await, web_refused(&[1]));
@@ -973,7 +1009,7 @@ async fn a_refused_scale_up_retries_in_place_with_the_room_it_needed() {
 /// not roll the healthy replica, and the refusal it answered goes away.
 #[tokio::test]
 async fn the_share_left_after_a_refused_replica_moves_is_not_rolled() {
-    let (mut agent, _grill, _job) = agent_with_web_beside_a_job_lease().await;
+    let (mut agent, _grill, _job) = agent_with_web_beside_another_apps_lease().await;
     let before = live_web_ids(&agent);
     drain_deploy(&mut agent, budgeted_web("web:v1", 2)).await;
     assert_eq!(reported_refusals(&mut agent).await, web_refused(&[1]));
@@ -990,10 +1026,10 @@ async fn the_share_left_after_a_refused_replica_moves_is_not_rolled() {
 }
 
 /// #967: a rolling replacement reserves its new instance from the budget
-/// before the old one leaves, so job leases can refuse it too.
+/// before the old one leaves, so a full budget can refuse it too.
 #[tokio::test]
 async fn capacity_refusal_while_reserving_a_rolling_replacement_reaches_the_state_snapshot() {
-    let (mut agent, _grill, job) = agent_with_web_beside_a_job_lease().await;
+    let (mut agent, _grill, job) = agent_with_web_beside_another_apps_lease().await;
 
     let events = drain_deploy(&mut agent, budgeted_web("web:v2", 1)).await;
     assert!(

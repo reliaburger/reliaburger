@@ -42,6 +42,9 @@ pub(super) async fn current_apps_handler(
                     resource,
                     image: spec.image.clone(),
                     fingerprint: app_fingerprint_in(spec, &app_id.namespace),
+                    // The owner lives on the effective spec: a policy
+                    // default can't fill it in, but a claim sets it there.
+                    owner: effective.owner.clone(),
                 },
             );
         }
@@ -53,6 +56,7 @@ pub(super) async fn current_apps_handler(
                     resource,
                     image: None,
                     fingerprint: spec_fingerprint(spec),
+                    owner: None,
                 },
             );
         }
@@ -64,6 +68,7 @@ pub(super) async fn current_apps_handler(
                     resource,
                     image: None,
                     fingerprint: spec_fingerprint(spec),
+                    owner: None,
                 },
             );
         }
@@ -75,6 +80,7 @@ pub(super) async fn current_apps_handler(
                     resource,
                     image: None,
                     fingerprint: spec_fingerprint(spec),
+                    owner: None,
                 },
             );
         }
@@ -116,6 +122,7 @@ pub(super) async fn current_apps_handler(
                 resource,
                 image: spec.image.clone(),
                 fingerprint: crate::config::fingerprint::job_fingerprint(&spec),
+                owner: None,
             },
         );
     }

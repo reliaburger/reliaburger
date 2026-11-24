@@ -290,6 +290,23 @@ pub struct DesiredAppEvidence {
     pub owner: Option<String>,
 }
 
+/// Whether one app's current spec has finished rolling out, as the leader
+/// sees it (`GET /v1/diagnostics/rollouts`, #2240).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutEvidence {
+    /// Application name.
+    pub app: String,
+    /// Application namespace.
+    pub namespace: String,
+    /// [`crate::meat::deploy_types::rollout_fingerprint`] of the app's
+    /// current spec.
+    pub fingerprint: String,
+    /// The current spec runs healthy on every node it's placed on, and the
+    /// leader has recorded it as released. `false` while a changed spec
+    /// still rolls out, and before a new app's first rollout finishes.
+    pub rolled_out: bool,
+}
+
 /// Current diagnostics wire schema.
 pub const LOCAL_DIAGNOSTIC_SCHEMA_VERSION: u32 = 1;
 

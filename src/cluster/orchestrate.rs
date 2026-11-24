@@ -1335,10 +1335,35 @@ pub fn plan_pass(
             .with_dns_required(dns_required)
             .with_daemon_credit(committed_footprints(desired, app_id));
         let Placed {
-            decision,
-            unplaced,
-            choices,
+            mut decision,
+            mut unplaced,
+            mut choices,
         } = scheduler.place_app(app_id, &effective_spec);
+        // The yield pass (#1967). Free room comes first, but an app isn't
+        // left unplaced for room only job work holds: counting that room as
+        // free, the scheduler places the rest on the node with the most room
+        // after apps. Its job work yields the room at the next task
+        // boundary; nothing running is stopped. A node that refused this
+        // app outright has no room to make, so it sits the pass out.
+        let mut yielded = 0;
+        if let Some(short) =
+            unplaced.filter(|short| short.reason == crate::meat::types::UnplacedReason::NoRoom)
+            && matches!(effective_spec.replicas, Replicas::Fixed(_))
+        {
+            let credited = scheduler.cluster.credit_job_reservations();
+            if !credited.is_empty() {
+                let refusing = scheduler.cluster.sit_out_refusing_nodes(app_id);
+                let mut rest = effective_spec.clone();
+                rest.replicas = Replicas::Fixed(short.missing);
+                let more = scheduler.place_app(app_id, &rest);
+                scheduler.cluster.restore_readiness(refusing);
+                yielded = more.decision.placements.len();
+                decision.placements.extend(more.decision.placements);
+                choices.extend(more.choices);
+                unplaced = more.unplaced;
+            }
+            scheduler.cluster.restore_job_reservations(credited);
+        }
         *cache = scheduler.cluster;
         if let Some(unplaced) = unplaced {
             unschedulable.insert(
@@ -1382,6 +1407,7 @@ pub fn plan_pass(
                 home: &from_home,
                 added: &added,
                 choices: &choices,
+                yielded,
             };
             if let Some(decision) = placement_provenance(&why) {
                 provenance.insert(app_id.clone(), decision);
@@ -1417,6 +1443,8 @@ struct PlacementWhy<'a> {
     /// Why each of `added` went where it did, in the same order. Empty for
     /// a daemon set.
     choices: &'a [crate::meat::scheduler::ReplicaChoice],
+    /// How many of `added` went on room job work holds (#1967).
+    yielded: usize,
 }
 
 /// The decision a committed placement records: the rule that placed the new
@@ -1441,6 +1469,11 @@ fn placement_provenance(why: &PlacementWhy<'_>) -> Option<crate::bun::decisions:
     }
     let mut decision = if why.added.is_empty() {
         Decision::new("placement.volume_home")
+    } else if why.yielded > 0 {
+        Decision::new("placement.jobs_yield_to_apps")
+            .with("wanted", why.want)
+            .with("kept", why.kept)
+            .with("yielded", why.yielded)
     } else {
         Decision::new("placement.scored")
             .with("wanted", why.want)
@@ -2396,6 +2429,14 @@ fn build_cluster_cache(
             // inert rather than fed guesses.
             cached_images: HashSet::new(),
         });
+        cache.record_job_reservations(
+            &member.node_id,
+            Resources::new(
+                report.job_reservations.cpu_millicores,
+                report.job_reservations.memory_bytes,
+                0,
+            ),
+        );
         for instance in &report.running_apps {
             cache.record_reported_instance(
                 &member.node_id,
@@ -2967,8 +3008,13 @@ fn spawn_placement_reconciler_with_io_timeout(
                 }
                 publish_converged(&cmd_tx, &applied);
                 if let Err(error) = outcome {
-                    let deferral =
-                        backoff.record_failure(&key, &fingerprint, std::time::Instant::now());
+                    let now = std::time::Instant::now();
+                    let deferral = match error {
+                        DeployWaitError::CapacityRefused { kind, .. } => {
+                            backoff.record_capacity_refusal(&key, &fingerprint, now, kind)
+                        }
+                        _ => backoff.record_failure(&key, &fingerprint, now),
+                    };
                     eprintln!(
                         "orchestrator: deploy of {}/{} failed (attempt {}), retrying in {}s: {error}",
                         key.0,
@@ -3330,6 +3376,14 @@ enum DeployWaitError {
     /// The agent reported the deploy failed, with its reason.
     #[error("{0}")]
     Failed(String),
+    /// The node had no room for the app, with the agent's reason, and
+    /// whether its job work is making room. Retried sooner than other
+    /// failures (#1967).
+    #[error("{message}")]
+    CapacityRefused {
+        kind: crate::bun::execution_budget::CapacityRefusalKind,
+        message: String,
+    },
     /// The agent dropped the event stream without a terminal event.
     #[error("the agent closed the deploy's event stream without an outcome")]
     Closed,
@@ -3343,6 +3397,17 @@ enum DeployWaitError {
     /// `rolled_back` when every instance runs the previous version again.
     #[error("{reason}")]
     RolloutAborted { rolled_back: bool, reason: String },
+}
+
+/// The kind of capacity refusal a deploy stream's error status names, if
+/// it names one.
+fn capacity_refusal_kind(status: u16) -> Option<crate::bun::execution_budget::CapacityRefusalKind> {
+    use crate::bun::execution_budget::CapacityRefusalKind;
+    match status {
+        crate::bun::CAPACITY_YIELDING_STATUS => Some(CapacityRefusalKind::Yielding),
+        crate::bun::CAPACITY_FULL_STATUS => Some(CapacityRefusalKind::Full),
+        _ => None,
+    }
 }
 
 /// Drain a deploy's event stream until it reaches `Complete` within `timeout`.
@@ -3374,13 +3439,25 @@ async fn deploy_outcome(
                 // The abort says what happened to the instances; the first
                 // error says why. The leader's mark needs both (#1111).
                 let reason = match failure {
-                    Some(DeployWaitError::Failed(cause)) => format!("{cause}; {reason}"),
+                    Some(
+                        DeployWaitError::Failed(cause)
+                        | DeployWaitError::CapacityRefused { message: cause, .. },
+                    ) => {
+                        format!("{cause}; {reason}")
+                    }
                     _ => reason,
                 };
                 failure = Some(DeployWaitError::RolloutAborted {
                     rolled_back,
                     reason,
                 });
+            }
+            ApplyEvent::Error {
+                message,
+                status: Some(status),
+            } if failure.is_none() && capacity_refusal_kind(status).is_some() => {
+                failure = capacity_refusal_kind(status)
+                    .map(|kind| DeployWaitError::CapacityRefused { kind, message });
             }
             ApplyEvent::Error { message, .. } if failure.is_none() => {
                 failure = Some(DeployWaitError::Failed(message));
@@ -5256,6 +5333,41 @@ image = "busybox:latest"
                 .to_string()
                 .contains("container's cgroup is not empty")
         );
+    }
+
+    /// #1967: a node's refusal for lack of room is told apart from other
+    /// failures, and a yielding one from a full one, so the reconciler
+    /// retries each at its own pace.
+    #[tokio::test]
+    async fn deploy_outcome_tells_capacity_refusals_apart() {
+        use crate::bun::execution_budget::CapacityRefusalKind;
+        for (status, kind) in [
+            (
+                crate::bun::CAPACITY_YIELDING_STATUS,
+                CapacityRefusalKind::Yielding,
+            ),
+            (crate::bun::CAPACITY_FULL_STATUS, CapacityRefusalKind::Full),
+        ] {
+            let (tx, rx) = mpsc::channel(4);
+            let message =
+                "node capacity cannot admit cpu=100m mem=32Mi; available cpu=900m mem=14Mi";
+            tx.send(ApplyEvent::Error {
+                status: Some(status),
+                message: message.to_string(),
+            })
+            .await
+            .unwrap();
+            drop(tx);
+            let error = deploy_outcome(rx, Duration::from_secs(5))
+                .await
+                .expect_err("a refusal must fail the deploy");
+            assert!(
+                matches!(&error, DeployWaitError::CapacityRefused { kind: got, message: reason }
+                    if *got == kind && reason == message),
+                "{error:?}"
+            );
+            assert_eq!(error.to_string(), message);
+        }
     }
 
     /// #692: a rollout's abort follows the error that caused it, and it's
@@ -7172,6 +7284,127 @@ image = "busybox:latest"
 
         assert_eq!(decisions.len(), 1, "{decisions:?}");
         assert_eq!(nodes_of(&decisions[0]), ["idle"]);
+    }
+
+    /// Reports where job work fills both `full` and `idle`.
+    fn job_filled_reports() -> (Vec<MembershipSnapshot>, AggregatedState) {
+        let (members, mut reports) = job_filled_and_idle_reports();
+        let idle = reports.reports.get_mut(&NodeId::new("idle")).unwrap();
+        idle.job_reservations = crate::reporting::types::JobReservations {
+            cpu_millicores: 4000,
+            memory_bytes: 1 << 30,
+        };
+        (members, reports)
+    }
+
+    fn both_alive() -> PassMembers {
+        PassMembers {
+            alive: HashSet::from([NodeId::new("full"), NodeId::new("idle")]),
+            ..PassMembers::default()
+        }
+    }
+
+    /// #1967: the 0.3.0 rehearsal's job campaign filled every node with
+    /// executors, and the leader left `redis` unplaced ("no node that can
+    /// run it has room") for the whole settle window. With no free room
+    /// anywhere, the yield pass places the app on room job work holds, and
+    /// only up to what that frees.
+    #[test]
+    fn with_every_node_full_of_jobs_an_app_is_placed_where_jobs_yield() {
+        let (members, reports) = job_filled_reports();
+        let mut cache = build_cluster_cache(&members, &reports);
+        let mut desired = DesiredState::default();
+        let app = AppId::new("redis", "default");
+        // Three replicas of 3000m: two nodes of 4000m fit only two.
+        desired.apps.insert(app.clone(), app_spec(3000, 3));
+
+        let plan = plan_pass(
+            &mut cache,
+            &desired,
+            &both_alive(),
+            &mut QuotaLedger::default(),
+            false,
+        );
+
+        assert_eq!(plan.decisions.len(), 1, "{:?}", plan.decisions);
+        let mut nodes = nodes_of(&plan.decisions[0]);
+        nodes.sort();
+        assert_eq!(nodes, ["full", "idle"]);
+        assert_eq!(plan.unschedulable[&app].placed, 2);
+        let details = plan.provenance[&app].clone().into_details();
+        assert_eq!(details["rule"], "placement.jobs_yield_to_apps");
+        assert_eq!(details["yielded"], "2");
+        assert_eq!(
+            cache
+                .get_node(&NodeId::new("full"))
+                .unwrap()
+                .allocated
+                .cpu_millicores,
+            7000,
+            "job work's reservations count as allocated again after the pass"
+        );
+    }
+
+    /// Room apps hold doesn't yield: a node full of apps is still no room.
+    #[test]
+    fn a_node_full_of_apps_is_still_no_room() {
+        let (members, mut reports) = job_filled_and_idle_reports();
+        for node in ["full", "idle"] {
+            let report = reports.reports.get_mut(&NodeId::new(node)).unwrap();
+            report.job_reservations = Default::default();
+            report.resource_usage.cpu_used_millicores = 4000;
+        }
+        let mut cache = build_cluster_cache(&members, &reports);
+        let mut desired = DesiredState::default();
+        let app = AppId::new("redis", "default");
+        desired.apps.insert(app.clone(), app_spec(1000, 1));
+
+        let plan = plan_pass(
+            &mut cache,
+            &desired,
+            &both_alive(),
+            &mut QuotaLedger::default(),
+            false,
+        );
+
+        assert!(plan.decisions.is_empty(), "{:?}", plan.decisions);
+        assert_eq!(
+            plan.unschedulable[&app].reason,
+            crate::meat::types::UnplacedReason::NoRoom
+        );
+    }
+
+    /// A node that refused the app outright (its claim lapsed, or apps hold
+    /// its room) has nothing to yield, so the yield pass looks elsewhere.
+    #[test]
+    fn a_node_that_refused_the_app_sits_out_the_yield_pass() {
+        let (members, mut reports) = job_filled_reports();
+        reports
+            .reports
+            .get_mut(&NodeId::new("full"))
+            .unwrap()
+            .capacity_refusals
+            .push(refused("redis", &[0]));
+        let mut desired = DesiredState::default();
+        let app = AppId::new("redis", "default");
+        desired.apps.insert(app.clone(), app_spec(1000, 1));
+        desired.scheduling.insert(app.clone(), placed_on(&["full"]));
+        let mut cache = build_cluster_cache(&members, &reports);
+
+        let plan = plan_pass(
+            &mut cache,
+            &desired,
+            &both_alive(),
+            &mut QuotaLedger::default(),
+            false,
+        );
+
+        assert_eq!(plan.decisions.len(), 1, "{:?}", plan.decisions);
+        assert_eq!(nodes_of(&plan.decisions[0]), ["idle"]);
+        assert!(
+            cache.get_node(&NodeId::new("full")).unwrap().ready,
+            "the node sat out one pass, not for good"
+        );
     }
 
     /// A placement the node refuses for lack of capacity moves: holding it

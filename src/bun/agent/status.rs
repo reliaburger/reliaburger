@@ -24,6 +24,10 @@ pub struct CurrentResourceStatus {
     /// Complete effective desired-spec evidence; absence means unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
+    /// The controller that owns this app (#1125), which an apply that
+    /// doesn't declare it skips. Absent for anything nobody owns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 /// Status of a single workload instance.

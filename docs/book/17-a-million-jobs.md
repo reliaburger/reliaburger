@@ -199,7 +199,7 @@ What we didn't do is as telling. No per-task Raft entries, obviously. No bitmap 
 
 ### Packing profiles and querying outcomes
 
-A shared `ExecutionBudget` accounts for app commitments and actual running attempts in CPU and memory. App creation, rolling replacements and adoption use the same ledger as batch work. Recovery restores ownership even if the node's capacity has shrunk; it stops new admission rather than erasing a surviving app. Waiting batch attempts enter a FIFO resource queue. This prevents continual overtaking by smaller requests, but can leave free capacity idle behind a large request. There is no tenant DRF or app pre-emption; new deployments still need rollout headroom.
+A shared `ExecutionBudget` accounts for app commitments and actual running attempts in CPU and memory. App creation, rolling replacements and adoption use the same ledger as batch work. Recovery restores ownership even if the node's capacity has shrunk; it stops new admission rather than erasing a surviving app. Waiting batch attempts enter a FIFO resource queue. This prevents continual overtaking by smaller requests, but can leave free capacity idle behind a large request. There is no tenant DRF or app pre-emption; new deployments still need rollout headroom. (Since 0.3.3 an app a node refuses does make job work yield its room at the next task boundary; "Apps first", later in this chapter, tells that story.)
 
 A manifest groups up to sixteen homogeneous resource profiles. Stable parent/profile/index identities avoid serialising a million specs. Workers reserve each attempt, not its queued chunk, release requests during retry backoff, and reuse a bounded pool of owned runtime identities per namespace. Each image attempt has a fresh runtime generation, a read-only root and temporary scratch space. Cached images reduce transfer and unpacking cost; runc still launches a container per attempt, so startup cost remains part of the throughput budget.
 
@@ -5277,6 +5277,231 @@ refusal stood with nowhere to go. That was the 0.2.0 scheduler. In 0.2.1 the
 leader already records why an app is short in council state and logs only
 when that changes (#702), and a test now checks that a standing refusal is
 news once.
+
+### Apps first
+
+The 0.3.0 rehearsal found the case all of that still missed (#1967). Its jobs
+soak runs a batch campaign beside a handful of apps and breaks things on a
+schedule. After the quorum-loss step, every node's budget was full: the
+campaign's executors held 1,424 to 1,432 MiB of the 1,438 MiB each node had to
+give. For the whole ten-minute settle window, `redis` ran zero of its one
+replica and `frontend` two of its three. The leader logged "no node that can
+run it has room", and the node that did get `frontend`'s third replica said
+`node capacity cannot admit cpu=100m mem=32Mi; available ... mem=14Mi`. It
+cleared only when the next fault killed a Bun, and its executors with it.
+
+Each piece was doing what we'd built it to do, again. Look at who could ask
+the budget for room. A task attempt or an executor that doesn't fit calls
+`acquire`, which joins a FIFO queue and waits. An idle executor (a warm
+container kept for the next command, which retires after a second unused)
+gives its room back early when `has_waiters` says someone is queued. An app
+replica calls `try_acquire`, which answers at once and never queues, for the
+reason we gave above: an app waiting behind attempts is the same outage,
+slower. So an app could never be a waiter. And during a campaign the
+executors never sit idle for a second: one command ends and the next is
+already waiting for that executor. Whenever room did come free, the next
+queued attempt took it.
+
+The leader made it worse in two ways. Since #681 it counts what job work holds
+as allocated, which is right while some other node has free room, and leaves
+an app unplaced when none does. That's `redis`. And when a node refused a
+replica, its placement reconciler backed off like any failed deploy: 5 s,
+10 s, 20 s, and on up to five minutes. The soak saw 160 s between tries.
+
+What do the others do? Kubernetes, Nomad and Slurm all pre-empt: they evict or
+kill lower-priority work to make room, and Kubernetes notes that the freed
+room can still go to someone else in the gap. Our FIFO was exactly that gap.
+We wrote the options up in a plan before touching any code
+(`docs/plans/2026-11-16-plan-app-memory-priority.md`), and the maintainer
+settled three questions in it: apps come first on every cluster, with no
+setting; a node waits a minute for its jobs to make room; and the leader picks
+the node with the most room after apps. The fix has three parts, and none of
+them stops a running task.
+
+**A refusal leaves a claim.** When `try_acquire_app` refuses an app, the
+supervisor asks the budget what kind of refusal it is:
+
+```rust
+pub enum CapacityRefusalKind {
+    Yielding,
+    Full,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Claim {
+    resources: Resources,
+    deadline: Instant,
+}
+```
+
+`claim_for_app` takes the app's whole share on the node (every replica is
+admitted at once, so a claim for one would just be refused again), and checks
+it against the capacity left after other apps' leases and other apps' claims.
+If it fits there, job work leaving would make room, so the app gets a `Claim`
+and the refusal is `Yielding`. If it doesn't, nothing job work does will help,
+and the refusal is `Full`. The budget keeps claims in a `HashMap<AppId, Claim>`
+and the kind travels in `BunError::Capacity` to the agent and the reconciler.
+
+While a claim is live, two rules change. `has_waiters` says yes when the free
+room doesn't cover the claims, so idle executors retire, a busy one retires
+when its command ends instead of going back to the warm pool, and the pool
+hands out no warm executors. And job admission, both `acquire` and the
+executor's immediate path, measures against what's free *after* the claims:
+
+```rust
+fn available_to(&mut self, now: Instant, except: Option<&AppId>) -> Resources {
+    let claimed = self.claimed(now, except);
+    self.capacity
+        .saturating_sub(&self.used)
+        .saturating_sub(&claimed)
+}
+```
+
+`except` is how an app gets its own claim: `try_acquire_app` passes the app,
+so it sees the room it claimed, while job work (and every other app) passes
+`None` or itself and sees that room as taken. When an attempt finishes now,
+the next queued one doesn't take its place if the app needs that room. The
+node's offers to the grant loop use the same figure, so the leader stops
+granting chunks into it too. And `has_waiters` compares the claims with the
+free room, not with zero: once enough is free, the remaining executors stay
+warm.
+
+A yielding refusal isn't reported to the leader. That's the important one:
+since #967, a reported refusal makes the leader move the replica, and here it
+would move it away from room being freed for it. So `note_admission` records
+only `Full` refusals, and an admission drops the claim. So does the app
+leaving the node, through `withdraw_app_claim`.
+
+**Claims run out.** A claim lasts `CLAIM_PATIENCE`, 60 s from the *first*
+refusal; a second refusal updates the share but keeps the deadline. A quarantined
+attempt stuck in the kernel never gives its room back, and an app the leader
+has moved elsewhere never retries here, so something has to end the wait.
+`claimed` drops lapsed claims as it sums the rest with `fold`, and puts their
+apps on a five-minute `CLAIM_COOLDOWN`: their next refusal on this node is
+`Full`, reported, and the leader moves them on. Without the cooldown, an app
+whose room never comes back would hold a rolling minute's claim for ever.
+
+Our first version had exactly that hole, and review caught it. Leaving the
+node called the same `release_app_claim` as admission, which forgot the
+cooldown along with the claim. But a full refusal *makes* the app leave: the
+leader moves it, and the node retires it. So the cooldown was gone seconds
+after it started, and the yield pass could put the replica straight back with
+a fresh 60 s claim. Now there are two calls. `release_app_claim`, on
+admission, forgets both; `withdraw_app_claim`, on leaving, drops only the
+claim, and turns a lapsed claim into its cooldown first, in case nothing has
+read the ledger since it ran out. The test,
+`leaving_the_node_keeps_a_lapsed_claims_cooldown`, lets a claim lapse,
+withdraws the app, and checks that it gets `Full` until the cooldown has
+passed.
+
+A lapsing claim isn't a release, though, so nothing notifies the attempts
+waiting behind it. The wait in `acquire` gets a third branch that sleeps until
+the next claim lapses:
+
+```rust
+let lapsed = async {
+    match lapse {
+        Some(until) => tokio::time::sleep_until(until).await,
+        None => std::future::pending::<()>().await,
+    }
+};
+tokio::select! { biased; () = cancel.cancelled() => return None, () = changed => {}, () = lapsed => {} }
+```
+
+`std::future::pending` is a future that never finishes, the async version of
+"wait for ever", and `::<()>` (the turbofish again) says what it would have
+returned, since nothing else tells the compiler. With no claim, that branch
+can never win, and `select!` behaves exactly as before. The deadline is a
+`tokio::time::Instant` rather than a `std::time::Instant`, because tokio's
+clock is the one a test can pause.
+
+**The leader gets a yield pass.** In `plan_pass`, after the scheduler places
+what it can, a replica left over for `NoRoom` gets a second try with job
+reservations counted as free:
+
+```rust
+let credited = scheduler.cluster.credit_job_reservations();
+if !credited.is_empty() {
+    let refusing = scheduler.cluster.sit_out_refusing_nodes(app_id);
+    let mut rest = effective_spec.clone();
+    rest.replicas = Replicas::Fixed(short.missing);
+    let more = scheduler.place_app(app_id, &rest);
+    scheduler.cluster.restore_readiness(refusing);
+    // ... merge `more` into this app's placements
+}
+scheduler.cluster.restore_job_reservations(credited);
+```
+
+The cache keeps each node's job reservations beside its `allocated` total.
+`credit_job_reservations` takes them off and returns exactly what it took, and
+`restore_job_reservations` puts that back, so the next app in the same pass
+sees each node as full as it really is, plus this app. With job work counted
+as free, the usual scoring picks the node with the most room after apps,
+which is the maintainer's second answer. A node that refused this app outright
+sits the pass out: its claim lapsed or apps hold its room, so it has nothing
+to give. Free room still wins: with an idle node in the cluster, the first
+pass places the replica there and the second never runs, which is the #681
+behaviour unchanged. The decision records its own rule,
+`placement.jobs_yield_to_apps`, so `relish agent explain` can say why a
+replica landed on a busy node.
+
+**The retry comes sooner.** A refused deploy's `Error` event carries a status,
+in the field #2157 added so a stream's failure can say what kind it is: 503
+for a yielding refusal, 507 for a full one. The reconciler's `deploy_outcome`
+turns them into `DeployWaitError::CapacityRefused` with the kind, and
+`DeployBackoff::record_capacity_refusal` retries a yielding one every 5 s
+(the claim's patience bounds how long) and backs a full one off to at most
+30 s. Every other failure still backs off to five minutes: a broken image
+doesn't get better by being redeployed more often.
+
+What didn't we do? We didn't make apps queue in the budget. App admission runs
+on the agent's loop, which must never wait, and the reconciler awaits each
+deploy before the next, so one app waiting for memory would hold up every
+other app's deploy on that node. We didn't stop running attempts either.
+Pre-emption needs priorities, a grace time and a requeue that doesn't count
+against `max_retries`, and it belongs with the priority work. "Yield at the
+next boundary" gets the room back within one task's length without throwing
+anyone's work away; a task that runs for hours still holds its room for hours,
+and then the claim lapses and the leader looks elsewhere. And we didn't make
+the leader ignore job reservations: that would put a replica on a node full of
+long attempts while another sat idle, which is #681 all over again.
+
+The tests follow the layers, and the plan listed them before the code. In
+`execution_budget.rs`,
+`a_released_job_lease_goes_to_the_claiming_app_not_the_queued_attempt` is the
+soak's failure in miniature: an attempt waits in `acquire`, a job lease drops,
+and the attempt stays queued while the app's retry gets the room.
+`jobs_yield_only_while_claims_exceed_free_memory` checks that executors stop
+retiring once a claim is covered.
+`a_claim_lapses_after_its_patience_and_wakes_job_waiters`,
+`a_lapsed_claim_puts_its_app_on_cooldown` and
+`a_second_refusal_of_the_same_app_replaces_its_claim_and_keeps_the_deadline`
+run on tokio's paused clock (`start_paused`), where `tokio::time::advance`
+moves time forward a minute without waiting one. They poll the waiting future
+by hand rather than `tokio::spawn` it: with the clock paused, time can jump
+past a deadline before a spawned task has even run, and the test would be
+checking a race instead of the budget. A proptest throws random sequences of app
+admissions, refusals, job leases and releases at the budget and checks after
+every step that no job admission lands in claimed room and that claims never
+exceed what apps leave. On Linux the executor pool's
+`a_node_offers_job_work_none_of_the_room_an_app_claims` checks the offers.
+On the agent, `a_yielding_refusal_claims_room_and_is_not_reported_to_the_leader`
+deploys a two-replica app onto a budget an attempt fills and checks the 503,
+the claim for both replicas, an empty refusal report and the claim's release
+on admission; the older `capacity_refusal_and_job_reservations_reach_the_state_snapshot`
+now has another app hold half the node, so its refusal is a full one and
+still reported. On the leader,
+`with_every_node_full_of_jobs_an_app_is_placed_where_jobs_yield`,
+`a_node_full_of_apps_is_still_no_room` and
+`a_node_that_refused_the_app_sits_out_the_yield_pass` cover the yield pass,
+and `deploy_outcome_tells_capacity_refusals_apart` and the three backoff tests
+cover the reconciler. In the gated cluster suite,
+`app_is_placed_while_job_work_fills_every_node` starts three nodes, fills all
+of them with a campaign's attempts and places an app. Before the fix it
+waited in "no node that can run it has room" until the test gave up. It stops
+at placement: the cluster harness runs apps on the process runtime, which
+can't enforce resource limits and so refuses an app with requests before it
+gets to the budget. The agent test is where admission is proven.
 
 ### Retiring the batch engine from Chapter 12
 
