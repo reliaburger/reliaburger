@@ -146,6 +146,48 @@ The second gap was the attempt count. A drained task that had failed once was re
 
 `a_draining_pool_retries_nothing_and_leaves_the_task_not_run` in `src/bun/task_executor.rs` fails a task's first attempt and fires the token inside it. The task must end not run after one attempt. Without the token it failed after three. `a_draining_pool_launches_no_task_that_had_not_started` and `draining_lets_a_running_attempt_finish` check the other two edges. `a_stopping_node_retries_nothing_and_its_restart_runs_the_task` in `src/bun/task_array_node.rs` goes through the node: the drained chunk isn't reported, and a node restarted on the same directory runs the task and succeeds. `a_drained_chunk_of_a_default_job_restarts_without_a_replay` does the same with `replay_unknown = false`. `a_drained_task_keeps_its_attempts_across_the_restart` and `a_resumed_not_run_record_continues_the_tasks_attempt_count` check the attempt count, and `a_drained_chunk_counts_no_durations_until_it_is_reported` checks the durations. The soak harness got a fix as well: its verifier's systemd unit now starts `Before=reliaburger.service`, and systemd stops units in the reverse order, so the verifier outlives Bun.
 
+#### One slow answer isn't an unknown outcome
+
+An attempt in a fresh container finds out it has finished by asking. `OwnedRunner::run` calls `has_exited` every 10 ms, and on runc that's a `runc state` through the instance's process owner. The owner has 2 s to answer (`OWNER_REQUEST_TIMEOUT` in `src/grill/process_control.rs`). With 16 CPU spinners and two fsync writers on the same VM, it sometimes didn't make it, and the poll came back `StateUnavailable` with "process owner request timed out" ([#2288](https://github.com/reliaburger/reliaburger/issues/2288)).
+
+The loop used `?` on that answer. `?` is Rust's early return: on an `Err` it leaves the enclosing function, or here the enclosing `async` block, with the error. So one late answer ended the observation, and the attempt became `Unknown`. For a job with the default `replay_unknown = false` that's as bad as an attempt gets: the run stops until an operator acknowledges a replay, and a critical "unknown outcome" event fires. All because one `runc state` took a bit over 2 s. The stop path had the same cliff, and [#2251](https://github.com/reliaburger/reliaburger/pull/2251) made it ask again within the stop's grace ([#1902](https://github.com/reliaburger/reliaburger/issues/1902)). This is the exit poll's turn.
+
+`StateUnavailable` already means "the runtime can't say yet". `observe_runtime_exit`, which a stop uses, asks again when it gets one ([#1898](https://github.com/reliaburger/reliaburger/issues/1898)). So the runtime needed no change, only the poll loop, which now matches on the answer instead of using `?`:
+
+```rust
+let read = match self.runtime.has_exited(&id).await {
+    Ok(true) => self.runtime.exit_code(&id).await.map(Some),
+    Ok(false) => Ok(None),
+    Err(error) => Err(error),
+};
+let pause = match read {
+    Ok(Some(status)) => return Ok(status),
+    Ok(None) => {
+        unanswered.answered();
+        Duration::from_millis(10)
+    }
+    Err(error @ crate::grill::GrillError::StateUnavailable { .. }) => {
+        unanswered.missed(&error)?;
+        Duration::from_millis(100)
+    }
+    Err(error) => return Err(error.to_string()),
+};
+```
+
+`error @ GrillError::StateUnavailable { .. }` is a *binding pattern*: the arm matches only that variant, and `error` binds the whole value so the arm can still use it. `{ .. }` ignores the fields. The exit code read goes through the same match, because a runtime that has said the workload exited can still miss the next question, what it exited with. Any other error, such as `NotFound`, still ends the attempt at once: that's an answer, and a bad one.
+
+Asking again can't go on for ever. A runtime that has really lost the instance would hold the attempt, and its slot, until the job's own timeout, and a job may not have one. `UnansweredPolls` counts the misses in a row and remembers when the first one came back, and any answer resets both. The attempt becomes `Unknown` once the polls have gone unanswered for `EXIT_POLL_PATIENCE`, 60 s, and at least `EXIT_POLL_MIN_MISSES`, three, have missed. The longest owner stall we've seen was 27 s, in #1902, so 60 s is twice that with room to spare. The minimum count means one read that hangs for a minute can't do it alone. After a miss the loop waits 100 ms instead of 10 ms, so a struggling owner isn't asked a hundred times a second. The outcome's reason, which the event carries, says what happened:
+
+```text
+no exit poll answered for 60.4s (31 in a row); last: container ... state unavailable: process owner request timed out
+```
+
+The price is that a runtime that really has lost track takes a minute to say so, where it used to take 2 s. We'll take that: the old way turned healthy runs on a busy host into replays.
+
+The init container wait in `deploy_worker.rs` has the same `?` on its state and exit code reads, so one late answer fails a deploy. We left it alone for now. A test there injects an initialiser the runtime never answers about and expects the deploy to fail promptly, so asking again changes what a lost init costs a deploy, from one read to the init's whole 300 s bound. That's a decision of its own, not a copy of this one.
+
+Three tests in `src/bun/task_runtime.rs` use `MockGrill::set_state_unavailable_times`, which answers the next *n* state reads with `StateUnavailable`. `an_exit_poll_the_runtime_did_not_answer_is_asked_again` misses four polls and then lets the workload exit with code 3. The attempt must end `Exited { code: 3 }`; before the fix it ended `Unknown`. `an_exit_code_read_the_runtime_did_not_answer_is_asked_again` does the same for the exit code read. `exit_polls_unanswered_past_the_patience_end_the_attempt_unknown` cuts the patience to 200 ms and misses ten polls in a row: the attempt must end `Unknown`, with a reason that says for how long and why.
+
 ### Putting it together, in one process
 
 The acceptance test in the portable suite wires three simulated nodes (each a real pool with a fake runner and a real ledger on disk) to the real leader state and grant policy. One task in a hundred fails its first attempt and succeeds on retry. A third of the way through, node n3 is lost: its chunks go back to the queue at the next attempt, and its late reports are refused by the fence. At the end every index has exactly one accepted outcome, exactly one retry is counted per failing index, and the three ledgers between them hold a terminal record for all of them. The suite runs 100,000 tasks, which takes about three seconds in a debug build. With the full million it took 30.6 seconds on the laptop, about 32,700 tasks a second, and the leader changed its state in 422 ticks. Real processes will be far slower than a fake; the Criterion suite (`make bench-task-arrays`) measures the machine's fork/exec floor through the real runner, so we'll know by how much before promising anyone a number.

@@ -37,6 +37,10 @@ Not released yet: this is what the train carries, and it can change before the t
 
 - A quickstart VM no longer upgrades itself or restarts Bun without warning. Ubuntu's `apt-daily` timers and unattended-upgrades are masked in the guest image and at first boot, which covers stock and older guest images too, and needrestart, where installed, only lists what it would restart. An automatic libc upgrade had restarted Bun mid-run. Security updates arrive with releases, in each release's guest image ([#2274](https://github.com/reliaburger/reliaburger/issues/2274)).
 
+### Fixed
+
+- A batch attempt no longer becomes Unknown, needing a replay, when one exit check misses the process owner's 2 s request timeout on a loaded node. The check asks again, and the attempt becomes Unknown only after 60 s of unanswered checks, with that in the reason. ([#2288](https://github.com/reliaburger/reliaburger/issues/2288)).
+
 ## [0.3.2] - 2026-11-23
 
 Fixes from the Wyse 3040 lab that need a new appliance image. [Release page](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.2), [release log](docs/release-log.md#032-wyse-lab-fixes).
