@@ -163,6 +163,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             drains: self.drains.clone(),
             operation: Some(operation),
             stop_confirmation_timeout: self.stop_confirmation_timeout,
+            init_answer_patience: self.init_answer_patience,
             egress: self.egress_resolver(),
             secrets: self.secret_providers.clone(),
         };

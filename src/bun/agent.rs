@@ -146,6 +146,15 @@ use trace::backend_addresses;
 /// init wait so a hung init can't wedge the agent event loop indefinitely.
 const INIT_TIMEOUT_SECS: u64 = 300;
 
+/// How long an init container's wait keeps asking a runtime that doesn't
+/// answer its state or exit code reads before it fails the deploy (#2293).
+/// A process owner under load misses a 2 s request timeout now and then and
+/// answers the next one: that is slow. One that hasn't answered for 15 s,
+/// seven of its own timeouts in a row, has lost the init. A failed deploy
+/// says why and can be applied again, so this is far shorter than the 60 s a
+/// batch attempt's exit poll waits, where giving up means an unknown outcome.
+const INIT_ANSWER_PATIENCE: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Most bytes of an init container's captured stderr carried into its failure.
 /// Runc prints why it refused to start (an occupied cgroup, a missing binary)
 /// in its last line or two, so a short tail says why without flooding logs.
@@ -1009,6 +1018,9 @@ pub struct BunAgent<G: Grill> {
     /// Per-step deadline for the runtime to confirm a stop or force-kill
     /// (`[runtime] stop_confirmation_timeout_secs`).
     stop_confirmation_timeout: std::time::Duration,
+    /// How long an init container's wait asks a runtime that doesn't answer
+    /// again before it fails the deploy ([`INIT_ANSWER_PATIENCE`]).
+    init_answer_patience: std::time::Duration,
     /// The `[secret_providers.*]` this node runs for `PROVIDER[...]` env
     /// values, resolved off the loop just before a launch (#1123).
     secret_providers: crate::sesame::secret_provider::SecretProviders,
@@ -1152,6 +1164,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             node_leaf_lifetime: crate::sesame::ca::NODE_LEAF_LIFETIME,
             stop_confirmation_timeout: crate::config::node::RuntimeSection::default()
                 .stop_confirmation_timeout(),
+            init_answer_patience: INIT_ANSWER_PATIENCE,
             secret_providers: Default::default(),
             node_fault_fence: crate::smoker::reservation::NodeFaultFence::default(),
             node_drain_gate: crate::smoker::node_fault::NodeDrainGate::new(),
@@ -1314,6 +1327,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             node_leaf_lifetime: crate::sesame::ca::NODE_LEAF_LIFETIME,
             stop_confirmation_timeout: crate::config::node::RuntimeSection::default()
                 .stop_confirmation_timeout(),
+            init_answer_patience: INIT_ANSWER_PATIENCE,
             secret_providers: Default::default(),
             node_fault_fence: crate::smoker::reservation::NodeFaultFence::default(),
             node_drain_gate: crate::smoker::node_fault::NodeDrainGate::new(),
@@ -1605,6 +1619,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// step of a stop or force-kill may wait for the runtime to confirm it.
     pub fn set_stop_confirmation_timeout(&mut self, timeout: std::time::Duration) {
         self.stop_confirmation_timeout = timeout;
+    }
+
+    /// Shorten how long an init container's wait asks a silent runtime
+    /// again, so a test of a lost init doesn't wait the full patience.
+    #[cfg(test)]
+    pub(crate) fn set_init_answer_patience(&mut self, patience: std::time::Duration) {
+        self.init_answer_patience = patience;
     }
 
     /// Configure the opt-in node-pressure helper and clean owned crash

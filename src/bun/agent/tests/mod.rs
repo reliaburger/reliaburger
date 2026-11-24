@@ -1742,6 +1742,7 @@ async fn a_batch_of_retirements_waits_out_the_patience_once() {
         drains: agent.drains.clone(),
         operation: None,
         stop_confirmation_timeout: agent.stop_confirmation_timeout,
+        init_answer_patience: agent.init_answer_patience,
         egress: agent.egress_resolver(),
         secrets: agent.secret_providers.clone(),
     };
@@ -1800,6 +1801,7 @@ async fn a_failed_retirement_in_a_batch_leaves_the_others_retired() {
         drains: agent.drains.clone(),
         operation: None,
         stop_confirmation_timeout: agent.stop_confirmation_timeout,
+        init_answer_patience: agent.init_answer_patience,
         egress: agent.egress_resolver(),
         secrets: agent.secret_providers.clone(),
     };
@@ -3205,6 +3207,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             drains: self.drains.clone(),
             operation: None,
             stop_confirmation_timeout: self.stop_confirmation_timeout,
+            init_answer_patience: self.init_answer_patience,
             egress: self.egress_resolver(),
             secrets: self.secret_providers.clone(),
         };
@@ -9425,6 +9428,90 @@ async fn failing_init_container_reports_the_runtimes_stderr() {
         message.len() < 1_024,
         "the stderr tail is unbounded ({} bytes)",
         message.len()
+    );
+}
+
+/// #2293: a process owner that misses one state read (its 2 s request
+/// timeout under load) is slow, not lost. The init wait asks again, and the
+/// deploy goes on once the runtime answers.
+#[tokio::test]
+async fn an_init_state_read_the_runtime_did_not_answer_is_asked_again() {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    let init_id = InstanceId("default__web-0__init-0".to_string());
+    grill.set_state(&init_id, ContainerState::Stopped);
+    grill.set_exit_code(&init_id, Some(0));
+    grill.set_state_unavailable_times(&init_id, 1);
+    let agent_handle = tokio::spawn(async move { agent.run().await });
+
+    let events = send_deploy(&tx, config_with_init_container()).await;
+    shutdown.cancel();
+    agent_handle.await.unwrap();
+
+    let (created, _instances) = expect_complete(&events);
+    assert_eq!(created, 1);
+}
+
+/// #2293: the same for the exit code read after the init has stopped. The
+/// runtime doesn't answer it for a moment; the wait asks again and reads the
+/// init's real exit code.
+#[tokio::test]
+async fn an_init_exit_code_read_the_runtime_did_not_answer_is_asked_again() {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    let init_id = InstanceId("default__web-0__init-0".to_string());
+    grill.set_state(&init_id, ContainerState::Stopped);
+    grill.set_exit_code(&init_id, Some(0));
+    grill.set_instance_exit_code_failure(&init_id, true);
+    let agent_handle = tokio::spawn(async move { agent.run().await });
+    let answering = grill.clone();
+    let answer_id = init_id.clone();
+    let answer = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        answering.set_instance_exit_code_failure(&answer_id, false);
+    });
+
+    let events = send_deploy(&tx, config_with_init_container()).await;
+    answer.await.unwrap();
+    shutdown.cancel();
+    agent_handle.await.unwrap();
+
+    let (created, _instances) = expect_complete(&events);
+    assert_eq!(created, 1);
+}
+
+/// #2293: an init the runtime never answers about is lost, not slow. The
+/// deploy fails once the misses have lasted the patience, long before the
+/// init's own 300 s bound, and says how long nothing answered.
+#[tokio::test]
+async fn an_init_the_runtime_never_answers_about_fails_the_deploy_within_the_patience() {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    let patience = std::time::Duration::from_millis(300);
+    agent.set_init_answer_patience(patience);
+    let init_id = InstanceId("default__web-0__init-0".to_string());
+    grill.set_state_unavailable_times(&init_id, u32::MAX);
+    let agent_handle = tokio::spawn(async move { agent.run().await });
+
+    let started = std::time::Instant::now();
+    let events = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        send_deploy(&tx, config_with_init_container()),
+    )
+    .await
+    .expect("a lost init held the deploy past its patience");
+    let waited = started.elapsed();
+    shutdown.cancel();
+    agent_handle.await.unwrap();
+
+    let message = match events.last().expect("no events") {
+        ApplyEvent::Error { message, .. } => message.clone(),
+        other => panic!("a lost init didn't fail the deploy: {other:?}"),
+    };
+    assert!(
+        waited >= patience,
+        "the deploy failed on the first miss, after {waited:?}"
+    );
+    assert!(
+        message.contains("no state read answered for") && message.contains("process owner is busy"),
+        "the failure doesn't say how long nothing answered: {message}"
     );
 }
 

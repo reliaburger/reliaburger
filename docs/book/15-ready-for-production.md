@@ -5902,6 +5902,64 @@ exit code. Changing the trait's return type was the whole fix in a sense: the
 compiler then listed every call site that had been quietly treating an error
 as an answer.
 
+Propagating with `?` was right for an error that means "this went wrong",
+but `StateUnavailable` doesn't always mean that. The runc runtime asks its
+process owner for `runc state` and gives each request 2 seconds. Under heavy
+host load the owner sometimes misses that, and the next request gets an
+answer. A batch attempt's exit poll turned one such miss into an unknown
+outcome (#2288), and the init container's wait failed the whole deploy on
+one (#2293).
+
+Fixing the init wait wasn't a matter of copying the batch fix, which keeps
+asking for 60 seconds. The first try did that, and it showed a test the
+answer it expected: `uncertain_initialiser_preserves_parent_policy_until_confirmed_retirement`
+in `tests/ebpf.rs` injects an init the runtime never answers about, and
+expects the deploy to fail. With the change, it waited out the init's whole
+300-second bound. The real question was how long to wait for a runtime that
+might never answer, and the two callers answer it differently because
+giving up costs them different things. Giving up on a batch attempt makes
+its outcome unknown, and an operator has to acknowledge a replay. Giving up
+on an init fails a deploy, which says why and can simply be run again, while
+waiting holds the deploy and everyone watching it. So the init wait asks
+again for 15 seconds (`INIT_ANSWER_PATIENCE` in `src/bun/agent.rs`), seven of
+the owner's own timeouts in a row, and the batch poll keeps its 60.
+
+```rust
+match poll_initialiser(&self.grill, &init_id).await {
+    Ok(InitProgress::Running) => unanswered.answered(),
+    Ok(InitProgress::Finished(outcome)) => break outcome,
+    Err(GrillError::StateUnavailable { instance, reason }) => {
+        unanswered.missed(instance, reason, self.init_answer_patience)?
+    }
+    Err(error) => return Err(error.into()),
+}
+```
+
+`GrillError::StateUnavailable { instance, reason }` is a pattern that both
+picks the variant and takes its two fields apart, moving them into new
+variables for that arm. Any other error, such as an inspection that failed
+outright, still fails the deploy at once, as it should. `missed` counts the
+misses in a row and remembers when the first came back, and any answer
+resets both. It gives up only once the misses have lasted the patience *and*
+there have been at least three, so one read that hangs for half a minute
+can't fail an init on its own. Then it hands back the same
+`StateUnavailable` it was given, with a reason that says how long nothing
+answered: `no state read answered for 15.1s (61 in a row); last: process
+owner request timed out`. The variant matters more than the words. Retiring
+the parent and recovering after a crash both treat an initialiser they
+couldn't read as possibly still running, and keep its network policy, which
+is exactly what the eBPF test checks. The init's 300-second bound and its
+kill still apply on top.
+
+The eBPF test didn't need changing. It never asserted how fast the deploy
+fails, only that it fails and that the policy stays put, and it now takes 15
+seconds longer. Three agent tests in `src/bun/agent/tests/mod.rs` pin the
+rest down with the mock runtime: one unanswered state read, then a stopped
+init, and the deploy completes; an exit code read the runtime doesn't answer
+for 300 ms, and the deploy completes with the real code; and an init it
+never answers about, with the patience cut to 300 ms, fails the deploy no
+sooner than the patience and well inside ten seconds.
+
 Making the exit code honest brought the rootless test back once more (#456),
 this time with a pid but `runtime_unknown: true` for fifteen seconds
 straight. The pid had escaped the lifecycle lock, but the exit code and the
