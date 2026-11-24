@@ -1,0 +1,112 @@
+{
+  "_comment": "Every lane scripts/release/qualify-v02-loops-local.sh runs on a Mac Studio: macOS natively and arm64 Linux in Lima, named by platform. The x86-64 lanes are listed with a skip reason, so loop_summary.py --combine reports them as skipped, not missing. test_loop_summary.py checks this list against v02-loop-lanes.json and the script.",
+  "lanes": [
+    {
+      "lane": "test-upgrade-cluster (macos-studio)"
+    },
+    {
+      "lane": "test-upgrade-node (macos-studio)"
+    },
+    {
+      "lane": "registry-lease-expiry (macos-studio)",
+      "tests": [
+        "reliaburger::registry_recovery::expired_registry_lease_recovers_after_bun_sigkill_and_preserves_shared_content"
+      ]
+    },
+    {
+      "lane": "registry-new-leader (macos-studio)",
+      "tests": [
+        "reliaburger::registry_recovery::new_leader_retains_registry_cleanup_until_the_killed_writer_returns"
+      ]
+    },
+    {
+      "lane": "export-lock-checkpoint (macos-studio)",
+      "tests": [
+        "reliaburger::suite::log_export::active_export_lock_refuses_another_writer_without_uploading",
+        "reliaburger::suite::log_export::export_persists_and_reloads_the_authoritative_checkpoint"
+      ]
+    },
+    {
+      "lane": "test-upgrade-cluster (linux-arm64-lima)"
+    },
+    {
+      "lane": "test-upgrade-node (linux-arm64-lima)"
+    },
+    {
+      "lane": "council_disaster_recovery (linux-arm64-lima)"
+    },
+    {
+      "lane": "cluster_failover (linux-arm64-lima)"
+    },
+    {
+      "lane": "registry-lease-expiry (linux-arm64-lima)",
+      "tests": [
+        "reliaburger::registry_recovery::expired_registry_lease_recovers_after_bun_sigkill_and_preserves_shared_content"
+      ]
+    },
+    {
+      "lane": "registry-new-leader (linux-arm64-lima)",
+      "tests": [
+        "reliaburger::registry_recovery::new_leader_retains_registry_cleanup_until_the_killed_writer_returns"
+      ]
+    },
+    {
+      "lane": "export-lock-checkpoint (linux-arm64-lima)",
+      "tests": [
+        "reliaburger::suite::log_export::active_export_lock_refuses_another_writer_without_uploading",
+        "reliaburger::suite::log_export::export_persists_and_reloads_the_authoritative_checkpoint"
+      ]
+    },
+    {
+      "lane": "test-storage-owner-death (linux-arm64-lima)",
+      "tests": [
+        "reliaburger::test_storage::lease_loop_storage_survives_owner_process_death"
+      ]
+    },
+    {
+      "lane": "test-upgrade-cluster (linux-x86-64)",
+      "skip": "the Studio has no x86-64 host; v02-loops.yml's ubuntu-latest lane runs it"
+    },
+    {
+      "lane": "test-upgrade-node (linux-x86-64)",
+      "skip": "the Studio has no x86-64 host; v02-loops.yml's ubuntu-latest lane runs it"
+    },
+    {
+      "lane": "council_disaster_recovery (linux-x86-64)",
+      "skip": "the Studio has no x86-64 host; v02-loops.yml's ubuntu-latest lane runs it"
+    },
+    {
+      "lane": "cluster_failover (linux-x86-64)",
+      "skip": "the Studio has no x86-64 host; v02-loops.yml's ubuntu-latest lane runs it"
+    },
+    {
+      "lane": "registry-lease-expiry (linux-x86-64)",
+      "tests": [
+        "reliaburger::registry_recovery::expired_registry_lease_recovers_after_bun_sigkill_and_preserves_shared_content"
+      ],
+      "skip": "the Studio has no x86-64 host; v02-loops.yml's ubuntu-latest lane runs it"
+    },
+    {
+      "lane": "registry-new-leader (linux-x86-64)",
+      "tests": [
+        "reliaburger::registry_recovery::new_leader_retains_registry_cleanup_until_the_killed_writer_returns"
+      ],
+      "skip": "the Studio has no x86-64 host; v02-loops.yml's ubuntu-latest lane runs it"
+    },
+    {
+      "lane": "export-lock-checkpoint (linux-x86-64)",
+      "tests": [
+        "reliaburger::suite::log_export::active_export_lock_refuses_another_writer_without_uploading",
+        "reliaburger::suite::log_export::export_persists_and_reloads_the_authoritative_checkpoint"
+      ],
+      "skip": "the Studio has no x86-64 host; v02-loops.yml's ubuntu-latest lane runs it"
+    },
+    {
+      "lane": "test-storage-owner-death (linux-x86-64)",
+      "tests": [
+        "reliaburger::test_storage::lease_loop_storage_survives_owner_process_death"
+      ],
+      "skip": "the Studio has no x86-64 host; v02-loops.yml's ubuntu-latest lane runs it"
+    }
+  ]
+}
