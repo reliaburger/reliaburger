@@ -1024,19 +1024,20 @@ contribution there is: the new test is right when the mutant stops being
 missed.
 
 [`mutants.yml`](../.github/workflows/mutants.yml) runs it, on Linux only and
-in its own workflow, so it's never on a pull request's critical path: the
-evidence gate doesn't wait for it, and a missed mutant doesn't turn the check
-red. Only a broken run (the unmutated tree failing its tests, say) does. It
-runs on pull requests into the branches `ci.yml` does, so a pull request into
-a release's merge train gets it as one into `main` does; the merge queue and
-the push to the train don't run it, since it was never a required check.
+in its own workflow, and never on a pull request: the evidence gate doesn't
+wait for it, and a missed mutant doesn't turn the check red. Only a broken
+run (the unmutated tree failing its tests, say) does. It used to run on every
+pull request that touched `src/`, but on 24 November 2026 that held a Linux
+runner for up to 75 minutes per train PR while the train's own CI queued
+behind it, so it moved to a nightly run.
+
+The nightly run mutates the newest release train (`release-*`), where work
+lands before `main`, or `main` when no train has work `main` doesn't.
 
 | Run | What it mutates | At most | Test budget |
 |---|---|---|---|
-| A pull request into `main` or a release's merge train (`release-*`) that touches `src/` | The lines it changes ([`--in-diff`](https://mutants.rs/in-diff.html)) | 12 mutants | 60 minutes, in a 75-minute job |
-| A pull request that changes only the mutants set-up | `src/file_lock.rs`, as a check that the job still works | 12 | the same |
-| Sundays at 04:23 UTC | What landed on `main` in the last seven days | 60 | 300 minutes, in a 330-minute job |
-| By hand (`workflow_dispatch`) | A glob of files, or the last seven days | as asked (12 by default) | 300 minutes |
+| Every night at 04:23 UTC | The lines that changed under `src/` on the newest train in the last day ([`--in-diff`](https://mutants.rs/in-diff.html)); nothing if none did | 60 mutants | 300 minutes, in a 330-minute job |
+| By hand (`workflow_dispatch`) | A glob of files, or the newest train's last day | as asked (12 by default) | 300 minutes |
 
 Each mutant rebuilds the crate, so the budget is a count and a clock. Over
 the count, the job tests one round-robin shard (`--shard 0/K --sharding
@@ -1058,9 +1059,8 @@ That run had the old budget (20 mutants, no clock) and hit the job's
 `FileLock::remove` before it did. The first local trial (the Mac Studio at a
 load average of about 40) took 194 s for its one buildable mutant and 5 s to
 test it; two others failed to compile (*unviable*) within 75 s. A pull
-request that touches `src/` therefore costs up to 75 Linux runner-minutes,
-and usually far less with a warm cache and a short diff; one that doesn't
-touch it costs nothing. The sizing is in
+request that touched `src/` cost up to 75 Linux runner-minutes, which is
+why it now runs once a night instead. The sizing is in
 [`mutants_plan.py`](../scripts/ci/mutants_plan.py) and its tests in
 [`test_mutants_plan.py`](../scripts/ci/test_mutants_plan.py).
 
@@ -1076,7 +1076,7 @@ tests and only process-level suites reach the third.
 
 There's no whole-crate run. `cargo mutants --list` finds about 27,000
 mutants, which at a few minutes each is over a thousand runner-hours. The
-weekly run covers the new code instead, which is where a missing test is most
+nightly run covers the new code instead, which is where a missing test is most
 likely and cheapest to add.
 
 **Missed mutants become issues by hand.** The job summary lists each missed
