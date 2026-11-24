@@ -476,6 +476,64 @@ async fn role_exec_does_not_hold_the_adapter_lock_while_cleanup_retires_it() {
     cleanup.finish(None).await.unwrap();
 }
 
+/// Send `signal` to every process owner under `root`.
+fn signal_owners(root: &Path, signal: &str) {
+    // The tempdir's own name, since macOS resolves `/var` to `/private/var`.
+    let name = root.file_name().unwrap().to_string_lossy();
+    let pattern = format!("__process-owner.* --directory .*/{name}/");
+    let status = std::process::Command::new("pkill")
+        .args([signal, "-f", &pattern])
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "no process owner under {}",
+        root.display()
+    );
+}
+
+/// A role exec first asks the role's owner whether the role runs, and each
+/// of those requests gets 2 s. On a host whose disk was busy, one answer
+/// came late and the exec failed with "process owner request timed out"
+/// although the role was running (#2305). A late answer from a live owner
+/// is asked again, as the waits for a command's end already do, so a
+/// stalled owner only delays the exec.
+#[tokio::test]
+async fn role_exec_waits_out_an_owner_that_misses_a_request_deadline() {
+    use reliaburger::grill::command::ClaimedCommandExecutor;
+    let root = tempfile::tempdir().unwrap();
+    let executor = ClaimedCommandExecutor::new(
+        shell(
+            fresh(root.path()).await,
+            RuntimeRole::Launcher,
+            "exec sleep 60",
+        )
+        .await,
+    );
+    signal_owners(root.path(), "-STOP");
+    let running = executor.clone();
+    let caller = tokio::spawn(async move {
+        running
+            .exec_role(
+                RuntimeRole::Launcher,
+                &["/bin/sh".into(), "-c".into(), "printf late".into()],
+            )
+            .await
+    });
+    // Longer than one owner request's deadline.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    signal_owners(root.path(), "-CONT");
+    let output = caller.await.unwrap().unwrap();
+    assert_eq!(output.output, "late");
+    executor
+        .seal(Duration::from_secs(15))
+        .await
+        .unwrap()
+        .finish(None)
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn cancelled_role_exec_cannot_complete_a_late_mutation() {
     use reliaburger::grill::command::ClaimedCommandExecutor;
@@ -496,7 +554,10 @@ async fn cancelled_role_exec_cannot_complete_a_late_mutation() {
     wait_for_exec(&ready, &mut caller).await;
     caller.abort();
     let _ = caller.await;
-    let cleanup = executor.seal(Duration::from_secs(15)).await.unwrap();
+    // Sealing retires the launcher and the cancelled exec. On a loaded host
+    // that overran 15 s (#2305); the bound is how long cleanup may take,
+    // not what the test checks.
+    let cleanup = executor.seal(Duration::from_secs(60)).await.unwrap();
     std::fs::write(root.path().join("release"), "continue").unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(!root.path().join("late-exec").exists());
