@@ -7,7 +7,9 @@ and it says ordinary process workloads already run in a private mount
 namespace. They don't. Every host workload is refused under isolation: apps,
 single jobs and task arrays. This plan decides what the isolated view is,
 where it's built, which refusals go, and which tests prove it. It's a plan,
-not code, and it ends with the questions the maintainer needs to answer.
+not code. The maintainer settled its six questions on 24 November 2026 (see
+[Decisions](#decisions)), and it's for
+[0.4.0](https://github.com/reliaburger/reliaburger/milestone/7).
 
 Line references are to `main` at
 [`b78fc184`](https://github.com/reliaburger/reliaburger/tree/b78fc18419462921c0c2461b07c5ed21ea8d2ce9)
@@ -83,9 +85,9 @@ starts `bun --runtime runc`, which is container-only, and the `node.toml` it
 writes has no `allowed_binaries`. Turning isolation off wouldn't make
 host work run there. That matters when we get to the defaults.
 
-The investigation on 24 November estimated 3–5 days. This plan agrees,
-for the view below without the optional parts. Each optional part costs
-about a day more.
+The investigation on 24 November estimated 3–5 days. This plan agrees for
+the view below, plus about a day for the bounding-set drop the maintainer
+chose (option C).
 
 ## Who this is for
 
@@ -138,8 +140,8 @@ compromised one that only uses paths):
   don't apply to them (manual 13 already says so);
 - resource abuse beyond the limits native executors enforce.
 
-That's why the plan offers a second, small step (option C below): drop a
-short list of capabilities from the bounding set before `exec`. It closes the
+That's why the plan adds a second, small step (option C, decided in Q2):
+drop a short list of capabilities from the bounding set before `exec`. It closes the
 first two escapes, because `umount` and `setns` need `CAP_SYS_ADMIN`, and
 `/proc/<pid>/root` of a process with more capabilities than you needs
 `CAP_SYS_PTRACE`
@@ -153,7 +155,7 @@ trust the binary, give the workload an image.
 
 **Whose view: the host's root minus a denylist, or an allowlisted view?**
 
-| | A. Host root, minus Bun's paths (recommended) | B. Allowlisted view |
+| | A. Host root, minus Bun's paths (decided, Q1) | B. Allowlisted view |
 |---|---|---|
 | What the workload sees | Everything on the host except a list Bun computes | Only `/usr`, `/lib`, `/etc/ssl` and similar, read-only, plus what the operator grants |
 | Who it suits | The reasons host workloads exist: they need the host | Workloads that could be containers |
@@ -194,14 +196,16 @@ so the mask stays on top. That's a claim we test, not one we trust (see
 
 Recommended: `MS_REC|MS_SLAVE` on `/`.
 
-**Private `/tmp` and `/dev/shm`.** Yes: a fresh tmpfs on `/tmp`, `/var/tmp`
-and `/dev/shm`, `nosuid,nodev`, and `noexec` on `/dev/shm`, as the container
-helper does. `/var/tmp` is in the list because systemd's `PrivateTmp=`
+**Private `/tmp` and `/dev/shm`.** Yes: a fresh tmpfs for `/tmp` and
+`/var/tmp`, and another on `/dev/shm`, `nosuid,nodev`, and `noexec` on
+`/dev/shm`, as the container helper does. `/var/tmp` is in the list because systemd's `PrivateTmp=`
 includes it and tools use it for exactly the files we're trying to keep apart.
 Each tmpfs is per launch, so it's empty at start and gone at exit. Its pages
 are charged to the memory cgroup of whoever writes them, so a workload with a
-memory limit pays for its own temp files. Sizes are a question for the
-maintainer (Q3). The container helper's 16 MiB is too small for a host app.
+memory limit pays for its own temp files. The container helper's 16 MiB is
+too small for a host app. Decided (Q3): one 256 MiB tmpfs holding two
+directories, bound at `/tmp` and `/var/tmp` so they share the cap, and
+64 MiB for `/dev/shm`. Both are constants.
 
 **Hiding paths: tmpfs over each, or bind-mask?**
 
@@ -274,11 +278,13 @@ Built by the gate, in this order, in a single-threaded process:
 1. `unshare(CLONE_NEWNS)`.
 2. `mount(NULL, "/", NULL, MS_REC | MS_SLAVE, NULL)`.
 3. `open_tree(OPEN_TREE_CLONE)` each bind-back source.
-4. tmpfs on `/tmp`, `/var/tmp` and `/dev/shm`.
+4. One 256 MiB tmpfs, its two directories bound at `/tmp` and `/var/tmp`;
+   a 64 MiB tmpfs on `/dev/shm`.
 5. A read-only mode-000 tmpfs on each hidden directory, `/dev/null` on each
    hidden file.
 6. `move_mount` each bind-back to its path; remount the read-only ones.
-7. Option C: drop the listed capabilities from the bounding set.
+7. Drop `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE`, `CAP_SYS_MODULE`, `CAP_BPF` and
+   `CAP_SYS_BOOT` from the bounding set (option C).
 8. `exec`.
 
 It runs after the gate joins the workload's cgroup, so tmpfs pages are
@@ -441,7 +447,8 @@ workload can see:
   once.
 - `a_workload_writes_to_the_host_root_outside_the_hidden_list`: read-write
   root.
-- With option C: `an_isolated_root_workload_cannot_unmount_a_mask_or_setns`.
+- `an_isolated_root_workload_cannot_unmount_a_mask_or_setns` (option C).
+- `a_workloads_tmp_and_var_tmp_share_one_256_mib_cap`.
 
 The cluster suites (`tests/cluster_task_arrays.rs`,
 `tests/owned_task_arrays.rs`) set `mount_isolation: false` in about a dozen
@@ -502,11 +509,13 @@ In the same change, as `CLAUDE.md` asks:
 is the safe default, and after this plan it's also a default that works. The
 honest picture, though, is that `--ssh` nodes run no host workloads for two
 other reasons: `--runtime runc` and an empty allowlist. Both are right for a
-cluster that someone set up in one command, and neither is this plan's
-business. If the maintainer wants `--ssh` clusters to run host work out of
-the box, that's a separate question (Q5): `--runtime runc+process` and an
-allowlist would make host execution a default, which deny-by-default says
-not to.
+cluster that someone set up in one command. Decided (Q5): `--ssh` clusters
+stay that way, runc-only with an empty allowlist and isolation on, because
+`--runtime runc+process` and an allowlist would make host execution a
+default, which deny-by-default says not to. The manual documents the two
+changes an operator makes on a node to run host work: `--runtime
+runc+process` in the unit, and the binary in `[process_workloads]
+allowed_binaries`.
 
 The same goes for every other Linux node: keep the default on. The
 `mount_isolation = false` lines in `examples/node/process-runtime.toml`,
@@ -516,27 +525,23 @@ throughput benchmark keeps `false` until the soak shows what the view costs.
 
 ## 7. Milestone
 
-**Recommended: 0.3.3**, as its own PR on that train. The
-[0.3.3 milestone](https://github.com/reliaburger/reliaburger/milestone/36) is
-"loose ends before outside testers: tester-visible bugs", and this is one: a
-tester who follows manual 14 on a default Linux node gets a refusal that
-says "yet". It's a patch-sized change (one new module, one gate, no new
-config) with a wire and state bump, and 0.3.2 already moved the wire in a
-patch release.
-
-**The alternative is 0.4.0**, if 0.3.3 is close to its freeze or its 36 open
-issues are already more than a patch. 0.4.0's headline is planned
-maintenance, and this doesn't belong to that story, so it would be an
-"alongside" item. It shouldn't wait for "Stronger walls" (0.4.4 and 0.4.5):
-those are VMs, a different boundary.
+**Decided (maintainer, 24 November 2026): 0.4.0**, as its own PR on that
+train, and #714 has moved to the
+[0.4.0 milestone](https://github.com/reliaburger/reliaburger/milestone/7).
+The plan had suggested 0.3.3, the patch for tester-visible loose ends. 0.4.0's headline is planned maintenance,
+and this doesn't belong to that story, so it's an "alongside" item, like
+apps first on node memory (#1967). It doesn't wait for "Stronger walls"
+(0.4.4 and 0.4.5): those are VMs, a different boundary. Its protocol and
+state bump goes out with 0.4.0, so a 0.3.x cluster starts afresh on that
+upgrade.
 
 F02 ([#360](https://github.com/reliaburger/reliaburger/issues/360)) keeps the
 rest of process isolation: PID, network and UTS namespaces, seccomp, the
-`burger` user. This plan is the mount half of it, and #360 should say so
-when this merges. The field's doc comment cites #360 today; it would cite
+`burger` user. This plan is the mount half of it, and #360 narrows to that
+when this merges (Q6). The field's doc comment cites #360 today; it would cite
 nothing afterwards.
 
-## 8. Risks and open questions
+## 8. Risks and decisions
 
 ### Risks
 
@@ -558,35 +563,40 @@ nothing afterwards.
   delivers. The manual's wording carries the threat section's two lists, and
   `relish wtf` keeps its `namespace-isolation` warning for host workloads.
 
-### Questions for the maintainer
+### Decisions
 
-1. **Q1. Denylist view (A) or allowlisted view (B)?** Recommended A. B is
-   the design doc's target, but it's the filesystem half of a sandbox, and a
-   workload that wants it wants a container.
-2. **Q2. Option C, the bounding-set drop?** Recommended yes:
-   `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE`, `CAP_SYS_MODULE`, `CAP_BPF` and
-   `CAP_SYS_BOOT`, dropped in the gate after the view is built. Without it a
-   mask is one `umount` from gone. With it, a host workload that mounts
-   things, traces other processes or loads BPF needs `mount_isolation =
-   false`, and the manual says so. About a day.
-3. **Q3. Temp sizes.** Recommended 256 MiB for `/tmp` and `/var/tmp`
-   together and 64 MiB for `/dev/shm`, as constants, charged to the
-   workload's memory cgroup. Or sized from the workload's memory limit, when
-   it has one.
-4. **Q4. 0.3.3 or 0.4.0?** Recommended 0.3.3.
-5. **Q5. Host work on `--ssh` clusters by default?** Recommended no: keep
-   `--runtime runc` and an empty allowlist, and document the two lines an
-   operator adds.
-6. **Q6. Close #714 with this, and narrow #360?** Recommended: #714 closes
-   (its "done when" is met, apps included), and #360's body names what's
-   left.
+The plan asked the maintainer six questions. He took the recommended answer
+to each but the milestone on 24 November 2026.
+
+1. **Q1. Denylist view (A) or allowlisted view (B)?** Decided (maintainer,
+   24 Nov 2026): A, the host's root minus Bun's paths. B is the design doc's
+   target, but it's the filesystem half of a sandbox, and a workload that
+   wants it wants a container.
+2. **Q2. Option C, the bounding-set drop?** Decided (maintainer, 24 Nov
+   2026): yes. The gate drops `CAP_SYS_ADMIN`, `CAP_SYS_PTRACE`,
+   `CAP_SYS_MODULE`, `CAP_BPF` and `CAP_SYS_BOOT` from the bounding set after
+   the view is built and before `exec`. A host workload that mounts things,
+   traces other processes or loads BPF needs `mount_isolation = false`, and
+   the manual says so.
+3. **Q3. Temp sizes.** Decided (maintainer, 24 Nov 2026): 256 MiB for
+   `/tmp` and `/var/tmp` together, and 64 MiB for `/dev/shm`, as constants,
+   charged to the workload's memory cgroup.
+4. **Q4. 0.3.3 or 0.4.0?** Decided (maintainer, 24 Nov 2026): 0.4.0, not
+   the recommended 0.3.3. #714 is in the 0.4.0 milestone.
+5. **Q5. Host work on `--ssh` clusters by default?** Decided (maintainer,
+   24 Nov 2026): no. `--ssh` clusters stay runc-only with an empty allowlist
+   and isolation on, and the manual documents the two lines an operator
+   adds.
+6. **Q6. Close #714 with this, and narrow #360?** Decided (maintainer,
+   24 Nov 2026): #714 closes when the work lands, apps included, and #360
+   narrows to PID, network and UTS namespaces, seccomp and the `burger` user.
 
 ## Sources
 
 - Issues: [#714](https://github.com/reliaburger/reliaburger/issues/714)
   (host task arrays under isolation), [#360](https://github.com/reliaburger/reliaburger/issues/360)
   (F02, process-workload isolation), and the
-  [0.3.3 milestone](https://github.com/reliaburger/reliaburger/milestone/36)
+  [0.4.0 milestone](https://github.com/reliaburger/reliaburger/milestone/7)
 - Linux: [mount_namespaces(7)](https://man7.org/linux/man-pages/man7/mount_namespaces.7.html),
   [unshare(2)](https://man7.org/linux/man-pages/man2/unshare.2.html),
   [open_tree(2)](https://man7.org/linux/man-pages/man2/open_tree.2.html),
