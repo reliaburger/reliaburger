@@ -5682,8 +5682,9 @@ async fn a_scoped_token_reads_only_its_own_namespaces_events() {
 }
 
 /// Every route that upgrades, rolls back or re-elects the cluster.
-const CLUSTER_ADMIN_ROUTES: [&str; 11] = [
+const CLUSTER_ADMIN_ROUTES: [&str; 12] = [
     "/v1/os/stage",
+    "/v1/os/boot-logs",
     "/v1/os/rollout/start",
     "/v1/os/rollout/resume",
     "/v1/os/rollout/abort",
@@ -10433,6 +10434,64 @@ async fn a_node_that_isnt_an_appliance_refuses_to_stage_an_os() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert!(String::from_utf8_lossy(&body).contains("isn't an appliance"));
+    shutdown.cancel();
+}
+
+/// Boot logs live on an appliance's ESP (#2149): any other node says it
+/// has none, both when asked and when told where to send them.
+#[tokio::test]
+async fn a_node_that_isnt_an_appliance_has_no_boot_logs_to_send() {
+    let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (app, shutdown) = setup_with_auth(vec![token], None).await;
+    let (status, body) = post_authenticated(
+        app.clone(),
+        "/v1/os/boot-logs",
+        &plaintext,
+        r#"{"target":"10.42.0.1:6666"}"#,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(String::from_utf8_lossy(&body).contains("isn't an appliance"));
+    let response = app
+        .oneshot(
+            axum::http::Request::get("/v1/os/boot-logs")
+                .header("Authorization", format!("Bearer {plaintext}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    shutdown.cancel();
+}
+
+/// Reading where boot logs go is anyone's; changing it is a cluster
+/// admin's.
+#[tokio::test]
+async fn a_read_only_token_reads_boot_logs_but_cannot_change_them() {
+    let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::ReadOnly);
+    let (app, shutdown) = setup_with_auth(vec![token], None).await;
+    let (status, _) = post_authenticated(
+        app.clone(),
+        "/v1/os/boot-logs",
+        &plaintext,
+        r#"{"target":null}"#,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let response = app
+        .oneshot(
+            axum::http::Request::get("/v1/os/boot-logs")
+                .header("Authorization", format!("Bearer {plaintext}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Past authorisation: refused only because this isn't an appliance.
+    assert_eq!(response.status(), StatusCode::CONFLICT);
     shutdown.cancel();
 }
 
