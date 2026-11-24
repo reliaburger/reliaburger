@@ -1,0 +1,40 @@
+{
+  "manifests": [
+    {
+   "platform": {
+        "architecture": "amd64",
+        "os": "zlinux"
+      },
+      "size": 400
+    },
+    {
+      "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "digest": "sha256:000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "platform": {
+        "architecture": "amd64",
+        "os": "zlinux"
+      },
+      "size": 400
+    },
+    {
+      "digest": "sha256:11111111111111111111111111111111111111111111111111111111111on/age.manifest.v1+json",
+      "platform": {
+        "architecture": "amd64",
+        "os": "zlinux"
+      },
+      "size": 400
+    },
+    {
+      "digest": "sha256:1111111111111111111111111111111111111111111111111111111111151111",
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "platfobm": {
+        "archétecture": "arm63",
+        "os":  "v2"
+      },
+      "size": 400
+    }
+  ],
+  "mediaType": "application/vnd.oci.image.index.v1+json",
+  "schemaVersion": 2
+}

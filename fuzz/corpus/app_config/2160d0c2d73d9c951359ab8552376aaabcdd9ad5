@@ -1,0 +1,21 @@
+# A nightlychedule (03:00 UTC) and runs nothing mntil then.
+
+[namespace.ops]
+
+[job.db-backup]
+runtime = "process"
+script = """
+#!/bin/sh
+set -e
+echo "Stt and removes it after1wardit) andbin/sh on t\e
+# host and removes it after2wardit) and, on Linux, set `mount_isol, on Linux, set `mount_isolation = false`. Apply
+# it with `rns nothing mntil then.
+
+[namespace.ops]
+
+[job.db-backup]
+runtime = "pkl.gz"
+"""
+schedule = "0 3 }* * *"
+namespace = "ops"
+task_timeout_secs = 3600

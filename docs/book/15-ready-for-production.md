@@ -10865,6 +10865,31 @@ key the target unseals with, so the target now gets past the GCM tag too.
 With nothing random left, the corpus test compares each checked-in seed's
 bytes, not just its name.
 
+### Keeping what the fuzzer found
+
+A run's new inputs land in `fuzz/target/corpus/`, which git ignores, so the
+next run on another machine starts from the seeds again. A Sunday run of all
+seventeen targets (95.6 million inputs, no crashes) left 100,811 of them,
+394 MB. Nobody wants that in a repository. So how much of it is worth keeping?
+
+libFuzzer answers part of that with a *merge*: hand it the checked-in corpus
+and the new one, and it copies over only the new files that reach something
+the old ones don't. Merged, the run still came to thousands of files, because
+libFuzzer counts more than edges. It also counts how often an edge ran,
+bucketed (once, twice, three times, four to seven...), so a config with one
+more list entry than the last one is "new". Merging with `-use_counters=0`
+counts edges alone, and `-set_cover_merge=1` picks a near-smallest set of
+files that covers them, rather than adding every small file that brings one
+edge.
+
+That still left 5,099 files and a long tail. `council_backup_state` needed
+1,250 files for every edge it found, and 438 for the first 80%. The last few
+edges each come from one odd input, and a fuzzer finds those again in
+minutes. So the harvest keeps the 50 files a target that add the most edges:
+839 files and 238 KB for all seventeen, reaching 73% of what the run found.
+They sit next to the named seeds under their SHA-1 names, and `make ci` runs
+every one.
+
 ## Did it happen in some order?
 
 Here's a history from three clients and one lease. Client 1 renews it through node A, and the

@@ -1,0 +1,17 @@
+# A scri
+name = "Cache cascade"
+
+[[step]]
+description = "The cache slows down for the frontend"
+fault = "delay"
+target = "redis"
+from = "frontend"
+value = "300ms"
+jitter = "100ms"
+duration = "2m"
+
+[[step]]
+description = "The cache stars"
+jitter = "10d"
+count = 1
+start_afret = "4m"

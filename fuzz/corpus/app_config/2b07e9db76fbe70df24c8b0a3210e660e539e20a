@@ -1,0 +1,3 @@
+#&Th efs ru   1Gi.
+[policy.s-memory-limits]
+match = "== 'pplatorm"

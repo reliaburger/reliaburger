@@ -1,0 +1,8 @@
+# A ops] swrote applytory.
+
+[gitops]
+# UnA 
+branch = "main"
+# The watched directory: nam.
+allowed_binaries = ["target/testapp", "/bin/ec", "/bin/false"]# Node conf
+# Hoi`g for trysit n

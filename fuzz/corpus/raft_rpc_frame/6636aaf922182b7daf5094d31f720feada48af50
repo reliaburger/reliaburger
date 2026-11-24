@@ -1,0 +1,6 @@
+{"compatibility":{"protocol":44,"state":76},"sender_recovery_epoch":1,"sender_recov=ery_id":null,"request":{"InstallSnapshot":{"voAte":{"leader_id":{"term":1,"node_id":7},"committed":true},"meta":{"aslt_log_id":{"leader_id":{"term":1,"node_id":7},"index":2},"last_membership":{"log_id":null,"membership":{"configs":[],"nodes":{}}},"snapshot_id":"2-7-2"},"offset":0,"data"
+
+
+
+
+:[123,-125],"done":true}}}
