@@ -151,6 +151,11 @@ if [ "$result" = pass ]; then
     if [ "$dashboard" != pass ]; then
         echo "--- tty1 of node 1 ---"
         fold -w 80 "$work/screen.txt" 2>/dev/null | grep -v '^ *$' || true
+        echo "--- node 1 console journal ---"
+        timeout 30 ssh -i "$work/ssh-key" -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o LogLevel=ERROR \
+            "root@${ips[0]}" journalctl -b --no-pager -u reliaburger-console.service \
+            2>&1 | tail -n 60 || true
         result=fail
     fi
 fi

@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use crossterm::event::{Event, EventStream, KeyEventKind};
 use futures_util::StreamExt;
-use ratatui::{Terminal, backend::Backend};
+use ratatui::Terminal;
 use tokio::sync::{mpsc, watch};
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
@@ -91,7 +91,9 @@ pub async fn run(paths: &crate::appliance::Paths) -> std::io::Result<()> {
     let mode = Mode::for_terminal(stdin_name.as_deref());
     // BLOCKING-OK: appliance console: one open of the terminal device before the loop starts
     let (mut guard, mode) = ConsoleTerminal::open_or_screen_only(mode)?;
-    let result = event_loop(paths, &mut guard.terminal, mode).await;
+    // The first frame paints over the boot messages.
+    guard.repaint()?;
+    let result = event_loop(paths, &mut guard, mode).await;
     drop(guard);
     result
 }
@@ -102,9 +104,52 @@ pub async fn run(paths: &crate::appliance::Paths) -> std::io::Result<()> {
 /// It draws on a terminal device, not standard output: the unit keeps
 /// standard output for the journal, where the launcher's install messages
 /// go. There's no alternate screen, which the Linux console doesn't have.
+///
+/// The viewport is fixed at the size the device itself reports, read with
+/// `TIOCGWINSZ` on the file it draws on. crossterm's own size query asks
+/// `/dev/tty` or standard output, and a console without a controlling
+/// terminal, whose standard output is the journal, has neither, so it
+/// failed before drawing a thing (#2150's first CI run).
 struct ConsoleTerminal {
     terminal: Terminal<ratatui::backend::CrosstermBackend<std::fs::File>>,
+    /// The same device, for reading its size.
+    device: std::fs::File,
     raw: bool,
+}
+
+/// The Linux console's size, for a device that reports none.
+const FALLBACK_SIZE: (u16, u16) = (80, 25);
+
+/// The columns and rows the terminal `device` reports, or
+/// [`FALLBACK_SIZE`] when it reports zero.
+pub fn device_size(device: &std::fs::File) -> std::io::Result<(u16, u16)> {
+    use std::os::fd::AsRawFd as _;
+    let mut size = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: TIOCGWINSZ writes one `winsize` into `size`, which we own and
+    // which outlives the call, and the descriptor is open for as long as
+    // `device` is borrowed.
+    let result = unsafe { libc::ioctl(device.as_raw_fd(), libc::TIOCGWINSZ, &mut size) };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(sized(size.ws_col, size.ws_row))
+}
+
+fn sized(columns: u16, rows: u16) -> (u16, u16) {
+    if columns == 0 || rows == 0 {
+        FALLBACK_SIZE
+    } else {
+        (columns, rows)
+    }
+}
+
+fn area((columns, rows): (u16, u16)) -> ratatui::layout::Rect {
+    ratatui::layout::Rect::new(0, 0, columns, rows)
 }
 
 impl ConsoleTerminal {
@@ -113,7 +158,11 @@ impl ConsoleTerminal {
     fn open_or_screen_only(mode: Mode) -> std::io::Result<(Self, Mode)> {
         match Self::open(mode) {
             Ok(terminal) => Ok((terminal, mode)),
-            Err(_) if mode != Mode::ScreenOnly => {
+            Err(error) if mode != Mode::ScreenOnly => {
+                eprintln!(
+                    "console: can't draw on {}: {error}; drawing on {TTY1} without keys",
+                    mode.device()
+                );
                 Ok((Self::open(Mode::ScreenOnly)?, Mode::ScreenOnly))
             }
             Err(error) => Err(error),
@@ -121,33 +170,77 @@ impl ConsoleTerminal {
     }
 
     fn open(mode: Mode) -> std::io::Result<Self> {
-        let tty = std::fs::OpenOptions::new()
+        let device = std::fs::OpenOptions::new()
             .write(true)
             .open(mode.device())?;
-        let raw = mode.reads_keys();
-        if raw {
-            crossterm::terminal::enable_raw_mode()?;
-        }
+        let size = device_size(&device)?;
+        // Keys are a bonus: a terminal that won't go raw still gets drawn on.
+        let raw = mode.reads_keys()
+            && match crossterm::terminal::enable_raw_mode() {
+                Ok(()) => true,
+                Err(error) => {
+                    eprintln!("console: no keys, raw mode failed: {error}");
+                    false
+                }
+            };
         let restore = || {
             if raw {
                 let _ = crossterm::terminal::disable_raw_mode();
             }
         };
-        match Terminal::new(ratatui::backend::CrosstermBackend::new(tty)) {
-            Ok(mut terminal) => {
-                // The first draw paints every cell over the boot messages.
-                if let Err(error) = terminal.clear() {
-                    restore();
-                    return Err(error);
-                }
-                Ok(Self { terminal, raw })
-            }
+        let terminal = match fresh_terminal(&device, size) {
+            Ok(terminal) => terminal,
             Err(error) => {
                 restore();
-                Err(error)
+                return Err(error);
             }
-        }
+        };
+        eprintln!(
+            "console: drawing on {} at {}x{}{}",
+            mode.device(),
+            size.0,
+            size.1,
+            if raw { ", reading keys" } else { "" }
+        );
+        Ok(Self {
+            terminal,
+            device,
+            raw,
+        })
     }
+
+    /// Repaint every cell from the next frame on: clear the screen, and
+    /// start a new `Terminal`, whose blank last frame then matches it. Also
+    /// picks up a new screen size.
+    ///
+    /// Not `Terminal::clear`: it asks the terminal where the cursor is and
+    /// waits for the answer on standard input, which a VT under systemd
+    /// never gave, so the console exited before drawing anything (#2150's
+    /// first CI run).
+    fn repaint(&mut self) -> std::io::Result<()> {
+        use std::io::Write as _;
+        let size = device_size(&self.device)?;
+        self.device.write_all(CLEAR_SCREEN)?;
+        self.device.flush()?;
+        self.terminal = fresh_terminal(&self.device, size)?;
+        Ok(())
+    }
+}
+
+/// Home the cursor and clear the screen.
+const CLEAR_SCREEN: &[u8] = b"\x1b[H\x1b[2J";
+
+/// A ratatui terminal on `device` with a fixed viewport of `size`. Making
+/// one asks the terminal nothing: no size query, no cursor query.
+fn fresh_terminal(
+    device: &std::fs::File,
+    size: (u16, u16),
+) -> std::io::Result<Terminal<ratatui::backend::CrosstermBackend<std::fs::File>>> {
+    let backend = ratatui::backend::CrosstermBackend::new(device.try_clone()?);
+    let options = ratatui::TerminalOptions {
+        viewport: ratatui::Viewport::Fixed(area(size)),
+    };
+    Terminal::with_options(backend, options)
 }
 
 impl Drop for ConsoleTerminal {
@@ -167,11 +260,12 @@ async fn next_event(input: &mut Option<EventStream>) -> Option<std::io::Result<E
     }
 }
 
-async fn event_loop<B: Backend>(
+async fn event_loop(
     paths: &crate::appliance::Paths,
-    terminal: &mut Terminal<B>,
+    screen: &mut ConsoleTerminal,
     mode: Mode,
 ) -> std::io::Result<()> {
+    let keys = screen.raw;
     let (tx, mut rx) = mpsc::channel::<Msg>(64);
     let (tab_tx, tab_rx) = watch::channel(Tab::Status);
     let cancel = CancellationToken::new();
@@ -181,7 +275,7 @@ async fn event_loop<B: Backend>(
         sampler_tx.blocking_send(Msg::Sample(sample)).is_ok()
     });
 
-    let mut input = mode.reads_keys().then(EventStream::new);
+    let mut input = keys.then(EventStream::new);
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut repaint = tokio::time::interval(REPAINT_EVERY);
@@ -189,19 +283,19 @@ async fn event_loop<B: Backend>(
     let mut state = ConsoleState {
         now: unix_now(),
         can_quit: mode == Mode::Session,
-        keyless: !mode.reads_keys(),
+        keyless: !keys,
         ..ConsoleState::default()
     };
     let result = loop {
         // ratatui 0.30's `draw` returns the backend's own error type.
-        if let Err(error) = terminal.draw(|frame| view::render(frame, &state)) {
+        if let Err(error) = screen.terminal.draw(|frame| view::render(frame, &state)) {
             break Err(std::io::Error::other(error.to_string()));
         }
         tokio::select! {
             _ = tick.tick() => state.update(Msg::Tick(unix_now())),
             _ = repaint.tick() => {
-                if let Err(error) = terminal.clear() {
-                    break Err(std::io::Error::other(error.to_string()));
+                if let Err(error) = screen.repaint() {
+                    break Err(error);
                 }
             }
             Some(message) = rx.recv() => state.update(message),
@@ -210,7 +304,12 @@ async fn event_loop<B: Backend>(
                     state.update(Msg::Key(key));
                 }
                 Some(Ok(_)) => {}
-                Some(Err(error)) => break Err(error),
+                // Keys are a bonus: lose them, keep the screen.
+                Some(Err(error)) => {
+                    eprintln!("console: stopped reading keys: {error}");
+                    input = None;
+                    state.keyless = true;
+                }
                 // The terminal hung up; systemd starts a new console.
                 None => break Ok(()),
             },
@@ -409,6 +508,24 @@ mod tests {
         assert!(!Mode::ScreenOnly.reads_keys());
         assert_eq!(Mode::Kiosk.device(), "/dev/tty");
         assert!(Mode::Kiosk.reads_keys() && Mode::Session.reads_keys());
+    }
+
+    /// A terminal that reports no size gets the Linux console's.
+    #[test]
+    fn a_terminal_with_no_size_gets_80_by_25() {
+        assert_eq!(sized(0, 0), (80, 25));
+        assert_eq!(sized(160, 0), (80, 25));
+        assert_eq!(sized(160, 50), (160, 50));
+    }
+
+    /// The size comes from the device the console draws on, not from
+    /// `/dev/tty` or standard output, which a console started by an
+    /// older image's unit doesn't have. A file that isn't a terminal says
+    /// so rather than inventing a size.
+    #[test]
+    fn the_size_is_read_from_the_device_it_draws_on() {
+        let file = tempfile::tempfile().unwrap();
+        assert!(device_size(&file).is_err());
     }
 
     /// Switching back to a tab within its interval doesn't ask again.
