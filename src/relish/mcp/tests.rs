@@ -1839,3 +1839,137 @@ fn agent_commands_read_the_context_off_the_runtime() {
         "use BunClient::local().await instead: {offenders:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The admin client falls over with the context (#2304).
+
+/// A stand-in node of the cluster `hierarchy` signs for, over TLS, that
+/// makes tokens for the context's admin token, each named after `node`.
+/// Returns its endpoint.
+async fn token_node(
+    hierarchy: &crate::sesame::ca::CaHierarchy,
+    node: &'static str,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> String {
+    let (certificate_der, private_key_der, serial) = crate::sesame::ca::issue_node_cert(
+        node,
+        crate::sesame::types::SerialNumber(10),
+        &hierarchy.node.signing_keypair,
+        &hierarchy.node.certificate_params,
+    )
+    .unwrap();
+    let now = std::time::SystemTime::now();
+    let identity = crate::sesame::identity_store::NodeIdentity {
+        node_id: node.to_string(),
+        certificate_der,
+        private_key_der,
+        serial,
+        ca_generation: 0,
+        trust: crate::sesame::trust::TrustSet::single(
+            hierarchy.node.ca.certificate_der.clone(),
+            hierarchy.root.ca.certificate_der.clone(),
+        ),
+        node_ca_der: hierarchy.node.ca.certificate_der.clone(),
+        root_ca_der: hierarchy.root.ca.certificate_der.clone(),
+        not_before: now,
+        not_after: now + Duration::from_secs(24 * 3600),
+    };
+    let acceptor = tokio_rustls::TlsAcceptor::from(
+        crate::sesame::mtls::build_api_server_config(
+            &identity,
+            crate::sesame::mtls::CrlHandle::default(),
+        )
+        .unwrap(),
+    );
+    let app =
+        axum::Router::new().fallback(
+            move |method: axum::http::Method,
+                  uri: axum::http::Uri,
+                  headers: axum::http::HeaderMap| async move {
+                use axum::http::StatusCode;
+                let admin = headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    == Some(&format!("Bearer {CONTEXT_ADMIN}"));
+                match (method.as_str(), uri.path()) {
+                    ("GET", "/v1/token/list") if admin => {
+                        (StatusCode::OK, r#"{"tokens":[]}"#.to_string())
+                    }
+                    ("POST", "/v1/token/create") if admin => (
+                        StatusCode::OK,
+                        format!(r#"{{"token":"rbrg_minted_on_{node}","expires_at":null}}"#),
+                    ),
+                    _ => (StatusCode::NOT_FOUND, "no such thing".to_string()),
+                }
+            },
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("https://{}", listener.local_addr().unwrap());
+    tokio::spawn(crate::sesame::connection::serve_router_over_tls(
+        listener,
+        acceptor,
+        app,
+        crate::sesame::connection::ConnectionTimeouts::PRODUCTION,
+        shutdown.clone(),
+    ));
+    endpoint
+}
+
+/// #2304: `relish mcp` built its admin client once, on the node that
+/// answered at startup. When that node went down, it couldn't make a token
+/// though another node could; now it builds the client again on one that
+/// answers, as a tool call's own client does.
+#[tokio::test]
+async fn token_management_falls_over_when_the_node_it_started_on_goes_down() {
+    if ran_in_its_own_process("token_management_falls_over_when_the_node_it_started_on_goes_down")
+        .await
+    {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let hierarchy = crate::sesame::ca::generate_ca_hierarchy("mcp", b"ikm").unwrap();
+    let ca_cert = directory.path().join("root-ca.crt");
+    std::fs::write(
+        &ca_cert,
+        crate::sesame::cert::der_to_pem(&hierarchy.root.ca.certificate_der, "CERTIFICATE"),
+    )
+    .unwrap();
+    let first_down = tokio_util::sync::CancellationToken::new();
+    let still_up = tokio_util::sync::CancellationToken::new();
+    let first = token_node(&hierarchy, "node-1", &first_down).await;
+    let second = token_node(&hierarchy, "node-2", &still_up).await;
+    let context_path = directory.path().join("context.json");
+    crate::relish::local_context::LocalContext {
+        schema: 1,
+        owner: "bare-metal/lab".to_string(),
+        endpoint: first.clone(),
+        other_endpoints: vec![second.clone()],
+        last_answered: None,
+        token: CONTEXT_ADMIN.to_string(),
+        ca_cert,
+        service_endpoints: Default::default(),
+    }
+    .save(&context_path)
+    .unwrap();
+
+    let managed = Managed::from_context_at(&context_path, None, credentials::Purpose::Read)
+        .unwrap()
+        .unwrap();
+    // Node 1 answered at startup, and goes down after.
+    first_down.cancel();
+    let address = first.trim_start_matches("https://").to_string();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while tokio::net::TcpStream::connect(&address).await.is_ok() {
+        assert!(std::time::Instant::now() < deadline, "node 1 still listens");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let sent = managed.ensure().await.unwrap();
+
+    assert_eq!(sent.as_deref(), Some("rbrg_minted_on_node-2"));
+    let saved = crate::relish::local_context::LocalContext::load(&context_path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.last_answered, Some(second), "node 2 is remembered");
+    still_up.cancel();
+}

@@ -12,7 +12,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
@@ -725,14 +725,23 @@ enum Action {
 /// to watching its workload and exec helpers.
 const CLIENTS_PER_TURN: usize = 32;
 
-/// Answer the clients waiting on `listener`, up to [`CLIENTS_PER_TURN`],
-/// and return how many there were.
+/// Longest one turn of the owner's loop spends answering clients before it
+/// goes back to its workload (#2304). Each client may take 100 ms to read
+/// and 100 ms to write, so 32 slow ones would hold a turn for over 6 s, and
+/// a SIGKILL, an orphan or the workload's exit would wait behind them. A
+/// client already being answered finishes, so a turn ends within this plus
+/// one client's 200 ms.
+const TURN_BUDGET: Duration = Duration::from_millis(250);
+
+/// Answer the clients waiting on `listener`, up to [`CLIENTS_PER_TURN`] and
+/// for no longer than [`TURN_BUDGET`], and return how many there were.
 fn serve_waiting_clients(
     listener: &UnixListener,
     mut serve: impl FnMut(UnixStream),
 ) -> io::Result<usize> {
+    let started = Instant::now();
     let mut served = 0;
-    while served < CLIENTS_PER_TURN {
+    while served < CLIENTS_PER_TURN && started.elapsed() < TURN_BUDGET {
         match listener.accept() {
             Ok((connection, _)) => {
                 serve(connection);
@@ -996,6 +1005,51 @@ mod tests {
             CLIENTS_PER_TURN
         );
         assert_eq!(serve_waiting_clients(&listener, |_| {}).unwrap(), 2);
+        drop(clients);
+    }
+
+    /// #2304: a backlog of slow clients gives the turn back within its
+    /// budget, so a SIGKILL or the workload's exit isn't left waiting
+    /// seconds behind them.
+    #[test]
+    fn a_backlog_of_slow_clients_ends_the_turn_within_its_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("owner.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let clients: Vec<_> = (0..CLIENTS_PER_TURN)
+            .map(|_| UnixStream::connect(&path).unwrap())
+            .collect();
+        // As slow as a client that sends nothing: one read timeout.
+        let slow = Duration::from_millis(100);
+        let started = Instant::now();
+        let served = serve_waiting_clients(&listener, |_| std::thread::sleep(slow)).unwrap();
+        let took = started.elapsed();
+        assert!(served < CLIENTS_PER_TURN, "served {served}");
+        // The budget, the client that started inside it, and slack for a
+        // loaded host: far short of 32 clients' 3.2 s.
+        assert!(took < TURN_BUDGET + slow * 3, "the turn took {took:?}");
+        // The rest wait for the next turn rather than being dropped.
+        let rest = serve_waiting_clients(&listener, |_| {}).unwrap();
+        assert_eq!(served + rest, CLIENTS_PER_TURN);
+        drop(clients);
+    }
+
+    /// The budget doesn't undo #2236: a backlog of quick clients still
+    /// drains in one turn.
+    #[test]
+    fn a_backlog_of_fast_clients_is_answered_in_one_turn() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("owner.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let clients: Vec<_> = (0..CLIENTS_PER_TURN)
+            .map(|_| UnixStream::connect(&path).unwrap())
+            .collect();
+        let served =
+            serve_waiting_clients(&listener, |_| std::thread::sleep(Duration::from_millis(1)))
+                .unwrap();
+        assert_eq!(served, CLIENTS_PER_TURN);
         drop(clients);
     }
 
