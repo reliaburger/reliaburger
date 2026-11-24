@@ -492,7 +492,7 @@ appliance or is already updating to another version. Then, off the request:
    checking each one's hash, then move them into staging.
 3. Run `systemd-sysupdate` with `/usr/lib/reliaburger/sysupdate.d`. It writes
    `/usr` and its verity into the inactive slot, and the UKI into
-   `/EFI/Linux` with three tries left (`TriesLeft=3`). Its own verification is
+   `/EFI/Linux` with two tries left (`TriesLeft=2`). Its own verification is
    off, because bun has already checked every byte.
 4. Reboot.
 
@@ -502,29 +502,48 @@ Staging, Rebooting, Failed) and in `/v1/version` as `os_version` and
 
 **Boot counting.** `reliaburger-boot-check.service` is required by
 `boot-complete.target`, so `systemd-bless-boot` marks the new UKI good only
-once bun answers as healthy. It allows 90 seconds on a counted boot and 300
-seconds otherwise, and the clock doesn't start until prepare is done. The
-clock is seconds since boot (`/proc/uptime`), not the wall clock, which jumps
-when it first syncs: a machine with a flat RTC battery boots behind, and the
-jump would otherwise use the budget up at once. A
-failed check on a counted boot reboots. After three tries systemd-boot falls
-back to the previous UKI, whose `usrhash` pins the old `/usr`. Back on the old
-version, bun turns `Rebooting` into `Failed` ("failed its boot checks, so
-systemd-boot fell back"), which pauses the rollout.
+once the check passes. On a counted boot, the check passes when bun answers
+as healthy *and* the node has a global IPv4 address, and both must happen
+within 150 seconds of the kernel starting. Otherwise it reboots, and after
+two tries systemd-boot falls back to the previous UKI, whose `usrhash` pins
+the old `/usr`. Back on the old version, bun turns `Rebooting` into `Failed`
+("failed its boot checks, so systemd-boot fell back"), which pauses the
+rollout. Any other boot needs only bun, gets 300 seconds from the check's
+start once prepare is done, and never reboots. The clock is seconds since
+boot (`/proc/uptime`), not the wall clock, which jumps when it first syncs: a
+machine with a flat RTC battery boots behind, and the jump would otherwise
+use the budget up at once.
 
-The 90 s is a trade between the two ways the check can be wrong. Too long,
-and a broken update takes three times too long to fall back: a Wyse 3040
-spends about 65 s per try booting, rebooting and in firmware before the
-check starts, so with 120 s its fallback took 10 min 28 s, past the 10
-minutes S5 allows (#2143). 90 s brings that to about 9 minutes. Too short,
-and a slow but healthy first boot of a good update gets rolled back. The
-slowest healthy start is the 30 s clock wait below on a LAN with no NTP,
-plus bun's own start-up, which took 38 s on the 3040, so 90 s still leaves
-about 20 s spare. Three tries stay, so one transient failure doesn't roll a
-good update back. `image/tests/test_fallback_limit.py` models the Wyse's
-fallback from its measured timings and fails if the budget would take it
-past 10 minutes; `test_time_wait.py` fails if the budget no longer covers the
-slowest healthy start.
+The check isn't ordered after the network (#2245). It used to be, behind
+`network-online.target` and `reliaburger-netlog`, and that had two costs. A
+version whose network never came up never started the check, so it never
+failed its tries and never fell back. And every try waited for the network
+before the check's clock started, which made the Wyse 3040's fallback 11 min
+38 s in the 0.3.2 lab. The address is part of passing for the same reason:
+bun answers on the node itself, so without it an update that breaks the
+network would be kept and strand the node.
+
+The 150 s and the two tries are a trade between the two ways the check can
+be wrong, and on the 3040 three tries can't satisfy both. Too long, and a
+broken update falls back too slowly: each try costs the budget plus about
+46 s of reboot and firmware, so two tries come to about 8 min 20 s from the
+reboot into the broken version, inside the 10 minutes S5 allows (#2143).
+Too short, and a slow but healthy first boot of a good update gets rolled
+back. The slowest healthy start on the 3040 is about 134 s from the kernel:
+the network about 66 s in, the 30 s clock wait below on a LAN with no NTP,
+then bun's 38 s. Three tries would need each one under about 118 s to fit
+in 10 minutes, which that boot can't make; the maintainer chose two tries
+(24 November 2026), so a single bad boot still doesn't roll a good update
+back. `image/tests/test_fallback_limit.py` models the Wyse's fallback from
+its measured timings and fails if the budget would take it past 10 minutes;
+`test_time_wait.py` fails if the budget no longer covers the slowest healthy
+start. CI's `os-update.sh --no-link` cuts a VM's link as it reboots into a
+good update, and wants two failed tries and the fallback.
+
+When the node streams its boot logs (#2149), `reliaburger-netlog` gives the
+boot units `StandardOutput=kmsg` through runtime drop-ins. The check is
+already running by then, so it writes its own lines to `/dev/kmsg` once that
+drop-in exists, and they go out with the kernel's.
 
 **Time before bun.** bun and its peers expect a node's wall clock to move
 forward across restarts, so `reliaburger.service` starts after

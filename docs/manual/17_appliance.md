@@ -917,11 +917,12 @@ you turned `require_signatures` on.
 
 Each node keeps two copies of the operating system: the one it runs, and a
 spare slot for the next. An update goes into the spare slot. The node reboots
-into it with three tries, and it's only marked good once bun is healthy
-again. If bun doesn't come up, the node goes back to the previous version by
-itself after the third try. Each try waits up to 90 seconds for bun, so on a
-Wyse 3040, which takes about a minute to boot, a broken update is back on the
-old version in about 9 minutes.
+into it with two tries, and it's only marked good once bun is healthy again
+and the node has a network address. If either is missing 150 seconds after
+the kernel starts, the try fails, and after the second the node goes back to
+the previous version by itself. On a Wyse 3040 a broken update is back on the
+old version in about 8½ minutes. A node whose network doesn't come up on the
+new version falls back too, rather than staying cut off.
 
 bun does this across the cluster, one node at a time. See what each node runs
 and what the newest release is:

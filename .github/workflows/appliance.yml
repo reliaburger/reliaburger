@@ -596,12 +596,12 @@ jobs:
             "$RUNNER_TEMP/lab-release" "$NEXT_VERSION" source-bin/relish-linux-x86_64
 
       - name: OS fallback (x86-64, KVM)
-        # bun rolls the broken version onto a one-node cluster: three counted
+        # bun rolls the broken version onto a one-node cluster: two counted
         # boots fail their boot checks, systemd-boot falls back on its own,
         # and bun reports it, which pauses the rollout. The summary records
         # how long the fallback took (#406; the Wyse exit test needs 10 min).
         # The node streams its boot logs to `relish machines logs`, and the
-        # stream must show the three tries (#2149); mtools writes
+        # stream must show the two tries (#2149); mtools writes
         # netlog.conf onto its ESP.
         if: env.BROKEN_VERSION != '' && hashFiles('source-bin/relish-linux-x86_64') != ''
         timeout-minutes: 30
@@ -610,6 +610,19 @@ jobs:
           sudo apt-get install -y -qq mtools
           image/tests/os-update.sh image/mkosi.output "$IMAGE_VERSION" \
             "$RUNNER_TEMP/lab-release" "$BROKEN_VERSION" source-bin/relish-linux-x86_64 --fallback
+
+      - name: OS update with no network link (x86-64, KVM)
+        # The next version, but the VM's link goes down as the node reboots
+        # into it, as a Wyse's did in the 0.3.2 lab (#2245). The boot check
+        # doesn't wait for the network and wants an address on a counted
+        # boot, so both tries fail and the node falls back; with the link
+        # back, the rollout pauses on it.
+        if: env.NEXT_VERSION != '' && hashFiles('source-bin/relish-linux-x86_64') != ''
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          image/tests/os-update.sh image/mkosi.output "$IMAGE_VERSION" \
+            "$RUNNER_TEMP/lab-release" "$NEXT_VERSION" source-bin/relish-linux-x86_64 --no-link
 
       - name: Upload the image
         uses: actions/upload-artifact@v4

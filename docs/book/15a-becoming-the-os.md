@@ -651,15 +651,15 @@ PathRelativeTo=boot
 MatchPattern=reliaburger-os_@v+@l-@d.efi \
              reliaburger-os_@v+@l.efi \
              reliaburger-os_@v.efi
-# Writable: systemd-boot renames the file to count down its tries (+3-0,
-# +2-1, ...), which a FAT read-only attribute would stop.
+# Writable: systemd-boot renames the file to count down its tries (+2-0,
+# +1-1, +0-2), which a FAT read-only attribute would stop.
 Mode=0644
-TriesLeft=3
+TriesLeft=2
 TriesDone=0
 InstancesMax=2
 ```
 
-On node-05 of the lab cluster, `os-stage` took 14 s end to end, and the new UKI landed as `reliaburger-os_2026.40.23+3-0.efi`.
+On node-05 of the lab cluster, `os-stage` took 14 s end to end, and the new UKI landed as `reliaburger-os_2026.40.23+3-0.efi`. It had three tries then; it has two now, and [the second Wyse run](#the-second-wyse-run) says why.
 
 ### Three tries, then fall back
 
@@ -737,6 +737,27 @@ if counted; then limit=90; else limit=300; fi
 ```
 
 Two tests hold the trade-off in place, one per side. `test_time_wait.py` reads the budget out of the script and fails unless the 30 s clock wait plus the 3040's 38 s plus a 20 s margin fits inside it. `test_fallback_limit.py` models a Wyse fallback from the lab's timings, 41 s plus three tries of 65 s and the budget, plus 38 s, checks that the model reproduces the measured run to within 10 s at the old 120 s, and fails if the current budget would take it past 10 minutes. CI's VMs boot in 9 s and can't see this; the model is what stands in for the Wyse between hardware runs. It leaves about a minute spare, not much, so a slower unit or a slower kernel is something the lab's fallback step will tell us about first.
+
+### The second Wyse run
+
+The 0.3.2 lab (23 November) redid the fallback on the same hardware with the 90 s budget, and it took 11 min 38 s. Slower than the 10 min 28 s it was meant to improve on. The journal's boot list made the reason plain. Each try now took about 3 min 20 s: 46 s of reboot and firmware, 66 s from the kernel to the check's start, then the 90 s. The 66 s had been about 20 s on the first run's arithmetic. In between, 0.3.2 had added boot-log streaming, and `reliaburger-netlog` runs after `network-online.target` and before the units whose lines it forwards, the boot check among them. So every try now waited for `systemd-networkd-wait-online` (23 s on its own) and for the streamer before the check's clock even started.
+
+The same lab showed the worse half of that ordering. During `relish os upgrade`, one Wyse rebooted into the new version with its network link down, no light on the switch port, and stayed that way for 20 minutes until we power-cycled it. A boot that never reaches `network-online.target` never starts a check ordered after it, so it never fails its tries, so it never falls back. An update that broke networking would have stranded every node it reached.
+
+So the check no longer waits for the network. Its unit has no `After=network-online.target`, and the streamer is no longer ordered before it. That alone wasn't enough, because of where the clock started. The budget had been "90 s from when the check starts", and the check now starts about 25 s earlier, before bun can possibly be up: bun still waits for the network and the clock. The honest measure is from the kernel's start, which `/proc/uptime` already gives us:
+
+```sh
+if counted; then limit=150; else limit=300; fi
+if counted; then deadline=$limit; else deadline=$(( $(uptime_seconds) + limit )); fi
+```
+
+A counted boot has to be healthy 150 s into its life, however long the boot took to reach the check, and the loop always looks at bun at least once, so a check that starts late isn't failed unseen. Other boots keep 300 s from the check's start: on an unclaimed machine the check waits for prepare, maybe for hours, and a deadline measured from boot would be long gone by the time bun starts.
+
+The arithmetic then forced a choice. The slowest healthy boot we know on the 3040 is about 134 s from the kernel: the network about 66 s in, the full 30 s clock wait on a LAN with no NTP server, then bun's 38 s. A broken try costs the budget plus about 46 s of firmware, and the reboot into the new version and the final boot back on the old one add about 107 s. With three tries, fitting in 10 minutes needs each one under about 118 s, below that slowest healthy boot. Something had to give: the margin for slow good updates, the clock wait, or a try. The maintainer took a try. Two tries of 150 s come to about 8 min 20 s on the 3040 and leave the slowest healthy boot 16 s, and one bad boot still doesn't roll a good update back. `test_fallback_limit.py` now models the Wyse from the 0.3.2 run's timings, and reproduces its 698 s with the old ordering before it checks the new one.
+
+Passing the check changed too. On a counted boot it needs the node to have a global IPv4 address, not just bun answering. bun answers on `127.0.0.1`, so a version that broke the network but kept bun alive would have been blessed and kept: a node that's healthy to itself and unreachable to everyone else. An ordinary boot doesn't need the address, because nothing falls back from it, and an unplugged cable isn't the OS's fault. CI tests the case the Wyse hit: `os-update.sh --no-link` rolls a *good* update onto a VM and cuts its link through QEMU's monitor (`set_link n0 off`) the moment the kernel prints `reboot: Restarting system`. It wants two failed tries, the fallback, and, once the link is back, the rollout paused on it.
+
+Moving the check had one side effect on streaming. `reliaburger-netlog` makes the boot units log to the kernel through runtime drop-ins, and a drop-in only reaches a unit when it next starts. The check is already running when the streamer gets there, so it now looks for its own drop-in and, once it's there, writes its lines to `/dev/kmsg` itself, prefixed `reliaburger-boot-check:`. The kernel puts each on the screen once and netconsole sends it, so `relish machines logs` still shows every try.
 
 How the build is broken matters too, and the first way hid a bug. It used to be a unit override, `ExecStart=/bin/false`, so bun's launcher never ran. A real bad release breaks differently: its bun starts, says it's newer, and never answers. The launcher installs a bun from the image only when it's newer than the active one, so that no OS update can undo a bun upgrade, and that rule was the bug. Three failed tries, the fallback to the old OS, and its launcher saw a "newer" bun already active and left it. The fallback boot isn't counted, so nothing rebooted it again: a node with a dead bun and no way in. The review of the 0.3.0 train found it by reading the code.
 
