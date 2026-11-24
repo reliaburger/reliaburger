@@ -122,6 +122,68 @@ async fn only_an_admin_writes_a_policy() {
     );
 }
 
+/// A policy table needs an admin before its expressions are compiled: a
+/// deployer, scoped or not, gets the same refusal for a broken or deeply
+/// nested policy as for a good one, never the compiler's 400.
+#[tokio::test]
+async fn a_deployers_policy_is_refused_before_it_is_compiled() {
+    let council = seeded_council("policy-admin-before-compile").await;
+    let (admin_token, admin) = named_user_token("operator", ApiRole::Admin);
+    let (deployer_token, deployer) = named_user_token("ci", ApiRole::Deployer);
+    let scoped = crate::sesame::token::create_token(
+        "controller",
+        ApiRole::Deployer,
+        crate::sesame::types::TokenScope {
+            apps: None,
+            namespaces: Some(vec!["team-a".to_string()]),
+        },
+        None,
+    )
+    .unwrap();
+    let (app, _shutdown) = setup_with_auth_leases_events_and_council(
+        vec![admin_token, deployer_token, scoped.token],
+        None,
+        crate::bun::readiness::ReadinessTracker::new(),
+        crate::bun::capabilities::StaticCapabilities::default(),
+        None,
+        None,
+        Some(Arc::clone(&council)),
+    )
+    .await;
+    let call = |bearer: String, body: String| {
+        let app = app.clone();
+        async move {
+            let request = axum::http::Request::post("/v1/apply")
+                .header("authorization", format!("Bearer {bearer}"))
+                .extension(axum::extract::ConnectInfo(
+                    "203.0.113.9:40000".parse::<std::net::SocketAddr>().unwrap(),
+                ))
+                .body(Body::from(body))
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+    };
+    let invalid = "[policy.rule]\ndeny = \"permission.actions == []\"\n".to_string();
+    let deep = format!("[policy.rule]\ndeny = '''{}'''\n", "{".repeat(200));
+
+    // Compiled, either would be a 400 naming the expression.
+    for broken in [&invalid, &deep] {
+        let (status, body) = call(admin.clone(), broken.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+    for bearer in [&deployer, &scoped.plaintext] {
+        let refusal = call(bearer.clone(), NO_LATEST.to_string()).await;
+        assert_eq!(refusal.0, StatusCode::FORBIDDEN, "{}", refusal.1);
+        for broken in [&invalid, &deep] {
+            assert_eq!(call(bearer.clone(), broken.clone()).await, refusal);
+        }
+    }
+    assert!(council.desired_state().await.policies.is_empty());
+}
+
 /// A denied apply answers 422 naming the policy, writes nothing, and is
 /// audited as `policy.denied`.
 #[tokio::test]
