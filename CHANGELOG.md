@@ -26,7 +26,7 @@ Not released yet: this is what the train carries, and it can change before the t
 
 ### Fixed
 
-- A batch attempt no longer becomes Unknown, needing a replay, when one exit check misses the process owner's 2 s request timeout on a loaded node. The check asks again, and the attempt becomes Unknown only after 60 s of unanswered checks, with that in the reason. An init container's wait asks again the same way within its 300 s bound, instead of failing the deploy ([#2288](https://github.com/reliaburger/reliaburger/issues/2288)).
+- A batch attempt no longer becomes Unknown, needing a replay, when one exit check misses the process owner's 2 s request timeout on a loaded node. The check asks again, and the attempt becomes Unknown only after 60 s of unanswered checks, with that in the reason. ([#2288](https://github.com/reliaburger/reliaburger/issues/2288)).
 
 ## [0.3.2] - 2026-11-23
 

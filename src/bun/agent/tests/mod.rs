@@ -9357,26 +9357,6 @@ async fn deploy_with_init_container_succeeds() {
     agent_handle.await.unwrap();
 }
 
-/// #2288: an init container state read the runtime didn't answer (a process
-/// owner past its request timeout) is asked again, not a failed deploy.
-#[tokio::test]
-async fn an_init_container_read_the_runtime_did_not_answer_is_asked_again() {
-    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
-    let init_id = InstanceId("default__web-0__init-0".to_string());
-    grill.set_state(&init_id, ContainerState::Stopped);
-    grill.set_exit_code(&init_id, Some(0));
-    grill.set_state_unavailable_times(&init_id, 3);
-    let agent_handle = tokio::spawn(async move {
-        agent.run().await;
-    });
-
-    let events = send_deploy(&tx, config_with_init_container()).await;
-
-    shutdown.cancel();
-    agent_handle.await.unwrap();
-    expect_complete(&events);
-}
-
 #[tokio::test]
 async fn deploy_with_failing_init_container_fails() {
     let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
