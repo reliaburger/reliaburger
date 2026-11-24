@@ -11,6 +11,10 @@ This file is the short version. The longer records are:
 - [docs/releasing.md](docs/releasing.md#compatibility-before-100), for the full upgrade steps between each pair of releases;
 - the [GitHub release pages](https://github.com/reliaburger/reliaburger/releases), for the binaries and every merged pull request.
 
+## [Unreleased] - 0.3.3
+
+Not released yet: this is what the train carries, and it can change before the tag.
+
 ## [0.3.2] - 2026-11-23
 
 Fixes from the Wyse 3040 lab that need a new appliance image. [Release page](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.2), [release log](docs/release-log.md#032-wyse-lab-fixes).
