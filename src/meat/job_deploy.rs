@@ -19,6 +19,9 @@ pub enum DeploymentOutcome {
 pub struct DeploymentRecord {
     /// Encrypted, image-bound configuration accepted before any hook starts.
     pub config: Box<Config>,
+    /// The image each job in `config` declared, by job name, where
+    /// admission bound or pinned it to another (#1322).
+    pub declared_images: BTreeMap<String, String>,
     /// Hook names to common run identities.
     pub hook_runs: BTreeMap<String, u64>,
     /// Ordinary job names to common run identities; schedules create later runs.
@@ -68,6 +71,8 @@ impl DeploymentRecord {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use crate::config::Config;
     use crate::meat::{
         NodeId,
@@ -129,6 +134,98 @@ mod tests {
             next,
         );
     }
+    /// A deployment of two jobs whose images admission bound: a hook and
+    /// an ordinary job, with the tags they declared (#1322).
+    fn bound_deployment() -> (Config, BTreeMap<String, String>) {
+        let digest = format!("sha256:{}", "d".repeat(64));
+        let config = Config::parse(&format!(
+            "[app.web]\nimage='web:v1'\n\
+             [job.migrate]\nimage='migrate:v1@{digest}'\ncommand=['true']\nrun_before=['app.web']\n\
+             [job.notify]\nimage='notify:v1@{digest}'\ncommand=['true']"
+        ))
+        .unwrap();
+        let declared = BTreeMap::from([
+            ("migrate".to_string(), "migrate:v1".to_string()),
+            ("notify".to_string(), "notify:v1".to_string()),
+        ]);
+        (config, declared)
+    }
+
+    /// #1322: the hook a deployment admits at once and the job it admits
+    /// once the apps commit both keep the image they declared.
+    #[test]
+    fn a_deployment_admits_its_jobs_with_the_images_they_declared() {
+        let mut store = TaskArrays::default();
+        let mut next = 0;
+        let (config, declared) = bound_deployment();
+        apply(
+            &mut store,
+            TaskArrayWrite::DeployBegin {
+                operation_id: OP.into(),
+                config: Box::new(config),
+                declared_images: declared,
+                now_epoch_secs: 10,
+            },
+            &mut next,
+        );
+        let declared_image = |store: &TaskArrays, name: &str| {
+            store
+                .jobs()
+                .definition("default", name)
+                .map(|record| record.definition.declared_spec().image)
+        };
+        assert_eq!(
+            declared_image(&store, "migrate"),
+            Some(Some("migrate:v1".into()))
+        );
+        assert_eq!(declared_image(&store, "notify"), None);
+        let hook = store.deployments().next().unwrap().1.hook_runs["migrate"];
+        finish(&mut store, hook, true, &mut next);
+        apply(
+            &mut store,
+            TaskArrayWrite::DeployCommitted {
+                operation_id: OP.into(),
+                now_epoch_secs: 20,
+            },
+            &mut next,
+        );
+        assert_eq!(
+            declared_image(&store, "notify"),
+            Some(Some("notify:v1".into()))
+        );
+    }
+
+    /// #1322: a declared image names a job the same write carries, and a
+    /// deployment's identity covers what its jobs declared.
+    #[test]
+    fn declared_images_belong_to_the_jobs_in_the_write() {
+        let mut store = TaskArrays::default();
+        let (config, mut declared) = bound_deployment();
+        let mut ids = || 1;
+        let mut ghost = declared.clone();
+        ghost.insert("ghost".into(), "ghost:v1".into());
+        let begin = |declared_images| TaskArrayWrite::DeployBegin {
+            operation_id: OP.into(),
+            config: Box::new(config.clone()),
+            declared_images,
+            now_epoch_secs: 10,
+        };
+        assert!(store.apply(&begin(ghost), &mut ids).is_err());
+        let mut next = 0;
+        apply(&mut store, begin(declared.clone()), &mut next);
+        declared.remove("notify");
+        assert!(store.apply(&begin(declared), &mut ids).is_err());
+
+        let jobs = vec![("first".to_string(), config.job["notify"].clone())];
+        let register = TaskArrayWrite::RegisterJobs {
+            request_id: "batch".into(),
+            jobs,
+            declared_images: BTreeMap::from([("second".to_string(), "notify:v1".to_string())]),
+            submitted_at_epoch_secs: 10,
+        };
+        assert!(store.apply(&register, &mut ids).is_err());
+    }
+
     #[test]
     fn reopening_refuses_missing_hook_identity_or_outcome_state() {
         let mut store = TaskArrays::default();
@@ -138,6 +235,7 @@ mod tests {
             TaskArrayWrite::DeployBegin {
                 operation_id: OP.into(),
                 config: Box::new(config()),
+                declared_images: Default::default(),
                 now_epoch_secs: 10,
             },
             &mut next,
@@ -168,6 +266,7 @@ mod tests {
                     &TaskArrayWrite::RegisterJobs {
                         request_id: format!("group-{group}"),
                         jobs: jobs.clone(),
+                        declared_images: Default::default(),
                         submitted_at_epoch_secs: 10,
                     },
                     || {
@@ -197,6 +296,7 @@ mod tests {
             TaskArrayWrite::RegisterJobs {
                 request_id: "after-expiry".into(),
                 jobs: vec![("after".into(), config().job["notify"].clone())],
+                declared_images: Default::default(),
                 submitted_at_epoch_secs: 10_000,
             },
             &mut next,
@@ -215,6 +315,7 @@ mod tests {
         let write = TaskArrayWrite::RegisterJobs {
             request_id: OP.into(),
             jobs: jobs.clone(),
+            declared_images: Default::default(),
             submitted_at_epoch_secs: 10,
         };
         let result = store
@@ -246,6 +347,7 @@ mod tests {
                     &TaskArrayWrite::RegisterJobs {
                         request_id: "abcdef0123456789abcdef0123456789".into(),
                         jobs: invalid,
+                        declared_images: Default::default(),
                         submitted_at_epoch_secs: 10
                     },
                     || panic!("refusal cannot allocate")
@@ -263,6 +365,7 @@ mod tests {
             TaskArrayWrite::DeployBegin {
                 operation_id: OP.into(),
                 config: Box::new(config()),
+                declared_images: Default::default(),
                 now_epoch_secs: 10,
             },
             &mut next,
@@ -310,6 +413,7 @@ mod tests {
             TaskArrayWrite::DeployBegin {
                 operation_id: OP.into(),
                 config: Box::new(config()),
+                declared_images: Default::default(),
                 now_epoch_secs: 10,
             },
             &mut next,
@@ -372,6 +476,7 @@ mod tests {
             TaskArrayWrite::DeployBegin {
                 operation_id: OP.into(),
                 config: Box::new(config()),
+                declared_images: Default::default(),
                 now_epoch_secs: 10,
             },
             &mut next,
@@ -406,6 +511,7 @@ mod tests {
             TaskArrayWrite::DeployBegin {
                 operation_id: OP.into(),
                 config: Box::new(config()),
+                declared_images: Default::default(),
                 now_epoch_secs: 10,
             },
             &mut next,
@@ -441,6 +547,7 @@ mod tests {
         let write = TaskArrayWrite::DeployBegin {
             operation_id: OP.into(),
             config: Box::new(config()),
+            declared_images: Default::default(),
             now_epoch_secs: 10,
         };
         apply(&mut store, write.clone(), &mut next);
@@ -456,6 +563,7 @@ mod tests {
                     &TaskArrayWrite::DeployBegin {
                         operation_id: OP.into(),
                         config: Box::new(changed),
+                        declared_images: Default::default(),
                         now_epoch_secs: 10
                     },
                     || panic!("no allocation")
@@ -473,6 +581,7 @@ mod tests {
             TaskArrayWrite::DeployBegin {
                 operation_id: OP.into(),
                 config: Box::new(config()),
+                declared_images: Default::default(),
                 now_epoch_secs: 10,
             },
             &mut next,

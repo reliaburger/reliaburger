@@ -713,6 +713,7 @@ mod tests {
                 &TaskArrayWrite::DeployBegin {
                     operation_id: operation_id.clone(),
                     config: Box::new(config),
+                    declared_images: Default::default(),
                     now_epoch_secs: 2,
                 },
                 &mut ids,

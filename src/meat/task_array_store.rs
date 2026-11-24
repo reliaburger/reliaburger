@@ -198,6 +198,9 @@ pub enum TaskArrayWrite {
     RegisterJobs {
         request_id: String,
         jobs: Vec<(String, JobSpec)>,
+        /// The image each job declared, by job name, where admission bound
+        /// or pinned it to another (#1322).
+        declared_images: BTreeMap<String, String>,
         submitted_at_epoch_secs: u64,
     },
     /// Disable future occurrences and cancel all current runs in one transaction.
@@ -211,6 +214,9 @@ pub enum TaskArrayWrite {
     DeployBegin {
         operation_id: String,
         config: Box<crate::config::Config>,
+        /// The image each job in `config` declared, by job name, where
+        /// admission bound or pinned it to another (#1322).
+        declared_images: BTreeMap<String, String>,
         now_epoch_secs: u64,
     },
     /// App publication succeeded; admit ordinary jobs and register schedules.
@@ -1505,6 +1511,7 @@ impl TaskArrays {
             TaskArrayWrite::RegisterJobs {
                 request_id,
                 jobs,
+                declared_images,
                 submitted_at_epoch_secs,
             } => {
                 use sha2::{Digest, Sha256};
@@ -1540,7 +1547,10 @@ impl TaskArrays {
                         .validate()
                         .map_err(TaskArrayStoreError::Job)?;
                 }
-                let bytes = serde_json::to_vec(&jobs)
+                if declared_images.keys().any(|name| !names.contains(name)) {
+                    return Err(refuse("a declared image names a job outside the batch"));
+                }
+                let bytes = serde_json::to_vec(&(&jobs, declared_images))
                     .map_err(|error| TaskArrayStoreError::Job(error.to_string()))?;
                 let digest = hex::encode(Sha256::digest(bytes));
                 if let Some((id, prior)) = self.manifests.iter().find(|(_, record)| {
@@ -1562,11 +1572,13 @@ impl TaskArrays {
                 let mut cohorts = Vec::new();
                 for (name, spec) in jobs {
                     let namespace = spec.namespace.clone().unwrap_or_else(|| "default".into());
+                    let mut definition = JobDefinition::from_spec(spec);
+                    definition.declared_image = declared_images.get(&name).cloned();
                     let result = self.apply_job(
                         &JobWrite::Put {
                             name: name.clone(),
                             namespace,
-                            definition: Box::new(JobDefinition::from_spec(spec)),
+                            definition: Box::new(definition),
                             trigger: Some(RunTrigger::Manual {
                                 request_id: request_id.clone(),
                             }),
@@ -1599,6 +1611,7 @@ impl TaskArrays {
             TaskArrayWrite::DeployBegin {
                 operation_id,
                 config,
+                declared_images,
                 now_epoch_secs,
             } => {
                 if operation_id.len() != 32
@@ -1614,8 +1627,16 @@ impl TaskArrays {
                 if serde_json::to_vec(config).map_or(true, |bytes| bytes.len() > 128 * 1024) {
                     return Err(refuse("deployment exceeds 128 KiB"));
                 }
+                if declared_images
+                    .keys()
+                    .any(|name| !config.job.contains_key(name))
+                {
+                    return Err(refuse(
+                        "a declared image names a job outside the deployment",
+                    ));
+                }
                 if let Some(prior) = self.deployments.get(operation_id) {
-                    return if prior.config == *config {
+                    return if prior.config == *config && prior.declared_images == *declared_images {
                         Ok(TaskArrayApplied::JobRecorded)
                     } else {
                         Err(refuse("deployment identity already names different work"))
@@ -1656,6 +1677,7 @@ impl TaskArrays {
                     let namespace = spec.namespace.clone().unwrap_or_else(|| "default".into());
                     let mut definition = JobDefinition::from_spec(spec.clone());
                     definition.template.namespace = Some(namespace.clone());
+                    definition.declared_image = declared_images.get(name).cloned();
                     let trigger = definition.cron.is_none().then(|| RunTrigger::Hook {
                         operation_id: operation_id.clone(),
                     });
@@ -1691,6 +1713,7 @@ impl TaskArrays {
                 }
                 let mut record = DeploymentRecord {
                     config: config.clone(),
+                    declared_images: declared_images.clone(),
                     hook_runs: BTreeMap::new(),
                     job_runs: BTreeMap::new(),
                     apps_committed: false,
@@ -1710,6 +1733,7 @@ impl TaskArrays {
                     let namespace = spec.namespace.clone().unwrap_or_else(|| "default".into());
                     let mut definition = JobDefinition::from_spec(spec.clone());
                     definition.template.namespace = Some(namespace.clone());
+                    definition.declared_image = declared_images.get(name).cloned();
                     let result = self.apply_job(
                         &JobWrite::Put {
                             name: name.clone(),
@@ -1764,6 +1788,7 @@ impl TaskArrays {
                     let namespace = spec.namespace.clone().unwrap_or_else(|| "default".into());
                     let mut definition = JobDefinition::from_spec(spec.clone());
                     definition.template.namespace = Some(namespace.clone());
+                    definition.declared_image = record.declared_images.get(name).cloned();
                     let trigger = definition.cron.is_none().then(|| RunTrigger::Hook {
                         operation_id: operation_id.clone(),
                     });
@@ -2164,6 +2189,7 @@ mod tests {
                 &TaskArrayWrite::DeployBegin {
                     operation_id: "b".repeat(32),
                     config: Box::new(config),
+                    declared_images: Default::default(),
                     now_epoch_secs: 2,
                 },
                 &mut ids,
@@ -2941,6 +2967,7 @@ mod tests {
                     &TaskArrayWrite::DeployBegin {
                         operation_id: "a".repeat(32),
                         config: Box::new(config),
+                        declared_images: Default::default(),
                         now_epoch_secs: 1,
                     },
                     || {

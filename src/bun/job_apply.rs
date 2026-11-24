@@ -149,11 +149,19 @@ pub(crate) async fn apply(
         )
             .into_response();
     }
+    // Each job's image before binding, kept beside its definition so the
+    // policy audit judges the job as declared (#1322).
+    let declared: std::collections::BTreeMap<String, Option<String>> = config
+        .job
+        .iter()
+        .map(|(name, spec)| (name.clone(), spec.image.clone()))
+        .collect();
     if let Some(binder) = binder
         && let Err(response) = super::api::apply::bind_images(&state, binder, &mut config).await
     {
         return response;
     }
+    let mut declared_images = std::collections::BTreeMap::new();
     for (name, spec) in &mut config.job {
         let namespace = spec.namespace.clone().unwrap_or_else(|| "default".into());
         let mut definition = JobDefinition::from_spec(spec.clone());
@@ -170,6 +178,10 @@ pub(crate) async fn apply(
         .await
         {
             return response;
+        }
+        definition.settle_declared_image(declared.get(name).cloned().flatten());
+        if let Some(image) = definition.declared_image {
+            declared_images.insert(name.clone(), image);
         }
         spec.namespace = Some(namespace);
         spec.image = definition.template.image;
@@ -190,7 +202,7 @@ pub(crate) async fn apply(
         None if rerun => format!("{:032x}", rand::random::<u128>()),
         None => {
             use sha2::{Digest, Sha256};
-            let bytes = match serde_json::to_vec(&config) {
+            let bytes = match serde_json::to_vec(&(&config, &declared_images)) {
                 Ok(bytes) => bytes,
                 Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
             };
@@ -209,6 +221,7 @@ pub(crate) async fn apply(
         TaskArrayWrite::DeployBegin {
             operation_id: operation_id.clone(),
             config: Box::new(config),
+            declared_images,
             now_epoch_secs: crate::meat::batch_ids::epoch_now_secs(),
         },
     )

@@ -994,8 +994,14 @@ evaluates one.
   kept, else the stored one with its image read back as its tag) through
   `judge_app`, as the owner's token (with its role) for apps a controller
   owns (#1125), as `gitops` for apps GitOps owns and as the system caller
-  `audit` otherwise, including an owned app whose token is gone, and every job definition (schedule restored, image read
-  back) through `judge_job`. It changes nothing. `relish policy audit` prints
+  `audit` otherwise, including an owned app whose token is gone, and every job definition through `judge_job`, as
+  `JobDefinition::declared_spec`: schedule and run policy restored, and the
+  image the job declared. Admission keeps that as
+  `JobDefinition::declared_image` when binding or pinning changed the image
+  (#1322); `RegisterJobs` and `DeployBegin` carry it as `declared_images`
+  (job name to image), and a deployment keeps it in its record until its
+  jobs commit. Binding is the only change admission makes to a job, so the
+  image is the whole difference between the declared and stored spec. It changes nothing. `relish policy audit` prints
   it, and `relish wtf` reads it into a `policies` evidence row
   (`policy-would-deny`, `policy-audit`, `policy-broken`).
 - **Cost and coverage (#1126, #1311).** `benches/policy.rs` (in `make bench`)

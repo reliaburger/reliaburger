@@ -286,13 +286,21 @@ pub struct Compatibility {
 /// after the apply's stream has answered `200`, so `relish apply` on a
 /// cluster reports an image nobody built as `404`, not `500` (#2157).
 ///
+/// 0.4.0 (63/78; the numbers settle when the 0.4.0 train takes this beside
+/// #714's 62/77): jobs keep their declared spec for the policy audit
+/// (#1322). `JobDefinition::declared_image`, `TaskArrayWrite::RegisterJobs`
+/// and `DeployBegin`'s `declared_images`, and
+/// `DeploymentRecord::declared_images` are new; `JobDefinition` and
+/// `DeploymentRecord` refuse unknown fields, so a 76 replica can't read
+/// them. Start a fresh cluster.
+///
 /// Bumping either number makes the checked-in gossip and Raft fuzz seeds
 /// stale: run `make fuzz-corpus-seed` in the same change (#1941). Keep the
 /// two fields directly inside the braces: the release scripts read them with
 /// a regex.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 61,
-    state: 76,
+    protocol: 63,
+    state: 78,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.
