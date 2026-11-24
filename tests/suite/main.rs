@@ -111,6 +111,7 @@ mod task_array_million;
 mod task_array_recovery;
 mod task_arrays;
 mod templates;
+mod test_ports;
 mod tls_connection_lifetime;
 mod toolchain_pins;
 mod uninstall;
