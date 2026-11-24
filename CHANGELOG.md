@@ -31,6 +31,9 @@ Not released yet: this is what the train carries, and it can change before the t
 - The appliance image has Buildah, so `relish build` and the five-minute tour's burger build on a cluster of appliances. Its storage is on the data partition, where Btrfs reflinks the `vfs` driver's layer copies; the image adds `netavark` and `gpg` for it, drops Buildah's 97 MB of test helpers, and grows each `/usr` slot by 54 MB (667 MB to 721 MB of 1,100 MB on x86-64). A multi-platform build can't emulate the other architecture's `RUN` steps on an appliance, so cross-compile or name one `platform`. With no node able to build, the refusal no longer says appliances never can ([#2144](https://github.com/reliaburger/reliaburger/issues/2144)).
 - Policy expressions nested more than 32 deep are refused before they're parsed, and `relish apply` checks the admin permission for policy tables before compiling them.
 - `relish policy audit` documents what it judges of a job: the definition the cluster keeps, so a one-off job counts while a run refers to it and drops out once its last run is pruned, when it can't run again; and a job pinned by tag and digest is judged by its tag, until the cluster keeps a declared job spec as it does for apps. Tests now cover the audit's job path ([#1322](https://github.com/reliaburger/reliaburger/issues/1322)).
+- CI: the merge queue no longer runs portable macOS. A new nightly workflow, `macos-nightly.yml`, runs it on the newest release train. The release gate PR, the push to `main` and the candidate build still require it.
+- CI: cargo-fuzz no longer runs on pull requests, only nightly and by hand.
+- CI: draft pull requests, and pull requests from `0-4-0/` branches, run only select jobs, CI policy and lint. Marking a draft ready for review runs the full set.
 
 ### Fixed
 
