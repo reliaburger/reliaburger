@@ -161,7 +161,7 @@ The fast loop: aim for under 30 minutes a pass, and use the shortcuts freely.
 
   You want one node alive, `Size: up to 5 voters`, and nothing for `wtf` to fix. If `relish machines` sees nothing, run `dns-sd -B _rb-unclaimed._tcp`, or claim by address (`<ip-1>`) instead of MAC.
 
-- [ ] **1.6 Run a workload.** The ingress is on port 80 of the node, not `localhost:18080`. Note how long the image pull took compared with the laptop quickstart. Until an image with Buildah (#2144, 0.3.3) is on the node, use an image from Docker Hub. Save this as `~/wyse-lab/nginx.toml`:
+- [ ] **1.6 Run a workload.** The ingress is on port 80 of the node, not `localhost:18080`. Note how long the image pull took compared with the laptop quickstart: `apply --wait` prints each step (placed, pulling, ready) with the seconds since the apply, and returns once nginx runs and passes its health check. Until an image with Buildah (#2144, 0.3.3) is on the node, use an image from Docker Hub. Save this as `~/wyse-lab/nginx.toml`:
 
   ```toml
   [app.nginx]
@@ -180,7 +180,7 @@ The fast loop: aim for under 30 minutes a pass, and use the shortcuts freely.
   ```
 
   ```sh
-  $R apply ~/wyse-lab/nginx.toml
+  $R apply --wait ~/wyse-lab/nginx.toml
   $R apps
   curl -H 'Host: nginx.localhost' http://<ip-1>/
   ```

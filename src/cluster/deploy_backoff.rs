@@ -15,11 +15,24 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+use crate::bun::execution_budget::CapacityRefusalKind;
+
 /// Delay after the first failure of a specification.
 pub const INITIAL_DEPLOY_BACKOFF: Duration = Duration::from_secs(5);
 
 /// Ceiling for the delay between attempts at one failing specification.
 pub const MAX_DEPLOY_BACKOFF: Duration = Duration::from_secs(300);
+
+/// The fixed delay before retrying a deploy a node refused while its job
+/// work makes room for it (#1967). The node's claim, not this backoff,
+/// bounds how long that goes on.
+pub const CAPACITY_RETRY: Duration = Duration::from_secs(5);
+
+/// Ceiling for the delay after a node refused a deploy with no room to make.
+/// The leader moves the replica once it hears the refusal, so this mostly
+/// bounds the case where it sends the replica back; five minutes left a
+/// re-placed replica down long after it would have fitted.
+pub const MAX_CAPACITY_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Placement key: application name and namespace.
 pub type PlacementKey = (String, String);
@@ -83,11 +96,37 @@ impl DeployBackoff {
         fingerprint: &str,
         now: Instant,
     ) -> Deferral {
+        self.record(key, fingerprint, now, self.max)
+    }
+
+    /// Record an attempt the node refused for lack of room. It counts as a
+    /// failure like any other, but a yielding refusal waits a fixed
+    /// [`CAPACITY_RETRY`] and a full one at most [`MAX_CAPACITY_BACKOFF`].
+    pub fn record_capacity_refusal(
+        &mut self,
+        key: &PlacementKey,
+        fingerprint: &str,
+        now: Instant,
+        kind: CapacityRefusalKind,
+    ) -> Deferral {
+        match kind {
+            CapacityRefusalKind::Yielding => self.record(key, fingerprint, now, CAPACITY_RETRY),
+            CapacityRefusalKind::Full => self.record(key, fingerprint, now, MAX_CAPACITY_BACKOFF),
+        }
+    }
+
+    fn record(
+        &mut self,
+        key: &PlacementKey,
+        fingerprint: &str,
+        now: Instant,
+        ceiling: Duration,
+    ) -> Deferral {
         let failures = match self.failures.get(key) {
             Some(record) if record.fingerprint == fingerprint => record.failures.saturating_add(1),
             _ => 1,
         };
-        let delay = self.delay_for(failures);
+        let delay = self.delay_for(failures).min(ceiling);
         self.failures.insert(
             key.clone(),
             FailureRecord {
@@ -155,6 +194,51 @@ mod tests {
             })
             .collect();
         assert_eq!(delays, vec![5, 10, 20, 40, 80, 160, 300, 300, 300, 300]);
+    }
+
+    /// #1967: a replica refused for lack of room on a node full of job
+    /// executors waited up to five minutes between tries, long after the
+    /// executors had made way for it.
+    #[test]
+    fn a_yielding_refusal_retries_every_five_seconds_however_often_it_repeats() {
+        let mut backoff = DeployBackoff::default();
+        let now = Instant::now();
+        for _ in 0..10 {
+            let deferral = backoff.record_capacity_refusal(
+                &key(),
+                "spec-a",
+                now,
+                CapacityRefusalKind::Yielding,
+            );
+            assert_eq!(deferral.delay, CAPACITY_RETRY);
+        }
+    }
+
+    #[test]
+    fn a_capacity_refusal_never_waits_more_than_thirty_seconds() {
+        let mut backoff = DeployBackoff::default();
+        let now = Instant::now();
+        let delays: Vec<u64> = (0..8)
+            .map(|_| {
+                backoff
+                    .record_capacity_refusal(&key(), "spec-a", now, CapacityRefusalKind::Full)
+                    .delay
+                    .as_secs()
+            })
+            .collect();
+        assert_eq!(delays, vec![5, 10, 20, 30, 30, 30, 30, 30]);
+    }
+
+    #[test]
+    fn other_failures_keep_the_five_minute_ceiling() {
+        let mut backoff = DeployBackoff::default();
+        let now = Instant::now();
+        for _ in 0..6 {
+            backoff.record_capacity_refusal(&key(), "spec-a", now, CapacityRefusalKind::Full);
+        }
+        let deferral = backoff.record_failure(&key(), "spec-a", now);
+        assert_eq!(deferral.failures, 7);
+        assert_eq!(deferral.delay, MAX_DEPLOY_BACKOFF);
     }
 
     #[test]

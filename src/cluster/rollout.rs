@@ -195,6 +195,16 @@ pub fn app_shares(
         .collect()
 }
 
+/// Whether `spec` is the newest spec in `rollouts` that finished rolling
+/// out healthy on every node: the leader has committed its
+/// `RolloutReleased`. A new app is not, until its first rollout finishes;
+/// a scale change keeps the version, so it stays rolled out.
+pub fn is_rolled_out(spec: &AppSpec, rollouts: Option<&AppRollouts>) -> bool {
+    rollouts
+        .and_then(AppRollouts::last_released)
+        .is_some_and(|last| rollout_fingerprint(last) == rollout_fingerprint(spec))
+}
+
 /// The apps whose current spec now runs healthy on every node they're
 /// placed on and isn't yet their newest rollback target: the leader
 /// commits a `RolloutReleased` for each.
@@ -204,15 +214,10 @@ pub fn newly_released(desired: &DesiredState, reports: &AggregatedState) -> Vec<
         .iter()
         .filter(|(app_id, _)| !desired.stopped_apps.contains(*app_id))
         .filter_map(|(app_id, spec)| {
-            let fingerprint = rollout_fingerprint(spec);
-            let already = desired
-                .rollouts
-                .get(app_id)
-                .and_then(AppRollouts::last_released)
-                .is_some_and(|last| rollout_fingerprint(last) == fingerprint);
-            if already {
+            if is_rolled_out(spec, desired.rollouts.get(app_id)) {
                 return None;
             }
+            let fingerprint = rollout_fingerprint(spec);
             let shares = app_shares(desired, reports, app_id);
             let everywhere = !shares.is_empty()
                 && shares.values().all(|share| {
@@ -426,5 +431,28 @@ mod tests {
         );
         assert_eq!(desired_nodes(&plan), ["node-1"]);
         assert_eq!(plan[&node("node-2")], Release::Hold(&v2));
+    }
+
+    #[test]
+    fn a_spec_is_rolled_out_once_it_is_the_newest_released_one() {
+        // A new app with no rollout recorded yet is still rolling out.
+        assert!(!is_rolled_out(&spec("web:v1"), None));
+        assert!(!is_rolled_out(
+            &spec("web:v1"),
+            Some(&AppRollouts::default())
+        ));
+        // Released: rolled out.
+        let rollouts = released(&["web:v1"]);
+        assert!(is_rolled_out(&spec("web:v1"), Some(&rollouts)));
+        // A changed spec isn't, until it's released in its turn.
+        assert!(!is_rolled_out(&spec("web:v2"), Some(&rollouts)));
+        // An older release that isn't the newest doesn't count: v1 again
+        // after v2 rolls out has to roll out again.
+        let rollouts = released(&["web:v1", "web:v2"]);
+        assert!(!is_rolled_out(&spec("web:v1"), Some(&rollouts)));
+        // A scale change keeps the version, so it never waits.
+        let mut scaled = spec("web:v2");
+        scaled.replicas = crate::config::Replicas::Fixed(7);
+        assert!(is_rolled_out(&scaled, Some(&rollouts)));
     }
 }

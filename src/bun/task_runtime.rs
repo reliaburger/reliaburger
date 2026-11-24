@@ -310,7 +310,8 @@ impl<G: Grill + Clone> OwnedRunner<G> {
         if budget.has_waiters() {
             return 0;
         }
-        let available = budget.available();
+        // Room a refused app claims isn't offered to job work (#1967).
+        let available = budget.job_available();
         (available.cpu_millicores / profile.reservation.cpu_millicores)
             .min(available.memory_bytes / profile.reservation.memory_bytes)
             .min(MAX_EXECUTOR_SLOTS as u64) as u32

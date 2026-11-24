@@ -231,6 +231,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/v1/capabilities/cluster", AnyToken),
     route(Get, "/v1/diagnostics", AnyToken),
     route(Get, "/v1/diagnostics/apps", AnyToken),
+    route(Get, "/v1/diagnostics/rollouts", AnyToken),
     route(Post, "/v1/path", AnyToken),
     // A lease provisions isolated test namespaces or node jobs for the whole
     // cluster, so under a `[permission]` block it needs `admin` everywhere.

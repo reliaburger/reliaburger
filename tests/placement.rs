@@ -4765,3 +4765,199 @@ async fn replicas_move_off_a_node_whose_reports_stopped_after_the_grace() {
     }
     shutdown.cancel();
 }
+
+/// The running instances of `app` on `nodes`, as `node/id`.
+async fn running_instances(nodes: &[&Node], app: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for node in nodes {
+        if let Ok(statuses) = node.client.status().await {
+            found.extend(
+                statuses
+                    .iter()
+                    .filter(|s| s.app_name == app && s.state == "running")
+                    .map(|s| format!("{}/{}", node.name, s.id)),
+            );
+        }
+    }
+    found.sort();
+    found
+}
+
+/// A manifest file for `relish apply --wait`.
+fn manifest(
+    toml: &str,
+) -> (
+    tempfile::NamedTempFile,
+    reliaburger::relish::manifest::ManifestSource,
+) {
+    use std::io::Write as _;
+    let mut file = tempfile::Builder::new().suffix(".toml").tempfile().unwrap();
+    file.write_all(toml.as_bytes()).unwrap();
+    let source = reliaburger::relish::manifest::ManifestSource::File(file.path().to_path_buf());
+    (file, source)
+}
+
+/// `relish apply --wait` through `client`, asked again while the node
+/// answers 503 because it doesn't know the leader yet: a follower learns
+/// the leader's API through gossip a moment after the election. An apply
+/// is idempotent, so asking again changes nothing.
+async fn apply_and_wait_once_routed(
+    source: &reliaburger::relish::manifest::ManifestSource,
+    timeout: Duration,
+    poll: Duration,
+    client: &BunClient,
+) -> reliaburger::relish::apply_wait::ApplyWaitData {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match reliaburger::relish::apply_wait::apply_and_wait(
+            source,
+            reliaburger::relish::OutputFormat::Json,
+            timeout,
+            poll,
+            client,
+        )
+        .await
+        {
+            Ok(data) => return data,
+            Err(reliaburger::relish::RelishError::ApiError { status: 503, body })
+                if tokio::time::Instant::now() < deadline =>
+            {
+                eprintln!("apply answered 503 ({body}); asking again");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(error) => panic!("apply --wait failed: {error}"),
+        }
+    }
+}
+
+/// #2240: `relish apply --wait` returns only once every app in the file
+/// runs all its replicas; an update only once the new spec replaced the old
+/// one's instances; and a file with an app no node can take times out,
+/// naming that app and the scheduler's reason while the others are ready.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn apply_wait_returns_once_the_apps_run_and_names_what_never_does() {
+    use reliaburger::relish::apply_wait;
+
+    let shutdown = CancellationToken::new();
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_node("w1", base, vec![], &shutdown).await;
+    let n2 = start_node("w2", base + 4, vec![local(base)], &shutdown).await;
+    let n3 = start_node("w3", base + 8, vec![local(base)], &shutdown).await;
+    let nodes = [&n1, &n2, &n3];
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            nodes.iter().any(|n| *n.thinks_leader.borrow())
+        })
+        .await,
+        "no leader elected"
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await; // let reports land
+    // Through a follower, so the apply and both leader reads (desired
+    // apps and rollouts) are forwarded.
+    let follower = nodes
+        .iter()
+        .find(|n| !*n.thinks_leader.borrow())
+        .expect("a follower");
+    let poll = Duration::from_millis(250);
+
+    // Two apps in one file: the wait covers both.
+    let (_first, source) = manifest(
+        r#"
+        [app.web]
+        script = "exec sleep 600"
+        replicas = 3
+
+        [app.worker]
+        script = "exec sleep 600"
+        replicas = 1
+    "#,
+    );
+    let data =
+        apply_and_wait_once_routed(&source, Duration::from_secs(90), poll, &follower.client).await;
+    assert!(data.ready, "{data:#?}");
+    assert_eq!(apply_wait::exit_code(&data), 0);
+    // Ready means running, there and then.
+    let web_v1 = running_instances(&nodes, "web").await;
+    assert_eq!(web_v1.len(), 3, "{web_v1:?}");
+    assert_eq!(running_instances(&nodes, "worker").await.len(), 1);
+    assert!(
+        data.apps.iter().all(|app| app.rolled_out == Some(true)),
+        "{data:#?}"
+    );
+
+    // An update: every v1 instance still runs when the apply returns, so
+    // the wait has to see the new spec roll out.
+    let (_second, source) = manifest(
+        r#"
+        [app.web]
+        script = "exec sleep 600"
+        replicas = 3
+        env = { VERSION = "2" }
+
+        [app.worker]
+        script = "exec sleep 600"
+        replicas = 1
+    "#,
+    );
+    let data =
+        apply_and_wait_once_routed(&source, Duration::from_secs(120), poll, &follower.client).await;
+    assert!(data.ready, "{data:#?}");
+    let web_v2 = running_instances(&nodes, "web").await;
+    assert_eq!(web_v2.len(), 3, "{web_v2:?}");
+    assert!(
+        web_v2.iter().all(|instance| !web_v1.contains(instance)),
+        "the wait returned while v1 still served: v1 {web_v1:?}, now {web_v2:?}"
+    );
+
+    // No node carries the label `nowhere` asks for: it times out, named,
+    // with the scheduler's reason, and the rest are ready.
+    let (_third, source) = manifest(
+        r#"
+        [app.web]
+        script = "exec sleep 600"
+        replicas = 3
+        env = { VERSION = "2" }
+
+        [app.nowhere]
+        script = "exec sleep 600"
+        replicas = 1
+
+        [app.nowhere.placement]
+        required = ["zone=nowhere"]
+    "#,
+    );
+    let started = tokio::time::Instant::now();
+    let data =
+        apply_and_wait_once_routed(&source, Duration::from_secs(8), poll, &follower.client).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "the wait outlived its timeout"
+    );
+    assert!(!data.ready, "{data:#?}");
+    assert!(!data.gave_up);
+    assert_eq!(
+        apply_wait::exit_code(&data),
+        apply_wait::NOT_READY_EXIT_CODE
+    );
+    let web = data.apps.iter().find(|app| app.app == "web").unwrap();
+    assert!(web.ready, "{data:#?}");
+    let nowhere = data.apps.iter().find(|app| app.app == "nowhere").unwrap();
+    assert!(!nowhere.ready);
+    let reason = nowhere.reason.as_deref().unwrap_or_default();
+    assert!(reason.starts_with("unschedulable: "), "{data:#?}");
+    let rendered = apply_wait::render(&data);
+    assert!(
+        rendered.contains("not ready after 8s: 1 of 2 app(s)"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("relish apps nowhere"), "{rendered}");
+
+    shutdown.cancel();
+    for n in nodes {
+        if let Some(c) = &n.handle.council {
+            c.shutdown().await.ok();
+        }
+    }
+}

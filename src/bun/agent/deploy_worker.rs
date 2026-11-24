@@ -408,7 +408,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 Err(e) => {
                     let _ = events
                         .send(ApplyEvent::Error {
-                            status: None,
+                            status: e.apply_status(),
                             message: e.to_string(),
                         })
                         .await;
@@ -937,7 +937,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     .await;
                 let _ = events
                     .send(ApplyEvent::Error {
-                        status: None,
+                        status: error.apply_status(),
                         message: error.to_string(),
                     })
                     .await;
