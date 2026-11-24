@@ -729,9 +729,23 @@ async fn a_volume_app_is_refused_for_want_of_a_container_runtime() {
         "{error}"
     );
 
-    let statuses = harness.client.status().await.unwrap();
-    assert_eq!(statuses[0].app_name, "volapp");
-    assert_eq!(statuses[0].state, "failed");
+    // Status answers from the snapshot the agent loop publishes after each
+    // turn, so the turn that failed the instance may not have published yet
+    // when the apply returns (#1723).
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let statuses = harness.client.status().await.unwrap();
+        assert_eq!(statuses[0].app_name, "volapp");
+        if statuses[0].state == "failed" {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "volapp is still {}",
+            statuses[0].state
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 /// X3 regression: `relish rollback` used to only print advice. The
