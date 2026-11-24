@@ -6093,6 +6093,17 @@
           ]
         },
         {
+          "id": "legacy-ci-reliaburger-cluster_failover-a_context_whose_first_node_is_down_reaches_the_cluster_through_the_next",
+          "binary": "reliaburger::cluster_failover",
+          "test": "a_context_whose_first_node_is_down_reaches_the_cluster_through_the_next",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
+          ]
+        },
+        {
           "id": "legacy-ci-reliaburger-cluster_failover-an_agent_lease_survives_a_leader_change_and_the_new_leader_expires_it",
           "binary": "reliaburger::cluster_failover",
           "test": "an_agent_lease_survives_a_leader_change_and_the_new_leader_expires_it",

@@ -45,17 +45,44 @@ On first boot `systemd-repart` grows the data partition and adds an empty
 everything a node changes lives on the data partition. That's also why an OS
 update never touches the cluster's state (§4.4).
 
-The image has no Buildah, so no appliance node can run `relish build`. bun
-refuses a build that no node can run with `NO_BUILDER_ERROR`
-(`src/bun/build_runner.rs`), which names the ways out: build elsewhere and
-push into Pickle, or add a Linux node with Buildah, which bun hands builds to
-(#2144).
+The image has Buildah, so every appliance node can run `relish build`
+(#2144). Its storage is `<storage.data>/buildah` on the data partition, where
+the `vfs` driver's layer copies are Btrfs reflinks, so a layer costs metadata
+rather than a second copy of its parent's blocks on the eMMC. The appliance
+profile keeps a 1 GiB build cache (`src/appliance/seed.rs`). mkosi installs no
+Recommends, so `mkosi.conf` names the two Buildah needs: `netavark`, the
+network stack for `RUN` steps, and `gpg`, which satisfies libgpgme's
+`gnupg | gpg` without GnuPG's agents. `RUN` steps use the image's runc. The
+package's test helpers in `/usr/libexec/buildah` (97 MB of the package's
+125 MB) are removed. Buildah adds 54 MB to each `/usr` slot: on x86-64 the
+EROFS image went from 667 MB to 721 MB of the slot's 1,100 MB. `image/tests/builder_packages.py` checks the
+config and each built manifest, and CI's seeded pair builds the tour's burger
+on two appliances. With no node able to build, bun still refuses with
+`NO_BUILDER_ERROR` (`src/bun/build_runner.rs`), which names the ways out.
 
 Lab builds add `openssh-server` for debugging. Published images don't have
 it, and `image/tests/no_ssh_server.py` checks it twice. Its unit test reads
 the mkosi configs, where only a `Profiles=lab` drop-in may name an SSH
 server. In CI it reads each built image's manifest, where a published build
 must list none and a lab build must list `openssh-server`.
+
+With no login, the local keyboard reaches only tty1's status screen
+(`reliaburger-console.service`, #2279). A logind drop-in sets `NAutoVTs=0`
+and `ReserveVT=0`, so tty2 to tty6 get no getty, and Ubuntu's
+`getty-static.service`, which starts them when logind is missing, is masked.
+`ctrl-alt-del.target` is masked, and the image's preset disables
+`reboot.target`: the target is its alias, and systemd's 90-systemd.preset
+enabling it made `preset-all` replace the mask with the alias in the first CI
+build. `CtrlAltDelBurstAction=none` stops PID 1 forcing a reboot on seven
+quick presses. `kernel.sysrq = 176` keeps only
+SysRq's sync (16), read-only remount (32) and reboot (128): the gentlest way
+to restart a hung node with no login, and nothing the power button doesn't
+already give someone at the keyboard. Killing processes (64) and dumping
+tasks or memory (8) stay off. Physical access is still root. The drop-ins and
+the sysctl live in `/usr`, so an update brings them; the masks are in `/etc`,
+where etc-sync adds them on existing nodes. `image/tests/local_keyboard.py`
+checks the config in its unit test and each built image's `/usr` partition
+(with its factory `/etc`) in CI, settling every value as systemd would.
 
 ## 2. `relish netboot`
 

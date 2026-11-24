@@ -7,3 +7,8 @@ enable systemd-resolved.service
 enable systemd-timesyncd.service
 disable systemd-sysupdate.timer
 disable systemd-sysupdate-reboot.timer
+# ctrl-alt-del.target is reboot.target's alias, and systemd's 90-systemd.preset
+# enables reboot.target, which turns the alias back on over the mask in
+# /etc/systemd/system (#2279). Nothing needs it enabled: shutdown and
+# reboot start reboot.target directly.
+disable reboot.target

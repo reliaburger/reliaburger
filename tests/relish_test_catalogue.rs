@@ -320,6 +320,8 @@ fn registry_cases_push_through_the_contexts_forward_with_an_explicit_endpoint() 
         schema: 1,
         owner: "forward-fixture".to_string(),
         endpoint: secure.endpoint.clone(),
+        other_endpoints: Vec::new(),
+        last_answered: None,
         token: secure.token.clone(),
         ca_cert: secure.ca.clone(),
         service_endpoints: reliaburger::bun::capabilities::ServiceEndpoints {

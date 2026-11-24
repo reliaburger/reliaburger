@@ -631,6 +631,8 @@ fn guest_context(cluster_name: &str, token: &str) -> LocalContext {
         schema: 1,
         owner: format!("dev-{cluster_name}"),
         endpoint: "https://127.0.0.1:9117".to_string(),
+        other_endpoints: Vec::new(),
+        last_answered: None,
         token: token.to_string(),
         ca_cert: PathBuf::from(GUEST_ROOT_CA),
         service_endpoints: Default::default(),
@@ -781,6 +783,11 @@ pub async fn create(
         eprintln!("  Linux:  https://lima-vm.io/docs/installation/");
         return Err(RelishError::LimaNotFound);
     }
+    // The nodes share Lima's user-v2 network, which some QEMU builds abort on (#1495).
+    #[cfg(target_os = "linux")]
+    crate::relish::quickstart::preflight::qemu()
+        .await
+        .map_err(|error| invalid_input(format!("{error:#}")))?;
 
     if state_path(name).exists() {
         return Err(RelishError::DevClusterAlreadyExists {
