@@ -3324,6 +3324,36 @@ through the reference, much as `*p = x` does in C. `matches!` is a `match`
 that answers `true` or `false`, for when you only need to know which
 variant you have.
 
+A redacted view invites one mistake: a controller reads the spec, changes
+the image, and applies the whole thing back, writing the text `[redacted]`
+over the real password. So apply refuses a spec whose env value, inline
+config file, or command, argument, script or `pre_stop` word is exactly
+the placeholder, with `Config::refuse_redaction_placeholders` in
+`src/config/validate.rs` naming the first such field (#2296). It compares
+against the same `REDACTED` constant the view writes, so the two can't
+drift apart, and only a whole value or word counts: `x[redacted]y` is
+somebody's real data. The search is a chain of `Option`s:
+
+```rust
+in_env(&app.env)
+    .or_else(|| in_words("command", &app.command))
+    .or_else(|| in_words("args", &app.args))
+    .or(script)
+    // ...pre_stop, config files, init containers, sidecars
+```
+
+`Option::or_else` takes a closure and only calls it when the value so far
+is `None`, so the search stops at the first hit, much like a chain of `||`
+in C or Go; `or` takes a value that has already been computed. The check
+runs where an apply comes in (the `POST /v1/apply` handler, the GitOps sync,
+and `relish apply`, `deploy` and `lint`, so that a dry run refuses what the
+cluster would), but not in `validate_against`. The council's state machine
+calls that one on every node as it applies a log entry, and a rule added
+there in a release that keeps the protocol version would let a node on
+0.3.2 accept an entry a node on 0.3.3 refuses, so their states would
+differ. Refusing at the door changes nothing on the wire, so the protocol
+version stays where it was.
+
 Where to redact matters as much as what. A follower forwards the read to
 the leader under its service token, like the desired-apps read, and the
 leader builds the view and redacts before it answers, so no secret crosses

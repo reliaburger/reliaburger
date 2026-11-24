@@ -52,6 +52,14 @@ pub enum ConfigError {
         reason: String,
     },
 
+    /// A value that is exactly the placeholder the spec read writes in
+    /// place of a secret (#2296). Applied, it would replace the real value.
+    #[error(
+        "app {app}: {field} is the redaction placeholder {:?}; supply the real value",
+        crate::redact::REDACTED
+    )]
+    RedactionPlaceholder { app: String, field: String },
+
     /// A `[policy.*]` table that can't be committed (#1117).
     #[error("policy {name:?}: {source}")]
     InvalidPolicy {
