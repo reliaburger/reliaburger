@@ -393,7 +393,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// and register all its sidecars (#1315). A sidecar whose record the
     /// runtime vouches for runs on; any other is retired and due at once,
     /// to start again beside its instance from the spec it was launched
-    /// with (#1434). Returns the sidecars it adopted.
+    /// with (#1434). Returns which it adopted and which it retired.
+    ///
+    /// A sidecar's adoption is best effort, as its record is: one the
+    /// runtime can't vouch for either way (an error, or no answer in time)
+    /// is killed and retired like one it refused, and the node starts.
     async fn adopt_sidecars(
         &mut self,
         parent: &InstanceId,
@@ -401,49 +405,75 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         records: &std::collections::HashMap<String, crate::grill::records::InstanceRecord>,
         adoptable: impl Fn(&str) -> bool,
         now: Instant,
-    ) -> Result<std::collections::HashSet<InstanceId>, BunError> {
-        let mut adopted = std::collections::HashSet::new();
+    ) -> Result<SidecarAdoption, BunError> {
+        let mut outcome = SidecarAdoption::default();
         for spec in specs {
             let id = crate::grill::oci::sidecar_instance_id(parent, &spec.name);
             let Some(record) = records.get(&id.0).filter(|_| adoptable(&id.0)) else {
                 continue;
             };
-            let running = tokio::time::timeout(
+            let answer = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
                 self.supervisor.grill().adopt(&id, record),
             )
-            .await
-            .map_err(|_| {
-                BunError::AdoptionState(format!("runtime adoption timed out for {id}"))
-            })??;
-            if running {
-                adopted.insert(id);
-            } else if !self.defer_startup_retirement(&id).await? {
+            .await;
+            match answer {
+                Ok(Ok(true)) => {
+                    outcome.adopted.insert(id);
+                    continue;
+                }
+                // The runtime refused it and has cleaned up what it owned.
+                Ok(Ok(false)) => {}
+                Ok(Err(error)) => {
+                    eprintln!("bun: {id}: sidecar adoption failed, starting it again: {error}");
+                    sidecars::kill_unless_forgotten(
+                        self.supervisor.grill(),
+                        &id,
+                        self.stop_confirmation_timeout,
+                    )
+                    .await?;
+                }
+                Err(_) => {
+                    eprintln!("bun: {id}: sidecar adoption timed out, starting it again");
+                    sidecars::kill_unless_forgotten(
+                        self.supervisor.grill(),
+                        &id,
+                        self.stop_confirmation_timeout,
+                    )
+                    .await?;
+                }
+            }
+            if !self.defer_startup_retirement(&id).await? {
                 self.retire_instance_artifacts_fully(&id).await?;
             }
+            // Retirement may have made the runtime forget it, so nothing
+            // after this may kill it again (review of #2269).
+            outcome.retired.insert(id);
         }
         self.sidecars
-            .register_adopted(parent, specs, &adopted, now)?;
-        if !adopted.is_empty() {
+            .register_adopted(parent, specs, &outcome.adopted, now)?;
+        if !outcome.adopted.is_empty() {
             // Their cgroups are bound to their app's namespace on the next
             // tick, as a restarted sidecar's is (#1426).
             self.namespace_firewall_stale = true;
         }
-        Ok(adopted)
+        Ok(outcome)
     }
 
     /// After adoption: retire every sidecar startup left running that no
     /// adopted instance took, and remove every sidecar record but the
-    /// adopted ones' (#1315).
+    /// adopted ones' (#1315). One `adopt_sidecars` already retired is
+    /// skipped: runc has forgotten it, and a second kill is `NotFound`.
     async fn finish_sidecar_adoption(
         &mut self,
         directory: PathBuf,
         kept: &std::collections::HashSet<String>,
-        adopted: &std::collections::HashSet<InstanceId>,
+        outcome: &SidecarAdoption,
     ) -> Result<(), BunError> {
+        let adopted = &outcome.adopted;
         for id in kept {
             let id = InstanceId(id.clone());
-            if adopted.contains(&id) {
+            if adopted.contains(&id) || outcome.retired.contains(&id) {
                 continue;
             }
             kill_runtime_instance(self.supervisor.grill(), &id, self.stop_confirmation_timeout)
@@ -580,7 +610,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .into_iter()
             .map(|record| (record.instance_id.clone(), record))
             .collect();
-        let mut adopted_sidecars = std::collections::HashSet::new();
+        let mut sidecar_adoption = SidecarAdoption::default();
         for record in records {
             if stale.contains(&record.instance_id) {
                 continue;
@@ -712,7 +742,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .as_ref()
                 .filter(|spec| !spec.sidecar.is_empty())
             {
-                let adopted = self
+                let outcome = self
                     .adopt_sidecars(
                         &instance_id,
                         &spec.sidecar,
@@ -721,7 +751,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         now,
                     )
                     .await?;
-                adopted_sidecars.extend(adopted);
+                sidecar_adoption.adopted.extend(outcome.adopted);
+                sidecar_adoption.retired.extend(outcome.retired);
             }
             if let Some(spec) = record.app_spec {
                 self.deployed_specs.insert(key, spec);
@@ -732,15 +763,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             adopted_count += 1;
         }
 
-        self.finish_sidecar_adoption(sidecar_directory, &kept_sidecars, &adopted_sidecars)
+        self.finish_sidecar_adoption(sidecar_directory, &kept_sidecars, &sidecar_adoption)
             .await?;
         if adopted_count > 0 {
             println!("bun: adopted {adopted_count} running instance(s) from a previous process");
         }
-        if !adopted_sidecars.is_empty() {
+        if !sidecar_adoption.adopted.is_empty() {
             println!(
                 "bun: adopted {} running sidecar(s) with them",
-                adopted_sidecars.len()
+                sidecar_adoption.adopted.len()
             );
         }
 
@@ -759,6 +790,15 @@ pub(super) struct RuntimeReconciliation {
     pub(super) stale: std::collections::HashSet<String>,
     /// Recorded sidecars left running for adoption beside their instance.
     pub(super) kept_sidecars: std::collections::HashSet<String>,
+}
+
+/// What startup did with the recorded sidecars (#1315).
+#[derive(Debug, Default)]
+struct SidecarAdoption {
+    /// Adopted, running on beside their instance.
+    adopted: std::collections::HashSet<InstanceId>,
+    /// Refused or uncertain, and retired: due to start again.
+    retired: std::collections::HashSet<InstanceId>,
 }
 
 /// The sidecars' adoption records in `directory` (#1315). Unreadable ones

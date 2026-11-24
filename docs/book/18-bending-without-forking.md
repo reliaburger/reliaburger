@@ -2313,6 +2313,29 @@ Last, `finish_sidecar_adoption` kills every kept sidecar that nobody
 adopted (its instance's own adoption failed, say), so no sidecar runs
 beside nothing, and removes every sidecar record but the adopted ones'.
 
+Review caught two ways this stopped Bun starting at all, and the mock
+runtime hid both. First, a sidecar that died while Bun was down is refused
+by the runtime and retired, and retirement makes runc forget it: the
+launch's intent journal goes, and from then on runc answers `NotFound` for
+that identity. It was still "kept", though, so `finish_sidecar_adoption`
+killed it a second time, the `NotFound` came back as an error, and startup
+failed. `MockGrill::forget_retired` remembered nothing, so every kill
+succeeded. Now the mock can forget for real, `adopt_sidecars` returns what
+it retired as well as what it adopted, and the sweep skips both. The same
+`NotFound` met the sidecar's restart a moment later, since a restart begins
+by killing what's left of the last launch. `kill_unless_forgotten` treats
+it as nothing to kill, because a runtime with no intent for an identity
+has no launch under it. That one was older than #1315: before sidecars had
+records, every Bun restart retired them this way, and their restart then
+failed the same way.
+
+Second, an error or a timeout from the runtime while adopting a sidecar
+went up through `??` and refused startup, exactly as it does for an
+instance. That's the right call for an instance, whose record is the only
+proof of what runs. It's the wrong one for a sidecar, whose record is an
+optimisation. So a sidecar the runtime can't vouch for either way is killed
+and retired like one it refused, and starts again.
+
 One change was in the runtime. Runc's adoption of an instance ends by
 finding its network: the address it reserved and the veth it plugged in.
 A sidecar has neither, because it lives in its instance's namespace, so
@@ -3641,6 +3664,13 @@ two sidecars, `proxy` and `logs`:
 - `a_restarted_sidecar_is_recorded_again_and_a_stop_removes_the_records`
   deletes `proxy`'s record, crashes it, and waits for the restart to write
   the record back. Stopping the app removes both.
+- `a_sidecar_that_died_while_bun_was_down_is_retired_once_and_bun_starts`
+  turns on the mock's real forgetting and refuses `logs`'s adoption: startup
+  must succeed, forget `logs` once and never kill it after, and the next
+  tick must start it again.
+- `a_sidecar_whose_adoption_fails_starts_again_and_bun_still_starts`: the
+  runtime errors on `logs`'s adoption, and the node still starts, with
+  `logs` killed, retired and started again.
 - `an_instances_status_lists_its_sidecars_with_their_restarts`: the
   instance's status carries its sidecars, `running` with no restarts, then
   `backoff` after `proxy` exits, then `running` with one restart.
@@ -3650,7 +3680,11 @@ in `tests/owned_runc.rs` (run with `make test-linux`) does it with real
 runc: an instance and a busybox sidecar in its namespace, the runtime handle
 dropped as a Bun restart drops it, and a new one adopting both. The sidecar
 keeps its pid, has no address of its own, and its process is still in the
-same network namespace as its instance's. To check that the agent tests
+same network namespace as its instance's.
+`a_sidecar_that_died_before_adoption_is_refused_and_then_forgotten` kills
+the sidecar's process first: adoption refuses it, and after
+`forget_retired` a kill answers `NotFound`, which is what the mock now
+models. To check that the agent tests
 check something, we made startup adopt no sidecar at all: the restart, the
 refused-adoption and the inventory tests failed.
 

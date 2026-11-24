@@ -783,3 +783,65 @@ async fn startup_keeps_recorded_sidecar_launches_and_retires_the_rest() {
         [id(PROXY), id(LOGS)]
     );
 }
+
+/// Review of #2269: a sidecar that exited while Bun was down is refused by
+/// the runtime's adoption, and its retirement makes runc forget it. Startup
+/// then killed it a second time, runc answered `NotFound`, and Bun didn't
+/// start. The mock forgets for real here, as runc does.
+#[tokio::test]
+async fn a_sidecar_that_died_while_bun_was_down_is_retired_once_and_bun_starts() {
+    let records = tempfile::tempdir().unwrap();
+    let (first, _grill, _) = deployed_with_records(records.path()).await;
+    drop(first);
+
+    let (mut agent, grill) = restarted_agent(records.path());
+    grill.forget_retired_for_real();
+    grill.set_adopt_result(&id(WEB), true);
+    grill.set_adopt_result(&id(PROXY), true);
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+
+    let calls = grill.calls();
+    let logs = operations(&calls, &id(LOGS));
+    let forgets = logs.iter().filter(|op| *op == "forget_retired").count();
+    assert_eq!(forgets, 1, "{calls:?}");
+    let forgot = logs.iter().position(|op| op == "forget_retired").unwrap();
+    assert!(
+        !logs[forgot..].iter().any(|op| op == "kill"),
+        "a forgotten sidecar was killed again: {calls:?}"
+    );
+    assert_eq!(agent.sidecars.running_beside(&id(WEB)), [id(PROXY)]);
+    agent.relaunch_due_sidecars_to_completion().await;
+    assert_eq!(
+        agent.sidecars.running_beside(&id(WEB)),
+        [id(PROXY), id(LOGS)]
+    );
+}
+
+/// Review of #2269: a sidecar the runtime can't vouch for either way is
+/// best effort, as its records are. It's retired and starts again; the node
+/// still starts, with its instance and the other sidecar adopted.
+#[tokio::test]
+async fn a_sidecar_whose_adoption_fails_starts_again_and_bun_still_starts() {
+    let records = tempfile::tempdir().unwrap();
+    let (first, _grill, _) = deployed_with_records(records.path()).await;
+    drop(first);
+
+    let (mut agent, grill) = restarted_agent(records.path());
+    grill.forget_retired_for_real();
+    for instance in [WEB, PROXY, LOGS] {
+        grill.set_adopt_result(&id(instance), true);
+    }
+    grill.set_adopt_failure(&id(LOGS));
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+
+    let logs = operations(&grill.calls(), &id(LOGS));
+    assert!(logs.contains(&"kill".to_string()), "{logs:?}");
+    assert_eq!(agent.sidecars.running_beside(&id(WEB)), [id(PROXY)]);
+    let from = grill.calls().len();
+    agent.relaunch_due_sidecars_to_completion().await;
+    let restarted: Vec<String> = operations(&grill.calls()[from..], &id(LOGS))
+        .into_iter()
+        .filter(|op| op != "state")
+        .collect();
+    assert_eq!(restarted.last().map(String::as_str), Some("start"));
+}

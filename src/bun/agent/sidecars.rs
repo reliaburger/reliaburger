@@ -169,6 +169,21 @@ pub(super) async fn kill_sidecars<G: Grill>(
     Ok(())
 }
 
+/// Kill sidecar `id` and confirm its exit, where the runtime still knows
+/// it. A runtime that has forgotten it (runc, after its retirement
+/// deleted the launch's intent) answers `NotFound`: nothing of that launch
+/// is left to kill, so its identity is free (review of #2269).
+pub(super) async fn kill_unless_forgotten<G: Grill>(
+    grill: &G,
+    id: &InstanceId,
+    confirmation_timeout: Duration,
+) -> Result<(), BunError> {
+    match kill_runtime_instance(grill, id, confirmation_timeout).await {
+        Err(BunError::Grill(crate::grill::GrillError::NotFound { .. })) => Ok(()),
+        other => other,
+    }
+}
+
 /// Start a crashed sidecar again, alone: kill what's left of its last
 /// launch, so its identity is free, then create and start it. A
 /// `cancelled` token (its instance stopped or crashed meanwhile) stops it
@@ -182,7 +197,8 @@ async fn relaunch<G: Grill>(
     cancelled: CancellationToken,
     confirmation_timeout: Duration,
 ) -> Result<(), String> {
-    kill_runtime_instance(&grill, &launch.id, confirmation_timeout)
+    // A sidecar startup retired is one runc has forgotten.
+    kill_unless_forgotten(&grill, &launch.id, confirmation_timeout)
         .await
         .map_err(|error| error.to_string())?;
     if cancelled.is_cancelled() {
