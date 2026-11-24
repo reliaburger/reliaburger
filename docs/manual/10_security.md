@@ -577,6 +577,7 @@ The cluster checks a policy when you apply it, and refuses one that:
 - has an empty `deny` or `match`, or one over 1024 bytes, or a `message` over
   512 bytes;
 - isn't valid CEL;
+- nests brackets and `? :` conditionals more than 32 deep;
 - nests `all`, `exists`, `exists_one`, `map` or `filter` more than two deep
   (`app.args.all(a, app.args.exists_one(b, a == b))` is as deep as it goes),
   because each level multiplies what the policy costs to run;

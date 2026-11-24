@@ -930,7 +930,8 @@ evaluates one.
   (`apply` or `gitops`). Nothing else.
 - **Commit checks.** `policy::check_policy`, run by `Config::validate`: a DNS
   label name, expressions of at most 1024 bytes, a message of at most 512,
-  valid CEL, only the three variables, and only known `app` and `caller`
+  valid CEL nested at most 32 deep (`MAX_EXPRESSION_NESTING`, checked before
+  the parser runs, because it recurses per level), only the three variables, and only known `app` and `caller`
   fields, and no more than two nested macros (`all`, `exists`, `exists_one`,
   `map`, `filter`; `MAX_COMPREHENSION_NESTING`). The `cel` crate has no cost
   limit, so evaluation is bounded by expression size times input size squared,

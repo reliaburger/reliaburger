@@ -1801,3 +1801,149 @@ async fn admit_blocking_judges_like_admit() {
     assert_eq!(blocking, inline);
     assert!(matches!(blocking, Err(AdmitError::Denied(_))));
 }
+
+/// The deepest expression a policy may hold compiles; one level deeper is
+/// refused before the `cel` parser sees it, naming the cap.
+#[test]
+fn nesting_is_capped_before_the_cel_parser_runs() {
+    let at_cap = format!(
+        "{}app.replicas > 1{}",
+        "(".repeat(MAX_EXPRESSION_NESTING),
+        ")".repeat(MAX_EXPRESSION_NESTING)
+    );
+    check_policy("rule", &spec(None, &at_cap)).unwrap_or_else(|error| panic!("{error}"));
+
+    let over = format!(
+        "{}app.replicas > 1{}",
+        "(".repeat(MAX_EXPRESSION_NESTING + 1),
+        ")".repeat(MAX_EXPRESSION_NESTING + 1)
+    );
+    let error = check_policy("rule", &spec(Some(&over), "true")).unwrap_err();
+    assert_eq!(
+        error,
+        PolicyError::NestedTooDeep {
+            field: PolicyField::Match,
+            limit: MAX_EXPRESSION_NESTING,
+        }
+    );
+    assert!(error.to_string().contains("32 deep"), "{error}");
+
+    // An unterminated string would hide the brackets after it from the
+    // scan, so it's refused as the lexer would refuse it.
+    let hidden = format!("'{}", "(".repeat(200));
+    assert!(matches!(
+        check_policy("rule", &spec(None, &hidden)).unwrap_err(),
+        PolicyError::Unparseable {
+            field: PolicyField::Deny,
+            ..
+        }
+    ));
+}
+
+/// A request handler runs on a tokio worker, whose stack is 2 MiB, so
+/// that's the budget a parse has. Every shape of deep input an
+/// `[app]` manifest can carry is refused there with an error: CEL brackets
+/// and conditionals (bounded by `nesting`), long operator chains (bounded
+/// by `MAX_EXPRESSION_BYTES`), and nested TOML (the `toml` crate's own
+/// limit). `make test` runs this unoptimised, with `cel` and `antlr4rust`
+/// optimised as `Cargo.toml` asks; a release build uses less stack.
+#[test]
+fn deep_input_is_refused_on_a_two_mebibyte_thread() {
+    let policy = |expression: String| {
+        format!(
+            "[policy.deep]\napplies_to = \"apps\"\naction = \"deny\"\nmessage = \"m\"\ndeny = '''{expression}'''\n"
+        )
+    };
+    let mut manifests = Vec::new();
+    for depth in [12, 33, 100, 1_000, 10_000, 100_000] {
+        for open in ["{", "(", "[", "size(", "true ? 1 : ", "{1: "] {
+            manifests.push((format!("{open:?} x {depth}"), policy(open.repeat(depth))));
+        }
+        manifests.push((
+            format!("has({{ x {depth}"),
+            policy(format!("has({}", "{".repeat(depth))),
+        ));
+        manifests.push((
+            format!("toml arrays x {depth}"),
+            format!(
+                "[app.web]\nimage = 'x'\nlabels = {{ a = {}1{} }}\n",
+                "[".repeat(depth),
+                "]".repeat(depth)
+            ),
+        ));
+        manifests.push((
+            format!("toml tables x {depth}"),
+            format!(
+                "[app.web]\nimage = 'x'\nlabels = {}1{}\n",
+                "{a=".repeat(depth),
+                "}".repeat(depth)
+            ),
+        ));
+        manifests.push((
+            format!("policy default x {depth}"),
+            format!(
+                "[policy.deep]\napplies_to = \"apps\"\naction = \"deny\"\ndeny = 'false'\ndefault = {}1{}\n",
+                "{a=".repeat(depth),
+                "}".repeat(depth)
+            ),
+        ));
+    }
+    // The longest operator chains that fit in an expression: valid CEL,
+    // each parsed to a tree as deep as the chain, without a bracket.
+    let chain = |head: &str, step: &str| {
+        let steps = (MAX_EXPRESSION_BYTES - head.len()) / step.len();
+        format!("{}{head}", step.repeat(steps))
+    };
+    for (head, step) in [
+        ("1", "1+"),
+        ("1", "1<"),
+        ("1", "1*"),
+        ("1", "1-"),
+        ("1", "1=="),
+        ("true", "true&&"),
+        ("true", "!"),
+        ("true", "-"),
+    ] {
+        manifests.push((format!("chain {step:?}"), policy(chain(head, step))));
+    }
+    manifests.push((
+        "chain \".size()\"".to_string(),
+        policy(format!(
+            "'a'{}",
+            ".size()".repeat((MAX_EXPRESSION_BYTES - 3) / 7)
+        )),
+    ));
+    let checked = std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || {
+            manifests
+                .into_iter()
+                .map(|(name, manifest)| {
+                    let outcome = Config::parse(&manifest)
+                        .map_err(|error| error.to_string())
+                        .and_then(|config| {
+                            config
+                                .validate_intrinsic()
+                                .map_err(|error| error.to_string())?;
+                            let set = PolicySet::compile(&config.policy)
+                                .map_err(|error| error.to_string())?;
+                            // Judging walks the same tree the parser built.
+                            let web = apps("[app.web]\nimage = 'web:v1'\n");
+                            let _ = evaluate(&set, &web, &deployer(), Source::Apply);
+                            Ok(config)
+                        });
+                    (name, outcome.map(|_| ()))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap()
+        .join()
+        .expect("every manifest was checked within a 2 MiB stack");
+    for (name, outcome) in checked {
+        if name.starts_with("chain") {
+            assert!(outcome.is_ok(), "{name}: {outcome:?}");
+        } else {
+            assert!(outcome.is_err(), "{name} was accepted");
+        }
+    }
+}
