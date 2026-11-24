@@ -70,46 +70,88 @@ pub struct Versions {
     pub buildah: Option<String>,
 }
 
-/// Read who this machine is, and ask bun whether it's healthy.
-pub async fn gather(paths: &crate::appliance::Paths) -> LocalStatus {
-    let os_version = os_image_version().await;
-    let node_config = tokio::fs::read_to_string(paths.config_dir.join("node.toml"))
-        .await
-        .ok()
-        .and_then(|text| toml::from_str::<crate::config::node::NodeConfig>(&text).ok());
-    let claim_key = match &paths.claim_dir {
-        Some(dir) => tokio::fs::read(dir.join("claim.crt"))
+/// Reads [`LocalStatus`], keeping bun's version between reads.
+pub struct Gatherer {
+    paths: crate::appliance::Paths,
+    bun_binary: PathBuf,
+    /// bun's version, and the binary's modification time when it was read.
+    bun_version: tokio::sync::Mutex<Option<(std::time::SystemTime, Option<String>)>>,
+}
+
+impl Gatherer {
+    pub fn new(paths: crate::appliance::Paths) -> Self {
+        Self::with_bun_binary(paths, PathBuf::from(BUN_BINARY))
+    }
+
+    fn with_bun_binary(paths: crate::appliance::Paths, bun_binary: PathBuf) -> Self {
+        Self {
+            paths,
+            bun_binary,
+            bun_version: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// bun's version, running `bun --version` only when the binary has
+    /// changed since the last time: an upgrade replaces it, and nothing else
+    /// does.
+    async fn bun_version(&self) -> Option<String> {
+        let modified = tokio::fs::metadata(&self.bun_binary)
             .await
             .ok()
-            .map(|der| {
-                crate::appliance::claim::short_fingerprint(
-                    &crate::appliance::claim::certificate_fingerprint(&der),
-                )
-            }),
-        None => None,
-    };
-    // The address and the MACs come from the network stack and sysfs.
-    let net_dir = paths.net_dir.clone();
-    let (address, macs) = tokio::task::spawn_blocking(move || {
-        let address = crate::appliance::address::detect().map(|a| a.to_string());
-        let macs = crate::appliance::prepare::stick_names(&net_dir)
-            .into_iter()
-            .map(|name| name.replace('-', ":"))
-            .collect::<Vec<_>>();
-        (address, macs)
-    })
-    .await
-    .unwrap_or_default();
-    LocalStatus {
-        os_version,
-        bun_version: command_version(BUN_BINARY, parse_bun_version).await,
-        node: node_config.as_ref().and_then(|c| c.node.name.clone()),
-        cluster: node_config.as_ref().map(|c| c.cluster.name.clone()),
-        address,
-        macs,
-        healthy: healthy().await,
-        claim_key,
-        notes: Vec::new(),
+            .and_then(|metadata| metadata.modified().ok());
+        let mut cached = self.bun_version.lock().await;
+        if let (Some(modified), Some((seen, version))) = (modified, cached.as_ref())
+            && modified == *seen
+        {
+            return version.clone();
+        }
+        let version = command_version(&self.bun_binary, parse_bun_version).await;
+        *cached = modified.map(|modified| (modified, version.clone()));
+        version
+    }
+
+    /// Read who this machine is, and ask bun whether it's healthy.
+    pub async fn gather(&self) -> LocalStatus {
+        let paths = &self.paths;
+        let os_version = os_image_version().await;
+        let node_config = tokio::fs::read_to_string(paths.config_dir.join("node.toml"))
+            .await
+            .ok()
+            .and_then(|text| toml::from_str::<crate::config::node::NodeConfig>(&text).ok());
+        let claim_key = match &paths.claim_dir {
+            Some(dir) => tokio::fs::read(dir.join("claim.crt"))
+                .await
+                .ok()
+                .map(|der| {
+                    crate::appliance::claim::short_fingerprint(
+                        &crate::appliance::claim::certificate_fingerprint(&der),
+                    )
+                }),
+            None => None,
+        };
+        // The address and the MACs come from the network stack and sysfs.
+        let net_dir = paths.net_dir.clone();
+        let (address, macs) = tokio::task::spawn_blocking(move || {
+            let address = crate::appliance::address::detect().map(|a| a.to_string());
+            let macs = crate::appliance::prepare::stick_names(&net_dir)
+                .into_iter()
+                .map(|name| name.replace('-', ":"))
+                .collect::<Vec<_>>();
+            (address, macs)
+        })
+        .await
+        .unwrap_or_default();
+        LocalStatus {
+            os_version,
+            bun_version: self.bun_version().await,
+            node: node_config.as_ref().and_then(|c| c.node.name.clone()),
+            cluster: node_config.as_ref().map(|c| c.cluster.name.clone()),
+            address,
+            macs,
+            healthy: healthy().await,
+            claim_key,
+            notes: Vec::new(),
+        }
     }
 }
 
@@ -208,8 +250,11 @@ async fn os_image_version() -> Option<String> {
 }
 
 /// Run `program --version` and pick the version out of its first line.
-async fn command_version(program: &str, parse: fn(&str) -> Option<String>) -> Option<String> {
-    let mut command = tokio::process::Command::new(program);
+async fn command_version(
+    program: impl AsRef<std::ffi::OsStr>,
+    parse: fn(&str) -> Option<String>,
+) -> Option<String> {
+    let mut command = tokio::process::Command::new(program.as_ref());
     command.arg("--version").kill_on_drop(true);
     let output = tokio::time::timeout(COMMAND_TIMEOUT, command.output())
         .await
@@ -373,6 +418,55 @@ mod tests {
                 "15:07:42 bun: (binary message)",
             ]
         );
+    }
+
+    /// `bun --version` runs once per binary: again only when an upgrade
+    /// has replaced it, not on every five-second refresh.
+    #[tokio::test]
+    async fn bun_is_asked_its_version_only_when_its_binary_changes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let bun = dir.path().join("bun");
+        // Written beside it and renamed in, so no writable descriptor to
+        // the file being run is open (Linux refuses to run one: ETXTBSY).
+        let staged = dir.path().join("bun.new");
+        let write = |version: &str, modified: std::time::SystemTime| {
+            std::fs::write(
+                &staged,
+                format!(
+                    "#!/bin/sh\necho run >> '{}'\necho 'bun {version} (abc1234)'\n",
+                    runs.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let file = std::fs::File::options().write(true).open(&staged).unwrap();
+            file.set_modified(modified).unwrap();
+            drop(file);
+            std::fs::rename(&staged, &bun).unwrap();
+        };
+        let then =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_750_000_000);
+        write("0.3.3", then);
+        let paths = crate::appliance::Paths {
+            config_dir: dir.path().join("etc"),
+            credentials_dir: None,
+            stick_device: dir.path().join("stick"),
+            stick_mount: dir.path().join("mnt"),
+            stick_wait: std::time::Duration::ZERO,
+            net_dir: dir.path().join("net"),
+            claim_dir: None,
+        };
+        let gatherer = Gatherer::with_bun_binary(paths, bun.clone());
+        assert_eq!(gatherer.bun_version().await.as_deref(), Some("0.3.3"));
+        assert_eq!(gatherer.bun_version().await.as_deref(), Some("0.3.3"));
+        let count = || std::fs::read_to_string(&runs).unwrap().lines().count();
+        assert_eq!(count(), 1, "asked again with the binary unchanged");
+
+        write("0.3.4", then + std::time::Duration::from_secs(60));
+        assert_eq!(gatherer.bun_version().await.as_deref(), Some("0.3.4"));
+        assert_eq!(count(), 2);
     }
 
     #[test]

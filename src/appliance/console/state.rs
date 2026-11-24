@@ -126,6 +126,14 @@ pub struct ConsoleState {
     pub scroll: usize,
     /// Unix seconds, for "as of" and ages.
     pub now: u64,
+    /// Whether `q` leaves: on a terminal other than tty1 (an SSH session),
+    /// never on the machine's own screen.
+    pub can_quit: bool,
+    /// Set by `q` when it may leave; the event loop then stops.
+    pub quit: bool,
+    /// The console reads no keys: an older OS image's unit gave it no
+    /// terminal, so it only draws on tty1.
+    pub keyless: bool,
 }
 
 /// One input to the console.
@@ -169,6 +177,10 @@ impl ConsoleState {
     }
 
     fn key(&mut self, key: KeyEvent) {
+        if self.can_quit && key.code == KeyCode::Char('q') {
+            self.quit = true;
+            return;
+        }
         let tab = match key.code {
             KeyCode::Char(digit @ '1'..='6') => {
                 let index = digit as usize - '1' as usize;
@@ -252,6 +264,19 @@ mod tests {
             press(&mut state, code);
         }
         assert_eq!(state.tab, Tab::Status);
+    }
+
+    #[test]
+    fn q_leaves_only_a_session_on_another_terminal() {
+        let mut session = ConsoleState {
+            can_quit: true,
+            ..ConsoleState::default()
+        };
+        press(&mut session, KeyCode::Char('q'));
+        assert!(session.quit);
+        let mut kiosk = ConsoleState::default();
+        press(&mut kiosk, KeyCode::Char('q'));
+        assert!(!kiosk.quit, "tty1's console never quits");
     }
 
     #[test]

@@ -12,7 +12,7 @@ expression: console(&state)
 │bun        running (0.3.3)                                                    │
 │                                                                              │
 │Cluster DEGRADED, 8 problems (node-1 answered at 15:06:40)                    │
-│wtf        0 critical, 1 warning                                              │
+│wtf        0 critical, 0 warnings                                             │
 │nodes      2 alive, 0 suspect, 0 dead; partial (2 of 3 nodes)                 │
 │versions   bun 0.2.8 on 2 nodes; partial (2 of 3 nodes)                       │
 │usage      cpu 21%, memory 40%, disk 30%; newest sample 5 s old; partial (2 of│

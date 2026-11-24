@@ -24,6 +24,7 @@ pub mod view;
 
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{Event, EventStream, KeyEventKind};
@@ -40,42 +41,109 @@ use self::state::{ConsoleState, Msg, Tab};
 /// dashboard didn't change would keep them otherwise.
 const REPAINT_EVERY: Duration = Duration::from_secs(10);
 
-/// Run the console on this process's controlling terminal until it goes
-/// away. On an appliance that's tty1, which the unit hands it as standard
-/// input (`StandardInput=tty`); over SSH it's the session's own terminal.
+/// Where the console draws, and whether it reads keys there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// tty1 is its controlling terminal (`StandardInput=tty`): it reads
+    /// keys, and no key quits, since it's the only thing on the screen.
+    Kiosk,
+    /// Another terminal, an SSH session say: keys work and `q` quits.
+    Session,
+    /// No terminal at all, as under an OS image from before the dashboard
+    /// (0.3.0 to 0.3.2), whose unit gives the console no standard input
+    /// while a self-upgraded bun runs this code. It draws on tty1 and reads
+    /// no keys, rather than failing to start and restarting for ever.
+    ScreenOnly,
+}
+
+/// The screen an old unit's console draws on.
+const TTY1: &str = "/dev/tty1";
+
+impl Mode {
+    /// The mode for a process whose standard input is the terminal `stdin`
+    /// names (`ttyname`), or isn't a terminal.
+    pub fn for_terminal(stdin: Option<&std::path::Path>) -> Mode {
+        match stdin {
+            Some(name) if name == std::path::Path::new(TTY1) => Mode::Kiosk,
+            Some(_) => Mode::Session,
+            None => Mode::ScreenOnly,
+        }
+    }
+
+    /// The device it draws on.
+    fn device(self) -> &'static str {
+        match self {
+            Mode::Kiosk | Mode::Session => "/dev/tty",
+            Mode::ScreenOnly => TTY1,
+        }
+    }
+
+    fn reads_keys(self) -> bool {
+        self != Mode::ScreenOnly
+    }
+}
+
+/// Run the console until its terminal goes away: on tty1 under the unit,
+/// on an SSH session's terminal by hand, or keyless on tty1 under an older
+/// image's unit ([`Mode`]).
 pub async fn run(paths: &crate::appliance::Paths) -> std::io::Result<()> {
+    let stdin_name = nix::unistd::ttyname(std::io::stdin()).ok();
+    let mode = Mode::for_terminal(stdin_name.as_deref());
     // BLOCKING-OK: appliance console: one open of the terminal device before the loop starts
-    let mut guard = ConsoleTerminal::open()?;
-    let result = event_loop(paths, &mut guard.terminal).await;
+    let (mut guard, mode) = ConsoleTerminal::open_or_screen_only(mode)?;
+    let result = event_loop(paths, &mut guard.terminal, mode).await;
     drop(guard);
     result
 }
 
-/// The controlling terminal in raw mode, with the cursor hidden, put back
-/// on every return path.
+/// The console's terminal, in raw mode when it reads keys, put back on
+/// every return path.
 ///
-/// It draws on `/dev/tty`, not standard output: the unit keeps standard
-/// output for the journal, where the launcher's install messages go.
-/// There's no alternate screen, which the Linux console doesn't have.
+/// It draws on a terminal device, not standard output: the unit keeps
+/// standard output for the journal, where the launcher's install messages
+/// go. There's no alternate screen, which the Linux console doesn't have.
 struct ConsoleTerminal {
     terminal: Terminal<ratatui::backend::CrosstermBackend<std::fs::File>>,
+    raw: bool,
 }
 
 impl ConsoleTerminal {
-    fn open() -> std::io::Result<Self> {
-        let tty = std::fs::OpenOptions::new().write(true).open("/dev/tty")?;
-        crossterm::terminal::enable_raw_mode()?;
+    /// Open `mode`'s terminal, or, when that fails, tty1 without keys,
+    /// which needs nothing from the unit.
+    fn open_or_screen_only(mode: Mode) -> std::io::Result<(Self, Mode)> {
+        match Self::open(mode) {
+            Ok(terminal) => Ok((terminal, mode)),
+            Err(_) if mode != Mode::ScreenOnly => {
+                Ok((Self::open(Mode::ScreenOnly)?, Mode::ScreenOnly))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn open(mode: Mode) -> std::io::Result<Self> {
+        let tty = std::fs::OpenOptions::new()
+            .write(true)
+            .open(mode.device())?;
+        let raw = mode.reads_keys();
+        if raw {
+            crossterm::terminal::enable_raw_mode()?;
+        }
+        let restore = || {
+            if raw {
+                let _ = crossterm::terminal::disable_raw_mode();
+            }
+        };
         match Terminal::new(ratatui::backend::CrosstermBackend::new(tty)) {
             Ok(mut terminal) => {
                 // The first draw paints every cell over the boot messages.
                 if let Err(error) = terminal.clear() {
-                    let _ = crossterm::terminal::disable_raw_mode();
+                    restore();
                     return Err(error);
                 }
-                Ok(Self { terminal })
+                Ok(Self { terminal, raw })
             }
             Err(error) => {
-                let _ = crossterm::terminal::disable_raw_mode();
+                restore();
                 Err(error)
             }
         }
@@ -84,14 +152,25 @@ impl ConsoleTerminal {
 
 impl Drop for ConsoleTerminal {
     fn drop(&mut self) {
-        let _ = crossterm::terminal::disable_raw_mode();
+        if self.raw {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
         let _ = self.terminal.show_cursor();
+    }
+}
+
+/// The next terminal event, or never, for a console that reads no keys.
+async fn next_event(input: &mut Option<EventStream>) -> Option<std::io::Result<Event>> {
+    match input {
+        Some(input) => input.next().await,
+        None => std::future::pending().await,
     }
 }
 
 async fn event_loop<B: Backend>(
     paths: &crate::appliance::Paths,
     terminal: &mut Terminal<B>,
+    mode: Mode,
 ) -> std::io::Result<()> {
     let (tx, mut rx) = mpsc::channel::<Msg>(64);
     let (tab_tx, tab_rx) = watch::channel(Tab::Status);
@@ -102,13 +181,15 @@ async fn event_loop<B: Backend>(
         sampler_tx.blocking_send(Msg::Sample(sample)).is_ok()
     });
 
-    let mut input = EventStream::new();
+    let mut input = mode.reads_keys().then(EventStream::new);
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut repaint = tokio::time::interval(REPAINT_EVERY);
     repaint.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut state = ConsoleState {
         now: unix_now(),
+        can_quit: mode == Mode::Session,
+        keyless: !mode.reads_keys(),
         ..ConsoleState::default()
     };
     let result = loop {
@@ -124,7 +205,7 @@ async fn event_loop<B: Backend>(
                 }
             }
             Some(message) = rx.recv() => state.update(message),
-            event = input.next() => match event {
+            event = next_event(&mut input) => match event {
                 Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                     state.update(Msg::Key(key));
                 }
@@ -133,6 +214,9 @@ async fn event_loop<B: Backend>(
                 // The terminal hung up; systemd starts a new console.
                 None => break Ok(()),
             },
+        }
+        if state.quit {
+            break Ok(());
         }
         tab_tx.send_if_modified(|tab| {
             let changed = *tab != state.tab;
@@ -152,7 +236,6 @@ fn spawn_pollers(
     tab: &watch::Receiver<Tab>,
     cancel: &CancellationToken,
 ) {
-    let config_dir = paths.config_dir.clone();
     let every = |seconds| Duration::from_secs(seconds);
     let poller = |interval, wanted| Poller {
         every: interval,
@@ -161,35 +244,38 @@ fn spawn_pollers(
         cancel: cancel.clone(),
         tx: tx.clone(),
     };
+    let local = Arc::new(local::Gatherer::new(paths.clone()));
+    let remote = Arc::new(remote::Remote::new(paths.config_dir.clone()));
 
     // The header shows bun's health on every tab.
-    let local_paths = paths.clone();
     poller(every(5), |_| true).spawn(move || {
-        let paths = local_paths.clone();
-        async move { Msg::Local(local::gather(&paths).await) }
+        let local = Arc::clone(&local);
+        async move { Msg::Local(local.gather().await) }
     });
-    let dir = config_dir.clone();
-    poller(every(5), |tab| {
+    // The summary fans out to every node, so it's asked less often.
+    let source = Arc::clone(&remote);
+    poller(every(15), |tab| {
         matches!(tab, Tab::Status | Tab::Cluster | Tab::Versions)
     })
     .spawn(move || {
-        let dir = dir.clone();
-        async move { Msg::Summary(Box::new(remote::summary(dir).await)) }
+        let remote = Arc::clone(&source);
+        async move { Msg::Summary(Box::new(remote.summary().await)) }
     });
-    let dir = config_dir.clone();
-    poller(every(60), |tab| tab == Tab::Status).spawn(move || {
-        let dir = dir.clone();
-        async move { Msg::Wtf(remote::wtf(dir).await) }
+    // `wtf` asks every node a dozen questions: every five minutes is plenty
+    // for a screen.
+    let source = Arc::clone(&remote);
+    poller(every(300), |tab| tab == Tab::Status).spawn(move || {
+        let remote = Arc::clone(&source);
+        async move { Msg::Wtf(remote.wtf().await) }
     });
-    let dir = config_dir.clone();
+    let source = Arc::clone(&remote);
     poller(every(5), |tab| tab == Tab::Workloads).spawn(move || {
-        let dir = dir.clone();
-        async move { Msg::Workloads(remote::workloads(dir).await) }
+        let remote = Arc::clone(&source);
+        async move { Msg::Workloads(remote.workloads().await) }
     });
-    let dir = config_dir;
     poller(every(5), |tab| tab == Tab::Cluster).spawn(move || {
-        let dir = dir.clone();
-        async move { Msg::Council(remote::council(dir).await) }
+        let remote = Arc::clone(&remote);
+        async move { Msg::Council(remote.council().await) }
     });
     poller(every(60), |tab| tab == Tab::Versions)
         .spawn(|| async { Msg::Versions(local::versions().await) });
@@ -226,6 +312,7 @@ impl Poller {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(every);
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            let mut last: Option<tokio::time::Instant> = None;
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => return,
@@ -236,7 +323,11 @@ impl Poller {
                         }
                         // Copy the tab out; the borrow ends with the statement.
                         let shown = *tab.borrow_and_update();
-                        if !wanted(shown) {
+                        // Coming back to a tab doesn't ask again before its
+                        // interval is up: flicking through the tabs mustn't
+                        // run `wtf` each time.
+                        let fresh = last.is_some_and(|at| at.elapsed() < every);
+                        if !wanted(shown) || fresh {
                             continue;
                         }
                         interval.reset();
@@ -246,6 +337,7 @@ impl Poller {
                 if !wanted(shown) {
                     continue;
                 }
+                last = Some(tokio::time::Instant::now());
                 let message = tokio::select! {
                     _ = cancel.cancelled() => return,
                     message = fetch() => message,
@@ -295,6 +387,51 @@ mod tests {
             .expect("asked once the Logs tab showed");
         assert!(matches!(message, Some(Msg::Logs(Ok(_)))));
 
+        cancel.cancel();
+    }
+
+    /// The unit's tty1 is a kiosk; any other terminal is a session `q`
+    /// leaves; no terminal (an older image's unit, #2150's review) draws on
+    /// tty1 without keys instead of failing to start.
+    #[test]
+    fn the_terminal_on_standard_input_picks_the_mode() {
+        use std::path::Path;
+        assert_eq!(
+            Mode::for_terminal(Some(Path::new("/dev/tty1"))),
+            Mode::Kiosk
+        );
+        assert_eq!(
+            Mode::for_terminal(Some(Path::new("/dev/pts/3"))),
+            Mode::Session
+        );
+        assert_eq!(Mode::for_terminal(None), Mode::ScreenOnly);
+        assert_eq!(Mode::ScreenOnly.device(), "/dev/tty1");
+        assert!(!Mode::ScreenOnly.reads_keys());
+        assert_eq!(Mode::Kiosk.device(), "/dev/tty");
+        assert!(Mode::Kiosk.reads_keys() && Mode::Session.reads_keys());
+    }
+
+    /// Switching back to a tab within its interval doesn't ask again.
+    #[tokio::test]
+    async fn a_poller_does_not_ask_again_when_its_tab_returns_early() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let (tab_tx, tab_rx) = watch::channel(Tab::Status);
+        let cancel = CancellationToken::new();
+        Poller {
+            every: Duration::from_secs(300),
+            wanted: |tab| tab == Tab::Status,
+            tab: tab_rx,
+            cancel: cancel.clone(),
+            tx,
+        }
+        .spawn(|| async { Msg::Tick(0) });
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("asked on start");
+        tab_tx.send_replace(Tab::Logs);
+        tab_tx.send_replace(Tab::Status);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(rx.try_recv().is_err(), "asked again within the interval");
         cancel.cancel();
     }
 }

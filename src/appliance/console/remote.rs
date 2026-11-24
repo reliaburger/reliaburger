@@ -29,8 +29,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long `wtf`'s checks get, as `relish status` gives them more.
 const WTF_BUDGET: Duration = Duration::from_secs(30);
 
-/// Where and how to reach this node's bun.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Where and how to reach this node's bun. Its `Debug` leaves the token
+/// out.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Endpoint {
     pub base_url: String,
     /// The console token; `None` on a node with no master key, which
@@ -38,6 +39,16 @@ pub struct Endpoint {
     pub token: Option<String>,
     /// The cluster's root CA, PEM; `None` for plain HTTP.
     pub root_ca_pem: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Endpoint")
+            .field("base_url", &self.base_url)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("root_ca_pem", &self.root_ca_pem.as_ref().map(Vec::len))
+            .finish()
+    }
 }
 
 /// Why the console can't ask bun anything yet.
@@ -96,7 +107,7 @@ fn advertised_ip(config: &NodeConfig) -> Option<IpAddr> {
 
 /// Read node.toml, the root CA and the master key, and build the client.
 /// The files are small, but they're read on a blocking thread all the same.
-pub async fn client(config_dir: PathBuf) -> Result<BunClient, EndpointError> {
+async fn build_client(config_dir: PathBuf) -> Result<BunClient, EndpointError> {
     let endpoint = tokio::task::spawn_blocking(move || read_endpoint(&config_dir))
         .await
         .map_err(|error| EndpointError::Credentials(error.to_string()))??;
@@ -150,32 +161,106 @@ async fn bounded<T>(
     }
 }
 
-/// The cluster summary, as `relish status` reads it.
-pub async fn summary(config_dir: PathBuf) -> Result<ClusterSummary, String> {
-    let client = client(config_dir).await.map_err(|e| e.to_string())?;
-    bounded(client.cluster_summary()).await
-}
+/// The sources `wtf` reads that only an admin may, so the read-only
+/// console principal always gets them as unknown: `GET /v1/token/list`.
+const ADMIN_ONLY_SOURCES: [&str; 1] = ["tokens"];
 
-/// `wtf`'s checks, as `relish status` runs them.
-pub async fn wtf(config_dir: PathBuf) -> WtfCheck {
-    match client(config_dir).await {
-        Ok(client) => crate::relish::status_cmd::run_wtf(&client, WTF_BUDGET).await,
-        Err(error) => WtfCheck::Failed {
-            reason: error.to_string(),
-        },
+/// `wtf`'s counts as the console shows them: a check only an admin can run
+/// isn't counted as unknown, or every screen would say `1 unknown`.
+pub fn console_check(report: &crate::relish::wtf::WtfReport) -> WtfCheck {
+    let unknown = report
+        .unknown
+        .iter()
+        .filter(|unknown| !ADMIN_ONLY_SOURCES.contains(&unknown.source.as_str()))
+        .count();
+    WtfCheck::Checked {
+        critical: report.critical.len(),
+        warning: report.warnings.len(),
+        unknown,
+        first_critical: report.critical.first().map(|finding| finding.title.clone()),
     }
 }
 
-/// This node's workloads with their CPU and memory.
-pub async fn workloads(config_dir: PathBuf) -> Result<Vec<TopRow>, String> {
-    let client = client(config_dir).await.map_err(|e| e.to_string())?;
-    bounded(client.node_top()).await
+/// bun's API for the console, with one client kept between fetches.
+///
+/// Building a client reads node.toml and the master key, derives two
+/// tokens and sets up TLS, so it's done once and again only after a fetch
+/// fails: a restarted bun, a renewed CA or a node seeded since all show
+/// up as a failure first.
+pub struct Remote {
+    config_dir: PathBuf,
+    client: tokio::sync::Mutex<Option<BunClient>>,
 }
 
-/// What every node says about the council.
-pub async fn council(config_dir: PathBuf) -> Result<Vec<CouncilNodeObservation>, String> {
-    let client = client(config_dir).await.map_err(|e| e.to_string())?;
-    bounded(crate::relish::council_view::survey(&client)).await
+impl Remote {
+    pub fn new(config_dir: PathBuf) -> Self {
+        Self {
+            config_dir,
+            client: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    async fn client(&self) -> Result<BunClient, String> {
+        let mut cached = self.client.lock().await;
+        if let Some(client) = cached.as_ref() {
+            return Ok(client.clone());
+        }
+        let client = build_client(self.config_dir.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        *cached = Some(client.clone());
+        Ok(client)
+    }
+
+    /// Drop the cached client after a failure, so the next fetch rebuilds it.
+    async fn forget<T, E>(&self, result: Result<T, E>) -> Result<T, E> {
+        if result.is_err() {
+            *self.client.lock().await = None;
+        }
+        result
+    }
+
+    /// The cluster summary, as `relish status` reads it.
+    pub async fn summary(&self) -> Result<ClusterSummary, String> {
+        let client = self.client().await?;
+        self.forget(bounded(client.cluster_summary()).await).await
+    }
+
+    /// `wtf`'s checks, as `relish status` runs them, counted by
+    /// [`console_check`].
+    pub async fn wtf(&self) -> WtfCheck {
+        let client = match self.client().await {
+            Ok(client) => client,
+            Err(reason) => return WtfCheck::Failed { reason },
+        };
+        let collected =
+            tokio::time::timeout(WTF_BUDGET, crate::relish::wtf::collect(&client, None)).await;
+        match collected {
+            Err(_) => WtfCheck::Late {
+                budget_seconds: WTF_BUDGET.as_secs(),
+            },
+            Ok(Err(error)) => {
+                *self.client.lock().await = None;
+                WtfCheck::Failed {
+                    reason: error.to_string(),
+                }
+            }
+            Ok(Ok(inputs)) => console_check(&crate::relish::wtf::diagnose(&inputs)),
+        }
+    }
+
+    /// This node's workloads with their CPU and memory.
+    pub async fn workloads(&self) -> Result<Vec<TopRow>, String> {
+        let client = self.client().await?;
+        self.forget(bounded(client.node_top()).await).await
+    }
+
+    /// What every node says about the council.
+    pub async fn council(&self) -> Result<Vec<CouncilNodeObservation>, String> {
+        let client = self.client().await?;
+        self.forget(bounded(crate::relish::council_view::survey(&client)).await)
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -224,6 +309,63 @@ mod tests {
         assert!(matches!(
             endpoint_for(&config, Some(b"pem".to_vec()), None),
             Err(EndpointError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn an_endpoints_debug_never_shows_its_token() {
+        let service = crate::sesame::token::derive_service_token(&[1u8; 32]).unwrap();
+        let endpoint =
+            endpoint_for(&appliance_config(), Some(b"pem".to_vec()), Some(&service)).unwrap();
+        let token = endpoint.token.clone().unwrap();
+        let shown = format!("{endpoint:?}");
+        assert!(!shown.contains(&token), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
+        assert!(shown.contains("https://192.168.1.52:9117"), "{shown}");
+    }
+
+    fn report(unknown_sources: &[&str]) -> crate::relish::wtf::WtfReport {
+        crate::relish::wtf::WtfReport {
+            schema_version: 1,
+            cluster_name: "home".into(),
+            collected_at: 0,
+            node_count: 3,
+            critical: vec![],
+            warnings: vec![],
+            unknown: unknown_sources
+                .iter()
+                .map(|source| crate::relish::wtf::WtfUnknown {
+                    source: source.to_string(),
+                    reason: "403".into(),
+                    affected_resource: "cluster".into(),
+                })
+                .collect(),
+            ok: vec![],
+            summary: crate::relish::wtf::WtfSummary {
+                critical_count: 0,
+                warning_count: 0,
+                unknown_count: unknown_sources.len(),
+                ok_count: 0,
+            },
+        }
+    }
+
+    /// The console's principal can't list tokens, so that check is left
+    /// out rather than shown as unknown on every screen.
+    #[test]
+    fn checks_only_an_admin_can_run_are_not_counted_unknown() {
+        assert_eq!(
+            console_check(&report(&["tokens"])),
+            WtfCheck::Checked {
+                critical: 0,
+                warning: 0,
+                unknown: 0,
+                first_critical: None
+            }
+        );
+        assert!(matches!(
+            console_check(&report(&["tokens", "gitops"])),
+            WtfCheck::Checked { unknown: 1, .. }
         ));
     }
 

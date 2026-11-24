@@ -12,7 +12,7 @@ expression: "console(&healthy_state(Tab::Status))"
 │bun        running (0.3.3)                                                    │
 │                                                                              │
 │Cluster HEALTHY, no problems (node-1 answered at 15:06:40)                    │
-│wtf        0 critical, 1 warning                                              │
+│wtf        0 critical, 0 warnings                                             │
 │nodes      3 alive, 0 suspect, 0 dead                                         │
 │council    leader node-1 (term 4), 3/3 voters, quorum ok, 0 lagging           │
 │gossip     3 members, last change 10 m ago, 1,204 updates received            │

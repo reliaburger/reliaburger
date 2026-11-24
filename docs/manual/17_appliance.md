@@ -768,6 +768,7 @@ the node. It never shows secrets, tokens or environment variables.
 | `←` `→`, `Tab`, `h` `l` | the previous or next tab |
 | `↑` `↓`, `k` `j`, `PgUp` `PgDn` | scroll a list, or back through the logs |
 | `Home`, `End` | back to the top, or the newest log line |
+| `q` | quit, on any terminal but tty1 (an SSH session) |
 
 | Tab | Shows | From |
 | --- | --- | --- |
@@ -789,15 +790,34 @@ machine itself, so they still work; Workloads and Cluster say bun isn't
 answering. An unclaimed machine shows its claim key twice, once as text and
 once in large letters you can read from across the room.
 
-The console reads bun as its own principal, `__console`: read-only and
-derived from the cluster's master key, which it reads as root. No token to
-make, and none to lose. A monitor on one node shows the whole cluster, as
-`relish status` would.
+The console reads bun as its own principal, `__console`: read-only, with
+a token derived from the cluster's master key, which the console reads as
+root. A monitor on one node shows the whole cluster, as `relish status`
+would. `wtf`'s token-lifetime check needs an admin, so the console leaves
+it out instead of counting it as unknown.
+
+Know what that token is before you rely on it:
+
+- **It's valid on every node for the life of the cluster.** Every node
+  derives the same value, and there's no master-key rotation, so it can't
+  be revoked or rotated on its own. `relish token list` doesn't show it,
+  and `relish token revoke` can't reach it.
+- **Only root on a node can derive it**, from `/etc/reliaburger/master.key`.
+  Root there already holds the master key, which is far more than this
+  read-only token gives.
+- **It only reads the API.** The dashboard's login (`/ui/session`) and the
+  image registry don't accept it.
 
 `bun appliance console` runs it on whatever terminal it's started from, so
 on a lab image, whose sshd runs, `ssh -t root@home-1
 /var/lib/reliaburger/bin/bun appliance console` shows the same dashboard in
-your own terminal.
+your own terminal. There, and on any terminal other than tty1, `q` quits.
+On tty1 nothing quits it: it's the only thing on the screen.
+
+A node that runs a newer bun on an OS image from before the dashboard
+(0.3.0 to 0.3.2) still shows it, but without keys: that image's unit gives
+the console no keyboard, so it stays on the Status tab until the OS is
+updated.
 
 ## Take the tour
 

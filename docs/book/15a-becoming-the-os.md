@@ -1256,11 +1256,13 @@ StandardError=journal
 TTYPath=/dev/tty1
 ```
 
-`StandardInput=tty` also makes tty1 the process's *controlling terminal*, the one `/dev/tty` names. crossterm, which ratatui drives, reads keys and the screen size from standard input when it's a terminal, and the console draws on `/dev/tty`. Standard output stays the journal's: with `StandardInput=tty`, systemd would otherwise send it to the terminal too, and the launcher's install messages would vanish under the dashboard. `test_console_unit.py` pins all four lines. One bonus of `/dev/tty`: over `ssh -t`, the controlling terminal is your SSH session, so `bun appliance console` draws the dashboard on a laptop.
+`StandardInput=tty` also makes tty1 the process's *controlling terminal*, the one `/dev/tty` names. crossterm, which ratatui drives, reads keys and the screen size from standard input when it's a terminal, and the console draws on `/dev/tty`. Standard output stays the journal's: with `StandardInput=tty`, systemd would otherwise send it to the terminal too, and the launcher's install messages would vanish under the dashboard. `test_console_unit.py` pins all four lines. One bonus of `/dev/tty`: over `ssh -t`, the controlling terminal is your SSH session, so `bun appliance console` draws the dashboard on a laptop. There `q` quits; on tty1 nothing does. The console tells them apart by asking which terminal its standard input is (`ttyname`).
+
+There's a third case, and the review caught it. bun upgrades itself, but the unit file belongs to the OS image. A node on a 0.3.0 to 0.3.2 image that has upgraded to this bun runs the new console under the old unit, with no standard input. Opening `/dev/tty` then fails with `ENXIO` (no controlling terminal), and a console that gave up there would restart every five seconds and show nothing. So `Mode` has three variants: `Kiosk` (tty1, keys, no quitting), `Session` (another terminal, `q` quits) and `ScreenOnly`, which draws on `/dev/tty1` the way the old console did and reads no keys. A screen without keys still beats a black one.
 
 ### Asking only for what's on screen
 
-A Wyse 3040 has a four-core Atom, and bun is busy enough. So each source has a poller that asks only while a tab that shows it is on screen, and at once when one comes on:
+A Wyse 3040 has a four-core Atom, and bun is busy enough. So each source has a poller that asks only while a tab that shows it is on screen, and at once when one comes on, unless it asked within its interval anyway. Intervals follow cost: local reads every 5 s, the summary (which fans out to every node) every 15 s, and `wtf` (a dozen questions per node) every 5 minutes. `bun --version` runs again only when the binary's modification time changes, and the API client, which reads `master.key`, derives two tokens and sets up TLS, is built once and rebuilt only after a request fails.
 
 ```rust
 struct Poller {
@@ -1294,7 +1296,11 @@ pub fn derive_console_token(service_token: &str) -> Result<String, TokenError> {
 }
 ```
 
-The service token is already derived from the master key with HKDF, and every node holds it. `AuthState::new` derives the console token from it once, and the auth middleware accepts it as `__console`: read-only and unscoped, a principal no stored token can be named after. The console, running as root beside bun, reads `master.key` and takes the same two steps. HKDF is one-way, so the console token gives nothing towards the service token. Every node derives the same value, so `wtf`'s per-node checks work from the console as they do from a laptop. Nothing is stored, rotated or revoked. A Unix socket would have been as safe, but `wtf` and the council survey talk to every node over TCP, and a socket only reaches one.
+The service token is already derived from the master key with HKDF, and every node holds it. `AuthState::new` derives the console token from it once, and the auth middleware accepts it as `__console`: read-only and unscoped, a principal no stored token can be named after. The console, running as root beside bun, reads `master.key` and takes the same two steps. HKDF is one-way, so the console token gives nothing towards the service token. Every node derives the same value, so `wtf`'s per-node checks work from the console as they do from a laptop. A Unix socket would have been as safe, but `wtf` and the council survey talk to every node over TCP, and a socket only reaches one.
+
+The price is a limitation, and the manual states it. Nothing is stored, so nothing can be revoked: the token is valid on every node for as long as the master key is, which today is the cluster's life, since there's no master-key rotation. Only root on a node can derive it, and root there already holds the master key itself. It's accepted by the API's bearer middleware only. The dashboard login (`/ui/session`) and the registry check stored tokens and the service token, never this one.
+
+Read-only also means `wtf` can't list tokens, which needs an admin. Counted as `relish status` counts it, every console would say `1 unknown` for ever, a permanent false alarm. So the console's `console_check` leaves out the sources only an admin can read (today just `tokens`) and counts the rest.
 
 The console talks to its own bun at the node's LAN address, not loopback. The node's certificate names that address and never loopback (#1508), and the console checks it against the cluster's root CA from the identity directory. Only `/v1/health`, which is public and carries no token, goes to loopback without checking.
 

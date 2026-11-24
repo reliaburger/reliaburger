@@ -65,10 +65,14 @@ pub fn render(frame: &mut Frame<'_>, state: &ConsoleState) {
     };
     frame.render_widget(Paragraph::new(lines), inner);
 
-    frame.render_widget(
-        Paragraph::new(" 1-6 or <- -> tabs   up/down scroll   read-only: no login here"),
-        footer,
-    );
+    let keys = if state.keyless {
+        " read-only; this OS image's console takes no keys"
+    } else if state.can_quit {
+        " 1-6 or <- -> tabs   up/down scroll   q quit   read-only"
+    } else {
+        " 1-6 or <- -> tabs   up/down scroll   read-only: no login here"
+    };
+    frame.render_widget(Paragraph::new(keys), footer);
     frame.render_widget(
         Paragraph::new(format!("{} UTC ", clock(state.now))).alignment(Alignment::Right),
         footer,
@@ -772,12 +776,30 @@ mod tests {
         };
         let summary = TestScenario::HealthyCluster.data().summary.unwrap();
         state.update(Msg::Summary(Box::new(Ok(summary))));
-        state.update(Msg::Wtf(WtfCheck::Checked {
-            critical: 0,
-            warning: 1,
-            unknown: 0,
-            first_critical: None,
-        }));
+        // What a real console gets: `wtf` as `__console`, whose token list
+        // is refused, counted the console's way.
+        state.update(Msg::Wtf(super::super::remote::console_check(
+            &crate::relish::wtf::WtfReport {
+                schema_version: 1,
+                cluster_name: "home".into(),
+                collected_at: FIXTURE_NOW,
+                node_count: 3,
+                critical: vec![],
+                warnings: vec![],
+                unknown: vec![crate::relish::wtf::WtfUnknown {
+                    source: "tokens".into(),
+                    reason: "token lifetimes need an unscoped admin credential".into(),
+                    affected_resource: "cluster".into(),
+                }],
+                ok: vec![],
+                summary: crate::relish::wtf::WtfSummary {
+                    critical_count: 0,
+                    warning_count: 0,
+                    unknown_count: 1,
+                    ok_count: 30,
+                },
+            },
+        )));
         state.update(Msg::Workloads(Ok(workloads())));
         state.update(Msg::Council(Ok(council())));
         state.update(Msg::Versions(Versions {
@@ -953,6 +975,20 @@ mod tests {
     }
 
     #[test]
+    fn a_session_over_ssh_says_q_quits() {
+        let mut state = healthy_state(Tab::Versions);
+        state.can_quit = true;
+        assert!(console(&state).contains("q quit"));
+    }
+
+    #[test]
+    fn an_older_images_console_says_it_takes_no_keys() {
+        let mut state = healthy_state(Tab::Status);
+        state.keyless = true;
+        assert!(console(&state).contains("takes no keys"));
+    }
+
+    #[test]
     fn metrics_with_a_history() {
         insta::assert_snapshot!(console(&healthy_state(Tab::Metrics)));
     }
@@ -995,6 +1031,16 @@ mod tests {
         let mut observations = council();
         observations[2] = CouncilNodeObservation::unanswered("node-3", "gossip reports it dead");
         state.update(Msg::Council(Ok(observations)));
+        // The summary agrees: gossip has node-3 dead, and two voters answer.
+        let mut summary = state.summary.value.clone().unwrap();
+        if let Some(nodes) = &mut summary.nodes.value {
+            nodes.alive = 2;
+            nodes.dead = 1;
+        }
+        if let Some(council) = &mut summary.council.value {
+            council.voters_answering = 2;
+        }
+        state.update(Msg::Summary(Box::new(Ok(summary))));
         insta::assert_snapshot!(console(&state));
     }
 
