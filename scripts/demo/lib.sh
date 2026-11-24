@@ -19,6 +19,10 @@
 #   DEMO_PORT_BASE        first of seven local ports the demo binds: the
 #                         API, gossip, Raft, reporting, and three for the
 #                         demo's apps (default 29200)
+#   DEMO_WORKLOAD_PORTS   START-END, the node's [network] port_range for
+#                         workload host ports, end exclusive (default: what
+#                         relish init writes). The test harness sets it to
+#                         keep workloads off other tests' leased ports (#2261)
 #   DEMO_KEEP=1           keep the temporary directory, Bun's log included
 #   DEMO_RUNTIME          the node's runtime: process (default), or runc as root
 #                         on Linux to try the container examples
@@ -180,7 +184,19 @@ demo_binaries() {
 # the demo's ports, loopback addresses, and the process runtime's allowlist.
 demo_node_config() {
     local generated="$1" config="$2"
-    sed -e "s|^data = .*|data = \"${DEMO_WORK}/data\"|" \
+    local workload_start="" workload_end=""
+    if [[ -n "${DEMO_WORKLOAD_PORTS:-}" ]]; then
+        workload_start="${DEMO_WORKLOAD_PORTS%-*}"
+        workload_end="${DEMO_WORKLOAD_PORTS#*-}"
+    fi
+    # The port_range edit comes first: the [network.port_range] rewrite
+    # below puts [network] ahead of the header, and the range address then
+    # no longer sees it at the start of the line.
+    sed -e "/^\[network.port_range\]/,/^end = /{
+s|^start = \(.*\)|start = ${workload_start:-\\1}|
+s|^end = \(.*\)|end = ${workload_end:-\\1}|
+}" \
+        -e "s|^data = .*|data = \"${DEMO_WORK}/data\"|" \
         -e "s|^images = .*|images = \"${DEMO_WORK}/images\"|" \
         -e "s|^logs = .*|logs = \"${DEMO_WORK}/logs\"|" \
         -e "s|^metrics = .*|metrics = \"${DEMO_WORK}/metrics\"|" \

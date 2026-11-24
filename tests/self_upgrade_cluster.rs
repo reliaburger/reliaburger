@@ -264,6 +264,8 @@ retain_versions = 3
                 ),
             )
             .unwrap();
+            // Workload host ports outside the lease range (#2261).
+            bun_process::use_test_workload_ports(&config_path);
 
             let api = format!("127.0.0.1:{api_port}");
             let (stop_tx, mut stop_rx) = watch::channel(false);

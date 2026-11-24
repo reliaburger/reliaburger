@@ -17,6 +17,9 @@ async fn bun_publishes_reachable_ephemeral_service_endpoints() {
     node.ingress.https_port = 0;
     let path = root.path().join("node.toml");
     std::fs::write(&path, toml::to_string_pretty(&node).unwrap()).unwrap();
+    // `NodeConfig::default()` writes Bun's range out; move workloads off the
+    // lease range (#2261).
+    crate::bun_process::use_test_workload_ports(&path);
     let log = std::fs::File::create(root.path().join("bun.log")).unwrap();
     // Pay `bun`'s first launch before the 30 s wait below starts (#1149).
     crate::bun_process::first_launch_binaries();
