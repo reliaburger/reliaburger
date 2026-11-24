@@ -124,9 +124,9 @@ use metrics::{
     metrics_query_handler, metrics_rollup_handler, metrics_summary_handler,
 };
 use node_info::{
-    DesiredAppsSource, capabilities_handler, cluster_capabilities_handler, desired_apps_handler,
-    diagnostics_handler, gather_desired_apps, health_handler, path_handler, readiness_handler,
-    rollouts_handler, version_handler,
+    DesiredAppsSource, app_spec_handler, capabilities_handler, cluster_capabilities_handler,
+    desired_apps_handler, diagnostics_handler, gather_desired_apps, health_handler, path_handler,
+    readiness_handler, rollouts_handler, version_handler,
 };
 use nodes::{
     MAX_RELAY_REQUEST_BYTES, cluster_elect_handler, council_handler, node_relay_handler,
@@ -701,6 +701,7 @@ pub fn router_with_upgrade(
         .route("/v1/apply", post(apply_handler))
         .route("/v1/status", get(status_handler))
         .route("/v1/apps", get(current_apps_handler))
+        .route("/v1/apps/{app}/{namespace}/spec", get(app_spec_handler))
         .route("/v1/readiness", get(readiness_handler))
         .route("/v1/jobs", get(jobs_handler))
         .route("/v1/jobs/runs", post(super::job_api::submit_handler))

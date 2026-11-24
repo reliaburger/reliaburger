@@ -2639,6 +2639,7 @@ const LEADER_ONLY_CALLS: &[(&str, &str, &str)] = &[
     ("POST", "/v1/upgrade/abort", ""),
     ("GET", "/v1/diagnostics/apps", ""),
     ("GET", "/v1/diagnostics/rollouts", ""),
+    ("GET", "/v1/apps/web/default/spec", ""),
     ("POST", "/v1/batch/1/cancel", ""),
     ("GET", "/v1/batch/1/results", ""),
     ("GET", "/v1/batch/1/tasks/0/logs", ""),
@@ -12561,4 +12562,71 @@ async fn a_node_without_a_council_reports_no_rollouts() {
     let (status, rollouts) = get_rollouts(&app, &admin_key).await;
     assert_eq!(status, StatusCode::OK);
     assert!(rollouts.is_empty());
+}
+
+/// A follower of a stub leader whose API is `leader`, and an admin's key.
+async fn follower_of_a_stub_leader(
+    leader: Router,
+) -> (Router, String, Vec<Arc<crate::council::CouncilNode>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, leader).await.unwrap() });
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (follower, nodes) = follower_of_the_leader_api_on(admin, None, port).await;
+    (follower, admin_key, nodes)
+}
+
+/// #1322: a leader that doesn't serve the spec read (an older release
+/// during a rolling upgrade) answers an empty 404. The follower says so
+/// with a 503 rather than claiming the app doesn't exist.
+#[tokio::test]
+async fn a_follower_says_when_its_leader_does_not_serve_spec_reads() {
+    let (follower, admin_key, nodes) = follower_of_a_stub_leader(Router::new()).await;
+    let (status, reply) = send_bounded(
+        follower,
+        "GET",
+        "/v1/apps/web/default/spec",
+        &admin_key,
+        "",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{reply}");
+    assert!(reply.contains("may run an older release"), "{reply}");
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// #1322: a leader that has no such app answers a 404 with a reason, and
+/// the follower passes the 404 on.
+#[tokio::test]
+async fn a_follower_passes_on_its_leaders_spec_read_404() {
+    let leader = Router::new().route(
+        "/v1/apps/{app}/{namespace}/spec",
+        axum::routing::get(|| async {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "no app \"web\" in namespace \"default\"" })),
+            )
+        }),
+    );
+    let (follower, admin_key, nodes) = follower_of_a_stub_leader(leader).await;
+    let (status, reply) = send_bounded(
+        follower,
+        "GET",
+        "/v1/apps/web/default/spec",
+        &admin_key,
+        "",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{reply}");
+    assert!(
+        reply.contains(r#"no app \"web\" in namespace \"default\""#),
+        "{reply}"
+    );
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
 }

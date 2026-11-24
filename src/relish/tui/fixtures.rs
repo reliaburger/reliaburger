@@ -173,6 +173,7 @@ impl TestScenario {
                     age_seconds: 60,
                 },
             });
+            data.app_spec = fixture_web_spec();
             data.app_metrics = Some(MetricsQueryResult {
                 data: vec![
                     MetricsQueryRow {
@@ -374,6 +375,20 @@ impl TuiApp {
         app.now_epoch = FIXTURE_NOW;
         app
     }
+}
+
+/// `web` in `default` as the spec read answers it (#1322), its one env
+/// value redacted.
+fn fixture_web_spec() -> Option<crate::bun::spec_read::AppSpecView> {
+    let spec: crate::config::AppSpec = toml::from_str(
+        "image = 'app:v1'\nreplicas = 3\nport = 8080\nnamespace = 'default'\n\
+         [env]\nDATABASE_URL = 'postgres://app:hunter2@db/app'\n",
+    )
+    .ok()?;
+    let id = crate::meat::AppId::new("web", "default");
+    let mut desired = crate::council::types::DesiredState::default();
+    desired.apps.insert(id.clone(), spec);
+    crate::bun::spec_read::app_spec_view(&desired, &id)
 }
 
 /// Render styles-agnostic terminal text for assertions and snapshots.

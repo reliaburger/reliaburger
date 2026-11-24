@@ -21,6 +21,7 @@ Not released yet: this is what the train carries, and it can change before the t
 - `relish apps NAME` lists each instance's sidecars under it, with their state (`running`, `backoff`, `restarting` or `stopped`) and how often each has restarted on its own, and `-o json` carries them on each instance as `sidecars`. They used to show up only as Restart events ([#1315](https://github.com/reliaburger/reliaburger/issues/1315)).
 - The appliance's console on tty1 is a read-only dashboard: tabs for status (with `relish status`'s lines and `wtf`'s counts), metrics with a short history, this node's workloads, gossip and Raft with each node's lag, versions, and the journal of `reliaburger` and `reliaburger-boot-check`. Keys `1` to `6` and the arrows move between tabs; nothing on it changes the node. It reads bun as a new read-only principal, `__console`, whose token every node derives from the cluster's master key, so there's no token to make. While bun doesn't answer it shows the screen it always had, and an unclaimed machine's claim key also appears in large letters. `bun appliance console` loses `--tty` and draws on its controlling terminal, so it also runs over `ssh -t` ([#2150](https://github.com/reliaburger/reliaburger/issues/2150)).
 - `relish apply --wait` returns once every app in the file runs its replicas, passes its health checks and has finished rolling out, printing each step (placed, pulling, waiting for the health check, ready). `--timeout` bounds it (5 minutes by default); when it runs out, `apply` names each app that isn't ready and why, and exits 1, while a failed apply exits 3, 4 or 5. With `-o json` it answers in the `relish.agent/v1` envelope. A daemon set or an autoscaled app counts the replicas the scheduler placed ([#2240](https://github.com/reliaburger/reliaburger/issues/2240)).
+- `GET /v1/apps/{app}/{namespace}/spec` reads one app's spec back: the one the cluster runs, and the one declared where they differ, with every env value, config file content and recognisable secret (including the value after a flag like `--password`, and a token in a health check or ingress path) left out and each redacted field named. A controller uses it to see an app's image and resources, and `relish tui`'s Config tab now shows it instead of saying the API doesn't expose it. It's a new read, so the wire protocol stays at 61; a follower whose leader still runs 0.3.2 answers 503 for it until the leader is upgraded ([#1322](https://github.com/reliaburger/reliaburger/issues/1322)).
 
 ### Changed
 
@@ -28,27 +29,17 @@ Not released yet: this is what the train carries, and it can change before the t
 - On Linux with glibc, Bun calls `malloc_trim(0)` on its blocking pool every ten minutes, so its resident memory follows what it holds instead of climbing with the free memory glibc keeps. Under hours of load that kept memory had looked like a leak in `relish nodes`, `relish top` and `top`. A trim that takes 100 ms or more is logged. macOS and musl builds are unchanged ([#1936](https://github.com/reliaburger/reliaburger/issues/1936)).
 - The appliance image has Buildah, so `relish build` and the five-minute tour's burger build on a cluster of appliances. Its storage is on the data partition, where Btrfs reflinks the `vfs` driver's layer copies; the image adds `netavark` and `gpg` for it, drops Buildah's 97 MB of test helpers, and grows each `/usr` slot by 54 MB (667 MB to 721 MB of 1,100 MB on x86-64). A multi-platform build can't emulate the other architecture's `RUN` steps on an appliance, so cross-compile or name one `platform`. With no node able to build, the refusal no longer says appliances never can ([#2144](https://github.com/reliaburger/reliaburger/issues/2144)).
 - Policy expressions nested more than 32 deep are refused before they're parsed, and `relish apply` checks the admin permission for policy tables before compiling them.
+- `relish policy audit` documents what it judges of a job: the definition the cluster keeps, so a one-off job counts while a run refers to it and drops out once its last run is pruned, when it can't run again; and a job pinned by tag and digest is judged by its tag, until the cluster keeps a declared job spec as it does for apps. Tests now cover the audit's job path ([#1322](https://github.com/reliaburger/reliaburger/issues/1322)).
 
 ### Fixed
 
 - A node checks an app's runtime knobs and host-path sources again each time one of its instances restarts. A restart builds the container from what the deploy approved, so a node restarted with a shorter `[runtime]` or `[storage] allowed_host_paths` list in `node.toml` brought crashed containers back with what it no longer allowed. Now the restart is refused, the instance is `Failed` with the refusal as its reason in `relish apps` and `relish wtf`, and it isn't retried. A `make test-linux` test starts a real runc container with a capability, a network and an IPC sysctl and `/dev/fuse`, and checks each from inside it ([#1316](https://github.com/reliaburger/reliaburger/issues/1316)).
 - A Bun restart or self-upgrade adopts running sidecars with their app instead of restarting them. Sidecars had no adoption records, so every Bun restart killed them and started them again about a second later. Each now has a record of its own, checked against the runtime like an app's ([#1315](https://github.com/reliaburger/reliaburger/issues/1315)).
-
-### Fixed
-
 - A quickstart VM no longer upgrades itself or restarts Bun without warning. Ubuntu's `apt-daily` timers and unattended-upgrades are masked in the guest image and at first boot, which covers stock and older guest images too, and needrestart, where installed, only lists what it would restart. An automatic libc upgrade had restarted Bun mid-run. Security updates arrive with releases, in each release's guest image ([#2274](https://github.com/reliaburger/reliaburger/issues/2274)).
-
-### Fixed
-
 - A batch attempt no longer becomes Unknown, needing a replay, when one exit check misses the process owner's 2 s request timeout on a loaded node. The check asks again, and the attempt becomes Unknown only after 60 s of unanswered checks, with that in the reason. ([#2288](https://github.com/reliaburger/reliaburger/issues/2288)).
-
-### Fixed
-
 - `node_pressure` no longer stays unavailable when Bun starts before systemd enables the cpu and memory cgroup controllers at the root. Bun prepares `/sys/fs/cgroup/reliaburger-chaos` again before each pressure fault and each capability report, enables the two controllers in the parent when it offers them, and says in `/v1/capabilities` what's missing when it can't ([#2242](https://github.com/reliaburger/reliaburger/issues/2242)).
-
-### Fixed
-
 - `make ci` no longer times out on a machine whose `relish` context names a cluster that's switched off. The examples dry-run test, and the other tests that run `relish` with no cluster of their own, read the developer's context and waited about 4 s per command for it; they now give each `relish` an empty `RELIABURGER_HOME` and drop the endpoint, token and CA variables ([#2290](https://github.com/reliaburger/reliaburger/issues/2290)).
+- A token scoped to some namespaces no longer misses its own events on a busy cluster. `GET /v1/events` took the newest `limit` of every node's events merged and only then kept the token's, so another namespace's traffic on one node could push the rest out. Each node's events are now trimmed to the token's scope before the merge ([#1322](https://github.com/reliaburger/reliaburger/issues/1322)).
 
 ## [0.3.2] - 2026-11-23
 

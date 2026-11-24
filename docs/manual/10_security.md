@@ -669,8 +669,13 @@ token's role, from `apply`, since only that token writes it (see
 `writing-a-controller`). An app GitOps owns is judged as a GitOps sync, and
 everything else as the cluster's own caller `audit`, role `system`, from
 `apply`; so is a controller-owned app whose token is gone. Jobs are judged from
-the definitions the cluster keeps, which are scheduled jobs and deployment
-hooks; a one-off job's definition goes once its runs are pruned. `relish wtf` shows the same
+the definitions the cluster keeps, with their schedules put back: scheduled
+jobs, deployment hooks, and one-off jobs while a run refers to them. Once a
+one-off job's last run is pruned its definition goes, and so does the job
+from the audit: it won't run again, and the next submission is judged when
+it arrives. The cluster keeps no declared spec for a job, so a job pinned by
+tag and digest (`report:v1@sha256:…`) is judged by its tag, `report:v1`, as
+a tag the cluster bound would be. `relish wtf` shows the same
 denials and audit findings as warnings.
 
 Any token can run it, but a token limited to some apps or namespaces sees
