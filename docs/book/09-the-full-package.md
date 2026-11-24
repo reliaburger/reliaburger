@@ -1641,6 +1641,77 @@ so the signed cold-install gate must exercise it too.
 
 The context also records the other loopback forwards, HTTP ingress on 18080 and the authenticated registry on 15050, so tools don't have to guess guest ports. And the guest's systemd unit mounts bpffs at `/sys/fs/bpf` in an `ExecStartPre` step if the base image didn't, so Bun never starts without the filesystem that holds its eBPF pins.
 
+### A crash in somebody else's event loop
+
+An evaluator on Arch Linux sent us a report we couldn't run (#1495). The
+cluster booted, and about 20 seconds later one node went `Broken`, because
+QEMU had died:
+
+```text
+qemu-system-x86_64: ../net/net.c:2175: net_fill_rstate: Assertion `size == 0' failed.
+```
+
+They'd done the hard part already. The core dump showed QEMU's socket
+network backend calling `recv()`, getting `-1` with `errno` set to `EAGAIN`,
+and passing the `-1` on as a packet length. Lima's `user-v2` network, the one
+that lets our VMs reach each other, hands QEMU exactly that backend:
+`-netdev socket,fd=3`, a Unix socket to Lima's user-mode network daemon. We
+had no Linux desktop with QEMU 11.1, though, so the issue sat parked.
+
+So we built one. The Mac runs Lima's `vz` driver with nested virtualisation,
+which gives a Fedora 44 guest its own `/dev/kvm`. Fedora 45's QEMU 11.1.3
+installs into it, and Lima 2.2.1 inside it runs two Ubuntu VMs on `user-v2`,
+the quickstart's configuration in miniature. The first VM survived its boot;
+the second one aborted during its first boot with the same assertion. After
+that `iperf3` between the two VMs killed one of them every single round.
+
+Reading QEMU's source explained half of it. `net_socket_send()` has let
+`EAGAIN` fall through to the packet parser for years, and `net_fill_rstate()`
+has asserted `size == 0` since 2016, so the bug is old. What's new is that something now
+calls the handler when there's nothing to read. QEMU 10.2 moved its main
+loop onto io_uring when the kernel allows it, rather than glib's `ppoll(2)`,
+and the file descriptor handlers moved with it. Take io_uring away and QEMU
+falls back to `ppoll(2)` without complaint. With `sysctl
+kernel.io_uring_disabled=1`, which keeps io_uring for root only, or `2`,
+which turns it off, the same `iperf3` rounds ran clean. Fedora 44's QEMU 10.2.2
+crashed just like 11.1.3, and Fedora 43's 10.1.5 didn't.
+
+We can't fix QEMU from here, and Lima on Linux has no other network that
+connects VMs without root. What we can do is refuse to start a cluster that
+we know will fall over, and say how to get past it. `preflight::qemu` runs
+`qemu-system-<arch> --version`, reads `/proc/sys/kernel/io_uring_disabled`,
+and hands both to a plain function:
+
+```rust
+fn check_qemu(command: &str, version: Option<QemuVersion>, io_uring: IoUring) -> Result<()> {
+    let Some(version) = version else {
+        return Ok(());
+    };
+    if version < QemuVersion::IO_URING_MAIN_LOOP || io_uring != IoUring::Enabled {
+        return Ok(());
+    }
+    bail!( /* the QEMU version, the issue link and the sysctl that fixes it */ )
+}
+```
+
+`let Some(version) = version else { ... }` is a `let`-`else`: it either
+binds the inner value or runs the block, which has to leave the function. A
+banner we can't parse lets setup carry on, because this check is for one known
+crash and shouldn't turn into a list of approved builds. `version <
+QemuVersion::IO_URING_MAIN_LOOP` compares two structs with `<`.
+`#[derive(PartialOrd, Ord)]` makes that compare the fields in the order
+they're declared (major, then minor, then micro), which is exactly how
+version numbers sort. In Go you'd write the comparison out by hand.
+
+Keeping the decision in a function that takes values rather than running
+commands means the tests are a handful of `assert!`s: Fedora's and Debian's
+banners, a build from git, 10.1 against 10.2, and each io_uring setting.
+Setup checks before it downloads anything, `relish local start` checks again
+in case QEMU was upgraded since, and so does `relish dev create`. The report
+for QEMU's developers names the two places that need a fix: the socket and
+stream backends should return on `EAGAIN`, and the io_uring file descriptor
+monitor shouldn't turn a failed poll into "readable".
+
 ### One clock, not two
 
 The 0.1.5 soak turned up a bug that wasn't in our code at all. On every node,
