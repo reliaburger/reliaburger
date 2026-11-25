@@ -146,6 +146,48 @@ The second gap was the attempt count. A drained task that had failed once was re
 
 `a_draining_pool_retries_nothing_and_leaves_the_task_not_run` in `src/bun/task_executor.rs` fails a task's first attempt and fires the token inside it. The task must end not run after one attempt. Without the token it failed after three. `a_draining_pool_launches_no_task_that_had_not_started` and `draining_lets_a_running_attempt_finish` check the other two edges. `a_stopping_node_retries_nothing_and_its_restart_runs_the_task` in `src/bun/task_array_node.rs` goes through the node: the drained chunk isn't reported, and a node restarted on the same directory runs the task and succeeds. `a_drained_chunk_of_a_default_job_restarts_without_a_replay` does the same with `replay_unknown = false`. `a_drained_task_keeps_its_attempts_across_the_restart` and `a_resumed_not_run_record_continues_the_tasks_attempt_count` check the attempt count, and `a_drained_chunk_counts_no_durations_until_it_is_reported` checks the durations. The soak harness got a fix as well: its verifier's systemd unit now starts `Before=reliaburger.service`, and systemd stops units in the reverse order, so the verifier outlives Bun.
 
+#### One slow answer isn't an unknown outcome
+
+An attempt in a fresh container finds out it has finished by asking. `OwnedRunner::run` calls `has_exited` every 10 ms, and on runc that's a `runc state` through the instance's process owner. The owner has 2 s to answer (`OWNER_REQUEST_TIMEOUT` in `src/grill/process_control.rs`). With 16 CPU spinners and two fsync writers on the same VM, it sometimes didn't make it, and the poll came back `StateUnavailable` with "process owner request timed out" ([#2288](https://github.com/reliaburger/reliaburger/issues/2288)).
+
+The loop used `?` on that answer. `?` is Rust's early return: on an `Err` it leaves the enclosing function, or here the enclosing `async` block, with the error. So one late answer ended the observation, and the attempt became `Unknown`. For a job with the default `replay_unknown = false` that's as bad as an attempt gets: the run stops until an operator acknowledges a replay, and a critical "unknown outcome" event fires. All because one `runc state` took a bit over 2 s. The stop path had the same cliff, and [#2251](https://github.com/reliaburger/reliaburger/pull/2251) made it ask again within the stop's grace ([#1902](https://github.com/reliaburger/reliaburger/issues/1902)). This is the exit poll's turn.
+
+`StateUnavailable` already means "the runtime can't say yet". `observe_runtime_exit`, which a stop uses, asks again when it gets one ([#1898](https://github.com/reliaburger/reliaburger/issues/1898)). So the runtime needed no change, only the poll loop, which now matches on the answer instead of using `?`:
+
+```rust
+let read = match self.runtime.has_exited(&id).await {
+    Ok(true) => self.runtime.exit_code(&id).await.map(Some),
+    Ok(false) => Ok(None),
+    Err(error) => Err(error),
+};
+let pause = match read {
+    Ok(Some(status)) => return Ok(status),
+    Ok(None) => {
+        unanswered.answered();
+        Duration::from_millis(10)
+    }
+    Err(error @ crate::grill::GrillError::StateUnavailable { .. }) => {
+        unanswered.missed(&error)?;
+        Duration::from_millis(100)
+    }
+    Err(error) => return Err(error.to_string()),
+};
+```
+
+`error @ GrillError::StateUnavailable { .. }` is a *binding pattern*: the arm matches only that variant, and `error` binds the whole value so the arm can still use it. `{ .. }` ignores the fields. The exit code read goes through the same match, because a runtime that has said the workload exited can still miss the next question, what it exited with. Any other error, such as `NotFound`, still ends the attempt at once: that's an answer, and a bad one.
+
+Asking again can't go on for ever. A runtime that has really lost the instance would hold the attempt, and its slot, until the job's own timeout, and a job may not have one. `UnansweredPolls` counts the misses in a row and remembers when the first one came back, and any answer resets both. The attempt becomes `Unknown` once the polls have gone unanswered for `EXIT_POLL_PATIENCE`, 60 s, and at least `EXIT_POLL_MIN_MISSES`, three, have missed. The longest owner stall we've seen was 27 s, in #1902, so 60 s is twice that with room to spare. The minimum count means one read that hangs for a minute can't do it alone. After a miss the loop waits 100 ms instead of 10 ms, so a struggling owner isn't asked a hundred times a second. The outcome's reason, which the event carries, says what happened:
+
+```text
+no exit poll answered for 60.4s (31 in a row); last: container ... state unavailable: process owner request timed out
+```
+
+The price is that a runtime that really has lost track takes a minute to say so, where it used to take 2 s. We'll take that: the old way turned healthy runs on a busy host into replays.
+
+The init container wait in `deploy_worker.rs` has the same `?` on its state and exit code reads, so one late answer fails a deploy. We left it alone for now. A test there injects an initialiser the runtime never answers about and expects the deploy to fail promptly, so asking again changes what a lost init costs a deploy, from one read to the init's whole 300 s bound. That's a decision of its own, not a copy of this one.
+
+Three tests in `src/bun/task_runtime.rs` use `MockGrill::set_state_unavailable_times`, which answers the next *n* state reads with `StateUnavailable`. `an_exit_poll_the_runtime_did_not_answer_is_asked_again` misses four polls and then lets the workload exit with code 3. The attempt must end `Exited { code: 3 }`; before the fix it ended `Unknown`. `an_exit_code_read_the_runtime_did_not_answer_is_asked_again` does the same for the exit code read. `exit_polls_unanswered_past_the_patience_end_the_attempt_unknown` cuts the patience to 200 ms and misses ten polls in a row: the attempt must end `Unknown`, with a reason that says for how long and why.
+
 ### Putting it together, in one process
 
 The acceptance test in the portable suite wires three simulated nodes (each a real pool with a fake runner and a real ledger on disk) to the real leader state and grant policy. One task in a hundred fails its first attempt and succeeds on retry. A third of the way through, node n3 is lost: its chunks go back to the queue at the next attempt, and its late reports are refused by the fence. At the end every index has exactly one accepted outcome, exactly one retry is counted per failing index, and the three ledgers between them hold a terminal record for all of them. The suite runs 100,000 tasks, which takes about three seconds in a debug build. With the full million it took 30.6 seconds on the laptop, about 32,700 tasks a second, and the leader changed its state in 422 ticks. Real processes will be far slower than a fake; the Criterion suite (`make bench-task-arrays`) measures the machine's fork/exec floor through the real runner, so we'll know by how much before promising anyone a number.
@@ -4178,6 +4220,122 @@ stayed flat; node 2's rose with its store and levelled when the store
 stopped growing at hour 20. Getting there also took one trick: `relish
 logs` fans out to every node, so even "node 2's" tail had queried node 3's
 store, and the day tier now asks each node's own `/v1/logs/entries`.
+
+"Not a leak" is a fine answer for us and a poor one for someone watching
+`top` on a 2 GB appliance for a week. To them, a Bun that climbs by
+200–330 MiB is leaking, whoever holds the bytes. The gdb trick already said
+what fixes it, so from 0.3.3 Bun does it itself
+([#1936](https://github.com/reliaburger/reliaburger/issues/1936)): every ten
+minutes it calls `malloc_trim(0)`. There were cheaper-looking options. Bun
+already caps glibc at two arenas, so fewer arenas has little left to give.
+glibc's automatic trim threshold (`M_TRIM_THRESHOLD`) only ever returns the
+free space at the very top of the main heap, and long-running Bun's free
+space is scattered through the middle, between blocks still in use. A
+different allocator, such as jemalloc with background threads, returns
+memory on its own, but it adds a C dependency to every build, including the
+static musl ones and the appliance image, to do what one glibc call already
+does. `malloc_trim` walks every arena and hands each whole free page back
+with `madvise(MADV_DONTNEED)`, wherever it sits.
+
+The code is in `src/bun/malloc_trim.rs`. The FFI is one call:
+
+```rust
+pub fn trim_now() -> bool {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // SAFETY: malloc_trim takes no pointers and touches only malloc's
+        // own state, under the same per-arena locks malloc and free take, so
+        // it is safe to call from any thread at any time. The argument is
+        // the padding to leave at the top of the heap; 0 keeps none.
+        let released = unsafe { libc::malloc_trim(0) };
+        released != 0
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        false
+    }
+}
+```
+
+`libc::malloc_trim` is a declaration of glibc's C function, written out by
+the `libc` crate: an `extern "C"` signature, `fn malloc_trim(pad: size_t)
+-> c_int`, with nothing behind it in Rust. The linker finds the symbol in
+glibc, exactly as it would for a C program; Go's cgo does the same with a
+`// #include` comment and generated stubs. Rust calls every such foreign
+function `unsafe`, because the compiler can't see into C and can't promise
+it upholds Rust's rules about pointers, aliasing and threads. `unsafe { ... }`
+doesn't switch any checks off for the code around it. It marks the one place
+where a human made that promise, and the `// SAFETY:` comment, which this
+project requires on every such block, is where they say why. Here the
+argument is easy to make: no pointers cross, and glibc takes its own locks.
+
+The two `#[cfg]` blocks are the function body for each kind of build, and
+the compiler sees only one of them. On macOS and musl, `libc::malloc_trim`
+doesn't exist at all, so naming it outside a `cfg` would fail to compile
+there, not just do nothing. The block's last expression is its value, and
+the function's, so each build returns a `bool` with no `return` keyword. The
+loop that calls it checks the compile-time `cfg!` boolean `SUPPORTED` first
+and returns at once where there is no glibc.
+
+`malloc_trim` locks each arena while it walks it, and any thread that
+allocates in the meantime waits. That's fine for a sliver of a second, but
+not on one of Tokio's async worker threads, where it would stall every task
+queued behind it. So the loop sends the call to the blocking pool:
+
+```rust
+pub async fn run_trim_loop<F>(interval: Duration, shutdown: CancellationToken, trim: F)
+where
+    F: Fn() -> bool + Clone + Send + 'static,
+{
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // The first tick completes at once; skip it.
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = ticker.tick() => {}
+        }
+        let trim = trim.clone();
+        let started = Instant::now();
+        // A join error means the runtime is shutting down.
+        if tokio::task::spawn_blocking(trim).await.is_err() {
+            return;
+        }
+        if let Some(warning) = slow_trim_warning(started.elapsed()) {
+            eprintln!("{warning}");
+        }
+    }
+}
+```
+
+The trim is a parameter so the tests can pass a fake. `F` is a generic type
+with bounds in the `where` clause: anything callable with no arguments that
+returns a `bool` (`Fn() -> bool`), that can be copied for each tick
+(`Clone`), moved to another thread (`Send`), and holds no borrowed
+references (`'static`), because the blocking pool may run it after this
+function's stack frame has moved on. Production passes `trim_now`, a plain
+function, which meets all four for free. A test passes a closure that
+sends on a channel each time it's called. With `start_paused = true`, Tokio's
+clock stands still and jumps straight to the next timer whenever every task
+is waiting, so the test sees trims at exactly 600, 1,200 and 1,800 virtual
+seconds without waiting ten minutes. Two more tests cancel the token, before
+the first tick and halfway between two, and check that the loop returns at
+the cancel and never trims again. A trim slower than 100 ms goes to stderr,
+so a long pause on a big heap shows up in the journal.
+
+We measured it before trusting it, on a one-node Bun in a VM, with host
+job arrays and a loop of `relish nodes`, `top`, `metrics` and `logs`
+([the 24 November record](../qualification/2026-11-24-bun-malloc-trim.md)).
+After a 15-minute burst of load, the old Bun went quiet at 114 MiB of
+anonymous memory and stayed there; the first trim took the new one from 104
+to 77 MiB, and twelve minutes in it was at 92. Under steady load the two
+builds were the same, 113 MiB on average over 40 minutes. That's the honest
+limit of the fix: a trim returns what is free at that moment, and under
+load the free pages are the next second's allocations, so they come straight
+back. What it's for is the slow build-up of free memory that nobody reuses,
+which #1417's day run saw over hours. A 40-minute run can't show that, so
+the next day tier's malloc points will. Each trim took 2 to 41 ms.
 
 The run before that one taught a lesson about the test bed rather than
 Bun. Installing `gdb` meant an `apt-get update` in each guest, which gave

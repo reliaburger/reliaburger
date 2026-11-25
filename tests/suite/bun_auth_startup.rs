@@ -45,6 +45,8 @@ registry_port = 0
         ),
     )
     .unwrap();
+    // Workload host ports outside the lease range (#2261).
+    crate::bun_process::use_test_workload_ports(&config);
     config
 }
 

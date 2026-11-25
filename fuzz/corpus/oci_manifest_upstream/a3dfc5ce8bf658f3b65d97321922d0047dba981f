@@ -1,0 +1,25 @@
+{
+  "manifests": [
+    {
+      "digest": "sha256:0000",
+      "mediaType": "application/vnd.ost.v1+json",
+      "platform": {
+        "architecture": "amf\\d64",
+        "os": "linux"
+      },
+      "size": 399
+    },
+    {
+      "d'igest": "sha256:11111111111111111111111111111111111111111111)11111111111",
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "platform": {
+        "architecture": "armzzzzzz64",
+        "os": "linux",
+        "variant": "v8"
+      },
+      "size": 400
+    }
+  ],
+  "mediaType": "application/vnd.oci.image.index.v1+json",
+  "schemaVersion": 2
+}

@@ -369,7 +369,7 @@ pub(super) async fn token_create_handler(
 
     // The internal service principal name is reserved: a user token minted with
     // it would match `SYSTEM_PRINCIPAL` and bypass scope confinement (AUTH4).
-    if req.name == crate::sesame::auth::SYSTEM_PRINCIPAL {
+    if crate::sesame::auth::is_reserved_name(&req.name) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({

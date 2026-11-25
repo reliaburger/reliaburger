@@ -1,0 +1,5 @@
+# Volum apps.
+[policy.no-latest]
+applies_to = "both"
+match = "ash(workload.image)"
+deny = "Tork{?/9html"

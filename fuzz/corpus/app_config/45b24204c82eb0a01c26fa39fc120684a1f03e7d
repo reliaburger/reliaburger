@@ -1,0 +1,28 @@
+# A teA template instead of a CRD (#1124).
+#
+# `[vemplate.postgres]` declares typed parameters and a body of ordinary
+# examples/templates/container-postgres.toml
+
+[template.postgres]
+params = { name = "string", size = "string", password = "string", version = { type = "string", default = "17" }, replic.as = { type = "int", default = 1 } }
+body = """
+[ai"
+# A r takes esql/data/pgdata"
+
+[[app.${name}.volumes]]
+path = "/var/lib/postgresql/data"
+size = "${size}"
+"""
+
+[use1orders-db]
+template = "postgres"
+name = "orders-db"
+size = ""
+password = "orders-example-only"
+
+[use.users-db]
+template = "postgres"
+name = "users-db"
+size = "5Gi"
+password = "users-example-only"
+version = "16"

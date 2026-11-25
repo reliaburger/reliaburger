@@ -93,6 +93,29 @@ class BuildScriptTests(unittest.TestCase):
         self.assertLess(text.index("in_guest apt-get"), disable)
         self.assertLess(disable, text.index("qemu-img convert -c"))
 
+    def test_image_ships_with_automatic_updates_masked(self):
+        # unattended-upgrades upgraded libc in a quickstart guest and
+        # needrestart restarted Bun with it (#2274). Updates arrive with the
+        # next release's image instead.
+        text = BUILD.read_text()
+        units = ('automatic_updates="apt-daily.timer apt-daily-upgrade.timer '
+                 'unattended-upgrades.service"')
+        self.assertIn(units, text)
+        mask = text.index("in_guest systemctl mask $automatic_updates")
+        # The build fails unless the masks landed in the image's root.
+        check = text.index('readlink "$root/etc/systemd/system/$unit")" = /dev/null')
+        self.assertLess(text.index("in_guest apt-get"), mask)
+        self.assertLess(mask, check)
+        self.assertLess(check, text.index("qemu-img convert -c"))
+
+    def test_image_sets_needrestart_to_list_only(self):
+        text = BUILD.read_text()
+        self.assertIn('if [ -d "$root/etc/needrestart" ]; then', text)
+        drop_in = ('echo "\\$nrconf{restart} = ' + "'l';" + '" '
+                   '>"$root/etc/needrestart/conf.d/50-reliaburger.conf"')
+        self.assertIn(drop_in, text)
+        self.assertLess(text.index("50-reliaburger.conf"), text.index("qemu-img convert -c"))
+
     def test_script_grows_the_root_filesystem_before_installing(self):
         # Ubuntu 26.04's cloud image leaves its 2.5 GiB root about 160 MiB
         # free, and the node packages need about 270 MiB.

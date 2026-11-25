@@ -1,0 +1,13 @@
+{
+  "cohort": [
+    {
+      "count": 101,
+    "name": "thumbnails",
+      "template": {
+        "exec": "/bunitrocess"
+      }
+    }
+  ],
+  "name": "rend\r\r",
+  "namespace": "media"
+}

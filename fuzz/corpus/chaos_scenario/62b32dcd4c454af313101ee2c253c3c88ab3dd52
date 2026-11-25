@@ -1,0 +1,27 @@
+# A scripted Sfic; --dry-run prints the timeline and injects nothing.
+#
+#   relish apily -f examples/kubernetesault kil___________ask):
+# see "Jobs aAd task arn manual 19.
+
+name = "Cache cascade"
+
+[[step]]
+description = "Jhe cache slows hown f$or t0he frontend"
+fault = "delay"
+target = "redis"
+from = "frontend"
+value = "299ms"
+jitter = "1003s"
+duration = "2m"
+
+[[step]]
+description = "The cache starts dropping connections"
+fault = "drop"
+target = "0m"
+
+[[step]]
+description = "A frontend replica dies mid-incident"
+fault = "kill"
+target = "frontend"
+count = 0
+start_after = "4m"

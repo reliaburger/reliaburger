@@ -163,6 +163,20 @@ marker, or a marker that isn't right before a fence, fails the test rather
 than skipping anything. Run the marker test with `--no-capture` to see every
 opt-out.
 
+### A `relish` that can't see your cluster
+
+A test that runs the compiled `relish` would otherwise ask the cluster your
+own context names, or the one `RELIABURGER_ENDPOINT` names. When that
+cluster is off, every command waits for it, and a test that runs dozens of
+them times out ([#2290](https://github.com/reliaburger/reliaburger/issues/2290)).
+Build the command with `relish_command(home)` from
+[`tests/support/isolated_relish.rs`](../tests/support/isolated_relish.rs),
+or pass an existing one to `isolate_relish`. Either gives it an empty
+`RELIABURGER_HOME` the test owns and drops `RELIABURGER_ENDPOINT`,
+`RELIABURGER_TOKEN` and `RELIABURGER_CA_CERT`. Set them per command, never
+for the whole of `make ci`: the installer tests in
+`scripts/release/test_package.py` need your real home.
+
 ## The agent loop's turn budget
 
 Each node's agent runs one loop that owns all of the node's state, one turn at
@@ -438,15 +452,17 @@ jobs. What else runs depends on where the change is going:
 
 | Run | Jobs | Typical wall time |
 |---|---|---|
-| Pull request into a merge train (`release-*`, e.g. `release-0-2-4`) | The light set: CI policy (with the dependency audit and the demo app's Go tests), lint and format, minimum Rust, the source bundle build, portable Linux (with coverage), the doctests and the nightly-signing key test, and the optimised contract boundaries | about 19 minutes of running, set by portable Linux, down from 30 (#1723, [measured](qualification/2026-11-09-v0.2.8-train-pr-timings.md)), then about 35 once the coverage build went to one job at a time (#2102; median 22.7 minutes in 13 green train PRs before, 34.8 in 14 after). From 18 to 20 November, with the train's dependency cache saved by its pushes, 22 green train PRs without macOS took a median of 31.3 minutes of running and 43.9 of wall time: portable Linux builds the crate for 13 of its 25 to 31 minutes, one compile at a time. Since 0.3.2 `make coverage` builds the lib tests alone and then the rest, both at full parallelism (#1723): estimated at about 6 minutes of build and 18 to 24 of portable Linux (median near 21), to be confirmed by the first CI runs |
+| Pull request into a merge train (`release-*`, e.g. `release-0-2-4`) | The light set: CI policy (with the dependency audit and the demo app's Go tests), lint and format, minimum Rust, the source bundle build, portable Linux (with coverage), the doctests and the nightly-signing key test, and the optimised contract boundaries | about 19 minutes of running, set by portable Linux, down from 30 (#1723, [measured](qualification/2026-11-09-v0.2.8-train-pr-timings.md)), then about 35 once the coverage build went to one job at a time (#2102; median 22.7 minutes in 13 green train PRs before, 34.8 in 14 after). From 18 to 20 November, with the train's dependency cache saved by its pushes, 22 green train PRs without macOS took a median of 31.3 minutes of running and 43.9 of wall time: portable Linux builds the crate for 13 of its 25 to 31 minutes, one compile at a time. Since 0.3.2 `make coverage` builds the lib tests alone and then the rest, both at full parallelism (#1723): over 80 train runs from 21 to 24 November portable Linux took a median of 23.7 minutes (20.4 to 30.2), about 2 of setup, 7.5 of build, 8.5 running the suite and 3 writing the coverage report, and 21 green train PRs without macOS took a median of 23.8 minutes of running and 40.0 of wall time |
 | The same, labelled `full-ci` | The light set plus privileged Linux, the cluster, acceptance and upgrade suites, and the benchmarks the change touches | about 45 minutes |
 | The gate PR (a train into `main`) | The light set on each push; with `full-ci`, the heavy suites too | as above |
 | The gate PR labelled `release-gate` | Everything, portable macOS included; the evidence gate refuses less | about 45 minutes, plus any wait for macOS runners |
 | Any other pull request into `main` | The light set plus the heavy suites and the benchmarks the change touches | about 45 minutes |
 | Pull request stacked on any other branch | The light set; the heavy suites only with `full-ci` | about 17 minutes |
-| Merge-queue group | Everything; only CI policy and the gate when the group changes nothing but documentation | about 60 minutes, set by portable macOS, plus any wait for runners |
+| Draft pull request, or one from a `0-4-0/` branch, whatever its labels | Select jobs, CI policy and lint; the full set for its base once it's marked ready for review | a few minutes |
+| Merge-queue group | Everything but portable macOS; only CI policy and the gate when the group changes nothing but documentation | set by acceptance and the privileged Linux jobs instead of portable macOS, plus any wait for runners |
 | Push to a train | Nothing but CI policy and the gate when the merge queue's run on that commit passed every job at its first attempt; portable Linux too when the train's `Cargo.lock`, `Cargo.toml` or `.cargo/config.toml` differs from `main`'s, to save its cache; everything otherwise | a few minutes; about 25 with portable Linux |
 | Push to `main`, nightly, manual, `build.yml`'s candidate build | Everything | about 45 minutes, plus any wait for macOS runners |
+| [`macos-nightly.yml`](../.github/workflows/macos-nightly.yml), nightly and by hand | Portable macOS alone (`make lint-macos`, `make test-macos`, relish's doctests) on the newest `release-*` train with work `main` doesn't have, else `main` | about an hour, plus any wait for a macOS runner |
 
 **macOS only where it adds something**
 ([#1443](https://github.com/reliaburger/reliaburger/issues/1443), maintainer
@@ -464,9 +480,33 @@ portable macOS only when
 - it carries the `macos` label (any code PR, Dependabot's included); or
 - it's the gate PR labelled `release-gate`.
 
-Dependabot's PRs never get macOS otherwise; the nightly covers them. Every
-push to a train or to `main`, the merge queue, the nightly and the candidate
-build still run it, so no commit reaches a train or `main` without it.
+Dependabot's PRs never get macOS otherwise; the nightly covers them.
+
+**macOS out of the merge queue** (maintainer decision of 24 November 2026).
+Portable macOS took 50 minutes to over 2 hours in merge-group runs and set
+every group's length, and on 24 November it was cancelled or failed three
+times, each time rebuilding the whole queue, while one PR's CI waited over 3
+hours for a runner. So select jobs leaves it out of every merge group, and the
+evidence gate accepts a merge group with every owner but `portable-darwin`
+(the `train-full` selection). A train push the queue already tested still
+runs nothing: `ci_reuse.py --event merge_group` accepts a skipped `portable
+macOS` there and nowhere else. Instead,
+[`macos-nightly.yml`](../.github/workflows/macos-nightly.yml) runs the same
+lint, tests and doctests every night on the newest train (picked the way
+[mutation testing](#mutation-testing) picks it), and by hand on any ref. A red
+nightly is handled like a flake: an issue the same day. So a train may carry a
+macOS break for up to a day, never into a release: the gate PR labelled
+`release-gate` runs portable macOS and its evidence gate refuses it without,
+the push to `main` runs it, and a candidate build only reuses a push or
+nightly run in which `portable macOS` passed; otherwise `validate-release`
+runs all of `ci.yml`, macOS included.
+
+**Drafts and 0.4.0 work run the cheap set** (same decision). A draft pull
+request, and one whose head branch starts with `0-4-0/`, runs select jobs, CI
+policy and lint (when it changes code) and nothing else, whatever its labels;
+`appliance.yml` builds no image for it and `build.yml` builds nothing.
+`ready_for_review` starts a run with the full set for its base, and
+`converted_to_draft` starts a cheap run that cancels the one still going.
 
 Both privileged Linux jobs guard their hosted runner the way the 26.04 job
 learned to (#1943). The runner's own processes run at `oom_score_adj` -1000
@@ -497,21 +537,43 @@ cargo-llvm-cov keeps `--no-run` for itself (a deprecated alias for its report),
 hence `--list`. The first CI runs measure it: watch the resource log for
 `mem_floor:` and memory-stall stops, and the report step for kernel OOM lines.
 
+The instrumented run takes eight test threads, `--test-threads=8` in the
+recipe, where nextest's default is one per CPU, four on a hosted runner
+(#1723). Most of the suite waits on timers, sockets and child processes, not
+the CPU: at four threads the runner's load stayed at 2 to 5. It's a contract
+setting, not an override: `coverage_owner.py` pins the recipe and the exact
+nextest command line cargo-llvm-cov generates, so a run at any other count is
+refused, and the evidence owners still strip every `NEXTEST_*` variable.
+Heavy tests keep their nextest test groups, which cap them inside the eight.
+Other jobs, and `make test` on a laptop, keep nextest's default. It was
+measured in a 4-vCPU, 16 GB Lima VM on the Mac Studio, with CI's toolchain,
+flags and coverage, ten full runs at each count, alternating: the suite took
+a median of 469 s at four threads and 294 s at eight, with the host still
+44 to 58% idle at eight. Two runs failed at four threads and four at eight,
+seven failures from four tests in all; each was a test
+reading state once that the product publishes a moment later, or a timing
+bound tighter than what it proves, and each is fixed and in the [flakes
+register](flakes.md). After the fixes, ten more runs at eight threads all
+passed, at a median of 238 s on a quieter host. Two runs at twelve took 191
+and 212 s; twelve needs its own ten runs before anyone pins it. Portable
+macOS keeps the default: its tests take under two minutes on a 3-core runner.
+
 The light set exists because macOS was the critical path of almost every run:
 twelve runs before the change took 45–55 minutes of wall time, of which
 runner queueing was mostly under ten, portable macOS 35–49 and acceptance
 about 34; every other job finished in about 15. A pull request into a train
 only needs to show it compiles, lints and passes the portable suite on Linux,
 with the coverage floor (`COVERAGE_MIN_LINES`, which only the Linux job
-measures). Nothing is lost, only moved: the merge queue runs every job on the
-result before it lands, so every commit on a train has full coverage. The gate PR
+measures). Nothing is lost, only moved: the merge queue runs every job but
+portable macOS on the result before it lands, so every commit on a train has
+full coverage on Linux, and the macOS nightly covers the train's tip. The gate PR
 doesn't run it all again on each push, since the queue just did; it runs
 everything once it's labelled `release-gate` at code freeze. Label a pull
 request `full-ci` when you want the heavy suites on the PR itself, for
 example for a change to privileged Linux, cluster or acceptance code. The
 evidence gate calls a heavy selection without macOS `train-full` and accepts
-it, like the light set, only on a `pull_request` event, and never on a
-`release-gate` PR. For macOS-only code the PR runs portable macOS itself; for
+it only on a `pull_request` or `merge_group` event, and never on a
+`release-gate` PR; the light set only on a `pull_request`. For macOS-only code the PR runs portable macOS itself; for
 anything else, check it on a Mac with `make test`, or add the `macos` label.
 Either way the job runs relish and the macOS-only tests, not the whole suite
 ([what runs on macOS](#what-runs-on-macos-and-what-runs-on-linux)), so in CI a
@@ -525,8 +587,9 @@ train is named in the queue's ruleset when it opens
 The queue requires one check, `ignored-test evidence`. It waits for
 every other job, fails if any of them failed or was cancelled, and then runs
 the evidence aggregation below, so a skipped job can only count when select
-jobs left it out. On a merge-queue group, a push or a manual run the
-aggregation demands every owner; only a pull request may qualify with fewer.
+jobs left it out. On a push or a manual run the aggregation demands every
+owner, and on a merge-queue group every owner but portable macOS; only a pull
+request may qualify with fewer.
 Evidence there binds to the queue's temporary group commit
 (`github.event.merge_group.head_sha`), the commit it checked out.
 
@@ -584,8 +647,9 @@ to 110 to report (#1723). Three things wasted runners, and each now has a fix:
   ([`ci_reuse.py`](../scripts/release/ci_reuse.py) with `--event
   merge_group`: same commit, first attempt, every job green), and when it
   finds one the push runs only CI policy and the gate, which names the run
-  it rests on. A candidate build of that commit reuses the queue's run, not
-  the push's. Any doubt, an API error included, runs everything.
+  it rests on. That lookup accepts a skipped `portable macOS`, since the queue
+  no longer runs it; a candidate build never does, so it can't rest on the
+  queue's run or that push's. Any doubt, an API error included, runs everything.
 - **Groups the queue had dropped.** When the queue re-forms it deletes the
   dropped groups' `gh-readonly-queue/...` branches but leaves their runs
   going, and each merge-group run has a concurrency group of its own. Five
@@ -607,8 +671,14 @@ testing. Scripts are code here, since the jobs run them.
 
 What's left is mostly the queue's own settings, which only the maintainer can
 change: building eight groups at once (`max_entries_to_build` in the "release
-trains merge queue" ruleset) means up to 160 jobs, and portable macOS (52 to
-57 minutes with a warm cache) sets every group's length.
+trains merge queue" ruleset) meant up to 144 jobs; it builds three since 24
+November 2026, after a group's jobs waited a median 633 job-minutes for runners
+against 276 running
+([merge queue experiments](qualification/2026-11-24-merge-queue-experiments.md)).
+Portable macOS (52 to 57 minutes with a warm cache, 35 to 47 once its lib tests
+built alone, and over 2 hours when its runners ran short) set every group's
+length until it left the queue the same day ([above](#which-jobs-a-pull-request-runs)),
+when fuzzing also stopped running on pull requests ([fuzzing](#fuzzing)).
 
 ### What runs on macOS and what runs on Linux
 
@@ -700,6 +770,29 @@ ways to keep the merge honest.
 [`test_shard_partition.py`](../scripts/ci/test_shard_partition.py) checks the
 merge against what the pinned nextest really prints, on a throwaway crate.
 Coverage is unaffected: only the Linux portable job measures it.
+
+Its time goes on one compile. Over 83 runs on the 0.3.2 and 0.3.3 trains, 21
+to 24 November 2026, the job took a median of 58.4 minutes (31.7 to 102.5);
+the tests took under two and the lint, which checks the same crate, about two.
+The rest was `cargo test --no-run`, which took 21 to 93 minutes for the same
+build from the same full cache hit. It compiled the lib tests and the lib side
+by side on a 3-core, 7 GB runner, [#1943](https://github.com/reliaburger/reliaburger/issues/1943)'s
+mechanism on a smaller host, so `make test-macos` now builds the lib tests on
+their own first, as `test-linux` does, then the rest (#1723). In its first
+two runs
+([45338026382](https://github.com/reliaburger/reliaburger/actions/runs/45338026382),
+[45348952470](https://github.com/reliaburger/reliaburger/actions/runs/45348952470))
+the lib tests took 24:55 and 33:35, the rest 4:43 and 6:43, and the job 34.8
+and 46.5 minutes. The lib tests still page on their own: swap in use peaked
+at 1.3 GB both times, and 3.6 to 4.6 GB went out to swap while they compiled.
+Splitting `relish` into its own crate, so macOS compiles only what it tests,
+is what would end the paging.
+
+The job logs the runner's memory every 15 seconds from before the lint
+([`watch-macos-memory`](../scripts/ci/watch-macos-memory)): the load, free
+memory, swap in use, swap-outs so far and the biggest process. It prints the
+peaks after the tests and keeps the log as the `portable-macos-memory`
+artifact, pass or fail.
 
 ### Trimming the Actions caches
 
@@ -950,16 +1043,17 @@ rebuilt reliaburger, twice a target: the nightly spent 25 minutes a target
 and hit its timeout.
 
 [`fuzz.yml`](../.github/workflows/fuzz.yml) runs `make fuzz-smoke` nightly at
-300 seconds a target, and for 30 seconds on a pull request that touches a
-decoder's file or the fuzzing set-up (or by hand, with any budget). A
-dependency bump, a Makefile change or the rest of `src/config/` waits for the
-nightly: the job takes 14 to 33 minutes. The job summary has each target's last
+300 seconds a target, and by hand with any budget. Until 24 November 2026 it
+also ran for 30 seconds a target on every pull request that touched a
+decoder's file, but the job takes 14 to 33 minutes and runners were short, so
+the maintainer took it off pull requests; the release gate never used it.
+The stable half, every target over its checked-in corpus, still runs in the
+portable suite on every pull request. The job summary has each target's last
 libFuzzer status line (executions, coverage, corpus size). A crash fails the
 job and its input is kept as the `fuzz-crashes` artefact. The workflow pins a
 dated nightly (`FUZZ_TOOLCHAIN`) and caches the sanitizer build under one
-rust-cache key for nightly and pull request runs, which only the nightly and
-runs by hand save, so pull requests don't eat into the cache quota `ci.yml`
-keeps for `main`; a floating nightly would change that key every day. Move the pin forward by hand when a newer nightly
+rust-cache key that the nightly and runs by hand save; a floating nightly
+would change that key every day. Move the pin forward by hand when a newer nightly
 is needed. Locally, `FUZZ_TOOLCHAIN` defaults to `nightly`.
 
 A crash is handled like a flake: an issue the same day. Then add the input as
@@ -975,6 +1069,20 @@ seeds then stop decoding. `fuzz::tests` runs every checked-in fixture seed
 through its target and fails if one is refused, so a bump that leaves stale
 seeds fails `make test`. libFuzzer writes what it finds to
 `fuzz/target/corpus/`, never into the checked-in seeds.
+
+Beside the named seeds, `fuzz/corpus/` keeps up to 50 inputs a target from
+long runs, named by their SHA-1 as libFuzzer names them. `fuzz::tests` only
+wants them to run without a panic, so a protocol bump doesn't break them;
+they just stop reaching past the version check until the next harvest. To
+harvest a run, merge its `fuzz/target/corpus/<target>/` into a copy of the
+checked-in one with `-set_cover_merge=1 -use_counters=0 -use_value_profile=0`
+(so a file counts only for new edges, not hit counts), then keep the 50 files
+that add the most edges, the smaller first on a tie. The control file the
+merge writes (`-merge_control_file`) lists each file's edges. The long tail is
+cheap to find again and expensive to keep: the first harvest
+([#1414](https://github.com/reliaburger/reliaburger/issues/1414), from a
+95.6-million-input run) needed 5,099 files for every new edge, and the 839 it
+kept reach 73% of them.
 
 OSS-Fuzz is the follow-up: Google's continuous fuzzing runs Rust projects
 through the same cargo-fuzz targets
@@ -1007,19 +1115,20 @@ contribution there is: the new test is right when the mutant stops being
 missed.
 
 [`mutants.yml`](../.github/workflows/mutants.yml) runs it, on Linux only and
-in its own workflow, so it's never on a pull request's critical path: the
-evidence gate doesn't wait for it, and a missed mutant doesn't turn the check
-red. Only a broken run (the unmutated tree failing its tests, say) does. It
-runs on pull requests into the branches `ci.yml` does, so a pull request into
-a release's merge train gets it as one into `main` does; the merge queue and
-the push to the train don't run it, since it was never a required check.
+in its own workflow, and never on a pull request: the evidence gate doesn't
+wait for it, and a missed mutant doesn't turn the check red. Only a broken
+run (the unmutated tree failing its tests, say) does. It used to run on every
+pull request that touched `src/`, but on 24 November 2026 that held a Linux
+runner for up to 75 minutes per train PR while the train's own CI queued
+behind it, so it moved to a nightly run.
+
+The nightly run mutates the newest release train (`release-*`), where work
+lands before `main`, or `main` when no train has work `main` doesn't.
 
 | Run | What it mutates | At most | Test budget |
 |---|---|---|---|
-| A pull request into `main` or a release's merge train (`release-*`) that touches `src/` | The lines it changes ([`--in-diff`](https://mutants.rs/in-diff.html)) | 12 mutants | 60 minutes, in a 75-minute job |
-| A pull request that changes only the mutants set-up | `src/file_lock.rs`, as a check that the job still works | 12 | the same |
-| Sundays at 04:23 UTC | What landed on `main` in the last seven days | 60 | 300 minutes, in a 330-minute job |
-| By hand (`workflow_dispatch`) | A glob of files, or the last seven days | as asked (12 by default) | 300 minutes |
+| Every night at 04:23 UTC | The lines that changed under `src/` on the newest train in the last day ([`--in-diff`](https://mutants.rs/in-diff.html)); nothing if none did | 60 mutants | 300 minutes, in a 330-minute job |
+| By hand (`workflow_dispatch`) | A glob of files, or the newest train's last day | as asked (12 by default) | 300 minutes |
 
 Each mutant rebuilds the crate, so the budget is a count and a clock. Over
 the count, the job tests one round-robin shard (`--shard 0/K --sharding
@@ -1041,9 +1150,8 @@ That run had the old budget (20 mutants, no clock) and hit the job's
 `FileLock::remove` before it did. The first local trial (the Mac Studio at a
 load average of about 40) took 194 s for its one buildable mutant and 5 s to
 test it; two others failed to compile (*unviable*) within 75 s. A pull
-request that touches `src/` therefore costs up to 75 Linux runner-minutes,
-and usually far less with a warm cache and a short diff; one that doesn't
-touch it costs nothing. The sizing is in
+request that touched `src/` cost up to 75 Linux runner-minutes, which is
+why it now runs once a night instead. The sizing is in
 [`mutants_plan.py`](../scripts/ci/mutants_plan.py) and its tests in
 [`test_mutants_plan.py`](../scripts/ci/test_mutants_plan.py).
 
@@ -1059,7 +1167,7 @@ tests and only process-level suites reach the third.
 
 There's no whole-crate run. `cargo mutants --list` finds about 27,000
 mutants, which at a few minutes each is over a thousand runner-hours. The
-weekly run covers the new code instead, which is where a missing test is most
+nightly run covers the new code instead, which is where a missing test is most
 likely and cheapest to add.
 
 **Missed mutants become issues by hand.** The job summary lists each missed
@@ -1178,8 +1286,8 @@ with `limactl stop --force`, waits 5–60 s and powers it back on with
 
 | # | Invariant | Pass means |
 |---|---|---|
-| I1 | Acknowledged volume writes | `/data/seq` holds 1..N with no gap or duplicate, and the writer started again, and at every start since the previous check resumed at or past the last `ACK` read before the cut |
-| I2 | Redis counter | Never goes backwards, and the client started again, and at every start since the previous check found it at or past the last `INCR` read before the cut |
+| I1 | Acknowledged volume writes | `/data/seq` holds 1..N with no gap or duplicate; the writer started again after the cut, and every start since then resumed at or past the last `ACK` read before the cut; a start between the cuts resumed at or past the previous cut's `ACK` |
+| I2 | Redis counter | Never goes backwards; the client started again after the cut, and every start since then found it at or past the last `INCR` read before the cut; a start between the cuts found it at or past the previous cut's `INCR` |
 | I4 | Stores open cleanly | Bun started once since boot, never exited, and logged no panic or store error |
 | I6 | Recovery in time | Bun answered an API read within 120 s of power-on, and every workload ran within 300 s |
 | I7 | Desired = running | Each workload runs exactly once |
@@ -1195,13 +1303,41 @@ writes. If the harness can't read a last `ACK` and `INCR` before a cut (the
 log is unreadable, holds none, or went below the last one read), it doesn't
 make the cut: I1 and I2 would hold whatever happened.
 
+Two timings matter here. Just before each power-off the harness records how
+many starts each record holds, so a start between two cuts (in run 8
+needrestart restarted Bun after an unattended libc upgrade) is held to the
+previous cut's `ACK`, the last one before it, not to this cut's. And
+"settled" only means every instance runs: the Redis client still has to
+reach Redis before it can push its start, so after a cut the harness polls
+both records for up to 60 s for a new start before it calls the cut "no new
+start". The guest's automatic updates (`apt-daily*.timer` and
+unattended-upgrades) are masked at install and on every resume, since a cut
+mid-dpkg can damage the guest.
+
+Two Lima failures get one forced stop and one more `limactl start`, each
+counted under `environment_events` in `summary.json`: the VZ refusal straight
+after a forced stop, when the VM never booted, and Lima 2.2.1's host agent
+coming up with its vsock SSH forwarder spinning on `accept` (about 1 boot in
+1,500; the guest and Bun are fine, but SSH and the port forwards never come
+up). The harness spots the second in the start log within about 10 s, or by
+the start timing out. That guest had booted, so its forced stop is a second
+power cut: the line records it as an extra power-off, the summary counts
+them, and the invariants after it cover both. A spinning forwarder writes
+gigabytes of log a minute, so the power-on log and Lima's `ha.stderr.log`
+keep only their first and last 25 MB.
+
 ```sh
 scripts/release/qualify-power-cut-endurance.sh --release 0.2.8 --tier quick
 ```
 
 `--tier quick` cuts for an hour; `--duration 6h` sets any other length.
-`--plan` prints the seeded schedule and exits. `--port-offset N` adds N to the cluster's
-ports, so several runs can share a host, each in its own checkout. Each cut writes a line to
+`--plan` prints the seeded schedule and exits. The cluster's API, ingress and
+registry ports are 31000, 31600 and 32200 on the host, and `--port-offset N`
+(up to 500) adds N to each, so several runs can share a host, each in its own
+checkout. That block sits above the test suites' ports (the crash fixtures'
+27000–29999, which once took a run's API port, and the 15000–26999 and
+30000–30999 the in-process suites hard-code) and below every ephemeral range
+(Linux's from 32768, macOS's from 49152). Each cut writes a line to
 `cuts.jsonl` and a directory of evidence; the run ends with `summary.json`
 (schema `reliaburger.power-cut-endurance/1`) holding the cuts, violations,
 recovery percentiles and the rule-of-three bound. A violation powers the VM
@@ -1212,7 +1348,12 @@ a cut that was made has no line in `cuts.jsonl`. Between cuts, such as when
 the last `ACK` couldn't be read three times running, it stops the cluster
 cleanly with `relish local stop` and `--resume` carries on: forcing the VM
 off there would be a cut nobody recorded. Mid-cut, or if the clean stop
-fails, it forces the VM off and the run can't resume. It never touches `reliaburger-test`
+fails, it forces the VM off and the run can't resume. Nor can a run with a
+violation in `cuts.jsonl`: carrying on would overwrite the state kept for
+diagnosing it. `--rejudge DIR` runs today's checker over the cuts a run
+recorded, offline, without writing anything; for older evidence it infers
+which starts came before a cut and finds a late start in the next cut's
+record, and calls a cut it can't decide `undecided`. It never touches `reliaburger-test`
 or your own `~/.reliaburger`, and when a release gate holds the host it
 powers the cluster off cleanly and exits 75; `--resume --evidence DIR`
 carries on. [`test_power_cut_endurance.py`](../scripts/release/test_power_cut_endurance.py)
@@ -1754,6 +1895,55 @@ wider window to catch the same bug.
 
 The same check for job outcomes (exactly one completion per task-array chunk)
 is later work.
+
+## How tests get ports
+
+Several test processes share one host: two agents' `make test` and
+`make test-cluster`, or the V02 loop lanes beside them. They must never bind
+each other's ports, so every port a fixture picks comes from one place,
+[`tests/support/bun_process.rs`](../tests/support/bun_process.rs):
+
+- Fixture ports come from `TEST_PORTS`, 27000 to 29999. That's below every
+  ephemeral range (Linux 32768–60999, macOS 49152–65535), so no `bind(0)` or
+  outgoing connection lands there, and clear of the fixed ports the
+  in-process cluster suites use (15000–26999, 30000 and up). Never use
+  `bind(0)` for a port Bun binds later: on macOS the next outgoing
+  connection anywhere on the host gets it.
+- Each port is leased: a file lock under
+  `$TMPDIR/reliaburger-test-ports-<uid>/` that every helper checks before it
+  hands the port out. `reserve_port_block_lease` returns the lease as a
+  guard; keep it for as long as anything may bind the port, restarts and
+  upgrade execs included. `reserve_address`, `reserve_ports` and
+  `reserve_port_block` keep theirs until the test process exits, which under
+  nextest is the end of the test. They used to drop it as they returned, so
+  another test could lease the same port before this test's Bun bound it
+  ([#2261](https://github.com/reliaburger/reliaburger/issues/2261)).
+- A port a test's workload serves on is leased the same way.
+  `tests/self_upgrade.rs` used fixed ports 46011–46071, inside Linux's
+  ephemeral range; `deploy_testapp` now leases one.
+- Every test Bun gets `[network] port_range` 10000–14999
+  (`TEST_WORKLOAD_PORTS`), so the host ports it hands workloads never come
+  from the lease range. Bun's default, 10000–32767, covers all of it, and a
+  workload could take a port whose owner's Bun was down for a restart.
+  `BunProcess` and the shared spawn helpers set it; a test that starts Bun
+  itself calls `use_test_workload_ports` on its config first, as
+  `oci_crash`, `owned_rootless`, `job_recovery`, the self-upgrade fixtures
+  and the suite's start-up tests do. The helper also replaces a range that
+  overlaps the lease range, because a config that went through `NodeConfig`
+  and back, like every one built from `relish init`'s output, writes Bun's
+  default out. The demos get the range through `DEMO_WORKLOAD_PORTS`.
+  `ebpf` starts no Bun process: its in-process agents take ports from fixed
+  allocators at 41100 and up.
+
+A lease only keeps out processes that take one. The agent gym's
+`GYM_PORT_BASE` (default 29400) sits inside the lease range, and its nodes
+keep Bun's default `port_range`, so their workloads can land there too.
+Moving the gym takes both a new block and a gym `port_range` clear of every
+range above; until then, don't run `make test-gym` or anything else outside
+the test suites beside a test run.
+[`tests/suite/test_ports.rs`](../tests/suite/test_ports.rs) checks that the
+helpers keep their leases and that test configs keep workloads out of the
+lease range.
 
 ## When a test flakes
 

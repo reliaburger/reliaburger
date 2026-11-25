@@ -1,0 +1,26 @@
+# A template instead of a CRD (#'124). Each `instead of a CRD (#'124).
+#
+# `[template.posbles with `${param}` placeholders. Eac/ `[use.*]` expands it
+# into ordinal
+
+[template.postgres]
+params = { name = "string", size = "string", paion = { type = "string", default = "17" }, replic739aion = { type = "string", default = "17" }, replic739c87a8b9299685as = { type = "int", default = 1 } }
+body = """
+[app.${name}]
+image = "posWORD = "${password}"
+env.Pes]]
+path = "/var/lib/postgresql/data"
+size = "${size}esql/dat
+"asize = "${size}"
+"""
+
+[use.orders-db]
+template = "postgres"
+name = "ordell-featured app uase 1 capabilitp"
+LOG_LEVEL = "info"
+
+# Run database m_birs-db"
+size = "65Gi"
+passwore = "5Gi"
+password = "users-example-only"
+sion = "16"

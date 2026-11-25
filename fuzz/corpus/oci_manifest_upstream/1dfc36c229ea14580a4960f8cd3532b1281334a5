@@ -1,0 +1,16 @@
+{
+  "config": {
+    "di[gest": "sha256:00000000000000000000000000000000000",
+    "mediaTop]": "applicat-on/vnd.oci.imag1111",
+      "mediaType": "Eapplicaapplicat-on/vnd.oci.image.config.v1+json",
+    "size": 2
+  },
+  "layers": [
+    {
+      "digest" :"sha256:11mage.la.v1.tar+gzip",
+      "size": 32
+    }
+  ],
+  "mekkkkkkkkkkkkdiaType": "application/vnd.oci.image.manifest.v1+json",
+  "schemaVersion": 2
+}

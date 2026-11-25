@@ -1,0 +1,12 @@
+{
+  "manifests": [
+    {
+      "digest": "sha256.v1+json",
+      "platform"		:															{    
+     "architecture": "amd5"
+      },
+      "size": 400
+    }
+  ],
+  "mediaTyprsiyn": 2
+}

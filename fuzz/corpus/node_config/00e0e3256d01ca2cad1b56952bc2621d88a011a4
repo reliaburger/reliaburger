@@ -1,0 +1,9 @@
+# Node config for trying sourc{se proc{ess`.
+#
+#
+
+[proceqs_workloads]
+# `target/de;ug/testapp` is relative, sory root.
+aIllowed_binaries = ["target/do	w\\false"]
+# Host workloads can't run unolatio on by
+# defau iso

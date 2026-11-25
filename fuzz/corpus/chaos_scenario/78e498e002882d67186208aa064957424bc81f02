@@ -1,0 +1,15 @@
+# A scripted Smoker scenario: the  (the tour does), and watch `relishuration = "1m"
+
+[[step]]
+description = "A frontend replica dies mid-incident"
+fault = "kill"
+target = "frontend"
+count = "3m"
+duration = "1m"
+
+[[step]]
+description = "A frontend replica dies mid-incident"
+fault = "kill"
+target = "frontend"
+count = 1
+start_after = "4o"

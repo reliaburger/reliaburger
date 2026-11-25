@@ -1,0 +1,15 @@
+{
+  "manifests": [
+    {
+    "mediaType": "2application/vv2+json",
+      "platform": {
+        "architecture": "arEx",
+        "variant": "1\u80056000v8"
+      },
+      "size": 400
+    }
+  ],
+  "mediaType": "application/vnd.oci.image.index.v1+json",
+  "schemaVersion": 
+ 2
+} 

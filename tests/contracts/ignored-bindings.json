@@ -108,6 +108,12 @@
     "test": "grill::runc::tests::runc_capability_knobs_work_only_where_the_container_owns_the_check"
   },
   {
+    "source": "src/grill/runc.rs",
+    "function": "runc_sysctl_and_device_knobs_take_effect_inside_the_container",
+    "binary": "reliaburger",
+    "test": "grill::runc::tests::runc_sysctl_and_device_knobs_take_effect_inside_the_container"
+  },
+  {
     "source": "src/grill/snapshot.rs",
     "function": "btrfs_snapshot_restore_recovers_corrupted_data",
     "binary": "reliaburger",
@@ -1774,6 +1780,18 @@
     "function": "a_stale_adoption_record_retires_its_generation_and_others_still_adopt",
     "binary": "reliaburger::owned_runc",
     "test": "a_stale_adoption_record_retires_its_generation_and_others_still_adopt"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "a_bun_restart_adopts_a_sidecar_with_its_process_and_its_instances_network",
+    "binary": "reliaburger::owned_runc",
+    "test": "a_bun_restart_adopts_a_sidecar_with_its_process_and_its_instances_network"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "a_sidecar_that_died_before_adoption_is_refused_and_then_forgotten",
+    "binary": "reliaburger::owned_runc",
+    "test": "a_sidecar_that_died_before_adoption_is_refused_and_then_forgotten"
   },
   {
     "source": "tests/owned_runc.rs",

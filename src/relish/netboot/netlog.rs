@@ -33,7 +33,7 @@ use super::interface::{self, udp_socket};
 use super::{InterfaceChoice, Log, MacAddress, NetbootError};
 
 /// The UDP port boot logs arrive on: netconsole's usual one.
-pub const NETLOG_PORT: u16 = 6666;
+pub const NETLOG_PORT: u16 = crate::os::netlog::DEFAULT_PORT;
 
 /// The directory under the netboot directory the raw lines go to.
 pub const LOGS_DIRECTORY: &str = "logs";
@@ -199,6 +199,10 @@ impl LogFiles {
         }
         if let Some(file) = self.open.get_mut(&name) {
             file.write_all(format!("{line}\n").as_bytes()).await?;
+            // tokio's File hands the write to a blocking thread and returns
+            // before it lands; flush waits for it, so a line that has
+            // printed is in the file too.
+            file.flush().await?;
         }
         Ok(())
     }

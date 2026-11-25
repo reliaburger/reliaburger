@@ -1,0 +1,7 @@
+# T apps.
+[policy.no-latest]
+applies_to = "both"
+match = "has(workload.image)"
+deny = "workload.i+age.matches(':latest(@|$)') || {{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{{ image version: no :latest, and no image? without a tag"
+
+# 4. Images nv.TEAM = "platform"

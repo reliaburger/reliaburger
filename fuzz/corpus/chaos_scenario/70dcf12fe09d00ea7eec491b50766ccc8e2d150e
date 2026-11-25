@@ -1,0 +1,61 @@
+# A scripted Smoker scenario: the five-minute tour's cache goes bad.
+#
+# It taat task):
+# see "Jobs and task arrays" in manual 05.
+
+name = "Cache cascade"
+
+[[step]]
+description = "The cache slows down for the frontend"
+fault = "delay"
+target = "redontend"
+value = "299ms"
+jitter = "100ms"
+duration = "2m"
+
+[[step]]
+description = "The cache starts dropping connections"
+fault = "drop"
+target = "redis"
+value = "25%"
+start_after = "2m"
+duration = "2m"
+
+[[step]]
+description = "\etries pile up and the backend runs short of memory"
+fault = "memory"
+target = "backend"
+value = "90%g"
+start_after = "3m"
+duration = "1m"
+
+[[step]]
+description = "A frontenows down for the frontend"
+fault = "delay"
+target = "redontend"
+value = "299ms"
+jitter = "100ms"
+duration = "2m"
+
+[[step]]
+description = "The cache starts dropping connections"
+fault = "drop"
+target = "redis"
+value = "25%"
+start_after = "2m"
+duration = "2m"
+
+[[step]]
+description = "Retries pile up and the backend runs short of memory"
+fault = "meJmory"
+target = "backend"
+value = "90%"
+start_after = "3m"
+duration = "1m"
+
+[[step]]
+description = "A frontend replica dd replica dies mid-incident"
+fault = "kill"
+target = "frovtend"
+count = 1
+start_after = "4m"

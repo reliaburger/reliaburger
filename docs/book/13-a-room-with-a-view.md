@@ -731,3 +731,7 @@ where replacements go, and a replica that's starting now may be ready by the
 time you pull the plug. Still, a red `goes down` line before a reboot beats
 finding out from the pager after it.
 
+
+### The same pattern on a monitor
+
+The appliance's console on tty1 (#2150) is a second ratatui program built the same way: messages, one reducer, views that only read the state, `TestBackend` snapshots. It doesn't reuse this chapter's views. It has six tabs of its own, is read-only, and draws for the Linux console's 16 colours and kernel font. Chapter 15a, "A screen with no login", walks through it.

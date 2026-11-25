@@ -1,0 +1,9 @@
+{
+  "cohort": [
+    {"name": "small",
+      "template": {
+          }
+    }
+  ],
+  "name": "mixed"
+}

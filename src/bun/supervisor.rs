@@ -338,29 +338,42 @@ impl<G: Grill> WorkloadSupervisor<G> {
         app_name: &str,
         spec: &AppSpec,
     ) -> Result<(), BunError> {
-        let refused = |refusal: crate::grill::knobs::KnobRefusal| BunError::DeployFailed {
-            app_name: app_name.to_string(),
-            reason: refusal.to_string(),
-        };
-        let knobs: Vec<_> = spec.runtime_knob_uses().collect();
-        if knobs.is_empty() {
+        self.check_runtime_knobs(spec.runtime.as_ref())
+            .map_err(|refusal| BunError::DeployFailed {
+                app_name: app_name.to_string(),
+                reason: refusal.to_string(),
+            })
+    }
+
+    /// The node gate for a set of runtime knobs, as this node judges it
+    /// now. A restart asks again with the knobs its stored OCI spec
+    /// carries, because `node.toml` may have dropped one since the deploy
+    /// (#1316).
+    pub(crate) fn check_runtime_knobs(
+        &self,
+        knobs: Option<&crate::grill::knobs::RuntimeKnobs>,
+    ) -> Result<(), crate::grill::knobs::KnobRefusal> {
+        let Some(knobs) = knobs.filter(|knobs| !knobs.is_empty()) else {
             return Ok(());
-        }
+        };
         if !self.grill.applies_runtime_knobs() {
             let runtime = match self.grill.runtime_kind_for_host(false) {
                 crate::grill::records::RuntimeKind::Process => "the process runtime",
                 crate::grill::records::RuntimeKind::Apple => "Apple Container",
                 crate::grill::records::RuntimeKind::Runc => "rootless runc",
             };
-            return Err(refused(crate::grill::knobs::KnobRefusal::Unsupported {
-                knobs,
+            return Err(crate::grill::knobs::KnobRefusal::Unsupported {
+                knobs: knobs.uses().collect(),
                 runtime,
-            }));
+            });
         }
-        match &spec.runtime {
-            Some(knobs) => self.runtime_knobs.check(knobs).map_err(refused),
-            None => Ok(()),
-        }
+        self.runtime_knobs.check(knobs)
+    }
+
+    /// The node's host-path policy, for a check that runs off the agent
+    /// loop: a restart approves its app's sources again (#1316).
+    pub(crate) fn host_path_policy(&self) -> super::host_paths::HostPathPolicy {
+        self.host_paths.clone()
     }
 
     /// Full admission check for an app: host-exec/script allowlist (for the

@@ -11,6 +11,8 @@ use cel::common::ast::{EntryExpr, Expr, IdedExpr};
 
 use crate::config::{PolicyAction, PolicySpec, PolicyTarget};
 
+pub use super::nesting::MAX_EXPRESSION_NESTING;
+
 /// The longest `match` or `deny` expression a policy may hold, in bytes.
 ///
 /// CEL has no loops of its own, but its macros (`all`, `exists`, `map`,
@@ -368,6 +370,17 @@ pub enum PolicyError {
         /// The cap.
         limit: usize,
     },
+    /// An expression nests brackets and conditionals deeper than
+    /// [`MAX_EXPRESSION_NESTING`].
+    #[error(
+        "{field} nests brackets and conditionals more than {limit} deep; split it into simpler expressions"
+    )]
+    NestedTooDeep {
+        /// The expression.
+        field: PolicyField,
+        /// The cap.
+        limit: usize,
+    },
     /// An expression reads a field its variable doesn't have.
     #[error("{field} reads {variable}.{name}, which doesn't exist")]
     UnknownField {
@@ -504,6 +517,21 @@ pub(super) fn compile_checked(
             field,
             bytes: expression.len(),
             limit: MAX_EXPRESSION_BYTES,
+        });
+    }
+    // The `cel` parser recurses per level, so the depth is bounded before
+    // it starts, to keep its stack use small (see `nesting`).
+    let depth =
+        super::nesting::nesting_depth(expression, MAX_EXPRESSION_NESTING).map_err(|malformed| {
+            PolicyError::Unparseable {
+                field,
+                error: malformed.to_string(),
+            }
+        })?;
+    if depth > MAX_EXPRESSION_NESTING {
+        return Err(PolicyError::NestedTooDeep {
+            field,
+            limit: MAX_EXPRESSION_NESTING,
         });
     }
     let program =

@@ -3913,6 +3913,60 @@
       ]
     },
     {
+      "id": "issue-607-legacy-oci-owned_runc-a_bun_restart_adopts_a_sidecar_with_its_process_and_its_instances_network",
+      "issue": 607,
+      "promise": "Complete the exact retained legacy OCI case through its finite owned driver.",
+      "supported_paths": [
+        "Exact original ignored test identity and declared Make owner."
+      ],
+      "refused_paths": [
+        "No generic aliases or success from another test or owner."
+      ],
+      "boundaries": [
+        "Source binding only; real isolated Linux OCI execution and current receipt are required."
+      ],
+      "cases": [
+        {
+          "id": "legacy-oci-owned_runc-a_bun_restart_adopts_a_sidecar_with_its_process_and_its_instances_network",
+          "binary": "reliaburger::owned_runc",
+          "test": "a_bun_restart_adopts_a_sidecar_with_its_process_and_its_instances_network",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/owned_runc.rs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "issue-607-legacy-oci-owned_runc-a_sidecar_that_died_before_adoption_is_refused_and_then_forgotten",
+      "issue": 607,
+      "promise": "Complete the exact retained legacy OCI case through its finite owned driver.",
+      "supported_paths": [
+        "Exact original ignored test identity and declared Make owner."
+      ],
+      "refused_paths": [
+        "No generic aliases or success from another test or owner."
+      ],
+      "boundaries": [
+        "Source binding only; real isolated Linux OCI execution and current receipt are required."
+      ],
+      "cases": [
+        {
+          "id": "legacy-oci-owned_runc-a_sidecar_that_died_before_adoption_is_refused_and_then_forgotten",
+          "binary": "reliaburger::owned_runc",
+          "test": "a_sidecar_that_died_before_adoption_is_refused_and_then_forgotten",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/owned_runc.rs"
+          ]
+        }
+      ]
+    },
+    {
       "id": "issue-1849-legacy-oci-owned_runc-a_record_and_generation_split_by_a_power_cut_retire_and_others_still_adopt",
       "issue": 1849,
       "promise": "Complete the exact retained legacy OCI case through its finite owned driver.",
@@ -5442,6 +5496,17 @@
           "id": "legacy-ci-reliaburger-grill-runc-tests-runc_capability_knobs_work_only_where_the_container_owns_the_check",
           "binary": "reliaburger",
           "test": "grill::runc::tests::runc_capability_knobs_work_only_where_the_container_owns_the_check",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/grill/runc.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-grill-runc-tests-runc_sysctl_and_device_knobs_take_effect_inside_the_container",
+          "binary": "reliaburger",
+          "test": "grill::runc::tests::runc_sysctl_and_device_knobs_take_effect_inside_the_container",
           "requires": [
             "linux-root-storage"
           ],

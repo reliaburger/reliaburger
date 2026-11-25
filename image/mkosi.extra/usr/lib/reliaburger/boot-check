@@ -20,6 +20,31 @@ efivars=${BOOT_CHECK_EFIVARS:-/sys/firmware/efi/efivars}
 # days behind: the whole budget would pass at that jump, and a counted boot
 # of a good update would reboot and fall back. BOOT_CHECK_UPTIME is for the
 # tests, and the unit unsets it too.
+# Where reliaburger-netlog leaves its runtime drop-ins, and the kernel log.
+# BOOT_CHECK_RUN and BOOT_CHECK_KMSG are for the tests; the unit unsets them.
+run=${BOOT_CHECK_RUN:-/run}
+kmsg=${BOOT_CHECK_KMSG:-/dev/kmsg}
+# Whether this boot streams its logs (#2149). reliaburger-netlog gives the
+# boot units StandardOutput=kmsg through a runtime drop-in, but this check
+# doesn't wait for the network (#2245), so it's already running by then and
+# keeps the console it started with. Once the drop-in is there, it writes
+# to the kernel log itself: netconsole sends each line, and the kernel puts
+# it on the screen once (netlog lets info lines through).
+streaming() {
+    [ -e "$run/systemd/system/reliaburger-boot-check.service.d/50-netlog.conf" ] && [ -w "$kmsg" ]
+}
+emit() {
+    if streaming; then
+        while IFS= read -r line; do
+            printf '<6>reliaburger-boot-check: %s\n' "$line" >>"$kmsg"
+        done
+    else
+        cat
+    fi
+}
+say() {
+    printf '%s\n' "$*" | emit
+}
 uptime_seconds() {
     read -r up _ < "${BOOT_CHECK_UPTIME:-/proc/uptime}"
     echo "${up%.*}"
@@ -29,17 +54,19 @@ counted() {
     [ -e "$efivars/LoaderBootCountPath-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f" ]
 }
 report() {
-    echo "reliaburger: $1 on OS ${IMAGE_VERSION:-unknown}"
-    # The layout, so a boot test log shows the slots and the data partition.
-    lsblk -o NAME,SIZE,FSTYPE,PARTLABEL,MOUNTPOINTS 2>/dev/null | sed 's/^/reliaburger: disk: /'
-    ip -4 -br addr show scope global 2>/dev/null | sed 's/^/reliaburger: address: /'
-    findmnt -n -o TARGET,SOURCE,FSTYPE,OPTIONS / /usr 2>/dev/null | sed 's/^/reliaburger: mount: /'
-    journalctl -b -o cat --no-pager -u systemd-repart.service -u systemd-growfs-root.service 2>/dev/null \
-        | tail -n 40 | sed 's/^/reliaburger: journal: /'
-    # systemd breaks an ordering cycle by dropping jobs (a mount, say),
-    # and says so only in the journal; the CI boot test fails on this line.
-    journalctl -b -o cat --no-pager 2>/dev/null | grep "Found ordering cycle" \
-        | sed 's/^/reliaburger: ordering cycle: /'
+    say "reliaburger: $1 on OS ${IMAGE_VERSION:-unknown}"
+    {
+        # The layout, so a boot test log shows the slots and the data partition.
+        lsblk -o NAME,SIZE,FSTYPE,PARTLABEL,MOUNTPOINTS 2>/dev/null | sed 's/^/reliaburger: disk: /'
+        ip -4 -br addr show scope global 2>/dev/null | sed 's/^/reliaburger: address: /'
+        findmnt -n -o TARGET,SOURCE,FSTYPE,OPTIONS / /usr 2>/dev/null | sed 's/^/reliaburger: mount: /'
+        journalctl -b -o cat --no-pager -u systemd-repart.service -u systemd-growfs-root.service 2>/dev/null \
+            | tail -n 40 | sed 's/^/reliaburger: journal: /'
+        # systemd breaks an ordering cycle by dropping jobs (a mount, say),
+        # and says so only in the journal; the CI boot test fails on this line.
+        journalctl -b -o cat --no-pager 2>/dev/null | grep "Found ordering cycle" \
+            | sed 's/^/reliaburger: ordering cycle: /'
+    } | emit
     exit 0
 }
 # Whether prepare still has to finish: not yet started or running
@@ -59,31 +86,52 @@ while preparing; do
     fi
     sleep 2
 done
-# A counted boot is a new version on trial: 90 s, so a bad update falls
-# back in minutes (three tries). A Wyse 3040 needs about 65 s a try before
-# this check starts, so with 120 s its fallback took 10 min 28 s, past
-# S5's 10 (#2143); 90 s brings it to about 9. A healthy bun answers well
-# inside 90 s even there: at most the 30 s clock wait
-# (reliaburger-time-wait.service) plus the 38 s the 3040 took, and the
-# lab's x86 nodes take 8 to 23 s. Other boots get 300 s, since nothing
-# falls back from them. test_fallback_limit.py and test_time_wait.py read
-# this line, so keep it one line.
-if counted; then limit=90; else limit=300; fi
-deadline=$(( $(uptime_seconds) + limit ))
-while [ "$(uptime_seconds)" -lt "$deadline" ]; do
-    if curl -fsS --max-time 2 http://127.0.0.1:9117/v1/health >/dev/null 2>&1 \
-        || curl -fsSk --max-time 2 https://127.0.0.1:9117/v1/health >/dev/null 2>&1; then
-        report "bun healthy ($(/var/lib/reliaburger/bin/bun --version 2>/dev/null))"
+# A counted boot is a new version on trial. It must have bun healthy and an
+# IPv4 address within 150 s of the kernel starting, or it reboots, and after
+# its two tries systemd-boot falls back (10-uki.transfer). From the kernel's
+# start, not this check's: the check doesn't wait for the network, so a
+# version whose network never comes up still fails in time, and the address
+# means one that breaks the network falls back rather than stranding the
+# node (#2245). On a Wyse 3040 the slowest healthy boot is about 134 s (the
+# network about 66 s in, the 30 s clock wait, bun's 38 s), and two tries
+# fall back in about 8 min 20 s, inside S5's 10 (#2143). Other boots get 300
+# s from here and need no address, since nothing falls back from them, and
+# their clock starts only once prepare has finished. test_fallback_limit.py
+# and test_time_wait.py read this line, so keep it one line.
+if counted; then limit=150; else limit=300; fi
+if counted; then deadline=$limit; else deadline=$(( $(uptime_seconds) + limit )); fi
+has_address() {
+    [ -n "$(ip -4 -o addr show scope global 2>/dev/null)" ]
+}
+bun_healthy() {
+    curl -fsS --max-time 2 http://127.0.0.1:9117/v1/health >/dev/null 2>&1 \
+        || curl -fsSk --max-time 2 https://127.0.0.1:9117/v1/health >/dev/null 2>&1
+}
+missing="bun not healthy"
+# At least one look, even when a slow boot reaches the check late.
+looked=
+while [ -z "$looked" ] || [ "$(uptime_seconds)" -lt "$deadline" ]; do
+    looked=1
+    if bun_healthy; then
+        if ! counted || has_address; then
+            report "bun healthy ($(/var/lib/reliaburger/bin/bun --version 2>/dev/null))"
+        fi
+        missing="no IPv4 address"
+    else
+        missing="bun not healthy"
     fi
     sleep 2
 done
-echo "reliaburger: bun not healthy after $limit s on OS ${IMAGE_VERSION:-unknown}"
+say "reliaburger: $missing after $limit s on OS ${IMAGE_VERSION:-unknown}"
 # Why: bun's stderr is in the journal, and a CI boot test keeps only the
 # console.
 journalctl -b -o cat --no-pager -u reliaburger.service 2>/dev/null \
-    | tail -n 60 | sed 's/^/reliaburger: bun: /'
+    | tail -n 60 | sed 's/^/reliaburger: bun: /' | emit
+if [ "$missing" = "no IPv4 address" ]; then
+    ip -br link 2>/dev/null | sed 's/^/reliaburger: link: /' | emit
+fi
 if counted; then
-    echo "reliaburger: counted boot failed, rebooting (systemd-boot falls back after the last try)"
+    say "reliaburger: counted boot failed, rebooting (systemd-boot falls back after the last try)"
     systemctl reboot
 fi
 exit 1

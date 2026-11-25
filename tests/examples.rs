@@ -5,6 +5,10 @@
 //! included, through `relish apply --dry-run`. Neither needs a running agent.
 //! Node configs under `examples/node/` must parse as `NodeConfig`.
 
+#[path = "support/isolated_relish.rs"]
+mod isolated_relish;
+
+use isolated_relish::{isolate_relish, relish_command};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -21,9 +25,61 @@ fn example_configs(directory: &Path, found: &mut Vec<PathBuf>) {
     }
 }
 
+/// #2290: a developer's context naming a cluster that's switched off made
+/// every dry run wait for it, and the examples test passed nextest's limit.
+/// The isolated command never asks that cluster: here a listener that
+/// accepts and never answers, named by both a context file and the
+/// variables, sees no connection.
+#[test]
+fn an_isolated_dry_run_never_asks_the_developers_cluster() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let cluster = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    cluster.set_nonblocking(true).unwrap();
+    let address = cluster.local_addr().unwrap();
+
+    let developer = tempfile::tempdir().unwrap();
+    let ca_cert = developer.path().join("root-ca.crt");
+    std::fs::write(&ca_cert, b"cluster ca").unwrap();
+    reliaburger::relish::local_context::LocalContext {
+        schema: 1,
+        owner: "developer".to_string(),
+        endpoint: format!("https://{address}"),
+        other_endpoints: Vec::new(),
+        last_answered: None,
+        token: "rbrg_developer".to_string(),
+        ca_cert,
+        service_endpoints: Default::default(),
+    }
+    .save(&developer.path().join("context.json"))
+    .unwrap();
+
+    let empty = tempfile::tempdir().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_relish"));
+    command
+        .args([
+            "apply",
+            "examples/phase-1/proc-minimal-app.toml",
+            "--dry-run",
+        ])
+        .current_dir(root)
+        .env("RELIABURGER_HOME", developer.path())
+        .env("RELIABURGER_ENDPOINT", format!("http://{address}"))
+        .env("RELIABURGER_TOKEN", "rbrg_developer");
+    let output = isolate_relish(&mut command, empty.path()).output().unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    // The kernel queues a connection even though nothing accepts it, so an
+    // empty queue means `relish` never dialled.
+    assert!(
+        matches!(cluster.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "the dry run dialled the developer's cluster"
+    );
+}
+
 #[test]
 fn every_example_config_passes_a_dry_run() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let home = tempfile::tempdir().unwrap();
     let mut configs = Vec::new();
     example_configs(&root.join("examples"), &mut configs);
     configs.sort();
@@ -57,7 +113,7 @@ fn every_example_config_passes_a_dry_run() {
         } else {
             &["apply", path, "--dry-run"]
         };
-        let output = Command::new(env!("CARGO_BIN_EXE_relish"))
+        let output = relish_command(home.path())
             .args(arguments)
             .current_dir(root)
             .output()
@@ -146,7 +202,8 @@ fn shipped_app_names(root: &Path) -> std::collections::BTreeSet<String> {
 fn chaos_scenario_example_targets_apps_a_shipped_example_defines() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let scenario = root.join("examples/phase-8/container-chaos-scenario.toml");
-    let output = Command::new(env!("CARGO_BIN_EXE_relish"))
+    let home = tempfile::tempdir().unwrap();
+    let output = relish_command(home.path())
         .args(["fault", "scenario", scenario.to_str().unwrap(), "--dry-run"])
         .output()
         .unwrap();
@@ -260,7 +317,8 @@ fn gitops_example_repository_compiles_and_passes_a_dry_run() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let repository = root.join("examples/gitops/repository");
     assert!(repository.is_dir(), "no example GitOps repository");
-    let compiled = Command::new(env!("CARGO_BIN_EXE_relish"))
+    let home = tempfile::tempdir().unwrap();
+    let compiled = relish_command(home.path())
         .args(["compile", repository.to_str().unwrap()])
         .output()
         .unwrap();
@@ -284,7 +342,7 @@ fn gitops_example_repository_compiles_and_passes_a_dry_run() {
     let directory = tempfile::tempdir().unwrap();
     let merged = directory.path().join("all.toml");
     std::fs::write(&merged, &merged_text).unwrap();
-    let dry_run = Command::new(env!("CARGO_BIN_EXE_relish"))
+    let dry_run = relish_command(home.path())
         .args(["apply", merged.to_str().unwrap(), "--dry-run"])
         .output()
         .unwrap();

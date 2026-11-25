@@ -172,6 +172,7 @@ impl BunProcess {
     ) -> Self {
         first_launch_binaries();
         let _phase = fixture_phase("bun-child-spawn");
+        use_test_workload_ports(config);
         let log = std::fs::File::create(&log_path).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_bun"));
         command
@@ -237,7 +238,64 @@ impl Drop for BunProcess {
 /// outgoing connections anywhere on the host receive. On a busy runner one of
 /// them usually has before Bun binds, and Bun exits with "Address already in
 /// use" however often the harness retries.
-const TEST_PORTS: std::ops::Range<u16> = 27000..30000;
+///
+/// A port in this range is safe only while its lease is held, and only from
+/// processes that take leases: every fixture's port comes from here, and no
+/// test Bun hands a workload a port from here ([`TEST_WORKLOAD_PORTS`]).
+pub const TEST_PORTS: std::ops::Range<u16> = 27000..30000;
+
+/// The `[network] port_range` every test Bun gets, so the host ports it
+/// hands workloads never land on a port another test holds a lease for
+/// (#2261). Bun's default, 10000–32767, covers all of [`TEST_PORTS`]: a
+/// workload could take a leased port while its owner's Bun was down between
+/// a kill and a restart, and the restart then failed with "Address already
+/// in use". This range lies below the fixed ports the in-process suites use
+/// (15000–26999) and below every ephemeral range.
+pub const TEST_WORKLOAD_PORTS: std::ops::Range<u16> = 10000..15000;
+
+/// Give the node config at `path` [`TEST_WORKLOAD_PORTS`] as its
+/// `[network] port_range`, unless it sets one that stays out of
+/// [`TEST_PORTS`]. A range that overlaps the lease range is replaced: that's
+/// almost always Bun's default, written out by a config that went through
+/// `NodeConfig` and back, as every config built from `relish init`'s output
+/// does. Every helper here that starts Bun calls it; a test that starts Bun
+/// itself calls it on its config first. Edits in place and keeps the file's
+/// comments. A missing or malformed file is left alone, for the tests that
+/// start Bun on one to see it refused.
+pub fn use_test_workload_ports(path: &Path) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(mut config) = text.parse::<toml_edit::DocumentMut>() else {
+        return;
+    };
+    let range = config
+        .get("network")
+        .and_then(|network| network.get("port_range"));
+    let bound = |key: &str| range.and_then(|range| range.get(key)?.as_integer());
+    if let (Some(start), Some(end)) = (bound("start"), bound("end"))
+        && (end <= i64::from(TEST_PORTS.start) || start >= i64::from(TEST_PORTS.end))
+    {
+        return;
+    }
+    let mut range = toml_edit::InlineTable::new();
+    range.insert("start", i64::from(TEST_WORKLOAD_PORTS.start).into());
+    range.insert("end", i64::from(TEST_WORKLOAD_PORTS.end).into());
+    config["network"]["port_range"] = toml_edit::value(range);
+    std::fs::write(path, config.to_string()).unwrap();
+}
+
+/// Leases taken by [`reserve_port_block`], held until this test process
+/// exits (#2261). nextest runs every test in a process of its own, so that's
+/// the test's lifetime: long enough for the Bun that binds the ports to
+/// start, restart and stop. Dropping the lease as the helper returned let a
+/// leasing fixture in another test take the same port before this test's
+/// Bun bound it, and whichever bound second failed.
+///
+/// A `std` mutex, not tokio's: callers are synchronous, and nothing holds
+/// it across an `.await`.
+static HELD_FOR_THE_PROCESS: std::sync::Mutex<Vec<PortBlockReservation>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// A block held by a crash fixture while its Bun is offline.
 #[derive(Debug)]
@@ -307,17 +365,26 @@ pub fn reserve_port_block_lease(count: u16) -> PortBlockReservation {
     panic!("no free block of {count} test ports in {TEST_PORTS:?}");
 }
 
-/// Find currently TCP/UDP-free ports, respecting other fixtures' leases.
+/// Find currently TCP/UDP-free ports, respecting other fixtures' leases, and
+/// keep their lease until this test process exits.
 pub fn reserve_port_block(count: u16) -> u16 {
-    reserve_port_block_lease(count).base
+    let reservation = reserve_port_block_lease(count);
+    let base = reservation.base;
+    HELD_FOR_THE_PROCESS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(reservation);
+    base
 }
 
-/// A free loopback address for a Bun listener.
+/// A free loopback address for a Bun listener, leased until this test
+/// process exits.
 pub fn reserve_address() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], reserve_port_block(1)))
 }
 
-/// Three free loopback ports for gossip, Raft and reporting.
+/// Three free loopback ports for gossip, Raft and reporting, leased until
+/// this test process exits.
 pub fn reserve_ports() -> [u16; 3] {
     let base = reserve_port_block(3);
     [base, base + 1, base + 2]
@@ -367,8 +434,9 @@ pub fn wait_for_bind(bun: &mut BunProcess, address: SocketAddr) -> BunStart {
 /// Spawn a bun and wait for its API listener, re-reserving every port and
 /// respawning when it loses the reserve-then-bind race.
 ///
-/// `reserve_ports` releases its listeners before bun rebinds the ports, so a
-/// concurrently running test can steal one in between; with harness retries
+/// `reserve_ports` keeps its lease but releases its probe listeners before
+/// bun binds the ports, so a process that takes no lease (a tool outside the
+/// test suites) can still take one in between; with harness retries
 /// deliberately at zero, that host-level race must be healed here, scoped to
 /// the exact "Address already in use" exit. `build` reserves fresh ports,
 /// writes the config and returns `(config, api_address, log_path)`; on the
@@ -460,12 +528,15 @@ require_mtls = false
     config
 }
 
-/// Run the compiled `relish` with no endpoint, token or CA inherited from
-/// the environment.
+/// Run the compiled `relish` with no endpoint, token, CA or context
+/// inherited from the environment: an empty `RELIABURGER_HOME` keeps the
+/// developer's cluster out of it (#2290).
 pub fn run_relish(args: &[&str]) -> Output {
     let _phase = fixture_phase(safe_relish_phase(args));
+    let home = tempfile::tempdir().unwrap();
     Command::new(env!("CARGO_BIN_EXE_relish"))
         .args(args)
+        .env("RELIABURGER_HOME", home.path())
         .env_remove("RELIABURGER_ENDPOINT")
         .env_remove("RELIABURGER_TOKEN")
         .env_remove("RELIABURGER_CA_CERT")

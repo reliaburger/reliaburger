@@ -1,5 +1,4 @@
-"""The fuzzing workflow runs every target nightly and on decoder changes (#1398)."""
-from fnmatch import fnmatch
+"""The fuzzing workflow runs every target nightly and by hand (#1398)."""
 from pathlib import Path
 import os
 import re
@@ -26,11 +25,6 @@ def source_file(decoder):
             if candidate.is_file():
                 return candidate.relative_to(REPO).as_posix()
     return None
-
-
-def pull_request_paths(text):
-    block = re.search(r"(?m)^  pull_request:\n(?:    .*\n)*?    paths:\n((?:      - .*\n)+)", text)
-    return [line.strip()[2:] for line in block.group(1).splitlines()] if block else []
 
 
 class FuzzWorkflowTests(unittest.TestCase):
@@ -87,7 +81,7 @@ class FuzzWorkflowTests(unittest.TestCase):
         cache = self.text[self.text.index("uses: Swatinem/rust-cache@"):]
         cache = cache[:cache.index("\n      - ")]
         self.assertIn("workspaces: fuzz -> target", cache)
-        # One key for the nightly and the pull request runs.
+        # One key for the nightly and the runs by hand.
         self.assertIn("shared-key: fuzz", cache)
         self.assertNotIn("${{", cache.split("shared-key:")[1].splitlines()[0])
         # The cache restores before the build it saves.
@@ -118,33 +112,21 @@ class FuzzWorkflowTests(unittest.TestCase):
     def test_results_are_written_to_the_job_summary(self):
         self.assertIn("GITHUB_STEP_SUMMARY", self.text)
 
-    def test_a_pull_request_touching_any_decoder_runs_the_smoke(self):
-        paths = pull_request_paths(self.text)
-        self.assertIn("src/fuzz/**", paths)
-        self.assertIn("fuzz/**", paths)
+    def test_pull_requests_never_run_it(self):
+        # The job took 14 to 33 minutes of a starved runner pool on every
+        # PR that touched a decoder (maintainer decision of 24 November
+        # 2026). The nightly and runs by hand remain; the stable half, every
+        # target over its corpus, runs in ci.yml's portable suite.
+        triggers = self.text[self.text.index("\non:\n"):self.text.index("\njobs:\n")]
+        self.assertNotIn("pull_request", triggers)
+        self.assertNotIn("pull_request", self.text)
+
+    def test_every_decoder_has_a_source_file(self):
         found = decoders()
         self.assertGreaterEqual(len(found), 9)
         for decoder in found:
             with self.subTest(decoder=decoder):
-                path = source_file(decoder)
-                self.assertIsNotNone(path, f"{decoder} names no file under src/")
-                self.assertTrue(any(fnmatch(path, pattern.replace("**", "*")) for pattern in paths),
-                                f"{path} is missing from fuzz.yml's pull_request paths")
-
-    def test_only_the_decoders_and_the_fuzzing_set_up_start_a_pull_request_run(self):
-        # The job takes 14 to 33 minutes; a lockfile, Makefile or any config
-        # change shouldn't buy one. The nightly covers those (#1442).
-        paths = pull_request_paths(self.text)
-        for broad in ("Cargo.lock", "Makefile", "src/config/**"):
-            self.assertNotIn(broad, paths)
-        self.assertIn("src/config/mod.rs", paths)
-        self.assertIn("src/config/node.rs", paths)
-
-    def test_pull_request_runs_never_save_the_cache(self):
-        # ci.yml keeps the 10 GB cache quota for main (#1442).
-        cache = self.text[self.text.index("uses: Swatinem/rust-cache@"):]
-        cache = cache[:cache.index("\n      - ")]
-        self.assertIn("save-if: ${{ github.event_name != 'pull_request' }}", cache)
+                self.assertIsNotNone(source_file(decoder), f"{decoder} names no file under src/")
 
     def test_the_summary_reports_each_targets_coverage_counters(self):
         # The counter count is how a reader of the job sees that only the

@@ -1,0 +1,8 @@
+# The256Mi and mnay grow to
+#    1Gi.
+[policy.prod-needsimits]
+match = "app.namespace == 'prod'"
+deny = "!has(app.memordigest (`6:...@)ve;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;?;;;|||||||||pp.memordigest (`6:...|||||||;;;;;;;;;;;.memordigest (`5:...@)ve;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;|||||||||pp.memordigest (`6:...@!ve;;;;;;;;6;;;;;;;;;;;;;;;;;;;;;;;;;;;;||||||||||||||||||||||||||||||;;;;;;;;;;;;;;;||!|||||||||||||||||l||||||||||||||||||||;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;#;;;;; it out .to get the default"
+
+[policy.team-env.default]
+env.TEAM = "platform"

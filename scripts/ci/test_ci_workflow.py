@@ -443,7 +443,7 @@ class EvidenceTests(unittest.TestCase):
 
 
 class TrainAndQueueTests(unittest.TestCase):
-    """Light checks on train PRs; everything on the merge queue and the train."""
+    """Light checks on train PRs; everything but macOS on the merge queue; everything on the train."""
 
     def setUp(self):
         self.ci = (WORKFLOWS / "ci.yml").read_text()
@@ -458,9 +458,9 @@ class TrainAndQueueTests(unittest.TestCase):
         # The train ruleset's queue requires one check, "ignored-test
         # evidence". A merge group has no pull request and no label, so no
         # job may hang its condition on the event: each follows select jobs
-        # (which picks everything for a merge group that changes code, see
-        # test_select_jobs.py) or the closed-PR guard, and the gate always
-        # reports.
+        # (which picks everything but portable macOS for a merge group that
+        # changes code, see test_select_jobs.py) or the closed-PR guard, and
+        # the gate always reports.
         allowed = {"github.event.action == 'closed'", "github.event.action != 'closed'",
                    "${{ always() && github.event.action != 'closed' }}"}
         for name, job in self.jobs.items():
@@ -479,6 +479,28 @@ class TrainAndQueueTests(unittest.TestCase):
         self.assertIn("RELEASE_GATE: ${{ contains(github.event.pull_request.labels.*.name, 'release-gate') }}",
                       changes)
         self.assertIn("MACOS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'macos') }}", changes)
+        self.assertIn("DRAFT: ${{ github.event.pull_request.draft == true }}", changes)
+        self.assertIn("lint: ${{ steps.select.outputs.lint }}", changes)
+
+    def test_a_draft_reruns_the_full_set_when_it_is_marked_ready(self):
+        # A draft runs only the cheap set (select-jobs.sh). ready_for_review
+        # starts the full set; converted_to_draft cancels a run still going,
+        # since it joins the pull request's concurrency group.
+        types = re.search(r"\n  pull_request:\n(?:\s+#.*\n|\s+branches: .*\n)*\s+types: \[(.*)\]\n",
+                          self.triggers).group(1).split(", ")
+        self.assertIn("ready_for_review", types)
+        self.assertIn("converted_to_draft", types)
+
+    def test_the_merge_queue_leaves_portable_macos_to_the_nightly(self):
+        nightly = (WORKFLOWS / "macos-nightly.yml").read_text()
+        self.assertRegex(nightly, r"\n  schedule:\n    - cron: ")
+        self.assertIn("\n  workflow_dispatch:", nightly)
+        self.assertNotIn("pull_request", nightly.split("\njobs:")[0])
+        self.assertIn("git branch -r --list 'origin/release-*'", nightly)
+        self.assertIn("sort -V | tail -n 1", nightly)
+        # ci.yml's macOS job still follows select jobs, which never picks it
+        # for a merge group.
+        self.assertIn("    if: needs.changes.outputs.macos == 'true'\n", self.jobs["macos"])
 
     def test_a_merge_group_is_judged_against_the_commit_it_sits_on(self):
         self.assertIn("BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}",
@@ -603,6 +625,23 @@ class TrainAndQueueTests(unittest.TestCase):
         cache = next(step for step in steps(macos) if "Swatinem/rust-cache@" in step)
         self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", cache)
 
+    def test_macos_logs_its_memory_from_before_the_build_and_always_keeps_the_log(self):
+        # The same build took 21 to 93 minutes on the 7 GB runner (#1723):
+        # the log has to cover the build, and a failed or cancelled-by-timeout
+        # test step must still leave it.
+        blocks = steps(self.jobs["macos"])
+        watch = next(index for index, step in enumerate(blocks) if "nohup scripts/ci/watch-macos-memory" in step)
+        lint = next(index for index, step in enumerate(blocks) if "run: make lint-macos" in step)
+        tests = next(index for index, step in enumerate(blocks) if "--gate portable-darwin " in step)
+        report = next(index for index, step in enumerate(blocks) if "watch-macos-memory --summary" in step)
+        keep = next(index for index, step in enumerate(blocks) if "name: portable-macos-memory" in step)
+        self.assertLess(watch, lint)
+        self.assertLess(lint, tests)
+        self.assertLess(tests, report)
+        self.assertLess(report, keep)
+        for index in (report, keep):
+            self.assertIn("if: always()", blocks[index])
+
     def test_the_lint_job_checks_formatting_before_restoring_or_building_anything(self):
         # rustfmt needs no build: run it before the cache restore and the
         # apt step, so a format slip fails the job within a minute (#1724).
@@ -618,8 +657,10 @@ class TrainAndQueueTests(unittest.TestCase):
     def test_the_heavy_jobs_wait_for_their_own_selection(self):
         for name in ["linux", "linux-next", "build-tests", "cluster", "acceptance"]:
             self.assertIn("if: needs.changes.outputs.heavy == 'true'", self.jobs[name])
-        for name in ["lint", "minimum-rust", "doctests", "contract-boundaries", "source-bundle"]:
+        for name in ["minimum-rust", "doctests", "contract-boundaries", "source-bundle"]:
             self.assertIn("if: needs.changes.outputs.code == 'true'", self.jobs[name])
+        # Lint follows code, and runs alone on a draft or a 0-4-0/ branch.
+        self.assertIn("if: needs.changes.outputs.lint == 'true'", self.jobs["lint"])
         # Portable Linux also runs alone to save a train's cache (#1723).
         self.assertIn("if: needs.changes.outputs.portable == 'true'", self.jobs["portable"])
 
@@ -1599,6 +1640,19 @@ class ApplianceTests(unittest.TestCase):
         found = [s for s in self.image if f"- name: {name}" in s]
         self.assertEqual(len(found), 1, name)
         return found[0]
+
+    def test_a_draft_or_a_0_4_0_branch_builds_no_image(self):
+        # 24 November 2026: drafts and 0.4.0 work skip the heavy jobs, and
+        # ready_for_review starts them. Every job but scripts needs plan.
+        triggers = self.text.split("\njobs:", 1)[0]
+        self.assertRegex(triggers, r"\n    types: \[[^\]]*ready_for_review[^\]]*\]\n")
+        guard = ("    if: github.event_name != 'pull_request' || (!github.event.pull_request.draft && "
+                 "!startsWith(github.event.pull_request.head.ref, '0-4-0/'))\n")
+        for name in ["plan", "scripts"]:
+            self.assertIn(guard, self.jobs[name], name)
+        for name, job in self.jobs.items():
+            if name not in ("plan", "scripts"):
+                self.assertRegex(job, r"(^|\n)    needs: (\[plan|plan)", name)
 
     def test_nothing_publishes_on_a_schedule_until_v0_3_0_is_promoted(self):
         # Maintainer, 7 October 2026: the weekly publish stays off until

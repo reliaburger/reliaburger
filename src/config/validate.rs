@@ -136,6 +136,28 @@ impl Config {
         warnings
     }
 
+    /// Refuse an app whose env value, inline config file, or command,
+    /// argument, script or pre-stop word is exactly the placeholder
+    /// `GET /v1/apps/{app}/{namespace}/spec` writes in place of a secret
+    /// (#2296). A controller that applies that answer back would otherwise
+    /// replace the real values with the text `[redacted]`.
+    ///
+    /// Only the apply entry points call this (`relish apply`, `relish lint`,
+    /// `POST /v1/apply` and GitOps), not [`Config::validate_against`]: the
+    /// council's state machine runs that one on every node, and a rule it
+    /// gained mid-release would let nodes of two versions disagree.
+    pub fn refuse_redaction_placeholders(&self) -> Result<(), ConfigError> {
+        for (name, app) in &self.app {
+            if let Some(field) = redaction_placeholder_field(app) {
+                return Err(ConfigError::RedactionPlaceholder {
+                    app: name.clone(),
+                    field,
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn validate_with_namespace_context(
         &self,
         namespaces: Option<&[String]>,
@@ -176,6 +198,53 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// The first field of `app` that is exactly [`crate::redact::REDACTED`],
+/// named for the error: `env DB_PASSWORD`, `command word 2`,
+/// `init container 0 env PGPASSWORD`, `sidecar proxy args word 0`.
+fn redaction_placeholder_field(app: &super::app::AppSpec) -> Option<String> {
+    use crate::redact::REDACTED;
+    let in_env = |env: &std::collections::BTreeMap<String, super::types::EnvValue>| {
+        env.iter().find_map(|(key, value)| {
+            matches!(value, super::types::EnvValue::Plain(text) if text == REDACTED)
+                .then(|| format!("env {key}"))
+        })
+    };
+    let in_words = |field: &str, words: &[String]| {
+        words
+            .iter()
+            .position(|word| word == REDACTED)
+            .map(|index| format!("{field} word {index}"))
+    };
+    let script = app
+        .script
+        .as_deref()
+        .and_then(|script| script.split_whitespace().position(|word| word == REDACTED))
+        .map(|index| format!("script word {index}"));
+    let config_file = app.config_file.iter().find_map(|file| {
+        (file.content.as_deref() == Some(REDACTED))
+            .then(|| format!("config_file {}", file.path.display()))
+    });
+    let init = app.init.iter().enumerate().find_map(|(index, init)| {
+        in_env(&init.env)
+            .or_else(|| in_words("command", &init.command))
+            .map(|field| format!("init container {index} {field}"))
+    });
+    let sidecar = app.sidecar.iter().find_map(|sidecar| {
+        in_env(&sidecar.env)
+            .or_else(|| in_words("command", &sidecar.command))
+            .or_else(|| in_words("args", &sidecar.args))
+            .map(|field| format!("sidecar {} {field}", sidecar.name))
+    });
+    in_env(&app.env)
+        .or_else(|| in_words("command", &app.command))
+        .or_else(|| in_words("args", &app.args))
+        .or(script)
+        .or_else(|| in_words("pre_stop", &app.pre_stop))
+        .or(config_file)
+        .or(init)
+        .or(sidecar)
 }
 
 /// Actions a `[[permission]]` may grant. Mirrors `permission.rs`'s doc.
@@ -3181,5 +3250,109 @@ exec = "/usr/bin/python3""#,
             "image = \"web:v1\"\n[app.web.egress]\nallow_franchise = [\"redis.prod-west\"]",
             "allow_franchise",
         );
+    }
+
+    // #2296: the spec read writes `[redacted]` in place of a secret. Applied
+    // back, the cluster would take it as the literal value, so apply refuses
+    // any env value, inline config file or command word that is exactly it.
+
+    fn placeholder_refusal(toml: &str) -> String {
+        let config = Config::parse(toml).unwrap();
+        config
+            .refuse_redaction_placeholders()
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn apply_refuses_an_env_value_that_is_the_redaction_placeholder() {
+        let error = placeholder_refusal(
+            "[app.web]\nimage = \"web:v1\"\n[app.web.env]\nDB_PASSWORD = \"[redacted]\"\n",
+        );
+        assert_eq!(
+            error,
+            "app web: env DB_PASSWORD is the redaction placeholder \"[redacted]\"; \
+             supply the real value"
+        );
+    }
+
+    #[test]
+    fn apply_refuses_a_config_file_that_is_the_redaction_placeholder() {
+        let error = placeholder_refusal(
+            "[app.web]\nimage = \"web:v1\"\n[[app.web.config_file]]\n\
+             path = \"/etc/web.conf\"\ncontent = \"[redacted]\"\n",
+        );
+        assert!(error.contains("config_file /etc/web.conf"), "{error}");
+        assert!(error.contains("redaction placeholder"), "{error}");
+    }
+
+    #[test]
+    fn apply_refuses_a_command_word_that_is_the_redaction_placeholder() {
+        let error = placeholder_refusal(
+            "[app.web]\nimage = \"web:v1\"\ncommand = [\"web\", \"--password\", \"[redacted]\"]\n",
+        );
+        assert!(error.contains("app web: command word 2"), "{error}");
+    }
+
+    #[test]
+    fn apply_refuses_placeholders_in_args_pre_stop_and_script() {
+        let args = placeholder_refusal(
+            "[app.web]\nimage = \"web:v1\"\nargs = [\"--token\", \"[redacted]\"]\n",
+        );
+        assert!(args.contains("args word 1"), "{args}");
+        let pre_stop = placeholder_refusal(
+            "[app.web]\nimage = \"web:v1\"\npre_stop = [\"/bin/drain\", \"[redacted]\"]\n",
+        );
+        assert!(pre_stop.contains("pre_stop word 1"), "{pre_stop}");
+        let script =
+            placeholder_refusal("[app.web]\nscript = \"serve --key [redacted] --port 80\"\n");
+        assert!(script.contains("script word 2"), "{script}");
+    }
+
+    #[test]
+    fn apply_refuses_placeholders_in_init_containers_and_sidecars() {
+        let init_env = placeholder_refusal(
+            "[app.web]\nimage = \"web:v1\"\n[[app.web.init]]\nimage = \"migrate:v1\"\n\
+             command = [\"migrate\"]\n[app.web.init.env]\nPGPASSWORD = \"[redacted]\"\n",
+        );
+        assert!(
+            init_env.contains("init container 0 env PGPASSWORD"),
+            "{init_env}"
+        );
+        let init_command = placeholder_refusal(
+            "[app.web]\nimage = \"web:v1\"\n[[app.web.init]]\nimage = \"migrate:v1\"\n\
+             command = [\"migrate\", \"[redacted]\"]\n",
+        );
+        assert!(
+            init_command.contains("init container 0 command word 1"),
+            "{init_command}"
+        );
+        let sidecar = placeholder_refusal(
+            "[app.web]\nimage = \"web:v1\"\n[[app.web.sidecar]]\nname = \"proxy\"\n\
+             image = \"proxy:v1\"\nargs = [\"[redacted]\"]\n",
+        );
+        assert!(sidecar.contains("sidecar proxy args word 0"), "{sidecar}");
+    }
+
+    #[test]
+    fn apply_accepts_a_value_that_only_contains_the_placeholder_text() {
+        let config = Config::parse(
+            "[app.web]\nimage = \"web:v1\"\ncommand = [\"x[redacted]y\"]\n\
+             [app.web.env]\nNOTE = \"x[redacted]y\"\n\
+             [[app.web.config_file]]\npath = \"/etc/web.conf\"\ncontent = \"[redacted]\\n\"\n",
+        )
+        .unwrap();
+        config.refuse_redaction_placeholders().unwrap();
+    }
+
+    #[test]
+    fn apply_accepts_an_ordinary_spec() {
+        let config = Config::parse(
+            "[app.web]\nimage = \"web:v1\"\ncommand = [\"web\", \"--password\", \"hunter2\"]\n\
+             [app.web.env]\nDB_PASSWORD = \"hunter2\"\n",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        config.refuse_redaction_placeholders().unwrap();
     }
 }

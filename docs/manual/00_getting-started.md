@@ -26,6 +26,13 @@ installer only explains the choices and installs nothing. A laptop cluster is
 for development: until 1.0.0, Reliaburger is good enough for home labs and dev
 clusters, not production.
 
+The guest VMs don't update themselves. Ubuntu's automatic upgrades are
+switched off in them, and needrestart, where it's installed, only lists what it
+would restart. Left on, an automatic libc upgrade restarted Bun without
+warning. The cluster is disposable and each release builds its guest image
+again from a pinned Ubuntu image, so security updates arrive with Reliaburger
+releases: upgrade `relish` and build a fresh cluster to pick them up.
+
 On Linux, QEMU 10.2 and later abort as soon as the VMs talk to each other
 over Lima's `user-v2` network, with `net_fill_rstate: Assertion 'size == 0'
 failed`, while io_uring is open to ordinary users
