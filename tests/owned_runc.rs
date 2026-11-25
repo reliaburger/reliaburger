@@ -298,6 +298,61 @@ async fn runc_owned_adoption_validates_generation_and_restores_live_network() {
     assert_absent(root.path(), &id);
 }
 
+/// #2334: Bun's record keeps a `PROVIDER[...]` reference and runc's intent
+/// the value the provider gave. A restarted Bun must still adopt the
+/// instance, and a record from another request must still conflict.
+#[tokio::test]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
+async fn runc_owned_adoption_accepts_a_provider_reference_for_its_resolved_value() {
+    use reliaburger::grill::records::{InstanceRecord, RuntimeKind};
+    let root = crate::runc_residue::RuncRoot::new();
+    let id = instance(root.path());
+    let reference = spec(root.path(), "exec /bin/busybox sleep 60");
+    let mut supervised = reference.clone();
+    supervised
+        .process
+        .env
+        .push("DB_PASSWORD=PROVIDER[vault:secret/db#password]".into());
+    supervised.process.provider_env = vec!["DB_PASSWORD".into()];
+    let mut resolved = reference;
+    resolved.process.env.push(format!("DB_PASSWORD={SECRET}"));
+    let first = runtime(root.path());
+    first.create(&id, &resolved).await.unwrap();
+    install_fixture(root.path(), &id);
+    first.start(&id).await.unwrap();
+    let pid = first.pid(&id).await.unwrap().unwrap();
+    let mut record = InstanceRecord {
+        schema: reliaburger::grill::records::RECORD_SCHEMA,
+        instance_id: id.0.clone(),
+        namespace: "default".into(),
+        app_name: "owned-runc".into(),
+        replica_index: 0,
+        image: "/empty-fixture".into(),
+        runtime: RuntimeKind::Runc,
+        pid,
+        pid_started_at: reliaburger::grill::records::process_start_time(pid).unwrap(),
+        boot_id: reliaburger::grill::records::current_boot(),
+        runc_container_id: Some(id.0.clone()),
+        log_stem: first.log_stem(&id).await,
+        host_port: None,
+        app_spec: None,
+        oci_spec: supervised.clone(),
+        rootless_network: None,
+    };
+    drop(first);
+    let recovered = runtime(root.path());
+
+    record.oci_spec.process.args.push("--elsewhere".into());
+    let conflict = recovered.adopt(&id, &record).await;
+    assert!(conflict.is_err(), "{conflict:?}");
+
+    record.oci_spec = supervised;
+    assert!(recovered.adopt(&id, &record).await.unwrap());
+    assert_eq!(recovered.pid(&id).await.unwrap(), Some(pid));
+    recovered.kill(&id).await.unwrap();
+    assert_absent(root.path(), &id);
+}
+
 /// #1315: a restarted Bun adopts a sidecar beside its instance. The sidecar
 /// keeps its process, and it's still in its instance's network namespace,
 /// which it holds no address of its own in: there's no network of its own

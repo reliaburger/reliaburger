@@ -606,6 +606,153 @@ async fn a_bun_restart_adopts_running_sidecars_instead_of_restarting_them() {
     assert_eq!(sidecar_records(records.path(), 2).await.len(), 2);
 }
 
+/// `web` and its two sidecars with `PROVIDER[...]` variables: one on the
+/// app, which both sidecars inherit, and one on the proxy alone.
+fn web_with_provider_secrets() -> Config {
+    Config::parse(
+        r#"
+        [app.web]
+        image = "myapp:v1"
+        port = 8080
+
+        [app.web.env]
+        DB_PASSWORD = "PROVIDER[vault:secret/db#password]"
+        MODE = "plain"
+
+        [[app.web.init]]
+        command = ["migrate"]
+
+        [[app.web.sidecar]]
+        name = "proxy"
+        image = "envoy:1.31"
+
+        [app.web.sidecar.env]
+        PROXY_TOKEN = "PROVIDER[vault:secret/proxy#token]"
+
+        [[app.web.sidecar]]
+        name = "logs"
+        command = ["/bin/ship-logs"]
+        "#,
+    )
+    .unwrap()
+}
+
+/// Deploy [`web_with_provider_secrets`] on an agent that keeps records in
+/// `records`, and return the launches its runtime journalled: the
+/// resolved specs it was handed, as runc's intent journal keeps them.
+async fn deployed_with_provider_secrets(
+    records: &std::path::Path,
+    provider_dir: &std::path::Path,
+) -> Vec<crate::grill::RuntimeLaunch> {
+    use super::secret_providers::{PATIENT, answering, vault};
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    agent.set_records_dir(records.to_path_buf());
+    agent.set_secret_providers(vault(&answering(provider_dir), PATIENT));
+    grill.set_pid(std::process::id());
+    with_finished_init(&grill, WEB);
+    expect_complete(&drain_deploy(&mut agent, web_with_provider_secrets()).await);
+    sidecar_records(records, 2).await;
+    [WEB, PROXY, LOGS]
+        .into_iter()
+        .map(|instance| crate::grill::RuntimeLaunch {
+            generation: crate::grill::RuntimeGeneration::runc(instance),
+            instance_id: id(instance),
+            spec: grill.created_spec(&id(instance)).unwrap(),
+            network_reference: None,
+        })
+        .collect()
+}
+
+/// #2334: the records keep the `PROVIDER[...]` references and the runtime
+/// journals the resolved values. A Bun restart (or a self-upgrade, which
+/// is one) must still see the same launch and adopt the instance and its
+/// sidecars. Before, the two never matched, so every app that used a
+/// secret provider was killed and started again.
+#[tokio::test]
+async fn a_bun_restart_adopts_an_instance_and_sidecars_that_use_provider_secrets() {
+    use super::secret_providers::SECRET;
+    let records = tempfile::tempdir().unwrap();
+    let provider_dir = tempfile::tempdir().unwrap();
+    let launches = deployed_with_provider_secrets(records.path(), provider_dir.path()).await;
+    for launch in &launches {
+        assert!(
+            launch
+                .spec
+                .process
+                .env
+                .iter()
+                .any(|entry| entry.ends_with(SECRET)),
+            "{}: the runtime got no resolved value: {:?}",
+            launch.instance_id,
+            launch.spec.process.env
+        );
+    }
+
+    let (mut agent, grill) = restarted_agent(records.path());
+    grill.set_launch_inventory(launches).await;
+    for instance in [WEB, PROXY, LOGS] {
+        grill.set_adopt_result(&id(instance), true);
+    }
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+
+    let (web, proxy, logs) = (id(WEB), id(PROXY), id(LOGS));
+    assert_eq!(
+        agent.sidecars.running_beside(&web),
+        [proxy.clone(), logs.clone()]
+    );
+    agent.relaunch_due_sidecars_to_completion().await;
+    let calls = grill.calls();
+    for instance in [&web, &proxy, &logs] {
+        let touched: Vec<String> = operations(&calls, instance)
+            .into_iter()
+            .filter(|op| op != "state")
+            .collect();
+        assert_eq!(touched, ["adopt"], "{instance}: {calls:?}");
+    }
+
+    // The records still hold references, never the provider's value.
+    let mut recorded = crate::grill::records::load_records(records.path()).unwrap();
+    recorded.extend(sidecar_records(records.path(), 2).await);
+    for record in &recorded {
+        let env = &record.oci_spec.process.env;
+        assert!(
+            env.iter().all(|entry| !entry.contains(SECRET)),
+            "{}: {env:?}",
+            record.instance_id
+        );
+        assert!(
+            env.iter().any(|entry| entry.contains("PROVIDER[vault:")),
+            "{}: {env:?}",
+            record.instance_id
+        );
+    }
+}
+
+/// The provider's value is the only thing allowed to differ: a launch the
+/// runtime journalled from another request is still a conflict, so the
+/// instance and its sidecars are retired, not adopted.
+#[tokio::test]
+async fn a_provider_secret_launch_from_another_request_is_still_retired() {
+    let records = tempfile::tempdir().unwrap();
+    let provider_dir = tempfile::tempdir().unwrap();
+    let mut launches = deployed_with_provider_secrets(records.path(), provider_dir.path()).await;
+    launches[0].spec.process.args = vec!["/bin/something-else".into()];
+
+    let (mut agent, grill) = restarted_agent(records.path());
+    grill.set_launch_inventory(launches).await;
+    for instance in [WEB, PROXY, LOGS] {
+        grill.set_adopt_result(&id(instance), true);
+    }
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 0);
+
+    let calls = grill.calls();
+    for instance in [id(WEB), id(PROXY), id(LOGS)] {
+        let touched = operations(&calls, &instance);
+        assert!(!touched.contains(&"adopt".to_string()), "{calls:?}");
+        assert!(touched.contains(&"kill".to_string()), "{calls:?}");
+    }
+}
+
 /// A sidecar whose record the runtime won't vouch for (its process is gone,
 /// or another runs under its name) is retired and starts again beside its
 /// adopted instance, as every sidecar did before #1315.

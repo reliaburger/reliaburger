@@ -1232,6 +1232,11 @@ environment, the same way a decrypted `ENC[AGE:...]` value does, and every
 restart asks the provider again, so a secret you rotate at the source reaches
 the next restart without a redeploy.
 
+A Bun restart or self-upgrade isn't an instance restart. Bun adopts an app
+that uses a provider, and its sidecars, like any other running workload: they
+keep running with the values they started with, and the provider isn't asked.
+(Up to 0.3.2, Bun killed and restarted them instead, #2334.)
+
 ## The root CA backup
 
 The root CA is offline. Its private key exists in one place: a backup that
