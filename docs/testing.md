@@ -247,6 +247,23 @@ guard holds a lock in its root) and any `rb-rbtest-*` namespace no live guard
 reserved. It touches nothing else, and it relies on the `host-network` test
 group running runc tests one at a time.
 
+Cgroups get the same treatment
+([#2322](https://github.com/reliaburger/reliaburger/issues/2322)). A cgroup
+directory outlives its last process, so a passing `make test-linux` used to
+leave about 29 empty ones under `/sys/fs/cgroup/reliaburger`, and a
+long-lived VM gathered hundreds. A test that makes cgroups claims them with a
+guard from [`tests/support/test_cgroups.rs`](../tests/support/test_cgroups.rs):
+`TestCgroups::namespace("rbtest-batch")` for a test namespace, or path
+prefixes for anything else, such as an executor's slot groups in `default`.
+Its `Drop` removes each claimed tree children first, waiting a moment for
+processes still exiting; the kernel refuses to remove a cgroup with
+processes in it, so nothing in use goes. Each new guard first sweeps empty
+cgroups named `rbtest-*` or `cap-tmp*` (a namespace, a top-level cgroup or an
+app in any namespace) that no live guard claims; a guard proves it's alive
+with a registry entry naming its process and that process's start time.
+Give a new test's namespaces one of those prefixes and claim them. The
+library's unit tests include the same file under `#[cfg(test)]`.
+
 ### Who runs an ignored test
 
 Every `#[ignore = "..."]` reason names its owner, and `make check-ignored`

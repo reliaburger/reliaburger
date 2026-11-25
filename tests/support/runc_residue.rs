@@ -20,6 +20,10 @@
 //!   roots whose owner has gone, and `rb-rbtest-*` namespaces that no live
 //!   guard's pool names. Only names tests own are touched.
 //!
+//! A runc test's cgroups are [`test_cgroups`]'s: the sweep here runs its
+//! sweep too, and [`RuncRoot`] claims the cgroups named after its directory
+//! (#2322).
+//!
 //! A guard proves its owner is alive with a lock on a file in its root,
 //! which the kernel releases when the owner dies, however it dies. Runc
 //! tests run one at a time (nextest's `host-network` group), so a sweep
@@ -35,6 +39,10 @@ use std::time::{Duration, Instant};
 use reliaburger::file_lock::{FileLock, FileLockError};
 use reliaburger::grill::InstanceId;
 use reliaburger::grill::netns::host_veth_name;
+
+#[path = "test_cgroups.rs"]
+pub mod test_cgroups;
+use test_cgroups::TestCgroups;
 
 /// Where each live guard names its root, one file per root.
 const REGISTRY: &str = "/run/reliaburger-tests/runc-roots";
@@ -97,17 +105,39 @@ impl Drop for RuncResidue {
 /// releases the containers and networks first, then deletes the directory.
 pub struct RuncRoot {
     // Fields drop in declaration order, so the residue goes before the
-    // directory that names it.
+    // directory that names it, and the containers are gone before their
+    // cgroups are removed.
     residue: RuncResidue,
+    cgroups: TestCgroups,
     directory: tempfile::TempDir,
 }
 
 impl RuncRoot {
-    /// A fresh temporary root.
+    /// A fresh temporary root. It claims the cgroups tests name after it:
+    /// `rbtest-owned-runc-<root>` at the top of the hierarchy and as an app
+    /// in `default`, and the namespace `cap-<root>`.
     pub fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
+        let residue = RuncResidue::new(directory.path());
+        let suffix = directory
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .trim_start_matches('.')
+            .to_owned();
+        let instance = format!("rbtest-owned-runc-{suffix}");
+        let hierarchy = Path::new(test_cgroups::HIERARCHY);
+        // Tests add suffixes such as `-unit` and `-relocated`, so the top-level
+        // claim is a prefix.
+        let cgroups = TestCgroups::new([
+            Path::new(test_cgroups::CGROUP_MOUNT).join(format!("{instance}*")),
+            hierarchy.join("default").join(&instance),
+            hierarchy.join(format!("cap-{}", suffix.to_lowercase())),
+        ]);
         Self {
-            residue: RuncResidue::new(directory.path()),
+            residue,
+            cgroups,
             directory,
         }
     }
@@ -197,9 +227,15 @@ fn owner_alive(root: &Path) -> bool {
     matches!(FileLock::try_lock(file), Err(FileLockError::Busy))
 }
 
-/// Release the roots of tests that died without their guard's `Drop`, and
-/// the test namespaces that no live guard's pool names.
+/// Release the roots of tests that died without their guard's `Drop`, the
+/// test namespaces that no live guard's pool names, and the empty test
+/// cgroups no live guard claims.
 pub fn sweep_stale() {
+    sweep_stale_namespaces();
+    test_cgroups::sweep_stale();
+}
+
+fn sweep_stale_namespaces() {
     let mut live = BTreeSet::new();
     let mut pools_known = true;
     for entry in std::fs::read_dir(REGISTRY).into_iter().flatten().flatten() {
