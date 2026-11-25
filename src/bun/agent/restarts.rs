@@ -189,8 +189,8 @@ struct CreateInput {
     /// The node gate's verdict on the stored spec's runtime knobs, taken
     /// on the loop from this node's allowlist as it is now (#1316).
     knobs: Result<(), crate::grill::knobs::KnobRefusal>,
-    /// The node's host-path policy, to approve the app's sources again
-    /// off the loop: resolving them can block (#797, #1316).
+    /// The node's host-path policy, to approve the stored spec's host
+    /// paths again off the loop: resolving them can block (#797, #1316).
     host_paths: crate::bun::host_paths::HostPathPolicy,
 }
 
@@ -199,17 +199,89 @@ impl CreateInput {
     ///
     /// The restart builds it from the OCI spec stored at deploy, which
     /// skipped the gates a deploy passes. A node restarted with a narrower
-    /// `node.toml` must refuse what it no longer allows (#1316).
-    async fn admit(&self) -> Result<(), String> {
-        self.knobs.clone().map_err(|refusal| refusal.to_string())?;
-        if let Some(spec) = &self.app_spec {
-            self.host_paths
-                .approve_app_off_runtime(spec)
-                .await
-                .map_err(|refusal| format!("host path refused: {refusal}"))?;
+    /// `node.toml` must refuse what it no longer allows (#1316). The host
+    /// paths asked about are the ones this spec mounts, not the app's
+    /// current spec's: mid-rollout that's the new one, while this instance
+    /// is old (#2335). The check waits at most `bound`.
+    ///
+    /// `None` admits it; otherwise the step ends with the result returned.
+    async fn admit(&self, id: &InstanceId, bound: Duration) -> Option<StepResult> {
+        if let Err(refusal) = &self.knobs {
+            return Some(StepResult::Refused(refusal.to_string()));
         }
-        Ok(())
+        match recheck_host_paths(&self.host_paths, &self.oci_spec, bound).await {
+            Ok(()) => None,
+            Err(HostPathDenial::Refused(refusal)) => {
+                Some(StepResult::Refused(restart_refusal("restart", &refusal)))
+            }
+            Err(HostPathDenial::Unanswered(reason)) => {
+                Some(StepResult::Failed(BunError::HostPathUnanswered {
+                    instance_id: id.clone(),
+                    reason,
+                }))
+            }
+        }
     }
+}
+
+/// Why a restart's host-path check didn't admit a stored spec (#2335).
+#[derive(Debug)]
+pub(super) enum HostPathDenial {
+    /// The node's policy refused a source. Asking again fails the same way.
+    Refused(crate::bun::host_paths::HostPathRefusal),
+    /// The check gave no answer: it ran out of time, as on a source whose
+    /// NFS or autofs server isn't answering, or its blocking thread failed.
+    /// A later attempt may get one.
+    Unanswered(String),
+}
+
+/// Ask `policy` again about the host paths `spec` mounts, waiting at most
+/// `bound`.
+///
+/// Resolving a source can block on a filesystem that doesn't answer. The
+/// caller holds the restart's lane meanwhile, and a stop waits for that
+/// lane, so an unbounded check would fail every stop of the instance
+/// until the filesystem came back (#2335). The blocking thread itself can't
+/// be cancelled, and is left to finish on its own.
+pub(super) async fn recheck_host_paths(
+    policy: &crate::bun::host_paths::HostPathPolicy,
+    spec: &OciSpec,
+    bound: Duration,
+) -> Result<(), HostPathDenial> {
+    use crate::bun::host_paths::HostPathRefusal;
+    let check = policy.approve_sources_off_runtime(&spec.host_path_sources);
+    match tokio::time::timeout(bound, check).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(HostPathRefusal::CheckFailed { reason })) => Err(HostPathDenial::Unanswered(
+            format!("its blocking thread failed: {reason}"),
+        )),
+        // The earlier check's thread is still stuck: another would only join
+        // it (#2335).
+        Ok(Err(refusal @ HostPathRefusal::StillResolving { .. })) => {
+            Err(HostPathDenial::Unanswered(refusal.to_string()))
+        }
+        Ok(Err(refusal)) => Err(HostPathDenial::Refused(refusal)),
+        Err(_) => Err(HostPathDenial::Unanswered(format!(
+            "no answer within {bound:?}; a source on NFS or autofs may not be responding"
+        ))),
+    }
+}
+
+/// The reason a restart refused by the host-path policy records, for the
+/// instance or one of its sidecars (`subject`): where it happened, and the
+/// policy's own refusal, which names the path and the rule.
+///
+/// It doesn't say what changed. The node's `allowed_host_paths` may have,
+/// or a symlink in a listed prefix may now resolve somewhere else; either
+/// way the path the deploy approved isn't allowed now.
+pub(super) fn restart_refusal(
+    subject: &str,
+    refusal: &crate::bun::host_paths::HostPathRefusal,
+) -> String {
+    format!(
+        "{subject} refused: a host path it mounts isn't allowed on this node any more, \
+         though the deploy was: {refusal}"
+    )
 }
 
 /// What a restart step does to the instance's sidecars (#1120): the Clear
@@ -273,8 +345,8 @@ async fn run_step<G: Grill>(
         }
         RestartStep::Create => match create {
             Some(create) => {
-                if let Err(reason) = create.admit().await {
-                    return StepResult::Refused(reason);
+                if let Some(denied) = create.admit(&id, confirmation_timeout).await {
+                    return denied;
                 }
                 match super::launch::create_with_secrets(
                     &grill,
@@ -355,6 +427,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }),
             _ => None,
         };
+        if let (RestartStep::Create, Some(launch)) = (step, launch.as_ref()) {
+            // An adopted instance took no hold when it first launched.
+            self.supervisor
+                .hold_workload_cgroup(&launch.app_name, &launch.namespace);
+        }
         let sidecars = self.restart_sidecars(&id, step, launch.as_ref());
         let task = self
             .restart_steps

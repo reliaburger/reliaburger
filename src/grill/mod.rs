@@ -51,6 +51,7 @@ pub mod stop;
 pub mod userns;
 pub mod volume;
 mod whiteout;
+pub mod workload_groups;
 
 use std::fmt;
 use std::path::PathBuf;

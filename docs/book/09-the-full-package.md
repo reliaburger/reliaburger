@@ -1877,6 +1877,30 @@ missing expects no drop-in. The guest image test checks the build script masks
 the units after installing packages, checks the masks, and writes the drop-in,
 all before the image is compressed.
 
+The fix was written against an incident on a 24.04 guest, and the quickstart
+guest is 26.04. Does 26.04 even have the same moving parts? We booted the
+pinned 26.04 cloud image and looked. It does: unattended-upgrades 2.12 still
+runs from `apt-daily-upgrade.service` (`apt.systemd.daily install`),
+`unattended-upgrades.service` is still only its shutdown helper, and
+needrestart 3.11 is installed by default, hooked into every dpkg run and still
+reading `conf.d`. Its other timers (`update-notifier-download`, `motd-news`,
+`fwupd-refresh`, Ubuntu Pro's `ua-timer`) fetch data but install nothing.
+Then we built the image with the script, booted it as a quickstart VM, and
+reinstalled libc6 by hand. needrestart printed "Service restarts being
+deferred" with `systemd-logind.service` on the list, and logind kept its PID.
+
+One gap showed up on the way. The script writes the drop-in only if
+`/etc/needrestart` exists, and nothing checked that it landed. 26.04's image
+always has needrestart, so a drop-in that silently went missing would bring
+back exactly the restart we'd just fixed, and the masks' check wouldn't
+notice. So the build now
+asks dpkg whether needrestart is installed in the image and, if it is, fails
+unless the drop-in says `'l'`, the same way it fails over a missing mask. The
+test pulls that check out of the script and runs it against a fake image
+root, with a stub standing in for the chroot: a missing drop-in or one that
+says `'a'` fails, `'l'` passes, and so does a needrestart that was removed
+(`rc`) or never installed.
+
 `relish setup --ssh` doesn't do any of this. A server is the operator's
 machine, and its update policy is the operator's call.
 

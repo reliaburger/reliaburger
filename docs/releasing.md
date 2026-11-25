@@ -2407,7 +2407,8 @@ package indexes and downloads on a tmpfs so they never reach the image and with
 service starts blocked. It disables chrony, Ubuntu 26.04's time daemon, because
 Lima's guest agent owns the guest clock (#608). It masks `apt-daily.timer`,
 `apt-daily-upgrade.timer` and `unattended-upgrades.service`, fails unless the
-masks are in the image, and sets needrestart, if present, to list only, so
+masks are in the image, and sets needrestart, if present, to list only, failing
+unless an installed needrestart got that setting (26.04's image has it), so
 nothing upgrades the guest or restarts Bun behind a tester's back (#2274);
 updates arrive with releases. It adds a systemd `.link` file
 naming the virtio NIC `eth0`: 26.04's initrd brings the NIC up as `enp0s1`,

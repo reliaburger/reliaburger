@@ -1015,6 +1015,33 @@ mod tests {
 
     struct TestNetworkCleanup(Vec<InstanceId>);
 
+    /// Kills a test's container when dropped, so a panic between its
+    /// create and the test's own kill doesn't leave it running (#2335).
+    /// `Drop` can't await, and blocking the test's runtime from inside it
+    /// would deadlock, so the kill runs on a thread of its own with a
+    /// runtime of its own. A container the test already killed is killed
+    /// again, which does nothing.
+    struct KillOnDrop {
+        grill: RuncGrill,
+        id: InstanceId,
+    }
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let (grill, id) = (self.grill.clone(), self.id.clone());
+            let _ = std::thread::spawn(move || {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                let _ = runtime.block_on(grill.kill(&id));
+            })
+            .join();
+        }
+    }
+
     impl Drop for TestNetworkCleanup {
         fn drop(&mut self) {
             for instance in &self.0 {
@@ -1037,6 +1064,7 @@ mod tests {
         let id = InstanceId("rootless-writable".to_string());
         let spec = crate::grill::oci::OciSpec {
             managed_volumes: Vec::new(),
+            host_path_sources: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1107,6 +1135,7 @@ mod tests {
         let id = InstanceId(format!("capacity-{}", std::process::id()));
         let spec = crate::grill::oci::OciSpec {
             managed_volumes: Vec::new(),
+            host_path_sources: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1180,6 +1209,7 @@ mod tests {
         let id = InstanceId("runc-test-0".to_string());
         let spec = crate::grill::oci::OciSpec {
             managed_volumes: Vec::new(),
+            host_path_sources: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1282,6 +1312,7 @@ mod tests {
         let _network_cleanup = TestNetworkCleanup(ids.to_vec());
         let spec = crate::grill::oci::OciSpec {
             managed_volumes: Vec::new(),
+            host_path_sources: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1450,6 +1481,7 @@ mod tests {
         let spec_for =
             |value: &str, initial_delay: u64, final_delay: u64| crate::grill::oci::OciSpec {
                 managed_volumes: Vec::new(),
+                host_path_sources: Vec::new(),
                 reusable_executor: false,
                 host_process: false,
                 initialiser: false,
@@ -1624,6 +1656,7 @@ mod tests {
         .unwrap();
         let spec = crate::grill::oci::OciSpec {
             managed_volumes: Vec::new(),
+            host_path_sources: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1692,6 +1725,7 @@ mod tests {
         let _network_cleanup = TestNetworkCleanup(vec![id.clone()]);
         let spec = crate::grill::oci::OciSpec {
             managed_volumes: Vec::new(),
+            host_path_sources: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1895,6 +1929,7 @@ mod tests {
         let id = InstanceId("runc-pinned-workload".to_string());
         let spec = crate::grill::oci::OciSpec {
             managed_volumes: Vec::new(),
+            host_path_sources: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -2592,6 +2627,10 @@ mod tests {
             ),
         );
         grill.create(&id, &spec).await.unwrap();
+        let _container = KillOnDrop {
+            grill: grill.clone(),
+            id: id.clone(),
+        };
         grill.start(&id).await.unwrap();
         let run = |command: &str| {
             let argv = ["/bin/sh".to_string(), "-c".to_string(), command.to_string()];

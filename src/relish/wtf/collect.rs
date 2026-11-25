@@ -690,10 +690,27 @@ fn collect_replicas(
         .map(|desired| {
             let mut running = BTreeMap::new();
             let mut launch_failures = Vec::new();
+            let mut refused_sidecars = Vec::new();
             for node in collected {
                 let Ok(instances) = &node.instances else {
                     continue;
                 };
+                refused_sidecars.extend(
+                    instances
+                        .iter()
+                        .filter(|instance| {
+                            instance.app_name == desired.app
+                                && instance.namespace == desired.namespace
+                        })
+                        .flat_map(|instance| &instance.sidecars)
+                        .filter_map(|sidecar| {
+                            Some(LaunchFailureObservation {
+                                node: node.node_id.clone(),
+                                instance: sidecar.id.clone(),
+                                reason: sidecar.refused.clone()?,
+                            })
+                        }),
+                );
                 launch_failures.extend(
                     instances
                         .iter()
@@ -736,6 +753,7 @@ fn collect_replicas(
                 unschedulable: desired.unschedulable.as_ref().map(ToString::to_string),
                 rollout_failed: desired.rollout_failed.clone(),
                 launch_failures,
+                refused_sidecars,
             }
         })
         .collect();
