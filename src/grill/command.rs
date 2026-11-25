@@ -24,6 +24,9 @@ pub use executor::{ClaimedCommandExecutor, DirectCommandExecutor, RuntimeCommand
 
 const OUTPUT_LIMIT: u64 = 1024 * 1024;
 
+/// The bound on one short runtime command, such as `runc kill`.
+pub(crate) const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Identity of one immutable command attempt, independent of its caller's PID.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

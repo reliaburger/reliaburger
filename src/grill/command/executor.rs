@@ -9,10 +9,8 @@ use std::time::Duration;
 use futures_util::future::BoxFuture;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-use super::{CommandOutput, CommandState};
+use super::{COMMAND_TIMEOUT, CommandOutput, CommandState};
 use crate::grill::runc_intent::{IntentCommands, IntentPhase, RuntimeRole};
-
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a role exec keeps asking a busy owner whether its role runs.
 /// Each ask has its own 2 s deadline, so this covers many of them; it stays
@@ -21,10 +19,10 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const EXEC_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The first pause before asking a late owner again; it doubles each time.
-const ADMISSION_BACKOFF_START: Duration = Duration::from_millis(10);
+const LATE_ANSWER_BACKOFF_START: Duration = Duration::from_millis(10);
 
 /// The longest pause between two asks.
-const ADMISSION_BACKOFF_LIMIT: Duration = Duration::from_millis(200);
+const LATE_ANSWER_BACKOFF_LIMIT: Duration = Duration::from_millis(200);
 
 /// How much of a seal's timeout its asking leaves for the drain. Retiring
 /// a launcher sends one force-kill through its owner (one 2 s request
@@ -46,20 +44,25 @@ struct LateAnswerBackoff(Duration);
 
 impl LateAnswerBackoff {
     fn new() -> Self {
-        Self(ADMISSION_BACKOFF_START)
+        Self(LATE_ANSWER_BACKOFF_START)
     }
 
     async fn pause(&mut self) {
         tokio::time::sleep(self.0).await;
-        self.0 = (self.0 * 2).min(ADMISSION_BACKOFF_LIMIT);
+        self.0 = (self.0 * 2).min(LATE_ANSWER_BACKOFF_LIMIT);
     }
 }
 
 /// Ask through `ask`, and ask again while the owner's answer is lost or
 /// late, as exec admission does. Any other error returns at once. It has
 /// no bound of its own: the caller runs it under a timeout, as a seal's
-/// drain does (#2328). Each ask must be safe to repeat.
-pub(crate) async fn ask_while_late<T, F, Fut>(mut ask: F) -> io::Result<T>
+/// drain does (#2328). While it is asking again, `late` holds the last late
+/// answer, so a caller whose timeout cuts it short can say why; once an
+/// ask answers, `late` is cleared. Each ask must be safe to repeat.
+pub(crate) async fn ask_while_late<T, F, Fut>(
+    late: &mut Option<io::Error>,
+    mut ask: F,
+) -> io::Result<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = io::Result<T>>,
@@ -67,8 +70,14 @@ where
     let mut backoff = LateAnswerBackoff::new();
     loop {
         match ask().await {
-            Err(error) if transient_owner_error(&error) => backoff.pause().await,
-            answer => return answer,
+            Err(error) if transient_owner_error(&error) => {
+                *late = Some(error);
+                backoff.pause().await;
+            }
+            answer => {
+                *late = None;
+                return answer;
+            }
         }
     }
 }
@@ -191,10 +200,13 @@ impl ClaimedCommandExecutor {
     }
 
     /// [`role_state`](Self::role_state), asking again while the role's
-    /// owner answers late, for up to `bound` (#2328). An ask that starts
-    /// just before `bound` runs out can overrun it by one owner request
-    /// (2 s). Each ask takes the adapter mutex afresh. Any other refusal,
-    /// like an owner that died while its workload runs, returns at once.
+    /// owner answers late, for up to `bound` (#2328). One ask checks every
+    /// role, one owner request each, then reads `role` once more, and each
+    /// request has a 2 s deadline, so an ask that starts just before
+    /// `bound` runs out can overrun it by that much: 6 s with a rootless
+    /// network helper. A zero `bound` asks once. Each ask takes the adapter
+    /// mutex afresh. Any other refusal, like an owner that died while its
+    /// workload runs, returns at once.
     pub async fn role_state_patiently(
         &self,
         role: RuntimeRole,
@@ -499,6 +511,62 @@ mod tests {
             timeout: Duration::from_secs(1),
         };
         assert!(!transient_owner_error(&wrapped(overran)));
+    }
+
+    fn late() -> io::Error {
+        let late = io::Error::new(io::ErrorKind::TimedOut, "process owner request timed out");
+        wrapped(CommandError::Io(late))
+    }
+
+    // These await the helper directly, with no `tokio::spawn`: a paused
+    // clock advances only while the test's own future is idle.
+    #[tokio::test(start_paused = true)]
+    async fn ask_while_late_asks_again_after_a_late_answer() {
+        let started = tokio::time::Instant::now();
+        let mut asks = 0;
+        let mut last_late = None;
+        let answer = ask_while_late(&mut last_late, || {
+            asks += 1;
+            let ask = asks;
+            async move { if ask < 3 { Err(late()) } else { Ok(ask) } }
+        })
+        .await;
+        assert_eq!(answer.unwrap(), 3);
+        // The 10 ms pause, then the doubled 20 ms one.
+        assert_eq!(started.elapsed(), Duration::from_millis(30));
+        assert!(last_late.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ask_while_late_keeps_the_last_late_answer_for_a_timeout() {
+        let mut last_late = None;
+        let cut = tokio::time::timeout(
+            Duration::from_secs(1),
+            ask_while_late(&mut last_late, || async { Err::<(), _>(late()) }),
+        )
+        .await;
+        assert!(cut.is_err());
+        assert!(last_late.unwrap().to_string().contains("timed out"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ask_while_late_returns_any_other_error_at_once() {
+        let started = tokio::time::Instant::now();
+        let mut asks = 0;
+        let mut last_late = None;
+        let answer: io::Result<()> = ask_while_late(&mut last_late, || {
+            asks += 1;
+            async {
+                Err(io::Error::other(
+                    "process owner died while its workload still runs",
+                ))
+            }
+        })
+        .await;
+        assert!(answer.unwrap_err().to_string().contains("owner died"));
+        assert_eq!(asks, 1);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert!(last_late.is_none());
     }
 
     #[test]

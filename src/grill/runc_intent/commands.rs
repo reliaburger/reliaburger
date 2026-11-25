@@ -519,8 +519,9 @@ impl IntentCommands {
     pub async fn seal(mut self, timeout: Duration) -> io::Result<Self> {
         tokio::spawn(async move {
             self.claim = self.claim.begin_retirement().await?;
-            tokio::time::timeout(timeout, async {
-                ask_while_late(|| self.validate_roles()).await?;
+            let mut late = None;
+            let drained = tokio::time::timeout(timeout, async {
+                ask_while_late(&mut late, || self.validate_roles()).await?;
                 for role in RuntimeRole::ALL {
                     let collection = self.collection(role);
                     for id in collection.inventory().await.map_err(io::Error::other)? {
@@ -536,19 +537,14 @@ impl IntentCommands {
                         .await
                         .map_err(io::Error::other)?;
                 }
-                ask_while_late(|| async {
+                ask_while_late(&mut late, || async {
                     self.require_terminal_roles().await?;
                     self.require_terminal_commands().await
                 })
                 .await
             })
-            .await
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "runtime command retirement timed out",
-                )
-            })??;
+            .await;
+            drained.map_err(|_| retirement_timed_out(late))??;
             self.drained = true;
             Ok(self)
         })
@@ -655,6 +651,18 @@ impl IntentCommands {
         }
         Ok(None)
     }
+}
+
+/// A drain that ran out of time, with the owner's last late answer when
+/// that is what it was waiting on.
+fn retirement_timed_out(late: Option<io::Error>) -> io::Error {
+    let message = match late {
+        Some(error) => format!(
+            "runtime command retirement timed out; the process owner was still answering late: {error}"
+        ),
+        None => "runtime command retirement timed out".into(),
+    };
+    io::Error::new(io::ErrorKind::TimedOut, message)
 }
 
 /// Name the command that blocks admission and its state, so a refusal in a

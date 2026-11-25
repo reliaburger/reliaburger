@@ -808,11 +808,24 @@ async fn a_seals_drain_waits_out_an_owner_that_misses_a_request_deadline() {
 /// first check of the roles and again in the drain's (#2328). Both are
 /// late answers, so the seal waits out each and still seals.
 ///
-/// The first check asks the launcher's owner, then the helper's. With the
-/// helper's owner stopped, an ask is nearly always waiting on the helper,
-/// its launcher answer already in hand. Stopping the launcher's owner and
-/// then letting the helper's go lets that ask answer, so the seal starts
-/// its drain, and the drain's own check meets the stopped launcher.
+/// The first check asks the launcher's owner, then the helper's, and the
+/// test times the second stall from a moment it causes itself:
+///
+/// 1. Both owners are stopped, so the first check waits on the launcher,
+///    misses its 2 s deadline and asks again.
+/// 2. Letting the launcher's owner go answers that ask at once, and the
+///    check moves on to the stopped helper, whose own 2 s deadline starts
+///    then. That release is the anchor.
+/// 3. 1 s after it, the ask is halfway through the helper's deadline. The
+///    test stops the launcher's owner again and lets the helper's go: the
+///    ask answers, the seal starts its drain, and the drain's own check
+///    meets the stopped launcher.
+///
+/// The margin is 1 s either side of the switch. The launcher's answer
+/// must come within 1 s of its release (it takes milliseconds), and the
+/// helper's deadline is a fixed 2 s from it. The test asserts the intent
+/// record says `Retiring` during the second stall, so a switch that lands
+/// in the first check fails loudly instead of passing for the wrong reason.
 #[tokio::test]
 async fn a_seal_waits_out_a_second_owner_stall_in_its_drain() {
     use reliaburger::grill::command::ClaimedCommandExecutor;
@@ -827,13 +840,18 @@ async fn a_seal_waits_out_a_second_owner_stall_in_its_drain() {
         shell(commands, RuntimeRole::RootlessNetwork, "exec sleep 60").await,
     );
     let helper_stopped = StoppedOwners::stop_scope(root.path(), "rootless-network/");
+    let launcher_stopped = StoppedOwners::stop_scope(root.path(), "launcher/");
     let sealing = executor.clone();
     let seal = tokio::spawn(async move { sealing.seal(Duration::from_secs(30)).await });
-    tokio::time::sleep(OWNER_STALL).await;
+    // More than one 2 s deadline, so the first check asks again.
+    tokio::time::sleep(Duration::from_secs(3)).await;
     assert!(!seal.is_finished(), "the seal ended during the first stall");
+    drop(launcher_stopped);
+    let anchor = tokio::time::Instant::now();
+    tokio::time::sleep_until(anchor + Duration::from_secs(1)).await;
     assert!(
         !draining(root.path()).await,
-        "the seal drained with no answer"
+        "the seal drained before the helper answered"
     );
     let launcher_stopped = StoppedOwners::stop_scope(root.path(), "launcher/");
     drop(helper_stopped);

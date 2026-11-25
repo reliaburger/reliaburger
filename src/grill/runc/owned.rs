@@ -54,12 +54,27 @@ struct BoundLauncher {
     started_at: u64,
 }
 
-/// How long a stop or kill asks a busy launcher owner for the launcher's
-/// state before it seals (#2328). Half the agent's default 10 s stop
-/// confirmation (`stop_confirmation_timeout_secs`), so the signal still
-/// has the other half. A longer stall fails the stop as before, without
-/// consuming the claim, and the caller can stop it again.
-const LAUNCHER_READ_PATIENCE: Duration = Duration::from_secs(5);
+/// The longest one ask of the launcher's state can take. `role_state`
+/// checks every role, one owner request each for the launcher and a
+/// rootless network helper, then reads the launcher once more, and each
+/// request has a 2 s deadline.
+const LAUNCHER_ASK_WORST: Duration =
+    crate::grill::process_control::OWNER_REQUEST_TIMEOUT.saturating_mul(3);
+
+/// How long a stop or kill keeps asking a busy launcher owner for the
+/// launcher's state before it signals or seals (#2328). The agent waits
+/// `stop_confirmation` for the whole request. The patience is what's left
+/// after the last ask, which can overrun the patience by one worst-case ask,
+/// and a `runc kill` (one short command), so a stall can't push a stop past
+/// the agent's wait. With the default 10 s nothing is left, and the read
+/// asks once, as before; a longer configured timeout buys patience. A late
+/// answer here fails the stop without consuming the claim, and the caller
+/// can stop it again.
+fn launcher_read_patience(stop_confirmation: Duration) -> Duration {
+    stop_confirmation
+        .saturating_sub(LAUNCHER_ASK_WORST)
+        .saturating_sub(crate::grill::command::COMMAND_TIMEOUT)
+}
 
 fn failure(instance: &InstanceId, error: impl std::fmt::Display) -> GrillError {
     GrillError::StateUnavailable {
@@ -466,6 +481,18 @@ impl RuncGrill {
         id: &InstanceId,
         context: &ClaimedCommandExecutor,
     ) -> io::Result<()> {
+        self.owned_cleanup_after(id, context, None).await
+    }
+
+    /// [`owned_cleanup`](Self::owned_cleanup) for a caller that has just
+    /// read the launcher's state and passes it in `launcher`, so a stalled
+    /// owner isn't asked twice (#2328). `None` reads it here.
+    async fn owned_cleanup_after(
+        &self,
+        id: &InstanceId,
+        context: &ClaimedCommandExecutor,
+        launcher: Option<Option<CommandState>>,
+    ) -> io::Result<()> {
         self.forget_launcher(id).await;
         let record = context.intent().await?;
         if matches!(record.phase, IntentPhase::Retired { .. }) {
@@ -492,10 +519,18 @@ impl RuncGrill {
                 }
             }
         }
-        let exit_code = match context
-            .role_state_patiently(RuntimeRole::Launcher, LAUNCHER_READ_PATIENCE)
-            .await?
-        {
+        let launcher = match launcher {
+            Some(state) => state,
+            None => {
+                context
+                    .role_state_patiently(
+                        RuntimeRole::Launcher,
+                        launcher_read_patience(self.stop_confirmation),
+                    )
+                    .await?
+            }
+        };
+        let exit_code = match launcher {
             Some(CommandState::Retired { exit_code }) => exit_code,
             _ => None,
         };
@@ -638,13 +673,16 @@ impl RuncGrill {
     /// Signal a running container through an owned Runc command.
     pub(super) async fn owned_stop(&self, instance: &InstanceId) -> Result<(), GrillError> {
         self.owned_operation(instance, |runtime, id, context| async move {
-            if !matches!(
-                context
-                    .role_state_patiently(RuntimeRole::Launcher, LAUNCHER_READ_PATIENCE)
-                    .await?,
-                Some(CommandState::Running { .. })
-            ) {
-                return runtime.owned_cleanup(&id, &context).await;
+            let launcher = context
+                .role_state_patiently(
+                    RuntimeRole::Launcher,
+                    launcher_read_patience(runtime.stop_confirmation),
+                )
+                .await?;
+            if !matches!(launcher, Some(CommandState::Running { .. })) {
+                return runtime
+                    .owned_cleanup_after(&id, &context, Some(launcher))
+                    .await;
             }
             // The app's own stop signal (#1121), from its original intent.
             let signal = context.intent().await?.spec.stop_signal().name();
@@ -1425,7 +1463,29 @@ fn container_processes(init: u32, launcher: u32) -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::container_processes;
+    use super::{container_processes, launcher_read_patience};
+    use std::time::Duration;
+
+    #[test]
+    fn the_default_stop_confirmation_leaves_no_room_to_ask_again() {
+        assert_eq!(
+            launcher_read_patience(Duration::from_secs(10)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            launcher_read_patience(Duration::from_secs(1)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn a_longer_stop_confirmation_leaves_one_ask_and_a_runc_kill_unspent() {
+        // 30 s, less one 6 s worst-case ask and the 5 s `runc kill` bound.
+        assert_eq!(
+            launcher_read_patience(Duration::from_secs(30)),
+            Duration::from_secs(19)
+        );
+    }
 
     #[test]
     fn a_group_that_holds_the_launcher_names_only_the_init() {
