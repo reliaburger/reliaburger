@@ -7322,6 +7322,58 @@
       ]
     },
     {
+      "id": "issue-2322-test-cgroups-are-removed",
+      "issue": 2322,
+      "promise": "A guarded Linux test removes the cgroups it made, children first and only once they're empty, and a new guard sweeps empty test-owned cgroups that no live guard claims.",
+      "supported_paths": [
+        "Rootful Linux tests on cgroup v2 that claim their cgroups with tests/support/test_cgroups.rs"
+      ],
+      "cases": [
+        {
+          "id": "issue-2322-cgroup_guard_removes_its_tree_children_first_once_empty",
+          "binary": "reliaburger",
+          "test": "grill::cgroup::tests::cgroup_guard_removes_its_tree_children_first_once_empty",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/grill/cgroup.rs",
+            "tests/support/test_cgroups.rs"
+          ]
+        },
+        {
+          "id": "issue-2322-cgroup_guard_removes_every_test_cgroup_its_prefix_claims",
+          "binary": "reliaburger",
+          "test": "grill::cgroup::tests::cgroup_guard_removes_every_test_cgroup_its_prefix_claims",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/grill/cgroup.rs",
+            "tests/support/test_cgroups.rs"
+          ]
+        },
+        {
+          "id": "issue-2322-cgroup_sweep_removes_only_stale_empty_test_cgroups",
+          "binary": "reliaburger",
+          "test": "grill::cgroup::tests::cgroup_sweep_removes_only_stale_empty_test_cgroups",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/grill/cgroup.rs",
+            "tests/support/test_cgroups.rs"
+          ]
+        }
+      ],
+      "refused_paths": [
+        "The sweep never touches a cgroup with processes in it, one a live guard claims, one changed in the last two minutes, or a name no test owns."
+      ],
+      "boundaries": [
+        "Test-harness cleanup only; Bun's own cgroup cleanup is covered by its executor and agent tests."
+      ]
+    },
+    {
       "id": "issue-740-slow-cold-pull-is-interruptible",
       "issue": 740,
       "promise": "Cancelling an array, or a task's deadline expiring, during a real cold image pull for a shared-runc executor ends the attempt promptly with nothing held, while the pull carries on filling the image cache.",

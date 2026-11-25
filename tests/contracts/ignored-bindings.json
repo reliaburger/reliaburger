@@ -1944,6 +1944,24 @@
     "test": "bun::reusable_executor::pool::tests::cgroup_deadline_during_cold_preparation_retires_the_context"
   },
   {
+    "source": "src/grill/cgroup.rs",
+    "function": "cgroup_guard_removes_its_tree_children_first_once_empty",
+    "binary": "reliaburger",
+    "test": "grill::cgroup::tests::cgroup_guard_removes_its_tree_children_first_once_empty"
+  },
+  {
+    "source": "src/grill/cgroup.rs",
+    "function": "cgroup_guard_removes_every_test_cgroup_its_prefix_claims",
+    "binary": "reliaburger",
+    "test": "grill::cgroup::tests::cgroup_guard_removes_every_test_cgroup_its_prefix_claims"
+  },
+  {
+    "source": "src/grill/cgroup.rs",
+    "function": "cgroup_sweep_removes_only_stale_empty_test_cgroups",
+    "binary": "reliaburger",
+    "test": "grill::cgroup::tests::cgroup_sweep_removes_only_stale_empty_test_cgroups"
+  },
+  {
     "source": "tests/owned_task_arrays.rs",
     "function": "cgroup_host_executor_never_reuses_a_killed_task_cgroup",
     "binary": "reliaburger::owned_task_arrays",

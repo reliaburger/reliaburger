@@ -10,6 +10,9 @@ use std::time::{Duration, Instant};
 #[path = "support/bun_process.rs"]
 mod bun_process;
 #[cfg(target_os = "linux")]
+#[path = "support/test_cgroups.rs"]
+mod test_cgroups;
+#[cfg(target_os = "linux")]
 use bun_process::spawn_bun_with_runtime_port_retry;
 use bun_process::{
     WAIT, assert_success, reserve_address, reserve_ports, run_relish, run_relish_init,
@@ -260,6 +263,30 @@ fn runc_catalogue_deploys_the_exact_image_pushed_to_pickle() {
     qualify_runc_catalogue("image-registry");
 }
 
+/// The namespace cgroups `relish test` runs make, `rbtest-<run id>-<NN>` with
+/// a 32-digit hex run id. Only these catalogue tests run `relish test` under
+/// `make test-linux`, one at a time, so a new one is this test's.
+#[cfg(target_os = "linux")]
+fn catalogue_namespaces() -> std::collections::BTreeSet<String> {
+    let run_namespace = |name: &str| {
+        name.strip_prefix("rbtest-")
+            .and_then(|rest| rest.split_once('-'))
+            .is_some_and(|(run, index)| {
+                run.len() == 32
+                    && run.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    && index.len() == 2
+                    && index.bytes().all(|byte| byte.is_ascii_digit())
+            })
+    };
+    std::fs::read_dir(test_cgroups::HIERARCHY)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| run_namespace(name))
+        .collect()
+}
+
 /// The V02 soak ran `relish test --endpoint <a node's forwarded API>` from the
 /// Mac. `--endpoint` bypassed the managed context, so the registry cases
 /// pushed to the node's own listener port, which nothing forwards. Relish now
@@ -386,6 +413,9 @@ fn qualify_runc_catalogue(group: &str) {
         nix::unistd::geteuid().is_root(),
         "run this qualification as root"
     );
+    // Declared first, so it drops last, after Bun: the run's namespace
+    // cgroups stay behind when their apps go (#2322).
+    let mut cgroups = test_cgroups::TestCgroups::new([]);
     let root = tempfile::tempdir().unwrap();
     let cluster_dir = root.path().join("cluster");
     assert_success(
@@ -458,6 +488,7 @@ fn qualify_runc_catalogue(group: &str) {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+    let before = catalogue_namespaces();
     let output = run_relish(&[
         "--endpoint",
         &endpoint,
@@ -475,6 +506,9 @@ fn qualify_runc_catalogue(group: &str) {
         "--parallel",
         "1",
     ]);
+    for namespace in catalogue_namespaces().difference(&before) {
+        cgroups.claim(std::path::Path::new(test_cgroups::HIERARCHY).join(namespace));
+    }
     let report: serde_json::Value =
         serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
             panic!(

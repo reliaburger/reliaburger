@@ -1806,6 +1806,33 @@ panics with a container running and checks that nothing is left, and two
 more tests leave a container behind the way an unguarded panic and a SIGKILL
 would, then start a container that takes the same address.
 
+Even passing tests left something behind, though
+([#2322](https://github.com/reliaburger/reliaburger/issues/2322)). A cgroup v2
+group is a directory, and it stays when its last process exits: the kernel
+only removes it when someone calls `rmdir`. Bun removes the leaves it knows
+about, but the namespace and app groups above them stayed. A passing
+`make test-linux` left about 29 empty groups, and our shared test VM had
+gathered more than 700. Harmless one at a time, unbounded over months.
+
+The fix is another guard, `TestCgroups`, which claims the cgroups one test
+makes and removes them in its `Drop`, deepest first. It never has to decide
+whether a group is still in use: `rmdir` on a cgroup that still has
+processes fails with `EBUSY`, so the kernel makes that call for us, and the
+guard just retries for a few seconds while the last processes exit. The
+sweep is more careful, because it cleans up after other tests. It only looks
+at names tests own (`rbtest-*` and `cap-tmp*`), only removes a group with no
+processes anywhere in it (`populated 0` in its `cgroup.events`), and skips
+any group a live guard claims. "Live" here is a registry file naming the
+guard's process ID and that process's start time from `/proc/<pid>/stat`, so
+a recycled process ID doesn't keep a dead test's claim alive.
+
+The file lives in `tests/support/` and uses only the standard library,
+because two kinds of tests include it. An integration test pulls it in with
+`#[path = "support/test_cgroups.rs"] mod test_cgroups;`, and the library's
+own unit tests do the same from `src/lib.rs` under `#[cfg(test)]`. The
+`#[path]` attribute tells the compiler where a module's file is when it isn't
+where the module's name says, which lets one file serve both.
+
 ### A signal is not proof of exit
 
 The same idea runs through the agent's stop path. A runtime can accept a kill
