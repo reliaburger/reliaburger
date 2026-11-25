@@ -457,8 +457,9 @@ say), or `--off` couldn't switch netconsole off, the node gives the reason in
 brackets, and the next boot tries again from the file. A node that isn't an
 appliance shows as `not an appliance` and is left alone. A node whose bun is
 older than 0.3.3 has no boot-logs setting, and shows as failed until you
-upgrade it. The command fails if any node didn't answer, or if no node is an
-appliance. A node that didn't answer may still have written the file before
+upgrade it. With `--to` or `--off`, the command fails if any node didn't
+answer, or if no node is an appliance; showing the setting never fails, and
+a node that didn't answer is a row in the table. A node that didn't answer may still have written the file before
 the connection dropped, so run `relish os boot-logs` to see where it stands. The target must be
 one machine's IPv4 address, as netconsole needs: not a broadcast,
 multicast, loopback or `0.0.0.0` address. With `-o json`, each node has a
@@ -611,7 +612,8 @@ relish wtf
 ```
 
 All of them alive, all three in the council, and nothing to fix. Each
-machine's monitor shows its name, address and whether bun is running.
+machine's monitor shows its dashboard ("The console", below): the Status
+tab names the machine and its address, and says whether bun is running.
 
 relish keeps one current cluster, in `~/.reliaburger/context.json`. The
 claim makes the new cluster that one, unless another cluster's context is
@@ -815,7 +817,7 @@ the node. It never shows secrets, tokens or environment variables.
 
 | Tab | Shows | From |
 | --- | --- | --- |
-| 1 Status | who the machine is, then `relish status`'s lines and `wtf`'s counts, the ones that need attention first | the machine, bun's summary, `wtf` every minute |
+| 1 Status | who the machine is, then `relish status`'s lines and `wtf`'s counts, the ones that need attention first | the machine, bun's summary, `wtf` every five minutes |
 | 2 Metrics | CPU, memory, the data partition and the network, with four minutes of history | the machine |
 | 3 Workloads | the instances on this node: state, restarts, CPU and memory | bun (`/v1/top`) |
 | 4 Cluster | gossip's members and Raft's leader, term and quorum, then every node's role, applied and log index and lag | bun's summary and every node's council view |
@@ -925,9 +927,9 @@ spare slot for the next. An update goes into the spare slot. The node reboots
 into it with two tries, and it's only marked good once bun is healthy again
 and the node has a network address. If either is missing 150 seconds after
 the kernel starts, the try fails, and after the second the node goes back to
-the previous version by itself. On a Wyse 3040 a broken update is back on the
-old version in about 8½ minutes. A node whose network doesn't come up on the
-new version falls back too, rather than staying cut off.
+the previous version by itself. On a Wyse 3040 a broken update's fallback is
+modelled at about 8½ minutes; the Wyse lab hasn't timed it yet. A node whose
+network doesn't come up on the new version falls back too, rather than staying cut off.
 
 bun does this across the cluster, one node at a time. See what each node runs
 and what the newest release is:

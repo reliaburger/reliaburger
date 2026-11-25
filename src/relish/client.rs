@@ -3249,7 +3249,10 @@ impl BunClient {
         let status = response.status().as_u16();
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(RelishError::ApiError { status, body });
+            return Err(RelishError::ApiError {
+                status,
+                body: api_sentence(body),
+            });
         }
 
         response
@@ -4161,6 +4164,17 @@ fn audit_path(filter: &crate::bun::audit::AuditFilter, cluster: bool) -> String 
     format!("/v1/audit?{}", params.finish())
 }
 
+/// The API's own sentence from an error body (its JSON `error` field), or
+/// the body as it came when it has none.
+fn api_sentence(body: String) -> String {
+    match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(answer) => match answer["error"].as_str() {
+            Some(sentence) => sentence.to_string(),
+            None => body,
+        },
+        Err(_) => body,
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4391,6 +4405,58 @@ mod tests {
         for dots in ["", ".", ".."] {
             assert!(path_segment(dots).is_err(), "{dots:?}");
         }
+    }
+
+    /// A refused token request: the error carries the API's own sentence,
+    /// not its JSON, so a person reads what the manual quotes.
+    #[tokio::test]
+    async fn a_refused_token_request_reads_as_the_apis_sentence() {
+        let app = axum::Router::new()
+            .route(
+                "/v1/token/create",
+                axum::routing::post(|| async {
+                    (
+                        axum::http::StatusCode::CONFLICT,
+                        axum::Json(serde_json::json!({
+                            "error": "refusing to create the first API token: no master key"
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/v1/token/rotate",
+                axum::routing::post(|| async {
+                    (axum::http::StatusCode::BAD_GATEWAY, "upstream gone")
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client =
+            BunClient::new_with_token(&format!("http://{}", listener.local_addr().unwrap()), None);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let request = TokenRequest {
+            name: "ci".into(),
+            role: "deployer".into(),
+            apps: None,
+            namespaces: None,
+            lifetime: TokenLifetime::Default,
+            inherit_permissions: false,
+            agent: false,
+        };
+        let refused = client.token_create(&request).await.unwrap_err();
+        // A body that isn't JSON comes through as it was.
+        let raw = client.token_rotate("ci", None).await.unwrap_err();
+        server.abort();
+        assert!(
+            matches!(&refused, RelishError::ApiError { status: 409, .. }),
+            "{refused:?}"
+        );
+        assert_eq!(
+            refused.to_string(),
+            "API error (status 409): refusing to create the first API token: no master key"
+        );
+        assert_eq!(raw.to_string(), "API error (status 502): upstream gone");
     }
 
     /// D34: a command that ran and failed is an answer, not an HTTP error.

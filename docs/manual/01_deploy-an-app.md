@@ -475,8 +475,8 @@ a node that's unreachable does so when it comes back. Run `relish apps web` (or
 `relish apply` on a cluster returns as soon as the council has recorded the
 change. The scheduler places the apps afterwards, and each node pulls the
 image and starts its share, so a script or a checklist that goes straight on
-to `curl` finds nothing there yet. `--wait` holds on until every app in the
-file is ready:
+to `curl` finds nothing there yet. `--wait` (0.3.3, not in 0.3.2) holds on
+until every app in the file is ready:
 
 ```text
 $ relish apply --wait web.toml
@@ -856,7 +856,7 @@ and failure reports would get 401 from then on, so on such a cluster
 `relish token create` refuses:
 
 ```text
-refusing to create the first API token: this plaintext cluster has no master key, so its nodes have no service token, and once a token exists the API answers their calls (placement polls, rollout reports) with 401. Set [security] master_key_path to the same key on every node, restart them, then create the token
+error: API error (status 409): refusing to create the first API token: this plaintext cluster has no master key, so its nodes have no service token, and once a token exists the API answers their calls (placement polls, rollout reports) with 401. Set [security] master_key_path to the same key on every node, restart them, then create the token
 ```
 
 Set `[security] master_key_path` on every node, restart them, and create the
