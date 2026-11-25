@@ -1849,6 +1849,45 @@ fn the_scrutiny_section_follows_the_install_and_sources_every_number() {
     );
 }
 
+/// The evidence band puts four numbers in large type before the sections that
+/// back them. Like the scrutiny section's, each links where it comes from: a
+/// section of this page or a committed record.
+#[test]
+fn the_evidence_band_links_every_number() {
+    let page = read("docs/website/index.html");
+    let start = page
+        .find("<aside id=\"evidence\" class=\"numbers-band\"")
+        .expect("no evidence band");
+    assert!(
+        start < page.find("<section id=\"scrutiny\"").unwrap(),
+        "the band comes before the evidence sections"
+    );
+    let band = &page[start..start + page[start..].find("</aside>").unwrap()];
+    let numbers: Vec<&str> = band.split("<div><dt>").skip(1).collect();
+    assert_eq!(numbers.len(), 4, "the band shows four numbers");
+    for number in numbers {
+        let number = &number[..number.find("</div>").unwrap()];
+        let href = number
+            .split("<a href=\"")
+            .nth(1)
+            .map(|rest| &rest[..rest.find('"').unwrap()])
+            .unwrap_or_else(|| panic!("a number with no source: {number}"));
+        match href.strip_prefix('#') {
+            Some(id) => assert!(
+                page.contains(&format!("<section id=\"{id}\"")),
+                "the band links #{id}, which isn't a section"
+            ),
+            None => {
+                let record = href
+                    .strip_prefix("https://github.com/reliaburger/reliaburger/blob/main/")
+                    .unwrap_or_else(|| panic!("{href} isn't a record in this repository"));
+                let record = record.split('#').next().unwrap();
+                assert!(repository().join(record).is_file(), "{record} is missing");
+            }
+        }
+    }
+}
+
 /// The first difference (#1731): Reliaburger was built for AI agents from the
 /// start, not retrofitted. `bun` is already "the one agent every node runs"
 /// on the slide after it, so every "agent" here is an AI agent, your agent or

@@ -542,6 +542,21 @@ footer { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-top: 20px; paddi
 .home .facts > div:nth-child(3) { border-top-color: var(--tomato); }
 .home .facts dt { margin-top: 2px; }
 
+/* The evidence in four large numbers, on a dark band of its own. */
+.numbers-band { margin-top: 104px; padding: 30px 32px 34px; background: var(--ink); color: #e4e9e3; border-radius: 4px; scroll-margin-top: 1rem; }
+.numbers-band .eyebrow { color: #f49463; margin-bottom: 18px; }
+.numbers-band dl { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 24px 32px; margin: 0; }
+.numbers-band dt { font: 650 clamp(1.5rem, 2.5vw, 2.05rem)/1.1 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; letter-spacing: -.04em; font-variant-numeric: tabular-nums; color: #f4bf3a; }
+.numbers-band div:nth-child(2) dt { color: #c98bc3; }
+.numbers-band div:nth-child(3) dt { color: #7fbf4a; }
+.numbers-band div:nth-child(4) dt { color: #f0705a; }
+.numbers-band dd { margin: 8px 0 0; color: #b9c6ba; font-size: .9375rem; }
+.numbers-band a { color: #fff; white-space: nowrap; }
+.numbers-band a:focus-visible { outline: 3px solid #f49463; outline-offset: 2px; }
+.numbers-band + .section { margin-top: 72px; }
+@media (max-width: 900px) { .numbers-band dl { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 600px) { .numbers-band { margin-top: 64px; padding: 24px 20px; } .numbers-band dl { grid-template-columns: 1fr; } }
+
 /* Dark theme, chosen with the button copy.js adds and remembered in this browser.
    The dark boxes (terminals, recordings, the whitepaper's band) keep their light
    text and go a shade darker than the page, so they still read as boxes. */
@@ -561,6 +576,7 @@ footer { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-top: 20px; paddi
 :root[data-theme="dark"] .install-button,
 :root[data-theme="dark"] .paper-band,
 :root[data-theme="dark"] .recording-fold summary { background: var(--box); }
+:root[data-theme="dark"] .numbers-band { background: var(--box); border: 1px solid var(--line); }
 :root[data-theme="dark"] .primary-link, :root[data-theme="dark"] .mark, :root[data-theme="dark"] .skip { border-color: var(--line); }
 :root[data-theme="dark"] .primary-link:hover { background: #1f2421; }
 :root[data-theme="dark"] .paper-band, :root[data-theme="dark"] .terminal, :root[data-theme="dark"] .recording-fold summary { border: 1px solid var(--line); }

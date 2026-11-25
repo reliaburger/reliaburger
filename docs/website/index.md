@@ -579,6 +579,24 @@ Planned. ACME certificates for the ingress, an ingress address that fails over b
 
 [Milestone](https://github.com/reliaburger/reliaburger/milestone/13) 
 
+THE EVIDENCE
+
+2,649,391,295
+
+tasks in one real day, on three 4-vCPU VMs. [Batch jobs](https://reliaburger.com/#job-throughput)
+
+8 hours
+
+of killed agents, power cuts and partitions before every release. [The gate](https://reliaburger.com/#release-testing)
+
+1/10
+
+of the code: 202,730 lines of Rust against 2,134,280 of Go. [How it was counted](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-10-loc-comparison.md)
+
+0 of 30
+
+recorded agent sessions changed the cluster by themselves. [The record](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-06-v0.2.7-exit-test.md#second-run-1742-utc)
+
 ## A young project you can verify
 
 Popularity no longer protects code: 92,319 CVEs from January to October 2026, against 41,213 a year earlier ([RuntimeWire’s count of NVD](https://runtimewire.com/article/nvd-recorded-2-24-times-as-many-cves-from-january-through-october-as-in-the-same)). What protects it is less code, open to checking, with fixes that reach every node fast.
