@@ -256,6 +256,7 @@ means, the numbers that decide it and the line of code that does (see
 | `crashloop` | critical | An app restarted 3 times in 15 minutes |
 | `no-backends` | critical | A service has no healthy backend |
 | `launch-failed` | critical | The runtime refused to launch an app |
+| `sidecar-refused` | warning | An app runs without a sidecar the node refused to start again |
 | `quota-blocked` | warning | A namespace quota keeps an app unplaced |
 | `volume-home-away` | critical | An app waits for the node holding its volume |
 | `unschedulable` | warning | Some of an app's replicas have no node |

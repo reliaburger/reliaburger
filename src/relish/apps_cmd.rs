@@ -405,16 +405,21 @@ pub fn render_instances(
                 age_cell(s.age_seconds)
             );
             // Each sidecar under its instance, with its own state and
-            // restarts (#1315).
+            // restarts (#1315). One the node refused to start again says
+            // so, with why, in the last column (#2335).
             for sidecar in &s.sidecars {
+                let (state, last) = match &sidecar.refused {
+                    Some(reason) => ("refused".to_string(), reason.as_str()),
+                    None => (sidecar.state.to_string(), "-"),
+                };
                 let _ = writeln!(
                     output,
-                    "{:<24} {:<20} {:<15} {:<12} {:<10} {:<10} {:<8} -",
+                    "{:<24} {:<20} {:<15} {:<12} {:<10} {:<10} {:<8} {last}",
                     "",
                     format!("+ {}", sidecar.name),
                     "sidecar",
                     "",
-                    sidecar.state,
+                    state,
                     "-",
                     sidecar.restart_count,
                 );
@@ -626,6 +631,7 @@ mod tests {
             id: format!("prod__web-0__sidecar-{name}"),
             state,
             restart_count,
+            refused: None,
         };
         let mut web = instance("node-1", "web", 0, "running");
         web.instance.sidecars = vec![
@@ -648,6 +654,39 @@ mod tests {
         assert!(
             json[1].get("sidecars").is_none(),
             "an instance without sidecars says nothing about them"
+        );
+    }
+
+    /// #2335: a sidecar the node refused to start again is listed as
+    /// `refused`, with the node's reason, under its app, which keeps
+    /// running; `-o json` carries the reason.
+    #[test]
+    fn a_refused_sidecar_is_listed_with_its_reason() {
+        use crate::bun::agent::{SidecarState, SidecarStatus};
+        let mut web = instance("node-1", "web", 0, "running");
+        web.instance.sidecars = vec![SidecarStatus {
+            name: "proxy".into(),
+            id: "prod__web-0__sidecar-proxy".into(),
+            state: SidecarState::Stopped,
+            restart_count: 1,
+            refused: Some("restart of sidecar prod__web-0__sidecar-proxy refused".into()),
+        }];
+        let rows = vec![web];
+        let table = render_instances(&rows, &[]);
+        let line = table
+            .lines()
+            .find(|line| line.contains("+ proxy"))
+            .unwrap_or_else(|| panic!("no sidecar row: {table}"));
+        assert!(line.contains("refused"), "{line}");
+        assert!(
+            line.ends_with("restart of sidecar prod__web-0__sidecar-proxy refused"),
+            "{line}"
+        );
+        let json = serde_json::to_value(&rows).unwrap();
+        assert_eq!(json[0]["sidecars"][0]["state"], "stopped");
+        assert_eq!(
+            json[0]["sidecars"][0]["refused"],
+            "restart of sidecar prod__web-0__sidecar-proxy refused"
         );
     }
 

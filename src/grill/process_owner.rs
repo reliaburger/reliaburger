@@ -1067,6 +1067,7 @@ mod tests {
                 instance_id: super::super::InstanceId("default__web-0".into()),
                 spec: OciSpec {
                     managed_volumes: Vec::new(),
+                    host_path_sources: Vec::new(),
                     reusable_executor: false,
                     host_process: false,
                     initialiser: false,

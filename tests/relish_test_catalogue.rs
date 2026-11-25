@@ -287,6 +287,40 @@ fn catalogue_namespaces() -> std::collections::BTreeSet<String> {
         .collect()
 }
 
+/// Bun removes a run's namespace cgroup once the run has removed the
+/// namespace's last app (#2324). This checks Bun itself, while it still
+/// runs: the `TestCgroups` guard only removes leftovers after it stops.
+/// Retirement finishes on Bun's loop after the cleanup is confirmed, so
+/// allow it a few seconds.
+#[cfg(target_os = "linux")]
+fn assert_run_namespace_cgroups_removed(before: &std::collections::BTreeSet<String>) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let left: Vec<String> = catalogue_namespaces().difference(before).cloned().collect();
+        if left.is_empty() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            let trees: Vec<String> = left
+                .iter()
+                .map(|namespace| {
+                    let children: Vec<String> =
+                        std::fs::read_dir(format!("{}/{namespace}", test_cgroups::HIERARCHY))
+                            .into_iter()
+                            .flatten()
+                            .flatten()
+                            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                            .collect();
+                    format!("{namespace} {children:?}")
+                })
+                .collect();
+            panic!("relish test left its namespace cgroups behind: {trees:?}");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// The V02 soak ran `relish test --endpoint <a node's forwarded API>` from the
 /// Mac. `--endpoint` bypassed the managed context, so the registry cases
 /// pushed to the node's own listener port, which nothing forwards. Relish now
@@ -413,8 +447,9 @@ fn qualify_runc_catalogue(group: &str) {
         nix::unistd::geteuid().is_root(),
         "run this qualification as root"
     );
-    // Declared first, so it drops last, after Bun: the run's namespace
-    // cgroups stay behind when their apps go (#2322).
+    // Declared first, so it drops last, after Bun. Bun removes the run's
+    // namespace cgroups itself (#2324, asserted below); this guard is the
+    // backstop when the test fails part-way (#2322).
     let mut cgroups = test_cgroups::TestCgroups::new([]);
     let root = tempfile::tempdir().unwrap();
     let cluster_dir = root.path().join("cluster");
@@ -524,6 +559,7 @@ fn qualify_runc_catalogue(group: &str) {
         assert_eq!(case["cleanup"]["status"], "confirmed", "{report}");
     }
     assert_success(&output, "qualify runtime catalogue");
+    assert_run_namespace_cgroups_removed(&before);
     if group == "image-registry" {
         let listed = run_relish(&[
             "--endpoint",
@@ -596,5 +632,6 @@ fn qualify_runc_catalogue(group: &str) {
             !output.status.success(),
             "untrusted workload certificate passed"
         );
+        assert_run_namespace_cgroups_removed(&before);
     }
 }

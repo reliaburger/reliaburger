@@ -19,11 +19,14 @@ const MAX_NAMESPACES: usize = 256;
 /// How long a task's egress allowlist may take to resolve before the
 /// attempt is refused.
 const EGRESS_DNS_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
-#[derive(Default)]
 struct Binding {
     cgroup: u64,
     users: usize,
     published: bool,
+    /// Keeps the namespace's cgroup while it is bound, so Bun never removes
+    /// a directory this binding and its journal name (#2324). The journal
+    /// must match the live inode at startup, and an idle binding is kept.
+    _namespace_cgroup: crate::grill::workload_groups::WorkloadGroupHold,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -395,6 +398,9 @@ impl TaskNamespacePolicy {
                 return Err(std::io::Error::other("delegated namespace cgroup changed"));
             }
         } else {
+            // An evicted binding's hold is only dropped once the journal no
+            // longer names its namespace, below. Dropping removes nothing.
+            let mut _evicted = None;
             if bindings.len() == MAX_NAMESPACES {
                 let idle = bindings
                     .iter()
@@ -407,7 +413,7 @@ impl TaskNamespacePolicy {
                     let mut kernel = self.kernel.lock().await;
                     remove_binding(&mut kernel, &idle.0, idle.1)?;
                 }
-                bindings.remove(&idle.0);
+                _evicted = bindings.remove(&idle.0);
             }
             bindings.insert(
                 namespace.into(),
@@ -415,6 +421,8 @@ impl TaskNamespacePolicy {
                     cgroup: cgroup_id,
                     users: 0,
                     published: false,
+                    _namespace_cgroup: crate::grill::workload_groups::WorkloadGroups::shared()
+                        .hold_namespace(namespace),
                 },
             );
             // Record ownership before publishing; failed persistence never starts work.
