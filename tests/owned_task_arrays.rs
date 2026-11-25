@@ -788,7 +788,7 @@ async fn delegated_namespace_isolation_and_policy_loss(isolation: &str) {
     let root = root_path.as_path();
     let namespace = format!("rbtest-job-{}", rand::random::<u32>());
     let other = format!("rbtest-other-{}", rand::random::<u32>());
-    let hierarchy = Path::new(runc_residue::test_cgroups::HIERARCHY);
+    let hierarchy = std::path::Path::new(runc_residue::test_cgroups::HIERARCHY);
     let _cgroups = TestCgroups::new([hierarchy.join(&namespace), hierarchy.join(&other)]);
     let _runc_residue = runc_residue::RuncResidue::new(root);
     eprintln!("namespace fixture ({isolation}): {}", root.display());
@@ -3619,7 +3619,7 @@ async fn runc_shared_arrays_across_namespaces_leave_no_executor_metadata_after_r
         .tempdir()
         .unwrap()
         .keep();
-    let hierarchy = Path::new(runc_residue::test_cgroups::HIERARCHY);
+    let hierarchy = std::path::Path::new(runc_residue::test_cgroups::HIERARCHY);
     let _cgroups = TestCgroups::new(
         ["rbtest-tenant-a", "rbtest-tenant-b", "rbtest-tenant-c"].map(|name| hierarchy.join(name)),
     );
