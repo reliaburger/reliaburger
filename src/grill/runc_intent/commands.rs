@@ -168,9 +168,13 @@ impl IntentCommands {
         }
     }
 
-    // Check every role before signalling any command. An unbound prepared
-    // attempt is a crash before activation permission; executed ones are corruption.
-    async fn validate_roles(&self) -> io::Result<()> {
+    /// Check every role's binding against its owner before signalling any
+    /// command. An unbound prepared attempt is a crash before activation
+    /// permission; executed ones are corruption. Asks each bound role's
+    /// owner for its state, so a busy owner can answer late. Idempotent,
+    /// not read-only: observing an owner that died after its workload ended
+    /// completes that retirement record, and asking again finds it done.
+    pub(crate) async fn validate_roles(&self) -> io::Result<()> {
         let record = self
             .record()
             .ok_or_else(|| io::Error::other("no runtime role intent"))?;

@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Mutex;
+use futures_util::future::BoxFuture;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use super::{CommandOutput, CommandState};
 use crate::grill::runc_intent::{IntentCommands, IntentPhase, RuntimeRole};
@@ -24,6 +25,12 @@ const ADMISSION_BACKOFF_START: Duration = Duration::from_millis(10);
 
 /// The longest pause between two asks.
 const ADMISSION_BACKOFF_LIMIT: Duration = Duration::from_millis(200);
+
+/// How much of a seal's timeout its asking leaves for the drain. Retiring
+/// a launcher sends one force-kill through its owner (one 2 s request
+/// deadline), then reads the owner's Retired record and makes a durable
+/// write; the extra second covers those two on a busy disk.
+const DRAIN_RESERVE: Duration = Duration::from_secs(3);
 
 /// Whether a role observation failed only because an owner's answer was
 /// lost or late, so that asking again may succeed.
@@ -189,36 +196,12 @@ impl ClaimedCommandExecutor {
                 "cleanup handle cannot execute runtime roles",
             ));
         }
-        let started = tokio::time::Instant::now();
-        let mut backoff = ADMISSION_BACKOFF_START;
-        let mut attempts: u32 = 0;
-        let execution = loop {
-            attempts += 1;
-            let admitted = {
-                let guard = self.commands.lock().await;
-                match guard.as_ref() {
-                    Some(commands) => commands.execution(role).await,
-                    None => Err(unavailable()),
-                }
-            };
-            match admitted {
-                Ok(execution) => break execution,
-                Err(error) if transient_owner_error(&error) => {
-                    if started.elapsed() >= EXEC_ADMISSION_TIMEOUT {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            format!(
-                                "process owner didn't answer for {}s ({attempts} attempts): {error}",
-                                EXEC_ADMISSION_TIMEOUT.as_secs()
-                            ),
-                        ));
-                    }
-                }
-                Err(error) => return Err(error),
-            }
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(ADMISSION_BACKOFF_LIMIT);
-        };
+        let (guard, execution) = self
+            .ask_patiently(EXEC_ADMISSION_TIMEOUT, |commands| {
+                Box::pin(commands.execution(role))
+            })
+            .await?;
+        drop(guard);
         // Keep the socket future in this caller, so cancellation reaches the owner.
         execution.execute(command).await
     }
@@ -234,12 +217,50 @@ impl ClaimedCommandExecutor {
     }
 
     /// Fence normal handles and return a cleanup handle after positive command draining.
+    ///
+    /// The seal first checks every role with its owner, and each ask has a
+    /// short deadline. A busy owner that answers late is asked again, as
+    /// exec admission does (#2320), until [`DRAIN_RESERVE`] before `timeout`
+    /// runs out; the drain gets what's left. Each ask takes the adapter
+    /// mutex afresh. If no answer comes in time, or one comes too late to
+    /// leave the drain its reserve, the seal returns `TimedOut` with the
+    /// claim as it was, so the caller can seal again. Any other refusal,
+    /// like an owner that died while its workload runs, is the seal's own:
+    /// it fences admission and fails at once, leaving the claim for recovery.
+    ///
+    /// The asking and the drain stay inside `timeout`. Persisting the fence
+    /// before the drain is a durable write that no deadline bounds, so a
+    /// slow disk can still push a seal past it.
     pub async fn seal(&self, timeout: Duration) -> io::Result<Self> {
-        let mut guard = self.commands.clone().lock_owned().await;
+        let started = tokio::time::Instant::now();
+        let deadline = started + timeout;
+        let asking = timeout.saturating_sub(DRAIN_RESERVE);
+        // Dropping this mid-attempt is safe: an attempt's observations are
+        // idempotent, and dropping it releases the mutex or its place in
+        // the queue for it.
+        let answered = tokio::time::timeout_at(
+            started + asking,
+            self.ask_patiently(asking, |commands| {
+                Box::pin(async move {
+                    match commands.validate_roles().await {
+                        Err(error) if transient_owner_error(&error) => Err(error),
+                        // The seal checks the roles again and reports this itself.
+                        _ => Ok(()),
+                    }
+                })
+            }),
+        )
+        .await
+        .map_err(|_| seal_unanswered(asking))?;
+        let (mut guard, ()) = answered?;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining < DRAIN_RESERVE {
+            return Err(seal_unanswered(asking));
+        }
         let commands = self.commands.clone();
         tokio::spawn(async move {
             let current = guard.take().ok_or_else(unavailable)?;
-            *guard = Some(current.seal(timeout).await?);
+            *guard = Some(current.seal(remaining).await?);
             Ok(Self {
                 commands,
                 cleanup: true,
@@ -247,6 +268,46 @@ impl ClaimedCommandExecutor {
         })
         .await
         .map_err(io::Error::other)?
+    }
+
+    /// Ask the claim through `ask`, and ask again while the owner's answer
+    /// is lost or late, for up to `bound`. Each attempt takes the adapter
+    /// mutex and drops it before pausing, so other callers get in between
+    /// two asks. Returns the answer with the mutex of the attempt that got
+    /// it, still held. Any other error returns at once.
+    async fn ask_patiently<T>(
+        &self,
+        bound: Duration,
+        ask: impl Fn(&IntentCommands) -> BoxFuture<'_, io::Result<T>>,
+    ) -> io::Result<(OwnedMutexGuard<Option<IntentCommands>>, T)> {
+        let started = tokio::time::Instant::now();
+        let mut backoff = ADMISSION_BACKOFF_START;
+        let mut attempts: u32 = 0;
+        loop {
+            attempts += 1;
+            let guard = self.commands.clone().lock_owned().await;
+            let answer = match guard.as_ref() {
+                Some(commands) => ask(commands).await,
+                None => Err(unavailable()),
+            };
+            match answer {
+                Ok(value) => return Ok((guard, value)),
+                Err(error) if transient_owner_error(&error) => {
+                    if started.elapsed() >= bound {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "process owner didn't answer for {bound:?} ({attempts} attempts): {error}"
+                            ),
+                        ));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+            drop(guard);
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(ADMISSION_BACKOFF_LIMIT);
+        }
     }
 
     /// Save a network reference without cancellation releasing the generation claim.
@@ -346,6 +407,16 @@ impl RuntimeCommandExecutor for ClaimedCommandExecutor {
         .await
         .map_err(io::Error::other)?
     }
+}
+
+/// A seal that got no answer in time to drain; it leaves the claim intact.
+fn seal_unanswered(asking: Duration) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "process owner didn't answer within {asking:?} with time left to drain; the claim is kept, seal again"
+        ),
+    )
 }
 
 fn unavailable() -> io::Error {
