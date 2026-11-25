@@ -1726,3 +1726,161 @@ async fn concurrent_forgets_of_retired_generations_all_succeed() {
         .collect();
     assert!(kept.is_empty(), "{kept:?}");
 }
+
+/// The values a launch gets that must not outlive it: one a secret provider
+/// resolved and one decrypted from `ENC[...]`.
+const PROVIDER_VALUE: &str = "provider-value-7f3a";
+const DECRYPTED_VALUE: &str = "decrypted-value-91c2";
+
+/// The spec the runtime gets: `spec(script)` with the resolved values.
+fn resolved_spec(script: &str) -> OciSpec {
+    let mut spec = spec(script);
+    spec.process.env = vec![
+        format!("DB_PASSWORD={PROVIDER_VALUE}"),
+        format!("API_KEY={DECRYPTED_VALUE}"),
+    ];
+    spec
+}
+
+/// The adoption record Bun keeps for that launch: the provider's variable
+/// as its reference, the decrypted value as it was launched (#2334).
+fn adoption_record(id: &InstanceId, script: &str) -> reliaburger::grill::records::InstanceRecord {
+    use reliaburger::grill::records;
+    let mut oci_spec = spec(script);
+    oci_spec.process.env = vec![
+        "DB_PASSWORD=PROVIDER[script:db#password]".into(),
+        format!("API_KEY={DECRYPTED_VALUE}"),
+    ];
+    oci_spec.process.provider_env = vec!["DB_PASSWORD".into()];
+    records::InstanceRecord {
+        schema: records::RECORD_SCHEMA,
+        instance_id: id.0.clone(),
+        namespace: "default".into(),
+        app_name: "secrets".into(),
+        replica_index: 0,
+        image: String::new(),
+        runtime: records::RuntimeKind::Process,
+        pid: 1,
+        pid_started_at: 0,
+        boot_id: records::current_boot(),
+        runc_container_id: None,
+        log_stem: None,
+        host_port: None,
+        app_spec: None,
+        oci_spec,
+        rootless_network: None,
+    }
+}
+
+/// The owner record on disk, as text, and its mode.
+fn owner_file(directory: &Path, id: &InstanceId) -> (String, u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = directory
+        .join("process-owners")
+        .join(&id.0)
+        .join("owner.json");
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    (std::fs::read_to_string(path).unwrap(), mode)
+}
+
+fn assert_values_gone(raw: &str) {
+    for value in [PROVIDER_VALUE, DECRYPTED_VALUE] {
+        assert!(
+            !raw.contains(value),
+            "retired owner record kept {value}: {raw}"
+        );
+    }
+    for name in ["DB_PASSWORD", "API_KEY"] {
+        assert!(
+            raw.contains(name),
+            "retired owner record lost {name}: {raw}"
+        );
+    }
+}
+
+/// A launch that exited keeps only its variable names, and a restarted Bun
+/// still reads its outcome and adopts nothing from it, as before.
+#[tokio::test]
+async fn a_retired_launch_keeps_only_the_names_of_its_environment() {
+    let directory = tempfile::tempdir().unwrap();
+    let id = InstanceId("default__secrets-0".into());
+    // The values reach the workload by its environment, never its command.
+    let script = "echo \"$DB_PASSWORD $API_KEY\"; exit 23".to_string();
+    let first = runtime(directory.path());
+    first.create(&id, &resolved_spec(&script)).await.unwrap();
+    first.start(&id).await.unwrap();
+    stopped(&first, &id).await;
+    assert_eq!(first.exit_code(&id).await.unwrap(), Some(23));
+    let (raw, mode) = owner_file(directory.path(), &id);
+    assert_values_gone(&raw);
+    assert_eq!(mode, 0o600);
+    drop(first);
+
+    let recovered = runtime(directory.path());
+    assert_eq!(recovered.state(&id).await.unwrap(), ContainerState::Stopped);
+    assert_eq!(recovered.exit_code(&id).await.unwrap(), Some(23));
+    assert_eq!(
+        recovered.logs(&id).await.unwrap().trim(),
+        format!("{PROVIDER_VALUE} {DECRYPTED_VALUE}")
+    );
+    let inventory = recovered.launch_inventory().await.unwrap().unwrap();
+    assert_eq!(
+        inventory[0].spec,
+        resolved_spec(&script).without_environment_values()
+    );
+    assert!(
+        !recovered
+            .adopt(&id, &adoption_record(&id, &script))
+            .await
+            .unwrap()
+    );
+    // Another request is still refused, retired or not.
+    assert!(
+        recovered
+            .adopt(&id, &adoption_record(&id, "exit 0"))
+            .await
+            .is_err()
+    );
+}
+
+/// A running launch keeps its values, since an exec inherits them, and
+/// adopts as before; once it is killed, its record keeps only the names.
+#[tokio::test]
+async fn a_live_launch_keeps_its_environment_until_it_retires() {
+    let directory = tempfile::tempdir().unwrap();
+    let id = InstanceId("default__secrets-0".into());
+    let first = runtime(directory.path());
+    first.create(&id, &resolved_spec("sleep 30")).await.unwrap();
+    first.start(&id).await.unwrap();
+    let (raw, _) = owner_file(directory.path(), &id);
+    assert!(raw.contains(PROVIDER_VALUE) && raw.contains(DECRYPTED_VALUE));
+    drop(first);
+
+    let recovered = runtime(directory.path());
+    let adopted = recovered
+        .adopt(&id, &adoption_record(&id, "sleep 30"))
+        .await;
+    let exec = recovered
+        .exec(
+            &id,
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo \"$DB_PASSWORD\"".into(),
+            ],
+        )
+        .await;
+    recovered.kill(&id).await.unwrap();
+    stopped(&recovered, &id).await;
+    assert!(adopted.unwrap());
+    assert_eq!(exec.unwrap().output.trim(), PROVIDER_VALUE);
+    let (raw, mode) = owner_file(directory.path(), &id);
+    assert_values_gone(&raw);
+    assert_eq!(mode, 0o600);
+    assert!(
+        !runtime(directory.path())
+            .adopt(&id, &adoption_record(&id, "sleep 30"))
+            .await
+            .unwrap()
+    );
+}
