@@ -6,6 +6,10 @@ on:
   workflow_dispatch:
   pull_request:
     branches: [main, "codex/**"]
+    # A draft, or a 0-4-0/ branch, builds nothing (24 November 2026):
+    # ready_for_review starts the builds, and converted_to_draft cancels a
+    # build still going.
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
 
 # PR updates supersede earlier checks. Main/candidate runs retain their own group.
 # Fixed prefixes also keep reusable source CI separate from its release caller.
@@ -23,7 +27,8 @@ jobs:
     # or packaging inputs change, and the guest images only when their build
     # script or pins change; main builds the whole matrix. The profiling
     # build runs on pushes and manual runs, and on a pull request only when
-    # this workflow changes.
+    # this workflow changes. A draft pull request, or one from a 0-4-0/
+    # branch, builds nothing, like ci.yml's heavy jobs.
     name: select builds
     runs-on: ubuntu-24.04
     outputs:
@@ -40,6 +45,8 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          DRAFT: ${{ github.event.pull_request.draft == true }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
           all='[{"target":"aarch64-unknown-linux-gnu","suffix":"linux-aarch64","runner":"ubuntu-22.04-arm","arguments":"--features ebpf --bin bun --bin relish"},{"target":"x86_64-unknown-linux-gnu","suffix":"linux-x86_64","runner":"ubuntu-22.04","arguments":"--features ebpf --bin bun --bin relish"},{"target":"aarch64-apple-darwin","suffix":"macos-aarch64","runner":"macos-15","arguments":"--bin relish"}]'
           if [ "$EVENT" != pull_request ]; then
@@ -52,13 +59,17 @@ jobs:
             grep -qE '^scripts/release/(build_guest_image\.sh|guest-images\.json)$|^\.github/workflows/build\.yml$' <<<"$changed" && guest_images=true
             grep -qE '^\.github/workflows/build\.yml$' <<<"$changed" && profiling=true
             matrix=$(jq -c '[.[] | select(.suffix == "linux-x86_64")]' <<<"$all")
+            if [ "$DRAFT" = true ] || [[ "$HEAD_REF" == 0-4-0/* ]]; then
+              echo "a draft or 0-4-0/ pull request builds nothing"
+              pdf=false binaries=false guest_images=false profiling=false
+            fi
           fi
           { echo "pdf=$pdf"; echo "binaries=$binaries"; echo "matrix=$matrix"; echo "guest_images=$guest_images"; echo "profiling=$profiling"; } >>"$GITHUB_OUTPUT"
           echo "pdf=$pdf binaries=$binaries guest_images=$guest_images profiling=$profiling"
 
   ci-evidence:
     # A candidate's commit has normally passed ci.yml already, on the push to
-    # main (#1363). If a push, merge-queue or nightly run on exactly this
+    # main (#1363). If a push or nightly run on exactly this
     # commit passed every job, ignored-test evidence included, on its first
     # attempt (a run re-run until it went green doesn't count, #1436), the
     # build reuses it instead of running the suite again, saving about an hour,

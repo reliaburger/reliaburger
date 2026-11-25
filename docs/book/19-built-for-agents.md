@@ -1822,6 +1822,65 @@ desired apps answer 503 for a second or two, and a node can miss its three
 seconds; the next look usually works, and the last error goes in the
 report if it doesn't.
 
+That rule had a hole the train's review found (#2302). "An old node answers
+404" was true of an old node asked directly, but `relish upgrade` does the
+leader last, so for most of a rolling upgrade a 0.3.3 follower forwards the
+rollouts read to a 0.3.2 leader. The leader answered 404, and
+`read_from_leader` turned every failure into a 503. `observe` treated only a
+404 as "no rollouts read", so every look failed and the wait timed out after
+five minutes with nothing to show. The fix has two halves. The follower now
+passes the leader's 404 on, with an error saying the leader may run an older
+release, so relish sees through the follower what it would see asking the
+old node itself. The spec read (#1322) had grown a sibling of
+`read_from_leader` for the same reason, which returns `Found(T)` or
+`Missing(body)` instead of folding a 404 into its error, and the rollouts
+handler uses it. And `observe` stopped trusting any one status: a rollouts
+read that fails for any reason is no rollouts read, never a failed look.
+
+That left the second half of the same bug: with no rollouts read, an image
+update looked ready at once, because the old version's instances run every
+replica. The image is the one part of an update the instances report, so
+with no read the wait counts only the instances on the applied image. A node
+reports `nginx:1.27@sha256:…` when apply bound the tag to a digest, which
+still names the tag, but pinning can also replace the tag outright
+(`nginx@sha256:…`), and then which tag it was is lost. So the comparison
+answers in three ways, not two:
+
+```rust
+fn runs_image(applied: &str, running: &str) -> Option<bool> {
+```
+
+`Some(true)`, `Some(false)` or `None` for "can't tell". `on_applied_image`
+keeps an app's instances on the applied image, and gives up the moment one
+can't be told, with `?` on an `Option` inside a loop:
+
+```rust
+for row in own {
+    if runs_image(applied, row.instance.image.as_deref()?)? {
+        current.push(*row);
+    }
+}
+```
+
+In a function that returns `Option`, `?` on a `None` returns `None` from
+the whole function, as it returns the error from one that returns `Result`.
+So an instance with no reported image, or one that can't be compared, ends
+the filtering, and the wait falls back to counting every running replica, as
+it does for a process workload with no image at all. That fallback can say
+ready early, so it's never silent: `wait_until_ready` takes a second
+callback that hears a note, or a warning when it fell back, once per wait:
+
+```rust
+match rollouts_notice(targets, &observation) {
+    Some(told @ RolloutsNotice::ByImage(_)) if !noted => {
+```
+
+`told @ pattern` binds the whole value to `told` when it matches the
+pattern, so the arm can hand the notice on without rebuilding it, and the
+`if` guard means the arm matches only the first time. The note goes to
+stderr in every output format: an agent reading the JSON on stdout still
+gets told that `ready` rests on the image alone.
+
 `--wait` is a flag, not `--wait 5m` as the issue suggested. A flag with an
 optional value would read `relish apply --wait app.toml` as a wait of
 "app.toml", so the duration went into its own `--timeout`, which clap makes
@@ -2652,10 +2711,15 @@ runs against whatever this build carries:
   paths were relative to `src/`, which made every path an agent quoted subtly
   wrong.
 - `the_digest_is_the_tarballs`: the recorded digest matches the bytes.
-- `the_bundle_stays_under_six_megabytes_at_release_level`: a debug build
+- `the_bundle_stays_under_seven_megabytes_at_release_level`: a debug build
   compresses at level 3, so the test compresses the tarball at 19 itself and
   checks what a release would embed. The failure message says what to do: drop
-  something from the list, or raise the ceiling on purpose.
+  something from the list, or raise the ceiling on purpose. The ceiling was
+  6 MiB until 0.3.3, when the tree had grown to 6.22 MB and the release's
+  queued pull requests together took it to 6.33 MB. Each passed alone; only
+  the merge queue, testing them together, crossed the line. The biggest single
+  addition was a fuzz corpus, 67 KB compressed, and the fuzz tests read it, so
+  it stays: we raised the ceiling to 7 MiB on purpose instead.
 
 The second kind packs a small tree in a temporary directory, so the result is
 known exactly: two packs of the same files give the same digest and the same
@@ -6892,8 +6956,10 @@ the lock file and returns every other error. Change that match guard to
 `true`, so every error is ignored, and `file_lock::`'s tests still pass.
 Nothing checks that a real failure to remove the file gets reported.
 
-So a pull request that touches `src/`, into `main` or into a release's merge
-train, now gets a mutants job, and the job
+So a mutants job now runs every night on the newest release train,
+mutating what changed under `src/` that day. It ran on every pull request at
+first, until the runners it held made the train's own CI queue behind it.
+The job
 summary lists each mutant its tests missed, with a link that opens a
 pre-filled `missed-mutant` issue. A person files it. The job never does, for
 the same reason `relish agent report` only drafts: nothing posts to GitHub on
@@ -6903,16 +6969,16 @@ The cost shaped most of the design. The crate has about 27,000 mutants, and
 each one rebuilds the crate before its tests run, so a whole-crate run is a
 thousand runner-hours. Four limits keep it affordable:
 
-- **Only the change.** `--in-diff` mutates only the lines a pull request
-  touches, and the weekly run takes only the week's changes on `main`.
-- **A budget.** At most 12 mutants a pull request, as one round-robin shard
+- **Only the change.** `--in-diff` mutates only the lines that changed,
+  and each night's run takes only that day's changes on the newest train.
+- **A budget.** At most 60 mutants a night, as one round-robin shard
   of the list, so the sample spreads over every file instead of using up the
   budget on the first one.
 - **Only the nearby tests.** A mutant in `src/council/network.rs` runs
   `council::`'s unit tests, not the whole suite. A mutant that only an
   integration test catches then shows as missed, and the summary says so.
-- **A clock.** The test step stops itself after 60 minutes and reports what
-  it finished, so a slow run still produces a summary.
+- **A clock.** The test step stops itself after 300 minutes and reports
+  what it finished, so a slow run still produces a summary.
 
 The clock came from the first CI run, which had only the count. Each mutant
 took seven and a half minutes to build, the job hit its 90-minute limit

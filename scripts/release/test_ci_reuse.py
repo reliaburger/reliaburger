@@ -86,10 +86,15 @@ class DecideTests(unittest.TestCase):
     def test_a_green_run_on_the_commit_skips_the_suite(self):
         self.assertEqual(self.decide([run()]), (1, []))
 
-    def test_merge_queue_and_nightly_runs_count(self):
-        for event in ("merge_group", "schedule"):
-            with self.subTest(event=event):
-                self.assertEqual(self.decide([run(event=event)])[0], 1)
+    def test_nightly_runs_count(self):
+        self.assertEqual(self.decide([run(event="schedule")])[0], 1)
+
+    def test_a_merge_queue_run_never_stands_in_for_a_candidate(self):
+        # The queue doesn't run portable macOS (24 November 2026), so a
+        # candidate can't rest on it, even one whose jobs all claim success.
+        self.assertNotIn("merge_group", FULL_EVENTS)
+        run_id, reasons = self.decide([run(event="merge_group")])
+        self.assertIsNone(run_id)
 
     def test_a_failed_cancelled_or_skipped_required_job_runs_the_suite(self):
         for conclusion in ("failure", "cancelled", "skipped", "timed_out", None):
@@ -361,6 +366,29 @@ class MainTests(unittest.TestCase):
         self.assertEqual(self.main(clock.runs_for, clock=clock, extra=["--event", "merge_group"])[1],
                          "reuse=false\nci_run=\nci_run_attempt=\n")
         self.assertEqual(clock.calls, 1)
+
+    def test_a_train_push_reuses_a_queue_run_that_skipped_only_portable_macos(self):
+        # select-jobs.sh leaves portable macOS out of every merge group; the
+        # nightly on the newest train runs it (macos-nightly.yml).
+        for conclusion in ("skipped", "success"):
+            with self.subTest(conclusion=conclusion):
+                self.assertEqual(self.main(lambda repository, commit: [run(7, event="merge_group")],
+                                           jobs_for=lambda repository, run_id: with_job("portable macOS",
+                                                                                         conclusion),
+                                           extra=["--event", "merge_group"])[1],
+                                 "reuse=true\nci_run=7\nci_run_attempt=1\n")
+        for conclusion in ("failure", "cancelled"):
+            with self.subTest(conclusion=conclusion):
+                self.assertEqual(self.main(lambda repository, commit: [run(7, event="merge_group")],
+                                           jobs_for=lambda repository, run_id: with_job("portable macOS",
+                                                                                         conclusion),
+                                           extra=["--event", "merge_group"])[1],
+                                 "reuse=false\nci_run=\nci_run_attempt=\n")
+
+    def test_a_candidate_never_reuses_a_run_that_skipped_portable_macos(self):
+        self.assertEqual(self.main(lambda repository, commit: [run(7, event="push")],
+                                   jobs_for=lambda repository, run_id: with_job("portable macOS", "skipped"))[1],
+                         "reuse=false\nci_run=\nci_run_attempt=\n")
 
     def test_a_queue_run_that_skipped_a_job_leaves_the_push_to_run_everything(self):
         # A documentation-only group selects no code jobs (select-jobs.sh).

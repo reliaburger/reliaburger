@@ -1850,12 +1850,10 @@ fn dry_run_rejects_a_misspelt_cohort_key() {
         .unwrap();
     };
     let dry_run = || {
-        std::process::Command::new(env!("CARGO_BIN_EXE_relish"))
+        crate::isolated_relish::relish_command(&dir.path().join("home"))
             .args(["batch", "submit"])
             .arg(&manifest)
             .arg("--dry-run")
-            .env_remove("RELIABURGER_TOKEN")
-            .env_remove("RELIABURGER_CA_CERT")
             .output()
             .unwrap()
     };

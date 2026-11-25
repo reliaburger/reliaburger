@@ -1,0 +1,9 @@
+{
+  "cohort": [
+    {
+     "count": 100,
+      "name": "thuObnails",
+      "template": {
+        "exec": "/bin/true",
+     "namespace": "media"
+}

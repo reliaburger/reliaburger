@@ -1,0 +1,29 @@
+---
+source: src/appliance/console/view.rs
+expression: console(&state)
+---
+ Reliaburger OS 2026.47.228 | node-1 | cluster home                 bun running
+  1 Status   2 Metrics   3 Workloads  [4 Cluster]  5 Versions   6 Logs
+┌ 4 Cluster ───────────────────────────────────────────────────────────────────┐
+│Gossip     3 members: 2 alive, 0 suspect, 1 dead                              │
+│           1,204 updates received, last change 10 m ago                       │
+│Raft       leader node-1, term 4, quorum ok (2 of 3 voters answer)            │
+│                                                                              │
+│NODE                ROLE          TERM   APPLIED       LOG     LAG            │
+│node-1              leader           4      1350      1350       0            │
+│node-2              follower         4      1349      1350       1            │
+│node-3              unreachable: gossip reports it dead                       │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+ 1-6 or <- -> tabs   up/down scroll   read-only: no login here     15:06:40 UTC

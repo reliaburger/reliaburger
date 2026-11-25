@@ -25,6 +25,8 @@ struct Node {
 
 impl Node {
     async fn start(config: &Path, log: &Path) -> Self {
+        // Workload host ports outside the lease range (#2261).
+        bun_process::use_test_workload_ports(config);
         let offset = std::fs::metadata(log).map_or(0, |metadata| metadata.len()) as usize;
         let output = std::fs::OpenOptions::new()
             .create(true)

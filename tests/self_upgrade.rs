@@ -47,8 +47,9 @@ struct RealNodeHarness {
     release_pkcs8: Vec<u8>,
     external_pkcs8: Vec<u8>,
     deployed_apps: Vec<(String, String)>,
-    /// The fixed ports every exec and respawn rebinds, leased for the test.
-    _held_ports: Vec<bun_process::PortBlockReservation>,
+    /// The fixed ports every exec and respawn rebinds, and every workload's
+    /// port, leased for the test.
+    held_ports: Vec<bun_process::PortBlockReservation>,
 }
 
 impl RealNodeHarness {
@@ -140,6 +141,8 @@ retain_versions = 3
                 ports.base, ports.base + 1, ports.base + 2).unwrap();
             held_ports.push(ports);
         }
+        // Workload host ports outside the lease range (#2261).
+        bun_process::use_test_workload_ports(&config_path);
 
         // The supervisor: spawn the symlink, respawn on exit. On a
         // successful upgrade the exec keeps the pid, so wait() simply keeps
@@ -192,7 +195,7 @@ retain_versions = 3
             release_pkcs8,
             external_pkcs8,
             deployed_apps: Vec::new(),
-            _held_ports: held_ports,
+            held_ports,
         };
         harness.wait_healthy().await;
         harness
@@ -269,8 +272,17 @@ retain_versions = 3
         .await;
     }
 
-    /// Deploy a testapp instance serving HTTP on `port`.
-    async fn deploy_testapp(&mut self, app: &str, port: u16) {
+    /// Deploy a testapp instance serving HTTP on a port leased for the
+    /// harness's lifetime, and return the port.
+    ///
+    /// The port comes from the lease range rather than a fixed number. Fixed
+    /// ports 46011–46071 sat inside Linux's ephemeral range (32768–60999),
+    /// where any outgoing connection or `bind(0)` on the host could hold one
+    /// when the workload bound it (#2261).
+    async fn deploy_testapp(&mut self, app: &str) -> u16 {
+        let reservation = bun_process::reserve_port_block_lease(1);
+        let port = reservation.base;
+        self.held_ports.push(reservation);
         let config = format!(
             r#"
 [app.{app}]
@@ -300,21 +312,13 @@ command = ["--mode", "healthy", "--port", "{port}"]
                 .is_ok()
         })
         .await;
+        port
     }
 
-    /// The pid of an app's first instance, from /v1/status.
-    async fn workload_pid(&self, app: &str) -> Option<u32> {
-        let response = self.client.get(self.url("/v1/status")).send().await.ok()?;
-        let statuses: serde_json::Value = response.json().await.ok()?;
-        statuses
-            .as_array()?
-            .iter()
-            .find_map(|instance| {
-                (instance["app_name"] == app)
-                    .then(|| instance["pid"].as_u64())
-                    .flatten()
-            })
-            .map(|pid| pid as u32)
+    /// The pid of an app's first instance, from /v1/status, waiting up to
+    /// `WAIT` for one; see [`wait_for_workload_pid`].
+    async fn workload_pid(&self, app: &str) -> u32 {
+        wait_for_workload_pid(&self.client, &self.url("/v1/status"), app, WAIT).await
     }
 
     /// Build a signed directive for the staged file `bin/bun-{version}`.
@@ -505,6 +509,117 @@ where
     }
 }
 
+/// The pid of `app`'s first instance that reports one in the `/v1/status`
+/// body `body`, if any.
+fn instance_pid(body: &str, app: &str) -> Option<u32> {
+    let statuses: serde_json::Value = serde_json::from_str(body).ok()?;
+    statuses.as_array()?.iter().find_map(|instance| {
+        (instance["app_name"] == app)
+            .then(|| instance["pid"].as_u64())
+            .flatten()
+            .and_then(|pid| u32::try_from(pid).ok())
+    })
+}
+
+/// Read `status_url` until `app` reports a pid, and return it.
+///
+/// A status read can come back with the instance but no pid: when the
+/// runtime doesn't answer within the status reader's deadline, the instance
+/// shows `pid: null` and `runtime_unknown: true` (#2236). That's "not known
+/// yet", not "no process", so this keeps asking. It fails after `timeout`
+/// with the last body it read, so a failure shows what the node reported
+/// (#2261).
+async fn wait_for_workload_pid(
+    client: &reqwest::Client,
+    status_url: &str,
+    app: &str,
+    timeout: Duration,
+) -> u32 {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut last_body = String::from("(no answer)");
+    loop {
+        let body = match client.get(status_url).send().await {
+            Ok(response) => response.text().await.ok(),
+            Err(_) => None,
+        };
+        if let Some(body) = body {
+            if let Some(pid) = instance_pid(&body, app) {
+                return pid;
+            }
+            last_body = body;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{app} reported no pid within {timeout:?}; last /v1/status body: {last_body}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Serve each body in `bodies` as one HTTP response, in order, repeating the
+/// last, and return the server's address.
+async fn serve_status_bodies(bodies: Vec<&'static str>) -> std::net::SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // An in-process stand-in for Bun's API that nothing rebinds, so an
+    // ephemeral port is fine here.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        for index in 0.. {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let body = bodies[index.min(bodies.len() - 1)];
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    address
+}
+
+const RUNTIME_UNKNOWN_STATUS: &str =
+    r#"[{"app_name":"web","id":"default__web-0","pid":null,"runtime_unknown":true}]"#;
+
+/// A status read that misses the runtime's answer reports the instance with
+/// no pid and `runtime_unknown`. The harness used to take that as "no pid"
+/// and fail the test at once; it now asks again.
+#[tokio::test]
+async fn workload_pid_waits_out_a_runtime_unknown_status() {
+    let address = serve_status_bodies(vec![
+        RUNTIME_UNKNOWN_STATUS,
+        RUNTIME_UNKNOWN_STATUS,
+        r#"[{"app_name":"web","id":"default__web-0","pid":4242,"runtime_unknown":false}]"#,
+    ])
+    .await;
+    let pid = wait_for_workload_pid(
+        &reqwest::Client::new(),
+        &format!("http://{address}/v1/status"),
+        "web",
+        WAIT,
+    )
+    .await;
+    assert_eq!(pid, 4242);
+}
+
+/// When the pid never comes, the failure shows the last status body.
+#[tokio::test]
+#[should_panic(expected = "runtime_unknown\":true")]
+async fn workload_pid_prints_the_status_body_when_it_gives_up() {
+    let address = serve_status_bodies(vec![RUNTIME_UNKNOWN_STATUS]).await;
+    wait_for_workload_pid(
+        &reqwest::Client::new(),
+        &format!("http://{address}/v1/status"),
+        "web",
+        Duration::from_millis(500),
+    )
+    .await;
+}
+
 // Each test runs a full node (or several processes) on this machine;
 // running them concurrently starves each other of CPU and flakes the
 // timing-sensitive waits. One at a time.
@@ -525,10 +640,10 @@ async fn single_node_upgrade_preserves_running_containers() {
     let mut harness = RealNodeHarness::start().await;
     assert_eq!(harness.version().await.as_deref(), Some("v0.1.0"));
 
-    harness.deploy_testapp("web", 46011).await;
+    harness.deploy_testapp("web").await;
     // Preserve an actual canary generation across exec, then replace it again.
-    harness.deploy_testapp("web", 46012).await;
-    let pid_before = harness.workload_pid("web").await.expect("workload pid");
+    let canary_port = harness.deploy_testapp("web").await;
+    let pid_before = harness.workload_pid("web").await;
 
     let directive = harness.directive("v0.2.0", "up-1");
     assert_eq!(harness.post_upgrade(&directive).await, 202);
@@ -537,12 +652,12 @@ async fn single_node_upgrade_preserves_running_containers() {
     harness.wait_upgrade_settled().await;
 
     // The workload sailed through the exec: same pid, still serving.
-    let pid_after = harness.workload_pid("web").await.expect("workload pid");
+    let pid_after = harness.workload_pid("web").await;
     assert_eq!(
         pid_before, pid_after,
         "workload was restarted by the upgrade"
     );
-    let response = reqwest::get("http://127.0.0.1:46012/").await;
+    let response = reqwest::get(format!("http://127.0.0.1:{canary_port}/")).await;
     assert!(
         response.is_ok(),
         "workload stopped serving after the upgrade"
@@ -553,7 +668,7 @@ async fn single_node_upgrade_preserves_running_containers() {
     assert_eq!(target, Path::new("bun-v0.2.0"));
     assert!(!harness.data_dir.join("upgrade/marker.json").exists());
 
-    harness.deploy_testapp("web", 46013).await;
+    harness.deploy_testapp("web").await;
     let status: serde_json::Value = harness
         .client
         .get(harness.url("/v1/status"))
@@ -573,7 +688,7 @@ async fn single_node_upgrade_preserves_running_containers() {
         web["id"], "default__web-g2-0",
         "replacement reused an adopted generation: {status}"
     );
-    assert_ne!(harness.workload_pid("web").await, Some(pid_after));
+    assert_ne!(harness.workload_pid("web").await, pid_after);
     harness.shutdown().await;
 }
 
@@ -586,8 +701,8 @@ async fn single_node_rollback_reverts_to_previous_version() {
     );
     let _serial = SERIAL.lock().await;
     let mut harness = RealNodeHarness::start().await;
-    harness.deploy_testapp("web", 46021).await;
-    let pid_before = harness.workload_pid("web").await.expect("workload pid");
+    harness.deploy_testapp("web").await;
+    let pid_before = harness.workload_pid("web").await;
 
     // Upgrade to v0.2.0 first, then roll back.
     let directive = harness.directive("v0.2.0", "up-1");
@@ -602,7 +717,7 @@ async fn single_node_rollback_reverts_to_previous_version() {
     let target = std::fs::read_link(harness.bin_dir.join("bun")).unwrap();
     assert_eq!(target, Path::new("bun-v0.1.0"));
     // The workload survived BOTH swaps.
-    let pid_after = harness.workload_pid("web").await.expect("workload pid");
+    let pid_after = harness.workload_pid("web").await;
     assert_eq!(pid_before, pid_after);
 
     harness.shutdown().await;
@@ -617,8 +732,8 @@ async fn failed_upgrade_triggers_automatic_rollback() {
     );
     let _serial = SERIAL.lock().await;
     let mut harness = RealNodeHarness::start().await;
-    harness.deploy_testapp("web", 46031).await;
-    let pid_before = harness.workload_pid("web").await.expect("workload pid");
+    harness.deploy_testapp("web").await;
+    let pid_before = harness.workload_pid("web").await;
 
     // Poison v0.2.0: it exits right after startup recovery, burning boot
     // attempts until the crash-loop revert kicks in.
@@ -656,7 +771,7 @@ async fn failed_upgrade_triggers_automatic_rollback() {
 
     // The workload never noticed: it was reparented during the crash loop
     // and adopted back by the reverted binary.
-    let pid_after = harness.workload_pid("web").await.expect("workload pid");
+    let pid_after = harness.workload_pid("web").await;
     assert_eq!(
         pid_before, pid_after,
         "workload was restarted by the failed upgrade"
@@ -798,8 +913,8 @@ async fn isolated_replacement_reverts_without_restarting_its_workload() {
     assert!(upgrade_tests_enabled());
     let _serial = SERIAL.lock().await;
     let mut harness = RealNodeHarness::start_with_cluster(true).await;
-    harness.deploy_testapp("rejoin", 46071).await;
-    let pid = harness.workload_pid("rejoin").await.unwrap();
+    harness.deploy_testapp("rejoin").await;
+    let pid = harness.workload_pid("rejoin").await;
     assert_eq!(
         harness
             .post_upgrade(&harness.directive("v0.2.0", "no-rejoin"))
@@ -815,7 +930,7 @@ async fn isolated_replacement_reverts_without_restarting_its_workload() {
     );
     harness.wait_for_version("v0.1.0").await;
     harness.wait_upgrade_settled().await;
-    assert_eq!(harness.workload_pid("rejoin").await, Some(pid));
+    assert_eq!(harness.workload_pid("rejoin").await, pid);
     assert_eq!(
         std::fs::read_link(harness.bin_dir.join("bun")).unwrap(),
         Path::new("bun-v0.1.0")

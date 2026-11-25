@@ -111,7 +111,7 @@ pub fn create_token(
     // The service principal name is not a real user token; a user token minted
     // with this name would match `SYSTEM_PRINCIPAL` in the auth layer and
     // bypass every scope/role confinement. Refuse it at the source.
-    if name == super::auth::SYSTEM_PRINCIPAL {
+    if super::auth::is_reserved_name(name) {
         return Err(TokenError::ReservedName(name.to_string()));
     }
 
@@ -453,6 +453,29 @@ pub fn derive_service_token(ikm: &[u8; 32]) -> Result<String, TokenError> {
     Ok(format!("rbrg_{}", hex::encode(bytes)))
 }
 
+/// Fixed HKDF salt for the appliance console's token.
+const CONSOLE_TOKEN_SALT: [u8; 32] = *b"reliaburger-console-token-salt!!";
+
+/// Derive the appliance console's read-only token from the cluster's
+/// service token (#2150).
+///
+/// The console on a node's screen has no login, so it can't hold a token a
+/// person made. Instead it derives this one from the master key it can read
+/// as root, by way of the service token, and every node derives the same
+/// value, so the console's cross-node reads (`relish wtf`'s) work too. The
+/// derivation is one-way: holding the console token gives nothing towards
+/// the service token. The auth layer accepts it as [`super::auth::CONSOLE_PRINCIPAL`],
+/// which is read-only and can't be raised.
+pub fn derive_console_token(service_token: &str) -> Result<String, TokenError> {
+    let bytes = super::crypto::hkdf_derive_key(
+        service_token.as_bytes(),
+        &CONSOLE_TOKEN_SALT,
+        "reliaburger-console-token-v1",
+    )
+    .map_err(|e| TokenError::GenerationFailed(e.to_string()))?;
+    Ok(format!("rbrg_{}", hex::encode(bytes)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,6 +515,28 @@ mod tests {
             None,
         );
         assert!(matches!(result, Err(TokenError::ReservedName(_))));
+    }
+
+    #[test]
+    fn create_token_rejects_the_reserved_console_name() {
+        let result = create_token(
+            super::super::auth::CONSOLE_PRINCIPAL,
+            ApiRole::ReadOnly,
+            TokenScope::default(),
+            None,
+        );
+        assert!(matches!(result, Err(TokenError::ReservedName(_))));
+    }
+
+    #[test]
+    fn the_console_token_is_derived_from_the_service_token_and_differs_from_it() {
+        let service = derive_service_token(&[5u8; 32]).unwrap();
+        let console = derive_console_token(&service).unwrap();
+        assert_eq!(console, derive_console_token(&service).unwrap());
+        assert_ne!(console, service);
+        assert!(looks_like_token(&console));
+        let other = derive_service_token(&[6u8; 32]).unwrap();
+        assert_ne!(console, derive_console_token(&other).unwrap());
     }
 
     #[test]

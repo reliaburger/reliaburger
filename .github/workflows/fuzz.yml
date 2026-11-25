@@ -2,51 +2,21 @@ name: Fuzz
 
 # Every decoder that reads bytes from another machine has a cargo-fuzz target
 # (fuzz/, bodies in src/fuzz/, #1398). Nightly, each one runs for five
-# minutes. A pull request that touches a decoder runs each for 30 seconds.
-# Any crash fails the job and its input is kept as an artefact. A nightly
-# crash gets an issue the same day, like a flake (docs/flakes.md), and
-# becomes a unit test before it's fixed (docs/testing.md, "Fuzzing").
+# minutes; a run by hand takes any budget. Pull requests don't run it
+# (maintainer decision of 24 November 2026): the job took 14 to 33 minutes of
+# a starved runner pool, and the release gate doesn't use it. Any crash fails
+# the job and its input is kept as an artefact. A nightly crash gets an issue
+# the same day, like a flake (docs/flakes.md), and becomes a unit test before
+# it's fixed (docs/testing.md, "Fuzzing").
 #
 # It is its own workflow, like flakes.yml: cargo-fuzz needs nightly Rust,
 # which nothing in ci.yml uses, and the evidence gate there waits on every
 # job it holds. The stable half (every target over its checked-in corpus)
-# already runs in ci.yml's portable suite.
+# runs in ci.yml's portable suite, on every pull request.
 
 on:
   schedule:
     - cron: "29 2 * * *"
-  pull_request:
-    branches: [main, "codex/**", "fix/**", "release-*"]
-    # The decoders the targets drive, and the fuzzing set-up itself. Only
-    # the files that hold a decoder: a dependency bump, a Makefile change or
-    # the rest of src/config waits for the nightly, since the job takes 14
-    # to 33 minutes (#1442).
-    paths:
-      - src/fuzz/**
-      - fuzz/**
-      - src/mustard/message.rs
-      - src/council/network.rs
-      - src/council/backup.rs
-      - src/onion/dns.rs
-      - src/pickle/api.rs
-      - src/grill/oci_pull.rs
-      - src/sesame/ca.rs
-      - src/config/mod.rs
-      - src/config/node.rs
-      - src/bun/task_array_api.rs
-      - src/meat/task_array_store.rs
-      - src/smoker/types.rs
-      - src/smoker/scenario.rs
-      - src/council/types.rs
-      - src/sesame/auth.rs
-      - src/sesame/oidc.rs
-      - src/sesame/token.rs
-      - src/wrapper/proxy.rs
-      - src/wrapper/routing.rs
-      - src/relish/netboot/tftp.rs
-      - src/relish/netboot/dhcp.rs
-      - src/relish/netboot/wipe.rs
-      - .github/workflows/fuzz.yml
   workflow_dispatch:
     inputs:
       seconds:
@@ -57,8 +27,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: fuzz-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: fuzz-${{ github.run_id }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -99,14 +69,13 @@ jobs:
         with:
           tool: cargo-fuzz@0.13.2
       # The sanitizer build of the whole crate is most of the job. One key
-      # serves the nightly run and pull requests, and only the nightly (or a
-      # run by hand) saves it: a PR's saved cache counts against the 10 GB
-      # quota ci.yml keeps for main (#1442).
+      # serves the nightly run and runs by hand, and both save it.
       #
       # The key also names the coverage wrapper, since Cargo doesn't
       # fingerprint a RUSTC_WRAPPER. From 17 Nov 2026, main's nightly saved
-      # crates built through fuzz/rustc-coverage.sh, and pull requests into a
-      # train that didn't have the wrapper yet restored them. Each rebuilt
+      # crates built through fuzz/rustc-coverage.sh, and pull requests (which
+      # ran this then) into a train that didn't have the wrapper yet restored
+      # them. Each rebuilt
       # the whole crate (33 minutes instead of 11) and then took about 20
       # minutes per 30-second target, so every one hit the job's limit
       # (#2125).
@@ -115,7 +84,6 @@ jobs:
           workspaces: fuzz -> target
           shared-key: fuzz
           key: coverage-${{ hashFiles('fuzz/rustc-coverage.sh') }}
-          save-if: ${{ github.event_name != 'pull_request' }}
           cache-on-failure: true
           # reliaburger is a path dependency here, which rust-cache would
           # otherwise prune as a local crate; on a nightly with no new
@@ -126,7 +94,7 @@ jobs:
       # 16 GB runner is reclaimed mid-build (#1839).
       - name: Run each target
         env:
-          FUZZ_SECONDS: ${{ github.event_name == 'pull_request' && '30' || inputs.seconds || '300' }}
+          FUZZ_SECONDS: ${{ inputs.seconds || '300' }}
         run: make fuzz-smoke
       - name: Report executions and coverage per target
         if: always()

@@ -1560,6 +1560,32 @@ integration test had failed 21 times in 200 runs. With the fix it passed 300
 of 300, at loads up to 58, and the median run got quicker too, from 9.5 s to
 3.2 s in the first pair of loops.
 
+A review of the 0.3.3 train found the cap was the wrong unit
+([#2304](https://github.com/reliaburger/reliaburger/issues/2304)). `respond`
+gives each client 100 ms to send its request and 100 ms to take the answer, so
+32 slow clients could hold one turn for 6.4 s. All that time the owner isn't
+checking for cancellation, so a SIGKILL Bun asked for waits, and neither does
+it reap orphans or notice the workload exit. It's mostly theoretical, because
+a client that gives up closes its socket and `respond` returns at once, but
+a turn should be bounded by what it costs, not by how many clients it saw. So
+the loop now stops at whichever comes first, 32 clients or 250 ms:
+
+```rust
+let started = Instant::now();
+let mut served = 0;
+while served < CLIENTS_PER_TURN && started.elapsed() < TURN_BUDGET {
+```
+
+The check comes before each `accept`, so a client already being answered
+finishes; a turn ends within 250 ms plus one client's 200 ms. Clients left in
+the queue aren't dropped: the kernel holds them until the next turn, 10 ms
+later. And #2236's benefit stays, because a quick answer takes well under a
+millisecond: two new tests pin both sides. One queues 32 clients and serves
+each with a 100 ms sleep, and the turn must stop early, well short of 3.2 s,
+with the rest served next turn. The other serves 32 quick ones and they must
+all go in one turn. `Instant` is `std::time::Instant`, a monotonic clock, so
+a wall-clock jump can't stretch or cut a turn.
+
 ### Kill the shell before its children
 
 Both fallbacks above answered "why did the signal fail?". The next macOS

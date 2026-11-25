@@ -517,3 +517,77 @@ async fn a_job_manifest_skips_an_owned_app() {
     assert!(configs[0].app.is_empty(), "{:?}", configs[0].app);
     assert!(configs[0].job.contains_key("migrate"));
 }
+
+impl Cluster {
+    async fn get(&self, uri: &str, bearer: &str) -> (StatusCode, String) {
+        let request = axum::http::Request::get(uri)
+            .header("authorization", format!("Bearer {bearer}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = self.app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
+/// #1322: a controller reads back the spec of the app it owns: its image,
+/// its resources and its owner, with every env value left out and named.
+#[tokio::test]
+async fn a_controller_reads_its_apps_spec_without_its_secrets() {
+    let cluster = cluster("spec-read").await;
+    let manifest = "[app.db]\nimage = 'postgres:17'\nnamespace = 'pg'\nowner = 'pg-failover'\n\
+                    memory = '512Mi'\n[app.db.env]\nPGPASSWORD = 'hunter2'\nPGDATA = '/data'\n";
+    let (status, body) = cluster
+        .call("/v1/apply", &cluster.controller, manifest)
+        .await;
+    assert!(body.contains("committed"), "{status}: {body}");
+
+    let (status, body) = cluster
+        .get("/v1/apps/db/pg/spec", &cluster.controller)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        !body.contains("hunter2") && !body.contains("/data"),
+        "{body}"
+    );
+    let view: crate::bun::spec_read::AppSpecView = serde_json::from_str(&body).unwrap();
+    assert_eq!((view.app.as_str(), view.namespace.as_str()), ("db", "pg"));
+    assert_eq!(view.owner.as_deref(), Some("pg-failover"));
+    assert_eq!(view.spec.image.as_deref(), Some("postgres:17"));
+    assert!(view.spec.memory.is_some());
+    assert_eq!(view.redacted, ["spec.env.PGDATA", "spec.env.PGPASSWORD"]);
+}
+
+/// #1322: the spec read keeps to the token's scope, and names an app the
+/// cluster doesn't have.
+#[tokio::test]
+async fn the_spec_read_keeps_to_the_tokens_scope() {
+    let cluster = cluster("spec-read-scope").await;
+    let (status, body) = cluster
+        .call(
+            "/v1/apply",
+            &cluster.admin,
+            "[namespace.shop]\n[app.web]\nimage = 'web:v1'\nnamespace = 'shop'\n",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = cluster
+        .get("/v1/apps/web/shop/spec", &cluster.controller)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(!body.contains("web:v1"), "{body}");
+
+    let (status, body) = cluster.get("/v1/apps/web/shop/spec", &cluster.human).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = cluster
+        .get("/v1/apps/db/pg/spec", &cluster.controller)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(
+        body.contains("no app \\\"db\\\" in namespace \\\"pg\\\""),
+        "{body}"
+    );
+}

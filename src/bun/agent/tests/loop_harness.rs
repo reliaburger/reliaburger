@@ -5406,8 +5406,15 @@ async fn a_later_launch_writes_its_own_record(earlier_fails: bool) {
         "{in_flight:?}"
     );
     // The instance leaves `Starting`; nothing collects the write, which
-    // lands on its own.
-    tokio::time::sleep(SLOW_RECORD_WRITE + std::time::Duration::from_millis(300)).await;
+    // lands on its own. A loaded host can take longer than the stall to run
+    // it, so wait for it to land rather than a fixed time (#1723).
+    let landed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while agent.record_write_in_flight(&id) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(landed.is_ok(), "the earlier launch's write never landed");
     agent.turn_deadline = None;
     agent.set_records_dir(records.clone());
     agent

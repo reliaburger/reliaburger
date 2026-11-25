@@ -1656,6 +1656,23 @@ enum OsAction {
     Resume,
     /// Stop the rollout; nodes keep the version they're on.
     Abort,
+    /// Where each appliance sends its kernel and boot logs over UDP, or
+    /// change it: with --to, to that machine from now on, where `relish
+    /// machines logs` or `relish netboot --stream-logs` shows them; with
+    /// --off, nowhere. The lines cross the LAN in cleartext. Each node keeps
+    /// the setting on its ESP, so it holds across reboots and OS updates.
+    BootLogs {
+        /// Send them to this machine: an IPv4 address, and a UDP port if
+        /// not 6666.
+        #[arg(long, value_name = "ADDRESS[:PORT]", conflicts_with = "off")]
+        to: Option<reliaburger::os::netlog::NetlogTarget>,
+        /// Stop sending them.
+        #[arg(long)]
+        off: bool,
+        /// Only this node (repeatable). Default: every node.
+        #[arg(long = "node", value_name = "NODE")]
+        nodes: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3708,6 +3725,14 @@ async fn main() -> ExitCode {
             OsAction::Status => reliaburger::relish::os::status(cli.output).await,
             OsAction::Resume => reliaburger::relish::os::resume(cli.output).await,
             OsAction::Abort => reliaburger::relish::os::abort(cli.output).await,
+            OsAction::BootLogs { to, off, nodes } => {
+                reliaburger::relish::os::boot_logs(
+                    reliaburger::relish::os::BootLogsRequest::from_flags(to, off),
+                    &nodes,
+                    cli.output,
+                )
+                .await
+            }
         },
         Command::JoinToken { action } => match &action {
             JoinTokenAction::List => commands::join_token_list(cli.output).await,
@@ -5038,6 +5063,40 @@ mod tests {
             list(&["relish", "os", "list", "--key", "lab.pem"]),
             Some(PathBuf::from("lab.pem"))
         );
+    }
+
+    #[test]
+    fn os_boot_logs_takes_a_target_or_off_but_not_both() {
+        let boot_logs = |args: &[&str]| match parse(args).unwrap().command {
+            Command::Os {
+                action: OsAction::BootLogs { to, off, nodes },
+            } => (to.map(|t| t.to_string()), off, nodes),
+            _ => panic!("not os boot-logs"),
+        };
+        assert_eq!(
+            boot_logs(&["relish", "os", "boot-logs"]),
+            (None, false, vec![])
+        );
+        assert_eq!(
+            boot_logs(&["relish", "os", "boot-logs", "--to", "10.42.0.1"]),
+            (Some("10.42.0.1:6666".to_string()), false, vec![])
+        );
+        assert_eq!(
+            boot_logs(&[
+                "relish",
+                "os",
+                "boot-logs",
+                "--off",
+                "--node",
+                "home-1",
+                "--node",
+                "home-2"
+            ]),
+            (None, true, vec!["home-1".to_string(), "home-2".to_string()])
+        );
+        assert!(parse(&["relish", "os", "boot-logs", "--to", "10.42.0.1", "--off"]).is_err());
+        assert!(parse(&["relish", "os", "boot-logs", "--to", "laptop.local"]).is_err());
+        assert!(parse(&["relish", "os", "boot-logs", "--to", "10.42.0.1:0"]).is_err());
     }
 
     #[test]

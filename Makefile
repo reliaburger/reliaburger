@@ -48,8 +48,12 @@ warm-executables: ## Build the suite and its binaries, then run each binary once
 # links `bun` and `testapp`, because it builds every binary for an integration
 # test, but none of their tests run. scripts/ci/test_macos_selection.py pins
 # this filterset, and scripts/ci/macos_selection.py keeps the evidence
-# manifest's portable-darwin cases inside it.
+# manifest's portable-darwin cases inside it. The lib tests build alone
+# first, as test-linux's do, so their 10 to 12 GB rustc never runs beside
+# the lib's on the 7 GB macos-15 runner, where one build took 21 to 93
+# minutes from the same cache (#1723).
 test-macos: ## Run relish's tests and the macOS-only tests (the macOS CI job; `test` runs everything)
+	$(CARGO) test --no-run --lib
 	$(CARGO) test --no-run --lib --bin relish --test suite --test runtime_selection
 	python3 scripts/ci/warm_executables.py
 	$(NEXTEST) --lib --bin relish --test suite --test runtime_selection -E 'binary_id(reliaburger::bin/relish) | (binary_id(reliaburger) & (test(/^relish::/) | test(/^grill::apple::/) | test(/^grill::records::tests::absolute_start_time/))) | (binary_id(reliaburger::suite) & (test(/^relish_/) | test(/^user_directories::macos_/))) | binary_id(reliaburger::runtime_selection)'
@@ -193,13 +197,16 @@ bench-task-arrays: ## Run in-process task-array benchmarks (leader cost, pool ov
 # listing leaves is deleted before the run. One report call writes the lcov
 # file and then checks the floor: each call merges every profile and reads
 # every binary's coverage map again, about two minutes on CI (plan
-# 2026-11-06, F3). scripts/ci/coverage_owner.py pins this recipe, so CI's
+# 2026-11-06, F3). The run takes eight test threads, twice a hosted runner's
+# four vCPUs: most tests wait on timers, sockets and child processes, and at
+# four the runner's load stayed at 2 to 5 (#1723). Heavy tests keep their
+# nextest test groups. scripts/ci/coverage_owner.py pins this recipe, so CI's
 # evidence owner runs exactly these stages.
 coverage: ## Run the portable suite once under line coverage, write the lcov report and enforce the floor
 	$(CARGO) llvm-cov clean --workspace
 	$(CARGO) llvm-cov --no-report test --lib -- --list
 	$(CARGO) llvm-cov clean --profraw-only
-	$(CARGO) llvm-cov --no-report nextest --profile $(NEXTEST_PROFILE) --no-tests=fail
+	$(CARGO) llvm-cov --no-report nextest --profile $(NEXTEST_PROFILE) --no-tests=fail --test-threads=8
 	mkdir -p target/coverage
 	$(COVERAGE_REPORT) --lcov --output-path target/coverage/lcov.info --fail-under-lines $(COVERAGE_MIN_LINES)
 

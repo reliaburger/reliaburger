@@ -1,0 +1,14 @@
+{
+  "manifests": [
+    {
+      "digest": "sha257:000000000000000000000n/vnd.o111111111111111",
+      "medi    e":"ap11",
+      "mediaType": {
+ 
+      },
+      "size": 400
+    }
+  ],
+  "mediYType": "applica.v1+json",
+  "schemaVersion": 2
+}

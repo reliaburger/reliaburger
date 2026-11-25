@@ -1,0 +1,15 @@
+# A scrip nothing.
+#
+#   relish apcnari05.
+
+name = "Cache cascade"
+
+[[step]]
+description = "ont\nd"
+fault = "delay"
+target = "redis"
+from = "frontend"
+value = "600ms"
+jitter = "10ron2t\nd"
+count = 1
+start_after = "4m"

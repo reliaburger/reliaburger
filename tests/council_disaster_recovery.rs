@@ -632,6 +632,7 @@ fn fence_data_dir(index: usize) -> std::path::PathBuf {
 /// One running node of the split-brain test: the real cluster runtime, as
 /// `bun --cluster` starts it, on a data directory that survives restarts.
 struct FenceNode {
+    data_dir: std::path::PathBuf,
     council: Arc<reliaburger::council::node::CouncilNode>,
     shutdown: CancellationToken,
     _handle: reliaburger::bun::agent::ClusterHandle,
@@ -680,6 +681,7 @@ impl FenceNode {
                     let mut snapshot_rx = std::mem::replace(&mut handle.snapshot_rx, unused_rx);
                     tokio::spawn(async move { while snapshot_rx.recv().await.is_some() {} });
                     return Self {
+                        data_dir: fence_data_dir(index),
                         council,
                         shutdown,
                         _handle: handle,
@@ -707,12 +709,52 @@ impl FenceNode {
             .collect()
     }
 
+    /// Stop the node and return once its Raft stores are free to open, as
+    /// an offline `relish council recover` or the next start would open
+    /// them. The node's sockets need no wait: `start` retries its binds.
     async fn stop(self) {
         self.shutdown.cancel();
         let _ = self.council.shutdown().await;
+        let data_dir = self.data_dir.clone();
         drop(self);
-        // Let the cancelled tasks release the redb files and sockets.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        wait_for_raft_stores_released(&data_dir).await;
+    }
+}
+
+/// How long a stopped node's cancelled tasks may keep its redb files open.
+/// Generous, because a loaded host can keep them running for seconds
+/// (#2312); a healthy one releases them in milliseconds.
+const STORE_RELEASE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Wait until no task still holds the Raft log or snapshot store under
+/// `data_dir`, by opening each one. A cancelled node's tasks wind down in
+/// the background, and redb refuses a second open while one of them holds a
+/// store, so a fixed sleep raced them on a loaded host (#2312).
+async fn wait_for_raft_stores_released(data_dir: &std::path::Path) {
+    let deadline = Instant::now() + STORE_RELEASE_DEADLINE;
+    for name in ["log.redb", "snapshot.redb"] {
+        let path = data_dir.join("raft").join(name);
+        loop {
+            let probe = path.clone();
+            let held = tokio::task::spawn_blocking(move || {
+                probe.exists()
+                    && matches!(
+                        redb::Database::open(&probe),
+                        Err(redb::DatabaseError::DatabaseAlreadyOpen)
+                    )
+            })
+            .await
+            .unwrap();
+            if !held {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{} was still open {STORE_RELEASE_DEADLINE:?} after its node stopped",
+                path.display()
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
     }
 }
 
@@ -1129,6 +1171,39 @@ async fn recovering_two_survivors_independently_fences_one() {
     for index in 6..9 {
         let _ = std::fs::remove_dir_all(fence_data_dir(index));
     }
+}
+
+/// #2312: `FenceNode::stop` returns only once a task that still holds a
+/// stopped node's Raft store has let it go, however long that takes, so
+/// the offline open that follows never finds it locked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
+async fn stop_waits_for_a_lingering_task_to_release_the_raft_store() {
+    assert!(
+        cluster_tests_enabled(),
+        "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("raft")).unwrap();
+    let log = dir.path().join("raft").join("log.redb");
+    let held = redb::Database::create(&log).unwrap();
+    // Longer than the fixed 500 ms the harness used to sleep.
+    let hold_for = Duration::from_secs(2);
+    let started = Instant::now();
+    let lingering = tokio::spawn(async move {
+        tokio::time::sleep(hold_for).await;
+        drop(held);
+    });
+
+    wait_for_raft_stores_released(dir.path()).await;
+
+    assert!(
+        started.elapsed() >= hold_for,
+        "returned after {:?}, while a task still held the store",
+        started.elapsed()
+    );
+    lingering.await.unwrap();
+    redb::Database::open(&log).expect("the released store opens");
 }
 
 /// #694: a restarted old voter used to serve Raft five seconds after its

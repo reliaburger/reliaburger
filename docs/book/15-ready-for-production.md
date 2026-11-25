@@ -1382,6 +1382,58 @@ Portable macOS, 52 to 57 minutes with a warm cache, still sets the length of eve
 group. And the queue builds up to eight groups at once, 160 jobs, a setting in the
 repository ruleset that only the maintainer can change.
 
+Should it be one? We'd meant to find out by queueing a compatible pair of PRs and a
+conflicting pair on purpose. The 0.3.3 train did it for us on 24 November, 27 times, so we
+read the answer back from the API instead of spending runners on a staged one. The first
+surprise was that a "group" is never a group. Every one of the 53 merge-group commits on
+the last two trains has, as its first parent, the head of the entry ahead of it: each PR is
+built alone, stacked on the one in front. The ruleset's `max_entries_to_merge` of 8 only
+lets several entries that have all passed land in one push. Builds don't combine.
+
+That makes concurrency a question of waiting, not of cost. Each entry is built once
+whatever the setting, so the queue's runner-minutes stay the same; only a failure makes it
+rebuild the entries behind. At eight groups, a group's jobs waited a median 633
+job-minutes for a runner and ran for 276, and the slowest took the whole 240-minute
+timeout. At one, an uncontended group takes 70 to 80 minutes, so the queue would land under
+one PR an hour against the 2.25 an hour that arrived. Little's law, the number in flight
+equals the arrival rate times the time each one spends, puts the answer near three.
+
+The second surprise was the conflicts. Four PRs that day edited the same rows of
+`docs/flakes.md` or `CHANGELOG.md` as a PR queued ahead of them. The queue spotted each one
+at once and marked it `UNMERGEABLE`, built the entries behind it past it, and said nothing
+until the PR reached the head, between one and a half and two and a half hours later, when
+it dropped it. All four merged cleanly onto the train, so checking against the train would
+have missed every one. `queue_conflicts.py` checks against the queue's tip instead, with
+`git merge-tree`, and walks back to the entry that brought the conflict in:
+
+```python
+def find_blocker(head, train_tip, ahead, conflicts):
+    bases = [(None, train_tip)]
+    bases += [(entry["pullRequest"]["number"], entry["headCommit"]["oid"])
+              for entry in ahead if entry.get("headCommit")]
+    tip_paths = conflicts(bases[-1][1], head)
+    if not tip_paths:
+        return None
+    for number, base in bases[:-1]:
+        paths = conflicts(base, head)
+        if paths:
+            return number, paths
+    return bases[-1][0], tip_paths
+```
+
+`bases[-1]` is Python's last element, and the list comprehension skips the entries the
+queue never built, which have no head commit. One merge decides the common case, a clean
+PR; only a conflict pays for the walk. Replayed on the day's four, it names #2249, #2234,
+#2234 and #2253, the PRs each one had collided with.
+
+Why not make the conflicts go away with `merge=union` in `.gitattributes`, which keeps both
+sides' lines? We tried it on the same pairs with `git merge-file --union`. One of them,
+#2234 against #2249, carried the same flake row on both sides, "Open" on one and "Fixed" on
+the other, and union kept both. On the changelog, a bullet appended to one subsection while
+another PR added a new subsection after it landed under the wrong heading. A conflict a
+person resolves in a minute beats a register that lies quietly. The settings went to the
+maintainer as a recommendation: three groups at once and a 360-minute timeout.
+
 That left portable Linux, which builds the crate for 13 of its 25 to 31 minutes, one
 compile at a time. Every train PR waits for it. Did the build really have to be that slow?
 The problem was never parallelism as such. It was two particular rustc processes running at
@@ -1446,6 +1498,212 @@ from 85 minutes back to 62. What should the first runs be watched for? The watch
 runner. The lib still compiles alone, since everything after it links it, so any of those
 would mean the targets built after it, four at a time with the suite among them, hold more
 than we think.
+
+The runners answered within a day. Over 80 train runs from 21 to 24 November, portable Linux
+took a median of 23.7 minutes, 20.4 to 30.2, with no memory stop and no lost runner. That's
+two minutes over the estimate's median, and the job's own resource log says where they went:
+about 2 minutes of setup, 7.5 of build (3.5 of them the lib tests alone, at a load of about
+1.3, because a single rustc type-checking one crate is mostly one thread), 8.5 running the
+suite and 3 writing the coverage report. The suite is the next lever for the light path, and
+[Eight threads on four cores](#eight-threads-on-four-cores) below pulls it.
+
+Portable macOS was the bigger target. It sets the length of every merge-queue group, and
+over 83 runs on the 0.3.2 and 0.3.3 trains it took a median of 58.4 minutes, anywhere from
+32 to 103. Its tests take under two minutes of that. The lint before them, which
+type-checks the same crate, takes about two. The rest was one line of `make test-macos`:
+
+```make
+$(CARGO) test --no-run --lib --bin relish --test suite --test runtime_selection
+```
+
+That one compile took 21 minutes in one run and 93 in another, for the same build from the
+same full cache hit. A build whose time swings by a factor of four with nothing changed
+isn't short of CPU. It's short of memory. The `macos-15` runner has three cores and 7 GB,
+and the line above compiles the lib tests (10 to 12 GB of rustc on Linux) beside the lib
+(about 7 GB): #1943's mechanism, on a host with less than half the memory. The fix was
+already in the Makefile twice, so `test-macos` got it too:
+
+```make
+test-macos:
+	$(CARGO) test --no-run --lib
+	$(CARGO) test --no-run --lib --bin relish --test suite --test runtime_selection
+```
+
+The second line rebuilds nothing the first built: same flags, same profile, so Cargo finds
+the lib tests' binary fresh and compiles the lib, the binaries and the two integration
+tests. `test_make_prebuilds.py` pins the order, as it does for the other two recipes.
+
+The job had no way to say whether a slow build paged, so it got a watcher too:
+`scripts/ci/watch-macos-memory` writes one line every 15 seconds with the load, free memory,
+swap in use, swap-outs so far and the biggest process. Linux's watcher reads `/proc`, which
+macOS doesn't have, so this one asks `sysctl`, `memory_pressure`, `vm_stat` and `ps`, each
+looked up on `PATH` so the tests can stand in fakes for them. It never stops anything. Its
+job is to leave evidence, and its tests check that a missing tool leaves a field empty
+rather than ending the log.
+
+The first two runs after the split took 34.8 and 46.5 minutes, against the 58.4 median: 24:55
+and 33:35 for the lib tests, 4:43 and 6:43 for the rest, under two for the tests. Better, and
+still a wide spread. The first run's log shows why the lib tests are slow on their own. Free
+memory fell from 78% to 35% in the first six minutes, swap started two minutes later and grew
+for sixteen more, and by the time the binary linked about 4.6 GB had gone out to swap. One rustc of the lib
+tests is more than this runner holds. Splitting `relish` into its own crate, so macOS
+compiles only what it tests, is still the real fix.
+
+#### Eight threads on four cores
+
+Once the build was quick, the suite was the biggest piece of portable Linux left: about 8.5
+of its 24 minutes. nextest runs one test per CPU by default, four on a hosted runner, and
+keeps all four slots busy. Yet the runner's load sat between 2 and 5. Why would a full
+queue leave cores idle? Because a lot of the suite isn't computing. It's a test waiting out a
+stop grace, a health check's interval or a proxy's 30-second timeout, holding a slot while
+the CPU does nothing. More slots than cores fills those gaps.
+
+The risk is the other way round. Every test that does burn CPU now shares a core with more
+neighbours, and a suite this full of deadlines is exactly where a busier host turns into
+flakes. So the number had to be measured, not guessed. We ran the whole portable suite under
+coverage, with CI's toolchain and flags, in a Lima VM cut to a runner's size: 4 vCPUs and
+16 GB, with swap. Ten full runs at four threads and ten at eight, alternating, so that
+whatever else the Mac Studio was doing landed on both. Every failure counted, and nothing
+was re-run.
+
+Eight threads took the suite from a median of 469 seconds to 294, 37% less, and even then
+the VM's CPUs were idle 44 to 58% of the time. Two of the ten runs at four threads failed
+one test each; four of the ten at eight failed, five failures in all. Four distinct tests,
+and none was a bug in Reliaburger. Every one was a test that asked too early or measured too
+tightly:
+
+- A rollout reports complete once its replacements run, but an old instance whose cleanup
+  outlasts the agent loop's turn stays listed, stopped, until a later turn retires it. The
+  test read the list once.
+- A test left a record write in flight with a 1.5-second stall, slept 1.8 seconds and
+  expected it to have landed. On a busy host the write's blocking task starts late.
+- Status answers from a snapshot the loop publishes at the end of each turn, so right after
+  a failed apply it can still say `preparing`.
+- Two stubborn stops that overlap should cost one 2-second grace, not two. The test allowed
+  1.8 graces and saw 3.65 and 3.86 seconds. But serial stops can't take less than two graces,
+  since each waits out its whole grace before the kill, so two graces is the bound that
+  proves the overlap, and it leaves the slack a loaded host needs.
+
+The first three now wait for the state they check, with a deadline, instead of reading it
+once or sleeping a fixed time. The fourth asserts what it means. The second reproduced on
+the Mac Studio too, 3 failures in 120 runs at a load of 22, and passed 240 of 240 after.
+With all four fixed, ten more runs at eight threads passed, every one, at a median of 238
+seconds; the host was quieter by then, so that number flatters eight a little. Two runs at
+twelve took 191 and 212 seconds. That's tempting, but two runs prove nothing about flakes,
+so twelve waits for its own ten.
+
+What does that buy on a runner? At four threads the suite was about 8.5 of portable Linux's
+24 minutes. If CI scales the way the VM did, eight threads make that about 5.4, and the job
+about 20.5 minutes. Closer to the 19, still not there; the pull request's own runs are the
+real measurement.
+
+Where does the number live? Not in the environment. The evidence owners strip every
+`NEXTEST_*` variable before they run anything, deliberately, so that nobody can change what a
+gate ran by setting one. A `NEXTEST_TEST_THREADS` in the workflow would be thrown away, and
+it should be. The setting goes in the recipe the owner already pins:
+
+```make
+	$(CARGO) llvm-cov --no-report nextest --profile $(NEXTEST_PROFILE) --no-tests=fail --test-threads=8
+```
+
+`coverage_owner.py` holds that line, the stage list and the exact command line
+cargo-llvm-cov generates for nextest, which puts `--test-threads=8` straight after
+`--no-tests=fail`. The adapter compares the child's arguments with that list before it lets
+the run start, so a run at sixteen threads, or at the default, is refused as a different
+selection. Changing the number is a reviewed change to the recipe and the owner together,
+and it should come with flake runs like these.
+
+Why only here? The thread count is a property of this job's runner and this suite. The
+`ci` profile in `.config/nextest.toml` is shared by the privileged Linux and cluster jobs,
+whose tests start real clusters, and they keep the default. So does portable macOS, whose
+tests take under two minutes on three cores. The heavy groups (`process-heavy`,
+`cluster-heavy` and the rest) still cap their members inside the eight.
+
+### macOS leaves the queue
+
+Splitting its build didn't get portable macOS out of the queue's way. On 24 November, with the 0.3.3
+train filling up, portable macOS took 50 minutes in a good merge-group run and over two hours
+in a bad one, much of it waiting for one of the five macOS runners the plan allows. It was
+cancelled or failed three times that day. Each time the queue dropped the group, re-formed
+everything behind it and started every job again. One PR's CI waited more than three hours
+for a runner at all.
+
+The fix is to ask the queue a smaller question. What must every commit on a train prove before
+it lands? That it builds, lints, and passes every Linux suite, portable and privileged, cluster
+and acceptance, because that's where Bun runs and where almost every change lives. What must a
+*release* prove? Everything, macOS included. Those don't have to be answered at the same
+moment.
+
+So `select-jobs.sh` now answers `macos=false` for every merge group:
+
+```bash
+if [ "${EVENT}" = merge_group ]; then
+    if [ "$code" = false ]; then
+        emit false false false false false false
+    else
+        emit true true true true false true
+    fi
+    exit 0
+fi
+```
+
+The fifth argument is `macos`. That one `false` isn't enough on its own, because three other
+places assumed the queue ran everything, and each had to learn the new rule without getting
+weaker anywhere else:
+
+- The evidence aggregator calls a heavy selection without macOS `train-full`. It used to
+  accept that only from a `pull_request` event. Now a `merge_group` may qualify with
+  `train-full` too, but never with the light set, and a push or a manual run still has to show
+  every owner.
+- `every_job.py` needed nothing: a job that select jobs skipped already counts as skipped, not
+  failed.
+- `ci_reuse.py` has two callers with different needs. The train push asks, with `--event
+  merge_group`, whether the queue already tested its commit. There a skipped `portable macOS`
+  is fine, or every train push would run all twenty jobs again. The candidate build asks
+  whether it can skip running `ci.yml` itself. There it isn't fine, so a merge-queue run no
+  longer counts for a candidate at all.
+
+Where does macOS run now? A new workflow, `macos-nightly.yml`, runs the same three commands as
+the CI job (`make lint-macos`, `make test-macos` and relish's doctests) every night on the
+newest `release-*` train with work `main` doesn't have. It picks the branch the way the nightly
+mutation run does:
+
+```bash
+train=$(git branch -r --list 'origin/release-*' | sed 's/^ *//' | sort -V | tail -n 1)
+if [ -n "$train" ] && [ -n "$(git rev-list -1 origin/main.."$train")" ]; then
+  ref=$train
+fi
+```
+
+`sort -V` sorts version numbers numerically, so `release-1-3-10` comes after `release-1-3-9`.
+Why a separate workflow and not a second `schedule` in `ci.yml`? GitHub runs every scheduled
+workflow from the default branch, at `main`'s commit, so `ci.yml`'s nightly tests `main`. A
+nightly that tests a train has to check the train out itself, and doing that inside `ci.yml`
+would have put a "which commit am I testing?" question into every job's evidence binding. A
+test in `tests/suite/toolchain_pins.rs` holds the two workflows to the same Rust, nextest,
+runner and commands, so the nightly can't drift from what the CI job would have run.
+
+The release keeps all of it. The gate PR, once labelled `release-gate`, runs portable macOS,
+and its evidence gate refuses it without. Merging it pushes to `main`, which runs everything.
+The candidate build rests only on a push or nightly run in which `portable macOS` passed, or
+runs `ci.yml` itself. What we gave up is a day: a macOS break can now sit on a train until the
+nightly finds it, instead of being refused at the door.
+
+What didn't we do? We didn't make the macOS job `continue-on-error` in the queue: it would
+still take a runner for an hour and still set each group's length, only without counting. We
+didn't shard it again: three shards each compiled the whole crate, which is why it became one
+job. And we kept the macOS-code rule for pull requests. A PR that changes the Apple runtime, a
+file with a `target_os = "macos"` cfg or the installers still runs portable macOS itself, where
+its author is watching.
+
+Two smaller changes went in the same day. A draft pull request, or one from a `0-4-0/` branch
+(work for a release whose train isn't open yet), now runs only select jobs, CI policy and lint,
+whatever its labels say. A new `lint` output carries "there's code to lint" on its own, since
+`code=true` would start every Linux suite. `ready_for_review` starts the full run, and
+`converted_to_draft` starts a cheap one which, being in the PR's concurrency group, cancels
+the expensive run still going. `appliance.yml` and `build.yml` follow the same rule. And the
+cargo-fuzz job no longer runs on pull requests. Its 14 to 33 minutes now run only nightly and
+by hand, while the portable suite still feeds every target its checked-in corpus on each PR.
 
 ### A release gate that fits in a week
 
@@ -3944,6 +4202,39 @@ test/Bun process outside it, confirms the total-memory target, clears the
 fault, then drops the controller and proves a restarted owner removes the
 stale cgroup. On macOS, rootless Linux or a cgroup hierarchy without both
 controllers, capability evidence says `Unavailable`. Honest again.
+
+Honest, but for a while not *current*. The Wyse lab in 0.3.2 refused the
+chaos suite on all three nodes with `node_pressure (unavailable)`, although
+every node ran rootful with both ceilings at 80% (#2242). A cgroup only offers
+the controllers its parent switched on in the parent's
+`cgroup.subtree_control`, and systemd switches cpu and memory on at the root
+lazily, when a unit or container first asks. Bun started first, found an empty
+`cgroup.controllers` in `reliaburger-chaos`, and recorded `false` once, at
+startup. Nothing asked again, and nothing said why. Restarting Bun after the
+containers were up "fixed" it, which is the kind of fix you don't want an
+operator to need.
+
+So preparation stopped being a startup event. `ensure_controllers` makes the
+cgroup ready and is cheap to repeat: two reads when it's already right, and
+it writes only the controllers that are missing, so it never touches a control
+a live helper relies on. If the parent offers cpu and memory but hasn't
+delegated them, it enables them there itself, which is what runc does for every
+container's ancestors anyway. `NodePressureController::apply` calls it (on the
+blocking pool, through the public `probe`) before each fault, and so does
+`/v1/capabilities` before it reports `node_pressure`. The startup result is
+now only a fallback for a report built without a fresh probe. Startup keeps the
+one job that must happen once: sweeping `fault-*` cgroups a crashed Bun left
+behind. A probe can't sweep, because a sweep would kill a running helper.
+
+The failure now says what's missing, in the capability's details and in the
+refusal: `cgroup v2 cpu controller is unavailable: /sys/fs/cgroup doesn't offer
+it`. The tests drive `ensure_controllers` against a fake hierarchy in a
+temporary directory: one starts with nothing delegated, fails, gains the
+controllers and then succeeds with `+cpu +memory` written; another checks that
+the parent's `cgroup.subtree_control` gets the delegation; a third proves a
+ready cgroup isn't rewritten. Because the function is plain `std::fs`, it's
+compiled for tests on macOS too (`#[cfg(any(target_os = "linux", test))]`), so
+the logic is checked on every laptop and not only under `make test-linux`.
 
 ## Chaos with a safety catch
 
@@ -10232,6 +10523,50 @@ refusal (the VM never booted then), and leaves a slow Bun to I6. The lesson isn'
 repeating every time you write an invariant: make it fail on purpose at least
 once, or you don't know what it checks.
 
+### And a check that fails when nothing's wrong
+
+Then the opposite happened. Nineteen runs and 968 cuts later, a handful of
+runs had stopped on a violation, and we went through every one. None had
+lost an acknowledged write. Every one was the checker or the environment:
+
+- **A start that hadn't happened yet.** "Settled" means every instance is
+  running. The Redis client still has to reach Redis before it can push its
+  start onto `soak:starts`, and the harness read the list a few seconds after
+  settling. Usually the client was a few `INCR`s ahead; three times it
+  wasn't, and the cut was "no new start". Now the harness polls both records
+  for up to 60 s before it says so.
+- **A start in the wrong window.** In one run, unattended-upgrades upgraded
+  libc in the guest during the work period and needrestart restarted Bun. The
+  writer started again between two cuts and resumed past the *previous* cut's
+  `ACK`, but the checker held it to this cut's, which came later. Now the
+  harness counts each record's starts just before the power-off: a start
+  before that is held to the previous `ACK`, a start after it to this one.
+  And the guest's automatic updates are masked, because cutting power
+  mid-dpkg can break the guest in ways that aren't ours to answer for.
+- **Somebody else's port.** Lima couldn't forward the API port because a
+  cargo test binary on the same host held it: the harness's ports sat in the
+  test suites' range. They now live in 31000–32767, above every port a test
+  takes and below the first ephemeral port Linux hands out. Why not 50000?
+  On a Mac that's inside the ephemeral range, where any outgoing connection
+  can grab it.
+
+- **Lima's own bad boot.** About one boot in 1,500, Lima 2.2.1's host agent
+  came up with its vsock SSH forwarder spinning on `accept: bad file
+  descriptor`. The guest and Bun were fine, but SSH was refused, the port
+  forwards never went in, and the agent wrote 9 GB of logs in five minutes.
+  The harness now spots that line in the start log within seconds, forces
+  the VM off and starts it again. It also records that forced stop as an
+  extra power cut, because the guest had booted, and caps both logs.
+
+One more: `--resume` carried a run on past a violation, powering the kept VM
+on and overwriting what we'd have diagnosed. It refuses now. And because
+the evidence of every old run was still on disk, `--rejudge` runs today's
+checker over it offline. Where the old evidence can't settle a cut, such as
+the last cut of a run whose late start nobody ever recorded, it says
+"undecided" rather than "pass". A checker that cries wolf is less dangerous
+than one that can't fail, but only just: after the third false alarm you
+stop reading the alarms.
+
 ## A thousand nodes that aren't there
 
 How big a cluster have we actually run? Three VMs. The whitepaper's 10,000-node
@@ -10864,6 +11199,31 @@ and the backup seed is sealed by hand with a fixed salt and nonce, under the
 key the target unseals with, so the target now gets past the GCM tag too.
 With nothing random left, the corpus test compares each checked-in seed's
 bytes, not just its name.
+
+### Keeping what the fuzzer found
+
+A run's new inputs land in `fuzz/target/corpus/`, which git ignores, so the
+next run on another machine starts from the seeds again. A Sunday run of all
+seventeen targets (95.6 million inputs, no crashes) left 100,811 of them,
+394 MB. Nobody wants that in a repository. So how much of it is worth keeping?
+
+libFuzzer answers part of that with a *merge*: hand it the checked-in corpus
+and the new one, and it copies over only the new files that reach something
+the old ones don't. Merged, the run still came to thousands of files, because
+libFuzzer counts more than edges. It also counts how often an edge ran,
+bucketed (once, twice, three times, four to seven...), so a config with one
+more list entry than the last one is "new". Merging with `-use_counters=0`
+counts edges alone, and `-set_cover_merge=1` picks a near-smallest set of
+files that covers them, rather than adding every small file that brings one
+edge.
+
+That still left 5,099 files and a long tail. `council_backup_state` needed
+1,250 files for every edge it found, and 438 for the first 80%. The last few
+edges each come from one odd input, and a fuzzer finds those again in
+minutes. So the harvest keeps the 50 files a target that add the most edges:
+839 files and 238 KB for all seventeen, reaching 73% of what the run found.
+They sit next to the named seeds under their SHA-1 names, and `make ci` runs
+every one.
 
 ## Did it happen in some order?
 

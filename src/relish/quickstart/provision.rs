@@ -39,7 +39,7 @@ pub fn vm_config(
         "networks":[{"lima":"user-v2"}],
         "portForwards":forwards,
         "provision":[{"mode":"system","script": format!(
-            "#!/bin/bash\nset -eu\nexport DEBIAN_FRONTEND=noninteractive\n{}{}{}{}",
+            "#!/bin/bash\nset -eu\nexport DEBIAN_FRONTEND=noninteractive\n{}{}{}{}{}",
             // Lima changes the user manager during first boot. Reconnect logind
             // after that transition so subsequent PAM sessions do not stall.
             // A graceful stop sometimes spins until systemd's 90 s stop
@@ -47,6 +47,7 @@ pub fn vm_config(
             "systemctl kill --signal=SIGKILL systemd-logind.service || true\n\
              systemctl restart systemd-logind.service\n",
             ONE_CLOCK_SOURCE,
+            NO_AUTOMATIC_UPDATES,
             install_missing_packages(&super::artifacts::guest_image_pins()?.packages)?,
             "install -d -m 700 /etc/reliaburger\n")
         }]
@@ -67,6 +68,25 @@ pub fn vm_config(
 const ONE_CLOCK_SOURCE: &str = "for service in chrony.service systemd-timesyncd.service; do\n  \
      if systemctl cat \"$service\" >/dev/null 2>&1; then\n    \
      systemctl disable --now \"$service\"\n  fi\ndone\n";
+
+/// Shell that stops Ubuntu updating and restarting services on its own.
+///
+/// Ubuntu's defaults run unattended-upgrades from `apt-daily-upgrade.timer`,
+/// and needrestart then restarts every service whose libraries changed. In a
+/// power-cut endurance run a libc upgrade restarted Bun mid-run (#2274): an
+/// unexplained API outage for a tester, and an apt run that a laptop sleep or
+/// hard stop could interrupt. The VM is disposable and rebuilt from the
+/// pinned image each release, so updates arrive with releases instead. The
+/// release image ships these masked; this covers stock images and VMs made
+/// from older image versions. Masking a unit that isn't installed still
+/// works; stopping one doesn't, hence `|| true`. needrestart, where present,
+/// only lists what it would restart.
+const NO_AUTOMATIC_UPDATES: &str = "systemctl mask apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service\n\
+     systemctl stop apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service || true\n\
+     if dpkg-query -W -f='${db:Status-Abbrev}\\n' needrestart 2>/dev/null | grep -q '^ii'; then\n  \
+     install -d -m 755 /etc/needrestart/conf.d\n  \
+     echo \"\\$nrconf{restart} = 'l';\" | tee /etc/needrestart/conf.d/50-reliaburger.conf >/dev/null\n\
+     fi\n";
 
 /// Shell that installs the node packages unless the image already has them.
 ///
@@ -273,11 +293,14 @@ mod tests {
         assert!(kill < restart, "{script}");
     }
 
-    /// What the generated provision script asked of `apt-get` and `systemctl`.
+    /// What the generated provision script asked of `apt-get` and
+    /// `systemctl`, and what it wrote through `tee`: the target path, then
+    /// each line written.
     #[cfg(unix)]
     struct Provisioned {
         apt: Vec<String>,
         systemctl: Vec<String>,
+        written: Vec<String>,
     }
 
     /// Run the generated provision script with stub system tools and
@@ -296,10 +319,12 @@ mod tests {
         let logs = tempfile::tempdir().unwrap();
         let apt_log = logs.path().join("apt.log");
         let systemctl_log = logs.path().join("systemctl.log");
+        let tee_log = logs.path().join("tee.log");
         let stubs = "dpkg-query() { for arg in \"$@\"; do case \"$arg\" in -*) ;; \"$MISSING\") ;; *) echo 'ii ' ;; esac; done; }\n\
                      apt-get() { echo \"$*\" >> \"$APT_LOG\"; }\n\
                      systemctl() { echo \"$*\" >> \"$SYSTEMCTL_LOG\"; }\n\
-                     install() { true; }\n";
+                     install() { true; }\n\
+                     tee() { echo \"$*\" >> \"$TEE_LOG\"; cat >> \"$TEE_LOG\"; }\n";
         let status = std::process::Command::new("bash")
             .arg("-c")
             .arg(format!("{stubs}{script}"))
@@ -307,6 +332,7 @@ mod tests {
             .env("MISSING", missing.unwrap_or(""))
             .env("APT_LOG", &apt_log)
             .env("SYSTEMCTL_LOG", &systemctl_log)
+            .env("TEE_LOG", &tee_log)
             .status()
             .unwrap();
         assert!(status.success());
@@ -318,6 +344,7 @@ mod tests {
         Provisioned {
             apt: lines(&apt_log),
             systemctl: lines(&systemctl_log),
+            written: lines(&tee_log),
         }
     }
 
@@ -360,6 +387,44 @@ mod tests {
                 "{service}: {calls:?}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provisioning_masks_automatic_updates_before_touching_apt() {
+        // unattended-upgrades upgraded libc in a quickstart guest and
+        // needrestart restarted Bun with it (#2274). The guest gets its
+        // updates from the next release's image instead.
+        let calls = run_provisioning(None).systemctl;
+        assert!(
+            calls.contains(
+                &"mask apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service"
+                    .to_string()
+            ),
+            "{calls:?}"
+        );
+        let yaml = vm_config("/private/cache/guest.qcow2", "aarch64", 19117, None, None).unwrap();
+        let mask = yaml.find("systemctl mask apt-daily.timer").unwrap();
+        assert!(mask < yaml.find("apt-get update").unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provisioning_sets_needrestart_to_list_only() {
+        let written = run_provisioning(None).written;
+        assert_eq!(
+            written,
+            vec![
+                "/etc/needrestart/conf.d/50-reliaburger.conf".to_string(),
+                "$nrconf{restart} = 'l';".to_string()
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provisioning_writes_no_needrestart_config_without_needrestart() {
+        assert!(run_provisioning(Some("needrestart")).written.is_empty());
     }
 
     #[test]

@@ -1,0 +1,6 @@
+# App with an init conuainer cef app!sarIfa }
+
+[[app.web.volumes]]
+path = 3
+threshoold_unhealthy = 3
+threshold_healthy = 1

@@ -1,0 +1,26 @@
+{
+  "config": {
+    "digest": "sha256:0000QQQQQQQ0000000",
+    "mediaType": "application/vnd.oci.age.config.v1+json",
+    "sonfig": {
+    "digest": "sha.config.v1+json",
+    "size": 2
+  },
+  "layers": [
+    {
+      "size": 32
+    }
+  ],
+  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "schemaVersionize": 2
+  },
+  "layers": [
+    {
+      "digest": "",
+					      "mediaType": "application/vnd.oci.image.layer.v0.tar+gzip",
+      "size": 32
+    }
+  ],
+  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "schemaVersion": 2
+}

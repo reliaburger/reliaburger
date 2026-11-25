@@ -20,7 +20,7 @@ coverage: ## Run the portable suite once under line coverage, write the lcov rep
 	$(CARGO) llvm-cov clean --workspace
 	$(CARGO) llvm-cov --no-report test --lib -- --list
 	$(CARGO) llvm-cov clean --profraw-only
-	$(CARGO) llvm-cov --no-report nextest --profile $(NEXTEST_PROFILE) --no-tests=fail
+	$(CARGO) llvm-cov --no-report nextest --profile $(NEXTEST_PROFILE) --no-tests=fail --test-threads=8
 	mkdir -p target/coverage
 	$(COVERAGE_REPORT) --lcov --output-path target/coverage/lcov.info --fail-under-lines $(COVERAGE_MIN_LINES)
 """
@@ -128,11 +128,16 @@ class Owner(unittest.TestCase):
                     '--target-dir',
                     target,
                     '--no-tests=fail',
+                    '--test-threads=8',
                     '--profile',
                     'ci',
                 ]
                 if self.mode == 'legacy-order':
-                    actual[-3:] = ['--profile', 'ci', '--no-tests=fail']
+                    actual[-4:] = ['--profile', 'ci', '--no-tests=fail', '--test-threads=8']
+                if self.mode == 'threads-change':
+                    actual[-3] = '--test-threads=16'
+                if self.mode == 'missing-threads':
+                    actual.remove('--test-threads=8')
                 if self.mode == 'profile-change':
                     actual[-1] = 'default'
                 if self.mode == 'missing-no-tests':
@@ -241,7 +246,7 @@ class Owner(unittest.TestCase):
             ['clean', '--workspace'],
             ['--no-report', 'test', '--lib', '--', '--list'],
             ['clean', '--profraw-only'],
-            ['--no-report', 'nextest', '--profile', 'ci', '--no-tests=fail'],
+            ['--no-report', 'nextest', '--profile', 'ci', '--no-tests=fail', '--test-threads=8'],
         ])
 
     def test_a_handshake_during_the_lib_test_build_is_refused(self):
@@ -385,11 +390,11 @@ class Owner(unittest.TestCase):
             str(self.root / 'nextest'), 'nextest', 'run',
             '--manifest-path', str(self.root / 'Cargo.toml'),
             '--target-dir', str(self.root / 'target/llvm-cov-target'),
-            '--no-tests=fail', '--profile', 'ci',
+            '--no-tests=fail', '--test-threads=8', '--profile', 'ci',
         ])
         self.assertEqual(self.child_count, 1)
         self.assertEqual(configuration['expected']['stages'][3][2:],
-                         ['--no-report', 'nextest', '--profile', 'ci', '--no-tests=fail'])
+                         ['--no-report', 'nextest', '--profile', 'ci', '--no-tests=fail', '--test-threads=8'])
 
     def test_owner_refuses_old_order_without_normalizing_equivalent_flags(self):
         self.mode = 'legacy-order'
@@ -399,7 +404,7 @@ class Owner(unittest.TestCase):
         self.assertIn('actual finite child selectors differ', self.refusal)
 
     def test_owner_refuses_changed_or_missing_recorded_finite_selectors(self):
-        for mode in ('profile-change', 'missing-no-tests'):
+        for mode in ('profile-change', 'missing-no-tests', 'threads-change', 'missing-threads'):
             with self.subTest(mode=mode):
                 self.mode = mode
                 with self.assertRaisesRegex(c.Invalid, 'handshake|interception'):

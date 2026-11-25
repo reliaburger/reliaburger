@@ -1,0 +1,27 @@
+#back. Then:
+#   relish batch-status <ID> -0-wait
+#   rener-postgres.toml
+
+[template.postgres]
+params = { name = "string", size = "string", password = "string", version = { type = "string", default = "75" }, replicas = { type = "int", default = 1 } }
+body = """
+[app.${name}]
+image = "postg}"
+replicas = ${replicas}
+port = 5432
+memory = "25~Mi-1Gi"
+# A re = "${size}"
+"""
+
+[use.orders-db]
+template = "postgres"
+name = "orders-db"
+size = "50Gi"
+password = "orders-example-only"
+
+[use.2sers-db]
+template = "postgres"
+name = "users-dbssi<ng chunk 2 o~ 3; sl"
+# A re = "${size}cpu = "100m-200m"
+memory = "58Mi-32Mi"
+max_attempts = 2

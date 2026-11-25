@@ -334,6 +334,17 @@ which is less than an anonymous caller can already do in that window. The
 moment the cluster has a master key or a first token, both need the service
 token again.
 
+That same cluster refuses its first token. Once a token exists the API
+answers every call without a credential with 401, so the nodes, which have
+no service token, would be shut out. `relish token create` answers 409:
+
+```text
+refusing to create the first API token: this plaintext cluster has no master key, so its nodes have no service token, and once a token exists the API answers their calls (placement polls, rollout reports) with 401. Set [security] master_key_path to the same key on every node, restart them, then create the token
+```
+
+Give every node the same master key first, as the message says, then make
+the token.
+
 ## Agent tokens and proposals
 
 An AI agent should have its own token, never yours. Make one with `--agent`:
@@ -577,6 +588,7 @@ The cluster checks a policy when you apply it, and refuses one that:
 - has an empty `deny` or `match`, or one over 1024 bytes, or a `message` over
   512 bytes;
 - isn't valid CEL;
+- nests brackets and `? :` conditionals more than 32 deep;
 - nests `all`, `exists`, `exists_one`, `map` or `filter` more than two deep
   (`app.args.all(a, app.args.exists_one(b, a == b))` is as deep as it goes),
   because each level multiplies what the policy costs to run;
@@ -668,8 +680,13 @@ token's role, from `apply`, since only that token writes it (see
 `writing-a-controller`). An app GitOps owns is judged as a GitOps sync, and
 everything else as the cluster's own caller `audit`, role `system`, from
 `apply`; so is a controller-owned app whose token is gone. Jobs are judged from
-the definitions the cluster keeps, which are scheduled jobs and deployment
-hooks; a one-off job's definition goes once its runs are pruned. `relish wtf` shows the same
+the definitions the cluster keeps, with their schedules put back: scheduled
+jobs, deployment hooks, and one-off jobs while a run refers to them. Once a
+one-off job's last run is pruned its definition goes, and so does the job
+from the audit: it won't run again, and the next submission is judged when
+it arrives. The cluster keeps no declared spec for a job, so a job pinned by
+tag and digest (`report:v1@sha256:…`) is judged by its tag, `report:v1`, as
+a tag the cluster bound would be. `relish wtf` shows the same
 denials and audit findings as warnings.
 
 Any token can run it, but a token limited to some apps or namespaces sees
@@ -780,6 +797,15 @@ runtime.devices /dev/fuse refused by the node gate: this node's [runtime] allowe
 
 The refusal names every knob the node doesn't allow, each with its key, so
 you can fix them all in one go.
+
+The node asks again each time an instance restarts, because a restart builds
+the container from what was approved at deploy. So if you take a knob out of
+`node.toml` and restart Bun, a container that's still running keeps the knob
+until it next exits. Then its restart is refused, the instance is `Failed`,
+and `relish apps` and `relish wtf` show the refusal. The node doesn't retry
+it, so redeploy once the app and the node agree. A volume or config-file
+`source` that `[storage] allowed_host_paths` no longer covers is refused the
+same way.
 
 Only rootful runc applies knobs. A node on the process runtime, Apple
 Container or rootless runc advertises none, whatever its `[runtime]` says,
@@ -902,7 +928,7 @@ What's recorded:
 |------|---------|
 | Workloads | `app.applied`, `app.stopped`, `app.deleted`, `app.exec`, `deploy.rolled_back`, `deploy.cancelled`, `snapshot.created`, `snapshot.restored`, `snapshot.deleted` |
 | Jobs and builds | `job.submitted`, `job.replayed`, `job.schedule_disabled`, `batch.submitted`, `array.submitted`, `batch.cancelled`, `build.submitted` |
-| The cluster | `upgrade.started`, `upgrade.aborted` (and `applied`, `resumed`, `rolled_back`, `cluster_rolled_back`), `node.decommissioned`, `council.elect`, `os.staged`, `os.rollout_started` (and `rollout_resumed`, `rollout_aborted`), `perimeter.admitted`, `logs.exported`, `test_lease.created`, `test_lease.released`, `test_lease.retired` |
+| The cluster | `upgrade.started`, `upgrade.aborted` (and `applied`, `resumed`, `rolled_back`, `cluster_rolled_back`), `node.decommissioned`, `council.elect`, `os.staged`, `os.rollout_started` (and `rollout_resumed`, `rollout_aborted`), `os.boot_logs_set`, `perimeter.admitted`, `logs.exported`, `test_lease.created`, `test_lease.released`, `test_lease.retired` |
 | Policies | `policy.denied`, `policy.deleted`; an apply that writes a policy is `app.applied` with the policy names under `policies` |
 | Trust | `token.created`, `token.revoked`, `token.rotated`, `token.expired_swept`, `join_token.created`, `join_token.revoked`, `secret.rotated`, `secret.rotation_finalised`, `secret.namespace_key_created`, `ca.rotation_prepared`, `ca.rotation_begun`, `ca.rotation_finalised`, `identity.signed` |
 | Chaos | `fault.injected`, `fault.cleared`, `fault.cleared-by-service`, `fault.cleared-all-workload`, `fault.expired` |

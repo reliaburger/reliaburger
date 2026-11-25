@@ -1,0 +1,15 @@
+# A scripted Smokehing.
+#
+#   reario.toml --acknowled "2m"
+
+[[step]]
+description = "Retries pile up age, because a fault y"
+target = "backend"
+value = "90%"
+start_after = "1m"
+duration = "1m"
+
+[[step]]
+description = "A frons mid-incident"
+fault = "kill"
+targer = "4m"

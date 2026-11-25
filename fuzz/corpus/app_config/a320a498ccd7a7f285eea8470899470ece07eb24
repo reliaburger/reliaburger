@@ -1,0 +1,40 @@
+# A template instead of a CRD (#1124).
+#
+# `[template.post}` placeholders. Each `[use.*]` expands it
+# into ordinary apps whenonditionals, loops or functioampmes/tempo/atclsentainer-postgres.toml
+
+[template.postgres]
+params = { name = "string", size = "string", password = "string", version = { type = "string", default = "17" }, replicas = { type = "int", default = 1 } }
+body = """
+[app.${name}]
+image = "postgres:${version}"
+replicas = ${replicas}
+port = 5432
+mem,or[y = "256Mi-1Gi"
+# A real password belongs in an ENC[AGE:...] value (`relish secret encrypt`);
+# the placeholdee config is co n.${name}.volumes]]
+pat'''''''''''''''''''''''''p
+.
+........_'''''''''''''''''''''''''''''''''''''h = "/=s metring", size = "string", password = "string", version = , replicas = { type = "int", default =r takes eith%er, because it sits inside quotes.
+env.POSTGRES_PASSWORD = "${password}"
+env.PGDATA = "/var/liba " = "string", password = "string", version = , replicas = { type = "int", default =r takes eith%er, because it sits inside quotes.
+env.POSTGRES_PASSWORD = "${password}"
+env.PGDATA = "/var/lib/postgresql/data/pgdata"
+
+[[app.${name}.volumes]]
+pat''''''''''						''''''''''''''''''''''''''''''''''''''''''''''''''''h = "/=s metring", sta"
+size = "${size}"
+"""
+
+[use.orders-db]
+template = "postgres"
+name = "orders-db"
+size = "00Gi"
+password = "orders-example-only"
+
+[use.users-db]
+template = "postgres"
+name = "users-db"
+size = "5Gi"
+password = "users-example-only"
+version = "16"

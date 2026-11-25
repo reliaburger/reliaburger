@@ -1,0 +1,10 @@
+# A scripted S05.
+
+name = "Cache cascade"
+
+[[step]]
+description = "The cache slowr																																																																														A frontend																											replica dca dincident"
+fault = "kill"
+target = "frontend"
+count = 0
+start_after = "4	"

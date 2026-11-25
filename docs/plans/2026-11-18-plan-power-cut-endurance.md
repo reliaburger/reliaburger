@@ -63,8 +63,8 @@ The invariants each cut must pass (numbered as in #2067's design):
 
 | # | Invariant | Pass means |
 |---|---|---|
-| I1 | Acknowledged volume writes | `/data/seq` holds 1..N with no gap or duplicate, and the writer, started again, resumed at or past the highest `ACK` the host saw before the cut. (N ≥ that `ACK` alone proves nothing: by the time the cluster settles, a writer that lost writes has appended past them again, as the step 1 smoke run showed) |
-| I2 | Redis counter | Never decreases across cuts, and the client, started again, found it at or past the last ACKed value before its first `INCR` |
+| I1 | Acknowledged volume writes | `/data/seq` holds 1..N with no gap or duplicate, and the writer, started again after the cut, resumed at or past the highest `ACK` the host saw before the cut; a start between two cuts resumed at or past the previous cut's `ACK`. (N ≥ that `ACK` alone proves nothing: by the time the cluster settles, a writer that lost writes has appended past them again, as the step 1 smoke run showed) |
+| I2 | Redis counter | Never decreases across cuts, and the client, started again after the cut, found it at or past the last ACKed value before its first `INCR`; a start between two cuts found it at or past the previous cut's value |
 | I3 | Acknowledged changes | Every change the driver's ledger acknowledged before the cut is in desired state after it |
 | I4 | Stores open cleanly | Bun starts first time on every node; no redb or Raft open error, no panic, no crash loop |
 | I5 | Raft commit index | Committed index after recovery ≥ the highest read before the cut; leases stay linearizable |

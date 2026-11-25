@@ -13,6 +13,9 @@ status-level = "leak"
 final-status-level = "slow"
 slow-timeout = { period = "30s", terminate-after = 2 }
 
+# Portable Linux's coverage run passes --test-threads=8 on the command line
+# (the Makefile's coverage recipe, pinned by scripts/ci/coverage_owner.py);
+# every other job using this profile keeps one thread per CPU (#1723).
 [profile.ci]
 retries = 0
 leak-timeout = { period = "100ms", result = "fail" }
@@ -64,6 +67,17 @@ slow-timeout = { period = "120s", terminate-after = 5 }
 filter = 'binary(autoscale_memory)'
 test-group = "host-network"
 slow-timeout = { period = "120s", terminate-after = 4 }
+
+# The owned-runc capacity contract cold-starts five runc executors in turn
+# and retires each one. Alone it takes about 6 s; in an 8-vCPU VM at load
+# 8 to 17 it took up to 107 s, and beside a full `make test-linux` one
+# start alone ran past 20 s (#2267). Each step now waits up to 90 s, so the
+# test gets more than the host-network limit below, which it would
+# otherwise match first. The limit only has to catch a hang.
+[[profile.default.overrides]]
+filter = 'binary(owned_runc) & test(=capacity_contract::runc_ordinary_terminal_receipt_releases_nonzero_capacity_for_actual_batch_http)'
+test-group = "host-network"
+slow-timeout = { period = "60s", terminate-after = 5 }
 
 [[profile.default.overrides]]
 filter = 'binary(ebpf) | binary(owned_network) | binary(owned_runc) | binary(owned_rootless) | test(/(runc_|_runc|runc::|netns|btrfs|buildah|image_pull)/)'

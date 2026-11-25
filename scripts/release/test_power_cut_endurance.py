@@ -148,6 +148,36 @@ class ResumeCheck(unittest.TestCase):
         self.assertTrue(result["pass"], result)
         self.assertEqual(result["starts"], 1)
 
+    # A start between the cuts (run8 cut 63: needrestart restarted Bun after
+    # an unattended libc upgrade) resumes past the previous cut's ACK, not
+    # this one's, which it came before.
+
+    def test_a_start_before_the_cut_is_held_to_the_previous_cuts_ack(self):
+        result = endurance.resume_check("0\n100\n150\n230\n", 200, 2, before_cut=3, previous_acked=120)
+        self.assertTrue(result["pass"], result)
+        self.assertEqual((result["between_cuts"], result["new_starts"]), ([150], [230]))
+
+    def test_a_start_before_the_cut_below_the_previous_ack_fails(self):
+        result = endurance.resume_check("0\n100\n110\n230\n", 200, 2, before_cut=3, previous_acked=120)
+        self.assertFalse(result["pass"])
+        self.assertIn("start 3, before the cut, resumed at 110, below the previous cut's acknowledged 120",
+                      result["reason"])
+
+    def test_a_start_after_the_cut_is_still_held_to_this_cuts_ack(self):
+        result = endurance.resume_check("0\n100\n150\n190\n", 200, 2, before_cut=3, previous_acked=120)
+        self.assertFalse(result["pass"])
+        self.assertIn("start 4 resumed at 190, below the acknowledged 200", result["reason"])
+
+    def test_only_a_start_before_the_cut_is_no_new_start(self):
+        result = endurance.resume_check("0\n100\n150\n", 200, 2, before_cut=3, previous_acked=120)
+        self.assertFalse(result["pass"])
+        self.assertIn("no new start since the cut", result["reason"])
+
+    def test_without_a_count_before_the_cut_every_new_start_is_held_to_this_ack(self):
+        result = endurance.resume_check("0\n100\n150\n230\n", 200, 2)
+        self.assertFalse(result["pass"])
+        self.assertIn("start 3 resumed at 150", result["reason"])
+
 
 class CounterCheck(unittest.TestCase):
     def test_at_or_above_the_ack_and_the_last_value_passes(self):
@@ -307,6 +337,16 @@ class Summary(unittest.TestCase):
         self.assertEqual(summary["topologies"]["1"]["recovery_seconds"], {"p50": 20, "p95": 100, "max": 100})
         self.assertEqual(summary["environment_events"]["vz_start_retries"], 2)
 
+    def test_a_forwarder_retry_is_an_environment_event_and_an_extra_power_off(self):
+        lines = [self.line(1), self.line(2)]
+        lines[1]["recovery"]["forwarder_retries"] = 1
+        lines[1]["extra_power_offs"] = 1
+        summary = endurance.summarise(self.run_with(2), lines)
+        self.assertEqual(summary["environment_events"]["lima_forwarder_retries"], 1)
+        self.assertEqual(summary["topologies"]["1"]["extra_power_offs"], 1)
+        self.assertEqual(summary["pooled"]["power_offs"], 3)
+        self.assertEqual(summary["verdict"], "pass")
+
     def test_no_cuts_is_not_a_pass(self):
         self.assertEqual(endurance.summarise(self.run_with(0), [])["verdict"], "no cuts")
 
@@ -409,6 +449,123 @@ class RecordAndSummaryCommands(unittest.TestCase):
             resumes.write_text("0\n120\n")
             result = self.run_endurance("seq", str(seq), "--acked", "100", "--resumes", str(resumes), "--starts", "1")
             self.assertEqual(result.returncode, 0, result.stdout)
+
+
+class Ports(unittest.TestCase):
+    """The cluster's host ports stay clear of every port the host hands out or tests take.
+
+    Run 6 lost cut 77 to a cargo test binary holding the API port
+    (127.0.0.1:29277): the harness's old ports sat inside TEST_PORTS
+    (27000..30000, tests/support/bun_process.rs), and the in-process suites
+    hard-code 15000-26999 and 30000-30999. Ephemeral ports are out too: Linux
+    hands them out from 32768, macOS from 49152, so 50000 and up would race
+    every outgoing connection on a Mac.
+    """
+
+    def test_every_offset_keeps_the_ports_in_the_documented_block(self):
+        for offset in range(0, endurance.MAX_PORT_OFFSET + 1):
+            ports = endurance.ports(offset)
+            for port in ports.values():
+                self.assertGreaterEqual(port, 31000, (offset, ports))
+                self.assertLess(port, 32768, (offset, ports))
+            self.assertEqual(len(set(ports.values())), 3)
+
+    def test_no_offset_gives_one_runs_port_to_another_kind(self):
+        seen = {}
+        for offset in range(0, endurance.MAX_PORT_OFFSET + 1):
+            for kind, port in endurance.ports(offset).items():
+                self.assertEqual(seen.setdefault(port, kind), kind, (offset, kind, port))
+
+    def test_an_offset_past_the_block_is_refused(self):
+        with self.assertRaises(ValueError):
+            endurance.ports(endurance.MAX_PORT_OFFSET + 1)
+
+    def test_the_harness_takes_its_ports_from_the_checker(self):
+        result = subprocess.run([sys.executable, str(HERE / "power_cut" / "endurance.py"), "ports", "--offset", "120"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.stdout.split(), ["31120", "31720", "32320"], result.stderr)
+
+
+class Rejudge(unittest.TestCase):
+    """`rejudge` runs today's checker over a run's recorded cuts, offline.
+
+    Old evidence has no start counts from before each cut and no record of a
+    start that came after verify read the list, so rejudge infers the one
+    and looks for the other in the next cut's record, and says so.
+    """
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.evidence = Path(directory.name)
+        self.lines = []
+
+    def cut(self, number, acked, writer, redis, previous_starts, **detail):
+        cut = self.evidence / "cuts" / f"{number:05d}"
+        cut.mkdir(parents=True)
+        (cut / "seq.txt").write_text(f"MAX {acked + 50}\nLAST {acked + 50}\n")
+        (cut / "counter.txt").write_text(f"{acked + 5}\n")
+        (cut / "resumes-writer.txt").write_text("".join(f"{value}\n" for value in writer))
+        (cut / "resumes-redis.txt").write_text("".join(f"{value}\n" for value in redis))
+        passed = {"pass": True}
+        resume = {"previous_starts": previous_starts}
+        self.lines.append({
+            "cut": number, "topology": "1", "kind": "site", "acked": {"writer": acked, "redis": acked},
+            "recovery": {"api_seconds": 10, "settled_seconds": 30, "start_retries": 0}, **detail,
+            "invariants": {"I1": {"pass": False, "resume": resume}, "I2": {"pass": False, "previous": None,
+                                                                          "resume": resume},
+                           "I4": passed, "I6": passed, "I7": passed},
+            "violations": ["I1", "I2"]})
+
+    def rejudge(self):
+        (self.evidence / "cuts.jsonl").write_text("".join(json.dumps(line) + "\n" for line in self.lines))
+        return endurance.rejudge(str(self.evidence))
+
+    def test_a_restart_between_the_cuts_is_no_violation(self):
+        # Run 8 cut 63, without the counts the harness now records.
+        self.cut(1, 120, [0, 130], [0, 130], 1)
+        self.cut(2, 200, [0, 130, 150, 230], [0, 130, 150, 230], 2)
+        report = self.rejudge()
+        self.assertEqual(report["verdict"], "pass", report)
+        cut = report["cuts"][1]
+        self.assertEqual((cut["was"], cut["now"]), (["I1", "I2"], []))
+        self.assertTrue(cut["inferred_before_cut"])
+        self.assertEqual(report["restarts_between_cuts"], [2])
+
+    def test_a_late_start_is_found_in_the_next_cuts_record(self):
+        # Run 10 cut 13: verify read soak:starts before the client pushed.
+        self.cut(1, 120, [0, 130], [0, 130], 1)
+        self.cut(2, 200, [0, 130, 230], [0, 130], 2)
+        self.cut(3, 300, [0, 130, 230, 310], [0, 130, 205, 310], 3, starts_before_cut={"writer": 3, "redis": 3})
+        report = self.rejudge()
+        self.assertEqual(report["verdict"], "pass", report)
+        self.assertEqual(report["cuts"][1]["late_start_from"], {"I2": 3})
+
+    def test_a_late_start_with_no_later_record_is_undecided(self):
+        # Run 12 cut 4: the run stopped at the violation, so nothing later shows the start.
+        self.cut(1, 120, [0, 130], [0, 130], 1)
+        self.cut(2, 200, [0, 130, 230], [0, 130], 2)
+        report = self.rejudge()
+        self.assertEqual(report["verdict"], "undecided", report)
+        self.assertEqual(report["cuts"][1]["undecided"], ["I2"])
+
+    def test_a_real_loss_is_still_a_violation(self):
+        self.cut(1, 120, [0, 130], [0, 130], 1)
+        self.cut(2, 200, [0, 130, 190], [0, 130, 230], 2)
+        report = self.rejudge()
+        self.assertEqual(report["verdict"], "fail", report)
+        self.assertEqual(report["cuts"][1]["now"], ["I1"])
+        self.assertIn("resumed at 190", report["cuts"][1]["reasons"]["I1"])
+
+    def test_rejudge_writes_nothing_into_the_evidence(self):
+        self.cut(1, 120, [0, 130], [0, 130], 1)
+        (self.evidence / "cuts.jsonl").write_text(json.dumps(self.lines[0]) + "\n")
+        before = sorted(str(path) for path in self.evidence.rglob("*"))
+        result = subprocess.run([sys.executable, str(HERE / "power_cut" / "endurance.py"), "rejudge",
+                                 "--evidence", str(self.evidence)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["verdict"], "pass")
+        self.assertEqual(sorted(str(path) for path in self.evidence.rglob("*")), before)
 
 
 class Quiet(unittest.TestCase):
@@ -531,6 +688,26 @@ class HarnessRefusals(unittest.TestCase):
             self.assert_refused(result, "no quickstart cluster in /tmp/rbpc.gone")
             self.assertNotIn("aborted", result.stderr)
 
+    def test_resume_refuses_a_run_with_a_violation(self):
+        # Run 10 carried on past cut 13's violation and so lost the state
+        # kept for diagnosing it.
+        with tempfile.TemporaryDirectory() as evidence:
+            Path(evidence, "run.json").write_text(json.dumps({"seed": 1, "home": "/tmp/rbpc.gone",
+                                                              "cuts_started": 2}))
+            Path(evidence, "cuts.jsonl").write_text('{"cut": 1, "violations": []}\n'
+                                                    '{"cut": 2, "violations": ["I2"]}\n')
+            result = self.run_harness("--resume", "--evidence", evidence)
+            self.assert_refused(result, "cut 2 violated I2")
+            self.assertIn("--rejudge", result.stderr)
+
+    def test_refuses_a_port_offset_past_the_block(self):
+        self.assert_refused(self.run_harness("--tier", "quick", "--release", "0.2.8", "--port-offset", "501"),
+                            "--port-offset takes a whole number up to 500")
+
+    def test_rejudge_needs_an_evidence_directory_with_cuts(self):
+        with tempfile.TemporaryDirectory() as evidence:
+            self.assert_refused(self.run_harness("--rejudge", evidence), "no cuts.jsonl")
+
     def test_resume_refuses_an_adopted_home_it_did_not_make(self):
         with tempfile.TemporaryDirectory() as evidence:
             Path(evidence, "run.json").write_text(json.dumps({"seed": 1, "home": os.path.expanduser("~/.reliaburger"),
@@ -577,8 +754,9 @@ class HarnessShell(unittest.TestCase):
     """
 
     FUNCTIONS = ("with_timeout", "now", "endurance", "run_get", "run_set", "rel", "read_resumes", "starts_in",
-                 "acked_now", "read_acked", "acked_problems", "abort_run", "take_baseline", "power_back", "verify", "one_cut",
-                 "cuts_done", "cleanup")
+                 "acked_now", "read_acked", "acked_problems", "abort_run", "take_baseline", "power_back", "await_start",
+                 "verify", "one_cut", "cuts_done", "cleanup", "hold_guest_updates", "start_vm", "cap_log",
+                 "cap_power_logs")
 
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -594,11 +772,20 @@ class HarnessShell(unittest.TestCase):
             if [ "$1" = start ]; then
                 n=$(grep -c '^limactl start' "$FAKE/calls")
                 if [ -f "$FAKE/start-$n" ]; then cat "$FAKE/start-$n" >&2; exit 1; fi
+                # Lima 2.2.1's host agent spinning on its vsock forwarder: the
+                # start never returns.
+                if [ -f "$FAKE/spin-$n" ]; then cat "$FAKE/spin-$n" >&2; exec sleep 30; fi
+                if [ -f "$FAKE/hang-$n" ]; then exec sleep 30; fi
             fi
             """)
         self.fake("relish", """
             echo "relish $*" >> "$FAKE/calls"
             answer() { [ -f "$FAKE/$1" ] || exit 1; cat "$FAKE/$1"; }
+            # NAME-N answers the Nth call matching PATTERN, when it exists.
+            numbered() {
+                local n; n=$(grep -c "$2" "$FAKE/calls")
+                if [ -f "$FAKE/$1-$n" ]; then cat "$FAKE/$1-$n"; else answer "$1"; fi
+            }
             case "$*" in
                 "--output json apps --instances")
                     n=$(grep -c 'apps --instances' "$FAKE/calls")
@@ -607,9 +794,9 @@ class HarnessShell(unittest.TestCase):
                 "logs soak-writer"*) answer log-writer ;;
                 "logs soak-redis-client"*) answer log-redis ;;
                 "exec soak-writer awk"*) answer seq ;;
-                "exec soak-writer cat /data/resumes") answer resumes-writer ;;
+                "exec soak-writer cat /data/resumes") numbered resumes-writer 'cat /data/resumes' ;;
                 "exec soak-redis redis-cli GET soak:counter") answer counter ;;
-                "exec soak-redis redis-cli LRANGE soak:starts 0 -1") answer resumes-redis ;;
+                "exec soak-redis redis-cli LRANGE soak:starts 0 -1") numbered resumes-redis 'LRANGE soak:starts' ;;
                 "local stop --yes") answer local-stop ;;
                 *) exit 1 ;;
             esac
@@ -633,12 +820,15 @@ class HarnessShell(unittest.TestCase):
             (self.evidence / "cuts.jsonl").write_text("".join(json.dumps({"cut": n, "violations": []}) + "\n"
                                                               for n in range(1, cuts + 1)))
         functions = "".join(shell_function(HARNESS, name) for name in self.FUNCTIONS)
+        # The harness's own pattern for Lima's spinning forwarder, not a copy.
+        functions += next(line for line in HARNESS.read_text().splitlines()
+                          if line.startswith("forwarder_spin=")) + "\n"
         prelude = textwrap.dedent(f"""
             set -uo pipefail
             export FAKE={self.path}
             here={HERE / "power_cut"}; evidence={self.evidence}; power_log_dir={self.evidence}/logs
             limactl={self.path}/limactl; relish={self.path}/relish; vm=(none node-a); down=(0 1)
-            api_bound=120; want='soak-writer=1,soak-redis=1,soak-redis-client=1'
+            api_bound=120; start_wait=60; start_timeout=300; log_cap=52428800; want='soak-writer=1,soak-redis=1,soak-redis-client=1'
             fail() {{ printf 'power-cut: %s\\n' "$*" >&2; exit 1; }}
             say() {{ printf '%s\\n' "$*"; }}
             sleep() {{ :; }}
@@ -704,6 +894,72 @@ class HarnessShell(unittest.TestCase):
         self.assertEqual([call for call in self.calls_made() if call.startswith("limactl")],
                          ["limactl start --tty=false node-a"])
 
+    # Lima's vsock forwarder spinning at boot (run 7 cut 108)
+
+    SPIN = ("level=error msg=\"vsock forwarder accept error: accept tcp 127.0.0.1:60022: "
+            "accept: bad file descriptor\"\n")
+
+    def test_a_spinning_vsock_forwarder_is_stopped_and_started_again(self):
+        self.answer("instances", "[]")
+        self.answer("spin-1", self.SPIN * 3)
+        started = time.monotonic()
+        result = self.run_shell("powered_on_at=$(now)\n"
+                                "power_back && echo \"back retries=$start_retries forwarder=$forwarder_retries\"\n")
+        self.assertEqual(result.stdout.strip(), "back retries=0 forwarder=1", result.stderr)
+        self.assertLess(time.monotonic() - started, 20, "it waited for the start to time out")
+        self.assertEqual([call for call in self.calls_made() if call.startswith("limactl")],
+                         ["limactl start --tty=false node-a", "limactl stop --force node-a",
+                          "limactl start --tty=false node-a"])
+
+    def test_a_start_that_times_out_is_treated_as_the_same_failure(self):
+        self.answer("instances", "[]")
+        self.answer("hang-1", "")
+        result = self.run_shell("start_timeout=2; powered_on_at=$(now)\n"
+                                "power_back && echo \"back forwarder=$forwarder_retries\"\n")
+        self.assertEqual(result.stdout.strip(), "back forwarder=1", result.stderr)
+        self.assertEqual([call for call in self.calls_made() if call.startswith("limactl")],
+                         ["limactl start --tty=false node-a", "limactl stop --force node-a",
+                          "limactl start --tty=false node-a"])
+
+    def test_a_forwarder_that_spins_twice_is_left_to_the_invariants(self):
+        self.answer("instances", "[]")
+        self.answer("spin-1", self.SPIN)
+        self.answer("spin-2", self.SPIN)
+        result = self.run_shell("powered_on_at=$(now)\n"
+                                "power_back || echo \"failed forwarder=$forwarder_retries\"\n")
+        self.assertEqual(result.stdout.strip(), "failed forwarder=1", result.stderr)
+        self.assertEqual(len([call for call in self.calls_made() if call.startswith("limactl start")]), 2)
+
+    def test_a_huge_log_keeps_its_head_and_tail(self):
+        log = self.path / "ha.stderr.log"
+        log.write_text("FIRST\n" + "x" * 5000 + "\nLAST\n")
+        result = self.run_shell(f"cap_log {log} 1000\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = log.read_text()
+        self.assertLess(len(text), 1200)
+        self.assertTrue(text.startswith("FIRST\n"))
+        self.assertTrue(text.endswith("LAST\n"))
+        self.assertIn("power-cut: cut", text)
+
+    def test_a_small_log_is_left_alone(self):
+        log = self.path / "ha.stderr.log"
+        log.write_text("short\n")
+        self.run_shell(f"cap_log {log} 1000\ncap_log {self.path}/missing.log 1000\n")
+        self.assertEqual(log.read_text(), "short\n")
+
+    def test_power_back_caps_the_start_log_and_lima_s_log(self):
+        self.answer("instances", "[]")
+        self.answer("spin-1", self.SPIN * 200)
+        lima = self.path / "lima" / "node-a"
+        lima.mkdir(parents=True)
+        (lima / "ha.stderr.log").write_text(self.SPIN * 200)
+        result = self.run_shell(f"LIMA_HOME={self.path}/lima; log_cap=2000; powered_on_at=$(now)\n"
+                                "power_back && echo back\n")
+        self.assertEqual(result.stdout.strip(), "back", result.stderr)
+        self.assertLessEqual((lima / "ha.stderr.log").stat().st_size, 2200)
+        for log in (self.evidence / "logs").glob("power-on-*.log"):
+            self.assertLessEqual(log.stat().st_size, 2200, log)
+
     # The last ACK and INCR (finding 3)
 
     def test_read_acked_keeps_the_last_value_and_refuses_none_or_less(self):
@@ -746,7 +1002,7 @@ class HarnessShell(unittest.TestCase):
                                              ("soak-writer", "soak-redis", "soak-redis-client")]))
         cut = self.evidence / "cuts" / "00002"
         cut.mkdir()
-        result = self.run_shell(f"cut_dir={cut}\nverify 100 100\n",
+        result = self.run_shell(f"cut_dir={cut}\nverify 100 100 1 1 90 90\n",
                                 run={"writer_starts": 1, "redis_starts": 1, "counter": 110})
         self.assertEqual(result.returncode, 0, result.stderr)
         writer = json.loads((cut / "I1.json").read_text())
@@ -756,6 +1012,94 @@ class HarnessShell(unittest.TestCase):
         self.assertTrue(json.loads((cut / "I7.json").read_text())["pass"])
         run = self.run_json()
         self.assertEqual((run["writer_starts"], run["redis_starts"], run["counter"]), (3, 2, 130))
+
+    def running(self):
+        self.answer("instances", json.dumps([{"app_name": app, "state": "running"} for app in
+                                             ("soak-writer", "soak-redis", "soak-redis-client")]))
+
+    def test_verify_waits_for_a_start_recorded_after_the_cluster_settled(self):
+        # Run 12 cut 4: every instance ran, but the client hadn't yet reached
+        # Redis and pushed its start onto soak:starts. (Its start at 90 came
+        # before the cut, held to the previous cut's 90.)
+        self.answer("seq", "MAX 500\nLAST 500\n")
+        self.answer("resumes-writer", "0\n120\n")
+        self.answer("counter", "130\n")
+        self.answer("resumes-redis-1", "0\n90\n")
+        self.answer("resumes-redis-2", "0\n90\n")
+        self.answer("resumes-redis", "0\n90\n100\n")
+        self.running()
+        cut = self.evidence / "cuts" / "00002"
+        cut.mkdir()
+        result = self.run_shell(f"cut_dir={cut}\nverify 100 100 1 2 90 90\n",
+                                run={"writer_starts": 1, "redis_starts": 1, "counter": 110})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        redis = json.loads((cut / "I2.json").read_text())
+        self.assertTrue(redis["pass"], redis)
+        self.assertEqual(redis["resume"]["new_starts"], [100])
+        self.assertEqual(self.calls_made().count("relish exec soak-redis redis-cli LRANGE soak:starts 0 -1"), 3)
+        self.assertEqual(self.run_json()["redis_starts"], 3)
+
+    def test_verify_gives_up_on_a_start_that_never_comes(self):
+        self.answer("seq", "MAX 500\nLAST 500\n")
+        self.answer("resumes-writer", "0\n120\n")
+        self.answer("counter", "130\n")
+        self.answer("resumes-redis", "0\n90\n")
+        self.running()
+        cut = self.evidence / "cuts" / "00002"
+        cut.mkdir()
+        result = self.run_shell(f"cut_dir={cut}\nverify 100 100 1 2 90 90\n",
+                                run={"writer_starts": 1, "redis_starts": 1, "counter": 110}, fast_clock=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        redis = json.loads((cut / "I2.json").read_text())
+        self.assertFalse(redis["pass"])
+        self.assertIn("no new start since the cut", redis["reason"])
+
+    def test_a_cut_records_each_apps_starts_just_before_the_power_off(self):
+        # Run 8 cut 63: needrestart restarted Bun between the cuts, so the
+        # writer started once (at 150) before the cut and once (at 230) after it.
+        self.running()
+        self.answer("log-writer", "ACK 200\n")
+        self.answer("log-redis", "INCR 200\n")
+        self.answer("seq", "MAX 300\nLAST 300\n")
+        self.answer("counter", "210\n")
+        self.answer("resumes-writer", "0\n100\n150\n")
+        self.answer("resumes-redis", "0\n100\n")
+        result = self.run_shell("""
+            seed=1 work_min=1 work_max=1 off_min=1 off_max=1
+            power_off() {
+                echo "power_off $1" >> "$FAKE/calls"
+                printf '0\\n100\\n150\\n230\\n' > "$FAKE/resumes-writer"
+                printf '0\\n100\\n205\\n' > "$FAKE/resumes-redis"
+            }
+            power_back() { start_retries=0; }
+            settle() { settled_seconds=20; }
+            one_cut 2
+            echo "returned $?"
+            """, run={"cuts_started": 1, "writer_acked": 120, "redis_acked": 90, "writer_starts": 2,
+                      "redis_starts": 2, "counter": 95}, cuts=1)
+        self.assertIn("returned 0", result.stdout, result.stderr)
+        line = json.loads((self.evidence / "cuts.jsonl").read_text().splitlines()[-1])
+        self.assertEqual(line["starts_before_cut"], {"writer": 3, "redis": 2})
+        self.assertEqual(line["previous_acked"], {"writer": 120, "redis": 90})
+        self.assertEqual(line["invariants"]["I1"]["resume"]["between_cuts"], [150])
+        self.assertEqual(line["violations"], [])
+        calls = self.calls_made()
+        self.assertLess(max(i for i, call in enumerate(calls) if "cat /data/resumes" in call
+                            and i < calls.index("power_off 1")), calls.index("power_off 1"))
+
+    def test_the_guest_stops_updating_itself(self):
+        # Cutting power mid-dpkg can damage the guest, and needrestart
+        # restarted Bun after an unattended libc upgrade (run 8).
+        result = self.run_shell("""
+            gsh() { printf '%s\\n' "$1" > "$FAKE/guest-script"; }
+            hold_guest_updates && echo held
+            """, run={})
+        self.assertEqual(result.stdout.strip(), "held", result.stderr)
+        script = (self.path / "guest-script").read_text()
+        for unit in ("apt-daily.timer", "apt-daily-upgrade.timer", "unattended-upgrades.service"):
+            self.assertIn(unit, script)
+        self.assertIn("mask", script)
+        self.assertIn("needrestart", script)
 
     def test_the_baseline_records_each_workloads_starts_and_last_values(self):
         self.answer("instances", json.dumps([{"app_name": app, "state": "running"} for app in

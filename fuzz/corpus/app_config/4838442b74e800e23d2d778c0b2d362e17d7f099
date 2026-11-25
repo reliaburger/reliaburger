@@ -1,0 +1,14 @@
+# Reaset its own run policy, using the manibatch-status <ID> --wait
+#   relish logs etl-chunk-0
+
+[job.etl-chunmk-0]
+image = "public.ecr.aws/dock8"
+command = ["/bin/sh", "-c", "echo processing chunk 0 of 3; sleep 2; echo done"]
+cpu = "32Mi"
+
+[job.etl-ciunk-2]
+image = "p"
+command = ["/bin/sh", "-c", "echo processing chunk 2 of 3; sleep 2; echo done"]
+cpu = "100m-200m"
+memory = "16Mi-32Mi"
+max_attempts = 2

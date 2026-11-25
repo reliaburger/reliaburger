@@ -1333,7 +1333,7 @@ impl BunClient {
     /// remember it in the context at `path` so the next command asks it
     /// first (#2241). Remembering is best effort: a busy or unwritable
     /// context only costs the next command the same wait.
-    fn report_fallover(
+    pub(crate) fn report_fallover(
         context: &super::local_context::LocalContext,
         choice: &super::local_context::EndpointChoice,
         path: Option<&std::path::Path>,
@@ -1822,6 +1822,19 @@ impl BunClient {
         &self,
     ) -> Result<Vec<crate::bun::diagnostics::RolloutEvidence>, RelishError> {
         self.get_typed_json("/v1/diagnostics/rollouts").await
+    }
+
+    /// Fetch one app's spec as the cluster holds it, with its secrets left
+    /// out (`GET /v1/apps/{app}/{namespace}/spec`, #1322).
+    pub async fn app_spec(
+        &self,
+        app: &str,
+        namespace: &str,
+    ) -> Result<crate::bun::spec_read::AppSpecView, RelishError> {
+        let app = checked_name(NameKind::App, app)?;
+        let namespace = checked_name(NameKind::Namespace, namespace)?;
+        self.get_typed_json(&format!("/v1/apps/{app}/{namespace}/spec"))
+            .await
     }
 
     /// Fetch desired application replicas and current scheduler coverage.
@@ -2935,6 +2948,12 @@ impl BunClient {
         })
     }
 
+    /// The answering node's own workloads with their latest CPU and memory
+    /// samples (`GET /v1/top`), for the appliance console's Workloads tab.
+    pub async fn node_top(&self) -> Result<Vec<crate::bun::top::TopRow>, RelishError> {
+        self.get_typed_json("/v1/top").await
+    }
+
     /// Every node's workloads with their latest CPU and memory samples.
     pub async fn cluster_top(&self) -> Result<crate::bun::top::ClusterTop, RelishError> {
         self.get_typed_json("/v1/top?cluster=true").await
@@ -3759,6 +3778,23 @@ impl BunClient {
                 "allow_downgrade": allow_downgrade,
             })
             .to_string(),
+        )
+        .await
+    }
+
+    /// Where this node sends its boot logs (#2149): `{"target": …}`.
+    pub async fn os_boot_logs(&self) -> Result<serde_json::Value, RelishError> {
+        self.get_json("/v1/os/boot-logs").await
+    }
+
+    /// Send this node's boot logs to `target`, or stop for `None`.
+    pub async fn os_boot_logs_set(
+        &self,
+        target: Option<crate::os::netlog::NetlogTarget>,
+    ) -> Result<serde_json::Value, RelishError> {
+        self.post_json(
+            "/v1/os/boot-logs",
+            serde_json::json!({ "target": target }).to_string(),
         )
         .await
     }

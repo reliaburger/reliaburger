@@ -227,7 +227,10 @@ container workload, fresh node-kill and node-pressure evidence, and server
 grants for `provision_isolated_workloads`, `alter_node_state` and
 `saturate_capacity`. Missing destructive prerequisites refuse the suite. They
 don't turn into green skips. Node pressure needs rootful Linux runc with
-cgroup v2.
+cgroup v2 and the cpu and memory controllers. Bun checks for them on every
+pressure fault and capability report, and enables them in the parent cgroup
+when it can, so they can come on after Bun starts. When they can't,
+the node's `/v1/capabilities` report says which one is missing.
 
 An interactive run asks you to type exactly `yes`; CI uses `--yes`. Pass
 `--filter` with a scenario name to run just that one:

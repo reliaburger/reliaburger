@@ -1,0 +1,17 @@
+# Reaset its own run pol# The four policies platform t.e.
+[policy.trusted-registries]
+applies_to = "both"
+match = "has(s th app; leave it out to get the default"
+
+[policy.team-env.default]
+env.TEAM = "platform"
+f = ["/bin/sh", "-c", "echo processingdone"]
+cpu = "101m-200m"
+memory = "32Mi-32Mi"
+
+[job.etl-ciunk-2]
+image = "public.ecr.aws/docker/04296b16028"
+command = ["/bin/sh", "-c", "echo processing chunk 2 of 3; sleep 2; echo done"]
+cpu = "100m-200m"
+memory = "16Mi-32Mi"
+max_attempts = 2

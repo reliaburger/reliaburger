@@ -57,7 +57,7 @@ class Repository:
 
     def outputs(self, event="pull_request", base_ref="main", base_sha="", full_ci=False,
                 head_ref="feature", release_gate=False, macos=False, ref="refs/pull/1/merge",
-                queue_run="", main_ref="main"):
+                queue_run="", main_ref="main", draft=False):
         """Every output the script writes, as the strings it wrote."""
         with tempfile.TemporaryDirectory() as scratch:
             output = Path(scratch) / "output"
@@ -66,20 +66,23 @@ class Repository:
                    "FULL_CI": "true" if full_ci else "false",
                    "RELEASE_GATE": "true" if release_gate else "false",
                    "MACOS_LABEL": "true" if macos else "false",
-                   "GITHUB_REF": ref, "QUEUE_RUN": queue_run, "MAIN_REF": main_ref}
+                   "GITHUB_REF": ref, "QUEUE_RUN": queue_run, "MAIN_REF": main_ref,
+                   "DRAFT": "true" if draft else "false"}
             subprocess.run(["bash", str(SCRIPT)], cwd=self.root, env=env, check=True,
                            capture_output=True, text=True)
             return dict(line.split("=", 1) for line in output.read_text().splitlines())
 
     def select(self, **kwargs):
-        """The six job groups, as booleans. Without a queue run, portable follows code."""
+        """The six job groups, as booleans. Without a queue run, portable and lint follow code."""
         found = self.outputs(**kwargs)
-        assert found["portable"] == found["code"] and found["tested_by"] == "", found
+        assert found["portable"] == found["code"] == found["lint"] and found["tested_by"] == "", found
         return {key: found[key] == "true" for key in ("code", "gossip", "heavy", "task_arrays", "macos", "s3")}
 
 
 ALL = {"code": True, "gossip": True, "heavy": True, "task_arrays": True, "macos": True, "s3": True}
 NOTHING = {key: False for key in ALL}
+# What a merge-queue group with code runs: everything but portable macOS.
+QUEUE = dict(ALL, macos=False)
 
 
 class SelectJobsTests(unittest.TestCase):
@@ -384,17 +387,24 @@ class SelectJobsTests(unittest.TestCase):
                 self.assertFalse(self.repo.select(base_ref="release-1-1-4", base_sha=base,
                                                   head_ref=head_ref)["macos"])
 
-    def test_the_merge_queue_runs_everything(self):
+    def test_the_merge_queue_runs_everything_but_macos(self):
         # merge_group carries no pull_request fields: no base ref, no label.
-        # Its base is the commit the group sits on.
+        # Its base is the commit the group sits on. Portable macOS took 50
+        # minutes to over 2 hours there and set every group's length; the
+        # nightly on the newest train runs it instead (macos-nightly.yml).
         self.pull_request("src/lib.rs")
         self.assertEqual(self.repo.select(event="merge_group", base_ref="", head_ref="", base_sha=self.main),
-                         ALL)
+                         QUEUE)
+
+    def test_the_merge_queue_skips_macos_even_for_macos_code(self):
+        # The macos label and the macOS-code rule are pull request rules.
+        self.pull_request("src/grill/process.rs", "src/grill/apple.rs")
+        self.assertEqual(self.repo.select(event="merge_group", base_sha=self.main, macos=True), QUEUE)
 
     def test_the_merge_queue_runs_every_benchmark_whatever_the_group_touches(self):
-        # A candidate build reuses a queue run only when every job ran.
         self.pull_request("src/grill/process.rs")
-        self.assertEqual(self.repo.select(event="merge_group", base_sha=self.main), ALL)
+        found = self.repo.select(event="merge_group", base_sha=self.main)
+        self.assertTrue(found["gossip"] and found["task_arrays"] and found["s3"], found)
 
     def test_a_documentation_only_merge_group_runs_no_code_job(self):
         # Its code is its base's, which the run before it tests (#1723).
@@ -402,13 +412,47 @@ class SelectJobsTests(unittest.TestCase):
         self.assertEqual(self.repo.select(event="merge_group", base_ref="", head_ref="", base_sha=self.main),
                          NOTHING)
 
-    def test_a_merge_group_with_documentation_that_tests_read_runs_everything(self):
+    def test_a_merge_group_with_documentation_that_tests_read_runs_everything_but_macos(self):
         self.pull_request("docs/manual/intro.md")
-        self.assertEqual(self.repo.select(event="merge_group", base_sha=self.main), ALL)
+        self.assertEqual(self.repo.select(event="merge_group", base_sha=self.main), QUEUE)
 
-    def test_a_merge_group_without_a_base_runs_everything(self):
+    def test_a_merge_group_without_a_base_runs_everything_but_macos(self):
         self.pull_request("docs/design/gossip.md")
-        self.assertEqual(self.repo.select(event="merge_group", base_sha=""), ALL)
+        self.assertEqual(self.repo.select(event="merge_group", base_sha=""), QUEUE)
+
+    def test_a_draft_runs_only_the_cheap_set(self):
+        # Lint and format (with CI policy and select jobs, which always run);
+        # no portable suite, no heavy suite, no macOS. Marking it ready for
+        # review starts a run with the full set.
+        self.pull_request("src/lib.rs", "src/grill/apple.rs", "src/mustard/gossip.rs")
+        for base_ref, labels in [("main", {}), ("release-1-3-3", dict(full_ci=True, macos=True))]:
+            with self.subTest(base=base_ref):
+                found = self.repo.outputs(base_ref=base_ref, base_sha=self.main, draft=True, **labels)
+                self.assertEqual(found, dict({key: "false" for key in ALL}, portable="false", tested_by="",
+                                             lint="true"))
+        self.assertEqual(self.repo.select(base_sha=self.main, draft=False)["heavy"], True)
+
+    def test_a_0_4_0_branch_runs_only_the_cheap_set_until_its_release_opens(self):
+        self.pull_request("src/lib.rs")
+        for head_ref in ["0-4-0/gpu-scheduling", "0-4-0/x"]:
+            with self.subTest(head=head_ref):
+                found = self.repo.outputs(base_sha=self.main, head_ref=head_ref, full_ci=True)
+                self.assertEqual(found, dict({key: "false" for key in ALL}, portable="false", tested_by="",
+                                             lint="true"))
+        # Only the prefix counts.
+        self.assertTrue(self.repo.select(base_sha=self.main, head_ref="fix/0-4-0/x")["heavy"])
+
+    def test_a_documentation_only_draft_skips_lint_too(self):
+        self.pull_request("docs/design/gossip.md")
+        found = self.repo.outputs(base_sha=self.main, draft=True)
+        self.assertEqual(found["lint"], "false")
+        self.assertEqual(found["code"], "false")
+
+    def test_the_merge_queue_ignores_the_draft_rule(self):
+        # A merge group has no pull request: DRAFT and HEAD_REF are empty.
+        self.pull_request("src/lib.rs")
+        self.assertEqual(self.repo.select(event="merge_group", base_sha=self.main, head_ref="", draft=False),
+                         QUEUE)
 
 
     def test_documentation_into_a_release_train_skips_every_rust_job(self):
@@ -461,7 +505,8 @@ class TrainPushTests(unittest.TestCase):
 
     def test_a_push_the_queue_passed_runs_no_job(self):
         found = self.push(queue_run="44820647332")
-        self.assertEqual(found, dict({key: "false" for key in ALL}, portable="false", tested_by="44820647332"))
+        self.assertEqual(found, dict({key: "false" for key in ALL}, portable="false", tested_by="44820647332",
+                                     lint="false"))
 
     def test_a_train_whose_dependencies_differ_from_mains_still_saves_its_cache(self):
         self.repo.write("Cargo.lock", "[[package]]\nname = \"serde\"\nversion = \"1.0.1\"\n")
@@ -481,7 +526,8 @@ class TrainPushTests(unittest.TestCase):
         for queue_run in ["", "not-a-run"]:
             with self.subTest(queue_run=queue_run):
                 found = self.push(queue_run=queue_run)
-                self.assertEqual(found, dict({key: "true" for key in ALL}, portable="true", tested_by=""))
+                self.assertEqual(found, dict({key: "true" for key in ALL}, portable="true", tested_by="",
+                                             lint="true"))
 
     def test_a_push_to_main_runs_everything_whatever_it_is_told(self):
         found = self.push(queue_run="7", ref="refs/heads/main")

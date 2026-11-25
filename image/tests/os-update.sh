@@ -3,7 +3,7 @@
 # on lab builds, which build a second, newer version for it, and a third,
 # broken one for the fallback.
 #
-#   os-update.sh <artefact dir> <version> <release tree> <target> <relish> [--fallback]
+#   os-update.sh <artefact dir> <version> <release tree> <target> <relish> [--fallback|--no-link]
 #
 # One appliance on the bridge LAN forms a cluster from its seed, on
 # <version>, on a 7.25 GiB disk (disk.sh). The runner serves <release tree>,
@@ -18,11 +18,15 @@
 #
 # Without --fallback, <target> is the next version, which the channel names:
 # the test passes when the rollout completes and the node is healthy on it.
+# Before the upgrade, `relish os boot-logs --to` turns boot logs on through
+# bun (#2149): the node must say hello to `relish machines logs` on the
+# runner straight away, and its boot on <target> must stream from the
+# netlog.conf bun wrote. After it, `--off` must read back as off.
 #
 # With --fallback, <target> is the broken version, whose bun starts and
 # never gets healthy (image/tests/broken-bun), so bun's launcher installs it
 # as it would a bad release's. After the fallback, <version>'s launcher must
-# put <version>'s own bun back, or the node never gets healthy again. Each of its three counted boots fails the boot
+# put <version>'s own bun back, or the node never gets healthy again. Each of its two counted boots fails the boot
 # check and reboots; then systemd-boot falls back to <version> by itself.
 # The test passes when the node is healthy on <version> again, never was on
 # <target>, and the rollout has paused on the fallback bun reported. It
@@ -31,8 +35,19 @@
 # Wyse exit test allows (S5, image/tests/fallback.sh). The node streams its
 # boot logs to `relish machines logs` on the runner (#2149), as a Wyse in the
 # lab does to the lab Mac: reliaburger/netlog.conf on its ESP names the
-# runner. The stream must carry each of the three failed tries and bun
+# runner. The stream must carry each of the two failed tries and bun
 # healthy again on <version>.
+#
+# With --no-link, <target> is the next version again, but the VM's network
+# link goes down (QEMU's set_link) the moment <version> reboots into it, as
+# a Wyse's did in the 0.3.2 lab (#2245). The boot check doesn't wait for the
+# network and wants an address on a counted boot, so both tries of <target>
+# fail and systemd-boot falls back to <version>. bun can't start without an
+# address (its DNS responder has nothing to bind), so the link comes back as
+# the fallback boot starts; then bun must be healthy on <version> and the
+# rollout must pause on the fallback bun reports. Nothing streams with the
+# link down, so this mode doesn't stream, and it records the fallback's
+# time without holding it to the 10 minutes.
 # Needs root (the bridge), qemu-system-x86, ovmf, dnsmasq, mtools and
 # /dev/kvm.
 set -euo pipefail
@@ -40,7 +55,7 @@ set -euo pipefail
 . "$(dirname "$0")/disk.sh"
 # shellcheck source=image/tests/fallback.sh
 . "$(dirname "$0")/fallback.sh"
-usage="usage: os-update.sh <artefact dir> <version> <release tree> <target> <relish> [--fallback]"
+usage="usage: os-update.sh <artefact dir> <version> <release tree> <target> <relish> [--fallback|--no-link]"
 out=$(cd "${1:?$usage}" && pwd)
 version=${2:?$usage}
 tree=$(cd "${3:?$usage}" && pwd)
@@ -50,9 +65,10 @@ mode=update
 case "${6:-}" in
     "") ;;
     --fallback) mode=fallback ;;
+    --no-link) mode=no-link ;;
     *) echo "$usage" >&2; exit 2 ;;
 esac
-if [ "$mode" = update ]; then
+if [ "$mode" != fallback ]; then
     # The lab channel names the version the node updates to, signed with the
     # run's throwaway key (lab-signing-key.pub.pem, beside it). relish reads
     # it with --key, so `relish os list` must name it as the newest, and the
@@ -109,9 +125,11 @@ if [ "$mode" = fallback ]; then
     printf 'target=10.42.0.1:6666\n' > "$work/netlog.conf"
     mmd -i "$esp" ::reliaburger
     mcopy -i "$esp" "$work/netlog.conf" ::reliaburger/netlog.conf
-    "$relish" machines logs --interface rbbr0 --dir "$work/netlog" >"$work/netlog.out" 2>&1 &
-    netlog=$!
 fi
+# The listener: for the fallback, the netlog.conf written above; for the
+# update, the one `relish os boot-logs --to` has bun write.
+"$relish" machines logs --interface rbbr0 --dir "$work/netlog" >"$work/netlog.out" 2>&1 &
+netlog=$!
 cp /usr/share/OVMF/OVMF_VARS_4M.fd "$work/vars.fd"
 seed="$work/cluster/stick/seeds/$(echo "$mac" | tr : -).seed"
 log="$work/serial.log"
@@ -122,8 +140,20 @@ qemu-system-x86_64 -machine q35,accel=kvm -cpu host -smp 2 -m 2048 \
     -netdev tap,id=n0,ifname=rbtap0,script=no,downscript=no \
     -device "virtio-net-pci,netdev=n0,mac=$mac" \
     -smbios "type=11,value=io.systemd.credential.binary:reliaburger.seed=$(base64 -w0 < "$seed")" \
+    -monitor "unix:$work/monitor,server,nowait" \
     -display none -serial "file:$log" &
 qemu=$!
+# The VM's network link, as its NIC sees it: QEMU's monitor, set_link.
+link() {
+    python3 - "$work/monitor" "$1" <<'EOF'
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])
+s.sendall(f"set_link n0 {sys.argv[2]}\n".encode())
+time.sleep(0.5)
+s.close()
+EOF
+}
 
 start=$(date +%s)
 deadline=$((start + 1500))
@@ -135,6 +165,14 @@ wait_for() {
         sleep 2
     done
 }
+# wait_for, polling five times a second, for a line worth catching at once.
+wait_closely() {
+    until "$@" >/dev/null 2>&1; do
+        [ "$(date +%s)" -lt "$deadline" ] || return 1
+        kill -0 "$qemu" 2>/dev/null || return 1
+        sleep 0.2
+    done
+}
 # How many times the serial console shows a line matching $1.
 seen() { grep -a -c -e "$1" "$log" 2>/dev/null || true; }
 at_least() { [ "$(seen "$1")" -ge "$2" ]; }
@@ -144,6 +182,12 @@ healthy_on() { at_least "$healthy $1" "${2:-1}"; }
 on_next() { "$relish" os list --channel "$channel" --key "$key" 2>/dev/null | grep -q "solo-1 *$target"; }
 newest_is_next() { "$relish" os list --channel "$channel" --key "$key" | grep -x "Newest OS release: $target" >/dev/null; }
 finished() { "$relish" os status 2>/dev/null | tee "$work/status.txt" | grep -q "to $target: complete"; }
+# relish answered no DHCP here, so the streamed lines are under the node's
+# address.
+streamed="$work/netlog/logs/$ip.log"
+streamed_seen() { grep -a -c -e "$1" "$streamed" 2>/dev/null || true; }
+said_hello() { [ "$(streamed_seen "reliaburger-netlog: streaming from")" -ge 1 ]; }
+boot_logs_are() { "$relish" os boot-logs 2>/dev/null | tee "$work/boot-logs.txt" | grep "^solo-1 *$1\$" >/dev/null; }
 # bun on <version> reads os-update.json, finds it isn't on <target> and says
 # so; the leader (the same node) pauses the rollout on it.
 paused() {
@@ -153,18 +197,65 @@ paused() {
 
 if [ "$mode" = update ]; then
     if wait_for healthy_on "$version" \
+        && boot_logs_are off \
+        && "$relish" os boot-logs --to 10.42.0.1 \
+        && wait_for said_hello \
+        && boot_logs_are "to 10.42.0.1:6666" \
         && newest_is_next \
         && "$relish" os upgrade --channel "$channel" --key "$key" \
         && wait_for healthy_on "$target" \
         && wait_for on_next \
-        && wait_for finished; then
+        && wait_for finished \
+        && "$relish" os boot-logs --off \
+        && boot_logs_are off; then
         result=pass
     fi
-    outcome="$result"
+    # The boot on <target> read the netlog.conf bun wrote on <version>.
+    s_hello=$(streamed_seen "reliaburger-netlog: streaming from")
+    s_target=$(streamed_seen "$healthy $target")
+    detail="streamed: $s_hello hellos, healthy on $target $s_target times"
+    if [ "$result" = pass ] && { [ "$s_hello" -lt 2 ] || [ "$s_target" -lt 1 ]; }; then
+        result=fail
+        detail="$detail, not the boot on $target"
+    fi
+    outcome="$result: $detail"
     title="OS update $version → $target"
+elif [ "$mode" = no-link ]; then
+    # The kernel's last line before the firmware: cut the link there, so
+    # <target>'s boots never see one. The fourth kernel banner is the
+    # fallback boot (one before the update, two tries).
+    rebooting() { at_least "reboot: Restarting system" 1; }
+    t_upgrade='' t_reboot='' t_back=''
+    if wait_for healthy_on "$version" \
+        && newest_is_next \
+        && "$relish" os upgrade --channel "$channel" --key "$key" \
+        && t_upgrade=$(date +%s) \
+        && wait_closely rebooting \
+        && link off \
+        && t_reboot=$(date +%s) \
+        && wait_for at_least "Linux version" 4 \
+        && link on \
+        && wait_for healthy_on "$version" 2 \
+        && t_back=$(date +%s) \
+        && wait_for paused; then
+        result=pass
+    fi
+    failed=$(seen "reliaburger: \(bun not healthy\|no IPv4 address\) after [0-9]* s on OS $target")
+    on_target=$(seen "$healthy $target")
+    boots=$(seen "Linux version")
+    detail="$failed failed tries, $boots boots"
+    if [ "$result" = pass ] && { [ "$failed" -ne 2 ] || [ "$on_target" -ne 0 ]; }; then
+        result=fail
+        detail="$detail, not the two failed tries and the fallback"
+    fi
+    if [ -n "$t_back" ]; then
+        detail="$detail, healthy on $version again $((t_back - t_reboot)) s after the reboot into $target"
+    fi
+    outcome="$result: $detail"
+    title="OS update with no link $version → $target → $version"
 else
     # Each boot starts the kernel afresh, so its banner counts them: one
-    # before the update, three tries of <target>, one back on <version>.
+    # before the update, two tries of <target>, one back on <version>.
     t_upgrade='' t_reboot='' t_back=''
     if wait_for healthy_on "$version" \
         && "$relish" os list --channel "$channel" --key "$key" \
@@ -180,23 +271,20 @@ else
     tries=$(seen "reliaburger: bun not healthy after [0-9]* s on OS $target")
     on_broken=$(seen "$healthy $target")
     boots=$(seen "Linux version")
-    # Three failed tries, never healthy on the broken version: anything
+    # Two failed tries, never healthy on the broken version: anything
     # else isn't the fallback this test is for.
-    if [ "$result" = pass ] && { [ "$tries" -ne 3 ] || [ "$on_broken" -ne 0 ]; }; then
+    if [ "$result" = pass ] && { [ "$tries" -ne 2 ] || [ "$on_broken" -ne 0 ]; }; then
         result=fail
     fi
     detail="$tries failed tries, $boots boots"
-    # The same, as the node streamed it. relish answered no DHCP here, so
-    # the lines are under the node's address.
-    streamed="$work/netlog/logs/$ip.log"
-    streamed_seen() { grep -a -c -e "$1" "$streamed" 2>/dev/null || true; }
+    # The same, as the node streamed it.
     s_tries=$(streamed_seen "reliaburger: bun not healthy after [0-9]* s on OS $target")
     s_back=$(streamed_seen "$healthy $version")
     s_rebooting=$(streamed_seen "reliaburger: counted boot failed, rebooting")
     detail="$detail; streamed: $s_tries failed tries, $s_rebooting reboots, healthy on $version $s_back times"
-    if [ "$result" = pass ] && { [ "$s_tries" -ne 3 ] || [ "$s_back" -lt 2 ]; }; then
+    if [ "$result" = pass ] && { [ "$s_tries" -ne 2 ] || [ "$s_back" -lt 2 ]; }; then
         result=fail
-        detail="$detail, not the three tries and the fallback"
+        detail="$detail, not the two tries and the fallback"
     fi
     if [ -n "$t_back" ]; then
         fallback=$((t_back - t_reboot))
@@ -212,17 +300,17 @@ fi
 elapsed=$(( $(date +%s) - start ))
 echo "--- serial console ---"
 cat "$log" || true
-if [ -n "${netlog:-}" ]; then
-    echo "--- relish machines logs ---"
-    cat "$work/netlog.out" || true
-fi
+echo "--- relish machines logs ---"
+cat "$work/netlog.out" || true
+echo "--- relish os boot-logs ---"
+cat "$work/boot-logs.txt" 2>/dev/null || true
 echo "--- release server ---"
 cat "$work/http.log" || true
 {
     echo "### $title: $outcome; ${elapsed} s in all"
     echo '```'
     cat "$work/status.txt" 2>/dev/null || true
-    grep -a -h -e "reliaburger: bun" -e "reliaburger: counted boot" -e "os update" "$log" || true
+    grep -a -h -e "reliaburger: bun" -e "reliaburger: no IPv4" -e "reliaburger: counted boot" -e "os update" "$log" || true
     echo '```'
 } | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}" # the log too, which the API serves
 [ "$result" = pass ]

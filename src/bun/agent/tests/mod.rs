@@ -7191,8 +7191,10 @@ async fn retirement_releases_ownership_only_after_the_process_exits() {
 }
 
 /// Two stubborn stops overlap: together they cost one grace, not two.
-/// Serial stops take at least two graces; the 1.8 bound leaves a
-/// loaded runner room without admitting them.
+/// Each stubborn stop waits out its whole grace before the kill, so serial
+/// stops take at least two graces, and anything under two proves they
+/// overlapped. A 1.8 bound failed overlapping stops at 3.6 to 3.9 s on a
+/// loaded 4-vCPU host (#1723).
 #[tokio::test]
 async fn concurrent_sigterm_ignoring_stops_overlap() {
     let (tx, shutdown, handle, grill, volumes) = stubborn_agent();
@@ -7211,7 +7213,7 @@ async fn concurrent_sigterm_ignoring_stops_overlap() {
     let elapsed = started.elapsed();
 
     assert!(
-        elapsed < STUBBORN_GRACE * 9 / 5,
+        elapsed < STUBBORN_GRACE * 2,
         "stops serialised: {elapsed:?} for two {STUBBORN_GRACE:?} graces"
     );
     for app in ["first", "second"] {
@@ -14380,6 +14382,7 @@ fn runtime_unknown_is_serialised_only_when_set() {
         age_seconds: None,
         image: None,
         data_on_node: false,
+        sidecars: Vec::new(),
         reason: None,
     };
     let plain = serde_json::to_value(&status).unwrap();

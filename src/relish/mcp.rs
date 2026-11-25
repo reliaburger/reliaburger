@@ -250,7 +250,13 @@ pub const REFUSAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(
 pub struct Managed {
     path: PathBuf,
     scope: credentials::Scope,
-    admin: BunClient,
+    /// The admin client, aimed at whichever of the context's nodes answered
+    /// when it was built. Locked only to read or replace it.
+    admin: tokio::sync::Mutex<BunClient>,
+    /// The saved context the admin client came from, read again to build a
+    /// new one when its node stops answering (#2304). `None`: a client
+    /// given whole, which is all there is.
+    context: Option<PathBuf>,
     /// Held while a token is checked or made, so two calls at once don't
     /// make two. Another process is kept out by the file lock in
     /// [`credentials::obtain`].
@@ -296,7 +302,8 @@ impl Managed {
         Managed {
             path,
             scope,
-            admin,
+            admin: tokio::sync::Mutex::new(admin),
+            context: None,
             state: tokio::sync::Mutex::default(),
         }
     }
@@ -308,24 +315,60 @@ impl Managed {
         purpose: credentials::Purpose,
     ) -> Result<Option<Managed>, RelishError> {
         let context_path = crate::relish::local_context::default_path()?;
-        let Some(context) = crate::relish::local_context::LocalContext::load(&context_path)? else {
+        Self::from_context_at(&context_path, namespace, purpose)
+    }
+
+    /// [`from_context`](Self::from_context), for the context saved at
+    /// `context_path`.
+    fn from_context_at(
+        context_path: &std::path::Path,
+        namespace: Option<&str>,
+        purpose: credentials::Purpose,
+    ) -> Result<Option<Managed>, RelishError> {
+        let Some(context) = crate::relish::local_context::LocalContext::load(context_path)? else {
             return Ok(None);
         };
-        let path = credentials::path_for(&context_path, namespace, purpose).map_err(|error| {
+        let path = credentials::path_for(context_path, namespace, purpose).map_err(|error| {
             RelishError::InvalidFlag {
                 flag: "namespace".to_string(),
                 reason: error.to_string(),
             }
         })?;
-        // `None` asks for the context's own token, never an override.
-        let admin = context.client(None, None)?;
+        let admin = context_admin(&context, context_path)?;
         let scope = credentials::Scope {
             owner: context.owner.clone(),
             endpoint: context.endpoint.clone(),
             namespace: namespace.map(str::to_string),
             purpose,
         };
-        Ok(Some(Managed::new(path, scope, admin)))
+        let mut managed = Managed::new(path, scope, admin);
+        managed.context = Some(context_path.to_path_buf());
+        Ok(Some(managed))
+    }
+
+    /// The admin client in use.
+    async fn admin(&self) -> BunClient {
+        self.admin.lock().await.clone()
+    }
+
+    /// Build the admin client again from the saved context, aimed at the
+    /// first of its nodes that answers now, as each tool call's client is
+    /// (#2241). `None` when it was given whole, or the context can't give
+    /// one: the caller keeps the answer it had.
+    async fn rebuild_admin(&self) -> Option<BunClient> {
+        let context_path = self.context.clone()?;
+        // Probing the endpoints blocks, as reading the context does.
+        let built = tokio::task::spawn_blocking(move || {
+            let context = crate::relish::local_context::LocalContext::load(&context_path)
+                .ok()
+                .flatten()?;
+            context_admin(&context, &context_path).ok()
+        })
+        .await
+        .ok()
+        .flatten()?;
+        *self.admin.lock().await = built.clone();
+        Some(built)
     }
 
     /// Make sure every request from here on sends a read-only token: the
@@ -362,14 +405,29 @@ impl Managed {
             Want::Any => None,
             Want::Replacing(rejected) => rejected,
         };
-        let obtained = credentials::obtain(
+        let admin = self.admin().await;
+        let mut obtained = credentials::obtain(
             &self.path,
             &self.scope,
-            &self.admin,
+            &admin,
             credentials::now(),
             rejected,
         )
         .await;
+        // The node the admin client was built on has stopped answering:
+        // fall over to another of the context's nodes and ask once more.
+        if matches!(obtained, Err(CredentialError::Unreachable(_)))
+            && let Some(admin) = self.rebuild_admin().await
+        {
+            obtained = credentials::obtain(
+                &self.path,
+                &self.scope,
+                &admin,
+                credentials::now(),
+                rejected,
+            )
+            .await;
+        }
         let credential = match obtained {
             Ok((credential, _)) => credential,
             Err(error) => {
@@ -409,7 +467,7 @@ impl Managed {
     /// when it can't say, or when the context's own token was sent.
     async fn rejects(&self, sent: Option<&str>) -> bool {
         match sent {
-            Some(token) => credentials::accepted(&self.admin, token).await == Some(false),
+            Some(token) => credentials::accepted(&self.admin().await, token).await == Some(false),
             None => false,
         }
     }
@@ -423,6 +481,20 @@ impl Managed {
             *at = earlier;
         }
     }
+}
+
+/// An admin client for `context`, saved at `context_path`, on the first of
+/// its nodes that answers. It says on stderr which nodes it passed over, as
+/// every relish command does, and remembers the one that answered. It sends
+/// the context's own token, never an override.
+fn context_admin(
+    context: &crate::relish::local_context::LocalContext,
+    context_path: &std::path::Path,
+) -> Result<BunClient, RelishError> {
+    let (admin, choice) =
+        context.connect(None, None, crate::relish::local_context::probe_endpoint)?;
+    BunClient::report_fallover(context, &choice, Some(context_path));
+    Ok(admin)
 }
 
 /// The MCP server: the tools it offers and how to run them.

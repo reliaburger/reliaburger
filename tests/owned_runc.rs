@@ -294,6 +294,131 @@ async fn runc_owned_adoption_validates_generation_and_restores_live_network() {
     assert_absent(root.path(), &id);
 }
 
+/// #1315: a restarted Bun adopts a sidecar beside its instance. The sidecar
+/// keeps its process, and it's still in its instance's network namespace,
+/// which it holds no address of its own in: there's no network of its own
+/// to adopt, so adoption mustn't look for one.
+#[tokio::test]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
+async fn a_bun_restart_adopts_a_sidecar_with_its_process_and_its_instances_network() {
+    let root = tempfile::tempdir().unwrap();
+    let parent = instance(root.path());
+    let sidecar = reliaburger::grill::oci::sidecar_instance_id(&parent, "probe");
+    let app = spec(root.path(), "exec /bin/busybox sleep 60");
+    let mut beside = spec(root.path(), "exec /bin/busybox sleep 60");
+    let shared = reliaburger::grill::oci::network_namespace_path(&parent);
+    beside.linux.namespaces = reliaburger::grill::oci::standard_namespaces(Some(shared.as_str()));
+    let first = runtime(root.path());
+    // Bun's order: the instance's create makes the namespace the sidecar
+    // joins, and the sidecar starts first.
+    first.create(&parent, &app).await.unwrap();
+    install_fixture(root.path(), &parent);
+    first.create(&sidecar, &beside).await.unwrap();
+    install_fixture(root.path(), &sidecar);
+    first.start(&sidecar).await.unwrap();
+    first.start(&parent).await.unwrap();
+    let parent_pid = first.pid(&parent).await.unwrap().unwrap();
+    let sidecar_pid = first.pid(&sidecar).await.unwrap().unwrap();
+    let parent_record = adoption_record(&parent, parent_pid, first.log_stem(&parent).await, app);
+    let sidecar_record = adoption_record(
+        &sidecar,
+        sidecar_pid,
+        first.log_stem(&sidecar).await,
+        beside,
+    );
+    drop(first);
+
+    let recovered = runtime(root.path());
+    assert!(recovered.adopt(&parent, &parent_record).await.unwrap());
+    let adopted = recovered.adopt(&sidecar, &sidecar_record).await;
+    assert!(matches!(adopted, Ok(true)), "{adopted:?}");
+    assert_eq!(recovered.pid(&sidecar).await.unwrap(), Some(sidecar_pid));
+    assert_eq!(
+        recovered.state(&sidecar).await.unwrap(),
+        ContainerState::Running
+    );
+    assert_eq!(recovered.container_ip(&sidecar).await, None);
+    let network_of = |pid: u32| std::fs::read_link(format!("/proc/{pid}/ns/net")).unwrap();
+    let workload = |pids: Vec<u32>| *pids.first().expect("no workload process");
+    let parent_workload = workload(recovered.workload_pids(&parent).await.unwrap());
+    let sidecar_workload = workload(recovered.workload_pids(&sidecar).await.unwrap());
+    assert_eq!(
+        network_of(sidecar_workload),
+        network_of(parent_workload),
+        "the adopted sidecar left its instance's namespace"
+    );
+
+    recovered.kill(&sidecar).await.unwrap();
+    recovered.kill(&parent).await.unwrap();
+    assert_absent(root.path(), &sidecar);
+    assert_absent(root.path(), &parent);
+}
+
+/// Review of #2269: a sidecar that died while Bun was down. Its record names
+/// a process that's gone, so adoption refuses it, and once its retirement
+/// has made the runtime forget it, the runtime answers `NotFound`: what the
+/// agent must not kill a second time.
+#[tokio::test]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
+async fn a_sidecar_that_died_before_adoption_is_refused_and_then_forgotten() {
+    let root = tempfile::tempdir().unwrap();
+    let parent = instance(root.path());
+    let sidecar = reliaburger::grill::oci::sidecar_instance_id(&parent, "probe");
+    let app = spec(root.path(), "exec /bin/busybox sleep 60");
+    let mut beside = spec(root.path(), "exec /bin/busybox sleep 60");
+    let shared = reliaburger::grill::oci::network_namespace_path(&parent);
+    beside.linux.namespaces = reliaburger::grill::oci::standard_namespaces(Some(shared.as_str()));
+    let first = runtime(root.path());
+    first.create(&parent, &app).await.unwrap();
+    install_fixture(root.path(), &parent);
+    first.create(&sidecar, &beside).await.unwrap();
+    install_fixture(root.path(), &sidecar);
+    first.start(&sidecar).await.unwrap();
+    first.start(&parent).await.unwrap();
+    let sidecar_pid = first.pid(&sidecar).await.unwrap().unwrap();
+    let parent_record = adoption_record(
+        &parent,
+        first.pid(&parent).await.unwrap().unwrap(),
+        first.log_stem(&parent).await,
+        app,
+    );
+    let sidecar_record = adoption_record(
+        &sidecar,
+        sidecar_pid,
+        first.log_stem(&sidecar).await,
+        beside,
+    );
+    for pid in first.workload_pids(&sidecar).await.unwrap() {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while first.state(&sidecar).await.unwrap() != ContainerState::Stopped {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the killed sidecar never stopped");
+    drop(first);
+
+    let recovered = runtime(root.path());
+    assert!(recovered.adopt(&parent, &parent_record).await.unwrap());
+    let refused = recovered.adopt(&sidecar, &sidecar_record).await;
+    assert!(matches!(refused, Ok(false)), "{refused:?}");
+    recovered.forget_retired(&sidecar).await.unwrap();
+    let again = recovered.kill(&sidecar).await;
+    assert!(
+        matches!(again, Err(reliaburger::grill::GrillError::NotFound { .. })),
+        "{again:?}"
+    );
+
+    recovered.kill(&parent).await.unwrap();
+    assert_absent(root.path(), &sidecar);
+    assert_absent(root.path(), &parent);
+}
+
 fn adoption_record(
     id: &InstanceId,
     pid: u32,
@@ -1593,7 +1718,7 @@ mod capacity_contract {
     use reliaburger::council::types::{CouncilConfig, CouncilNodeInfo};
     use reliaburger::grill::image::{ClusterFetchFuture, ClusterImageSource, LocalImageBlobs};
     use reliaburger::grill::runc::RuncGrill;
-    use reliaburger::grill::{ContainerState, Grill, ImageStore, PortAllocator};
+    use reliaburger::grill::{ContainerState, Grill, ImageStore, InstanceId, PortAllocator};
     use reliaburger::relish::client::BunClient;
     use sha2::{Digest, Sha256};
     use tokio::sync::{RwLock, mpsc};
@@ -1986,6 +2111,55 @@ mod capacity_contract {
         }
     }
 
+    /// How long one step of the capacity contract may take: an apply, an
+    /// executor's cold start or a batch's retirement. Each takes about a
+    /// second alone, but a cold owned-runc start runs some twenty supervised
+    /// `ip`, `nft` and `sysctl` commands and a synced image unpack, one
+    /// after another. Beside a full `make test-linux`, or in an 8-vCPU VM at
+    /// load 17 with two fsync writers, one start took 5 to 25 s and a single
+    /// `ip link` 7.5 s, so a 20 s wait failed while nothing was wrong
+    /// (#2267). The limit only has to catch a step that never comes.
+    const STEP_DEADLINE: Duration = Duration::from_secs(90);
+
+    /// Wait until the singleton's command has written `work/ready` inside
+    /// its rootfs. Fails at once if the runtime retires the instance first,
+    /// and says how far the start got if the deadline passes.
+    async fn wait_for_singleton_ready(
+        runtime: &RuncGrill,
+        root: &Path,
+        identity: &InstanceId,
+    ) -> Result<(), String> {
+        let rootfs = root.join("bundles").join(&identity.0).join("rootfs");
+        let started = std::time::Instant::now();
+        while started.elapsed() < STEP_DEADLINE {
+            if rootfs.join("work/ready").exists() {
+                return Ok(());
+            }
+            let launched = runtime
+                .launch_inventory()
+                .await
+                .map_err(|error| format!("launch inventory unavailable: {error}"))?
+                .unwrap_or_default()
+                .iter()
+                .any(|launch| launch.instance_id == *identity);
+            if !launched {
+                return Err(format!(
+                    "{} left the launch inventory after {:?} without writing work/ready",
+                    identity.0,
+                    started.elapsed()
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Err(format!(
+            "{} not ready after {STEP_DEADLINE:?}: network namespace {}, rootfs mounted {}, runc state {}",
+            identity.0,
+            reliaburger::grill::netns::namespace_path(identity).exists(),
+            rootfs.join("bin/busybox").exists(),
+            root.join("state").join(&identity.0).exists(),
+        ))
+    }
+
     fn fresh_capacity(harness: &Harness, term: u64) {
         harness._capacity_publisher.send_modify(|state| {
             state.leadership_epoch = Some(term);
@@ -2040,12 +2214,12 @@ mod capacity_contract {
             ordinary.job["ordinary"].memory.unwrap().request,
             128 * 1024 * 1024
         );
-        tokio::time::timeout(Duration::from_secs(20), harness.client.apply(&ordinary))
+        tokio::time::timeout(STEP_DEADLINE, harness.client.apply(&ordinary))
             .await
             .expect("real ordinary apply did not acknowledge")
             .unwrap();
         let mut identity = None;
-        tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::time::timeout(STEP_DEADLINE, async {
             while identity.is_none() {
                 identity = runtime
                     .launch_inventory()
@@ -2068,13 +2242,9 @@ mod capacity_contract {
         let identity = identity.unwrap();
         let rootfs = root.path().join("bundles").join(&identity.0).join("rootfs");
         let release = ReleaseOnDrop(rootfs.join("work/release"));
-        tokio::time::timeout(Duration::from_secs(20), async {
-            while !rootfs.join("work/ready").exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("owned singleton did not start");
+        if let Err(reason) = wait_for_singleton_ready(&runtime, root.path(), &identity).await {
+            panic!("owned singleton did not start: {reason}");
+        }
         assert_eq!(
             runtime.state(&identity).await.unwrap(),
             ContainerState::Running
@@ -2149,24 +2319,25 @@ mod capacity_contract {
         }
         std::fs::write(&release.0, b"release").unwrap();
         for id in std::iter::once(ordinary_id).chain(pending) {
-            tokio::time::timeout(Duration::from_secs(30), async {
-                loop {
-                    let summary = harness.client.batch_status(id).await.unwrap();
-                    if summary["done"] == true {
-                        assert_eq!(summary["succeeded"], 1, "{summary}");
-                        assert_eq!(summary["failed"], 0);
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+            let started = std::time::Instant::now();
+            let summary = loop {
+                let summary = harness.client.batch_status(id).await.unwrap();
+                if summary["done"] == true || started.elapsed() >= STEP_DEADLINE {
+                    break summary;
                 }
-            })
-            .await
-            .expect("positive owned retirement did not free waiting work");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            assert_eq!(
+                summary["done"], true,
+                "positive owned retirement did not free waiting work: {summary}"
+            );
+            assert_eq!(summary["succeeded"], 1, "{summary}");
+            assert_eq!(summary["failed"], 0, "{summary}");
         }
 
         fresh_capacity(&harness, council.current_term());
         let admitted = tokio::time::timeout(
-            Duration::from_secs(20),
+            STEP_DEADLINE,
             harness
                 .client
                 .submit_batch(&probe("full-after-terminal", "8", "16Gi"), None),
@@ -2177,7 +2348,7 @@ mod capacity_contract {
         assert_eq!(admitted["assigned"], 1, "{admitted}");
         assert_eq!(admitted["unschedulable"], serde_json::json!([]));
         let batch_id = admitted["batch_id"].as_u64().unwrap();
-        tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::time::timeout(STEP_DEADLINE, async {
             loop {
                 let summary = harness.client.batch_status(batch_id).await.unwrap();
                 if summary["done"] == true {

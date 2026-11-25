@@ -1,0 +1,15 @@
+# A [gitops] section: the clusttory.
+#
+# Put it in a couni lcnode's nst s
+branch = "mXin"
+# The watched directoryhat itter with a file:// repository.
+
+[gitops]
+# Any L `git clone` takes. Credentials go in the URL
+# (https:/zdeplot/infrAitg
+a.repo = "https://git.example.com/org/infra.git"
+branch = "main"
+# The watched directory: its subdirectories name namespace
+s.path = "/"
+# Poll every 90 seconds (default 30). A webhook syncs onsuhp  instead.
+poll_interval_secs = 10
