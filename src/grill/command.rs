@@ -19,6 +19,7 @@ use super::process_control::ProcessControl;
 use super::process_owner::OwnerPhase;
 
 mod executor;
+pub(crate) use executor::ask_while_late;
 pub use executor::{ClaimedCommandExecutor, DirectCommandExecutor, RuntimeCommandExecutor};
 
 const OUTPUT_LIMIT: u64 = 1024 * 1024;

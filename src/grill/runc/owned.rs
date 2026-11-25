@@ -54,6 +54,13 @@ struct BoundLauncher {
     started_at: u64,
 }
 
+/// How long a stop or kill asks a busy launcher owner for the launcher's
+/// state before it seals (#2328). Half the agent's default 10 s stop
+/// confirmation (`stop_confirmation_timeout_secs`), so the signal still
+/// has the other half. A longer stall fails the stop as before, without
+/// consuming the claim, and the caller can stop it again.
+const LAUNCHER_READ_PATIENCE: Duration = Duration::from_secs(5);
+
 fn failure(instance: &InstanceId, error: impl std::fmt::Display) -> GrillError {
     GrillError::StateUnavailable {
         instance: instance.clone(),
@@ -485,7 +492,10 @@ impl RuncGrill {
                 }
             }
         }
-        let exit_code = match context.role_state(RuntimeRole::Launcher).await? {
+        let exit_code = match context
+            .role_state_patiently(RuntimeRole::Launcher, LAUNCHER_READ_PATIENCE)
+            .await?
+        {
             Some(CommandState::Retired { exit_code }) => exit_code,
             _ => None,
         };
@@ -629,7 +639,9 @@ impl RuncGrill {
     pub(super) async fn owned_stop(&self, instance: &InstanceId) -> Result<(), GrillError> {
         self.owned_operation(instance, |runtime, id, context| async move {
             if !matches!(
-                context.role_state(RuntimeRole::Launcher).await?,
+                context
+                    .role_state_patiently(RuntimeRole::Launcher, LAUNCHER_READ_PATIENCE)
+                    .await?,
                 Some(CommandState::Running { .. })
             ) {
                 return runtime.owned_cleanup(&id, &context).await;

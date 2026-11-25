@@ -5,7 +5,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::grill::command::{CommandId, CommandOutput, CommandState, OwnedCommands};
+use crate::grill::command::{
+    CommandId, CommandOutput, CommandState, OwnedCommands, ask_while_late,
+};
 
 use super::{IntentClaim, IntentPhase, RuntimeIntent};
 
@@ -507,11 +509,18 @@ impl IntentCommands {
     /// Persist refusal of new work, then positively retire every admitted mutator.
     /// Caller cancellation retains the claim through this bounded drain.
     /// A failed or timed-out drain leaves the generation sealed for recovery.
+    ///
+    /// The drain's role checks ask each running role's owner for its state,
+    /// one short request each. A late answer is asked again within
+    /// `timeout`, so a busy owner delays the drain rather than failing it
+    /// (#2328); any other refusal, like an owner that died while its
+    /// workload runs, fails it at once. Retiring a command already asks
+    /// again on its own.
     pub async fn seal(mut self, timeout: Duration) -> io::Result<Self> {
         tokio::spawn(async move {
             self.claim = self.claim.begin_retirement().await?;
             tokio::time::timeout(timeout, async {
-                self.validate_roles().await?;
+                ask_while_late(|| self.validate_roles()).await?;
                 for role in RuntimeRole::ALL {
                     let collection = self.collection(role);
                     for id in collection.inventory().await.map_err(io::Error::other)? {
@@ -527,8 +536,11 @@ impl IntentCommands {
                         .await
                         .map_err(io::Error::other)?;
                 }
-                self.require_terminal_roles().await?;
-                self.require_terminal_commands().await
+                ask_while_late(|| async {
+                    self.require_terminal_roles().await?;
+                    self.require_terminal_commands().await
+                })
+                .await
             })
             .await
             .map_err(|_| {

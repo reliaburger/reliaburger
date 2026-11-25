@@ -41,6 +41,38 @@ fn transient_owner_error(error: &io::Error) -> bool {
         .is_some_and(super::CommandError::is_transient)
 }
 
+/// The pause before asking a late owner again: 10 ms, doubling to 200 ms.
+struct LateAnswerBackoff(Duration);
+
+impl LateAnswerBackoff {
+    fn new() -> Self {
+        Self(ADMISSION_BACKOFF_START)
+    }
+
+    async fn pause(&mut self) {
+        tokio::time::sleep(self.0).await;
+        self.0 = (self.0 * 2).min(ADMISSION_BACKOFF_LIMIT);
+    }
+}
+
+/// Ask through `ask`, and ask again while the owner's answer is lost or
+/// late, as exec admission does. Any other error returns at once. It has
+/// no bound of its own: the caller runs it under a timeout, as a seal's
+/// drain does (#2328). Each ask must be safe to repeat.
+pub(crate) async fn ask_while_late<T, F, Fut>(mut ask: F) -> io::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = io::Result<T>>,
+{
+    let mut backoff = LateAnswerBackoff::new();
+    loop {
+        match ask().await {
+            Err(error) if transient_owner_error(&error) => backoff.pause().await,
+            answer => return answer,
+        }
+    }
+}
+
 /// Executes a bounded short runtime command without shell interpolation.
 pub trait RuntimeCommandExecutor: Send + Sync {
     /// Return actual exit evidence and captured output, or retain uncertainty as an error.
@@ -156,6 +188,23 @@ impl ClaimedCommandExecutor {
             .ok_or_else(unavailable)?
             .role_state(role)
             .await
+    }
+
+    /// [`role_state`](Self::role_state), asking again while the role's
+    /// owner answers late, for up to `bound` (#2328). An ask that starts
+    /// just before `bound` runs out can overrun it by one owner request
+    /// (2 s). Each ask takes the adapter mutex afresh. Any other refusal,
+    /// like an owner that died while its workload runs, returns at once.
+    pub async fn role_state_patiently(
+        &self,
+        role: RuntimeRole,
+        bound: Duration,
+    ) -> io::Result<Option<CommandState>> {
+        let (guard, state) = self
+            .ask_patiently(bound, |commands| Box::pin(commands.role_state(role)))
+            .await?;
+        drop(guard);
+        Ok(state)
     }
 
     /// Observe the bound network helper after cancelling one that an earlier
@@ -281,7 +330,7 @@ impl ClaimedCommandExecutor {
         ask: impl Fn(&IntentCommands) -> BoxFuture<'_, io::Result<T>>,
     ) -> io::Result<(OwnedMutexGuard<Option<IntentCommands>>, T)> {
         let started = tokio::time::Instant::now();
-        let mut backoff = ADMISSION_BACKOFF_START;
+        let mut backoff = LateAnswerBackoff::new();
         let mut attempts: u32 = 0;
         loop {
             attempts += 1;
@@ -305,8 +354,7 @@ impl ClaimedCommandExecutor {
                 Err(error) => return Err(error),
             }
             drop(guard);
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(ADMISSION_BACKOFF_LIMIT);
+            backoff.pause().await;
         }
     }
 
