@@ -394,7 +394,30 @@ log 6c:4b:90:12:34:56: [    9.412871] r8169 0000:01:00.0 enp1s0: Link is Up - 1G
 log 6c:4b:90:12:34:56: reliaburger: bun not healthy after 120 s on OS 2026.47.228
 ```
 
-Each line also goes to `os/logs/<mac>.log`. The machine's first line on
+Each line also goes to `os/logs/<mac>.log`. Three machines booting at once
+send hundreds of kernel lines each, so to keep the screen to what's
+happening, print only the boot units' lines:
+
+```sh
+sudo relish netboot os --stream-logs=units
+```
+
+```
+log 6c:4b:90:12:34:56: reliaburger-netlog: streaming from 192.168.1.77 (enp1s0 6c:4b:90:12:34:56) to 192.168.1.20:6666
+log 6c:4b:90:12:34:56: [    9.412871] install[412]: reliaburger-install: target /dev/mmcblk0, 7818 MB
+log 6c:4b:90:12:34:56: [   31.554310] reliaburger-boot-check: reliaburger: bun healthy on OS 2026.47.228
+```
+
+`--stream-logs` on its own, or `--stream-logs=all`, prints every line.
+`--stream-logs=units` prints the lines of the installer, the boot check, bun,
+the seed and the clock wait, and the machine's hello, which names its MAC.
+It leaves the kernel's other lines out, except a panic, an oops or a `BUG:`,
+which always print. Write the value with `=`: a word after a bare
+`--stream-logs` is the netboot directory. Either way, every line goes to
+`os/logs/<mac>.log`, so `tail -f os/logs/<mac>.log` shows one machine's whole
+kernel log.
+
+The machine's first line on
 each boot names its MAC, so it keeps its name when your router gives the
 installed system a different address from the one it network-booted with. A
 line from a machine `relish netboot` didn't answer shows as
