@@ -65,14 +65,14 @@
 
       <!-- Three claims, each with the page its numbers come from. -->
       <dl class="facts" aria-label="Three reasons to let an agent operate it">
-        <div><dt>Security built in.</dt><dd>Agents are part of the design, so anything they
+        <div><dt><svg class="mini-art" viewBox="0 0 48 48" width="48" height="48" aria-hidden="true" focusable="false"><g fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M24 5 L40 11 V23 C40 33 33 40 24 43 C15 40 8 33 8 23 V11 Z"/><path d="M16.5 24 l5.5 5.5 l10 -11"/></g></svg>Security built in.</dt><dd>Agents are part of the design, so anything they
           do is reviewed first and can be reverted after. Across
           <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-06-v0.2.7-exit-test.md#second-run-1742-utc">30 recorded sessions</a>, Claude Code changed
           nothing by itself.</dd></div>
-        <div><dt>Everything in the burger.</dt><dd>App scheduling, batch jobs, ingress, mTLS,
+        <div><dt><svg class="mini-art" viewBox="0 0 48 48" width="48" height="48" aria-hidden="true" focusable="false"><g fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 20 C9 11 16 7 24 7 C32 7 39 11 39 20 Z"/><path d="M7 26 q4.2 -5 8.5 0 t8.5 0 t8.5 0 t8.5 0"/><path d="M9 32 H39"/><path d="M10 37 H38 C38 40 36 42 33 42 H15 C12 42 10 40 10 37 Z"/></g></svg>Everything in the burger.</dt><dd>App scheduling, batch jobs, ingress, mTLS,
           service discovery, metrics, logs, a registry, GitOps and chaos testing.
           <a href="features">Nothing else to install</a>.</dd></div>
-        <div><dt>Small &amp; simple.</dt><dd>8 resource kinds and a tenth of the code: 202,730
+        <div><dt><svg class="mini-art" viewBox="0 0 48 48" width="48" height="48" aria-hidden="true" focusable="false"><g fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M7 14 H41 M7 14 V10 M41 14 V10"/><rect x="7" y="22" width="34" height="7" rx="2"/><rect x="7" y="35" width="5" height="7" rx="2" fill="currentColor"/></g></svg>Small &amp; simple.</dt><dd>8 resource kinds and a tenth of the code: 202,730
           lines of Rust, against 2,134,280 of Go for the same features on Kubernetes,
           <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-10-loc-comparison.md">counted the same way</a>.</dd></div>
       </dl>
@@ -430,19 +430,19 @@
           </tbody>
         </table></div>
         <ul class="benefits">
-          <li><h3>One project, instead of a dozen.</h3>
+          <li><svg class="mini-art" viewBox="0 0 48 48" width="48" height="48" aria-hidden="true" focusable="false"><g fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M24 6 L40 15 V33 L24 42 L8 33 V15 Z"/><path d="M8 15 L24 24 L40 15 M24 24 V42"/></g></svg><h3>One project, instead of a dozen.</h3>
             <p>Scheduling, ingress, the registry and policy are one binary, so the cluster
               works out what a change touches and how to undo it. On Kubernetes an agent
               pieces that together across dozens of resource kinds and add-ons.</p></li>
-          <li><h3>The source it’s actually running.</h3>
+          <li><svg class="mini-art" viewBox="0 0 48 48" width="48" height="48" aria-hidden="true" focusable="false"><g fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5 H29 L37 13 V43 H12 Z"/><path d="M29 5 V13 H37"/><path d="M21 24 l-4 4.5 l4 4.5 M28 24 l4 4.5 l-4 4.5"/></g></svg><h3>The source it’s actually running.</h3>
             <p><code>relish</code> carries the manual and the exact source it was built from.
               Your agent reads how a finding is decided, not whatever is on GitHub today.</p></li>
-          <li><h3 id="act-context">Small enough to hold in a context window.</h3>
+          <li><svg class="mini-art" viewBox="0 0 48 48" width="48" height="48" aria-hidden="true" focusable="false"><g fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="9" width="36" height="30" rx="3"/><path d="M6 17 H42"/><path d="M13 24 H27 M13 31 H21"/></g></svg><h3 id="act-context">Small enough to hold in a context window.</h3>
             <p>Reliaburger has 8 resource kinds and 211 commands and subcommands, counted from
               the CLI’s own definitions, hidden ones included. A test fails when either number
               moves, so a new concept is a line in a pull request that someone has to agree
               with.</p></li>
-          <li><h3>Rules it can’t talk its way past.</h3>
+          <li><svg class="mini-art" viewBox="0 0 48 48" width="48" height="48" aria-hidden="true" focusable="false"><g fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 42 V12 M10 16 H40 M10 26 H40"/><path d="M17 16 l6 10 M27 16 l6 10 M37 16 l3 5"/><circle cx="10" cy="9" r="3"/></g></svg><h3>Rules it can’t talk its way past.</h3>
             <p>A guardrail judges the proposal and never sees the agent’s reason. One can
               refuse outright, and one can approve small routine changes so nobody gets
               paged for them.</p></li>

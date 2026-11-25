@@ -571,6 +571,16 @@ footer { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-top: 20px; paddi
 }
 @media (prefers-reduced-motion: reduce) { .burger-map svg { transition: none; } }
 
+/* Small line drawings beside the three facts and the four design points, each in
+   its ingredient's colour. */
+.mini-art { display: block; width: 44px; height: 44px; margin: 4px 0 10px; }
+.home .facts > div:nth-child(1) .mini-art { color: var(--lettuce); }
+.home .facts > div:nth-child(2) .mini-art { color: var(--mustard); }
+.home .facts > div:nth-child(3) .mini-art { color: var(--tomato); }
+.home .benefits li { display: grid; grid-template-columns: 44px minmax(0, 1fr); gap: 0 18px; align-content: start; }
+.home .benefits .mini-art { grid-row: span 2; margin: 2px 0 0; color: var(--tint); }
+.home .benefits h3 { margin-top: 0; }
+
 /* Dark theme, chosen with the button copy.js adds and remembered in this browser.
    The dark boxes (terminals, recordings, the whitepaper's band) keep their light
    text and go a shade darker than the page, so they still read as boxes. */
