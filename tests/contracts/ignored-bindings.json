@@ -492,6 +492,12 @@
     "test": "slow_gossip_restart_never_acknowledges_on_the_old_epoch"
   },
   {
+    "source": "tests/council_disaster_recovery.rs",
+    "function": "stop_waits_for_a_lingering_task_to_release_the_raft_store",
+    "binary": "reliaburger::council_disaster_recovery",
+    "test": "stop_waits_for_a_lingering_task_to_release_the_raft_store"
+  },
+  {
     "source": "tests/council_self_healing.rs",
     "function": "killed_voter_is_replaced_by_healthy_spare",
     "binary": "reliaburger::council_self_healing",
