@@ -390,11 +390,23 @@ impl TaskNamespacePolicy {
         let cgroup_id = crate::sesame::egress::cgroup_id_of_path(directory)
             .ok_or_else(|| std::io::Error::other("delegated namespace identity is unavailable"))?;
         let mut bindings = self.bindings.lock().await;
-        if let Some(binding) = bindings.get(namespace) {
-            if binding.cgroup != cgroup_id {
+        if let Some(binding) = bindings.get(namespace)
+            && binding.cgroup != cgroup_id
+        {
+            if binding.users > 0 {
                 return Err(std::io::Error::other("delegated namespace cgroup changed"));
             }
-        } else {
+            // An idle binding outlives its cgroup: the namespace's last
+            // workload leaving removes the directory, and this attempt made
+            // a new one (#2324). Lift the dead inode's entry and bind afresh.
+            let stale = binding.cgroup;
+            {
+                let mut kernel = self.kernel.lock().await;
+                remove_binding(&mut kernel, namespace, stale)?;
+            }
+            bindings.remove(namespace);
+        }
+        if !bindings.contains_key(namespace) {
             if bindings.len() == MAX_NAMESPACES {
                 let idle = bindings
                     .iter()

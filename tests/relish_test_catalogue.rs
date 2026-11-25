@@ -260,6 +260,67 @@ fn runc_catalogue_deploys_the_exact_image_pushed_to_pickle() {
     qualify_runc_catalogue("image-registry");
 }
 
+/// The namespace cgroups under `/sys/fs/cgroup/reliaburger` named like a
+/// `relish test` run's, `rbtest-<32 hex run id>-<NN>`.
+#[cfg(target_os = "linux")]
+fn run_namespace_cgroups() -> std::collections::BTreeSet<String> {
+    let run_namespace = |name: &str| {
+        name.strip_prefix("rbtest-")
+            .and_then(|rest| rest.split_once('-'))
+            .is_some_and(|(run, index)| {
+                run.len() == 32
+                    && run.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    && index.len() == 2
+                    && index.bytes().all(|byte| byte.is_ascii_digit())
+            })
+    };
+    std::fs::read_dir("/sys/fs/cgroup/reliaburger")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| run_namespace(name))
+        .collect()
+}
+
+/// Bun removes a run's namespace cgroup once the run has removed the
+/// namespace's last app (#2324). Only these catalogue tests run `relish
+/// test` under `make test-linux`, one at a time, so a new run namespace is
+/// this test's. Retirement finishes on Bun's loop after the cleanup is
+/// confirmed, so allow it a few seconds.
+#[cfg(target_os = "linux")]
+fn assert_run_namespace_cgroups_removed(before: &std::collections::BTreeSet<String>) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let left: Vec<String> = run_namespace_cgroups()
+            .difference(before)
+            .cloned()
+            .collect();
+        if left.is_empty() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            let trees: Vec<String> = left
+                .iter()
+                .map(|namespace| {
+                    let children: Vec<String> =
+                        std::fs::read_dir(format!("/sys/fs/cgroup/reliaburger/{namespace}"))
+                            .into_iter()
+                            .flatten()
+                            .flatten()
+                            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                            .collect();
+                    format!("{namespace} {children:?}")
+                })
+                .collect();
+            panic!("relish test left its namespace cgroups behind: {trees:?}");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// The V02 soak ran `relish test --endpoint <a node's forwarded API>` from the
 /// Mac. `--endpoint` bypassed the managed context, so the registry cases
 /// pushed to the node's own listener port, which nothing forwards. Relish now
@@ -458,6 +519,7 @@ fn qualify_runc_catalogue(group: &str) {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+    let before = run_namespace_cgroups();
     let output = run_relish(&[
         "--endpoint",
         &endpoint,
@@ -490,6 +552,7 @@ fn qualify_runc_catalogue(group: &str) {
         assert_eq!(case["cleanup"]["status"], "confirmed", "{report}");
     }
     assert_success(&output, "qualify runtime catalogue");
+    assert_run_namespace_cgroups_removed(&before);
     if group == "image-registry" {
         let listed = run_relish(&[
             "--endpoint",
@@ -559,5 +622,6 @@ fn qualify_runc_catalogue(group: &str) {
             !output.status.success(),
             "untrusted workload certificate passed"
         );
+        assert_run_namespace_cgroups_removed(&before);
     }
 }

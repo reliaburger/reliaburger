@@ -133,6 +133,14 @@ pub struct WorkloadSupervisor<G: Grill> {
     capabilities: PlatformCapabilities,
     budget: std::sync::Arc<super::execution_budget::ExecutionBudget>,
     resource_leases: HashMap<InstanceId, super::execution_budget::ResourceLease>,
+    /// The cgroup hierarchy's app groups, shared with the job runner and the
+    /// executor pools so a namespace cgroup is removed only once none of
+    /// them launches into it (#2324).
+    workload_groups: std::sync::Arc<crate::grill::workload_groups::WorkloadGroups>,
+    /// This node's claim on each app's cgroup group, keyed like
+    /// `app_instances`. Taken before an instance's cgroup is made, dropped
+    /// when the app's last instance retires.
+    cgroup_holds: HashMap<(String, String), crate::grill::workload_groups::WorkloadGroupHold>,
 }
 
 impl<G: Grill> WorkloadSupervisor<G> {
@@ -173,6 +181,37 @@ impl<G: Grill> WorkloadSupervisor<G> {
                 u32::MAX,
             )),
             resource_leases: HashMap::new(),
+            workload_groups: crate::grill::workload_groups::WorkloadGroups::shared(),
+            cgroup_holds: HashMap::new(),
+        }
+    }
+
+    /// Point the app cgroup groups at a stand-in hierarchy.
+    #[cfg(test)]
+    pub(crate) fn set_workload_groups(
+        &mut self,
+        groups: std::sync::Arc<crate::grill::workload_groups::WorkloadGroups>,
+    ) {
+        self.workload_groups = groups;
+    }
+
+    /// Whether this runtime puts workloads in cgroups under the Reliaburger
+    /// hierarchy, the ones [`Self::hold_workload_cgroup`] guards.
+    fn places_workload_cgroups(&self) -> bool {
+        self.grill.honours_cgroup_path() || self.grill.places_host_processes()
+    }
+
+    /// Keep `app_name`'s cgroup group, and its namespace's, while an
+    /// instance of it is launched and runs. Call before the instance's
+    /// cgroup is made; the app's last [`Self::retire_instance`] releases it.
+    pub(crate) fn hold_workload_cgroup(&mut self, app_name: &str, namespace: &str) {
+        if !self.places_workload_cgroups() {
+            return;
+        }
+        let key = (app_name.to_string(), namespace.to_string());
+        if !self.cgroup_holds.contains_key(&key) {
+            let hold = self.workload_groups.hold(namespace, app_name);
+            self.cgroup_holds.insert(key, hold);
         }
     }
 
@@ -913,8 +952,37 @@ impl<G: Grill> WorkloadSupervisor<G> {
                 let _ = self.port_allocator.release(port).await;
             }
         }
-        self.instances.remove(id);
+        let owner = self
+            .instances
+            .remove(id)
+            .map(|instance| (instance.app_name, instance.namespace));
         self.resource_leases.remove(id);
+        if let Some(key) = owner {
+            self.release_workload_cgroup(key);
+        }
+    }
+
+    /// Remove an app's empty cgroup group, and then its namespace's, once
+    /// no instance of the app is left on this node (#2324). The runtime has
+    /// already removed the instance's own leaf.
+    fn release_workload_cgroup(&mut self, key: (String, String)) {
+        let (app_name, namespace) = &key;
+        if self
+            .instances
+            .values()
+            .any(|instance| &instance.app_name == app_name && &instance.namespace == namespace)
+        {
+            return;
+        }
+        // BLOCKING-OK: a few rmdirs on cgroupfs, an in-memory kernel interface: no disk behind it
+        match self.cgroup_holds.remove(&key) {
+            Some(hold) => drop(hold),
+            // An instance adopted from an earlier run never took a hold.
+            None if self.places_workload_cgroups() => {
+                self.workload_groups.remove_if_idle(namespace, app_name)
+            }
+            None => {}
+        }
     }
 
     /// Get a reference to an instance by ID.
@@ -1455,6 +1523,129 @@ mod tests {
             0,
             "removing the app should release its ports"
         );
+    }
+
+    // -- app and namespace cgroups (#2324) -------------------------------------
+
+    /// A supervisor whose runtime places workloads in cgroups, under a
+    /// stand-in hierarchy of plain directories.
+    fn cgroup_supervisor() -> (tempfile::TempDir, WorkloadSupervisor<MockGrill>) {
+        let root = tempfile::tempdir().unwrap();
+        let grill = MockGrill::new();
+        grill.set_honours_cgroup_path(true);
+        let mut sup = WorkloadSupervisor::new(grill, PortAllocator::new(30000, 31000));
+        sup.set_workload_groups(crate::grill::workload_groups::WorkloadGroups::new(
+            root.path(),
+        ));
+        (root, sup)
+    }
+
+    /// Deploy `app` into `namespace` as the agent does: hold its cgroup
+    /// group, then let the "runtime" make each instance's parents. Returns
+    /// the instance IDs.
+    async fn deploy_with_cgroups(
+        sup: &mut WorkloadSupervisor<MockGrill>,
+        root: &std::path::Path,
+        app: &str,
+        namespace: &str,
+    ) -> Vec<InstanceId> {
+        let ids = sup
+            .deploy_app(
+                app,
+                namespace,
+                &app_spec_with_replicas(2, None),
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+        for id in &ids {
+            sup.hold_workload_cgroup(app, namespace);
+            let leaf = crate::grill::cgroup::instance_cgroup_path(namespace, app, id).unwrap();
+            let relative = leaf
+                .strip_prefix(crate::grill::cgroup::CGROUP_ROOT)
+                .unwrap();
+            std::fs::create_dir_all(root.join(relative).parent().unwrap()).unwrap();
+        }
+        ids
+    }
+
+    async fn retire_all(sup: &mut WorkloadSupervisor<MockGrill>, ids: &[InstanceId]) {
+        for id in ids {
+            sup.retire_instance(id).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn retiring_the_last_app_removes_its_empty_namespace_cgroup() {
+        let (root, mut sup) = cgroup_supervisor();
+        let ids = deploy_with_cgroups(&mut sup, root.path(), "cfg-app", "rbtest-run-01").await;
+        // One replica retiring leaves the app's group for the other.
+        retire_all(&mut sup, &ids[..1]).await;
+        assert!(root.path().join("rbtest-run-01/cfg-app").exists());
+        retire_all(&mut sup, &ids[1..]).await;
+        assert!(
+            !root.path().join("rbtest-run-01").exists(),
+            "the namespace's last app took its empty cgroups with it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_namespace_with_another_app_keeps_its_cgroup() {
+        let (root, mut sup) = cgroup_supervisor();
+        let web = deploy_with_cgroups(&mut sup, root.path(), "web", "shop").await;
+        let api = deploy_with_cgroups(&mut sup, root.path(), "api", "shop").await;
+        retire_all(&mut sup, &web).await;
+        assert!(!root.path().join("shop/web").exists(), "web's group went");
+        assert!(root.path().join("shop/api").exists(), "api's stays");
+        retire_all(&mut sup, &api).await;
+        assert!(!root.path().join("shop").exists());
+    }
+
+    #[tokio::test]
+    async fn an_app_joining_the_namespace_keeps_its_cgroup() {
+        // A deploy into the namespace has taken its hold, but its runtime
+        // hasn't made the app's cgroup yet, when the last other app retires.
+        let (root, mut sup) = cgroup_supervisor();
+        let web = deploy_with_cgroups(&mut sup, root.path(), "web", "shop").await;
+        sup.hold_workload_cgroup("api", "shop");
+        retire_all(&mut sup, &web).await;
+        assert!(root.path().join("shop").exists());
+    }
+
+    #[tokio::test]
+    async fn an_adopted_app_without_a_hold_still_removes_its_cgroups() {
+        let (root, mut sup) = cgroup_supervisor();
+        let ids = sup
+            .deploy_app(
+                "web",
+                "rbtest-run-02",
+                &app_spec_with_replicas(1, None),
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+        std::fs::create_dir_all(root.path().join("rbtest-run-02/web")).unwrap();
+        retire_all(&mut sup, &ids).await;
+        assert!(!root.path().join("rbtest-run-02").exists());
+    }
+
+    #[tokio::test]
+    async fn a_runtime_without_cgroups_never_touches_the_hierarchy() {
+        let (root, mut sup) = cgroup_supervisor();
+        sup.grill().set_honours_cgroup_path(false);
+        let ids = sup
+            .deploy_app(
+                "web",
+                "shop",
+                &app_spec_with_replicas(1, None),
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+        sup.hold_workload_cgroup("web", "shop");
+        std::fs::create_dir_all(root.path().join("shop/web")).unwrap();
+        retire_all(&mut sup, &ids).await;
+        assert!(root.path().join("shop/web").exists());
     }
 
     // -- deploy_app -----------------------------------------------------------
