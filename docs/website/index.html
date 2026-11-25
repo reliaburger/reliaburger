@@ -10,7 +10,7 @@
   <link rel="stylesheet" href="./style.css">
   <link rel="alternate" type="text/markdown" href="index.md">
 </head>
-<body>
+<body class="home">
   <a class="skip" href="#main">Skip to content</a>
   <div class="page">
     <!-- The first thing an agent reading this page meets: where its own page is.
@@ -18,18 +18,14 @@
     <aside class="agent-banner" aria-label="For AI agents">
       <strong>Are you an AI agent?</strong>
       <a href="agents">Start here</a>
-      <span>with the page written for you, also <a href="agents.md">as Markdown</a>, and the manual’s <a href="llms.txt">llms.txt</a>.</span>
+      <span>or read it <a href="agents.md">as Markdown</a>, or the manual’s <a href="llms.txt">llms.txt</a>.</span>
     </aside>
     <header class="masthead">
       <a class="wordmark" href="./" aria-label="Reliaburger home"><span class="mark" aria-hidden="true">r/</span>reliaburger</a>
       <nav aria-label="Main navigation">
         <a href="#designed">Agents</a>
-        <a href="#whitepaper">Whitepaper</a>
         <a href="#tour">Tour</a>
         <a href="#install">Install</a>
-        <a href="#release-testing">Testing</a>
-        <a href="#job-throughput">Batch jobs</a>
-        <a href="#netboot">Bare metal</a>
         <a href="#docs">Docs</a>
         <a href="features">What’s ready?</a>
         <a href="https://github.com/reliaburger/reliaburger">GitHub <span aria-hidden="true">↗</span></a>
@@ -486,8 +482,18 @@ deny = 'proposal.kind == "delete"'</code></pre>
             asks. The cluster writes down what the change would do, a person or
             a policy you wrote says yes, and the undo is one command, shown before anything
             happens.</p>
-          <details class="tour-commands recording-fold" id="act-recording-fold">
-            <summary>Watch the recording <span class="tour-commands-note">a real Claude Code session with an agent token, 9 chapters</span></summary>
+          <details class="recording-fold" id="act-recording-fold">
+            <summary>
+              <span class="poster-lines" aria-hidden="true"><span class="comment"># Claude Code, holding an agent token</span>
+$ relish agent lease take app web --namespace shop
+$ relish agent propose rollback web --namespace shop
+<span class="comment"># you, with your own token</span>
+$ relish proposal approve 17
+$ relish undo 17</span>
+              <span class="poster-play"><span class="poster-button" aria-hidden="true"></span>
+                <span class="poster-closed">Watch the recording</span><span class="poster-open">Hide the recording</span>
+                <span class="poster-note">a real Claude Code session with an agent token, 9 chapters</span></span>
+            </summary>
           <figure id="act-recording" class="recording" data-cast="./assets/agent-act.cast" data-chapters="markers">
             <div class="recording-screen"></div>
             <noscript><p class="recording-fallback">The recording plays with JavaScript. Without it,
@@ -652,8 +658,18 @@ match = 'author.kind == "agent" &amp;&amp; proposal.kind == "scale" &amp;&amp; p
             it reads the cluster, the manual and the exact source its <code>relish</code> was
             built from. When the bug is ours, it proves a fix on a throwaway cluster and
             drafts the report for you to send. It never fixes your cluster for you.</p>
-          <details class="tour-commands recording-fold" id="debug-recording-fold">
-            <summary>Watch the recording <span class="tour-commands-note">a real Claude Code session with a read-only token, 13 chapters</span></summary>
+          <details class="recording-fold" id="debug-recording-fold">
+            <summary>
+              <span class="poster-lines" aria-hidden="true"><span class="comment"># Claude Code, holding a read-only token</span>
+$ relish agent diagnose
+$ relish agent explain
+$ relish agent source grep classify_error
+<span class="comment"># the bug is ours: prove a fix, never on your cluster</span>
+$ relish agent patch try ./fix</span>
+              <span class="poster-play"><span class="poster-button" aria-hidden="true"></span>
+                <span class="poster-closed">Watch the recording</span><span class="poster-open">Hide the recording</span>
+                <span class="poster-note">a real Claude Code session with a read-only token, 13 chapters</span></span>
+            </summary>
           <figure id="agent-recording" class="recording" data-cast="./assets/agent-debug.cast" data-chapters="markers">
             <div class="recording-screen"></div>
             <noscript><p class="recording-fallback">The recording plays with JavaScript. Without it,

@@ -8407,6 +8407,21 @@ agent's prompt, and that the install section still carries the install line.
 The concept budget and the unmeasured Kubernetes comparison moved to the new
 section, so their tests read it there.
 
+A second pass was about how the page looks. The navigation went from ten
+links to six, and the Markdown and Claude buttons moved onto the line for
+agents, so nothing sits between the masthead and the title. Each folded
+recording shows a poster, a few of its commands dimmed under a play button,
+because a row with a plus sign doesn't say "video". Section headings grew and
+sections moved further apart, on the homepage only.
+
+The site also got a dark theme. It's a button, not a media query: the page
+stays light unless you ask, and remembers what you chose. The button comes
+from `copy.js`, the script that already adds the other two, so the site still
+has three scripts. One trap is worth knowing. The terminals paint themselves
+with `var(--ink)`, the text colour, which is light in the dark theme, so every
+one of them would have turned white. The dark theme repaints each with a
+colour of its own, and a test walks the stylesheet to check none is missed.
+
 Two things we chose not to do. We didn't move the benchmarks and the gate to
 pages of their own, though the page would be shorter for it: links to
 `#job-throughput` and `#netboot` are out there, and a fold keeps them working.

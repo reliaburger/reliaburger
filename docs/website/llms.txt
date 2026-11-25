@@ -66,7 +66,7 @@ If you're an agent operating or debugging a Reliaburger cluster:
 
 Every page on reliaburger.com, as Markdown.
 
-- [Reliaburger — a container orchestrator in Rust](https://reliaburger.com/index.md)
+- [Reliaburger — the container platform built for AI agents to run](https://reliaburger.com/index.md)
 - [Working with an AI agent · Reliaburger](https://reliaburger.com/agents.md)
 - [AI agents on Reliaburger and Kubernetes](https://reliaburger.com/compare/ai-agents.md)
 - [Reliaburger and Coolify · Reliaburger comparisons](https://reliaburger.com/compare/coolify.md)

@@ -36,6 +36,24 @@ isn't rotating by itself. The drawings are inline SVG animated by CSS in
 `style.css`, so reduced motion stills them and nothing loads from elsewhere.
 Without JavaScript all seven stay stacked.
 
+`assets/copy.js` also adds the theme button, "Dark" or "Light", beside the
+Markdown and Claude buttons. On the homepage the three sit on the line for
+agents above the masthead; on other pages they stay above the page's content.
+The site is light unless the visitor chose dark with that button: the choice is
+kept in `localStorage` and sets `data-theme="dark"` on the root element, and
+every dark rule in `style.css` hangs off that. A box the light theme paints
+with `var(--ink)` (a terminal, a recording, the whitepaper's band) must be
+listed in the dark theme's `var(--box)` rule, or it turns light there;
+`tests/suite/website.rs` fails when one is missing. The burger's loop has a
+white background that only vanishes on a light page, so in the dark theme it
+sits on a light plate.
+
+The two agent recordings (`#debug-recording-fold`, `#act-recording-fold`) fold
+behind a poster: a few of the session's commands, dimmed, under a play button.
+The poster's lines are plain text in an `aria-hidden` span, not `<code>`, so no
+test parses them; keep them to commands the session really ran. The player
+loads a recording when it comes into view, which happens when its fold opens.
+
 Don't add other scripts. The footer names all three, so change them together.
 
 Every `<section>` has a stable `id` (`why`, `designed`, `act`, `debug`, `who`, `tour`, `install`,

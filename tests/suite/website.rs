@@ -2065,7 +2065,10 @@ fn the_install_section_offers_homebrew_after_the_one_line_install() {
     let section = &section[..section.find("</section>").unwrap()];
     let tyres = section.find(">Kick the tyres</label>").unwrap();
     let homebrew = section.find(">Homebrew</label>").expect("no Homebrew tab");
-    assert!(tyres < homebrew, "the one-line install comes before Homebrew");
+    assert!(
+        tyres < homebrew,
+        "the one-line install comes before Homebrew"
+    );
     let panel = &section[section.find("install-panel-homebrew").unwrap()..];
     let panel = &panel[..panel.find("</pre>").unwrap()];
     let brew = panel.find("brew install reliaburger/tap/relish").unwrap();
@@ -2286,6 +2289,89 @@ fn every_recording_has_a_screen_and_speed_buttons() {
         );
     }
     assert!(figures >= 4, "found only {figures} recordings");
+}
+
+/// The two agent recordings fold, so their sections read as a paragraph and a
+/// choice. Each fold's summary is a poster: a few of the session's commands,
+/// hidden from screen readers, under a label that says what opening it does
+/// and what closing it does. Nothing in the fold needs a script of its own:
+/// the player loads a recording when it scrolls into view, which a closed
+/// fold never does.
+#[test]
+fn the_agent_recordings_fold_behind_a_poster() {
+    let page = read("docs/website/index.html");
+    let folds = details_ranges(&page);
+    for (fold, figure) in [
+        ("debug-recording-fold", "agent-recording"),
+        ("act-recording-fold", "act-recording"),
+    ] {
+        let start = page
+            .find(&format!("<details class=\"recording-fold\" id=\"{fold}\">"))
+            .unwrap_or_else(|| panic!("no #{fold}"));
+        let range = folds.iter().find(|range| range.start == start).unwrap();
+        let body = &page[range.clone()];
+        assert!(
+            body.contains(&format!("<figure id=\"{figure}\"")),
+            "#{figure} isn't inside #{fold}"
+        );
+        let summary = &body[body.find("<summary>").unwrap()..body.find("</summary>").unwrap()];
+        assert!(summary.contains("<span class=\"poster-lines\" aria-hidden=\"true\">"));
+        for label in ["Watch the recording", "Hide the recording"] {
+            assert!(summary.contains(label), "#{fold}'s summary lacks {label:?}");
+        }
+        assert!(
+            !summary.contains("<code"),
+            "the poster's lines are decoration, not commands the tests parse"
+        );
+    }
+    let style = read("docs/website/style.css");
+    for rule in [
+        ".recording-fold[open] .poster-lines",
+        ".recording-fold summary:focus-visible",
+    ] {
+        assert!(style.contains(rule), "style.css has no {rule} rule");
+    }
+}
+
+/// The site has a dark theme a visitor turns on with a button and keeps in
+/// their browser. The button comes from the site's one shared script, so
+/// there's no dead button without JavaScript, and the theme hangs off
+/// `data-theme` on the root element. Every box the light theme paints dark
+/// gets its own darker colour there, so a terminal still reads as a box.
+#[test]
+fn the_dark_theme_is_a_button_and_keeps_every_dark_box_dark() {
+    let script = read("docs/website/assets/copy.js");
+    for needle in [
+        "\"theme-toggle\"",
+        "localStorage.getItem(\"theme\")",
+        "setAttribute(\"data-theme\", \"dark\")",
+        "aria-pressed",
+    ] {
+        assert!(script.contains(needle), "copy.js lacks {needle:?}");
+    }
+    let page = read("docs/website/index.html");
+    assert!(
+        !page.contains("theme-toggle"),
+        "the theme button comes from the script, not the markup"
+    );
+    let css = read("docs/website/style.css");
+    let dark = ":root[data-theme=\"dark\"]";
+    assert!(css.contains(&format!("{dark} {{ color-scheme: dark;")));
+    for (selector, body) in css_rules(&css) {
+        if selector.contains("data-theme") || !body.contains("background: var(--ink)") {
+            continue;
+        }
+        // A comment above a rule comes back as part of its selector.
+        let selector = selector.rsplit("*/").next().unwrap();
+        for part in selector.split(',') {
+            let part = part.trim();
+            assert!(
+                css.contains(&format!("{dark} {part},"))
+                    || css.contains(&format!("{dark} {part} {{ background: var(--box)")),
+                "`{part}` paints a dark box, but the dark theme doesn't repaint it"
+            );
+        }
+    }
 }
 
 /// The `#act` section of the homepage: what 0.2.8 lets an agent do (#1690).

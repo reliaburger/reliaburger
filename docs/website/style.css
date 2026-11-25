@@ -428,7 +428,7 @@ footer { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-top: 20px; paddi
 .paper-band p { margin: 0; color: #b9c6ba; }
 .paper-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
 .paper-actions a { text-decoration: none; font-size: .9375rem; padding: 10px 16px; border: 1px solid #e4e9e3; color: #fff; }
-.paper-actions a:first-child { background: var(--paper); color: var(--ink); border-color: var(--paper); }
+.paper-actions a:first-child { background: #fafbf9; color: #181b19; border-color: #fafbf9; }
 .paper-actions a:hover { border-color: #f49463; color: #f49463; }
 .paper-actions a:first-child:hover { background: #fff; color: var(--accent); }
 .paper-actions a:focus-visible { outline: 3px solid #f49463; outline-offset: 2px; }
@@ -475,8 +475,76 @@ footer { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-top: 20px; paddi
   .toolkit tbody th { border-bottom: 0; padding-bottom: 2px; }
   .toolkit td { padding-top: 0; padding-left: 0; }
 }
-.recording-fold { margin-top: 18px; }
-.recording-fold summary { font-size: 1.0625rem; }
-.recording-fold summary::before { content: "\25B6"; color: var(--accent); font-size: .8125rem; }
+/* A folded recording shows a poster: a few of the session's commands, dimmed, under
+   a play button. Open, the poster goes and the row offers to hide it again. */
+.recording-fold { margin: 18px 0 0; }
+.recording-fold summary { position: relative; display: block; cursor: pointer; list-style: none; border-radius: 4px; overflow: hidden; background: var(--ink); color: #e4e9e3; }
+.recording-fold summary::-webkit-details-marker { display: none; }
+.recording-fold summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.poster-lines { display: block; white-space: pre; overflow: hidden; height: 208px; padding: 20px 24px; font: .8125rem/1.9 var(--mono); opacity: .38; -webkit-mask-image: linear-gradient(#000 55%, transparent); mask-image: linear-gradient(#000 55%, transparent); }
+.poster-play { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; text-align: center; padding: 0 16px; }
+.poster-button { display: grid; place-items: center; width: 60px; height: 60px; margin-bottom: 6px; border-radius: 50%; background: #f49463; transition: transform .15s ease; }
+.poster-button::before { content: ""; margin-left: 5px; border-style: solid; border-width: 11px 0 11px 18px; border-color: transparent transparent transparent #181b19; }
+.recording-fold summary:hover .poster-button { transform: scale(1.08); }
+.poster-closed, .poster-open { font-size: 1.125rem; font-weight: 650; color: #fff; }
+.poster-open { display: none; }
+.poster-note { font-size: .875rem; color: #b9c6ba; }
+.recording-fold[open] summary { background: none; color: var(--ink); border: 1px solid var(--line); margin-bottom: 14px; }
+.recording-fold[open] .poster-lines, .recording-fold[open] .poster-button, .recording-fold[open] .poster-closed { display: none; }
+.recording-fold[open] .poster-play { position: static; flex-direction: row; justify-content: flex-start; gap: 12px; padding: 10px 16px; }
+.recording-fold[open] .poster-open { display: inline; font-size: 1rem; color: var(--ink); }
+.recording-fold[open] .poster-note { color: var(--muted); }
 .recording-fold .recording { margin-top: 0; margin-bottom: 16px; }
 .recording-fold + .tour-commands { margin-top: 12px; }
+@media (max-width: 600px) { .poster-lines { height: 190px; padding: 16px; font-size: .75rem; } }
+@media (prefers-reduced-motion: reduce) { .poster-button { transition: none; } }
+
+/* The homepage breathes more than the reference pages: larger section headings
+   and more room between sections. */
+.home .section { margin-top: 104px; }
+.home .section-heading { margin-bottom: 30px; }
+.home .section-heading h2 { font-size: clamp(1.6rem, 3vw, 2.05rem); line-height: 1.2; letter-spacing: -.035em; }
+.home .paper-band { margin-top: 72px; }
+.home .masthead { min-height: 84px; }
+.home .contributing { margin-top: 104px; }
+/* With a banner on the page, the Markdown, Claude and theme buttons sit on its line. */
+.agent-banner .page-actions { margin: 0 0 0 auto; }
+.agent-banner .page-actions { gap: 6px; flex-wrap: nowrap; }
+.agent-banner .page-actions a, .agent-banner .page-actions button { color: var(--ink); font-weight: 500; padding: 6px 8px; white-space: nowrap; }
+.agent-banner { align-items: center; column-gap: .3em; }
+.agent-banner strong { margin-right: .5em; }
+@media (max-width: 600px) {
+  .home .section, .home .contributing { margin-top: 64px; }
+  .home .paper-band { margin-top: 48px; }
+  .agent-banner .page-actions { margin-left: 0; justify-content: flex-start; flex-wrap: wrap; }
+}
+
+/* Dark theme, chosen with the button copy.js adds and remembered in this browser.
+   The dark boxes (terminals, recordings, the whitepaper's band) keep their light
+   text and go a shade darker than the page, so they still read as boxes. */
+:root[data-theme="dark"] { color-scheme: dark; --paper: #141715; --ink: #e9ede8; --muted: #a4aea5; --line: #2f3631; --accent: #f08a5d; --box: #0a0c0b; }
+:root[data-theme="dark"] .skip,
+:root[data-theme="dark"] .mark,
+:root[data-theme="dark"] .primary-link,
+:root[data-theme="dark"] .tour-steps pre,
+:root[data-theme="dark"] .tour-cleanup,
+:root[data-theme="dark"] .recording-screen,
+:root[data-theme="dark"] .recording-fallback,
+:root[data-theme="dark"] .tour .copyable,
+:root[data-theme="dark"] .terminal,
+:root[data-theme="dark"] .recording-pending,
+:root[data-theme="dark"] .agents-page pre,
+:root[data-theme="dark"] .agents-page .copyable,
+:root[data-theme="dark"] .install-button,
+:root[data-theme="dark"] .paper-band,
+:root[data-theme="dark"] .recording-fold summary { background: var(--box); }
+:root[data-theme="dark"] .primary-link, :root[data-theme="dark"] .mark, :root[data-theme="dark"] .skip { border-color: var(--line); }
+:root[data-theme="dark"] .primary-link:hover { background: #1f2421; }
+:root[data-theme="dark"] .paper-band, :root[data-theme="dark"] .terminal, :root[data-theme="dark"] .recording-fold summary { border: 1px solid var(--line); }
+:root[data-theme="dark"] .recording-fold[open] summary { background: none; color: var(--ink); }
+:root[data-theme="dark"] .install-tab-input:checked + .install-tab { background: var(--line); }
+/* The burger's white background vanishes by multiplying into a light page. On a
+   dark one it sits on a light plate instead. */
+:root[data-theme="dark"] .intro-art { background: #fafbf9; border-radius: 28px; padding: 14px 10px; }
+:root[data-theme="dark"] .soak-chart img { background: #fafbf9; border-radius: 4px; }
+:root[data-theme="dark"] .comparison-note, :root[data-theme="dark"] .comparison-page th { background: #1c211e; }
