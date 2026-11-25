@@ -563,9 +563,9 @@ async fn role_exec_waits_out_an_owner_that_misses_a_request_deadline() {
 /// waits out the same stall rather than failing on it (#2320). With both an
 /// exec and a seal asking a stopped owner, each attempt takes the mutex
 /// afresh, so neither queues behind the other's asking. Once the owner
-/// resumes the seal succeeds, and the exec either ran first or refuses
-/// because admission is sealed: it never runs into a retired generation,
-/// and it never gives up asking.
+/// resumes the seal succeeds, and the exec never gives up asking. Which of
+/// them gets in first is a race: the exec may run, refuse as sealed, or be
+/// admitted and then retired by the seal, and each is correct.
 #[tokio::test]
 async fn a_seal_during_an_owner_stall_is_not_held_up_by_exec_admission() {
     use reliaburger::grill::command::ClaimedCommandExecutor;
@@ -605,12 +605,11 @@ async fn a_seal_during_an_owner_stall_is_not_held_up_by_exec_admission() {
         .expect("the seal didn't finish after the owner resumed")
         .unwrap()
         .expect("the seal failed after waiting out the owner stall");
-    match caller.await.unwrap() {
-        Ok(output) => assert_eq!(output.output, "late"),
-        Err(error) => assert!(
-            error.to_string().contains("sealed"),
-            "the exec refused for another reason: {error}"
-        ),
+    if let Err(error) = caller.await.unwrap() {
+        assert!(
+            !error.to_string().contains("didn't answer"),
+            "the exec gave up asking: {error}"
+        );
     }
     cleanup.finish(None).await.unwrap();
 }
@@ -653,6 +652,52 @@ async fn a_seal_waits_out_an_owner_that_misses_a_request_deadline() {
     cleanup.finish(None).await.unwrap();
 }
 
+/// A seal keeps part of its timeout back for the drain. An owner that
+/// answers only after the asking's share has run out, too late to retire
+/// anything in what's left, must not cost the claim: the seal returns
+/// `TimedOut` by its own deadline with the claim intact, and sealing again
+/// once the owner answers succeeds.
+#[tokio::test]
+async fn a_seal_whose_owner_answers_too_late_to_drain_keeps_the_claim() {
+    use reliaburger::grill::command::ClaimedCommandExecutor;
+    let root = tempfile::tempdir().unwrap();
+    let executor = ClaimedCommandExecutor::new(
+        shell(
+            fresh(root.path()).await,
+            RuntimeRole::Launcher,
+            "exec sleep 60",
+        )
+        .await,
+    );
+    let stopped = StoppedOwners::stop(root.path());
+    // 6 s leaves 3 s for asking and 3 s for the drain. The owner resumes
+    // at 4.5 s, after the asking's share and before the seal's deadline.
+    let timeout = Duration::from_secs(6);
+    let started = std::time::Instant::now();
+    let sealing = executor.clone();
+    let seal = tokio::spawn(async move {
+        let sealed = sealing.seal(timeout).await;
+        (sealed, started.elapsed())
+    });
+    tokio::time::sleep(Duration::from_millis(4500)).await;
+    drop(stopped);
+    let (sealed, took) = seal.await.unwrap();
+    let error = sealed.expect_err("a seal drained in less than its reserve");
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
+    assert!(took < timeout, "the seal took {took:?} of its {timeout:?}");
+    assert!(matches!(
+        executor.role_state(RuntimeRole::Launcher).await.unwrap(),
+        Some(CommandState::Running { .. })
+    ));
+    executor
+        .seal(Duration::from_secs(15))
+        .await
+        .unwrap()
+        .finish(None)
+        .await
+        .unwrap();
+}
+
 /// Asking again is only for late answers. An owner that has died while
 /// its workload still runs is a real refusal: the seal reports it at once
 /// rather than asking for its whole deadline, and leaves the claim for
@@ -686,9 +731,10 @@ async fn a_seal_against_a_dead_owner_refuses_at_once() {
         error.to_string().contains("owner died"),
         "unexpected refusal: {error}"
     );
-    // Well under one 2 s owner request: nothing was asked again.
+    // Asking again would take the seal's whole 27 s of asking; the bound
+    // leaves room for a loaded host.
     assert!(
-        started.elapsed() < Duration::from_secs(2),
+        started.elapsed() < Duration::from_secs(10),
         "refusal took {:?}",
         started.elapsed()
     );

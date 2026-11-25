@@ -26,6 +26,12 @@ const ADMISSION_BACKOFF_START: Duration = Duration::from_millis(10);
 /// The longest pause between two asks.
 const ADMISSION_BACKOFF_LIMIT: Duration = Duration::from_millis(200);
 
+/// How much of a seal's timeout its asking leaves for the drain. Retiring
+/// a launcher sends one force-kill through its owner (one 2 s request
+/// deadline), then reads the owner's Retired record and makes a durable
+/// write; the extra second covers those two on a busy disk.
+const DRAIN_RESERVE: Duration = Duration::from_secs(3);
+
 /// Whether a role observation failed only because an owner's answer was
 /// lost or late, so that asking again may succeed.
 fn transient_owner_error(error: &io::Error) -> bool {
@@ -214,16 +220,27 @@ impl ClaimedCommandExecutor {
     ///
     /// The seal first checks every role with its owner, and each ask has a
     /// short deadline. A busy owner that answers late is asked again, as
-    /// exec admission does, until `timeout` runs out (#2320); the drain then
-    /// gets what's left of it. Each ask takes the adapter mutex afresh, and
-    /// one that never got an answer leaves the claim as it was, so the
-    /// caller can seal again. Any other refusal, like an owner that died
-    /// while its workload runs, is the seal's own: it fences admission and
-    /// fails at once, leaving the claim for recovery.
+    /// exec admission does (#2320), until [`DRAIN_RESERVE`] before `timeout`
+    /// runs out; the drain gets what's left. Each ask takes the adapter
+    /// mutex afresh. If no answer comes in time, or one comes too late to
+    /// leave the drain its reserve, the seal returns `TimedOut` with the
+    /// claim as it was, so the caller can seal again. Any other refusal,
+    /// like an owner that died while its workload runs, is the seal's own:
+    /// it fences admission and fails at once, leaving the claim for recovery.
+    ///
+    /// The asking and the drain stay inside `timeout`. Persisting the fence
+    /// before the drain is a durable write that no deadline bounds, so a
+    /// slow disk can still push a seal past it.
     pub async fn seal(&self, timeout: Duration) -> io::Result<Self> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        let (mut guard, ()) = self
-            .ask_patiently(timeout, |commands| {
+        let started = tokio::time::Instant::now();
+        let deadline = started + timeout;
+        let asking = timeout.saturating_sub(DRAIN_RESERVE);
+        // Dropping this mid-attempt is safe: an attempt's observations are
+        // idempotent, and dropping it releases the mutex or its place in
+        // the queue for it.
+        let answered = tokio::time::timeout_at(
+            started + asking,
+            self.ask_patiently(asking, |commands| {
                 Box::pin(async move {
                     match commands.validate_roles().await {
                         Err(error) if transient_owner_error(&error) => Err(error),
@@ -231,9 +248,15 @@ impl ClaimedCommandExecutor {
                         _ => Ok(()),
                     }
                 })
-            })
-            .await?;
+            }),
+        )
+        .await
+        .map_err(|_| seal_unanswered(asking))?;
+        let (mut guard, ()) = answered?;
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining < DRAIN_RESERVE {
+            return Err(seal_unanswered(asking));
+        }
         let commands = self.commands.clone();
         tokio::spawn(async move {
             let current = guard.take().ok_or_else(unavailable)?;
@@ -384,6 +407,16 @@ impl RuntimeCommandExecutor for ClaimedCommandExecutor {
         .await
         .map_err(io::Error::other)?
     }
+}
+
+/// A seal that got no answer in time to drain; it leaves the claim intact.
+fn seal_unanswered(asking: Duration) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "process owner didn't answer within {asking:?} with time left to drain; the claim is kept, seal again"
+        ),
+    )
 }
 
 fn unavailable() -> io::Error {
