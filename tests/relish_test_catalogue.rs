@@ -296,10 +296,7 @@ fn catalogue_namespaces() -> std::collections::BTreeSet<String> {
 fn assert_run_namespace_cgroups_removed(before: &std::collections::BTreeSet<String>) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let left: Vec<String> = catalogue_namespaces()
-            .difference(before)
-            .cloned()
-            .collect();
+        let left: Vec<String> = catalogue_namespaces().difference(before).cloned().collect();
         if left.is_empty() {
             return;
         }
