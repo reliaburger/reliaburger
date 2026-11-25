@@ -1756,6 +1756,56 @@ nothing else can stop the workload either. The regression tests are
 workload and checks the reads `relish status` makes, then stops it, once after
 the pause is cleared and once while it's still in force.
 
+That heartbeat test later failed in a way that taught us more about our
+tests than about pauses
+([#2315](https://github.com/reliaburger/reliaburger/issues/2315)). The
+workload's loop runs `sleep 0.05` over and over, so `workload_pids` often
+names a `sleep` that has exited by the time the signal goes out. `kill`
+answers `ESRCH` (no such process), and the test's `.unwrap()` panicked. That
+was one flake. The damage came next: the panic skipped the test's own
+cleanup, so its container kept running, and with it the network namespace,
+the veth and the route to its address. Every test runtime hands out the same
+first address, so fourteen of the next sixteen container tests failed to add
+that route with `RTNETLINK answers: File exists`.
+
+The pause fix copies Smoker, which already skips a pid it can't signal: the
+test pauses what's still there, treats `ESRCH` as "already gone", and fails
+on any other error. It now also requires the container's init, the shell that
+lives for the whole test, to be among the paused, so skipping a pid can't
+hide a pause that froze nothing.
+
+The leak fix is a guard. In Rust, a value's `Drop` runs when it goes out of
+scope, and that includes a panic unwinding past it, so a cleanup in `Drop`
+runs on a failure as surely as on a pass. Go's `defer` and Python's `finally`
+do the same job, but you have to remember to write them at each call site;
+here the type carries it. `RuncRoot` wraps the temporary directory a test's
+runtime lives in, and its `Drop` kills that root's runc containers and
+deletes the namespaces and veths its address pool reserved, before the
+directory itself goes:
+
+```rust
+pub struct RuncRoot {
+    // Fields drop in declaration order, so the residue goes before the
+    // directory that names it.
+    residue: RuncResidue,
+    directory: tempfile::TempDir,
+}
+```
+
+The order matters. A struct's fields drop in the order they're declared,
+while a function's local variables drop in reverse. Had the directory gone
+first, runc would have lost the state it needs to find the containers.
+
+A panic is the easy case, though. A test that nextest kills for running too
+long gets no unwinding and no `Drop`. So every new guard first sweeps up after
+such tests: each guard holds a file lock in its root, the kernel releases it
+when the process dies however it dies, and a root whose lock is free has lost
+its owner. The sweep releases those roots, then any `rb-rbtest-*` namespace
+that no live guard's pool names. `runc_a_panicking_test_leaves_no_container_or_network_behind`
+panics with a container running and checks that nothing is left, and two
+more tests leave a container behind the way an unguarded panic and a SIGKILL
+would, then start a container that takes the same address.
+
 ### A signal is not proof of exit
 
 The same idea runs through the agent's stop path. A runtime can accept a kill

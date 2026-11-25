@@ -1800,6 +1800,24 @@
     "test": "a_record_and_generation_split_by_a_power_cut_retire_and_others_still_adopt"
   },
   {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_a_panicking_test_leaves_no_container_or_network_behind",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_a_panicking_test_leaves_no_container_or_network_behind"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_a_test_after_an_unguarded_panic_takes_the_same_address",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_a_test_after_an_unguarded_panic_takes_the_same_address"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_a_test_after_a_killed_test_releases_its_root_and_takes_the_same_address",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_a_test_after_a_killed_test_releases_its_root_and_takes_the_same_address"
+  },
+  {
     "source": "tests/cluster_task_arrays.rs",
     "function": "a_task_array_survives_losing_a_node_mid_run",
     "binary": "reliaburger::cluster_task_arrays",
