@@ -233,6 +233,20 @@ does, and never search the target directory. Worktrees can share one
 `CARGO_TARGET_DIR` without testing each other's programs.
 `tests_load_the_object_this_build_compiled` checks this without a kernel.
 
+A rootful runc test cleans up after itself even when it fails. Every test
+runtime starts with an empty address pool, so its first container always
+takes the same address, and a container left running holds that address's
+route: every later runc test then fails with `RTNETLINK answers: File
+exists` ([#2315](https://github.com/reliaburger/reliaburger/issues/2315)).
+So the runtime roots in `tests/owned_runc.rs` and `tests/owned_task_arrays.rs`
+carry a guard from [`tests/support/runc_residue.rs`](../tests/support/runc_residue.rs):
+its `Drop` kills the root's containers and deletes the namespaces and veths
+its pool reserved, on a panic as on a pass. A test killed outright gets no
+`Drop`, so each new guard first releases roots whose owner has died (each
+guard holds a lock in its root) and any `rb-rbtest-*` namespace no live guard
+reserved. It touches nothing else, and it relies on the `host-network` test
+group running runc tests one at a time.
+
 ### Who runs an ignored test
 
 Every `#[ignore = "..."]` reason names its owner, and `make check-ignored`

@@ -288,6 +288,9 @@ impl BootLogsRequest {
     }
 }
 
+/// Why a node with no `/v1/os/boot-logs` route can't answer.
+const TOO_OLD: &str = "this node's bun predates relish os boot-logs (0.3.3); upgrade it first";
+
 /// One node's boot logs, as it answered.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -319,6 +322,13 @@ impl BootLogState {
                 if body.contains("isn't an appliance") =>
             {
                 return Self::NotAnAppliance;
+            }
+            // A bun from before 0.3.3 has no such route, and answers a bare
+            // 404 (#2323).
+            Err(RelishError::ApiError { status: 404, .. }) => {
+                return Self::Failed {
+                    reason: TOO_OLD.to_string(),
+                };
             }
             Err(error) => {
                 return Self::Failed {
@@ -355,8 +365,8 @@ pub struct BootLogsReport {
 }
 
 impl BootLogsReport {
-    /// Why the command fails after printing: a change that some node didn't
-    /// make, or that no node could.
+    /// Why the command fails after printing: a change that some node may
+    /// not have made, or that no node could.
     pub fn failure(&self) -> Option<String> {
         if self.request == BootLogsRequest::Show {
             return None;
@@ -368,7 +378,12 @@ impl BootLogsReport {
             .map(|node| node.node_id.as_str())
             .collect();
         if !failed.is_empty() {
-            return Some(format!("boot logs unchanged on {}", failed.join(", ")));
+            // A node may have written the file and then lost the
+            // connection, so its answer doesn't prove nothing changed.
+            return Some(format!(
+                "boot logs may not have changed on {}; run `relish os boot-logs` to check",
+                failed.join(", ")
+            ));
         }
         if self
             .nodes
@@ -615,6 +630,14 @@ mod tests {
             ))),
             BootLogState::NotAnAppliance
         );
+        assert_eq!(
+            BootLogState::from_answer(Err(api_error(404, ""))),
+            BootLogState::Failed {
+                reason: "this node's bun predates relish os boot-logs (0.3.3); upgrade it first"
+                    .into()
+            },
+            "a 0.3.2 bun has no boot-logs route"
+        );
         assert!(matches!(
             BootLogState::from_answer(Err(api_error(403, "forbidden"))),
             BootLogState::Failed { .. }
@@ -727,7 +750,9 @@ mod tests {
         };
         assert_eq!(
             report(BootLogsRequest::Off, vec![("gone", failed.clone())]).failure(),
-            Some("boot logs unchanged on gone".into())
+            Some(
+                "boot logs may not have changed on gone; run `relish os boot-logs` to check".into()
+            )
         );
         assert_eq!(
             report(

@@ -7,6 +7,9 @@ use std::time::Duration;
 use reliaburger::grill::runc::RuncGrill;
 use reliaburger::grill::{ContainerState, Grill, ImageStore, InstanceId, OciSpec};
 
+#[path = "support/runc_residue.rs"]
+mod runc_residue;
+
 fn runtime(root: &Path) -> RuncGrill {
     RuncGrill::new(
         root.join("bundles"),
@@ -119,7 +122,7 @@ fn assert_absent(root: &Path, id: &InstanceId) {
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn runc_owned_preparation_recovers_original_intent_and_retires_without_adoption() {
     assert!(nix::unistd::geteuid().is_root());
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let original = spec(root.path(), "exit 0");
     let first = runtime(root.path());
@@ -163,7 +166,7 @@ async fn runc_owned_preparation_recovers_original_intent_and_retires_without_ado
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn runc_owned_short_job_keeps_its_actual_exit_and_logs_after_reconstruction() {
     assert!(nix::unistd::geteuid().is_root());
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let first = runtime(root.path());
     first
@@ -190,7 +193,7 @@ async fn runc_owned_short_job_keeps_its_actual_exit_and_logs_after_reconstructio
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn runc_owned_launcher_and_exec_retire_after_actual_caller_sigkill() {
     assert!(nix::unistd::geteuid().is_root());
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let mut caller = tokio::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "owned_runc_fixture", "--ignored", "--nocapture"])
@@ -242,7 +245,7 @@ async fn owned_runc_fixture() {
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn runc_owned_adoption_validates_generation_and_restores_live_network() {
     use reliaburger::grill::records::{InstanceRecord, RuntimeKind};
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let specification = spec(root.path(), "exec /bin/busybox sleep 60");
     let first = runtime(root.path());
@@ -301,7 +304,7 @@ async fn runc_owned_adoption_validates_generation_and_restores_live_network() {
 #[tokio::test]
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn a_bun_restart_adopts_a_sidecar_with_its_process_and_its_instances_network() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let parent = instance(root.path());
     let sidecar = reliaburger::grill::oci::sidecar_instance_id(&parent, "probe");
     let app = spec(root.path(), "exec /bin/busybox sleep 60");
@@ -361,7 +364,7 @@ async fn a_bun_restart_adopts_a_sidecar_with_its_process_and_its_instances_netwo
 #[tokio::test]
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn a_sidecar_that_died_before_adoption_is_refused_and_then_forgotten() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let parent = instance(root.path());
     let sidecar = reliaburger::grill::oci::sidecar_instance_id(&parent, "probe");
     let app = spec(root.path(), "exec /bin/busybox sleep 60");
@@ -455,7 +458,7 @@ fn adoption_record(
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn a_record_and_generation_split_by_a_power_cut_retire_and_others_still_adopt() {
     assert!(nix::unistd::geteuid().is_root());
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let healthy = instance(root.path());
     // The record is newer: it names a launch whose binding never reached
     // the generation, so the generation has no launcher at all.
@@ -525,7 +528,7 @@ async fn a_stale_adoption_record_retires_its_generation_and_others_still_adopt()
     // every start, taking every workload on the node down with it.
     use reliaburger::grill::records::{InstanceRecord, RuntimeKind};
     assert!(nix::unistd::geteuid().is_root());
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let stale = instance(root.path());
     let healthy = InstanceId(format!("{}-b", stale.0));
     let specification = spec(root.path(), "exec /bin/busybox sleep 60");
@@ -590,7 +593,7 @@ async fn runc_owned_cancelled_preparation_keeps_its_worker_until_queued_cleanup(
         return;
     }
     use std::os::unix::fs::PermissionsExt;
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let bin = root.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     let real_ip = std::process::Command::new("sh")
@@ -674,7 +677,7 @@ async fn cancelled_preparation(root: &Path) {
 #[tokio::test]
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn runc_owned_completed_log_reader_cannot_block_a_replacement_generation() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let runtime = runtime(root.path());
     runtime
@@ -725,7 +728,7 @@ async fn runc_owned_completed_log_reader_cannot_block_a_replacement_generation()
 async fn following_a_large_capture_after_a_restart_does_not_hold_the_runtime() {
     const LINES: u64 = 200_000;
     const LINE: &str = "spam the quick brown fox jumps over";
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let first = runtime(root.path());
     first
@@ -790,7 +793,7 @@ async fn following_a_large_capture_after_a_restart_does_not_hold_the_runtime() {
 #[tokio::test]
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn generated_cgroup_path_matches_the_actual_container_before_its_first_instruction() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let expected = format!("/{}", id.0);
     let host_path = format!("/sys/fs/cgroup{expected}");
@@ -828,7 +831,7 @@ async fn generated_cgroup_path_matches_the_actual_container_before_its_first_ins
 #[tokio::test]
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn a_memory_request_smaller_than_runc_init_does_not_hold_the_start() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let host_path = format!("/sys/fs/cgroup/{}", id.0);
     let runtime = runtime(root.path());
@@ -873,7 +876,7 @@ async fn a_memory_request_smaller_than_runc_init_does_not_hold_the_start() {
 #[tokio::test]
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn recovered_source_identity_belongs_to_the_container_not_its_launcher() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let path = format!("/sys/fs/cgroup/{}", id.0);
     let mut specification = spec(root.path(), "exec /bin/busybox sleep 60");
@@ -901,7 +904,7 @@ async fn recovered_source_identity_belongs_to_the_container_not_its_launcher() {
 #[tokio::test]
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn source_identity_refuses_a_container_moved_out_of_its_original_cgroup() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let runtime = runtime(root.path());
     let mut specification = spec(root.path(), "exec /bin/busybox sleep 60");
@@ -930,7 +933,7 @@ async fn source_identity_refuses_a_container_moved_out_of_its_original_cgroup() 
 #[tokio::test]
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn retiring_a_rollout_predecessor_preserves_its_live_successor() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let app_name = instance(root.path()).0;
     let first_id = reliaburger::grill::InstanceIdentity::new("default", &app_name, 0).instance_id();
     let successor_id =
@@ -976,7 +979,7 @@ async fn retiring_a_rollout_predecessor_preserves_its_live_successor() {
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn retained_addresses_survive_exit_and_recovery_until_the_original_reference_releases() {
     assert!(nix::unistd::geteuid().is_root());
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let first = runtime(root.path());
     first
@@ -1091,7 +1094,7 @@ async fn restart_recovers_a_retiring_generation_that_still_holds_its_address() {
     use reliaburger::grill::records::{InstanceRecord, RuntimeKind};
     use reliaburger::grill::runc_intent::NetworkReferenceState;
     assert!(nix::unistd::geteuid().is_root());
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let specification = spec(root.path(), "exec /bin/busybox sleep 60");
     let first = runtime(root.path());
@@ -1173,7 +1176,7 @@ async fn restart_recovers_a_retiring_generation_that_still_holds_its_address() {
 #[tokio::test]
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn previous_boot_intent_cannot_start_or_remove_conflicting_live_resources() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let first = runtime(root.path());
     first
@@ -1372,7 +1375,7 @@ enum Paused {
 async fn paused_container_takes_its_stop_signal_at_once(paused: Paused) {
     use reliaburger::bun::agent::{InstanceStop, stop_runtime_instance};
     assert!(nix::unistd::geteuid().is_root());
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let runtime = runtime(root.path());
     runtime
@@ -1394,10 +1397,8 @@ async fn paused_container_takes_its_stop_signal_at_once(paused: Paused) {
         Paused::Workload => runtime.workload_pids(&id).await.unwrap(),
         Paused::ContainerInit => vec![container_init(root.path(), &id).expect("a container init")],
     };
+    let pids = pause_live(&pids);
     assert!(!pids.is_empty(), "nothing to pause");
-    for pid in &pids {
-        reliaburger::smoker::process::pause_process(*pid as i32).unwrap();
-    }
 
     let grace = Duration::from_secs(20);
     let begun = std::time::Instant::now();
@@ -1460,9 +1461,9 @@ async fn runc_container_with_a_paused_init_takes_its_stop_signal_at_once() {
 #[tokio::test]
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
 async fn runc_pause_freezes_the_workload_not_its_launcher() {
-    use reliaburger::smoker::process::{pause_process, resume_process};
+    use reliaburger::smoker::process::resume_process;
     assert!(nix::unistd::geteuid().is_root());
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let runtime = runtime(root.path());
     runtime
@@ -1485,10 +1486,10 @@ async fn runc_pause_freezes_the_workload_not_its_launcher() {
             .unwrap_or(0)
     };
     let launcher = runtime.pid(&id).await.unwrap().expect("a launcher");
-    let paused = runtime.workload_pids(&id).await.unwrap();
-    for pid in &paused {
-        pause_process(*pid as i32).unwrap();
-    }
+    // The shell loop is the container's init and lives for the whole test.
+    let init = container_init(root.path(), &id).expect("a container init");
+    let listed = runtime.workload_pids(&id).await.unwrap();
+    let paused = pause_live(&listed);
     // A write already under way when the signal landed may still finish.
     tokio::time::sleep(Duration::from_millis(300)).await;
     let frozen = beats();
@@ -1510,10 +1511,160 @@ async fn runc_pause_freezes_the_workload_not_its_launcher() {
         "the workload kept running while {paused:?} were paused"
     );
     assert!(
-        !paused.contains(&launcher),
-        "the pause froze the runc launcher {launcher}"
+        !listed.contains(&launcher),
+        "the pause named the runc launcher {launcher}: {listed:?}"
+    );
+    assert!(
+        paused.contains(&init),
+        "the pause missed the workload's init {init}: {paused:?}"
     );
     moved.expect("the workload never ran again after its resume");
+}
+
+/// Pause each of `pids` that still exists, and return those it paused.
+/// A workload's pids include short-lived children, such as its loop's
+/// `sleep`, which may exit between the listing and the signal; Smoker's
+/// pause skips those too. Any other failure is a test failure (#2315).
+fn pause_live(pids: &[u32]) -> Vec<u32> {
+    use reliaburger::smoker::process::{ProcessFaultError, pause_process};
+    pids.iter()
+        .copied()
+        .filter(|pid| match pause_process(*pid as i32) {
+            Ok(()) => true,
+            Err(ProcessFaultError::SignalFailed {
+                source: nix::errno::Errno::ESRCH,
+                ..
+            }) => false,
+            Err(error) => panic!("cannot pause {pid}: {error}"),
+        })
+        .collect()
+}
+
+/// Start a container that sleeps, in a runtime rooted at `root`, and return
+/// the runtime, the instance and its address.
+async fn start_sleeper(root: &Path) -> (RuncGrill, InstanceId, std::net::Ipv4Addr) {
+    let id = instance(root);
+    let runtime = runtime(root);
+    runtime
+        .create(&id, &spec(root, "exec /bin/busybox sleep 600"))
+        .await
+        .unwrap();
+    install_fixture(root, &id);
+    runtime.start(&id).await.unwrap();
+    let address = runtime
+        .container_ip(&id)
+        .await
+        .expect("a container address");
+    (runtime, id, address)
+}
+
+/// Whether the host still routes `address` anywhere.
+fn routed(address: std::net::Ipv4Addr) -> bool {
+    let output = std::process::Command::new("ip")
+        .args(["route", "show", &format!("{address}/32")])
+        .output()
+        .unwrap();
+    !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+}
+
+/// Wait until process `pid` has gone.
+async fn wait_gone(pid: u32) {
+    let proc = Path::new("/proc").join(pid.to_string());
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while proc.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("process {pid} outlived its test"));
+}
+
+/// A runc test that panics with its container running leaves nothing
+/// behind: no container, network namespace, veth or route (#2315). Before
+/// its root carried a guard, one such panic held the first container
+/// address, and every later runc test failed with `RTNETLINK answers: File
+/// exists`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
+async fn runc_a_panicking_test_leaves_no_container_or_network_behind() {
+    assert!(nix::unistd::geteuid().is_root());
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let failed = tokio::spawn(async move {
+        let root = runc_residue::RuncRoot::new();
+        let (_runtime, id, address) = start_sleeper(root.path()).await;
+        let init = container_init(root.path(), &id).expect("a container init");
+        started_tx
+            .send((root.path().to_path_buf(), id, address, init))
+            .unwrap();
+        panic!("a failed assertion with the container still running");
+    })
+    .await;
+    assert!(failed.unwrap_err().is_panic());
+    let (root, id, address, init) = started_rx.await.unwrap();
+    wait_gone(init).await;
+    assert!(!root.exists(), "{} survived the panic", root.display());
+    assert!(!reliaburger::grill::netns::namespace_path(&id).exists());
+    assert!(
+        !Path::new("/sys/class/net")
+            .join(reliaburger::grill::netns::host_veth_name(&id))
+            .exists()
+    );
+    assert!(!routed(address), "{address} is still routed");
+}
+
+/// A runc test still starts after an earlier one that panicked with no
+/// guard at all: its container kept running, its root was deleted, and its
+/// namespace, veth and route stayed. That is what the pause test's panic
+/// left (#2315). The next test's guard releases the stale namespace, and
+/// the next container takes the same address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
+async fn runc_a_test_after_an_unguarded_panic_takes_the_same_address() {
+    assert!(nix::unistd::geteuid().is_root());
+    let unguarded = tempfile::tempdir().unwrap();
+    let (stale_runtime, stale, stale_address) = start_sleeper(unguarded.path()).await;
+    let stale_init = container_init(unguarded.path(), &stale).expect("a container init");
+    drop(stale_runtime);
+    drop(unguarded);
+    assert!(routed(stale_address));
+
+    let root = runc_residue::RuncRoot::new();
+    wait_gone(stale_init).await;
+    assert!(!reliaburger::grill::netns::namespace_path(&stale).exists());
+    let (runtime, id, address) = start_sleeper(root.path()).await;
+    assert_eq!(address, stale_address, "the stale address never collided");
+    runtime.kill(&id).await.unwrap();
+    assert_absent(root.path(), &id);
+}
+
+/// A runc test still starts after an earlier one was killed outright, by a
+/// timeout's SIGKILL, with its container running and its root kept. Its
+/// guard's lock went with it, so the next guard releases that root's
+/// container and network, and the next container takes the same address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
+async fn runc_a_test_after_a_killed_test_releases_its_root_and_takes_the_same_address() {
+    assert!(nix::unistd::geteuid().is_root());
+    let killed = tempfile::tempdir().unwrap().keep();
+    let residue = runc_residue::RuncResidue::new(&killed);
+    let (stale_runtime, stale, stale_address) = start_sleeper(&killed).await;
+    let stale_init = container_init(&killed, &stale).expect("a container init");
+    drop(stale_runtime);
+    residue.abandon();
+    assert!(routed(stale_address));
+
+    let root = runc_residue::RuncRoot::new();
+    wait_gone(stale_init).await;
+    assert!(
+        container_init(&killed, &stale).is_none(),
+        "runc still lists it"
+    );
+    assert!(!reliaburger::grill::netns::namespace_path(&stale).exists());
+    let (runtime, id, address) = start_sleeper(root.path()).await;
+    assert_eq!(address, stale_address, "the stale address never collided");
+    runtime.kill(&id).await.unwrap();
+    assert_absent(root.path(), &id);
+    std::fs::remove_dir_all(&killed).unwrap();
 }
 
 /// Kill every process in a stand-in for Bun's systemd unit cgroup the way
@@ -1553,7 +1704,7 @@ async fn restart_after_unit_cgroup_stop(retiring: bool) {
     use reliaburger::grill::records::InstanceRecord;
     use reliaburger::grill::runc_intent::NetworkReferenceState;
     assert!(nix::unistd::geteuid().is_root());
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let unit = Path::new("/sys/fs/cgroup").join(format!("{}-unit", id.0));
     std::fs::create_dir(&unit).unwrap();
@@ -2174,7 +2325,7 @@ mod capacity_contract {
     async fn runc_ordinary_terminal_receipt_releases_nonzero_capacity_for_actual_batch_http() {
         assert!(nix::unistd::geteuid().is_root());
         assert!(Path::new("/sys/fs/cgroup/cgroup.controllers").is_file());
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::runc_residue::RuncRoot::new();
         let suffix = root
             .path()
             .file_name()
@@ -2403,7 +2554,7 @@ mod capacity_contract {
     #[ignore = "requires root, runc, overlayfs, cgroup v2, ip and nft; run with scripts/release/qualify-oci-interruptions.sh"]
     async fn runc_capacity_harness_unmounts_identity_tmpfs_and_removes_its_volumes() {
         assert!(nix::unistd::geteuid().is_root());
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::runc_residue::RuncRoot::new();
         let (harness, _council) = bare_harness(root.path()).await;
         let volumes = harness.volumes.clone();
         mount_identity(&volumes);
@@ -2420,7 +2571,7 @@ mod capacity_contract {
     #[ignore = "requires root, runc, overlayfs, cgroup v2, ip and nft; run with scripts/release/qualify-oci-interruptions.sh"]
     async fn runc_capacity_harness_unmounts_identity_tmpfs_while_a_failed_test_unwinds() {
         assert!(nix::unistd::geteuid().is_root());
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::runc_residue::RuncRoot::new();
         let (volumes_tx, volumes_rx) = tokio::sync::oneshot::channel();
         let root_path = root.path().to_path_buf();
         let failed = tokio::spawn(async move {

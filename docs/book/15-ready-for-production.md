@@ -4220,9 +4220,19 @@ it writes only the controllers that are missing, so it never touches a control
 a live helper relies on. If the parent offers cpu and memory but hasn't
 delegated them, it enables them there itself, which is what runc does for every
 container's ancestors anyway. `NodePressureController::apply` calls it (on the
-blocking pool, through the public `probe`) before each fault, and so does
-`/v1/capabilities` before it reports `node_pressure`. The startup result is
-now only a fallback for a report built without a fresh probe. Startup keeps the
+blocking pool, through the public `prepare`) before each fault.
+`/v1/capabilities` asks too, before it reports `node_pressure`, but through
+`probe`, which only reads. The first version had the capability report call
+the preparing function, and the review of the 0.3.3 train noticed what that
+meant: any token, even a read-only one, could make Bun create
+`reliaburger-chaos` and write `+cpu +memory` into the host's root
+`cgroup.subtree_control`, just by asking what the node could do. A GET should
+never change the host. So `check_controllers` reads the same two
+`cgroup.controllers` files and gives the same answer `ensure_controllers`
+would, and the writes stay in `apply`, which only an authorised fault request
+reaches. Its test snapshots every file in the fake hierarchy before and after the
+probe and wants them equal, with the pressure cgroup still absent. The startup
+result is now only a fallback for a report built without a fresh probe. Startup keeps the
 one job that must happen once: sweeping `fault-*` cgroups a crashed Bun left
 behind. A probe can't sweep, because a sweep would kill a running helper.
 

@@ -915,8 +915,9 @@ async fn a_boot_log_change_is_audited_with_its_target() {
     std::fs::create_dir_all(esp.path().join("boot/EFI")).unwrap();
     let app = app.layer(axum::Extension(crate::os::netlog::NetlogPaths {
         esp_candidates: vec![esp.path().join("boot")],
-        netconsole_enabled: esp.path().join("enabled"),
+        netconsole: esp.path().join("netconsole"),
         restart: vec!["true".into()],
+        journal: vec!["true".into()],
     }));
 
     for body in [r#"{"target":"10.42.0.1"}"#, r#"{"target":null}"#] {
