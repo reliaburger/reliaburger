@@ -863,57 +863,22 @@ What each release added, changed and fixed, newest first.
 
 Every release carries PDFs, and these links always fetch the latest: [whitepaper](https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-whitepaper.pdf), [design docs](https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-design-docs.pdf), [the book](https://github.com/reliaburger/reliaburger/releases/latest/download/building-reliaburger.pdf) and [roadmap](https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-roadmap.pdf). The Markdown on GitHub follows `main`, so it can be newer.
 
-## Follow a subsystem
+## What’s in the burger
 
-`bun` runs on each node. `relish` talks to its API. The names are burger ingredients; the links are the design documents.
+The names are burger ingredients, and the burger is the architecture. `bun` runs on each node and holds every layer; `relish` talks to its API. Each layer links its design document.
 
-[Bun / Grill](https://github.com/reliaburger/reliaburger/blob/main/docs/design/agent-bun.md)
-
-Agent, container lifecycle, health checks
-
-[Mustard / Council](https://github.com/reliaburger/reliaburger/blob/main/docs/design/gossip-mustard.md)
-
-SWIM membership, Raft consensus
-
-[Meat](https://github.com/reliaburger/reliaburger/blob/main/docs/design/scheduler-meat.md)
-
-Placement, resources, scheduling
-
-[Onion](https://github.com/reliaburger/reliaburger/blob/main/docs/design/discovery-onion.md)
-
-DNS, service discovery, eBPF
-
-[Wrapper](https://github.com/reliaburger/reliaburger/blob/main/docs/design/ingress-wrapper.md)
-
-Ingress, TLS, connection draining
-
-[Sesame](https://github.com/reliaburger/reliaburger/blob/main/docs/design/security-sesame.md)
-
-PKI, mTLS, secrets, authorisation
-
-[Pickle](https://github.com/reliaburger/reliaburger/blob/main/docs/design/registry-pickle.md)
-
-OCI registry, image distribution
-
-[Mayo](https://github.com/reliaburger/reliaburger/blob/main/docs/design/metrics-mayo.md) / [Ketchup](https://github.com/reliaburger/reliaburger/blob/main/docs/design/logs-ketchup.md)
-
-Metrics, SQL queries, logs
-
-[Lettuce](https://github.com/reliaburger/reliaburger/blob/main/docs/design/gitops-lettuce.md)
-
-GitOps, reconciliation
-
-[Deployments](https://github.com/reliaburger/reliaburger/blob/main/docs/design/deployments.md)
-
-Rollouts, health gates, rollback
-
-[Smoker](https://github.com/reliaburger/reliaburger/blob/main/docs/design/chaos-smoker.md)
-
-Fault injection, recovery testing
-
-[Relish](https://github.com/reliaburger/reliaburger/blob/main/docs/design/cli-relish.md) / [Brioche](https://github.com/reliaburger/reliaburger/blob/main/docs/design/ui-brioche.md)
-
-CLI, terminal UI, web dashboard
+1.   [Deployments](https://github.com/reliaburger/reliaburger/blob/main/docs/design/deployments.md)Rollouts, health gates, rollback
+2.   [Bun / Grill](https://github.com/reliaburger/reliaburger/blob/main/docs/design/agent-bun.md)Agent, container lifecycle, health checks
+3.   [Sesame](https://github.com/reliaburger/reliaburger/blob/main/docs/design/security-sesame.md)PKI, mTLS, secrets, authorisation
+4.   [Lettuce](https://github.com/reliaburger/reliaburger/blob/main/docs/design/gitops-lettuce.md)GitOps, reconciliation
+5.   [Onion](https://github.com/reliaburger/reliaburger/blob/main/docs/design/discovery-onion.md)DNS, service discovery, eBPF
+6.   [Pickle](https://github.com/reliaburger/reliaburger/blob/main/docs/design/registry-pickle.md)OCI registry, image distribution
+7.   [Mustard / Council](https://github.com/reliaburger/reliaburger/blob/main/docs/design/gossip-mustard.md)SWIM membership, Raft consensus
+8.   [Mayo](https://github.com/reliaburger/reliaburger/blob/main/docs/design/metrics-mayo.md) / [Ketchup](https://github.com/reliaburger/reliaburger/blob/main/docs/design/logs-ketchup.md)Metrics, SQL queries, logs
+9.   [Meat](https://github.com/reliaburger/reliaburger/blob/main/docs/design/scheduler-meat.md)Placement, resources, scheduling
+10.  [Smoker](https://github.com/reliaburger/reliaburger/blob/main/docs/design/chaos-smoker.md)Fault injection, recovery testing
+11.  [Relish](https://github.com/reliaburger/reliaburger/blob/main/docs/design/cli-relish.md) / [Brioche](https://github.com/reliaburger/reliaburger/blob/main/docs/design/ui-brioche.md)CLI, terminal UI, web dashboard
+12.  [Wrapper](https://github.com/reliaburger/reliaburger/blob/main/docs/design/ingress-wrapper.md)Ingress, TLS, connection draining
 
 ## Build it from source
 
