@@ -176,6 +176,14 @@ filter = 'test(/a_shell_waiting_on_killed_children_as_killed$/)'
 test-group = "process-heavy"
 slow-timeout = { period = "60s", terminate-after = 3 }
 
+# The role owner stall tests stop process owners with SIGSTOP and time
+# their next step from a 2 s owner request deadline, with about 1 s of
+# margin (#2328). A crowded host eats that margin, so they run at most two
+# at a time.
+[[profile.default.overrides]]
+filter = 'binary(runc_roles) & test(/stall|request_deadline|too_late|patient_role_read|dies_before_the_drain/)'
+test-group = "process-heavy"
+
 [[profile.default.overrides]]
 filter = 'binary(integration) | binary(placement) | binary(job_recovery)'
 test-group = "process-heavy"
@@ -281,6 +289,14 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 filter = 'test(/a_shell_waiting_on_killed_children_as_killed$/)'
 test-group = "process-heavy"
 slow-timeout = { period = "60s", terminate-after = 3 }
+
+# The role owner stall tests stop process owners with SIGSTOP and time
+# their next step from a 2 s owner request deadline, with about 1 s of
+# margin (#2328). A crowded host eats that margin, so they run at most two
+# at a time.
+[[profile.ci.overrides]]
+filter = 'binary(runc_roles) & test(/stall|request_deadline|too_late|patient_role_read|dies_before_the_drain/)'
+test-group = "process-heavy"
 
 [[profile.ci.overrides]]
 filter = 'binary(integration) | binary(placement) | binary(job_recovery)'

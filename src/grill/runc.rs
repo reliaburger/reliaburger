@@ -59,6 +59,10 @@ pub struct RuncGrill {
     dns_nameserver: Option<std::net::Ipv4Addr>,
     /// Source identities change with network ownership, before workloads start.
     dns_sources: tokio::sync::watch::Sender<crate::onion::dns::DnsSourceNamespaces>,
+    /// The agent's `[runtime] stop_confirmation_timeout_secs`, which bounds
+    /// each stop and kill this runtime answers; a stop's patience with a
+    /// late owner comes out of it (#2328).
+    stop_confirmation: std::time::Duration,
 }
 
 impl RuncGrill {
@@ -108,7 +112,16 @@ impl RuncGrill {
                 crate::onion::dns::DnsSourceNamespaces::default(),
             )
             .0,
+            stop_confirmation: crate::config::node::RuntimeSection::default()
+                .stop_confirmation_timeout(),
         })
+    }
+
+    /// Bound stops and kills by the agent's configured stop confirmation
+    /// timeout rather than its default.
+    pub fn with_stop_confirmation_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.stop_confirmation = timeout;
+        self
     }
 
     async fn lock_lifecycle(&self, instance: &InstanceId) -> tokio::sync::OwnedMutexGuard<()> {

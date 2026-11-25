@@ -19,9 +19,13 @@ use super::process_control::ProcessControl;
 use super::process_owner::OwnerPhase;
 
 mod executor;
+pub(crate) use executor::ask_while_late;
 pub use executor::{ClaimedCommandExecutor, DirectCommandExecutor, RuntimeCommandExecutor};
 
 const OUTPUT_LIMIT: u64 = 1024 * 1024;
+
+/// The bound on one short runtime command, such as `runc kill`.
+pub(crate) const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Identity of one immutable command attempt, independent of its caller's PID.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -1260,6 +1260,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         &instances_dir,
         &pickle_dir,
         &config.images.mirrors,
+        config.runtime.stop_confirmation_timeout(),
     )
     .await?;
     #[cfg(target_os = "linux")]
@@ -4173,9 +4174,10 @@ async fn select_runtime(
     instances_dir: &std::path::Path,
     image_directory: &std::path::Path,
     mirrors: &reliaburger::grill::ImageMirrors,
+    stop_confirmation: std::time::Duration,
 ) -> anyhow::Result<AnyGrill> {
     #[cfg(not(target_os = "linux"))]
-    let _ = (image_directory, mirrors);
+    let _ = (image_directory, mirrors, stop_confirmation);
     match name {
         RuntimeChoice::Auto => {
             // Both runtimes use durable owners, so launches remain
@@ -4187,7 +4189,8 @@ async fn select_runtime(
                 )),
                 #[cfg(target_os = "linux")]
                 DetectedRuntime::Runc { rootless } => AnyGrill::with_host_processes(
-                    create_runc_runtime(instances_dir, image_directory, rootless, mirrors)?,
+                    create_runc_runtime(instances_dir, image_directory, rootless, mirrors)?
+                        .with_stop_confirmation_timeout(stop_confirmation),
                     instances_dir,
                     std::env::current_exe()?,
                 ),
@@ -4216,7 +4219,8 @@ async fn select_runtime(
             let is_rootless = reliaburger::grill::rootless::is_rootless();
             let mode = if is_rootless { "rootless" } else { "root" };
             println!("bun: using {name} runtime ({mode})");
-            let grill = create_runc_runtime(instances_dir, image_directory, is_rootless, mirrors)?;
+            let grill = create_runc_runtime(instances_dir, image_directory, is_rootless, mirrors)?
+                .with_stop_confirmation_timeout(stop_confirmation);
             if name == RuntimeChoice::Mixed {
                 Ok(AnyGrill::with_host_processes(
                     grill,
@@ -4570,6 +4574,7 @@ mod tests {
             root.path(),
             root.path(),
             &Default::default(),
+            std::time::Duration::from_secs(10),
         )
         .await
         .err()
@@ -4626,6 +4631,7 @@ mod tests {
                 &root.path().join(mode.to_string()),
                 &root.path().join("images"),
                 &Default::default(),
+                std::time::Duration::from_secs(10),
             )
             .await
             .unwrap();
@@ -4654,6 +4660,7 @@ mod tests {
             &root.path().join("instances"),
             &root.path().join("custom-images"),
             &Default::default(),
+            std::time::Duration::from_secs(10),
         )
         .await
         .unwrap();

@@ -476,11 +476,23 @@ async fn role_exec_does_not_hold_the_adapter_lock_while_cleanup_retires_it() {
     cleanup.finish(None).await.unwrap();
 }
 
+/// The `pkill -f` pattern for the process owners under `root` whose
+/// command directory sits in `scope`: a role's directory (`launcher/`,
+/// `rootless-network/`), or `""` for every owner.
+fn owner_pattern(root: &Path, scope: &str) -> String {
+    // The tempdir's own name, since macOS resolves `/var` to `/private/var`.
+    let name = root.file_name().unwrap_or_default().to_string_lossy();
+    format!("__process-owner.* --directory .*/{name}/.*{scope}")
+}
+
 /// Send `signal` to every process owner under `root`.
 fn signal_owners(root: &Path, signal: &str) {
-    // The tempdir's own name, since macOS resolves `/var` to `/private/var`.
-    let name = root.file_name().unwrap().to_string_lossy();
-    let pattern = format!("__process-owner.* --directory .*/{name}/");
+    signal_scoped_owners(root, "", signal);
+}
+
+/// Send `signal` to the process owners under `root` in `scope`.
+fn signal_scoped_owners(root: &Path, scope: &str, signal: &str) {
+    let pattern = owner_pattern(root, scope);
     let status = std::process::Command::new("pkill")
         .args([signal, "-f", &pattern])
         .status()
@@ -494,22 +506,25 @@ fn signal_owners(root: &Path, signal: &str) {
 
 /// Stops every process owner under a root until dropped, so a failing
 /// test never leaves an owner stopped behind it.
-struct StoppedOwners<'a>(&'a Path);
+struct StoppedOwners<'a>(&'a Path, &'static str);
 
 impl<'a> StoppedOwners<'a> {
     fn stop(root: &'a Path) -> Self {
-        signal_owners(root, "-STOP");
-        Self(root)
+        Self::stop_scope(root, "")
+    }
+
+    /// Stop only the owners of one role, named by its directory.
+    fn stop_scope(root: &'a Path, scope: &'static str) -> Self {
+        signal_scoped_owners(root, scope, "-STOP");
+        Self(root, scope)
     }
 }
 
 impl Drop for StoppedOwners<'_> {
     fn drop(&mut self) {
         // Not `signal_owners`: a panic inside `drop` while unwinding aborts.
-        let name = self.0.file_name().unwrap_or_default().to_string_lossy();
-        let pattern = format!("__process-owner.* --directory .*/{name}/");
         let _ = std::process::Command::new("pkill")
-            .args(["-CONT", "-f", &pattern])
+            .args(["-CONT", "-f", &owner_pattern(self.0, self.1)])
             .status();
     }
 }
@@ -750,6 +765,261 @@ async fn a_seal_against_a_dead_owner_refuses_at_once() {
     drop(workload);
 }
 
+/// Whether this generation's seal has fenced admission and started its drain.
+async fn draining(root: &Path) -> bool {
+    journal(root).inventory().await.unwrap()[0].phase == IntentPhase::Retiring
+}
+
+/// The drain inside a seal checks every role with its owner again before
+/// it retires anything, and each ask has a 2 s deadline. A late answer
+/// there failed the drain, which had already taken the claim, so the
+/// instance needed recovery (#2328). The drain asks again within its own
+/// timeout, so a stall only delays it.
+#[tokio::test]
+async fn a_seals_drain_waits_out_an_owner_that_misses_a_request_deadline() {
+    let root = tempfile::tempdir().unwrap();
+    let commands = shell(
+        fresh(root.path()).await,
+        RuntimeRole::Launcher,
+        "exec sleep 60",
+    )
+    .await;
+    let stopped = StoppedOwners::stop(root.path());
+    let seal = tokio::spawn(async move { commands.seal(Duration::from_secs(30)).await });
+    tokio::time::sleep(OWNER_STALL).await;
+    assert!(
+        !seal.is_finished(),
+        "the drain ended while the owner was stopped"
+    );
+    drop(stopped);
+    let cleanup = tokio::time::timeout(Duration::from_secs(20), seal)
+        .await
+        .expect("the drain didn't finish after the owner resumed")
+        .unwrap()
+        .expect("the drain failed after waiting out the owner stall");
+    assert!(matches!(
+        cleanup.role_state(RuntimeRole::Launcher).await.unwrap(),
+        Some(CommandState::Retired { .. })
+    ));
+    cleanup.finish(None).await.unwrap();
+}
+
+/// A host whose owners keep stalling can stall a seal twice: once in its
+/// first check of the roles and again in the drain's (#2328). Both are
+/// late answers, so the seal waits out each and still seals.
+///
+/// The first check asks the launcher's owner, then the helper's, and the
+/// test times the second stall from a moment it causes itself:
+///
+/// 1. Both owners are stopped, so the first check waits on the launcher,
+///    misses its 2 s deadline and asks again.
+/// 2. Letting the launcher's owner go answers that ask at once, and the
+///    check moves on to the stopped helper, whose own 2 s deadline starts
+///    then. That release is the anchor.
+/// 3. 1 s after it, the ask is halfway through the helper's deadline. The
+///    test stops the launcher's owner again and lets the helper's go: the
+///    ask answers, the seal starts its drain, and the drain's own check
+///    meets the stopped launcher.
+///
+/// The margin is 1 s either side of the switch. The launcher's answer
+/// must come within 1 s of its release (it takes milliseconds), and the
+/// helper's deadline is a fixed 2 s from it. The test asserts the intent
+/// record says `Retiring` during the second stall, so a switch that lands
+/// in the first check fails loudly instead of passing for the wrong reason.
+#[tokio::test]
+async fn a_seal_waits_out_a_second_owner_stall_in_its_drain() {
+    use reliaburger::grill::command::ClaimedCommandExecutor;
+    let root = tempfile::tempdir().unwrap();
+    let commands = shell(
+        fresh(root.path()).await,
+        RuntimeRole::Launcher,
+        "exec sleep 60",
+    )
+    .await;
+    let executor = ClaimedCommandExecutor::new(
+        shell(commands, RuntimeRole::RootlessNetwork, "exec sleep 60").await,
+    );
+    let helper_stopped = StoppedOwners::stop_scope(root.path(), "rootless-network/");
+    let launcher_stopped = StoppedOwners::stop_scope(root.path(), "launcher/");
+    let sealing = executor.clone();
+    let seal = tokio::spawn(async move { sealing.seal(Duration::from_secs(30)).await });
+    // More than one 2 s deadline, so the first check asks again.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!seal.is_finished(), "the seal ended during the first stall");
+    drop(launcher_stopped);
+    let anchor = tokio::time::Instant::now();
+    tokio::time::sleep_until(anchor + Duration::from_secs(1)).await;
+    assert!(
+        !draining(root.path()).await,
+        "the seal drained before the helper answered"
+    );
+    let launcher_stopped = StoppedOwners::stop_scope(root.path(), "launcher/");
+    drop(helper_stopped);
+    tokio::time::sleep(OWNER_STALL).await;
+    assert!(
+        draining(root.path()).await,
+        "the second stall didn't reach the drain"
+    );
+    assert!(
+        !seal.is_finished(),
+        "the seal ended during the second stall"
+    );
+    drop(launcher_stopped);
+    let cleanup = tokio::time::timeout(Duration::from_secs(20), seal)
+        .await
+        .expect("the seal didn't finish after the owners resumed")
+        .unwrap()
+        .expect("the seal failed after waiting out two owner stalls");
+    for role in [RuntimeRole::Launcher, RuntimeRole::RootlessNetwork] {
+        assert!(matches!(
+            cleanup.role_state(role).await.unwrap(),
+            Some(CommandState::Retired { .. })
+        ));
+    }
+    cleanup.finish(None).await.unwrap();
+}
+
+/// The drain asks again only on late answers. An owner that dies after
+/// the first check, while its workload still runs, is a real refusal: the
+/// drain reports it at once rather than asking until its deadline, and
+/// leaves the claim for recovery as before.
+#[tokio::test]
+async fn a_seal_whose_owner_dies_before_the_drain_refuses_at_once() {
+    use reliaburger::grill::command::ClaimedCommandExecutor;
+    let root = tempfile::tempdir().unwrap();
+    let commands = shell(
+        fresh(root.path()).await,
+        RuntimeRole::Launcher,
+        "exec sleep 60",
+    )
+    .await;
+    let commands = shell(commands, RuntimeRole::RootlessNetwork, "exec sleep 60").await;
+    let mut workloads = Vec::new();
+    for role in [RuntimeRole::Launcher, RuntimeRole::RootlessNetwork] {
+        let Some(CommandState::Running { pid }) = commands.role_state(role).await.unwrap() else {
+            panic!("the {role:?} isn't running");
+        };
+        workloads.push(RunningWorkload(pid));
+    }
+    let executor = ClaimedCommandExecutor::new(commands);
+    // As in the test above: the first check waits on the helper, with the
+    // launcher's answer in hand, when the launcher's owner dies.
+    let helper_stopped = StoppedOwners::stop_scope(root.path(), "rootless-network/");
+    let sealing = executor.clone();
+    let seal = tokio::spawn(async move { sealing.seal(Duration::from_secs(30)).await });
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    signal_scoped_owners(root.path(), "launcher/", "-KILL");
+    wait_for_no_scoped_owners(root.path(), "launcher/").await;
+    drop(helper_stopped);
+    let resumed = std::time::Instant::now();
+    // Asking again would take the drain's whole remaining 20 s or more;
+    // the bound leaves room for a loaded host.
+    let error = tokio::time::timeout(Duration::from_secs(10), seal)
+        .await
+        .expect("the drain asked a dead owner again")
+        .unwrap()
+        .expect_err("a seal succeeded with its owner dead and its workload running");
+    assert!(
+        error.to_string().contains("owner died"),
+        "unexpected refusal: {error}"
+    );
+    assert!(
+        draining(root.path()).await,
+        "the refusal came before the drain"
+    );
+    assert!(
+        resumed.elapsed() < Duration::from_secs(10),
+        "refusal took {:?}",
+        resumed.elapsed()
+    );
+    assert!(
+        executor
+            .role_state(RuntimeRole::Launcher)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("recover")
+    );
+    drop(workloads);
+}
+
+/// A stop reads the launcher's state before it seals, and that read is one
+/// owner request with a 2 s deadline. A patient read asks again while the
+/// owner answers late (#2328), so a stall only delays the stop.
+#[tokio::test]
+async fn a_patient_role_read_waits_out_an_owner_that_misses_a_request_deadline() {
+    use reliaburger::grill::command::ClaimedCommandExecutor;
+    let root = tempfile::tempdir().unwrap();
+    let executor = ClaimedCommandExecutor::new(
+        shell(
+            fresh(root.path()).await,
+            RuntimeRole::Launcher,
+            "exec sleep 60",
+        )
+        .await,
+    );
+    let stopped = StoppedOwners::stop(root.path());
+    let reading = executor.clone();
+    let read = tokio::spawn(async move {
+        reading
+            .role_state_patiently(RuntimeRole::Launcher, Duration::from_secs(20))
+            .await
+    });
+    tokio::time::sleep(OWNER_STALL).await;
+    assert!(
+        !read.is_finished(),
+        "the read ended while the owner was stopped"
+    );
+    drop(stopped);
+    let state = tokio::time::timeout(Duration::from_secs(10), read)
+        .await
+        .expect("the read didn't finish after the owner resumed")
+        .unwrap()
+        .expect("the read failed after waiting out the owner stall");
+    assert!(matches!(state, Some(CommandState::Running { .. })));
+    executor
+        .seal(Duration::from_secs(15))
+        .await
+        .unwrap()
+        .finish(None)
+        .await
+        .unwrap();
+}
+
+/// A patient read keeps to its bound: an owner that stays stopped fails it
+/// with `TimedOut` soon after the bound, with the claim intact.
+#[tokio::test]
+async fn a_patient_role_read_gives_up_at_its_bound() {
+    use reliaburger::grill::command::ClaimedCommandExecutor;
+    let root = tempfile::tempdir().unwrap();
+    let executor = ClaimedCommandExecutor::new(
+        shell(
+            fresh(root.path()).await,
+            RuntimeRole::Launcher,
+            "exec sleep 60",
+        )
+        .await,
+    );
+    let stopped = StoppedOwners::stop(root.path());
+    let started = std::time::Instant::now();
+    let error = executor
+        .role_state_patiently(RuntimeRole::Launcher, Duration::from_secs(3))
+        .await
+        .expect_err("a read answered with its owner stopped");
+    let took = started.elapsed();
+    drop(stopped);
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
+    // The bound, plus at most one 2 s ask that started just before it.
+    assert!(took < Duration::from_secs(6), "the read took {took:?}");
+    executor
+        .seal(Duration::from_secs(15))
+        .await
+        .unwrap()
+        .finish(None)
+        .await
+        .unwrap();
+}
+
 /// Kills a role's workload when dropped, for a test that killed its owner.
 struct RunningWorkload(u32);
 
@@ -763,8 +1033,12 @@ impl Drop for RunningWorkload {
 
 /// Wait until no process owner under `root` is left.
 async fn wait_for_no_owners(root: &Path) {
-    let name = root.file_name().unwrap().to_string_lossy().into_owned();
-    let pattern = format!("__process-owner.* --directory .*/{name}/");
+    wait_for_no_scoped_owners(root, "").await;
+}
+
+/// Wait until no process owner under `root` in `scope` is left.
+async fn wait_for_no_scoped_owners(root: &Path, scope: &str) {
+    let pattern = owner_pattern(root, scope);
     tokio::time::timeout(Duration::from_secs(10), async {
         while std::process::Command::new("pgrep")
             .args(["-f", &pattern])
