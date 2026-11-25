@@ -20,6 +20,8 @@ use crate::config::node::NodeConfig;
 use crate::relish::client::BunClient;
 use crate::relish::council_view::CouncilNodeObservation;
 
+use super::invaders::Invader;
+
 /// bun's API port on an appliance (`--listen`'s default).
 pub const API_PORT: u16 = 9117;
 
@@ -253,6 +255,31 @@ impl Remote {
     pub async fn workloads(&self) -> Result<Vec<TopRow>, String> {
         let client = self.client().await?;
         self.forget(bounded(client.node_top()).await).await
+    }
+
+    /// The cluster's `[appliance]` settings: whether kill mode is on.
+    pub async fn settings(&self) -> Result<crate::appliance::settings::ApplianceSettings, String> {
+        let client = self.client().await?;
+        self.forget(bounded(client.os_settings()).await).await
+    }
+
+    /// Ask bun to kill `invader`'s instance on `node`, with the request
+    /// `relish fault kill --instance` sends, and answer the fault's id.
+    /// Bun admits it only in kill mode (#2151); Smoker's rails, the
+    /// server's test policy and the audit trail treat it as any other.
+    pub async fn kill(&self, invader: &Invader, node: &str) -> Result<u64, String> {
+        let client = self.client().await?;
+        let request = crate::relish::fault::instance_kill_request(
+            &invader.app,
+            &invader.namespace,
+            &invader.instance,
+            node,
+            &format!("shot down in the invaders game on {node}'s console"),
+        );
+        // A refusal is an answer, not a sign the client went stale.
+        bounded(client.inject_fault(&request))
+            .await
+            .map(|summary| summary.id)
     }
 
     /// What every node says about the council.

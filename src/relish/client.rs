@@ -3802,6 +3802,28 @@ impl BunClient {
         .await
     }
 
+    /// The cluster's `[appliance]` settings (#2151).
+    pub async fn os_settings(
+        &self,
+    ) -> Result<crate::appliance::settings::ApplianceSettings, RelishError> {
+        self.get_typed_json("/v1/os/settings").await
+    }
+
+    /// Replace the cluster's `[appliance]` settings (cluster admin), and
+    /// answer them as they now stand.
+    pub async fn os_settings_set(
+        &self,
+        settings: &crate::appliance::settings::ApplianceSettings,
+    ) -> Result<crate::appliance::settings::ApplianceSettings, RelishError> {
+        let answer = self
+            .post_json("/v1/os/settings", serde_json::json!(settings).to_string())
+            .await?;
+        serde_json::from_value(answer).map_err(|e| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse response: {e}"),
+        })
+    }
+
     /// Resume a paused OS rollout.
     pub async fn os_rollout_resume(&self) -> Result<serde_json::Value, RelishError> {
         self.post_json("/v1/os/rollout/resume", "{}".to_string())

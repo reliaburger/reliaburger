@@ -4,9 +4,11 @@
 //! boot logs (`crate::os::netlog`).
 
 use std::fmt;
+use std::path::Path;
 
 use serde::Serialize;
 
+use crate::appliance::settings::ApplianceSettings;
 use crate::os::netlog::NetlogTarget;
 use crate::os::rollout::{OsNodePhase, OsRollout, OsRolloutPhase, OsUpdateState};
 use crate::relish::RelishError;
@@ -469,6 +471,45 @@ pub async fn boot_logs(
         Some(reason) => Err(failed(&reason)),
         None => Ok(()),
     }
+}
+
+/// The cluster's `[appliance]` settings, as `relish os settings` and
+/// `relish os set` show them: the TOML section itself.
+#[derive(Debug, Clone, Serialize)]
+pub struct SettingsReport(pub ApplianceSettings);
+
+impl fmt::Display for SettingsReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0.to_toml())?;
+        if self.0.console_chaos {
+            writeln!(
+                f,
+                "\nKill mode is on: a hit in a console's invaders game kills that instance."
+            )
+        } else {
+            writeln!(
+                f,
+                "\nKill mode is off: a hit in a console's invaders game only pops the invader."
+            )
+        }
+    }
+}
+
+/// `relish os settings`: the cluster's `[appliance]` settings (#2151).
+pub async fn settings(output: OutputFormat) -> Result<(), RelishError> {
+    let settings = BunClient::default_local().os_settings().await?;
+    print_output(&SettingsReport(settings), output)
+}
+
+/// `relish os set FILE`: replace the cluster's `[appliance]` settings with
+/// the `[appliance]` section of `path` (cluster admin; audited).
+pub async fn set_settings(path: &Path, output: OutputFormat) -> Result<(), RelishError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| failed(&format!("can't read {}: {e}", path.display())))?;
+    let wanted = ApplianceSettings::from_toml(&text)
+        .map_err(|e| failed(&format!("{}: {e}", path.display())))?;
+    let settings = BunClient::default_local().os_settings_set(&wanted).await?;
+    print_output(&SettingsReport(settings), output)
 }
 
 fn failed(message: &str) -> RelishError {

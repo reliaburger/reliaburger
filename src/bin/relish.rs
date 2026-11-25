@@ -1654,6 +1654,16 @@ enum OsAction {
     },
     /// The rollout in progress, or the last one.
     Status,
+    /// The cluster's `[appliance]` settings, such as whether the console
+    /// invaders' kill mode is on.
+    Settings,
+    /// Replace the cluster's `[appliance]` settings with a file's
+    /// `[appliance]` section (admin only; audited). A key left out is off.
+    Set {
+        /// TOML file with an `[appliance]` section, such as
+        /// `console_chaos = true`.
+        path: PathBuf,
+    },
     /// Carry on with a paused rollout, retrying the node that stopped it.
     Resume,
     /// Stop the rollout; nodes keep the version they're on.
@@ -3725,6 +3735,10 @@ async fn main() -> ExitCode {
                 }
             },
             OsAction::Status => reliaburger::relish::os::status(cli.output).await,
+            OsAction::Settings => reliaburger::relish::os::settings(cli.output).await,
+            OsAction::Set { path } => {
+                reliaburger::relish::os::set_settings(&path, cli.output).await
+            }
             OsAction::Resume => reliaburger::relish::os::resume(cli.output).await,
             OsAction::Abort => reliaburger::relish::os::abort(cli.output).await,
             OsAction::BootLogs { to, off, nodes } => {

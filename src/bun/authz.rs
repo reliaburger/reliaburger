@@ -271,6 +271,10 @@ pub const ROUTE_MATRIX: &[Route] = &[
     // sends the node's whole kernel log somewhere, so it acts on the cluster.
     route(Get, "/v1/os/boot-logs", AnyToken),
     gated(Post, "/v1/os/boot-logs", Admin, Cluster(ADMIN)),
+    // The cluster's `[appliance]` settings (#2151): reading them tells a
+    // console whether kill mode is on; changing them can turn it on.
+    route(Get, "/v1/os/settings", AnyToken),
+    gated(Post, "/v1/os/settings", Admin, Cluster(ADMIN)),
     route(Get, "/v1/os/rollout", AnyToken),
     gated(Post, "/v1/os/rollout/start", Admin, Cluster(ADMIN)),
     gated(Post, "/v1/os/rollout/resume", Admin, Cluster(ADMIN)),

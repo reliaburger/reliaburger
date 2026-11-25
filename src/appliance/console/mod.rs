@@ -4,19 +4,22 @@
 //! up, so whoever stands in front of a box can tell its name and address
 //! without logging in (there's no login). Once bun answers, it's a small
 //! read-only dashboard with six tabs: status, metrics, workloads, the
-//! cluster, versions and logs (#2150). `bun appliance console` runs it on
+//! cluster, versions and logs (#2150), and an invaders game on `7`, which
+//! kills nothing unless the cluster has opted in (#2151). `bun appliance console` runs it on
 //! the terminal systemd gives it (`reliaburger-console.service`).
 //!
 //! The parts:
 //!
 //! - [`state`]: what the screen shows and the reducer that changes it;
 //! - [`view`]: drawing a state with ratatui, and the snapshot tests;
+//! - [`invaders`]: the game, one invader per instance on this node;
 //! - [`local`]: what the machine itself says, bun or no bun;
 //! - [`remote`]: what bun says, through relish's client, as the read-only
 //!   console principal;
 //! - this module: the event loop and the pollers that feed it.
 
 pub mod bigtext;
+pub mod invaders;
 pub mod local;
 pub mod remote;
 pub mod state;
@@ -269,7 +272,8 @@ async fn event_loop(
     let (tx, mut rx) = mpsc::channel::<Msg>(64);
     let (tab_tx, tab_rx) = watch::channel(Tab::Status);
     let cancel = CancellationToken::new();
-    spawn_pollers(paths, &tx, &tab_rx, &cancel);
+    let remote = Arc::new(remote::Remote::new(paths.config_dir.clone()));
+    spawn_pollers(paths, &remote, &tx, &tab_rx, &cancel);
     let sampler_tx = tx.clone();
     local::spawn_sampler(PathBuf::from(local::DATA_PATH), move |sample| {
         sampler_tx.blocking_send(Msg::Sample(sample)).is_ok()
@@ -317,6 +321,9 @@ async fn event_loop(
         if state.quit {
             break Ok(());
         }
+        if let Some(invader) = state.take_kill() {
+            send_kill(&remote, &tx, invader, state.local.node.clone());
+        }
         tab_tx.send_if_modified(|tab| {
             let changed = *tab != state.tab;
             *tab = state.tab;
@@ -327,10 +334,35 @@ async fn event_loop(
     result
 }
 
+/// Send a kill the invaders game queued in kill mode, and feed bun's
+/// answer back to the game. Bun decides whether it happens.
+fn send_kill(
+    remote: &Arc<remote::Remote>,
+    tx: &mpsc::Sender<Msg>,
+    invader: invaders::Invader,
+    node: Option<String>,
+) {
+    let remote = Arc::clone(remote);
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let answer = match node {
+            Some(node) => remote.kill(&invader, &node).await,
+            None => Err("this machine isn't in a cluster yet".to_string()),
+        };
+        let _ = tx
+            .send(Msg::KillAnswered {
+                instance: invader.instance,
+                answer,
+            })
+            .await;
+    });
+}
+
 /// Start one poller per source, each asking only while a tab that shows
 /// it is on screen.
 fn spawn_pollers(
     paths: &crate::appliance::Paths,
+    remote: &Arc<remote::Remote>,
     tx: &mpsc::Sender<Msg>,
     tab: &watch::Receiver<Tab>,
     cancel: &CancellationToken,
@@ -344,7 +376,7 @@ fn spawn_pollers(
         tx: tx.clone(),
     };
     let local = Arc::new(local::Gatherer::new(paths.clone()));
-    let remote = Arc::new(remote::Remote::new(paths.config_dir.clone()));
+    let remote = Arc::clone(remote);
 
     // The header shows bun's health on every tab.
     poller(every(5), |_| true).spawn(move || {
@@ -368,9 +400,17 @@ fn spawn_pollers(
         async move { Msg::Wtf(remote.wtf().await) }
     });
     let source = Arc::clone(&remote);
-    poller(every(5), |tab| tab == Tab::Workloads).spawn(move || {
+    poller(every(5), |tab| {
+        matches!(tab, Tab::Workloads | Tab::Invaders)
+    })
+    .spawn(move || {
         let remote = Arc::clone(&source);
         async move { Msg::Workloads(remote.workloads().await) }
+    });
+    let source = Arc::clone(&remote);
+    poller(every(15), |tab| tab == Tab::Invaders).spawn(move || {
+        let remote = Arc::clone(&source);
+        async move { Msg::Settings(remote.settings().await) }
     });
     poller(every(5), |tab| tab == Tab::Cluster).spawn(move || {
         let remote = Arc::clone(&remote);

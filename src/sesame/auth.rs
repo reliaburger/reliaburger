@@ -482,6 +482,20 @@ pub(crate) fn console_context() -> AuthContext {
     }
 }
 
+/// The console principal once the fault route has admitted one of its
+/// kills (#2151): a `Deployer` for that one request, so the rest of the
+/// route (the server's test policy, Smoker's rails, the audit record)
+/// treats it as it treats `relish fault kill`. Only
+/// `bun::api::faults` makes one, after checking the cluster's
+/// `[appliance] console_chaos` and the request's shape.
+pub(crate) fn console_kill_context() -> AuthContext {
+    AuthContext {
+        role: ApiRole::Deployer,
+        granted_role: ApiRole::Deployer,
+        ..console_context()
+    }
+}
+
 /// Constant-time comparison of two token strings, to avoid leaking the service
 /// token byte-by-byte through response timing. The length is not secret (all
 /// tokens share the fixed `rbrg_` + 64-hex shape), so an early length check is

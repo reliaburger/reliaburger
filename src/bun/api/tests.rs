@@ -5683,9 +5683,10 @@ async fn a_scoped_token_reads_only_its_own_namespaces_events() {
 }
 
 /// Every route that upgrades, rolls back or re-elects the cluster.
-const CLUSTER_ADMIN_ROUTES: [&str; 12] = [
+const CLUSTER_ADMIN_ROUTES: [&str; 13] = [
     "/v1/os/stage",
     "/v1/os/boot-logs",
+    "/v1/os/settings",
     "/v1/os/rollout/start",
     "/v1/os/rollout/resume",
     "/v1/os/rollout/abort",

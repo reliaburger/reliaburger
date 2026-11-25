@@ -414,3 +414,145 @@ pub(super) async fn os_rollout_abort_handler(
     }
     Json(serde_json::json!({ "aborted": rollout_id })).into_response()
 }
+
+/// `?local=true`: answer from this node's replica alone.
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct SettingsQuery {
+    #[serde(default)]
+    local: bool,
+}
+
+/// How long a node with no Raft seat waits for the leader's settings.
+const LEADER_SETTINGS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The cluster's `[appliance]` settings (#2151), from this node's replica,
+/// or, on a node with no Raft seat, whose replica holds nothing, from the
+/// leader's. A standalone node has no council, so every setting is off.
+pub(super) async fn appliance_settings(
+    state: &ApiState,
+    directory: Option<&LeaderDirectory>,
+) -> Result<crate::appliance::settings::ApplianceSettings, String> {
+    use crate::appliance::settings::ApplianceSettings;
+    let Some(council) = &state.council else {
+        return Ok(ApplianceSettings::default());
+    };
+    if council.holds_security_state().await {
+        return Ok(local_appliance_settings(council).await);
+    }
+    let LeaderDirectory(directory) =
+        directory.ok_or("this node has no Raft seat and no gossip directory to find the leader")?;
+    let leader = crate::cluster::directory::leader_api_address(Some(&council.metrics()), directory)
+        .ok_or("no council leader is known yet")?;
+    let url = state
+        .cluster_http
+        .url(&leader.to_string(), "/v1/os/settings?local=true");
+    let mut request = state.cluster_http.client().get(url);
+    if let Some(token) = &state.service_token {
+        request = request.bearer_auth(token);
+    }
+    let fetch = async { request.send().await?.error_for_status()?.json().await };
+    match tokio::time::timeout(LEADER_SETTINGS_TIMEOUT, fetch).await {
+        Ok(Ok(settings)) => Ok(settings),
+        Ok(Err(error)) => Err(format!("the leader's settings: {error}")),
+        Err(_) => Err(format!(
+            "the leader didn't answer within {} s",
+            LEADER_SETTINGS_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+async fn local_appliance_settings(
+    council: &crate::council::CouncilNode,
+) -> crate::appliance::settings::ApplianceSettings {
+    council
+        .read_desired(|desired| {
+            crate::appliance::settings::ApplianceSettings::from_council(&desired.config)
+        })
+        .await
+}
+
+/// `GET /v1/os/settings`: the cluster's `[appliance]` settings (#2151).
+/// Any node answers ([`appliance_settings`]); with `?local=true`, only from
+/// its own replica, which is how a node with no Raft seat asks the leader.
+pub(super) async fn os_settings_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    directory: Option<axum::Extension<LeaderDirectory>>,
+    Query(query): Query<SettingsQuery>,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::ReadOnly)
+    {
+        return resp;
+    }
+    let settings = match (&state.council, query.local) {
+        (Some(council), true) => Ok(local_appliance_settings(council).await),
+        _ => appliance_settings(&state, directory.as_deref()).await,
+    };
+    match settings {
+        Ok(settings) => Json(settings).into_response(),
+        Err(reason) => refuse(StatusCode::SERVICE_UNAVAILABLE, reason),
+    }
+}
+
+/// `POST /v1/os/settings {"console_chaos": bool}`: replace the cluster's
+/// `[appliance]` settings (cluster admin; audited). A field left out is
+/// off. A follower passes the request, with the caller's own credential,
+/// to the leader, which writes it to the council.
+pub(super) async fn os_settings_set_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    directory: Option<axum::Extension<LeaderDirectory>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    if let Err(resp) = authorize_cluster_admin(&state, auth.as_deref()).await {
+        return resp;
+    }
+    let settings: crate::appliance::settings::ApplianceSettings = match serde_json::from_str(&body)
+    {
+        Ok(settings) => settings,
+        Err(e) => {
+            return refuse(
+                StatusCode::BAD_REQUEST,
+                format!("invalid appliance settings: {e}"),
+            );
+        }
+    };
+    let Some(council) = &state.council else {
+        return refuse(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "appliance settings live in the cluster's council; this node is standalone",
+        );
+    };
+    if let Some(forwarded) = super::upgrade::forward_upgrade_to_leader(
+        &state,
+        council,
+        directory.as_deref(),
+        "/v1/os/settings",
+        &headers,
+        &body,
+    )
+    .await
+    {
+        return forwarded;
+    }
+    crate::bun::audit::annotate(crate::bun::audit::AuditNote {
+        app: None,
+        namespace: None,
+        details: [(
+            "console_chaos".to_string(),
+            settings.console_chaos.to_string(),
+        )]
+        .into(),
+    });
+    for (key, value) in settings.council_entries() {
+        if let Err(e) = council
+            .write(crate::council::types::RaftRequest::ConfigSet { key, value })
+            .await
+        {
+            return refuse(StatusCode::SERVICE_UNAVAILABLE, e.to_string());
+        }
+    }
+    Json(settings).into_response()
+}
