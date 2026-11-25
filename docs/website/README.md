@@ -38,12 +38,44 @@ Without JavaScript all seven stay stacked.
 
 Don't add other scripts. The footer names all three, so change them together.
 
-Every `<section>` has a stable `id` (`scrutiny`, `why`, `install`, `tour`, `netboot`, `debug`,
-`start`, `docs`, `internals`, `next`, `contributing`) and every section heading a `#` permalink, shown on
+Every `<section>` has a stable `id` (`why`, `designed`, `act`, `debug`, `who`, `tour`, `install`,
+`scrutiny`, `release-testing`, `job-throughput`, `netboot`, `docs`, `internals`, `start`,
+`contributing`) and every section heading a `#` permalink, shown on
 hover or focus, so a section can be shared as `reliaburger.com/#install`.
 Renaming an `id` breaks links people have already shared; add a new section
-instead. `tests/suite/website.rs` checks the ids, the permalinks and that the
-page leads with the one-line install.
+instead. Three ids that used to be sections live on other elements, so old
+links still land: `#whitepaper` is the whitepaper's band, `#next` the next
+release's card under the install, and `#compare` the comparisons' entry in
+"Read more". `tests/suite/website.rs` checks the ids, the permalinks and that
+the page leads with the prompt for an agent.
+
+### The order of the page
+
+The page is written for a team with no platform team of its own, and makes one
+case: the platform is built for the AI agent you already have to run. The order
+follows from that.
+
+1. The hero: the title, one line on what a person gets, and the prompt to paste
+   into an agent. The one-line install is one link below it.
+2. Three facts, each linked to the record its numbers come from.
+3. The whitepaper's band, for readers who want the reasoning before the demo,
+   and under it the seven differences (`#why`), three of which it names.
+4. `#designed`, what an agent gets by name.
+5. Two real recordings of an agent at work, `#act` and `#debug`. Each section
+   is a paragraph and a "Watch the recording" fold, so the page reaches its
+   argument quickly; the player loads a recording when its fold opens. Then
+   `#who`, the contrast with a hosted platform and with Kubernetes, each
+   ending in what the other side still does better.
+6. The tour and the install, with the agent's tab first
+   and chosen, then where the project stands and the next two releases.
+7. The evidence: `#scrutiny`, `#release-testing`, `#job-throughput` and
+   `#netboot`. Each opens with its claim; the method and the full results fold.
+8. Reading, subsystems, building from source.
+
+A section answers one question. When one grows, fold the detail into a
+`<details class="tour-commands">` rather than add paragraphs above its
+recording. The tour's, the jobs' and the netboot recordings stay in plain view:
+people didn't find the tour while it sat in a fold.
 
 The player is asciinema-player 3.17.0 (Apache 2.0, `assets/asciinema/LICENSE`),
 the `dist/bundle/asciinema-player.min.js` and `asciinema-player.css` files from
@@ -95,7 +127,7 @@ all built from the server name and command line `relish agent setup` writes.
 The README carries the same links through cursor.com and vscode.dev, because
 GitHub drops links with other schemes.
 
-The "Debug the platform, not just your app" section (`#debug`) shows what an
+The "Watch it debug the platform, not just your app" section (`#debug`) shows what an
 agent does from 0.2.7. Its commands carry `data-agent-command`, and
 `tests/suite/website.rs` parses each with the real CLI. Its recording slot
 (`#agent-recording`) has no `data-cast` until a real session is recorded
@@ -259,9 +291,9 @@ The table under the recording keeps its own five-round medians.
 ### Recording the agent sessions
 
 Two slots on the homepage wait for a real agent session: `#agent-recording`
-in "Debug the platform, not just your app"
+in "Watch it debug the platform, not just your app"
 ([#1678](https://github.com/reliaburger/reliaburger/issues/1678)), and
-`#act-recording` in "Let your agent act, then take it back"
+`#act-recording` in "Watch it propose a change, then take it back"
 ([#1690](https://github.com/reliaburger/reliaburger/issues/1690)).
 `scripts/record/recording.py` records both through the agent gym. The gym
 builds the cluster (and, for the first, the planted `relish`), sets up the
@@ -448,8 +480,8 @@ same paragraph, `<details>` or section. The generated command list in the
 manual's reference chapter labels such commands itself. When the installer's default changes, regenerate
 the snapshot; the test refuses a snapshot for another version.
 
-The page leads with the one-line install now that releases are published;
-building from source is the second path. Update the release-status paragraph
+The page leads with the prompt for an agent; the one-line install is the
+install section's second tab, and building from source is the last path. Update the release-status paragraph
 (version, date and release-notes link) and the install section's release-notes
 link when you promote a release. The source quickstart intentionally matches
 `examples/phase-1/proc-first-run.toml` and `examples/node/process-runtime.toml`.

@@ -24,7 +24,7 @@ code { font-family: var(--mono); font-size: .875em; }
 nav { display: flex; flex-wrap: wrap; gap: 28px; font-size: .875rem; font-weight: 550; }
 nav a { text-decoration: none; padding: 8px 0; }
 nav a:hover { text-decoration: underline; }
-.intro { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 40px; align-items: center; padding: 68px 0 48px; }
+.intro { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 40px; align-items: center; padding: 40px 0 44px; }
 .intro-copy { min-width: 0; }
 .intro-art { margin: 0; justify-self: end; }
 .burger { display: block; width: clamp(220px, 24vw, 300px); height: auto; mix-blend-mode: multiply; }
@@ -412,3 +412,71 @@ footer { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-top: 20px; paddi
 .throughput-comparison table { width: 100%; min-width: 32rem; border-collapse: collapse; font-size: .875rem; }
 .throughput-comparison caption { text-align: left; color: var(--muted); padding-bottom: 10px; }
 .throughput-comparison th, .throughput-comparison td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+
+/* The landing page's hero prompt, its three facts, the whitepaper's band, what an
+   agent gets, the two contrasts and the tour's highlights. */
+.intro-prompt { margin-top: 26px; }
+.intro-prompt .terminal-heading { flex-wrap: wrap; gap: 4px 16px; }
+.intro-prompt pre { font-size: .8125rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0 40px; margin: 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.facts > div { padding: 20px 0 22px; }
+.facts dt { font: 650 1.3rem/1.25 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; letter-spacing: -.03em; }
+.facts dd { margin: 6px 0 0; color: var(--muted); font-size: .9375rem; }
+.paper-band { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 20px 40px; align-items: center; margin-top: 62px; padding: 30px 32px 32px; background: var(--ink); color: #e4e9e3; border-radius: 4px; scroll-margin-top: 1rem; }
+.paper-band .eyebrow { color: #f49463; margin-bottom: 10px; }
+.paper-band h2 { color: #fff; margin-bottom: 10px; }
+.paper-band p { margin: 0; color: #b9c6ba; }
+.paper-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.paper-actions a { text-decoration: none; font-size: .9375rem; padding: 10px 16px; border: 1px solid #e4e9e3; color: #fff; }
+.paper-actions a:first-child { background: var(--paper); color: var(--ink); border-color: var(--paper); }
+.paper-actions a:hover { border-color: #f49463; color: #f49463; }
+.paper-actions a:first-child:hover { background: #fff; color: var(--accent); }
+.paper-actions a:focus-visible { outline: 3px solid #f49463; outline-offset: 2px; }
+.toolkit { margin: 0 0 26px; }
+.toolkit td, .toolkit th { vertical-align: top; }
+.toolkit thead th { font: 500 .75rem var(--mono); letter-spacing: .07em; color: var(--muted); text-transform: uppercase; }
+.toolkit tbody th { font-weight: 500; white-space: nowrap; padding-left: 0; }
+.toolkit thead th:first-child { padding-left: 0; }
+.toolkit tbody th code { font-size: .8125rem; }
+.toolkit td { color: var(--muted); }
+.benefits { display: grid; grid-template-columns: 1fr 1fr; column-gap: 56px; margin: 0; padding: 0; list-style: none; }
+.benefits li { border-top: 1px solid var(--line); padding: 16px 0 22px; }
+.benefits h3 { scroll-margin-top: 1rem; }
+.benefits p { margin: 0; color: var(--muted); }
+.designed-proof { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 32px; align-items: start; }
+.designed-proof .measure-pending { margin: 0; }
+.designed-proof .measure-pending strong { display: block; }
+/* The two contrasts share one set of rows, so their rules line up across the columns. */
+.versus { display: grid; grid-template-columns: 1fr 1fr; gap: 0 56px; }
+.versus > div { display: grid; grid-template-rows: subgrid; grid-row: span 6; min-width: 0; }
+.versus h3 { font-size: 1.3rem; line-height: 1.25; letter-spacing: -.02em; margin: 0; padding-bottom: 12px; border-bottom: 2px solid var(--ink); align-self: end; }
+.points { display: contents; list-style: none; margin: 0; padding: 0; }
+.points li { border-bottom: 1px solid var(--line); padding: 11px 0; color: var(--muted); }
+.points strong { display: block; color: var(--ink); font-weight: 600; }
+.they-win { margin: 16px 0 0; align-self: start; font-size: .9375rem; color: var(--muted); border-left: 2px solid var(--line); padding-left: 14px; }
+.they-win strong { color: var(--ink); }
+.highlights { list-style: none; margin: 18px 0 0; padding: 0; display: grid; grid-template-columns: 1fr 1fr; column-gap: 40px; }
+.highlights li { border-top: 1px solid var(--line); padding: 10px 0; color: var(--muted); font-size: .9375rem; }
+.highlights strong { color: var(--ink); font-weight: 600; }
+.status + .status { border-top: 0; }
+@media (max-width: 900px) {
+  .paper-band, .designed-proof { grid-template-columns: 1fr; }
+}
+@media (max-width: 600px) {
+  .intro { padding-top: 26px; }
+  .intro h1 br { display: none; }
+  .intro-prompt pre { font-size: .75rem; padding: 16px; }
+  .facts, .benefits, .highlights, .versus { grid-template-columns: 1fr; }
+  .facts > div + div { border-top: 1px solid var(--line); }
+  .versus > div + div { margin-top: 32px; }
+  .paper-band { margin-top: 44px; padding: 24px 20px; }
+  .toolkit thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  .toolkit table, .toolkit tbody, .toolkit tr, .toolkit tbody th, .toolkit td { display: block; width: auto; min-width: 0; white-space: normal; }
+  .toolkit tbody th { border-bottom: 0; padding-bottom: 2px; }
+  .toolkit td { padding-top: 0; padding-left: 0; }
+}
+.recording-fold { margin-top: 18px; }
+.recording-fold summary { font-size: 1.0625rem; }
+.recording-fold summary::before { content: "\25B6"; color: var(--accent); font-size: .8125rem; }
+.recording-fold .recording { margin-top: 0; margin-bottom: 16px; }
+.recording-fold + .tour-commands { margin-top: 12px; }
