@@ -565,6 +565,9 @@ fn qualify_runc_catalogue(group: &str) {
             "--parallel",
             "1",
         ]);
+        for namespace in catalogue_namespaces().difference(&before) {
+            cgroups.claim(std::path::Path::new(test_cgroups::HIERARCHY).join(namespace));
+        }
         let report: serde_json::Value =
             serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
                 panic!(
