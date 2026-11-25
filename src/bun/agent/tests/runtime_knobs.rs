@@ -352,64 +352,6 @@ async fn a_host_path_check_that_runs_out_of_time_fails_the_restart_and_retries_i
     assert_eq!(creates(&grill, &id), 2);
 }
 
-/// #2335: a sidecar mounts its app's volumes, and a sidecar that crashes
-/// on its own is created again from them. After the node stops allowing
-/// one, the sidecar's restart is refused before the runtime sees it, and
-/// its instance, which mounts the same path, is stopped and fails with the
-/// reason instead of running on without its sidecar.
-#[tokio::test]
-async fn a_sidecar_restart_after_the_node_drops_a_host_path_is_refused_with_the_reason() {
-    let source = tempfile::tempdir().unwrap();
-    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
-    agent.set_host_path_policy(allowing(&[source.path()]));
-    let config = web_mounting(
-        "web:v1",
-        source.path(),
-        "[[app.web.sidecar]]\nname = 'proxy'\nimage = 'envoy:1.31'\n",
-    );
-    expect_complete(&drain_deploy(&mut agent, config).await);
-    let web = InstanceId("default__web-0".into());
-    let proxy = InstanceId("default__web-0__sidecar-proxy".into());
-    assert_eq!(creates(&grill, &proxy), 1);
-
-    agent.set_host_path_policy(Default::default());
-    grill.set_state(&proxy, ContainerState::Stopped);
-    agent.check_apps().await;
-    agent.relaunch_due_sidecars_to_completion().await;
-    agent.drive_pending_restarts_to_completion().await;
-
-    assert_eq!(
-        creates(&grill, &proxy),
-        1,
-        "the refused sidecar was created again"
-    );
-    assert!(
-        agent
-            .sidecars
-            .due(std::time::Instant::now() + std::time::Duration::from_secs(120))
-            .is_empty(),
-        "the refused sidecar is parked, not due again"
-    );
-    let instance = agent.supervisor.get_instance(&web).unwrap();
-    assert_eq!(instance.state, ContainerState::Failed);
-    assert!(
-        !instance.retry_pending,
-        "a refused instance is not restarted"
-    );
-    assert_eq!(creates(&grill, &web), 1, "the app wasn't restarted");
-    assert!(
-        grill
-            .calls()
-            .iter()
-            .any(|(call, instance)| call == "kill" && instance == &web),
-        "the app was left running: {:?}",
-        grill.calls()
-    );
-    let reason = launch_failure(&agent, &web);
-    assert!(reason.contains("sidecar"), "names the sidecar: {reason}");
-    assert_restart_refusal(&reason, source.path());
-}
-
 /// `web` mounting `source`, with a proxy sidecar.
 fn web_with_proxy(source: &std::path::Path) -> Config {
     web_mounting(
@@ -511,6 +453,90 @@ async fn a_sidecar_retry_while_its_first_host_path_check_is_stuck_starts_no_new_
     assert_eq!(creates(&grill, &proxy), 1);
 }
 
+/// The refusal recorded on `parent`'s sidecar `sidecar`, if it's parked.
+fn sidecar_refusal(agent: &TestAgent, parent: &InstanceId, sidecar: &InstanceId) -> Option<String> {
+    agent
+        .sidecars
+        .statuses(parent, true)
+        .into_iter()
+        .find(|status| status.id == sidecar.0)
+        .and_then(|status| status.refused)
+}
+
+/// #2335: a sidecar mounts its app's volumes, and a sidecar that crashes
+/// on its own is created again from them. After the node stops allowing
+/// one, the sidecar's restart is refused before the runtime sees it. It's
+/// parked with the reason, and its app keeps running: a node never kills a
+/// running instance over a policy change (#1316). The app's own next
+/// restart is refused by the same check.
+#[tokio::test]
+async fn a_sidecar_restart_after_the_node_drops_a_host_path_is_refused_and_its_app_runs_on() {
+    let source = tempfile::tempdir().unwrap();
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    agent.set_host_path_policy(allowing(&[source.path()]));
+    expect_complete(&drain_deploy(&mut agent, web_with_proxy(source.path())).await);
+    let (web, proxy) = (InstanceId(WEB.into()), InstanceId(PROXY.into()));
+    assert_eq!(creates(&grill, &proxy), 1);
+
+    agent.set_host_path_policy(Default::default());
+    let from = grill.calls().len();
+    grill.set_state(&proxy, ContainerState::Stopped);
+    agent.check_apps().await;
+    agent.relaunch_due_sidecars_to_completion().await;
+    agent.drive_pending_restarts_to_completion().await;
+
+    assert_eq!(
+        creates(&grill, &proxy),
+        1,
+        "the refused sidecar was created again"
+    );
+    assert!(
+        agent
+            .sidecars
+            .due(std::time::Instant::now() + std::time::Duration::from_secs(120))
+            .is_empty(),
+        "the refused sidecar is parked, not due again"
+    );
+    assert!(
+        !touched(&grill, &web, from),
+        "the app was touched: {:?}",
+        grill.calls()
+    );
+    let instance = agent.supervisor.get_instance(&web).unwrap();
+    assert_eq!(instance.state, ContainerState::Running);
+    assert_eq!(instance.launch_failure, None);
+    let status = agent
+        .sidecars
+        .statuses(&web, true)
+        .into_iter()
+        .find(|status| status.id == PROXY)
+        .unwrap();
+    assert_eq!(status.state, crate::bun::agent::SidecarState::Stopped);
+    let reason = status.refused.unwrap_or_default();
+    assert!(
+        reason.contains("restart of sidecar"),
+        "names the sidecar: {reason}"
+    );
+    assert_restart_refusal(&reason, source.path());
+
+    // A later sweep leaves the parked sidecar alone.
+    agent.check_apps().await;
+    agent.relaunch_due_sidecars_to_completion().await;
+    assert_eq!(creates(&grill, &proxy), 1);
+
+    // The app's own next restart is refused, as #1316 has it.
+    crash_and_restart(&mut agent, &grill, &web).await;
+    let instance = agent.supervisor.get_instance(&web).unwrap();
+    assert_eq!(instance.state, ContainerState::Failed);
+    assert!(!instance.retry_pending, "a refused restart is not retried");
+    assert_restart_refusal(&launch_failure(&agent, &web), source.path());
+    assert_eq!(
+        creates(&grill, &web),
+        1,
+        "only the deploy reached the runtime"
+    );
+}
+
 /// #2335: the instance cancels a sidecar's restart when it crashes itself,
 /// because it restarts with its sidecars. A refusal that relaunch brings
 /// back afterwards is about a launch that's gone, and must leave the
@@ -542,11 +568,12 @@ async fn a_cancelled_sidecar_restart_that_comes_back_refused_leaves_its_instance
         instance.state, before,
         "the late refusal moved the instance"
     );
-    assert_ne!(
-        instance.restart_cause,
-        Some(crate::bun::restart::RestartCause::Refused)
-    );
     assert_eq!(instance.launch_failure, None);
+    assert_eq!(
+        sidecar_refusal(&agent, &web, &proxy),
+        None,
+        "a refusal for a cancelled restart parked the sidecar"
+    );
 }
 
 /// #2335: a record written before the spec named its host paths carries

@@ -189,7 +189,7 @@ pub(super) async fn kill_unless_forgotten<G: Grill>(
 pub(super) enum RelaunchFailure {
     /// The node gate refused it before the runtime saw it: the host paths
     /// it shares with its app are no longer allowed (#2335). Asking again
-    /// fails the same way, and so would the app's own restart.
+    /// fails the same way, so it's parked until its app next restarts.
     Refused(String),
     /// Anything else, which a later attempt may get past.
     Failed(String),
@@ -368,9 +368,10 @@ struct SidecarRun {
     due: Option<Instant>,
     /// Set while a restart is in flight.
     relaunching: Option<CancellationToken>,
-    /// Set once the node gate refused its restart (#2335): it's never due
-    /// again, and its instance is stopped and fails.
-    parked: bool,
+    /// Why the node gate refused its restart, once it did (#2335). It's
+    /// parked: never due again until its instance restarts with it, and its
+    /// status says why. The app keeps running.
+    refused: Option<String>,
 }
 
 /// Every instance's sidecars on this node, and the restarts in flight.
@@ -433,7 +434,7 @@ impl Sidecars {
                     restarts: 0,
                     restarted_at: None,
                     relaunching: None,
-                    parked: false,
+                    refused: None,
                 }
             })
             .collect();
@@ -490,6 +491,7 @@ impl Sidecars {
     pub(super) fn started_with(&mut self, parent: &InstanceId) {
         for run in self.by_parent.get_mut(parent).into_iter().flatten() {
             run.due = None;
+            run.refused = None;
         }
     }
 
@@ -509,7 +511,9 @@ impl Sidecars {
             .get(parent)
             .map(|runs| {
                 runs.iter()
-                    .filter(|run| run.due.is_none() && run.relaunching.is_none() && !run.parked)
+                    .filter(|run| {
+                        run.due.is_none() && run.relaunching.is_none() && run.refused.is_none()
+                    })
                     .map(|run| run.id.clone())
                     .collect()
             })
@@ -583,12 +587,13 @@ impl Sidecars {
         cancelled
     }
 
-    /// The node gate refused `sidecar`'s restart (#2335): it won't be
-    /// started again, and a sweep no longer reads it.
-    pub(super) fn park(&mut self, sidecar: &InstanceId) {
+    /// The node gate refused `sidecar`'s restart (#2335), for `reason`: it
+    /// won't be started again until its instance restarts with it, and a
+    /// sweep no longer reads it.
+    pub(super) fn park(&mut self, sidecar: &InstanceId, reason: &str) {
         if let Some(run) = self.run_mut(sidecar) {
             run.due = None;
-            run.parked = true;
+            run.refused = Some(reason.to_string());
         }
     }
 
@@ -617,7 +622,7 @@ impl Sidecars {
             .map(|run| SidecarStatus {
                 name: run.spec.name.clone(),
                 id: run.id.0.clone(),
-                state: if !parent_running {
+                state: if !parent_running || run.refused.is_some() {
                     SidecarState::Stopped
                 } else if run.relaunching.is_some() {
                     SidecarState::Restarting
@@ -627,6 +632,7 @@ impl Sidecars {
                     SidecarState::Running
                 },
                 restart_count: run.restarts,
+                refused: run.refused.clone(),
             })
             .collect()
     }
@@ -797,8 +803,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if let Err(RelaunchFailure::Refused(reason)) = &result
             && !cancelled
         {
-            self.sidecars.park(&sidecar);
-            self.give_up_refused_instance(&parent, reason).await;
+            self.park_refused_sidecar(&parent, &sidecar, reason).await;
             return;
         }
         // Its new cgroup is bound to its app's namespace on the next tick
@@ -852,35 +857,31 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
-    /// Stop `parent` and mark it failed with `reason`, because the node gate
-    /// refused one of its sidecars while it ran (#2335). The sidecar mounts
-    /// the app's host paths, so the app's own restart would be refused too;
-    /// running on without the sidecar isn't what was deployed.
-    ///
-    /// It goes the way an instance that never passed its startup probe
-    /// goes: `Stopping` with cleanup owed, so the next tick withdraws it
-    /// from discovery and the Cleanup step kills it and its sidecars off
-    /// the loop, then `maybe_restart` marks it `Failed` instead of
-    /// restarting it.
-    async fn give_up_refused_instance(&mut self, parent: &InstanceId, reason: &str) {
-        let Some(instance) = self.supervisor.get_instance_mut(parent) else {
+    /// Park `sidecar`, whose restart the node gate refused for `reason`
+    /// (#2335), and say so. Its app keeps running, with the mount the gate
+    /// refused, until its own next restart, which the same check refuses:
+    /// a node never kills a running instance over a policy change (#1316).
+    async fn park_refused_sidecar(
+        &mut self,
+        parent: &InstanceId,
+        sidecar: &InstanceId,
+        reason: &str,
+    ) {
+        eprintln!("bun: {sidecar} is parked, {parent} runs on: {reason}");
+        self.sidecars.park(sidecar, reason);
+        let Some(instance) = self.supervisor.get_instance(parent) else {
             return;
         };
-        let Ok(stopping) = instance.state.transition_to(ContainerState::Stopping) else {
-            return;
-        };
-        eprintln!("bun: {parent} stops: {reason}");
-        instance.state = stopping;
-        instance.retry_pending = true;
-        instance.restart_cause = Some(crate::bun::restart::RestartCause::Refused);
-        instance.launch_failure = Some(reason.to_string());
         let (app, namespace) = (instance.app_name.clone(), instance.namespace.clone());
         self.record_event(
             crate::bun::events::EventKind::Restart,
             crate::bun::events::EventSeverity::Warning,
             Some(app),
             Some(namespace),
-            format!("instance {parent} stops and fails: {reason}"),
+            format!(
+                "sidecar {sidecar} of {parent} is parked: {reason}; {parent} keeps running \
+                 until its next restart"
+            ),
         )
         .await;
     }

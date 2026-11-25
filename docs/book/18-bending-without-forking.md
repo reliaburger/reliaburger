@@ -2645,17 +2645,23 @@ that can redeploy.
 Sidecars were the other way round the gate. A sidecar that crashes on its
 own is created again from a spec carrying its app's mounts, and that relaunch
 never asked anyone. Now it runs the same `recheck_host_paths` first. A
-refused sidecar is parked, never due again, and its instance goes the way an
-instance that never passed its startup probe goes: `Stopping` with cleanup
-owed and a new `RestartCause::Refused`, so the next tick withdraws it from
-discovery, the Cleanup step kills it and its sidecars, and `maybe_restart`
-marks it `Failed` with the reason instead of restarting it. A refusal that
-comes back after the instance cancelled the sidecar's restart (the app
-crashed meanwhile and restarts with its sidecars) is ignored: it's about a
-launch that's gone, and the app's own restart asks the gate anyway. Here we do stop
-a running app, which the paragraph above said we wouldn't, but the choice is
-different: the app is already down a sidecar it was deployed with, and its
-own restart would be refused for the same mount.
+refused sidecar is parked: `SidecarRun::refused` holds the reason, the
+sidecar is never due again, and sweeps stop reading it. Its app keeps
+running, still holding the mount the gate refused, until the app's own next
+restart, which the same check refuses. The first version stopped the app
+here, on the grounds that its own restart would be refused anyway. The
+maintainer chose the rule above instead: a node never kills a running
+instance over a policy change. So the refusal has to be visible where an
+operator looks. `relish apps` lists the sidecar as `refused`, with the
+reason; `SidecarStatus` carries it as an optional `refused` field beside the
+`stopped` state, which an older `relish` ignores rather than failing on an
+enum variant it doesn't know. The event log has it, and `relish wtf` warns
+`sidecar-refused` for an app that runs without one. A restart of the whole
+instance clears it, because that restart asks the gate again.
+
+A refusal that comes back after the instance cancelled the sidecar's restart
+(the app crashed meanwhile and restarts with its sidecars) is ignored: it's
+about a launch that's gone, and the app's own restart asks the gate anyway.
 
 `WorkloadSupervisor::check_runtime_knobs` is the deploy's own check with the
 `AppSpec` taken out: it takes an `Option<&RuntimeKnobs>`, so the deploy
@@ -4139,8 +4145,10 @@ whose halves are never tested apart can quietly become a single gate.
   the instance, crashes it, and checks the runtime is never asked to create
   it. `a_host_path_check_that_runs_out_of_time_fails_the_restart_and_retries_it`
   stalls the check past its bound, then lets the retry through.
-  `a_sidecar_restart_after_the_node_drops_a_host_path_is_refused_with_the_reason`
-  crashes only the sidecar. All four failed before the fix: the first two
+  `a_sidecar_restart_after_the_node_drops_a_host_path_is_refused_and_its_app_runs_on`
+  crashes only the sidecar, checks the app was never touched and the
+  sidecar shows `refused` with the reason, then crashes the app and checks
+  its restart is refused. All four failed before the fix: the first two
   restarts came back `Running`, the stalled check waited out its stall, and
   the sidecar was created again. The review added four more:
   `a_sidecar_retry_while_its_first_host_path_check_is_stuck_starts_no_new_check`

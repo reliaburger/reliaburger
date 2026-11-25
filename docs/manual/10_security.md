@@ -808,9 +808,11 @@ it, so redeploy once the app and the node agree. A volume or config-file
 same way, and the reason says the restart was refused because the path
 isn't allowed on this node any more. Each restart asks about the paths that instance mounts, so during a
 rollout an old instance is judged by the old version's paths. A sidecar that
-crashes on its own mounts its app's paths and is asked too: if it's refused,
-the node stops the instance and marks it `Failed` with the reason, because
-the app's own restart would be refused the same way.
+crashes on its own mounts its app's paths and is asked too. If it's refused,
+the sidecar isn't started again, and `relish apps` lists it as `refused`
+with the reason, which the events and `relish wtf` show too. The app keeps
+running, with its mount, until it next restarts, and that restart is
+refused the same way.
 
 The check resolves symlinks, which can hang on an NFS or autofs source that
 isn't answering. It waits at most `[runtime] stop_confirmation_timeout_secs`

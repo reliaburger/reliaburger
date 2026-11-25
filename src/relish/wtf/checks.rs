@@ -238,6 +238,7 @@ pub const CHECKS: &[CheckKind] = &[
         id: "replicas",
         findings: &[
             "launch-failed",
+            "sidecar-refused",
             "quota-blocked",
             "volume-home-away",
             "unschedulable",
@@ -247,7 +248,8 @@ pub const CHECKS: &[CheckKind] = &[
         tests: "Compares each app's desired replicas with the instances every node reports \
                 running. Fewer running is a finding that names why: the runtime refused \
                 the launch or the volume's home node is away (critical), or the namespace \
-                quota, the scheduler or a lost node left replicas unplaced (warning).",
+                quota, the scheduler or a lost node left replicas unplaced (warning). A \
+                running app whose sidecar the node refused to start again is a warning too.",
         docs: "01_deploy-an-app.md#when-some-replicas-dont-fit",
         manual: "deploy-an-app",
     },
