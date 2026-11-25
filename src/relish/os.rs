@@ -473,8 +473,7 @@ pub async fn boot_logs(
     }
 }
 
-/// The cluster's `[appliance]` settings, as `relish os settings` and
-/// `relish os set` show them: the TOML section itself.
+/// The cluster's `[appliance]` settings, as `relish os settings` shows them: the TOML section itself.
 #[derive(Debug, Clone, Serialize)]
 pub struct SettingsReport(pub ApplianceSettings);
 
@@ -501,7 +500,7 @@ pub async fn settings(output: OutputFormat) -> Result<(), RelishError> {
     print_output(&SettingsReport(settings), output)
 }
 
-/// `relish os set FILE`: replace the cluster's `[appliance]` settings with
+/// `relish os settings --set FILE`: replace the cluster's `[appliance]` settings with
 /// the `[appliance]` section of `path` (cluster admin; audited).
 pub async fn set_settings(path: &Path, output: OutputFormat) -> Result<(), RelishError> {
     let text = tokio::fs::read_to_string(path)

@@ -7,9 +7,9 @@ expression: console(&state)
 ┌ 7 Invaders ──────────────────────────────────────────────────────────────────┐
 │Kill mode off: a hit pops the invader and touches nothing.                    │
 │                                                                              │
-│  _/OO\_      _/OO\_      _/OO\_                                              │
-│  \/  \/      \/  \/      \/  \/                                              │
-│   web-0     worker-1    burger-0                                             │
+│  _/OO\_      _/OO\_      _/OO\_      _/OO\_                                  │
+│  \/  \/      \/  \/      \/  \/      \/  \/                                  │
+│~ault/web-0    web-1       api-0    ~am-b/web-0                               │
 │                                                                              │
 │                                                                              │
 │                                                                              │

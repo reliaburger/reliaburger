@@ -347,7 +347,9 @@ fn send_kill(
     tokio::spawn(async move {
         let answer = match node {
             Some(node) => remote.kill(&invader, &node).await,
-            None => Err("this machine isn't in a cluster yet".to_string()),
+            None => invaders::KillAnswer::Refused {
+                reason: "this machine isn't in a cluster yet".to_string(),
+            },
         };
         let _ = tx
             .send(Msg::KillAnswered {

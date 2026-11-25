@@ -528,6 +528,18 @@ fn fit(text: &str, width: usize) -> String {
     }
 }
 
+/// `text` cut to `width` columns from the left, marked with `~`, so the end
+/// survives: an invader's label ends with what tells it apart (`web-0`).
+fn fit_tail(text: &str, width: usize) -> String {
+    let count = text.chars().count();
+    if count <= width {
+        return text.to_string();
+    }
+    std::iter::once('~')
+        .chain(text.chars().skip(count + 1 - width))
+        .collect()
+}
+
 // --- 4 Cluster ---
 
 fn cluster_lines(state: &ConsoleState, height: usize) -> Vec<Line<'static>> {
@@ -761,7 +773,7 @@ fn invader_lines(state: &ConsoleState, height: usize) -> Vec<Line<'static>> {
             for (line, sprite) in SPRITE.iter().enumerate() {
                 paint(&mut field[line], sprite_at, sprite);
             }
-            let label = fit(&invader.instance, label_width);
+            let label = fit_tail(&invader.label, label_width);
             let label_at = column + (label_width - label.chars().count()) / 2;
             paint(&mut field[2], label_at, &label);
         }
@@ -834,7 +846,7 @@ fn shot_line(
     use super::invaders::Shot;
     let waiting_on_bun = matches!(
         state.game.last,
-        Some(Shot::Sending { .. } | Shot::Refused { .. })
+        Some(Shot::Sending { .. } | Shot::Refused { .. } | Shot::Unknown { .. })
     );
     if cleared && !no_workloads && !waiting_on_bun {
         return Line::raw("Wave cleared. r brings every invader back.");
@@ -854,6 +866,13 @@ fn shot_line(
         Some(Shot::Refused { instance, reason }) => {
             warning(format!("{instance} survived: {reason}"))
         }
+        Some(Shot::Unknown { instance, reason }) => warning(format!(
+            "{instance}: no clear answer ({reason}); holding fire until the list shows it"
+        )),
+        Some(Shot::Gone { instance }) => Line::styled(
+            format!("Smoker killed {instance} (see relish fault list)."),
+            Style::default().fg(BAD),
+        ),
         None if no_workloads => Line::raw("No workloads run on this node: nothing to shoot."),
         None if waiting > 0 => muted(format!("{waiting} more waiting off the field.")),
         None => muted("One invader for each instance on this node."),
@@ -968,10 +987,12 @@ mod tests {
         state
     }
 
-    fn instance(id: &str, state: &str, restarts: u32) -> InstanceStatus {
+    /// Instance `label` (`web-0`) of an app in `default`, with the id bun
+    /// gives it (`default__web-0`).
+    fn instance(label: &str, state: &str, restarts: u32) -> InstanceStatus {
         InstanceStatus {
-            id: id.into(),
-            app_name: id.split('-').next().unwrap_or(id).into(),
+            id: format!("default__{label}"),
+            app_name: label.split('-').next().unwrap_or(label).into(),
             namespace: "default".into(),
             state: state.into(),
             restart_count: restarts,
@@ -1163,9 +1184,37 @@ mod tests {
         insta::assert_snapshot!(console(&state));
     }
 
+    /// The workloads the game tests shoot at: four running instances, two
+    /// of them `web-0` in different namespaces, and the fixture's unhealthy
+    /// and pending ones, which get no invader.
+    fn invader_workloads() -> Vec<TopRow> {
+        let mut rows = workloads();
+        for label in ["web-1", "api-0"] {
+            rows.push(TopRow {
+                node: "node-1".into(),
+                instance: instance(label, "running", 0),
+                cpu_percent: None,
+                memory_bytes: None,
+                tasks: None,
+            });
+        }
+        let mut other = instance("web-0", "running", 0);
+        other.id = "team-b__web-0".into();
+        other.namespace = "team-b".into();
+        rows.push(TopRow {
+            node: "node-1".into(),
+            instance: other,
+            cpu_percent: None,
+            memory_bytes: None,
+            tasks: None,
+        });
+        rows
+    }
+
     #[test]
     fn invaders_with_kill_mode_off() {
         let mut state = healthy_state(Tab::Invaders);
+        state.update(Msg::Workloads(Ok(invader_workloads())));
         state.update(Msg::Settings(Ok(Default::default())));
         insta::assert_snapshot!(console(&state));
     }
@@ -1175,6 +1224,7 @@ mod tests {
     #[test]
     fn invaders_in_kill_mode_after_a_refused_kill() {
         let mut state = healthy_state(Tab::Invaders);
+        state.update(Msg::Workloads(Ok(invader_workloads())));
         state.update(Msg::Settings(Ok(
             crate::appliance::settings::ApplianceSettings {
                 console_chaos: true,
@@ -1188,7 +1238,9 @@ mod tests {
         let kill = state.take_kill().expect("kill mode queues a kill");
         state.update(Msg::KillAnswered {
             instance: kill.instance,
-            answer: Err("safety check failed: web would have no replica left".into()),
+            answer: super::super::invaders::KillAnswer::Refused {
+                reason: "safety check failed: web would have no replica left".into(),
+            },
         });
         insta::assert_snapshot!(console(&state));
     }

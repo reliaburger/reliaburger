@@ -425,9 +425,13 @@ pub(super) struct SettingsQuery {
 /// How long a node with no Raft seat waits for the leader's settings.
 const LEADER_SETTINGS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The cluster's `[appliance]` settings (#2151), from this node's replica,
-/// or, on a node with no Raft seat, whose replica holds nothing, from the
-/// leader's. A standalone node has no council, so every setting is off.
+/// The cluster's `[appliance]` settings (#2151), from this node's replica
+/// when it's a council member that holds the cluster's state, or else from
+/// the leader's. A node with no Raft seat replicates nothing, and one
+/// evicted from the council keeps a replica that no longer moves, so both
+/// ask the leader. A standalone node has no council, so every setting is
+/// off. An error means the answer couldn't be had, which a caller deciding
+/// whether kill mode is on must read as off.
 pub(super) async fn appliance_settings(
     state: &ApiState,
     directory: Option<&LeaderDirectory>,
@@ -436,17 +440,16 @@ pub(super) async fn appliance_settings(
     let Some(council) = &state.council else {
         return Ok(ApplianceSettings::default());
     };
-    if council.holds_security_state().await {
+    if is_council_member(council) && council.holds_security_state().await {
         return Ok(local_appliance_settings(council).await);
     }
-    let LeaderDirectory(directory) =
-        directory.ok_or("this node has no Raft seat and no gossip directory to find the leader")?;
-    let leader = crate::cluster::directory::leader_api_address(Some(&council.metrics()), directory)
-        .ok_or("no council leader is known yet")?;
-    let url = state
+    let leader = super::upgrade::leader_base_url(state, council, directory, &HeaderMap::new())
+        .await
+        .map_err(|refusal| refusal.to_string())?;
+    let mut request = state
         .cluster_http
-        .url(&leader.to_string(), "/v1/os/settings?local=true");
-    let mut request = state.cluster_http.client().get(url);
+        .client()
+        .get(format!("{leader}/v1/os/settings?local=true"));
     if let Some(token) = &state.service_token {
         request = request.bearer_auth(token);
     }
@@ -459,6 +462,18 @@ pub(super) async fn appliance_settings(
             LEADER_SETTINGS_TIMEOUT.as_secs()
         )),
     }
+}
+
+/// Whether Raft's current membership names this node, as a voter or a
+/// learner: one whose replica the leader keeps up to date.
+fn is_council_member(council: &crate::council::CouncilNode) -> bool {
+    // One borrow, copied out in this statement (the #1273 rule).
+    let metrics = council.metrics().borrow().clone();
+    metrics
+        .membership_config
+        .membership()
+        .get_node(&metrics.id)
+        .is_some()
 }
 
 async fn local_appliance_settings(

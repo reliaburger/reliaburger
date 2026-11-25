@@ -35,7 +35,26 @@ const CANNON_STEP: usize = 2;
 pub struct Invader {
     pub app: String,
     pub namespace: String,
+    /// The instance id, `{namespace}__{app}-{n}`, which the kill names.
     pub instance: String,
+    /// What the field shows under the sprite: the id without its namespace,
+    /// unless another invader on the field would then read the same.
+    pub label: String,
+    /// The instance's restart count when the list was read, so the game can
+    /// tell a killed instance that restarted from one that never died.
+    pub restarts: u32,
+}
+
+/// What bun said to a kill.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KillAnswer {
+    /// Smoker killed it, as this fault.
+    Killed { fault_id: u64 },
+    /// Bun or Smoker said no, and why: the instance wasn't touched.
+    Refused { reason: String },
+    /// No clear answer (a timeout, a dropped connection, a server error):
+    /// the kill may still land.
+    Unknown { reason: String },
 }
 
 /// What the last shot did, for the line under the field.
@@ -60,6 +79,32 @@ pub enum Shot {
         instance: String,
         reason: String,
     },
+    /// Kill mode: no clear answer, so the game holds fire until the
+    /// workload list shows whether the instance died.
+    Unknown {
+        instance: String,
+        reason: String,
+    },
+    /// Kill mode: after an unclear answer, the workload list shows the
+    /// instance died.
+    Gone {
+        instance: String,
+    },
+}
+
+/// How long the game holds fire after an unclear answer when the workload
+/// list never shows the instance leave `running`. By then bun's own window
+/// for counting a recent kill (`smoker::types::KILL_SETTLE`) has passed
+/// too, so a kill that landed late can't have been missed by the rail.
+pub const UNCONFIRMED_HOLD_SECONDS: u64 = 30;
+
+/// The kill the game is waiting on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Awaiting {
+    instance: String,
+    restarts: u32,
+    /// When bun's answer came back unclear; `None` while there's none yet.
+    unconfirmed_since: Option<u64>,
 }
 
 /// The game's state.
@@ -79,10 +124,10 @@ pub struct Game {
     pub last: Option<Shot>,
     /// A kill for the event loop to send, taken with [`Game::take_kill`].
     kill: Option<Invader>,
-    /// The instance whose kill bun hasn't answered yet. Kill mode holds
-    /// fire until it does, so a burst of shots can't race Smoker's replica
-    /// rail with several kills at once.
-    awaiting: Option<String>,
+    /// The kill bun hasn't clearly answered yet. Kill mode holds fire until
+    /// it has, or the workload list shows how it went, so the screen never
+    /// says a kill failed while it may still land.
+    awaiting: Option<Awaiting>,
 }
 
 impl Default for Game {
@@ -100,18 +145,48 @@ impl Default for Game {
     }
 }
 
-/// The invaders for `rows`, in the workload list's order: one per app
-/// instance, leaving out the ones popped this wave. A job row stands for
-/// all of a job's tasks on the node, not one container, so it gets none.
+/// The invaders for `rows`, in the workload list's order: one per running
+/// app instance, leaving out the ones popped this wave. A job gets none: a
+/// task-array row stands for all of a job's tasks on the node, and a
+/// singleton run's `run-N` row isn't an instance bun's kill can name. An
+/// instance that isn't `running` has nothing to kill yet.
 pub fn invaders(rows: &[TopRow], popped: &BTreeSet<String>) -> Vec<Invader> {
-    rows.iter()
-        .filter(|row| row.tasks.is_none() && !popped.contains(&row.instance.id))
+    let mut invaders: Vec<Invader> = rows
+        .iter()
+        .filter(|row| is_app_instance(row) && !popped.contains(&row.instance.id))
         .map(|row| Invader {
             app: row.instance.app_name.clone(),
             namespace: row.instance.namespace.clone(),
             instance: row.instance.id.clone(),
+            label: short_label(&row.instance.id, &row.instance.namespace).to_string(),
+            restarts: row.instance.restart_count,
         })
-        .collect()
+        .collect();
+    let shown = invaders.len().min(PER_ROW * MAX_ROWS);
+    let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for invader in &invaders[..shown] {
+        *seen.entry(invader.label.clone()).or_default() += 1;
+    }
+    for invader in &mut invaders[..shown] {
+        if seen.get(&invader.label).is_some_and(|count| *count > 1) {
+            invader.label = format!("{}/{}", invader.namespace, invader.label);
+        }
+    }
+    invaders
+}
+
+/// Whether a workload row is a running app instance, the only kind of row
+/// that gets an invader.
+fn is_app_instance(row: &TopRow) -> bool {
+    row.tasks.is_none() && !row.instance.id.starts_with("run-") && row.instance.state == "running"
+}
+
+/// An instance id without its `{namespace}__` prefix: `web-0` for
+/// `default__web-0`.
+fn short_label<'a>(id: &'a str, namespace: &str) -> &'a str {
+    id.strip_prefix(namespace)
+        .and_then(|rest| rest.strip_prefix("__"))
+        .unwrap_or(id)
 }
 
 /// How far a formation of `count` invaders can march across the field.
@@ -175,7 +250,11 @@ impl Game {
         self.popped.insert(instance.clone());
         self.last = Some(if kill_mode {
             self.kill = Some(invader.clone());
-            self.awaiting = Some(instance.clone());
+            self.awaiting = Some(Awaiting {
+                instance: instance.clone(),
+                restarts: invader.restarts,
+                unconfirmed_since: None,
+            });
             Shot::Sending { instance }
         } else {
             Shot::Popped { instance }
@@ -187,19 +266,54 @@ impl Game {
         self.kill.take()
     }
 
-    /// What bun said to a kill: the fault's id, or why it refused. A
-    /// refused invader comes back, since its instance still runs.
-    pub fn kill_answered(&mut self, instance: String, answer: Result<u64, String>) {
-        if self.awaiting.as_deref() == Some(instance.as_str()) {
-            self.awaiting = None;
-        }
+    /// What bun said to a kill, at `now`. A refused invader comes back,
+    /// since its instance still runs. After an unclear answer the game
+    /// keeps holding fire: see [`Game::workloads_seen`].
+    pub fn kill_answered(&mut self, instance: String, answer: KillAnswer, now: u64) {
+        let awaiting = self
+            .awaiting
+            .take()
+            .filter(|awaiting| awaiting.instance == instance);
         self.last = Some(match answer {
-            Ok(fault_id) => Shot::Killed { instance, fault_id },
-            Err(reason) => {
+            KillAnswer::Killed { fault_id } => Shot::Killed { instance, fault_id },
+            KillAnswer::Refused { reason } => {
                 self.popped.remove(&instance);
                 Shot::Refused { instance, reason }
             }
+            KillAnswer::Unknown { reason } => {
+                self.awaiting = awaiting.map(|awaiting| Awaiting {
+                    unconfirmed_since: Some(now),
+                    ..awaiting
+                });
+                Shot::Unknown { instance, reason }
+            }
         });
+    }
+
+    /// The workload list arrived at `now`. After an unclear answer, it
+    /// settles the kill: the instance has left `running` or restarted, so
+    /// the kill landed; or it's been [`UNCONFIRMED_HOLD_SECONDS`], so the
+    /// game stops waiting.
+    pub fn workloads_seen(&mut self, rows: &[TopRow], now: u64) {
+        let Some(awaiting) = &self.awaiting else {
+            return;
+        };
+        let Some(since) = awaiting.unconfirmed_since else {
+            return;
+        };
+        let still_running = rows.iter().any(|row| {
+            row.instance.id == awaiting.instance
+                && row.instance.state == "running"
+                && row.instance.restart_count == awaiting.restarts
+        });
+        if !still_running {
+            self.last = Some(Shot::Gone {
+                instance: awaiting.instance.clone(),
+            });
+            self.awaiting = None;
+        } else if now.saturating_sub(since) >= UNCONFIRMED_HOLD_SECONDS {
+            self.awaiting = None;
+        }
     }
 
     /// Bring every invader back.
@@ -214,11 +328,15 @@ impl Game {
 mod tests {
     use super::*;
 
-    fn invader(instance: &str) -> Invader {
+    /// The invader for instance `label` (`web-0`) in `default`, with the
+    /// id bun gives it.
+    fn invader(label: &str) -> Invader {
         Invader {
-            app: instance.split('-').next().unwrap_or(instance).into(),
+            app: label.split('-').next().unwrap_or(label).into(),
             namespace: "default".into(),
-            instance: instance.into(),
+            instance: format!("default__{label}"),
+            label: label.into(),
+            restarts: 0,
         }
     }
 
@@ -245,10 +363,10 @@ mod tests {
         assert_eq!(
             game.last,
             Some(Shot::Popped {
-                instance: "web-1".into()
+                instance: "default__web-1".into()
             })
         );
-        assert!(game.popped.contains("web-1"));
+        assert!(game.popped.contains("default__web-1"));
         assert_eq!(game.take_kill(), None, "no kill without kill mode");
         assert_eq!(game.laser, Some(game.cannon));
     }
@@ -261,7 +379,7 @@ mod tests {
         assert_eq!(
             game.last,
             Some(Shot::Sending {
-                instance: "web-2".into()
+                instance: "default__web-2".into()
             })
         );
         assert_eq!(game.take_kill(), Some(invader("web-2")));
@@ -277,8 +395,12 @@ mod tests {
         game.cannon = CELL_WIDTH + 3;
         game.fire(&invaders, true);
         assert_eq!(game.take_kill(), None, "a second kill while one is out");
-        assert!(!game.popped.contains("web-1"));
-        game.kill_answered("web-0".into(), Ok(1));
+        assert!(!game.popped.contains("default__web-1"));
+        game.kill_answered(
+            "default__web-0".into(),
+            KillAnswer::Killed { fault_id: 1 },
+            0,
+        );
         game.fire(&invaders, true);
         assert_eq!(game.take_kill(), Some(invader("web-1")));
     }
@@ -301,7 +423,7 @@ mod tests {
         let invaders = formation(PER_ROW + 1);
         let mut game = aimed_at(0);
         game.fire(&invaders, false);
-        let hit = format!("web-{PER_ROW}");
+        let hit = format!("default__web-{PER_ROW}");
         assert_eq!(game.last, Some(Shot::Popped { instance: hit }));
     }
 
@@ -320,16 +442,26 @@ mod tests {
         let invaders = formation(1);
         let mut game = aimed_at(0);
         game.fire(&invaders, true);
-        game.kill_answered("web-0".into(), Err("kill mode is off".into()));
+        game.kill_answered(
+            "default__web-0".into(),
+            KillAnswer::Refused {
+                reason: "kill mode is off".into(),
+            },
+            0,
+        );
         assert!(game.popped.is_empty());
         assert!(matches!(game.last, Some(Shot::Refused { .. })));
         game.fire(&invaders, true);
-        game.kill_answered("web-0".into(), Ok(7));
-        assert!(game.popped.contains("web-0"));
+        game.kill_answered(
+            "default__web-0".into(),
+            KillAnswer::Killed { fault_id: 7 },
+            0,
+        );
+        assert!(game.popped.contains("default__web-0"));
         assert_eq!(
             game.last,
             Some(Shot::Killed {
-                instance: "web-0".into(),
+                instance: "default__web-0".into(),
                 fault_id: 7
             })
         );
@@ -374,16 +506,15 @@ mod tests {
         assert_eq!(game.last, None);
     }
 
-    #[test]
-    fn job_rows_and_popped_instances_get_no_invader() {
-        use crate::bun::agent::InstanceStatus;
-        let row = |id: &str, tasks: Option<u64>| TopRow {
+    /// A workload row as `/v1/top` gives it.
+    fn row(id: &str, app: &str, namespace: &str, state: &str, tasks: Option<u64>) -> TopRow {
+        TopRow {
             node: "node-1".into(),
-            instance: InstanceStatus {
+            instance: crate::bun::agent::InstanceStatus {
                 id: id.into(),
-                app_name: id.split('-').next().unwrap_or(id).into(),
-                namespace: "default".into(),
-                state: "running".into(),
+                app_name: app.into(),
+                namespace: namespace.into(),
+                state: state.into(),
                 restart_count: 0,
                 host_port: None,
                 exit_code: None,
@@ -399,13 +530,103 @@ mod tests {
             cpu_percent: None,
             memory_bytes: None,
             tasks,
-        };
+        }
+    }
+
+    /// Only running app instances get invaders: not a task-array row
+    /// (`add_job_rows`'s `tasks`), not a singleton job's `run-N` row, not an
+    /// instance that's still starting, and not one popped this wave.
+    #[test]
+    fn only_running_app_instances_get_an_invader() {
         let rows = vec![
-            row("web-0", None),
-            row("nightly", Some(4)),
-            row("web-1", None),
+            row("default__web-0", "web", "default", "running", None),
+            row("tasks", "nightly", "default", "running", Some(4)),
+            row("run-42", "migrate", "default", "running", None),
+            row("default__web-1", "web", "default", "running", None),
+            row("default__web-2", "web", "default", "pending", None),
         ];
-        let popped = BTreeSet::from(["web-1".to_string()]);
+        let popped = BTreeSet::from(["default__web-1".to_string()]);
         assert_eq!(invaders(&rows, &popped), vec![invader("web-0")]);
+    }
+
+    /// After an unclear answer the game holds fire until the list shows the
+    /// instance died (or restarted), and never says it survived.
+    #[test]
+    fn an_unclear_answer_holds_fire_until_the_list_shows_the_kill() {
+        let invaders = formation(2);
+        let mut game = aimed_at(0);
+        game.fire(&invaders, true);
+        assert!(game.take_kill().is_some());
+        game.kill_answered(
+            "default__web-0".into(),
+            KillAnswer::Unknown {
+                reason: "no answer within 10 s".into(),
+            },
+            100,
+        );
+        assert!(matches!(game.last, Some(Shot::Unknown { .. })));
+        assert!(
+            game.popped.contains("default__web-0"),
+            "not shown as survived"
+        );
+
+        let running = |restarts| {
+            let mut row = row("default__web-0", "web", "default", "running", None);
+            row.instance.restart_count = restarts;
+            row
+        };
+        game.workloads_seen(&[running(0)], 105);
+        game.cannon = CELL_WIDTH + 3;
+        game.fire(&invaders, true);
+        assert_eq!(game.take_kill(), None, "still holding fire");
+
+        game.workloads_seen(&[running(1)], 110);
+        assert_eq!(
+            game.last,
+            Some(Shot::Gone {
+                instance: "default__web-0".into()
+            })
+        );
+        game.fire(&invaders, true);
+        assert_eq!(game.take_kill(), Some(invader("web-1")));
+    }
+
+    #[test]
+    fn an_unclear_answer_stops_holding_fire_after_a_while() {
+        let invaders = formation(2);
+        let mut game = aimed_at(0);
+        game.fire(&invaders, true);
+        assert!(game.take_kill().is_some());
+        game.kill_answered(
+            "default__web-0".into(),
+            KillAnswer::Unknown {
+                reason: "502".into(),
+            },
+            100,
+        );
+        let still = [row("default__web-0", "web", "default", "running", None)];
+        game.workloads_seen(&still, 100 + UNCONFIRMED_HOLD_SECONDS - 1);
+        game.cannon = CELL_WIDTH + 3;
+        game.fire(&invaders, true);
+        assert_eq!(game.take_kill(), None);
+        game.workloads_seen(&still, 100 + UNCONFIRMED_HOLD_SECONDS);
+        game.fire(&invaders, true);
+        assert_eq!(game.take_kill(), Some(invader("web-1")));
+    }
+
+    /// A label drops the namespace, and keeps it only where two invaders on
+    /// the field would otherwise read the same.
+    #[test]
+    fn labels_drop_the_namespace_unless_two_would_collide() {
+        let rows = vec![
+            row("default__web-0", "web", "default", "running", None),
+            row("team-b__web-0", "web", "team-b", "running", None),
+            row("team-b__api-g2-1", "api", "team-b", "running", None),
+        ];
+        let labels: Vec<String> = invaders(&rows, &BTreeSet::new())
+            .into_iter()
+            .map(|invader| invader.label)
+            .collect();
+        assert_eq!(labels, ["default/web-0", "team-b/web-0", "api-g2-1"]);
     }
 }

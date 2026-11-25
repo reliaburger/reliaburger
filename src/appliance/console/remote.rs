@@ -20,7 +20,7 @@ use crate::config::node::NodeConfig;
 use crate::relish::client::BunClient;
 use crate::relish::council_view::CouncilNodeObservation;
 
-use super::invaders::Invader;
+use super::invaders::{Invader, KillAnswer};
 
 /// bun's API port on an appliance (`--listen`'s default).
 pub const API_PORT: u16 = 9117;
@@ -264,11 +264,16 @@ impl Remote {
     }
 
     /// Ask bun to kill `invader`'s instance on `node`, with the request
-    /// `relish fault kill --instance` sends, and answer the fault's id.
-    /// Bun admits it only in kill mode (#2151); Smoker's rails, the
-    /// server's test policy and the audit trail treat it as any other.
-    pub async fn kill(&self, invader: &Invader, node: &str) -> Result<u64, String> {
-        let client = self.client().await?;
+    /// `relish fault kill --instance` sends. Bun admits it only in kill mode
+    /// (#2151); Smoker's rails, the server's test policy and the audit trail
+    /// treat it as any other. Only a 4xx is a clear no: a timeout, a dropped
+    /// connection or a 5xx may still have killed it, so they're
+    /// [`KillAnswer::Unknown`] and the game waits for the workload list.
+    pub async fn kill(&self, invader: &Invader, node: &str) -> KillAnswer {
+        let client = match self.client().await {
+            Ok(client) => client,
+            Err(reason) => return KillAnswer::Refused { reason },
+        };
         let request = crate::relish::fault::instance_kill_request(
             &invader.app,
             &invader.namespace,
@@ -277,9 +282,24 @@ impl Remote {
             &format!("shot down in the invaders game on {node}'s console"),
         );
         // A refusal is an answer, not a sign the client went stale.
-        bounded(client.inject_fault(&request))
-            .await
-            .map(|summary| summary.id)
+        match tokio::time::timeout(REQUEST_TIMEOUT, client.inject_fault(&request)).await {
+            Ok(Ok(summary)) => KillAnswer::Killed {
+                fault_id: summary.id,
+            },
+            Ok(Err(crate::relish::RelishError::ApiError { status, body }))
+                if (400..500).contains(&status) =>
+            {
+                KillAnswer::Refused {
+                    reason: refusal_reason(&body),
+                }
+            }
+            Ok(Err(error)) => KillAnswer::Unknown {
+                reason: error.to_string(),
+            },
+            Err(_) => KillAnswer::Unknown {
+                reason: format!("no answer within {} s", REQUEST_TIMEOUT.as_secs()),
+            },
+        }
     }
 
     /// What every node says about the council.
@@ -288,6 +308,15 @@ impl Remote {
         self.forget(bounded(crate::relish::council_view::survey(&client)).await)
             .await
     }
+}
+
+/// The reason in a refusal's body: its `error` field when it's JSON, the
+/// text otherwise.
+fn refusal_reason(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("error")?.as_str().map(str::to_string))
+        .unwrap_or_else(|| body.trim().to_string())
 }
 
 #[cfg(test)]
@@ -394,6 +423,15 @@ mod tests {
             console_check(&report(&["tokens", "gitops"])),
             WtfCheck::Checked { unknown: 1, .. }
         ));
+    }
+
+    #[test]
+    fn a_refusal_shows_its_error_field() {
+        assert_eq!(
+            refusal_reason(r#"{"error":"kill mode is off"}"#),
+            "kill mode is off"
+        );
+        assert_eq!(refusal_reason("plain words\n"), "plain words");
     }
 
     #[test]

@@ -75,7 +75,8 @@ async fn admit_console_kill(
     if let Some(reason) = console_kill_refusal(request, state.node_name.as_deref()) {
         return Err(forbidden(reason.to_string()));
     }
-    // The instance must be one this node runs, of the app the request names.
+    // The instance must be one this node runs, of the app the request names,
+    // and running: there's nothing to kill in one that's starting or gone.
     // Smoker's routing reads a job's `--instance` as a task index, and an
     // instance id (`namespace__name-N`) never parses as one, so this also
     // keeps the console off job tasks.
@@ -85,10 +86,11 @@ async fn admit_console_kill(
         Some(status.id.as_str()) == request.target_instance.as_deref()
             && status.app_name == request.target_service
             && status.namespace == namespace
+            && status.state == "running"
     });
     if !runs_here {
         return Err(forbidden(format!(
-            "the console only kills instances of {namespace}/{} that run on this node",
+            "the console only kills running instances of {namespace}/{} on this node",
             request.target_service
         )));
     }

@@ -858,8 +858,8 @@ Know what that token is before you rely on it:
 ### Invaders
 
 `7` opens a tab the tab bar doesn't show: a game with one invader for each
-app instance on this node, labelled with the instance's id. Job tasks get
-none. The formation marches once a second, five invaders to a row and up to
+running app instance on this node, labelled `web-0` and so on (with the
+namespace in front only when two would read the same). Jobs get none. The formation marches once a second, five invaders to a row and up to
 three rows; the rest wait off the field.
 
 | Key | Does |
@@ -878,8 +878,8 @@ a switch for whoever stands at its keyboard. Only an unscoped cluster admin
 can change it:
 
 ```bash
-relish os settings          # shows [appliance] and whether kill mode is on
-relish os set appliance.toml
+relish os settings                       # shows [appliance] and whether kill mode is on
+relish os settings --set appliance.toml   # replaces it
 ```
 
 where `appliance.toml` says
@@ -889,10 +889,19 @@ where `appliance.toml` says
 console_chaos = true
 ```
 
-`relish os set` replaces the whole `[appliance]` section, so a key you leave
+`--set` replaces the whole `[appliance]` section, so a key you leave
 out is off, and a misspelt one is refused. The change is audited as
 `os.settings_set`. Set `console_chaos = false`, or leave it out, to turn kill
 mode off again.
+
+Kill mode covers every namespace on the node: the console's invaders stand
+for every app instance there, whoever's it is. Turn it on only on a cluster
+where anyone at a keyboard may kill any of them.
+
+Each node reads the setting from its own copy of the council's state when
+it's a council member, and asks the leader when it isn't (a node without a
+Raft seat, or one removed from the council). If it can't get an answer,
+kill mode is off there.
 
 A hit in kill mode is the request `relish fault kill web --instance ID
 --node NODE` sends, from the console's principal `__console`, and the node
@@ -905,7 +914,13 @@ treats it as one:
   it, each kill is refused and the invader comes back.
 - **Smoker's rails apply.** A kill that would take a service's last running
   replica is refused, and the invader comes back with the reason underneath.
-  The console sends one kill at a time and waits for the answer.
+  A killed replica counts as gone for ten seconds, so two kills in quick
+  succession, from the console or `relish fault kill`, can't take the last
+  one between them. A kill stays on `relish fault list` for those ten seconds.
+- **An unclear answer isn't a no.** If bun doesn't answer in time, or answers
+  with a server error, the kill may still land, so the game says it doesn't
+  know and holds fire until the workload list shows whether the instance
+  died, for up to 30 seconds.
 - **It's on the record.** `relish fault list` shows the kill, and the events
   and `relish audit --action 'fault.*'` name `__console` as who did it.
 

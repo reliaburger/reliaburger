@@ -404,7 +404,7 @@ enum TomlKind {
     Scenario,
     /// `relish batch submit`: `[[cohort]]` entries.
     Manifest,
-    /// `relish os set`: the cluster's `[appliance]` settings.
+    /// `relish os settings --set`: the cluster's `[appliance]` settings.
     Appliance,
 }
 

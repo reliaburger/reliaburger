@@ -2039,15 +2039,10 @@ async fn follower_with_history_of_a_recording_leader(
     (follower, seen, nodes)
 }
 
-/// A three-node council led by node 1, whose API is whatever listens on
-/// `leader_port`. Returns node 2's real router (a follower) with `token` in
-/// its store and `history` as its deploy records, and the council nodes to
-/// shut down.
-async fn follower_of_the_leader_api_on(
-    token: crate::sesame::types::ApiToken,
-    history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
-    leader_port: u16,
-) -> (Router, Vec<Arc<crate::council::CouncilNode>>) {
+/// Three in-memory council nodes, node 1 leading, none of them seeded with
+/// the cluster's security state. Without gossip, a follower finds the
+/// leader's API at its Raft IP (127.0.0.1) and the cluster's API port.
+async fn three_council_nodes() -> Vec<Arc<crate::council::CouncilNode>> {
     use crate::council::CouncilNode;
     use crate::council::log_store::MemLogStore;
     use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
@@ -2090,6 +2085,20 @@ async fn follower_of_the_leader_api_on(
     })
     .await
     .unwrap();
+
+    nodes
+}
+
+/// A three-node council led by node 1, whose API is whatever listens on
+/// `leader_port`. Returns node 2's real router (a follower) with `token` in
+/// its store and `history` as its deploy records, and the council nodes to
+/// shut down.
+async fn follower_of_the_leader_api_on(
+    token: crate::sesame::types::ApiToken,
+    history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
+    leader_port: u16,
+) -> (Router, Vec<Arc<crate::council::CouncilNode>>) {
+    let nodes = three_council_nodes().await;
 
     let (commands, _receiver) = mpsc::channel(4);
     let store = crate::sesame::auth::new_token_store();
@@ -12715,6 +12724,8 @@ struct ConsoleNode {
     reader: String,
     /// The process both replicas report as theirs, which a kill signals.
     process: Option<std::process::Child>,
+    /// The node's event ring, where the audit records land.
+    events: Arc<RwLock<crate::bun::events::EventStore>>,
 }
 
 impl Drop for ConsoleNode {
@@ -12731,6 +12742,16 @@ impl Drop for ConsoleNode {
 const CONSOLE_TARGET: &str = "default__web-0";
 
 async fn console_node(tag: &str) -> ConsoleNode {
+    console_node_on(seeded_council(tag).await, "node-1", 9117).await
+}
+
+/// [`console_node`] on `council`, named `node_name`, finding other nodes'
+/// APIs on `api_port`.
+async fn console_node_on(
+    council: Arc<crate::council::CouncilNode>,
+    node_name: &str,
+    api_port: u16,
+) -> ConsoleNode {
     let (cmd_tx, cmd_rx) = mpsc::channel(32);
     let shutdown = CancellationToken::new();
     let process = std::process::Command::new("sleep")
@@ -12769,6 +12790,7 @@ async fn console_node(tag: &str) -> ConsoleNode {
         named_user_token("console-reader", crate::sesame::types::ApiRole::ReadOnly);
     let store = crate::sesame::auth::new_token_store();
     *store.write().await = vec![admin_token, reader_token];
+    let events = Arc::new(RwLock::new(crate::bun::events::EventStore::new()));
     let app = router_with_upgrade(
         cmd_tx,
         None,
@@ -12776,19 +12798,19 @@ async fn console_node(tag: &str) -> ConsoleNode {
         None,
         None,
         None,
-        Some(seeded_council(tag).await),
+        Some(council),
         Some(store),
         Some(service),
         None,
         None,
         None,
         None,
-        9117,
-        None,
+        api_port,
+        Some(Arc::clone(&events)),
         None,
         None,
         "default".to_string(),
-        Some("node-1".to_string()),
+        Some(node_name.to_string()),
         crate::bun::build_runner::BuildSettings::with_timeout(900),
         crate::cluster::ClusterHttp::plaintext(),
         5050,
@@ -12809,6 +12831,7 @@ async fn console_node(tag: &str) -> ConsoleNode {
         admin,
         reader,
         process: Some(process),
+        events,
     }
 }
 
@@ -12977,6 +13000,18 @@ async fn the_console_kills_one_instance_in_kill_mode() {
     let summary: crate::smoker::types::FaultSummary = serde_json::from_value(body).unwrap();
     assert_eq!(summary.injected_by, crate::sesame::auth::CONSOLE_PRINCIPAL);
     assert_eq!(summary.target_instance.as_deref(), Some(CONSOLE_TARGET));
+    let recorded = node.events.read().await.recent(10, None, None);
+    let injected = recorded
+        .iter()
+        .find(|event| event.action.as_deref() == Some("fault.injected"))
+        .expect("the kill is audited");
+    assert!(
+        injected
+            .principal
+            .as_deref()
+            .is_some_and(|principal| principal.contains(crate::sesame::auth::CONSOLE_PRINCIPAL)),
+        "{injected:?}"
+    );
     let mut node = node;
     let process = node.process.as_mut().unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -12997,49 +13032,92 @@ async fn kill_mode_doesnt_widen_what_the_console_may_do() {
 
     let node = console_node("console-widen").await;
     node.set_kill_mode(true).await;
-    let widened: Vec<(&str, ChangeRequest)> = vec![
-        ("a counted kill", |r| {
-            r.fault_type = FaultType::Kill { count: 2 }
+    let widened: Vec<(&str, &str, ChangeRequest)> = vec![
+        (
+            "a counted kill",
+            "the console only kills one instance at a time",
+            |r| r.fault_type = FaultType::Kill { count: 2 },
+        ),
+        (
+            "a kill of every replica",
+            "the console only kills one instance at a time",
+            |r| r.fault_type = FaultType::Kill { count: 0 },
+        ),
+        (
+            "another fault type",
+            "the console only kills one instance at a time",
+            |r| r.fault_type = FaultType::Pause,
+        ),
+        (
+            "a network fault",
+            "the console only kills one instance at a time",
+            |r| r.fault_type = FaultType::DnsNxdomain,
+        ),
+        (
+            "a node fault",
+            "the console only kills one instance at a time",
+            |r| {
+                r.fault_type = FaultType::NodeKill {
+                    kill_containers: true,
+                };
+                r.target_service = String::new();
+            },
+        ),
+        (
+            "a lasting fault",
+            "the console only kills one instance at a time",
+            |r| r.duration = std::time::Duration::from_secs(600),
+        ),
+        (
+            "another node",
+            "the console only kills instances on its own node",
+            |r| r.target_node = Some("node-2".into()),
+        ),
+        (
+            "no node",
+            "the console only kills instances on its own node",
+            |r| r.target_node = None,
+        ),
+        ("no instance", "must name its instance", |r| {
+            r.target_instance = None
         }),
-        ("a kill of every replica", |r| {
-            r.fault_type = FaultType::Kill { count: 0 }
+        ("a task index", "not job tasks", |r| r.task_index = Some(0)),
+        // Routing would read a bare number as a job's task index.
+        (
+            "a number as the instance",
+            "the console only kills running instances of",
+            |r| r.target_instance = Some("0".into()),
+        ),
+        (
+            "an instance that doesn't run here",
+            "the console only kills running instances of",
+            |r| r.target_instance = Some("default__web-9".into()),
+        ),
+        (
+            "an instance of another app",
+            "the console only kills running instances of",
+            |r| r.target_service = "api".into(),
+        ),
+        (
+            "an instance in another namespace",
+            "the console only kills running instances of",
+            |r| r.namespace = Some("team-b".into()),
+        ),
+        ("the leader", "can't override Smoker's safety rails", |r| {
+            r.include_leader = true
         }),
-        ("another fault type", |r| r.fault_type = FaultType::Pause),
-        ("a network fault", |r| r.fault_type = FaultType::DnsNxdomain),
-        ("a node fault", |r| {
-            r.fault_type = FaultType::NodeKill {
-                kill_containers: true,
-            };
-            r.target_service = String::new();
-        }),
-        ("another node", |r| r.target_node = Some("node-2".into())),
-        ("no node", |r| r.target_node = None),
-        ("no instance", |r| r.target_instance = None),
-        ("a task index", |r| r.task_index = Some(0)),
-        ("a job's task, by index", |r| {
-            r.target_service = "nightly".into();
-            r.target_instance = Some("0".into());
-        }),
-        ("an instance that doesn't run here", |r| {
-            r.target_instance = Some("default__web-9".into())
-        }),
-        ("an instance of another app", |r| {
-            r.target_service = "api".into()
-        }),
-        ("an instance in another namespace", |r| {
-            r.namespace = Some("team-b".into())
-        }),
-        ("a lasting fault", |r| {
-            r.duration = std::time::Duration::from_secs(600)
-        }),
-        ("the leader", |r| r.include_leader = true),
-        ("a safety override", |r| r.override_safety = true),
+        (
+            "a safety override",
+            "can't override Smoker's safety rails",
+            |r| r.override_safety = true,
+        ),
     ];
-    for (what, change) in widened {
+    for (what, refusal, change) in widened {
         let mut request = console_kill();
         change(&mut request);
         let (status, body) = node.console_fault(&request).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{what}: {body}");
+        assert!(body.to_string().contains(refusal), "{what}: {body}");
     }
 
     // Other mutating routes stay closed to the read-only console.
@@ -13096,8 +13174,110 @@ async fn a_standalone_node_reads_kill_mode_as_off() {
         admin: String::new(),
         reader: String::new(),
         process: None,
+        events: Arc::new(RwLock::new(crate::bun::events::EventStore::new())),
     };
     assert!(!node.kill_mode(&console).await);
     let (status, body) = node.console_fault(&console_kill()).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+/// Two kills in quick succession of a two-replica app: the first leaves
+/// its instance reading `running` until the agent's sweep, but the rail
+/// counts it as gone, so the second is refused and one replica survives.
+/// The same holds from the CLI, through a person's token.
+#[tokio::test]
+async fn two_quick_kills_cant_take_the_last_replica() {
+    let node = console_node("console-race").await;
+    node.set_kill_mode(true).await;
+    let (status, body) = node.console_fault(&console_kill()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let mut second = console_kill();
+    second.target_instance = Some("default__web-1".into());
+    let (status, body) = node.console_fault(&second).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("replica"), "{body}");
+
+    let (status, body) = node
+        .call(
+            "POST",
+            "/v1/fault",
+            &node.admin,
+            serde_json::to_string(&second).unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "from the CLI: {body}");
+}
+
+/// Node 2 of three council nodes led by node 1, with a stub of the leader's
+/// API on a port of its own. Node 2's replica holds no cluster state, so it
+/// asks the leader for the setting.
+async fn console_follower(leader: Router) -> (ConsoleNode, Vec<Arc<crate::council::CouncilNode>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, leader).await.unwrap() });
+    let nodes = three_council_nodes().await;
+    let node = console_node_on(Arc::clone(&nodes[1]), "node-2", port).await;
+    (node, nodes)
+}
+
+/// A node whose replica holds nothing reads kill mode from the leader,
+/// asking for the leader's own replica (`?local=true`), and admits the
+/// console's kill on the leader's word.
+#[tokio::test]
+async fn a_node_without_the_clusters_state_reads_kill_mode_from_the_leader() {
+    let asked: Arc<tokio::sync::Mutex<Vec<String>>> = Arc::default();
+    let seen = Arc::clone(&asked);
+    let leader = Router::new().route(
+        "/v1/os/settings",
+        axum::routing::get(move |uri: axum::http::Uri| {
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.lock().await.push(uri.to_string());
+                Json(serde_json::json!({ "console_chaos": true }))
+            }
+        }),
+    );
+    let (node, councils) = console_follower(leader).await;
+    assert!(node.kill_mode(&node.console).await);
+    let mut kill = console_kill();
+    kill.target_node = Some("node-2".into());
+    let (status, body) = node.console_fault(&kill).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let asked = asked.lock().await.clone();
+    assert!(!asked.is_empty());
+    assert!(
+        asked.iter().all(|uri| uri == "/v1/os/settings?local=true"),
+        "{asked:?}"
+    );
+    for council in councils {
+        council.shutdown().await.unwrap();
+    }
+}
+
+/// When the leader can't answer, kill mode is off: the read fails, and
+/// the console's kill is refused, saying why.
+#[tokio::test]
+async fn an_unreachable_leader_means_kill_mode_is_off() {
+    let leader = Router::new().route(
+        "/v1/os/settings",
+        axum::routing::get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+    );
+    let (node, councils) = console_follower(leader).await;
+    let (status, _) = node
+        .call("GET", "/v1/os/settings", &node.console, String::new())
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let mut kill = console_kill();
+    kill.target_node = Some("node-2".into());
+    let (status, body) = node.console_fault(&kill).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        body.to_string()
+            .contains("can't read the cluster's [appliance] settings"),
+        "{body}"
+    );
+    for council in councils {
+        council.shutdown().await.unwrap();
+    }
 }

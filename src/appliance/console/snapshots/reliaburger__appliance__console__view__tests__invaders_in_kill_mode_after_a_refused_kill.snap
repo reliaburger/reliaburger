@@ -7,9 +7,9 @@ expression: console(&state)
 ┌ 7 Invaders ──────────────────────────────────────────────────────────────────┐
 │KILL MODE ON: a hit kills that instance, as an audited Smoker fault.          │
 │                                                                              │
-│  _/OO\_      _/OO\_      _/OO\_                                              │
-│  \/  \/      \/  \/      \/  \/                                              │
-│   web-0     worker-1    burger-0                                             │
+│  _/OO\_      _/OO\_      _/OO\_      _/OO\_                                  │
+│  \/  \/      \/  \/      \/  \/      \/  \/                                  │
+│~ault/web-0    web-1       api-0    ~am-b/web-0                               │
 │                                                                              │
 │   |                                                                          │
 │   |                                                                          │
@@ -24,6 +24,6 @@ expression: console(&state)
 │   |                                                                          │
 │   |                                                                          │
 │  /A\                                                                         │
-│web-0 survived: safety check failed: web would have no replica left           │
+│default__web-0 survived: safety check failed: web would have no replica left  │
 └──────────────────────────────────────────────────────────────────────────────┘
  h l or <- -> aim   space fire   r new wave   Tab leave            15:06:40 UTC

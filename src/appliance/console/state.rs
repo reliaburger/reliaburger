@@ -183,7 +183,7 @@ pub enum Msg {
     /// it refused.
     KillAnswered {
         instance: String,
-        answer: Result<u64, String>,
+        answer: invaders::KillAnswer,
     },
 }
 
@@ -203,7 +203,12 @@ impl ConsoleState {
             Msg::Local(local) => self.local = local,
             Msg::Summary(result) => self.summary.record(*result, now),
             Msg::Wtf(check) => self.wtf = Some(check),
-            Msg::Workloads(result) => self.workloads.record(result, now),
+            Msg::Workloads(result) => {
+                if let Ok(rows) = &result {
+                    self.game.workloads_seen(rows, now);
+                }
+                self.workloads.record(result, now)
+            }
             Msg::Council(result) => self.council.record(result, now),
             Msg::Versions(versions) => self.versions = Some(versions),
             Msg::Sample(sample) => {
@@ -214,7 +219,9 @@ impl ConsoleState {
             }
             Msg::Logs(result) => self.logs.record(result, now),
             Msg::Settings(result) => self.settings.record(result, now),
-            Msg::KillAnswered { instance, answer } => self.game.kill_answered(instance, answer),
+            Msg::KillAnswered { instance, answer } => {
+                self.game.kill_answered(instance, answer, now)
+            }
         }
     }
 
@@ -383,7 +390,7 @@ mod tests {
             tab: Tab::Invaders,
             ..ConsoleState::default()
         };
-        state.update(Msg::Workloads(Ok(vec![workload("web-0")])));
+        state.update(Msg::Workloads(Ok(vec![workload("default__web-0")])));
         state.game.cannon = 3;
         state
     }
@@ -404,7 +411,7 @@ mod tests {
         let mut state = game_with_one_invader();
         assert!(!state.kill_mode());
         press(&mut state, KeyCode::Char(' '));
-        assert!(state.game.popped.contains("web-0"));
+        assert!(state.game.popped.contains("default__web-0"));
         assert_eq!(state.take_kill(), None);
         assert!(state.invaders().is_empty(), "the popped invader is gone");
 
@@ -415,10 +422,12 @@ mod tests {
         assert!(state.kill_mode());
         press(&mut state, KeyCode::Char(' '));
         let kill = state.take_kill().expect("kill mode queues a kill");
-        assert_eq!(kill.instance, "web-0");
+        assert_eq!(kill.instance, "default__web-0");
         state.update(Msg::KillAnswered {
-            instance: "web-0".into(),
-            answer: Err("kill mode is off".into()),
+            instance: "default__web-0".into(),
+            answer: invaders::KillAnswer::Refused {
+                reason: "kill mode is off".into(),
+            },
         });
         assert_eq!(state.invaders().len(), 1, "a refused kill brings it back");
     }
