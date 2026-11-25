@@ -539,7 +539,7 @@ struct SlowColdPull {
     // assertion left behind.
     residue: ExecutorResidue,
     // After the residue, so the executors are gone before their cgroups.
-    cgroups: TestCgroups,
+    _cgroups: TestCgroups,
 }
 
 impl SlowColdPull {
@@ -624,7 +624,7 @@ impl SlowColdPull {
             budget,
             work,
             residue,
-            cgroups,
+            _cgroups: cgroups,
         }
     }
 
