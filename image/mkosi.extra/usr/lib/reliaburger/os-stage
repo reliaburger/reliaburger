@@ -53,4 +53,4 @@ for file in $wanted; do
 done
 say "staged $version; running systemd-sysupdate"
 /usr/lib/systemd/systemd-sysupdate --definitions=/usr/lib/reliaburger/sysupdate.d update "$version"
-say "done; reboot to try $version (three tries, then systemd-boot falls back)"
+say "done; reboot to try $version (two tries, then systemd-boot falls back)"

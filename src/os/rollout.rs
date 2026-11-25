@@ -9,7 +9,7 @@
 //! `systemd-sysupdate` write it into its spare slot and reboots. The leader
 //! then polls `/v1/version` until the node reports the target version and
 //! healthy, and moves on. A node that boots back into its old version (the
-//! new one failed its boot checks three times and systemd-boot fell back)
+//! new one failed its boot checks on both tries and systemd-boot fell back)
 //! or doesn't come back in time pauses the rollout for the operator.
 //!
 //! The whole rollout lives in Raft (`DesiredState::os_rollout`), so when the
