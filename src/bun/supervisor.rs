@@ -976,7 +976,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
         }
         // BLOCKING-OK: a few rmdirs on cgroupfs, an in-memory kernel interface: no disk behind it
         match self.cgroup_holds.remove(&key) {
-            Some(hold) => drop(hold),
+            Some(hold) => hold.release(),
             // An instance adopted from an earlier run never took a hold.
             None if self.places_workload_cgroups() => {
                 self.workload_groups.remove_if_idle(namespace, app_name)

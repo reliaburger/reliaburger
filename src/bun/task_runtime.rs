@@ -1280,7 +1280,9 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
             remove_unused_task_cgroup(&cgroup).await;
         }
         // BLOCKING-OK: a few rmdirs on cgroupfs, an in-memory kernel interface
-        drop(cgroup_hold);
+        if let Some(hold) = cgroup_hold {
+            hold.release();
+        }
         if let Some(run) = run_id {
             self.retire_singleton(run).await;
         }

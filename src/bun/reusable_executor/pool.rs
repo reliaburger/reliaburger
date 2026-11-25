@@ -117,7 +117,8 @@ struct Context {
     namespace: Option<crate::bun::task_namespace::NamespaceLease>,
     /// Keeps the slot's executor group and namespace cgroups while the slot
     /// exists; released once retirement has removed the slot's cgroup, so
-    /// the namespace's last user removes the empty parents (#2324).
+    /// the namespace's last user removes the empty parents (#2324). A
+    /// context dropped unretired removes nothing.
     cgroup_hold: Option<crate::grill::workload_groups::WorkloadGroupHold>,
 }
 /// A fixed set of executor slots. A dropped [`ReusablePool::run`] future
@@ -550,15 +551,21 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             tokio::spawn(async move {
                 namespace.retired().await;
                 // BLOCKING-OK: a few rmdirs on cgroupfs, an in-memory kernel interface
-                drop(cgroup_hold);
+                if let Some(hold) = cgroup_hold {
+                    hold.release();
+                }
             });
         } else {
             // BLOCKING-OK: a few rmdirs on cgroupfs, an in-memory kernel interface
-            drop(cgroup_hold);
+            if let Some(hold) = cgroup_hold {
+                hold.release();
+            }
         }
         #[cfg(not(feature = "ebpf"))]
         // BLOCKING-OK: a few rmdirs on cgroupfs, an in-memory kernel interface
-        drop(cgroup_hold);
+        if let Some(hold) = cgroup_hold {
+            hold.release();
+        }
         context.lease.confirm_retired();
         true
     }

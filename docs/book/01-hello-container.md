@@ -983,23 +983,34 @@ pub fn hold(self: &Arc<Self>, namespace: &str, group: &str) -> WorkloadGroupHold
 
 `self: &Arc<Self>` is a method receiver you haven't seen yet. Most methods take `&self`; this one says "call me on an `Arc` of the registry", so the method can clone that `Arc` into the hold it returns. The hold then keeps the registry alive for as long as the hold exists, wherever it ends up. `bool::then` turns a condition into an `Option`: `Some(key)` when both names are valid workload labels, `None` otherwise. A hold for `../etc` is a hold on nothing.
 
-What *doesn't* appear is a `release` method for callers. Releasing happens in `Drop`:
+A hold is given back in one of two ways, and the difference matters:
 
 ```rust
+impl WorkloadGroupHold {
+    /// Give the claim up now that its workload's cgroup is gone.
+    pub fn release(mut self) {
+        if let Some(key) = self.key.take() {
+            self.groups.give_back(&key, true);
+        }
+    }
+}
+
 impl Drop for WorkloadGroupHold {
     fn drop(&mut self) {
         if let Some(key) = self.key.take() {
-            self.groups.release(&key);
+            self.groups.give_back(&key, false);
         }
     }
 }
 ```
 
-`Drop` is Rust's destructor. The compiler calls it exactly once, when the value goes out of scope, is overwritten or is passed to `drop()`. Go would use `defer` and Python a `with` block, and both make the caller remember. Here, owning the hold *is* the claim. The supervisor keeps one per app and drops it when the app's last instance retires. The executor pool stores one in each slot's context and drops it after retirement has removed the slot's cgroup. A fresh job attempt keeps one in a local variable until its container has gone. Whichever way an owner leaves, an early return included, the count goes down.
+`release(mut self)` takes the hold *by value*. After the call the caller doesn't have it any more, and the compiler rejects any later use, so a hold can't be released twice. `Drop` is Rust's destructor. The compiler calls it exactly once, when a value goes out of scope or is passed to `drop()`, and here it runs on the hold that `release` just consumed too. That's why both take the key out with `Option::take`: whichever runs first finds `Some`, and the other finds `None` and does nothing.
 
-When the last hold on a group goes, `release` removes the group's tree, children first. Each `rmdir` fails on anything still busy, so only empty cgroups go. If no group in the namespace is still held, it removes the namespace directory too, with one plain `rmdir` rather than a recursive sweep: a group another process made is that process's business, and while it's there the namespace stays. Both steps run under the lock `hold` takes, so a launch either finds the directories gone and makes them again, or keeps them.
+Why two ways? Our first version removed directories in `Drop`, on the theory that owning the hold is the claim, so letting go of it should clean up. `make test-linux` showed us why not. An eBPF test "crashes" Bun by dropping its agent, then starts a new agent that adopts the running workloads. Dropping the agent dropped every hold, and the cleanup removed a cgroup a workload still had, from under the adoption that followed. A Bun that stops or crashes hasn't proved anything about its workloads, so a dropped hold only gives its count back. Only `release`, called once retirement *has* proved the workload's cgroup gone, removes anything. The codebase already worked this way elsewhere: the job runner's namespace lease deliberately has no `Drop` release, because an abandoned runtime still owns its source. The supervisor releases an app's hold when the app's last instance retires, the executor pool when retirement has removed a slot's cgroup, and a fresh job attempt when its container has gone.
 
-There are two exceptions. The `default` namespace's directory stays, because every node has it and it gets the most launches. And a group whose tree was still busy when its last hold went (a process the kernel hadn't reaped yet, say) is remembered and tried again when the namespace's last hold goes.
+When the last hold on a group is released, `release` removes the group's directory, then, if no group in the namespace is still held, the namespace's: children first, with one plain `rmdir` each. A group's leaves belong to the runtime that made them, and a group that still has one stays. So does a namespace with a group some other process made: that's the other process's business. Both steps run under the lock `hold` takes, so a launch either finds the directories gone and makes them again, or keeps them.
+
+There are two exceptions. The `default` namespace's directory stays, because every node has it and it gets the most launches. And a group that still had a leaf when its last hold went (its runtime hadn't finished removing it, say) is remembered and tried again when the namespace's last hold goes.
 
 The agent, the job runner and both executor pools launch into the same namespaces, so they share one registry. That's a `static`:
 
@@ -1007,11 +1018,11 @@ The agent, the job runner and both executor pools launch into the same namespace
 static SHARED: LazyLock<Arc<WorkloadGroups>> = LazyLock::new(|| WorkloadGroups::new(CGROUP_ROOT));
 ```
 
-`LazyLock` builds the value the first time someone touches it, and only once, even if two threads race to be first. Its state sits behind a `std::sync::Mutex` rather than tokio's, because `drop` can't `.await`. Our rules allow that only for short critical sections that never cross an `.await`, and this one is a map update plus a few `rmdir`s on cgroupfs, which is kernel memory, not disk.
+`LazyLock` builds the value the first time someone touches it, and only once, even if two threads race to be first. Its state sits behind a `std::sync::Mutex` rather than tokio's, because `drop` can't `.await`, and a dropped hold still has to give its count back. Our rules allow that only for short critical sections that never cross an `.await`, and this one is a map update plus a few `rmdir`s on cgroupfs, which is kernel memory, not disk.
 
 Removing namespace cgroups had one knock-on effect. With eBPF on, the job runner binds a namespace's cgroup inode in the kernel, so its tasks answer to their namespace as a network source (Chapter 17). The binding outlives its tasks on purpose, and an attempt that found a *different* inode used to refuse with "delegated namespace cgroup changed". Now that Bun removes and recreates namespace directories, a new inode is normal, so an idle binding (no task using it) whose cgroup changed is lifted and bound afresh. A changed inode under a binding still in use is still refused: that would mean something else removed the directory.
 
-The tests live in three places. `src/grill/workload_groups.rs` uses a temporary directory as a stand-in hierarchy, where a plain file inside a directory makes `rmdir` fail the way a process does in a real cgroup. Its tests check that the last hold removes the namespace, that another app's hold keeps it, that a launch which has taken its hold but not yet made its directory keeps it, that a busy leaf keeps its ancestors until it empties, and that a name like `..` is never touched. `src/bun/supervisor.rs` drives the same rules through deploys and retirements. On Linux, the `runc_catalogue_*` tests in `tests/relish_test_catalogue.rs` run real `relish test` groups and fail if any of the run's namespace cgroups is still there afterwards.
+The tests live in three places. `src/grill/workload_groups.rs` uses a temporary directory as a stand-in hierarchy, where a plain file inside a directory makes `rmdir` fail the way a process does in a real cgroup. Its tests check that the last hold removes the namespace, that another app's hold keeps it, that a launch which has taken its hold but not yet made its directory keeps it, that a leaf the runtime still has keeps its group, that a dropped hold removes nothing, and that a name like `..` is never touched. `src/bun/supervisor.rs` drives the same rules through deploys and retirements. On Linux, the `runc_catalogue_*` tests in `tests/relish_test_catalogue.rs` run real `relish test` groups and fail if any of the run's namespace cgroups is still there afterwards.
 
 ## Generating OCI specs
 

@@ -15,11 +15,12 @@
 //! controllers in each parent on the way down; if the namespace directory
 //! is removed between two of those steps, the launch fails. So every
 //! launcher takes a [`WorkloadGroupHold`] on its `(namespace, group)` before
-//! it creates anything, and keeps it until its workload's leaf has gone.
-//! Releasing the last hold on a group removes the group's empty tree,
-//! children first; releasing the last hold in a namespace then removes the
-//! namespace directory too. Both happen under the same lock `hold` takes, so
-//! a launch either sees the directories gone or keeps them.
+//! it creates anything, and releases it once its workload's leaf has gone.
+//! Releasing the last hold on a group removes the group's directory once
+//! its runtime has removed every leaf; releasing the last hold in a
+//! namespace then removes the namespace directory too, children first.
+//! Both happen under the same lock `hold` takes, so a launch either sees
+//! the directories gone or keeps them.
 //!
 //! The kernel refuses to remove a cgroup that still has processes or child
 //! cgroups, so a busy group, or one another process made, is never removed:
@@ -49,7 +50,8 @@ type GroupKey = (String, String);
 #[derive(Debug)]
 pub struct WorkloadGroups {
     root: PathBuf,
-    // A std mutex: `release` runs from `Drop`, which can't await. Every
+    // A std mutex: a hold gives its count back from `Drop`, which can't
+    // await. Every
     // critical section is a map update plus a few `rmdir`s on cgroupfs,
     // an in-memory kernel interface, and never holds the lock across an await.
     state: Mutex<GroupState>,
@@ -58,8 +60,8 @@ pub struct WorkloadGroups {
 #[derive(Debug, Default)]
 struct GroupState {
     users: BTreeMap<GroupKey, usize>,
-    /// Groups whose last hold went while their tree was still busy, for
-    /// example a leaf whose last process hadn't been reaped. The last
+    /// Groups whose last hold went while a leaf was still there, for
+    /// example one whose runtime hadn't finished removing it. The last
     /// release in their namespace tries them again.
     unremoved: BTreeSet<GroupKey>,
 }
@@ -109,14 +111,16 @@ impl WorkloadGroups {
     /// in this process holds them. For a workload this Bun adopted from an
     /// earlier run, which never took a hold.
     pub fn remove_if_idle(self: &Arc<Self>, namespace: &str, group: &str) {
-        drop(self.hold(namespace, group));
+        self.hold(namespace, group).release();
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, GroupState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn release(&self, key: &GroupKey) {
+    /// Give back one hold on `key`. Only a `retired` release, whose
+    /// workload's cgroup is proven gone, removes anything.
+    fn give_back(&self, key: &GroupKey, retired: bool) {
         let mut state = self.lock();
         match state.users.get_mut(key) {
             Some(users) if *users > 1 => {
@@ -128,9 +132,12 @@ impl WorkloadGroups {
             }
             None => return,
         }
+        if !retired {
+            return;
+        }
         let (namespace, group) = key;
         let namespace_dir = self.root.join(namespace);
-        if !remove_empty_tree(&namespace_dir.join(group)) {
+        if !remove_group(&namespace_dir.join(group)) {
             state.unremoved.insert(key.clone());
         }
         if namespace == PERMANENT_NAMESPACE || state.users.keys().any(|(held, _)| held == namespace)
@@ -144,7 +151,7 @@ impl WorkloadGroups {
             .cloned()
             .collect();
         for key in waiting {
-            if remove_empty_tree(&namespace_dir.join(&key.1)) {
+            if remove_group(&namespace_dir.join(&key.1)) {
                 state.unremoved.remove(&key);
             }
         }
@@ -154,34 +161,42 @@ impl WorkloadGroups {
     }
 }
 
-/// A launcher's claim on one app or executor group. Dropping the last one
-/// for a group removes the group's empty cgroups, and the namespace's once
-/// no group in it is held.
+/// A launcher's claim on one app or executor group.
+///
+/// [`WorkloadGroupHold::release`] it once the workload's cgroup has gone:
+/// the last release for a group removes the group's empty cgroup, and the
+/// namespace's once no group in it is held. A hold that is merely dropped
+/// (its owner abandoned, or Bun stopping or crashing) gives its count back
+/// and removes nothing, because a workload it covered may still own its
+/// cgroup.
 #[derive(Debug)]
 pub struct WorkloadGroupHold {
     groups: Arc<WorkloadGroups>,
     key: Option<GroupKey>,
 }
 
-impl Drop for WorkloadGroupHold {
-    fn drop(&mut self) {
+impl WorkloadGroupHold {
+    /// Give the claim up now that its workload's cgroup is gone.
+    pub fn release(mut self) {
         if let Some(key) = self.key.take() {
-            self.groups.release(&key);
+            self.groups.give_back(&key, true);
         }
     }
 }
 
-/// Remove `path` and the cgroups below it, children first, and say whether
-/// `path` is gone. A busy cgroup, or one with a busy child, stays, because
-/// the kernel refuses the `rmdir`. A symbolic link is never followed.
-fn remove_empty_tree(path: &Path) -> bool {
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                remove_empty_tree(&entry.path());
-            }
+impl Drop for WorkloadGroupHold {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.groups.give_back(&key, false);
         }
     }
+}
+
+/// Remove the cgroup at `path` and say whether it's gone. Only an empty
+/// one goes: the kernel refuses to remove a cgroup with processes or child
+/// cgroups. Leaves belong to the runtime that made them, so a group whose
+/// runtime hasn't removed every leaf yet stays.
+fn remove_group(path: &Path) -> bool {
     match std::fs::remove_dir(path) {
         Ok(()) => true,
         Err(error) => error.kind() == std::io::ErrorKind::NotFound,
@@ -216,7 +231,7 @@ mod tests {
         let hold = groups.hold("rbtest-run-00", "web");
         // The runtime already removed the leaf; its parents are left.
         make(root.path(), "rbtest-run-00/web");
-        drop(hold);
+        hold.release();
         assert!(!root.path().join("rbtest-run-00").exists());
     }
 
@@ -228,12 +243,14 @@ mod tests {
         make(root.path(), "shop/web");
         let api_leaf = make(root.path(), "shop/api/g1-0");
         busy(&api_leaf);
-        drop(web);
+        web.release();
         assert!(!root.path().join("shop/web").exists());
         assert!(api_leaf.exists());
-        // The api app's leaf retires; its last hold then takes the rest.
+        // The api app's runtime retires its leaf; its last hold then takes
+        // the rest.
         std::fs::remove_file(api_leaf.join("cgroup.procs")).unwrap();
-        drop(api);
+        std::fs::remove_dir(&api_leaf).unwrap();
+        api.release();
         assert!(!root.path().join("shop").exists());
     }
 
@@ -243,33 +260,25 @@ mod tests {
         let old = groups.hold("shop", "web");
         let new = groups.hold("shop", "web");
         make(root.path(), "shop/web");
-        drop(old);
+        old.release();
         assert!(root.path().join("shop/web").exists());
-        drop(new);
+        new.release();
         assert!(!root.path().join("shop").exists());
     }
 
     #[test]
-    fn a_busy_child_keeps_its_group_and_namespace_until_it_empties() {
+    fn a_leaf_the_runtime_still_has_keeps_its_group_until_it_goes() {
         let (root, groups) = hierarchy();
         let hold = groups.hold("batch", "executor-abc-host");
-        make(root.path(), "batch/executor-abc-host/0/helper");
-        let task = make(root.path(), "batch/executor-abc-host/0/task");
-        busy(&task);
-        drop(hold);
-        // Empty siblings go, children first; the busy leaf and its
-        // ancestors stay.
-        assert!(
-            !root
-                .path()
-                .join("batch/executor-abc-host/0/helper")
-                .exists()
-        );
-        assert!(task.exists());
-        // Once it empties, the last release in the namespace retries it.
-        std::fs::remove_file(task.join("cgroup.procs")).unwrap();
+        let slot = make(root.path(), "batch/executor-abc-host/0");
+        hold.release();
+        // A leaf is the runtime's to remove, busy or not.
+        assert!(slot.exists());
+        // Once the runtime has removed it, the last release in the
+        // namespace tries the group again.
+        std::fs::remove_dir(&slot).unwrap();
         let other = groups.hold("batch", "report");
-        drop(other);
+        other.release();
         assert!(!root.path().join("batch").exists());
     }
 
@@ -280,7 +289,7 @@ mod tests {
         make(root.path(), "shop/web");
         // Another Bun on this host, say, which this process never held.
         let foreign = make(root.path(), "shop/executor-other");
-        drop(hold);
+        hold.release();
         assert!(!root.path().join("shop/web").exists());
         assert!(foreign.exists());
     }
@@ -289,8 +298,8 @@ mod tests {
     fn the_default_namespace_cgroup_stays() {
         let (root, groups) = hierarchy();
         let hold = groups.hold("default", "web");
-        make(root.path(), "default/web/g1-0");
-        drop(hold);
+        make(root.path(), "default/web");
+        hold.release();
         assert!(!root.path().join("default/web").exists());
         assert!(root.path().join("default").exists());
     }
@@ -307,7 +316,21 @@ mod tests {
         make(root.path(), "rbtest-run-02/cfg-app");
         groups.remove_if_idle("rbtest-run-02", "cfg-app");
         assert!(root.path().join("rbtest-run-02/cfg-app").exists());
-        drop(launching);
+        launching.release();
+    }
+
+    #[test]
+    fn a_dropped_hold_removes_nothing_but_stops_holding() {
+        // Bun stopping or crashing drops its holds; a workload it covered
+        // may still own its cgroup, so nothing goes.
+        let (root, groups) = hierarchy();
+        let abandoned = groups.hold("shop", "web");
+        let group = make(root.path(), "shop/web");
+        drop(abandoned);
+        assert!(group.exists());
+        // The next Bun, adopting nothing there, removes it once idle.
+        groups.remove_if_idle("shop", "web");
+        assert!(!root.path().join("shop").exists());
     }
 
     #[test]
@@ -320,9 +343,9 @@ mod tests {
         make(root.path(), "shop/web");
         let joining = groups.hold("shop", "api");
         make(root.path(), "shop");
-        drop(leaving);
+        leaving.release();
         assert!(root.path().join("shop").exists(), "namespace kept for api");
-        drop(joining);
+        joining.release();
         assert!(!root.path().join("shop").exists());
     }
 
@@ -330,20 +353,9 @@ mod tests {
     fn names_that_are_not_workload_labels_are_never_touched() {
         let (root, groups) = hierarchy();
         let outside = make(root.path(), "victim");
-        drop(groups.hold("..", "victim"));
-        drop(groups.hold("shop", "../../victim"));
+        groups.hold("..", "victim").release();
+        groups.hold("shop", "../../victim").release();
         groups.remove_if_idle("", "victim");
         assert!(outside.exists());
-    }
-
-    #[test]
-    fn symbolic_links_are_not_followed() {
-        let (root, groups) = hierarchy();
-        let elsewhere = tempfile::tempdir().unwrap();
-        let precious = make(elsewhere.path(), "precious");
-        make(root.path(), "shop/web");
-        std::os::unix::fs::symlink(elsewhere.path(), root.path().join("shop/web/link")).unwrap();
-        drop(groups.hold("shop", "web"));
-        assert!(precious.exists());
     }
 }
