@@ -338,6 +338,7 @@ async fn runc_owned_adoption_accepts_a_provider_reference_for_its_resolved_value
         app_spec: None,
         oci_spec: supervised.clone(),
         rootless_network: None,
+        sidecar_restarts: None,
     };
     drop(first);
     let recovered = runtime(root.path());
