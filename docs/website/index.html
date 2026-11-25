@@ -743,31 +743,36 @@ $ relish agent patch try ./fix</span>
           <h2 id="who-title">No platform to rent. No team to hire.
             <a class="permalink" href="#who" aria-label="Link to who it's for">#</a></h2>
         </div>
-        <div class="versus">
-          <div>
-            <h3>Coming from Heroku, Render or Railway?</h3>
-            <ul class="points">
-              <li><strong>Nobody can freeze it.</strong> Apache 2.0, on machines you choose.</li>
-              <li><strong>Growth costs machines.</strong> No price per process, no price per add-on.</li>
-              <li><strong>Still no ops team.</strong> Your own agent operates it, safely.</li>
-              <li><strong>More in the box.</strong> Batch jobs, chaos testing and policies, same binary.</li>
-            </ul>
-            <p class="they-win"><strong>They still win on:</strong> a public address from the
-              first deploy, managed databases, no machines to find. The public address is
-              <a href="#next">next on our roadmap</a>.</p>
+        <!-- Two radio buttons styled as a switch, like the install tabs, so it works
+             without a script. The hosted-platform side is the one chosen. -->
+        <div class="from-switch" role="radiogroup" aria-label="Where you are coming from">
+          <span class="from-label" aria-hidden="true">Coming from</span>
+          <input class="from-input" type="radio" name="coming-from" id="from-paas" checked>
+          <label class="from-tab" for="from-paas">Heroku, Render or Railway</label>
+          <input class="from-input" type="radio" name="coming-from" id="from-kubernetes">
+          <label class="from-tab" for="from-kubernetes">Kubernetes, managed or your own</label>
+          <div class="from-panel from-panel-paas">
+          <ul class="points">
+            <li><strong>Nobody can freeze it.</strong> Apache 2.0, on machines you choose.</li>
+            <li><strong>Growth costs machines.</strong> No price per process, no price per add-on.</li>
+            <li><strong>Still no ops team.</strong> Your own agent operates it, safely.</li>
+            <li><strong>More in the box.</strong> Batch jobs, chaos testing and policies, same binary.</li>
+          </ul>
+          <p class="they-win"><strong>They still win on:</strong> a public address from the
+            first deploy, managed databases, no machines to find. The public address is
+            <a href="#next">next on our roadmap</a>.</p>
           </div>
-          <div>
-            <h3>Coming from Kubernetes, managed or your own?</h3>
-            <ul class="points">
-              <li><strong>Nothing to assemble.</strong> Ingress, mTLS, metrics, logs, GitOps and policy are built in.</li>
-              <li><strong>One upgrade.</strong> One signed binary, not a dozen release cycles.</li>
-              <li><strong>Any machine.</strong> Plain VMs in any cloud, or a cupboard. No per-cluster fee.</li>
-              <li><strong>Safer for your agent.</strong> It proposes; the cluster works out the blast radius and the undo.</li>
-            </ul>
-            <p class="they-win"><strong>They still win on:</strong> someone else on call,
-              autoscaling nodes, cloud load balancers and disks, production readiness. Need
-              production in the cloud this quarter? Use one.
-              <a href="./compare/kubernetes">The full comparison</a>.</p>
+          <div class="from-panel from-panel-kubernetes">
+          <ul class="points">
+            <li><strong>Nothing to assemble.</strong> Ingress, mTLS, metrics, logs, GitOps and policy are built in.</li>
+            <li><strong>One upgrade.</strong> One signed binary, not a dozen release cycles.</li>
+            <li><strong>Any machine.</strong> Plain VMs in any cloud, or a cupboard. No per-cluster fee.</li>
+            <li><strong>Safer for your agent.</strong> It proposes; the cluster works out the blast radius and the undo.</li>
+          </ul>
+          <p class="they-win"><strong>They still win on:</strong> someone else on call,
+            autoscaling nodes, cloud load balancers and disks, production readiness. Need
+            production in the cloud this quarter? Use one.
+            <a href="./compare/kubernetes">The full comparison</a>.</p>
           </div>
         </div>
       </section>

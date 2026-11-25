@@ -581,6 +581,22 @@ footer { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-top: 20px; paddi
 .home .benefits .mini-art { grid-row: span 2; margin: 2px 0 0; color: var(--tint); }
 .home .benefits h3 { margin-top: 0; }
 
+/* "Coming from" is a switch: two radio buttons, one panel each, no script. */
+.from-switch { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.from-label { font: 500 .75rem var(--mono); letter-spacing: .07em; text-transform: uppercase; color: var(--muted); margin-right: 6px; }
+.from-input { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; }
+.from-tab { padding: 9px 18px; border: 1px solid var(--line); border-radius: 999px; font-weight: 600; color: var(--muted); cursor: pointer; }
+.from-tab:hover { border-color: var(--tint); color: var(--ink); }
+.from-input:checked + .from-tab { background: var(--tint); border-color: var(--tint); color: var(--paper); }
+.from-input:focus-visible + .from-tab { outline: 3px solid var(--accent); outline-offset: 2px; }
+.from-panel { display: none; flex-basis: 100%; min-width: 0; margin-top: 14px; }
+#from-paas:checked ~ .from-panel-paas, #from-kubernetes:checked ~ .from-panel-kubernetes { display: block; }
+.from-panel .points { display: grid; grid-template-columns: 1fr 1fr; gap: 0 56px; }
+.from-panel .points li { border-bottom: 0; border-top: 1px solid var(--line); padding: 18px 0 20px; font-size: 1.0625rem; }
+.from-panel .points strong { font-size: 1.25rem; letter-spacing: -.02em; margin-bottom: 4px; }
+.from-panel .they-win { margin-top: 6px; max-width: 760px; }
+@media (max-width: 600px) { .from-panel .points { grid-template-columns: 1fr; } .from-label { flex-basis: 100%; } }
+
 /* Dark theme, chosen with the button copy.js adds and remembered in this browser.
    The dark boxes (terminals, recordings, the whitepaper's band) keep their light
    text and go a shade darker than the page, so they still read as boxes. */

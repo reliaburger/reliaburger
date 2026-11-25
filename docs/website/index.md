@@ -275,7 +275,7 @@ Last, it drafts a redacted bug report with the reproducer, the patch and what it
 
 ## No platform to rent. No team to hire.
 
-### Coming from Heroku, Render or Railway?
+Heroku, Render or Railway Kubernetes, managed or your own
 
 - **Nobody can freeze it.** Apache 2.0, on machines you choose.
 - **Growth costs machines.** No price per process, no price per add-on.
@@ -283,8 +283,6 @@ Last, it drafts a redacted bug report with the reproducer, the patch and what it
 - **More in the box.** Batch jobs, chaos testing and policies, same binary.
 
 **They still win on:** a public address from the first deploy, managed databases, no machines to find. The public address is [next on our roadmap](https://reliaburger.com/#next).
-
-### Coming from Kubernetes, managed or your own?
 
 - **Nothing to assemble.** Ingress, mTLS, metrics, logs, GitOps and policy are built in.
 - **One upgrade.** One signed binary, not a dozen release cycles.
