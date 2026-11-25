@@ -88,7 +88,7 @@ which the next trim would take again.
   can't measure the trim's cost. The pauses it logged, 2 to 41 ms every ten
   minutes, are at most 0.007% of wall time.
 - **Other allocators.** jemalloc and mimalloc weren't measured. They'd add a
-  C build dependency to every target, including the static musl builds and
-  the appliance image, and nothing here says glibc plus a trim falls short.
+  C build dependency to every target, including the Linux release binaries
+  and the appliance image, and nothing here says glibc plus a trim falls short.
 - **The appliance.** The VM is arm64 with 16 GiB. The 2 GB Wyse 3040 is
   x86-64; the call and the arenas behave the same there.

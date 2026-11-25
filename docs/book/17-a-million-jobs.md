@@ -4233,7 +4233,7 @@ free space at the very top of the main heap, and long-running Bun's free
 space is scattered through the middle, between blocks still in use. A
 different allocator, such as jemalloc with background threads, returns
 memory on its own, but it adds a C dependency to every build, including the
-static musl ones and the appliance image, to do what one glibc call already
+Linux release binaries and the appliance image, to do what one glibc call already
 does. `malloc_trim` walks every arena and hands each whole free page back
 with `madvise(MADV_DONTNEED)`, wherever it sits.
 
@@ -4270,7 +4270,7 @@ project requires on every such block, is where they say why. Here the
 argument is easy to make: no pointers cross, and glibc takes its own locks.
 
 The two `#[cfg]` blocks are the function body for each kind of build, and
-the compiler sees only one of them. On macOS and musl, `libc::malloc_trim`
+the compiler sees only one of them. On macOS, `libc::malloc_trim`
 doesn't exist at all, so naming it outside a `cfg` would fail to compile
 there, not just do nothing. The block's last expression is its value, and
 the function's, so each build returns a `bool` with no `return` keyword. The
@@ -4297,12 +4297,18 @@ where
             _ = ticker.tick() => {}
         }
         let trim = trim.clone();
-        let started = Instant::now();
+        // Timed on the blocking thread, so a wait for a free one in a busy
+        // pool doesn't count as a slow trim (#2323).
+        let timed = move || {
+            let started = Instant::now();
+            trim();
+            started.elapsed()
+        };
         // A join error means the runtime is shutting down.
-        if tokio::task::spawn_blocking(trim).await.is_err() {
+        let Ok(took) = tokio::task::spawn_blocking(timed).await else {
             return;
-        }
-        if let Some(warning) = slow_trim_warning(started.elapsed()) {
+        };
+        if let Some(warning) = slow_trim_warning(took) {
             eprintln!("{warning}");
         }
     }
@@ -4322,7 +4328,11 @@ is waiting, so the test sees trims at exactly 600, 1,200 and 1,800 virtual
 seconds without waiting ten minutes. Two more tests cancel the token, before
 the first tick and halfway between two, and check that the loop returns at
 the cancel and never trims again. A trim slower than 100 ms goes to stderr,
-so a long pause on a big heap shows up in the journal.
+so a long pause on a big heap shows up in the journal. The clock starts and
+stops inside the closure, on the blocking thread. The first version timed the
+`spawn_blocking(...).await` from the async side, which also counts the wait
+for a free blocking thread, so a busy pool, with image pulls or cgroup work
+queued, would have reported a slow trim that never happened.
 
 We measured it before trusting it, on a one-node Bun in a VM, with host
 job arrays and a loop of `relish nodes`, `top`, `metrics` and `logs`

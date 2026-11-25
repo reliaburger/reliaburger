@@ -451,10 +451,15 @@ Each node's bun rewrites `reliaburger/netlog.conf` on its EFI partition, or
 deletes it for `--off`, so the setting holds across reboots and OS updates.
 It also takes effect now: with `--to` the node starts streaming straight
 away, saying hello to the listener, and with `--off` it switches the
-kernel's netconsole off. If either step fails, the node says so in brackets,
-and the change starts at its next boot. A node that isn't an appliance shows
-as `not an appliance` and is left alone. The command fails if any node
-didn't make the change, or if no node is an appliance. The target must be
+kernel's netconsole off. With `--to`, the node then checks that the kernel
+really sends to the new target. If it doesn't (no route to the listener,
+say), or `--off` couldn't switch netconsole off, the node gives the reason in
+brackets, and the next boot tries again from the file. A node that isn't an
+appliance shows as `not an appliance` and is left alone. A node whose bun is
+older than 0.3.3 has no boot-logs setting, and shows as failed until you
+upgrade it. The command fails if any node didn't answer, or if no node is an
+appliance. A node that didn't answer may still have written the file before
+the connection dropped, so run `relish os boot-logs` to see where it stands. The target must be
 one machine's IPv4 address, as netconsole needs: not a broadcast,
 multicast, loopback or `0.0.0.0` address. With `-o json`, each node has a
 `state` of `on` (with its `target`), `off`, `not_an_appliance` or `failed`
