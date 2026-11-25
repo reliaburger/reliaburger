@@ -2315,38 +2315,52 @@ mod tests {
     /// grandchild), records its pid, and waits; after `run_bounded`
     /// times out, that grandchild must be gone — proving the whole
     /// process group was signalled, not just the direct child.
+    ///
+    /// The check needs the shim to record the grandchild's pid before the
+    /// timeout fires. Under load `sh` can take longer to start than a short
+    /// timeout, and then the group kill stops it before it writes the pid
+    /// (#2347). So an attempt that times out before the pid is recorded is
+    /// retried with double the timeout (at most 8 s), until a 25 s deadline;
+    /// with the 15 s wait for the kill, the worst case stays under
+    /// nextest's 60 s.
     #[cfg(unix)]
     #[tokio::test]
     async fn run_bounded_kills_the_whole_process_group_on_timeout() {
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
 
         let dir = tempfile::tempdir().unwrap();
         let pidfile = dir.path().join("grandchild.pid");
         let script = format!("sleep 300 & echo $! > {}; wait", pidfile.display());
         let args = vec!["-c".to_string(), script];
 
-        let result = run_bounded("sh", &args, dir.path(), Duration::from_millis(300)).await;
-        assert!(matches!(result, Err(BoundedError::Timeout)));
+        let record_deadline = Instant::now() + Duration::from_secs(25);
+        let mut timeout = Duration::from_millis(300);
+        let pid = loop {
+            let _ = std::fs::remove_file(&pidfile);
+            let result = run_bounded("sh", &args, dir.path(), timeout).await;
+            assert!(matches!(result, Err(BoundedError::Timeout)));
 
-        // Read the grandchild pid the shim recorded.
-        let mut child_pid = None;
-        for _ in 0..50 {
+            // Once `run_bounded` returns, the shim has been SIGKILLed: the
+            // pidfile holds the grandchild's pid now or never will.
             if let Ok(text) = std::fs::read_to_string(&pidfile)
                 && let Ok(pid) = text.trim().parse::<i32>()
             {
-                child_pid = Some(pid);
-                break;
+                break pid;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let pid = child_pid.expect("shim never recorded its child pid");
+            assert!(
+                Instant::now() < record_deadline,
+                "shim never recorded its child pid, last timeout {timeout:?}"
+            );
+            timeout = (timeout * 2).min(Duration::from_secs(8));
+        };
 
         use nix::sys::signal::{Signal, kill};
         use nix::unistd::Pid;
         // Poll until the grandchild is gone (reaped after the group kill).
         // `kill` with `None` sends no signal, only an existence check.
+        let gone_deadline = Instant::now() + Duration::from_secs(15);
         let mut gone = false;
-        for _ in 0..100 {
+        while Instant::now() < gone_deadline {
             if kill(Pid::from_raw(pid), None).is_err() {
                 gone = true;
                 break;
