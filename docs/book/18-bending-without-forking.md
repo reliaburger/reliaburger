@@ -1715,10 +1715,72 @@ test seals a real `ENC[AGE:...]` value whose plaintext is
 it through a provider script that records any call, and checks the workload
 gets the plaintext and the provider is never run.
 
-That copy is the only place the resolved environment lives. The supervisor
+That copy goes to the runtime, and nowhere else in Bun. The supervisor
 keeps the original, references and all, so a restart asks the provider again.
 That means a secret rotated at the source reaches the next restart, and Bun's
 memory holds no secrets it doesn't need.
+
+**Two copies that have to agree (#2334).** The runtime does keep its copy.
+runc writes the spec it was handed into its launch intent (chapter 10's
+`intent.json`, 0600, scrubbed to names when the generation retires), and
+when Bun restarts it compares that intent with its own adoption record
+before it adopts anything. The record holds
+`DB_PASSWORD=PROVIDER[vault:secret/db#password]` and
+`provider_env = ["DB_PASSWORD"]`. The intent holds `DB_PASSWORD=hunter2` and
+no `provider_env` at all. `matches_journal` saw two different requests and
+retired the launch. So every restart and every self-upgrade killed each app
+that used a provider, and its sidecars with it, which is exactly what
+adoption exists to prevent.
+
+We had two ways out. We could journal the references and resolve only when
+writing runc's bundle, but the intents a 0.3.2 node already wrote hold
+values, and they have to adopt after the upgrade too. Or we compare on a
+shape both copies share, which handles old intents and new ones alike. We
+took the second:
+
+```rust
+fn without_provider_values(&self, declared: &[&str]) -> OciSpec {
+    let mut shape = self.clone();
+    for entry in &mut shape.process.env {
+        if let Some((name, _value)) = entry.split_once('=')
+            && declared.contains(&name)
+        {
+            *entry = name.to_string();
+        }
+    }
+    shape.process.provider_env.clear();
+    shape
+}
+```
+
+`matches_journal` collects the declared names from both sides (so it
+doesn't matter which one you call it on), cuts those variables down to their
+names in both, clears `provider_env`, and compares what's left the same two
+ways as before. The `if let ... && ...` is a *let chain*, new in Rust 2024: the
+pattern has to match and the condition hold, in one `if`, without nesting a
+second one inside. Only the provider's own variables lose their values. A
+literal value that just looks like a reference isn't in `provider_env`
+(#1819), so it still has to match exactly, and so does every other field: a
+launch from another image, other arguments or another plain variable is
+still a conflict. What we give up is noticing that the reference itself
+changed. That's fine, because a changed reference is a new deploy, and a new
+deploy writes a new record and a new intent together.
+
+The process runtime had the same bug twice over. Its owner records the
+resolved spec too, and `ProcessGrill::adopt` compared it with the record using
+plain `!=`. That didn't just restart the app: the adoption error stopped the
+new Bun starting at all, so a self-upgrade crash-looped and reverted. It now
+calls `matches_journal` like everything else. The real-binary self-upgrade
+test found that one, which is a fair argument for keeping a test that runs the
+whole binary even when the unit tests are green.
+
+The tests drive a restart through the sidecar adoption harness: deploy an app
+whose env and whose proxy sidecar both use a provider, hand the restarted
+agent a launch inventory holding the resolved specs the runtime got, and
+check that the instance and both sidecars see only `adopt`. They also check
+that no adoption record on disk contains the provider's value. A twin test
+changes one argument in the journalled spec and checks all three are killed
+instead.
 
 **Failing closed.** A provider error becomes a new `LaunchProblem` variant:
 

@@ -128,8 +128,46 @@ impl OciSpec {
     /// A live intent keeps the exact spec, so it must be equal. A retired
     /// intent keeps [`OciSpec::without_environment_values`], so everything
     /// except environment values must be equal.
+    ///
+    /// A spec with `PROVIDER[...]` variables is the exception (#2334). The
+    /// supervisor keeps the references, but the runtime is handed, and
+    /// journals, the values the provider gave, with
+    /// [`OciProcess::provider_env`] cleared. So the provider's variables,
+    /// as either side declares them, are compared by name only, and
+    /// everything else must match as above.
     pub fn matches_journal(&self, journal: &OciSpec) -> bool {
-        self == journal || self.without_environment_values() == *journal
+        if self == journal || self.without_environment_values() == *journal {
+            return true;
+        }
+        let declared: Vec<&str> = self
+            .process
+            .provider_env
+            .iter()
+            .chain(&journal.process.provider_env)
+            .map(String::as_str)
+            .collect();
+        if declared.is_empty() {
+            return false;
+        }
+        let launched = self.without_provider_values(&declared);
+        let journal = journal.without_provider_values(&declared);
+        launched == journal || launched.without_environment_values() == journal
+    }
+
+    /// The same spec with each `declared` provider variable cut down to its
+    /// name and no provider declarations: the shape a supervisor's spec
+    /// and the resolved copy a runtime journalled from it share.
+    fn without_provider_values(&self, declared: &[&str]) -> OciSpec {
+        let mut shape = self.clone();
+        for entry in &mut shape.process.env {
+            if let Some((name, _value)) = entry.split_once('=')
+                && declared.contains(&name)
+            {
+                *entry = name.to_string();
+            }
+        }
+        shape.process.provider_env.clear();
+        shape
     }
 }
 
@@ -2826,6 +2864,80 @@ mod tests {
         let mut moved = spec_with_env(&["SECRET=plaintext"]);
         moved.process.args = vec!["elsewhere".into()];
         assert!(!moved.matches_journal(&journal));
+    }
+
+    /// What the supervisor keeps for a launch with a `PROVIDER[...]`
+    /// variable (#1123): the reference, with the variable declared.
+    fn spec_with_provider(env: &[&str], declared: &[&str]) -> OciSpec {
+        let mut oci = spec_with_env(env);
+        oci.process.provider_env = declared.iter().map(|name| name.to_string()).collect();
+        oci
+    }
+
+    /// The copy a runtime got and journalled: the value resolved, and no
+    /// declaration left.
+    fn resolved(oci: &OciSpec, env: &[&str]) -> OciSpec {
+        let mut launched = oci.clone();
+        launched.process.env = env.iter().map(|entry| entry.to_string()).collect();
+        launched.process.provider_env.clear();
+        launched
+    }
+
+    /// #2334: the record keeps the reference and the journal the value the
+    /// provider gave, so the two must still match, live or retired, from
+    /// either side.
+    #[test]
+    fn a_spec_with_a_provider_reference_matches_its_resolved_journal_copy() {
+        let record = spec_with_provider(
+            &[
+                "DB_PASSWORD=PROVIDER[vault:secret/db#password]",
+                "MODE=plain",
+            ],
+            &["DB_PASSWORD"],
+        );
+        let journal = resolved(&record, &["DB_PASSWORD=s3cret", "MODE=plain"]);
+        assert!(record.matches_journal(&journal));
+        assert!(record.matches_journal(&journal.without_environment_values()));
+        assert!(journal.matches_journal(&record));
+    }
+
+    /// Only the provider's value may differ: every other part of the spec,
+    /// the other variables included, still has to match.
+    #[test]
+    fn a_provider_journal_copy_still_refuses_a_different_request() {
+        let record = spec_with_provider(
+            &[
+                "DB_PASSWORD=PROVIDER[vault:secret/db#password]",
+                "MODE=plain",
+            ],
+            &["DB_PASSWORD"],
+        );
+        let journal = resolved(&record, &["DB_PASSWORD=s3cret", "MODE=plain"]);
+
+        let mut moved = record.clone();
+        moved.process.args = vec!["elsewhere".into()];
+        assert!(!moved.matches_journal(&journal));
+        assert!(!moved.matches_journal(&journal.without_environment_values()));
+
+        let other_mode = spec_with_provider(
+            &[
+                "DB_PASSWORD=PROVIDER[vault:secret/db#password]",
+                "MODE=loud",
+            ],
+            &["DB_PASSWORD"],
+        );
+        assert!(!other_mode.matches_journal(&journal));
+
+        let renamed = spec_with_provider(
+            &["DB_TOKEN=PROVIDER[vault:secret/db#password]", "MODE=plain"],
+            &["DB_TOKEN"],
+        );
+        assert!(!renamed.matches_journal(&journal));
+
+        // A literal value that only looks like a reference isn't resolved
+        // (#1819), so it must match exactly.
+        let literal = spec_with_env(&["DB_PASSWORD=PROVIDER[vault:secret/db#password]"]);
+        assert!(!literal.matches_journal(&resolved(&literal, &["DB_PASSWORD=s3cret"])));
     }
 
     #[test]

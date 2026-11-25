@@ -1236,7 +1236,9 @@ impl super::Grill for ProcessGrill {
                 .status(instance)
                 .await
                 .map_err(|error| owner_error(instance, error))?;
-            if owner.launch.spec != record.oci_spec {
+            // The owner keeps the spec it launched, with any `PROVIDER[...]`
+            // value resolved; the record keeps the reference (#2334).
+            if !record.oci_spec.matches_journal(&owner.launch.spec) {
                 return Err(owner_error(
                     instance,
                     "process launch conflicts with adoption record",
