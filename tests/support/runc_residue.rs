@@ -15,19 +15,30 @@
 //!   root's runc containers and deletes every network namespace and veth
 //!   its address pool reserved, on a panic as on a pass. [`RuncRoot`] is a
 //!   temporary directory that carries one.
-//! - Creating a guard first sweeps what a test killed outright (by a
-//!   timeout's SIGKILL, or a panic before this guard existed) left behind:
-//!   roots whose owner has gone, and `rb-rbtest-*` namespaces that no live
-//!   guard's pool names. Only names tests own are touched.
+//! - [`TestNamespaces`] is a guard over namespaces a test makes itself,
+//!   outside any runtime root's pool, such as `owned_network`'s. Its `Drop`
+//!   deletes them, and its registry entry names its owning process and that
+//!   process's start time, as [`test_cgroups`]'s does.
+//! - Creating either guard first sweeps what a test killed outright (by a
+//!   timeout's SIGKILL, or a panic before its guard existed) left behind:
+//!   roots and namespace claims whose owner has gone, and `rb-rbtest-*`
+//!   namespaces that nothing claims and that are older than [`STALE_AFTER`].
+//!   Only names tests own are touched.
 //!
 //! A runc test's cgroups are [`test_cgroups`]'s: the sweep here runs its
 //! sweep too, and [`RuncRoot`] claims the cgroups named after its directory
 //! (#2322).
 //!
-//! A guard proves its owner is alive with a lock on a file in its root,
-//! which the kernel releases when the owner dies, however it dies. Runc
-//! tests run one at a time (nextest's `host-network` group), so a sweep
-//! never meets another test's half-made namespace.
+//! A root's guard proves its owner is alive with a lock on a file in its
+//! root, which the kernel releases when the owner dies, however it dies.
+//!
+//! A namespace nobody claims is never deleted just because nobody claims
+//! it: tests outside nextest's `host-network` group sweep too (the
+//! leader-loss test on host processes, under `cgroup_`), so a sweep can run
+//! while another test is half way through making its namespace (#2332).
+//! The kernel stamps a namespace's inode when `ip netns add` mounts it, and
+//! only a namespace unclaimed for longer than any test takes to claim one is
+//! left behind.
 
 #![allow(dead_code)]
 
@@ -46,6 +57,15 @@ use test_cgroups::TestCgroups;
 
 /// Where each live guard names its root, one file per root.
 const REGISTRY: &str = "/run/reliaburger-tests/runc-roots";
+
+/// Where each live [`TestNamespaces`] lists the namespaces it claims, one
+/// file per guard, named as [`test_cgroups::register_in`] names them.
+const NAMESPACE_REGISTRY: &str = "/run/reliaburger-tests/netns";
+
+/// How old a namespace no guard claims must be before the sweep counts it as
+/// left behind. A test claims its namespaces before it makes them, so a
+/// young unclaimed one belongs to a test that has no guard, still running.
+pub const STALE_AFTER: Duration = test_cgroups::STALE_AFTER;
 
 /// The file in a root whose lock says its test is still running.
 const OWNER_LOCK: &str = ".runc-test-owner.lock";
@@ -154,6 +174,57 @@ impl Default for RuncRoot {
     }
 }
 
+/// A guard over network namespaces a test makes itself, outside a runtime
+/// root's address pool. Dropping it deletes them and their host veths.
+pub struct TestNamespaces {
+    names: Vec<String>,
+    entry: Option<PathBuf>,
+}
+
+impl TestNamespaces {
+    /// Sweep stale test leftovers, then claim the namespaces `names` (such
+    /// as `rb-rbtest-owned-net-<pid>`). Claim them before making them.
+    pub fn new(names: impl IntoIterator<Item = String>) -> Self {
+        sweep_stale();
+        let names: Vec<String> = names.into_iter().collect();
+        let entry = test_cgroups::register_in(Path::new(NAMESPACE_REGISTRY), &names);
+        Self { names, entry }
+    }
+
+    /// Claim the namespace of test instance `instance`.
+    pub fn instance(instance: &InstanceId) -> Self {
+        Self::new([format!("rb-{}", instance.0)])
+    }
+
+    /// Give the namespaces up the way a SIGKILLed test does: the entry
+    /// stays but names an owner that no longer runs, and nothing is
+    /// released. Only for testing the sweep.
+    pub fn abandon(mut self) {
+        if let Some(entry) = self.entry.take() {
+            let name = entry.file_name().unwrap().to_string_lossy().into_owned();
+            let mut parts = name.splitn(3, '-');
+            let (pid, _, n) = (parts.next(), parts.next(), parts.next());
+            // No process started at tick 0 is still this pid's.
+            let dead = format!("{}-0-{}", pid.unwrap(), n.unwrap());
+            std::fs::rename(&entry, entry.with_file_name(dead)).unwrap();
+        }
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for TestNamespaces {
+    fn drop(&mut self) {
+        for name in &self.names {
+            if namespace_exists(name) {
+                release_network(name);
+            }
+        }
+        if let Some(entry) = &self.entry {
+            let _ = std::fs::remove_file(entry);
+        }
+    }
+}
+
 /// Kill a root's runc containers, then delete the networks its address
 /// pool reserved.
 fn release_root(root: &Path) {
@@ -227,16 +298,19 @@ fn owner_alive(root: &Path) -> bool {
     matches!(FileLock::try_lock(file), Err(FileLockError::Busy))
 }
 
-/// Release the roots of tests that died without their guard's `Drop`, the
-/// test namespaces that no live guard's pool names, and the empty test
-/// cgroups no live guard claims.
+/// Release the roots and namespace claims of tests that died without their
+/// guard's `Drop`, the test namespaces nothing claims that are older than
+/// [`STALE_AFTER`], and the empty test cgroups no live guard claims.
 pub fn sweep_stale() {
-    sweep_stale_namespaces();
+    sweep_stale_namespaces(STALE_AFTER);
     test_cgroups::sweep_stale();
 }
 
-fn sweep_stale_namespaces() {
-    let mut live = BTreeSet::new();
+/// [`sweep_stale`]'s namespace sweep, counting an unclaimed namespace as
+/// left behind once it is `age` old. Only for testing the sweep, which
+/// stands in this way for one that runs [`STALE_AFTER`] later.
+pub fn sweep_stale_namespaces(age: Duration) {
+    let mut live = claimed_namespaces();
     let mut pools_known = true;
     for entry in std::fs::read_dir(REGISTRY).into_iter().flatten().flatten() {
         let Ok(root) = std::fs::read_to_string(entry.path()) else {
@@ -258,11 +332,55 @@ fn sweep_stale_namespaces() {
         return;
     }
     for name in test_namespaces() {
-        if !live.contains(&name) {
+        if !live.contains(&name) && older_than(&name, age) {
             eprintln!("runc residue: releasing stale test namespace {name}");
             release_network(&name);
         }
     }
+}
+
+/// The namespaces live [`TestNamespaces`] guards claim. The namespaces of
+/// guards whose owner has gone are released, and their entries removed.
+fn claimed_namespaces() -> BTreeSet<String> {
+    let mut live = BTreeSet::new();
+    let registry = Path::new(NAMESPACE_REGISTRY);
+    for entry in std::fs::read_dir(registry).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let Ok(body) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        if test_cgroups::entry_alive(&name) {
+            live.extend(body.lines().map(str::to_owned));
+            continue;
+        }
+        for namespace in body.lines() {
+            if namespace.starts_with(TEST_NAMESPACE_PREFIX) && namespace_exists(namespace) {
+                eprintln!("runc residue: releasing namespace {namespace} of a dead test");
+                release_network(namespace);
+            }
+        }
+        let _ = std::fs::remove_file(entry.path());
+    }
+    live
+}
+
+/// Whether network namespace `name` exists.
+fn namespace_exists(name: &str) -> bool {
+    Path::new("/var/run/netns").join(name).exists()
+}
+
+/// Whether namespace `name` was made at least `age` ago. Its mount carries
+/// the namespace inode's time, which the kernel sets when the namespace is
+/// first mounted and never changes. One whose age can't be read is young.
+fn older_than(name: &str, age: Duration) -> bool {
+    std::fs::metadata(Path::new("/var/run/netns").join(name))
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|made| made.elapsed().ok())
+        .is_some_and(|elapsed| elapsed >= age)
 }
 
 /// The host's `rb-rbtest-*` network namespaces.

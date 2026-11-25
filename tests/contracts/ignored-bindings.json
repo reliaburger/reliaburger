@@ -1242,6 +1242,24 @@
     "test": "published_ports_answer_members_only_and_rewrite_only_local_destinations"
   },
   {
+    "source": "tests/owned_network.rs",
+    "function": "a_sweep_leaves_a_young_unclaimed_test_namespace_alone",
+    "binary": "reliaburger::owned_network",
+    "test": "a_sweep_leaves_a_young_unclaimed_test_namespace_alone"
+  },
+  {
+    "source": "tests/owned_network.rs",
+    "function": "a_sweep_leaves_a_claimed_namespace_alone_and_its_guard_deletes_it",
+    "binary": "reliaburger::owned_network",
+    "test": "a_sweep_leaves_a_claimed_namespace_alone_and_its_guard_deletes_it"
+  },
+  {
+    "source": "tests/owned_network.rs",
+    "function": "a_sweep_releases_the_namespace_of_a_test_that_died",
+    "binary": "reliaburger::owned_network",
+    "test": "a_sweep_releases_the_namespace_of_a_test_that_died"
+  },
+  {
     "source": "tests/owned_rootless.rs",
     "function": "rootless_cluster_refuses_before_ownership_recovery_for_every_selection",
     "binary": "reliaburger::owned_rootless",

@@ -24,6 +24,9 @@ use reliaburger::grill::{PortAllocator, ProcessGrill};
 use tokio::sync::{RwLock, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(target_os = "linux")]
+#[path = "support/runc_residue.rs"]
+mod runc_residue;
 #[path = "support/task_harness.rs"]
 mod task_harness;
 use task_harness::TestTasks;
@@ -1313,6 +1316,8 @@ async fn a_two_platform_build_runs_the_nodes_own_platform_under_runc() {
             .unwrap()
             .trim_start_matches('.')
     ));
+    // Released on a panic too, and never taken for a dead test's (#2332).
+    let _namespaces = runc_residue::TestNamespaces::instance(&id);
     let mut spec: OciSpec = serde_json::from_value(serde_json::json!({
         "root": {"path": "mixed:v1", "readonly": true},
         "process": {"args": ["/busybox", "sleep", "60"], "env": ["PATH=/"], "cwd": "/", "user": {"uid": 0, "gid": 0}},

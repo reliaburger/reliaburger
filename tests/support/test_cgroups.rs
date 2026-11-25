@@ -133,22 +133,30 @@ impl Drop for TestCgroups {
 /// registry can't be written, as on a host without `/run` access; the guard
 /// still removes its cgroups on drop.
 fn register(paths: &[PathBuf]) -> Option<PathBuf> {
-    std::fs::create_dir_all(REGISTRY).ok()?;
+    let lines: Vec<String> = paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    register_in(Path::new(REGISTRY), &lines)
+}
+
+/// Write an entry in `registry` claiming `lines` for this process, named
+/// `<pid>-<start time>-<n>` so [`entry_alive`] can tell whether its owner
+/// still runs. `None` when the registry can't be written.
+pub fn register_in(registry: &Path, lines: &[String]) -> Option<PathBuf> {
+    std::fs::create_dir_all(registry).ok()?;
     let pid = std::process::id();
     let started = process_start(pid)?;
     let name = format!(
         "{pid}-{started}-{}",
         NEXT_GUARD.fetch_add(1, Ordering::Relaxed)
     );
-    let body: String = paths
-        .iter()
-        .map(|path| format!("{}\n", path.display()))
-        .collect();
+    let body: String = lines.iter().map(|line| format!("{line}\n")).collect();
     // Write under a hidden name and rename, so a sweep never reads half an
     // entry and takes the guard for a dead one.
-    let partial = Path::new(REGISTRY).join(format!(".{name}"));
+    let partial = registry.join(format!(".{name}"));
     std::fs::write(&partial, body).ok()?;
-    let entry = Path::new(REGISTRY).join(name);
+    let entry = registry.join(name);
     std::fs::rename(&partial, &entry).ok()?;
     Some(entry)
 }
@@ -164,7 +172,7 @@ fn process_start(pid: u32) -> Option<u64> {
 }
 
 /// Whether the process an entry named `pid-start-n` belongs to still runs.
-fn entry_alive(name: &str) -> bool {
+pub fn entry_alive(name: &str) -> bool {
     let mut parts = name.split('-');
     let (Some(pid), Some(started)) = (parts.next(), parts.next()) else {
         return false;

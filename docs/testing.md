@@ -243,9 +243,15 @@ carry a guard from [`tests/support/runc_residue.rs`](../tests/support/runc_resid
 its `Drop` kills the root's containers and deletes the namespaces and veths
 its pool reserved, on a panic as on a pass. A test killed outright gets no
 `Drop`, so each new guard first releases roots whose owner has died (each
-guard holds a lock in its root) and any `rb-rbtest-*` namespace no live guard
-reserved. It touches nothing else, and it relies on the `host-network` test
-group running runc tests one at a time.
+guard holds a lock in its root). A test that makes a namespace itself, outside
+a runtime's pool (`tests/owned_network.rs`, the mixed-architecture build
+test), claims it first with `TestNamespaces`, whose registry entry names the
+test's process and start time; the sweep releases a claim's namespaces once
+that process is gone. A `rb-rbtest-*` namespace nothing claims goes only when
+it is older than two minutes: the sweep also runs in tests outside the
+`host-network` group, and once deleted a young one another test was still
+setting up ([#2332](https://github.com/reliaburger/reliaburger/issues/2332)).
+It touches nothing else.
 
 Cgroups get the same treatment
 ([#2322](https://github.com/reliaburger/reliaburger/issues/2322)). A cgroup

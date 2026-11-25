@@ -1832,6 +1832,41 @@ panics with a container running and checks that nothing is left, and two
 more tests leave a container behind the way an unguarded panic and a SIGKILL
 would, then start a container that takes the same address.
 
+That last rule, "no live guard names it", turned out to be one step too
+eager ([#2332](https://github.com/reliaburger/reliaburger/issues/2332)).
+`owned_network_setup_and_forwarding_retire_through_the_generation` makes its
+namespace itself, with no runtime root and so no guard, and it started
+failing about three runs in four with `Cannot open network namespace`: the
+namespace vanished between two steps of its own setup. Nextest runs every
+runc and network test one at a time, so no other runc test could have swept
+it. But the leader-loss test on host processes runs outside that group (its
+name says `cgroup_`, not `runc_`), and it sweeps before it starts. Name
+alone said "stale"; the namespace was seconds old.
+
+A name nobody claims isn't evidence that its owner is dead. So the fix gives
+those tests a claim, `TestNamespaces`, with the same proof of life as
+`TestCgroups`: a registry file named after the owning process ID and its
+start time. The sweep releases a claimed namespace only once that process
+has gone, and an unclaimed one only once it is older than two minutes,
+which it reads from the namespace file's modification time. That time comes
+from the kernel's namespace inode, which is stamped when `ip netns add`
+mounts it and never changes after. A test that registers before it makes
+its namespace can never lose it to a sweep, and an unguarded test that runs
+for less than two minutes can't either.
+
+The same full runs turned up an older flake in a reusable runc executor
+test, which parsed `printf '%s' "$!"`, the PID of a job it had just put in
+the background, and sometimes got `ParseIntError`. The shell forks the job
+first and applies its `>/dev/null` afterwards, in the child. For that moment
+the child holds the command's output pipe, and on a busy host the moment can
+outlast the command. The executor waits only 10 ms for a silent pipe after
+the command exits, then stops and appends
+`[reliaburger: output written after exit truncated]` to stderr, because
+silence is no proof the writer has finished
+([#715](https://github.com/reliaburger/reliaburger/issues/715)). The test,
+not the executor, was wrong: it now reads the PID from the first line and
+accepts that marker after it, and nothing else.
+
 Even passing tests left something behind, though
 ([#2322](https://github.com/reliaburger/reliaburger/issues/2322)). A cgroup v2
 group is a directory, and it stays when its last process exits: the kernel
