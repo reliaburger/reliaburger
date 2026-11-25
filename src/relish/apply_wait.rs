@@ -35,7 +35,8 @@ use std::time::Duration;
 use schemars::JsonSchema;
 use serde::Serialize;
 
-use super::agent::envelope::{AgentError, BuildInfo, CommandName, Envelope, NextStep};
+use super::agent::envelope::{BuildInfo, CommandName, Envelope, NextStep};
+use super::agent::lease::lease_error;
 use super::apps_cmd::{self, Instances};
 use super::client::BunClient;
 use super::{CommandOutcome, OutputFormat, RelishError};
@@ -859,7 +860,13 @@ fn print_structured<T: Serialize>(value: &T, output: OutputFormat) -> Result<(),
 /// authenticate to, `4` for a refusal and `5` for anything else. Never `1`,
 /// which means "applied, not ready".
 pub fn failure_exit_code(error: &RelishError) -> u8 {
-    AgentError::from(error).code.exit_status().code()
+    lease_error(error).code.exit_status().code()
+}
+
+/// The agent envelope for an apply that failed: `lease_held` when a lease
+/// refused it, so it exits `4` like every other refusal.
+fn failure_envelope(error: &RelishError) -> Envelope<()> {
+    Envelope::failed(CommandName::Apply, BuildInfo::current(), lease_error(error))
 }
 
 /// Run `relish apply --wait` against the configured endpoint.
@@ -895,11 +902,7 @@ pub async fn run_with_client(
         }
         Err(error) if output == OutputFormat::Human => Err(error),
         Err(error) => {
-            let envelope: Envelope<()> = Envelope::failed(
-                CommandName::Apply,
-                BuildInfo::current(),
-                AgentError::from(&error),
-            );
+            let envelope = failure_envelope(&error);
             print_structured(&envelope, output)?;
             Ok(CommandOutcome::Exited(envelope.exit_status().code()))
         }
@@ -1679,6 +1682,54 @@ mod tests {
             body: "boom".into(),
         };
         assert_eq!(failure_exit_code(&broken), 5);
+    }
+
+    fn lease_held_body() -> String {
+        serde_json::json!({
+            "error": "app:shop/web is held by holmes",
+            "code": "lease_held",
+            "lease": {
+                "target": "app:shop/web",
+                "kind": "app",
+                "namespace": "shop",
+                "app": "web",
+                "holder": "holmes",
+                "purpose": "draining",
+                "proposal": null,
+                "acquired_at_unix_ms": 1,
+                "expires_at_unix_ms": 2,
+                "expires_in_seconds": 87
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn an_apply_refused_by_a_held_lease_exits_4_not_5() {
+        let held = RelishError::ApiError {
+            status: 409,
+            body: lease_held_body(),
+        };
+        assert_eq!(failure_exit_code(&held), 4);
+        // Any other 409 is still a conflict.
+        let other = RelishError::ApiError {
+            status: 409,
+            body: r#"{"error":"already exists"}"#.into(),
+        };
+        assert_eq!(failure_exit_code(&other), 5);
+    }
+
+    #[test]
+    fn the_json_failure_for_a_held_lease_says_lease_held_and_exits_4() {
+        let envelope = failure_envelope(&RelishError::ApiError {
+            status: 409,
+            body: lease_held_body(),
+        });
+        assert_eq!(envelope.exit_status().code(), 4);
+        let value = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["code"], "lease_held");
+        assert_eq!(value["error"]["lease"]["holder"], "holmes");
     }
 
     #[test]

@@ -1891,7 +1891,21 @@ submits them, and `relish jobs` follows their runs.
 The exit codes follow `relish status --check`. 0 when every app is ready, 1
 when the apply went through but an app wasn't ready in time, and the
 envelope's 3, 4 and 5 when the apply itself failed, in every output format.
-So a script can tell "applied, still converging" from "not applied". With
+So a script can tell "applied, still converging" from "not applied".
+
+The docs truth pass before 0.3.3's testers caught one of those codes lying.
+The manual's table promised 4 for "someone else's lease", and the apply gave
+5. `failure_exit_code` turned the error into an envelope error with
+`AgentError::from`, which sees only the HTTP status, and a held lease
+answers 409, the same as any other conflict. The agent commands already had
+the fix: `agent::lease::lease_error` reads the 409's JSON, and when its
+`code` is `lease_held` it makes the error `LeaseHeld`, which exits 4 and
+names the holder. The apply's error paths now go through it too, for people
+and for `-o json`. Two tests pin it: a 409 with a lease in its body exits 4,
+with `lease_held` and the holder in the envelope, and a 409 without one is
+still a conflict.
+
+With
 `-o json` it answers in the agent envelope with `command: "apply"`, and,
 like `status`, `ok` is `true` whenever the apply happened. An agent that
 read `ok: false` for a timeout would think nothing changed, and the change

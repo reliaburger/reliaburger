@@ -31,8 +31,10 @@ struct Cli {
     #[arg(long, global = true)]
     ca_cert: Option<PathBuf>,
 
-    /// Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default
-    /// local address (`http[s]://127.0.0.1:9117`).
+    /// Bun API base URL. Overrides `RELIABURGER_ENDPOINT`, the saved
+    /// context's endpoints (whose other nodes it falls over to when the
+    /// first doesn't answer) and the default local address
+    /// (`http[s]://127.0.0.1:9117`).
     #[arg(long, global = true, value_parser = parse_endpoint)]
     endpoint: Option<String>,
 

@@ -2968,6 +2968,8 @@ honest answers, `Structured` and `Interactive`, and only six commands give the
 second: `tui`, `dashboard`, `manual`'s reader, `source`, `setup` and `dev
 shell`. 0.3.0 added two more, `machines claim`, which waits for a person to
 compare claim keys, and `netboot`, which serves installs until it's stopped.
+0.3.2 added a ninth, `machines logs`, which listens for a machine's boot logs
+until you stop it.
 
 Every other command follows the pattern `status` and `events` already used: a
 small struct that derives `Serialize` for the data and implements `Display`

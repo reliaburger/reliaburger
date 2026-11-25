@@ -838,6 +838,19 @@ before it records a run.
 The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
 same steps and the same losses.
 
+### Upgrading from 0.3.2
+
+0.3.3 keeps 0.3.2's formats, protocol 61 and state format 76: `CURRENT` in
+`src/compatibility.rs` doesn't change on the 0.3.3 train. So a 0.3.2
+cluster's nodes accept 0.3.3's binary, and `relish upgrade start v0.3.3`
+rolls it in place, workers first and the leader last. Until every node runs
+0.3.3, `relish apply --wait` through a 0.3.2 leader counts only instances
+running the applied image, and says so on stderr
+([#2302](https://github.com/reliaburger/reliaburger/issues/2302)).
+
+If a walk fails, a fresh cluster, as [from 0.2.0](#upgrading-from-020),
+still works.
+
 ## Signing identity
 
 Configure `RELIABURGER_RELEASE_KEY` as a secret of the `release` GitHub
