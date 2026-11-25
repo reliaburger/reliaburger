@@ -1823,6 +1823,63 @@ report now prints whether timesyncd or chrony is active, either of which fails
 the check outright, and counts the `SyncTime` steps the guest agent logged since
 the last report. The record lists the total per node.
 
+### Nobody upgrades the guest but us
+
+The clock wasn't the only thing in the guest with a mind of its own. In a
+power-cut endurance run, Bun stopped cleanly and started again in the middle of
+a work period, with nobody touching it. The guest journal had the answer:
+Ubuntu's `apt-daily-upgrade.timer` had run unattended-upgrades, which upgraded
+libc, and needrestart then restarted every service still mapping the old
+library, `reliaburger.service` among them
+([#2274](https://github.com/reliaburger/reliaburger/issues/2274)). The
+workloads came back and nothing was lost, so it wasn't a durability bug. For a
+tester, though, it's an API outage nobody can explain. And an apt run cut short
+by a laptop going to sleep can leave a broken guest behind.
+
+The image build had set `NEEDRESTART_SUSPEND=1`, but only for its own
+`apt-get` calls in the chroot. The VM booted with Ubuntu's defaults.
+
+Why not just keep the updates and stop the restarts? Because the guest is
+disposable. Each release builds its guest image again from a pinned Ubuntu
+image, and a laptop cluster is torn down and rebuilt far more often than a
+server. Updates arrive with releases, the way Bun's own fixes do, and never
+under a running cluster. So `build_guest_image.sh` masks the two apt timers
+and `unattended-upgrades.service` in the chroot. Masking links the unit to
+`/dev/null`, so nothing can start it, not even another unit that wants it;
+disabling would only remove the timers' `[Install]` links. The script then
+checks that each link really is in the image's root, and fails the build if
+not. If the image has needrestart, a drop-in sets `$nrconf{restart} = 'l'`:
+list what would need a restart, restart nothing.
+
+Provisioning does the same at first boot, which covers the stock image of
+development runs and a cluster built from an older guest image:
+
+```rust
+const NO_AUTOMATIC_UPDATES: &str = "systemctl mask apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service\n\
+     systemctl stop apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service || true\n\
+     if dpkg-query -W -f='${db:Status-Abbrev}\\n' needrestart 2>/dev/null | grep -q '^ii'; then\n  \
+     install -d -m 755 /etc/needrestart/conf.d\n  \
+     echo \"\\$nrconf{restart} = 'l';\" | tee /etc/needrestart/conf.d/50-reliaburger.conf >/dev/null\n\
+     fi\n";
+```
+
+It runs before the stock image's `apt-get install`, so a timer can't fire in
+the middle of it. `systemctl mask` succeeds for a unit that isn't installed,
+but `stop` doesn't, hence the `|| true` under `set -eu`. Inside a Rust string
+literal, `\\` is one backslash, so the shell sees `\n` in the `dpkg-query`
+format and `\$` in the double-quoted `echo`, which keeps Bash from expanding
+`$nrconf` as a variable.
+
+The tests reuse the stub harness from the clock fix. The provisioning test
+expects the `mask` call in the stub `systemctl`'s log, a stub `tee` records the
+drop-in's path and contents, and a second run with needrestart reported
+missing expects no drop-in. The guest image test checks the build script masks
+the units after installing packages, checks the masks, and writes the drop-in,
+all before the image is compressed.
+
+`relish setup --ssh` doesn't do any of this. A server is the operator's
+machine, and its update policy is the operator's call.
+
 ### Pin a Lima that doesn't leak
 
 The 0.2.0 jobs soak found the next Lima bug the hard way. Node 1's guest

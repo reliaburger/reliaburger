@@ -37,6 +37,15 @@ class EveryJob(unittest.TestCase):
         problems = every_job.problems(needs(task_array_benchmarks='failure'), 'merge_group')
         self.assertEqual(problems, ["task-array-benchmarks finished as 'failure'"])
 
+    def test_a_merge_group_passes_with_portable_macos_skipped(self):
+        # select-jobs.sh leaves portable macOS out of every merge group (24
+        # November 2026); a skipped job counts only because selection skipped it.
+        found = needs(macos='skipped')
+        found['changes']['outputs'].update(heavy='true', macos='false')
+        self.assertEqual(every_job.problems(found, 'merge_group'), [])
+        self.assertEqual(every_job.problems(needs(macos='failure'), 'merge_group'),
+                         ["macos finished as 'failure'"])
+
     def test_selection_must_succeed_before_any_skip_counts(self):
         found = needs()
         found['changes']['result'] = 'failure'

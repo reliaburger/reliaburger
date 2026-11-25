@@ -1,0 +1,29 @@
+---
+source: src/appliance/console/view.rs
+expression: console(&state)
+---
+ Reliaburger OS                                               bun not answering
+  1 Status   2 Metrics   3 Workloads  [4 Cluster]  5 Versions   6 Logs
+┌ 4 Cluster ───────────────────────────────────────────────────────────────────┐
+│This machine isn't part of a cluster yet: see 1 Status.                       │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+ 1-6 or <- -> tabs   up/down scroll   read-only: no login here     15:06:40 UTC

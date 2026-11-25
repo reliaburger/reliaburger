@@ -1,5 +1,6 @@
-# The UKI goes onto the ESP beside the running one, with three tries under
-# systemd-boot's boot counting. systemd-bless-boot marks it good once
+# The UKI goes onto the ESP beside the running one, with two tries under
+# systemd-boot's boot counting (three couldn't fall back within 10 minutes on
+# a Wyse 3040 and still give a slow healthy boot its time, #2245). systemd-bless-boot marks it good once
 # boot-complete.target is reached, which reliaburger-boot-check.service
 # holds back until bun is healthy. Its usrhash= pins the /usr written by
 # 20-usr.transfer, so the UKI picks the slot.
@@ -21,9 +22,9 @@ PathRelativeTo=boot
 MatchPattern=reliaburger-os_@v+@l-@d.efi \
              reliaburger-os_@v+@l.efi \
              reliaburger-os_@v.efi
-# Writable: systemd-boot renames the file to count down its tries (+3-0,
-# +2-1, ...), which a FAT read-only attribute would stop.
+# Writable: systemd-boot renames the file to count down its tries (+2-0,
+# +1-1, +0-2), which a FAT read-only attribute would stop.
 Mode=0644
-TriesLeft=3
+TriesLeft=2
 TriesDone=0
 InstancesMax=2

@@ -197,13 +197,16 @@ bench-task-arrays: ## Run in-process task-array benchmarks (leader cost, pool ov
 # listing leaves is deleted before the run. One report call writes the lcov
 # file and then checks the floor: each call merges every profile and reads
 # every binary's coverage map again, about two minutes on CI (plan
-# 2026-11-06, F3). scripts/ci/coverage_owner.py pins this recipe, so CI's
+# 2026-11-06, F3). The run takes eight test threads, twice a hosted runner's
+# four vCPUs: most tests wait on timers, sockets and child processes, and at
+# four the runner's load stayed at 2 to 5 (#1723). Heavy tests keep their
+# nextest test groups. scripts/ci/coverage_owner.py pins this recipe, so CI's
 # evidence owner runs exactly these stages.
 coverage: ## Run the portable suite once under line coverage, write the lcov report and enforce the floor
 	$(CARGO) llvm-cov clean --workspace
 	$(CARGO) llvm-cov --no-report test --lib -- --list
 	$(CARGO) llvm-cov clean --profraw-only
-	$(CARGO) llvm-cov --no-report nextest --profile $(NEXTEST_PROFILE) --no-tests=fail
+	$(CARGO) llvm-cov --no-report nextest --profile $(NEXTEST_PROFILE) --no-tests=fail --test-threads=8
 	mkdir -p target/coverage
 	$(COVERAGE_REPORT) --lcov --output-path target/coverage/lcov.info --fail-under-lines $(COVERAGE_MIN_LINES)
 

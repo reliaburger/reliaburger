@@ -82,7 +82,9 @@ pub struct StaticCapabilities {
     /// with cgroup v2. Off elsewhere, which is why those faults refuse
     /// rather than pretend on macOS.
     pub cgroup_faults: bool,
-    /// A dedicated, bounded node-pressure helper can run on this node.
+    /// A dedicated, bounded node-pressure helper could run on this node at
+    /// startup. A fresh [`CapabilityObservations::node_pressure`] overrides
+    /// it, because the host can enable the controllers later (#2242).
     pub node_pressure: bool,
     /// Registry image policy requires trusted signatures.
     pub registry_signatures_required: bool,
@@ -130,6 +132,9 @@ pub struct CapabilityObservations {
     pub cluster_id: Option<String>,
     /// Fresh council quorum decision. `None` means no conclusive observation.
     pub council_quorum: Option<bool>,
+    /// A fresh node-pressure probe: `Ok` when a helper can run now, or why
+    /// not. `None` falls back to the startup result.
+    pub node_pressure: Option<Result<(), String>>,
 }
 
 /// Whether fresh evidence proves a capability usable or unusable.
@@ -443,8 +448,19 @@ impl ClusterCapabilities {
             process_workloads: statics.process_workloads,
             test_policy: statics.test_policy.clone(),
         };
-        report.capabilities =
-            report.build_capability_evidence(statics, wired, observations.council_quorum);
+        let node_pressure = observations
+            .node_pressure
+            .unwrap_or(if statics.node_pressure {
+                Ok(())
+            } else {
+                Err("the startup probe failed".to_string())
+            });
+        report.capabilities = report.build_capability_evidence(
+            statics,
+            wired,
+            observations.council_quorum,
+            node_pressure,
+        );
         report
     }
 
@@ -453,6 +469,7 @@ impl ClusterCapabilities {
         statics: &StaticCapabilities,
         wired: &WiredSubsystems,
         council_quorum: Option<bool>,
+        node_pressure: Result<(), String>,
     ) -> Vec<CapabilityEvidence> {
         let mut evidence = Vec::new();
         let mut add = |capability: Capability, state: CapabilityState, detail: String| {
@@ -745,15 +762,17 @@ impl ClusterCapabilities {
         );
         add(
             Capability::NodePressure,
-            known(statics.node_pressure),
-            if statics.node_pressure {
-                format!(
+            known(node_pressure.is_ok()),
+            match node_pressure {
+                Ok(()) => format!(
                     "dedicated cgroup helper; CPU ceiling {}%, memory target ceiling {}%",
                     statics.test_policy.max_node_pressure_cpu_percent,
                     statics.test_policy.max_node_pressure_memory_percent
-                )
-            } else {
-                "requires rootful Linux cgroup v2 and non-zero server pressure ceilings".to_string()
+                ),
+                Err(reason) => format!(
+                    "requires rootful Linux cgroup v2 and non-zero server pressure ceilings: \
+                     {reason}"
+                ),
             },
         );
 
@@ -1211,6 +1230,47 @@ mod tests {
         assert_eq!(
             capabilities.state(Capability::NodePressure),
             CapabilityState::Unavailable
+        );
+    }
+
+    /// #2242: the startup probe failed, but the controllers came on later.
+    /// A fresh probe wins, and a failing one says what's missing.
+    #[test]
+    fn fresh_node_pressure_probe_overrides_the_startup_result() {
+        let mut statics = statics();
+        statics.node_pressure = false;
+        let observed = |probe: Result<(), String>| {
+            ClusterCapabilities::derive_with_observations(
+                &statics,
+                &WiredSubsystems::default(),
+                CapabilityObservations {
+                    node_pressure: Some(probe),
+                    ..CapabilityObservations::default()
+                },
+            )
+        };
+
+        assert_eq!(
+            observed(Ok(())).state(Capability::NodePressure),
+            CapabilityState::Available
+        );
+        let refused = observed(Err("cgroup v2 cpu controller is unavailable".to_string()));
+        assert_eq!(
+            refused.state(Capability::NodePressure),
+            CapabilityState::Unavailable
+        );
+        let evidence = refused
+            .capabilities
+            .iter()
+            .find(|evidence| evidence.capability == Capability::NodePressure)
+            .unwrap();
+        assert!(
+            evidence
+                .details
+                .iter()
+                .any(|detail| detail.contains("cpu controller is unavailable")),
+            "{:?}",
+            evidence.details
         );
     }
 

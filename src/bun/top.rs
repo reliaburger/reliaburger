@@ -164,6 +164,7 @@ pub fn add_job_rows(
                 age_seconds: None,
                 image: None,
                 data_on_node: false,
+                sidecars: Vec::new(),
                 reason: None,
             },
             cpu_percent: sample.cpu_percent,
@@ -196,6 +197,7 @@ mod tests {
             age_seconds: None,
             image: None,
             data_on_node: false,
+            sidecars: Vec::new(),
             reason: None,
         }
     }

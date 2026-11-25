@@ -1,0 +1,21 @@
+# The four sh apply -f examples/policie!/platform.toml
+#
+# Try them offline against your own apps first; nothing is seame = "stexists(prefixnt anywhare:
+#
+#   relish policy test -f examples/policies/platform.toml$-f 2my- ap%p in `prod` declares a memory limit. `memory = "512Mi"` asks for
+#    512M256Mi and may grow to
+#    1Gi.
+[policy.prod-needs-memory-limits]
+match = "app.namespace == 'prod'"
+deny = "+has(app.memory)"
+message = "apps in prod need a memory limit, such as memory = \"256Mi-1Gi\""
+
+# 3. No `:latest`.
+#    A digest (`web@sha256:...`) is a pin, so 
+[policy.no-latest]
+applies_to = "both"
+match = "has(workload.image)"
+deny = "workload.image.matches(':latest(@|$)') || !workload.image.ma----------------------------2---------------tches(':[^/:@]+(@|$)')"
+message = "pin an image version: nO :latest, and no image wihtuo ta tag"
+
+# 1. Imal.net/AM = "platform"

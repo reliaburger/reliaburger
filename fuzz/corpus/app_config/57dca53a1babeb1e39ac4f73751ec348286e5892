@@ -1,0 +1,7 @@
+# The f:...`) il`as apps.
+[policy.no-latest]
+applies_to = "both"
+match = "has(workload.image)"
+deny = "workload.image.mat.image.matc(es(%:[^6666666666666666666666666666666666666666666666666/:@]+(@|$)on: no :late.image.matc(es(':[/:^@]+(@|$)a# Real contgematc(es(':[/:^@]+(?|$)a)!ilVasg"
+
+# 4.api* Imaback unt0lsi

@@ -199,6 +199,10 @@ impl LogFiles {
         }
         if let Some(file) = self.open.get_mut(&name) {
             file.write_all(format!("{line}\n").as_bytes()).await?;
+            // tokio's File hands the write to a blocking thread and returns
+            // before it lands; flush waits for it, so a line that has
+            // printed is in the file too.
+            file.flush().await?;
         }
         Ok(())
     }

@@ -122,6 +122,68 @@ async fn only_an_admin_writes_a_policy() {
     );
 }
 
+/// A policy table needs an admin before its expressions are compiled: a
+/// deployer, scoped or not, gets the same refusal for a broken or deeply
+/// nested policy as for a good one, never the compiler's 400.
+#[tokio::test]
+async fn a_deployers_policy_is_refused_before_it_is_compiled() {
+    let council = seeded_council("policy-admin-before-compile").await;
+    let (admin_token, admin) = named_user_token("operator", ApiRole::Admin);
+    let (deployer_token, deployer) = named_user_token("ci", ApiRole::Deployer);
+    let scoped = crate::sesame::token::create_token(
+        "controller",
+        ApiRole::Deployer,
+        crate::sesame::types::TokenScope {
+            apps: None,
+            namespaces: Some(vec!["team-a".to_string()]),
+        },
+        None,
+    )
+    .unwrap();
+    let (app, _shutdown) = setup_with_auth_leases_events_and_council(
+        vec![admin_token, deployer_token, scoped.token],
+        None,
+        crate::bun::readiness::ReadinessTracker::new(),
+        crate::bun::capabilities::StaticCapabilities::default(),
+        None,
+        None,
+        Some(Arc::clone(&council)),
+    )
+    .await;
+    let call = |bearer: String, body: String| {
+        let app = app.clone();
+        async move {
+            let request = axum::http::Request::post("/v1/apply")
+                .header("authorization", format!("Bearer {bearer}"))
+                .extension(axum::extract::ConnectInfo(
+                    "203.0.113.9:40000".parse::<std::net::SocketAddr>().unwrap(),
+                ))
+                .body(Body::from(body))
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+    };
+    let invalid = "[policy.rule]\ndeny = \"permission.actions == []\"\n".to_string();
+    let deep = format!("[policy.rule]\ndeny = '''{}'''\n", "{".repeat(200));
+
+    // Compiled, either would be a 400 naming the expression.
+    for broken in [&invalid, &deep] {
+        let (status, body) = call(admin.clone(), broken.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+    for bearer in [&deployer, &scoped.plaintext] {
+        let refusal = call(bearer.clone(), NO_LATEST.to_string()).await;
+        assert_eq!(refusal.0, StatusCode::FORBIDDEN, "{}", refusal.1);
+        for broken in [&invalid, &deep] {
+            assert_eq!(call(bearer.clone(), broken.clone()).await, refusal);
+        }
+    }
+    assert!(council.desired_state().await.policies.is_empty());
+}
+
 /// A denied apply answers 422 naming the policy, writes nothing, and is
 /// audited as `policy.denied`.
 #[tokio::test]
@@ -620,4 +682,117 @@ async fn the_audit_shows_a_scoped_token_only_its_own_namespaces() {
     let audit: crate::policy::audit::PolicyAudit = serde_json::from_str(&body).unwrap();
     assert_eq!((audit.apps, audit.jobs), (2, 1), "{body}");
     assert_eq!(audit.verdict.denials.len(), 3, "{body}");
+}
+
+/// Submit `definition` as job `nightly` in `default` through `/v1/jobs/runs`.
+async fn submit_nightly(cluster: &Cluster, definition: &str, request_id: Option<&str>) {
+    let request_id = request_id.map_or(String::new(), |id| format!(r#","request_id":"{id}""#));
+    let (status, body) = cluster
+        .call(
+            "/v1/jobs/runs",
+            &cluster.admin,
+            &format!(r#"{{"name":"nightly","namespace":"default","definition":{definition}{request_id}}}"#),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+}
+
+/// The audit's denials, as the CLI prints them.
+fn denials(audit: &crate::policy::audit::PolicyAudit) -> Vec<String> {
+    audit
+        .verdict
+        .denials
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// #1322: the audit's job path. A scheduled job committed before a jobs
+/// policy is judged from the definition the cluster keeps, with its
+/// schedule put back, so a rule about `job.schedule` sees it.
+#[tokio::test]
+async fn the_audit_judges_a_scheduled_job_from_its_definition() {
+    let cluster = cluster("policy-audit-job").await;
+    submit_nightly(
+        &cluster,
+        r#"{"template":{"image":"report:latest","command":["true"]},"cron":{"expression":"0 3 * * *"}}"#,
+        None,
+    )
+    .await;
+    let (status, body) = cluster
+        .call(
+            "/v1/apply",
+            &cluster.admin,
+            "[policy.pinned-nightly]\napplies_to = 'jobs'\n\
+             deny = \"job.image.endsWith(':latest') && job.schedule == '0 3 * * *'\"\n\
+             message = 'pin a version'\n",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = cluster.get("/v1/policies/audit", &cluster.deployer).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let audit: crate::policy::audit::PolicyAudit = serde_json::from_str(&body).unwrap();
+    assert_eq!((audit.apps, audit.jobs), (0, 1), "{body}");
+    assert_eq!(
+        denials(&audit),
+        vec!["policy pinned-nightly denies job default/nightly: pin a version".to_string()]
+    );
+}
+
+/// #1322: the cluster keeps no declared spec for a job, so a job pinned by
+/// tag and digest is judged by its tag, as a bound tag would be. This pins
+/// that limitation until the cluster keeps a declared job spec.
+#[tokio::test]
+async fn the_audit_judges_a_job_pinned_by_tag_and_digest_by_its_tag() {
+    let cluster = cluster("policy-audit-job-digest").await;
+    let digest = format!("sha256:{}", "a".repeat(64));
+    submit_nightly(
+        &cluster,
+        &format!(
+            r#"{{"template":{{"image":"report:latest@{digest}","command":["true"]}},"cron":{{"expression":"0 3 * * *"}}}}"#
+        ),
+        None,
+    )
+    .await;
+    let (status, body) = cluster
+        .call("/v1/apply", &cluster.admin, &pinned_jobs_policy("deny"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = cluster.get("/v1/policies/audit", &cluster.deployer).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let audit: crate::policy::audit::PolicyAudit = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        denials(&audit),
+        vec!["policy pinned-jobs denies job default/nightly: pin a version".to_string()]
+    );
+}
+
+/// #1322: a one-off job is audited while the cluster keeps its definition,
+/// which it does as long as a run refers to it. Once its last run is
+/// pruned the definition goes and the job won't run again, so there is
+/// nothing left to judge.
+#[tokio::test]
+async fn the_audit_judges_a_one_off_job_while_its_run_is_kept() {
+    let cluster = cluster("policy-audit-one-off").await;
+    submit_nightly(
+        &cluster,
+        r#"{"template":{"image":"report:latest","command":["true"]}}"#,
+        Some("first"),
+    )
+    .await;
+    let (status, body) = cluster
+        .call("/v1/apply", &cluster.admin, &pinned_jobs_policy("deny"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = cluster.get("/v1/policies/audit", &cluster.deployer).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let audit: crate::policy::audit::PolicyAudit = serde_json::from_str(&body).unwrap();
+    assert_eq!(audit.jobs, 1, "{body}");
+    assert_eq!(
+        denials(&audit),
+        vec!["policy pinned-jobs denies job default/nightly: pin a version".to_string()]
+    );
 }

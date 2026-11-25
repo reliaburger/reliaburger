@@ -50,7 +50,8 @@ STUBS = {
           'case "$*" in\n'
           '  *"route get"*) [ -n "${NO_ROUTE:-}" ] && exit 2\n'
           '                 echo "$ROUTE" ;;\n'
-          '  *"neigh show"*) echo "127.0.0.1 dev lo lladdr 3c:22:fb:00:00:01 REACHABLE" ;;\n'
+          '  *"neigh show"*) [ -n "${NO_NEIGHBOUR:-}" ] && exit 0\n'
+          '                 echo "127.0.0.1 dev lo lladdr 3c:22:fb:00:00:01 REACHABLE" ;;\n'
           "esac\n",
     "modprobe": 'echo "modprobe $*" >> "$STUB_DIR/calls"\n'
                 '[ "$1" = netconsole ] && [ -n "${NO_NETCONSOLE:-}" ] && exit 1\n'
@@ -146,6 +147,19 @@ class NetlogScript(unittest.TestCase):
     def test_without_a_target_nothing_streams_and_the_boot_goes_on(self):
         run = self.run_netlog()
         self.assert_not_streaming(run, "no reliaburger.netlog= and no netlog.conf")
+
+    def test_a_retarget_with_no_neighbour_answer_falls_back_to_broadcast(self):
+        # `relish os boot-logs --to` restarts this unit with a new target
+        # (#2255), and the configfs target outlives the restart. If the new
+        # next hop doesn't answer ARP in time, the old hop's MAC must not
+        # stay: netconsole would send every line to the wrong machine.
+        self.write_conf(f"target=127.0.0.1:{self.port}\n")
+        first = self.run_netlog()
+        self.assertEqual(first.target("remote_mac"), "3c:22:fb:00:00:01")
+        again = self.run_netlog(NO_NEIGHBOUR="1")
+        self.assertEqual(again.result.returncode, 0, again.result.stdout + again.result.stderr)
+        self.assertEqual(again.target("remote_mac"), "ff:ff:ff:ff:ff:ff")
+        self.assertEqual(again.target("enabled"), "1")
 
     def test_a_target_in_netlog_conf_starts_netconsole_and_sends_the_kernel_log_once(self):
         self.write_conf(f"# relish netboot --stream-logs\ntarget=127.0.0.1:{self.port}\n")
@@ -281,8 +295,13 @@ class NetlogUnits(unittest.TestCase):
         service = unit(UNITS / "reliaburger-netlog.service")
         self.assertIn("network-online.target", words(service["Unit"], "After"))
         for forwarded in ("reliaburger-seed.service", "reliaburger-time-wait.service",
-                          "reliaburger.service", "reliaburger-boot-check.service"):
+                          "reliaburger.service"):
             self.assertIn(forwarded, words(service["Unit"], "Before"))
+        # Not before the boot check: that would make the check wait for the
+        # network after all (#2245). The check's lines still reach the
+        # console and the journal, and its result goes out over netconsole
+        # once streaming starts.
+        self.assertNotIn("reliaburger-boot-check.service", words(service["Unit"], "Before"))
         self.assertEqual(service["Service"]["ExecStart"], ["-/usr/lib/reliaburger/netlog"])
         self.assertEqual(
             sorted(words(service["Service"], "UnsetEnvironment")),

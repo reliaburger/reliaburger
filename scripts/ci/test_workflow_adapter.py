@@ -215,7 +215,9 @@ class WorkflowAdapter(unittest.TestCase):
 
     def test_only_a_pull_request_may_qualify_without_every_owner(self):
         # Pushes to a train or main, merge-queue groups and manual runs
-        # always demand the full set, whatever select jobs said.
+        # always demand the full set, whatever select jobs said. A merge
+        # group may leave out only portable macOS, with every heavy owner
+        # (train-full, below), never with the light or portable set.
         for event in ['push', 'merge_group', 'schedule', 'workflow_dispatch']:
             for macos in ['true', 'false']:
                 with self.subTest(event=event, macos=macos):
@@ -309,11 +311,11 @@ class WorkflowAdapter(unittest.TestCase):
         with self.assertRaises(c.Invalid):
             self.aggregate_heavy([])
 
-    def test_push_and_merge_queue_still_demand_the_macos_owners(self):
-        # Only a pull request may leave the macOS shards out: the train push,
-        # the merge queue, schedules and manual runs need every owner.
+    def test_push_schedule_and_manual_runs_still_demand_the_macos_owners(self):
+        # A pull request and the merge queue may leave the macOS shards out;
+        # the train push, schedules and manual runs need every owner.
         legacy = self.heavy_owners(macos='false')
-        for event in ['push', 'merge_group', 'schedule', 'workflow_dispatch']:
+        for event in ['push', 'schedule', 'workflow_dispatch']:
             with self.subTest(event=event), self.assertRaisesRegex(c.Invalid, 'every owner'):
                 self.aggregate_heavy(legacy, event=event)
         # Claiming macOS ran without its shards' sealed outputs fails too.
@@ -323,6 +325,18 @@ class WorkflowAdapter(unittest.TestCase):
             with self.subTest(event=event, macos='claimed'), \
                     self.assertRaisesRegex(c.Invalid, 'missing successful owner step output'):
                 self.aggregate_heavy(legacy, event=event)
+
+    def test_the_merge_queue_qualifies_with_every_heavy_owner_but_not_macos(self):
+        # Portable macOS left the merge queue (maintainer decision of 24
+        # November 2026); macos-nightly.yml runs it on the newest train.
+        legacy = self.heavy_owners(macos='false')
+        verified = self.aggregate_heavy(legacy, event='merge_group')
+        self.assertEqual(set(verified), {(gate, self.manifest['gates'][gate]['hosts'][0])
+                                         for gate in self.a.w.OWNERS if gate != 'portable-darwin'})
+        # A missing heavy owner still fails the group.
+        self.needs['acceptance']['result'] = 'skipped'
+        with self.assertRaises(c.Invalid):
+            self.aggregate_heavy(legacy, event='merge_group')
 
     def test_the_release_gate_pull_request_passes_with_every_owner(self):
         legacy = self.heavy_owners(macos='true')

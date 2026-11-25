@@ -1,0 +1,29 @@
+---
+source: src/appliance/console/view.rs
+expression: "console(&healthy_state(Tab::Workloads))"
+---
+ Reliaburger OS 2026.47.228 | node-1 | cluster home                 bun running
+  1 Status   2 Metrics  [3 Workloads]  4 Cluster   5 Versions   6 Logs
+┌ 3 Workloads ─────────────────────────────────────────────────────────────────┐
+│INSTANCE                  NAMESPACE     STATE      RESTARTS    CPU     MEMORY │
+│web-0                     default       running           0   1.5%   48.0 MiB │
+│worker-1                  default       unhealthy         4  92.0%  700.0 MiB │
+│burger-0                  default       pending           0      -          - │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+ 1-6 or <- -> tabs   up/down scroll   read-only: no login here     15:06:40 UTC

@@ -26,6 +26,7 @@
 pub mod audit;
 mod check;
 mod defaults;
+mod nesting;
 mod proposal;
 pub mod report;
 
@@ -41,9 +42,9 @@ use crate::sesame::types::ApiRole;
 
 pub use check::{
     APP_FIELDS, AUTHOR_FIELDS, CALLER_FIELDS, JOB_FIELDS, MAX_COLLECTION_ENTRIES,
-    MAX_COMPREHENSION_NESTING, MAX_DEFAULT_BYTES, MAX_EXPRESSION_BYTES, MAX_MESSAGE_BYTES,
-    POLICY_VARIABLES, PROPOSAL_FIELDS, PolicyError, PolicyField, UNFILLABLE_FIELDS,
-    WORKLOAD_FIELDS, app_fields, check_policy, workload_variables,
+    MAX_COMPREHENSION_NESTING, MAX_DEFAULT_BYTES, MAX_EXPRESSION_BYTES, MAX_EXPRESSION_NESTING,
+    MAX_MESSAGE_BYTES, POLICY_VARIABLES, PROPOSAL_FIELDS, PolicyError, PolicyField,
+    UNFILLABLE_FIELDS, WORKLOAD_FIELDS, app_fields, check_policy, workload_variables,
 };
 pub use defaults::Filled;
 pub use proposal::{

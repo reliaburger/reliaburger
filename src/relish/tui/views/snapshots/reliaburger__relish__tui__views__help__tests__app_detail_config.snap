@@ -9,18 +9,18 @@ expression: "render_to_string(&app, 120, 40)"
 │ Overview  │  Instances  │  Logs  │  Metrics  │  Deploys  │ [Config]                                                  │
 │←/→ or Tab: switch tabs                                                                                               │
 │                                                                                                                      │
-│full resolved config is not exposed by the API                                                                        │
-│instances      2                                                                                                      │
-│host ports     [8000, 8000]                                                                                           │
+│owner          -                                                                                                      │
+│gitops         no                                                                                                     │
+│redacted       1 value(s): env values, config file contents and secrets in commands                                   │
 │                                                                                                                      │
+│RESOLVED SPEC                                                                                                         │
+│image = "app:v1"                                                                                                      │
+│replicas = 3                                                                                                          │
+│port = 8080                                                                                                           │
+│namespace = "default"                                                                                                 │
 │                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
+│[env]                                                                                                                 │
+│DATABASE_URL = "[redacted]"                                                                                           │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │

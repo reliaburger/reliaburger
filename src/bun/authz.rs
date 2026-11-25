@@ -184,6 +184,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     gated(Post, "/v1/apply", Deployer, Body(DEPLOY)),
     route(Get, "/v1/status", AnyToken),
     route(Get, "/v1/apps", AnyToken),
+    route(Get, "/v1/apps/{app}/{namespace}/spec", AnyToken),
     route(Get, "/v1/readiness", AnyToken),
     route(Get, "/v1/jobs", AnyToken),
     route(Get, "/v1/jobs/definitions", AnyToken),
@@ -1164,15 +1165,26 @@ mod tests {
     /// Events span every tenant and their routes name no app, so the
     /// per-app scan above can't see them. The listing filters each event by
     /// the caller's scope, so a controller reads its own namespace's
-    /// (#1125); the dashboard's live stream refuses a scoped token, which
+    /// (#1125), and it filters each node's answer before the merge
+    /// (#1322); the dashboard's live stream refuses a scoped token, which
     /// it once didn't.
     #[test]
     fn both_event_routes_keep_a_scoped_token_to_its_own_events() {
         let source = include_str!("api.rs");
         let listing = mounted_handler_body(source, "events_handler").expect("events_handler");
         assert!(
-            listing.matches("event_visible").count() >= 2,
-            "events_handler must filter both the listing and the live feed by scope"
+            listing.contains("event_visible"),
+            "events_handler must filter the live feed by scope"
+        );
+        assert!(
+            listing.contains("cluster_recent_events(&state, &query, limit, auth.as_ref())"),
+            "events_handler must hand the caller to the listing"
+        );
+        let merge =
+            mounted_handler_body(source, "cluster_recent_events").expect("cluster_recent_events");
+        assert!(
+            merge.contains("event_visible(auth, event)"),
+            "cluster_recent_events must filter each node's answer by scope"
         );
         let stream = mounted_handler_body(source, "ws_events_handler").expect("ws_events_handler");
         assert!(

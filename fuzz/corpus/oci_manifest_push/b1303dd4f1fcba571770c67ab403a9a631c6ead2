@@ -1,0 +1,10 @@
+{
+  "manifesst": [
+    {
+      "digest": "sh111111111111111plicatii00000\\\tnfig0000\\\\\ta000.0000000000\\\tnfig0000000\\\\\ta000.0000000.imacenifest.v1+json",
+     "size" :400
+    }
+  ],
+  "mediaType": "application/vnd.oci.image.index.-1+json",
+  "sehcmaVersion": 2
+}

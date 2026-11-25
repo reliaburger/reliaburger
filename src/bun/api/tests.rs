@@ -2639,6 +2639,7 @@ const LEADER_ONLY_CALLS: &[(&str, &str, &str)] = &[
     ("POST", "/v1/upgrade/abort", ""),
     ("GET", "/v1/diagnostics/apps", ""),
     ("GET", "/v1/diagnostics/rollouts", ""),
+    ("GET", "/v1/apps/web/default/spec", ""),
     ("POST", "/v1/batch/1/cancel", ""),
     ("GET", "/v1/batch/1/results", ""),
     ("GET", "/v1/batch/1/tasks/0/logs", ""),
@@ -8265,6 +8266,35 @@ async fn apply_invalid_config_returns_400() {
     shutdown.cancel();
 }
 
+/// #2296: the spec read's `[redacted]` placeholder, applied back, would
+/// replace the real value, so the apply endpoint refuses it by name.
+#[tokio::test]
+async fn apply_refuses_the_redaction_placeholder_as_a_value() {
+    let (app, shutdown) = test_setup();
+
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/apply")
+                .body(Body::from(
+                    "[app.web]\nimage = \"web:v1\"\n[app.web.env]\nDB_PASSWORD = \"[redacted]\"\n",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        body.contains("app web: env DB_PASSWORD is the redaction placeholder"),
+        "{body}"
+    );
+    shutdown.cancel();
+}
+
 #[tokio::test]
 async fn cluster_status_refuses_to_report_success_when_a_member_is_unreachable() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -12543,6 +12573,35 @@ async fn a_follower_forwards_the_rollouts_read_to_the_leader() {
     }
 }
 
+/// #2302: a 0.3.2 leader doesn't serve the rollouts read and answers 404.
+/// A follower passes the 404 on, saying why, so relish sees what it would
+/// see asking the old node itself, not a 503 that fails the whole look.
+#[tokio::test]
+async fn a_follower_passes_on_its_leaders_rollouts_404() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let leader_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let leader_port = leader_listener.local_addr().unwrap().port();
+    // An old release's router: no rollouts route, so axum's empty 404.
+    let leader = axum::Router::new();
+    tokio::spawn(async move { axum::serve(leader_listener, leader).await.unwrap() });
+    let (follower, nodes) = follower_of_the_leader_api_on(admin, None, leader_port).await;
+
+    let (status, reply) = send_bounded(
+        follower,
+        "GET",
+        "/v1/diagnostics/rollouts",
+        &admin_key,
+        "",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{reply}");
+    assert!(reply.contains("may run an older release"), "{reply}");
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
 /// #2240: a node with no council has no rollouts to report: an empty list,
 /// so `relish apply --wait` goes by the instance count.
 #[tokio::test]
@@ -12561,4 +12620,74 @@ async fn a_node_without_a_council_reports_no_rollouts() {
     let (status, rollouts) = get_rollouts(&app, &admin_key).await;
     assert_eq!(status, StatusCode::OK);
     assert!(rollouts.is_empty());
+}
+
+/// A follower of a stub leader whose API is `leader`, and an admin's key.
+async fn follower_of_a_stub_leader(
+    leader: Router,
+) -> (Router, String, Vec<Arc<crate::council::CouncilNode>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, leader).await.unwrap() });
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (follower, nodes) = follower_of_the_leader_api_on(admin, None, port).await;
+    (follower, admin_key, nodes)
+}
+
+/// #1322: a leader that doesn't serve the spec read (an older release
+/// during a rolling upgrade) answers an empty 404. The follower passes the
+/// 404 on and says why, rather than claiming the app doesn't exist.
+#[tokio::test]
+async fn a_follower_says_when_its_leader_does_not_serve_spec_reads() {
+    let (follower, admin_key, nodes) = follower_of_a_stub_leader(Router::new()).await;
+    let (status, reply) = send_bounded(
+        follower,
+        "GET",
+        "/v1/apps/web/default/spec",
+        &admin_key,
+        "",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{reply}");
+    assert!(
+        reply.contains("the leader doesn't serve spec reads; it may run an older release"),
+        "{reply}"
+    );
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// #1322: a leader that has no such app answers a 404 with a reason, and
+/// the follower passes the 404 on.
+#[tokio::test]
+async fn a_follower_passes_on_its_leaders_spec_read_404() {
+    let leader = Router::new().route(
+        "/v1/apps/{app}/{namespace}/spec",
+        axum::routing::get(|| async {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "no app \"web\" in namespace \"default\"" })),
+            )
+        }),
+    );
+    let (follower, admin_key, nodes) = follower_of_a_stub_leader(leader).await;
+    let (status, reply) = send_bounded(
+        follower,
+        "GET",
+        "/v1/apps/web/default/spec",
+        &admin_key,
+        "",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{reply}");
+    assert!(
+        reply.contains(r#"no app \"web\" in namespace \"default\""#),
+        "{reply}"
+    );
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
 }

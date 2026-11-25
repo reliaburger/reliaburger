@@ -3,15 +3,12 @@
 //! Parser unit tests are useful, but they cannot catch broken exit codes,
 //! stdout/stderr routing, or a binary that was wired to the wrong handler.
 
+use crate::isolated_relish::relish_command;
 use std::process::{Command, Output};
 
 fn run(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_relish"))
-        .args(args)
-        .env_remove("RELIABURGER_TOKEN")
-        .env_remove("RELIABURGER_CA_CERT")
-        .output()
-        .unwrap()
+    let home = tempfile::tempdir().unwrap();
+    relish_command(home.path()).args(args).output().unwrap()
 }
 
 #[test]
@@ -31,11 +28,9 @@ fn version_reports_the_compiled_binary() {
 /// stdout. Gives up after 20 s, so a reader that hangs fails the test
 /// instead of the run.
 fn run_without_a_terminal(args: &[&str]) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_relish"))
+    let home = tempfile::tempdir().unwrap();
+    let mut child = relish_command(home.path())
         .args(args)
-        .env_remove("RELIABURGER_TOKEN")
-        .env_remove("RELIABURGER_CA_CERT")
-        .env_remove("RELIABURGER_ENDPOINT")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -98,12 +93,10 @@ script = "exec true"
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_relish"))
+    let output = relish_command(&dir.path().join("home"))
         .arg("apply")
         .arg(&config)
         .arg("--dry-run")
-        .env_remove("RELIABURGER_TOKEN")
-        .env_remove("RELIABURGER_CA_CERT")
         .output()
         .unwrap();
 
@@ -877,12 +870,10 @@ async fn hung_toml_job_times_out() {
 /// Run `relish agent ...` the way an agent's tool runner does: no terminal,
 /// nothing on stdin, no connection settings in the environment.
 fn run_agent(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_relish"))
+    let home = tempfile::tempdir().unwrap();
+    relish_command(home.path())
         .args(args)
         .stdin(std::process::Stdio::null())
-        .env_remove("RELIABURGER_TOKEN")
-        .env_remove("RELIABURGER_CA_CERT")
-        .env_remove("RELIABURGER_ENDPOINT")
         .env_remove("TERM")
         .output()
         .unwrap()

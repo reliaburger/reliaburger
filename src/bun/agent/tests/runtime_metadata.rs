@@ -39,6 +39,31 @@ async fn instance_ids(tx: &mpsc::Sender<AgentCommand>) -> Vec<InstanceId> {
     ids
 }
 
+/// Wait until none of `old` is listed any more, and return what is.
+///
+/// A rollout reports complete once its replacements run, but an old instance
+/// whose cleanup outlasts the turn stays listed, stopped, until a later turn
+/// retires it (`defer_retirement`). On a loaded host that's the usual case
+/// (#1723).
+async fn wait_until_replaced(
+    tx: &mpsc::Sender<AgentCommand>,
+    old: &[InstanceId],
+    strategy: &str,
+) -> Vec<InstanceId> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let ids = instance_ids(tx).await;
+        if old.iter().all(|id| !ids.contains(id)) {
+            return ids;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{strategy}: the replaced instances are still listed: {ids:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 async fn send_retire(tx: &mpsc::Sender<AgentCommand>, app_name: &str) -> Result<(), BunError> {
     let (response, reply) = oneshot::channel();
     tx.send(AgentCommand::Retire {
@@ -136,11 +161,7 @@ async fn a_rollout_forgets_the_instances_it_replaced_but_not_their_replacements(
         ))
         .unwrap();
         expect_complete(&send_deploy(&tx, config).await);
-        let new = instance_ids(&tx).await;
-        assert!(
-            old.iter().all(|id| !new.contains(id)),
-            "{strategy}: {new:?}"
-        );
+        let new = wait_until_replaced(&tx, &old, strategy).await;
 
         wait_until_forgotten(&grill, &old).await;
         assert!(

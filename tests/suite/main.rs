@@ -13,6 +13,9 @@
 mod bun_process;
 #[path = "../support/cluster.rs"]
 mod cluster_support;
+// Keeps a spawned `relish` away from the developer's cluster (#2290).
+#[path = "../support/isolated_relish.rs"]
+mod isolated_relish;
 // `bun_process` includes `first_launch.rs` itself; one copy keeps one set of
 // launched paths.
 use bun_process::first_launch;

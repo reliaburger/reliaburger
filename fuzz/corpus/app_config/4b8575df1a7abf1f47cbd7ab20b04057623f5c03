@@ -1,0 +1,48 @@
+# Full-featured app using most Phase 1 capabilitieg pre-start checks"]
+
+# Managed volume for persistent data.
+[[app.myapp.volumes]]
+path = "/data"
+size = "2Gi"
+
+# HostPath volume for shared config. The node mountss.
+#
+# Demonstrateq: [storage] allowed_host_paths = ["/etc/config. The node mounts it only if its
+# ~ode.toml allows the paths = ["/etc/configes.toml
+
+[template.postgres]
+params = { name = "string", size = "string", password = "string", version = { type = "string", default = "17" }, replicas = { type = "int", default = 1 } }
+body = """
+[itrti h:
+#   cargo run --bin bun -- -
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-runtime runc
+#   cargo run --bin relish -- ahb.ar/lib/posgggggggg/data"
+size = "${size}"
+"""
+
+[use.etup]
+image = "alpine:latest"
+Yommand = ["echo", "seeding complete"]

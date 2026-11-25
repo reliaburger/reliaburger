@@ -445,10 +445,11 @@ def aggregate(root, manifest_path, incoming, context, needs, bindings_path=None,
     """Waited job results and trusted output hashes authorize artifact consumption.
 
     `event` is the workflow's own event name. Only a pull request may qualify
-    with fewer than every owner (`light`, `portable` or `train-full`); the
-    command line always passes it. `release_gate` is true for a pull request
-    labelled `release-gate`, which needs every owner too, macOS included
-    (#1443).
+    with fewer than every owner (`light`, `portable` or `train-full`), and a
+    merge group with every owner but portable macOS (`train-full`, maintainer
+    decision of 24 November 2026); the command line always passes it.
+    `release_gate` is true for a pull request labelled `release-gate`, which
+    needs every owner, macOS included (#1443).
     """
     root, incoming = Path(root), Path(incoming)
     manifest = c.inventory(c.read_json(manifest_path), root)
@@ -456,8 +457,9 @@ def aggregate(root, manifest_path, incoming, context, needs, bindings_path=None,
     selection = w.selected_workflow(context, code=changes.get('code'), heavy=changes.get('heavy'),
                                     macos=changes.get('macos'))
     c.require(selection is not None, 'no selected code qualification')
-    c.require(event in (None, 'pull_request') or selection['mode'] == 'full',
-              'only a pull request may qualify without every owner')
+    c.require(event in (None, 'pull_request') or selection['mode'] == 'full'
+              or (event == 'merge_group' and selection['mode'] == 'train-full'),
+              'only a pull request may qualify without every owner, or a merge group without macOS')
     c.require(not release_gate or selection['mode'] == 'full',
               'the release gate pull request needs every owner, macOS included')
     w.job_results(selection, needs)

@@ -1225,6 +1225,12 @@ impl RuncGrill {
                 runtime.owned_rootless_network(&context, pid).await?;
                 return Ok(true);
             }
+            // A sidecar lives in its parent's namespace and holds no address
+            // of its own (#1120), so there's no network of its own to adopt:
+            // its parent's adoption restores the one it shares (#1315).
+            if intent.spec.joined_network().is_some() {
+                return Ok(true);
+            }
             let index = runtime
                 .network_leases
                 .lookup(&id, runtime.node_index)

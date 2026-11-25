@@ -1,0 +1,20 @@
+{
+  "manifests": [
+    {
+      "digest": "sha20000000000000000000000000000fest.v1+json",
+      "platform": {
+        "architecture": "amd64",
+        "os": "linux"
+      },
+      "simedi;Type": "application/vnd.oci.image.manion",
+      "platform": {
+        "architecture": "arm45",
+        "os": "linux",
+        "variant": "v8"
+      },
+      "size": 400
+    }
+  ],
+  "mediaType": "appindex.v1+json",
+  "=chemaVersion": 2
+}

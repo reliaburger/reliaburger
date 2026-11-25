@@ -1,0 +1,5 @@
+#&The four sh apply -f examples/polic
+# exiu test (tests/cluster_failover.rs) applies t. `meer.rs) a0plgrow to
+#    1Gi.
+[policy.prod-needs-memory-limits]
+match = "app[[[[[[[[[[[[[[[[W[[[[[[[[T[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[777777777777777777777777777777777777777.77[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[U[[[[[[[[+.name]space == 'pplatform"

@@ -1824,6 +1824,19 @@ impl BunClient {
         self.get_typed_json("/v1/diagnostics/rollouts").await
     }
 
+    /// Fetch one app's spec as the cluster holds it, with its secrets left
+    /// out (`GET /v1/apps/{app}/{namespace}/spec`, #1322).
+    pub async fn app_spec(
+        &self,
+        app: &str,
+        namespace: &str,
+    ) -> Result<crate::bun::spec_read::AppSpecView, RelishError> {
+        let app = checked_name(NameKind::App, app)?;
+        let namespace = checked_name(NameKind::Namespace, namespace)?;
+        self.get_typed_json(&format!("/v1/apps/{app}/{namespace}/spec"))
+            .await
+    }
+
     /// Fetch desired application replicas and current scheduler coverage.
     pub async fn desired_apps(
         &self,
@@ -2933,6 +2946,12 @@ impl BunClient {
             status: 0,
             body: format!("failed to parse response: {e}"),
         })
+    }
+
+    /// The answering node's own workloads with their latest CPU and memory
+    /// samples (`GET /v1/top`), for the appliance console's Workloads tab.
+    pub async fn node_top(&self) -> Result<Vec<crate::bun::top::TopRow>, RelishError> {
+        self.get_typed_json("/v1/top").await
     }
 
     /// Every node's workloads with their latest CPU and memory samples.

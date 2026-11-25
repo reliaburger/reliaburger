@@ -1,0 +1,1 @@
+{"compatibility":{"protocol":61,"state":76},"sender_recovery_epochid":null,"request":{"InstallSnapshot":{"vote":{"leader_id":{"term":0,"node_id":7},"committed":true},"meta":{"last_log_id":{"leader_id":{"term":0,"node_id":7},"index":2},"last_membership":{"log_id":null,"membership":{"configs":[],"nodes":{}}},"snapshot_id":"1-7-2"},"offset":0,"data":[12e3,125],"doneﬁÀeru}t}}

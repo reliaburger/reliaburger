@@ -19,6 +19,7 @@ const DEVCONTAINER: &str = ".devcontainer/devcontainer.json";
 const CI: &str = ".github/workflows/ci.yml";
 const MUTANTS: &str = ".github/workflows/mutants.yml";
 const COPILOT: &str = ".github/workflows/copilot-setup-steps.yml";
+const MACOS_NIGHTLY: &str = ".github/workflows/macos-nightly.yml";
 
 /// The default of `ARG <name>=<value>` in the devcontainer's Dockerfile.
 fn dockerfile_arg(name: &str) -> String {
@@ -128,6 +129,56 @@ fn the_devcontainer_builds_with_the_rust_ci_tests_with() {
             "{DOCKERFILE}'s RUST_VERSION must match ci.yml's {name} job"
         );
     }
+}
+
+#[test]
+fn the_macos_nightly_tests_with_ci_s_macos_toolchain() {
+    // The merge queue left portable macOS to this nightly (24 November
+    // 2026), so it must test the way ci.yml's job does: same Rust, same
+    // nextest, same runner, same commands.
+    let ci = workflow(CI);
+    let ci_macos = job(&ci, "macos");
+    let nightly = workflow(MACOS_NIGHTLY);
+    let nightly_macos = job(&nightly, "macos");
+    assert_eq!(rust_version(nightly_macos), rust_version(ci_macos));
+    assert_eq!(
+        installed_tools(nightly_macos).get("cargo-nextest"),
+        Some(&nextest_pin())
+    );
+    assert_eq!(nightly_macos["runs-on"], ci_macos["runs-on"]);
+    let commands: Vec<&str> = steps(nightly_macos)
+        .iter()
+        .filter_map(|step| step["run"].as_str())
+        .collect();
+    for command in [
+        "make lint-macos",
+        "make test-macos",
+        "cargo test --locked --doc -- relish::",
+    ] {
+        assert!(
+            commands.contains(&command),
+            "{MACOS_NIGHTLY} runs {command:?}: {commands:?}"
+        );
+    }
+    assert_eq!(
+        nightly["env"]["NEXTEST_PROFILE"],
+        ci["env"]["NEXTEST_PROFILE"]
+    );
+    // Nightly and by hand, on the newest train, never on a pull request.
+    let on = &nightly["on"];
+    assert!(on.get("pull_request").is_none(), "{on:#}");
+    assert!(on.get("workflow_dispatch").is_some(), "{on:#}");
+    let cron = on["schedule"][0]["cron"].as_str().unwrap();
+    assert!(cron.ends_with(" * * *"), "every night: {cron}");
+    let choose = steps(nightly_macos)
+        .iter()
+        .find(|step| step["name"] == "Choose what to test")
+        .and_then(|step| step["run"].as_str())
+        .unwrap();
+    assert!(
+        choose.contains("origin/release-*") && choose.contains("sort -V"),
+        "the nightly tests the newest train: {choose}"
+    );
 }
 
 #[test]

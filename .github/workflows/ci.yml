@@ -15,11 +15,16 @@ on:
     # PR into a train, everything but portable macOS). closed starts a
     # no-op run in the PR's concurrency group, which cancels the run still
     # working on the closed (or merged) PR; every other job skips it.
-    types: [opened, synchronize, reopened, labeled, closed]
+    # A draft runs only the cheap set (lint, CI policy, select jobs), so
+    # converted_to_draft cancels a run already going, and ready_for_review
+    # starts the full set.
+    types: [opened, synchronize, reopened, labeled, closed, ready_for_review, converted_to_draft]
   merge_group:
     # The merge queue on release-* tests each batch, merged onto the train,
-    # with every job before any of it lands. It requires one check:
-    # "ignored-test evidence", which waits for every other job.
+    # with every job but portable macOS before any of it lands (maintainer
+    # decision of 24 November 2026; macos-nightly.yml runs it on the newest
+    # train instead). It requires one check: "ignored-test evidence", which
+    # waits for every other job.
     types: [checks_requested]
   schedule:
     # Nightly full run on main, including the benchmarks.
@@ -96,6 +101,7 @@ jobs:
       s3: ${{ steps.select.outputs.s3 }}
       portable: ${{ steps.select.outputs.portable }}
       tested_by: ${{ steps.select.outputs.tested_by }}
+      lint: ${{ steps.select.outputs.lint }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -132,6 +138,8 @@ jobs:
           # a macos label asks for portable macOS on any PR (#1443).
           RELEASE_GATE: ${{ contains(github.event.pull_request.labels.*.name, 'release-gate') }}
           MACOS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'macos') }}
+          # A draft runs only lint until it's marked ready for review.
+          DRAFT: ${{ github.event.pull_request.draft == true }}
         run: scripts/ci/select-jobs.sh
 
   ci-policy:
@@ -173,10 +181,11 @@ jobs:
 
   lint:
     # Formatting and Clippy report on their own, a few minutes in, instead of
-    # waiting behind the test suite.
+    # waiting behind the test suite. It follows `code`, and is the one Rust
+    # job a draft or a 0-4-0/ pull request runs.
     name: lint
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.lint == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -372,7 +381,10 @@ jobs:
         # (docs/flakes.md). The coverage recipe builds the lib tests alone
         # first, then the rest, so each phase runs at full parallelism and
         # the peak stays one 12 GB rustc (#1723). No cap on build jobs:
-        # one job would also hold each rustc's codegen to one thread.
+        # one job would also hold each rustc's codegen to one thread. The
+        # run takes eight test threads on the runner's four vCPUs, set in
+        # the recipe the owner pins, not here: the owner strips NEXTEST_*
+        # (#1723, docs/testing.md).
         run: |
           choom -n 0 -- python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate portable-linux --host linux --directory target/contracts/linux/portable-linux --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
       - name: Report the coverage run's headroom
@@ -1090,7 +1102,8 @@ jobs:
     # portable suite took a 66-minute median here; relish alone took 31 from
     # a cold cache (#1699). It's one job, not three shards that each compiled
     # the same suite (plan 2026-11-06, F1). scripts/release/ci_reuse.py waits
-    # for this job by name.
+    # for this job by name. The merge queue doesn't run it (select-jobs.sh);
+    # macos-nightly.yml runs the same lint and tests on the newest train.
     name: portable macOS
     needs: changes
     if: needs.changes.outputs.macos == 'true'
