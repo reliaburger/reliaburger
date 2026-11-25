@@ -12,6 +12,8 @@ use std::time::Duration;
 mod bun_process;
 #[path = "support/cluster.rs"]
 mod cluster_support;
+#[path = "support/runc_residue.rs"]
+mod runc_residue;
 #[path = "support/slow_registry.rs"]
 mod slow_registry;
 
@@ -38,6 +40,7 @@ async fn runc_owned_task_arrays_pack_profiles_reuse_slots_and_retire_cancelled_p
     use tokio_util::sync::CancellationToken;
     assert!(nix::unistd::geteuid().is_root());
     let root = tempfile::tempdir().unwrap();
+    let _runc_residue = runc_residue::RuncResidue::new(root.path());
     let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
     let images = ImageStore::new(root.path().join("images"))
         .with_owner_shift(reliaburger::grill::userns::HOST_ID_BASE)
@@ -256,6 +259,7 @@ async fn runc_executor_start_that_misses_its_bound_retries_on_a_fresh_executor()
         .prefix("rb-759-start-")
         .tempdir()
         .unwrap();
+    let _runc_residue = runc_residue::RuncResidue::new(root.path());
     let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
     let images = ImageStore::new(root.path().join("images"))
         .with_owner_shift(reliaburger::grill::userns::HOST_ID_BASE)
@@ -406,6 +410,7 @@ async fn runc_warm_pinned_executor_cold_starts_make_no_registry_requests() {
         .tempdir()
         .unwrap()
         .keep();
+    runc_residue::sweep_stale();
     // Declared before the runtime, so it drops after it: a failed assertion
     // still releases the executors' namespaces for the next runc test.
     let _residue = ExecutorResidue { root: root.clone() };
@@ -543,6 +548,7 @@ impl SlowColdPull {
             .tempdir()
             .unwrap()
             .keep();
+        runc_residue::sweep_stale();
         let residue = ExecutorResidue { root: root.clone() };
         let node = root.join("node-0");
         std::fs::create_dir_all(&node).unwrap();
@@ -734,6 +740,14 @@ async fn runc_delegated_namespace_isolation_and_policy_loss_retire_the_original_
     }
 }
 
+/// How long a delegated task's container may take to start. Alone it starts
+/// in a second or two; in a loaded VM beside a full `make test-linux`, one
+/// runc start alone took more than 20 s (#2267), and a 10 s bound here
+/// failed the test with no fault in it (#2315). The bound only has to catch
+/// a start that never happens.
+#[cfg(feature = "ebpf")]
+const OWNER_START_DEADLINE: Duration = Duration::from_secs(90);
+
 #[cfg(feature = "ebpf")]
 async fn delegated_namespace_isolation_and_policy_loss(isolation: &str) {
     use reliaburger::bun::task_executor::{AttemptOutcome, TaskInvocation, TaskRunner};
@@ -753,6 +767,7 @@ async fn delegated_namespace_isolation_and_policy_loss(isolation: &str) {
         .unwrap()
         .keep();
     let root = root_path.as_path();
+    let _runc_residue = runc_residue::RuncResidue::new(root);
     eprintln!("namespace fixture ({isolation}): {}", root.display());
     let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
     let images = ImageStore::new(root.join("images"))
@@ -869,13 +884,15 @@ async fn delegated_namespace_isolation_and_policy_loss(isolation: &str) {
             runner
                 .run(
                     &sleeping,
-                    Duration::from_secs(30),
+                    // Past the start deadline below, so the task can't time
+                    // out before the loss is injected.
+                    OWNER_START_DEADLINE * 2,
                     &CancellationToken::new(),
                 )
                 .await
         })
     };
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(OWNER_START_DEADLINE, async {
         loop {
             let mut running = false;
             for owner in runtime.launch_inventory().await.unwrap().unwrap() {
@@ -1019,6 +1036,7 @@ async fn runc_fresh_named_job_task_is_bound_to_its_job_and_egress_before_it_runs
         .unwrap()
         .keep();
     let root = root_path.as_path();
+    let _runc_residue = runc_residue::RuncResidue::new(root);
     eprintln!("fresh named job fixture: {}", root.display());
     let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
     let images = ImageStore::new(root.join("images"))
@@ -1226,6 +1244,7 @@ async fn runc_common_job_api_runs_encrypted_singletons_and_gates_hooks_on_accept
         .tempdir()
         .unwrap()
         .keep();
+    let _runc_residue = runc_residue::RuncResidue::new(&root);
     eprintln!("common mixed/reuse API fixture: {}", root.display());
     let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
     let images = ImageStore::new(root.as_path().join("images"))
@@ -1537,6 +1556,7 @@ async fn runc_reusable_commands_keep_the_container_but_retire_task_state_and_idl
         .tempdir()
         .unwrap()
         .keep();
+    let _runc_residue = runc_residue::RuncResidue::new(&root);
     eprintln!("reusable fixture: {}", root.display());
     let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
     let images = ImageStore::new(root.as_path().join("images"))
@@ -1854,6 +1874,7 @@ async fn runc_mixed_runtimes_run_host_and_container_jobs_and_recover_both_origin
         .tempdir()
         .unwrap()
         .keep();
+    let _runc_residue = runc_residue::RuncResidue::new(&root);
     eprintln!("mixed runtime fixture: {}", root.display());
     let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
     let images = ImageStore::new(root.join("images"))
@@ -1987,6 +2008,7 @@ async fn runc_containers_from_a_runc_agent_are_recovered_by_a_mixed_agent() {
         .tempdir()
         .unwrap()
         .keep();
+    let _runc_residue = runc_residue::RuncResidue::new(&root);
     eprintln!("runtime switch fixture: {}", root.display());
     let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
     let images = ImageStore::new(root.join("images"))
@@ -2082,6 +2104,7 @@ async fn runc_array_attempt_can_be_paused_and_resumed() {
         .prefix("rb-704-pause-")
         .tempdir()
         .unwrap();
+    let _runc_residue = runc_residue::RuncResidue::new(root.path());
     let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
     let images = ImageStore::new(root.path().join("images"))
         .with_owner_shift(reliaburger::grill::userns::HOST_ID_BASE)
@@ -2220,6 +2243,7 @@ async fn runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_sec
         .tempdir()
         .unwrap()
         .keep();
+    let _runc_residue = runc_residue::RuncResidue::new(&root);
     eprintln!("admission and revocation fixture: {}", root.display());
     let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
     let images = ImageStore::new(root.join("images"))
@@ -3545,6 +3569,7 @@ async fn runc_shared_arrays_across_namespaces_leave_no_executor_metadata_after_r
         .tempdir()
         .unwrap()
         .keep();
+    let _runc_residue = runc_residue::RuncResidue::new(&root);
     eprintln!("executor metadata fixture: {}", root.display());
     let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
     let images = ImageStore::new(root.join("images"))
@@ -3667,6 +3692,7 @@ async fn runc_shared_profile_reports_cgroup_cpu_and_memory() {
         .prefix("rb-684-usage-")
         .tempdir()
         .unwrap();
+    let _runc_residue = runc_residue::RuncResidue::new(root.path());
     let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
     let images = ImageStore::new(root.path().join("images"))
         .with_owner_shift(reliaburger::grill::userns::HOST_ID_BASE)
@@ -3973,6 +3999,7 @@ async fn leader_loss_mid_array(template: serde_json::Value) {
         .tempdir()
         .unwrap()
         .keep();
+    runc_residue::sweep_stale();
     eprintln!("leader-loss fixture: {}", root.display());
     // Declared before the runtime and nodes, so it drops after them: on a
     // failed assertion as on a pass.

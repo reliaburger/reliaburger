@@ -79,6 +79,14 @@ filter = 'binary(owned_runc) & test(=capacity_contract::runc_ordinary_terminal_r
 test-group = "host-network"
 slow-timeout = { period = "60s", terminate-after = 5 }
 
+# The delegated namespace test starts two task containers, one per
+# isolation mode, and gives each start up to 90 s on a loaded host (#2315).
+# The first matching override wins, so this precedes the host-network one.
+[[profile.default.overrides]]
+filter = 'binary(owned_task_arrays) & test(=runc_delegated_namespace_isolation_and_policy_loss_retire_the_original_owner)'
+test-group = "host-network"
+slow-timeout = { period = "60s", terminate-after = 5 }
+
 [[profile.default.overrides]]
 filter = 'binary(ebpf) | binary(owned_network) | binary(owned_runc) | binary(owned_rootless) | test(/(runc_|_runc|runc::|netns|btrfs|buildah|image_pull)/)'
 test-group = "host-network"
@@ -205,6 +213,12 @@ slow-timeout = { period = "120s", terminate-after = 5 }
 filter = 'binary(autoscale_memory)'
 test-group = "host-network"
 slow-timeout = { period = "120s", terminate-after = 4 }
+
+# The delegated namespace override above (#2315).
+[[profile.ci.overrides]]
+filter = 'binary(owned_task_arrays) & test(=runc_delegated_namespace_isolation_and_policy_loss_retire_the_original_owner)'
+test-group = "host-network"
+slow-timeout = { period = "60s", terminate-after = 5 }
 
 [[profile.ci.overrides]]
 filter = 'binary(ebpf) | binary(owned_network) | binary(owned_runc) | binary(owned_rootless) | test(/(runc_|_runc|runc::|netns|btrfs|buildah|image_pull)/)'

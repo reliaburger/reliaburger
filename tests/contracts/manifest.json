@@ -7930,6 +7930,87 @@
       ]
     },
     {
+      "id": "issue-2315-legacy-oci-owned_runc-runc_a_panicking_test_leaves_no_container_or_network_behind",
+      "issue": 2315,
+      "promise": "Complete the exact retained legacy OCI case through its finite owned driver.",
+      "supported_paths": [
+        "Exact original ignored test identity and declared Make owner."
+      ],
+      "refused_paths": [
+        "No generic aliases or success from another test or owner."
+      ],
+      "boundaries": [
+        "Source binding only; real isolated Linux OCI execution and current receipt are required."
+      ],
+      "cases": [
+        {
+          "id": "legacy-oci-owned_runc-runc_a_panicking_test_leaves_no_container_or_network_behind",
+          "binary": "reliaburger::owned_runc",
+          "test": "runc_a_panicking_test_leaves_no_container_or_network_behind",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/owned_runc.rs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "issue-2315-legacy-oci-owned_runc-runc_a_test_after_an_unguarded_panic_takes_the_same_address",
+      "issue": 2315,
+      "promise": "Complete the exact retained legacy OCI case through its finite owned driver.",
+      "supported_paths": [
+        "Exact original ignored test identity and declared Make owner."
+      ],
+      "refused_paths": [
+        "No generic aliases or success from another test or owner."
+      ],
+      "boundaries": [
+        "Source binding only; real isolated Linux OCI execution and current receipt are required."
+      ],
+      "cases": [
+        {
+          "id": "legacy-oci-owned_runc-runc_a_test_after_an_unguarded_panic_takes_the_same_address",
+          "binary": "reliaburger::owned_runc",
+          "test": "runc_a_test_after_an_unguarded_panic_takes_the_same_address",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/owned_runc.rs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "issue-2315-legacy-oci-owned_runc-runc_a_test_after_a_killed_test_releases_its_root_and_takes_the_same_address",
+      "issue": 2315,
+      "promise": "Complete the exact retained legacy OCI case through its finite owned driver.",
+      "supported_paths": [
+        "Exact original ignored test identity and declared Make owner."
+      ],
+      "refused_paths": [
+        "No generic aliases or success from another test or owner."
+      ],
+      "boundaries": [
+        "Source binding only; real isolated Linux OCI execution and current receipt are required."
+      ],
+      "cases": [
+        {
+          "id": "legacy-oci-owned_runc-runc_a_test_after_a_killed_test_releases_its_root_and_takes_the_same_address",
+          "binary": "reliaburger::owned_runc",
+          "test": "runc_a_test_after_a_killed_test_releases_its_root_and_takes_the_same_address",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/owned_runc.rs"
+          ]
+        }
+      ]
+    },
+    {
       "id": "issue-734-rootless-test-cleanup",
       "issue": 734,
       "promise": "A failed rootless OCI test leaves none of its network helpers running.",
