@@ -10,6 +10,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 
@@ -447,27 +448,46 @@ class WorkloadResumeRecords(unittest.TestCase):
     """The writer and the Redis client record each start before their first
     acknowledgement, which is what the resume checks above rely on."""
 
-    def run_until(self, script, pattern, env=None, deadline=30):
-        """Run SCRIPT until its output matches PATTERN, or DEADLINE seconds pass.
+    def run_until(self, script, line, env=None, deadline=30):
+        """Run SCRIPT until it prints a whole line matching LINE, or DEADLINE
+        seconds pass, and return its stdout as a list of lines.
 
         A fixed run of half a second missed the writer's first ACK on a
-        loaded host (#2184), so wait for what the test checks instead.
+        loaded host (#2184), so wait for what the test checks instead. The
+        script's stdout and stderr each go to their own pipe, read on its own
+        thread. They used to share a temporary file with this process, and so
+        its file offset: a line the script wrote while the poll had seeked
+        back to the start landed over the first lines (#2311).
         """
-        with tempfile.TemporaryFile(mode="w+") as log:
-            process = subprocess.Popen(["sh", "-c", script], stdout=log, stderr=subprocess.STDOUT,
-                                       text=True, env={**os.environ, **(env or {})})
-            try:
-                give_up = time.monotonic() + deadline
-                while time.monotonic() < give_up and process.poll() is None:
-                    log.seek(0)
-                    if re.search(pattern, log.read()):
-                        break
-                    time.sleep(0.02)
-            finally:
-                process.terminate()
-                process.wait(timeout=10)
-            log.seek(0)
-            return log.read()
+        process = subprocess.Popen(["sh", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, env={**os.environ, **(env or {})})
+        stdout, stderr = [], []
+        printed = threading.Event()
+
+        def collect(stream, lines, watch):
+            for text in stream:
+                lines.append(text.rstrip("\n"))
+                if watch and re.fullmatch(line, lines[-1]):
+                    printed.set()
+
+        readers = [threading.Thread(target=collect, args=(process.stdout, stdout, True)),
+                   threading.Thread(target=collect, args=(process.stderr, stderr, False))]
+        for reader in readers:
+            reader.start()
+        try:
+            give_up = time.monotonic() + deadline
+            while not printed.wait(0.05) and process.poll() is None and time.monotonic() < give_up:
+                pass
+        finally:
+            process.terminate()
+            process.wait(timeout=10)
+            for reader in readers:
+                reader.join(timeout=10)
+            process.stdout.close()
+            process.stderr.close()
+        self.assertTrue(printed.is_set(), f"no line matched {line!r} in {deadline} s: "
+                        f"stdout {stdout!r}, stderr {stderr!r}")
+        return stdout
 
     def test_the_writer_records_where_it_resumed_before_its_first_ack(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -475,19 +495,19 @@ class WorkloadResumeRecords(unittest.TestCase):
             # A torn last line in both files, as a power cut mid-append leaves.
             (data / "seq").write_text("1\n2\n3\n4")
             (data / "resumes").write_text("0\n2")
-            output = self.run_until(workload_script("soak-writer").replace("/data", directory), r"ACK \d+")
-            self.assertRegex(output, r"RESUME 3 after +3 lines")
+            lines = self.run_until(workload_script("soak-writer").replace("/data", directory), r"ACK \d+")
+            # wc -l pads its count with spaces on macOS.
+            self.assertRegex(lines[0], r"^RESUME 3 after +3 lines$")
             self.assertEqual((data / "resumes").read_text(), "0\n3\n")
-            first_ack = int(re.search(r"ACK (\d+)", output).group(1))
-            self.assertEqual(first_ack, 4)
+            self.assertEqual(lines[1], "ACK 4")
 
     def test_a_writer_slow_to_start_is_still_waited_for(self):
         # A loaded host can take longer than any fixed wait to start the
         # shell (#2184): the run lasts until the first ACK, not a set time.
         with tempfile.TemporaryDirectory() as directory:
             script = "sleep 1\n" + workload_script("soak-writer").replace("/data", directory)
-            output = self.run_until(script, r"ACK \d+")
-            self.assertRegex(output, r"ACK 1\b")
+            lines = self.run_until(script, r"ACK \d+")
+            self.assertEqual(lines[1], "ACK 1")
 
     def fake_redis_cli(self, directory, incr_answers):
         """A redis-cli on PATH that keeps lists in files and answers INCR from INCR_ANSWERS in turn."""
@@ -513,10 +533,11 @@ class WorkloadResumeRecords(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             (Path(directory) / "counter").write_text("41\n")
             env = self.fake_redis_cli(directory, [42, 43, 39, 40])
-            output = self.run_until(script, r"BACK 43 39", env)
-            self.assertIn("START 41", output)
+            # The client pushes the step back after it logs BACK, so run on
+            # to the next INCR, which it logs only once the push has landed.
+            lines = self.run_until(script, r"INCR 40", env)
+            self.assertEqual(lines[:6], ["START 41", "INCR 42", "INCR 43", "INCR 39", "BACK 43 39", "INCR 40"])
             self.assertEqual((Path(directory) / "soak:starts").read_text(), "41\n")
-            self.assertIn("BACK 43 39", output)
             self.assertEqual((Path(directory) / "soak:regressions").read_text(), "43 39\n")
 
 
