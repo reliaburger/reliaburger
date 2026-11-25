@@ -5962,8 +5962,9 @@ async fn workload_admission_fixture(
 /// quiet host it takes well under a second, but the path crosses several
 /// Raft writes and the task ledger's commits, and at 12 nextest threads
 /// with the host's disk busy it overran a 5 s bound once in ten runs
-/// (#2305). The wait ends as soon as every job succeeds.
-const SETTLEMENT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+/// (#2305). The wait ends as soon as every job succeeds, and it fails with
+/// its own message before nextest's 60 s kill.
+const SETTLEMENT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(45);
 
 async fn assert_authorised_job_dispatch_and_settlement(
     commands: &mut mpsc::Receiver<WorkloadAdmissionTrace>,

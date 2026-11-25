@@ -91,7 +91,7 @@ async fn wait_for_exec(
     ready: &Path,
     caller: &mut tokio::task::JoinHandle<std::io::Result<reliaburger::grill::ExecOutput>>,
 ) {
-    tokio::time::timeout(Duration::from_secs(120), async {
+    tokio::time::timeout(Duration::from_secs(50), async {
         while !ready.exists() {
             if caller.is_finished() {
                 let answer = (&mut *caller).await;
@@ -492,6 +492,32 @@ fn signal_owners(root: &Path, signal: &str) {
     );
 }
 
+/// Stops every process owner under a root until dropped, so a failing
+/// test never leaves an owner stopped behind it.
+struct StoppedOwners<'a>(&'a Path);
+
+impl<'a> StoppedOwners<'a> {
+    fn stop(root: &'a Path) -> Self {
+        signal_owners(root, "-STOP");
+        Self(root)
+    }
+}
+
+impl Drop for StoppedOwners<'_> {
+    fn drop(&mut self) {
+        // Not `signal_owners`: a panic inside `drop` while unwinding aborts.
+        let name = self.0.file_name().unwrap_or_default().to_string_lossy();
+        let pattern = format!("__process-owner.* --directory .*/{name}/");
+        let _ = std::process::Command::new("pkill")
+            .args(["-CONT", "-f", &pattern])
+            .status();
+    }
+}
+
+/// How long the stall tests keep an owner stopped: more than two of its
+/// 2 s request deadlines, so admission really asks again.
+const OWNER_STALL: Duration = Duration::from_secs(5);
+
 /// A role exec first asks the role's owner whether the role runs, and each
 /// of those requests gets 2 s. On a host whose disk was busy, one answer
 /// came late and the exec failed with "process owner request timed out"
@@ -510,7 +536,7 @@ async fn role_exec_waits_out_an_owner_that_misses_a_request_deadline() {
         )
         .await,
     );
-    signal_owners(root.path(), "-STOP");
+    let stopped = StoppedOwners::stop(root.path());
     let running = executor.clone();
     let caller = tokio::spawn(async move {
         running
@@ -520,11 +546,95 @@ async fn role_exec_waits_out_an_owner_that_misses_a_request_deadline() {
             )
             .await
     });
-    // Longer than one owner request's deadline.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    signal_owners(root.path(), "-CONT");
+    tokio::time::sleep(OWNER_STALL).await;
+    drop(stopped);
     let output = caller.await.unwrap().unwrap();
     assert_eq!(output.output, "late");
+    executor
+        .seal(Duration::from_secs(15))
+        .await
+        .unwrap()
+        .finish(None)
+        .await
+        .unwrap();
+}
+
+/// Asking a stalled owner again mustn't hold the adapter mutex. A stop
+/// that seals the generation during the stall gets in between two asks
+/// instead of queueing behind up to 30 s of asking, and the exec then
+/// refuses rather than running a command into a generation being retired.
+///
+/// The seal itself still fails while the owner is stopped: its own first
+/// look at the roles is a single owner request. That leaves the claim for
+/// recovery, and the exec refuses because the claim is gone.
+#[tokio::test]
+async fn a_seal_during_an_owner_stall_is_not_held_up_by_exec_admission() {
+    use reliaburger::grill::command::ClaimedCommandExecutor;
+    let root = tempfile::tempdir().unwrap();
+    let executor = ClaimedCommandExecutor::new(
+        shell(
+            fresh(root.path()).await,
+            RuntimeRole::Launcher,
+            "exec sleep 60",
+        )
+        .await,
+    );
+    let stopped = StoppedOwners::stop(root.path());
+    let running = executor.clone();
+    let caller = tokio::spawn(async move {
+        running
+            .exec_role(
+                RuntimeRole::Launcher,
+                &["/bin/sh".into(), "-c".into(), "printf late".into()],
+            )
+            .await
+    });
+    // Let the exec's first ask start and miss its deadline.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let sealing = executor.clone();
+    let seal = tokio::spawn(async move { sealing.seal(Duration::from_secs(30)).await });
+    // One ask in flight (2 s) plus the seal's own request (2 s), with room.
+    // Holding the mutex across the asking would keep the seal waiting until
+    // the owner resumed.
+    let sealed = tokio::time::timeout(Duration::from_secs(10), seal)
+        .await
+        .expect("the seal waited for exec admission while the owner was stopped")
+        .unwrap();
+    drop(stopped);
+    let error = caller.await.unwrap().unwrap_err();
+    assert!(
+        !error.to_string().contains("didn't answer"),
+        "the exec kept asking after the seal: {error}"
+    );
+    if let Ok(cleanup) = sealed {
+        cleanup.finish(None).await.unwrap();
+    }
+}
+
+/// Asking again is only for late answers. An exec into a launcher that has
+/// exited refuses straight away; asking again would take 30 s.
+#[tokio::test]
+async fn role_exec_into_an_exited_launcher_refuses_at_once() {
+    use reliaburger::grill::command::ClaimedCommandExecutor;
+    let root = tempfile::tempdir().unwrap();
+    let commands = shell(fresh(root.path()).await, RuntimeRole::Launcher, "exit 0").await;
+    terminal(&commands, RuntimeRole::Launcher).await;
+    let executor = ClaimedCommandExecutor::new(commands);
+    let started = std::time::Instant::now();
+    let error = executor
+        .exec_role(RuntimeRole::Launcher, &["/bin/true".into()])
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("not running"),
+        "unexpected refusal: {error}"
+    );
+    // Well under one 2 s owner request: nothing was asked again.
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "refusal took {:?}",
+        started.elapsed()
+    );
     executor
         .seal(Duration::from_secs(15))
         .await
@@ -556,8 +666,8 @@ async fn cancelled_role_exec_cannot_complete_a_late_mutation() {
     let _ = caller.await;
     // Sealing retires the launcher and the cancelled exec. On a loaded host
     // that overran 15 s (#2305); the bound is how long cleanup may take,
-    // not what the test checks.
-    let cleanup = executor.seal(Duration::from_secs(60)).await.unwrap();
+    // not what the test checks, and it stays inside nextest's 60 s kill.
+    let cleanup = executor.seal(Duration::from_secs(40)).await.unwrap();
     std::fs::write(root.path().join("release"), "continue").unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(!root.path().join("late-exec").exists());

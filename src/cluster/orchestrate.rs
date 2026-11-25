@@ -3673,7 +3673,8 @@ mod tests {
             }
         });
 
-        tokio::time::timeout(Duration::from_secs(60), async {
+        // Inside nextest's 60 s kill, so a stuck retirement says so itself.
+        tokio::time::timeout(Duration::from_secs(45), async {
             while !crate::cluster::applied::load(&checkpoint)
                 .unwrap()
                 .is_empty()

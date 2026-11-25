@@ -9,18 +9,6 @@ use crate::grill::command::{CommandId, CommandOutput, CommandState, OwnedCommand
 
 use super::{IntentClaim, IntentPhase, RuntimeIntent};
 
-/// How long a role exec keeps asking a busy owner whether its role runs.
-const EXEC_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Whether a role observation failed only because an owner's answer was
-/// lost or late.
-fn transient_owner_error(error: &io::Error) -> bool {
-    error
-        .get_ref()
-        .and_then(|inner| inner.downcast_ref::<crate::grill::command::CommandError>())
-        .is_some_and(crate::grill::command::CommandError::is_transient)
-}
-
 /// Long-lived command whose identity must precede activation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeRole {
@@ -392,11 +380,6 @@ impl IntentCommands {
     /// Capture the immutable owner capability before releasing the adapter mutex.
     /// The independent owner fences and retires auxiliary work, including requests
     /// queued before sealing but delivered while retirement is in progress.
-    ///
-    /// The role's state comes from its owner, one request at a time, each
-    /// with its own short deadline. A busy owner that answers one late is
-    /// asked again for up to [`EXEC_ADMISSION_TIMEOUT`], so a loaded host
-    /// delays the exec instead of failing it (#2305).
     pub(crate) async fn execution(&self, role: RuntimeRole) -> io::Result<RoleExecution> {
         if !self
             .record()
@@ -404,18 +387,10 @@ impl IntentCommands {
         {
             return Err(io::Error::other("runtime exec admission is sealed"));
         }
-        let deadline = tokio::time::Instant::now() + EXEC_ADMISSION_TIMEOUT;
-        let state = loop {
-            match self.role_state(role).await {
-                Err(error)
-                    if transient_owner_error(&error) && tokio::time::Instant::now() < deadline =>
-                {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                state => break state?,
-            }
-        };
-        if !matches!(state, Some(CommandState::Running { .. })) {
+        if !matches!(
+            self.role_state(role).await?,
+            Some(CommandState::Running { .. })
+        ) {
             return Err(io::Error::other("runtime role is not running"));
         }
         let id = self
