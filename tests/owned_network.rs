@@ -9,6 +9,10 @@ use reliaburger::grill::netns;
 use reliaburger::grill::runc_intent::{IntentConfiguration, IntentJournal, IntentPhase};
 use reliaburger::grill::{InstanceId, OciSpec};
 
+#[path = "support/runc_residue.rs"]
+mod runc_residue;
+use runc_residue::TestNamespaces;
+
 const NODE_INDEX: u16 = 32_766;
 const CONTAINER_INDEX: u16 = 500;
 
@@ -54,6 +58,9 @@ async fn owned_network_setup_and_forwarding_retire_through_the_generation() {
     assert!(nix::unistd::geteuid().is_root());
     let root = tempfile::tempdir().unwrap();
     let id = InstanceId(format!("rbtest-owned-net-{}", std::process::id()));
+    // Claimed before it exists: a sweep in a test outside the host-network
+    // group must not take it for a dead test's (#2332).
+    let _namespaces = TestNamespaces::instance(&id);
     let executor = create_executor(root.path(), &id).await;
     let network = netns::setup_container_network_with_commands(
         &executor,
@@ -92,6 +99,7 @@ async fn killed_network_caller_cannot_publish_a_veth_after_recovered_retirement(
     assert!(nix::unistd::geteuid().is_root());
     let root = tempfile::tempdir().unwrap();
     let id = InstanceId(format!("rbtest-killed-net-{}", std::process::id()));
+    let _namespaces = TestNamespaces::instance(&id);
     let planned = netns::planned_container_network(&id, NODE_INDEX, CONTAINER_INDEX).unwrap();
     let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
         .args([
@@ -143,6 +151,72 @@ async fn killed_network_caller_cannot_publish_a_veth_after_recovered_retirement(
     assert_eq!(
         journal.inventory().await.unwrap()[0].phase,
         IntentPhase::Retired { exit_code: None }
+    );
+}
+
+/// Make network namespace `name` the way `ip netns add` does for a test
+/// with no guard.
+fn add_namespace(name: &str) {
+    let status = std::process::Command::new("ip")
+        .args(["netns", "add", name])
+        .status()
+        .unwrap();
+    assert!(status.success(), "ip netns add {name} failed");
+}
+
+/// The test that had no guard (#2332): another test's guard sweeps while
+/// this one's namespace exists, unclaimed and young. Deleting it because
+/// nothing claims it is what made `owned_network` lose its namespace half
+/// way through setup. It stays, and goes only once it is older than any
+/// test takes to claim one.
+#[test]
+#[ignore = "requires root and ip; run with make test-linux"]
+fn a_sweep_leaves_a_young_unclaimed_test_namespace_alone() {
+    assert!(nix::unistd::geteuid().is_root());
+    let name = format!("rb-rbtest-unguarded-{}", std::process::id());
+    let namespace = Path::new("/var/run/netns").join(&name);
+    add_namespace(&name);
+    drop(TestNamespaces::new([]));
+    drop(runc_residue::RuncRoot::new());
+    runc_residue::sweep_stale();
+    assert!(namespace.exists(), "the sweep deleted a live test's {name}");
+
+    runc_residue::sweep_stale_namespaces(Duration::ZERO);
+    assert!(!namespace.exists(), "an old unclaimed {name} survived");
+}
+
+/// A namespace a live guard claims stays however old it is, and goes with
+/// the guard.
+#[test]
+#[ignore = "requires root and ip; run with make test-linux"]
+fn a_sweep_leaves_a_claimed_namespace_alone_and_its_guard_deletes_it() {
+    assert!(nix::unistd::geteuid().is_root());
+    let name = format!("rb-rbtest-claimed-{}", std::process::id());
+    let namespace = Path::new("/var/run/netns").join(&name);
+    let guard = TestNamespaces::new([name.clone()]);
+    add_namespace(&name);
+    runc_residue::sweep_stale_namespaces(Duration::ZERO);
+    assert!(namespace.exists(), "the sweep deleted a claimed {name}");
+    drop(guard);
+    assert!(!namespace.exists(), "the guard left {name} behind");
+}
+
+/// A test killed outright leaves its claim naming a process that no longer
+/// runs. The next guard's sweep releases that test's namespace at once.
+#[test]
+#[ignore = "requires root and ip; run with make test-linux"]
+fn a_sweep_releases_the_namespace_of_a_test_that_died() {
+    assert!(nix::unistd::geteuid().is_root());
+    let name = format!("rb-rbtest-died-{}", std::process::id());
+    let namespace = Path::new("/var/run/netns").join(&name);
+    let guard = TestNamespaces::new([name.clone()]);
+    add_namespace(&name);
+    guard.abandon();
+    assert!(namespace.exists());
+    drop(TestNamespaces::new([]));
+    assert!(
+        !namespace.exists(),
+        "a dead test's {name} survived the sweep"
     );
 }
 

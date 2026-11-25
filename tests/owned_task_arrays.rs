@@ -1563,6 +1563,23 @@ async fn runc_common_job_api_runs_encrypted_singletons_and_gates_hooks_on_accept
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// The PID a command printed with `printf '%s' "$!"` after starting a
+/// background job. The job's shell holds the command's output pipes from
+/// its fork until its own redirections apply, so on a busy host it can
+/// still hold them when the command exits. The executor then stops
+/// draining and says so on stderr (#715), and that marker follows the PID
+/// (#2332). Nothing else may.
+fn background_pid(head: &[u8]) -> u32 {
+    let text = String::from_utf8_lossy(head);
+    let (pid, rest) = text.split_once('\n').unwrap_or((&text, ""));
+    assert!(
+        rest.is_empty() || rest == "[reliaburger: output written after exit truncated]\n",
+        "unexpected output after the PID: {text:?}"
+    );
+    pid.parse()
+        .unwrap_or_else(|error| panic!("no PID in {text:?}: {error}"))
+}
+
 /// Reuse keeps one live container while every command gets independent scratch,
 /// credentials, cgroup limits and whole-tree retirement.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1703,10 +1720,7 @@ async fn runc_reusable_commands_keep_the_container_but_retire_task_state_and_idl
         AttemptOutcome::Exited { code: 0 },
         "{escaped:?}"
     );
-    let descendant: u32 = String::from_utf8(escaped.output.head)
-        .unwrap()
-        .parse()
-        .unwrap();
+    let descendant = background_pid(&escaped.output.head);
     let mut clean = task.clone();
     clean.args = vec![
         "/bin/sh".into(),

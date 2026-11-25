@@ -1615,8 +1615,10 @@ async fn runc_a_panicking_test_leaves_no_container_or_network_behind() {
 /// A runc test still starts after an earlier one that panicked with no
 /// guard at all: its container kept running, its root was deleted, and its
 /// namespace, veth and route stayed. That is what the pause test's panic
-/// left (#2315). The next test's guard releases the stale namespace, and
-/// the next container takes the same address.
+/// left (#2315). Nothing claims that namespace, so a guard's sweep releases
+/// it once it is older than [`runc_residue::STALE_AFTER`] (#2332), and the
+/// next container takes the same address. The sweep here is told the
+/// namespace is old already rather than waiting two minutes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
 async fn runc_a_test_after_an_unguarded_panic_takes_the_same_address() {
@@ -1629,6 +1631,11 @@ async fn runc_a_test_after_an_unguarded_panic_takes_the_same_address() {
     assert!(routed(stale_address));
 
     let root = runc_residue::RuncRoot::new();
+    assert!(
+        reliaburger::grill::netns::namespace_path(&stale).exists(),
+        "a young unclaimed namespace went at once"
+    );
+    runc_residue::sweep_stale_namespaces(Duration::ZERO);
     wait_gone(stale_init).await;
     assert!(!reliaburger::grill::netns::namespace_path(&stale).exists());
     let (runtime, id, address) = start_sleeper(root.path()).await;
