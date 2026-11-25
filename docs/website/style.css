@@ -519,10 +519,33 @@ footer { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-top: 20px; paddi
   .agent-banner .page-actions { margin-left: 0; justify-content: flex-start; flex-wrap: wrap; }
 }
 
+/* The burger's colours. Each section of the homepage takes one ingredient for its
+   number and its rule, so the page isn't one orange from top to bottom. The light
+   values are dark enough to read as small text on the paper; the dark theme has
+   brighter ones. */
+:root { --mustard: #946a00; --lettuce: #3f7a1f; --tomato: #c23a1f; --onion: #8d3f86; --bun: #b8621a; --patty: #7b2b2d; }
+.home .section { --tint: var(--accent); }
+.home #why, .home #scrutiny { --tint: var(--mustard); }
+.home #designed, .home #tour, .home #docs { --tint: var(--lettuce); }
+.home #act, .home #install, .home #job-throughput { --tint: var(--tomato); }
+.home #debug, .home #release-testing, .home #internals { --tint: var(--onion); }
+.home #who, .home #netboot, .home #start { --tint: var(--bun); }
+.home .section .section-number { color: var(--tint); }
+.home .section .tour, .home .section .why-carousel { border-left-color: var(--tint); }
+.home .section .tour-commands summary::after, .home .section .tour-commands summary:hover { color: var(--tint); }
+.home .section .why-dot[aria-current="true"]::before { background: var(--tint); border-color: var(--tint); }
+.home .benefits li { border-top: 3px solid var(--tint); }
+.home .versus h3 { border-bottom-color: var(--tint); }
+.home .facts { border-top: 0; }
+.home .facts > div { border-top: 3px solid var(--lettuce); }
+.home .facts > div:nth-child(2) { border-top-color: var(--mustard); }
+.home .facts > div:nth-child(3) { border-top-color: var(--tomato); }
+.home .facts dt { margin-top: 2px; }
+
 /* Dark theme, chosen with the button copy.js adds and remembered in this browser.
    The dark boxes (terminals, recordings, the whitepaper's band) keep their light
    text and go a shade darker than the page, so they still read as boxes. */
-:root[data-theme="dark"] { color-scheme: dark; --paper: #141715; --ink: #e9ede8; --muted: #a4aea5; --line: #2f3631; --accent: #f08a5d; --box: #0a0c0b; }
+:root[data-theme="dark"] { color-scheme: dark; --paper: #141715; --ink: #e9ede8; --muted: #a4aea5; --line: #2f3631; --accent: #f08a5d; --box: #0a0c0b; --mustard: #f4bf3a; --lettuce: #7fbf4a; --tomato: #f0705a; --onion: #c98bc3; --bun: #ee9a4d; --patty: #c9787a; }
 :root[data-theme="dark"] .skip,
 :root[data-theme="dark"] .mark,
 :root[data-theme="dark"] .primary-link,
