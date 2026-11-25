@@ -275,14 +275,7 @@ Last, it drafts a redacted bug report with the reproducer, the patch and what it
 
 ## No platform to rent. No team to hire.
 
-Heroku, Render or Railway Kubernetes, managed or your own
-
-- **Nobody can freeze it.** Apache 2.0, on machines you choose.
-- **Growth costs machines.** No price per process, no price per add-on.
-- **Still no ops team.** Your own agent operates it, safely.
-- **More in the box.** Batch jobs, chaos testing and policies, same binary.
-
-**They still win on:** a public address from the first deploy, managed databases, no machines to find. The public address is [next on our roadmap](https://reliaburger.com/#next).
+Kubernetes, managed or your own Heroku, Render or Railway
 
 - **Nothing to assemble.** Ingress, mTLS, metrics, logs, GitOps and policy are built in.
 - **One upgrade.** One signed binary, not a dozen release cycles.
@@ -290,6 +283,13 @@ Heroku, Render or Railway Kubernetes, managed or your own
 - **Safer for your agent.** It proposes; the cluster works out the blast radius and the undo.
 
 **They still win on:** someone else on call, autoscaling nodes, cloud load balancers and disks, production readiness. Need production in the cloud this quarter? Use one. [The full comparison](https://reliaburger.com/compare/kubernetes).
+
+- **Nobody can freeze it.** Apache 2.0, on machines you choose.
+- **Growth costs machines.** No price per process, no price per add-on.
+- **Still no ops team.** Your own agent operates it, safely.
+- **More in the box.** Batch jobs, chaos testing and policies, same binary.
+
+**They still win on:** a public address from the first deploy, managed databases, no machines to find. The public address is [next on our roadmap](https://reliaburger.com/#next).
 
 ## Try it in five minutes
 
