@@ -229,6 +229,12 @@ class NetlogScript(unittest.TestCase):
             "target=10.0.0.1:0\n": "isn't <IPv4 address>[:<port>]",
             "target=10.0.0.1:70000\n": "isn't <IPv4 address>[:<port>]",
             "target=10.0.0.1:66a\n": "isn't <IPv4 address>[:<port>]",
+            # As relish and bun read a target (#2323): no sign, no leading
+            # zero in the port or in the address.
+            "target=10.0.0.1:+7000\n": "isn't <IPv4 address>[:<port>]",
+            "target=10.0.0.1:06666\n": "isn't <IPv4 address>[:<port>]",
+            "target=010.0.0.1:6666\n": "isn't <IPv4 address>[:<port>]",
+            "target=10.0.0.01\n": "isn't <IPv4 address>[:<port>]",
             "target=10.0.0\n": "isn't <IPv4 address>[:<port>]",
             "target=lab.example:6666\n": "isn't <IPv4 address>[:<port>]",
             "target=\n": "it has no target=",
