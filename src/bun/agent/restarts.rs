@@ -355,6 +355,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }),
             _ => None,
         };
+        if let (RestartStep::Create, Some(launch)) = (step, launch.as_ref()) {
+            // An adopted instance took no hold when it first launched.
+            self.supervisor
+                .hold_workload_cgroup(&launch.app_name, &launch.namespace);
+        }
         let sidecars = self.restart_sidecars(&id, step, launch.as_ref());
         let task = self
             .restart_steps
