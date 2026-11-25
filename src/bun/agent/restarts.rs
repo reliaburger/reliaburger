@@ -205,7 +205,7 @@ impl CreateInput {
     /// is old (#2335). The check waits at most `bound`.
     ///
     /// `None` admits it; otherwise the step ends with the result returned.
-    async fn admit(&self, bound: Duration) -> Option<StepResult> {
+    async fn admit(&self, id: &InstanceId, bound: Duration) -> Option<StepResult> {
         if let Err(refusal) = &self.knobs {
             return Some(StepResult::Refused(refusal.to_string()));
         }
@@ -215,8 +215,8 @@ impl CreateInput {
                 Some(StepResult::Refused(restart_refusal("restart", &refusal)))
             }
             Err(HostPathDenial::Unanswered(reason)) => {
-                Some(StepResult::Failed(BunError::DeployFailed {
-                    app_name: self.app_name.clone(),
+                Some(StepResult::Failed(BunError::HostPathUnanswered {
+                    instance_id: id.clone(),
                     reason,
                 }))
             }
@@ -253,30 +253,35 @@ pub(super) async fn recheck_host_paths(
     match tokio::time::timeout(bound, check).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(HostPathRefusal::CheckFailed { reason })) => Err(HostPathDenial::Unanswered(
-            format!("the host path check failed: {reason}"),
+            format!("its blocking thread failed: {reason}"),
         )),
+        // The earlier check's thread is still stuck: another would only join
+        // it (#2335).
+        Ok(Err(refusal @ HostPathRefusal::StillResolving { .. })) => {
+            Err(HostPathDenial::Unanswered(refusal.to_string()))
+        }
         Ok(Err(refusal)) => Err(HostPathDenial::Refused(refusal)),
         Err(_) => Err(HostPathDenial::Unanswered(format!(
-            "the host path check didn't answer within {bound:?}: a source on NFS or autofs \
-             may not be responding"
+            "no answer within {bound:?}; a source on NFS or autofs may not be responding"
         ))),
     }
 }
 
 /// The reason a restart refused by the host-path policy records, for the
-/// instance or one of its sidecars (`subject`): where it happened, what
-/// changed and the policy's own refusal, which names the path.
+/// instance or one of its sidecars (`subject`): where it happened, and the
+/// policy's own refusal, which names the path and the rule.
+///
+/// It doesn't say what changed. The node's `allowed_host_paths` may have,
+/// or a symlink in a listed prefix may now resolve somewhere else; either
+/// way the path the deploy approved isn't allowed now.
 pub(super) fn restart_refusal(
     subject: &str,
     refusal: &crate::bun::host_paths::HostPathRefusal,
 ) -> String {
-    let changed = match refusal {
-        crate::bun::host_paths::HostPathRefusal::NotAllowed { .. } => {
-            "this node's [storage] allowed_host_paths changed"
-        }
-        _ => "this node's node.toml changed",
-    };
-    format!("{subject} refused after {changed} since the deploy: {refusal}")
+    format!(
+        "{subject} refused: a host path it mounts isn't allowed on this node any more, \
+         though the deploy was: {refusal}"
+    )
 }
 
 /// What a restart step does to the instance's sidecars (#1120): the Clear
@@ -340,7 +345,7 @@ async fn run_step<G: Grill>(
         }
         RestartStep::Create => match create {
             Some(create) => {
-                if let Some(denied) = create.admit(confirmation_timeout).await {
+                if let Some(denied) = create.admit(&id, confirmation_timeout).await {
                     return denied;
                 }
                 match super::launch::create_with_secrets(

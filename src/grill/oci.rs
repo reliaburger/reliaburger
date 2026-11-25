@@ -2580,8 +2580,9 @@ mod tests {
         assert_eq!(sidecar_parent(&parent), None, "an instance is no sidecar");
     }
 
-    /// #1122: the gates admitted the app's runtime knobs for the app's own
-    /// container, so a sidecar built from its finished spec carries none.
+    /// #2335: the spec names the host paths it mounts, so a restart can ask
+    /// about exactly those, and the sidecar and init specs built from it
+    /// carry them with the mounts they copy.
     #[test]
     fn the_spec_records_the_apps_host_paths_and_a_sidecar_and_an_init_carry_them() {
         let app: AppSpec = toml::from_str(
@@ -2632,6 +2633,8 @@ mod tests {
         );
     }
 
+    /// #1122: the gates admitted the app's runtime knobs for the app's own
+    /// container, so a sidecar built from its finished spec carries none.
     #[test]
     fn a_sidecar_gets_none_of_the_apps_runtime_knobs() {
         let app = app_oci(

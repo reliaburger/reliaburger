@@ -247,7 +247,9 @@ async fn relaunch<G: Grill>(
                     &refusal,
                 ))
             }
-            super::restarts::HostPathDenial::Unanswered(reason) => RelaunchFailure::Failed(reason),
+            super::restarts::HostPathDenial::Unanswered(reason) => {
+                RelaunchFailure::Failed(format!("the host path check didn't finish: {reason}"))
+            }
         })?;
     let failed = |reason: String| RelaunchFailure::Failed(reason);
     // A sidecar startup retired is one runc has forgotten.
@@ -559,10 +561,17 @@ impl Sidecars {
     }
 
     /// A restart of `sidecar` has ended at `now`. A failed one is due again
-    /// after a longer backoff; either way it counts.
-    pub(super) fn finish_relaunch(&mut self, sidecar: &InstanceId, succeeded: bool, now: Instant) {
+    /// after a longer backoff; either way it counts. Returns whether its
+    /// instance cancelled it meanwhile: then the instance is stopping or
+    /// restarting, and what the restart found is no longer its to act on.
+    pub(super) fn finish_relaunch(
+        &mut self,
+        sidecar: &InstanceId,
+        succeeded: bool,
+        now: Instant,
+    ) -> bool {
         let Some(run) = self.run_mut(sidecar) else {
-            return;
+            return false;
         };
         let cancelled = run
             .relaunching
@@ -571,6 +580,7 @@ impl Sidecars {
         run.restarts = run.restarts.saturating_add(1);
         run.restarted_at = succeeded.then_some(now);
         run.due = (!succeeded && !cancelled).then(|| now + sidecar_backoff(run.restarts));
+        cancelled
     }
 
     /// The node gate refused `sidecar`'s restart (#2335): it won't be
@@ -778,9 +788,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             sidecar,
             result,
         } = relaunched;
-        self.sidecars
+        let cancelled = self
+            .sidecars
             .finish_relaunch(&sidecar, result.is_ok(), Instant::now());
-        if let Err(RelaunchFailure::Refused(reason)) = &result {
+        // A refusal that comes back after the instance cancelled the
+        // relaunch (it crashed, and restarts with its sidecars) belongs to
+        // a launch that's gone: the instance's own restart asks the gate.
+        if let Err(RelaunchFailure::Refused(reason)) = &result
+            && !cancelled
+        {
             self.sidecars.park(&sidecar);
             self.give_up_refused_instance(&parent, reason).await;
             return;
@@ -847,13 +863,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// the loop, then `maybe_restart` marks it `Failed` instead of
     /// restarting it.
     async fn give_up_refused_instance(&mut self, parent: &InstanceId, reason: &str) {
-        eprintln!("bun: {parent} stops: {reason}");
         let Some(instance) = self.supervisor.get_instance_mut(parent) else {
             return;
         };
         let Ok(stopping) = instance.state.transition_to(ContainerState::Stopping) else {
             return;
         };
+        eprintln!("bun: {parent} stops: {reason}");
         instance.state = stopping;
         instance.retry_pending = true;
         instance.restart_cause = Some(crate::bun::restart::RestartCause::Refused);

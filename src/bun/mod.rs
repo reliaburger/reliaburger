@@ -201,6 +201,13 @@ pub enum BunError {
     /// Deploy was rejected (e.g. process workload binary not in allowlist).
     #[error("deploy failed for {app_name:?}: {reason}")]
     DeployFailed { app_name: String, reason: String },
+    /// A restart's host-path check gave no answer in time, or couldn't run
+    /// (#2335). Not a refusal: the next attempt asks again.
+    #[error("the host path check for {instance_id} didn't finish: {reason}")]
+    HostPathUnanswered {
+        instance_id: InstanceId,
+        reason: String,
+    },
     /// The prerequisite's observed nonzero status was durably settled.
     #[error("run_before job {app_name} exited with {code}")]
     PrerequisiteFailed { app_name: String, code: i32 },

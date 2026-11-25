@@ -206,8 +206,8 @@ fn launch_failure(agent: &TestAgent, id: &InstanceId) -> String {
         .unwrap_or_default()
 }
 
-/// The refusal says where it happened and why, once: the restart, after
-/// `allowed_host_paths` changed, naming the path.
+/// The refusal says where it happened and why, once: at a restart, a path
+/// the deploy approved isn't allowed any more, naming the path.
 fn assert_restart_refusal(reason: &str, source: &std::path::Path) {
     let source = std::fs::canonicalize(source).unwrap();
     assert!(
@@ -219,8 +219,8 @@ fn assert_restart_refusal(reason: &str, source: &std::path::Path) {
         "says it was a restart: {reason}"
     );
     assert!(
-        reason.contains("allowed_host_paths changed"),
-        "says the node's list changed: {reason}"
+        reason.contains("isn't allowed on this node any more"),
+        "says the node no longer allows it: {reason}"
     );
     assert!(
         !reason.contains("host path refused: host path"),
@@ -408,4 +408,181 @@ async fn a_sidecar_restart_after_the_node_drops_a_host_path_is_refused_with_the_
     let reason = launch_failure(&agent, &web);
     assert!(reason.contains("sidecar"), "names the sidecar: {reason}");
     assert_restart_refusal(&reason, source.path());
+}
+
+/// `web` mounting `source`, with a proxy sidecar.
+fn web_with_proxy(source: &std::path::Path) -> Config {
+    web_mounting(
+        "web:v1",
+        source,
+        "[[app.web.sidecar]]\nname = 'proxy'\nimage = 'envoy:1.31'\n",
+    )
+}
+
+const WEB: &str = "default__web-0";
+const PROXY: &str = "default__web-0__sidecar-proxy";
+
+/// Whether the runtime was asked to stop, kill, create or start `id`
+/// since call `from`.
+fn touched(grill: &MockGrill, id: &InstanceId, from: usize) -> bool {
+    grill.calls()[from..]
+        .iter()
+        .any(|(call, instance)| instance == id && call != "state")
+}
+
+/// #2335: a sidecar's host-path check that runs out of time is a failed
+/// restart of the sidecar alone, tried again after its backoff. It's not a
+/// refusal, so the app keeps running and nothing stops it.
+#[tokio::test]
+async fn a_sidecar_whose_host_path_check_runs_out_of_time_is_retried_and_its_app_runs_on() {
+    let source = tempfile::tempdir().unwrap();
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    agent.set_host_path_policy(allowing(&[source.path()]));
+    expect_complete(&drain_deploy(&mut agent, web_with_proxy(source.path())).await);
+    let (web, proxy) = (InstanceId(WEB.into()), InstanceId(PROXY.into()));
+
+    agent.set_stop_confirmation_timeout(std::time::Duration::from_millis(50));
+    agent.set_host_path_policy(
+        allowing(&[source.path()]).stalling(std::time::Duration::from_millis(300)),
+    );
+    let from = grill.calls().len();
+    grill.set_state(&proxy, ContainerState::Stopped);
+    agent.check_apps().await;
+    agent.relaunch_due_sidecars_to_completion().await;
+
+    assert!(
+        !touched(&grill, &web, from),
+        "the app was touched: {:?}",
+        grill.calls()
+    );
+    let instance = agent.supervisor.get_instance(&web).unwrap();
+    assert_eq!(instance.state, ContainerState::Running);
+    assert_eq!(instance.launch_failure, None);
+    assert_eq!(creates(&grill, &proxy), 1, "the sidecar was created anyway");
+    assert_eq!(
+        agent
+            .sidecars
+            .due(std::time::Instant::now() + std::time::Duration::from_secs(120)),
+        [(web.clone(), proxy.clone())],
+        "the sidecar is due again after its backoff"
+    );
+
+    // The source answers again, and the retry after the backoff starts it.
+    agent.set_host_path_policy(allowing(&[source.path()]));
+    tokio::time::sleep(super::super::sidecars::sidecar_backoff(1)).await;
+    agent.relaunch_due_sidecars_to_completion().await;
+    assert_eq!(creates(&grill, &proxy), 2);
+    assert!(
+        !touched(&grill, &web, from),
+        "the app was touched: {:?}",
+        grill.calls()
+    );
+}
+
+/// #2335: a check stuck on a source that doesn't answer never returns, so
+/// each retry used to leave one more blocking thread behind it, about one a
+/// minute without limit. A retry while the first check is still stuck
+/// starts no new check, and fails as the first did.
+#[tokio::test]
+async fn a_sidecar_retry_while_its_first_host_path_check_is_stuck_starts_no_new_check() {
+    let source = tempfile::tempdir().unwrap();
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    agent.set_host_path_policy(allowing(&[source.path()]));
+    expect_complete(&drain_deploy(&mut agent, web_with_proxy(source.path())).await);
+    let proxy = InstanceId(PROXY.into());
+
+    agent.set_stop_confirmation_timeout(std::time::Duration::from_millis(20));
+    let stuck = allowing(&[source.path()]).stalling(std::time::Duration::from_secs(2));
+    agent.set_host_path_policy(stuck.clone());
+    grill.set_state(&proxy, ContainerState::Stopped);
+    agent.check_apps().await;
+    agent.relaunch_due_sidecars_to_completion().await;
+    assert_eq!(stuck.checks_started(), 1);
+
+    tokio::time::sleep(super::super::sidecars::sidecar_backoff(1)).await;
+    agent.relaunch_due_sidecars_to_completion().await;
+
+    assert_eq!(agent.sidecars.restarts(&proxy), 2, "the retry ran");
+    assert_eq!(
+        stuck.checks_started(),
+        1,
+        "the retry started a second check"
+    );
+    assert_eq!(creates(&grill, &proxy), 1);
+}
+
+/// #2335: the instance cancels a sidecar's restart when it crashes itself,
+/// because it restarts with its sidecars. A refusal that relaunch brings
+/// back afterwards is about a launch that's gone, and must leave the
+/// restarting instance to its own restart, which asks the gate itself.
+#[tokio::test]
+async fn a_cancelled_sidecar_restart_that_comes_back_refused_leaves_its_instance_alone() {
+    let source = tempfile::tempdir().unwrap();
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    agent.set_host_path_policy(allowing(&[source.path()]));
+    expect_complete(&drain_deploy(&mut agent, web_with_proxy(source.path())).await);
+    let (web, proxy) = (InstanceId(WEB.into()), InstanceId(PROXY.into()));
+
+    // The gate narrows, and the sidecar's check is slow to refuse.
+    agent.set_host_path_policy(
+        crate::bun::host_paths::HostPathPolicy::default()
+            .stalling(std::time::Duration::from_millis(200)),
+    );
+    grill.set_state(&proxy, ContainerState::Stopped);
+    agent.check_apps().await;
+    agent.relaunch_due_sidecars();
+    // Meanwhile the app crashes too, which cancels the sidecar's restart.
+    grill.set_state(&web, ContainerState::Stopped);
+    agent.check_apps().await;
+    let before = agent.supervisor.get_instance(&web).unwrap().state;
+    agent.relaunch_due_sidecars_to_completion().await;
+
+    let instance = agent.supervisor.get_instance(&web).unwrap();
+    assert_eq!(
+        instance.state, before,
+        "the late refusal moved the instance"
+    );
+    assert_ne!(
+        instance.restart_cause,
+        Some(crate::bun::restart::RestartCause::Refused)
+    );
+    assert_eq!(instance.launch_failure, None);
+}
+
+/// #2335: a record written before the spec named its host paths carries
+/// none, as an instance adopted after an in-place upgrade from 0.3.2 does.
+/// Its restart isn't re-checked: this pins the documented gap, which its
+/// next deploy closes.
+#[tokio::test]
+async fn an_adopted_instance_whose_record_names_no_host_paths_restarts_unchecked() {
+    let source = tempfile::tempdir().unwrap();
+    let records = tempfile::tempdir().unwrap();
+    let mut record = adoption_record(WEB, "web", false);
+    record.app_spec.as_mut().unwrap().volumes = vec![crate::config::types::VolumeSpec {
+        path: "/data".into(),
+        source: Some(source.path().to_path_buf()),
+        size: None,
+    }];
+    record.oci_spec.mounts.push(crate::grill::oci::OciMount {
+        destination: "/data".into(),
+        source: Some(source.path().to_path_buf()),
+        mount_type: Some("bind".into()),
+        options: vec!["bind".into(), "rw".into()],
+    });
+    assert!(record.oci_spec.host_path_sources.is_empty());
+    crate::grill::records::write_record(records.path(), &record).unwrap();
+
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    agent.set_records_dir(records.path().to_path_buf());
+    let id = InstanceId(WEB.into());
+    grill.set_adopt_result(&id, true);
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+
+    // The node allows no host path at all.
+    crash_and_restart(&mut agent, &grill, &id).await;
+
+    let instance = agent.supervisor.get_instance(&id).unwrap();
+    assert_ne!(instance.state, ContainerState::Failed);
+    assert_eq!(instance.launch_failure, None);
+    assert_eq!(creates(&grill, &id), 1, "the restart created it");
 }

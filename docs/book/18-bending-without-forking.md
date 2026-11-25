@@ -2575,7 +2575,12 @@ pub host_path_sources: Vec<PathBuf>,
 
 The sidecar and init specs copy the app's list along with its mounts, and
 the adoption record stores the spec, so every restart, whoever's spec it
-is, asks about exactly what it will mount.
+is, asks about exactly what it will mount. A record written before the
+field existed reads back with an empty list, because of
+`#[serde(default)]`, so an instance adopted after an in-place upgrade from
+0.3.2 isn't re-checked until it's next deployed. Before 1.0 we don't migrate
+records, and refusing to adopt them would have restarted every workload on
+the upgrade.
 
 Resolving those paths can hang. `canonicalize` on a source whose NFS server
 has gone quiet doesn't return, and the Create step holds its restart's lane
@@ -2584,16 +2589,55 @@ until the server answered. `recheck_host_paths` wraps the check in
 `tokio::time::timeout`, bounded by `[runtime] stop_confirmation_timeout_secs`,
 the bound the same step's kill already uses. Timing out isn't a refusal:
 the path may answer next time, so it's an ordinary failed attempt that
-spends the restart budget and is retried. The blocking thread can't be
-cancelled, so it finishes on its own whenever the filesystem lets it.
+spends the restart budget and is retried, as `BunError::HostPathUnanswered`.
+
+The blocking thread can't be cancelled. A `canonicalize` stuck on a dead NFS
+server never returns, so the first version left one more stuck thread
+behind each retry, about one a minute for a crashing sidecar, without limit.
+The policy now keeps the set of sources a check is resolving, shared by
+every copy of it, and a check refuses to start while one of its sources is
+in the set:
+
+```rust
+struct ResolvingClaim {
+    resolving: Arc<Mutex<HashSet<PathBuf>>>,
+    sources: Vec<PathBuf>,
+}
+
+impl Drop for ResolvingClaim {
+    fn drop(&mut self) {
+        let mut resolving = self
+            .resolving
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for source in &self.sources {
+            resolving.remove(source);
+        }
+    }
+}
+```
+
+The claim moves into the `spawn_blocking` closure, so it's dropped when the
+thread is done, however long that takes, and the sources are free again.
+That's the "drop guard" pattern: `Drop` runs when a value goes out of
+scope, on every path, including a panic, so cleanup can't be forgotten. It's
+a `std::sync::Mutex`, not tokio's, because the drop runs on a blocking thread
+outside the runtime and no `.await` ever happens while it's held. `lock`
+returns an error if a thread panicked while holding the lock ("poisoned");
+`PoisonError::into_inner` takes the set anyway, because a half-edited set of
+paths is still a set of paths. A retry that finds its source claimed gets
+`HostPathRefusal::StillResolving`, which the restart treats as no answer, not
+as a refusal.
 
 A refusal comes back as a new `StepResult::Refused(String)`, and the loop
 records it the way it records a binary that's gone: the instance is
 `Failed` with the reason, and the restart budget isn't spent. Retrying
 would fail the same way each time and only bury the reason. The reason says
-where and why, once: `restart refused after this node's [storage]
-allowed_host_paths changed since the deploy: host path "/srv/import" isn't
-under any of ...`. We didn't make it stop a running container the moment Bun
+where and why, once: `restart refused: a host path it mounts isn't allowed
+on this node any more, though the deploy was: host path "/srv/import" isn't
+under any of ...`. It doesn't claim `allowed_host_paths` changed, because a
+symlink in a listed prefix that now points elsewhere is refused the same
+way. We didn't make it stop a running container the moment Bun
 starts with a narrower list. Killing work because of a config edit is a
 bigger decision than refusing to start it again, and an operator who wants
 that can redeploy.
@@ -2605,7 +2649,10 @@ refused sidecar is parked, never due again, and its instance goes the way an
 instance that never passed its startup probe goes: `Stopping` with cleanup
 owed and a new `RestartCause::Refused`, so the next tick withdraws it from
 discovery, the Cleanup step kills it and its sidecars, and `maybe_restart`
-marks it `Failed` with the reason instead of restarting it. Here we do stop
+marks it `Failed` with the reason instead of restarting it. A refusal that
+comes back after the instance cancelled the sidecar's restart (the app
+crashed meanwhile and restarts with its sidecars) is ignored: it's about a
+launch that's gone, and the app's own restart asks the gate anyway. Here we do stop
 a running app, which the paragraph above said we wouldn't, but the choice is
 different: the app is already down a sidecar it was deployed with, and its
 own restart would be refused for the same mount.
@@ -4095,7 +4142,15 @@ whose halves are never tested apart can quietly become a single gate.
   `a_sidecar_restart_after_the_node_drops_a_host_path_is_refused_with_the_reason`
   crashes only the sidecar. All four failed before the fix: the first two
   restarts came back `Running`, the stalled check waited out its stall, and
-  the sidecar was created again.
+  the sidecar was created again. The review added four more:
+  `a_sidecar_retry_while_its_first_host_path_check_is_stuck_starts_no_new_check`
+  counts the blocking threads a stuck source gets (one, however many
+  retries), `a_sidecar_whose_host_path_check_runs_out_of_time_is_retried_and_its_app_runs_on`
+  checks a timeout is no refusal,
+  `a_cancelled_sidecar_restart_that_comes_back_refused_leaves_its_instance_alone`
+  crashes the app while its sidecar's refusal is on its way, and
+  `an_adopted_instance_whose_record_names_no_host_paths_restarts_unchecked`
+  pins the gap an in-place upgrade from 0.3.2 leaves.
 
 None of those run runc. The first version said the runc half was
 "exercised by `make test-linux`", and it wasn't: no Linux test ran a knob.
