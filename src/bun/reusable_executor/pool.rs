@@ -2931,6 +2931,8 @@ mod tests {
         timeout: Duration,
         cancel_after: Option<Duration>,
     ) -> Attempt {
+        // Dropped last, after the pool, so the namespace's cgroups go (#2322).
+        let _cgroups = crate::test_cgroups::TestCgroups::namespace(namespace);
         let root = tempfile::Builder::new()
             .prefix("rb-cold-interrupt-")
             .tempdir()

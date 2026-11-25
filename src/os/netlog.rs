@@ -17,7 +17,7 @@
 
 use std::fmt;
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -59,12 +59,14 @@ impl FromStr for NetlogTarget {
             value: value.to_string(),
         };
         let (address, port) = match value.split_once(':') {
-            Some((address, port)) => (address, port.parse::<u16>().map_err(|_| bad())?),
+            Some((address, port)) => (address, decimal(port).ok_or_else(bad)?),
             None => (value, DEFAULT_PORT),
         };
         if port == 0 {
             return Err(bad());
         }
+        // Rust's own parser already takes only four plain decimal numbers,
+        // with no sign and no leading zeros, which is the script's rule.
         let address = address.parse::<Ipv4Addr>().map_err(|_| bad())?;
         // One machine's listener, reachable over the LAN: not every machine
         // on it, not a group, not nowhere and not the node itself.
@@ -77,6 +79,16 @@ impl FromStr for NetlogTarget {
         }
         Ok(Self { address, port })
     }
+}
+
+/// A port as the boot script reads it: digits only, so no `+`, and no
+/// leading zero, which other tools may read as octal.
+fn decimal(text: &str) -> Option<u16> {
+    let digits_only = !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    if !digits_only || (text.len() > 1 && text.starts_with('0')) {
+        return None;
+    }
+    text.parse().ok()
 }
 
 impl fmt::Display for NetlogTarget {
@@ -149,29 +161,48 @@ fn present<'de, D: serde::Deserializer<'de>>(
     Option::deserialize(deserializer)
 }
 
+/// How long the netlog unit may take to restart: above its
+/// `TimeoutStartSec=30`, so systemd gives up on the script before this does.
+const RESTART_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// How long reading the unit's journal may take.
+const JOURNAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What the script starts each line it logs with.
+const SCRIPT_PREFIX: &str = "reliaburger-netlog: ";
+
 /// Paths and commands, overridable for tests.
 #[derive(Debug, Clone)]
 pub struct NetlogPaths {
     /// Where the ESP may be mounted, in the script's order: gpt-auto mounts
     /// it at `/boot`, or at `/efi` when `/boot` isn't empty.
     pub esp_candidates: Vec<PathBuf>,
-    /// The netconsole target the script creates in configfs.
-    pub netconsole_enabled: PathBuf,
-    /// Restarts the netlog unit without waiting for it, as argv.
+    /// The netconsole target the script creates in configfs: its
+    /// `enabled`, `remote_ip` and `remote_port` say where the kernel's lines
+    /// go now.
+    pub netconsole: PathBuf,
+    /// Restarts the netlog unit and waits for its script to finish, as argv.
     pub restart: Vec<String>,
+    /// Prints the netlog unit's journal, one message a line, as argv;
+    /// `--since=@<seconds>` goes on the end.
+    pub journal: Vec<String>,
 }
 
 impl Default for NetlogPaths {
     fn default() -> Self {
+        let argv = |words: &[&str]| words.iter().map(|word| word.to_string()).collect();
         Self {
             esp_candidates: vec![PathBuf::from("/boot"), PathBuf::from("/efi")],
-            netconsole_enabled: PathBuf::from("/sys/kernel/config/netconsole/reliaburger/enabled"),
-            restart: vec![
-                "systemctl".into(),
-                "restart".into(),
-                "--no-block".into(),
-                "reliaburger-netlog.service".into(),
-            ],
+            netconsole: PathBuf::from("/sys/kernel/config/netconsole/reliaburger"),
+            // Not --no-block: the unit is a oneshot, so this returns when the
+            // script has finished, and configfs then says whether it worked.
+            restart: argv(&["systemctl", "restart", "reliaburger-netlog.service"]),
+            journal: argv(&[
+                "journalctl",
+                "--unit=reliaburger-netlog.service",
+                "--output=cat",
+                "--no-pager",
+            ]),
         }
     }
 }
@@ -231,51 +262,110 @@ pub fn write(paths: &NetlogPaths, target: Option<NetlogTarget>) -> Result<(), St
 }
 
 /// Make the change take effect now as well as at the next boot: restart the
-/// netlog unit for a target (it reconfigures netconsole and says hello), or
-/// switch netconsole's target off. Best effort: what it returns is a
-/// warning, since the file is already written.
+/// netlog unit for a target (it reconfigures netconsole and says hello),
+/// then check that netconsole now sends to it; or switch netconsole's target
+/// off. Best effort: what it returns is a warning, since the file is already
+/// written.
 pub async fn apply_now(paths: &NetlogPaths, target: Option<NetlogTarget>) -> Option<String> {
-    match target {
-        Some(_) => {
-            let (program, args) = paths.restart.split_first()?;
-            // Killed if the timeout below drops it, not left behind.
-            let run = tokio::process::Command::new(program)
-                .args(args)
-                .kill_on_drop(true)
-                .output();
-            match tokio::time::timeout(std::time::Duration::from_secs(10), run).await {
-                Ok(Ok(output)) if output.status.success() => None,
-                Ok(Ok(output)) => Some(format!(
-                    "{program} failed: {}; boot logs start at the next boot",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                )),
-                Ok(Err(e)) => Some(format!("{program}: {e}; boot logs start at the next boot")),
-                Err(_) => Some(format!(
-                    "{program} took over 10 s; boot logs start at the next boot"
-                )),
-            }
-        }
-        None => {
-            if !paths.netconsole_enabled.exists() {
-                return None;
-            }
-            tokio::fs::write(&paths.netconsole_enabled, b"0\n")
-                .await
-                .err()
-                .map(|e| {
-                    format!(
-                        "{}: {e}; boot logs stop at the next boot",
-                        paths.netconsole_enabled.display()
-                    )
-                })
-        }
+    let Some(target) = target else {
+        return switch_off_now(paths).await;
+    };
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    if let Err(reason) = run(&paths.restart, RESTART_TIMEOUT).await {
+        return Some(format!("{reason}; boot logs start at the next boot"));
     }
+    // The unit's script exits 0 whatever happens, so that a boot never
+    // fails over its logs: configfs says whether it worked (#2323).
+    let found = netconsole_mismatch(&paths.netconsole, target).await?;
+    let mut journal = paths.journal.clone();
+    journal.push(format!("--since=@{since}"));
+    let reason = run(&journal, JOURNAL_TIMEOUT)
+        .await
+        .ok()
+        .and_then(|lines| script_reason(&lines))
+        .unwrap_or(found);
+    Some(format!(
+        "not streaming now: {reason}; the next boot tries again"
+    ))
+}
+
+/// Switch the netconsole target off, if the script made one.
+async fn switch_off_now(paths: &NetlogPaths) -> Option<String> {
+    let enabled = paths.netconsole.join("enabled");
+    if !enabled.exists() {
+        return None;
+    }
+    tokio::fs::write(&enabled, b"0\n").await.err().map(|e| {
+        format!(
+            "{}: {e}; boot logs stop at the next boot",
+            enabled.display()
+        )
+    })
+}
+
+/// Run `argv` to the end within `limit`, and answer what it printed, or why
+/// it failed.
+async fn run(argv: &[String], limit: std::time::Duration) -> Result<String, String> {
+    let Some((program, args)) = argv.split_first() else {
+        return Err("no command".to_string());
+    };
+    // Killed if the timeout below drops it, not left behind.
+    let output = tokio::process::Command::new(program)
+        .args(args)
+        .kill_on_drop(true)
+        .output();
+    match tokio::time::timeout(limit, output).await {
+        Ok(Ok(output)) if output.status.success() => {
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        }
+        Ok(Ok(output)) => Err(format!(
+            "{program} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Ok(Err(e)) => Err(format!("{program}: {e}")),
+        Err(_) => Err(format!("{program} took over {} s", limit.as_secs())),
+    }
+}
+
+/// `None` when the netconsole target in `dir` is on and sends to `target`;
+/// else what it found instead.
+async fn netconsole_mismatch(dir: &Path, target: NetlogTarget) -> Option<String> {
+    let read = |name: &str| {
+        let path = dir.join(name);
+        async move {
+            tokio::fs::read_to_string(&path)
+                .await
+                .map(|text| text.trim().to_string())
+        }
+    };
+    let Ok(enabled) = read("enabled").await else {
+        return Some("the kernel has no netconsole target".to_string());
+    };
+    if enabled != "1" {
+        return Some("the kernel's netconsole target is off".to_string());
+    }
+    let address = read("remote_ip").await.unwrap_or_default();
+    let port = read("remote_port").await.unwrap_or_default();
+    if address == target.address.to_string() && port == target.port.to_string() {
+        return None;
+    }
+    Some(format!("the kernel's netconsole sends to {address}:{port}"))
+}
+
+/// The script's last word in its journal lines: why it isn't streaming.
+fn script_reason(lines: &str) -> Option<String> {
+    lines
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(SCRIPT_PREFIX))
+        .next_back()
+        .map(str::to_string)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     fn target(value: &str) -> NetlogTarget {
         value.parse().unwrap()
@@ -291,6 +381,13 @@ mod tests {
             }
         );
         assert_eq!(target("192.168.1.20:7000").port, 7000);
+        assert_eq!(target("10.0.0.1:1").port, 1);
+        assert_eq!(target("10.0.0.1:65535").port, 65535);
+        assert_eq!(
+            target("10.0.0.10:6666").address,
+            Ipv4Addr::new(10, 0, 0, 10)
+        );
+        assert_eq!(target("10.0.0.0:6666").address, Ipv4Addr::new(10, 0, 0, 0));
         assert_eq!(target("10.42.0.1").to_string(), "10.42.0.1:6666");
     }
 
@@ -323,6 +420,18 @@ mod tests {
             "0.0.0.0",
             "127.0.0.1",
             "127.1.2.3:6666",
+            // What the boot script refuses too (#2323): a sign, a leading
+            // zero, a space, more than one colon.
+            "10.42.0.1:+7000",
+            "10.42.0.1:-1",
+            "10.42.0.1:07000",
+            "10.42.0.1:00",
+            "10.42.0.1: 7000",
+            "10.42.0.1:7000:1",
+            "010.42.0.1",
+            "10.042.0.1:6666",
+            "10.42.0.01",
+            "+10.42.0.1",
         ] {
             assert!(
                 value.parse::<NetlogTarget>().is_err(),
@@ -385,8 +494,9 @@ mod tests {
     fn esps(dir: &Path) -> NetlogPaths {
         NetlogPaths {
             esp_candidates: vec![dir.join("boot"), dir.join("efi")],
-            netconsole_enabled: dir.join("enabled"),
+            netconsole: dir.join("netconsole"),
             restart: vec!["true".into()],
+            journal: vec!["true".into()],
         }
     }
 
@@ -454,21 +564,84 @@ mod tests {
             None,
             "no target, nothing to do"
         );
-        std::fs::write(&paths.netconsole_enabled, "1\n").unwrap();
+        let enabled = paths.netconsole.join("enabled");
+        std::fs::create_dir_all(&paths.netconsole).unwrap();
+        std::fs::write(&enabled, "1\n").unwrap();
         assert_eq!(apply_now(&paths, None).await, None);
-        assert_eq!(
-            std::fs::read_to_string(&paths.netconsole_enabled).unwrap(),
-            "0\n"
-        );
+        assert_eq!(std::fs::read_to_string(&enabled).unwrap(), "0\n");
+    }
+
+    /// A netconsole target in configfs as the kernel shows it.
+    fn netconsole(paths: &NetlogPaths, enabled: &str, address: &str, port: &str) {
+        std::fs::create_dir_all(&paths.netconsole).unwrap();
+        for (name, value) in [
+            ("enabled", enabled),
+            ("remote_ip", address),
+            ("remote_port", port),
+        ] {
+            std::fs::write(paths.netconsole.join(name), format!("{value}\n")).unwrap();
+        }
+    }
+
+    /// A journal that prints `lines`, whatever it's asked.
+    fn journal(lines: &str) -> Vec<String> {
+        vec![
+            "sh".into(),
+            "-c".into(),
+            format!("printf '{lines}'"),
+            "journalctl".into(),
+        ]
     }
 
     #[tokio::test]
     async fn a_restart_that_fails_is_a_warning_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let mut paths = esps(dir.path());
-        assert_eq!(apply_now(&paths, Some(target("10.0.0.1"))).await, None);
         paths.restart = vec!["false".into()];
         let warning = apply_now(&paths, Some(target("10.0.0.1"))).await.unwrap();
         assert!(warning.contains("next boot"), "{warning}");
+    }
+
+    #[tokio::test]
+    async fn a_netconsole_sending_to_the_target_needs_no_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = esps(dir.path());
+        netconsole(&paths, "1", "10.0.0.1", "7000");
+        paths.journal = journal("reliaburger-netlog: no route to 10.0.0.1; not streaming\\n");
+        assert_eq!(apply_now(&paths, Some(target("10.0.0.1:7000"))).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_script_that_didnt_stream_is_a_warning_with_its_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = esps(dir.path());
+        paths.journal = journal(
+            "Starting reliaburger-netlog.service\\n\
+             reliaburger-netlog: no route to 10.0.0.1; not streaming\\n",
+        );
+        // The unit restarted and exited 0, but netconsole has no target.
+        assert_eq!(
+            apply_now(&paths, Some(target("10.0.0.1"))).await,
+            Some(
+                "not streaming now: no route to 10.0.0.1; not streaming; the next boot tries again"
+                    .into()
+            )
+        );
+        // An old target, still on: the script gave up before changing it.
+        netconsole(&paths, "1", "10.0.0.9", "6666");
+        paths.journal = journal("");
+        assert_eq!(
+            apply_now(&paths, Some(target("10.0.0.1"))).await,
+            Some(
+                "not streaming now: the kernel's netconsole sends to 10.0.0.9:6666; \
+                 the next boot tries again"
+                    .into()
+            )
+        );
+        netconsole(&paths, "0", "10.0.0.1", "6666");
+        let warning = apply_now(&paths, Some(target("10.0.0.1"))).await.unwrap();
+        assert!(warning.contains("target is off"), "{warning}");
+        netconsole(&paths, "1", "10.0.0.1", "6667");
+        assert!(apply_now(&paths, Some(target("10.0.0.1"))).await.is_some());
     }
 }

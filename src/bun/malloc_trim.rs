@@ -82,12 +82,18 @@ where
             _ = ticker.tick() => {}
         }
         let trim = trim.clone();
-        let started = Instant::now();
+        // Timed on the blocking thread, so a wait for a free one in a busy
+        // pool doesn't count as a slow trim (#2323).
+        let timed = move || {
+            let started = Instant::now();
+            trim();
+            started.elapsed()
+        };
         // A join error means the runtime is shutting down.
-        if tokio::task::spawn_blocking(trim).await.is_err() {
+        let Ok(took) = tokio::task::spawn_blocking(timed).await else {
             return;
-        }
-        if let Some(warning) = slow_trim_warning(started.elapsed()) {
+        };
+        if let Some(warning) = slow_trim_warning(took) {
             eprintln!("{warning}");
         }
     }
