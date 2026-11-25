@@ -234,6 +234,10 @@ pub struct ReplicaObservation {
     /// Instances the runtime refused to launch, with why (#881).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub launch_failures: Vec<LaunchFailureObservation>,
+    /// Sidecars the node refused to start again beside a running instance,
+    /// with why (#2335). `instance` names the sidecar.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused_sidecars: Vec<LaunchFailureObservation>,
 }
 
 /// One instance the runtime refused to launch, such as for a missing binary.

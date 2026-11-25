@@ -104,6 +104,11 @@ pub struct SidecarStatus {
     /// How many times it has restarted on its own since it last started
     /// with its instance.
     pub restart_count: u32,
+    /// Why the node refused to start it again, when it did (#2335): a host
+    /// path it shares with its app isn't allowed on this node any more. It
+    /// stays `stopped` beside its running app until the app next restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
 }
 
 /// Where a sidecar is in its life, as the node's agent last saw it.
@@ -116,7 +121,8 @@ pub enum SidecarState {
     Backoff,
     /// It's being started again.
     Restarting,
-    /// Its instance isn't running, so neither is it.
+    /// It isn't running: its instance isn't, or the node refused to start
+    /// it again ([`SidecarStatus::refused`] says why).
     Stopped,
 }
 

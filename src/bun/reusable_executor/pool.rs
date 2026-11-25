@@ -2077,6 +2077,7 @@ mod tests {
         let id = InstanceId(name.into());
         let spec = OciSpec {
             managed_volumes: Vec::new(),
+            host_path_sources: Vec::new(),
             reusable_executor: false,
             host_process: true,
             initialiser: false,

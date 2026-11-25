@@ -369,6 +369,12 @@ pub const FINDINGS: &[FindingKind] = &[
         thresholds: &[],
     },
     FindingKind {
+        id: "sidecar-refused",
+        severities: WARNING,
+        meaning: "an app runs without a sidecar the node refused to start again, because a host path it mounts isn't allowed any more",
+        thresholds: &[],
+    },
+    FindingKind {
         id: "quota-blocked",
         severities: WARNING,
         meaning: "an app isn't placed because its namespace quota has no room",

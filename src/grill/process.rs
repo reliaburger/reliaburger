@@ -1639,6 +1639,7 @@ mod tests {
     fn spec_with_args(args: Vec<String>) -> OciSpec {
         OciSpec {
             managed_volumes: Vec::new(),
+            host_path_sources: Vec::new(),
             reusable_executor: false,
             host_process: true,
             initialiser: false,
