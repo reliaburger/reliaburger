@@ -489,16 +489,16 @@ async fn runc_warm_pinned_executor_cold_starts_make_no_registry_requests() {
         );
         assert_eq!(attempt.output.head, b"ran", "{attempt:?}");
     }
-    let executors = runtime
-        .launch_inventory()
-        .await
+    // Count cold starts from the pool's own record, not the runtime's
+    // inventory: an executor idle for a second retires while a slower slot
+    // is still starting, so on a loaded host the inventory read after the
+    // burst can miss executors that did cold-start (#2338).
+    let startups = runner
+        .executor_timings(reliaburger::config::job::JobRuntime::SharedRunc)
         .unwrap()
-        .unwrap()
-        .into_iter()
-        .filter(|launch| launch.instance_id.0.contains("__executor-"))
-        .map(|launch| launch.instance_id)
-        .collect::<Vec<_>>();
-    assert_eq!(executors.len(), BURST, "every slot cold-started");
+        .startup
+        .samples;
+    assert_eq!(startups, BURST as u64, "every slot cold-started");
     assert_eq!(
         connections.load(Ordering::SeqCst),
         0,
@@ -512,8 +512,10 @@ async fn runc_warm_pinned_executor_cold_starts_make_no_registry_requests() {
     })
     .await
     .expect("idle executors never retired");
-    for id in &executors {
-        assert_retired(&runtime, id).await;
+    for launch in runtime.launch_inventory().await.unwrap().unwrap() {
+        if launch.instance_id.0.contains("__executor-") {
+            assert_retired(&runtime, &launch.instance_id).await;
+        }
     }
 }
 
