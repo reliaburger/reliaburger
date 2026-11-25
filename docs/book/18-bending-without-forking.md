@@ -2390,9 +2390,30 @@ sidecar starts or restarts, carries the count. A crash the state sweep sees
 calls `record_sidecar_restarts`, which rewrites only that field
 (`update_sidecar_restarts` reads the record, changes it and writes it
 back) with the time the backoff ends. A restart that fails does the same
-with its longer backoff. All three run in tasks, best effort, like the
-records themselves: a lost write only means the next Bun starts the
-backoff over.
+with its longer backoff. All three are best effort, like the records
+themselves: a lost write only means the next Bun starts the backoff over.
+
+They mustn't land out of order, though. Each write carries the loop's
+state at the moment it was queued, and the first version gave each its own
+task. Coverage CI, an instrumented build on a busy runner, then caught a
+record that never showed its restart: the crash's write had read the
+record, the restart's whole record had landed, and the crash's write put
+its older count back over it. The fix is one writer.
+`SidecarRecordWriter` holds the sending half of a `tokio::sync::mpsc`
+channel, and a single task drains the other half, one write at a time, so
+the order on disk is the order the loop queued. The loop never waits on a
+record, so the channel is unbounded; a sidecar's backoff bounds how fast
+it fills.
+
+The sender sits in a `std::sync::OnceLock`, which runs its initialiser
+once, on first use, through a shared reference. That matters because
+`record_sidecars` takes `&self`, and spawning the writer needs a running
+Tokio runtime, which the agent's constructor can't count on. When the
+agent is dropped, so is the sender; the writer's `recv()` then returns
+what's still queued and finally `None`, and the task ends after the last
+write has landed. Tests use a `Flush` write that answers through a
+`oneshot` once everything queued before it is on disk, so they wait for
+exactly that rather than polling.
 
 At startup, `register_adopted` takes what the records kept:
 
@@ -4006,6 +4027,10 @@ two sidecars, `proxy` and `logs`:
   before.
 - `sidecars_say_starting_while_their_app_starts_slowly` (#2336): with the
   instance held in Starting, both sidecars say `starting`.
+- `a_crash_write_never_overwrites_a_later_restart_record` (#2336): three
+  rounds of crash then restart, each queueing the crash's write just
+  before the restart's whole record; after each the record says the right
+  count and no backoff, and a last crash's backoff lands on top.
 - `a_rolling_replacements_sidecar_records_name_its_pinned_image` (#2336):
   the sidecar records a rolling replacement writes name the image the
   supervisor holds for the instance, which the trust policy may have pinned

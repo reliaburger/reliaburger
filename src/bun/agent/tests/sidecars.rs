@@ -856,7 +856,9 @@ async fn sidecar_record_once(
     landed: impl Fn(&crate::grill::records::InstanceRecord) -> bool,
 ) -> crate::grill::records::InstanceRecord {
     let directory = crate::grill::records::sidecar_records_dir(records);
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    // Generous, under nextest's 60 s: an instrumented build under load
+    // writes slowly (#2336).
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
             let found = crate::grill::records::load_records(&directory)
                 .unwrap()
@@ -1049,4 +1051,50 @@ async fn a_rolling_replacements_sidecar_records_name_its_pinned_image() {
     assert_eq!(logs.image, PINNED, "logs runs the app's image");
     let proxy = sidecar_record_once(records.path(), PROXY, |_| true).await;
     assert_eq!(proxy.image, "envoy:1.31", "proxy names its own image");
+}
+
+/// #2336: a crash's write of the backoff and a restart's write of the
+/// whole record land in the order they were queued. They used to race in
+/// separate tasks, and a crash's write that read the record before the
+/// restart's landed put its older count back over it, which coverage CI
+/// caught as a record that never showed one restart.
+#[tokio::test]
+async fn a_crash_write_never_overwrites_a_later_restart_record() {
+    let records = tempfile::tempdir().unwrap();
+    let (mut agent, grill, _) = deployed_with_records(records.path()).await;
+    let directory = crate::grill::records::sidecar_records_dir(records.path());
+    let proxy_record = || {
+        crate::grill::records::load_records(&directory)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.instance_id == PROXY)
+            .unwrap()
+    };
+    for round in 1..=3u32 {
+        // Crash: the backoff write is queued...
+        grill.set_state(&id(PROXY), ContainerState::Stopped);
+        agent.check_apps().await;
+        // ...and straight after it, the restart's whole record, with the
+        // backoff cut short so the restart needn't wait for it.
+        agent
+            .sidecars
+            .make_due(&id(PROXY), std::time::Instant::now());
+        grill.set_state(&id(PROXY), ContainerState::Running);
+        agent.relaunch_due_sidecars_to_completion().await;
+        agent.flush_sidecar_records().await;
+        let record = proxy_record();
+        assert_eq!(restart_count(&record), Some(round), "round {round}");
+        assert_eq!(
+            record.sidecar_restarts.unwrap().due_at_unix_ms,
+            None,
+            "round {round}: a running sidecar's record says it's in backoff"
+        );
+    }
+    // A last crash queues after the restart, so its backoff lands.
+    grill.set_state(&id(PROXY), ContainerState::Stopped);
+    agent.check_apps().await;
+    agent.flush_sidecar_records().await;
+    let restarts = proxy_record().sidecar_restarts.unwrap();
+    assert_eq!(restarts.count, 3);
+    assert!(restarts.due_at_unix_ms.is_some());
 }

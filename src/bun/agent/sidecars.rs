@@ -342,6 +342,119 @@ async fn record_sidecar<G: Grill>(
     .map_err(|error| error.to_string())?
 }
 
+/// One write to the sidecars' adoption records, queued by the agent loop.
+#[derive(Debug)]
+enum SidecarRecordWrite {
+    /// A sidecar started: its whole record. Boxed, because a launch's spec
+    /// dwarfs the other writes.
+    Launch(Box<LaunchRecordWrite>),
+    /// A sidecar exited or failed to start again: only its crash-loop state.
+    Restarts {
+        directory: std::path::PathBuf,
+        sidecar: InstanceId,
+        restarts: crate::grill::records::SidecarRestarts,
+    },
+    /// Answers once every write queued before it has landed.
+    #[cfg(test)]
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
+
+/// The whole record of a sidecar that started, queued for the writer.
+#[derive(Debug)]
+struct LaunchRecordWrite {
+    directory: std::path::PathBuf,
+    owner: SidecarOwner,
+    replica_index: u32,
+    launch: SidecarLaunch,
+    image: String,
+    restarts: Option<crate::grill::records::SidecarRestarts>,
+}
+
+/// Writes the sidecars' adoption records one at a time, in the order the
+/// agent loop queued them (#2336).
+///
+/// Each write carries the loop's state at the moment it was queued, so the
+/// last one queued must be the last to land. Separate tasks raced: a
+/// crash's write could read the record, a restart's whole record land, and
+/// the crash's write put back its older count over it. One queue and one
+/// writer make the order on disk the loop's order. The queue is unbounded
+/// because the loop never waits on a record, and a sidecar's backoff bounds
+/// how fast it fills.
+#[derive(Debug, Default)]
+pub(super) struct SidecarRecordWriter {
+    queue: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<SidecarRecordWrite>>,
+}
+
+impl SidecarRecordWriter {
+    /// Queue `write`, starting the writer task on first use.
+    fn queue<G: Grill + Clone + 'static>(&self, grill: &G, write: SidecarRecordWrite) {
+        let queue = self.queue.get_or_init(|| {
+            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(write_sidecar_records(grill.clone(), receiver));
+            sender
+        });
+        if queue.send(write).is_err() {
+            eprintln!("bun: sidecar record writer has stopped; a Bun restart restarts sidecars");
+        }
+    }
+}
+
+/// The writer task behind [`SidecarRecordWriter`]: each write in turn,
+/// until the agent drops the queue and what it queued has landed.
+async fn write_sidecar_records<G: Grill>(
+    grill: G,
+    mut queue: tokio::sync::mpsc::UnboundedReceiver<SidecarRecordWrite>,
+) {
+    while let Some(write) = queue.recv().await {
+        match write {
+            SidecarRecordWrite::Launch(write) => {
+                let LaunchRecordWrite {
+                    directory,
+                    owner,
+                    replica_index,
+                    launch,
+                    image,
+                    restarts,
+                } = *write;
+                let sidecar = launch.id.clone();
+                let recorded = record_sidecar(
+                    &grill,
+                    directory,
+                    owner,
+                    replica_index,
+                    launch,
+                    image,
+                    restarts,
+                )
+                .await;
+                if let Err(reason) = recorded {
+                    eprintln!(
+                        "bun: {sidecar}: sidecar not recorded for adoption, so a Bun restart restarts it: {reason}"
+                    );
+                }
+            }
+            SidecarRecordWrite::Restarts {
+                directory,
+                sidecar,
+                restarts,
+            } => {
+                let id = sidecar.0.clone();
+                let updated = tokio::task::spawn_blocking(move || {
+                    crate::grill::records::update_sidecar_restarts(&directory, &id, restarts)
+                })
+                .await;
+                if let Ok(Err(error)) = updated {
+                    eprintln!("bun: {sidecar}: sidecar restarts not recorded: {error}");
+                }
+            }
+            #[cfg(test)]
+            SidecarRecordWrite::Flush(done) => {
+                let _ = done.send(());
+            }
+        }
+    }
+}
+
 /// A sidecar's restart, finished, for the loop to record.
 #[derive(Debug)]
 pub(super) struct Relaunched {
@@ -612,6 +725,15 @@ impl Sidecars {
             .map_or(0, |run| run.restarts)
     }
 
+    /// Cut `sidecar`'s backoff short: it's due at `at`. For tests that
+    /// can't wait a backoff out.
+    #[cfg(test)]
+    pub(super) fn make_due(&mut self, sidecar: &InstanceId, at: Instant) {
+        if let Some(run) = self.run_mut(sidecar) {
+            run.due = Some(at);
+        }
+    }
+
     /// `sidecar`'s crash-loop state as its record keeps it (#2336), with
     /// `now` on the monotonic clock being `wall_now`.
     pub(super) fn restart_state(
@@ -710,7 +832,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         sidecar_launches(&self.sidecars.specs_of(parent), parent, parent_spec)
     }
 
-    /// Record `parent`'s sidecars for adoption, from a task (#1315): all of
+    /// Record `parent`'s sidecars for adoption, through the record writer
+    /// (#1315, #2336): all of
     /// them after the instance's own launch was recorded, or only `only`
     /// after it restarted alone. `parent_spec` is the spec the instance was
     /// launched from.
@@ -756,27 +879,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let replica_index = crate::grill::InstanceIdentity::parse(&parent.0)
             .map(|identity| identity.ordinal)
             .unwrap_or(0);
-        let grill = self.supervisor.grill().clone();
-        tokio::spawn(async move {
-            for (launch, image, restarts) in launches {
-                let sidecar = launch.id.clone();
-                let recorded = record_sidecar(
-                    &grill,
-                    directory.clone(),
-                    owner.clone(),
+        for (launch, image, restarts) in launches {
+            self.sidecar_records.queue(
+                self.supervisor.grill(),
+                SidecarRecordWrite::Launch(Box::new(LaunchRecordWrite {
+                    directory: directory.clone(),
+                    owner: owner.clone(),
                     replica_index,
                     launch,
                     image,
                     restarts,
-                )
-                .await;
-                if let Err(reason) = recorded {
-                    eprintln!(
-                        "bun: {sidecar}: sidecar not recorded for adoption, so a Bun restart restarts it: {reason}"
-                    );
-                }
-            }
-        });
+                })),
+            );
+        }
     }
 
     /// Who `parent`'s sidecar records name as their owner: the instance as
@@ -792,7 +907,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         })
     }
 
-    /// Write `sidecar`'s crash-loop state into its record, from a task,
+    /// Write `sidecar`'s crash-loop state into its record, through the queue,
     /// after it exited or failed to start again (#2336), so a Bun restart
     /// keeps its count and the rest of its backoff. Best effort, as the
     /// record is: a lost write means the next Bun starts its backoff over.
@@ -810,17 +925,23 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         else {
             return;
         };
-        let sidecar = sidecar.clone();
-        tokio::spawn(async move {
-            let id = sidecar.0.clone();
-            let updated = tokio::task::spawn_blocking(move || {
-                crate::grill::records::update_sidecar_restarts(&directory, &id, restarts)
-            })
-            .await;
-            if let Ok(Err(error)) = updated {
-                eprintln!("bun: {sidecar}: sidecar restarts not recorded: {error}");
-            }
-        });
+        self.sidecar_records.queue(
+            self.supervisor.grill(),
+            SidecarRecordWrite::Restarts {
+                directory,
+                sidecar: sidecar.clone(),
+                restarts,
+            },
+        );
+    }
+
+    /// Wait until every sidecar record write queued so far has landed.
+    #[cfg(test)]
+    pub(super) async fn flush_sidecar_records(&self) {
+        let (done, landed) = tokio::sync::oneshot::channel();
+        self.sidecar_records
+            .queue(self.supervisor.grill(), SidecarRecordWrite::Flush(done));
+        let _ = landed.await;
     }
 
     /// Start every crashed sidecar whose backoff is over and whose instance
