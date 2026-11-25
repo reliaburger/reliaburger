@@ -87,6 +87,14 @@ pub enum CommandError {
     OutputTooLarge,
 }
 
+impl CommandError {
+    /// Whether a live owner's answer was lost or late, so that asking again
+    /// may succeed. It says nothing about the command itself.
+    pub(crate) fn is_transient(&self) -> bool {
+        matches!(self, Self::Io(error) if transient_control_error(error))
+    }
+}
+
 /// Durable command attempts belonging to one exclusive runtime lifecycle.
 #[derive(Debug, Clone)]
 pub struct OwnedCommands {

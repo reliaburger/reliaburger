@@ -13,6 +13,27 @@ use crate::grill::runc_intent::{IntentCommands, IntentPhase, RuntimeRole};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a role exec keeps asking a busy owner whether its role runs.
+/// Each ask has its own 2 s deadline, so this covers many of them; it stays
+/// well under an exec's own 300 s default, and sits between the 15 s that
+/// #2297 gives a command's start and the 60 s that #2292 gives a stop.
+const EXEC_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The first pause before asking a late owner again; it doubles each time.
+const ADMISSION_BACKOFF_START: Duration = Duration::from_millis(10);
+
+/// The longest pause between two asks.
+const ADMISSION_BACKOFF_LIMIT: Duration = Duration::from_millis(200);
+
+/// Whether a role observation failed only because an owner's answer was
+/// lost or late, so that asking again may succeed.
+fn transient_owner_error(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<super::CommandError>())
+        .is_some_and(super::CommandError::is_transient)
+}
+
 /// Executes a bounded short runtime command without shell interpolation.
 pub trait RuntimeCommandExecutor: Send + Sync {
     /// Return actual exit evidence and captured output, or retain uncertainty as an error.
@@ -150,6 +171,14 @@ impl ClaimedCommandExecutor {
     /// Run auxiliary work without holding the adapter mutex during its lifetime.
     /// Cancellation closes the caller's owner socket; sealing can retire the role
     /// concurrently and waits for its accepted auxiliary children to disappear.
+    ///
+    /// Admission asks the role's owner whether the role runs, and each ask
+    /// has a short deadline. When a busy owner answers late, admission asks
+    /// again for up to [`EXEC_ADMISSION_TIMEOUT`], so a loaded host delays
+    /// the exec instead of failing it (#2305). Each attempt takes the adapter
+    /// mutex afresh: a seal can get in between attempts, and the next
+    /// attempt then refuses, because admission is sealed or because a failed
+    /// seal left the claim for recovery.
     pub async fn exec_role(
         &self,
         role: RuntimeRole,
@@ -160,13 +189,35 @@ impl ClaimedCommandExecutor {
                 "cleanup handle cannot execute runtime roles",
             ));
         }
-        let execution = {
-            let guard = self.commands.lock().await;
-            guard
-                .as_ref()
-                .ok_or_else(unavailable)?
-                .execution(role)
-                .await?
+        let started = tokio::time::Instant::now();
+        let mut backoff = ADMISSION_BACKOFF_START;
+        let mut attempts: u32 = 0;
+        let execution = loop {
+            attempts += 1;
+            let admitted = {
+                let guard = self.commands.lock().await;
+                match guard.as_ref() {
+                    Some(commands) => commands.execution(role).await,
+                    None => Err(unavailable()),
+                }
+            };
+            match admitted {
+                Ok(execution) => break execution,
+                Err(error) if transient_owner_error(&error) => {
+                    if started.elapsed() >= EXEC_ADMISSION_TIMEOUT {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "process owner didn't answer for {}s ({attempts} attempts): {error}",
+                                EXEC_ADMISSION_TIMEOUT.as_secs()
+                            ),
+                        ));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(ADMISSION_BACKOFF_LIMIT);
         };
         // Keep the socket future in this caller, so cancellation reaches the owner.
         execution.execute(command).await
@@ -299,4 +350,41 @@ impl RuntimeCommandExecutor for ClaimedCommandExecutor {
 
 fn unavailable() -> io::Error {
     io::Error::other("runtime command claim is unavailable; recover the recorded generation")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::grill::command::CommandError;
+
+    fn wrapped(error: CommandError) -> io::Error {
+        io::Error::other(error)
+    }
+
+    #[test]
+    fn a_late_owner_answer_is_transient() {
+        let late = io::Error::new(io::ErrorKind::TimedOut, "process owner request timed out");
+        assert!(transient_owner_error(&wrapped(CommandError::Io(late))));
+    }
+
+    #[test]
+    fn a_missing_record_is_not_transient() {
+        let missing = io::Error::new(io::ErrorKind::NotFound, "no owner record");
+        assert!(!transient_owner_error(&wrapped(CommandError::Io(missing))));
+    }
+
+    #[test]
+    fn a_command_that_overran_its_wait_is_not_transient() {
+        let overran = CommandError::TimedOut {
+            command: crate::grill::command::CommandId(crate::grill::InstanceId("command-0".into())),
+            timeout: Duration::from_secs(1),
+        };
+        assert!(!transient_owner_error(&wrapped(overran)));
+    }
+
+    #[test]
+    fn a_bare_timeout_is_not_an_owner_answer() {
+        let bare = io::Error::new(io::ErrorKind::TimedOut, "timed out");
+        assert!(!transient_owner_error(&bare));
+    }
 }
