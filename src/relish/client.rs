@@ -1333,7 +1333,7 @@ impl BunClient {
     /// remember it in the context at `path` so the next command asks it
     /// first (#2241). Remembering is best effort: a busy or unwritable
     /// context only costs the next command the same wait.
-    fn report_fallover(
+    pub(crate) fn report_fallover(
         context: &super::local_context::LocalContext,
         choice: &super::local_context::EndpointChoice,
         path: Option<&std::path::Path>,

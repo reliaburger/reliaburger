@@ -1218,6 +1218,18 @@ When relish does pass over a node, it says which ones on stderr and which node i
 
 The unit tests in `local_context.rs` drive `choose_endpoint` with a probe closure: three endpoints with the first down still answer, and the probe stops at the first that does; none up gives an error listing all three; one endpoint is never probed; the remembered endpoint goes first and is ignored once it's no longer listed. One test uses the real probe against a port that refuses and one that listens. `tests/suite/context_endpoints.rs` runs the real `relish nodes` against a context whose first node refuses and whose second is a TLS stand-in for the cluster, and checks the warning, the answer and the remembered node, then that the next command says nothing. And `make test-cluster` has the lab's case in `cluster_failover.rs`: three wired nodes, the context's first node the leader, killed; the context passes over it, and the node it picks names the new leader.
 
+One client didn't follow along (#2304). `relish mcp`, started from an admin context, makes the agent a read-only token of its own with an admin client, and it built that client once, at startup, on whichever node answered then. Each tool call builds its own client through `BunClient::local`, so the agent's reads fell over, but making or replacing the token kept asking the node `relish mcp` had started on, and printed no warning. Building the admin client for every call would put a probe in front of every tool call that only reuses the stored token, which needs no network at all. So `Managed` keeps the client behind a `tokio::sync::Mutex`, along with the path of the context it came from, and builds it again only when a token request comes back unreachable:
+
+```rust
+if matches!(obtained, Err(CredentialError::Unreachable(_)))
+    && let Some(admin) = self.rebuild_admin().await
+{
+    obtained = credentials::obtain(/* the same arguments, the new client */).await;
+}
+```
+
+`if ... && let Some(admin) = ...` is a *let chain*, new in Rust 2024: the pattern only binds if the condition before it holds, and the body runs only if both do. `rebuild_admin` reads the context again and goes through the same `connect` and `report_fallover` as every other command, inside `spawn_blocking` because the probe blocks. So the warning appears on stderr, which is safe for `relish mcp` since only stdout carries the protocol, and the node that answered is remembered. When no node answers, it returns `None` and the caller keeps the original unreachable error. The test starts two TLS stand-ins that make tokens, builds `Managed` while both are up, stops the first, and asks for a token: it must come from the second node, and the context must remember it.
+
 ## A screen with no login
 
 On the Wyse lab's first evening the monitor was the only view of a node that didn't need the laptop, and it showed five lines: name, cluster, address, MAC, and whether bun answered. When a node misbehaved, the next step was always the laptop. So the console grew into a dashboard (#2150), with six tabs: status, metrics, workloads, the cluster, versions and logs.
