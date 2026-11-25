@@ -635,6 +635,15 @@ mod tests {
         let rows = vec![web, instance("node-2", "api", 1, "running")];
         insta::assert_snapshot!(render_instances(&rows, &[]));
 
+        // #2336: sidecars beside an app still starting say so.
+        let mut starting = instance("node-1", "web", 0, "starting");
+        starting.instance.sidecars = vec![sidecar("proxy", SidecarState::Starting, 2)];
+        let text = render_instances(std::slice::from_ref(&starting), &[]);
+        let row = text.lines().find(|line| line.contains("+ proxy")).unwrap();
+        assert!(row.contains(" starting "), "{text}");
+        let json = serde_json::to_value(&starting).unwrap();
+        assert_eq!(json["sidecars"][0]["state"], "starting");
+
         let json = serde_json::to_value(&rows).unwrap();
         assert_eq!(
             json[0]["sidecars"][1],

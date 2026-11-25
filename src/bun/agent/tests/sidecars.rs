@@ -7,6 +7,7 @@
 //! crash, and restart with it when it crashes.
 
 use super::*;
+use crate::bun::agent::SidecarState;
 
 const WEB: &str = "default__web-0";
 const PROXY: &str = "default__web-0__sidecar-proxy";
@@ -703,7 +704,6 @@ async fn a_restarted_sidecar_is_recorded_again_and_a_stop_removes_the_records() 
 /// apps` can show them. Before, a sidecar showed up only as Restart events.
 #[tokio::test]
 async fn an_instances_status_lists_its_sidecars_with_their_restarts() {
-    use crate::bun::agent::SidecarState;
     let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
     with_finished_init(&grill, WEB);
     expect_complete(&drain_deploy(&mut agent, web_with_sidecars("myapp:v1")).await);
@@ -844,4 +844,209 @@ async fn a_sidecar_whose_adoption_fails_starts_again_and_bun_still_starts() {
         .filter(|op| op != "state")
         .collect();
     assert_eq!(restarted.last().map(String::as_str), Some("start"));
+}
+
+// --- Restart counts and backoff across a Bun restart (#2336) ---
+
+/// The sidecar record of `sidecar` under `records`, once `landed` says the
+/// write it waits for is there: records are written from tasks.
+async fn sidecar_record_once(
+    records: &std::path::Path,
+    sidecar: &str,
+    landed: impl Fn(&crate::grill::records::InstanceRecord) -> bool,
+) -> crate::grill::records::InstanceRecord {
+    let directory = crate::grill::records::sidecar_records_dir(records);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let found = crate::grill::records::load_records(&directory)
+                .unwrap()
+                .into_iter()
+                .find(|record| record.instance_id == sidecar && landed(record));
+            if let Some(record) = found {
+                return record;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{sidecar}'s record never showed the write"))
+}
+
+fn restart_count(record: &crate::grill::records::InstanceRecord) -> Option<u32> {
+    record.sidecar_restarts.map(|restarts| restarts.count)
+}
+
+/// The status of `parent`'s sidecars: identity, state and restarts.
+fn sidecar_statuses(
+    agent: &TestAgent,
+    parent: &str,
+) -> Vec<(String, crate::bun::agent::SidecarState, u32)> {
+    agent
+        .status_entries()
+        .into_iter()
+        .find(|entry| entry.status.id == parent)
+        .unwrap()
+        .status
+        .sidecars
+        .into_iter()
+        .map(|sidecar| (sidecar.id, sidecar.state, sidecar.restart_count))
+        .collect()
+}
+
+/// #2336: a sidecar's restart count is how often it restarted on its own,
+/// as manual 01 says, and a Bun restart that adopts it doesn't reset it.
+/// Before, every adopted sidecar showed `RESTARTS 0`.
+#[tokio::test]
+async fn a_bun_restart_keeps_a_sidecars_restart_count() {
+    let records = tempfile::tempdir().unwrap();
+    let (mut first, grill, _) = deployed_with_records(records.path()).await;
+    grill.set_state(&id(PROXY), ContainerState::Stopped);
+    first.check_apps().await;
+    grill.set_state(&id(PROXY), ContainerState::Running);
+    first.relaunch_due_sidecars_to_completion().await;
+    assert_eq!(first.sidecars.restarts(&id(PROXY)), 1);
+    sidecar_record_once(records.path(), PROXY, |record| {
+        restart_count(record) == Some(1)
+    })
+    .await;
+    drop(first);
+
+    let (mut agent, grill) = restarted_agent(records.path());
+    for instance in [WEB, PROXY, LOGS] {
+        grill.set_adopt_result(&id(instance), true);
+    }
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+    assert_eq!(agent.sidecars.restarts(&id(PROXY)), 1);
+    assert_eq!(agent.sidecars.restarts(&id(LOGS)), 0);
+    assert_eq!(
+        sidecar_statuses(&agent, WEB),
+        [
+            (PROXY.to_string(), SidecarState::Running, 1),
+            (LOGS.to_string(), SidecarState::Running, 0)
+        ]
+    );
+}
+
+/// #2336: a sidecar waiting out its backoff when Bun restarts keeps waiting
+/// it out. Before, startup retired it and started it again at once, so a
+/// crash loop skipped its backoff on every Bun restart.
+#[tokio::test]
+async fn a_sidecar_in_backoff_at_a_bun_restart_keeps_its_backoff() {
+    let records = tempfile::tempdir().unwrap();
+    let (mut first, grill, _) = deployed_with_records(records.path()).await;
+    // Its first restart is at once; the mock then keeps reporting it
+    // stopped, so the next sweep sees it crash again.
+    grill.set_state(&id(PROXY), ContainerState::Stopped);
+    first.check_apps().await;
+    first.relaunch_due_sidecars_to_completion().await;
+    sidecar_record_once(records.path(), PROXY, |record| {
+        restart_count(record) == Some(1)
+    })
+    .await;
+    first.check_apps().await;
+    assert!(first.sidecars.due(std::time::Instant::now()).is_empty());
+    // The crash itself writes when its backoff ends.
+    let record = sidecar_record_once(records.path(), PROXY, |record| {
+        record
+            .sidecar_restarts
+            .is_some_and(|restarts| restarts.due_at_unix_ms.is_some())
+    })
+    .await;
+    // A one-second backoff is too short to assert on, so make it thirty.
+    let restarts = record.sidecar_restarts.unwrap();
+    let thirty_seconds_on = std::time::SystemTime::now() + std::time::Duration::from_secs(30);
+    let due_at_unix_ms = thirty_seconds_on
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let directory = crate::grill::records::sidecar_records_dir(records.path());
+    crate::grill::records::update_sidecar_restarts(
+        &directory,
+        PROXY,
+        crate::grill::records::SidecarRestarts {
+            due_at_unix_ms: Some(due_at_unix_ms),
+            ..restarts
+        },
+    )
+    .unwrap();
+    drop(first);
+
+    // Its process is gone, so the runtime refuses it.
+    let (mut agent, grill) = restarted_agent(records.path());
+    grill.set_adopt_result(&id(WEB), true);
+    grill.set_adopt_result(&id(LOGS), true);
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+    let from = grill.calls().len();
+    agent.relaunch_due_sidecars_to_completion().await;
+    assert!(
+        !operations(&grill.calls()[from..], &id(PROXY)).contains(&"create".to_string()),
+        "the sidecar skipped its backoff"
+    );
+    assert_eq!(
+        sidecar_statuses(&agent, WEB)[0],
+        (PROXY.to_string(), SidecarState::Backoff, 1)
+    );
+    let now = std::time::Instant::now();
+    assert!(
+        agent
+            .sidecars
+            .due(now + std::time::Duration::from_secs(25))
+            .is_empty()
+    );
+    assert_eq!(
+        agent.sidecars.due(now + std::time::Duration::from_secs(31)),
+        [(id(WEB), id(PROXY))]
+    );
+}
+
+/// #2336: sidecars start before their app, so during a slow app start the
+/// status says they're starting. Before, they showed `stopped`.
+#[tokio::test]
+async fn sidecars_say_starting_while_their_app_starts_slowly() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    with_finished_init(&grill, WEB);
+    expect_complete(&drain_deploy(&mut agent, web_with_sidecars("myapp:v1")).await);
+    // Where a slow app start holds it: its sidecars run, the app doesn't yet.
+    agent.supervisor.get_instance_mut(&id(WEB)).unwrap().state = ContainerState::Starting;
+    assert_eq!(
+        sidecar_statuses(&agent, WEB),
+        [
+            (PROXY.to_string(), SidecarState::Starting, 0),
+            (LOGS.to_string(), SidecarState::Starting, 0)
+        ]
+    );
+}
+
+/// #2336: a rolling replacement's sidecar records name the image its
+/// instance runs as the supervisor keeps it, digest-pinned where the trust
+/// policy pinned it, as a fresh instance's records do. Before, they took
+/// the spec's image.
+#[tokio::test]
+async fn a_rolling_replacements_sidecar_records_name_its_pinned_image() {
+    let records = tempfile::tempdir().unwrap();
+    let (mut agent, grill, _) = deployed_with_records(records.path()).await;
+    const PINNED: &str =
+        "myapp:v1@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let web = id(WEB);
+    let instance = agent.supervisor.get_instance_mut(&web).unwrap();
+    instance.image = PINNED.to_string();
+    let oci_spec = instance.oci_spec.clone().unwrap();
+    let host_port = instance.host_port;
+    let spec = agent.deployed_specs[&("web".to_string(), "default".to_string())].clone();
+    let launch = launch_evidence::LaunchEvidence::read(&grill, &web).await;
+    let replacement = RollingInstance {
+        instance_id: web.clone(),
+        app_name: "web".to_string(),
+        namespace: "default".to_string(),
+        spec,
+        oci_spec,
+        host_port,
+        launch,
+    };
+    agent.persist_rolling_instance(&replacement).await.unwrap();
+
+    let logs = sidecar_record_once(records.path(), LOGS, |record| record.image == PINNED).await;
+    assert_eq!(logs.image, PINNED, "logs runs the app's image");
+    let proxy = sidecar_record_once(records.path(), PROXY, |_| true).await;
+    assert_eq!(proxy.image, "envoy:1.31", "proxy names its own image");
 }

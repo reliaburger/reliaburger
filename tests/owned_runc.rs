@@ -270,6 +270,7 @@ async fn runc_owned_adoption_validates_generation_and_restores_live_network() {
         app_spec: None,
         oci_spec: specification,
         rootless_network: None,
+        sidecar_restarts: None,
     };
     drop(first);
     let recovered = runtime(root.path());
@@ -445,6 +446,7 @@ fn adoption_record(
         app_spec: None,
         oci_spec,
         rootless_network: None,
+        sidecar_restarts: None,
     }
 }
 
@@ -556,6 +558,7 @@ async fn a_stale_adoption_record_retires_its_generation_and_others_still_adopt()
             app_spec: None,
             oci_spec: specification.clone(),
             rootless_network: None,
+            sidecar_restarts: None,
         });
     }
     // The stale record names another start of the launcher's pid, further
@@ -1120,6 +1123,7 @@ async fn restart_recovers_a_retiring_generation_that_still_holds_its_address() {
         app_spec: None,
         oci_spec: specification,
         rootless_network: None,
+        sidecar_restarts: None,
     };
     // A rollout stops the instance; discovery still holds its address.
     first.kill(&id).await.unwrap();
@@ -1838,6 +1842,7 @@ async fn owned_runc_unit_stop_fixture() {
         app_spec: None,
         oci_spec: specification,
         rootless_network: None,
+        sidecar_restarts: None,
     };
     std::fs::write(
         root.join("shared/record.json"),

@@ -86,6 +86,27 @@ pub struct InstanceRecord {
     /// Rootless userspace-network owner and recreation parameters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rootless_network: Option<RootlessNetworkRecord>,
+    /// A sidecar's record only: how often it has restarted on its own and
+    /// when it may next start, so a Bun restart keeps both (#2336). An
+    /// instance's record, and a sidecar record an older Bun wrote, has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar_restarts: Option<SidecarRestarts>,
+}
+
+/// A sidecar's crash-loop state as its record keeps it (#2336). Times are
+/// wall-clock milliseconds since the Unix epoch, because the monotonic
+/// clock a running Bun uses means nothing to the next one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SidecarRestarts {
+    /// Restarts on its own since it last started with its instance.
+    #[serde(default)]
+    pub count: u32,
+    /// When its last restart on its own succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restarted_at_unix_ms: Option<u64>,
+    /// Set while it's down: when its backoff ends and it may start again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_at_unix_ms: Option<u64>,
 }
 
 /// The instance record format this build writes and reads.
@@ -114,6 +135,27 @@ pub fn write_record(records_dir: &Path, record: &InstanceRecord) -> std::io::Res
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     crate::sesame::identity::atomic_write_mode(&path, &json, Some(0o600))?;
     Ok(())
+}
+
+/// Replace the crash-loop state in `instance_id`'s record in `records_dir`,
+/// keeping everything else it says (#2336). Returns `false`, writing
+/// nothing, when there's no such record: a sidecar whose record is gone is
+/// restarted from scratch after a Bun restart anyway.
+pub fn update_sidecar_restarts(
+    records_dir: &Path,
+    instance_id: &str,
+    restarts: SidecarRestarts,
+) -> std::io::Result<bool> {
+    let bytes = match std::fs::read(record_path(records_dir, instance_id)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let mut record: InstanceRecord = serde_json::from_slice(&bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    record.sidecar_restarts = Some(restarts);
+    write_record(records_dir, &record)?;
+    Ok(true)
 }
 
 /// Remove an instance's record and sync its directory. Missing records are fine.
@@ -412,6 +454,7 @@ mod tests {
             app_spec: None,
             oci_spec: oci_spec(),
             rootless_network: None,
+            sidecar_restarts: None,
         }
     }
 
@@ -423,6 +466,63 @@ mod tests {
 
         let loaded = load_records(dir.path()).unwrap();
         assert_eq!(loaded, vec![original]);
+    }
+
+    /// #2336: a sidecar record carries its crash-loop state, and the format
+    /// reads both ways: a record without it (an older Bun's) loads with
+    /// none, and one with it loads in a reader that doesn't know the field,
+    /// because nothing denies unknown fields.
+    #[test]
+    fn sidecar_restarts_roundtrip_and_read_both_ways() {
+        let mut original = record(4242, 1000);
+        original.sidecar_restarts = Some(SidecarRestarts {
+            count: 4,
+            restarted_at_unix_ms: Some(1_700_000_000_000),
+            due_at_unix_ms: Some(1_700_000_008_000),
+        });
+        let json = serde_json::to_value(&original).unwrap();
+        let restored: InstanceRecord = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(restored, original);
+
+        let mut old = json.clone();
+        old.as_object_mut().unwrap().remove("sidecar_restarts");
+        let restored: InstanceRecord = serde_json::from_value(old).unwrap();
+        assert_eq!(restored.sidecar_restarts, None);
+        let without = serde_json::to_value(record(4242, 1000)).unwrap();
+        assert!(
+            without.get("sidecar_restarts").is_none(),
+            "an instance's record says nothing about sidecar restarts"
+        );
+
+        /// What an older Bun reads a record as: no `sidecar_restarts`.
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OlderRecord {
+            instance_id: String,
+            pid: u32,
+            rootless_network: Option<RootlessNetworkRecord>,
+        }
+        let older: OlderRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(older.instance_id, "web-0");
+    }
+
+    #[test]
+    fn updating_sidecar_restarts_keeps_the_rest_of_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = record(4242, 1000);
+        write_record(dir.path(), &original).unwrap();
+        let restarts = SidecarRestarts {
+            count: 2,
+            restarted_at_unix_ms: None,
+            due_at_unix_ms: Some(5),
+        };
+        assert!(update_sidecar_restarts(dir.path(), "web-0", restarts).unwrap());
+        let loaded = load_records(dir.path()).unwrap();
+        assert_eq!(loaded[0].sidecar_restarts, Some(restarts));
+        assert_eq!(loaded[0].pid, original.pid);
+        assert_eq!(loaded[0].oci_spec, original.oci_spec);
+        assert!(!update_sidecar_restarts(dir.path(), "gone-0", restarts).unwrap());
+        assert_eq!(load_records(dir.path()).unwrap().len(), 1);
     }
 
     #[test]

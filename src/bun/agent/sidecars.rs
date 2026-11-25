@@ -26,7 +26,7 @@
 //!   them again before it.
 
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio_util::sync::CancellationToken;
 
@@ -51,14 +51,66 @@ pub(super) fn sidecar_backoff(restarts: u32) -> Duration {
     Duration::from_secs(seconds).min(SIDECAR_MAX_BACKOFF)
 }
 
+/// `at` on the wall clock, in milliseconds since the Unix epoch, given that
+/// the monotonic `now` is `wall_now`. A record keeps times this way because
+/// an `Instant` means nothing to the next Bun process (#2336).
+fn to_unix_ms(at: Instant, now: Instant, wall_now: SystemTime) -> Option<u64> {
+    let wall = if at >= now {
+        wall_now.checked_add(at - now)?
+    } else {
+        wall_now.checked_sub(now - at)?
+    };
+    let since_epoch = wall.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+    u64::try_from(since_epoch.as_millis()).ok()
+}
+
+/// The `Instant` of a wall-clock time a record kept, the inverse of
+/// [`to_unix_ms`]. `None` for one the monotonic clock can't express.
+fn from_unix_ms(unix_ms: u64, now: Instant, wall_now: SystemTime) -> Option<Instant> {
+    let wall = SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(unix_ms))?;
+    match wall.duration_since(wall_now) {
+        Ok(ahead) => now.checked_add(ahead),
+        Err(behind) => now.checked_sub(behind.duration()),
+    }
+}
+
+/// What a sidecar's status says while its instance is in `state` (#2336).
+/// Sidecars start before their app, so while it's still being prepared or
+/// started they're `starting`; only beside a started instance does each
+/// say what it's doing itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SidecarPhase {
+    /// The instance is being prepared or started, and its sidecars with it.
+    Starting,
+    /// The instance has started and not begun to stop.
+    Beside,
+    /// The instance hasn't started, is stopping, or has stopped.
+    Stopped,
+}
+
+impl SidecarPhase {
+    /// The phase of the sidecars of an instance in `state`.
+    pub(super) fn of(state: ContainerState) -> Self {
+        match state {
+            ContainerState::Preparing | ContainerState::Initialising | ContainerState::Starting => {
+                Self::Starting
+            }
+            ContainerState::HealthWait | ContainerState::Running | ContainerState::Unhealthy => {
+                Self::Beside
+            }
+            ContainerState::Pending
+            | ContainerState::Stopping
+            | ContainerState::Stopped
+            | ContainerState::Failed => Self::Stopped,
+        }
+    }
+}
+
 /// Whether an instance in `state` has started and not begun to stop, so
 /// its sidecars should be running beside it. An unhealthy app keeps them:
 /// a sidecar that's down may be why it's unhealthy.
 pub(super) fn runs_beside(state: ContainerState) -> bool {
-    matches!(
-        state,
-        ContainerState::HealthWait | ContainerState::Running | ContainerState::Unhealthy
-    )
+    SidecarPhase::of(state) == SidecarPhase::Beside
 }
 
 /// One sidecar's runtime launch: its identity and the spec it's created
@@ -246,6 +298,7 @@ async fn record_sidecar<G: Grill>(
     replica_index: u32,
     launch: SidecarLaunch,
     image: String,
+    restarts: Option<crate::grill::records::SidecarRestarts>,
 ) -> Result<(), String> {
     let (pid, log_stem) = tokio::time::timeout(SIDECAR_RECORD_TIMEOUT, async {
         let pid = grill.pid(&launch.id).await;
@@ -281,6 +334,7 @@ async fn record_sidecar<G: Grill>(
             app_spec: None,
             oci_spec: launch.spec,
             rootless_network: None,
+            sidecar_restarts: restarts,
         };
         records::write_record(&directory, &record).map_err(|error| error.to_string())
     })
@@ -305,7 +359,8 @@ struct SidecarRun {
     /// instances still run (#1434).
     spec: SidecarSpec,
     /// Restarts since it last started with its instance, or since it last
-    /// ran for [`SIDECAR_STABLE_RUN`].
+    /// ran for [`SIDECAR_STABLE_RUN`]. Its record keeps it across a Bun
+    /// restart (#2336).
     restarts: u32,
     /// When its last restart alone succeeded.
     restarted_at: Option<Instant>,
@@ -335,15 +390,47 @@ impl Sidecars {
 
     /// Record `specs` as the sidecars of `parent`, an instance adopted after
     /// a Bun restart (#1315). Those in `adopted` run on, adopted with it;
-    /// every other one is down and due at `now`, because startup retired it.
+    /// every other one is down, because startup retired it.
+    ///
+    /// Each keeps the restart count and backoff its record `restored`
+    /// (#2336), read with `now` on the monotonic clock being `wall_now`. A
+    /// retired one whose record says it was waiting out a backoff waits out
+    /// the rest of it, at most [`SIDECAR_MAX_BACKOFF`] in case the wall clock
+    /// stepped. One that was running when the last Bun stopped exited
+    /// meanwhile, so it's due after its next backoff, as if it exited `now`.
     pub(super) fn register_adopted(
         &mut self,
         parent: &InstanceId,
         specs: &[SidecarSpec],
         adopted: &HashSet<InstanceId>,
+        restored: &HashMap<InstanceId, crate::grill::records::SidecarRestarts>,
         now: Instant,
+        wall_now: SystemTime,
     ) -> Result<Vec<InstanceId>, BunError> {
-        self.register_with(parent, specs, |id| (!adopted.contains(id)).then_some(now))
+        let ids = self.register_with(parent, specs, |_| None)?;
+        for id in &ids {
+            let saved = restored.get(id).copied().unwrap_or_default();
+            let Some(run) = self.run_mut(id) else {
+                continue;
+            };
+            run.restarts = saved.count;
+            run.restarted_at = saved
+                .restarted_at_unix_ms
+                .and_then(|unix_ms| from_unix_ms(unix_ms, now, wall_now));
+            if adopted.contains(id) {
+                continue;
+            }
+            match saved.due_at_unix_ms {
+                Some(unix_ms) => {
+                    let due = from_unix_ms(unix_ms, now, wall_now).unwrap_or(now);
+                    run.due = Some(due.clamp(now, now + SIDECAR_MAX_BACKOFF));
+                }
+                None => {
+                    self.mark_exited(id, now);
+                }
+            }
+        }
+        Ok(ids)
     }
 
     /// Register `specs`, each due when `due_of` its identity says: `None`
@@ -525,13 +612,34 @@ impl Sidecars {
             .map_or(0, |run| run.restarts)
     }
 
-    /// What `parent`'s sidecars are doing, for its status (#1315).
-    /// `parent_running` is whether the instance has started and not begun
-    /// to stop: if not, its sidecars aren't running either.
+    /// `sidecar`'s crash-loop state as its record keeps it (#2336), with
+    /// `now` on the monotonic clock being `wall_now`.
+    pub(super) fn restart_state(
+        &self,
+        sidecar: &InstanceId,
+        now: Instant,
+        wall_now: SystemTime,
+    ) -> Option<crate::grill::records::SidecarRestarts> {
+        let run = self
+            .by_parent
+            .values()
+            .flatten()
+            .find(|run| &run.id == sidecar)?;
+        Some(crate::grill::records::SidecarRestarts {
+            count: run.restarts,
+            restarted_at_unix_ms: run
+                .restarted_at
+                .and_then(|at| to_unix_ms(at, now, wall_now)),
+            due_at_unix_ms: run.due.and_then(|due| to_unix_ms(due, now, wall_now)),
+        })
+    }
+
+    /// What `parent`'s sidecars are doing, for its status (#1315), in the
+    /// `phase` its instance's state puts them in (#2336).
     pub(super) fn statuses(
         &self,
         parent: &InstanceId,
-        parent_running: bool,
+        phase: SidecarPhase,
     ) -> Vec<super::status::SidecarStatus> {
         use super::status::{SidecarState, SidecarStatus};
         self.by_parent
@@ -541,8 +649,10 @@ impl Sidecars {
             .map(|run| SidecarStatus {
                 name: run.spec.name.clone(),
                 id: run.id.0.clone(),
-                state: if !parent_running {
+                state: if phase == SidecarPhase::Stopped {
                     SidecarState::Stopped
+                } else if phase == SidecarPhase::Starting {
+                    SidecarState::Starting
                 } else if run.relaunching.is_some() {
                     SidecarState::Restarting
                 } else if run.due.is_some() {
@@ -624,13 +734,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return;
         };
         let specs = self.sidecars.specs_of(parent);
-        let launches: Vec<(SidecarLaunch, String)> = sidecar_launches(&specs, parent, parent_spec)
+        let (now, wall_now) = (Instant::now(), SystemTime::now());
+        type Recorded = (
+            SidecarLaunch,
+            String,
+            Option<crate::grill::records::SidecarRestarts>,
+        );
+        let launches: Vec<Recorded> = sidecar_launches(&specs, parent, parent_spec)
             .into_iter()
             .zip(&specs)
             .filter(|(launch, _)| only.is_none_or(|id| &launch.id == id))
             .map(|(launch, spec)| {
                 let image = spec.image.clone().unwrap_or_else(|| owner.image.clone());
-                (launch, image)
+                let restarts = self.sidecars.restart_state(&launch.id, now, wall_now);
+                (launch, image, restarts)
             })
             .collect();
         if launches.is_empty() {
@@ -641,7 +758,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .unwrap_or(0);
         let grill = self.supervisor.grill().clone();
         tokio::spawn(async move {
-            for (launch, image) in launches {
+            for (launch, image, restarts) in launches {
                 let sidecar = launch.id.clone();
                 let recorded = record_sidecar(
                     &grill,
@@ -650,6 +767,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     replica_index,
                     launch,
                     image,
+                    restarts,
                 )
                 .await;
                 if let Err(reason) = recorded {
@@ -657,6 +775,50 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         "bun: {sidecar}: sidecar not recorded for adoption, so a Bun restart restarts it: {reason}"
                     );
                 }
+            }
+        });
+    }
+
+    /// Who `parent`'s sidecar records name as their owner: the instance as
+    /// the supervisor keeps it, with the image it runs, pinned to its digest
+    /// where the trust policy pinned it. Every writer of a sidecar record
+    /// asks here, so the records agree with the instance's own (#2336).
+    pub(super) fn sidecar_owner(&self, parent: &InstanceId) -> Option<SidecarOwner> {
+        let instance = self.supervisor.get_instance(parent)?;
+        Some(SidecarOwner {
+            namespace: instance.namespace.clone(),
+            app_name: instance.app_name.clone(),
+            image: instance.image.clone(),
+        })
+    }
+
+    /// Write `sidecar`'s crash-loop state into its record, from a task,
+    /// after it exited or failed to start again (#2336), so a Bun restart
+    /// keeps its count and the rest of its backoff. Best effort, as the
+    /// record is: a lost write means the next Bun starts its backoff over.
+    pub(super) fn record_sidecar_restarts(&self, sidecar: &InstanceId) {
+        let Some(directory) = self
+            .records_dir
+            .as_deref()
+            .map(crate::grill::records::sidecar_records_dir)
+        else {
+            return;
+        };
+        let Some(restarts) =
+            self.sidecars
+                .restart_state(sidecar, Instant::now(), SystemTime::now())
+        else {
+            return;
+        };
+        let sidecar = sidecar.clone();
+        tokio::spawn(async move {
+            let id = sidecar.0.clone();
+            let updated = tokio::task::spawn_blocking(move || {
+                crate::grill::records::update_sidecar_restarts(&directory, &id, restarts)
+            })
+            .await;
+            if let Ok(Err(error)) = updated {
+                eprintln!("bun: {sidecar}: sidecar restarts not recorded: {error}");
             }
         });
     }
@@ -726,16 +888,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return;
         };
         let (app, namespace) = (instance.app_name.clone(), instance.namespace.clone());
-        // Its new process is what a restarted Bun must find (#1315).
+        // Its new process is what a restarted Bun must find (#1315), and a
+        // failed start leaves a longer backoff it must keep (#2336).
         if result.is_ok()
             && let Some(parent_spec) = instance.oci_spec.clone()
+            && let Some(owner) = self.sidecar_owner(&parent)
         {
-            let owner = SidecarOwner {
-                namespace: namespace.clone(),
-                app_name: app.clone(),
-                image: instance.image.clone(),
-            };
             self.record_sidecars(&parent, owner, &parent_spec, Some(&sidecar));
+        } else if result.is_err() {
+            self.record_sidecar_restarts(&sidecar);
         }
         let severity = crate::bun::events::EventSeverity::Warning;
         match result {
@@ -953,7 +1114,14 @@ mod tests {
         let (parent, proxy) = (id("web-0"), id("web-0__sidecar-proxy"));
         let now = Instant::now();
         sidecars
-            .register_adopted(&parent, &proxy_spec(), &HashSet::new(), now)
+            .register_adopted(
+                &parent,
+                &proxy_spec(),
+                &HashSet::new(),
+                &HashMap::new(),
+                now,
+                SystemTime::now(),
+            )
             .unwrap();
         assert_eq!(sidecars.due(now), vec![(parent.clone(), proxy.clone())]);
         assert_eq!(sidecars.parent_of(&proxy), Some(&parent));
@@ -978,9 +1146,14 @@ mod tests {
         );
         sidecars.register(&parent, &app.sidecar).unwrap();
         let now = Instant::now();
-        let states = |sidecars: &Sidecars, running| -> Vec<(String, SidecarState, u32)> {
+        let states = |sidecars: &Sidecars, running: bool| -> Vec<(String, SidecarState, u32)> {
+            let phase = if running {
+                SidecarPhase::Beside
+            } else {
+                SidecarPhase::Stopped
+            };
             sidecars
-                .statuses(&parent, running)
+                .statuses(&parent, phase)
                 .into_iter()
                 .map(|status| (status.name, status.state, status.restart_count))
                 .collect()
@@ -1011,7 +1184,171 @@ mod tests {
                 .iter()
                 .all(|(_, state, _)| *state == SidecarState::Stopped)
         );
-        assert!(sidecars.statuses(&id("api-0"), true).is_empty());
+        assert!(
+            sidecars
+                .statuses(&id("api-0"), SidecarPhase::Beside)
+                .is_empty()
+        );
+    }
+
+    /// #2336: sidecars start before their app, so while it's prepared or
+    /// started they're `starting`, not `stopped`.
+    #[test]
+    fn sidecars_beside_an_instance_still_starting_say_starting() {
+        use crate::bun::agent::status::SidecarState;
+        let mut sidecars = Sidecars::default();
+        let parent = id("web-0");
+        sidecars.register(&parent, &proxy_spec()).unwrap();
+        for state in [
+            ContainerState::Preparing,
+            ContainerState::Initialising,
+            ContainerState::Starting,
+        ] {
+            let statuses = sidecars.statuses(&parent, SidecarPhase::of(state));
+            assert_eq!(statuses[0].state, SidecarState::Starting, "{state:?}");
+        }
+        for (state, expected) in [
+            (ContainerState::HealthWait, SidecarState::Running),
+            (ContainerState::Running, SidecarState::Running),
+            (ContainerState::Unhealthy, SidecarState::Running),
+            (ContainerState::Pending, SidecarState::Stopped),
+            (ContainerState::Stopping, SidecarState::Stopped),
+            (ContainerState::Stopped, SidecarState::Stopped),
+            (ContainerState::Failed, SidecarState::Stopped),
+        ] {
+            let statuses = sidecars.statuses(&parent, SidecarPhase::of(state));
+            assert_eq!(statuses[0].state, expected, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn wall_clock_times_survive_the_trip_through_a_record() {
+        let (now, wall_now) = (Instant::now(), SystemTime::now());
+        for offset in [Duration::ZERO, Duration::from_millis(1500)] {
+            let later = now + offset;
+            let unix_ms = to_unix_ms(later, now, wall_now).unwrap();
+            let back = from_unix_ms(unix_ms, now, wall_now).unwrap();
+            assert!(back.max(later) - back.min(later) < Duration::from_millis(1));
+            if let Some(earlier) = now.checked_sub(offset) {
+                let unix_ms = to_unix_ms(earlier, now, wall_now).unwrap();
+                let back = from_unix_ms(unix_ms, now, wall_now).unwrap();
+                assert!(back.max(earlier) - back.min(earlier) < Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// #2336: an adopted instance's sidecars keep the restart count their
+    /// records kept. One the runtime adopted runs on; one it retired while
+    /// it waited out a backoff waits out the rest of it, and one retired
+    /// with no backoff pending exited while Bun was down, so it's due after
+    /// its next backoff.
+    #[test]
+    fn adopted_sidecars_keep_their_restart_count_and_backoff() {
+        use crate::grill::records::SidecarRestarts;
+        let mut sidecars = Sidecars::default();
+        let app: AppSpec = toml::from_str(
+            "image = \"a:1\"\n[[sidecar]]\nname = \"proxy\"\n[[sidecar]]\nname = \"logs\"\n[[sidecar]]\nname = \"metrics\"\n",
+        )
+        .unwrap();
+        let (parent, proxy, logs, metrics) = (
+            id("web-0"),
+            id("web-0__sidecar-proxy"),
+            id("web-0__sidecar-logs"),
+            id("web-0__sidecar-metrics"),
+        );
+        let (now, wall_now) = (Instant::now(), SystemTime::now());
+        let in_ms = |after: Duration| to_unix_ms(now + after, now, wall_now);
+        let restored = HashMap::from([
+            (
+                proxy.clone(),
+                SidecarRestarts {
+                    count: 2,
+                    restarted_at_unix_ms: in_ms(Duration::ZERO),
+                    due_at_unix_ms: None,
+                },
+            ),
+            (
+                logs.clone(),
+                SidecarRestarts {
+                    count: 5,
+                    restarted_at_unix_ms: None,
+                    due_at_unix_ms: in_ms(Duration::from_secs(20)),
+                },
+            ),
+            (
+                metrics.clone(),
+                SidecarRestarts {
+                    count: 3,
+                    restarted_at_unix_ms: None,
+                    due_at_unix_ms: None,
+                },
+            ),
+        ]);
+        let adopted = HashSet::from([proxy.clone()]);
+        sidecars
+            .register_adopted(&parent, &app.sidecar, &adopted, &restored, now, wall_now)
+            .unwrap();
+
+        assert_eq!(sidecars.restarts(&proxy), 2);
+        assert_eq!(sidecars.restarts(&logs), 5);
+        assert_eq!(sidecars.restarts(&metrics), 3);
+        assert_eq!(
+            sidecars.running_beside(&parent),
+            std::slice::from_ref(&proxy)
+        );
+        assert!(sidecars.due(now).is_empty(), "nothing relaunches at once");
+        // metrics: the backoff after three restarts, four seconds.
+        assert!(sidecars.due(now + Duration::from_millis(3900)).is_empty());
+        assert_eq!(
+            sidecars.due(now + Duration::from_secs(4)),
+            [(parent.clone(), metrics.clone())]
+        );
+        // logs: the rest of the backoff its record kept.
+        assert_eq!(sidecars.due(now + Duration::from_secs(20)).len(), 2);
+        // The adopted one's next crash backs off by its kept count.
+        let later = now + Duration::from_secs(1);
+        assert!(sidecars.mark_exited(&proxy, later));
+        assert!(
+            sidecars
+                .due(later + Duration::from_millis(1900))
+                .iter()
+                .all(|(_, id)| id != &proxy)
+        );
+        assert!(
+            sidecars
+                .due(later + Duration::from_secs(2))
+                .iter()
+                .any(|(_, id)| id == &proxy)
+        );
+    }
+
+    /// #2336: a backoff a record kept never waits longer than the longest
+    /// backoff, even when the wall clock stepped back meanwhile.
+    #[test]
+    fn a_kept_backoff_never_waits_longer_than_a_minute() {
+        use crate::grill::records::SidecarRestarts;
+        let mut sidecars = Sidecars::default();
+        let (parent, proxy) = (id("web-0"), id("web-0__sidecar-proxy"));
+        let (now, wall_now) = (Instant::now(), SystemTime::now());
+        let restored = HashMap::from([(
+            proxy.clone(),
+            SidecarRestarts {
+                count: 9,
+                restarted_at_unix_ms: None,
+                due_at_unix_ms: to_unix_ms(now + Duration::from_secs(3600), now, wall_now),
+            },
+        )]);
+        sidecars
+            .register_adopted(
+                &parent,
+                &proxy_spec(),
+                &HashSet::new(),
+                &restored,
+                now,
+                wall_now,
+            )
+            .unwrap();
+        assert_eq!(sidecars.due(now + SIDECAR_MAX_BACKOFF), [(parent, proxy)]);
     }
 
     /// #1315: a sidecar adopted with its instance runs on; only the ones
@@ -1031,7 +1368,14 @@ mod tests {
         let now = Instant::now();
         let adopted = HashSet::from([proxy.clone()]);
         sidecars
-            .register_adopted(&parent, &app.sidecar, &adopted, now)
+            .register_adopted(
+                &parent,
+                &app.sidecar,
+                &adopted,
+                &HashMap::new(),
+                now,
+                SystemTime::now(),
+            )
             .unwrap();
         assert_eq!(sidecars.running_beside(&parent), vec![proxy]);
         assert_eq!(sidecars.due(now), vec![(parent, logs)]);

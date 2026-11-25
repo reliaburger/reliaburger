@@ -1710,6 +1710,7 @@ mod tests {
             app_spec: None,
             oci_spec: sleep_spec("60"),
             rootless_network: None,
+            sidecar_restarts: None,
         }
     }
 

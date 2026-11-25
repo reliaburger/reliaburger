@@ -110,6 +110,9 @@ pub struct SidecarStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SidecarState {
+    /// Started with its instance, which is still being prepared or started
+    /// (#2336): sidecars start before their app.
+    Starting,
     /// Running beside its instance.
     Running,
     /// It exited and is waiting out its backoff before it starts again.
@@ -124,6 +127,7 @@ impl std::fmt::Display for SidecarState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // `pad`, not `write_str`, so a table's `{:<10}` widths apply.
         f.pad(match self {
+            Self::Starting => "starting",
             Self::Running => "running",
             Self::Backoff => "backoff",
             Self::Restarting => "restarting",
@@ -742,9 +746,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             .deployed_specs
                             .get(&(instance.app_name.clone(), instance.namespace.clone()))
                             .is_some_and(crate::cluster::orchestrate::stays_through_os_rollout),
-                        sidecars: self
-                            .sidecars
-                            .statuses(&instance.id, super::sidecars::runs_beside(instance.state)),
+                        sidecars: self.sidecars.statuses(
+                            &instance.id,
+                            super::sidecars::SidecarPhase::of(instance.state),
+                        ),
                     },
                     evidence,
                 }
