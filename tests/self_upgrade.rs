@@ -67,6 +67,16 @@ impl RealNodeHarness {
     /// Install every version in `installed`, point the symlink at
     /// `running`, and start the supervisor there.
     async fn start_configured(cluster: bool, installed: &[&str], running: &str) -> Self {
+        Self::start_with_node_config(cluster, installed, running, "").await
+    }
+
+    /// [`Self::start_configured`] with `extra` appended to `node.toml`.
+    async fn start_with_node_config(
+        cluster: bool,
+        installed: &[&str],
+        running: &str,
+        extra: &str,
+    ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let bin_dir = root.path().join("bin");
         let data_dir = root.path().join("data");
@@ -140,6 +150,17 @@ retain_versions = 3
                 "\n[cluster]\ngossip_port = {}\nraft_port = {}\nreporting_port = {}\n[network]\nadvertise_address = \"127.0.0.1\"\n[security]\nrequire_mtls = false",
                 ports.base, ports.base + 1, ports.base + 2).unwrap();
             held_ports.push(ports);
+        }
+        if !extra.is_empty() {
+            use std::io::Write;
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&config_path)
+                    .unwrap(),
+                "\n{extra}"
+            )
+            .unwrap();
         }
         // Workload host ports outside the lease range (#2261).
         bun_process::use_test_workload_ports(&config_path);
@@ -280,6 +301,12 @@ retain_versions = 3
     /// where any outgoing connection or `bind(0)` on the host could hold one
     /// when the workload bound it (#2261).
     async fn deploy_testapp(&mut self, app: &str) -> u16 {
+        self.deploy_testapp_with(app, "").await
+    }
+
+    /// [`Self::deploy_testapp`] with `extra` TOML lines added to the app's
+    /// table, such as an `env` line.
+    async fn deploy_testapp_with(&mut self, app: &str, extra: &str) -> u16 {
         let reservation = bun_process::reserve_port_block_lease(1);
         let port = reservation.base;
         self.held_ports.push(reservation);
@@ -288,6 +315,7 @@ retain_versions = 3
 [app.{app}]
 exec = "{testapp}"
 command = ["--mode", "healthy", "--port", "{port}"]
+{extra}
 "#,
             testapp = env!("CARGO_BIN_EXE_testapp"),
         );
@@ -689,6 +717,59 @@ async fn single_node_upgrade_preserves_running_containers() {
         "replacement reused an adopted generation: {status}"
     );
     assert_ne!(harness.workload_pid("web").await, pid_after);
+    harness.shutdown().await;
+}
+
+/// #2334: an app with a `PROVIDER[...]` variable survives the upgrade's
+/// exec too. Bun's adoption record keeps the reference and the runtime's
+/// launch keeps the value the provider gave; before, the two never matched,
+/// so the new Bun killed the app and started it again.
+#[tokio::test]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and real bun processes; run with make test-upgrade-node"]
+async fn single_node_upgrade_adopts_an_app_that_uses_a_secret_provider() {
+    use std::os::unix::fs::PermissionsExt as _;
+    assert!(
+        upgrade_tests_enabled(),
+        "set RELIABURGER_UPGRADE_TESTS=1 before running ignored upgrade tests"
+    );
+    let _serial = SERIAL.lock().await;
+    let provider_dir = tempfile::tempdir().unwrap();
+    let provider = provider_dir.path().join("provider");
+    std::fs::write(
+        &provider,
+        "#!/bin/sh\nhead -n 1 > /dev/null\nprintf '{\"version\":1,\"value\":\"from-the-provider\"}'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut harness = RealNodeHarness::start_with_node_config(
+        false,
+        &["v0.1.0", "v0.2.0"],
+        "v0.1.0",
+        &format!(
+            "[secret_providers.vault]\nbinary = \"{}\"\ntimeout_secs = 60",
+            provider.display()
+        ),
+    )
+    .await;
+
+    harness
+        .deploy_testapp_with(
+            "web",
+            r#"env = { DB_PASSWORD = "PROVIDER[vault:secret/db#password]" }"#,
+        )
+        .await;
+    let pid_before = harness.workload_pid("web").await;
+
+    let directive = harness.directive("v0.2.0", "up-provider");
+    assert_eq!(harness.post_upgrade(&directive).await, 202);
+    harness.wait_for_version("v0.2.0").await;
+    harness.wait_upgrade_settled().await;
+
+    assert_eq!(
+        harness.workload_pid("web").await,
+        pid_before,
+        "the upgrade restarted an app that uses a secret provider"
+    );
     harness.shutdown().await;
 }
 

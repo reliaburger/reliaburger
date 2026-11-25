@@ -1339,6 +1339,12 @@
   },
   {
     "source": "tests/owned_runc.rs",
+    "function": "runc_owned_adoption_accepts_a_provider_reference_for_its_resolved_value",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_owned_adoption_accepts_a_provider_reference_for_its_resolved_value"
+  },
+  {
+    "source": "tests/owned_runc.rs",
     "function": "runc_owned_cancelled_preparation_keeps_its_worker_until_queued_cleanup",
     "binary": "reliaburger::owned_runc",
     "test": "runc_owned_cancelled_preparation_keeps_its_worker_until_queued_cleanup"
@@ -1666,6 +1672,12 @@
     "function": "single_node_upgrade_preserves_running_containers",
     "binary": "reliaburger::self_upgrade",
     "test": "single_node_upgrade_preserves_running_containers"
+  },
+  {
+    "source": "tests/self_upgrade.rs",
+    "function": "single_node_upgrade_adopts_an_app_that_uses_a_secret_provider",
+    "binary": "reliaburger::self_upgrade",
+    "test": "single_node_upgrade_adopts_an_app_that_uses_a_secret_provider"
   },
   {
     "source": "tests/self_upgrade.rs",
