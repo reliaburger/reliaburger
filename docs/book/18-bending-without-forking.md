@@ -2514,8 +2514,8 @@ that one itself with a copy of the policy. Both travel in `CreateInput`:
 /// The node gate's verdict on the stored spec's runtime knobs, taken
 /// on the loop from this node's allowlist as it is now (#1316).
 knobs: Result<(), crate::grill::knobs::KnobRefusal>,
-/// The node's host-path policy, to approve the app's sources again
-/// off the loop: resolving them can block (#797, #1316).
+/// The node's host-path policy, to approve the stored spec's host
+/// paths again off the loop: resolving them can block (#797, #1316).
 host_paths: crate::bun::host_paths::HostPathPolicy,
 ```
 
@@ -2525,30 +2525,90 @@ verdict that was reached in one place and is acted on in another. The task
 asks before it calls the runtime:
 
 ```rust
-async fn admit(&self) -> Result<(), String> {
-    self.knobs.clone().map_err(|refusal| refusal.to_string())?;
-    if let Some(spec) = &self.app_spec {
-        self.host_paths
-            .approve_app_off_runtime(spec)
-            .await
-            .map_err(|refusal| format!("host path refused: {refusal}"))?;
+async fn admit(&self, bound: Duration) -> Option<StepResult> {
+    if let Err(refusal) = &self.knobs {
+        return Some(StepResult::Refused(refusal.to_string()));
     }
-    Ok(())
+    match recheck_host_paths(&self.host_paths, &self.oci_spec, bound).await {
+        Ok(()) => None,
+        Err(HostPathDenial::Refused(refusal)) => Some(StepResult::Refused(restart_refusal(
+            "restart", &refusal,
+        ))),
+        Err(HostPathDenial::Unanswered(reason)) => {
+            Some(StepResult::Failed(BunError::DeployFailed {
+                app_name: self.app_name.clone(),
+                reason,
+            }))
+        }
+    }
 }
 ```
 
-`self.knobs` is borrowed (`&self`), and `map_err` takes its `Result` by
-value, so we `clone` it first; Rust won't let us move a field out of a value
-we only borrowed. The knob check reads the knobs in the stored spec, not the
-app's config, because the spec is what runc will apply.
+`None` means admitted. A first draft returned `Result<(), StepResult>`, and
+clippy's `result_large_err` lint refused it: a `StepResult` can carry launch
+evidence, and every `Result` is as big as its larger variant, so an `Ok(())`
+would still have been moved around at that size. `Option` says what we
+mean anyway: there's either a result that ends the step or nothing. `if let
+Err(refusal) = &self.knobs` borrows the verdict rather than moving it out of
+`self`, which we only borrowed (`&self`): Rust won't let us move a field
+out of a value we don't own. Both checks read the stored spec, not the app's config,
+because the spec is what the runtime will create.
+
+The first version got that half right. The knob check read the stored
+spec's knobs, but the host-path check asked about the app's *current* spec,
+the one in `deployed_specs` (#2335). Mid-rollout that's the new version,
+while the instance restarting is old and mounts the old version's paths, so
+the check judged the wrong mounts. With no deployed spec at all, as after a
+Bun restart that adopted the instance from its record, it quietly checked
+nothing. The stored spec can't be read back for host paths, though: a bind
+mount of `/srv/import` looks the same as the node's own bind of an inline
+config file or the identity directory. So the spec builder now records them
+as it goes, as it already did for managed volumes:
+
+```rust
+/// The host paths among [`Self::mounts`]: every volume and config-file
+/// `source` the app named, as the node's host-path policy approved
+/// them, recorded when the spec is built. ...
+#[serde(default, skip_serializing_if = "Vec::is_empty")]
+pub host_path_sources: Vec<PathBuf>,
+```
+
+The sidecar and init specs copy the app's list along with its mounts, and
+the adoption record stores the spec, so every restart, whoever's spec it
+is, asks about exactly what it will mount.
+
+Resolving those paths can hang. `canonicalize` on a source whose NFS server
+has gone quiet doesn't return, and the Create step holds its restart's lane
+while it waits, so every stop of that instance failed `StopUnconfirmed`
+until the server answered. `recheck_host_paths` wraps the check in
+`tokio::time::timeout`, bounded by `[runtime] stop_confirmation_timeout_secs`,
+the bound the same step's kill already uses. Timing out isn't a refusal:
+the path may answer next time, so it's an ordinary failed attempt that
+spends the restart budget and is retried. The blocking thread can't be
+cancelled, so it finishes on its own whenever the filesystem lets it.
 
 A refusal comes back as a new `StepResult::Refused(String)`, and the loop
 records it the way it records a binary that's gone: the instance is
 `Failed` with the reason, and the restart budget isn't spent. Retrying
-would fail the same way each time and only bury the reason. We didn't make
-it stop a running container the moment Bun starts with a narrower list.
-Killing work because of a config edit is a bigger decision than refusing to
-start it again, and an operator who wants that can redeploy.
+would fail the same way each time and only bury the reason. The reason says
+where and why, once: `restart refused after this node's [storage]
+allowed_host_paths changed since the deploy: host path "/srv/import" isn't
+under any of ...`. We didn't make it stop a running container the moment Bun
+starts with a narrower list. Killing work because of a config edit is a
+bigger decision than refusing to start it again, and an operator who wants
+that can redeploy.
+
+Sidecars were the other way round the gate. A sidecar that crashes on its
+own is created again from a spec carrying its app's mounts, and that relaunch
+never asked anyone. Now it runs the same `recheck_host_paths` first. A
+refused sidecar is parked, never due again, and its instance goes the way an
+instance that never passed its startup probe goes: `Stopping` with cleanup
+owed and a new `RestartCause::Refused`, so the next tick withdraws it from
+discovery, the Cleanup step kills it and its sidecars, and `maybe_restart`
+marks it `Failed` with the reason instead of restarting it. Here we do stop
+a running app, which the paragraph above said we wouldn't, but the choice is
+different: the app is already down a sidecar it was deployed with, and its
+own restart would be refused for the same mount.
 
 `WorkloadSupervisor::check_runtime_knobs` is the deploy's own check with the
 `AppSpec` taken out: it takes an `Option<&RuntimeKnobs>`, so the deploy
@@ -4023,6 +4083,19 @@ whose halves are never tested apart can quietly become a single gate.
   `a_restart_the_node_still_allows_creates_the_instance_again` checks the
   re-check refuses only what changed. The two refusal tests failed before
   the fix: the instance came back `Running`.
+- **Restarts, again** (#2335):
+  `an_old_instance_restarting_mid_rollout_is_checked_against_its_own_host_paths`
+  stores a new spec mounting another path, as a rollout does, then lets the
+  node allow only that one: the old instance's restart must be refused for
+  its own path. `an_adopted_instance_that_crashes_under_a_narrower_gate_is_refused`
+  deploys with records, starts a fresh agent with an empty allowlist, adopts
+  the instance, crashes it, and checks the runtime is never asked to create
+  it. `a_host_path_check_that_runs_out_of_time_fails_the_restart_and_retries_it`
+  stalls the check past its bound, then lets the retry through.
+  `a_sidecar_restart_after_the_node_drops_a_host_path_is_refused_with_the_reason`
+  crashes only the sidecar. All four failed before the fix: the first two
+  restarts came back `Running`, the stalled check waited out its stall, and
+  the sidecar was created again.
 
 None of those run runc. The first version said the runc half was
 "exercised by `make test-linux`", and it wasn't: no Linux test ran a knob.

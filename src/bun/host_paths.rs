@@ -69,6 +69,10 @@ impl ApprovedHostPath {
 pub struct HostPathPolicy {
     allowed: Vec<PathBuf>,
     protected: Vec<PathBuf>,
+    /// How long each check off the runtime blocks before it resolves, as a
+    /// source on an NFS server that doesn't answer would (#2335).
+    #[cfg(test)]
+    stall: Option<std::time::Duration>,
 }
 
 impl HostPathPolicy {
@@ -77,6 +81,18 @@ impl HostPathPolicy {
         Self {
             allowed: allowed.iter().map(|path| resolve(path)).collect(),
             protected: protected.iter().map(|path| resolve(path)).collect(),
+            #[cfg(test)]
+            stall: None,
+        }
+    }
+
+    /// This policy, with every check off the runtime blocking for `stall`
+    /// first, for tests of what a hung source does to its caller.
+    #[cfg(test)]
+    pub fn stalling(self, stall: std::time::Duration) -> Self {
+        Self {
+            stall: Some(stall),
+            ..self
         }
     }
 
@@ -202,13 +218,52 @@ impl HostPathPolicy {
         }
         let policy = self.clone();
         let spec = spec.clone();
-        let approved =
-            tokio::task::spawn_blocking(move || policy.approve_app(&spec).map(Cow::into_owned))
-                .await
-                .map_err(|error| HostPathRefusal::CheckFailed {
-                    reason: error.to_string(),
-                })??;
+        let approved = tokio::task::spawn_blocking(move || {
+            policy.stall_for_test();
+            policy.approve_app(&spec).map(Cow::into_owned)
+        })
+        .await
+        .map_err(|error| HostPathRefusal::CheckFailed {
+            reason: error.to_string(),
+        })??;
         Ok(Cow::Owned(approved))
+    }
+
+    /// Admit each of `sources` again, with the symlink resolution on a
+    /// blocking thread, or refuse with the first refusal.
+    ///
+    /// A restart asks this about the host paths its stored OCI spec mounts
+    /// ([`crate::grill::oci::OciSpec::host_path_sources`]), which the deploy
+    /// already approved and resolved, because `node.toml` may have dropped
+    /// one since (#1316, #2335). No sources means no I/O, and the answer
+    /// comes back without leaving the caller's thread.
+    pub async fn approve_sources_off_runtime(
+        &self,
+        sources: &[PathBuf],
+    ) -> Result<(), HostPathRefusal> {
+        if sources.is_empty() {
+            return Ok(());
+        }
+        let policy = self.clone();
+        let sources = sources.to_vec();
+        tokio::task::spawn_blocking(move || {
+            policy.stall_for_test();
+            sources
+                .iter()
+                .try_for_each(|source| policy.admit(source).map(drop))
+        })
+        .await
+        .map_err(|error| HostPathRefusal::CheckFailed {
+            reason: error.to_string(),
+        })?
+    }
+
+    /// Block for the test stall, if one is set. Runs on a blocking thread.
+    fn stall_for_test(&self) {
+        #[cfg(test)]
+        if let Some(stall) = self.stall {
+            std::thread::sleep(stall);
+        }
     }
 }
 
@@ -291,6 +346,39 @@ mod tests {
             matches!(error, HostPathRefusal::NotAllowed { .. }),
             "{error}"
         );
+    }
+
+    /// #2335: a restart asks again about the host paths its stored spec
+    /// mounts, off the runtime, and any one the policy no longer allows
+    /// refuses the lot.
+    #[test]
+    fn approving_stored_sources_resolves_them_off_the_runtime_and_refuses_any_unlisted() {
+        let root = tempfile::tempdir().unwrap();
+        let import = root.path().join("import");
+        std::fs::create_dir_all(&import).unwrap();
+        let policy = policy(&[&import], &root.path().join("volumes"));
+        let listed = vec![import.join("daily")];
+        crate::off_runtime::assert_runs_on_blocking_pool(
+            policy.approve_sources_off_runtime(&listed),
+        )
+        .unwrap();
+
+        let mixed = vec![import.join("daily"), root.path().join("elsewhere")];
+        let refusal = crate::off_runtime::assert_runs_on_blocking_pool(
+            policy.approve_sources_off_runtime(&mixed),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(refusal, HostPathRefusal::NotAllowed { ref path } if path == &mixed[1]),
+            "{refusal}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_stored_sources_are_approved_in_one_poll() {
+        let policy = HostPathPolicy::default();
+        let first = futures_util::poll!(std::pin::pin!(policy.approve_sources_off_runtime(&[])));
+        assert!(matches!(first, std::task::Poll::Ready(Ok(()))));
     }
 
     fn policy(allowed: &[&Path], volumes: &Path) -> HostPathPolicy {

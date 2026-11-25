@@ -1005,10 +1005,13 @@ impl<G: Grill> WorkloadSupervisor<G> {
             return Ok(false);
         }
 
-        // A stopped instance that never passed its startup health check is
-        // given up, not restarted.
+        // A stopped instance that never passed its startup health check, or
+        // that the node gate refused while it ran, is given up, not
+        // restarted.
         if instance.state == ContainerState::Stopped
-            && instance.restart_cause == Some(crate::bun::restart::RestartCause::NeverHealthy)
+            && instance
+                .restart_cause
+                .is_some_and(crate::bun::restart::RestartCause::gives_up)
         {
             instance.state = instance.state.transition_to(ContainerState::Failed)?;
             instance.retry_pending = false;

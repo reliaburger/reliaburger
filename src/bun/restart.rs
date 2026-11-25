@@ -77,6 +77,20 @@ pub enum RestartCause {
     /// stopped and then marked failed, not restarted: a probe aimed at the
     /// wrong path or port fails the same way every time.
     NeverHealthy,
+    /// The node gate refused one of its containers while it ran: a sidecar
+    /// that crashed couldn't be created again from the host paths it shares
+    /// with the app, which `node.toml` no longer allows (#2335). It is
+    /// stopped and then marked failed, not restarted, because the app's
+    /// own restart would be refused the same way.
+    Refused,
+}
+
+impl RestartCause {
+    /// Whether an instance stopped for this cause is marked failed once its
+    /// cleanup is done, rather than restarted.
+    pub fn gives_up(self) -> bool {
+        matches!(self, RestartCause::NeverHealthy | RestartCause::Refused)
+    }
 }
 
 /// The decision a restart records: `rule`, the instance, which attempt this

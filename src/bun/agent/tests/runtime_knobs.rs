@@ -165,12 +165,247 @@ async fn a_restart_after_the_node_drops_a_host_path_is_refused_with_the_reason()
 
     let instance = agent.supervisor.get_instance(&id).unwrap();
     assert_eq!(instance.state, ContainerState::Failed);
-    let reason = instance.launch_failure.clone().unwrap_or_default();
-    assert!(reason.contains("host path refused"), "{reason}");
+    assert_restart_refusal(&launch_failure(&agent, &id), source.path());
     assert!(!instance.retry_pending, "a refused restart is not retried");
     assert_eq!(
         creates(&grill, &id),
         1,
         "only the deploy reached the runtime"
     );
+}
+
+// --- #2335: the host-path re-check reads the restarting instance's own
+// spec, covers sidecars, and is bounded. ---
+
+/// A policy that admits host paths under `directories` only.
+fn allowing(directories: &[&std::path::Path]) -> crate::bun::host_paths::HostPathPolicy {
+    crate::bun::host_paths::HostPathPolicy::new(
+        directories.iter().map(|path| path.to_path_buf()).collect(),
+        Vec::new(),
+    )
+}
+
+/// `web`, image `image`, mounting `source` at `/data`, with `extra` TOML
+/// appended to the app.
+fn web_mounting(image: &str, source: &std::path::Path, extra: &str) -> Config {
+    Config::parse(&format!(
+        "[app.web]\nimage = '{image}'\n[[app.web.volumes]]\npath = '/data'\nsource = '{}'\n{extra}",
+        source.display()
+    ))
+    .unwrap()
+}
+
+/// The instance's launch failure, which `relish apps` and `relish wtf` show.
+fn launch_failure(agent: &TestAgent, id: &InstanceId) -> String {
+    agent
+        .supervisor
+        .get_instance(id)
+        .unwrap()
+        .launch_failure
+        .clone()
+        .unwrap_or_default()
+}
+
+/// The refusal says where it happened and why, once: the restart, after
+/// `allowed_host_paths` changed, naming the path.
+fn assert_restart_refusal(reason: &str, source: &std::path::Path) {
+    let source = std::fs::canonicalize(source).unwrap();
+    assert!(
+        reason.contains(&source.display().to_string()),
+        "names the path: {reason}"
+    );
+    assert!(
+        reason.contains("restart"),
+        "says it was a restart: {reason}"
+    );
+    assert!(
+        reason.contains("allowed_host_paths changed"),
+        "says the node's list changed: {reason}"
+    );
+    assert!(
+        !reason.contains("host path refused: host path"),
+        "says it once: {reason}"
+    );
+}
+
+/// #2335: a rollout stores the new spec before its old instances go. An
+/// old instance that crashes meanwhile restarts from its own stored spec,
+/// so the gate must judge its own mounts, not the new spec's: here the
+/// node now allows only the path the new spec mounts.
+#[tokio::test]
+async fn an_old_instance_restarting_mid_rollout_is_checked_against_its_own_host_paths() {
+    let (old_source, new_source) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    agent.set_host_path_policy(allowing(&[old_source.path(), new_source.path()]));
+    expect_complete(&drain_deploy(&mut agent, web_mounting("web:v1", old_source.path(), "")).await);
+    let id = agent.supervisor.list_instances()[0].id.clone();
+    // What the deploy worker's store_deployed_spec does as the rollout begins.
+    agent.deployed_specs.insert(
+        ("web".to_string(), "default".to_string()),
+        web_mounting("web:v2", new_source.path(), "").app["web"].clone(),
+    );
+
+    agent.set_host_path_policy(allowing(&[new_source.path()]));
+    crash_and_restart(&mut agent, &grill, &id).await;
+
+    let instance = agent.supervisor.get_instance(&id).unwrap();
+    assert_eq!(instance.state, ContainerState::Failed);
+    assert!(!instance.retry_pending, "a refused restart is not retried");
+    assert_restart_refusal(&launch_failure(&agent, &id), old_source.path());
+    assert_eq!(
+        creates(&grill, &id),
+        1,
+        "only the deploy reached the runtime"
+    );
+}
+
+/// #2335: a restart re-checks what its stored spec mounts even when the
+/// agent holds no deployed spec for the app, as after a Bun restart that
+/// adopted the instance from its record and hasn't seen a deploy since.
+#[tokio::test]
+async fn an_adopted_instance_that_crashes_under_a_narrower_gate_is_refused() {
+    let source = tempfile::tempdir().unwrap();
+    let records = tempfile::tempdir().unwrap();
+    let id = InstanceId("default__web-0".into());
+    {
+        let (mut first, _tx, _shutdown, grill) = test_agent_with_grill();
+        first.set_records_dir(records.path().to_path_buf());
+        grill.set_pid(std::process::id());
+        first.set_host_path_policy(allowing(&[source.path()]));
+        expect_complete(&drain_deploy(&mut first, web_mounting("web:v1", source.path(), "")).await);
+        let record = crate::grill::records::record_path(records.path(), &id.0);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !record.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the record never landed");
+    }
+
+    // Bun restarts with a `node.toml` that no longer lists the source.
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    agent.set_records_dir(records.path().to_path_buf());
+    grill.set_pid(std::process::id());
+    grill.set_adopt_result(&id, true);
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+    assert_eq!(
+        agent.supervisor.get_instance(&id).unwrap().state,
+        ContainerState::Running,
+        "a running container is adopted, whatever the gate says now"
+    );
+
+    crash_and_restart(&mut agent, &grill, &id).await;
+
+    let instance = agent.supervisor.get_instance(&id).unwrap();
+    assert_eq!(instance.state, ContainerState::Failed);
+    assert!(!instance.retry_pending, "a refused restart is not retried");
+    assert_restart_refusal(&launch_failure(&agent, &id), source.path());
+    assert_eq!(
+        creates(&grill, &id),
+        0,
+        "the restart never reached the runtime"
+    );
+}
+
+/// #2335: resolving a host path can hang on a source whose NFS or autofs
+/// server doesn't answer. The check is bounded by the runtime's
+/// confirmation timeout, as the restart's kill is, and running out of time
+/// is a failed attempt that's retried, not a refusal: the path may answer
+/// next time.
+#[tokio::test]
+async fn a_host_path_check_that_runs_out_of_time_fails_the_restart_and_retries_it() {
+    let source = tempfile::tempdir().unwrap();
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    agent.set_host_path_policy(allowing(&[source.path()]));
+    expect_complete(&drain_deploy(&mut agent, web_mounting("web:v1", source.path(), "")).await);
+    let id = agent.supervisor.list_instances()[0].id.clone();
+
+    agent.set_stop_confirmation_timeout(std::time::Duration::from_millis(50));
+    agent.set_host_path_policy(
+        allowing(&[source.path()]).stalling(std::time::Duration::from_millis(500)),
+    );
+    crash_and_restart(&mut agent, &grill, &id).await;
+
+    let instance = agent.supervisor.get_instance(&id).unwrap();
+    assert_ne!(
+        instance.state,
+        ContainerState::Failed,
+        "a timeout isn't a refusal"
+    );
+    assert!(instance.retry_pending, "the restart is tried again");
+    assert_eq!(instance.launch_failure, None);
+    assert_eq!(
+        creates(&grill, &id),
+        1,
+        "only the deploy reached the runtime"
+    );
+
+    // The source answers again, and the retry, once its backoff is over,
+    // creates the instance.
+    agent.set_host_path_policy(allowing(&[source.path()]));
+    agent.drive_pending_restarts_to_completion().await;
+    agent.supervisor.get_instance_mut(&id).unwrap().last_restart = None;
+    agent.drive_pending_restarts_to_completion().await;
+    let instance = agent.supervisor.get_instance(&id).unwrap();
+    assert_eq!(instance.state, ContainerState::Running);
+    assert_eq!(creates(&grill, &id), 2);
+}
+
+/// #2335: a sidecar mounts its app's volumes, and a sidecar that crashes
+/// on its own is created again from them. After the node stops allowing
+/// one, the sidecar's restart is refused before the runtime sees it, and
+/// its instance, which mounts the same path, is stopped and fails with the
+/// reason instead of running on without its sidecar.
+#[tokio::test]
+async fn a_sidecar_restart_after_the_node_drops_a_host_path_is_refused_with_the_reason() {
+    let source = tempfile::tempdir().unwrap();
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    agent.set_host_path_policy(allowing(&[source.path()]));
+    let config = web_mounting(
+        "web:v1",
+        source.path(),
+        "[[app.web.sidecar]]\nname = 'proxy'\nimage = 'envoy:1.31'\n",
+    );
+    expect_complete(&drain_deploy(&mut agent, config).await);
+    let web = InstanceId("default__web-0".into());
+    let proxy = InstanceId("default__web-0__sidecar-proxy".into());
+    assert_eq!(creates(&grill, &proxy), 1);
+
+    agent.set_host_path_policy(Default::default());
+    grill.set_state(&proxy, ContainerState::Stopped);
+    agent.check_apps().await;
+    agent.relaunch_due_sidecars_to_completion().await;
+    agent.drive_pending_restarts_to_completion().await;
+
+    assert_eq!(
+        creates(&grill, &proxy),
+        1,
+        "the refused sidecar was created again"
+    );
+    assert!(
+        agent
+            .sidecars
+            .due(std::time::Instant::now() + std::time::Duration::from_secs(120))
+            .is_empty(),
+        "the refused sidecar is parked, not due again"
+    );
+    let instance = agent.supervisor.get_instance(&web).unwrap();
+    assert_eq!(instance.state, ContainerState::Failed);
+    assert!(
+        !instance.retry_pending,
+        "a refused instance is not restarted"
+    );
+    assert_eq!(creates(&grill, &web), 1, "the app wasn't restarted");
+    assert!(
+        grill
+            .calls()
+            .iter()
+            .any(|(call, instance)| call == "kill" && instance == &web),
+        "the app was left running: {:?}",
+        grill.calls()
+    );
+    let reason = launch_failure(&agent, &web);
+    assert!(reason.contains("sidecar"), "names the sidecar: {reason}");
+    assert_restart_refusal(&reason, source.path());
 }

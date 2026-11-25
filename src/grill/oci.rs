@@ -81,6 +81,15 @@ pub struct OciSpec {
     /// is the operator's and is never chowned, whatever files sit beside it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub managed_volumes: Vec<ManagedVolumeMount>,
+    /// The host paths among [`Self::mounts`]: every volume and config-file
+    /// `source` the app named, as the node's host-path policy approved
+    /// them, recorded when the spec is built. Not part of the OCI runtime
+    /// spec: a restart creates the container from this stored spec, so it
+    /// asks the node's policy about exactly these again (#2335). The other
+    /// bind mounts are the node's own (managed volumes, inline config
+    /// files, the identity directory).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_path_sources: Vec<PathBuf>,
 }
 
 /// A managed volume a spec mounts, as the spec builder named it.
@@ -471,7 +480,7 @@ pub fn generate_oci_spec_with_decryptor(
     let env = build_env_with_decryptor(spec, decryptor)?;
     let provider_env = declared_provider_env(&spec.env);
     let args = build_args(app_name, spec);
-    let (mounts, managed_volumes) = build_mounts(
+    let (mounts, managed_volumes, host_path_sources) = build_mounts(
         spec,
         host_port,
         app_name,
@@ -486,6 +495,7 @@ pub fn generate_oci_spec_with_decryptor(
 
     Ok(OciSpec {
         managed_volumes,
+        host_path_sources,
         reusable_executor: false,
         host_process: spec.exec.is_some() || spec.script.is_some(),
         initialiser: false,
@@ -682,8 +692,9 @@ fn build_mounts(
     namespace: &str,
     instance_id: &str,
     volumes_dir: Option<&Path>,
-) -> (Vec<OciMount>, Vec<ManagedVolumeMount>) {
+) -> (Vec<OciMount>, Vec<ManagedVolumeMount>, Vec<PathBuf>) {
     let mut mounts = standard_mounts();
+    let mut host_paths = Vec::new();
 
     // Config files: read-only bind mounts.
     // Inline content is written to a file under volumes_dir so it can be
@@ -693,6 +704,7 @@ fn build_mounts(
     // rewrites the file under a running instance (#701).
     for cf in &spec.config_file {
         let source = if let Some(ref source_path) = cf.source {
+            host_paths.push(PathBuf::from(source_path));
             Some(PathBuf::from(source_path))
         } else if let Some(ref content) = cf.content {
             let base = volumes_dir
@@ -723,6 +735,7 @@ fn build_mounts(
     for vol in &spec.volumes {
         let host_path = if let Some(source) = &vol.source {
             // HostPath mode: use the explicit host path
+            host_paths.push(source.clone());
             source.clone()
         } else {
             // Managed mode: resolve to a subdirectory under volumes_dir
@@ -769,7 +782,7 @@ fn build_mounts(
         options: vec!["bind".to_string(), "ro".to_string()],
     });
 
-    (mounts, managed)
+    (mounts, managed, host_paths)
 }
 
 /// Standard Linux namespaces for container isolation.
@@ -987,6 +1000,7 @@ pub fn generate_job_oci_spec(
 
     OciSpec {
         managed_volumes: Vec::new(),
+        host_path_sources: Vec::new(),
         reusable_executor: false,
         host_process: spec.is_host(),
         initialiser: false,
@@ -1089,6 +1103,7 @@ pub fn generate_init_oci_spec(
     let from_image = init.image.is_some() || app.process.overrides.is_some();
     OciSpec {
         managed_volumes: Vec::new(),
+        host_path_sources: app.host_path_sources.clone(),
         reusable_executor: false,
         // A host app's init that names no image runs on the host like its
         // app, so the mixed runtime routes it there too (#935).
@@ -1190,6 +1205,9 @@ pub fn generate_sidecar_oci_spec(
     }
     OciSpec {
         managed_volumes: Vec::new(),
+        // The app's mounts, and with them its host paths, which a
+        // sidecar's own restart asks about again (#2335).
+        host_path_sources: app.host_path_sources.clone(),
         reusable_executor: false,
         host_process: false,
         // A sidecar borrows the app's volumes as an init does, so a runtime
@@ -2564,6 +2582,56 @@ mod tests {
 
     /// #1122: the gates admitted the app's runtime knobs for the app's own
     /// container, so a sidecar built from its finished spec carries none.
+    #[test]
+    fn the_spec_records_the_apps_host_paths_and_a_sidecar_and_an_init_carry_them() {
+        let app: AppSpec = toml::from_str(
+            r#"
+            image = "web:v1"
+            [[volumes]]
+            source = "/srv/import"
+            path = "/data"
+            [[volumes]]
+            path = "/cache"
+            [[config_file]]
+            source = "/etc/shared/app.yaml"
+            path = "/etc/app.yaml"
+            [[config_file]]
+            content = "a: 1"
+            path = "/etc/inline.yaml"
+            [[sidecar]]
+            name = "proxy"
+            [[init]]
+            command = ["migrate"]
+            "#,
+        )
+        .unwrap();
+        let volumes = tempfile::tempdir().unwrap();
+        let oci = generate_oci_spec(
+            "web",
+            "default",
+            &app,
+            "default__web-0",
+            None,
+            "/cg",
+            Some(volumes.path()),
+            None,
+        );
+        // Only the app's own sources: not the managed volume, the inline
+        // config file's copy or the identity directory, which are the node's.
+        let expected = vec![
+            PathBuf::from("/etc/shared/app.yaml"),
+            PathBuf::from("/srv/import"),
+        ];
+        assert_eq!(oci.host_path_sources, expected);
+        let parent = crate::grill::InstanceId("default__web-0".into());
+        let sidecar = generate_sidecar_oci_spec(&app.sidecar[0], &oci, &parent);
+        assert_eq!(sidecar.host_path_sources, expected);
+        assert_eq!(
+            generate_init_oci_spec(&app.init[0], &oci).host_path_sources,
+            expected
+        );
+    }
+
     #[test]
     fn a_sidecar_gets_none_of_the_apps_runtime_knobs() {
         let app = app_oci(

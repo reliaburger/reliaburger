@@ -184,25 +184,78 @@ pub(super) async fn kill_unless_forgotten<G: Grill>(
     }
 }
 
-/// Start a crashed sidecar again, alone: kill what's left of its last
-/// launch, so its identity is free, then create and start it. A
-/// `cancelled` token (its instance stopped or crashed meanwhile) stops it
-/// between steps, and a launch it already made is killed again.
-async fn relaunch<G: Grill>(
-    grill: G,
+/// Why a sidecar's restart alone didn't start it.
+#[derive(Debug)]
+pub(super) enum RelaunchFailure {
+    /// The node gate refused it before the runtime saw it: the host paths
+    /// it shares with its app are no longer allowed (#2335). Asking again
+    /// fails the same way, and so would the app's own restart.
+    Refused(String),
+    /// Anything else, which a later attempt may get past.
+    Failed(String),
+}
+
+impl std::fmt::Display for RelaunchFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RelaunchFailure::Refused(reason) | RelaunchFailure::Failed(reason) => {
+                f.write_str(reason)
+            }
+        }
+    }
+}
+
+/// What a sidecar's restart alone needs besides the runtime and the launch.
+struct RelaunchContext {
     secrets: crate::sesame::secret_provider::SecretProviders,
     app_name: String,
     namespace: String,
-    launch: SidecarLaunch,
+    /// The node's host-path policy, to approve the launch's host paths again
+    /// off the loop (#2335).
+    host_paths: crate::bun::host_paths::HostPathPolicy,
     cancelled: CancellationToken,
     confirmation_timeout: Duration,
-) -> Result<(), String> {
+}
+
+/// Start a crashed sidecar again, alone: ask the node gate about the host
+/// paths it mounts, kill what's left of its last launch, so its identity is
+/// free, then create and start it. A `cancelled` token (its instance
+/// stopped or crashed meanwhile) stops it between steps, and a launch it
+/// already made is killed again.
+async fn relaunch<G: Grill>(
+    grill: G,
+    launch: SidecarLaunch,
+    context: RelaunchContext,
+) -> Result<(), RelaunchFailure> {
+    let RelaunchContext {
+        secrets,
+        app_name,
+        namespace,
+        host_paths,
+        cancelled,
+        confirmation_timeout,
+    } = context;
+    // The sidecar's spec carries its app's mounts as the deploy approved
+    // them, and `node.toml` may have dropped one since (#2335). The check
+    // is bounded as the kill after it is.
+    super::restarts::recheck_host_paths(&host_paths, &launch.spec, confirmation_timeout)
+        .await
+        .map_err(|denial| match denial {
+            super::restarts::HostPathDenial::Refused(refusal) => {
+                RelaunchFailure::Refused(super::restarts::restart_refusal(
+                    &format!("restart of sidecar {}", launch.id),
+                    &refusal,
+                ))
+            }
+            super::restarts::HostPathDenial::Unanswered(reason) => RelaunchFailure::Failed(reason),
+        })?;
+    let failed = |reason: String| RelaunchFailure::Failed(reason);
     // A sidecar startup retired is one runc has forgotten.
     kill_unless_forgotten(&grill, &launch.id, confirmation_timeout)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| failed(error.to_string()))?;
     if cancelled.is_cancelled() {
-        return Err("its instance stopped first".into());
+        return Err(failed("its instance stopped first".into()));
     }
     let started = launch_sidecars(
         &grill,
@@ -212,11 +265,11 @@ async fn relaunch<G: Grill>(
         std::slice::from_ref(&launch),
     )
     .await
-    .map_err(|failure| failure.error.to_string());
+    .map_err(|failure| failed(failure.error.to_string()));
     if cancelled.is_cancelled() {
         // Whatever it started belongs to an instance that's going away.
         let _ = kill_runtime_instance(&grill, &launch.id, confirmation_timeout).await;
-        return Err("its instance stopped first".into());
+        return Err(failed("its instance stopped first".into()));
     }
     started
 }
@@ -293,7 +346,7 @@ async fn record_sidecar<G: Grill>(
 pub(super) struct Relaunched {
     parent: InstanceId,
     sidecar: InstanceId,
-    result: Result<(), String>,
+    result: Result<(), RelaunchFailure>,
 }
 
 /// One registered sidecar.
@@ -313,6 +366,9 @@ struct SidecarRun {
     due: Option<Instant>,
     /// Set while a restart is in flight.
     relaunching: Option<CancellationToken>,
+    /// Set once the node gate refused its restart (#2335): it's never due
+    /// again, and its instance is stopped and fails.
+    parked: bool,
 }
 
 /// Every instance's sidecars on this node, and the restarts in flight.
@@ -375,6 +431,7 @@ impl Sidecars {
                     restarts: 0,
                     restarted_at: None,
                     relaunching: None,
+                    parked: false,
                 }
             })
             .collect();
@@ -450,7 +507,7 @@ impl Sidecars {
             .get(parent)
             .map(|runs| {
                 runs.iter()
-                    .filter(|run| run.due.is_none() && run.relaunching.is_none())
+                    .filter(|run| run.due.is_none() && run.relaunching.is_none() && !run.parked)
                     .map(|run| run.id.clone())
                     .collect()
             })
@@ -514,6 +571,15 @@ impl Sidecars {
         run.restarts = run.restarts.saturating_add(1);
         run.restarted_at = succeeded.then_some(now);
         run.due = (!succeeded && !cancelled).then(|| now + sidecar_backoff(run.restarts));
+    }
+
+    /// The node gate refused `sidecar`'s restart (#2335): it won't be
+    /// started again, and a sweep no longer reads it.
+    pub(super) fn park(&mut self, sidecar: &InstanceId) {
+        if let Some(run) = self.run_mut(sidecar) {
+            run.due = None;
+            run.parked = true;
+        }
     }
 
     /// How many times `sidecar` has been restarted alone.
@@ -686,19 +752,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             let token = CancellationToken::new();
             self.sidecars.begin_relaunch(&sidecar, token.clone());
             let grill = self.supervisor.grill().clone();
-            let secrets = self.secret_providers.clone();
-            let confirmation = self.stop_confirmation_timeout;
+            let context = RelaunchContext {
+                secrets: self.secret_providers.clone(),
+                app_name,
+                namespace,
+                host_paths: self.supervisor.host_path_policy(),
+                cancelled: token,
+                confirmation_timeout: self.stop_confirmation_timeout,
+            };
             self.follow_ups.spawn(async move {
-                let result = relaunch(
-                    grill,
-                    secrets,
-                    app_name,
-                    namespace,
-                    launch,
-                    token,
-                    confirmation,
-                )
-                .await;
+                let result = relaunch(grill, launch, context).await;
                 follow_ups::FollowUp::SidecarRelaunched(Relaunched {
                     parent,
                     sidecar,
@@ -717,6 +780,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         } = relaunched;
         self.sidecars
             .finish_relaunch(&sidecar, result.is_ok(), Instant::now());
+        if let Err(RelaunchFailure::Refused(reason)) = &result {
+            self.sidecars.park(&sidecar);
+            self.give_up_refused_instance(&parent, reason).await;
+            return;
+        }
         // Its new cgroup is bound to its app's namespace on the next tick
         // (#1426).
         if result.is_ok() {
@@ -766,6 +834,39 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .await;
             }
         }
+    }
+
+    /// Stop `parent` and mark it failed with `reason`, because the node gate
+    /// refused one of its sidecars while it ran (#2335). The sidecar mounts
+    /// the app's host paths, so the app's own restart would be refused too;
+    /// running on without the sidecar isn't what was deployed.
+    ///
+    /// It goes the way an instance that never passed its startup probe
+    /// goes: `Stopping` with cleanup owed, so the next tick withdraws it
+    /// from discovery and the Cleanup step kills it and its sidecars off
+    /// the loop, then `maybe_restart` marks it `Failed` instead of
+    /// restarting it.
+    async fn give_up_refused_instance(&mut self, parent: &InstanceId, reason: &str) {
+        eprintln!("bun: {parent} stops: {reason}");
+        let Some(instance) = self.supervisor.get_instance_mut(parent) else {
+            return;
+        };
+        let Ok(stopping) = instance.state.transition_to(ContainerState::Stopping) else {
+            return;
+        };
+        instance.state = stopping;
+        instance.retry_pending = true;
+        instance.restart_cause = Some(crate::bun::restart::RestartCause::Refused);
+        instance.launch_failure = Some(reason.to_string());
+        let (app, namespace) = (instance.app_name.clone(), instance.namespace.clone());
+        self.record_event(
+            crate::bun::events::EventKind::Restart,
+            crate::bun::events::EventSeverity::Warning,
+            Some(app),
+            Some(namespace),
+            format!("instance {parent} stops and fails: {reason}"),
+        )
+        .await;
     }
 
     /// Kill `parent`'s sidecars and forget them, after the instance itself
