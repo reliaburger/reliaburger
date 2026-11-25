@@ -27,8 +27,13 @@ pub(super) fn console_kill_refusal(
     request: &crate::smoker::types::FaultRequest,
     node_name: Option<&str>,
 ) -> Option<&'static str> {
-    if request.fault_type != (crate::smoker::types::FaultType::Kill { count: 1 }) {
+    if request.fault_type != (crate::smoker::types::FaultType::Kill { count: 1 })
+        || !request.duration.is_zero()
+    {
         return Some("the console only kills one instance at a time");
+    }
+    if request.task_index.is_some() {
+        return Some("the console only kills app instances, not job tasks");
     }
     if request
         .target_instance
@@ -52,6 +57,9 @@ pub(super) fn console_kill_refusal(
 /// with `[appliance] console_chaos = true`, a council setting no keyboard
 /// reaches, and the request must be [`console_kill_refusal`]'s one shape.
 /// What happens next is what happens to `relish fault kill`.
+// `Response` is large but it IS the HTTP reply to send on failure;
+// boxing it would tax every call site for a value that lives one frame.
+#[allow(clippy::result_large_err)]
 async fn admit_console_kill(
     state: &ApiState,
     directory: Option<&LeaderDirectory>,
@@ -66,6 +74,23 @@ async fn admit_console_kill(
     };
     if let Some(reason) = console_kill_refusal(request, state.node_name.as_deref()) {
         return Err(forbidden(reason.to_string()));
+    }
+    // The instance must be one this node runs, of the app the request names.
+    // Smoker's routing reads a job's `--instance` as a task index, and an
+    // instance id (`namespace__name-N`) never parses as one, so this also
+    // keeps the console off job tasks.
+    let statuses = ask_agent(&state.cmd_tx, |response| AgentCommand::Status { response }).await?;
+    let namespace = request.namespace.as_deref().unwrap_or("default");
+    let runs_here = statuses.iter().any(|status| {
+        Some(status.id.as_str()) == request.target_instance.as_deref()
+            && status.app_name == request.target_service
+            && status.namespace == namespace
+    });
+    if !runs_here {
+        return Err(forbidden(format!(
+            "the console only kills instances of {namespace}/{} that run on this node",
+            request.target_service
+        )));
     }
     match super::os::appliance_settings(state, directory).await {
         Ok(settings) if settings.console_chaos => Ok(()),
@@ -86,9 +111,11 @@ pub(super) async fn fault_inject_handler(
     headers: HeaderMap,
     Json(mut request): Json<crate::smoker::types::FaultRequest>,
 ) -> Response {
+    // The console's elevation lives in this local copy of the request's
+    // context, so it ends with this request.
     let mut auth = auth;
     if let Some(axum::Extension(context)) = auth.as_mut()
-        && context.principal_id == crate::sesame::auth::CONSOLE_PRINCIPAL
+        && crate::sesame::auth::is_console(context)
     {
         if let Err(response) = admit_console_kill(&state, directory.as_deref(), &request).await {
             return response;

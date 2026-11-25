@@ -79,6 +79,10 @@ pub struct Game {
     pub last: Option<Shot>,
     /// A kill for the event loop to send, taken with [`Game::take_kill`].
     kill: Option<Invader>,
+    /// The instance whose kill bun hasn't answered yet. Kill mode holds
+    /// fire until it does, so a burst of shots can't race Smoker's replica
+    /// rail with several kills at once.
+    awaiting: Option<String>,
 }
 
 impl Default for Game {
@@ -91,6 +95,7 @@ impl Default for Game {
             laser: None,
             last: None,
             kill: None,
+            awaiting: None,
         }
     }
 }
@@ -153,6 +158,9 @@ impl Game {
     /// Fire straight up. The lowest invader over the cannon is hit: it
     /// pops, and in kill mode its instance is queued to be killed.
     pub fn fire(&mut self, invaders: &[Invader], kill_mode: bool) {
+        if kill_mode && self.awaiting.is_some() {
+            return;
+        }
         self.laser = Some(self.cannon);
         let hit = (0..invaders.len())
             .filter_map(|index| Some((index, self.position(index)?)))
@@ -167,6 +175,7 @@ impl Game {
         self.popped.insert(instance.clone());
         self.last = Some(if kill_mode {
             self.kill = Some(invader.clone());
+            self.awaiting = Some(instance.clone());
             Shot::Sending { instance }
         } else {
             Shot::Popped { instance }
@@ -181,6 +190,9 @@ impl Game {
     /// What bun said to a kill: the fault's id, or why it refused. A
     /// refused invader comes back, since its instance still runs.
     pub fn kill_answered(&mut self, instance: String, answer: Result<u64, String>) {
+        if self.awaiting.as_deref() == Some(instance.as_str()) {
+            self.awaiting = None;
+        }
         self.last = Some(match answer {
             Ok(fault_id) => Shot::Killed { instance, fault_id },
             Err(reason) => {
@@ -254,6 +266,21 @@ mod tests {
         );
         assert_eq!(game.take_kill(), Some(invader("web-2")));
         assert_eq!(game.take_kill(), None);
+    }
+
+    #[test]
+    fn kill_mode_holds_fire_until_bun_answers_the_last_kill() {
+        let invaders = formation(2);
+        let mut game = aimed_at(0);
+        game.fire(&invaders, true);
+        assert_eq!(game.take_kill(), Some(invader("web-0")));
+        game.cannon = CELL_WIDTH + 3;
+        game.fire(&invaders, true);
+        assert_eq!(game.take_kill(), None, "a second kill while one is out");
+        assert!(!game.popped.contains("web-1"));
+        game.kill_answered("web-0".into(), Ok(1));
+        game.fire(&invaders, true);
+        assert_eq!(game.take_kill(), Some(invader("web-1")));
     }
 
     #[test]

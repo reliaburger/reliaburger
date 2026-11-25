@@ -69,7 +69,7 @@ pub fn render(frame: &mut Frame<'_>, state: &ConsoleState) {
     let keys = if state.keyless {
         " read-only; this OS image's console takes no keys"
     } else if state.tab == Tab::Invaders {
-        " <- -> aim   space fire   r new wave   1-6 tabs"
+        " h l or <- -> aim   space fire   r new wave   Tab leave"
     } else if state.can_quit {
         " 1-6 or <- -> tabs   up/down scroll   q quit   read-only"
     } else {
@@ -1160,6 +1160,36 @@ mod tests {
         let mut state = healthy_state(Tab::Workloads);
         state.update(Msg::Tick(FIXTURE_NOW + 30));
         state.update(Msg::Workloads(Err("no answer within 10 s".into())));
+        insta::assert_snapshot!(console(&state));
+    }
+
+    #[test]
+    fn invaders_with_kill_mode_off() {
+        let mut state = healthy_state(Tab::Invaders);
+        state.update(Msg::Settings(Ok(Default::default())));
+        insta::assert_snapshot!(console(&state));
+    }
+
+    /// Kill mode on, after bun refused a kill: the invader is back, and the
+    /// last line says why.
+    #[test]
+    fn invaders_in_kill_mode_after_a_refused_kill() {
+        let mut state = healthy_state(Tab::Invaders);
+        state.update(Msg::Settings(Ok(
+            crate::appliance::settings::ApplianceSettings {
+                console_chaos: true,
+            },
+        )));
+        state.game.cannon = 3;
+        state.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char(' '),
+            KeyModifiers::NONE,
+        )));
+        let kill = state.take_kill().expect("kill mode queues a kill");
+        state.update(Msg::KillAnswered {
+            instance: kill.instance,
+            answer: Err("safety check failed: web would have no replica left".into()),
+        });
         insta::assert_snapshot!(console(&state));
     }
 

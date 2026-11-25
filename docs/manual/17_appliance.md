@@ -789,7 +789,9 @@ drop it until you add it to their `[security] bootstrap_peers`.
 
 Each machine's monitor shows a small dashboard. There's no login, so it's
 read-only: anyone at the keyboard can look, and nothing they press changes
-the node. It never shows secrets, tokens or environment variables.
+the node. The one exception is the invaders game's kill mode, which is off
+until a cluster admin turns it on ("Invaders", below). The console never
+shows secrets, tokens or environment variables.
 
 ```
  Reliaburger OS 2026.47.228 | home-1 | cluster home                 bun running
@@ -852,6 +854,67 @@ Know what that token is before you rely on it:
   read-only token gives.
 - **It only reads the API.** The dashboard's login (`/ui/session`) and the
   image registry don't accept it.
+
+### Invaders
+
+`7` opens a tab the tab bar doesn't show: a game with one invader for each
+app instance on this node, labelled with the instance's id. Job tasks get
+none. The formation marches once a second, five invaders to a row and up to
+three rows; the rest wait off the field.
+
+| Key | Does |
+| --- | --- |
+| `h` `l`, `←` `→` | move the cannon |
+| `space` | fire |
+| `r` | bring every invader back |
+| `Tab`, `1` to `6` | leave the game |
+
+The top line says whether kill mode is on. While it's off, a hit only pops
+the invader, and nothing on the node changes.
+
+**Kill mode** makes a hit kill the instance the invader stands for. It's a
+cluster setting, never a node one, because a switch on the machine would be
+a switch for whoever stands at its keyboard. Only an unscoped cluster admin
+can change it:
+
+```bash
+relish os settings          # shows [appliance] and whether kill mode is on
+relish os set appliance.toml
+```
+
+where `appliance.toml` says
+
+```toml
+[appliance]
+console_chaos = true
+```
+
+`relish os set` replaces the whole `[appliance]` section, so a key you leave
+out is off, and a misspelt one is refused. The change is audited as
+`os.settings_set`. Set `console_chaos = false`, or leave it out, to turn kill
+mode off again.
+
+A hit in kill mode is the request `relish fault kill web --instance ID
+--node NODE` sends, from the console's principal `__console`, and the node
+treats it as one:
+
+- **The node needs a fault policy.** Its `[testing] allowed_operations` must
+  include `inject_workload_faults` ("Breaking things on purpose" has the
+  section). A cluster made with `relish cluster create --bare-metal --faults`
+  or `relish machines claim --create --faults` has one on every node; without
+  it, each kill is refused and the invader comes back.
+- **Smoker's rails apply.** A kill that would take a service's last running
+  replica is refused, and the invader comes back with the reason underneath.
+  The console sends one kill at a time and waits for the answer.
+- **It's on the record.** `relish fault list` shows the kill, and the events
+  and `relish audit --action 'fault.*'` name `__console` as who did it.
+
+The console may send that one kind of request and nothing else: a kill of
+one named app instance on its own node, with no `--include-leader` and no
+`--override-safety`. Anything else from the console is refused, kill mode
+or not.
+
+### Over SSH
 
 `bun appliance console` runs it on whatever terminal it's started from, so
 on a lab image, whose sshd runs, `ssh -t root@home-1
@@ -1084,9 +1147,6 @@ across a cluster you care about.
 - **No emulation for builds.** A multi-platform build's `RUN` steps for
   the other architecture can't run on an appliance. Cross-compile, or build
   for your nodes' architecture only ("Where builds run", above).
-- **The console's invaders game** isn't there yet: a game on the console
-  where each invader is a container on the node, planned with the dashboard
-  ([#2150](https://github.com/reliaburger/reliaburger/issues/2150)).
 - **Two machines can't roll a bun upgrade or an OS update.** Both are in
   the council, and taking one down would leave the other without a majority,
   so `relish upgrade start` and `relish os upgrade` refuse. Use three or more.

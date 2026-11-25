@@ -482,6 +482,14 @@ pub(crate) fn console_context() -> AuthContext {
     }
 }
 
+/// Whether `context` is the appliance console's, as the middleware makes
+/// it from the console token. No stored token can take the reserved name
+/// ([`is_reserved_name`]), and a workload's name always has a `workload:`
+/// prefix, so the name alone tells.
+pub(crate) fn is_console(context: &AuthContext) -> bool {
+    context.principal_id == CONSOLE_PRINCIPAL && context.token_name == CONSOLE_PRINCIPAL
+}
+
 /// The console principal once the fault route has admitted one of its
 /// kills (#2151): a `Deployer` for that one request, so the rest of the
 /// route (the server's test policy, Smoker's rails, the audit record)

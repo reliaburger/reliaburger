@@ -504,7 +504,8 @@ pub async fn settings(output: OutputFormat) -> Result<(), RelishError> {
 /// `relish os set FILE`: replace the cluster's `[appliance]` settings with
 /// the `[appliance]` section of `path` (cluster admin; audited).
 pub async fn set_settings(path: &Path, output: OutputFormat) -> Result<(), RelishError> {
-    let text = std::fs::read_to_string(path)
+    let text = tokio::fs::read_to_string(path)
+        .await
         .map_err(|e| failed(&format!("can't read {}: {e}", path.display())))?;
     let wanted = ApplianceSettings::from_toml(&text)
         .map_err(|e| failed(&format!("{}: {e}", path.display())))?;
