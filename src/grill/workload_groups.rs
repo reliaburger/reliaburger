@@ -107,6 +107,21 @@ impl WorkloadGroups {
         }
     }
 
+    /// Hold `namespace`'s own cgroup, without any group in it, for as long
+    /// as something outside a workload depends on its inode: the job
+    /// runner's eBPF namespace binding.
+    pub fn hold_namespace(self: &Arc<Self>, namespace: &str) -> WorkloadGroupHold {
+        let key = crate::config::valid_workload_label(namespace)
+            .then(|| (namespace.to_string(), String::new()));
+        if let Some(key) = &key {
+            *self.lock().users.entry(key.clone()).or_default() += 1;
+        }
+        WorkloadGroupHold {
+            groups: Arc::clone(self),
+            key,
+        }
+    }
+
     /// Remove `namespace`'s `group`, and the namespace after it, if nothing
     /// in this process holds them. For a workload this Bun adopted from an
     /// earlier run, which never took a hold.
@@ -137,7 +152,8 @@ impl WorkloadGroups {
         }
         let (namespace, group) = key;
         let namespace_dir = self.root.join(namespace);
-        if !remove_group(&namespace_dir.join(group)) {
+        // An empty group is a hold on the namespace itself.
+        if !group.is_empty() && !remove_group(&namespace_dir.join(group)) {
             state.unremoved.insert(key.clone());
         }
         if namespace == PERMANENT_NAMESPACE || state.users.keys().any(|(held, _)| held == namespace)
@@ -347,6 +363,20 @@ mod tests {
         assert!(root.path().join("shop").exists(), "namespace kept for api");
         joining.release();
         assert!(!root.path().join("shop").exists());
+    }
+
+    #[test]
+    fn a_namespace_hold_keeps_the_namespace_but_not_its_groups() {
+        // The job runner's eBPF binding names the namespace cgroup's inode.
+        let (root, groups) = hierarchy();
+        let bound = groups.hold_namespace("batch");
+        let job = groups.hold("batch", "executor-abc");
+        make(root.path(), "batch/executor-abc");
+        job.release();
+        assert!(!root.path().join("batch/executor-abc").exists());
+        assert!(root.path().join("batch").exists());
+        bound.release();
+        assert!(!root.path().join("batch").exists());
     }
 
     #[test]

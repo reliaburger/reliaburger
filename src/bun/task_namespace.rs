@@ -19,11 +19,14 @@ const MAX_NAMESPACES: usize = 256;
 /// How long a task's egress allowlist may take to resolve before the
 /// attempt is refused.
 const EGRESS_DNS_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
-#[derive(Default)]
 struct Binding {
     cgroup: u64,
     users: usize,
     published: bool,
+    /// Keeps the namespace's cgroup while it is bound, so Bun never removes
+    /// a directory this binding and its journal name (#2324). The journal
+    /// must match the live inode at startup, and an idle binding is kept.
+    _namespace_cgroup: crate::grill::workload_groups::WorkloadGroupHold,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -390,23 +393,14 @@ impl TaskNamespacePolicy {
         let cgroup_id = crate::sesame::egress::cgroup_id_of_path(directory)
             .ok_or_else(|| std::io::Error::other("delegated namespace identity is unavailable"))?;
         let mut bindings = self.bindings.lock().await;
-        if let Some(binding) = bindings.get(namespace)
-            && binding.cgroup != cgroup_id
-        {
-            if binding.users > 0 {
+        if let Some(binding) = bindings.get(namespace) {
+            if binding.cgroup != cgroup_id {
                 return Err(std::io::Error::other("delegated namespace cgroup changed"));
             }
-            // An idle binding outlives its cgroup: the namespace's last
-            // workload leaving removes the directory, and this attempt made
-            // a new one (#2324). Lift the dead inode's entry and bind afresh.
-            let stale = binding.cgroup;
-            {
-                let mut kernel = self.kernel.lock().await;
-                remove_binding(&mut kernel, namespace, stale)?;
-            }
-            bindings.remove(namespace);
-        }
-        if !bindings.contains_key(namespace) {
+        } else {
+            // An evicted binding's hold is only dropped once the journal no
+            // longer names its namespace, below. Dropping removes nothing.
+            let mut _evicted = None;
             if bindings.len() == MAX_NAMESPACES {
                 let idle = bindings
                     .iter()
@@ -419,7 +413,7 @@ impl TaskNamespacePolicy {
                     let mut kernel = self.kernel.lock().await;
                     remove_binding(&mut kernel, &idle.0, idle.1)?;
                 }
-                bindings.remove(&idle.0);
+                _evicted = bindings.remove(&idle.0);
             }
             bindings.insert(
                 namespace.into(),
@@ -427,6 +421,8 @@ impl TaskNamespacePolicy {
                     cgroup: cgroup_id,
                     users: 0,
                     published: false,
+                    _namespace_cgroup: crate::grill::workload_groups::WorkloadGroups::shared()
+                        .hold_namespace(namespace),
                 },
             );
             // Record ownership before publishing; failed persistence never starts work.
