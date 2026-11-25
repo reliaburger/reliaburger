@@ -769,6 +769,10 @@ Does your x86\_64 or arm64 hardware boot over the network? Then it boots straigh
 
 What works: we test on the Dell Wyse 3040, and 0.3.0’s exit test takes three of them from power-on to a cluster. The installer drives Realtek RTL8111, RTL8168 and RTL8125, Intel I219, I225, I226, I210 and I350 and Broadcom tg3 network cards, plus USB Ethernet adapters. Secure Boot must be off. Raspberry Pis aren’t supported yet; they’re [planned](https://github.com/reliaburger/reliaburger/issues/1971).
 
+![Three black Dell Wyse 3040 thin clients, each about the size of a paperback, leaning on a 16-port Netgear switch on a desk, joined to it by short blue network cables](https://reliaburger.com/assets/wyse-lab.webp)
+
+Our test rig: three Dell Wyse 3040s and a switch.
+
 Three machines with blank disks network-boot into Reliaburger and become one cluster. They’re QEMU VMs with UEFI firmware on a virtual switch, run by [scripts/demo/netboot.sh](https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/netboot.sh) in CI, serving a lab build of the OS signed with that run’s own key. Idle time is cut to two seconds; every wait says how long it really took. 
 
 Show the commands from blank disks to a cluster

@@ -104,6 +104,24 @@ The bundle is self-contained: no fonts, workers or other files to fetch. To
 upgrade, replace those three files from a newer tarball and check the
 recording still plays.
 
+### The homepage's drawings and its one photograph
+
+The homepage takes its colours from the burger: `style.css` defines `--mustard`,
+`--lettuce`, `--tomato`, `--onion` and `--bun`, each section sets `--tint` to
+one of them, and its number, its rule and its drawings use that. The dark theme
+redefines the five.
+
+"What's in the burger" (`#internals`) draws the burger as the architecture
+map, one inline SVG layer per subsystem, top to bottom, each beside the
+subsystem's name and its design document. A new subsystem needs a row and a
+drawing. The small drawings beside the three facts and the four design points
+are inline SVG too, drawn with `currentColor`.
+
+`assets/wyse-lab.webp` is the bare-metal section's photograph of the test rig:
+three Dell Wyse 3040s and a switch. It's a 1200×800 crop that shows only the
+machines, re-encoded so it carries no camera metadata. Replace it the same way
+if the rig changes.
+
 ### Recording the netboot demo
 
 The "Netboot real machines" section plays `assets/netboot.cast`: three QEMU

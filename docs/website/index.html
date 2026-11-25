@@ -1525,6 +1525,8 @@ relish setup --quickstart</code></pre>
           <h2 id="netboot-title">Bare metal: power on, install, join <a class="permalink" href="#netboot" aria-label="Link to the netboot section">#</a></h2>
         </div>
         <div class="tour">
+          <div class="lab-intro">
+          <div>
           <p class="tour-note">Does your x86_64 or arm64 hardware boot over the network?
             Then it boots straight into Reliaburger. From a mini PC to a rack server, each
             machine installs itself in under a minute, and one command makes them a
@@ -1536,6 +1538,15 @@ relish setup --quickstart</code></pre>
             Broadcom tg3 network cards, plus USB Ethernet adapters. Secure Boot must be off.
             Raspberry Pis aren’t supported yet; they’re
             <a href="https://github.com/reliaburger/reliaburger/issues/1971">planned</a>.</p>
+          </div>
+          <!-- The rig the exit tests run on. A photograph, so it carries its size and
+               loads lazily; the crop leaves out everything but the machines. -->
+          <figure class="lab-photo">
+            <img src="./assets/wyse-lab.webp" width="1200" height="800" loading="lazy"
+              alt="Three black Dell Wyse 3040 thin clients, each about the size of a paperback, leaning on a 16-port Netgear switch on a desk, joined to it by short blue network cables">
+            <figcaption>Our test rig: three Dell Wyse 3040s and a switch.</figcaption>
+          </figure>
+          </div>
           <figure id="netboot-recording" class="recording" data-cast="./assets/netboot.cast" data-poster="npt:118">
             <div class="recording-screen"></div>
             <noscript><p class="recording-fallback">The recording plays with JavaScript. Without it,
