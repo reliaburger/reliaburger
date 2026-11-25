@@ -332,13 +332,14 @@ def summarise(run, lines, unreadable=0):
     fails it.
     """
     topologies = {}
-    retries = 0
+    retries = forwarder = 0
     between = restarts_between_cuts(lines)
     port_taken = [line.get("cut") for line in lines if "host port taken" in line.get("environment", [])]
     for line in lines:
         topology = topologies.setdefault(str(line.get("topology", "1")), {
-            "cuts": 0, "violations": 0, "by_kind": {}, "api": [], "settled": [], "violated": []})
+            "cuts": 0, "violations": 0, "by_kind": {}, "api": [], "settled": [], "violated": [], "extra": 0})
         topology["cuts"] += 1
+        topology["extra"] += line.get("extra_power_offs", 0)
         topology["by_kind"][line.get("kind", "site")] = topology["by_kind"].get(line.get("kind", "site"), 0) + 1
         recovery = line.get("recovery", {})
         if recovery.get("api_seconds") is not None:
@@ -346,6 +347,7 @@ def summarise(run, lines, unreadable=0):
         if recovery.get("settled_seconds") is not None:
             topology["settled"].append(recovery["settled_seconds"])
         retries += recovery.get("start_retries", 0)
+        forwarder += recovery.get("forwarder_retries", 0)
         if line.get("violations"):
             topology["violations"] += 1
             topology["violated"].append({"cut": line["cut"], "violations": line["violations"]})
@@ -353,6 +355,9 @@ def summarise(run, lines, unreadable=0):
     for name, topology in sorted(topologies.items()):
         result[name] = {
             "cuts": topology["cuts"],
+            # Forced stops of a booted guest during recovery (Lima's
+            # spinning forwarder): power cuts too, judged with the cut's own.
+            "extra_power_offs": topology["extra"],
             "violations": topology["violations"],
             "bound95": bound95(topology["cuts"]) if topology["violations"] == 0 else None,
             "by_kind": topology["by_kind"],
@@ -384,8 +389,10 @@ def summarise(run, lines, unreadable=0):
                                          "started", "ended", "paused_seconds")},
         "topologies": result,
         "pooled": {"cuts": cuts, "violations": violations,
+                   "power_offs": cuts + sum(t["extra_power_offs"] for t in result.values()),
                    "bound95": bound95(cuts) if violations == 0 and not aborted else None},
-        "environment_events": {"vz_start_retries": retries, "restarts_between_cuts": between,
+        "environment_events": {"vz_start_retries": retries, "lima_forwarder_retries": forwarder,
+                               "restarts_between_cuts": between,
                                "host_port_taken": port_taken},
         "aborted": aborted,
         "verdict": verdict,

@@ -10314,6 +10314,14 @@ lost an acknowledged write. Every one was the checker or the environment:
   On a Mac that's inside the ephemeral range, where any outgoing connection
   can grab it.
 
+- **Lima's own bad boot.** About one boot in 1,500, Lima 2.2.1's host agent
+  came up with its vsock SSH forwarder spinning on `accept: bad file
+  descriptor`. The guest and Bun were fine, but SSH was refused, the port
+  forwards never went in, and the agent wrote 9 GB of logs in five minutes.
+  The harness now spots that line in the start log within seconds, forces
+  the VM off and starts it again. It also records that forced stop as an
+  extra power cut, because the guest had booted, and caps both logs.
+
 One more: `--resume` carried a run on past a violation, powering the kept VM
 on and overwriting what we'd have diagnosed. It refuses now. And because
 the evidence of every old run was still on disk, `--rejudge` runs today's
