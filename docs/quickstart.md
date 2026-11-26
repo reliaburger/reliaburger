@@ -260,14 +260,37 @@ RELIABURGER_HOME=/absolute/path/to/isolated-state \
 
 This bypasses release downloads for those two operator-supplied binaries. With
 no release to take the built guest image from, it boots the stock Ubuntu cloud
-image that image is built from, checked against its pinned SHA-256, and each VM
-installs the node packages from Ubuntu's mirrors at first boot: expect each
-boot to take 15–40 s longer, or much longer when the mirror is slow. The
-stock Ubuntu 26.04 image also can't name its network interface on its first
-boot, so setup restarts each VM once. If setup stops at its deadline, rerun
-the same command to resume. It still verifies the Lima archive. It prints a
-notice and does not count as qualification of a signed, downloadable release.
-Use the same `RELIABURGER_HOME` for subsequent CLI and lifecycle commands.
+image that image is built from, checked against its pinned SHA-256. That's
+much slower than a release. The stock Ubuntu 26.04 image can't name its
+network interface on its first boot (it renames `eth0` to `enp0s1` and
+stalls), so on a Mac the boot watchdog restarts each VM about 30 s in, with
+the note "restarted a VM whose console went silent". The second boot then
+installs the node packages from Ubuntu's mirrors, which took about 130 s on
+the Mac Studio: roughly 200 s per VM in all, or longer when the mirror is
+slow. A release image boots in about 65 s. If setup stops at its deadline,
+rerun the same command to resume. It still verifies the Lima archive. It
+prints a notice and does not count as qualification of a signed, downloadable
+release. Use the same `RELIABURGER_HOME` for subsequent CLI and lifecycle
+commands.
+
+To test a change to the guest image itself, boot one you built with
+`scripts/release/build_guest_image.sh` instead of the stock image. Name it,
+and the SHA-256 you expect it to have, in two environment variables:
+
+```sh
+RELIABURGER_HOME=/absolute/path/to/isolated-state \
+  RELIABURGER_DEV_GUEST_IMAGE=/absolute/path/to/guest-aarch64.qcow2 \
+  RELIABURGER_DEV_GUEST_IMAGE_SHA256="$(shasum -a 256 /absolute/path/to/guest-aarch64.qcow2 | cut -d' ' -f1)" \
+  target/debug/relish setup --quickstart \
+  --development-binaries /absolute/path/to/linux-binaries
+```
+
+The image must be for the host's architecture, since a laptop's VMs run its
+own. Setup hashes the file and refuses it unless the digest matches, then
+boots it with no package installs and no restart, like a release image. These
+variables are for development only: setup refuses them without
+`--development-binaries`, so a release quickstart always boots the signed
+release image.
 
 The [release runbook](releasing.md) lists the gates a candidate passes before
 it's published, including clean-host timing, interrupted setup, real container

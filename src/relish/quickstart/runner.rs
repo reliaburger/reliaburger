@@ -112,6 +112,8 @@ pub async fn run(options: Options) -> Result<()> {
         options.development_binaries.is_some(),
         options.release_mirror.is_some(),
     )?;
+    let local_image =
+        artifacts::development_guest_image_from_env(options.development_binaries.is_some())?;
     let mut downloader = Downloader::new(DOWNLOAD_STALL)?;
     if let Some(mirror) = &options.release_mirror {
         downloader = downloader.with_release_mirror(&version, mirror)?;
@@ -135,6 +137,7 @@ pub async fn run(options: Options) -> Result<()> {
         &mut operation,
         &bootstrap,
         options.development_binaries.as_deref(),
+        local_image.as_ref(),
         &downloader,
         &progress,
     )
@@ -253,6 +256,7 @@ async fn setup(
     operation: &mut Operation,
     bootstrap: &Bootstrap,
     development: Option<&Path>,
+    local_image: Option<&artifacts::LocalGuestImage>,
     downloader: &Downloader,
     progress: &Progress,
 ) -> Result<()> {
@@ -264,6 +268,7 @@ async fn setup(
             root,
             &operation.state.spec.version,
             development,
+            local_image,
             downloader,
             progress,
         ),
@@ -296,6 +301,7 @@ async fn prepare_artifacts(
     root: &Path,
     version: &BinaryVersion,
     development: Option<&Path>,
+    local_image: Option<&artifacts::LocalGuestImage>,
     downloader: &Downloader,
     progress: &Progress,
 ) -> Result<Artifacts> {
@@ -329,6 +335,13 @@ async fn prepare_artifacts(
         )
     };
     let image = async {
+        if let Some(local) = local_image {
+            progress.note(
+                "development guest image selected explicitly; this run does not qualify a release image",
+            );
+            let step = progress.step(Stage::Download, "use local guest image");
+            return step.record(local.verified().await);
+        }
         let step = progress.step(Stage::Download, "download guest image");
         let result = if development.is_some() {
             // Development runs have no release to take a built image from, so
@@ -766,8 +779,8 @@ async fn start_vm(
             start_watched(lima, name, &create, BOOT_SILENCE, step).await?;
         }
         Some("Running") if !lima.console_started(name).await => {
-            // A previous run left a VM that never booted; see BOOT_SILENCE.
-            step.note("restarted a VM that never booted");
+            // A previous run left a VM whose console stayed silent; see BOOT_SILENCE.
+            step.note(SILENT_VM_RESTARTED);
             lima.restart(name).await?;
         }
         Some("Running") => step.note("already running"),
@@ -818,6 +831,11 @@ const fn boot_silence(vm_type: VmType) -> Duration {
 /// The boot silence for this host's VMs; see [`boot_silence`].
 const BOOT_SILENCE: Duration = boot_silence(HOST_VM_TYPE);
 
+/// The step note when the watchdog restarts a VM. It says what was seen, not
+/// why: a VM that never booted (#2229) and the stock Ubuntu image's first-boot
+/// NIC rename stall on a development run look the same from the host.
+const SILENT_VM_RESTARTED: &str = "restarted a VM whose console went silent";
+
 /// Run a Lima start command, and if the VM's console is still silent
 /// `silence` after Lima's host agent started it, force it off and start it
 /// once more without the watchdog.
@@ -846,7 +864,7 @@ async fn start_watched(
     }
     // Dropping the start command above killed limactl; the VM itself is
     // still registered with Lima, so stop it by name and start it again.
-    step.note("restarted a VM that never booted");
+    step.note(SILENT_VM_RESTARTED);
     lima.restart(name).await
 }
 
@@ -1319,6 +1337,16 @@ esac
             Duration::from_secs(60)
         };
         assert_eq!(BOOT_SILENCE, expected);
+    }
+
+    /// The watchdog also fires on the stock image's known first-boot NIC
+    /// stall, where the VM did boot, so the note says what was seen (#2346).
+    #[test]
+    fn the_watchdog_note_names_the_silent_console_not_a_failed_boot() {
+        assert_eq!(
+            SILENT_VM_RESTARTED,
+            "restarted a VM whose console went silent"
+        );
     }
 
     #[tokio::test]
