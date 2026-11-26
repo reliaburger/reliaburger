@@ -237,8 +237,41 @@ pub(crate) fn from_previous_boot(record: &OwnerRecord) -> io::Result<bool> {
     Ok(current_boot_id()?.is_some_and(|current| record.boot_id != current))
 }
 
+impl OwnerRecord {
+    /// Whether the launch has stopped for good: no gate can exec from this
+    /// record and no exec can copy its environment any more.
+    fn finished(&self) -> bool {
+        match self.phase {
+            OwnerPhase::Prepared | OwnerPhase::Running { .. } => false,
+            OwnerPhase::Retiring { .. } | OwnerPhase::Retired { .. } | OwnerPhase::Cancelled => {
+                true
+            }
+        }
+    }
+
+    /// The same record with no environment value left, as a retired runc
+    /// intent keeps it: the spec's entries cut to their names, and no copy
+    /// of the environment the gate would have exported. Recovery still
+    /// compares the spec through [`OciSpec::matches_journal`].
+    ///
+    /// [`OciSpec::matches_journal`]: super::oci::OciSpec::matches_journal
+    fn without_environment_values(&self) -> OwnerRecord {
+        let mut reduced = self.clone();
+        reduced.environment.clear();
+        reduced.launch.spec = reduced.launch.spec.without_environment_values();
+        reduced
+    }
+}
+
+/// Write `record` atomically with mode 0600. A finished launch is written
+/// without its environment values, which have no reader once it can no
+/// longer run, decrypted and provider secrets included.
 pub(crate) fn persist(directory: &Path, record: &OwnerRecord) -> io::Result<()> {
-    let bytes = serde_json::to_vec(record)?;
+    let bytes = if record.finished() {
+        serde_json::to_vec(&record.without_environment_values())?
+    } else {
+        serde_json::to_vec(record)?
+    };
     if bytes.len() as u64 > RECORD_LIMIT {
         return Err(io::Error::other("process owner record exceeds size limit"));
     }
@@ -1266,6 +1299,77 @@ mod tests {
         let status = owned.child.wait().unwrap();
         owned.reaped = true;
         assert_eq!(status.code(), Some(3), "the handler didn't run: {status:?}");
+    }
+
+    /// A record carrying resolved values: a provider's and a decrypted
+    /// `ENC[...]` one, plus a variable inherited from Bun.
+    fn record_with_secrets() -> OwnerRecord {
+        let mut record = record(current_boot_id().unwrap().unwrap());
+        record.launch.spec.process.env = vec![
+            "DB_PASSWORD=provider-value-1".into(),
+            "API_KEY=decrypted-value-2".into(),
+        ];
+        record.environment = BTreeMap::from([
+            ("DB_PASSWORD".into(), "provider-value-1".into()),
+            ("API_KEY".into(), "decrypted-value-2".into()),
+            ("PATH".into(), "/usr/bin:/bin".into()),
+        ]);
+        record
+    }
+
+    /// Persist `record`, then return what landed on disk, what loads back
+    /// and the file's mode.
+    fn persisted(record: &OwnerRecord) -> (String, OwnerRecord, u32) {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        persist(directory.path(), record).unwrap();
+        let path = directory.path().join("owner.json");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        (raw, load(directory.path()).unwrap(), mode)
+    }
+
+    /// The gate execs from a Prepared record and an exec copies a Running
+    /// one, so both keep every value.
+    #[test]
+    fn a_launch_that_can_still_run_keeps_its_environment_values() {
+        for phase in [OwnerPhase::Prepared, OwnerPhase::Running { pid: 1 }] {
+            let mut record = record_with_secrets();
+            record.phase = phase;
+            let (raw, loaded, mode) = persisted(&record);
+            assert!(raw.contains("provider-value-1"), "{raw}");
+            assert!(raw.contains("decrypted-value-2"), "{raw}");
+            assert_eq!(loaded.environment, record.environment);
+            assert_eq!(loaded.launch.spec, record.launch.spec);
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    /// Once a launch has stopped for good, nothing reads its values, so the
+    /// record keeps only the variable names, as runc's retired intent does.
+    #[test]
+    fn a_retired_or_cancelled_launch_keeps_only_variable_names() {
+        for phase in [
+            OwnerPhase::Retiring { exit_code: Some(0) },
+            OwnerPhase::Retired { exit_code: Some(0) },
+            OwnerPhase::Cancelled,
+        ] {
+            let mut record = record_with_secrets();
+            record.phase = phase;
+            let (raw, loaded, mode) = persisted(&record);
+            for value in ["provider-value-1", "decrypted-value-2", "/usr/bin:/bin"] {
+                assert!(!raw.contains(value), "{value} kept: {raw}");
+            }
+            assert!(loaded.environment.is_empty());
+            assert_eq!(
+                loaded.launch.spec,
+                record.launch.spec.without_environment_values()
+            );
+            assert_eq!(loaded.launch.spec.process.env, ["DB_PASSWORD", "API_KEY"]);
+            assert_eq!(mode, 0o600);
+            // Writing the reduced record again changes nothing.
+            assert_eq!(persisted(&loaded).0, raw);
+        }
     }
 
     #[test]

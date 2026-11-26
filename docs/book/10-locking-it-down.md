@@ -1573,6 +1573,8 @@ A live intent must be equal, as before. A retired one must be equal once the val
 
 The test that pins it lives in `tests/runc_intent.rs`. It builds a spec from an app whose `API_TOKEN` is `ENC[AGE:...]`, decrypts it with a stand-in decryptor, publishes and retires the intent, then walks every file under the bundle base looking for the plaintext. Before the fix it found `intent.json`. The Linux runc tests now carry a fake decrypted secret in every workload and make the same check on each instance's bundle and intent once it has stopped.
 
+The process runtime's owner record, `owner.json`, is now reduced the same way: once its launch is retiring, retired or cancelled, `process_owner::persist` writes the spec through `without_environment_values` and drops its copy of the environment, so only the variable names stay.
+
 ### One key per namespace
 
 Here's an awkward question. Team A and team B share a cluster, and every `ENC[AGE:...]` value in it is sealed to the one cluster key. Team B finds team A's database password in an old commit, still encrypted. Can they read it?
