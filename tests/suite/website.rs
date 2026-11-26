@@ -25,6 +25,10 @@ const DEMO_MANIFEST_PENDING: bool = false;
 /// The one-line install names its mode: without one the installer only
 /// explains the choices (#670).
 const INSTALL_LINE: &str = "curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop";
+/// The prompt the page gives a person to paste into their agent, in the hero
+/// and in the install section's first tab.
+const AGENT_PROMPT: &str =
+    "Set up a Reliaburger cluster for me. Start at https://reliaburger.com/agents.";
 /// The Kubernetes demo the manual's Kubernetes chapter applies. The tour
 /// used it until 0.2.3 (#1343); the site still publishes it.
 const DEMO_URL: &str = "https://reliaburger.com/demo/podinfo.yaml";
@@ -679,7 +683,10 @@ fn readme_hero_matches_the_homepage() {
         ]
         .join(" "),
     );
-    assert!(homepage.contains("served ready"), "{homepage:?}");
+    assert!(
+        homepage.contains("built for AI agents to run"),
+        "{homepage:?}"
+    );
 
     let readme = read("README.md");
     let (start_marker, end_marker) = ("<!-- hero:start -->", "<!-- hero:end -->");
@@ -731,6 +738,8 @@ fn every_section_can_be_linked_to() {
         "netboot",
         "debug",
         "act",
+        "designed",
+        "who",
         "start",
         "docs",
         "internals",
@@ -761,8 +770,12 @@ fn the_status_box_says_who_it_is_for_and_that_1_0_0_has_no_date() {
     let start = page
         .find("<aside class=\"status status-note\"")
         .expect("the page has no status box");
-    let install = page.find("<section id=\"tour\"").unwrap();
-    assert!(start < install, "the status box should sit by the install");
+    let install = page.find("<section id=\"install\"").unwrap();
+    let after = page.find("<section id=\"scrutiny\"").unwrap();
+    assert!(
+        install < start && start < after,
+        "the status box should sit straight after the install"
+    );
     let text = strip_tags(&page[start..start + page[start..].find("</aside>").unwrap()]);
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     for phrase in ["home labs", "dev clusters", "production until 1.0.0"] {
@@ -827,17 +840,38 @@ fn every_command_on_the_welcome_page_parses_with_the_real_cli() {
     }
 }
 
-/// A release is published, so the page leads with the one-line install and keeps
-/// building from source as the second path (#280).
+/// The page leads with the prompt for an agent: the first thing to copy is the
+/// line that sends it to the playbook on `/agents`, in the hero. The one-line
+/// install is still on the page, in the install section the hero links, and
+/// building from source stays the last path (#280).
 #[test]
-fn the_page_leads_with_the_one_line_install() {
+fn the_page_leads_with_the_agent_prompt_and_keeps_the_one_line_install() {
     let page = read("docs/website/index.html");
     let first_snippet = &page[page.find("<pre").unwrap()..];
     let first_snippet = &first_snippet[..first_snippet.find("</pre>").unwrap()];
-    assert_eq!(decode(&strip_tags(first_snippet)), INSTALL_LINE);
+    assert_eq!(decode(&strip_tags(first_snippet)), AGENT_PROMPT);
+    let intro = &page[page.find("<section id=\"intro\"").unwrap()..];
+    let intro = &intro[..intro.find("</section>").unwrap()];
+    assert!(
+        intro.contains(first_snippet),
+        "the prompt is in the hero, not below it"
+    );
+    assert!(
+        intro.contains("<a href=\"#install\">Or install it yourself"),
+        "the hero links the install section"
+    );
+    let install = &page[page.find("<section id=\"install\"").unwrap()..];
+    let install = &install[..install.find("</section>").unwrap()];
+    assert!(
+        marked_commands(install, "data-agent-prompt") == [AGENT_PROMPT],
+        "the install section's prompt is the hero's"
+    );
+    assert!(
+        decode(&strip_tags(install)).contains(INSTALL_LINE),
+        "the install section lost the one-line install"
+    );
     let ids: Vec<String> = section_ids(&page).into_iter().flatten().collect();
     let position = |id: &str| ids.iter().position(|i| i == id).unwrap();
-    assert!(position("install") < position("tour"));
     assert!(position("install") < position("start"));
     for stale in [
         "Arrives with 0.1.0",
@@ -1496,7 +1530,7 @@ fn versions_named(text: &str) -> Vec<(u64, u64, u64)> {
         .collect()
 }
 
-/// "How a release is tested" follows the jobs section, shows the newest
+/// How a release is tested follows the case for scrutiny, shows the newest
 /// release's record and names no release older than the one the installer
 /// fetches, so a promotion can't leave it describing the last one (#979).
 #[test]
@@ -1506,8 +1540,8 @@ fn the_release_testing_section_shows_the_installed_release() {
     let position = |id: &str| ids.iter().position(|i| i == id);
     assert_eq!(
         position("release-testing"),
-        position("job-throughput").map(|jobs| jobs + 1),
-        "the release-testing section should come straight after the jobs section"
+        position("scrutiny").map(|scrutiny| scrutiny + 1),
+        "the release-testing section should come straight after the scrutiny section"
     );
     let section = release_testing_section(&page);
     let installed = installer_default();
@@ -1724,17 +1758,22 @@ fn why_slides(section: &str) -> Vec<&str> {
 /// The number of slides as the prose around the carousel spells it.
 const SLIDE_COUNT_WORD: &str = "seven";
 
-/// The seven differences sit between the hero and the install, each a short
+/// The seven differences come first after the hero, under the whitepaper's
+/// band, which names three of them. Each is a short
 /// punchline, two sentences and a drawing. The list works without script;
 /// `assets/why-carousel.js` turns it into a slideshow. The first, from 0.2.8,
 /// says it was built for AI agents from the start (#1731); the last, from
 /// 0.2.7, is the one about reading the recipe (#1578).
 #[test]
-fn seven_differences_come_just_before_the_install() {
+fn seven_differences_come_straight_after_the_hero() {
     let page = read("docs/website/index.html");
     let ids: Vec<String> = section_ids(&page).into_iter().flatten().collect();
     let position = |id: &str| ids.iter().position(|i| i == id).unwrap();
-    assert_eq!(position("why") + 1, position("install"), "{ids:?}");
+    assert_eq!(position("intro") + 1, position("why"), "{ids:?}");
+    assert!(
+        page.find("<aside id=\"whitepaper\"") < page.find("<section id=\"why\""),
+        "the whitepaper's band comes before the differences"
+    );
 
     let section = why_section(&page);
     assert!(section.contains("data-carousel"));
@@ -1766,19 +1805,23 @@ fn seven_differences_come_just_before_the_install() {
     }
 }
 
-/// The page opens its case with why Reliaburger asks to be trusted: for
-/// scrutiny anyone can repeat, not for popularity. It sits between the hero
-/// and the differences, and every paragraph or table cell that quotes a
-/// number links where the number comes from, so nothing on it is a claim a
-/// reader has to take on trust. Each part of the answer also says what
-/// doesn't exist yet.
+/// The page says why Reliaburger asks to be trusted: for scrutiny anyone can
+/// repeat, not for popularity. The case follows the install, with how a
+/// release is tested straight after it, and every paragraph or table cell
+/// that quotes a number links where the number comes from, so nothing on it
+/// is a claim a reader has to take on trust. Each part of the answer also
+/// says what doesn't exist yet.
 #[test]
-fn the_scrutiny_section_comes_first_and_sources_every_number() {
+fn the_scrutiny_section_follows_the_install_and_sources_every_number() {
     let page = read("docs/website/index.html");
     let ids: Vec<String> = section_ids(&page).into_iter().flatten().collect();
     let position = |id: &str| ids.iter().position(|i| i == id).unwrap();
-    assert_eq!(position("intro") + 1, position("scrutiny"), "{ids:?}");
-    assert_eq!(position("scrutiny") + 1, position("why"), "{ids:?}");
+    assert_eq!(position("install") + 1, position("scrutiny"), "{ids:?}");
+    assert_eq!(
+        position("scrutiny") + 1,
+        position("release-testing"),
+        "{ids:?}"
+    );
 
     let start = page.find("<section id=\"scrutiny\"").unwrap();
     let section = &page[start..start + page[start..].find("</section>").unwrap()];
@@ -1804,6 +1847,45 @@ fn the_scrutiny_section_comes_first_and_sources_every_number() {
         rows * 2,
         "each part says what exists and what doesn't yet"
     );
+}
+
+/// The evidence band puts four numbers in large type before the sections that
+/// back them. Like the scrutiny section's, each links where it comes from: a
+/// section of this page or a committed record.
+#[test]
+fn the_evidence_band_links_every_number() {
+    let page = read("docs/website/index.html");
+    let start = page
+        .find("<aside id=\"evidence\" class=\"numbers-band\"")
+        .expect("no evidence band");
+    assert!(
+        start < page.find("<section id=\"scrutiny\"").unwrap(),
+        "the band comes before the evidence sections"
+    );
+    let band = &page[start..start + page[start..].find("</aside>").unwrap()];
+    let numbers: Vec<&str> = band.split("<div><dt>").skip(1).collect();
+    assert_eq!(numbers.len(), 4, "the band shows four numbers");
+    for number in numbers {
+        let number = &number[..number.find("</div>").unwrap()];
+        let href = number
+            .split("<a href=\"")
+            .nth(1)
+            .map(|rest| &rest[..rest.find('"').unwrap()])
+            .unwrap_or_else(|| panic!("a number with no source: {number}"));
+        match href.strip_prefix('#') {
+            Some(id) => assert!(
+                page.contains(&format!("<section id=\"{id}\"")),
+                "the band links #{id}, which isn't a section"
+            ),
+            None => {
+                let record = href
+                    .strip_prefix("https://github.com/reliaburger/reliaburger/blob/main/")
+                    .unwrap_or_else(|| panic!("{href} isn't a record in this repository"));
+                let record = record.split('#').next().unwrap();
+                assert!(repository().join(record).is_file(), "{record} is missing");
+            }
+        }
+    }
 }
 
 /// The first difference (#1731): Reliaburger was built for AI agents from the
@@ -1982,10 +2064,10 @@ fn the_carousel_counts_its_slides_and_keeps_pause_and_play() {
     }
 }
 
-/// The install section has two tabs (#1579): the one-line install, and one
-/// prompt for an agent that sends it to the playbook on `/agents`. They're
-/// radio buttons, so they switch without a script, and the one-line install
-/// is the one chosen when the page loads.
+/// The install section has a tab with one prompt for an agent that sends it
+/// to the playbook on `/agents` (#1579), and one with the one-line install.
+/// They're radio buttons, so they switch without a script. The agent's tab
+/// comes first and is the one chosen when the page loads.
 #[test]
 fn the_install_section_offers_the_one_line_install_and_an_agent_prompt() {
     let page = read("docs/website/index.html");
@@ -1997,13 +2079,14 @@ fn the_install_section_offers_the_one_line_install_and_an_agent_prompt() {
             "no {tab:?} tab"
         );
     }
-    assert!(section.contains("id=\"install-tyres\" checked>"));
+    assert!(section.contains("id=\"install-agent\" checked>"));
+    assert!(
+        section.find(">With your agent</label>") < section.find(">Kick the tyres</label>"),
+        "the agent's tab comes first"
+    );
     let prompt = &section[section.find("<code data-agent-prompt>").unwrap()..];
     let prompt = &prompt["<code data-agent-prompt>".len()..prompt.find("</code>").unwrap()];
-    assert_eq!(
-        prompt,
-        "Set up a Reliaburger cluster for me. Start at https://reliaburger.com/agents."
-    );
+    assert_eq!(prompt, AGENT_PROMPT);
     // The page the prompt names is the one generated from the agent chapter,
     // and it carries the playbook.
     let agents = read("docs/website/agents.html");
@@ -2012,8 +2095,8 @@ fn the_install_section_offers_the_one_line_install_and_an_agent_prompt() {
 }
 
 /// A third tab installs the CLI with Homebrew (#1583): the tap, then the
-/// quickstart. The one-line install stays the first tab and the chosen one,
-/// and the Homebrew panel shows each tab its own style rule.
+/// quickstart. It comes after the one-line install, and the Homebrew panel
+/// shows each tab its own style rule.
 #[test]
 fn the_install_section_offers_homebrew_after_the_one_line_install() {
     let page = read("docs/website/index.html");
@@ -2021,7 +2104,10 @@ fn the_install_section_offers_homebrew_after_the_one_line_install() {
     let section = &section[..section.find("</section>").unwrap()];
     let tyres = section.find(">Kick the tyres</label>").unwrap();
     let homebrew = section.find(">Homebrew</label>").expect("no Homebrew tab");
-    assert!(tyres < homebrew, "the one-line install comes first");
+    assert!(
+        tyres < homebrew,
+        "the one-line install comes before Homebrew"
+    );
     let panel = &section[section.find("install-panel-homebrew").unwrap()..];
     let panel = &panel[..panel.find("</pre>").unwrap()];
     let brew = panel.find("brew install reliaburger/tap/relish").unwrap();
@@ -2146,16 +2232,20 @@ fn the_homepage_opens_with_a_line_for_agents() {
     assert!(read("docs/website/llms.txt").starts_with("# Reliaburger\n"));
 }
 
-/// The 0.2.7 headline sits in the hero, under the title.
+/// The title says who the platform is built for: AI agents are the ones that
+/// run it. The line under it says what a person gets.
 #[test]
 fn the_hero_says_who_it_is_built_for() {
     let page = read("docs/website/index.html");
     let intro = &page[page.find("<section id=\"intro\"").unwrap()..];
     let intro = &intro[..intro.find("</section>").unwrap()];
+    let title = intro
+        .find("<h1 id=\"title\">The container platform<br> built for AI agents to run.</h1>")
+        .expect("the hero lacks the title");
     let headline = intro
-        .find("<p class=\"headline-agents\">Built for humans and their agents.</p>")
+        .find("<p class=\"headline-agents\">From hosts to apps in minutes.</p>")
         .expect("the hero lacks the headline");
-    assert!(intro.find("<h1 id=\"title\">").unwrap() < headline);
+    assert!(title < headline);
 }
 
 /// Every command the agent section shows parses with the real CLI. They're
@@ -2182,7 +2272,7 @@ fn every_agent_section_command_parses_with_the_real_cli() {
     }
     let heading = &section[section.find("<h2").unwrap()..section.find("</h2>").unwrap()];
     assert!(
-        strip_tags(heading).contains("Debug the platform, not just your app"),
+        strip_tags(heading).contains("debug the platform, not just your app"),
         "{heading:?}"
     );
 }
@@ -2240,23 +2330,107 @@ fn every_recording_has_a_screen_and_speed_buttons() {
     assert!(figures >= 4, "found only {figures} recordings");
 }
 
+/// The two agent recordings fold, so their sections read as a paragraph and a
+/// choice. Each fold's summary is a poster: a few of the session's commands,
+/// hidden from screen readers, under a label that says what opening it does
+/// and what closing it does. Nothing in the fold needs a script of its own:
+/// the player loads a recording when it scrolls into view, which a closed
+/// fold never does.
+#[test]
+fn the_agent_recordings_fold_behind_a_poster() {
+    let page = read("docs/website/index.html");
+    let folds = details_ranges(&page);
+    for (fold, figure) in [
+        ("debug-recording-fold", "agent-recording"),
+        ("act-recording-fold", "act-recording"),
+    ] {
+        let start = page
+            .find(&format!("<details class=\"recording-fold\" id=\"{fold}\">"))
+            .unwrap_or_else(|| panic!("no #{fold}"));
+        let range = folds.iter().find(|range| range.start == start).unwrap();
+        let body = &page[range.clone()];
+        assert!(
+            body.contains(&format!("<figure id=\"{figure}\"")),
+            "#{figure} isn't inside #{fold}"
+        );
+        let summary = &body[body.find("<summary>").unwrap()..body.find("</summary>").unwrap()];
+        assert!(summary.contains("<span class=\"poster-lines\" aria-hidden=\"true\">"));
+        for label in ["Watch the recording", "Hide the recording"] {
+            assert!(summary.contains(label), "#{fold}'s summary lacks {label:?}");
+        }
+        assert!(
+            !summary.contains("<code"),
+            "the poster's lines are decoration, not commands the tests parse"
+        );
+    }
+    let style = read("docs/website/style.css");
+    for rule in [
+        ".recording-fold[open] .poster-lines",
+        ".recording-fold summary:focus-visible",
+    ] {
+        assert!(style.contains(rule), "style.css has no {rule} rule");
+    }
+}
+
+/// The site has a dark theme a visitor turns on with a button and keeps in
+/// their browser. The button comes from the site's one shared script, so
+/// there's no dead button without JavaScript, and the theme hangs off
+/// `data-theme` on the root element. Every box the light theme paints dark
+/// gets its own darker colour there, so a terminal still reads as a box.
+#[test]
+fn the_dark_theme_is_a_button_and_keeps_every_dark_box_dark() {
+    let script = read("docs/website/assets/copy.js");
+    for needle in [
+        "\"theme-toggle\"",
+        "localStorage.getItem(\"theme\")",
+        "setAttribute(\"data-theme\", \"dark\")",
+        "aria-pressed",
+    ] {
+        assert!(script.contains(needle), "copy.js lacks {needle:?}");
+    }
+    let page = read("docs/website/index.html");
+    assert!(
+        !page.contains("theme-toggle"),
+        "the theme button comes from the script, not the markup"
+    );
+    let css = read("docs/website/style.css");
+    let dark = ":root[data-theme=\"dark\"]";
+    assert!(css.contains(&format!("{dark} {{ color-scheme: dark;")));
+    for (selector, body) in css_rules(&css) {
+        if selector.contains("data-theme") || !body.contains("background: var(--ink)") {
+            continue;
+        }
+        // A comment above a rule comes back as part of its selector.
+        let selector = selector.rsplit("*/").next().unwrap();
+        for part in selector.split(',') {
+            let part = part.trim();
+            assert!(
+                css.contains(&format!("{dark} {part},"))
+                    || css.contains(&format!("{dark} {part} {{ background: var(--box)")),
+                "`{part}` paints a dark box, but the dark theme doesn't repaint it"
+            );
+        }
+    }
+}
+
 /// The `#act` section of the homepage: what 0.2.8 lets an agent do (#1690).
 fn act_section(page: &str) -> &str {
     let start = page.find("<section id=\"act\"").expect("no #act section");
     &page[start..start + page[start..].find("</section>").unwrap()]
 }
 
-/// 0.2.8's showcase sits right after the agent debugging section, which it
-/// builds on, and every command it shows parses with the real CLI.
+/// The agent sections follow the differences: what an agent
+/// gets, then 0.2.8's showcase, then the debugging section. Every command the
+/// showcase shows parses with the real CLI.
 #[test]
 fn every_act_section_command_parses_with_the_real_cli() {
     let page = read("docs/website/index.html");
     let ids: Vec<String> = section_ids(&page).into_iter().flatten().collect();
-    let debug = ids.iter().position(|id| id == "debug").unwrap();
+    let position = |id: &str| ids.iter().position(|i| i == id).unwrap();
     assert_eq!(
-        ids.get(debug + 1).map(String::as_str),
-        Some("act"),
-        "#act should follow #debug: {ids:?}"
+        [position("designed"), position("act"), position("debug")],
+        [2, 3, 4],
+        "what an agent gets, then #act, then #debug, after the differences: {ids:?}"
     );
     let section = act_section(&page);
     let commands = marked_commands(section, "data-act-command");
@@ -2295,12 +2469,21 @@ fn the_act_recording_slot_says_plainly_whether_there_is_a_recording() {
     }
 }
 
+/// The `#designed` section of the homepage: what the platform gives an agent,
+/// by name.
+fn designed_section(page: &str) -> &str {
+    let start = page
+        .find("<section id=\"designed\"")
+        .expect("no #designed section");
+    &page[start..start + page[start..].find("</section>").unwrap()]
+}
+
 /// What 0.2.8 hasn't measured yet has a slot that names its issue and quotes
 /// no number: the Kubernetes context comparison (#1679, for #1681).
 #[test]
 fn unmeasured_results_have_slots_that_claim_nothing() {
     let page = read("docs/website/index.html");
-    let section = act_section(&page);
+    let section = designed_section(&page);
     let slots: Vec<&str> = section
         .split("<aside class=\"measure-pending\"")
         .skip(1)
@@ -2390,14 +2573,33 @@ fn the_local_model_slot_quotes_only_its_record() {
     }
 }
 
-/// The concept counts the showcase quotes are the budget the test in
+/// The concept counts the page quotes are the budget the test in
 /// `src/bin/relish.rs` holds the CLI to, so the page can't drift from it.
+/// The section that quotes them also names what an agent gets, and each
+/// command it names is one the installed release has, which
+/// `every_advertised_command_exists_in_the_installed_release` covers.
 #[test]
-fn the_act_section_quotes_the_concept_budget() {
+fn the_designed_section_quotes_the_concept_budget() {
     let budget: serde_json::Value =
         serde_json::from_str(&read("docs/testing/concept-budget.json")).unwrap();
     let page = read("docs/website/index.html");
-    let text = decode(&strip_tags(act_section(&page)));
+    let section = designed_section(&page);
+    for command in [
+        "relish agent diagnose",
+        "relish agent explain",
+        "relish agent source",
+        "relish agent patch",
+        "relish agent propose",
+        "relish mcp",
+        "relish gym run",
+        "relish token create --agent",
+    ] {
+        assert!(
+            section.contains(&format!("<code>{command}</code>")),
+            "the #designed section doesn't name `{command}`"
+        );
+    }
+    let text = decode(&strip_tags(section));
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     for (key, words) in [
         ("resource_kinds", "resource kinds"),
@@ -2406,7 +2608,7 @@ fn the_act_section_quotes_the_concept_budget() {
         let count = budget[key]["budget"].as_u64().unwrap();
         assert!(
             text.contains(&format!("{count} {words}")),
-            "the #act section should say \"{count} {words}\""
+            "the #designed section should say \"{count} {words}\""
         );
     }
 }

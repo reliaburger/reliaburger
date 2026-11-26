@@ -3,7 +3,8 @@
 
     python3 scripts/record/recording.py debug --cast CAST --out DIR [options]
     python3 scripts/record/recording.py act --cast CAST --out DIR [options]
-    python3 scripts/record/recording.py prompt debug|act
+    python3 scripts/record/recording.py setup --cast CAST --out DIR --home HOME [options]
+    python3 scripts/record/recording.py prompt debug|act|setup
     python3 scripts/record/recording.py tidy CAST SESSION
 
 `debug` is #1678, for the "Debug the platform" section: the gym's
@@ -16,6 +17,17 @@ and a report it drafts and doesn't post.
 `propose-rollback` scenario, with Claude Code holding an agent token. It
 takes a lease and proposes the rollback, and then you, with your own token,
 show, approve and undo the proposal.
+
+`setup` is the homepage's hero: Claude Code, with a shell and an empty
+`RELIABURGER_HOME`, given the one line the page tells people to paste. It
+doesn't go through the gym, because there's no cluster to prepare and no
+answer to score: the session reads the playbook, asks where the cluster
+should run, gets the person's answer (`This computer`), installs `relish`
+and builds a laptop cluster, and then you look at it. The cast is kept only
+when the session ran the installer and your `relish nodes` and `relish
+status` both worked (see `setup_problems`). The cluster is destroyed
+afterwards and `HOME` removed, whatever happened. `--home` must be a new,
+short path: Lima's control sockets live under it.
 
 The gym does what it does for any solver: it builds the cluster and the
 planted `relish`, sets the scenario up, records every `relish` call the
@@ -49,10 +61,12 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 HERE = Path(__file__).resolve().parent
 GYM = HERE.parent / "gym"
@@ -74,7 +88,16 @@ IDLE_LIMIT = 2
 DEFAULT_TIMEOUT = 5400
 
 SCENARIOS = {"debug": "planted-logs-since", "act": "propose-rollback"}
-TITLES = {"debug": "an agent debugs the platform", "act": "an agent proposes, you decide"}
+TITLES = {"debug": "an agent debugs the platform", "act": "an agent proposes, you decide",
+          "setup": "an agent sets up a cluster"}
+
+# The setup session: the homepage's line, word for word, and the person's
+# answer to "where?". The answer also says not to ask again, because a
+# recorded session has nobody to answer a second question.
+SETUP_PROMPT = "Set up a Reliaburger cluster for me. Start at https://reliaburger.com/agents.\n"
+SETUP_REPLY = "This computer. Go ahead, you don't need to ask me anything else.\n"
+SETUP_TIMEOUT = 2700
+INSTALLER = "reliaburger.com/install.sh"
 
 # What each recording adds to the scenario's prompt, so the session takes
 # every step the page describes. The gym's answer contract still follows.
@@ -143,6 +166,144 @@ redirection: anything else is refused. A refused call doesn't mean the
 step is forbidden; run it again on its own. Every step above is allowed,
 and the session isn't done until all of them have run.
 """
+
+
+def setup_argv(claude, model, budget, session_id, resume=False):
+    """The setup session's `claude` command line, for its first turn or its second.
+
+    It gets a shell and may fetch reliaburger.com, as the person who pastes
+    the homepage's line into their own agent would give it, and none of this
+    machine's settings, plugins or MCP servers. The session is kept on disk
+    so the second turn can resume it.
+    """
+    argv = [
+        claude, "-p",
+        "--output-format", "stream-json", "--verbose",
+        "--setting-sources", "",
+        "--strict-mcp-config",
+        "--tools", "Bash,WebFetch",
+        "--allowedTools", "Bash", "WebFetch(domain:reliaburger.com)",
+        "--permission-mode", "dontAsk",
+        "--max-budget-usd", budget,
+        *(["--resume", session_id] if resume else ["--session-id", session_id]),
+    ]
+    if model:
+        argv += ["--model", model]
+    return argv
+
+
+def setup_problems(events, person):
+    """Why a setup recording can't be kept; empty when it can."""
+    problems = []
+    commands = [
+        block.get("input", {}).get("command", "")
+        for event in events if event.get("type") == "assistant"
+        for block in (event.get("message") or {}).get("content", [])
+        if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") == "Bash"
+    ]
+    if not any(INSTALLER in command for command in commands):
+        problems.append("the session never ran the installer")
+    results = [event for event in events if event.get("type") == "result"]
+    if len(results) < 2:
+        problems.append(f"the session had {len(results)} turns, not the two the recording shows")
+    if any(result.get("is_error") for result in results):
+        problems.append("a turn ended in an error")
+    if person is None:
+        problems.append("the person's check never ran")
+        return problems
+    for key, what in [("nodes_exit", "relish nodes"), ("status_exit", "relish status")]:
+        if person.get(key) != 0:
+            problems.append(f"the person's `{what}` exited {person.get(key)!r}")
+    return problems
+
+
+def installer_version():
+    """The release `install.sh` fetches by default, without its `v`."""
+    script = (HERE.parent.parent / "docs" / "website" / "install.sh").read_text()
+    return script.split("${RELIABURGER_VERSION:-", 1)[1].split("}", 1)[0].lstrip("v")
+
+
+def setup_env(environ, home):
+    """The setup session's environment: its own RELIABURGER_HOME, and none
+    of this machine's cluster in it."""
+    env = {
+        key: value for key, value in environ.items()
+        if key not in ("RELIABURGER_TOKEN", "RELIABURGER_ENDPOINT", "RELIABURGER_CA_CERT")
+        and not key.startswith("STAGE_") and not key.startswith("GYM_")
+    }
+    env["RELIABURGER_HOME"] = str(home)
+    return env
+
+
+def record_setup(args):
+    out = Path(args.out).resolve()
+    if out.exists() and any(out.iterdir()):
+        raise SystemExit(f"{out} isn't empty: name a new directory")
+    home = Path(args.home).resolve()
+    if home.exists():
+        raise SystemExit(f"{home} exists: name a new RELIABURGER_HOME, which the recording removes")
+    out.mkdir(parents=True, exist_ok=True)
+    cast = Path(args.cast).resolve()
+    cast.parent.mkdir(parents=True, exist_ok=True)
+    claude = os.environ.get("CLAUDE", "claude")
+    session_id = str(uuid.uuid4())
+    prompt, reply = out / "prompt.md", out / "reply.md"
+    prompt.write_text(SETUP_PROMPT)
+    reply.write_text(SETUP_REPLY)
+    stream, person_log = out / "session.jsonl", out / "person.json"
+    env = setup_env(os.environ, home)
+    env.update({
+        "STAGE_ARGV": json.dumps(setup_argv(claude, args.model, args.budget_usd, session_id)),
+        "STAGE_RESUME_ARGV": json.dumps(
+            setup_argv(claude, args.model, args.budget_usd, session_id, resume=True)),
+        "STAGE_PROMPT": str(prompt),
+        "STAGE_REPLY": str(reply),
+        "STAGE_STREAM": str(stream),
+        "STAGE_TIMEOUT": str(max(60, args.timeout - 120)),
+        "STAGE_PERSON_LOG": str(person_log),
+    })
+    recorder = [
+        "asciinema", "rec", "--headless", "--overwrite", "--return",
+        "--window-size", WINDOW, "--idle-time-limit", str(IDLE_LIMIT),
+        "--title", title("setup", args.title_version or installer_version()),
+        "-c", shlex.join([sys.executable, str(STAGE), "setup"]), str(cast),
+    ]
+    work = out / "session"
+    work.mkdir()
+    print(f"recording the setup session into {cast}", flush=True)
+    clock = time.monotonic()
+    try:
+        completed = subprocess.run(recorder, env=env, cwd=work, capture_output=True,
+                                   stdin=subprocess.DEVNULL, text=True,
+                                   timeout=2 * args.timeout, check=False)
+    finally:
+        tear_down(home, setup_env(os.environ, home))
+    if cast.exists():
+        cast.write_text("\n".join(post_process(cast.read_text().splitlines())) + "\n")
+    events = claude_code.events(stream.read_text() if stream.exists() else "")
+    person = json.loads(person_log.read_text()) if person_log.exists() else None
+    problems = setup_problems(events, person)
+    kept = cast.exists() and not problems
+    if cast.exists() and problems:
+        cast.rename(cast.with_name(cast.name + ".failed"))
+    summary = {"mode": "setup", "cast": str(cast) if kept else None, "problems": problems,
+               "seconds": time.monotonic() - clock, "recorder_exit": completed.returncode,
+               "person": person}
+    (out / "recording.json").write_text(json.dumps(summary, indent=2) + "\n")
+    if not kept:
+        print("not kept:\n  " + "\n  ".join(problems or ["asciinema wrote no cast"]), file=sys.stderr)
+        return 1
+    print(f"kept {cast}: the session ran the installer, and the cluster answered")
+    return 0
+
+
+def tear_down(home, env):
+    """Destroy the cluster the session built and remove its home, off camera."""
+    relish = Path(home) / "bin" / "relish"
+    if relish.exists():
+        subprocess.run([str(relish), "local", "destroy", "--yes"], env=env, capture_output=True,
+                       stdin=subprocess.DEVNULL, timeout=600, check=False)
+    shutil.rmtree(home, ignore_errors=True)
 
 
 def recording_prompt(mode, prompt):
@@ -465,13 +626,16 @@ def record(args):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    if argv == ["prompt", "setup"]:
+        print(SETUP_PROMPT, end="")
+        return 0
     if argv[:1] == ["prompt"] and len(argv) == 2 and argv[1] in SCENARIOS:
         print(exact_prompt(argv[1]), end="")
         return 0
     if argv[:1] == ["tidy"] and len(argv) == 3:
         return tidy_cast(argv[1], argv[2])
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("mode", choices=sorted(SCENARIOS))
+    parser.add_argument("mode", choices=sorted([*SCENARIOS, "setup"]))
     parser.add_argument("--cast", required=True, help="the asciicast to write")
     parser.add_argument("--out", required=True, help="a new directory for the gym's files")
     parser.add_argument("--relish")
@@ -483,7 +647,15 @@ def main(argv=None):
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     parser.add_argument("--port-base", type=int, default=gym.DEFAULT_PORT_BASE)
     parser.add_argument("--title-version")
-    return record(parser.parse_args(argv))
+    parser.add_argument("--home", help="(setup) a new, short RELIABURGER_HOME for the session")
+    args = parser.parse_args(argv)
+    if args.mode == "setup":
+        if not args.home:
+            parser.error("setup needs --home")
+        if args.timeout == DEFAULT_TIMEOUT:
+            args.timeout = SETUP_TIMEOUT
+        return record_setup(args)
+    return record(args)
 
 
 if __name__ == "__main__":

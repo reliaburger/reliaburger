@@ -24,7 +24,7 @@ code { font-family: var(--mono); font-size: .875em; }
 nav { display: flex; flex-wrap: wrap; gap: 28px; font-size: .875rem; font-weight: 550; }
 nav a { text-decoration: none; padding: 8px 0; }
 nav a:hover { text-decoration: underline; }
-.intro { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 40px; align-items: center; padding: 68px 0 48px; }
+.intro { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 40px; align-items: center; padding: 40px 0 44px; }
 .intro-copy { min-width: 0; }
 .intro-art { margin: 0; justify-self: end; }
 .burger { display: block; width: clamp(220px, 24vw, 300px); height: auto; mix-blend-mode: multiply; }
@@ -412,3 +412,230 @@ footer { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-top: 20px; paddi
 .throughput-comparison table { width: 100%; min-width: 32rem; border-collapse: collapse; font-size: .875rem; }
 .throughput-comparison caption { text-align: left; color: var(--muted); padding-bottom: 10px; }
 .throughput-comparison th, .throughput-comparison td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+
+/* The landing page's hero prompt, its three facts, the whitepaper's band, what an
+   agent gets, the two contrasts and the tour's highlights. */
+.intro-prompt { margin-top: 26px; }
+.intro-prompt .terminal-heading { flex-wrap: wrap; gap: 4px 16px; }
+.intro-prompt pre { font-size: .8125rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0 40px; margin: 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.facts > div { padding: 20px 0 22px; }
+.facts dt { font: 650 1.3rem/1.25 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; letter-spacing: -.03em; }
+.facts dd { margin: 6px 0 0; color: var(--muted); font-size: .9375rem; }
+.paper-band { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 20px 40px; align-items: center; margin-top: 62px; padding: 30px 32px 32px; background: var(--ink); color: #e4e9e3; border-radius: 4px; scroll-margin-top: 1rem; }
+.paper-band .eyebrow { color: #f49463; margin-bottom: 10px; }
+.paper-band h2 { color: #fff; margin-bottom: 10px; }
+.paper-band p { margin: 0; color: #b9c6ba; }
+.paper-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.paper-actions a { text-decoration: none; font-size: .9375rem; padding: 10px 16px; border: 1px solid #e4e9e3; color: #fff; }
+.paper-actions a:first-child { background: #fafbf9; color: #181b19; border-color: #fafbf9; }
+.paper-actions a:hover { border-color: #f49463; color: #f49463; }
+.paper-actions a:first-child:hover { background: #fff; color: var(--accent); }
+.paper-actions a:focus-visible { outline: 3px solid #f49463; outline-offset: 2px; }
+.toolkit { margin: 0 0 26px; }
+.toolkit td, .toolkit th { vertical-align: top; }
+.toolkit thead th { font: 500 .75rem var(--mono); letter-spacing: .07em; color: var(--muted); text-transform: uppercase; }
+.toolkit tbody th { font-weight: 500; white-space: nowrap; padding-left: 0; }
+.toolkit thead th:first-child { padding-left: 0; }
+.toolkit tbody th code { font-size: .8125rem; }
+.toolkit td { color: var(--muted); }
+.benefits { display: grid; grid-template-columns: 1fr 1fr; column-gap: 56px; margin: 0; padding: 0; list-style: none; }
+.benefits li { border-top: 1px solid var(--line); padding: 16px 0 22px; }
+.benefits h3 { scroll-margin-top: 1rem; }
+.benefits p { margin: 0; color: var(--muted); }
+.designed-proof { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 32px; align-items: start; }
+.designed-proof .measure-pending { margin: 0; }
+.designed-proof .measure-pending strong { display: block; }
+/* The two contrasts share one set of rows, so their rules line up across the columns. */
+.versus { display: grid; grid-template-columns: 1fr 1fr; gap: 0 56px; }
+.versus > div { display: grid; grid-template-rows: subgrid; grid-row: span 6; min-width: 0; }
+.versus h3 { font-size: 1.3rem; line-height: 1.25; letter-spacing: -.02em; margin: 0; padding-bottom: 12px; border-bottom: 2px solid var(--ink); align-self: end; }
+.points { display: contents; list-style: none; margin: 0; padding: 0; }
+.points li { border-bottom: 1px solid var(--line); padding: 11px 0; color: var(--muted); }
+.points strong { display: block; color: var(--ink); font-weight: 600; }
+.they-win { margin: 16px 0 0; align-self: start; font-size: .9375rem; color: var(--muted); border-left: 2px solid var(--line); padding-left: 14px; }
+.they-win strong { color: var(--ink); }
+.highlights { list-style: none; margin: 18px 0 0; padding: 0; display: grid; grid-template-columns: 1fr 1fr; column-gap: 40px; }
+.highlights li { border-top: 1px solid var(--line); padding: 10px 0; color: var(--muted); font-size: .9375rem; }
+.highlights strong { color: var(--ink); font-weight: 600; }
+.status + .status { border-top: 0; }
+@media (max-width: 900px) {
+  .paper-band, .designed-proof { grid-template-columns: 1fr; }
+}
+@media (max-width: 600px) {
+  .intro { padding-top: 26px; }
+  .intro h1 br { display: none; }
+  .intro-prompt pre { font-size: .75rem; padding: 16px; }
+  .facts, .benefits, .highlights, .versus { grid-template-columns: 1fr; }
+  .facts > div + div { border-top: 1px solid var(--line); }
+  .versus > div + div { margin-top: 32px; }
+  .paper-band { margin-top: 44px; padding: 24px 20px; }
+  .toolkit thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  .toolkit table, .toolkit tbody, .toolkit tr, .toolkit tbody th, .toolkit td { display: block; width: auto; min-width: 0; white-space: normal; }
+  .toolkit tbody th { border-bottom: 0; padding-bottom: 2px; }
+  .toolkit td { padding-top: 0; padding-left: 0; }
+}
+/* A folded recording shows a poster: a few of the session's commands, dimmed, under
+   a play button. Open, the poster goes and the row offers to hide it again. */
+.recording-fold { margin: 18px 0 0; }
+.recording-fold summary { position: relative; display: block; cursor: pointer; list-style: none; border-radius: 4px; overflow: hidden; background: var(--ink); color: #e4e9e3; }
+.recording-fold summary::-webkit-details-marker { display: none; }
+.recording-fold summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.poster-lines { display: block; white-space: pre; overflow: hidden; height: 208px; padding: 20px 24px; font: .8125rem/1.9 var(--mono); opacity: .38; -webkit-mask-image: linear-gradient(#000 55%, transparent); mask-image: linear-gradient(#000 55%, transparent); }
+.poster-play { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; text-align: center; padding: 0 16px; }
+.poster-button { display: grid; place-items: center; width: 60px; height: 60px; margin-bottom: 6px; border-radius: 50%; background: #f49463; transition: transform .15s ease; }
+.poster-button::before { content: ""; margin-left: 5px; border-style: solid; border-width: 11px 0 11px 18px; border-color: transparent transparent transparent #181b19; }
+.recording-fold summary:hover .poster-button { transform: scale(1.08); }
+.poster-closed, .poster-open { font-size: 1.125rem; font-weight: 650; color: #fff; }
+.poster-open { display: none; }
+.poster-note { font-size: .875rem; color: #b9c6ba; }
+.recording-fold[open] summary { background: none; color: var(--ink); border: 1px solid var(--line); margin-bottom: 14px; }
+.recording-fold[open] .poster-lines, .recording-fold[open] .poster-button, .recording-fold[open] .poster-closed { display: none; }
+.recording-fold[open] .poster-play { position: static; flex-direction: row; justify-content: flex-start; gap: 12px; padding: 10px 16px; }
+.recording-fold[open] .poster-open { display: inline; font-size: 1rem; color: var(--ink); }
+.recording-fold[open] .poster-note { color: var(--muted); }
+.recording-fold .recording { margin-top: 0; margin-bottom: 16px; }
+.recording-fold + .tour-commands { margin-top: 12px; }
+@media (max-width: 600px) { .poster-lines { height: 190px; padding: 16px; font-size: .75rem; } }
+.hero-fold { margin-top: 12px; }
+.hero-fold .poster-lines { height: 168px; }
+.hero-fold .poster-button { width: 48px; height: 48px; }
+.hero-fold .poster-button::before { border-width: 9px 0 9px 15px; }
+@media (prefers-reduced-motion: reduce) { .poster-button { transition: none; } }
+
+/* The homepage breathes more than the reference pages: larger section headings
+   and more room between sections. */
+.home .section { margin-top: 104px; }
+.home .section-heading { margin-bottom: 30px; }
+.home .section-heading h2 { font-size: clamp(1.6rem, 3vw, 2.05rem); line-height: 1.2; letter-spacing: -.035em; }
+.home .paper-band { margin-top: 72px; }
+.home .masthead { min-height: 84px; }
+.home .contributing { margin-top: 104px; }
+/* With a banner on the page, the Markdown, Claude and theme buttons sit on its line. */
+.agent-banner .page-actions { margin: 0 0 0 auto; }
+.agent-banner .page-actions { gap: 6px; flex-wrap: nowrap; }
+.agent-banner .page-actions a, .agent-banner .page-actions button { color: var(--ink); font-weight: 500; padding: 6px 8px; white-space: nowrap; }
+.agent-banner { align-items: center; column-gap: .3em; }
+.agent-banner strong { margin-right: .5em; }
+@media (max-width: 600px) {
+  .home .section, .home .contributing { margin-top: 64px; }
+  .home .paper-band { margin-top: 48px; }
+  .agent-banner .page-actions { margin-left: 0; justify-content: flex-start; flex-wrap: wrap; }
+}
+
+/* The burger's colours. Each section of the homepage takes one ingredient for its
+   number and its rule, so the page isn't one orange from top to bottom. The light
+   values are dark enough to read as small text on the paper; the dark theme has
+   brighter ones. */
+:root { --mustard: #946a00; --lettuce: #3f7a1f; --tomato: #c23a1f; --onion: #8d3f86; --bun: #b8621a; --patty: #7b2b2d; }
+.home .section { --tint: var(--accent); }
+.home #why, .home #scrutiny { --tint: var(--mustard); }
+.home #designed, .home #tour, .home #docs { --tint: var(--lettuce); }
+.home #act, .home #install, .home #job-throughput { --tint: var(--tomato); }
+.home #debug, .home #release-testing, .home #internals { --tint: var(--onion); }
+.home #who, .home #netboot, .home #start { --tint: var(--bun); }
+.home .section .section-number { color: var(--tint); }
+.home .section .tour, .home .section .why-carousel { border-left-color: var(--tint); }
+.home .section .tour-commands summary::after, .home .section .tour-commands summary:hover { color: var(--tint); }
+.home .section .why-dot[aria-current="true"]::before { background: var(--tint); border-color: var(--tint); }
+.home .benefits li { border-top: 3px solid var(--tint); }
+.home .versus h3 { border-bottom-color: var(--tint); }
+.home .facts { border-top: 0; }
+.home .facts > div { border-top: 3px solid var(--lettuce); }
+.home .facts > div:nth-child(2) { border-top-color: var(--mustard); }
+.home .facts > div:nth-child(3) { border-top-color: var(--tomato); }
+.home .facts dt { margin-top: 2px; }
+
+/* The evidence in four large numbers, on a dark band of its own. */
+.numbers-band { margin-top: 104px; padding: 30px 32px 34px; background: var(--ink); color: #e4e9e3; border-radius: 4px; scroll-margin-top: 1rem; }
+.numbers-band .eyebrow { color: #f49463; margin-bottom: 18px; }
+.numbers-band dl { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 24px 32px; margin: 0; }
+.numbers-band dt { font: 650 clamp(1.5rem, 2.5vw, 2.05rem)/1.1 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; letter-spacing: -.04em; font-variant-numeric: tabular-nums; color: #f4bf3a; }
+.numbers-band div:nth-child(2) dt { color: #c98bc3; }
+.numbers-band div:nth-child(3) dt { color: #7fbf4a; }
+.numbers-band div:nth-child(4) dt { color: #f0705a; }
+.numbers-band dd { margin: 8px 0 0; color: #b9c6ba; font-size: .9375rem; }
+.numbers-band a { color: #fff; white-space: nowrap; }
+.numbers-band a:focus-visible { outline: 3px solid #f49463; outline-offset: 2px; }
+.numbers-band + .section { margin-top: 72px; }
+@media (max-width: 900px) { .numbers-band dl { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 600px) { .numbers-band { margin-top: 64px; padding: 24px 20px; } .numbers-band dl { grid-template-columns: 1fr; } }
+
+/* The burger as the architecture map: one drawn layer per subsystem, stacked. */
+.burger-map { list-style: none; margin: 30px 0 0; padding: 0; max-width: 820px; }
+.burger-map li { display: grid; grid-template-columns: 150px minmax(150px, 190px) minmax(0, 1fr); gap: 0 28px; align-items: center; padding: 2px 0; font-size: .9375rem; }
+.burger-map svg { display: block; width: 150px; height: 34px; overflow: visible; transition: transform .15s ease; }
+.burger-map li:hover svg, .burger-map li:focus-within svg { transform: translateX(8px); }
+.burger-map .layer-name { font-family: var(--mono); font-weight: 550; font-size: .875rem; }
+.burger-map .layer-does { color: var(--muted); }
+@media (max-width: 600px) {
+  .burger-map li { grid-template-columns: 96px minmax(0, 1fr); gap: 0 16px; padding: 4px 0; }
+  .burger-map svg { width: 96px; height: 22px; grid-row: span 2; }
+  .burger-map .layer-does { grid-column: 2; font-size: .875rem; }
+}
+@media (prefers-reduced-motion: reduce) { .burger-map svg { transition: none; } }
+
+/* Small line drawings beside the three facts and the four design points, each in
+   its ingredient's colour. */
+.mini-art { display: block; width: 44px; height: 44px; margin: 4px 0 10px; }
+.home .facts > div:nth-child(1) .mini-art { color: var(--lettuce); }
+.home .facts > div:nth-child(2) .mini-art { color: var(--mustard); }
+.home .facts > div:nth-child(3) .mini-art { color: var(--tomato); }
+.home .benefits li { display: grid; grid-template-columns: 44px minmax(0, 1fr); gap: 0 18px; align-content: start; }
+.home .benefits .mini-art { grid-row: span 2; margin: 2px 0 0; color: var(--tint); }
+.home .benefits h3 { margin-top: 0; }
+
+/* "Coming from" is a switch: two radio buttons, one panel each, no script. */
+.from-switch { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.from-label { font: 500 .75rem var(--mono); letter-spacing: .07em; text-transform: uppercase; color: var(--muted); margin-right: 6px; }
+.from-input { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; }
+.from-tab { padding: 9px 18px; border: 1px solid var(--line); border-radius: 999px; font-weight: 600; color: var(--muted); cursor: pointer; }
+.from-tab:hover { border-color: var(--tint); color: var(--ink); }
+.from-input:checked + .from-tab { background: var(--tint); border-color: var(--tint); color: var(--paper); }
+.from-input:focus-visible + .from-tab { outline: 3px solid var(--accent); outline-offset: 2px; }
+.from-panel { display: none; flex-basis: 100%; min-width: 0; margin-top: 14px; }
+#from-paas:checked ~ .from-panel-paas, #from-kubernetes:checked ~ .from-panel-kubernetes { display: block; }
+.from-panel .points { display: grid; grid-template-columns: 1fr 1fr; gap: 0 56px; }
+.from-panel .points li { border-bottom: 0; border-top: 1px solid var(--line); padding: 18px 0 20px; font-size: 1.0625rem; }
+.from-panel .points strong { font-size: 1.25rem; letter-spacing: -.02em; margin-bottom: 4px; }
+.from-panel .they-win { margin-top: 6px; max-width: 760px; }
+@media (max-width: 600px) { .from-panel .points { grid-template-columns: 1fr; } .from-label { flex-basis: 100%; } }
+
+/* The bare-metal section's photograph of the test rig, beside its opening paragraphs. */
+.lab-intro { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 420px); gap: 28px; align-items: start; }
+.lab-intro p:first-child { margin-top: 0; }
+.lab-photo { margin: 0; }
+.lab-photo img { display: block; width: 100%; height: auto; border-radius: 4px; }
+.lab-photo figcaption { margin-top: 8px; font-size: .875rem; color: var(--muted); }
+@media (max-width: 900px) { .lab-intro { grid-template-columns: 1fr; } }
+
+/* Dark theme, chosen with the button copy.js adds and remembered in this browser.
+   The dark boxes (terminals, recordings, the whitepaper's band) keep their light
+   text and go a shade darker than the page, so they still read as boxes. */
+:root[data-theme="dark"] { color-scheme: dark; --paper: #141715; --ink: #e9ede8; --muted: #a4aea5; --line: #2f3631; --accent: #f08a5d; --box: #0a0c0b; --mustard: #f4bf3a; --lettuce: #7fbf4a; --tomato: #f0705a; --onion: #c98bc3; --bun: #ee9a4d; --patty: #c9787a; }
+:root[data-theme="dark"] .skip,
+:root[data-theme="dark"] .mark,
+:root[data-theme="dark"] .primary-link,
+:root[data-theme="dark"] .tour-steps pre,
+:root[data-theme="dark"] .tour-cleanup,
+:root[data-theme="dark"] .recording-screen,
+:root[data-theme="dark"] .recording-fallback,
+:root[data-theme="dark"] .tour .copyable,
+:root[data-theme="dark"] .terminal,
+:root[data-theme="dark"] .recording-pending,
+:root[data-theme="dark"] .agents-page pre,
+:root[data-theme="dark"] .agents-page .copyable,
+:root[data-theme="dark"] .install-button,
+:root[data-theme="dark"] .paper-band,
+:root[data-theme="dark"] .recording-fold summary { background: var(--box); }
+:root[data-theme="dark"] .numbers-band { background: var(--box); border: 1px solid var(--line); }
+:root[data-theme="dark"] .primary-link, :root[data-theme="dark"] .mark, :root[data-theme="dark"] .skip { border-color: var(--line); }
+:root[data-theme="dark"] .primary-link:hover { background: #1f2421; }
+:root[data-theme="dark"] .paper-band, :root[data-theme="dark"] .terminal, :root[data-theme="dark"] .recording-fold summary { border: 1px solid var(--line); }
+:root[data-theme="dark"] .recording-fold[open] summary { background: none; color: var(--ink); }
+:root[data-theme="dark"] .install-tab-input:checked + .install-tab { background: var(--line); }
+/* The burger's white background vanishes by multiplying into a light page. On a
+   dark one it sits on a light plate instead. */
+:root[data-theme="dark"] .intro-art { background: #fafbf9; border-radius: 28px; padding: 14px 10px; }
+:root[data-theme="dark"] .soak-chart img { background: #fafbf9; border-radius: 4px; }
+:root[data-theme="dark"] .comparison-note, :root[data-theme="dark"] .comparison-page th { background: #1c211e; }
