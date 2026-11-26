@@ -1209,6 +1209,51 @@ mod tests {
         }
     }
 
+    /// A launch that retires during recovery, here one from a previous boot,
+    /// keeps only variable names, and recovery still reads, inventories and
+    /// replaces that record.
+    #[tokio::test]
+    async fn a_launch_retired_by_recovery_keeps_only_variable_names() {
+        let root = tempfile::tempdir().unwrap();
+        let control = ProcessControl::new(root.path().join("owners"), "/unused".into());
+        let id = InstanceId("default__rebooted-0".into());
+        let mut spec = spec();
+        spec.process.env = vec![
+            "DB_PASSWORD=provider-value-1".into(),
+            "API_KEY=decrypted-value-2".into(),
+        ];
+        control.prepare(&id, &spec).await.unwrap();
+        let directory = control.directory(&id).unwrap();
+        let mut record = control.load(&id).unwrap();
+        record.phase = OwnerPhase::Running { pid: 1 };
+        record.boot_id = "00000000-0000-4000-8000-000000000000".into();
+        process_owner::persist(&directory, &record).unwrap();
+
+        let status = control.status(&id).await.unwrap();
+        assert!(matches!(
+            status.phase,
+            OwnerPhase::Retired { exit_code: None }
+        ));
+        let raw = std::fs::read_to_string(directory.join("owner.json")).unwrap();
+        for value in ["provider-value-1", "decrypted-value-2"] {
+            assert!(!raw.contains(value), "{value} kept: {raw}");
+        }
+        let inventory = control.inventory().await.unwrap();
+        assert_eq!(inventory[0].spec, spec.without_environment_values());
+        assert!(spec.matches_journal(&inventory[0].spec));
+
+        control.prepare(&id, &spec).await.unwrap();
+        let replacement = control.load(&id).unwrap();
+        assert!(matches!(replacement.phase, OwnerPhase::Prepared));
+        assert_eq!(
+            replacement
+                .environment
+                .get("DB_PASSWORD")
+                .map(String::as_str),
+            Some("provider-value-1")
+        );
+    }
+
     /// A live owner that hangs up on its first clients without answering, the
     /// way the real one drops a client slower than its read timeout.
     struct ImpatientOwner {
