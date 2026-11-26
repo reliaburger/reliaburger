@@ -60,6 +60,95 @@ pub fn guest_image(arch: &str) -> Result<GuestImage> {
         .context("unsupported guest architecture")
 }
 
+/// Development only: a locally built guest image to boot instead of the stock
+/// Ubuntu image, such as one from `scripts/release/build_guest_image.sh`.
+/// Read only alongside `--development-binaries`.
+pub const DEV_GUEST_IMAGE_ENV: &str = "RELIABURGER_DEV_GUEST_IMAGE";
+
+/// Development only: the SHA-256 the [`DEV_GUEST_IMAGE_ENV`] image must have.
+pub const DEV_GUEST_IMAGE_SHA256_ENV: &str = "RELIABURGER_DEV_GUEST_IMAGE_SHA256";
+
+/// A guest image a developer built and named, with the digest they expect.
+#[derive(Debug, Clone)]
+pub struct LocalGuestImage {
+    /// Absolute path to the image (qcow2 or raw) for this host's architecture.
+    pub path: PathBuf,
+    /// Expected SHA-256, lowercase hex.
+    pub sha256: String,
+}
+
+impl LocalGuestImage {
+    /// The image's canonical path, once its contents hash to the expected digest.
+    pub async fn verified(&self) -> Result<PathBuf> {
+        let path = tokio::fs::canonicalize(&self.path)
+            .await
+            .with_context(|| format!("cannot read local guest image {}", self.path.display()))?;
+        let hashed = path.clone();
+        // Hashing a guest image reads hundreds of megabytes; keep it off the runtime.
+        let actual =
+            tokio::task::spawn_blocking(move || crate::upgrade::signing::sha256_file(&hashed))
+                .await?
+                .with_context(|| format!("cannot hash local guest image {}", path.display()))?;
+        if actual != self.sha256 {
+            bail!(
+                "local guest image {} has SHA-256 {actual}, but {DEV_GUEST_IMAGE_SHA256_ENV} \
+                 expects {}",
+                path.display(),
+                self.sha256
+            );
+        }
+        Ok(path)
+    }
+}
+
+/// The local guest image the developer chose, from [`DEV_GUEST_IMAGE_ENV`]
+/// and [`DEV_GUEST_IMAGE_SHA256_ENV`], or `None` when neither is set.
+///
+/// Both must be set together, and only with `--development-binaries`: a
+/// release quickstart boots the signed release image and nothing else.
+pub fn development_guest_image(
+    path: Option<std::ffi::OsString>,
+    sha256: Option<String>,
+    development_binaries: bool,
+) -> Result<Option<LocalGuestImage>> {
+    let (path, sha256) = match (path, sha256) {
+        (None, None) => return Ok(None),
+        (Some(_), None) => {
+            bail!("{DEV_GUEST_IMAGE_ENV} needs {DEV_GUEST_IMAGE_SHA256_ENV}, the image's SHA-256")
+        }
+        (None, Some(_)) => {
+            bail!("{DEV_GUEST_IMAGE_SHA256_ENV} is set but {DEV_GUEST_IMAGE_ENV} is not")
+        }
+        (Some(path), Some(sha256)) => (PathBuf::from(path), sha256.to_ascii_lowercase()),
+    };
+    if !development_binaries {
+        bail!(
+            "{DEV_GUEST_IMAGE_ENV} is for development runs and only applies with \
+             --development-binaries; unset it to set up from a release"
+        );
+    }
+    if !path.is_absolute() {
+        bail!("{DEV_GUEST_IMAGE_ENV} must be an absolute path");
+    }
+    if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("{DEV_GUEST_IMAGE_SHA256_ENV} must be a SHA-256 of 64 hex digits");
+    }
+    Ok(Some(LocalGuestImage { path, sha256 }))
+}
+
+/// [`development_guest_image`] from this process's environment.
+pub fn development_guest_image_from_env(
+    development_binaries: bool,
+) -> Result<Option<LocalGuestImage>> {
+    let sha256 = std::env::var_os(DEV_GUEST_IMAGE_SHA256_ENV)
+        .map(|value| value.into_string().unwrap_or_default());
+    development_guest_image(
+        std::env::var_os(DEV_GUEST_IMAGE_ENV),
+        sha256,
+        development_binaries,
+    )
+}
+
 /// Release asset describing the built guest images, signed by the release key.
 pub const GUEST_IMAGE_METADATA: &str = "guest-image-metadata.json";
 
@@ -516,6 +605,123 @@ mod tests {
             managed_limactl(root),
             root.join(format!("tools/lima-{LIMA_VERSION}/bin/limactl"))
         );
+    }
+
+    const DIGEST: &str = "95e8da94f9e1326c8cf985e7213dff397d5d949229120009b7926abaa6e73353";
+
+    #[test]
+    fn no_local_guest_image_is_chosen_when_neither_variable_is_set() {
+        assert!(development_guest_image(None, None, true).unwrap().is_none());
+        assert!(
+            development_guest_image(None, None, false)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_local_guest_image_needs_both_its_path_and_its_digest() {
+        let path = Some("/images/guest.qcow2".into());
+        let only_path = development_guest_image(path, None, true).unwrap_err();
+        assert!(
+            format!("{only_path:#}").contains(DEV_GUEST_IMAGE_SHA256_ENV),
+            "{only_path:#}"
+        );
+        let only_digest = development_guest_image(None, Some(DIGEST.into()), true).unwrap_err();
+        assert!(
+            format!("{only_digest:#}").contains(DEV_GUEST_IMAGE_ENV),
+            "{only_digest:#}"
+        );
+    }
+
+    #[test]
+    fn a_local_guest_image_is_refused_without_development_binaries() {
+        let error = development_guest_image(
+            Some("/images/guest.qcow2".into()),
+            Some(DIGEST.into()),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("--development-binaries"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_local_guest_image_digest_must_be_64_hex_digits() {
+        for digest in ["", "abc", &DIGEST[1..], &format!("{}g", &DIGEST[1..])] {
+            assert!(
+                development_guest_image(
+                    Some("/images/guest.qcow2".into()),
+                    Some(digest.into()),
+                    true
+                )
+                .is_err(),
+                "{digest:?} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_local_guest_image_path_must_be_absolute() {
+        assert!(
+            development_guest_image(Some("guest.qcow2".into()), Some(DIGEST.into()), true).is_err()
+        );
+    }
+
+    #[test]
+    fn a_local_guest_image_digest_is_read_in_either_case() {
+        let image = development_guest_image(
+            Some("/images/guest.qcow2".into()),
+            Some(DIGEST.to_uppercase()),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(image.path, Path::new("/images/guest.qcow2"));
+        assert_eq!(image.sha256, DIGEST);
+    }
+
+    #[tokio::test]
+    async fn a_local_guest_image_with_its_own_digest_is_used() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("guest.qcow2");
+        std::fs::write(&path, b"branch-built guest").unwrap();
+        let image = LocalGuestImage {
+            path: path.clone(),
+            sha256: sha256_hex(b"branch-built guest"),
+        };
+        let verified = image.verified().await.unwrap();
+        assert_eq!(verified, std::fs::canonicalize(&path).unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_local_guest_image_with_another_digest_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("guest.qcow2");
+        std::fs::write(&path, b"branch-built guest").unwrap();
+        let image = LocalGuestImage {
+            path,
+            sha256: DIGEST.into(),
+        };
+        let error = image.verified().await.unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains(DIGEST), "{message}");
+        assert!(
+            message.contains(&sha256_hex(b"branch-built guest")),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_local_guest_image_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = LocalGuestImage {
+            path: directory.path().join("absent.qcow2"),
+            sha256: DIGEST.into(),
+        };
+        assert!(image.verified().await.is_err());
     }
 
     /// The soak harness drives the quickstart's own Lima, so it must look for

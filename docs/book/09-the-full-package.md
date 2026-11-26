@@ -2021,6 +2021,29 @@ Name=eth0
 
 A quickstart VM has exactly one NIC, so matching on the driver is enough. With it, a VM from the new image went from `limactl start` to `READY` in 19 s, and the 2-minute wait was gone. Development runs still boot the stock image, which has no such file. Their first boot loses the rename and setup restarts the VM once, which costs time but not correctness.
 
+How much time? When we checked a change to `build_guest_image.sh` on the Mac Studio (#2343, #2346), the watchdog fired on all three VMs about 30 s in, and the second boots, fetching packages from Ubuntu's mirrors, took about 130 s more: some 200 s per VM, against 65 s for the branch-built image. Two things followed. The watchdog's note had said "restarted a VM that never booted", which was wrong here: the VM had booted and stalled waiting for its NIC. From the host the two look the same, a silent console, so the note now says only that: "restarted a VM whose console went silent". And trying that branch-built image had needed a throwaway patch to `guest-images.json`, because a development run had no way to boot anything but the stock image. Now it has one, kept to the development path:
+
+```rust
+pub fn development_guest_image(
+    path: Option<std::ffi::OsString>,
+    sha256: Option<String>,
+    development_binaries: bool,
+) -> Result<Option<LocalGuestImage>> {
+    let (path, sha256) = match (path, sha256) {
+        (None, None) => return Ok(None),
+        (Some(_), None) => bail!("{DEV_GUEST_IMAGE_ENV} needs {DEV_GUEST_IMAGE_SHA256_ENV}, the image's SHA-256"),
+        (None, Some(_)) => bail!("{DEV_GUEST_IMAGE_SHA256_ENV} is set but {DEV_GUEST_IMAGE_ENV} is not"),
+        (Some(path), Some(sha256)) => (PathBuf::from(path), sha256.to_ascii_lowercase()),
+    };
+    if !development_binaries {
+        bail!("{DEV_GUEST_IMAGE_ENV} is for development runs and only applies with --development-binaries; ...");
+    }
+    // ... an absolute path and 64 hex digits, then Ok(Some(...))
+}
+```
+
+The two variables are `RELIABURGER_DEV_GUEST_IMAGE` and `RELIABURGER_DEV_GUEST_IMAGE_SHA256`. Matching on the pair `(path, sha256)` makes the compiler check that all four combinations are handled, where Go would need a chain of `if`s that could miss one. The path arrives as an `OsString`, which is what `std::env::var_os` returns: an environment variable on Unix is bytes, not necessarily UTF-8, and Rust won't pretend otherwise. We chose environment variables over a flag because this is a developer's tool and shouldn't add to the commands and flags an operator has to learn. The digest is the developer's own, so it proves only that setup boots the file they meant, and `LocalGuestImage::verified` hashes it off the async runtime with `spawn_blocking` before Lima sees it. Refusing the variables without `--development-binaries`, rather than ignoring them, keeps a release quickstart on the signed image without ever wondering which disk it booted. The unit tests in `artifacts.rs` cover each refusal, including `a_local_guest_image_with_another_digest_is_refused`.
+
 One more surprise was in our own build, not in Ubuntu. Building `bun` inside a 26.04 VM got us a binary whose eBPF objects kernel 7.0's verifier refused, and Chapter 3 tells that story. Release builds still compile on Ubuntu 22.04 with an older clang, so they weren't affected, but now the build pins the instruction set either way.
 
 What about one package list for the guest and the appliance? mkosi reads its `Packages=` from an INI-style file, not JSON, so generating one from the other would mean a build step for each. We kept the two files and made a test hold them together instead. `test_guest_images.py` parses `image/mkosi.conf` and fails if the guest's packages, less Buildah, aren't exactly the appliance's node packages. Buildah stayed guest-only, because the five-minute tour builds images on the laptop cluster, until the tour reached bare metal and the appliance got it too (chapter 15a, "A tour that couldn't build").

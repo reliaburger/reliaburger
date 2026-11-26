@@ -190,6 +190,12 @@ struct SetupOptions {
     #[arg(long, requires = "quickstart")]
     registry_port: Option<u16>,
     /// Use explicitly supplied Linux binaries for development before a release exists.
+    ///
+    /// Development only: such a run never qualifies a release. With
+    /// --quickstart, also set RELIABURGER_DEV_GUEST_IMAGE=<absolute path> and
+    /// RELIABURGER_DEV_GUEST_IMAGE_SHA256=<hex> to boot a locally built guest
+    /// image, checked against that digest, instead of the stock Ubuntu image.
+    /// A quickstart refuses those variables without this flag.
     #[arg(long, requires = "managed")]
     development_binaries: Option<PathBuf>,
     /// HTTPS directory containing unchanged signed release candidate assets.
