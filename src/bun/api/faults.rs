@@ -20,13 +20,110 @@ pub(super) async fn chaos_status_handler(State(state): State<ApiState>) -> Respo
     .into_response()
 }
 
+/// Why the appliance console may not send a fault: the only one it may
+/// send is a kill of one named instance on its own node, with no safety
+/// rail overridden (#2151).
+pub(super) fn console_kill_refusal(
+    request: &crate::smoker::types::FaultRequest,
+    node_name: Option<&str>,
+) -> Option<&'static str> {
+    if request.fault_type != (crate::smoker::types::FaultType::Kill { count: 1 })
+        || !request.duration.is_zero()
+    {
+        return Some("the console only kills one instance at a time");
+    }
+    if request.task_index.is_some() {
+        return Some("the console only kills app instances, not job tasks");
+    }
+    if request
+        .target_instance
+        .as_deref()
+        .is_none_or(|instance| instance.is_empty())
+    {
+        return Some("the console's kill must name its instance");
+    }
+    if node_name.is_none() || request.target_node.as_deref() != node_name {
+        return Some("the console only kills instances on its own node");
+    }
+    if request.include_leader || request.override_safety {
+        return Some("the console can't override Smoker's safety rails");
+    }
+    None
+}
+
+/// Admit a kill the appliance console sends from its invaders game in kill
+/// mode (#2151), or refuse it. The console's principal is read-only, so
+/// this is the one way it changes anything: the cluster must have opted in
+/// with `[appliance] console_chaos = true`, a council setting no keyboard
+/// reaches, and the request must be [`console_kill_refusal`]'s one shape.
+/// What happens next is what happens to `relish fault kill`.
+// `Response` is large but it IS the HTTP reply to send on failure;
+// boxing it would tax every call site for a value that lives one frame.
+#[allow(clippy::result_large_err)]
+async fn admit_console_kill(
+    state: &ApiState,
+    directory: Option<&LeaderDirectory>,
+    request: &crate::smoker::types::FaultRequest,
+) -> Result<(), Response> {
+    let forbidden = |reason: String| {
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": reason })),
+        )
+            .into_response()
+    };
+    if let Some(reason) = console_kill_refusal(request, state.node_name.as_deref()) {
+        return Err(forbidden(reason.to_string()));
+    }
+    // The instance must be one this node runs, of the app the request names,
+    // and running: there's nothing to kill in one that's starting or gone.
+    // Smoker's routing reads a job's `--instance` as a task index, and an
+    // instance id (`namespace__name-N`) never parses as one, so this also
+    // keeps the console off job tasks.
+    let statuses = ask_agent(&state.cmd_tx, |response| AgentCommand::Status { response }).await?;
+    let namespace = request.namespace.as_deref().unwrap_or("default");
+    let runs_here = statuses.iter().any(|status| {
+        Some(status.id.as_str()) == request.target_instance.as_deref()
+            && status.app_name == request.target_service
+            && status.namespace == namespace
+            && status.state == "running"
+    });
+    if !runs_here {
+        return Err(forbidden(format!(
+            "the console only kills running instances of {namespace}/{} on this node",
+            request.target_service
+        )));
+    }
+    match super::os::appliance_settings(state, directory).await {
+        Ok(settings) if settings.console_chaos => Ok(()),
+        Ok(_) => Err(forbidden(
+            "kill mode is off: the cluster hasn't set [appliance] console_chaos = true".to_string(),
+        )),
+        Err(reason) => Err(forbidden(format!(
+            "kill mode is off: can't read the cluster's [appliance] settings: {reason}"
+        ))),
+    }
+}
+
 /// Inject a fault (Smoker).
 pub(super) async fn fault_inject_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
+    directory: Option<axum::Extension<LeaderDirectory>>,
     headers: HeaderMap,
     Json(mut request): Json<crate::smoker::types::FaultRequest>,
 ) -> Response {
+    // The console's elevation lives in this local copy of the request's
+    // context, so it ends with this request.
+    let mut auth = auth;
+    if let Some(axum::Extension(context)) = auth.as_mut()
+        && crate::sesame::auth::is_console(context)
+    {
+        if let Err(response) = admit_console_kill(&state, directory.as_deref(), &request).await {
+            return response;
+        }
+        *context = crate::sesame::auth::console_kill_context();
+    }
     if let Err(resp) = crate::sesame::auth::authorize_user(
         auth.as_deref(),
         crate::sesame::types::ApiRole::Deployer,

@@ -245,29 +245,48 @@ pub fn plan_network_fault(
 /// the whole cluster, for the replica-minimum rail.
 ///
 /// `instances` is the same service-restricted list the planner takes;
-/// `faults` is every node's active fault list. Only pauses count: a paused
-/// replica is out of service for the fault's lifetime, while a kill is
-/// instantaneous and a network or resource fault leaves the replica running.
-/// A network fault is also installed on every caller's node, so counting it
-/// would count one fault several times.
+/// `faults` is every node's active fault list. Pauses and recent kills count:
+/// a paused replica is out of service for the fault's lifetime, and a killed
+/// one may still read `running` until its node's sweep sees it exit, so a
+/// kill stays listed for [`crate::smoker::types::KILL_SETTLE`] (#2151). A
+/// network or resource fault leaves the replica running; it's also installed
+/// on every caller's node, so counting it would count one fault several
+/// times.
 pub fn replica_evidence(
     request: &FaultRequest,
     instances: &[WorkloadInstance],
     faults: &[FaultSummary],
 ) -> ReplicaEvidence {
     let replicas = instances.iter().filter(|instance| instance.running).count() as u32;
-    let paused = FaultType::Pause.to_string();
     let faulted_replicas = faults
         .iter()
         .filter(|fault| {
             fault.target_service == request.target_service && fault.namespace == request.namespace
         })
-        .filter(|fault| fault.fault_type == paused)
-        .count() as u32;
+        .map(|fault| listed_out_of_service(&fault.fault_type))
+        .fold(0, u32::saturating_add);
     ReplicaEvidence {
         replicas,
         faulted_replicas,
     }
+}
+
+/// [`crate::smoker::types::replicas_out_of_service`] for a fault as a fault
+/// list shows it, by its displayed type: `pause`, `kill N` or `kill (all)`.
+fn listed_out_of_service(fault_type: &str) -> u32 {
+    let parsed = if fault_type == FaultType::Pause.to_string() {
+        Some(FaultType::Pause)
+    } else if fault_type == (FaultType::Kill { count: 0 }).to_string() {
+        Some(FaultType::Kill { count: 0 })
+    } else {
+        fault_type
+            .strip_prefix("kill ")
+            .and_then(|count| count.parse().ok())
+            .map(|count| FaultType::Kill { count })
+    };
+    parsed.map_or(0, |fault_type| {
+        crate::smoker::types::replicas_out_of_service(&fault_type)
+    })
 }
 
 #[cfg(test)]
@@ -479,6 +498,60 @@ mod tests {
             &[fault("delay 300ms"), fault("dns nxdomain"), fault("pause")],
         );
         assert_eq!(evidence.faulted_replicas, 1);
+    }
+
+    /// A kill a moment ago still counts: its replicas may read `running`
+    /// until their node's sweep sees them exit (#2151). Without this, a
+    /// second kill right after the first could take the last replica.
+    #[test]
+    fn a_recent_kill_counts_as_unavailable_replicas() {
+        let fault = |kind: &str| FaultSummary {
+            task_index: None,
+            id: 1,
+            fault_type: kind.to_string(),
+            target_service: "web".to_string(),
+            namespace: Some("default".to_string()),
+            target_instance: None,
+            target_node: None,
+            remaining_secs: 9,
+            injected_by: "ops".to_string(),
+            node: None,
+            routed: Vec::new(),
+        };
+        let one = (FaultType::Kill { count: 1 }).to_string();
+        let two = (FaultType::Kill { count: 2 }).to_string();
+        let all = (FaultType::Kill { count: 0 }).to_string();
+        let counted = |faults: &[FaultSummary]| {
+            replica_evidence(&request(FaultType::Kill { count: 1 }), &spread(), faults)
+                .faulted_replicas
+        };
+        assert_eq!(counted(&[fault(&one)]), 1);
+        assert_eq!(counted(&[fault(&one), fault(&two)]), 3);
+        assert!(counted(&[fault(&all)]) > 1_000, "a kill of every replica");
+        assert_eq!(counted(&[fault("kill x")]), 0, "not a kill");
+
+        // Two replicas, one just killed: a second kill would leave none.
+        let two_replicas = &spread()[..2];
+        let evidence = replica_evidence(
+            &request(FaultType::Kill { count: 1 }),
+            two_replicas,
+            &[fault(&one)],
+        );
+        let context = crate::smoker::types::SafetyContext {
+            workload: crate::smoker::types::WorkloadKind::App,
+            council_size: 0,
+            council_nodes_with_active_faults: 0,
+            leader_node_id: String::new(),
+            total_nodes: 0,
+            nodes_with_active_faults: 0,
+            target_service_replicas: evidence.replicas,
+            target_service_faulted_replicas: evidence.faulted_replicas,
+        };
+        let check = crate::smoker::safety::evaluate_safety(
+            &request(FaultType::Kill { count: 1 }),
+            &context,
+        );
+        assert!(!check.approved, "{evidence:?}");
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub mod claim;
 pub mod console;
 pub mod prepare;
 pub mod seed;
+pub mod settings;
 
 pub use prepare::{Paths, PrepareError, Step, next_step};
 pub use seed::{Seed, SeedConfig, SeedError, SeedRole};

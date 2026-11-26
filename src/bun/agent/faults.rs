@@ -460,8 +460,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         let target_service_faulted_replicas = self
             .fault_registry
-            .count_paused(request.namespace.as_deref(), &request.target_service)
-            as u32;
+            .count_out_of_service(request.namespace.as_deref(), &request.target_service);
 
         // Cluster-derived fields, or zeros when this node has no council. A
         // zero `council_size`/`total_nodes` makes the quorum, leader, and

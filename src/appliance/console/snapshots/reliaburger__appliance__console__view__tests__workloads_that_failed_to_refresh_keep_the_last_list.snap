@@ -7,9 +7,9 @@ expression: console(&state)
 ┌ 3 Workloads ─────────────────────────────────────────────────────────────────┐
 │can't refresh the workloads: no answer within 10 s (showing 15:06:40)         │
 │INSTANCE                  NAMESPACE     STATE      RESTARTS    CPU     MEMORY │
-│web-0                     default       running           0   1.5%   48.0 MiB │
-│worker-1                  default       unhealthy         4  92.0%  700.0 MiB │
-│burger-0                  default       pending           0      -          - │
+│default__web-0            default       running           0   1.5%   48.0 MiB │
+│default__worker-1         default       unhealthy         4  92.0%  700.0 MiB │
+│default__burger-0         default       pending           0      -          - │
 │                                                                              │
 │                                                                              │
 │                                                                              │

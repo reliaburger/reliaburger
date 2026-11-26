@@ -2521,6 +2521,79 @@ let reason = match crate::pickle::registry_auth::repository_namespace(&destinati
 
 The check lives in `config::build::check_destination_namespace`, and two places call it. `relish build` runs it as part of config validation, so you hear about it before your context uploads. `POST /v1/build` runs it again before anything else, with or without a council, because the API is where the trust decision is made: a raw `curl` never meets `relish`'s validation. A build with no `namespace` is still held only by its caller's token, so an unscoped admin can build a shared, bare-named image. Layer caching is deferred to Phase 12.
 
+## Space invaders with live ammunition
+
+Every appliance has a monitor, and every monitor shows the console dashboard from chapter 15a. Hidden behind its `7` key is a game: one invader for each app instance on the node, labelled with the instance's id. Shoot one and it pops. That's all it does, unless the cluster has turned on *kill mode*, and then shooting `web-0` kills `web-0`. It's a toy, and it's also the most honest demo of chaos engineering we have: put a cluster on a table at a meetup, hand someone the keyboard, and watch the services they shoot come back.
+
+It's also a keyboard with no login attached to a cluster. Anyone who can reach the machine can press space. So the design starts from the question "who decides?", and the answer can't be "whoever is standing there".
+
+### The switch lives in the council
+
+Kill mode is one setting, `[appliance] console_chaos`, and it lives in the council, not in a node's `node.toml`. A switch in a node's own files is a switch for whoever has that node's disk. A switch in Raft is one only a cluster admin can flip, and every node agrees on it.
+
+We didn't need a new Raft request for it. `DesiredState` already has a small key-value map, `config`, written with `RaftRequest::ConfigSet`. The setting is the key `appliance.console_chaos`, and `src/appliance/settings.rs` is the only code that names it:
+
+```rust
+pub fn from_council(config: &HashMap<String, String>) -> Self {
+    Self {
+        console_chaos: config.get(CONSOLE_CHAOS_KEY).map(String::as_str) == Some("true"),
+    }
+}
+```
+
+`config.get` returns an `Option<&String>`, and `.map(String::as_str)` turns it into an `Option<&str>` so it can be compared with `Some("true")`. A missing key, `"yes"`, `"TRUE"` or anything else reads as off. Off is the answer for every case we didn't think of. Since no new request or state format went in, there's no compatibility bump either.
+
+`relish os settings --set FILE` reads an `[appliance]` section and posts it to `POST /v1/os/settings`. That route takes an unscoped cluster admin, as an OS rollout does; a follower passes it to the leader with the caller's own credential, and the leader audits it as `os.settings_set`. The struct has `#[serde(deny_unknown_fields)]`, so `console_choas = true` is an error, not a silent no.
+
+### One request, one shape
+
+The console reads the API as `__console`, a read-only principal (chapter 15a). Kill mode doesn't give it a new token or a new role. Instead, the fault route makes one exception, for one request at a time:
+
+```rust
+let mut auth = auth;
+if let Some(axum::Extension(context)) = auth.as_mut()
+    && crate::sesame::auth::is_console(context)
+{
+    if let Err(response) = admit_console_kill(&state, directory.as_deref(), &request).await {
+        return response;
+    }
+    *context = crate::sesame::auth::console_kill_context();
+}
+```
+
+`if let ... && ...` is a *let chain* (Rust 2024): the pattern has to match and the condition has to hold, and `context` is in scope for both. `auth.as_mut()` turns the `Option<Extension<AuthContext>>` the handler was given into an `Option<&mut Extension<AuthContext>>`, so `*context = ...` replaces the context in the handler's own copy. Axum hands every handler its extensions by value, so the change can't outlive this request: the next one from the console arrives read-only, as before.
+
+`admit_console_kill` refuses with 403 unless three things hold. The request must be exactly the one `relish fault kill --instance ID --node NODE` sends: a `Kill { count: 1 }` of a named instance, with no duration, no task index, `target_node` naming this node, and neither `include_leader` nor `override_safety`. That's `console_kill_refusal`, a plain function a unit test drives through every field. The instance must run on this node (more on that below). And the council must say `console_chaos = true`. A node with a Raft seat reads its own replica; a node without one asks the leader, with the service token and a five-second timeout; a standalone node has no council, so its answer is off. If the answer can't be had at all, the kill is refused: a setting we can't read is a setting that's off.
+
+Once admitted, the console is a `Deployer` for the rest of the handler, which is the whole point. Nothing after the gate knows it's a game. The node's own `[testing]` policy must allow `inject_workload_faults`, Smoker's replica rail applies, and the fault, the event and the audit record all say `injected_by = __console`. `relish fault list` shows it next to the faults people made.
+
+### The hole the review found
+
+The rule says "an instance on this node", and the first version only checked the request's fields. But Smoker's routing decides for itself whether a target is an app or a job, from what runs (an app relabelled as a job would step around the replica rail, #704), and a job's `--instance` is a task index. So a console request naming a job and `--instance 0` passed the shape check and would have killed task 0's attempt on this node. It was still one kill on this node, under every rail, but it wasn't the request the setting promised.
+
+The fix asks the node instead of trusting the request. Before admitting a kill, `admit_console_kill` asks the agent what runs here and refuses unless one instance has exactly that id, app and namespace. Instance ids look like `default__web-0`, with the namespace and a `__` in them, so one never parses as a task index, and the job path is closed as a side effect. The test for it is in the table of widening attempts: beside a counted kill, another node, a node fault, a lasting fault and both overrides, a job's task by index, an instance that doesn't run here, another app's instance and another namespace must each come back 403 with kill mode on.
+
+### A kill that hasn't landed yet
+
+The second review found a race that was never the console's alone. Smoker answers a kill once the signal is sent. The instance is dead a moment later, but the agent only notices when its sweep next looks, and until then the instance reads `running`. The replica rail counted running instances and active pauses; a kill was instantaneous, so it never stayed on the fault list. Kill `web-0` of a two-replica app, kill `web-1` within the second, and the rail saw two running replicas and nothing faulted, and let the second kill through. No replicas left. The CLI could do it too; a space bar only made it easy.
+
+So a kill now stays on its node's fault list for `KILL_SETTLE`, ten seconds, and the rail counts what's on the list:
+
+```rust
+pub fn replicas_out_of_service(fault_type: &FaultType) -> u32 {
+    match fault_type {
+        FaultType::Pause => 1,
+        FaultType::Kill { count: 0 } => KILL_ALL_REPLICAS,
+        FaultType::Kill { count } => *count,
+        _ => 0,
+    }
+}
+```
+
+Match arms are tried in order, so `Kill { count: 0 }` (every replica) is caught before the general `Kill { count }` binds the count. `KILL_ALL_REPLICAS` is `u16::MAX`: more replicas than any service has, but small enough that adding a few never overflows the `u32` the rail sums in (`fold(0, u32::saturating_add)` makes sure of that anyway). The same function serves the node's own registry and the cluster-wide evidence a routed kill is judged by, which reads each node's fault list over HTTP and recovers the type from its displayed form. A replica that restarts within the ten seconds counts as gone a little longer than it is, which only makes the rail stricter. The `relish fault list` line a kill leaves for those ten seconds is the visible side of it.
+
+The game keeps a rule of its own as well: in kill mode it holds fire while a kill is out. That isn't the protection any more; the server is. It's about what the screen says. The console gives bun ten seconds, and the server's path can take longer (a leader read, the cluster-wide evidence, the signal), so a timeout doesn't mean the kill failed. Only a 4xx is a clear no, which brings the invader back. A timeout, a dropped connection or a 5xx is `KillAnswer::Unknown`: the game says so, and holds fire until the workload list shows the instance has left `running` or restarted (its restart count moved), or 30 seconds have passed, by which time the server's own window has closed too.
+
 ## Lessons learned
 
 Every chapter is supposed to end with what was tricky, what clicked, and what we'd do differently. This chapter had more of those moments than most.

@@ -139,7 +139,7 @@ You don't need to know where a replica runs. The node you talk to looks up
 which nodes run the target, checks the replica rail against every replica in
 the cluster (so `kill web --count 3` on a three-replica app is refused even
 though each node holds one, and a pause without `--instance` counts as
-freezing every replica, so it's always refused), and forwards each owner its
+freezing every replica, so it's always refused; and a replica killed in the last ten seconds still counts as gone, since it can read `running` until its node notices, so two quick kills can't take the last replica between them), and forwards each owner its
 share under your own credential, so the owner repeats every check. Add `--node NAME` to pick the
 node. A fault spread over several nodes becomes one fault per node, and the
 command prints each one. `relish fault list` shows every node's faults with a

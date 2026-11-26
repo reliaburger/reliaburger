@@ -1272,12 +1272,13 @@ On the Wyse lab's first evening the monitor was the only view of a node that did
 
 ### Reuse the pattern, not the views
 
-`relish tui` (chapter 13) already has an app loop, a reducer and a test harness, and the plan said to reuse it. We reused the *pattern* and the pieces underneath it, and gave the console its own small state and views. The TUI's views are about a cluster seen from a laptop: lists of apps, a kill key, a scale prompt, a command palette. The console has none of that and must never have the kill key. Bolting a "console mode" onto `TuiApp` would put an `if console` into every view. What the two do share, they share for real: `section_lines` and `assess` (the lines `relish status` prints), `run_wtf`, `council_view::survey`, `BunClient`, and the summary fixtures the TUI's snapshot tests already use.
+`relish tui` (chapter 13) already has an app loop, a reducer and a test harness, and the plan said to reuse it. We reused the *pattern* and the pieces underneath it, and gave the console its own small state and views. The TUI's views are about a cluster seen from a laptop: lists of apps, a kill key, a scale prompt, a command palette. The console has none of that and must never have the kill key. (It does have a game where shooting an invader can kill an instance, but only once a cluster admin has said so in the council, and through Smoker like any other fault: chapter 8, "Space invaders with live ammunition".) Bolting a "console mode" onto `TuiApp` would put an `if console` into every view. What the two do share, they share for real: `section_lines` and `assess` (the lines `relish status` prints), `run_wtf`, `council_view::survey`, `BunClient`, and the summary fixtures the TUI's snapshot tests already use.
 
-The console lives in `src/appliance/console/`, in five files:
+The console lives in `src/appliance/console/`, in six files:
 
 - `state.rs`: `ConsoleState` and the reducer, `ConsoleState::update(Msg)`;
 - `view.rs`: `render(frame, &state)`, and every snapshot test;
+- `invaders.rs`: the hidden seventh tab's game, where things are and what a key does;
 - `local.rs`: what the machine says without bun (versions, `/proc`, the journal);
 - `remote.rs`: what bun says, through relish's client;
 - `mod.rs`: the event loop and the pollers.
@@ -1376,6 +1377,10 @@ struct Poller {
 The event loop sends the current tab down a `watch` channel, which holds only its latest value: a poller that missed two tab switches wants to know where we are, not where we've been. In the poller, `*tab.borrow()` copies the `Tab` out in the same statement that borrows it. `Tab` is `Copy`, a few bytes, and the copy means the read lock the borrow holds ends right there (the rule from #1273). The loop itself is a `tokio::select!` over the cancellation token, the interval, and the tab changing. Each fetch races the cancellation token too, and has its own timeout inside (10 s for a request, 30 s for `wtf`, 5 s for a command), so no poller waits for ever.
 
 The machine's load comes from a different kind of source. `sysinfo` reads `/proc` with ordinary blocking calls, and a CPU percentage is the difference between two readings, so the reader keeps state between samples. That's a plain thread, `std::thread::spawn`, sleeping two seconds between samples and handing each one to the async side with `blocking_send`. When the console goes, the channel closes, `blocking_send` fails, and the thread returns. Everything else that touches a file uses `tokio::fs`, `tokio::process` or `spawn_blocking`, which is what the blocking rule (chapter 15) checks.
+
+### A tab the bar doesn't show
+
+The game is a seventh `Tab` variant, `Tab::Invaders`, and an easter egg should stay hidden. So `Tab` has two lists: `ALL`, seven tabs in number-key order, and `SHOWN`, the six the tab bar draws and the arrows step through. `7` picks `ALL[6]`; `Tab` and the arrows step through `SHOWN`, and from the game they land on Status or Logs, as if it sat between the two. Inside the game the reducer offers each key to `game_key` first, which takes `h`, `l`, the arrows, space and `r`, and returns `false` for anything else, so `Tab` and the number keys still leave. The game itself is `invaders::Game`, with no ratatui in it: `fire` and `tick` change positions, and `take_kill` hands the event loop the kill a hit queued in kill mode. The loop sends it on a spawned task, so a slow bun never stops the screen, and the answer comes back as one more message, `Msg::KillAnswered`. The snapshot tests draw the game at 80 by 25 with kill mode off, and with it on after a refused kill.
 
 ### A read-only identity nobody has to make
 
