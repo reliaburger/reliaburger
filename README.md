@@ -5,12 +5,10 @@
 # Reliaburger
 
 <!-- hero:start -->
-**The container platform, served ready. Built for humans and their agents.**
+**The container platform built for AI agents to run. From hosts to apps in minutes.**
 
-Kubernetes hands you the ingredients. Reliaburger hands you the burger:
-app scheduling, batch jobs, metrics, logs, service discovery, ingress, mTLS,
-a Docker registry, GitOps and chaos testing, in one Rust agent and one CLI.
-And that CLI speaks to your AI agent too.
+The whole container platform in one binary, designed for AI agents to install,
+operate, debug and improve. The platform team you need, in a box.
 <!-- hero:end -->
 
 **Status:** 0.3.2 was released on 23 November 2026. Until 1.0.0, Reliaburger is good enough for home labs and dev clusters, not for production.

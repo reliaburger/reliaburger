@@ -171,6 +171,32 @@ class Screen(unittest.TestCase):
         self.assertEqual(stage.took(605), "10 m 05 s")
 
 
+class SetupScreen(unittest.TestCase):
+    def test_the_playbook_the_installer_and_the_look_round_are_chapters(self):
+        renderer = stage.Renderer("setup", Clock())
+        fetch = {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "f", "name": "WebFetch",
+             "input": {"url": "https://reliaburger.com/agents"}}]}}
+        shown = plain(renderer.lines(fetch))
+        self.assertEqual(shown, ["", "» Read the playbook", "fetch https://reliaburger.com/agents"])
+        install = "curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop"
+        self.assertEqual(plain(renderer.lines(bash("i", install)))[:2], ["", "» Install and build"])
+        self.assertIn("» Look around", plain(renderer.lines(bash("s", "/tmp/h/bin/relish status"))))
+        self.assertNotIn("» Look around", plain(renderer.lines(bash("n", "relish nodes"))))
+
+    def test_other_recordings_dont_take_an_installer_for_a_chapter(self):
+        renderer = stage.Renderer("debug", Clock())
+        self.assertEqual(plain(renderer.lines(bash("i", "curl https://reliaburger.com/install.sh"))),
+                         ["$ curl https://reliaburger.com/install.sh"])
+
+    def test_both_turns_end_the_session_once(self):
+        renderer = stage.Renderer("setup", Clock())
+        for turns, milliseconds in [(3, 20_000), (9, 125_000)]:
+            renderer.lines({"type": "result", "num_turns": turns, "duration_ms": milliseconds})
+        self.assertEqual(plain(renderer.ending()),
+                         ["", "# The session ended after 12 turns and 2 m 25 s."])
+
+
 class Markers(unittest.TestCase):
     def cast(self, version):
         header = {"version": version, "command": "/Users/me/stage.py", "env": {"SHELL": "zsh"}}
@@ -319,6 +345,65 @@ class Session(unittest.TestCase):
                                 "GYM_CALL_LOG": "/gym/calls", "RELIABURGER_TOKEN": "agent",
                                 "STAGE_PERSON_TOKEN": "person", "HOME": "/h"}, "person")
         self.assertEqual(env, {"PATH": "/real:/usr/bin", "RELIABURGER_TOKEN": "person", "HOME": "/h"})
+
+
+def setup_events(*commands, turns=2, error=False):
+    events = [{"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": str(index), "name": "Bash", "input": {"command": command}}]}}
+        for index, command in enumerate(commands)]
+    events += [{"type": "result", "is_error": error} for _ in range(turns)]
+    return events
+
+
+class Setup(unittest.TestCase):
+    INSTALL = "curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop"
+    PERSON = {"nodes_exit": 0, "status_exit": 0}
+
+    def test_the_session_gets_a_shell_the_site_and_nothing_of_this_machines(self):
+        argv = recording.setup_argv("claude", None, "5", "0000")
+        self.assertEqual(argv[argv.index("--tools") + 1], "Bash,WebFetch")
+        self.assertEqual(argv[argv.index("--setting-sources") + 1], "")
+        self.assertIn("--strict-mcp-config", argv)
+        self.assertNotIn("--plugin-dir", argv)
+        self.assertNotIn("--no-session-persistence", argv, "the second turn resumes the first")
+        self.assertEqual(argv[argv.index("--session-id") + 1], "0000")
+        again = recording.setup_argv("claude", "some-model", "5", "0000", resume=True)
+        self.assertEqual(again[again.index("--resume") + 1], "0000")
+        self.assertNotIn("--session-id", again)
+        self.assertEqual(again[-2:], ["--model", "some-model"])
+
+    def test_the_prompt_is_the_homepages_line(self):
+        page = (Path(__file__).resolve().parents[2] / "docs/website/index.html").read_text()
+        self.assertIn(f"<code data-agent-prompt>{recording.SETUP_PROMPT.strip()}</code>", page)
+        self.assertEqual(recording.main(["prompt", "setup"]), 0)
+
+    def test_the_session_keeps_its_own_home_and_not_this_machines_cluster(self):
+        env = recording.setup_env({"PATH": "/bin", "RELIABURGER_TOKEN": "t",
+                                   "RELIABURGER_ENDPOINT": "e", "STAGE_X": "1"}, "/tmp/h")
+        self.assertEqual(env, {"PATH": "/bin", "RELIABURGER_HOME": "/tmp/h"})
+
+    def test_a_session_that_installed_and_a_cluster_that_answered_is_kept(self):
+        self.assertEqual(recording.setup_problems(setup_events(self.INSTALL), self.PERSON), [])
+
+    def test_a_session_that_never_installed_isnt(self):
+        problems = recording.setup_problems(setup_events("relish status"), self.PERSON)
+        self.assertEqual(problems, ["the session never ran the installer"])
+
+    def test_one_turn_an_error_or_a_cluster_that_didnt_answer_isnt(self):
+        self.assertIn("the session had 1 turns, not the two the recording shows",
+                      recording.setup_problems(setup_events(self.INSTALL, turns=1), self.PERSON))
+        self.assertIn("a turn ended in an error",
+                      recording.setup_problems(setup_events(self.INSTALL, error=True), self.PERSON))
+        self.assertIn("the person's `relish nodes` exited 1", recording.setup_problems(
+            setup_events(self.INSTALL), {"nodes_exit": 1, "status_exit": 0}))
+        self.assertIn("the person's check never ran",
+                      recording.setup_problems(setup_events(self.INSTALL), None))
+
+    def test_the_title_names_the_release_the_installer_fetches(self):
+        version = recording.installer_version()
+        self.assertRegex(version, r"^\d+\.\d+\.\d+$")
+        self.assertEqual(recording.title("setup", version),
+                         f"Reliaburger {version}: an agent sets up a cluster")
 
 
 def call(*words):

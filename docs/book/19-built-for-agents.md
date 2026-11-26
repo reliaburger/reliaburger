@@ -8589,6 +8589,65 @@ fetched, so the section said "0.2.8, not in 0.2.7", which the
 installed-release check asks for. When 0.2.8 shipped, that check failed until
 the label went, so the page can't keep calling a released feature new.
 
+### The page turned round
+
+After 0.3.2 we rewrote the homepage around one claim. Until then it said what
+Reliaburger was, "The container platform, served ready", and added who it was
+for underneath. The agent material sat eighth and ninth, after the install,
+the tour, the job benchmarks and the release gate. A reader had to get through
+some eight thousand words to find the thing nobody else offers.
+
+The new title is "The container platform built for AI agents to run". The
+platform is still the subject. We aren't selling an agent; we're building what
+your agent operates. The reader we wrote for is a team with no platform team
+of its own, which is who gains most from that.
+
+The order changed to match. The first thing to copy is the prompt you paste
+into your agent, in the hero, and the install section opens on the same
+prompt. Under the three facts the whitepaper gets a band of its own, because
+some readers want the reasoning before the demo, and the seven differences
+sit right under it. A new section comes next
+and names what an agent gets, command by command. The two recordings of a
+real agent follow, each folded behind "Watch the recording" so the sections
+read as a paragraph each. Another new section says where
+you might be coming from, a hosted platform or Kubernetes, and ends each
+comparison with what the other side still does better. The job benchmarks,
+the release gate and bare metal moved down, and each now opens with its claim
+and folds its method.
+
+Three things stayed exactly as they were. Every recording is the same file in
+the same figure. Every command a test parses is still on the page. And a
+number still needs a source: the three facts under the hero each link the
+record they come from.
+
+The tests changed where they pinned the old order, and nowhere else. The one
+that said the page leads with the one-line install now says it leads with the
+agent's prompt, and that the install section still carries the install line.
+The concept budget and the unmeasured Kubernetes comparison moved to the new
+section, so their tests read it there.
+
+A second pass was about how the page looks. The navigation went from ten
+links to six, and the Markdown and Claude buttons moved onto the line for
+agents, so nothing sits between the masthead and the title. Each folded
+recording shows a poster, a few of its commands dimmed under a play button,
+because a row with a plus sign doesn't say "video". Section headings grew and
+sections moved further apart, on the homepage only.
+
+The site also got a dark theme. It's a button, not a media query: the page
+stays light unless you ask, and remembers what you chose. The button comes
+from `copy.js`, the script that already adds the other two, so the site still
+has three scripts. One trap is worth knowing. The terminals paint themselves
+with `var(--ink)`, the text colour, which is light in the dark theme, so every
+one of them would have turned white. The dark theme repaints each with a
+colour of its own, and a test walks the stylesheet to check none is missed.
+
+Two things we chose not to do. We didn't move the benchmarks and the gate to
+pages of their own, though the page would be shorter for it: links to
+`#job-throughput` and `#netboot` are out there, and a fold keeps them working.
+And we didn't write "certificates" in the list of what's built in. The
+cluster's own mTLS is there; public certificates for the ingress arrive with
+0.4.1, and the page shouldn't promise them early.
+
 ## What we didn't do
 
 The three big refusals are at the start of the chapter. These are the smaller

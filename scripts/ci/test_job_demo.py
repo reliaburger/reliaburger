@@ -33,7 +33,6 @@ class JobDemo(unittest.TestCase):
         section=page.index('<section id="job-throughput"')
         tour=page.index('<section id="tour"')
         self.assertLess(tour,section)
-        self.assertRegex(page[page.index('</section>',tour)+10:section],r'^\s*$')
         self.assertLess(section,page.index('<section id="start"'))
         self.assertNotIn('id="jobs-recording"',page)
         self.assertNotIn('Development preview',page)
