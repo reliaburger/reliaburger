@@ -579,6 +579,40 @@ The map lives behind a `std::sync::Mutex`, not tokio's. The DHCP side updates it
 
 Nothing on this port is authenticated. Anyone on the LAN can send it lines, so the listener only prints and appends, marks a sender it never served as `log <address> (not served):`, and replaces control characters with `?`, so a packet can't clear your terminal or turn it red. Lines go through the same `Log` closure as the DHCP, TFTP and HTTP lines, so they print the same way, and to `<netboot dir>/logs/<mac>.log`, written before the line prints, so a line on the screen is already on disk. That took a `flush()` as well as the write: tokio's `File` hands each write to a blocking thread and returns before it lands, and a unit test that read the file straight after the second line printed found only the first, once, on a loaded CI runner. For a lab where nothing is being served, `relish machines logs` runs only the listener.
 
+**A quieter screen.** Streaming everything is right for one Wyse on the bench. Three machines installing at once is another story: each sends its whole `dmesg` backlog, a few hundred lines, then every kernel line after it, and the installer's dozen lines that say what's actually happening scroll past in the middle. The homepage's netboot recording is 110 columns by 32 rows, so it couldn't stream at all. So `--stream-logs` takes a value now. With none, or `=all`, nothing changes. With `=units`, the screen shows only the boot units' lines, the script's own and kernel panics; every line still goes to `os/logs/<mac>.log`, so a lab record loses nothing.
+
+Telling a unit's line from the kernel's is the interesting part, because netconsole sends neither a facility nor a source, only text. The text has structure, though. A kernel line arrives as `[    9.412871] r8169 …`, the timestamp the kernel puts on each console line (the `dmesg` backlog has the same). A unit's line went through journald on its way to the kernel log, and journald puts a syslog tag in front, the program's name and process ID: `[    9.412871] install[412]: reliaburger-install: target /dev/mmcblk0`. The boot check writes to `/dev/kmsg` itself, with no tag. The script's own lines (the hello, the backlog's start and end) carry no timestamp at all. Under all of that, every line our boot units print starts with their own tag: `reliaburger:`, `reliaburger-<unit>:` or bun's `bun:`. The image's tests already lean on it (they wait for `reliaburger: bun healthy`). So `kind` strips the timestamp and the syslog tag if they're there, and calls the line a unit's when the first word of what's left is one of those tags. A kernel line that mentions `reliaburger_fw` or says `reliaburger:` halfway along stays a kernel line, and so does `systemd[1]: Starting reliaburger.service`. A panic, an oops or a `BUG:` always prints, whatever the mode: those are the lines you'd have photographed off the monitor.
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum StreamLogs {
+    #[default]
+    All,
+    Units,
+}
+
+impl StreamLogs {
+    pub fn shows(self, line: &str) -> bool {
+        match self {
+            StreamLogs::All => true,
+            StreamLogs::Units => kind(line) != LineKind::Kernel,
+        }
+    }
+}
+```
+
+`clap::ValueEnum`, which Chapter 1 used for `--output`, makes clap accept `all` and `units` and refuse anything else while it parses, with the list of choices in the error. A flag whose value is optional takes three more settings:
+
+```rust
+#[arg(long, value_name = "WHICH", value_enum,
+      num_args = 0..=1, require_equals = true, default_missing_value = "all")]
+stream_logs: Option<StreamLogs>,
+```
+
+`num_args = 0..=1` says the flag takes zero or one value, and `default_missing_value = "all"` is what clap fills in when it gets zero. The field is an `Option`, so it has three states without a second flag: `None` (no `--stream-logs` at all, nothing streams), `Some(All)` and `Some(Units)`. `require_equals = true` is the one that's easy to forget. Without it, `relish netboot --stream-logs os` would read `os`, the netboot directory, as the flag's value, and fail with "invalid value 'os'". With it, a value has to be written `--stream-logs=units`, and a word after a bare `--stream-logs` stays the positional argument it was. A test pins all of it: `--stream-logs`, `=all`, `=units`, `--stream-logs lab` (directory `lab`, every line) and `=kernel` refused.
+
+The filter sits after the file write in the listener's loop, not before it, so the rule "a line on the screen is already on disk" still holds, and now so does "every line is on disk, on the screen or not". The test sends a mixed boot in one datagram, in both modes, and checks the file holds every line and the screen exactly the ones `shows` keeps. A snapshot test (`insta`) pins what `=units` leaves on screen for that boot: the hello, the backlog markers, the installer, the boot check, bun's start script and bun, and the panic, with no `r8169`, `EXT4-fs` or `audit:`.
+
 The script's unit tests run it against stubs for `ip`, `modprobe` and `dmesg`, with a temporary directory standing in for configfs, and a UDP socket on loopback as the operator's machine. They check what the script writes, not what systemd and the kernel make of it, which is how `journal+kmsg` got through, and a second slip with it: the installer's copy of the unit had no `[Install]` section, so the preset line `enable reliaburger-netlog.service` enabled nothing, and the installer never streamed. A preset enables a unit through the `WantedBy=` in that section, and a unit without one is "static". So the QEMU tests now run with streaming on. The netboot install test passes `--stream-logs` and wants the installer's lines and the installed system's boot check among relish's, under the VM's MAC. The fallback test writes `netlog.conf` onto the disk's ESP with mtools before the first boot, runs `relish machines logs` beside it, and wants every failed try and the fallback in what arrived.
 
 **Changing it later.** `--stream-logs` decides at install time. After that, a lab moves: the laptop gets a new address, or you want the logs off once the machines are in a cupboard. Unplugging a disk to delete a file from its ESP isn't an answer, so `relish os boot-logs --to <address>[:<port>]` and `--off` change it on a claimed cluster. The file stays the only state. relish asks each node's bun (`POST /v1/os/boot-logs`), and bun rewrites or deletes `netlog.conf` on its own ESP, so the next boot, and every boot after an OS update, reads what you set. Nothing goes through Raft: each node's setting lives on that node's disk, which is also the only place its boot can read it before bun starts.

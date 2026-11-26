@@ -780,14 +780,28 @@ fn help_text(
 }
 
 /// Whether `flag` is in a help text's option list and, if so, whether it
-/// takes a value.
+/// takes a value from the next word. An optional value written with `=`
+/// (clap prints `--stream-logs[=<WHICH>]`) never does.
 fn option_takes_value(help: &str, flag: &str) -> Option<bool> {
     help.lines()
         .map(str::trim_start)
         .filter(|line| line.starts_with('-'))
         .map(|line| line.split("  ").next().unwrap_or_default())
-        .find(|options| options.split([',', ' ']).any(|name| name == flag))
-        .map(|options| options.contains('<'))
+        .find(|options| {
+            options
+                .split([',', ' '])
+                .any(|name| name.split("[=").next() == Some(flag))
+        })
+        .map(|options| options.contains('<') && !options.contains("[="))
+}
+
+#[test]
+fn an_optional_equals_value_never_takes_the_next_word() {
+    let help = "Options:\n      --stream-logs[=<WHICH>]\n          Stream them\n      --key <FILE>\n          A key\n      --reinstall\n          Again\n";
+    assert_eq!(option_takes_value(help, "--stream-logs"), Some(false));
+    assert_eq!(option_takes_value(help, "--key"), Some(true));
+    assert_eq!(option_takes_value(help, "--reinstall"), Some(false));
+    assert_eq!(option_takes_value(help, "--stream"), None);
 }
 
 /// Check an inline span names a real subcommand with real flags. Leading
