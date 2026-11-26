@@ -14,6 +14,10 @@ PASTE INTO YOUR AGENT Claude Code, Codex, any agent with a shell
 Set up a Reliaburger cluster for me. Start at https://reliaburger.com/agents.
 ```
 
+ Watch an agent do itHide the recording a real Claude Code session, from that line to a three-node cluster
+
+A real session: Claude Code with a shell, an empty `RELIABURGER_HOME` and the line above, on a MacBook Pro, against the published 0.3.2. It read the playbook and the installer, asked where, built three VMs in 131 seconds and then ran the whole tour. Recorded by [scripts/record/recording.py](https://github.com/reliaburger/reliaburger/blob/main/scripts/record/recording.py). Still stretches are cut to two seconds, and each slow step says how long it really took.
+
 [Or install it yourself in five minutes](https://reliaburger.com/#install)
 
 Security built in.

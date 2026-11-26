@@ -497,6 +497,10 @@ footer { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-top: 20px; paddi
 .recording-fold .recording { margin-top: 0; margin-bottom: 16px; }
 .recording-fold + .tour-commands { margin-top: 12px; }
 @media (max-width: 600px) { .poster-lines { height: 190px; padding: 16px; font-size: .75rem; } }
+.hero-fold { margin-top: 12px; }
+.hero-fold .poster-lines { height: 168px; }
+.hero-fold .poster-button { width: 48px; height: 48px; }
+.hero-fold .poster-button::before { border-width: 9px 0 9px 15px; }
 @media (prefers-reduced-motion: reduce) { .poster-button { transition: none; } }
 
 /* The homepage breathes more than the reference pages: larger section headings

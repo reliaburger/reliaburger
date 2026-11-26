@@ -461,6 +461,42 @@ paragraph. `tests/suite/website.rs` accepts either state of each slot, and
 nothing in between. Commit the cast with the run's `recording.json`
 summary in the PR description: the model, the cost and the gym's verdict.
 
+#### 3. An agent sets up a cluster (the hero)
+
+The fold under the hero's prompt plays `assets/agent-setup.cast`: Claude Code,
+with a shell and an empty `RELIABURGER_HOME`, given the homepage's one line and
+nothing else. It doesn't go through the gym: there's no cluster to prepare and
+no answer to score. The session has two turns, because the playbook tells the
+agent to ask where the cluster should run and wait. The recording types the
+person's answer between them ("This computer. Go ahead, you don't need to ask
+me anything else."), and at the end you run `relish nodes` and `relish status`
+at your own prompt.
+
+```sh
+python3 scripts/record/recording.py setup \
+  --cast docs/website/assets/agent-setup.cast \
+  --out ~/rb-setup-recording --home ~/rbrec
+```
+
+`--home` must be a new, short path; Lima's control sockets live under it, and
+the session's `relish`, its VMs and its context all stay there, so a cluster
+this machine already talks to is untouched. The recording destroys the cluster
+and removes `--home` when it ends, whatever happened. It needs what the laptop
+install needs: Apple silicon or Linux with KVM, about 8 GiB of free memory and
+15 GiB of disk. The session may run any shell command and fetch
+reliaburger.com, as a visitor's own agent would, so record on a machine where
+that's acceptable.
+
+The cast is kept only when:
+
+- the session ran the installer (`reliaburger.com/install.sh`);
+- it had both turns, and neither ended in an error;
+- your `relish nodes` and `relish status` both exited 0.
+
+`python3 scripts/record/recording.py prompt setup` prints the prompt, which a
+test holds to the homepage's own line. Re-record it when the playbook on
+`/agents` or the laptop install changes what a session does.
+
 ### Soak charts
 
 "How a release is tested" (`#release-testing`) shows the released version's

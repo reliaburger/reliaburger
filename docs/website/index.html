@@ -47,6 +47,41 @@
             <div class="terminal-heading">PASTE INTO YOUR AGENT <span>Claude Code, Codex, any agent with a shell</span></div>
             <pre><code data-agent-prompt>Set up a Reliaburger cluster for me. Start at https://reliaburger.com/agents.</code></pre>
           </div>
+          <!-- What that line does, recorded: a real session, folded behind a poster like
+               the two agent recordings below. The player loads it when the fold opens. -->
+          <details class="recording-fold hero-fold" id="setup-recording-fold">
+            <summary>
+              <span class="poster-lines" aria-hidden="true"><span class="comment"># Claude Code, with a shell and that one line</span>
+fetch https://reliaburger.com/agents
+claude ▸ where should the cluster run?
+you ▸ This computer.
+$ relish setup --quickstart
+<span class="comment"># three nodes, healthy, 131 seconds later</span></span>
+              <span class="poster-play"><span class="poster-button" aria-hidden="true"></span>
+                <span class="poster-closed">Watch an agent do it</span><span class="poster-open">Hide the recording</span>
+                <span class="poster-note">a real Claude Code session, from that line to a three-node cluster</span></span>
+            </summary>
+          <figure id="setup-recording" class="recording" data-cast="./assets/agent-setup.cast" data-chapters="markers">
+            <div class="recording-screen"></div>
+            <noscript><p class="recording-fallback">The recording plays with JavaScript. Without it,
+              <a href="./assets/agent-setup.cast">download the recording</a> and play it in a terminal with
+              <code>asciinema play agent-setup.cast</code>.</p></noscript>
+            <figcaption>
+              <span class="recording-chapters" role="group" aria-label="Setup recording chapters" hidden></span>
+              <span>A real session: Claude Code with a shell, an empty <code>RELIABURGER_HOME</code> and
+                the line above, on a MacBook Pro, against the published 0.3.2. It read the
+                playbook and the installer, asked where, built three VMs in 131 seconds and then
+                ran the whole tour. Recorded by
+                <a href="https://github.com/reliaburger/reliaburger/blob/main/scripts/record/recording.py">scripts/record/recording.py</a>.
+                Still stretches are cut to two seconds, and each slow step says how long it
+                really took.</span>
+              <span class="recording-speed" role="group" aria-label="Setup playback speed" hidden>speed
+                <button type="button" data-speed="1" aria-pressed="true">1×</button>
+                <button type="button" data-speed="4" aria-pressed="false">4×</button>
+                <button type="button" data-speed="20" aria-pressed="false">20×</button></span>
+            </figcaption>
+          </figure>
+          </details>
           <div class="intro-links">
             <a href="#install">Or install it yourself in five minutes <span aria-hidden="true">↓</span></a>
           </div>
