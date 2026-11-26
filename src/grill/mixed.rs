@@ -39,6 +39,10 @@ impl<C: Grill + Clone + 'static, H: Grill + Clone + 'static> MixedGrill<C, H> {
     pub fn container(&self) -> &C {
         &self.container
     }
+    /// The runtime that runs host processes.
+    pub fn host(&self) -> &H {
+        &self.host
+    }
     pub fn with_container(mut self, container: C) -> Self {
         self.container = container;
         self

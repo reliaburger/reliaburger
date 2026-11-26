@@ -2089,6 +2089,61 @@ image nginx:1.27, and this node's runtime is process`, and the instance shows
 scheduler keeps image apps off such nodes in the first place (see "Finding
 Friends").
 
+### Sweeping up after a crash
+
+An owner directory holds more than `owner.json`. Every `relish exec` gets an
+`exec-*` directory with its helper's own record, lock and output. Every record
+write goes through `atomic_write_mode`, which writes a `.reliaburger-*`
+temporary and renames it over the old file. And a brand-new instance is staged
+in a `.preparing-*` directory beside the others, then renamed into place. On a
+good day each of these is gone a moment later. Pull the plug at the wrong
+instant and it isn't. Nothing removed an `exec-*` directory whose owner died
+before tidying it, a temporary that never got its rename, or a staging
+directory that was never published, so they piled up until the instance was
+forgotten ([#2363](https://github.com/reliaburger/reliaburger/issues/2363)).
+Inventory already skipped them, so nothing went wrong. It was just untidy.
+
+The hard part is knowing what's safe to delete, and the owner's state machine
+already answers that. Once a launch is `Retiring`, `Retired` or `Cancelled`,
+only the holder of its owner lock writes its record, and no new helper can
+start under it. So
+`process_owner::remove_leftovers` runs only on a finished launch, holding its
+owner lock, and goes through the directory:
+
+- Every `.reliaburger-*` file is a temporary nobody can still be writing, so it
+  goes. This is the same `remove_abandoned_atomic_writes` that runc already
+  calls on its bundles.
+- Each `exec-*` directory is a helper, and a helper can outlive its parent. A
+  dead parent owner doesn't take its exec helpers with it, since they lead
+  their own process groups. So a helper whose owner still holds its own lock,
+  or whose recorded command still has a process group, keeps its directory.
+  Any other is removed: one never started, finished or cancelled, one whose
+  command has gone or whose boot has passed, and one whose parent crashed
+  before writing its record.
+
+`complete_retirement` calls it just before it publishes `Retired`, so
+whichever process finishes the retirement, the owner itself or a Bun that
+found it dead, also tidies, and whoever reads `Retired` finds the directory
+tidy. Our first version tidied just after, and the integration test below
+caught Bun reading `Retired` before the owner had finished. A failure is only
+logged: the launch retires either way. Bun also calls `ProcessGrill::remove_owner_leftovers` once
+at startup, before recovery, which covers a launch that retired before the
+crash, and removes any `.preparing-*` directory older than ten minutes whose
+operation lock it can take. Publication renames a staging directory away, so a
+staging name that's still there never granted anything permission to run.
+
+The tests build each leftover by hand, the way a crash leaves it, and check
+that a sweep removes it. They also check that a live owner's lock, a prepared
+or running launch, or an exec helper with a running command keep every file.
+One integration test, `retirement_and_startup_remove_what_a_crash_left_behind`,
+does the whole thing with real owners: it starts a workload and an exec, adds
+the leftovers, shows that a startup sweep leaves them alone while the launch
+runs, kills the launch and watches retirement remove them, then adds them again
+and lets a fresh runtime's startup sweep finish the job.
+
+Runc's intent records had the same temporaries, written by the same helper, so
+`IntentClaim::retire` now removes them from the record's directory too.
+
 ## Batch scheduling
 
 The allocator below explains the original finite-batch design. Public jobs now

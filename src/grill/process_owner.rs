@@ -474,10 +474,29 @@ pub(crate) fn process_group_absent(leader: u32) -> io::Result<bool> {
     }
 }
 
+/// Tidy a `Retiring` launch's directory and remove its socket, then
+/// publish `Retired`. The caller holds the owner lock.
 pub(crate) fn complete_retirement(directory: &Path, record: &mut OwnerRecord) -> io::Result<()> {
     let OwnerPhase::Retiring { exit_code } = record.phase else {
         return Err(io::Error::other("process retirement has no absence proof"));
     };
+    // Retiring already proves the launch has stopped for good, and tidying
+    // first means whoever reads Retired finds it tidy. Tidying is
+    // housekeeping, though: the launch retires whether or not it works, and
+    // startup recovery tries again (#2363).
+    if let Err(error) = remove_leftovers(directory) {
+        eprintln!(
+            "process owner: cannot tidy {} on retirement: {error}",
+            directory.display()
+        );
+    }
+    remove_control_socket(record)?;
+    record.phase = OwnerPhase::Retired { exit_code };
+    persist(directory, record)
+}
+
+/// Remove `record`'s private control socket and its directory, if present.
+pub(crate) fn remove_control_socket(record: &OwnerRecord) -> io::Result<()> {
     let socket = socket_path(record);
     let parent = socket
         .parent()
@@ -485,13 +504,85 @@ pub(crate) fn complete_retirement(directory: &Path, record: &mut OwnerRecord) ->
     match validate_socket_directory(parent) {
         Ok(()) => {
             remove_socket(&socket)?;
-            std::fs::remove_dir(parent)?;
+            std::fs::remove_dir(parent)
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
-    record.phase = OwnerPhase::Retired { exit_code };
-    persist(directory, record)
+}
+
+/// Remove what a crash or power loss can leave in a finished launch's
+/// directory: the temporaries of atomic writes that never got their rename,
+/// and `exec-*` helper directories that no helper can still use (#2363).
+///
+/// Call it only while holding `directory`'s owner lock, with its launch
+/// retiring, retired or cancelled: then no owner can write its record or
+/// start another helper. A helper that still holds its own lock, or whose command
+/// still runs, keeps its directory.
+pub(crate) fn remove_leftovers(directory: &Path) -> io::Result<()> {
+    crate::sesame::identity::remove_abandoned_atomic_writes(directory)?;
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let helper = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with("exec-"));
+        // `file_type` doesn't follow a symlink, so only a real directory
+        // is ever removed.
+        if helper && entry.file_type()?.is_dir() {
+            remove_finished_helper(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove one exec helper's directory if nothing can still use it.
+fn remove_finished_helper(directory: &Path) -> io::Result<()> {
+    if crate::durable::validate_directory(directory).is_err() {
+        return Ok(());
+    }
+    // A live helper owner holds this lock for its whole life. Holding it
+    // also fences one that was spawned but hasn't started: it can't lock a
+    // directory that has gone.
+    let _helper = match lock_owner(directory) {
+        Ok(lock) => lock,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::NotFound
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let record = match load(directory) {
+        Ok(record) => Some(record),
+        // Its parent created the directory and crashed before the record:
+        // no helper was ever started for it.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        // An unreadable record proves nothing, so it stays for a person.
+        Err(_) => return Ok(()),
+    };
+    if let Some(record) = &record {
+        let finished = match record.phase {
+            OwnerPhase::Prepared
+            | OwnerPhase::Cancelled
+            | OwnerPhase::Retiring { .. }
+            | OwnerPhase::Retired { .. } => true,
+            OwnerPhase::Running { pid } => {
+                from_previous_boot(record)? || process_group_absent(pid)?
+            }
+        };
+        if !finished {
+            return Ok(());
+        }
+        remove_control_socket(record)?;
+    }
+    match std::fs::remove_dir_all(directory) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
 }
 
 pub(crate) fn validate_socket_directory(directory: &Path) -> io::Result<()> {
@@ -1378,5 +1469,140 @@ mod tests {
         assert!(!from_previous_boot(&record(current)).unwrap());
         let other = "00000000-0000-4000-8000-000000000000".to_owned();
         assert!(from_previous_boot(&record(other)).unwrap());
+    }
+
+    /// A record with its own generation, so no two tests share a control
+    /// socket path under `/tmp`.
+    fn unique_record(phase: OwnerPhase) -> OwnerRecord {
+        use ring::rand::{SecureRandom, SystemRandom};
+        let mut nonce = [0u8; 16];
+        SystemRandom::new().fill(&mut nonce).unwrap();
+        let mut record = record(current_boot_id().unwrap().unwrap());
+        record.nonce = hex::encode(nonce);
+        record.phase = phase;
+        record
+    }
+
+    /// An owner directory holding `record`, as `prepare` publishes one.
+    fn owner_directory(parent: &Path, name: &str, record: &OwnerRecord) -> PathBuf {
+        let directory = parent.join(name);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .unwrap();
+        persist(&directory, record).unwrap();
+        directory
+    }
+
+    /// A process group that has already gone: its leader ran `true` and
+    /// was reaped.
+    fn absent_group() -> u32 {
+        let mut child = Command::new("true").process_group(0).spawn().unwrap();
+        child.wait().unwrap();
+        child.id()
+    }
+
+    /// What a crash or power loss can leave beside a launch's record:
+    /// helpers that never started, finished, or ran a command that has
+    /// since gone, a helper directory whose record was never written, and
+    /// the temporary of an atomic write that never got its rename.
+    fn leave_crash_leftovers(launch: &Path) {
+        for (name, phase) in [
+            ("exec-prepared", OwnerPhase::Prepared),
+            ("exec-cancelled", OwnerPhase::Cancelled),
+            ("exec-retiring", OwnerPhase::Retiring { exit_code: Some(0) }),
+            ("exec-retired", OwnerPhase::Retired { exit_code: Some(0) }),
+            (
+                "exec-gone",
+                OwnerPhase::Running {
+                    pid: absent_group(),
+                },
+            ),
+        ] {
+            owner_directory(launch, name, &unique_record(phase));
+        }
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(launch.join("exec-unwritten"))
+            .unwrap();
+        std::fs::write(launch.join(".reliaburger-abandoned"), b"{\"partial").unwrap();
+    }
+
+    fn entries(directory: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A finished launch keeps its record and loses every leftover that no
+    /// helper can still use.
+    #[test]
+    fn a_finished_launch_loses_the_leftovers_of_a_crash() {
+        let parent = tempfile::tempdir().unwrap();
+        let launch = owner_directory(
+            parent.path(),
+            "launch",
+            &unique_record(OwnerPhase::Retired { exit_code: Some(0) }),
+        );
+        leave_crash_leftovers(&launch);
+
+        remove_leftovers(&launch).unwrap();
+
+        assert_eq!(entries(&launch), ["owner.json"]);
+    }
+
+    /// A helper whose owner still holds its lock, or whose command still
+    /// runs, keeps its directory: its record, output and lock are in use.
+    #[test]
+    fn a_live_exec_helper_keeps_its_directory() {
+        let parent = tempfile::tempdir().unwrap();
+        let launch = owner_directory(
+            parent.path(),
+            "launch",
+            &unique_record(OwnerPhase::Retired { exit_code: Some(0) }),
+        );
+        let locked = owner_directory(&launch, "exec-locked", &unique_record(OwnerPhase::Prepared));
+        let _helper_owner = lock_owner(&locked).unwrap();
+        let mut command = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        owner_directory(
+            &launch,
+            "exec-running",
+            &unique_record(OwnerPhase::Running { pid: command.id() }),
+        );
+
+        let result = remove_leftovers(&launch);
+        let _ = command.kill();
+        let _ = command.wait();
+
+        result.unwrap();
+        assert_eq!(
+            entries(&launch),
+            ["exec-locked", "exec-running", "owner.json"]
+        );
+        assert!(locked.join("owner.json").exists());
+    }
+
+    /// Retirement is the moment a launch finishes, so it tidies there too.
+    #[test]
+    fn retirement_removes_the_leftovers_of_a_crash() {
+        let parent = tempfile::tempdir().unwrap();
+        let mut record = unique_record(OwnerPhase::Retiring { exit_code: Some(3) });
+        let launch = owner_directory(parent.path(), "launch", &record);
+        leave_crash_leftovers(&launch);
+
+        complete_retirement(&launch, &mut record).unwrap();
+
+        assert!(matches!(
+            load(&launch).unwrap().phase,
+            OwnerPhase::Retired { exit_code: Some(3) }
+        ));
+        assert_eq!(entries(&launch), ["owner.json"]);
     }
 }

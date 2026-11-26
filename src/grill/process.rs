@@ -572,6 +572,19 @@ impl ProcessGrill {
         }
     }
 
+    /// Remove what a crash or power loss left in the owners' directories:
+    /// stale unpublished preparations, and each finished launch's abandoned
+    /// write temporaries and unused exec helper directories (#2363). Bun
+    /// calls it once at startup, before recovery. Nothing a live launch or
+    /// a live exec helper uses is touched. Without an owner there's nothing
+    /// to tidy.
+    pub async fn remove_owner_leftovers(&self) -> std::io::Result<()> {
+        match &self.control {
+            Some(control) => control.remove_leftovers().await,
+            None => Ok(()),
+        }
+    }
+
     #[cfg(target_os = "linux")]
     pub(crate) fn executor_directory(&self) -> Result<PathBuf, GrillError> {
         self.log_dir

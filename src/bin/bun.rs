@@ -1263,6 +1263,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         config.runtime.stop_confirmation_timeout(),
     )
     .await?;
+    // Housekeeping before recovery: a failure leaves files, never a workload.
+    if let Err(error) = runtime.remove_owner_leftovers().await {
+        eprintln!("bun: cannot tidy process owner leftovers: {error}");
+    }
     #[cfg(target_os = "linux")]
     let (durable_discovery, durable_kernel) = match &runtime {
         AnyGrill::Runc(runtime) if runtime.is_rootless() => {

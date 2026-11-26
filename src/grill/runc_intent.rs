@@ -558,6 +558,7 @@ impl IntentClaim {
                         "runtime exit evidence changed after retirement",
                     ));
                 }
+                remove_abandoned_writes(&self.journal, &self.instance)?;
                 return Ok(self);
             }
             record.phase = IntentPhase::Retired { exit_code };
@@ -573,6 +574,7 @@ impl IntentClaim {
                     .join(&self.instance.0),
                 record,
             )?;
+            remove_abandoned_writes(&self.journal, &self.instance)?;
             Ok(self)
         })
         .await
@@ -622,6 +624,16 @@ impl IntentClaim {
         .await
         .map_err(io::Error::other)?
     }
+}
+
+/// Remove the temporaries of intent writes a crash cut short (#2363).
+///
+/// Call only from a claim that is retiring its generation: the claim's lock
+/// excludes every other writer of the record.
+fn remove_abandoned_writes(journal: &IntentJournal, instance: &InstanceId) -> io::Result<()> {
+    crate::sesame::identity::remove_abandoned_atomic_writes(
+        &journal.directory.join("records").join(&instance.0),
+    )
 }
 
 fn persist(directory: &Path, record: &RuntimeIntent) -> io::Result<()> {
@@ -748,6 +760,37 @@ mod inventory_tests {
         let claim = claim.publish(&spec()).await.unwrap();
         let claim = claim.retire(Some(0)).await.unwrap();
         claim.record().unwrap().generation.clone()
+    }
+
+    /// A crash between an intent write and its rename leaves a temporary
+    /// beside `intent.json`. An owned generation keeps it, since a write may
+    /// be under way; retirement, and a retirement replayed by recovery,
+    /// removes it (#2363).
+    #[tokio::test]
+    async fn retirement_removes_abandoned_intent_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = journal(root.path());
+        let instance = InstanceId("default__web-0".into());
+        let claim = journal.claim(&instance, None).await.unwrap();
+        let claim = claim.publish(&spec()).await.unwrap();
+        let directory = journal.directory.join("records").join(&instance.0);
+        let abandoned = directory.join(".reliaburger-crashed");
+        std::fs::write(&abandoned, b"{").unwrap();
+        let claim = claim.retain_network(1).await.unwrap();
+        assert!(abandoned.exists());
+
+        let reference = match &claim.record().unwrap().network_reference {
+            Some(NetworkReferenceState::Held(reference)) => reference.clone(),
+            other => panic!("{other:?}"),
+        };
+        let claim = claim.release_network(reference).await.unwrap();
+        let claim = claim.retire(Some(0)).await.unwrap();
+        assert!(!abandoned.exists());
+
+        std::fs::write(&abandoned, b"{").unwrap();
+        claim.retire(Some(0)).await.unwrap();
+        assert!(!abandoned.exists());
+        assert!(directory.join("intent.json").exists());
     }
 
     #[tokio::test]

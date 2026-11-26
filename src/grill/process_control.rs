@@ -15,7 +15,7 @@ use ring::rand::{SecureRandom, SystemRandom};
 
 use super::InstanceId;
 use super::oci::OciSpec;
-use super::process_owner::{self, OwnerPhase, OwnerRecord, ProcessLaunch};
+use super::process_owner::{self, OwnerPhase, OwnerRecord, ProcessLaunch, remove_control_socket};
 use crate::durable::validate_directory;
 use crate::file_lock::{FileLock, FileLockError};
 
@@ -37,6 +37,7 @@ pub(crate) const OWNER_SOCKET_EXEC_TIMEOUT: Duration = Duration::from_secs(310);
 /// line in the journal and nothing else.
 const EXEC_REPORT_AFTER: Duration = Duration::from_secs(30);
 
+mod leftovers;
 mod prune;
 
 /// How many times `prepare` starts again after a concurrent forget removed
@@ -868,21 +869,6 @@ fn wait_for_owner_lock(directory: &Path) -> io::Result<FileLock> {
     }
 }
 
-fn remove_control_socket(record: &OwnerRecord) -> io::Result<()> {
-    let socket = process_owner::socket_path(record);
-    let parent = socket
-        .parent()
-        .ok_or_else(|| io::Error::other("invalid socket path"))?;
-    match process_owner::validate_socket_directory(parent) {
-        Ok(()) => {
-            process_owner::remove_socket(&socket)?;
-            std::fs::remove_dir(parent)
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
 /// Requests made to a live owner before a dropped connection is an error.
 const OWNER_REQUEST_ATTEMPTS: u32 = 10;
 
@@ -1097,7 +1083,7 @@ mod tests {
         );
     }
 
-    fn spec() -> OciSpec {
+    pub(super) fn spec() -> OciSpec {
         use super::super::oci::{OciLinux, OciProcess, OciRoot, OciUser};
         OciSpec {
             managed_volumes: Vec::new(),

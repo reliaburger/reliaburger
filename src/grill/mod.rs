@@ -416,9 +416,9 @@ pub struct RuntimeLaunch {
     pub generation: RuntimeGeneration,
     /// Canonical workload identity.
     pub instance_id: InstanceId,
-    /// Specification committed for this generation. A retired Runc generation
-    /// keeps environment variable names only, so compare it with
-    /// [`RuntimeLaunch::launched`], never `==`.
+    /// Specification committed for this generation. A retired generation,
+    /// runc or process, keeps environment variable names only, so compare it
+    /// with [`RuntimeLaunch::launched`], never `==`.
     pub spec: OciSpec,
     /// Original address hold or release receipt from the same durable runtime intent.
     /// Process runtimes have no reusable container address and return None.
@@ -826,6 +826,19 @@ pub enum AnyGrill {
 }
 
 impl AnyGrill {
+    /// Remove what a crash or power loss left under the process runtime's
+    /// owners, as [`ProcessGrill::remove_owner_leftovers`] describes. A
+    /// runtime without process owners has nothing to tidy.
+    pub async fn remove_owner_leftovers(&self) -> std::io::Result<()> {
+        match self {
+            Self::Process(runtime) => runtime.remove_owner_leftovers().await,
+            #[cfg(target_os = "linux")]
+            Self::Mixed(runtime) => runtime.host().remove_owner_leftovers().await,
+            #[allow(unreachable_patterns)]
+            _ => Ok(()),
+        }
+    }
+
     #[cfg(target_os = "linux")]
     pub fn runc_runtime(&self) -> Option<&runc::RuncGrill> {
         match self {

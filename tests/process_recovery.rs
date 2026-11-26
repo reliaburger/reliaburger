@@ -1886,3 +1886,100 @@ async fn a_live_launch_keeps_its_environment_until_it_retires() {
             .unwrap()
     );
 }
+
+/// Leave in `owner`, an instance's owner directory, what a crash or power
+/// loss can: an exec helper directory whose record was never written, and
+/// the temporary of an atomic write that never got its rename (#2363).
+fn leave_crash_leftovers(owner: &Path) {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(owner.join("exec-crashed"))
+        .unwrap();
+    std::fs::write(owner.join(".reliaburger-crashed"), b"{").unwrap();
+}
+
+/// The names in `owner` a crash can leave behind.
+fn owner_leftovers(owner: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(owner)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.starts_with("exec-") || name.starts_with(".reliaburger-"))
+        .collect();
+    names.sort();
+    names
+}
+
+/// A live launch and its running exec keep every file; its retirement
+/// removes what an earlier crash left, and so does a later startup.
+#[tokio::test]
+async fn retirement_and_startup_remove_what_a_crash_left_behind() {
+    let directory = tempfile::tempdir().unwrap();
+    let owners = directory.path().join("process-owners");
+    let id = InstanceId("default__leftovers-0".into());
+    let owner = owners.join(&id.0);
+    let grill = std::sync::Arc::new(runtime(directory.path()));
+    grill.create(&id, &spec("sleep 60")).await.unwrap();
+    grill.start(&id).await.unwrap();
+    let marker = directory.path().join("exec-pid");
+    let command = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        format!("echo $$ > '{}'; exec sleep 60", marker.display()),
+    ];
+    let exec = {
+        let grill = grill.clone();
+        let id = id.clone();
+        tokio::spawn(async move { grill.exec(&id, &command).await })
+    };
+    let exec_pid = read_exec_pid(&marker).await;
+    leave_crash_leftovers(&owner);
+    let live = owner_leftovers(&owner);
+    assert_eq!(live.len(), 3, "{live:?}");
+
+    // Startup while the launch and its exec run touches none of it.
+    runtime(directory.path())
+        .remove_owner_leftovers()
+        .await
+        .unwrap();
+    assert_eq!(owner_leftovers(&owner), live);
+    let helper = live
+        .iter()
+        .find(|name| name.starts_with("exec-") && *name != "exec-crashed")
+        .unwrap();
+    assert!(owner.join(helper).join("owner.json").exists());
+    assert!(reliaburger::grill::records::process_start_time(exec_pid).is_some());
+
+    grill.kill(&id).await.unwrap();
+    stopped(&grill, &id).await;
+    // The kill interrupts the exec; its answer doesn't matter here.
+    let _ = exec.await;
+    assert!(exec_process_is_gone(exec_pid).await);
+    assert_eq!(owner_leftovers(&owner), Vec::<String>::new());
+
+    // A power cut after retirement: startup recovery tidies it, and an
+    // unpublished preparation abandoned long ago, but keeps the record.
+    leave_crash_leftovers(&owner);
+    let staging = owners.join(".preparing-crashed");
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&staging)
+            .unwrap();
+    }
+    let long_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+    std::fs::File::open(&staging)
+        .unwrap()
+        .set_modified(long_ago)
+        .unwrap();
+    let recovered = runtime(directory.path());
+    recovered.remove_owner_leftovers().await.unwrap();
+    assert_eq!(owner_leftovers(&owner), Vec::<String>::new());
+    assert!(!staging.exists());
+    assert_eq!(recovered.state(&id).await.unwrap(), ContainerState::Stopped);
+    assert_eq!(
+        recovered.launch_inventory().await.unwrap().unwrap()[0].instance_id,
+        id
+    );
+}
