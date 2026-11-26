@@ -1770,6 +1770,7 @@ fn adoption_record(id: &InstanceId, script: &str) -> reliaburger::grill::records
         app_spec: None,
         oci_spec,
         rootless_network: None,
+        sidecar_restarts: None,
     }
 }
 
