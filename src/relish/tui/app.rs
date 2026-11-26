@@ -746,6 +746,7 @@ mod tests {
             result: Ok(crate::smoker::types::FaultSummary {
                 id: 7,
                 fault_type: "kill".into(),
+                kind: crate::smoker::types::FaultKind::Kill { count: 1 },
                 target_service: "web".into(),
                 namespace: Some("default".into()),
                 target_instance: Some("web-1".into()),

@@ -315,6 +315,7 @@ impl DataProvider for MockDataProvider {
         Ok(FaultSummary {
             id: 1,
             fault_type: "kill".into(),
+            kind: crate::smoker::types::FaultKind::Kill { count: 1 },
             target_service: target.app.clone(),
             namespace: Some(target.namespace.clone()),
             target_instance: Some(target.instance.clone()),
@@ -427,7 +428,8 @@ mod tests {
                         return axum::response::IntoResponse::into_response((code, body));
                     }
                     axum::response::IntoResponse::into_response(Json(serde_json::json!({
-                        "id": 7, "fault_type": "kill", "target_service": "web",
+                        "id": 7, "fault_type": "kill", "kind": {"type": "Kill", "count": 1},
+                        "target_service": "web",
                         "namespace": "default", "target_instance": "web-1",
                         "target_node": "node-2", "remaining_secs": 0,
                         "injected_by": "admin"

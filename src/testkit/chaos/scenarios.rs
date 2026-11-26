@@ -668,6 +668,7 @@ mod tests {
                 task_index: None,
                 id: 7,
                 fault_type: "node-kill".to_string(),
+                kind: crate::smoker::types::FaultKind::NodeKill,
                 target_service: String::new(),
                 namespace: None,
                 target_instance: None,

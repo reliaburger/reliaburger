@@ -940,6 +940,7 @@ mod tests {
             task_index: None,
             id,
             fault_type: "kill".to_string(),
+            kind: crate::smoker::types::FaultKind::Kill { count: 1 },
             target_service: service.to_string(),
             namespace: Some("default".to_string()),
             target_instance: None,

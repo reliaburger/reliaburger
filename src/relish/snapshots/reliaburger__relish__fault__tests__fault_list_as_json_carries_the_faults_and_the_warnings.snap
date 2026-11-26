@@ -7,6 +7,10 @@ expression: "crate::relish::output::format_output(&FaultList(listing),\nOutputFo
     {
       "id": 1,
       "fault_type": "kill",
+      "kind": {
+        "type": "Kill",
+        "count": 1
+      },
       "target_service": "web",
       "namespace": "default",
       "target_instance": null,

@@ -2590,7 +2590,35 @@ pub fn replicas_out_of_service(fault_type: &FaultType) -> u32 {
 }
 ```
 
-Match arms are tried in order, so `Kill { count: 0 }` (every replica) is caught before the general `Kill { count }` binds the count. `KILL_ALL_REPLICAS` is `u16::MAX`: more replicas than any service has, but small enough that adding a few never overflows the `u32` the rail sums in (`fold(0, u32::saturating_add)` makes sure of that anyway). The same function serves the node's own registry and the cluster-wide evidence a routed kill is judged by, which reads each node's fault list over HTTP and recovers the type from its displayed form. A replica that restarts within the ten seconds counts as gone a little longer than it is, which only makes the rail stricter. The `relish fault list` line a kill leaves for those ten seconds is the visible side of it.
+Match arms are tried in order, so `Kill { count: 0 }` (every replica) is caught before the general `Kill { count }` binds the count. `KILL_ALL_REPLICAS` is `u16::MAX`: more replicas than any service has, but small enough that adding a few never overflows the `u32` the rail sums in (`fold(0, u32::saturating_add)` makes sure of that anyway). The same function serves the node's own registry and the cluster-wide evidence a routed kill is judged by, which reads each node's fault list over HTTP. A replica that restarts within the ten seconds counts as gone a little longer than it is, which only makes the rail stricter. The `relish fault list` line a kill leaves for those ten seconds is the visible side of it.
+
+At first that evidence recovered each fault's type from its displayed form: `"pause"`, `"kill 2"`, `"kill (all)"`, parsed back into a `FaultType`. It worked, and it was a trap. The fault list's `fault_type` is text for people, and whoever next makes it friendlier (`"SIGKILL x2"`, say) would have turned every peer's kill into "not a kill" without a single test going red, because the parser just returns zero for text it doesn't know. A safety rail that a copy edit can weaken isn't a rail (#2353).
+
+So in 0.4.0 the fault list carries the type as data too. `FaultSummary` gains a `kind` beside the text:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum FaultKind {
+    Delay,
+    Drop,
+    // ...one variant per FaultType...
+    Kill { count: u32 },
+    Pause,
+    // ...
+}
+```
+
+It's `FaultType` with the parameters people read stripped off, except a kill's count, which the rail needs. `#[serde(tag = "type")]` is the same *internally tagged* representation `FaultType` uses: the variant's name goes in a `"type"` field next to its own fields, so a kill of two crosses the wire as `{"type": "Kill", "count": 2}` and a pause as `{"type": "Pause"}`. `From<&FaultType>` builds one with an exhaustive `match`, so adding a fault type without deciding its kind doesn't compile, and `replicas_out_of_service` now lives on `FaultKind` and lists every variant rather than ending in `_ => 0`. The free function the registry calls is one line, `FaultKind::from(fault_type).replicas_out_of_service()`, so the node's own count and the cluster's can't drift apart.
+
+The evidence then reads the field and nothing else:
+
+```rust
+.map(|fault| fault.kind.replicas_out_of_service())
+.fold(0, u32::saturating_add);
+```
+
+The test that keeps it honest builds fault lists whose text lies: a kill shown as `"SIGKILL x1 (settling)"`, a pause shown as `"frozen"`, an NXDOMAIN shown as `"pause"`, a resume shown as `"kill 5"`. The rail must count exactly the kill and the pause. `kind` is a required field, so a list from a node that doesn't send it fails to decode instead of reading as "nothing out of service". That's a wire change, and it rides 0.4.0's one protocol bump (62/77), so a 0.3.x node is refused at the door rather than half understood.
 
 The game keeps a rule of its own as well: in kill mode it holds fire while a kill is out. That isn't the protection any more; the server is. It's about what the screen says. The console gives bun ten seconds, and the server's path can take longer (a leader read, the cluster-wide evidence, the signal), so a timeout doesn't mean the kill failed. Only a 4xx is a clear no, which brings the invader back. A timeout, a dropped connection or a 5xx is `KillAnswer::Unknown`: the game says so, and holds fire until the workload list shows the instance has left `running` or restarted (its restart count moved), or 30 seconds have passed, by which time the server's own window has closed too.
 
