@@ -8479,6 +8479,22 @@ pins down the crash case: a write that fails off the turn fences discovery,
 the caller hears the error, and the receipt is still on disk for the next
 acknowledgement.
 
+One of those tests later caught us out, not the product (#2352).
+`a_receipt_confirmation_waits_off_the_loop_for_a_write_already_in_flight`
+sends the confirmation behind another writer's write, lands that write,
+takes the confirmation's own turn and then awaits the reply. Its own write
+gets the usual 500 ms. On a quiet disk it lands well inside that, the
+turn answers, and the test passes. On a Studio at load 14 it sometimes
+didn't: the write went in flight, the reply now belonged to a landing turn
+the test never took, and `reply.await` waited until nextest killed it at
+60 s. Hold the write for 600 ms and it fails every time. The loop itself
+was fine, because its `select!` always lands a write in flight. So the
+test now takes the landing turn whenever the write is still going, and
+checks it's `consumer_receipt/landed`. A sibling test makes that slow
+path happen on purpose. Every wait for a landing or a reply has a 30 s
+deadline too, so the next missing landing fails with a sentence instead
+of a kill.
+
 #### And the stragglers
 
 Three waits were left after the receipt (#1336). The first was the one
