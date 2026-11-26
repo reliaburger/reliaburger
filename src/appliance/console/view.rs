@@ -62,11 +62,14 @@ pub fn render(frame: &mut Frame<'_>, state: &ConsoleState) {
         Tab::Cluster => cluster_lines(state, height),
         Tab::Versions => version_lines(state),
         Tab::Logs => log_lines(state, height),
+        Tab::Invaders => invader_lines(state, height),
     };
     frame.render_widget(Paragraph::new(lines), inner);
 
     let keys = if state.keyless {
         " read-only; this OS image's console takes no keys"
+    } else if state.tab == Tab::Invaders {
+        " h l or <- -> aim   space fire   r new wave   Tab leave"
     } else if state.can_quit {
         " 1-6 or <- -> tabs   up/down scroll   q quit   read-only"
     } else {
@@ -115,7 +118,7 @@ fn bun_word(local: &LocalStatus) -> (&'static str, Color) {
 /// brackets.
 fn tab_bar(current: Tab) -> Line<'static> {
     let mut spans = vec![Span::raw(" ")];
-    for tab in Tab::ALL {
+    for tab in Tab::SHOWN {
         let label = format!("{} {}", tab.number(), tab.title());
         if tab == current {
             spans.push(Span::styled(
@@ -525,6 +528,18 @@ fn fit(text: &str, width: usize) -> String {
     }
 }
 
+/// `text` cut to `width` columns from the left, marked with `~`, so the end
+/// survives: an invader's label ends with what tells it apart (`web-0`).
+fn fit_tail(text: &str, width: usize) -> String {
+    let count = text.chars().count();
+    if count <= width {
+        return text.to_string();
+    }
+    std::iter::once('~')
+        .chain(text.chars().skip(count + 1 - width))
+        .collect()
+}
+
 // --- 4 Cluster ---
 
 fn cluster_lines(state: &ConsoleState, height: usize) -> Vec<Line<'static>> {
@@ -718,6 +733,152 @@ fn log_lines(state: &ConsoleState, height: usize) -> Vec<Line<'static>> {
     lines
 }
 
+// --- 7 Invaders ---
+
+/// The invader sprite, two lines of six columns.
+const SPRITE: [&str; 2] = ["_/OO\\_", "\\/  \\/"];
+
+/// The game: whether kill mode is on, the formation, the cannon and what
+/// the last shot did.
+fn invader_lines(state: &ConsoleState, height: usize) -> Vec<Line<'static>> {
+    use super::invaders::{CELL_WIDTH, FIELD_WIDTH, MAX_ROWS, PER_ROW};
+
+    let mut lines = vec![kill_mode_line(state), Line::raw("")];
+    if !state.local.bun_up() {
+        lines.push(bun_down_line("list of workloads to play with"));
+        return lines;
+    }
+    let Some(rows) = &state.workloads.value else {
+        lines.push(muted("asking bun for this node's workloads..."));
+        return lines;
+    };
+    let invaders = state.invaders();
+    let colour = if state.kill_mode() { BAD } else { GOOD };
+    let label_width = CELL_WIDTH - 1;
+    let rows_used = invaders.len().div_ceil(PER_ROW).min(MAX_ROWS);
+    for row in 0..rows_used {
+        let mut field = [
+            vec![' '; FIELD_WIDTH],
+            vec![' '; FIELD_WIDTH],
+            vec![' '; FIELD_WIDTH],
+        ];
+        for (index, invader) in invaders.iter().enumerate() {
+            let Some((at_row, column)) = state.game.position(index) else {
+                break;
+            };
+            if at_row != row {
+                continue;
+            }
+            let sprite_at = column + (label_width - SPRITE[0].len()) / 2;
+            for (line, sprite) in SPRITE.iter().enumerate() {
+                paint(&mut field[line], sprite_at, sprite);
+            }
+            let label = fit_tail(&invader.label, label_width);
+            let label_at = column + (label_width - label.chars().count()) / 2;
+            paint(&mut field[2], label_at, &label);
+        }
+        for line in field {
+            lines.push(Line::styled(
+                line.into_iter().collect::<String>().trim_end().to_string(),
+                Style::default().fg(colour),
+            ));
+        }
+        lines.push(Line::raw(""));
+    }
+    // The cannon sits on the last line but one; the laser climbs to it.
+    let filler = height.saturating_sub(lines.len() + 2);
+    let laser = state
+        .game
+        .laser
+        .map(|column| format!("{}|", " ".repeat(column)));
+    for _ in 0..filler {
+        lines.push(Line::raw(laser.clone().unwrap_or_default()));
+    }
+    let mut cannon = vec![' '; FIELD_WIDTH];
+    paint(&mut cannon, state.game.cannon.saturating_sub(1), "/A\\");
+    lines.push(Line::styled(
+        cannon
+            .into_iter()
+            .collect::<String>()
+            .trim_end()
+            .to_string(),
+        title_style(),
+    ));
+    let waiting = invaders.len().saturating_sub(PER_ROW * MAX_ROWS);
+    lines.push(shot_line(
+        state,
+        rows.is_empty(),
+        invaders.is_empty(),
+        waiting,
+    ));
+    lines
+}
+
+/// Write `text` into `line` from column `at`, as far as the line goes.
+fn paint(line: &mut [char], at: usize, text: &str) {
+    for (cell, character) in line.iter_mut().skip(at).zip(text.chars()) {
+        *cell = character;
+    }
+}
+
+fn kill_mode_line(state: &ConsoleState) -> Line<'static> {
+    if state.kill_mode() {
+        return Line::styled(
+            "KILL MODE ON: a hit kills that instance, as an audited Smoker fault.",
+            Style::default().fg(BAD).add_modifier(Modifier::BOLD),
+        );
+    }
+    match &state.settings.error {
+        Some(error) if state.settings.value.is_none() => muted(format!(
+            "Kill mode off (can't read the cluster's setting: {error}). A hit only pops."
+        )),
+        _ => muted("Kill mode off: a hit pops the invader and touches nothing."),
+    }
+}
+
+/// What the last shot did, or what there is to shoot at.
+fn shot_line(
+    state: &ConsoleState,
+    no_workloads: bool,
+    cleared: bool,
+    waiting: usize,
+) -> Line<'static> {
+    use super::invaders::Shot;
+    let waiting_on_bun = matches!(
+        state.game.last,
+        Some(Shot::Sending { .. } | Shot::Refused { .. } | Shot::Unknown { .. })
+    );
+    if cleared && !no_workloads && !waiting_on_bun {
+        return Line::raw("Wave cleared. r brings every invader back.");
+    }
+    match &state.game.last {
+        Some(Shot::Missed) => muted("Missed."),
+        Some(Shot::Popped { instance }) => {
+            Line::raw(format!("Pop! {instance} is gone until the next wave."))
+        }
+        Some(Shot::Sending { instance }) => {
+            warning(format!("Hit {instance}: asking Smoker to kill it..."))
+        }
+        Some(Shot::Killed { instance, fault_id }) => Line::styled(
+            format!("Smoker killed {instance} (fault {fault_id}; see relish fault list)."),
+            Style::default().fg(BAD),
+        ),
+        Some(Shot::Refused { instance, reason }) => {
+            warning(format!("{instance} survived: {reason}"))
+        }
+        Some(Shot::Unknown { instance, reason }) => warning(format!(
+            "{instance}: no clear answer ({reason}); holding fire until the list shows it"
+        )),
+        Some(Shot::Gone { instance }) => Line::styled(
+            format!("Smoker killed {instance} (see relish fault list)."),
+            Style::default().fg(BAD),
+        ),
+        None if no_workloads => Line::raw("No workloads run on this node: nothing to shoot."),
+        None if waiting > 0 => muted(format!("{waiting} more waiting off the field.")),
+        None => muted("One invader for each instance on this node."),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -826,10 +987,12 @@ mod tests {
         state
     }
 
-    fn instance(id: &str, state: &str, restarts: u32) -> InstanceStatus {
+    /// Instance `label` (`web-0`) of an app in `default`, with the id bun
+    /// gives it (`default__web-0`).
+    fn instance(label: &str, state: &str, restarts: u32) -> InstanceStatus {
         InstanceStatus {
-            id: id.into(),
-            app_name: id.split('-').next().unwrap_or(id).into(),
+            id: format!("default__{label}"),
+            app_name: label.split('-').next().unwrap_or(label).into(),
             namespace: "default".into(),
             state: state.into(),
             restart_count: restarts,
@@ -1018,6 +1181,67 @@ mod tests {
         let mut state = healthy_state(Tab::Workloads);
         state.update(Msg::Tick(FIXTURE_NOW + 30));
         state.update(Msg::Workloads(Err("no answer within 10 s".into())));
+        insta::assert_snapshot!(console(&state));
+    }
+
+    /// The workloads the game tests shoot at: four running instances, two
+    /// of them `web-0` in different namespaces, and the fixture's unhealthy
+    /// and pending ones, which get no invader.
+    fn invader_workloads() -> Vec<TopRow> {
+        let mut rows = workloads();
+        for label in ["web-1", "api-0"] {
+            rows.push(TopRow {
+                node: "node-1".into(),
+                instance: instance(label, "running", 0),
+                cpu_percent: None,
+                memory_bytes: None,
+                tasks: None,
+            });
+        }
+        let mut other = instance("web-0", "running", 0);
+        other.id = "team-b__web-0".into();
+        other.namespace = "team-b".into();
+        rows.push(TopRow {
+            node: "node-1".into(),
+            instance: other,
+            cpu_percent: None,
+            memory_bytes: None,
+            tasks: None,
+        });
+        rows
+    }
+
+    #[test]
+    fn invaders_with_kill_mode_off() {
+        let mut state = healthy_state(Tab::Invaders);
+        state.update(Msg::Workloads(Ok(invader_workloads())));
+        state.update(Msg::Settings(Ok(Default::default())));
+        insta::assert_snapshot!(console(&state));
+    }
+
+    /// Kill mode on, after bun refused a kill: the invader is back, and the
+    /// last line says why.
+    #[test]
+    fn invaders_in_kill_mode_after_a_refused_kill() {
+        let mut state = healthy_state(Tab::Invaders);
+        state.update(Msg::Workloads(Ok(invader_workloads())));
+        state.update(Msg::Settings(Ok(
+            crate::appliance::settings::ApplianceSettings {
+                console_chaos: true,
+            },
+        )));
+        state.game.cannon = 3;
+        state.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char(' '),
+            KeyModifiers::NONE,
+        )));
+        let kill = state.take_kill().expect("kill mode queues a kill");
+        state.update(Msg::KillAnswered {
+            instance: kill.instance,
+            answer: super::super::invaders::KillAnswer::Refused {
+                reason: "safety check failed: web would have no replica left".into(),
+            },
+        });
         insta::assert_snapshot!(console(&state));
     }
 

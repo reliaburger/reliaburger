@@ -145,8 +145,44 @@
 
     actions.appendChild(copy);
     actions.appendChild(open);
-    main.insertBefore(actions, main.firstChild);
+    actions.appendChild(themeButton());
+    // The homepage has a line for agents above its masthead, and the buttons
+    // sit on that line so nothing comes between the masthead and the title.
+    var banner = document.querySelector(".agent-banner");
+    if (banner) banner.appendChild(actions);
+    else main.insertBefore(actions, main.firstChild);
   }
+
+  // Light or dark. The site is light unless the visitor chose dark with this
+  // button before, in this browser; the stylesheet's dark rules hang off
+  // data-theme on the root element.
+  function storedTheme() {
+    try { return localStorage.getItem("theme"); } catch (error) { return null; }
+  }
+  function setTheme(theme) {
+    if (theme === "dark") document.documentElement.setAttribute("data-theme", "dark");
+    else document.documentElement.removeAttribute("data-theme");
+  }
+  function themeButton() {
+    var button = document.createElement("button");
+    button.type = "button";
+    button.className = "theme-toggle";
+    function show() {
+      var dark = document.documentElement.getAttribute("data-theme") === "dark";
+      button.textContent = dark ? "Light" : "Dark";
+      button.setAttribute("aria-label", dark ? "Switch to the light theme" : "Switch to the dark theme");
+      button.setAttribute("aria-pressed", dark ? "true" : "false");
+    }
+    button.addEventListener("click", function () {
+      var dark = document.documentElement.getAttribute("data-theme") === "dark";
+      setTheme(dark ? "light" : "dark");
+      try { localStorage.setItem("theme", dark ? "light" : "dark"); } catch (error) { /* private window */ }
+      show();
+    });
+    show();
+    return button;
+  }
+  setTheme(storedTheme());
   addPageActions();
 
   // The tour's commands sit in a <details>. A link to them (#tour-commands)

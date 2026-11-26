@@ -1166,6 +1166,7 @@ mod tests {
             .await;
         let spec = crate::grill::oci::OciSpec {
             managed_volumes: Vec::new(),
+            host_path_sources: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1254,6 +1255,7 @@ mod tests {
         let _ = grill.container_command(&["rm", "-f", &id.0], &id).await;
         let spec = crate::grill::oci::OciSpec {
             managed_volumes: Vec::new(),
+            host_path_sources: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1354,6 +1356,7 @@ mod tests {
         let id = InstanceId("apple-adopt-0".to_string());
         let spec = crate::grill::oci::OciSpec {
             managed_volumes: Vec::new(),
+            host_path_sources: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1416,6 +1419,7 @@ mod tests {
             app_spec: None,
             oci_spec: spec.clone(),
             rootless_network: None,
+            sidecar_restarts: None,
         };
 
         let fresh = AppleContainerGrill::new();

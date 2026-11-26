@@ -962,6 +962,13 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
             &cgroup.to_string_lossy(),
             None,
         );
+        // Before anything makes the attempt's cgroup; released once it has
+        // retired, so the namespace's last user removes the empty parents
+        // (#2324).
+        let cgroup_hold = self.runtime.honours_cgroup_path_for(&oci).then(|| {
+            crate::grill::workload_groups::WorkloadGroups::shared()
+                .hold(namespace, &format!("executor-{}", self.prefix))
+        });
         if template.image.is_some() && !singleton {
             oci.process.rlimits.push(crate::grill::oci::OciRlimit {
                 kind: "RLIMIT_FSIZE".into(),
@@ -1271,6 +1278,10 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
         if let Some(lease) = namespace_lease {
             lease.retired().await;
             remove_unused_task_cgroup(&cgroup).await;
+        }
+        // BLOCKING-OK: a few rmdirs on cgroupfs, an in-memory kernel interface
+        if let Some(hold) = cgroup_hold {
+            hold.release();
         }
         if let Some(run) = run_id {
             self.retire_singleton(run).await;

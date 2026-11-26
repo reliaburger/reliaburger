@@ -1948,6 +1948,18 @@ async fn receipt_turn(
     (end_scenario_turn(agent, turn), reply)
 }
 
+/// The answer a confirmation's reply carries, waited for no longer than
+/// [`LANDING_PATIENCE`]: a reply nothing will send fails here, not at
+/// nextest's kill.
+async fn answered(reply: oneshot::Receiver<Result<(), BunError>>) -> Result<(), BunError> {
+    tokio::time::timeout(LANDING_PATIENCE, reply)
+        .await
+        .unwrap_or_else(|_| {
+            panic!("the confirmation wasn't answered in {LANDING_PATIENCE:?}; is a write still in flight?")
+        })
+        .expect("the confirmation's reply was dropped unanswered")
+}
+
 /// Take the loop's turn for confirmations that waited for the journal.
 async fn waiting_receipts_turn(
     agent: &mut BunAgent<MockGrill>,
@@ -2066,13 +2078,13 @@ async fn a_receipt_confirmation_leaves_its_slow_journal_write_in_flight() {
         .set(LoopStall::Persist, std::time::Duration::ZERO);
     let landed = landing_turn(&mut agent).await;
     assert_eq!(landed.detail, Some("consumer_receipt/landed"), "{landed}");
-    assert!(reply.await.unwrap().is_ok());
+    assert!(answered(reply).await.is_ok());
     assert!(journalled_receipts(&agent).is_empty());
     assert!(agent.consumer_update(true).receipts.is_empty());
 
     // The second acknowledgement finds the receipt already forgotten.
     waiting_receipts_turn(&mut agent).await;
-    assert!(again.await.unwrap().is_ok());
+    assert!(answered(again).await.is_ok());
     assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached + 1);
 }
 
@@ -2126,7 +2138,64 @@ async fn a_receipt_confirmation_waits_off_the_loop_for_a_write_already_in_flight
         "{confirmed}"
     );
     assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached + 1);
-    assert!(reply.await.unwrap().is_ok());
+    // The confirmation's own write waits only until its turn's deadline. A
+    // loaded disk can keep it past that, and then only its landing turn
+    // answers (#2352).
+    if agent.discovery_write_in_flight() {
+        let landed = landing_turn(&mut agent).await;
+        assert_eq!(landed.detail, Some("consumer_receipt/landed"), "{landed}");
+    }
+    assert!(answered(reply).await.is_ok());
+    assert!(journalled_receipts(&agent).is_empty());
+}
+
+/// The same confirmation, on a disk that keeps its own write past its turn's
+/// deadline: the turn ends with the write in flight, and the turn that lands
+/// it answers (#2352).
+#[tokio::test]
+async fn a_receipt_confirmation_that_waited_is_answered_by_the_turn_landing_its_slow_write() {
+    let (mut agent, _root) = consumer_with_a_ready_receipt().await;
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let landing = agent
+        .write_discovery_inventory(
+            &crate::onion::service_id::ServiceId::new("system", "discovery"),
+            |_| {},
+            Some(tokio::time::Instant::now()),
+            super::discovery_ownership::WriteOwner::AskAgain {
+                branch: LoopBranch::FollowUp,
+                detail: "another_writer/landed",
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(landing, super::discovery_ownership::Landing::InFlight);
+    let (_, mut reply) = receipt_turn(&mut agent, 1).await;
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, std::time::Duration::ZERO);
+    landing_turn(&mut agent).await;
+
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, OUTLASTS_THE_TURN_DEADLINE);
+    let confirmed = waiting_receipts_turn(&mut agent).await;
+    assert!(confirmed.took < TURN_BUDGET, "{confirmed}");
+    assert!(
+        agent.discovery_write_in_flight(),
+        "the confirmation's turn waited for its own journal write: {confirmed}"
+    );
+    assert!(
+        reply.try_recv().is_err(),
+        "answered before its write landed"
+    );
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, std::time::Duration::ZERO);
+    let landed = landing_turn(&mut agent).await;
+    assert_eq!(landed.detail, Some("consumer_receipt/landed"), "{landed}");
+    assert!(answered(reply).await.is_ok());
     assert!(journalled_receipts(&agent).is_empty());
 }
 
@@ -2176,7 +2245,7 @@ async fn a_receipt_confirmation_whose_write_fails_off_the_turn_keeps_the_receipt
         .set(LoopStall::Persist, std::time::Duration::ZERO);
     landing_turn(&mut agent).await;
     assert!(
-        reply.await.unwrap().is_err(),
+        answered(reply).await.is_err(),
         "a failed write was confirmed"
     );
     assert!(matches!(
@@ -2821,9 +2890,23 @@ async fn probe_turn(
     agent.loop_meter.last_turn().unwrap()
 }
 
+/// How long a scenario waits for a write in flight to land, or for a reply
+/// a landing turn owes: well past any stalled write here, well inside
+/// nextest's 60 s kill, so a missing landing fails with its own message.
+const LANDING_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Wait for the write in flight to land, then take the loop's turn for it.
 async fn landing_turn(agent: &mut BunAgent<MockGrill>) -> crate::bun::loop_meter::TurnRecord {
-    let outcome = BunAgent::<MockGrill>::discovery_write_done(&mut agent.discovery_ownership).await;
+    assert!(
+        agent.discovery_write_in_flight(),
+        "no discovery write is in flight to land"
+    );
+    let outcome = tokio::time::timeout(
+        LANDING_PATIENCE,
+        BunAgent::<MockGrill>::discovery_write_done(&mut agent.discovery_ownership),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("the write in flight didn't land in {LANDING_PATIENCE:?}"));
     let turn = agent.begin_landing_turn();
     agent.land_write_in_flight(outcome).await;
     agent.consumer_syncs.end_turn();

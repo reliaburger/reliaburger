@@ -243,8 +243,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         sidecars::runs_beside(instance.state)
                             && state_sweep::Incarnation::of(instance) == read.incarnation
                     });
-                if current {
-                    self.sidecars.mark_exited(&read.id, Instant::now());
+                if current && self.sidecars.mark_exited(&read.id, Instant::now()) {
+                    // Its count and backoff outlive a Bun restart (#2336).
+                    self.record_sidecar_restarts(&read.id);
                 }
                 continue;
             }

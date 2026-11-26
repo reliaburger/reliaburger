@@ -20,6 +20,7 @@ fn instance(name: &str) -> InstanceId {
 fn spec() -> OciSpec {
     OciSpec {
         managed_volumes: Vec::new(),
+        host_path_sources: Vec::new(),
         reusable_executor: false,
         host_process: false,
         initialiser: false,

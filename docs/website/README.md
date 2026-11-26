@@ -36,14 +36,64 @@ isn't rotating by itself. The drawings are inline SVG animated by CSS in
 `style.css`, so reduced motion stills them and nothing loads from elsewhere.
 Without JavaScript all seven stay stacked.
 
+`assets/copy.js` also adds the theme button, "Dark" or "Light", beside the
+Markdown and Claude buttons. On the homepage the three sit on the line for
+agents above the masthead; on other pages they stay above the page's content.
+The site is light unless the visitor chose dark with that button: the choice is
+kept in `localStorage` and sets `data-theme="dark"` on the root element, and
+every dark rule in `style.css` hangs off that. A box the light theme paints
+with `var(--ink)` (a terminal, a recording, the whitepaper's band) must be
+listed in the dark theme's `var(--box)` rule, or it turns light there;
+`tests/suite/website.rs` fails when one is missing. The burger's loop has a
+white background that only vanishes on a light page, so in the dark theme it
+sits on a light plate.
+
+The two agent recordings (`#debug-recording-fold`, `#act-recording-fold`) fold
+behind a poster: a few of the session's commands, dimmed, under a play button.
+The poster's lines are plain text in an `aria-hidden` span, not `<code>`, so no
+test parses them; keep them to commands the session really ran. The player
+loads a recording when it comes into view, which happens when its fold opens.
+
 Don't add other scripts. The footer names all three, so change them together.
 
-Every `<section>` has a stable `id` (`scrutiny`, `why`, `install`, `tour`, `netboot`, `debug`,
-`start`, `docs`, `internals`, `next`, `contributing`) and every section heading a `#` permalink, shown on
+Every `<section>` has a stable `id` (`why`, `designed`, `act`, `debug`, `who`, `tour`, `install`,
+`scrutiny`, `release-testing`, `job-throughput`, `netboot`, `docs`, `internals`, `start`,
+`contributing`) and every section heading a `#` permalink, shown on
 hover or focus, so a section can be shared as `reliaburger.com/#install`.
 Renaming an `id` breaks links people have already shared; add a new section
-instead. `tests/suite/website.rs` checks the ids, the permalinks and that the
-page leads with the one-line install.
+instead. Three ids that used to be sections live on other elements, so old
+links still land: `#whitepaper` is the whitepaper's band, `#next` the next
+release's card under the install, and `#compare` the comparisons' entry in
+"Read more". `tests/suite/website.rs` checks the ids, the permalinks and that
+the page leads with the prompt for an agent.
+
+### The order of the page
+
+The page is written for a team with no platform team of its own, and makes one
+case: the platform is built for the AI agent you already have to run. The order
+follows from that.
+
+1. The hero: the title, one line on what a person gets, and the prompt to paste
+   into an agent. The one-line install is one link below it.
+2. Three facts, each linked to the record its numbers come from.
+3. The whitepaper's band, for readers who want the reasoning before the demo,
+   and under it the seven differences (`#why`), three of which it names.
+4. `#designed`, what an agent gets by name.
+5. Two real recordings of an agent at work, `#act` and `#debug`. Each section
+   is a paragraph and a "Watch the recording" fold, so the page reaches its
+   argument quickly; the player loads a recording when its fold opens. Then
+   `#who`, the contrast with a hosted platform and with Kubernetes, each
+   ending in what the other side still does better.
+6. The tour and the install, with the agent's tab first
+   and chosen, then where the project stands and the next two releases.
+7. The evidence: `#scrutiny`, `#release-testing`, `#job-throughput` and
+   `#netboot`. Each opens with its claim; the method and the full results fold.
+8. Reading, subsystems, building from source.
+
+A section answers one question. When one grows, fold the detail into a
+`<details class="tour-commands">` rather than add paragraphs above its
+recording. The tour's, the jobs' and the netboot recordings stay in plain view:
+people didn't find the tour while it sat in a fold.
 
 The player is asciinema-player 3.17.0 (Apache 2.0, `assets/asciinema/LICENSE`),
 the `dist/bundle/asciinema-player.min.js` and `asciinema-player.css` files from
@@ -53,6 +103,24 @@ the npm tarball
 The bundle is self-contained: no fonts, workers or other files to fetch. To
 upgrade, replace those three files from a newer tarball and check the
 recording still plays.
+
+### The homepage's drawings and its one photograph
+
+The homepage takes its colours from the burger: `style.css` defines `--mustard`,
+`--lettuce`, `--tomato`, `--onion` and `--bun`, each section sets `--tint` to
+one of them, and its number, its rule and its drawings use that. The dark theme
+redefines the five.
+
+"What's in the burger" (`#internals`) draws the burger as the architecture
+map, one inline SVG layer per subsystem, top to bottom, each beside the
+subsystem's name and its design document. A new subsystem needs a row and a
+drawing. The small drawings beside the three facts and the four design points
+are inline SVG too, drawn with `currentColor`.
+
+`assets/wyse-lab.webp` is the bare-metal section's photograph of the test rig:
+three Dell Wyse 3040s and a switch. It's a 1200×800 crop that shows only the
+machines, re-encoded so it carries no camera metadata. Replace it the same way
+if the rig changes.
 
 ### Recording the netboot demo
 
@@ -95,7 +163,7 @@ all built from the server name and command line `relish agent setup` writes.
 The README carries the same links through cursor.com and vscode.dev, because
 GitHub drops links with other schemes.
 
-The "Debug the platform, not just your app" section (`#debug`) shows what an
+The "Watch it debug the platform, not just your app" section (`#debug`) shows what an
 agent does from 0.2.7. Its commands carry `data-agent-command`, and
 `tests/suite/website.rs` parses each with the real CLI. Its recording slot
 (`#agent-recording`) has no `data-cast` until a real session is recorded
@@ -259,9 +327,9 @@ The table under the recording keeps its own five-round medians.
 ### Recording the agent sessions
 
 Two slots on the homepage wait for a real agent session: `#agent-recording`
-in "Debug the platform, not just your app"
+in "Watch it debug the platform, not just your app"
 ([#1678](https://github.com/reliaburger/reliaburger/issues/1678)), and
-`#act-recording` in "Let your agent act, then take it back"
+`#act-recording` in "Watch it propose a change, then take it back"
 ([#1690](https://github.com/reliaburger/reliaburger/issues/1690)).
 `scripts/record/recording.py` records both through the agent gym. The gym
 builds the cluster (and, for the first, the planted `relish`), sets up the
@@ -393,6 +461,42 @@ paragraph. `tests/suite/website.rs` accepts either state of each slot, and
 nothing in between. Commit the cast with the run's `recording.json`
 summary in the PR description: the model, the cost and the gym's verdict.
 
+#### 3. An agent sets up a cluster (the hero)
+
+The fold under the hero's prompt plays `assets/agent-setup.cast`: Claude Code,
+with a shell and an empty `RELIABURGER_HOME`, given the homepage's one line and
+nothing else. It doesn't go through the gym: there's no cluster to prepare and
+no answer to score. The session has two turns, because the playbook tells the
+agent to ask where the cluster should run and wait. The recording types the
+person's answer between them ("This computer. Go ahead, you don't need to ask
+me anything else."), and at the end you run `relish nodes` and `relish status`
+at your own prompt.
+
+```sh
+python3 scripts/record/recording.py setup \
+  --cast docs/website/assets/agent-setup.cast \
+  --out ~/rb-setup-recording --home ~/rbrec
+```
+
+`--home` must be a new, short path; Lima's control sockets live under it, and
+the session's `relish`, its VMs and its context all stay there, so a cluster
+this machine already talks to is untouched. The recording destroys the cluster
+and removes `--home` when it ends, whatever happened. It needs what the laptop
+install needs: Apple silicon or Linux with KVM, about 8 GiB of free memory and
+15 GiB of disk. The session may run any shell command and fetch
+reliaburger.com, as a visitor's own agent would, so record on a machine where
+that's acceptable.
+
+The cast is kept only when:
+
+- the session ran the installer (`reliaburger.com/install.sh`);
+- it had both turns, and neither ended in an error;
+- your `relish nodes` and `relish status` both exited 0.
+
+`python3 scripts/record/recording.py prompt setup` prints the prompt, which a
+test holds to the homepage's own line. Re-record it when the playbook on
+`/agents` or the laptop install changes what a session does.
+
 ### Soak charts
 
 "How a release is tested" (`#release-testing`) shows the released version's
@@ -448,8 +552,8 @@ same paragraph, `<details>` or section. The generated command list in the
 manual's reference chapter labels such commands itself. When the installer's default changes, regenerate
 the snapshot; the test refuses a snapshot for another version.
 
-The page leads with the one-line install now that releases are published;
-building from source is the second path. Update the release-status paragraph
+The page leads with the prompt for an agent; the one-line install is the
+install section's second tab, and building from source is the last path. Update the release-status paragraph
 (version, date and release-notes link) and the install section's release-notes
 link when you promote a release. The source quickstart intentionally matches
 `examples/phase-1/proc-first-run.toml` and `examples/node/process-runtime.toml`.

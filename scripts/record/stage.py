@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """What a website recording shows. recording.py runs this inside `asciinema rec`.
 
-    python3 scripts/record/stage.py debug|act
+    python3 scripts/record/stage.py debug|act|setup
 
 It narrates the setup in a few comment lines, runs the Claude Code session
 recording.py built (print mode, stream-json) and shows each event as it
@@ -16,6 +16,9 @@ Then the person's part, typed at a prompt the way the tour types it:
 - `debug`: you read the report the agent drafted. Nothing is posted.
 - `act`: you show, approve and undo the agent's proposal, with your own
   token, never the agent's.
+- `setup`: the session has two turns, because the playbook tells the agent
+  to ask where the cluster should run and wait. You answer between them,
+  and at the end you look at the cluster it built.
 
 Each part opens with a bold `» Title` line, which recording.py turns into a
 chapter marker. recording.py passes everything through the environment:
@@ -27,7 +30,9 @@ chapter marker. recording.py passes everything through the environment:
   STAGE_PERSON_TOKEN   (act) the person's token; the session never sees it
   STAGE_PERSON_PATH    (act) the person's PATH: the real relish, not the gym's shim
   STAGE_AGENT_NAME     (act) the agent token's name, to find its proposal
-  STAGE_PERSON_LOG     (act) where to write what the person's commands answered
+  STAGE_PERSON_LOG     (act, setup) where to write what the person's commands answered
+  STAGE_RESUME_ARGV    (setup) the command line that resumes the session, as a JSON list
+  STAGE_REPLY          (setup) the file holding the person's answer
 """
 import json
 import os
@@ -63,6 +68,10 @@ SAVE_PATCH = "Save the patch"
 PATCH_FILE = re.compile(r"\.(diff|patch)$")
 WRITTEN = re.compile(r"^✎ (?:edit|write) (.+)$")
 
+PLAYBOOK = "Read the playbook"
+INSTALL = "Install and build"
+LOOK = "Look around"
+
 # A command's first words, flags left out, and the chapter it opens. The
 # first matching prefix wins; a chapter is only opened when it changes.
 PHASES = {
@@ -90,6 +99,18 @@ PHASES = {
         ("agent propose", "Propose"),
         ("agent proposals", "Propose"),
     ],
+    # The installer isn't a relish command: command_phase finds it.
+    "setup": [
+        ("setup", INSTALL),
+        ("local", INSTALL),
+        ("status", LOOK),
+        ("nodes", LOOK),
+        ("apps", LOOK),
+        ("verify", LOOK),
+        ("council", LOOK),
+        ("wtf", LOOK),
+        ("manual", LOOK),
+    ],
 }
 
 INTRO = {
@@ -104,6 +125,12 @@ INTRO = {
         "agent token: it can read, take leases and propose changes, and the cluster refuses it",
         "everything else. Every line below is the real session as it ran. Idle time is cut to "
         f"{IDLE_LIMIT} s.",
+    ],
+    "setup": [
+        "One line from the homepage, given to Claude Code with a shell and an empty",
+        "RELIABURGER_HOME. It reads the playbook on reliaburger.com/agents and does the rest.",
+        "Every line below is the real session as it ran. Idle time is cut to "
+        f"{IDLE_LIMIT} s, and each slow step says how long it really took.",
     ],
 }
 
@@ -202,6 +229,20 @@ def phase_of(mode, words):
     return None
 
 
+def command_phase(mode, command):
+    """The chapter a shell command opens, or None.
+
+    The setup session's first commands aren't `relish` ones: it fetches the
+    playbook and pipes the installer to a shell.
+    """
+    if mode == "setup":
+        if "install.sh" in command:
+            return INSTALL
+        if "reliaburger.com/agents" in command or "llms.txt" in command:
+            return PLAYBOOK
+    return phase_of(mode, relish_words(command))
+
+
 def result_text(content):
     """A tool result's text, whether Claude Code sent a string or blocks."""
     if isinstance(content, str):
@@ -258,7 +299,7 @@ class Renderer:
         arguments = block.get("input") or {}
         if name == "Bash":
             command = arguments.get("command", "")
-            lines = self._open(phase_of(self.mode, relish_words(command)))
+            lines = self._open(command_phase(self.mode, command))
             wrapped = textwrap.wrap(command, WIDTH - 2, break_on_hyphens=False) or [""]
             lines.append(f"{GREEN}{BOLD}${RESET} {wrapped[0]}")
             lines.extend(f"  {line}" for line in wrapped[1:])
@@ -276,6 +317,11 @@ class Renderer:
                 title = SAVE_PATCH
             lines = self._open(title)
             lines.append(f"{GREEN}{BOLD}✎{RESET} {name.lower()} {path}")
+            return lines
+        if name == "WebFetch":
+            url = arguments.get("url", "")
+            lines = self._open(command_phase(self.mode, url))
+            lines.append(cut(f"{GREEN}{BOLD}fetch{RESET} {url}", WIDTH + 12))
             return lines
         return [f"{DIM}({name}){RESET}"]
 
@@ -359,9 +405,8 @@ def show(command, env, cwd):
     return subprocess.run(command, shell=True, env=env, cwd=cwd, check=False).returncode
 
 
-def run_session(mode, argv, prompt, env, cwd, stream_path, timeout):
-    """Run the session, showing each event as it arrives; its exit code."""
-    renderer = Renderer(mode)
+def play(renderer, argv, prompt, env, cwd, stream_path, timeout, append=False):
+    """Run one turn of a session, showing each event as it arrives; its exit code."""
     session = subprocess.Popen(
         argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         text=True, env=env, cwd=cwd,
@@ -371,7 +416,7 @@ def run_session(mode, argv, prompt, env, cwd, stream_path, timeout):
     try:
         session.stdin.write(prompt)
         session.stdin.close()
-        with open(stream_path, "w", encoding="utf-8") as stream:
+        with open(stream_path, "a" if append else "w", encoding="utf-8") as stream:
             for line in session.stdout:
                 stream.write(line)
                 stream.flush()
@@ -381,11 +426,55 @@ def run_session(mode, argv, prompt, env, cwd, stream_path, timeout):
                     continue
                 if isinstance(event, dict):
                     emit(renderer.lines(event))
-        status = session.wait()
-        emit(renderer.ending())
-        return status
+        return session.wait()
     finally:
         timer.cancel()
+
+
+def run_session(mode, argv, prompt, env, cwd, stream_path, timeout):
+    """Run the session, showing each event as it arrives; its exit code."""
+    renderer = Renderer(mode)
+    status = play(renderer, argv, prompt, env, cwd, stream_path, timeout)
+    emit(renderer.ending())
+    return status
+
+
+def type_reply(text):
+    """The person's answer to the agent, typed a character at a time."""
+    sys.stdout.write(f"{BOLD}you ▸{RESET} ")
+    sys.stdout.flush()
+    time.sleep(0.6)
+    for character in text:
+        sys.stdout.write(character)
+        sys.stdout.flush()
+        time.sleep(random.choice((0.02, 0.03, 0.05)))
+    time.sleep(0.5)
+    print(flush=True)
+
+
+def set_up(argv, resume_argv, prompt, reply, env, cwd, stream_path, timeout, log_path):
+    """The setup session's two turns, the person's answer between them and
+    their look at the cluster after. Returns 0 when the person's commands ran.
+
+    One renderer shows both turns, so the model is named once and the
+    session ends once, with both turns' time.
+    """
+    renderer = Renderer("setup")
+    record = {"first_exit": play(renderer, argv, prompt, env, cwd, stream_path, timeout)}
+    emit(["", heading("You answer")])
+    type_reply(reply)
+    record["second_exit"] = play(renderer, resume_argv, reply, env, cwd, stream_path, timeout,
+                                 append=True)
+    emit(renderer.ending())
+    emit(["", heading("You check"),
+          say("You now, at your own prompt: is there a cluster?")])
+    person = dict(env)
+    home = person.get("RELIABURGER_HOME", "")
+    person["PATH"] = os.pathsep.join([str(Path(home) / "bin"), person.get("PATH", "")])
+    record["nodes_exit"] = show("relish nodes", person, cwd)
+    record["status_exit"] = show("relish status", person, cwd)
+    Path(log_path).write_text(json.dumps(record, indent=2) + "\n")
+    return 1 if record["nodes_exit"] or record["status_exit"] else 0
 
 
 def report_dir(root):
@@ -483,6 +572,10 @@ def main(argv):
     emit([say(line) for line in INTRO[mode]])
     emit(["", heading("The prompt")])
     emit(f"{DIM}{cut(line)}{RESET}" for line in prompt.strip().splitlines()[:14])
+    if mode == "setup":
+        return set_up(session_argv, json.loads(os.environ["STAGE_RESUME_ARGV"]), prompt,
+                      Path(os.environ["STAGE_REPLY"]).read_text().strip(), session_env, cwd,
+                      os.environ["STAGE_STREAM"], timeout, os.environ["STAGE_PERSON_LOG"])
     status = run_session(mode, session_argv, prompt, session_env, cwd,
                          os.environ["STAGE_STREAM"], timeout)
     if status != 0:

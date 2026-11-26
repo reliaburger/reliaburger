@@ -905,6 +905,9 @@ pub struct BunAgent<G: Grill> {
     /// Each instance's sidecars, which stop after it and retire with it,
     /// and their restarts (#1120).
     sidecars: sidecars::Sidecars,
+    /// The one writer of the sidecars' adoption records, so they land in
+    /// the order the loop asked for them (#2336).
+    sidecar_records: sidecars::SidecarRecordWriter,
     /// The runtime generation each parent's initialisers last launched, so
     /// the parent's retirement can forget exactly those journals and never
     /// a successor's under the same identity (#850).
@@ -1223,6 +1226,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
             initialisers: std::collections::HashMap::new(),
             sidecars: sidecars::Sidecars::default(),
+            sidecar_records: sidecars::SidecarRecordWriter::default(),
             initialiser_generations: std::collections::HashMap::new(),
             startup_retirements: Default::default(),
             startup_cleanup_pending: false,
@@ -1396,6 +1400,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
             initialisers: std::collections::HashMap::new(),
             sidecars: sidecars::Sidecars::default(),
+            sidecar_records: sidecars::SidecarRecordWriter::default(),
             initialiser_generations: std::collections::HashMap::new(),
             startup_retirements: Default::default(),
             startup_cleanup_pending: false,

@@ -481,6 +481,32 @@ pub struct FaultRule {
 /// even an absurd `--duration` still expires.
 pub const MAX_FAULT_DURATION_NS: u64 = 24 * 3600 * 1_000_000_000;
 
+/// How long a kill stays on its node's fault list, counting the replicas it
+/// killed as out of service (#2151). Smoker answers a kill once the signal is
+/// sent, but the instance reads `running` until the agent's sweep sees it
+/// exit, so without this a second kill a moment later is judged against
+/// replicas that are already gone and can take the last one. Ten seconds
+/// covers the sweep with room to spare; a replica that restarts sooner is
+/// counted as out a little longer, which only makes the rail stricter.
+pub const KILL_SETTLE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The replicas a fault takes out of service while it's on the list, for
+/// the replica-minimum rail: one for a pause, the count for a kill (a kill
+/// of every replica counts as more than any service has), none otherwise.
+/// A network or resource fault leaves its replicas serving.
+pub fn replicas_out_of_service(fault_type: &FaultType) -> u32 {
+    match fault_type {
+        FaultType::Pause => 1,
+        FaultType::Kill { count: 0 } => KILL_ALL_REPLICAS,
+        FaultType::Kill { count } => *count,
+        _ => 0,
+    }
+}
+
+/// What a kill of every replica counts as: more replicas than a service
+/// has, but small enough that adding a few never overflows a `u32`.
+const KILL_ALL_REPLICAS: u32 = u16::MAX as u32;
+
 impl FaultRule {
     /// Create a new fault rule with the given parameters.
     pub fn new(

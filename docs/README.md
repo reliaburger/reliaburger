@@ -973,7 +973,13 @@ installs and boots, so a machine with no serial port needn't be watched on its
 monitor, and `relish os boot-logs --to <address>|--off` turns that on or off
 later on a claimed cluster (0.3.3, not in 0.3.2). Once it's a node, its monitor shows a
 read-only dashboard: status, metrics, workloads, the cluster, versions and
-logs (0.3.3, not in 0.3.2).
+logs, plus a hidden invaders game on `7` (0.3.3, not in 0.3.2). The game's
+kill mode, where a hit kills that instance as an audited Smoker fault, stays
+off until a cluster admin sets `[appliance] console_chaos = true` with
+`relish os settings --set FILE`; `relish os settings` shows it. Three Dell Wyse 3040s went from power-on to a
+working cluster in about 25 minutes in the exit test; its
+[record](qualification/2026-11-20-wyse-3040.md) has the go/no-go, which
+waits on a 0.3.3 rerun of the broken-update fallback.
 
 Keep `[cluster].name` identical on every node. `relish init`, `relish setup`
 and `relish dev create` write it for you; Bun validates it as a DNS-style SPIFFE trust domain.

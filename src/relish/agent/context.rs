@@ -585,6 +585,7 @@ mod tests {
             volume_home_away: None,
             unschedulable: None,
             rollout_failed: None,
+            refused_sidecars: Vec::new(),
             launch_failures: Vec::new(),
         }
     }

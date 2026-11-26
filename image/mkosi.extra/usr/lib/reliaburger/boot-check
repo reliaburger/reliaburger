@@ -5,7 +5,7 @@
 # This is also the A/B health gate (research §7.6): the unit runs before
 # boot-complete.target, so systemd-bless-boot only marks a freshly updated
 # UKI good once bun is healthy. On a counted boot a failure reboots, and
-# after three tries systemd-boot falls back to the previous UKI and slot.
+# after two tries systemd-boot falls back to the previous UKI and slot.
 #
 # A machine with no seed doesn't start bun: `bun appliance prepare` waits
 # for a claim (W5) and serves the claim API meanwhile. That counts as

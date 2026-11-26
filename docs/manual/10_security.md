@@ -805,7 +805,25 @@ until it next exits. Then its restart is refused, the instance is `Failed`,
 and `relish apps` and `relish wtf` show the refusal. The node doesn't retry
 it, so redeploy once the app and the node agree. A volume or config-file
 `source` that `[storage] allowed_host_paths` no longer covers is refused the
-same way.
+same way, and the reason says the restart was refused because the path
+isn't allowed on this node any more. Each restart asks about the paths that instance mounts, so during a
+rollout an old instance is judged by the old version's paths. A sidecar that
+crashes on its own mounts its app's paths and is asked too. If it's refused,
+the sidecar isn't started again, and `relish apps` lists it as `refused`
+with the reason, which the events and `relish wtf` show too. The app keeps
+running, with its mount, until it next restarts, and that restart is
+refused the same way.
+
+The check resolves symlinks, which can hang on an NFS or autofs source that
+isn't answering. It waits at most `[runtime] stop_confirmation_timeout_secs`
+(10 seconds by default). Running out of time isn't a refusal: the restart
+counts as a failed attempt and is tried again after its backoff. While an
+earlier check of a path is still stuck, a retry doesn't start another; it
+fails the same way until the path answers.
+
+An instance adopted after an in-place upgrade from 0.3.2 has no record of
+the host paths it mounts, so its restarts aren't checked until it's next
+deployed.
 
 Only rootful runc applies knobs. A node on the process runtime, Apple
 Container or rootless runc advertises none, whatever its `[runtime]` says,

@@ -8,7 +8,10 @@
 # that plays the LAN, as image/tests/relish-netboot-install.sh does. A network
 # namespace on it plays the home router: its dnsmasq hands out the addresses,
 # with a reservation per machine, and knows nothing about booting. The
-# recording shows the operator's side only: relish's commands and log.
+# recording shows the operator's side only: relish's commands and log, with
+# each machine's boot lines streamed to it (`--stream-logs=units`, so the
+# installer's and the boot units' lines print and the kernel's go to
+# os/logs/<mac>.log, which the end shows a few lines of).
 #
 # Usage:
 #   scripts/demo/netboot.sh [--record CAST] <artefact dir> <version>
@@ -101,13 +104,14 @@ scene() {
     export HOME="${DEMO_HOME}"
     cd "${HOME}"
     local netboot started
-    netboot="sudo relish netboot os --interface lan0 --key lab.pem \\
+    netboot="sudo relish netboot os --stream-logs=units --interface lan0 --key lab.pem \\
     --mac ${MACS[0]} --mac ${MACS[1]} --mac ${MACS[2]} &"
 
     say "Three machines on one switch (lan0), disks blank, network boot on in their firmware."
     say "The router hands out their addresses. relish adds only the boot part."
     say "os/ holds a lab build of the OS, signed with this run's own key, lab.pem."
     say "From a release, relish image download --dir os fetches it, checked against the release key."
+    say "--stream-logs=units: the machines' boot lines print here; the kernel's go to os/logs/<mac>.log."
     sleep 1
     type_command "${netboot}"
     # The log goes to the screen and to a file the waits below read.
@@ -128,6 +132,8 @@ scene() {
     show "relish nodes"
     wait_for "the council to reach all three" 300 council_reaches 3
     show "relish council"
+    say "Every kernel line each machine sent is kept, too:"
+    show "tail -n 4 os/logs/${MACS[0]}.log"
     say "From power-on to a three-node cluster in $(( $(date +%s) - started )) s, no USB stick, no OS install."
     sleep 3
 }
@@ -197,7 +203,7 @@ cleanup() {
         [[ -f "${DEMO_WORK}/node$i.pid" ]] && kill "$(cat "${DEMO_WORK}/node$i.pid")" 2>/dev/null
         sudo ip link del "rbdemo$i" 2>/dev/null || true
     done
-    sudo pkill -f "relish netboot os --interface lan0" 2>/dev/null || true
+    sudo pkill -f "relish netboot os --stream-logs=units --interface lan0" 2>/dev/null || true
     sudo ip netns pids rbdemo 2>/dev/null | xargs -r sudo kill 2>/dev/null || true
     sudo ip netns del rbdemo 2>/dev/null || true
     sudo ip link del rbdemoveth0 2>/dev/null || true

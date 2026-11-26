@@ -754,15 +754,38 @@ enum BoundedError {
     Spawn(std::io::Error),
 }
 
-/// SIGKILL an entire process group by its leader pid (JOB6). Buildah
-/// spawns children; killing only the parent orphans them. We put the
-/// build in its own process group and signal the whole group.
+/// How long [`kill_process_group`] keeps killing a timed-out build's
+/// process group before giving up on it.
 #[cfg(unix)]
-fn kill_process_group(pid: u32) {
-    use nix::sys::signal::{Signal, kill};
+const GROUP_SWEEP_LIMIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// SIGKILL an entire process group by its leader pid until it has no
+/// members left, for at most [`GROUP_SWEEP_LIMIT`] (JOB6). Buildah spawns
+/// children; killing only the parent orphans them. We put the build in
+/// its own process group and signal the whole group.
+///
+/// One kill can miss a process that a member was forking at that moment,
+/// so we keep killing until `killpg` answers ESRCH, as
+/// `lettuce::subprocess` does (#461, #2347). The leader's pid stays
+/// reserved as the group id while any member is left (POSIX never reuses
+/// a pid that still names a process group), so this reaches only the
+/// build's own processes, and the first ESRCH ends the sweep. A killed
+/// member counts until its new parent reaps it, which is usually at once;
+/// the limit only stops a slow reaper from holding the call.
+#[cfg(unix)]
+async fn kill_process_group(pid: u32) {
+    use nix::errno::Errno;
+    use nix::sys::signal::{Signal, killpg};
     use nix::unistd::Pid;
-    // A negative pid signals the process group whose id is `pid`.
-    let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGKILL);
+    let group = Pid::from_raw(pid as i32);
+    let deadline = tokio::time::Instant::now() + GROUP_SWEEP_LIMIT;
+    let mut pause = std::time::Duration::from_millis(1);
+    while killpg(group, Signal::SIGKILL) != Err(Errno::ESRCH)
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(pause).await;
+        pause = (pause * 2).min(std::time::Duration::from_millis(20));
+    }
 }
 
 /// Run a subprocess in `dir`, bounded by `timeout`. On Unix the child
@@ -795,10 +818,11 @@ async fn run_bounded(
         Err(_) => {
             // Dropping the wait future here also drops `child`, so
             // `kill_on_drop` SIGKILLs the direct child; the group kill
-            // reaches its grandchildren too.
+            // reaches its grandchildren too, and keeps going until the
+            // group is empty.
             #[cfg(unix)]
             if let Some(pid) = pid {
-                kill_process_group(pid);
+                kill_process_group(pid).await;
             }
             Err(BoundedError::Timeout)
         }
@@ -2315,38 +2339,52 @@ mod tests {
     /// grandchild), records its pid, and waits; after `run_bounded`
     /// times out, that grandchild must be gone — proving the whole
     /// process group was signalled, not just the direct child.
+    ///
+    /// The check needs the shim to record the grandchild's pid before the
+    /// timeout fires. Under load `sh` can take longer to start than a short
+    /// timeout, and then the group kill stops it before it writes the pid
+    /// (#2347). So an attempt that times out before the pid is recorded is
+    /// retried with double the timeout (at most 8 s), until a 25 s deadline;
+    /// with the 15 s wait for the kill, the worst case stays under
+    /// nextest's 60 s.
     #[cfg(unix)]
     #[tokio::test]
     async fn run_bounded_kills_the_whole_process_group_on_timeout() {
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
 
         let dir = tempfile::tempdir().unwrap();
         let pidfile = dir.path().join("grandchild.pid");
         let script = format!("sleep 300 & echo $! > {}; wait", pidfile.display());
         let args = vec!["-c".to_string(), script];
 
-        let result = run_bounded("sh", &args, dir.path(), Duration::from_millis(300)).await;
-        assert!(matches!(result, Err(BoundedError::Timeout)));
+        let record_deadline = Instant::now() + Duration::from_secs(25);
+        let mut timeout = Duration::from_millis(300);
+        let pid = loop {
+            let _ = std::fs::remove_file(&pidfile);
+            let result = run_bounded("sh", &args, dir.path(), timeout).await;
+            assert!(matches!(result, Err(BoundedError::Timeout)));
 
-        // Read the grandchild pid the shim recorded.
-        let mut child_pid = None;
-        for _ in 0..50 {
+            // Once `run_bounded` returns, the shim has been SIGKILLed: the
+            // pidfile holds the grandchild's pid now or never will.
             if let Ok(text) = std::fs::read_to_string(&pidfile)
                 && let Ok(pid) = text.trim().parse::<i32>()
             {
-                child_pid = Some(pid);
-                break;
+                break pid;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let pid = child_pid.expect("shim never recorded its child pid");
+            assert!(
+                Instant::now() < record_deadline,
+                "shim never recorded its child pid, last timeout {timeout:?}"
+            );
+            timeout = (timeout * 2).min(Duration::from_secs(8));
+        };
 
         use nix::sys::signal::{Signal, kill};
         use nix::unistd::Pid;
         // Poll until the grandchild is gone (reaped after the group kill).
         // `kill` with `None` sends no signal, only an existence check.
+        let gone_deadline = Instant::now() + Duration::from_secs(15);
         let mut gone = false;
-        for _ in 0..100 {
+        while Instant::now() < gone_deadline {
             if kill(Pid::from_raw(pid), None).is_err() {
                 gone = true;
                 break;
@@ -2357,6 +2395,62 @@ mod tests {
             let _ = kill(Pid::from_raw(-pid), Signal::SIGKILL);
         }
         assert!(gone, "grandchild sleep survived the process-group kill");
+    }
+
+    /// One group kill can miss a process that a member was forking at that
+    /// moment, which then outlives the timeout (the gap #461 closed in
+    /// `lettuce::subprocess`), and a single kill also let `run_bounded`
+    /// return while the group's members were still alive (#2347). When it
+    /// returns after a timeout, nothing may be left in the child's group.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn no_member_of_the_group_is_left_when_a_timed_out_run_returns() {
+        use nix::errno::Errno;
+        use nix::sys::signal::{Signal, killpg};
+        use nix::unistd::Pid;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("leader.pid");
+        // Record the shell's own pid (the group id) under a temp name and
+        // move it into place, so a reader never sees it half-written; then
+        // keep forking subshells that each start a sleeper, so the group
+        // changes while it is being killed.
+        let script = format!(
+            "echo $$ > {p}.tmp && mv {p}.tmp {p}; while :; do (sleep 300 &); sleep 0.005; done",
+            p = pidfile.display()
+        );
+        let args = vec!["-c".to_string(), script];
+
+        // As above, retry with a longer timeout if the shell was killed
+        // before it recorded its pid.
+        let record_deadline = Instant::now() + Duration::from_secs(25);
+        let mut timeout = Duration::from_millis(300);
+        let group = loop {
+            let _ = std::fs::remove_file(&pidfile);
+            let result = run_bounded("sh", &args, dir.path(), timeout).await;
+            assert!(matches!(result, Err(BoundedError::Timeout)));
+            if let Ok(text) = std::fs::read_to_string(&pidfile)
+                && let Ok(pid) = text.trim().parse::<i32>()
+            {
+                break Pid::from_raw(pid);
+            }
+            assert!(
+                Instant::now() < record_deadline,
+                "the shell never recorded its pid, last timeout {timeout:?}"
+            );
+            timeout = (timeout * 2).min(Duration::from_secs(8));
+        };
+
+        let probe = killpg(group, None);
+        if probe != Err(Errno::ESRCH) {
+            let _ = killpg(group, Signal::SIGKILL);
+        }
+        assert_eq!(
+            probe,
+            Err(Errno::ESRCH),
+            "the timed-out child's process group still has members"
+        );
     }
 
     #[test]

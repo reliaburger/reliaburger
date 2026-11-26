@@ -17,10 +17,13 @@ Four commands do it all:
 
 CI runs them against QEMU VMs on every change to the image. On x86_64 it
 runs the lot: netboot installs, claimed and seeded clusters, an OS update
-and a broken update falling back. On aarch64 it runs the boot test only. The hardware it's built for is the Dell Wyse 3040,
-netbooted from a Mac, and 0.3.0's exit test takes three of them from
-power-on to a working cluster. Other firmware may still have surprises;
-"What's missing" lists the ones we know of.
+and a broken update falling back. On aarch64 it runs the boot test only.
+The hardware it's built for is the Dell Wyse 3040, netbooted from a Mac.
+The exit test took three of them from power-on to a working three-node
+cluster in about 25 minutes
+([the Wyse lab record](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-20-wyse-3040.md)).
+Other firmware may still have surprises; "What's missing" lists the ones
+we know of.
 
 ## What you need
 
@@ -238,8 +241,7 @@ a USB-C or Thunderbolt Ethernet adapter, and a few things are different:
 ### The Wyse lab
 
 The lab we built this for is a Mac on a USB-C Ethernet adapter, a gigabit
-switch, and Dell Wyse 3040s (three for the release gate, ten in the full
-lab). It runs either of two ways.
+switch, and three Dell Wyse 3040s. It runs either of two ways.
 
 **On the home network.** The switch plugs into the home router, which hands
 out the addresses, with a reservation for each Wyse and one for the Mac's
@@ -391,10 +393,33 @@ They print among the netboot server's own lines, named by the machine's MAC:
 ```
 log 6c:4b:90:12:34:56: reliaburger-install: target /dev/mmcblk0, 7818 MB
 log 6c:4b:90:12:34:56: [    9.412871] r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full
-log 6c:4b:90:12:34:56: reliaburger: bun not healthy after 120 s on OS 2026.47.228
+log 6c:4b:90:12:34:56: reliaburger: bun not healthy after 150 s on OS 2026.47.228
 ```
 
-Each line also goes to `os/logs/<mac>.log`. The machine's first line on
+Each line also goes to `os/logs/<mac>.log`. Three machines booting at once
+send hundreds of kernel lines each, so to keep the screen to what's
+happening, print only the boot units' lines:
+
+```sh
+sudo relish netboot os --stream-logs=units
+```
+
+```
+log 6c:4b:90:12:34:56: reliaburger-netlog: streaming from 192.168.1.77 (enp1s0 6c:4b:90:12:34:56) to 192.168.1.20:6666
+log 6c:4b:90:12:34:56: [    9.412871] install[412]: reliaburger-install: target /dev/mmcblk0, 7818 MB
+log 6c:4b:90:12:34:56: [   31.554310] reliaburger-boot-check: reliaburger: bun healthy on OS 2026.47.228
+```
+
+`--stream-logs` on its own, or `--stream-logs=all`, prints every line.
+`--stream-logs=units` prints the lines of the installer, the boot check, bun,
+the seed and the clock wait, and the machine's hello, which names its MAC.
+It leaves the kernel's other lines out, except a panic, an oops or a `BUG:`,
+which always print. Write the value with `=`: a word after a bare
+`--stream-logs` is the netboot directory. Either way, every line goes to
+`os/logs/<mac>.log`, so `tail -f os/logs/<mac>.log` shows one machine's whole
+kernel log.
+
+The machine's first line on
 each boot names its MAC, so it keeps its name when your router gives the
 installed system a different address from the one it network-booted with. A
 line from a machine `relish netboot` didn't answer shows as
@@ -789,7 +814,9 @@ drop it until you add it to their `[security] bootstrap_peers`.
 
 Each machine's monitor shows a small dashboard. There's no login, so it's
 read-only: anyone at the keyboard can look, and nothing they press changes
-the node. It never shows secrets, tokens or environment variables.
+the node. The one exception is the invaders game's kill mode, which is off
+until a cluster admin turns it on ("Invaders", below). The console never
+shows secrets, tokens or environment variables.
 
 ```
  Reliaburger OS 2026.47.228 | home-1 | cluster home                 bun running
@@ -852,6 +879,82 @@ Know what that token is before you rely on it:
   read-only token gives.
 - **It only reads the API.** The dashboard's login (`/ui/session`) and the
   image registry don't accept it.
+
+### Invaders
+
+`7` opens a tab the tab bar doesn't show: a game with one invader for each
+running app instance on this node, labelled `web-0` and so on (with the
+namespace in front only when two would read the same). Jobs get none. The formation marches once a second, five invaders to a row and up to
+three rows; the rest wait off the field.
+
+| Key | Does |
+| --- | --- |
+| `h` `l`, `←` `→` | move the cannon |
+| `space` | fire |
+| `r` | bring every invader back |
+| `Tab`, `1` to `6` | leave the game |
+
+The top line says whether kill mode is on. While it's off, a hit only pops
+the invader, and nothing on the node changes.
+
+**Kill mode** makes a hit kill the instance the invader stands for. It's a
+cluster setting, never a node one, because a switch on the machine would be
+a switch for whoever stands at its keyboard. Only an unscoped cluster admin
+can change it:
+
+```bash
+relish os settings                       # shows [appliance] and whether kill mode is on
+relish os settings --set appliance.toml   # replaces it
+```
+
+where `appliance.toml` says
+
+```toml
+[appliance]
+console_chaos = true
+```
+
+`--set` replaces the whole `[appliance]` section, so a key you leave
+out is off, and a misspelt one is refused. The change is audited as
+`os.settings_set`. Set `console_chaos = false`, or leave it out, to turn kill
+mode off again.
+
+Kill mode covers every namespace on the node: the console's invaders stand
+for every app instance there, whoever's it is. Turn it on only on a cluster
+where anyone at a keyboard may kill any of them.
+
+Each node reads the setting from its own copy of the council's state when
+it's a council member, and asks the leader when it isn't (a node without a
+Raft seat, or one removed from the council). If it can't get an answer,
+kill mode is off there.
+
+A hit in kill mode is the request `relish fault kill web --instance ID
+--node NODE` sends, from the console's principal `__console`, and the node
+treats it as one:
+
+- **The node needs a fault policy.** Its `[testing] allowed_operations` must
+  include `inject_workload_faults` ("Breaking things on purpose" has the
+  section). A cluster made with `relish cluster create --bare-metal --faults`
+  or `relish machines claim --create --faults` has one on every node; without
+  it, each kill is refused and the invader comes back.
+- **Smoker's rails apply.** A kill that would take a service's last running
+  replica is refused, and the invader comes back with the reason underneath.
+  A killed replica counts as gone for ten seconds, so two kills in quick
+  succession, from the console or `relish fault kill`, can't take the last
+  one between them. A kill stays on `relish fault list` for those ten seconds.
+- **An unclear answer isn't a no.** If bun doesn't answer in time, or answers
+  with a server error, the kill may still land, so the game says it doesn't
+  know and holds fire until the workload list shows whether the instance
+  died, for up to 30 seconds.
+- **It's on the record.** `relish fault list` shows the kill, and the events
+  and `relish audit --action 'fault.*'` name `__console` as who did it.
+
+The console may send that one kind of request and nothing else: a kill of
+one named app instance on its own node, with no `--include-leader` and no
+`--override-safety`. Anything else from the console is refused, kill mode
+or not.
+
+### Over SSH
 
 `bun appliance console` runs it on whatever terminal it's started from, so
 on a lab image, whose sshd runs, `ssh -t root@home-1
@@ -927,9 +1030,12 @@ spare slot for the next. An update goes into the spare slot. The node reboots
 into it with two tries, and it's only marked good once bun is healthy again
 and the node has a network address. If either is missing 150 seconds after
 the kernel starts, the try fails, and after the second the node goes back to
-the previous version by itself. On a Wyse 3040 a broken update's fallback is
-modelled at about 8½ minutes; the Wyse lab hasn't timed it yet. A node whose
-network doesn't come up on the new version falls back too, rather than staying cut off.
+the previous version by itself. The check doesn't wait for the network to
+come up, so a node whose network never comes up on the new version falls
+back too, rather than staying cut off. On a Wyse 3040, two tries should
+fall back in about 8 minutes 20 seconds. The lab timed the older three-try
+check at 10 min 28 s and 11 min 38 s; the two-try check's run on the
+Wyses is still to come.
 
 bun does this across the cluster, one node at a time. See what each node runs
 and what the newest release is:
@@ -967,7 +1073,7 @@ or two later. While a node drains and updates it takes no new work, and
 `relish nodes` and `relish status` say it's cordoned by the OS rollout.
 
 If a node comes back on its old version, because the new one failed its boot
-checks three times, or doesn't come back within 45 minutes, the rollout
+check on both tries, or doesn't come back within 45 minutes, the rollout
 pauses and `relish os status` says which node and why. `relish os resume`
 tries that node again; `relish os abort` stops, leaving each node on the
 version it has. A node that's already on the target is skipped, so after
@@ -1050,7 +1156,7 @@ openssl pkeyutl -verify -pubin -inkey next/lab-signing-key.pub.pem -rawin \
 
 `next/` also holds a broken version, two build numbers on (`2026.41.9`),
 whose bun starts and never gets healthy. The channel doesn't name it. It's there to test the
-fallback: a node updated to it fails its boot checks three times, then comes
+fallback: a node updated to it fails its boot check twice, then comes
 back on the version it ran before, by itself. CI rolls it out on every x86_64
 build and records how long that took. To try it on one machine, stage it
 there with the image's `os-stage` and reboot:
@@ -1084,12 +1190,10 @@ across a cluster you care about.
 - **No emulation for builds.** A multi-platform build's `RUN` steps for
   the other architecture can't run on an appliance. Cross-compile, or build
   for your nodes' architecture only ("Where builds run", above).
-- **The console's invaders game** isn't there yet: a game on the console
-  where each invader is a container on the node, planned with the dashboard
-  ([#2150](https://github.com/reliaburger/reliaburger/issues/2150)).
 - **Two machines can't roll a bun upgrade or an OS update.** Both are in
   the council, and taking one down would leave the other without a majority,
   so `relish upgrade start` and `relish os upgrade` refuse. Use three or more.
 
-The design and the test results are in `docs/plans/2026-09-28-plan-appliance-lab.md`.
+The design is in `docs/plans/2026-09-28-plan-appliance-lab.md`, and the
+hardware results in `docs/qualification/2026-11-20-wyse-3040.md`.
 The QEMU lab that exercises all of this without hardware is in `image/lab/`.

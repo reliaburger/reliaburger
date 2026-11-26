@@ -9824,6 +9824,7 @@ fn adoption_record(
         app_spec: Some(app_spec),
         oci_spec: crate::grill::oci::OciSpec {
             managed_volumes: Vec::new(),
+            host_path_sources: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -9857,6 +9858,7 @@ fn adoption_record(
             runtime_knobs: None,
         },
         rootless_network: None,
+        sidecar_restarts: None,
     }
 }
 

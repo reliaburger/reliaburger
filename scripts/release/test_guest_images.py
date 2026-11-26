@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
 import unittest
 
 HERE = Path(__file__).resolve().parent
@@ -115,6 +116,49 @@ class BuildScriptTests(unittest.TestCase):
                    '>"$root/etc/needrestart/conf.d/50-reliaburger.conf"')
         self.assertIn(drop_in, text)
         self.assertLess(text.index("50-reliaburger.conf"), text.index("qemu-img convert -c"))
+
+    def test_build_fails_unless_an_installed_needrestart_lists_only(self):
+        # Ubuntu 26.04's cloud image ships needrestart (3.11), so the drop-in
+        # is all that stands between an upgrade and a restarted Bun. Like the
+        # masks, the build checks it landed in the image rather than trusting
+        # that /etc/needrestart was there to write it into.
+        text = BUILD.read_text()
+        installed = text.index(
+            "needrestart=$(in_guest dpkg-query -W -f='${db:Status-Abbrev}' needrestart")
+        self.assertIn('case "$needrestart" in\n  ii*) grep', text)
+        check = text.index(
+            'grep -qxF "\\$nrconf{restart} = \'l\';" '
+            '"$root/etc/needrestart/conf.d/50-reliaburger.conf"')
+        self.assertIn("needrestart is not set to list only in the image", text)
+        self.assertLess(text.index('>"$root/etc/needrestart/conf.d/50-reliaburger.conf"'), installed)
+        self.assertLess(installed, check)
+        self.assertLess(check, text.index("qemu-img convert -c"))
+
+    def test_needrestart_check_refuses_an_image_without_the_drop_in(self):
+        # Run the script's own check against a fake image root, with a stub
+        # in place of the chroot.
+        text = BUILD.read_text()
+        start = text.index("needrestart=$(in_guest")
+        snippet = text[start:text.index("esac\n", start) + len("esac\n")]
+
+        def check(status, drop_in):
+            with tempfile.TemporaryDirectory() as root:
+                if drop_in is not None:
+                    conf = Path(root, "etc/needrestart/conf.d")
+                    conf.mkdir(parents=True)
+                    (conf / "50-reliaburger.conf").write_text(drop_in)
+                stub = f"in_guest() {{ printf '%s' '{status}'; }}\nroot={root}\n"
+                return subprocess.run(["bash", "-euo", "pipefail", "-c", stub + snippet],
+                                      capture_output=True, text=True)
+
+        missing = check("ii ", None)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("needrestart is not set to list only", missing.stderr)
+        self.assertNotEqual(check("ii ", "$nrconf{restart} = 'a';\n").returncode, 0)
+        self.assertEqual(check("ii ", "$nrconf{restart} = 'l';\n").returncode, 0)
+        # Removed but not purged, or never installed: nothing to check.
+        self.assertEqual(check("rc ", None).returncode, 0)
+        self.assertEqual(check("", None).returncode, 0)
 
     def test_script_grows_the_root_filesystem_before_installing(self):
         # Ubuntu 26.04's cloud image leaves its 2.5 GiB root about 160 MiB
