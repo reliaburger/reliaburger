@@ -376,6 +376,16 @@ mod tests {
         let root = Path::new(CGROUP_ROOT);
         let mount = Path::new(test_cgroups::CGROUP_MOUNT);
         let default_existed = root.join("default").exists();
+        // A controller newly enabled in a parent adds its files to every
+        // child group, which moves each child's modification time and undoes
+        // `age` (#2356). runc enables every controller a parent offers when
+        // it makes a container's cgroup, and Bun enables three, so a test
+        // running beside this one could do that between `age` and the sweep.
+        // Enable them all first; a later enable of the same ones adds nothing.
+        std::fs::create_dir_all(root.join("default")).unwrap();
+        for parent in [mount, root, &root.join("default")] {
+            enable_every_controller(parent);
+        }
         // Left by a test that died: empty, test-owned, claimed by nobody and
         // untouched for an hour.
         let stale = [
@@ -434,6 +444,54 @@ mod tests {
         assert!(fresh_kept, "a cgroup made moments ago was swept");
         assert!(product_kept, "a cgroup no test owns was swept");
         assert!(!claimed.exists(), "the live guard's drop left its cgroup");
+    }
+
+    #[test]
+    #[ignore = "requires root and cgroup v2; run with make test-linux"]
+    fn cgroup_controller_enabled_in_a_parent_moves_its_children_mtime_only_once() {
+        assert_root_with_cgroup_v2();
+        let parent = Path::new(test_cgroups::CGROUP_MOUNT)
+            .join(format!("rbtest-controllers-{}", std::process::id()));
+        let child = parent.join("app");
+        let _guard = TestCgroups::new([parent.clone()]);
+        std::fs::create_dir_all(&child).unwrap();
+        let offered = std::fs::read_to_string(parent.join("cgroup.controllers")).unwrap();
+        let controller = offered.split_whitespace().next().expect("a controller");
+        let enable = || {
+            std::fs::write(
+                parent.join("cgroup.subtree_control"),
+                format!("+{controller}"),
+            )
+            .unwrap()
+        };
+        let untouched = |path: &Path| {
+            let modified = std::fs::metadata(path).unwrap().modified().unwrap();
+            modified.elapsed().unwrap() > std::time::Duration::from_secs(1800)
+        };
+
+        age(&child);
+        enable();
+        assert!(
+            !untouched(&child),
+            "enabling {controller} in the parent left the child's mtime alone"
+        );
+        age(&child);
+        enable();
+        assert!(
+            untouched(&child),
+            "enabling {controller} again moved the child's mtime"
+        );
+    }
+
+    /// Enable in `path`'s children every controller `path` offers, as runc
+    /// does in each parent of a container's cgroup.
+    fn enable_every_controller(path: &Path) {
+        let offered = std::fs::read_to_string(path.join("cgroup.controllers")).unwrap();
+        let enable: Vec<String> = offered
+            .split_whitespace()
+            .map(|controller| format!("+{controller}"))
+            .collect();
+        std::fs::write(path.join("cgroup.subtree_control"), enable.join(" ")).unwrap();
     }
 
     /// Make the cgroup tree at `path` look untouched for an hour.
