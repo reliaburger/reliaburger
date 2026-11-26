@@ -265,10 +265,12 @@ node-1                   default__api-0       api             default      runni
 
 A sidecar is `starting` while its app is still being prepared or started
 (sidecars start first), then `running`, in `backoff` after it exited,
-`restarting`, or `stopped` while its app isn't running. A new instance's
-sidecars start at 0, and a crash after ten quiet minutes counts as the
-first again. `-o json` puts the same on each instance as `sidecars`, a
-list of `name`, `id`, `state` and `restart_count`.
+`restarting`, or `stopped` while its app isn't running. One the node refused
+to start again is listed as `refused`, with the reason, whatever its app is
+doing (see [Runtime knobs](10_security.md#runtime-knobs)). A new instance's
+sidecars start at 0, and a crash after ten quiet minutes counts as the first
+again. `-o json` puts the same on each instance as `sidecars`, a list of
+`name`, `id`, `state`, `restart_count` and, for a refused one, `refused`.
 
 ## Config files
 

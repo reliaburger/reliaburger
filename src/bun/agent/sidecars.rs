@@ -236,25 +236,80 @@ pub(super) async fn kill_unless_forgotten<G: Grill>(
     }
 }
 
-/// Start a crashed sidecar again, alone: kill what's left of its last
-/// launch, so its identity is free, then create and start it. A
-/// `cancelled` token (its instance stopped or crashed meanwhile) stops it
-/// between steps, and a launch it already made is killed again.
-async fn relaunch<G: Grill>(
-    grill: G,
+/// Why a sidecar's restart alone didn't start it.
+#[derive(Debug)]
+pub(super) enum RelaunchFailure {
+    /// The node gate refused it before the runtime saw it: the host paths
+    /// it shares with its app are no longer allowed (#2335). Asking again
+    /// fails the same way, so it's parked until its app next restarts.
+    Refused(String),
+    /// Anything else, which a later attempt may get past.
+    Failed(String),
+}
+
+impl std::fmt::Display for RelaunchFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RelaunchFailure::Refused(reason) | RelaunchFailure::Failed(reason) => {
+                f.write_str(reason)
+            }
+        }
+    }
+}
+
+/// What a sidecar's restart alone needs besides the runtime and the launch.
+struct RelaunchContext {
     secrets: crate::sesame::secret_provider::SecretProviders,
     app_name: String,
     namespace: String,
-    launch: SidecarLaunch,
+    /// The node's host-path policy, to approve the launch's host paths again
+    /// off the loop (#2335).
+    host_paths: crate::bun::host_paths::HostPathPolicy,
     cancelled: CancellationToken,
     confirmation_timeout: Duration,
-) -> Result<(), String> {
+}
+
+/// Start a crashed sidecar again, alone: ask the node gate about the host
+/// paths it mounts, kill what's left of its last launch, so its identity is
+/// free, then create and start it. A `cancelled` token (its instance
+/// stopped or crashed meanwhile) stops it between steps, and a launch it
+/// already made is killed again.
+async fn relaunch<G: Grill>(
+    grill: G,
+    launch: SidecarLaunch,
+    context: RelaunchContext,
+) -> Result<(), RelaunchFailure> {
+    let RelaunchContext {
+        secrets,
+        app_name,
+        namespace,
+        host_paths,
+        cancelled,
+        confirmation_timeout,
+    } = context;
+    // The sidecar's spec carries its app's mounts as the deploy approved
+    // them, and `node.toml` may have dropped one since (#2335). The check
+    // is bounded as the kill after it is.
+    super::restarts::recheck_host_paths(&host_paths, &launch.spec, confirmation_timeout)
+        .await
+        .map_err(|denial| match denial {
+            super::restarts::HostPathDenial::Refused(refusal) => {
+                RelaunchFailure::Refused(super::restarts::restart_refusal(
+                    &format!("restart of sidecar {}", launch.id),
+                    &refusal,
+                ))
+            }
+            super::restarts::HostPathDenial::Unanswered(reason) => {
+                RelaunchFailure::Failed(format!("the host path check didn't finish: {reason}"))
+            }
+        })?;
+    let failed = |reason: String| RelaunchFailure::Failed(reason);
     // A sidecar startup retired is one runc has forgotten.
     kill_unless_forgotten(&grill, &launch.id, confirmation_timeout)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| failed(error.to_string()))?;
     if cancelled.is_cancelled() {
-        return Err("its instance stopped first".into());
+        return Err(failed("its instance stopped first".into()));
     }
     let started = launch_sidecars(
         &grill,
@@ -264,11 +319,11 @@ async fn relaunch<G: Grill>(
         std::slice::from_ref(&launch),
     )
     .await
-    .map_err(|failure| failure.error.to_string());
+    .map_err(|failure| failed(failure.error.to_string()));
     if cancelled.is_cancelled() {
         // Whatever it started belongs to an instance that's going away.
         let _ = kill_runtime_instance(&grill, &launch.id, confirmation_timeout).await;
-        return Err("its instance stopped first".into());
+        return Err(failed("its instance stopped first".into()));
     }
     started
 }
@@ -460,7 +515,7 @@ async fn write_sidecar_records<G: Grill>(
 pub(super) struct Relaunched {
     parent: InstanceId,
     sidecar: InstanceId,
-    result: Result<(), String>,
+    result: Result<(), RelaunchFailure>,
 }
 
 /// One registered sidecar.
@@ -481,6 +536,10 @@ struct SidecarRun {
     due: Option<Instant>,
     /// Set while a restart is in flight.
     relaunching: Option<CancellationToken>,
+    /// Why the node gate refused its restart, once it did (#2335). It's
+    /// parked: never due again until its instance restarts with it, and its
+    /// status says why. The app keeps running.
+    refused: Option<String>,
 }
 
 /// Every instance's sidecars on this node, and the restarts in flight.
@@ -575,6 +634,7 @@ impl Sidecars {
                     restarts: 0,
                     restarted_at: None,
                     relaunching: None,
+                    refused: None,
                 }
             })
             .collect();
@@ -631,6 +691,7 @@ impl Sidecars {
     pub(super) fn started_with(&mut self, parent: &InstanceId) {
         for run in self.by_parent.get_mut(parent).into_iter().flatten() {
             run.due = None;
+            run.refused = None;
         }
     }
 
@@ -650,7 +711,9 @@ impl Sidecars {
             .get(parent)
             .map(|runs| {
                 runs.iter()
-                    .filter(|run| run.due.is_none() && run.relaunching.is_none())
+                    .filter(|run| {
+                        run.due.is_none() && run.relaunching.is_none() && run.refused.is_none()
+                    })
                     .map(|run| run.id.clone())
                     .collect()
             })
@@ -702,10 +765,17 @@ impl Sidecars {
     }
 
     /// A restart of `sidecar` has ended at `now`. A failed one is due again
-    /// after a longer backoff; either way it counts.
-    pub(super) fn finish_relaunch(&mut self, sidecar: &InstanceId, succeeded: bool, now: Instant) {
+    /// after a longer backoff; either way it counts. Returns whether its
+    /// instance cancelled it meanwhile: then the instance is stopping or
+    /// restarting, and what the restart found is no longer its to act on.
+    pub(super) fn finish_relaunch(
+        &mut self,
+        sidecar: &InstanceId,
+        succeeded: bool,
+        now: Instant,
+    ) -> bool {
         let Some(run) = self.run_mut(sidecar) else {
-            return;
+            return false;
         };
         let cancelled = run
             .relaunching
@@ -714,6 +784,17 @@ impl Sidecars {
         run.restarts = run.restarts.saturating_add(1);
         run.restarted_at = succeeded.then_some(now);
         run.due = (!succeeded && !cancelled).then(|| now + sidecar_backoff(run.restarts));
+        cancelled
+    }
+
+    /// The node gate refused `sidecar`'s restart (#2335), for `reason`: it
+    /// won't be started again until its instance restarts with it, and a
+    /// sweep no longer reads it.
+    pub(super) fn park(&mut self, sidecar: &InstanceId, reason: &str) {
+        if let Some(run) = self.run_mut(sidecar) {
+            run.due = None;
+            run.refused = Some(reason.to_string());
+        }
     }
 
     /// How many times `sidecar` has been restarted alone.
@@ -771,7 +852,9 @@ impl Sidecars {
             .map(|run| SidecarStatus {
                 name: run.spec.name.clone(),
                 id: run.id.0.clone(),
-                state: if phase == SidecarPhase::Stopped {
+                // A refused sidecar stays stopped, with its reason, even
+                // beside an instance still starting (#2335, #2336).
+                state: if phase == SidecarPhase::Stopped || run.refused.is_some() {
                     SidecarState::Stopped
                 } else if phase == SidecarPhase::Starting {
                     SidecarState::Starting
@@ -783,6 +866,7 @@ impl Sidecars {
                     SidecarState::Running
                 },
                 restart_count: run.restarts,
+                refused: run.refused.clone(),
             })
             .collect()
     }
@@ -969,19 +1053,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             let token = CancellationToken::new();
             self.sidecars.begin_relaunch(&sidecar, token.clone());
             let grill = self.supervisor.grill().clone();
-            let secrets = self.secret_providers.clone();
-            let confirmation = self.stop_confirmation_timeout;
+            let context = RelaunchContext {
+                secrets: self.secret_providers.clone(),
+                app_name,
+                namespace,
+                host_paths: self.supervisor.host_path_policy(),
+                cancelled: token,
+                confirmation_timeout: self.stop_confirmation_timeout,
+            };
             self.follow_ups.spawn(async move {
-                let result = relaunch(
-                    grill,
-                    secrets,
-                    app_name,
-                    namespace,
-                    launch,
-                    token,
-                    confirmation,
-                )
-                .await;
+                let result = relaunch(grill, launch, context).await;
                 follow_ups::FollowUp::SidecarRelaunched(Relaunched {
                     parent,
                     sidecar,
@@ -998,8 +1079,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             sidecar,
             result,
         } = relaunched;
-        self.sidecars
+        let cancelled = self
+            .sidecars
             .finish_relaunch(&sidecar, result.is_ok(), Instant::now());
+        // A refusal that comes back after the instance cancelled the
+        // relaunch (it crashed, and restarts with its sidecars) belongs to
+        // a launch that's gone: the instance's own restart asks the gate.
+        if let Err(RelaunchFailure::Refused(reason)) = &result
+            && !cancelled
+        {
+            self.park_refused_sidecar(&parent, &sidecar, reason).await;
+            return;
+        }
         // Its new cgroup is bound to its app's namespace on the next tick
         // (#1426).
         if result.is_ok() {
@@ -1048,6 +1139,38 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .await;
             }
         }
+    }
+
+    /// Park `sidecar`, whose restart the node gate refused for `reason`
+    /// (#2335), and say so. Its app keeps running, with the mount the gate
+    /// refused, until its own next restart, which the same check refuses:
+    /// a node never kills a running instance over a policy change (#1316).
+    async fn park_refused_sidecar(
+        &mut self,
+        parent: &InstanceId,
+        sidecar: &InstanceId,
+        reason: &str,
+    ) {
+        eprintln!("bun: {sidecar} is parked, {parent} runs on: {reason}");
+        self.sidecars.park(sidecar, reason);
+        // Its count, which the refused restart raised, outlives a Bun
+        // restart, and its record no longer says it's in backoff (#2336).
+        self.record_sidecar_restarts(sidecar);
+        let Some(instance) = self.supervisor.get_instance(parent) else {
+            return;
+        };
+        let (app, namespace) = (instance.app_name.clone(), instance.namespace.clone());
+        self.record_event(
+            crate::bun::events::EventKind::Restart,
+            crate::bun::events::EventSeverity::Warning,
+            Some(app),
+            Some(namespace),
+            format!(
+                "sidecar {sidecar} of {parent} is parked: {reason}; {parent} keeps running \
+                 until its next restart"
+            ),
+        )
+        .await;
     }
 
     /// Kill `parent`'s sidecars and forget them, after the instance itself
@@ -1340,6 +1463,40 @@ mod tests {
             let statuses = sidecars.statuses(&parent, SidecarPhase::of(state));
             assert_eq!(statuses[0].state, expected, "{state:?}");
         }
+    }
+
+    /// #2336 with #2335: a sidecar the node gate refused keeps its restart
+    /// count and its reason, and says `stopped`, not `starting`, beside an
+    /// instance still starting.
+    #[test]
+    fn a_refused_sidecar_keeps_its_count_and_reason_and_never_says_starting() {
+        use crate::bun::agent::status::SidecarState;
+        let mut sidecars = Sidecars::default();
+        let (parent, proxy) = (id("web-0"), id("web-0__sidecar-proxy"));
+        sidecars.register(&parent, &proxy_spec()).unwrap();
+        let now = Instant::now();
+        sidecars.mark_exited(&proxy, now);
+        sidecars.begin_relaunch(&proxy, CancellationToken::new());
+        sidecars.finish_relaunch(&proxy, false, now);
+        sidecars.park(&proxy, "host path refused");
+        for phase in [
+            SidecarPhase::Starting,
+            SidecarPhase::Beside,
+            SidecarPhase::Stopped,
+        ] {
+            let status = &sidecars.statuses(&parent, phase)[0];
+            assert_eq!(status.state, SidecarState::Stopped, "{phase:?}");
+            assert_eq!(status.refused.as_deref(), Some("host path refused"));
+            assert_eq!(status.restart_count, 1, "{phase:?}");
+        }
+        let kept = sidecars
+            .restart_state(&proxy, now, SystemTime::now())
+            .unwrap();
+        assert_eq!(kept.count, 1);
+        assert_eq!(
+            kept.due_at_unix_ms, None,
+            "a parked sidecar isn't in backoff"
+        );
     }
 
     #[test]

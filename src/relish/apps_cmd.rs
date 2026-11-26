@@ -405,16 +405,21 @@ pub fn render_instances(
                 age_cell(s.age_seconds)
             );
             // Each sidecar under its instance, with its own state and
-            // restarts (#1315).
+            // restarts (#1315). One the node refused to start again says
+            // so, with why, in the last column (#2335).
             for sidecar in &s.sidecars {
+                let (state, last) = match &sidecar.refused {
+                    Some(reason) => ("refused".to_string(), reason.as_str()),
+                    None => (sidecar.state.to_string(), "-"),
+                };
                 let _ = writeln!(
                     output,
-                    "{:<24} {:<20} {:<15} {:<12} {:<10} {:<10} {:<8} -",
+                    "{:<24} {:<20} {:<15} {:<12} {:<10} {:<10} {:<8} {last}",
                     "",
                     format!("+ {}", sidecar.name),
                     "sidecar",
                     "",
-                    sidecar.state,
+                    state,
                     "-",
                     sidecar.restart_count,
                 );
@@ -626,6 +631,7 @@ mod tests {
             id: format!("prod__web-0__sidecar-{name}"),
             state,
             restart_count,
+            refused: None,
         };
         let mut web = instance("node-1", "web", 0, "running");
         web.instance.sidecars = vec![
@@ -635,14 +641,36 @@ mod tests {
         let rows = vec![web, instance("node-2", "api", 1, "running")];
         insta::assert_snapshot!(render_instances(&rows, &[]));
 
-        // #2336: sidecars beside an app still starting say so.
+        // #2336: sidecars beside an app still starting say so, while one
+        // the node refused (#2335) still says `refused` and why.
         let mut starting = instance("node-1", "web", 0, "starting");
-        starting.instance.sidecars = vec![sidecar("proxy", SidecarState::Starting, 2)];
+        let mut refused = sidecar("logs", SidecarState::Stopped, 4);
+        refused.refused = Some("host path /srv/logs is no longer allowed".into());
+        starting.instance.sidecars = vec![sidecar("proxy", SidecarState::Starting, 2), refused];
         let text = render_instances(std::slice::from_ref(&starting), &[]);
-        let row = text.lines().find(|line| line.contains("+ proxy")).unwrap();
-        assert!(row.contains(" starting "), "{text}");
+        let row = |name: &str| {
+            text.lines()
+                .find(|line| line.contains(&format!("+ {name}")))
+                .unwrap()
+                .to_string()
+        };
+        assert!(row("proxy").contains(" starting "), "{text}");
+        assert!(row("proxy").ends_with(" -"), "{text}");
+        assert!(row("logs").contains(" refused "), "{text}");
+        assert!(row("logs").contains(" 4 "), "{text}");
+        assert!(
+            row("logs").ends_with("host path /srv/logs is no longer allowed"),
+            "{text}"
+        );
         let json = serde_json::to_value(&starting).unwrap();
         assert_eq!(json["sidecars"][0]["state"], "starting");
+        assert!(json["sidecars"][0].get("refused").is_none());
+        assert_eq!(json["sidecars"][1]["state"], "stopped");
+        assert_eq!(json["sidecars"][1]["restart_count"], 4);
+        assert_eq!(
+            json["sidecars"][1]["refused"],
+            "host path /srv/logs is no longer allowed"
+        );
 
         let json = serde_json::to_value(&rows).unwrap();
         assert_eq!(
@@ -657,6 +685,39 @@ mod tests {
         assert!(
             json[1].get("sidecars").is_none(),
             "an instance without sidecars says nothing about them"
+        );
+    }
+
+    /// #2335: a sidecar the node refused to start again is listed as
+    /// `refused`, with the node's reason, under its app, which keeps
+    /// running; `-o json` carries the reason.
+    #[test]
+    fn a_refused_sidecar_is_listed_with_its_reason() {
+        use crate::bun::agent::{SidecarState, SidecarStatus};
+        let mut web = instance("node-1", "web", 0, "running");
+        web.instance.sidecars = vec![SidecarStatus {
+            name: "proxy".into(),
+            id: "prod__web-0__sidecar-proxy".into(),
+            state: SidecarState::Stopped,
+            restart_count: 1,
+            refused: Some("restart of sidecar prod__web-0__sidecar-proxy refused".into()),
+        }];
+        let rows = vec![web];
+        let table = render_instances(&rows, &[]);
+        let line = table
+            .lines()
+            .find(|line| line.contains("+ proxy"))
+            .unwrap_or_else(|| panic!("no sidecar row: {table}"));
+        assert!(line.contains("refused"), "{line}");
+        assert!(
+            line.ends_with("restart of sidecar prod__web-0__sidecar-proxy refused"),
+            "{line}"
+        );
+        let json = serde_json::to_value(&rows).unwrap();
+        assert_eq!(json[0]["sidecars"][0]["state"], "stopped");
+        assert_eq!(
+            json[0]["sidecars"][0]["refused"],
+            "restart of sidecar prod__web-0__sidecar-proxy refused"
         );
     }
 

@@ -14,7 +14,9 @@
 //! symlink swapped after the check therefore can't redirect the mount (#797).
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::config::app::AppSpec;
 
@@ -47,6 +49,12 @@ pub enum HostPathRefusal {
     /// was approved.
     #[error("the host path check failed: {reason}")]
     CheckFailed { reason: String },
+    /// An earlier check of this source is still running on its blocking
+    /// thread, as it does when the source's NFS or autofs server isn't
+    /// answering. Another would only leave a second thread stuck behind it
+    /// (#2335), so none is started.
+    #[error("an earlier check of host path {path:?} hasn't returned yet")]
+    StillResolving { path: PathBuf },
 }
 
 /// A host path this node's policy approved: absolute, with every symlink in
@@ -69,6 +77,39 @@ impl ApprovedHostPath {
 pub struct HostPathPolicy {
     allowed: Vec<PathBuf>,
     protected: Vec<PathBuf>,
+    /// The sources a check off the runtime is resolving now, shared by every
+    /// copy of this policy. A check that outlives its caller's timeout keeps
+    /// its sources here until its thread returns (#2335).
+    resolving: Arc<Mutex<HashSet<PathBuf>>>,
+    /// How long each check off the runtime blocks before it resolves, as a
+    /// source on an NFS server that doesn't answer would (#2335).
+    #[cfg(test)]
+    stall: Option<std::time::Duration>,
+    /// How many checks off the runtime started a blocking thread.
+    #[cfg(test)]
+    started: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// The sources one check is resolving, released from
+/// [`HostPathPolicy::resolving`] when the check's thread is done with them,
+/// or when its closure is dropped without running.
+struct ResolvingClaim {
+    resolving: Arc<Mutex<HashSet<PathBuf>>>,
+    sources: Vec<PathBuf>,
+}
+
+impl Drop for ResolvingClaim {
+    fn drop(&mut self) {
+        // A std mutex, because this runs on the blocking thread, outside the
+        // runtime; the critical section only edits the set.
+        let mut resolving = self
+            .resolving
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for source in &self.sources {
+            resolving.remove(source);
+        }
+    }
 }
 
 impl HostPathPolicy {
@@ -77,6 +118,23 @@ impl HostPathPolicy {
         Self {
             allowed: allowed.iter().map(|path| resolve(path)).collect(),
             protected: protected.iter().map(|path| resolve(path)).collect(),
+            ..Self::default()
+        }
+    }
+
+    /// How many checks off the runtime have started a blocking thread.
+    #[cfg(test)]
+    pub fn checks_started(&self) -> usize {
+        self.started.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// This policy, with every check off the runtime blocking for `stall`
+    /// first, for tests of what a hung source does to its caller.
+    #[cfg(test)]
+    pub fn stalling(self, stall: std::time::Duration) -> Self {
+        Self {
+            stall: Some(stall),
+            ..self
         }
     }
 
@@ -202,13 +260,77 @@ impl HostPathPolicy {
         }
         let policy = self.clone();
         let spec = spec.clone();
-        let approved =
-            tokio::task::spawn_blocking(move || policy.approve_app(&spec).map(Cow::into_owned))
-                .await
-                .map_err(|error| HostPathRefusal::CheckFailed {
-                    reason: error.to_string(),
-                })??;
+        let approved = tokio::task::spawn_blocking(move || {
+            policy.stall_for_test();
+            policy.approve_app(&spec).map(Cow::into_owned)
+        })
+        .await
+        .map_err(|error| HostPathRefusal::CheckFailed {
+            reason: error.to_string(),
+        })??;
         Ok(Cow::Owned(approved))
+    }
+
+    /// Admit each of `sources` again, with the symlink resolution on a
+    /// blocking thread, or refuse with the first refusal.
+    ///
+    /// A restart asks this about the host paths its stored OCI spec mounts
+    /// ([`crate::grill::oci::OciSpec::host_path_sources`]), which the deploy
+    /// already approved and resolved, because `node.toml` may have dropped
+    /// one since (#1316, #2335). No sources means no I/O, and the answer
+    /// comes back without leaving the caller's thread.
+    pub async fn approve_sources_off_runtime(
+        &self,
+        sources: &[PathBuf],
+    ) -> Result<(), HostPathRefusal> {
+        if sources.is_empty() {
+            return Ok(());
+        }
+        let claim = self.claim(sources)?;
+        let policy = self.clone();
+        tokio::task::spawn_blocking(move || {
+            policy.stall_for_test();
+            claim
+                .sources
+                .iter()
+                .try_for_each(|source| policy.admit(source).map(drop))
+        })
+        .await
+        .map_err(|error| HostPathRefusal::CheckFailed {
+            reason: error.to_string(),
+        })?
+    }
+
+    /// Claim `sources` for one check, or refuse with the first that an
+    /// earlier check is still resolving.
+    fn claim(&self, sources: &[PathBuf]) -> Result<ResolvingClaim, HostPathRefusal> {
+        // A std mutex: no `.await` while it's held, and the claim's `Drop`
+        // releases it from a blocking thread.
+        let mut resolving = self
+            .resolving
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(busy) = sources.iter().find(|source| resolving.contains(*source)) {
+            return Err(HostPathRefusal::StillResolving { path: busy.clone() });
+        }
+        resolving.extend(sources.iter().cloned());
+        Ok(ResolvingClaim {
+            resolving: Arc::clone(&self.resolving),
+            sources: sources.to_vec(),
+        })
+    }
+
+    /// Block for the test stall, if one is set, and count the check. Runs on
+    /// a blocking thread.
+    fn stall_for_test(&self) {
+        #[cfg(test)]
+        {
+            self.started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(stall) = self.stall {
+                std::thread::sleep(stall);
+            }
+        }
     }
 }
 
@@ -291,6 +413,73 @@ mod tests {
             matches!(error, HostPathRefusal::NotAllowed { .. }),
             "{error}"
         );
+    }
+
+    /// #2335: a restart asks again about the host paths its stored spec
+    /// mounts, off the runtime, and any one the policy no longer allows
+    /// refuses the lot.
+    #[test]
+    fn approving_stored_sources_resolves_them_off_the_runtime_and_refuses_any_unlisted() {
+        let root = tempfile::tempdir().unwrap();
+        let import = root.path().join("import");
+        std::fs::create_dir_all(&import).unwrap();
+        let policy = policy(&[&import], &root.path().join("volumes"));
+        let listed = vec![import.join("daily")];
+        crate::off_runtime::assert_runs_on_blocking_pool(
+            policy.approve_sources_off_runtime(&listed),
+        )
+        .unwrap();
+
+        let mixed = vec![import.join("daily"), root.path().join("elsewhere")];
+        let refusal = crate::off_runtime::assert_runs_on_blocking_pool(
+            policy.approve_sources_off_runtime(&mixed),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(refusal, HostPathRefusal::NotAllowed { ref path } if path == &mixed[1]),
+            "{refusal}"
+        );
+    }
+
+    /// #2335: a check stuck on a source that doesn't answer keeps it
+    /// claimed after its caller gave up, and a second check of that source
+    /// starts no thread of its own until the first returns.
+    #[tokio::test]
+    async fn a_source_still_being_resolved_starts_no_second_check() {
+        let root = tempfile::tempdir().unwrap();
+        let policy = policy(&[root.path()], &root.path().join("volumes"))
+            .stalling(std::time::Duration::from_millis(300));
+        let sources = vec![root.path().join("import")];
+        let first = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            policy.approve_sources_off_runtime(&sources),
+        )
+        .await;
+        assert!(first.is_err(), "the stalled check answered");
+
+        let second = policy.approve_sources_off_runtime(&sources).await;
+        assert!(
+            matches!(second, Err(HostPathRefusal::StillResolving { .. })),
+            "{second:?}"
+        );
+        assert_eq!(policy.checks_started(), 1);
+
+        // Once the first thread returns, the source can be checked again.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while policy.approve_sources_off_runtime(&sources).await.is_err() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the stalled check never released its source");
+        assert_eq!(policy.checks_started(), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_stored_sources_are_approved_in_one_poll() {
+        let policy = HostPathPolicy::default();
+        let first = futures_util::poll!(std::pin::pin!(policy.approve_sources_off_runtime(&[])));
+        assert!(matches!(first, std::task::Poll::Ready(Ok(()))));
     }
 
     fn policy(allowed: &[&Path], volumes: &Path) -> HostPathPolicy {

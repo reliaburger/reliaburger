@@ -19,8 +19,8 @@
 - [x] **S4, good update**: a second CI version is staged by hand the way bun would (`os-stage`: Ed25519, SHA-256, `systemd-sysupdate` from a local directory) and rolled across the cluster. Boot counting blesses each node, and Raft, images and volumes stay intact.
 - [x] **S4, bad update**: a deliberately broken version (bun won't start) falls back to the previous slot within three boots, with no hands.
 - [ ] **S4, bun upgrade on top**: an OS update never moves bun backwards (passed, 1 Oct), and `relish upgrade` refuses 0.1.0 → 0.1.1 on the appliance as `docs/releasing.md` says it must (passed). A rolling `relish upgrade` that actually swaps bun waits for two release-signed versions with the same formats. So far every release has bumped them: 0.1.0 is 27/44, 0.1.1 27/46, 0.1.2 (1 Oct) 28/47, and main is at 29/48.
-- [ ] **S5, three Dell Wyse 3040s** (ten until the 7 October 2026 decision): the last step, on the hardware (spike plan, research §9.7). The runbook, with what to record at each step, is [`2026-10-01-plan-appliance-s5-wyse.md`](2026-10-01-plan-appliance-s5-wyse.md).
-- [ ] **S6, write-up**: `docs/qualification/<date>-appliance-spike.md` and `<date>-wyse-3040.md`.
+- [x] **S5, three Dell Wyse 3040s** (ten until the 7 October 2026 decision; on 23 November 2026 the maintainer decided three are enough for the exit test). Ran on 20–21 and 23 November: the last step, on the hardware (spike plan, research §9.7). The runbook, with what to record at each step, is [`2026-10-01-plan-appliance-s5-wyse.md`](2026-10-01-plan-appliance-s5-wyse.md).
+- [x] **S6, write-up**: [`2026-09-28-appliance-spike.md`](../qualification/2026-09-28-appliance-spike.md) and [`2026-11-20-wyse-3040.md`](../qualification/2026-11-20-wyse-3040.md), whose go/no-go waits on the 0.3.3 Wyse lab for the fallback.
 
 ## Log
 

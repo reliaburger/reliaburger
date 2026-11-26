@@ -17,10 +17,13 @@ Four commands do it all:
 
 CI runs them against QEMU VMs on every change to the image. On x86_64 it
 runs the lot: netboot installs, claimed and seeded clusters, an OS update
-and a broken update falling back. On aarch64 it runs the boot test only. The hardware it's built for is the Dell Wyse 3040,
-netbooted from a Mac, and 0.3.0's exit test takes three of them from
-power-on to a working cluster. Other firmware may still have surprises;
-"What's missing" lists the ones we know of.
+and a broken update falling back. On aarch64 it runs the boot test only.
+The hardware it's built for is the Dell Wyse 3040, netbooted from a Mac.
+The exit test took three of them from power-on to a working three-node
+cluster in about 25 minutes
+([the Wyse lab record](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-20-wyse-3040.md)).
+Other firmware may still have surprises; "What's missing" lists the ones
+we know of.
 
 ## What you need
 
@@ -238,8 +241,7 @@ a USB-C or Thunderbolt Ethernet adapter, and a few things are different:
 ### The Wyse lab
 
 The lab we built this for is a Mac on a USB-C Ethernet adapter, a gigabit
-switch, and Dell Wyse 3040s (three for the release gate, ten in the full
-lab). It runs either of two ways.
+switch, and three Dell Wyse 3040s. It runs either of two ways.
 
 **On the home network.** The switch plugs into the home router, which hands
 out the addresses, with a reservation for each Wyse and one for the Mac's
@@ -391,7 +393,7 @@ They print among the netboot server's own lines, named by the machine's MAC:
 ```
 log 6c:4b:90:12:34:56: reliaburger-install: target /dev/mmcblk0, 7818 MB
 log 6c:4b:90:12:34:56: [    9.412871] r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full
-log 6c:4b:90:12:34:56: reliaburger: bun not healthy after 120 s on OS 2026.47.228
+log 6c:4b:90:12:34:56: reliaburger: bun not healthy after 150 s on OS 2026.47.228
 ```
 
 Each line also goes to `os/logs/<mac>.log`. The machine's first line on
@@ -927,9 +929,12 @@ spare slot for the next. An update goes into the spare slot. The node reboots
 into it with two tries, and it's only marked good once bun is healthy again
 and the node has a network address. If either is missing 150 seconds after
 the kernel starts, the try fails, and after the second the node goes back to
-the previous version by itself. On a Wyse 3040 a broken update's fallback is
-modelled at about 8½ minutes; the Wyse lab hasn't timed it yet. A node whose
-network doesn't come up on the new version falls back too, rather than staying cut off.
+the previous version by itself. The check doesn't wait for the network to
+come up, so a node whose network never comes up on the new version falls
+back too, rather than staying cut off. On a Wyse 3040, two tries should
+fall back in about 8 minutes 20 seconds. The lab timed the older three-try
+check at 10 min 28 s and 11 min 38 s; the two-try check's run on the
+Wyses is still to come.
 
 bun does this across the cluster, one node at a time. See what each node runs
 and what the newest release is:
@@ -967,7 +972,7 @@ or two later. While a node drains and updates it takes no new work, and
 `relish nodes` and `relish status` say it's cordoned by the OS rollout.
 
 If a node comes back on its old version, because the new one failed its boot
-checks three times, or doesn't come back within 45 minutes, the rollout
+check on both tries, or doesn't come back within 45 minutes, the rollout
 pauses and `relish os status` says which node and why. `relish os resume`
 tries that node again; `relish os abort` stops, leaving each node on the
 version it has. A node that's already on the target is skipped, so after
@@ -1050,7 +1055,7 @@ openssl pkeyutl -verify -pubin -inkey next/lab-signing-key.pub.pem -rawin \
 
 `next/` also holds a broken version, two build numbers on (`2026.41.9`),
 whose bun starts and never gets healthy. The channel doesn't name it. It's there to test the
-fallback: a node updated to it fails its boot checks three times, then comes
+fallback: a node updated to it fails its boot check twice, then comes
 back on the version it ran before, by itself. CI rolls it out on every x86_64
 build and records how long that took. To try it on one machine, stage it
 there with the image's `os-stage` and reboot:
@@ -1091,5 +1096,6 @@ across a cluster you care about.
   the council, and taking one down would leave the other without a majority,
   so `relish upgrade start` and `relish os upgrade` refuse. Use three or more.
 
-The design and the test results are in `docs/plans/2026-09-28-plan-appliance-lab.md`.
+The design is in `docs/plans/2026-09-28-plan-appliance-lab.md`, and the
+hardware results in `docs/qualification/2026-11-20-wyse-3040.md`.
 The QEMU lab that exercises all of this without hardware is in `image/lab/`.
