@@ -457,7 +457,7 @@ async fn a_sidecar_retry_while_its_first_host_path_check_is_stuck_starts_no_new_
 fn sidecar_refusal(agent: &TestAgent, parent: &InstanceId, sidecar: &InstanceId) -> Option<String> {
     agent
         .sidecars
-        .statuses(parent, true)
+        .statuses(parent, super::super::sidecars::SidecarPhase::Beside)
         .into_iter()
         .find(|status| status.id == sidecar.0)
         .and_then(|status| status.refused)
@@ -507,7 +507,7 @@ async fn a_sidecar_restart_after_the_node_drops_a_host_path_is_refused_and_its_a
     assert_eq!(instance.launch_failure, None);
     let status = agent
         .sidecars
-        .statuses(&web, true)
+        .statuses(&web, super::super::sidecars::SidecarPhase::Beside)
         .into_iter()
         .find(|status| status.id == PROXY)
         .unwrap();

@@ -641,6 +641,37 @@ mod tests {
         let rows = vec![web, instance("node-2", "api", 1, "running")];
         insta::assert_snapshot!(render_instances(&rows, &[]));
 
+        // #2336: sidecars beside an app still starting say so, while one
+        // the node refused (#2335) still says `refused` and why.
+        let mut starting = instance("node-1", "web", 0, "starting");
+        let mut refused = sidecar("logs", SidecarState::Stopped, 4);
+        refused.refused = Some("host path /srv/logs is no longer allowed".into());
+        starting.instance.sidecars = vec![sidecar("proxy", SidecarState::Starting, 2), refused];
+        let text = render_instances(std::slice::from_ref(&starting), &[]);
+        let row = |name: &str| {
+            text.lines()
+                .find(|line| line.contains(&format!("+ {name}")))
+                .unwrap()
+                .to_string()
+        };
+        assert!(row("proxy").contains(" starting "), "{text}");
+        assert!(row("proxy").ends_with(" -"), "{text}");
+        assert!(row("logs").contains(" refused "), "{text}");
+        assert!(row("logs").contains(" 4 "), "{text}");
+        assert!(
+            row("logs").ends_with("host path /srv/logs is no longer allowed"),
+            "{text}"
+        );
+        let json = serde_json::to_value(&starting).unwrap();
+        assert_eq!(json["sidecars"][0]["state"], "starting");
+        assert!(json["sidecars"][0].get("refused").is_none());
+        assert_eq!(json["sidecars"][1]["state"], "stopped");
+        assert_eq!(json["sidecars"][1]["restart_count"], 4);
+        assert_eq!(
+            json["sidecars"][1]["refused"],
+            "host path /srv/logs is no longer allowed"
+        );
+
         let json = serde_json::to_value(&rows).unwrap();
         assert_eq!(
             json[0]["sidecars"][1],

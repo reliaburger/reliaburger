@@ -63,12 +63,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // Its sidecars started before it did, so they're recorded now too.
         if let Some(instance) = self.supervisor.get_instance(instance_id)
             && let Some(spec) = instance.oci_spec.clone()
+            && let Some(owner) = self.sidecar_owner(instance_id)
         {
-            let owner = sidecars::SidecarOwner {
-                namespace: instance.namespace.clone(),
-                app_name: instance.app_name.clone(),
-                image: instance.image.clone(),
-            };
             self.record_sidecars(instance_id, owner, &spec, None);
         }
         Ok(())
@@ -136,6 +132,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .cloned(),
             oci_spec,
             rootless_network: evidence.rootless_network.clone(),
+            sidecar_restarts: None,
         };
         Ok(record)
     }
@@ -215,11 +212,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.write_record_within_turn(key, incarnation, directory, record)
             .await?
             .map_err(|reason| fail(format!("persist replacement record: {reason}")))?;
-        let owner = sidecars::SidecarOwner {
-            namespace: instance.namespace.clone(),
-            app_name: instance.app_name.clone(),
-            image: instance.spec.image.clone().unwrap_or_default(),
-        };
+        // The supervisor's image, as the instance's own launch records it,
+        // not the spec's (#2336).
+        let owner = self
+            .sidecar_owner(&instance.instance_id)
+            .unwrap_or_else(|| sidecars::SidecarOwner {
+                namespace: instance.namespace.clone(),
+                app_name: instance.app_name.clone(),
+                image: instance.spec.image.clone().unwrap_or_default(),
+            });
         self.record_sidecars(&instance.instance_id, owner, &instance.oci_spec, None);
         Ok(())
     }
@@ -267,6 +268,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             app_spec: Some(instance.spec.clone()),
             oci_spec: instance.oci_spec.clone(),
             rootless_network: instance.launch.rootless_network.clone(),
+            sidecar_restarts: None,
         };
         Ok(record)
     }
@@ -450,8 +452,27 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             // after this may kill it again (review of #2269).
             outcome.retired.insert(id);
         }
-        self.sidecars
-            .register_adopted(parent, specs, &outcome.adopted, now)?;
+        // Their counts and backoffs come back from their records, whether
+        // or not the runtime adopted them (#2336).
+        let restored: std::collections::HashMap<
+            InstanceId,
+            crate::grill::records::SidecarRestarts,
+        > = specs
+            .iter()
+            .map(|spec| crate::grill::oci::sidecar_instance_id(parent, &spec.name))
+            .filter_map(|id| {
+                let restarts = records.get(&id.0)?.sidecar_restarts?;
+                Some((id, restarts))
+            })
+            .collect();
+        self.sidecars.register_adopted(
+            parent,
+            specs,
+            &outcome.adopted,
+            &restored,
+            now,
+            std::time::SystemTime::now(),
+        )?;
         if !outcome.adopted.is_empty() {
             // Their cgroups are bound to their app's namespace on the next
             // tick, as a restarted sidecar's is (#1426).

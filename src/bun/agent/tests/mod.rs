@@ -9858,6 +9858,7 @@ fn adoption_record(
             runtime_knobs: None,
         },
         rootless_network: None,
+        sidecar_restarts: None,
     }
 }
 
