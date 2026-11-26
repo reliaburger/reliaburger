@@ -1,0 +1,29 @@
+---
+source: src/appliance/console/view.rs
+expression: console(&state)
+---
+ Reliaburger OS 2026.47.228 | node-1 | cluster home                 bun running
+  1 Status   2 Metrics   3 Workloads   4 Cluster   5 Versions   6 Logs
+┌ 7 Invaders ──────────────────────────────────────────────────────────────────┐
+│Kill mode off: a hit pops the invader and touches nothing.                    │
+│                                                                              │
+│  _/OO\_      _/OO\_      _/OO\_      _/OO\_                                  │
+│  \/  \/      \/  \/      \/  \/      \/  \/                                  │
+│~ault/web-0    web-1       api-0    ~am-b/web-0                               │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                      /A\                                     │
+│One invader for each instance on this node.                                   │
+└──────────────────────────────────────────────────────────────────────────────┘
+ h l or <- -> aim   space fire   r new wave   Tab leave            15:06:40 UTC

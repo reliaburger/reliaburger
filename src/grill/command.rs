@@ -19,9 +19,13 @@ use super::process_control::ProcessControl;
 use super::process_owner::OwnerPhase;
 
 mod executor;
+pub(crate) use executor::ask_while_late;
 pub use executor::{ClaimedCommandExecutor, DirectCommandExecutor, RuntimeCommandExecutor};
 
 const OUTPUT_LIMIT: u64 = 1024 * 1024;
+
+/// The bound on one short runtime command, such as `runc kill`.
+pub(crate) const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Identity of one immutable command attempt, independent of its caller's PID.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -87,6 +91,14 @@ pub enum CommandError {
     OutputTooLarge,
 }
 
+impl CommandError {
+    /// Whether a live owner's answer was lost or late, so that asking again
+    /// may succeed. It says nothing about the command itself.
+    pub(crate) fn is_transient(&self) -> bool {
+        matches!(self, Self::Io(error) if transient_control_error(error))
+    }
+}
+
 /// Durable command attempts belonging to one exclusive runtime lifecycle.
 #[derive(Debug, Clone)]
 pub struct OwnedCommands {
@@ -129,6 +141,7 @@ impl OwnedCommands {
         let id = CommandId(InstanceId(format!("command-{}", hex::encode(nonce))));
         let spec = OciSpec {
             managed_volumes: Vec::new(),
+            host_path_sources: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,

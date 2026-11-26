@@ -183,6 +183,7 @@ mod tests {
                 age_seconds: None,
                 image: None,
                 data_on_node: false,
+                sidecars: Vec::new(),
                 reason: None,
             },
             InstanceStatus {
@@ -199,6 +200,7 @@ mod tests {
                 age_seconds: None,
                 image: None,
                 data_on_node: false,
+                sidecars: Vec::new(),
                 reason: None,
             },
         ];

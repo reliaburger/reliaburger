@@ -245,25 +245,27 @@ pub fn plan_network_fault(
 /// the whole cluster, for the replica-minimum rail.
 ///
 /// `instances` is the same service-restricted list the planner takes;
-/// `faults` is every node's active fault list. Only pauses count: a paused
-/// replica is out of service for the fault's lifetime, while a kill is
-/// instantaneous and a network or resource fault leaves the replica running.
-/// A network fault is also installed on every caller's node, so counting it
-/// would count one fault several times.
+/// `faults` is every node's active fault list, read by each fault's `kind`,
+/// not its display text (#2353). Pauses and recent kills count:
+/// a paused replica is out of service for the fault's lifetime, and a killed
+/// one may still read `running` until its node's sweep sees it exit, so a
+/// kill stays listed for [`crate::smoker::types::KILL_SETTLE`] (#2151). A
+/// network or resource fault leaves the replica running; it's also installed
+/// on every caller's node, so counting it would count one fault several
+/// times.
 pub fn replica_evidence(
     request: &FaultRequest,
     instances: &[WorkloadInstance],
     faults: &[FaultSummary],
 ) -> ReplicaEvidence {
     let replicas = instances.iter().filter(|instance| instance.running).count() as u32;
-    let paused = FaultType::Pause.to_string();
     let faulted_replicas = faults
         .iter()
         .filter(|fault| {
             fault.target_service == request.target_service && fault.namespace == request.namespace
         })
-        .filter(|fault| fault.fault_type == paused)
-        .count() as u32;
+        .map(|fault| fault.kind.replicas_out_of_service())
+        .fold(0, u32::saturating_add);
     ReplicaEvidence {
         replicas,
         faulted_replicas,
@@ -458,48 +460,157 @@ mod tests {
         );
     }
 
-    #[test]
-    fn network_faults_do_not_count_as_unavailable_replicas() {
-        let fault = |kind: &str| FaultSummary {
+    /// A fault as a peer lists it: `fault_type` is the display text,
+    /// `kind` the data the rail reads.
+    fn listed(service: &str, namespace: &str, fault_type: &FaultType) -> FaultSummary {
+        FaultSummary {
             task_index: None,
             id: 1,
-            fault_type: kind.to_string(),
-            target_service: "web".to_string(),
-            namespace: Some("default".to_string()),
+            fault_type: fault_type.to_string(),
+            kind: fault_type.into(),
+            target_service: service.to_string(),
+            namespace: Some(namespace.to_string()),
             target_instance: None,
             target_node: None,
             remaining_secs: 30,
             injected_by: "ops".to_string(),
-            node: None,
+            node: Some("node-2".to_string()),
             routed: Vec::new(),
+        }
+    }
+
+    fn on_web(fault_type: FaultType) -> FaultSummary {
+        listed("web", "default", &fault_type)
+    }
+
+    fn faulted(instances: &[WorkloadInstance], faults: &[FaultSummary]) -> u32 {
+        replica_evidence(&request(FaultType::Kill { count: 1 }), instances, faults).faulted_replicas
+    }
+
+    /// Whether the replica rail lets one more kill through, on this evidence.
+    fn rail_allows_a_kill(evidence: ReplicaEvidence) -> bool {
+        let context = crate::smoker::types::SafetyContext {
+            workload: WorkloadKind::App,
+            council_size: 0,
+            council_nodes_with_active_faults: 0,
+            leader_node_id: String::new(),
+            total_nodes: 0,
+            nodes_with_active_faults: 0,
+            target_service_replicas: evidence.replicas,
+            target_service_faulted_replicas: evidence.faulted_replicas,
         };
+        crate::smoker::safety::evaluate_safety(&request(FaultType::Kill { count: 1 }), &context)
+            .approved
+    }
+
+    #[test]
+    fn network_faults_do_not_count_as_unavailable_replicas() {
+        let faults = [
+            on_web(FaultType::Delay {
+                delay_ns: 300_000_000,
+                jitter_ns: 0,
+                source_app: None,
+            }),
+            on_web(FaultType::DnsNxdomain),
+            on_web(FaultType::Pause),
+        ];
+        assert_eq!(faulted(&spread(), &faults), 1);
+    }
+
+    /// A kill a moment ago still counts: its replicas may read `running`
+    /// until their node's sweep sees them exit (#2151). Without this, a
+    /// second kill right after the first could take the last replica.
+    #[test]
+    fn a_recent_kill_counts_as_unavailable_replicas() {
+        let kill = |count| on_web(FaultType::Kill { count });
+        assert_eq!(faulted(&spread(), &[kill(1)]), 1);
+        assert_eq!(faulted(&spread(), &[kill(1), kill(2)]), 3);
+        assert!(
+            faulted(&spread(), &[kill(0)]) > 1_000,
+            "a kill of every replica"
+        );
+        assert_eq!(faulted(&spread(), &[on_web(FaultType::Resume)]), 0);
+    }
+
+    /// The console's double tap (#2151), with the first kill held on
+    /// another node: a two-replica app, one replica killed a moment ago on
+    /// node-2, both replicas still reading `running`. The second kill is
+    /// refused on node-2's listed evidence alone.
+    #[test]
+    fn the_rail_refuses_a_second_quick_kill_from_evidence_on_another_node() {
+        let two_replicas = vec![
+            instance("node-1", "default/web-0"),
+            instance("node-2", "default/web-1"),
+        ];
+        assert!(rail_allows_a_kill(replica_evidence(
+            &request(FaultType::Kill { count: 1 }),
+            &two_replicas,
+            &[],
+        )));
+
+        let mut first = on_web(FaultType::Kill { count: 1 });
+        first.target_instance = Some("default/web-1".to_string());
         let evidence = replica_evidence(
             &request(FaultType::Kill { count: 1 }),
-            &spread(),
-            &[fault("delay 300ms"), fault("dns nxdomain"), fault("pause")],
+            &two_replicas,
+            &[first],
         );
-        assert_eq!(evidence.faulted_replicas, 1);
+        assert_eq!(
+            evidence,
+            ReplicaEvidence {
+                replicas: 2,
+                faulted_replicas: 1,
+            }
+        );
+        assert!(!rail_allows_a_kill(evidence), "{evidence:?}");
+    }
+
+    /// The rail reads `kind`, not the words: rewording a fault's display
+    /// text neither hides a kill or a pause from it nor makes it count
+    /// something that leaves replicas serving (#2353).
+    #[test]
+    fn rewording_the_display_text_does_not_change_the_rail() {
+        let reworded = |fault_type: FaultType, text: &str| FaultSummary {
+            fault_type: text.to_string(),
+            ..on_web(fault_type)
+        };
+        let faults = [
+            reworded(FaultType::Kill { count: 1 }, "SIGKILL x1 (settling)"),
+            reworded(FaultType::Pause, "frozen"),
+            reworded(FaultType::DnsNxdomain, "pause"),
+            reworded(FaultType::Resume, "kill 5"),
+            reworded(
+                FaultType::NodeKill {
+                    kill_containers: false,
+                },
+                "kill (all)",
+            ),
+        ];
+        assert_eq!(faulted(&spread(), &faults), 2);
+
+        let two_replicas = &spread()[..2];
+        let evidence = replica_evidence(
+            &request(FaultType::Kill { count: 1 }),
+            two_replicas,
+            &faults[..1],
+        );
+        assert!(!rail_allows_a_kill(evidence), "{evidence:?}");
     }
 
     #[test]
     fn replica_evidence_counts_faults_from_every_node() {
-        let fault = |service: &str| FaultSummary {
-            task_index: None,
-            id: 1,
-            fault_type: "pause".to_string(),
-            target_service: service.to_string(),
-            namespace: Some("default".to_string()),
-            target_instance: None,
-            target_node: None,
-            remaining_secs: 30,
-            injected_by: "ops".to_string(),
-            node: None,
-            routed: Vec::new(),
+        let pause = |service: &str, node: &str| FaultSummary {
+            node: Some(node.to_string()),
+            ..listed(service, "default", &FaultType::Pause)
         };
         let evidence = replica_evidence(
             &request(FaultType::Kill { count: 1 }),
             &spread(),
-            &[fault("web"), fault("web"), fault("api")],
+            &[
+                pause("web", "node-1"),
+                pause("web", "node-3"),
+                pause("api", "node-1"),
+            ],
         );
         assert_eq!(
             evidence,
@@ -512,19 +623,7 @@ mod tests {
 
     #[test]
     fn replica_evidence_ignores_pauses_in_another_namespace() {
-        let pause = |namespace: &str| FaultSummary {
-            task_index: None,
-            id: 1,
-            fault_type: "pause".to_string(),
-            target_service: "web".to_string(),
-            namespace: Some(namespace.to_string()),
-            target_instance: None,
-            target_node: None,
-            remaining_secs: 30,
-            injected_by: "ops".to_string(),
-            node: None,
-            routed: Vec::new(),
-        };
+        let pause = |namespace: &str| listed("web", namespace, &FaultType::Pause);
         let evidence = replica_evidence(
             &request(FaultType::Kill { count: 1 }),
             &spread(),

@@ -1,0 +1,29 @@
+---
+source: src/appliance/console/view.rs
+expression: console(&state)
+---
+ Reliaburger OS 2026.47.228 | node-1 | cluster home                 bun running
+  1 Status   2 Metrics   3 Workloads   4 Cluster  [5 Versions]  6 Logs
+┌ 5 Versions ──────────────────────────────────────────────────────────────────┐
+│OS image   2026.47.228                                                        │
+│Kernel     6.8.0-48-generic                                                   │
+│bun        0.3.4 on disk, 0.3.3 running                                       │
+│runc       1.1.12                                                             │
+│systemd    255 (255.4-1ubuntu8)                                               │
+│Buildah    not installed                                                      │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+ 1-6 or <- -> tabs   up/down scroll   read-only: no login here     15:06:40 UTC

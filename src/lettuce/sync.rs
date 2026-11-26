@@ -154,7 +154,10 @@ pub fn execute_sync(
     // spec, a permission/build targeting an unknown namespace — was committed
     // straight to desired state via git and then silently ignored downstream.
     let known_namespaces: Vec<String> = current.namespaces.keys().cloned().collect();
-    if let Err(e) = git_config.validate_against(&known_namespaces) {
+    if let Err(e) = git_config
+        .validate_against(&known_namespaces)
+        .and_then(|()| git_config.refuse_redaction_placeholders())
+    {
         return failed(Some(commit), format!("config validation failed: {e}"));
     }
 
@@ -1140,6 +1143,26 @@ mod tests {
         );
         assert!(outcome.changes.is_empty());
         assert!(outcome.diff_summary.is_none());
+    }
+
+    /// #2296: a spec read's `[redacted]` placeholder committed to the
+    /// watched repository would replace the real value; the sync refuses it.
+    #[test]
+    fn gitops_refuses_the_redaction_placeholder_as_a_value() {
+        let mut repository = SigningRepo::new();
+        repository.commit_apps(
+            "[app.web]\nimage = 'web:v1'\n[app.web.env]\nDB_PASSWORD = '[redacted]'\n",
+            false,
+        );
+        let outcome = repository.sync(None);
+        let SyncResult::Failure { error } = &outcome.result else {
+            panic!("a [redacted] value synced: {:?}", outcome.result);
+        };
+        assert!(
+            error.contains("env DB_PASSWORD is the redaction placeholder"),
+            "{error}"
+        );
+        assert!(outcome.changes.is_empty());
     }
 
     #[test]

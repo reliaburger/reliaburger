@@ -185,12 +185,10 @@ enum ApplianceCommand {
     /// enrol and fetch the master key, then write node.toml. Run by
     /// reliaburger-seed.service before the agent.
     Prepare,
-    /// Show this node's status on a console, refreshed every five seconds.
-    Console {
-        /// The terminal to draw on.
-        #[arg(long, default_value = "/dev/tty1")]
-        tty: PathBuf,
-    },
+    /// Show this node's dashboard on the terminal it runs on: status,
+    /// metrics, workloads, the cluster, versions and logs. Read-only.
+    /// reliaburger-console.service runs it on tty1.
+    Console,
 }
 
 /// The address `[network] advertise_address` names, as an address or the
@@ -1045,9 +1043,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 .await
                 .map(|_| ())
                 .map_err(|e| anyhow::anyhow!("reliaburger: {e}")),
-            ApplianceCommand::Console { tty } => reliaburger::appliance::console::run(&paths, tty)
+            ApplianceCommand::Console => reliaburger::appliance::console::run(&paths)
                 .await
-                .map_err(|e| anyhow::anyhow!("console {}: {e}", tty.display())),
+                .map_err(|e| anyhow::anyhow!("console: {e}")),
         };
     }
 
@@ -1262,6 +1260,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         &instances_dir,
         &pickle_dir,
         &config.images.mirrors,
+        config.runtime.stop_confirmation_timeout(),
     )
     .await?;
     #[cfg(target_os = "linux")]
@@ -1338,6 +1337,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let shutdown = CancellationToken::new();
     // Startup failures must also stop the tasks already launched.
     let _shutdown_guard = shutdown.clone().drop_guard();
+    // Give glibc's kept free memory back every ten minutes, so resident
+    // memory follows the live heap (#1936). A no-op off glibc.
+    tokio::spawn(reliaburger::bun::malloc_trim::run_malloc_trim_loop(
+        shutdown.clone(),
+    ));
     let readiness = reliaburger::bun::readiness::ReadinessTracker::new();
     for name in ["agent", "api", "registry"] {
         readiness.register(name, true).await;
@@ -4170,9 +4174,10 @@ async fn select_runtime(
     instances_dir: &std::path::Path,
     image_directory: &std::path::Path,
     mirrors: &reliaburger::grill::ImageMirrors,
+    stop_confirmation: std::time::Duration,
 ) -> anyhow::Result<AnyGrill> {
     #[cfg(not(target_os = "linux"))]
-    let _ = (image_directory, mirrors);
+    let _ = (image_directory, mirrors, stop_confirmation);
     match name {
         RuntimeChoice::Auto => {
             // Both runtimes use durable owners, so launches remain
@@ -4184,7 +4189,8 @@ async fn select_runtime(
                 )),
                 #[cfg(target_os = "linux")]
                 DetectedRuntime::Runc { rootless } => AnyGrill::with_host_processes(
-                    create_runc_runtime(instances_dir, image_directory, rootless, mirrors)?,
+                    create_runc_runtime(instances_dir, image_directory, rootless, mirrors)?
+                        .with_stop_confirmation_timeout(stop_confirmation),
                     instances_dir,
                     std::env::current_exe()?,
                 ),
@@ -4213,7 +4219,8 @@ async fn select_runtime(
             let is_rootless = reliaburger::grill::rootless::is_rootless();
             let mode = if is_rootless { "rootless" } else { "root" };
             println!("bun: using {name} runtime ({mode})");
-            let grill = create_runc_runtime(instances_dir, image_directory, is_rootless, mirrors)?;
+            let grill = create_runc_runtime(instances_dir, image_directory, is_rootless, mirrors)?
+                .with_stop_confirmation_timeout(stop_confirmation);
             if name == RuntimeChoice::Mixed {
                 Ok(AnyGrill::with_host_processes(
                     grill,
@@ -4567,6 +4574,7 @@ mod tests {
             root.path(),
             root.path(),
             &Default::default(),
+            std::time::Duration::from_secs(10),
         )
         .await
         .err()
@@ -4623,6 +4631,7 @@ mod tests {
                 &root.path().join(mode.to_string()),
                 &root.path().join("images"),
                 &Default::default(),
+                std::time::Duration::from_secs(10),
             )
             .await
             .unwrap();
@@ -4651,6 +4660,7 @@ mod tests {
             &root.path().join("instances"),
             &root.path().join("custom-images"),
             &Default::default(),
+            std::time::Duration::from_secs(10),
         )
         .await
         .unwrap();

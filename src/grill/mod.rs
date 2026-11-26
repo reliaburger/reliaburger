@@ -51,6 +51,7 @@ pub mod stop;
 pub mod userns;
 pub mod volume;
 mod whiteout;
+pub mod workload_groups;
 
 use std::fmt;
 use std::path::PathBuf;
@@ -240,6 +241,16 @@ pub enum GrillError {
     /// A stop signal or exit wait could not be completed safely.
     #[error("container {instance} failed to stop: {reason}")]
     StopFailed {
+        instance: InstanceId,
+        reason: String,
+    },
+
+    /// The runtime didn't answer a stop or kill request in time: a process
+    /// owner stalled past its request timeout, or busy with another
+    /// operation (#1902). It may or may not have sent the signal, and
+    /// sending it again is harmless, so the caller may ask again.
+    #[error("container {instance} stop request got no answer: {reason}")]
+    StopUnanswered {
         instance: InstanceId,
         reason: String,
     },

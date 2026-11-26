@@ -94,6 +94,27 @@ impl TuiApp {
                 }
                 Err(error) => self.mark_disconnected(error.to_string()),
             },
+            DataUpdate::AppSpec {
+                app,
+                namespace,
+                result,
+            } => match result {
+                Ok(value) => {
+                    self.data.app_spec = Some(*value);
+                    self.data.app_spec_error = None;
+                    self.mark_connected();
+                }
+                // The API answered: a scope refusal, an app that's gone or
+                // a leader too old to serve the read isn't a lost
+                // connection, so the tab says it.
+                Err(super::data::ProviderError::Api { status, body }) => {
+                    self.data.app_spec = None;
+                    self.data.app_spec_error = Some(super::state::AppSpecError::from_answer(
+                        &app, &namespace, status, &body,
+                    ));
+                }
+                Err(error) => self.mark_disconnected(error.to_string()),
+            },
             DataUpdate::DesiredApps(result) => set_data!(result, desired_apps),
             DataUpdate::Scaled { app, to, result } => self.scaled(&app, to, result),
             DataUpdate::InstanceKilled { target, result } => self.killed(target, result),
@@ -244,6 +265,7 @@ mod tests {
                 age_seconds: None,
                 image: None,
                 data_on_node: false,
+                sidecars: Vec::new(),
                 reason: None,
             },
         });
@@ -724,6 +746,7 @@ mod tests {
             result: Ok(crate::smoker::types::FaultSummary {
                 id: 7,
                 fault_type: "kill".into(),
+                kind: crate::smoker::types::FaultKind::Kill { count: 1 },
                 target_service: "web".into(),
                 namespace: Some("default".into()),
                 target_instance: Some("web-1".into()),

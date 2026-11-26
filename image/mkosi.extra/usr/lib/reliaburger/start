@@ -6,7 +6,7 @@
 # one: neither an OS update nor a bun upgrade can move bun backwards.
 #
 # One exception. An OS update whose bun starts but never gets healthy fails
-# its boot check three times, and systemd-boot falls back to the previous
+# its boot check on both tries, and systemd-boot falls back to the previous
 # OS. That boot isn't counted, so nothing would reboot it again, and its
 # older bun would never come back: the node would keep the bad one. So
 # `image-installed` records which OS version installed the active bun. A

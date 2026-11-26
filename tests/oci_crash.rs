@@ -52,6 +52,9 @@ impl Node {
         };
         let listen =
             std::fs::read_to_string(root.join("listen")).unwrap_or_else(|_| "127.0.0.1:0".into());
+        // Workload host ports outside the lease range (#2261). Most configs
+        // here come from `relish init`'s, which carries Bun's default range.
+        bun_process::use_test_workload_ports(&root.join("node.toml"));
         let mut command = tokio::process::Command::new(executable);
         if root.join("cluster").exists() {
             command.arg("--cluster");
@@ -1846,6 +1849,7 @@ async fn managed_guest_startup_establishes_bpffs_before_bun() {
 
 #[cfg(feature = "ebpf")]
 async fn assert_startup_refused(root: &Path, expected: &str) {
+    bun_process::use_test_workload_ports(&root.join("node.toml"));
     let output = tokio::time::timeout(
         Duration::from_secs(20),
         tokio::process::Command::new(env!("CARGO_BIN_EXE_bun"))

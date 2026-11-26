@@ -308,4 +308,203 @@ mod tests {
                 .is_err()
         );
     }
+
+    // -- test cgroup cleanup (#2322) -----------------------------------------
+
+    use crate::test_cgroups::{self, TestCgroups};
+    use std::path::Path;
+
+    /// Start a process in the cgroup at `path`. It runs `sleep seconds`.
+    fn occupy(path: &Path, seconds: &str) -> std::process::Child {
+        let child = std::process::Command::new("sleep")
+            .arg(seconds)
+            .spawn()
+            .unwrap();
+        std::fs::write(path.join("cgroup.procs"), child.id().to_string()).unwrap();
+        child
+    }
+
+    fn assert_root_with_cgroup_v2() {
+        assert!(nix::unistd::geteuid().is_root(), "run as root");
+        assert!(Path::new("/sys/fs/cgroup/cgroup.controllers").is_file());
+    }
+
+    #[test]
+    #[ignore = "requires root and cgroup v2; run with make test-linux"]
+    fn cgroup_guard_removes_its_tree_children_first_once_empty() {
+        assert_root_with_cgroup_v2();
+        let namespace = format!("rbtest-guarded-{}", std::process::id());
+        let top = Path::new(CGROUP_ROOT).join(&namespace);
+        let leaf = top.join("executor-reuse/0/task");
+        let guard = TestCgroups::namespace(&namespace);
+        std::fs::create_dir_all(&leaf).unwrap();
+        // A process still exiting when the test ends: the guard waits for
+        // it rather than leaving the tree behind.
+        let mut child = occupy(&leaf, "0.5");
+        drop(guard);
+        let _ = child.wait();
+        assert!(!top.exists(), "{} was left behind", top.display());
+    }
+
+    #[test]
+    #[ignore = "requires root and cgroup v2; run with make test-linux"]
+    fn cgroup_guard_removes_every_test_cgroup_its_prefix_claims() {
+        assert_root_with_cgroup_v2();
+        let prefix = format!("rbtest-prefix-{}", std::process::id());
+        let top = Path::new(test_cgroups::CGROUP_MOUNT).join(&prefix);
+        let unit = Path::new(test_cgroups::CGROUP_MOUNT).join(format!("{prefix}-unit"));
+        let app = Path::new(CGROUP_ROOT).join("default").join(&prefix);
+        let default_existed = Path::new(CGROUP_ROOT).join("default").exists();
+        let guard = TestCgroups::new([PathBuf::from(format!("{}*", top.display())), app.clone()]);
+        for path in [&top, &unit, &app.join("0")] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        drop(guard);
+        if !default_existed {
+            let _ = std::fs::remove_dir(Path::new(CGROUP_ROOT).join("default"));
+        }
+        for path in [&top, &unit, &app] {
+            assert!(!path.exists(), "{} was left behind", path.display());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires root and cgroup v2; run with make test-linux"]
+    fn cgroup_sweep_removes_only_stale_empty_test_cgroups() {
+        assert_root_with_cgroup_v2();
+        let id = std::process::id();
+        let root = Path::new(CGROUP_ROOT);
+        let mount = Path::new(test_cgroups::CGROUP_MOUNT);
+        let default_existed = root.join("default").exists();
+        // A controller newly enabled in a parent adds its files to every
+        // child group, which moves each child's modification time and undoes
+        // `age` (#2356). runc enables every controller a parent offers when
+        // it makes a container's cgroup, and Bun enables three, so a test
+        // running beside this one could do that between `age` and the sweep.
+        // Enable them all first; a later enable of the same ones adds nothing.
+        std::fs::create_dir_all(root.join("default")).unwrap();
+        for parent in [mount, root, &root.join("default")] {
+            enable_every_controller(parent);
+        }
+        // Left by a test that died: empty, test-owned, claimed by nobody and
+        // untouched for an hour.
+        let stale = [
+            root.join(format!("rbtest-stale-{id}")),
+            root.join(format!("cap-tmpstale{id}")),
+            root.join(format!("default/rbtest-stale-{id}")),
+            mount.join(format!("rbtest-stale-{id}")),
+        ];
+        for (top, leaf) in stale.iter().zip(["executor-host/3", "app/0", "0", ""]) {
+            std::fs::create_dir_all(top.join(leaf)).unwrap();
+            age(top);
+        }
+        let abandoned = root.join(format!("rbtest-abandoned-{id}"));
+        let guard = TestCgroups::new([abandoned.clone()]);
+        std::fs::create_dir_all(abandoned.join("0")).unwrap();
+        age(&abandoned);
+        guard.abandon();
+        // Kept: a test cgroup with a process in it, one a live guard claims,
+        // one made moments ago, and a namespace whose name no test owns.
+        let busy = root.join(format!("rbtest-busy-{id}"));
+        std::fs::create_dir_all(busy.join("app/0")).unwrap();
+        let mut child = occupy(&busy.join("app/0"), "30");
+        age(&busy);
+        let claimed = root.join(format!("rbtest-claimed-{id}"));
+        let live = TestCgroups::new([claimed.clone()]);
+        std::fs::create_dir_all(claimed.join("0")).unwrap();
+        age(&claimed);
+        let fresh = root.join(format!("rbtest-fresh-{id}"));
+        std::fs::create_dir_all(fresh.join("app/0")).unwrap();
+        let product = root.join(format!("sweep-keeps-{id}"));
+        std::fs::create_dir_all(product.join("app/0")).unwrap();
+        age(&product);
+
+        test_cgroups::sweep_stale();
+
+        let busy_kept = busy.join("app/0").exists();
+        let claimed_kept = claimed.join("0").exists();
+        let fresh_kept = fresh.join("app/0").exists();
+        let product_kept = product.join("app/0").exists();
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(live);
+        let wait = std::time::Duration::from_secs(5);
+        for path in [&busy, &fresh, &product] {
+            test_cgroups::remove_tree(path, wait);
+        }
+        if !default_existed {
+            let _ = std::fs::remove_dir(root.join("default"));
+        }
+        for path in &stale {
+            assert!(!path.exists(), "stale {} was kept", path.display());
+        }
+        assert!(!abandoned.exists(), "an abandoned claim kept its cgroup");
+        assert!(busy_kept, "a cgroup with a process in it was swept");
+        assert!(claimed_kept, "a live guard's cgroup was swept");
+        assert!(fresh_kept, "a cgroup made moments ago was swept");
+        assert!(product_kept, "a cgroup no test owns was swept");
+        assert!(!claimed.exists(), "the live guard's drop left its cgroup");
+    }
+
+    #[test]
+    #[ignore = "requires root and cgroup v2; run with make test-linux"]
+    fn cgroup_controller_enabled_in_a_parent_moves_its_children_mtime_only_once() {
+        assert_root_with_cgroup_v2();
+        let parent = Path::new(test_cgroups::CGROUP_MOUNT)
+            .join(format!("rbtest-controllers-{}", std::process::id()));
+        let child = parent.join("app");
+        let _guard = TestCgroups::new([parent.clone()]);
+        std::fs::create_dir_all(&child).unwrap();
+        let offered = std::fs::read_to_string(parent.join("cgroup.controllers")).unwrap();
+        let controller = offered.split_whitespace().next().expect("a controller");
+        let enable = || {
+            std::fs::write(
+                parent.join("cgroup.subtree_control"),
+                format!("+{controller}"),
+            )
+            .unwrap()
+        };
+        let untouched = |path: &Path| {
+            let modified = std::fs::metadata(path).unwrap().modified().unwrap();
+            modified.elapsed().unwrap() > std::time::Duration::from_secs(1800)
+        };
+
+        age(&child);
+        enable();
+        assert!(
+            !untouched(&child),
+            "enabling {controller} in the parent left the child's mtime alone"
+        );
+        age(&child);
+        enable();
+        assert!(
+            untouched(&child),
+            "enabling {controller} again moved the child's mtime"
+        );
+    }
+
+    /// Enable in `path`'s children every controller `path` offers, as runc
+    /// does in each parent of a container's cgroup.
+    fn enable_every_controller(path: &Path) {
+        let offered = std::fs::read_to_string(path.join("cgroup.controllers")).unwrap();
+        let enable: Vec<String> = offered
+            .split_whitespace()
+            .map(|controller| format!("+{controller}"))
+            .collect();
+        std::fs::write(path.join("cgroup.subtree_control"), enable.join(" ")).unwrap();
+    }
+
+    /// Make the cgroup tree at `path` look untouched for an hour.
+    fn age(path: &Path) {
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for entry in std::fs::read_dir(path).unwrap().flatten() {
+            if entry.file_type().unwrap().is_dir() {
+                age(&entry.path());
+            }
+        }
+        std::fs::File::open(path)
+            .unwrap()
+            .set_modified(hour_ago)
+            .unwrap();
+    }
 }

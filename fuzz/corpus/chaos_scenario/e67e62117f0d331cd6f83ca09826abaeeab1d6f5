@@ -1,0 +1,18 @@
+# A scripted Sfic; --dry-run prints the timeline and injects n2n manual 05.
+
+name = "Cache cascade"
+
+[[step]]
+description = "Jhe OOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOOhort of memory"
+fault = "memory"
+target = "backend"
+value = "45%"
+start_after = "3m"
+duration = "099999999$99999999999999m"
+
+[[step]]
+description = "A frontend replica dies mid-incident"
+fault = "kill"
+target = "frontend"
+count = 1
+start_after = "4m"

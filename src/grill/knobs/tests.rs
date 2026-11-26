@@ -344,6 +344,42 @@ fn the_node_gate_names_the_field_the_value_and_the_gate() {
     assert!(refusal.contains("allowed_devices"), "{refusal}");
 }
 
+/// #1316: one refusal names every knob the node doesn't allow, of every
+/// kind, so a config with several needs one round trip, not several. A knob
+/// the node allows isn't named.
+#[test]
+fn the_node_gate_names_every_refused_knob_at_once() {
+    let allowed = allowlist("[runtime]\nallowed_capabilities = [\"CAP_CHECKPOINT_RESTORE\"]\n");
+    let refusal = allowed
+        .check(&knobs(
+            "capabilities = [\"CHECKPOINT_RESTORE\", \"IPC_OWNER\", \"SYS_ADMIN\"]\n\
+             sysctls = { \"net.core.somaxconn\" = \"1024\" }\n\
+             devices = [{ path = \"/dev/fuse\" }]\n",
+        ))
+        .unwrap_err();
+    let refused: Vec<String> = refusal.knobs().iter().map(ToString::to_string).collect();
+    assert_eq!(
+        refused,
+        [
+            "runtime.capabilities CAP_IPC_OWNER",
+            "runtime.capabilities CAP_SYS_ADMIN",
+            "runtime.sysctls net.core.somaxconn",
+            "runtime.devices /dev/fuse",
+        ]
+    );
+    let message = refusal.to_string();
+    for (knob, key) in [
+        ("runtime.capabilities CAP_IPC_OWNER", "allowed_capabilities"),
+        ("runtime.capabilities CAP_SYS_ADMIN", "allowed_capabilities"),
+        ("runtime.sysctls net.core.somaxconn", "allowed_sysctls"),
+        ("runtime.devices /dev/fuse", "allowed_devices"),
+    ] {
+        assert!(message.contains(knob), "{message}");
+        assert!(message.contains(key), "{message}");
+    }
+    assert!(!message.contains("CHECKPOINT_RESTORE"), "{message}");
+}
+
 #[test]
 fn the_node_gate_admits_exactly_what_it_lists() {
     let allowed = allowlist(

@@ -1,0 +1,16 @@
+{
+  "manifests": [
+    {
+      "digest": "sf.manifest.v1+json",
+      "platform": {
+        "architectura" :"amd64",
+        "os": "arm64",
+        "os": "linux",
+        "variant": "v8"
+      },
+      "size": 200
+    }
+  ],
+  "mediaType": "application/vnd.oci.image.ind9D999999999999999999999ex.v1+json",
+  "schemaVeon": 2
+}

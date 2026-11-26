@@ -212,6 +212,102 @@ impl FaultType {
     }
 }
 
+/// A fault's type as data, without the parameters people read in its
+/// display text.
+///
+/// The fault list a node returns carries one of these beside `fault_type`'s
+/// text, so a peer judging the replica rail reads the kind and a kill's count
+/// from fields, not by parsing `"kill 2"` back out of words a person might
+/// reword (#2353). Only `Kill` keeps a parameter, because the rail needs it.
+/// On the wire it's tagged like [`FaultType`]: `{"type": "Kill", "count": 2}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum FaultKind {
+    /// [`FaultType::Delay`].
+    Delay,
+    /// [`FaultType::Drop`].
+    Drop,
+    /// [`FaultType::DnsNxdomain`].
+    DnsNxdomain,
+    /// [`FaultType::Partition`].
+    Partition,
+    /// [`FaultType::CouncilPartition`].
+    CouncilPartition,
+    /// [`FaultType::Bandwidth`].
+    Bandwidth,
+    /// [`FaultType::CpuStress`].
+    CpuStress,
+    /// [`FaultType::MemoryPressure`].
+    MemoryPressure,
+    /// [`FaultType::DiskIoThrottle`].
+    DiskIoThrottle,
+    /// [`FaultType::Kill`].
+    Kill {
+        /// How many replicas it killed; `0` means every matching replica.
+        count: u32,
+    },
+    /// [`FaultType::Pause`].
+    Pause,
+    /// [`FaultType::Resume`].
+    Resume,
+    /// [`FaultType::NodeDrain`].
+    NodeDrain,
+    /// [`FaultType::NodeKill`].
+    NodeKill,
+    /// [`FaultType::NodePressure`].
+    NodePressure,
+}
+
+impl FaultKind {
+    /// The replicas a fault of this kind takes out of service while it's on
+    /// the list, for the replica-minimum rail: one for a pause, the count for
+    /// a kill (a kill of every replica counts as more than any service has),
+    /// none otherwise. A network or resource fault leaves its replicas
+    /// serving.
+    pub fn replicas_out_of_service(self) -> u32 {
+        match self {
+            Self::Pause => 1,
+            Self::Kill { count: 0 } => KILL_ALL_REPLICAS,
+            Self::Kill { count } => count,
+            Self::Delay
+            | Self::Drop
+            | Self::DnsNxdomain
+            | Self::Partition
+            | Self::CouncilPartition
+            | Self::Bandwidth
+            | Self::CpuStress
+            | Self::MemoryPressure
+            | Self::DiskIoThrottle
+            | Self::Resume
+            | Self::NodeDrain
+            | Self::NodeKill
+            | Self::NodePressure => 0,
+        }
+    }
+}
+
+impl From<&FaultType> for FaultKind {
+    fn from(fault_type: &FaultType) -> Self {
+        match fault_type {
+            FaultType::Delay { .. } => Self::Delay,
+            FaultType::Drop { .. } => Self::Drop,
+            FaultType::DnsNxdomain => Self::DnsNxdomain,
+            FaultType::Partition { .. } => Self::Partition,
+            FaultType::CouncilPartition { .. } => Self::CouncilPartition,
+            FaultType::Bandwidth { .. } => Self::Bandwidth,
+            FaultType::CpuStress { .. } => Self::CpuStress,
+            FaultType::MemoryPressure { .. } => Self::MemoryPressure,
+            FaultType::DiskIoThrottle { .. } => Self::DiskIoThrottle,
+            FaultType::Kill { count } => Self::Kill { count: *count },
+            FaultType::Pause => Self::Pause,
+            FaultType::Resume => Self::Resume,
+            FaultType::NodeDrain => Self::NodeDrain,
+            FaultType::NodeKill { .. } => Self::NodeKill,
+            FaultType::NodePressure { .. } => Self::NodePressure,
+        }
+    }
+}
+
 impl fmt::Display for FaultType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -480,6 +576,27 @@ pub struct FaultRule {
 /// bounded experiment, not a permanent config change; clamping here guarantees
 /// even an absurd `--duration` still expires.
 pub const MAX_FAULT_DURATION_NS: u64 = 24 * 3600 * 1_000_000_000;
+
+/// How long a kill stays on its node's fault list, counting the replicas it
+/// killed as out of service (#2151). Smoker answers a kill once the signal is
+/// sent, but the instance reads `running` until the agent's sweep sees it
+/// exit, so without this a second kill a moment later is judged against
+/// replicas that are already gone and can take the last one. Ten seconds
+/// covers the sweep with room to spare; a replica that restarts sooner is
+/// counted as out a little longer, which only makes the rail stricter.
+pub const KILL_SETTLE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The replicas a fault takes out of service while it's on the list, for
+/// the replica-minimum rail: one for a pause, the count for a kill (a kill
+/// of every replica counts as more than any service has), none otherwise.
+/// A network or resource fault leaves its replicas serving.
+pub fn replicas_out_of_service(fault_type: &FaultType) -> u32 {
+    FaultKind::from(fault_type).replicas_out_of_service()
+}
+
+/// What a kill of every replica counts as: more replicas than a service
+/// has, but small enough that adding a few never overflows a `u32`.
+const KILL_ALL_REPLICAS: u32 = u16::MAX as u32;
 
 impl FaultRule {
     /// Create a new fault rule with the given parameters.
@@ -797,8 +914,11 @@ pub struct ScenarioStep {
 pub struct FaultSummary {
     /// Fault ID.
     pub id: u64,
-    /// Human-readable fault type.
+    /// Human-readable fault type, for people. Code reads `kind`.
     pub fault_type: String,
+    /// The fault's type as data. The replica rail counts a peer's pauses and
+    /// recent kills from this, never from `fault_type`'s text (#2353).
+    pub kind: FaultKind,
     /// Target service.
     pub target_service: String,
     /// Namespace of the target service; `None` for a node fault, which
@@ -832,6 +952,7 @@ impl From<&FaultRule> for FaultSummary {
         Self {
             id: rule.id.0,
             fault_type: rule.fault_type.to_string(),
+            kind: FaultKind::from(&rule.fault_type),
             target_service: rule.target_service.clone(),
             namespace: rule.namespace.clone(),
             target_instance: rule.target_instance.clone(),
@@ -1128,9 +1249,53 @@ mod tests {
         let summary = FaultSummary::from(&rule);
         assert_eq!(summary.id, 7);
         assert_eq!(summary.fault_type, "drop 25%");
+        assert_eq!(summary.kind, FaultKind::Drop);
         assert_eq!(summary.target_service, "api");
         assert_eq!(summary.injected_by, "bob");
         assert!(summary.remaining_secs >= 119);
+    }
+
+    /// The kind and a kill's count cross the wire as fields, tagged like a
+    /// `FaultType`, and a list without them is refused rather than read as
+    /// "nothing out of service" (#2353).
+    #[test]
+    fn a_fault_summary_carries_its_kind_as_data_on_the_wire() {
+        let rule = FaultRule::new(
+            FaultId(3),
+            FaultType::Kill { count: 2 },
+            "web".into(),
+            Duration::from_secs(10),
+            "ops".into(),
+        );
+        let json = serde_json::to_value(FaultSummary::from(&rule)).unwrap();
+        assert_eq!(
+            json["kind"],
+            serde_json::json!({"type": "Kill", "count": 2})
+        );
+
+        let back: FaultSummary = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(back.kind, FaultKind::Kill { count: 2 });
+
+        let mut without = json;
+        without.as_object_mut().unwrap().remove("kind");
+        assert!(serde_json::from_value::<FaultSummary>(without).is_err());
+    }
+
+    #[test]
+    fn only_pauses_and_kills_take_replicas_out_of_service() {
+        assert_eq!(FaultKind::Pause.replicas_out_of_service(), 1);
+        assert_eq!(FaultKind::Kill { count: 3 }.replicas_out_of_service(), 3);
+        assert!(FaultKind::Kill { count: 0 }.replicas_out_of_service() > 1_000);
+        for other in [
+            FaultType::DnsNxdomain,
+            FaultType::Resume,
+            FaultType::Drop { probability: 100 },
+            FaultType::NodeKill {
+                kill_containers: true,
+            },
+        ] {
+            assert_eq!(replicas_out_of_service(&other), 0, "{other}");
+        }
     }
 
     #[test]

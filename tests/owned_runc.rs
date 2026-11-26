@@ -7,6 +7,9 @@ use std::time::Duration;
 use reliaburger::grill::runc::RuncGrill;
 use reliaburger::grill::{ContainerState, Grill, ImageStore, InstanceId, OciSpec};
 
+#[path = "support/runc_residue.rs"]
+mod runc_residue;
+
 fn runtime(root: &Path) -> RuncGrill {
     RuncGrill::new(
         root.join("bundles"),
@@ -119,7 +122,7 @@ fn assert_absent(root: &Path, id: &InstanceId) {
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn runc_owned_preparation_recovers_original_intent_and_retires_without_adoption() {
     assert!(nix::unistd::geteuid().is_root());
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let original = spec(root.path(), "exit 0");
     let first = runtime(root.path());
@@ -163,7 +166,7 @@ async fn runc_owned_preparation_recovers_original_intent_and_retires_without_ado
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn runc_owned_short_job_keeps_its_actual_exit_and_logs_after_reconstruction() {
     assert!(nix::unistd::geteuid().is_root());
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let first = runtime(root.path());
     first
@@ -190,7 +193,7 @@ async fn runc_owned_short_job_keeps_its_actual_exit_and_logs_after_reconstructio
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn runc_owned_launcher_and_exec_retire_after_actual_caller_sigkill() {
     assert!(nix::unistd::geteuid().is_root());
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let mut caller = tokio::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "owned_runc_fixture", "--ignored", "--nocapture"])
@@ -242,7 +245,7 @@ async fn owned_runc_fixture() {
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn runc_owned_adoption_validates_generation_and_restores_live_network() {
     use reliaburger::grill::records::{InstanceRecord, RuntimeKind};
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let specification = spec(root.path(), "exec /bin/busybox sleep 60");
     let first = runtime(root.path());
@@ -267,6 +270,7 @@ async fn runc_owned_adoption_validates_generation_and_restores_live_network() {
         app_spec: None,
         oci_spec: specification,
         rootless_network: None,
+        sidecar_restarts: None,
     };
     drop(first);
     let recovered = runtime(root.path());
@@ -294,6 +298,187 @@ async fn runc_owned_adoption_validates_generation_and_restores_live_network() {
     assert_absent(root.path(), &id);
 }
 
+/// #2334: Bun's record keeps a `PROVIDER[...]` reference and runc's intent
+/// the value the provider gave. A restarted Bun must still adopt the
+/// instance, and a record from another request must still conflict.
+#[tokio::test]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
+async fn runc_owned_adoption_accepts_a_provider_reference_for_its_resolved_value() {
+    use reliaburger::grill::records::{InstanceRecord, RuntimeKind};
+    let root = crate::runc_residue::RuncRoot::new();
+    let id = instance(root.path());
+    let reference = spec(root.path(), "exec /bin/busybox sleep 60");
+    let mut supervised = reference.clone();
+    supervised
+        .process
+        .env
+        .push("DB_PASSWORD=PROVIDER[vault:secret/db#password]".into());
+    supervised.process.provider_env = vec!["DB_PASSWORD".into()];
+    let mut resolved = reference;
+    resolved.process.env.push(format!("DB_PASSWORD={SECRET}"));
+    let first = runtime(root.path());
+    first.create(&id, &resolved).await.unwrap();
+    install_fixture(root.path(), &id);
+    first.start(&id).await.unwrap();
+    let pid = first.pid(&id).await.unwrap().unwrap();
+    let mut record = InstanceRecord {
+        schema: reliaburger::grill::records::RECORD_SCHEMA,
+        instance_id: id.0.clone(),
+        namespace: "default".into(),
+        app_name: "owned-runc".into(),
+        replica_index: 0,
+        image: "/empty-fixture".into(),
+        runtime: RuntimeKind::Runc,
+        pid,
+        pid_started_at: reliaburger::grill::records::process_start_time(pid).unwrap(),
+        boot_id: reliaburger::grill::records::current_boot(),
+        runc_container_id: Some(id.0.clone()),
+        log_stem: first.log_stem(&id).await,
+        host_port: None,
+        app_spec: None,
+        oci_spec: supervised.clone(),
+        rootless_network: None,
+        sidecar_restarts: None,
+    };
+    drop(first);
+    let recovered = runtime(root.path());
+
+    record.oci_spec.process.args.push("--elsewhere".into());
+    let conflict = recovered.adopt(&id, &record).await;
+    assert!(conflict.is_err(), "{conflict:?}");
+
+    record.oci_spec = supervised;
+    assert!(recovered.adopt(&id, &record).await.unwrap());
+    assert_eq!(recovered.pid(&id).await.unwrap(), Some(pid));
+    recovered.kill(&id).await.unwrap();
+    assert_absent(root.path(), &id);
+}
+
+/// #1315: a restarted Bun adopts a sidecar beside its instance. The sidecar
+/// keeps its process, and it's still in its instance's network namespace,
+/// which it holds no address of its own in: there's no network of its own
+/// to adopt, so adoption mustn't look for one.
+#[tokio::test]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
+async fn a_bun_restart_adopts_a_sidecar_with_its_process_and_its_instances_network() {
+    let root = crate::runc_residue::RuncRoot::new();
+    let parent = instance(root.path());
+    let sidecar = reliaburger::grill::oci::sidecar_instance_id(&parent, "probe");
+    let app = spec(root.path(), "exec /bin/busybox sleep 60");
+    let mut beside = spec(root.path(), "exec /bin/busybox sleep 60");
+    let shared = reliaburger::grill::oci::network_namespace_path(&parent);
+    beside.linux.namespaces = reliaburger::grill::oci::standard_namespaces(Some(shared.as_str()));
+    let first = runtime(root.path());
+    // Bun's order: the instance's create makes the namespace the sidecar
+    // joins, and the sidecar starts first.
+    first.create(&parent, &app).await.unwrap();
+    install_fixture(root.path(), &parent);
+    first.create(&sidecar, &beside).await.unwrap();
+    install_fixture(root.path(), &sidecar);
+    first.start(&sidecar).await.unwrap();
+    first.start(&parent).await.unwrap();
+    let parent_pid = first.pid(&parent).await.unwrap().unwrap();
+    let sidecar_pid = first.pid(&sidecar).await.unwrap().unwrap();
+    let parent_record = adoption_record(&parent, parent_pid, first.log_stem(&parent).await, app);
+    let sidecar_record = adoption_record(
+        &sidecar,
+        sidecar_pid,
+        first.log_stem(&sidecar).await,
+        beside,
+    );
+    drop(first);
+
+    let recovered = runtime(root.path());
+    assert!(recovered.adopt(&parent, &parent_record).await.unwrap());
+    let adopted = recovered.adopt(&sidecar, &sidecar_record).await;
+    assert!(matches!(adopted, Ok(true)), "{adopted:?}");
+    assert_eq!(recovered.pid(&sidecar).await.unwrap(), Some(sidecar_pid));
+    assert_eq!(
+        recovered.state(&sidecar).await.unwrap(),
+        ContainerState::Running
+    );
+    assert_eq!(recovered.container_ip(&sidecar).await, None);
+    let network_of = |pid: u32| std::fs::read_link(format!("/proc/{pid}/ns/net")).unwrap();
+    let workload = |pids: Vec<u32>| *pids.first().expect("no workload process");
+    let parent_workload = workload(recovered.workload_pids(&parent).await.unwrap());
+    let sidecar_workload = workload(recovered.workload_pids(&sidecar).await.unwrap());
+    assert_eq!(
+        network_of(sidecar_workload),
+        network_of(parent_workload),
+        "the adopted sidecar left its instance's namespace"
+    );
+
+    recovered.kill(&sidecar).await.unwrap();
+    recovered.kill(&parent).await.unwrap();
+    assert_absent(root.path(), &sidecar);
+    assert_absent(root.path(), &parent);
+}
+
+/// Review of #2269: a sidecar that died while Bun was down. Its record names
+/// a process that's gone, so adoption refuses it, and once its retirement
+/// has made the runtime forget it, the runtime answers `NotFound`: what the
+/// agent must not kill a second time.
+#[tokio::test]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
+async fn a_sidecar_that_died_before_adoption_is_refused_and_then_forgotten() {
+    let root = crate::runc_residue::RuncRoot::new();
+    let parent = instance(root.path());
+    let sidecar = reliaburger::grill::oci::sidecar_instance_id(&parent, "probe");
+    let app = spec(root.path(), "exec /bin/busybox sleep 60");
+    let mut beside = spec(root.path(), "exec /bin/busybox sleep 60");
+    let shared = reliaburger::grill::oci::network_namespace_path(&parent);
+    beside.linux.namespaces = reliaburger::grill::oci::standard_namespaces(Some(shared.as_str()));
+    let first = runtime(root.path());
+    first.create(&parent, &app).await.unwrap();
+    install_fixture(root.path(), &parent);
+    first.create(&sidecar, &beside).await.unwrap();
+    install_fixture(root.path(), &sidecar);
+    first.start(&sidecar).await.unwrap();
+    first.start(&parent).await.unwrap();
+    let sidecar_pid = first.pid(&sidecar).await.unwrap().unwrap();
+    let parent_record = adoption_record(
+        &parent,
+        first.pid(&parent).await.unwrap().unwrap(),
+        first.log_stem(&parent).await,
+        app,
+    );
+    let sidecar_record = adoption_record(
+        &sidecar,
+        sidecar_pid,
+        first.log_stem(&sidecar).await,
+        beside,
+    );
+    for pid in first.workload_pids(&sidecar).await.unwrap() {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while first.state(&sidecar).await.unwrap() != ContainerState::Stopped {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the killed sidecar never stopped");
+    drop(first);
+
+    let recovered = runtime(root.path());
+    assert!(recovered.adopt(&parent, &parent_record).await.unwrap());
+    let refused = recovered.adopt(&sidecar, &sidecar_record).await;
+    assert!(matches!(refused, Ok(false)), "{refused:?}");
+    recovered.forget_retired(&sidecar).await.unwrap();
+    let again = recovered.kill(&sidecar).await;
+    assert!(
+        matches!(again, Err(reliaburger::grill::GrillError::NotFound { .. })),
+        "{again:?}"
+    );
+
+    recovered.kill(&parent).await.unwrap();
+    assert_absent(root.path(), &sidecar);
+    assert_absent(root.path(), &parent);
+}
+
 fn adoption_record(
     id: &InstanceId,
     pid: u32,
@@ -317,6 +502,7 @@ fn adoption_record(
         app_spec: None,
         oci_spec,
         rootless_network: None,
+        sidecar_restarts: None,
     }
 }
 
@@ -330,7 +516,7 @@ fn adoption_record(
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn a_record_and_generation_split_by_a_power_cut_retire_and_others_still_adopt() {
     assert!(nix::unistd::geteuid().is_root());
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let healthy = instance(root.path());
     // The record is newer: it names a launch whose binding never reached
     // the generation, so the generation has no launcher at all.
@@ -400,7 +586,7 @@ async fn a_stale_adoption_record_retires_its_generation_and_others_still_adopt()
     // every start, taking every workload on the node down with it.
     use reliaburger::grill::records::{InstanceRecord, RuntimeKind};
     assert!(nix::unistd::geteuid().is_root());
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let stale = instance(root.path());
     let healthy = InstanceId(format!("{}-b", stale.0));
     let specification = spec(root.path(), "exec /bin/busybox sleep 60");
@@ -428,6 +614,7 @@ async fn a_stale_adoption_record_retires_its_generation_and_others_still_adopt()
             app_spec: None,
             oci_spec: specification.clone(),
             rootless_network: None,
+            sidecar_restarts: None,
         });
     }
     // The stale record names another start of the launcher's pid, further
@@ -465,7 +652,7 @@ async fn runc_owned_cancelled_preparation_keeps_its_worker_until_queued_cleanup(
         return;
     }
     use std::os::unix::fs::PermissionsExt;
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let bin = root.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     let real_ip = std::process::Command::new("sh")
@@ -549,7 +736,7 @@ async fn cancelled_preparation(root: &Path) {
 #[tokio::test]
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn runc_owned_completed_log_reader_cannot_block_a_replacement_generation() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let runtime = runtime(root.path());
     runtime
@@ -600,7 +787,7 @@ async fn runc_owned_completed_log_reader_cannot_block_a_replacement_generation()
 async fn following_a_large_capture_after_a_restart_does_not_hold_the_runtime() {
     const LINES: u64 = 200_000;
     const LINE: &str = "spam the quick brown fox jumps over";
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let first = runtime(root.path());
     first
@@ -665,7 +852,7 @@ async fn following_a_large_capture_after_a_restart_does_not_hold_the_runtime() {
 #[tokio::test]
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn generated_cgroup_path_matches_the_actual_container_before_its_first_instruction() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let expected = format!("/{}", id.0);
     let host_path = format!("/sys/fs/cgroup{expected}");
@@ -703,7 +890,7 @@ async fn generated_cgroup_path_matches_the_actual_container_before_its_first_ins
 #[tokio::test]
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn a_memory_request_smaller_than_runc_init_does_not_hold_the_start() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let host_path = format!("/sys/fs/cgroup/{}", id.0);
     let runtime = runtime(root.path());
@@ -748,7 +935,7 @@ async fn a_memory_request_smaller_than_runc_init_does_not_hold_the_start() {
 #[tokio::test]
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn recovered_source_identity_belongs_to_the_container_not_its_launcher() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let path = format!("/sys/fs/cgroup/{}", id.0);
     let mut specification = spec(root.path(), "exec /bin/busybox sleep 60");
@@ -776,7 +963,7 @@ async fn recovered_source_identity_belongs_to_the_container_not_its_launcher() {
 #[tokio::test]
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn source_identity_refuses_a_container_moved_out_of_its_original_cgroup() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let runtime = runtime(root.path());
     let mut specification = spec(root.path(), "exec /bin/busybox sleep 60");
@@ -805,7 +992,7 @@ async fn source_identity_refuses_a_container_moved_out_of_its_original_cgroup() 
 #[tokio::test]
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn retiring_a_rollout_predecessor_preserves_its_live_successor() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let app_name = instance(root.path()).0;
     let first_id = reliaburger::grill::InstanceIdentity::new("default", &app_name, 0).instance_id();
     let successor_id =
@@ -851,7 +1038,7 @@ async fn retiring_a_rollout_predecessor_preserves_its_live_successor() {
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn retained_addresses_survive_exit_and_recovery_until_the_original_reference_releases() {
     assert!(nix::unistd::geteuid().is_root());
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let first = runtime(root.path());
     first
@@ -966,7 +1153,7 @@ async fn restart_recovers_a_retiring_generation_that_still_holds_its_address() {
     use reliaburger::grill::records::{InstanceRecord, RuntimeKind};
     use reliaburger::grill::runc_intent::NetworkReferenceState;
     assert!(nix::unistd::geteuid().is_root());
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let specification = spec(root.path(), "exec /bin/busybox sleep 60");
     let first = runtime(root.path());
@@ -992,6 +1179,7 @@ async fn restart_recovers_a_retiring_generation_that_still_holds_its_address() {
         app_spec: None,
         oci_spec: specification,
         rootless_network: None,
+        sidecar_restarts: None,
     };
     // A rollout stops the instance; discovery still holds its address.
     first.kill(&id).await.unwrap();
@@ -1048,7 +1236,7 @@ async fn restart_recovers_a_retiring_generation_that_still_holds_its_address() {
 #[tokio::test]
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn previous_boot_intent_cannot_start_or_remove_conflicting_live_resources() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let first = runtime(root.path());
     first
@@ -1247,7 +1435,7 @@ enum Paused {
 async fn paused_container_takes_its_stop_signal_at_once(paused: Paused) {
     use reliaburger::bun::agent::{InstanceStop, stop_runtime_instance};
     assert!(nix::unistd::geteuid().is_root());
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let runtime = runtime(root.path());
     runtime
@@ -1269,10 +1457,8 @@ async fn paused_container_takes_its_stop_signal_at_once(paused: Paused) {
         Paused::Workload => runtime.workload_pids(&id).await.unwrap(),
         Paused::ContainerInit => vec![container_init(root.path(), &id).expect("a container init")],
     };
+    let pids = pause_live(&pids);
     assert!(!pids.is_empty(), "nothing to pause");
-    for pid in &pids {
-        reliaburger::smoker::process::pause_process(*pid as i32).unwrap();
-    }
 
     let grace = Duration::from_secs(20);
     let begun = std::time::Instant::now();
@@ -1335,9 +1521,9 @@ async fn runc_container_with_a_paused_init_takes_its_stop_signal_at_once() {
 #[tokio::test]
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
 async fn runc_pause_freezes_the_workload_not_its_launcher() {
-    use reliaburger::smoker::process::{pause_process, resume_process};
+    use reliaburger::smoker::process::resume_process;
     assert!(nix::unistd::geteuid().is_root());
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let runtime = runtime(root.path());
     runtime
@@ -1360,10 +1546,10 @@ async fn runc_pause_freezes_the_workload_not_its_launcher() {
             .unwrap_or(0)
     };
     let launcher = runtime.pid(&id).await.unwrap().expect("a launcher");
-    let paused = runtime.workload_pids(&id).await.unwrap();
-    for pid in &paused {
-        pause_process(*pid as i32).unwrap();
-    }
+    // The shell loop is the container's init and lives for the whole test.
+    let init = container_init(root.path(), &id).expect("a container init");
+    let listed = runtime.workload_pids(&id).await.unwrap();
+    let paused = pause_live(&listed);
     // A write already under way when the signal landed may still finish.
     tokio::time::sleep(Duration::from_millis(300)).await;
     let frozen = beats();
@@ -1385,10 +1571,167 @@ async fn runc_pause_freezes_the_workload_not_its_launcher() {
         "the workload kept running while {paused:?} were paused"
     );
     assert!(
-        !paused.contains(&launcher),
-        "the pause froze the runc launcher {launcher}"
+        !listed.contains(&launcher),
+        "the pause named the runc launcher {launcher}: {listed:?}"
+    );
+    assert!(
+        paused.contains(&init),
+        "the pause missed the workload's init {init}: {paused:?}"
     );
     moved.expect("the workload never ran again after its resume");
+}
+
+/// Pause each of `pids` that still exists, and return those it paused.
+/// A workload's pids include short-lived children, such as its loop's
+/// `sleep`, which may exit between the listing and the signal; Smoker's
+/// pause skips those too. Any other failure is a test failure (#2315).
+fn pause_live(pids: &[u32]) -> Vec<u32> {
+    use reliaburger::smoker::process::{ProcessFaultError, pause_process};
+    pids.iter()
+        .copied()
+        .filter(|pid| match pause_process(*pid as i32) {
+            Ok(()) => true,
+            Err(ProcessFaultError::SignalFailed {
+                source: nix::errno::Errno::ESRCH,
+                ..
+            }) => false,
+            Err(error) => panic!("cannot pause {pid}: {error}"),
+        })
+        .collect()
+}
+
+/// Start a container that sleeps, in a runtime rooted at `root`, and return
+/// the runtime, the instance and its address.
+async fn start_sleeper(root: &Path) -> (RuncGrill, InstanceId, std::net::Ipv4Addr) {
+    let id = instance(root);
+    let runtime = runtime(root);
+    runtime
+        .create(&id, &spec(root, "exec /bin/busybox sleep 600"))
+        .await
+        .unwrap();
+    install_fixture(root, &id);
+    runtime.start(&id).await.unwrap();
+    let address = runtime
+        .container_ip(&id)
+        .await
+        .expect("a container address");
+    (runtime, id, address)
+}
+
+/// Whether the host still routes `address` anywhere.
+fn routed(address: std::net::Ipv4Addr) -> bool {
+    let output = std::process::Command::new("ip")
+        .args(["route", "show", &format!("{address}/32")])
+        .output()
+        .unwrap();
+    !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+}
+
+/// Wait until process `pid` has gone.
+async fn wait_gone(pid: u32) {
+    let proc = Path::new("/proc").join(pid.to_string());
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while proc.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("process {pid} outlived its test"));
+}
+
+/// A runc test that panics with its container running leaves nothing
+/// behind: no container, network namespace, veth or route (#2315). Before
+/// its root carried a guard, one such panic held the first container
+/// address, and every later runc test failed with `RTNETLINK answers: File
+/// exists`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
+async fn runc_a_panicking_test_leaves_no_container_or_network_behind() {
+    assert!(nix::unistd::geteuid().is_root());
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let failed = tokio::spawn(async move {
+        let root = runc_residue::RuncRoot::new();
+        let (_runtime, id, address) = start_sleeper(root.path()).await;
+        let init = container_init(root.path(), &id).expect("a container init");
+        started_tx
+            .send((root.path().to_path_buf(), id, address, init))
+            .unwrap();
+        panic!("a failed assertion with the container still running");
+    })
+    .await;
+    assert!(failed.unwrap_err().is_panic());
+    let (root, id, address, init) = started_rx.await.unwrap();
+    wait_gone(init).await;
+    assert!(!root.exists(), "{} survived the panic", root.display());
+    assert!(!reliaburger::grill::netns::namespace_path(&id).exists());
+    assert!(
+        !Path::new("/sys/class/net")
+            .join(reliaburger::grill::netns::host_veth_name(&id))
+            .exists()
+    );
+    assert!(!routed(address), "{address} is still routed");
+}
+
+/// A runc test still starts after an earlier one that panicked with no
+/// guard at all: its container kept running, its root was deleted, and its
+/// namespace, veth and route stayed. That is what the pause test's panic
+/// left (#2315). Nothing claims that namespace, so a guard's sweep releases
+/// it once it is older than [`runc_residue::STALE_AFTER`] (#2332), and the
+/// next container takes the same address. The sweep here is told the
+/// namespace is old already rather than waiting two minutes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
+async fn runc_a_test_after_an_unguarded_panic_takes_the_same_address() {
+    assert!(nix::unistd::geteuid().is_root());
+    let unguarded = tempfile::tempdir().unwrap();
+    let (stale_runtime, stale, stale_address) = start_sleeper(unguarded.path()).await;
+    let stale_init = container_init(unguarded.path(), &stale).expect("a container init");
+    drop(stale_runtime);
+    drop(unguarded);
+    assert!(routed(stale_address));
+
+    let root = runc_residue::RuncRoot::new();
+    assert!(
+        reliaburger::grill::netns::namespace_path(&stale).exists(),
+        "a young unclaimed namespace went at once"
+    );
+    runc_residue::sweep_stale_namespaces(Duration::ZERO);
+    wait_gone(stale_init).await;
+    assert!(!reliaburger::grill::netns::namespace_path(&stale).exists());
+    let (runtime, id, address) = start_sleeper(root.path()).await;
+    assert_eq!(address, stale_address, "the stale address never collided");
+    runtime.kill(&id).await.unwrap();
+    assert_absent(root.path(), &id);
+}
+
+/// A runc test still starts after an earlier one was killed outright, by a
+/// timeout's SIGKILL, with its container running and its root kept. Its
+/// guard's lock went with it, so the next guard releases that root's
+/// container and network, and the next container takes the same address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux"]
+async fn runc_a_test_after_a_killed_test_releases_its_root_and_takes_the_same_address() {
+    assert!(nix::unistd::geteuid().is_root());
+    let killed = tempfile::tempdir().unwrap().keep();
+    let residue = runc_residue::RuncResidue::new(&killed);
+    let (stale_runtime, stale, stale_address) = start_sleeper(&killed).await;
+    let stale_init = container_init(&killed, &stale).expect("a container init");
+    drop(stale_runtime);
+    residue.abandon();
+    assert!(routed(stale_address));
+
+    let root = runc_residue::RuncRoot::new();
+    wait_gone(stale_init).await;
+    assert!(
+        container_init(&killed, &stale).is_none(),
+        "runc still lists it"
+    );
+    assert!(!reliaburger::grill::netns::namespace_path(&stale).exists());
+    let (runtime, id, address) = start_sleeper(root.path()).await;
+    assert_eq!(address, stale_address, "the stale address never collided");
+    runtime.kill(&id).await.unwrap();
+    assert_absent(root.path(), &id);
+    std::fs::remove_dir_all(&killed).unwrap();
 }
 
 /// Kill every process in a stand-in for Bun's systemd unit cgroup the way
@@ -1428,7 +1771,7 @@ async fn restart_after_unit_cgroup_stop(retiring: bool) {
     use reliaburger::grill::records::InstanceRecord;
     use reliaburger::grill::runc_intent::NetworkReferenceState;
     assert!(nix::unistd::geteuid().is_root());
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::runc_residue::RuncRoot::new();
     let id = instance(root.path());
     let unit = Path::new("/sys/fs/cgroup").join(format!("{}-unit", id.0));
     std::fs::create_dir(&unit).unwrap();
@@ -1555,6 +1898,7 @@ async fn owned_runc_unit_stop_fixture() {
         app_spec: None,
         oci_spec: specification,
         rootless_network: None,
+        sidecar_restarts: None,
     };
     std::fs::write(
         root.join("shared/record.json"),
@@ -1593,7 +1937,7 @@ mod capacity_contract {
     use reliaburger::council::types::{CouncilConfig, CouncilNodeInfo};
     use reliaburger::grill::image::{ClusterFetchFuture, ClusterImageSource, LocalImageBlobs};
     use reliaburger::grill::runc::RuncGrill;
-    use reliaburger::grill::{ContainerState, Grill, ImageStore, PortAllocator};
+    use reliaburger::grill::{ContainerState, Grill, ImageStore, InstanceId, PortAllocator};
     use reliaburger::relish::client::BunClient;
     use sha2::{Digest, Sha256};
     use tokio::sync::{RwLock, mpsc};
@@ -1986,6 +2330,55 @@ mod capacity_contract {
         }
     }
 
+    /// How long one step of the capacity contract may take: an apply, an
+    /// executor's cold start or a batch's retirement. Each takes about a
+    /// second alone, but a cold owned-runc start runs some twenty supervised
+    /// `ip`, `nft` and `sysctl` commands and a synced image unpack, one
+    /// after another. Beside a full `make test-linux`, or in an 8-vCPU VM at
+    /// load 17 with two fsync writers, one start took 5 to 25 s and a single
+    /// `ip link` 7.5 s, so a 20 s wait failed while nothing was wrong
+    /// (#2267). The limit only has to catch a step that never comes.
+    const STEP_DEADLINE: Duration = Duration::from_secs(90);
+
+    /// Wait until the singleton's command has written `work/ready` inside
+    /// its rootfs. Fails at once if the runtime retires the instance first,
+    /// and says how far the start got if the deadline passes.
+    async fn wait_for_singleton_ready(
+        runtime: &RuncGrill,
+        root: &Path,
+        identity: &InstanceId,
+    ) -> Result<(), String> {
+        let rootfs = root.join("bundles").join(&identity.0).join("rootfs");
+        let started = std::time::Instant::now();
+        while started.elapsed() < STEP_DEADLINE {
+            if rootfs.join("work/ready").exists() {
+                return Ok(());
+            }
+            let launched = runtime
+                .launch_inventory()
+                .await
+                .map_err(|error| format!("launch inventory unavailable: {error}"))?
+                .unwrap_or_default()
+                .iter()
+                .any(|launch| launch.instance_id == *identity);
+            if !launched {
+                return Err(format!(
+                    "{} left the launch inventory after {:?} without writing work/ready",
+                    identity.0,
+                    started.elapsed()
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Err(format!(
+            "{} not ready after {STEP_DEADLINE:?}: network namespace {}, rootfs mounted {}, runc state {}",
+            identity.0,
+            reliaburger::grill::netns::namespace_path(identity).exists(),
+            rootfs.join("bin/busybox").exists(),
+            root.join("state").join(&identity.0).exists(),
+        ))
+    }
+
     fn fresh_capacity(harness: &Harness, term: u64) {
         harness._capacity_publisher.send_modify(|state| {
             state.leadership_epoch = Some(term);
@@ -2000,7 +2393,7 @@ mod capacity_contract {
     async fn runc_ordinary_terminal_receipt_releases_nonzero_capacity_for_actual_batch_http() {
         assert!(nix::unistd::geteuid().is_root());
         assert!(Path::new("/sys/fs/cgroup/cgroup.controllers").is_file());
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::runc_residue::RuncRoot::new();
         let suffix = root
             .path()
             .file_name()
@@ -2040,12 +2433,12 @@ mod capacity_contract {
             ordinary.job["ordinary"].memory.unwrap().request,
             128 * 1024 * 1024
         );
-        tokio::time::timeout(Duration::from_secs(20), harness.client.apply(&ordinary))
+        tokio::time::timeout(STEP_DEADLINE, harness.client.apply(&ordinary))
             .await
             .expect("real ordinary apply did not acknowledge")
             .unwrap();
         let mut identity = None;
-        tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::time::timeout(STEP_DEADLINE, async {
             while identity.is_none() {
                 identity = runtime
                     .launch_inventory()
@@ -2068,13 +2461,9 @@ mod capacity_contract {
         let identity = identity.unwrap();
         let rootfs = root.path().join("bundles").join(&identity.0).join("rootfs");
         let release = ReleaseOnDrop(rootfs.join("work/release"));
-        tokio::time::timeout(Duration::from_secs(20), async {
-            while !rootfs.join("work/ready").exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("owned singleton did not start");
+        if let Err(reason) = wait_for_singleton_ready(&runtime, root.path(), &identity).await {
+            panic!("owned singleton did not start: {reason}");
+        }
         assert_eq!(
             runtime.state(&identity).await.unwrap(),
             ContainerState::Running
@@ -2149,24 +2538,25 @@ mod capacity_contract {
         }
         std::fs::write(&release.0, b"release").unwrap();
         for id in std::iter::once(ordinary_id).chain(pending) {
-            tokio::time::timeout(Duration::from_secs(30), async {
-                loop {
-                    let summary = harness.client.batch_status(id).await.unwrap();
-                    if summary["done"] == true {
-                        assert_eq!(summary["succeeded"], 1, "{summary}");
-                        assert_eq!(summary["failed"], 0);
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+            let started = std::time::Instant::now();
+            let summary = loop {
+                let summary = harness.client.batch_status(id).await.unwrap();
+                if summary["done"] == true || started.elapsed() >= STEP_DEADLINE {
+                    break summary;
                 }
-            })
-            .await
-            .expect("positive owned retirement did not free waiting work");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            assert_eq!(
+                summary["done"], true,
+                "positive owned retirement did not free waiting work: {summary}"
+            );
+            assert_eq!(summary["succeeded"], 1, "{summary}");
+            assert_eq!(summary["failed"], 0, "{summary}");
         }
 
         fresh_capacity(&harness, council.current_term());
         let admitted = tokio::time::timeout(
-            Duration::from_secs(20),
+            STEP_DEADLINE,
             harness
                 .client
                 .submit_batch(&probe("full-after-terminal", "8", "16Gi"), None),
@@ -2177,7 +2567,7 @@ mod capacity_contract {
         assert_eq!(admitted["assigned"], 1, "{admitted}");
         assert_eq!(admitted["unschedulable"], serde_json::json!([]));
         let batch_id = admitted["batch_id"].as_u64().unwrap();
-        tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::time::timeout(STEP_DEADLINE, async {
             loop {
                 let summary = harness.client.batch_status(batch_id).await.unwrap();
                 if summary["done"] == true {
@@ -2232,7 +2622,7 @@ mod capacity_contract {
     #[ignore = "requires root, runc, overlayfs, cgroup v2, ip and nft; run with scripts/release/qualify-oci-interruptions.sh"]
     async fn runc_capacity_harness_unmounts_identity_tmpfs_and_removes_its_volumes() {
         assert!(nix::unistd::geteuid().is_root());
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::runc_residue::RuncRoot::new();
         let (harness, _council) = bare_harness(root.path()).await;
         let volumes = harness.volumes.clone();
         mount_identity(&volumes);
@@ -2249,7 +2639,7 @@ mod capacity_contract {
     #[ignore = "requires root, runc, overlayfs, cgroup v2, ip and nft; run with scripts/release/qualify-oci-interruptions.sh"]
     async fn runc_capacity_harness_unmounts_identity_tmpfs_while_a_failed_test_unwinds() {
         assert!(nix::unistd::geteuid().is_root());
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::runc_residue::RuncRoot::new();
         let (volumes_tx, volumes_rx) = tokio::sync::oneshot::channel();
         let root_path = root.path().to_path_buf();
         let failed = tokio::spawn(async move {

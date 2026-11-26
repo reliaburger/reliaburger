@@ -65,6 +65,9 @@ availability starts at three. Lose a node and the scheduler moves its
 workloads to the survivors. Lose the whole
 council and `relish council recover` rebuilds it from a backup, fencing off the
 old voters if they return; `relish council status` shows every node's view.
+A bare-metal or `setup --ssh` cluster's saved context lists every node, so
+when node 1 is down `relish` falls over to another and says on stderr which
+one it used (0.3.3, not in 0.3.2).
 
 **Service discovery in the kernel.** Every app gets a stable virtual IP and,
 with DNS enabled, a `.internal` name. An eBPF connect hook sends each
@@ -75,7 +78,10 @@ who may connect at all.
 by the cluster's own ingress CA or files you provide. WebSockets and streaming
 pass through, and connections drain before an instance stops. Each app can
 pick its stop signal, its grace and a pre-stop command, and run sidecars
-that share its network and start before it and stop after it.
+that share its network and start before it and stop after it. A Bun restart
+or self-upgrade adopts running sidecars with their app instead of restarting
+them (0.3.3, not in 0.3.2), and `relish apps NAME` lists each instance's sidecars with
+their state and restarts (0.3.3, not in 0.3.2).
 
 **Security on by default.** A generated cluster requires mTLS between nodes.
 Nodes join with single-use tokens and certificate signing requests.
@@ -120,7 +126,9 @@ ask it to. `scripts/demo/rollout.sh` and `scripts/demo/gitops.sh` show both on
 a one-node cluster from a checkout, with
 [`examples/phase-1/proc-rollout.toml`](../examples/phase-1/proc-rollout.toml) and
 [`examples/gitops/repository`](../examples/gitops/repository), and measure Bun's
-memory and CPU as they go.
+memory and CPU as they go. `relish apply --wait` returns once every app in the
+file runs its replicas, passes its health checks and has finished rolling
+out, and exits 1 naming each app that wasn't ready in time (0.3.3, not in 0.3.2).
 
 **Policies.** `[policy.*]` rules in CEL, such as "apps in `prod` need a memory
 limit", are kept in the council and checked on the leader before an app is
@@ -186,7 +194,8 @@ place ([record](qualification/2026-10-29-rolling-walk-0.2.2-to-0.2.3.md));
 0.2.4, 0.2.5 and 0.2.6 each change them again, 0.2.7 kept 0.2.6's, and 0.2.8
 and 0.3.0 each change them again, so a 0.2.8 cluster starts afresh on 0.3.0;
 0.3.1 keeps 0.3.0's, so a 0.3.0 cluster rolls onto it in place, and 0.3.2
-moves the protocol to 61, so a 0.3.1 cluster starts afresh on 0.3.2
+moves the protocol to 61, so a 0.3.1 cluster starts afresh on 0.3.2;
+0.3.3 keeps 0.3.2's (61/76), so a 0.3.2 cluster rolls onto it in place
 ([compatibility before 1.0.0](releasing.md#compatibility-before-100)). A release with other cluster formats, or a
 rollback to a version some node doesn't hold, is refused before anything is
 recorded.
@@ -961,7 +970,16 @@ instead, with no distro to install, see
 [Bare metal: the appliance and netboot](manual/17_appliance.md). `relish
 netboot --stream-logs` prints each machine's kernel and boot logs as it
 installs and boots, so a machine with no serial port needn't be watched on its
-monitor.
+monitor, and `relish os boot-logs --to <address>|--off` turns that on or off
+later on a claimed cluster (0.3.3, not in 0.3.2). Once it's a node, its monitor shows a
+read-only dashboard: status, metrics, workloads, the cluster, versions and
+logs, plus a hidden invaders game on `7` (0.3.3, not in 0.3.2). The game's
+kill mode, where a hit kills that instance as an audited Smoker fault, stays
+off until a cluster admin sets `[appliance] console_chaos = true` with
+`relish os settings --set FILE`; `relish os settings` shows it. Three Dell Wyse 3040s went from power-on to a
+working cluster in about 25 minutes in the exit test; its
+[record](qualification/2026-11-20-wyse-3040.md) has the go/no-go, which
+waits on a 0.3.3 rerun of the broken-update fallback.
 
 Keep `[cluster].name` identical on every node. `relish init`, `relish setup`
 and `relish dev create` write it for you; Bun validates it as a DNS-style SPIFFE trust domain.
@@ -1689,6 +1707,8 @@ The bun agent exposes a local HTTP API on port 9117:
 | `GET` | `/v1/capabilities/cluster` | Bounded authenticated capability evidence from every expected node |
 | `GET` | `/v1/diagnostics` | Bounded local disk, cgroup throttling and public certificate evidence |
 | `GET` | `/v1/diagnostics/apps` | Desired replicas, scheduled replicas, service exposure and any `RolloutFailed` mark used by diagnostics. A node that isn't the leader forwards the read to the leader, and answers `503` when no leader answers |
+| `GET` | `/v1/apps/{app}/{namespace}/spec` | One app's spec as the cluster runs it, and as declared where the two differ, with env values, config file contents and recognisable secrets redacted (each redacted field is named). Scoped to the token; forwarded to the leader like `/v1/diagnostics/apps`; `404` for an app the cluster doesn't have (0.3.3, not in 0.3.2) |
+| `GET` | `/v1/diagnostics/rollouts` | Whether each app's current spec has finished rolling out (`rolled_out`, with its `fingerprint`), for `relish apply --wait`. Forwarded to the leader like `/v1/diagnostics/apps`; a node without a council answers an empty list |
 | `POST` | `/v1/path` | Run fixed DNS and TCP probes from a local source workload and return live service/firewall evidence |
 | `POST` | `/v1/test/leases` | Create a policy-authorised, server-owned Phase 15 app lease |
 | `GET` | `/v1/test/leases/{id}` | Inspect an owned lease (or inspect any lease as unscoped Admin) |

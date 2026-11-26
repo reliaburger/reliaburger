@@ -103,7 +103,6 @@ pub fn node_memory_max(total_bytes: u64, target_percentage: u8) -> u64 {
 pub struct NodePressureController {
     limits: NodePressureLimits,
     executable: Option<PathBuf>,
-    available: bool,
     #[cfg(target_os = "linux")]
     active: std::collections::HashMap<FaultId, NodePressureHandle>,
     /// Cgroup directories whose helper was killed but whose (now-empty)
@@ -171,32 +170,32 @@ fn capture_helper_stderr(
 impl NodePressureController {
     /// Configure the controller and clean leftovers owned by a crashed Bun.
     ///
-    /// Returns whether the primitive is usable on this node. A false result is
-    /// capability evidence, not a fault: the default policy intentionally
-    /// disables pressure.
+    /// Returns whether the primitive was usable at startup. A false result
+    /// is capability evidence, not a fault: the default policy intentionally
+    /// disables pressure. It isn't final either: the host may enable the cpu
+    /// and memory controllers later, so [`apply`](Self::apply) and
+    /// [`probe`] prepare the cgroup again before relying on it (#2242).
     pub fn configure(&mut self, limits: NodePressureLimits, executable: PathBuf) -> bool {
         self.limits = limits;
         self.executable = Some(executable);
-        self.available = prepare_controller(limits).is_ok();
-        self.available
-    }
-
-    /// Whether configuration and the host cgroup hierarchy support pressure.
-    pub fn available(&self) -> bool {
-        self.available
+        match prepare_controller(limits) {
+            Ok(()) => true,
+            Err(reason) => {
+                if limits.enabled() {
+                    eprintln!("smoker: node pressure is unavailable for now: {reason}");
+                }
+                false
+            }
+        }
     }
 
     /// Whether `apply` would accept this request now: within the server's
-    /// limits, on a usable controller, with no other pressure fault active.
-    /// Cheap, so the agent loop can refuse a request before it hands the
-    /// helper's start to a task.
+    /// limits, with no other pressure fault active. Cheap, so the agent loop
+    /// can refuse a request before it hands the helper's start to a task.
+    /// Whether the cgroup hierarchy is usable is `apply`'s question: that
+    /// answer needs cgroupfs I/O, and it can change after startup.
     pub fn check_apply(&self, cpu_percentage: u8, memory_percentage: u8) -> Result<(), String> {
         validate_request(cpu_percentage, memory_percentage, self.limits)?;
-        if !self.available {
-            return Err(
-                "node pressure requires an enabled rootful Linux cgroup-v2 controller".to_string(),
-            );
-        }
         #[cfg(not(target_os = "linux"))]
         return Err("node pressure requires Linux cgroup v2".to_string());
         #[cfg(target_os = "linux")]
@@ -232,6 +231,11 @@ impl NodePressureController {
                 .executable
                 .as_ref()
                 .ok_or_else(|| "node-pressure helper executable is unavailable".to_string())?;
+            // Prepare again on every use: the controllers may have come on
+            // since startup, or been switched off by the host (#2242).
+            prepare(self.limits)
+                .await
+                .map_err(|reason| format!("node pressure is unavailable: {reason}"))?;
             let cgroup = Path::new(NODE_PRESSURE_CGROUP_ROOT).join(id.to_string());
             // Setting up writes cgroupfs, and a failed setup removes the
             // cgroup, which retries with a sleep: off the runtime (#1860).
@@ -487,6 +491,51 @@ async fn remove_fault_cgroup_async(cgroup: PathBuf) -> Result<(), String> {
         .map_err(|e| format!("cgroup cleanup task panicked: {e}"))?
 }
 
+/// Prepare node pressure's cgroup for a fault, or say what is missing.
+///
+/// Idempotent and cheap once the cgroup is ready, so it runs before every
+/// pressure fault: a host that enabled the cpu and memory controllers after
+/// Bun started gets node pressure without a restart (#2242). It may create
+/// the cgroup and enable controllers, so only `apply` calls it; a capability
+/// report calls [`probe`], which writes nothing. The cgroupfs work runs on
+/// the blocking pool.
+pub async fn prepare(limits: NodePressureLimits) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        tokio::task::spawn_blocking(move || ensure_ready(limits))
+            .await
+            .map_err(|error| format!("node-pressure preparation task panicked: {error}"))?
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = limits;
+        Err("node pressure requires Linux cgroup v2".to_string())
+    }
+}
+
+/// Whether a pressure fault could run now, without changing anything: what
+/// `/v1/capabilities` reports, which any token may read, so it mustn't
+/// create cgroups or enable controllers on the host (#2323). `Ok` means
+/// [`prepare`] would succeed, given the permission to write. The error says
+/// what is missing.
+pub async fn probe(limits: NodePressureLimits) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        tokio::task::spawn_blocking(move || {
+            check_policy(limits)?;
+            check_controllers(Path::new(NODE_PRESSURE_CGROUP_ROOT))
+        })
+        .await
+        .map_err(|error| format!("node-pressure probe task panicked: {error}"))?
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = limits;
+        Err("node pressure requires Linux cgroup v2".to_string())
+    }
+}
+
+/// Startup preparation: clean leftovers from a crashed Bun, then prepare.
 #[cfg(target_os = "linux")]
 fn prepare_controller(limits: NodePressureLimits) -> Result<(), String> {
     if crate::grill::rootless::is_rootless() {
@@ -501,23 +550,117 @@ fn prepare_controller(limits: NodePressureLimits) -> Result<(), String> {
     {
         cleanup_stale_cgroups(root)?;
     }
+    ensure_ready(limits)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn prepare_controller(_limits: NodePressureLimits) -> Result<(), String> {
+    Err("node pressure requires Linux cgroup v2".to_string())
+}
+
+/// Every precondition for a pressure fault, without touching live helpers.
+#[cfg(target_os = "linux")]
+fn ensure_ready(limits: NodePressureLimits) -> Result<(), String> {
+    check_policy(limits)?;
+    ensure_controllers(Path::new(NODE_PRESSURE_CGROUP_ROOT))
+}
+
+/// The preconditions that aren't cgroupfs: a rootful Bun, and a policy
+/// that allows pressure.
+#[cfg(target_os = "linux")]
+fn check_policy(limits: NodePressureLimits) -> Result<(), String> {
+    if crate::grill::rootless::is_rootless() {
+        return Err("rootless Bun has no delegated pressure cgroup".to_string());
+    }
     if !limits.enabled() {
         return Err("node pressure is disabled by policy".to_string());
     }
+    Ok(())
+}
+
+/// The cpu and memory controllers `root`'s children would get, read only:
+/// `Ok` when `root` offers both, or when its parent does, which
+/// [`ensure_controllers`] then delegates. A `root` that doesn't exist yet is
+/// judged by its parent alone, as `ensure_controllers` would create it.
+#[cfg(any(target_os = "linux", test))]
+fn check_controllers(root: &Path) -> Result<(), String> {
+    const REQUIRED: [&str; 2] = ["cpu", "memory"];
+    let offers = |listed: &str, wanted: &str| listed.split_whitespace().any(|item| item == wanted);
+    let at_root = std::fs::read_to_string(root.join("cgroup.controllers")).unwrap_or_default();
+    if REQUIRED.iter().all(|required| offers(&at_root, required)) {
+        return Ok(());
+    }
+    let parent = root
+        .parent()
+        .ok_or_else(|| format!("{} has no parent cgroup", root.display()))?;
+    let parent_offers =
+        std::fs::read_to_string(parent.join("cgroup.controllers")).unwrap_or_default();
+    match REQUIRED
+        .iter()
+        .find(|required| !offers(&parent_offers, required))
+    {
+        Some(absent) => Err(format!(
+            "cgroup v2 {absent} controller is unavailable: {} doesn't offer it",
+            parent.display()
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Make `root` a cgroup whose children get the cpu and memory controllers.
+///
+/// A cgroup only offers the controllers its parent enabled in the parent's
+/// `cgroup.subtree_control`. systemd enables them at the root lazily, when a
+/// unit first asks, so a fresh boot can leave them off (#2242). If the
+/// parent offers them, we enable them there ourselves, as runc does for a
+/// container's ancestors. Only missing controllers are written, so a ready
+/// cgroup costs two reads.
+#[cfg(any(target_os = "linux", test))]
+fn ensure_controllers(root: &Path) -> Result<(), String> {
+    const REQUIRED: [&str; 2] = ["cpu", "memory"];
+    let lacks = |listed: &str, wanted: &str| !listed.split_whitespace().any(|item| item == wanted);
+
     std::fs::create_dir_all(root)
         .map_err(|error| format!("failed to create {}: {error}", root.display()))?;
-
-    let controllers = std::fs::read_to_string(root.join("cgroup.controllers"))
+    let offered = std::fs::read_to_string(root.join("cgroup.controllers"))
         .map_err(|error| format!("failed to read cgroup controllers: {error}"))?;
-    for required in ["cpu", "memory"] {
-        if !controllers.split_whitespace().any(|item| item == required) {
-            return Err(format!("cgroup v2 {required} controller is unavailable"));
-        }
-    }
-    let enabled = std::fs::read_to_string(root.join("cgroup.subtree_control")).unwrap_or_default();
-    let missing: Vec<_> = ["cpu", "memory"]
+    let undelegated: Vec<_> = REQUIRED
         .into_iter()
-        .filter(|required| !enabled.split_whitespace().any(|item| item == *required))
+        .filter(|required| lacks(&offered, required))
+        .collect();
+    if !undelegated.is_empty() {
+        let parent = root
+            .parent()
+            .ok_or_else(|| format!("{} has no parent cgroup", root.display()))?;
+        // A missing file reads as "offers nothing", which the check below
+        // reports with the controller's name.
+        let parent_offers =
+            std::fs::read_to_string(parent.join("cgroup.controllers")).unwrap_or_default();
+        if let Some(absent) = undelegated
+            .iter()
+            .find(|required| lacks(&parent_offers, required))
+        {
+            return Err(format!(
+                "cgroup v2 {absent} controller is unavailable: {} doesn't offer it",
+                parent.display()
+            ));
+        }
+        let enable: Vec<_> = undelegated.iter().map(|item| format!("+{item}")).collect();
+        std::fs::write(parent.join("cgroup.subtree_control"), enable.join(" ")).map_err(
+            |error| {
+                format!(
+                    "failed to enable {} in {}: {error}",
+                    undelegated.join(" and "),
+                    parent.display()
+                )
+            },
+        )?;
+    }
+
+    let enabled = std::fs::read_to_string(root.join("cgroup.subtree_control")).unwrap_or_default();
+    let missing: Vec<_> = REQUIRED
+        .into_iter()
+        .filter(|required| lacks(&enabled, required))
         .map(|item| format!("+{item}"))
         .collect();
     if !missing.is_empty() {
@@ -525,11 +668,6 @@ fn prepare_controller(limits: NodePressureLimits) -> Result<(), String> {
             .map_err(|error| format!("failed to enable pressure cgroup controllers: {error}"))?;
     }
     Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn prepare_controller(_limits: NodePressureLimits) -> Result<(), String> {
-    Err("node pressure requires Linux cgroup v2".to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -817,6 +955,128 @@ mod tests {
         assert_eq!(memory_bytes_to_target(10 * gib, 6 * gib, 90), 5 * gib);
         assert_eq!(memory_bytes_to_target(10 * gib, gib, 90), 0);
         assert_eq!(node_memory_max(10 * gib, 90), 9 * gib);
+    }
+
+    /// A fake cgroup v2 tree: `parent` stands in for `/sys/fs/cgroup` and
+    /// `parent/reliaburger-chaos` for the pressure root.
+    fn fake_cgroup_tree() -> (tempfile::TempDir, PathBuf) {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("reliaburger-chaos");
+        std::fs::create_dir(&root).unwrap();
+        // A fresh child cgroup offers nothing until its parent delegates.
+        std::fs::write(root.join("cgroup.controllers"), "").unwrap();
+        (parent, root)
+    }
+
+    /// #2242: Bun started before systemd enabled cpu and memory at the
+    /// root, so the first preparation failed. Once the controllers exist,
+    /// the next preparation must succeed without a Bun restart.
+    #[test]
+    fn preparation_succeeds_once_controllers_appear_after_startup() {
+        let (_parent, root) = fake_cgroup_tree();
+
+        let error = ensure_controllers(&root).expect_err("nothing is delegated yet");
+        assert!(error.contains("cpu controller is unavailable"), "{error}");
+
+        // systemd (or runc) later enables cpu and memory at the root.
+        std::fs::write(root.join("cgroup.controllers"), "cpu memory pids").unwrap();
+
+        ensure_controllers(&root).expect("controllers now exist");
+        assert_eq!(
+            std::fs::read_to_string(root.join("cgroup.subtree_control")).unwrap(),
+            "+cpu +memory"
+        );
+    }
+
+    /// #2242: the parent offers cpu and memory but hasn't delegated them,
+    /// which is how a fresh appliance boot looks. Preparation delegates
+    /// them itself, as runc does for a container's ancestors.
+    #[test]
+    fn preparation_delegates_controllers_the_parent_offers() {
+        let (parent, root) = fake_cgroup_tree();
+        std::fs::write(
+            parent.path().join("cgroup.controllers"),
+            "cpuset cpu io memory pids",
+        )
+        .unwrap();
+        std::fs::write(parent.path().join("cgroup.subtree_control"), "").unwrap();
+
+        ensure_controllers(&root).expect("the parent can delegate");
+        assert_eq!(
+            std::fs::read_to_string(parent.path().join("cgroup.subtree_control")).unwrap(),
+            "+cpu +memory"
+        );
+    }
+
+    /// Preparation runs before every use, so it must not rewrite controls
+    /// that are already right (a live helper may be using them).
+    #[test]
+    fn preparation_leaves_enabled_controllers_alone() {
+        let (_parent, root) = fake_cgroup_tree();
+        std::fs::write(root.join("cgroup.controllers"), "cpu memory").unwrap();
+        std::fs::write(root.join("cgroup.subtree_control"), "cpu memory").unwrap();
+
+        ensure_controllers(&root).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("cgroup.subtree_control")).unwrap(),
+            "cpu memory"
+        );
+    }
+
+    /// Every file under `dir`, with its contents, to compare before and
+    /// after.
+    fn snapshot(dir: &Path) -> Vec<(PathBuf, String)> {
+        let mut files = Vec::new();
+        for entry in walkdir(dir) {
+            let contents = std::fs::read_to_string(&entry).unwrap_or_default();
+            files.push((entry, contents));
+        }
+        files.sort();
+        files
+    }
+
+    fn walkdir(dir: &Path) -> Vec<PathBuf> {
+        let mut found = vec![dir.to_path_buf()];
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                found.extend(walkdir(&path));
+            } else {
+                found.push(path);
+            }
+        }
+        found
+    }
+
+    /// #2323: any token may read `/v1/capabilities`, so its probe answers
+    /// as preparation would, and creates and writes nothing.
+    #[test]
+    fn the_capability_probe_creates_and_writes_nothing() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("reliaburger-chaos");
+        std::fs::write(parent.path().join("cgroup.controllers"), "cpu io").unwrap();
+        std::fs::write(parent.path().join("cgroup.subtree_control"), "").unwrap();
+        let before = snapshot(parent.path());
+
+        let error = check_controllers(&root).expect_err("the parent lacks memory");
+        assert!(
+            error.contains("memory controller is unavailable"),
+            "{error}"
+        );
+        std::fs::write(parent.path().join("cgroup.controllers"), "cpu io memory").unwrap();
+        let before_ready = snapshot(parent.path());
+        check_controllers(&root).expect("the parent offers both, so apply could delegate");
+
+        assert!(!root.exists(), "the probe created the pressure cgroup");
+        assert_eq!(snapshot(parent.path()), before_ready);
+        assert_ne!(before, before_ready);
+        // An existing root that offers both is ready, whatever the parent says.
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("cgroup.controllers"), "cpu memory").unwrap();
+        std::fs::write(parent.path().join("cgroup.controllers"), "").unwrap();
+        let before = snapshot(parent.path());
+        check_controllers(&root).unwrap();
+        assert_eq!(snapshot(parent.path()), before);
     }
 
     #[test]

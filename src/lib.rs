@@ -10,6 +10,10 @@
 #[path = "../tests/support/first_launch.rs"]
 pub(crate) mod first_launch;
 
+#[cfg(test)]
+#[path = "../tests/support/test_cgroups.rs"]
+pub(crate) mod test_cgroups;
+
 pub mod appliance;
 pub mod brioche;
 pub mod bun;

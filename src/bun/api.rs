@@ -124,17 +124,18 @@ use metrics::{
     metrics_query_handler, metrics_rollup_handler, metrics_summary_handler,
 };
 use node_info::{
-    DesiredAppsSource, capabilities_handler, cluster_capabilities_handler, desired_apps_handler,
-    diagnostics_handler, gather_desired_apps, health_handler, path_handler, readiness_handler,
-    version_handler,
+    DesiredAppsSource, app_spec_handler, capabilities_handler, cluster_capabilities_handler,
+    desired_apps_handler, diagnostics_handler, gather_desired_apps, health_handler, path_handler,
+    readiness_handler, rollouts_handler, version_handler,
 };
 use nodes::{
     MAX_RELAY_REQUEST_BYTES, cluster_elect_handler, council_handler, node_relay_handler,
     nodes_handler,
 };
 use os::{
-    os_rollout_abort_handler, os_rollout_handler, os_rollout_resume_handler,
-    os_rollout_start_handler, os_stage_handler,
+    os_boot_logs_handler, os_boot_logs_set_handler, os_rollout_abort_handler, os_rollout_handler,
+    os_rollout_resume_handler, os_rollout_start_handler, os_settings_handler,
+    os_settings_set_handler, os_stage_handler,
 };
 use policies::{policies_handler, policy_audit_handler, policy_delete_handler};
 use proposals::{
@@ -701,6 +702,7 @@ pub fn router_with_upgrade(
         .route("/v1/apply", post(apply_handler))
         .route("/v1/status", get(status_handler))
         .route("/v1/apps", get(current_apps_handler))
+        .route("/v1/apps/{app}/{namespace}/spec", get(app_spec_handler))
         .route("/v1/readiness", get(readiness_handler))
         .route("/v1/jobs", get(jobs_handler))
         .route("/v1/jobs/runs", post(super::job_api::submit_handler))
@@ -766,6 +768,7 @@ pub fn router_with_upgrade(
         )
         .route("/v1/diagnostics", get(diagnostics_handler))
         .route("/v1/diagnostics/apps", get(desired_apps_handler))
+        .route("/v1/diagnostics/rollouts", get(rollouts_handler))
         .route("/v1/path", post(path_handler))
         .route("/v1/test/leases", post(test_lease_create_handler))
         .route("/v1/test/leases/{id}", get(test_lease_get_handler))
@@ -798,6 +801,14 @@ pub fn router_with_upgrade(
             post(upgrade_cluster_rollback_handler),
         )
         .route("/v1/os/stage", post(os_stage_handler))
+        .route(
+            "/v1/os/boot-logs",
+            get(os_boot_logs_handler).post(os_boot_logs_set_handler),
+        )
+        .route(
+            "/v1/os/settings",
+            get(os_settings_handler).post(os_settings_set_handler),
+        )
         .route("/v1/os/rollout", get(os_rollout_handler))
         .route("/v1/os/rollout/start", post(os_rollout_start_handler))
         .route("/v1/os/rollout/resume", post(os_rollout_resume_handler))

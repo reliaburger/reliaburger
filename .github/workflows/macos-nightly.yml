@@ -1,0 +1,90 @@
+name: macOS nightly
+
+# Portable macOS on the newest release train, every night.
+#
+# The merge queue doesn't run portable macOS (maintainer decision of 24
+# November 2026): it took 50 minutes to over 2 hours in merge-group runs, set
+# every group's length, and was cancelled or failed three times that day,
+# each time rebuilding the whole queue. So this runs what ci.yml's `portable
+# macOS` job runs (`make lint-macos`, `make test-macos` and relish's
+# doctests) on the newest `release-*` train that has work main doesn't, or on
+# main when no train is ahead of it, the way mutants.yml picks its branch.
+# A failure here is a red nightly, handled like a flake: an issue the same
+# day (docs/flakes.md).
+#
+# The release still runs it before anything ships: the gate PR labelled
+# `release-gate` runs portable macOS and its evidence gate refuses it
+# without, the push to main runs it, and build.yml's candidate never rests on
+# a run that skipped it (scripts/release/ci_reuse.py).
+#
+# It is its own workflow because GitHub runs a scheduled workflow from the
+# default branch, at main's commit: ci.yml's own nightly tests main.
+
+on:
+  schedule:
+    - cron: "41 1 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or commit to test (empty means the newest train, else main)
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-nightly-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  NEXTEST_PROFILE: ci
+  PYTHONDONTWRITEBYTECODE: '1'
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+jobs:
+  macos:
+    name: portable macOS (newest train)
+    runs-on: macos-15
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # The newest release train, when it has work main doesn't, else main.
+      # Release trains are release-<x>-<y>-<z>; sort -V puts the newest last.
+      - name: Choose what to test
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          ref=${REF:-}
+          if [ -z "$ref" ]; then
+            ref=origin/main
+            train=$(git branch -r --list 'origin/release-*' | sed 's/^ *//' | sort -V | tail -n 1)
+            if [ -n "$train" ] && [ -n "$(git rev-list -1 origin/main.."$train")" ]; then
+              ref=$train
+            fi
+          elif git rev-parse --verify --quiet "origin/$ref" >/dev/null; then
+            ref=origin/$ref
+          fi
+          git checkout --quiet --detach "$ref"
+          echo "testing $ref at $(git rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: clippy
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.151
+      # Restores main's macOS cache (ci.yml's push to main saves it) and never
+      # saves one: the key would carry the train's Cargo.lock under main's
+      # scope, beside the cache ci.yml keeps for main.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos
+          save-if: false
+      - name: Lint the library, relish and bun (bun's compile check), all features
+        run: make lint-macos
+      - name: Relish and macOS-only tests
+        run: make test-macos
+      - name: Relish's doctests
+        run: 'cargo test --locked --doc -- relish::'

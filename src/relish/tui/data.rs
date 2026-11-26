@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::bun::agent::{ClusterInstanceStatus, CouncilStatus};
 use crate::bun::cluster_view::{ClusterDeployHistory, ClusterEvents, ClusterJobs};
 use crate::bun::diagnostics::DesiredAppEvidence;
+use crate::bun::spec_read::AppSpecView;
 use crate::bun::summary::ClusterSummary;
 use crate::mayo::rollup::MetricsQueryResult;
 use crate::relish::client::BunClient;
@@ -77,6 +78,12 @@ pub trait DataProvider: Send + Sync + 'static {
     fn desired_apps(
         &self,
     ) -> impl Future<Output = Result<Vec<DesiredAppEvidence>, ProviderError>> + Send;
+    /// One app's spec, its secrets left out (#1322).
+    fn app_spec(
+        &self,
+        app: &str,
+        namespace: &str,
+    ) -> impl Future<Output = Result<AppSpecView, ProviderError>> + Send;
     /// Set an app's replica count to `to`, if its spec still asks for
     /// `from` (#2176).
     fn scale(
@@ -162,6 +169,12 @@ impl DataProvider for HttpDataProvider {
     }
     async fn desired_apps(&self) -> Result<Vec<DesiredAppEvidence>, ProviderError> {
         self.client.desired_apps().await.map_err(Into::into)
+    }
+    async fn app_spec(&self, app: &str, namespace: &str) -> Result<AppSpecView, ProviderError> {
+        self.client
+            .app_spec(app, namespace)
+            .await
+            .map_err(Into::into)
     }
     async fn scale(
         &self,
@@ -276,6 +289,16 @@ impl DataProvider for MockDataProvider {
                 warnings: Vec::new(),
             }))
     }
+    async fn app_spec(&self, app: &str, namespace: &str) -> Result<AppSpecView, ProviderError> {
+        self.scenario
+            .data()
+            .app_spec
+            .filter(|view| view.app == app && view.namespace == namespace)
+            .ok_or(ProviderError::Api {
+                status: 404,
+                body: format!("no app {app:?} in namespace {namespace:?}"),
+            })
+    }
     async fn desired_apps(&self) -> Result<Vec<DesiredAppEvidence>, ProviderError> {
         Ok(self.scenario.data().desired_apps)
     }
@@ -292,6 +315,7 @@ impl DataProvider for MockDataProvider {
         Ok(FaultSummary {
             id: 1,
             fault_type: "kill".into(),
+            kind: crate::smoker::types::FaultKind::Kill { count: 1 },
             target_service: target.app.clone(),
             namespace: Some(target.namespace.clone()),
             target_instance: Some(target.instance.clone()),
@@ -404,7 +428,8 @@ mod tests {
                         return axum::response::IntoResponse::into_response((code, body));
                     }
                     axum::response::IntoResponse::into_response(Json(serde_json::json!({
-                        "id": 7, "fault_type": "kill", "target_service": "web",
+                        "id": 7, "fault_type": "kill", "kind": {"type": "Kill", "count": 1},
+                        "target_service": "web",
                         "namespace": "default", "target_instance": "web-1",
                         "target_node": "node-2", "remaining_secs": 0,
                         "injected_by": "admin"

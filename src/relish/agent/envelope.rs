@@ -132,11 +132,14 @@ pub enum CommandName {
     /// `relish status -o json`: not under `relish agent`, but it answers in
     /// the same envelope, so `relish agent schema status` describes it.
     Status,
+    /// `relish apply --wait -o json`: like `status`, outside `relish agent`
+    /// but in the same envelope (#2240).
+    Apply,
 }
 
 impl CommandName {
     /// The command as a caller types it after `relish agent`, or after
-    /// `relish` for `status`.
+    /// `relish` for `status` and `apply`.
     pub fn as_str(self) -> &'static str {
         match self {
             CommandName::Agent => "agent",
@@ -174,6 +177,7 @@ impl CommandName {
             CommandName::Withdraw => "withdraw",
             CommandName::Undo => "undo",
             CommandName::Status => "status",
+            CommandName::Apply => "apply",
         }
     }
 
@@ -214,6 +218,7 @@ impl CommandName {
         CommandName::Withdraw,
         CommandName::Undo,
         CommandName::Status,
+        CommandName::Apply,
     ];
 }
 
@@ -437,6 +442,13 @@ impl From<&RelishError> for AgentError {
                 };
                 let mut agent_error = AgentError::new(code, message).with_hint(hint);
                 agent_error.endpoint = Some(endpoint.clone());
+                agent_error
+            }
+            RelishError::NoEndpointAnswered { attempts } => {
+                let mut agent_error = AgentError::new(ErrorCode::Unreachable, message).with_hint(
+                    "no node in the context answered: check this machine's network, or pass --endpoint for a node that is up",
+                );
+                agent_error.endpoint = attempts.first().map(|attempt| attempt.endpoint.clone());
                 agent_error
             }
             RelishError::AgentRequired { .. }

@@ -243,9 +243,34 @@ Namespace isolation does cover sidecars: a sidecar belongs to its app's
 namespace, and its app's `allow_from` grants are its grants too. A sidecar
 reaches what its app may reach in other namespaces, and nothing else.
 
-A Bun restart adopts running apps but not their sidecars, which have no
-adoption records. Bun starts them again on its next tick, a second or so
-later.
+A Bun restart or self-upgrade adopts running sidecars along with their
+app: each sidecar has an adoption record of its own, and the new Bun checks
+that the process it names is still the one the runtime runs before it takes
+it over. A sidecar that can't be adopted this way, because it crashed while
+Bun was down, say, starts again after its next backoff, which is at once
+(on Bun's next tick) if it had never restarted. Its record also keeps how
+often it has restarted and when its backoff ends, so a Bun restart changes
+neither: a sidecar in a crash loop keeps its count and waits out the rest of
+its backoff.
+
+`relish apps NAME` lists each instance's sidecars under it, with their
+state and how often each has restarted on its own:
+
+```text
+NODE                     INSTANCE             APP             NAMESPACE    STATE      PID        RESTARTS AGE
+node-1                   default__api-0       api             default      running    4211       0        2h
+                         + proxy              sidecar                      running    -          0        -
+                         + logs               sidecar                      backoff    -          3        -
+```
+
+A sidecar is `starting` while its app is still being prepared or started
+(sidecars start first), then `running`, in `backoff` after it exited,
+`restarting`, or `stopped` while its app isn't running. One the node refused
+to start again is listed as `refused`, with the reason, whatever its app is
+doing (see [Runtime knobs](10_security.md#runtime-knobs)). A new instance's
+sidecars start at 0, and a crash after ten quiet minutes counts as the first
+again. `-o json` puts the same on each instance as `sidecars`, a list of
+`name`, `id`, `state`, `restart_count` and, for a refused one, `refused`.
 
 ## Config files
 
@@ -428,6 +453,7 @@ see `images-and-volumes`.
 
 ```sh
 relish apply app.toml            # deploy (or converge) everything in the file
+relish apply app.toml --wait     # ...and return once its apps run and pass their health checks
 relish apply app.toml --dry-run  # preview; no-agent output states its offline assumption
 relish lint app.toml             # validate only
 relish logs web -f               # stream logs from every node (--tail 20 for the last 20)
@@ -451,6 +477,100 @@ In a cluster, `relish stop` and `relish delete` return as soon as the council
 has recorded the change. Each node then retires its instances on its own, and
 a node that's unreachable does so when it comes back. Run `relish apps web` (or
 `relish inspect web`) to watch the instances go.
+
+### Waiting until it runs
+
+`relish apply` on a cluster returns as soon as the council has recorded the
+change. The scheduler places the apps afterwards, and each node pulls the
+image and starts its share, so a script or a checklist that goes straight on
+to `curl` finds nothing there yet. `--wait` (0.3.3, not in 0.3.2) holds on
+until every app in the file is ready:
+
+```text
+$ relish apply --wait web.toml
+applied 2 app(s); waiting up to 5m for them to run
+[   1s] web: 0/3 running; placed on node-1, node-2, node-3
+[   2s] web: 0/3 running; 3 pulling nginx:1.27 on node-1, node-2, node-3
+[   2s] worker: 0/1 running; 1 starting on node-2
+[   3s] worker: ready, 1/1 running on node-2
+[  14s] web: 1/3 running; 2 waiting for the health check on node-2, node-3
+[  17s] web: ready, 3/3 running on node-1, node-2, node-3
+2 app(s) ready in 17s
+```
+
+An app is ready when it runs as many replicas as it wants, each of them has
+passed its health check (an app without one counts as healthy once its
+process starts), and, on a cluster, its spec has finished rolling out. That
+last part matters for an update: the old version's instances are still
+running when `apply` returns, so `--wait` waits for the leader to record
+that the new spec runs healthy on every node it's placed on, after the
+rolling deploy. Each line goes to stderr when something changes, with the
+seconds since the apply.
+
+A cluster whose leader runs 0.3.2 or older, such as one halfway through
+`relish upgrade` (which upgrades the leader last), can't say whether a
+rollout finished. `--wait` then counts only the instances that run the image
+the file names, so the old version's instances don't make an update look
+ready, and prints a note once:
+
+```text
+note: the cluster can't report rollouts (it may run an older release); --wait counts only instances running the applied image
+```
+
+Where it can't tell the versions apart by image, for a process workload or
+an image a node pinned to its digest, it counts every running replica and
+warns once that it does:
+
+```text
+warning: the cluster can't report rollouts (it may run an older release), so --wait counts running replicas only
+```
+
+"As many replicas as it wants" is the file's `replicas`, with two
+exceptions. A daemon set (`replicas = "*"`) wants one on each node it can
+run on, so a node its `placement` rules out doesn't hold the wait up. An
+autoscaled app wants whatever count the autoscaler holds it at, which can
+be below or above the file's `replicas`. For both, `--wait` goes by what the
+scheduler placed, once it has placed them all.
+
+`--timeout` bounds the wait (`90s`, `5m`, `1h`; 5 minutes by default). When
+it runs out, `apply` names each app that isn't ready, what it was doing, and
+why when the cluster knows: a namespace quota, no node with room or the
+labels it asks for, an image that won't pull, a crash loop or a failing
+health check:
+
+```text
+not ready after 5m: 1 of 2 app(s)
+  big (namespace shop): 0/2 running; not placed yet
+    unschedulable: placed 0 of 2 replicas: no ready node has its required labels
+The change is applied. `relish apps big --namespace shop` shows where it stands.
+```
+
+A rollout that fails ends the wait at once, because the cluster doesn't
+retry a spec that failed (see [rolling deploys](#rolling-deploys)). The
+exit code tells a script which case it's in:
+
+| Exit | Meaning |
+|------|---------|
+| 0 | Applied, and every app is ready |
+| 1 | Applied, but an app wasn't ready in time, or its rollout failed. The change stays applied and the cluster keeps working on it |
+| 2 | The command line was wrong |
+| 3 | `relish` couldn't reach the cluster or authenticate to it |
+| 4 | The cluster refused the apply: a permission, a policy or someone else's lease |
+| 5 | Anything else, such as a manifest that doesn't parse |
+
+Jobs, namespaces, policies and builds have nothing to wait for: the apply is
+done once it returns. A job's runs are followed with `relish jobs`, a task
+array's with `relish batch watch`. `--wait` can't be combined with
+`--dry-run`, which applies nothing, or `--rerun-jobs`. Preview the change
+with `--dry-run` first, then apply it with `--wait`.
+
+With `-o json`, `apply --wait` answers in the same envelope as `relish
+agent` (see [working with an AI agent](16_working-with-an-ai-agent.md)):
+`ok` is `true` whenever the apply went through, `data.ready` says whether
+every app is ready, `data.apps` has each one's counts, phase and reason, and
+`next` points at `relish apps` for the ones that aren't. A failed apply is
+`ok: false` with an `error.code`. Without `--wait`, `apply -o json` prints
+the node's answer as before.
 
 ### Scaling without editing the file
 
@@ -739,11 +859,18 @@ The node reports the failure to the leader with the cluster's service token.
 A plaintext development cluster with no master key has no service token, and
 until its first API token exists nobody holds a credential at all, so there
 the leader takes the report without one. It takes it only for a node the app
-is placed on, and once any credential exists (a master key or a first token)
-it requires the service token again. If `bun` logs
-`the leader refused the rollout failure of default/web` with a 401 or 403,
-the cluster has a token but its nodes have no master key to sign with: set
-`[security] master_key_path` on every node.
+is placed on. A first API token would end that, and the nodes' placement polls
+and failure reports would get 401 from then on, so on such a cluster
+`relish token create` refuses:
+
+```text
+error: API error (status 409): refusing to create the first API token: this plaintext cluster has no master key, so its nodes have no service token, and once a token exists the API answers their calls (placement polls, rollout reports) with 401. Set [security] master_key_path to the same key on every node, restart them, then create the token
+```
+
+Set `[security] master_key_path` on every node, restart them, and create the
+token again. If `bun` logs `the leader refused the rollout failure of
+default/web` with a 401 or 403 anyway (a node started without the key the
+others have, say), give that node the same `master_key_path`.
 
 `cancel-deploy` takes the operation id that `apply` prints and waits for the
 in-flight step to finish. It works on a single node only: a cluster `apply`
@@ -829,6 +956,13 @@ A stop then runs four steps, each with its own limit:
    cleanly, as under Docker or Kubernetes.
 3. `stop_grace`, while Bun waits for the instance to exit.
 4. SIGKILL, if it's still running.
+
+The grace counts from when Bun first asks for the signal. On the process
+runtime, a process owner stalled by a long disk flush can miss its 2 s
+request timeout; Bun then asks again until the grace runs out. The owner may
+have sent the signal before it stalled, so a workload can get its
+`stop_signal` twice. If a second one means "exit now" to your app, give it a
+`stop_grace` long enough to finish on the first.
 
 Without `stop_grace`, a deploy gives each old instance its `drain_timeout`,
 and any other stop (`relish stop`, or the leader moving a replica off a node)
@@ -971,9 +1105,11 @@ executors all lease from it, and a queued task holds nothing until it starts.
 Each node's state report carries what its task attempts and executors hold,
 apart from its app requests, and the leader adds both together before it places
 a replica. So a node that jobs have filled looks full, and the leader puts the
-replica somewhere else. If jobs take the room after a replica was placed, the
-node can't start it: its agent reports the refusal, and the leader moves the
-replica to another node instead of waiting there. Running attempts are never
-stopped to make room for an app.
+replica somewhere else. When every node is full of job work, the replica goes
+where apps hold least, and that node's job work gives the room back as its
+tasks finish, within about a minute. When job work can't free enough, the
+node's agent reports the refusal, and the leader moves the replica to another
+node instead of waiting there. Running attempts are never stopped to make room
+for an app.
 
 Directory defaults support `image`, `memory`, `cpu`, `[env]` and `[deploy]`. Child directories override individual fields; environment and deployment tables merge by key, and explicit workload values win. Common fields apply to jobs too, while deployment strategies apply to apps. Unknown defaults keys fail compilation.

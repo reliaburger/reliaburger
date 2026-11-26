@@ -4,9 +4,13 @@
 # (spike S4).
 # Not ordered after reliaburger.service: a machine waiting for a claim
 # never starts bun, and the script tells the two apart itself.
+# Not ordered after the network either (#2245). A version whose network
+# never comes up must still fail its counted boots and fall back, and
+# waiting for the network before the check made each Wyse try longer. The
+# script times a counted boot from the kernel's start and wants an address
+# as well as a healthy bun.
 [Unit]
 Description=Reliaburger boot check
-After=network-online.target
 Wants=reliaburger.service
 Before=boot-complete.target
 
@@ -17,8 +21,8 @@ StandardOutput=journal+console
 # The script's test overrides (image/tests/test_boot_check.py): never take
 # them from the manager's environment, or a node could decide its boots were
 # never counted and a bad update would never fall back, or read a frozen
-# uptime and never finish.
-UnsetEnvironment=BOOT_CHECK_EFIVARS BOOT_CHECK_UPTIME
+# uptime and never finish, or write its lines somewhere nobody reads.
+UnsetEnvironment=BOOT_CHECK_EFIVARS BOOT_CHECK_UPTIME BOOT_CHECK_RUN BOOT_CHECK_KMSG
 ExecStart=/usr/lib/reliaburger/boot-check
 
 [Install]

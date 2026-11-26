@@ -1468,6 +1468,7 @@ mod tests {
             task_index: None,
             id,
             fault_type: request.fault_type.to_string(),
+            kind: (&request.fault_type).into(),
             target_service: request.target_service,
             namespace: request.namespace.clone(),
             target_instance: request.target_instance,
@@ -2071,6 +2072,7 @@ mod tests {
             age_seconds: None,
             image: None,
             data_on_node: false,
+            sidecars: Vec::new(),
             reason: None,
         }
     }

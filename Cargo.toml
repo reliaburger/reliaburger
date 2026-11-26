@@ -1,6 +1,6 @@
 [package]
 name = "reliaburger"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 rust-version = "1.97"
 license = "Apache-2.0"
@@ -201,6 +201,17 @@ debug = "line-tables-only"
 # read-back; unoptimised SHA-256 runs at ~30 MB/s and dominates the
 # image-transfer tests (100 MB P2P pull). Optimise just the hash
 # crates — everything else keeps fast debug builds.
+# The CEL parser recurses through about ten generated functions per level
+# of nesting. Unoptimised, each level takes about 170 KiB of stack, so
+# only a dozen fit in a 2 MiB thread; optimised, a 32-level expression
+# (the policy cap) needs under 400 KiB. Tests and debug nodes parse
+# policies on 2 MiB threads too, so these two are always optimised.
+[profile.dev.package.cel]
+opt-level = 3
+
+[profile.dev.package.antlr4rust]
+opt-level = 3
+
 [profile.dev.package.sha2]
 opt-level = 3
 

@@ -1,0 +1,15 @@
+# Node config for trying Reliaburger from sory to
+# start from, and scripts/de:// repository.
+
+[gitops]
+# Any URL `git clone` takes. Credentials gft. A local bare
+# repository works too: file:///srv/git/infra.git
+repo = "https://git.example.com/org/infra.gis"
+branch = "main"
+# The les/node/process-runtime.toml
+
+[process_workloads]
+# `target/debug/testapp` is relative, so start Bun from the repository root.
+allowed_binaries = ["target/debug/testapp", "/bin/echo", "/bin/false"]
+# Host wolt on Linux, so turn it off: these processes aren't isolated.
+moknt_isolation = false

@@ -115,6 +115,11 @@ struct Context {
     host_environment: Option<std::collections::BTreeMap<String, String>>,
     #[cfg(feature = "ebpf")]
     namespace: Option<crate::bun::task_namespace::NamespaceLease>,
+    /// Keeps the slot's executor group and namespace cgroups while the slot
+    /// exists; released once retirement has removed the slot's cgroup, so
+    /// the namespace's last user removes the empty parents (#2324). A
+    /// context dropped unretired removes nothing.
+    cgroup_hold: Option<crate::grill::workload_groups::WorkloadGroupHold>,
 }
 /// A fixed set of executor slots. A dropped [`ReusablePool::run`] future
 /// hands its executor to the eviction loop to retire (see [`Checkout`]).
@@ -394,7 +399,8 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                     })
             })
             .count();
-        let available = self.budget.available();
+        // Room a refused app claims isn't offered to job work (#1967).
+        let available = self.budget.job_available();
         let cold = (available.cpu_millicores / reservation.cpu_millicores)
             .min(available.memory_bytes / reservation.memory_bytes)
             .min((idle - warm) as u64);
@@ -533,11 +539,32 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         if !retired {
             return false;
         }
+        // The slot's cgroup is gone, so its parents can go too once no other
+        // user holds them. Release the namespace binding first: a later
+        // attempt then finds the binding idle and rebinds a recreated
+        // namespace cgroup.
+        let cgroup_hold = context.cgroup_hold.take();
         // Releasing the binding takes a lock and must not be cut off halfway,
         // so it runs on its own once retirement is proven.
         #[cfg(feature = "ebpf")]
         if let Some(namespace) = context.namespace.take() {
-            tokio::spawn(namespace.retired());
+            tokio::spawn(async move {
+                namespace.retired().await;
+                // BLOCKING-OK: a few rmdirs on cgroupfs, an in-memory kernel interface
+                if let Some(hold) = cgroup_hold {
+                    hold.release();
+                }
+            });
+        } else {
+            // BLOCKING-OK: a few rmdirs on cgroupfs, an in-memory kernel interface
+            if let Some(hold) = cgroup_hold {
+                hold.release();
+            }
+        }
+        #[cfg(not(feature = "ebpf"))]
+        // BLOCKING-OK: a few rmdirs on cgroupfs, an in-memory kernel interface
+        if let Some(hold) = cgroup_hold {
+            hold.release();
         }
         context.lease.confirm_retired();
         true
@@ -1134,6 +1161,9 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                     return failed(error);
                 }
             };
+            // Before `prepare_cgroups` makes any of the slot's cgroups.
+            let cgroup_hold =
+                crate::grill::workload_groups::WorkloadGroups::shared().hold(namespace, &app);
             let new = checkout.context.insert(Context {
                 key,
                 directory,
@@ -1150,6 +1180,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
                 host_environment: None,
                 #[cfg(feature = "ebpf")]
                 namespace: None,
+                cgroup_hold: Some(cgroup_hold),
             });
             // `stop` asks start to give up at its next safe point. It never
             // abandons a runtime call halfway, so retirement sees whatever
@@ -2046,6 +2077,7 @@ mod tests {
         let id = InstanceId(name.into());
         let spec = OciSpec {
             managed_volumes: Vec::new(),
+            host_path_sources: Vec::new(),
             reusable_executor: false,
             host_process: true,
             initialiser: false,
@@ -2103,6 +2135,7 @@ mod tests {
             host_environment: None,
             #[cfg(feature = "ebpf")]
             namespace: None,
+            cgroup_hold: None,
         }
     }
 
@@ -2548,6 +2581,21 @@ mod tests {
         ExecutorKey([byte; 32])
     }
 
+    /// #1967: room an app was refused here is held for it, so the node
+    /// doesn't offer it to job work while the app's retry is pending.
+    #[tokio::test]
+    async fn a_node_offers_job_work_none_of_the_room_an_app_claims() {
+        let budget = ExecutionBudget::new(Resources::new(1000, 1 << 30, 0));
+        let pool = pool(&ProcessGrill::new(), HangingKill::default(), &budget);
+        let before = pool.available_slots(None, reservation()).await;
+        assert!(before > 0);
+        let web = crate::meat::AppId::new("web", "default");
+        budget.claim_for_app(&web, budget.capacity());
+        assert_eq!(pool.available_slots(None, reservation()).await, 0);
+        budget.release_app_claim(&web);
+        assert_eq!(pool.available_slots(None, reservation()).await, before);
+    }
+
     #[tokio::test]
     async fn a_slot_waiting_for_admission_counts_as_busy_only_once_admitted() {
         let budget = ExecutionBudget::new(Resources::new(1000, 1 << 30, 0));
@@ -2884,6 +2932,8 @@ mod tests {
         timeout: Duration,
         cancel_after: Option<Duration>,
     ) -> Attempt {
+        // Dropped last, after the pool, so the namespace's cgroups go (#2322).
+        let _cgroups = crate::test_cgroups::TestCgroups::namespace(namespace);
         let root = tempfile::Builder::new()
             .prefix("rb-cold-interrupt-")
             .tempdir()

@@ -21,6 +21,7 @@ const CONFIRMATION: Duration = Duration::from_secs(5);
 fn workload(script: &str, stop: StopPolicy) -> OciSpec {
     OciSpec {
         managed_volumes: Vec::new(),
+        host_path_sources: Vec::new(),
         reusable_executor: false,
         host_process: true,
         initialiser: false,
@@ -650,4 +651,137 @@ fn the_shutdown_budget_fits_inside_every_units_stop_timeout() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// A runtime that doesn't answer a stop or kill in time (#1902). A process
+// owner stalled by a long fsync misses its 2 s request timeout. That says
+// nothing about the workload, and a signal sent twice is harmless, so the
+// stop asks again: the graceful signal within the grace, the kill within the
+// confirmation bound.
+
+#[tokio::test]
+async fn a_stop_the_runtime_did_not_answer_is_asked_again_within_the_grace() {
+    let id = InstanceId("default__stalled-0".into());
+    let grill = running_mock(&id).await;
+    grill.set_unanswered_times(crate::grill::mock::MockCall::Stop, &id, 1);
+    let from = grill.calls().len();
+
+    let stop = InstanceStop::for_policy(None, Duration::from_secs(5));
+    stop_runtime_instance(&grill, &id, &stop, CONFIRMATION)
+        .await
+        .expect("one unanswered stop request then an answer is a confirmed stop");
+
+    let operations = operations_on(&grill, &id, from);
+    assert_eq!(
+        operations.iter().filter(|op| *op == "stop").count(),
+        2,
+        "{operations:?}"
+    );
+    assert!(!operations.contains(&"kill".to_string()), "{operations:?}");
+}
+
+#[tokio::test]
+async fn a_stop_never_answered_within_the_grace_falls_through_to_the_kill() {
+    let id = InstanceId("default__stalled-1".into());
+    let grill = running_mock(&id).await;
+    grill.set_unanswered_times(crate::grill::mock::MockCall::Stop, &id, u32::MAX);
+    let grace = Duration::from_millis(300);
+
+    let begun = Instant::now();
+    let stop = InstanceStop::for_policy(None, grace);
+    stop_runtime_instance(&grill, &id, &stop, CONFIRMATION)
+        .await
+        .expect("the kill still ends the instance");
+
+    assert!(
+        grill
+            .calls()
+            .iter()
+            .any(|(op, instance)| op == "kill" && instance == &id),
+        "the grace ran out unanswered, so the instance is killed"
+    );
+    assert!(
+        begun.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        begun.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn a_kill_the_runtime_did_not_answer_is_asked_again() {
+    let id = InstanceId("default__stalled-2".into());
+    let grill = running_mock(&id).await;
+    grill.set_ignore_stop(true);
+    grill.set_unanswered_times(crate::grill::mock::MockCall::Kill, &id, 1);
+    let from = grill.calls().len();
+
+    let stop = InstanceStop::for_policy(None, Duration::from_millis(200));
+    stop_runtime_instance(&grill, &id, &stop, CONFIRMATION)
+        .await
+        .expect("one unanswered kill then an answer is a confirmed stop");
+
+    let operations = operations_on(&grill, &id, from);
+    assert_eq!(
+        operations.iter().filter(|op| *op == "kill").count(),
+        2,
+        "{operations:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_kill_never_answered_ends_the_stop_unconfirmed_within_its_bound() {
+    let id = InstanceId("default__stalled-3".into());
+    let grill = running_mock(&id).await;
+    grill.set_ignore_stop(true);
+    grill.set_unanswered_times(crate::grill::mock::MockCall::Kill, &id, u32::MAX);
+    let confirmation = Duration::from_millis(300);
+
+    let begun = Instant::now();
+    let stop = InstanceStop::for_policy(None, Duration::from_millis(200));
+    let error = stop_runtime_instance(&grill, &id, &stop, confirmation)
+        .await
+        .expect_err("a kill nobody answers isn't a stop");
+
+    assert!(
+        matches!(error, BunError::StopUnconfirmed { .. }),
+        "{error:?}"
+    );
+    assert!(
+        begun.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        begun.elapsed()
+    );
+}
+
+/// #1902 review: the grace runs from the first ask, not from the answer.
+/// A stop answered near the end of its grace waits out only what's left
+/// of it before the kill, so the whole stop stays within grace plus
+/// confirmation, which `stop_completion_bound` relies on.
+#[tokio::test]
+async fn a_stop_answered_late_in_the_grace_still_kills_within_grace_and_confirmation() {
+    let id = InstanceId("default__stalled-4".into());
+    let grill = running_mock(&id).await;
+    grill.set_ignore_stop(true);
+    // Eight unanswered asks, 100 ms apart: the answer lands about 0.8 s
+    // into a 1 s grace.
+    grill.set_unanswered_times(crate::grill::mock::MockCall::Stop, &id, 8);
+    let grace = Duration::from_secs(1);
+    let confirmation = Duration::from_millis(300);
+
+    let begun = Instant::now();
+    let stop = InstanceStop::for_policy(None, grace);
+    stop_runtime_instance(&grill, &id, &stop, confirmation)
+        .await
+        .expect("the kill ends the instance");
+    let took = begun.elapsed();
+
+    assert!(
+        grill
+            .calls()
+            .iter()
+            .any(|(op, instance)| op == "kill" && instance == &id),
+        "the workload ignored its signal, so it's killed"
+    );
+    assert!(took < grace + confirmation, "{took:?}");
 }

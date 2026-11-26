@@ -7,30 +7,25 @@ name: Mutants
 # the job summary lists each one with a link that opens a pre-filled
 # `missed-mutant` issue, which a person files. Nothing here posts to GitHub.
 #
-# It is its own workflow, like fuzz.yml, so it is never on a pull request's
-# critical path: ci.yml's evidence gate (the one required check) doesn't wait
-# for it, it runs on Linux only, and it doesn't fail on a missed mutant. Each
-# mutant rebuilds the crate and runs its module's unit tests, a few minutes
-# apiece, so a pull request tests at most MUTANTS_MAX of its mutants, a
-# round-robin sample over every file it touches (scripts/ci/mutants_plan.py).
-# A whole-crate run is about 27,000 mutants, far beyond any runner, so the
-# weekly run mutates what landed on the branch in the last seven days.
+# It is its own workflow, like fuzz.yml, and it doesn't run on pull requests:
+# a job per train PR held a Linux runner for up to 75 minutes while the
+# train's own CI queued behind it (24 November 2026). It runs every night
+# instead, on the newest release train (where work lands before main), or on
+# main when no train is ahead of it, and mutates what landed in the last day.
+# It runs on Linux only and doesn't fail on a missed mutant. Each mutant
+# rebuilds the crate and runs its module's unit tests, a few minutes apiece,
+# so a run tests at most MUTANTS_MAX mutants, a round-robin sample over every
+# file the day changed (scripts/ci/mutants_plan.py). A whole-crate run is
+# about 27,000 mutants, far beyond any runner.
 
 on:
-  pull_request:
-    branches: [main, "codex/**", "fix/**", "release-*"]
-    paths:
-      - src/**
-      - .cargo/mutants.toml
-      - scripts/ci/mutants_plan.py
-      - .github/workflows/mutants.yml
   schedule:
-    # Sundays, when the runners are quiet.
-    - cron: "23 4 * * 0"
+    # Every night, when the runners are quiet.
+    - cron: "23 4 * * *"
   workflow_dispatch:
     inputs:
       files:
-        description: Glob of files to mutate, e.g. src/council/** (empty means the last seven days' changes)
+        description: Glob of files to mutate, e.g. src/council/** (empty means the newest train's last day of changes)
         default: ""
       max:
         description: Most mutants to test
@@ -40,21 +35,18 @@ permissions:
   contents: read
 
 concurrency:
-  group: mutants-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: mutants-${{ github.run_id }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
   # A mutant only has to build and fail; no debugger reads these binaries,
   # and no debug info makes each rebuild's link faster.
   CARGO_PROFILE_DEV_DEBUG: "0"
-  MUTANTS_MAX: ${{ github.event_name == 'pull_request' && '12' || github.event_name == 'schedule' && '60' || inputs.max }}
+  MUTANTS_MAX: ${{ github.event_name == 'schedule' && '60' || inputs.max }}
   # The test step's own budget, inside the job's limit, so the summary and
   # the artefact still come out when the mutants take longer than planned.
-  MUTANTS_MINUTES: ${{ github.event_name == 'pull_request' && '60' || '300' }}
-  # When a pull request changes only this set-up, it mutates one small file,
-  # so the change shows the job still works.
-  SETUP_SAMPLE: src/file_lock.rs
+  MUTANTS_MINUTES: "300"
 
 jobs:
   mutants:
@@ -64,7 +56,7 @@ jobs:
     # 13.5-minute baseline build, then 7.5 minutes a mutant without
     # incremental builds. The test step stops itself at MUTANTS_MINUTES; this
     # limit leaves room for the summary and the artefact after it.
-    timeout-minutes: ${{ github.event_name == 'pull_request' && 75 || 330 }}
+    timeout-minutes: 330
     steps:
       - uses: actions/checkout@v4
         with:
@@ -73,46 +65,50 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.151,cargo-mutants@27.1.0
-      # Only the weekly run and runs by hand save the cache, so pull requests
-      # don't eat into the quota ci.yml keeps for main.
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: mutants
-          save-if: ${{ github.event_name != 'pull_request' }}
           cache-on-failure: true
       - name: Prepare portable build host
         run: |
           sudo apt-get update -qq
           sudo apt-get remove -y -qq buildah
           sudo apt-get install -y -qq clang libbpf-dev llvm
+      # The newest release train, when it has work main doesn't, else main.
+      # Release trains are release-<x>-<y>-<z>; sort -V puts the newest last.
       - name: Choose what to mutate
+        id: choose
         env:
-          EVENT: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           FILES: ${{ inputs.files }}
         run: |
+          ref=origin/main
+          train=$(git branch -r --list 'origin/release-*' | sed 's/^ *//' | sort -V | tail -n 1)
+          if [ -n "$train" ] && [ -n "$(git rev-list -1 origin/main.."$train")" ]; then
+            ref=$train
+          fi
+          echo "mutating $ref" >&2
+          git checkout --quiet --detach "$ref"
+          echo "COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          if [ -n "$FILES" ]; then
+            echo "SELECT_FLAG=--file" >> "$GITHUB_ENV"
+            echo "SELECT_VALUE=$FILES" >> "$GITHUB_ENV"
+            exit 0
+          fi
           diff="$RUNNER_TEMP/change.diff"
-          case "$EVENT" in
-            pull_request)
-              git diff "$BASE_SHA"...HEAD -- src/ > "$diff"
-              if [ ! -s "$diff" ]; then
-                echo "SELECT_FLAG=--file" >> "$GITHUB_ENV"
-                echo "SELECT_VALUE=$SETUP_SAMPLE" >> "$GITHUB_ENV"
-                exit 0
-              fi ;;
-            *)
-              if [ -n "$FILES" ]; then
-                echo "SELECT_FLAG=--file" >> "$GITHUB_ENV"
-                echo "SELECT_VALUE=$FILES" >> "$GITHUB_ENV"
-                exit 0
-              fi
-              since=$(git rev-list -1 --before='7 days ago' HEAD)
-              git diff "$since" HEAD -- src/ > "$diff" ;;
-          esac
+          since=$(git rev-list -1 --first-parent --before='1 day ago' HEAD)
+          # A train younger than a day: everything since it left main.
+          [ -n "$since" ] || since=$(git merge-base origin/main HEAD)
+          git diff "$since" HEAD -- src/ > "$diff"
+          if [ ! -s "$diff" ]; then
+            echo "nothing under src/ landed on $ref in the last day" >&2
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           echo "SELECT_FLAG=--in-diff" >> "$GITHUB_ENV"
           echo "SELECT_VALUE=$diff" >> "$GITHUB_ENV"
       - name: List and plan
         id: plan
+        if: steps.choose.outputs.skip != 'true'
         run: |
           cargo mutants --list "$SELECT_FLAG" "$SELECT_VALUE" | tee "$RUNNER_TEMP/mutants.list"
           python3 scripts/ci/mutants_plan.py plan --list "$RUNNER_TEMP/mutants.list" --max "$MUTANTS_MAX" --github-output "$GITHUB_OUTPUT"
@@ -149,7 +145,6 @@ jobs:
         if: always() && steps.plan.outcome == 'success'
         env:
           REPOSITORY: ${{ github.repository }}
-          COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           python3 scripts/ci/mutants_plan.py summary --list "$RUNNER_TEMP/mutants.list" --max "$MUTANTS_MAX" \
             --results "$RUNNER_TEMP/mutants.out" --repository "$REPOSITORY" --commit "$COMMIT" \

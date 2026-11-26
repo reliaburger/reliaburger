@@ -256,6 +256,7 @@ means, the numbers that decide it and the line of code that does (see
 | `crashloop` | critical | An app restarted 3 times in 15 minutes |
 | `no-backends` | critical | A service has no healthy backend |
 | `launch-failed` | critical | The runtime refused to launch an app |
+| `sidecar-refused` | warning | An app runs without a sidecar the node refused to start again |
 | `quota-blocked` | warning | A namespace quota keeps an app unplaced |
 | `volume-home-away` | critical | An app waits for the node holding its volume |
 | `unschedulable` | warning | Some of an app's replicas have no node |
@@ -315,6 +316,7 @@ far back the records reach: unknown, not "it didn't happen".
 | Rule | Means |
 |------|-------|
 | `placement.scored` | The scheduler put a new replica on the node running fewest of the app's replicas, then the highest score; the evidence has the score's parts, how many nodes passed the filter and the runner-up |
+| `placement.jobs_yield_to_apps` | No node had free room, so a replica went to the node with the most room after apps, where job work gives it back at the next task boundary |
 | `placement.daemon` | A daemon set runs on every node that passes the filter |
 | `placement.volume_home` | An app with managed volumes went back to the nodes that hold them |
 | `placement.short` | Some replicas found no node, and why: the first constraint none met |

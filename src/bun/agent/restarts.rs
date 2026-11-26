@@ -159,6 +159,10 @@ pub(super) enum StepResult {
     Started(Box<LaunchEvidence>),
     /// The runtime refused or didn't confirm.
     Failed(BunError),
+    /// The node gate refused the replacement before the runtime saw it:
+    /// `node.toml` no longer allows a runtime knob or host path the stored
+    /// spec uses (#1316). Retrying can't help, so it fails with the reason.
+    Refused(String),
     /// A stop or retirement took the instance back before the step began.
     Cancelled,
 }
@@ -182,6 +186,102 @@ struct CreateInput {
     namespace: String,
     /// The node's secret providers: a restart asks them again (#1123).
     secrets: crate::sesame::secret_provider::SecretProviders,
+    /// The node gate's verdict on the stored spec's runtime knobs, taken
+    /// on the loop from this node's allowlist as it is now (#1316).
+    knobs: Result<(), crate::grill::knobs::KnobRefusal>,
+    /// The node's host-path policy, to approve the stored spec's host
+    /// paths again off the loop: resolving them can block (#797, #1316).
+    host_paths: crate::bun::host_paths::HostPathPolicy,
+}
+
+impl CreateInput {
+    /// Ask the node gate again whether the replacement may be created.
+    ///
+    /// The restart builds it from the OCI spec stored at deploy, which
+    /// skipped the gates a deploy passes. A node restarted with a narrower
+    /// `node.toml` must refuse what it no longer allows (#1316). The host
+    /// paths asked about are the ones this spec mounts, not the app's
+    /// current spec's: mid-rollout that's the new one, while this instance
+    /// is old (#2335). The check waits at most `bound`.
+    ///
+    /// `None` admits it; otherwise the step ends with the result returned.
+    async fn admit(&self, id: &InstanceId, bound: Duration) -> Option<StepResult> {
+        if let Err(refusal) = &self.knobs {
+            return Some(StepResult::Refused(refusal.to_string()));
+        }
+        match recheck_host_paths(&self.host_paths, &self.oci_spec, bound).await {
+            Ok(()) => None,
+            Err(HostPathDenial::Refused(refusal)) => {
+                Some(StepResult::Refused(restart_refusal("restart", &refusal)))
+            }
+            Err(HostPathDenial::Unanswered(reason)) => {
+                Some(StepResult::Failed(BunError::HostPathUnanswered {
+                    instance_id: id.clone(),
+                    reason,
+                }))
+            }
+        }
+    }
+}
+
+/// Why a restart's host-path check didn't admit a stored spec (#2335).
+#[derive(Debug)]
+pub(super) enum HostPathDenial {
+    /// The node's policy refused a source. Asking again fails the same way.
+    Refused(crate::bun::host_paths::HostPathRefusal),
+    /// The check gave no answer: it ran out of time, as on a source whose
+    /// NFS or autofs server isn't answering, or its blocking thread failed.
+    /// A later attempt may get one.
+    Unanswered(String),
+}
+
+/// Ask `policy` again about the host paths `spec` mounts, waiting at most
+/// `bound`.
+///
+/// Resolving a source can block on a filesystem that doesn't answer. The
+/// caller holds the restart's lane meanwhile, and a stop waits for that
+/// lane, so an unbounded check would fail every stop of the instance
+/// until the filesystem came back (#2335). The blocking thread itself can't
+/// be cancelled, and is left to finish on its own.
+pub(super) async fn recheck_host_paths(
+    policy: &crate::bun::host_paths::HostPathPolicy,
+    spec: &OciSpec,
+    bound: Duration,
+) -> Result<(), HostPathDenial> {
+    use crate::bun::host_paths::HostPathRefusal;
+    let check = policy.approve_sources_off_runtime(&spec.host_path_sources);
+    match tokio::time::timeout(bound, check).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(HostPathRefusal::CheckFailed { reason })) => Err(HostPathDenial::Unanswered(
+            format!("its blocking thread failed: {reason}"),
+        )),
+        // The earlier check's thread is still stuck: another would only join
+        // it (#2335).
+        Ok(Err(refusal @ HostPathRefusal::StillResolving { .. })) => {
+            Err(HostPathDenial::Unanswered(refusal.to_string()))
+        }
+        Ok(Err(refusal)) => Err(HostPathDenial::Refused(refusal)),
+        Err(_) => Err(HostPathDenial::Unanswered(format!(
+            "no answer within {bound:?}; a source on NFS or autofs may not be responding"
+        ))),
+    }
+}
+
+/// The reason a restart refused by the host-path policy records, for the
+/// instance or one of its sidecars (`subject`): where it happened, and the
+/// policy's own refusal, which names the path and the rule.
+///
+/// It doesn't say what changed. The node's `allowed_host_paths` may have,
+/// or a symlink in a listed prefix may now resolve somewhere else; either
+/// way the path the deploy approved isn't allowed now.
+pub(super) fn restart_refusal(
+    subject: &str,
+    refusal: &crate::bun::host_paths::HostPathRefusal,
+) -> String {
+    format!(
+        "{subject} refused: a host path it mounts isn't allowed on this node any more, \
+         though the deploy was: {refusal}"
+    )
 }
 
 /// What a restart step does to the instance's sidecars (#1120): the Clear
@@ -244,35 +344,40 @@ async fn run_step<G: Grill>(
             }
         }
         RestartStep::Create => match create {
-            Some(create) => match super::launch::create_with_secrets(
-                &grill,
-                &create.secrets,
-                super::launch::LaunchTarget {
-                    instance_id: &id,
-                    app_name: &create.app_name,
-                    namespace: &create.namespace,
-                },
-                &create.oci_spec,
-            )
-            .await
-            {
-                Ok(_) => {
-                    let retained = if retains_network(create.app_spec.as_ref()) {
-                        grill
-                            .retain_network_reference(&id)
-                            .await
-                            .map_err(BunError::from)
-                    } else {
-                        Ok(None)
-                    };
-                    let egress = create.egress.resolve(create.app_spec.as_ref()).await;
-                    return StepResult::Created {
-                        retained,
-                        egress: Box::new(egress),
-                    };
+            Some(create) => {
+                if let Some(denied) = create.admit(&id, confirmation_timeout).await {
+                    return denied;
                 }
-                Err(error) => Err(error.into()),
-            },
+                match super::launch::create_with_secrets(
+                    &grill,
+                    &create.secrets,
+                    super::launch::LaunchTarget {
+                        instance_id: &id,
+                        app_name: &create.app_name,
+                        namespace: &create.namespace,
+                    },
+                    &create.oci_spec,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        let retained = if retains_network(create.app_spec.as_ref()) {
+                            grill
+                                .retain_network_reference(&id)
+                                .await
+                                .map_err(BunError::from)
+                        } else {
+                            Ok(None)
+                        };
+                        let egress = create.egress.resolve(create.app_spec.as_ref()).await;
+                        return StepResult::Created {
+                            retained,
+                            egress: Box::new(egress),
+                        };
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            }
             None => Err(BunError::DeployFailed {
                 app_name: id.0.clone(),
                 reason: "restart has no stored OCI spec".into(),
@@ -315,9 +420,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 app_name: launch.app_name.clone(),
                 namespace: launch.namespace.clone(),
                 secrets: self.secret_providers.clone(),
+                knobs: self
+                    .supervisor
+                    .check_runtime_knobs(launch.oci_spec.runtime_knobs.as_ref()),
+                host_paths: self.supervisor.host_path_policy(),
             }),
             _ => None,
         };
+        if let (RestartStep::Create, Some(launch)) = (step, launch.as_ref()) {
+            // An adopted instance took no hold when it first launched.
+            self.supervisor
+                .hold_workload_cgroup(&launch.app_name, &launch.namespace);
+        }
         let sidecars = self.restart_sidecars(&id, step, launch.as_ref());
         let task = self
             .restart_steps
@@ -583,6 +697,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     }
                     None => self.record_failed_restart(&id, &error.to_string()).await,
                 }
+            }
+            (RestartStep::Create, StepResult::Refused(reason), _) => {
+                eprintln!("bun: restart of {id} refused by the node gate: {reason}");
+                self.record_launch_failure(&id, reason).await;
+            }
+            (step, StepResult::Refused(reason), _) => {
+                eprintln!("bun: restart of {id} got a refusal after {step:?}: {reason}");
             }
             (RestartStep::Refuse, StepResult::Done, _) => {
                 if let Some(instance) = self.supervisor.get_instance_mut(&id)

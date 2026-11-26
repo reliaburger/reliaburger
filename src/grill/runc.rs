@@ -59,6 +59,10 @@ pub struct RuncGrill {
     dns_nameserver: Option<std::net::Ipv4Addr>,
     /// Source identities change with network ownership, before workloads start.
     dns_sources: tokio::sync::watch::Sender<crate::onion::dns::DnsSourceNamespaces>,
+    /// The agent's `[runtime] stop_confirmation_timeout_secs`, which bounds
+    /// each stop and kill this runtime answers; a stop's patience with a
+    /// late owner comes out of it (#2328).
+    stop_confirmation: std::time::Duration,
 }
 
 impl RuncGrill {
@@ -108,7 +112,16 @@ impl RuncGrill {
                 crate::onion::dns::DnsSourceNamespaces::default(),
             )
             .0,
+            stop_confirmation: crate::config::node::RuntimeSection::default()
+                .stop_confirmation_timeout(),
         })
+    }
+
+    /// Bound stops and kills by the agent's configured stop confirmation
+    /// timeout rather than its default.
+    pub fn with_stop_confirmation_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.stop_confirmation = timeout;
+        self
     }
 
     async fn lock_lifecycle(&self, instance: &InstanceId) -> tokio::sync::OwnedMutexGuard<()> {
@@ -1002,6 +1015,33 @@ mod tests {
 
     struct TestNetworkCleanup(Vec<InstanceId>);
 
+    /// Kills a test's container when dropped, so a panic between its
+    /// create and the test's own kill doesn't leave it running (#2335).
+    /// `Drop` can't await, and blocking the test's runtime from inside it
+    /// would deadlock, so the kill runs on a thread of its own with a
+    /// runtime of its own. A container the test already killed is killed
+    /// again, which does nothing.
+    struct KillOnDrop {
+        grill: RuncGrill,
+        id: InstanceId,
+    }
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let (grill, id) = (self.grill.clone(), self.id.clone());
+            let _ = std::thread::spawn(move || {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                let _ = runtime.block_on(grill.kill(&id));
+            })
+            .join();
+        }
+    }
+
     impl Drop for TestNetworkCleanup {
         fn drop(&mut self) {
             for instance in &self.0 {
@@ -1024,6 +1064,7 @@ mod tests {
         let id = InstanceId("rootless-writable".to_string());
         let spec = crate::grill::oci::OciSpec {
             managed_volumes: Vec::new(),
+            host_path_sources: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1094,6 +1135,7 @@ mod tests {
         let id = InstanceId(format!("capacity-{}", std::process::id()));
         let spec = crate::grill::oci::OciSpec {
             managed_volumes: Vec::new(),
+            host_path_sources: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1167,6 +1209,7 @@ mod tests {
         let id = InstanceId("runc-test-0".to_string());
         let spec = crate::grill::oci::OciSpec {
             managed_volumes: Vec::new(),
+            host_path_sources: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1269,6 +1312,7 @@ mod tests {
         let _network_cleanup = TestNetworkCleanup(ids.to_vec());
         let spec = crate::grill::oci::OciSpec {
             managed_volumes: Vec::new(),
+            host_path_sources: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1437,6 +1481,7 @@ mod tests {
         let spec_for =
             |value: &str, initial_delay: u64, final_delay: u64| crate::grill::oci::OciSpec {
                 managed_volumes: Vec::new(),
+                host_path_sources: Vec::new(),
                 reusable_executor: false,
                 host_process: false,
                 initialiser: false,
@@ -1611,6 +1656,7 @@ mod tests {
         .unwrap();
         let spec = crate::grill::oci::OciSpec {
             managed_volumes: Vec::new(),
+            host_path_sources: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1679,6 +1725,7 @@ mod tests {
         let _network_cleanup = TestNetworkCleanup(vec![id.clone()]);
         let spec = crate::grill::oci::OciSpec {
             managed_volumes: Vec::new(),
+            host_path_sources: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -1780,6 +1827,7 @@ mod tests {
             app_spec: None,
             oci_spec: spec,
             rootless_network: None,
+            sidecar_restarts: None,
         };
         drop(original); // A Bun exec/process death drops the child handle only.
 
@@ -1882,6 +1930,7 @@ mod tests {
         let id = InstanceId("runc-pinned-workload".to_string());
         let spec = crate::grill::oci::OciSpec {
             managed_volumes: Vec::new(),
+            host_path_sources: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,
@@ -2540,6 +2589,91 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// #1316: the sysctl and device knobs reach a real container, together
+    /// with a capability. The node writes the `net.*` sysctl into the
+    /// network namespace it made, runc writes the IPC one, and the device
+    /// appears with a cgroup rule that lets the container open it. Neither
+    /// sysctl changes the host's own value.
+    #[tokio::test]
+    #[ignore = "requires rootful runc, a pinned OCI image (local test mirror or registry access), /dev/fuse, and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
+    async fn runc_sysctl_and_device_knobs_take_effect_inside_the_container() {
+        assert!(runc_tests_enabled(), "set RELIABURGER_RUNC_TESTS=1");
+        assert!(nix::unistd::geteuid().is_root(), "rootful runc needs root");
+        assert!(
+            std::path::Path::new("/dev/fuse").exists(),
+            "the test host needs /dev/fuse"
+        );
+        let host_somaxconn = std::fs::read_to_string("/proc/sys/net/core/somaxconn").unwrap();
+        let host_shmmni = std::fs::read_to_string("/proc/sys/kernel/shmmni").unwrap();
+        // Values no default kernel picks, so seeing them proves the knob.
+        let (somaxconn, shmmni) = ("4321", "2345");
+        assert_ne!(host_somaxconn.trim(), somaxconn);
+        assert_ne!(host_shmmni.trim(), shmmni);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let id = InstanceId("default__knobs-0".to_string());
+        remove_test_network(&id);
+        let _network_cleanup = TestNetworkCleanup(vec![id.clone()]);
+        let (grill, spec) = image_app(
+            tmp.path(),
+            &id,
+            &format!(
+                "image = \"{ALPINE_IMAGE}\"\ncommand = [\"sleep\", \"3609\"]\n\
+                 [runtime]\ncapabilities = [\"IPC_OWNER\"]\n\
+                 sysctls = {{ \"net.core.somaxconn\" = \"{somaxconn}\", \
+                 \"kernel.shmmni\" = \"{shmmni}\" }}\n\
+                 devices = [{{ path = \"/dev/fuse\", permissions = \"rw\" }}]\n"
+            ),
+        );
+        grill.create(&id, &spec).await.unwrap();
+        let _container = KillOnDrop {
+            grill: grill.clone(),
+            id: id.clone(),
+        };
+        grill.start(&id).await.unwrap();
+        let run = |command: &str| {
+            let argv = ["/bin/sh".to_string(), "-c".to_string(), command.to_string()];
+            let grill = &grill;
+            let id = &id;
+            async move { grill.exec(id, &argv).await.unwrap() }
+        };
+        let network = run("cat /proc/sys/net/core/somaxconn").await;
+        let ipc = run("cat /proc/sys/kernel/shmmni").await;
+        let device = run("test -c /dev/fuse && exec 3<>/dev/fuse && echo opened").await;
+        let status = run("cat /proc/self/status").await;
+        grill.kill(&id).await.unwrap();
+
+        assert_eq!(network.output.trim(), somaxconn, "{}", network.output);
+        assert_eq!(ipc.output.trim(), shmmni, "{}", ipc.output);
+        assert_eq!(
+            (device.exit_code, device.output.trim()),
+            (0, "opened"),
+            "the container couldn't open /dev/fuse read-write"
+        );
+        let effective = status
+            .output
+            .lines()
+            .find_map(|line| line.strip_prefix("CapEff:"))
+            .map(|hex| u64::from_str_radix(hex.trim(), 16).unwrap())
+            .unwrap();
+        assert_ne!(
+            effective & (1 << 15),
+            0,
+            "no CAP_IPC_OWNER: {}",
+            status.output
+        );
+        assert_eq!(
+            std::fs::read_to_string("/proc/sys/net/core/somaxconn").unwrap(),
+            host_somaxconn,
+            "the network sysctl leaked to the host"
+        );
+        assert_eq!(
+            std::fs::read_to_string("/proc/sys/kernel/shmmni").unwrap(),
+            host_shmmni,
+            "the IPC sysctl leaked to the host"
+        );
     }
 
     async fn redis_cli(grill: &RuncGrill, id: &InstanceId, command: &[&str]) -> String {

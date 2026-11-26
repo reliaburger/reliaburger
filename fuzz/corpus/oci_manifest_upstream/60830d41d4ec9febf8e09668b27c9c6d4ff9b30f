@@ -1,0 +1,17 @@
+{
+  "manifests": [
+    {
+      "digest": "sha256:00000000000000p111111EEEEEEEEEEEEE11",
+      "mediaType": "2application/vv2+json",
+      "platform": {
+        "architecture": "arm28",
+        "os": "linuEEEEEEEEEEEEEEEEEEEx",
+        "`variant": "1\u80056000v8"
+      },
+      "size": 400
+    }
+  ],
+  "mediaType": "application/vnd.oci.image.index.v1+json",
+  "schemaVersion": 
+ 2
+} 

@@ -1,0 +1,29 @@
+---
+source: src/appliance/console/view.rs
+expression: "console(&healthy_state(Tab::Status))"
+---
+ Reliaburger OS 2026.47.228 | node-1 | cluster home                 bun running
+ [1 Status]  2 Metrics   3 Workloads   4 Cluster   5 Versions   6 Logs
+┌ 1 Status ────────────────────────────────────────────────────────────────────┐
+│Node       node-1                                                             │
+│Cluster    home                                                               │
+│Address    192.168.1.52                                                       │
+│MAC        d8:9e:f3:12:34:56                                                  │
+│bun        running (0.3.3)                                                    │
+│                                                                              │
+│Cluster HEALTHY, no problems (node-1 answered at 15:06:40)                    │
+│wtf        0 critical, 0 warnings                                             │
+│nodes      3 alive, 0 suspect, 0 dead                                         │
+│council    leader node-1 (term 4), 3/3 voters, quorum ok, 0 lagging           │
+│gossip     3 members, last change 10 m ago, 1,204 updates received            │
+│versions   bun 0.2.8 on 3 nodes                                               │
+│capacity   cpu 25% allocated (6 of 24 cores), memory 3%                       │
+│usage      cpu 21%, memory 40%, disk 30%; newest sample 5 s old               │
+│apps       3: 3 running                                                       │
+│instances  6 of 6 running                                                     │
+│jobs       none running or finished in the last hour                          │
+│logs       newest line 2 s old                                                │
+│faults     none active                                                        │
+│alerts     none firing                                                        │
+└──────────────────────────────────────────────────────────────────────────────┘
+ 1-6 or <- -> tabs   up/down scroll   read-only: no login here     15:06:40 UTC

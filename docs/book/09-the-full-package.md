@@ -1480,6 +1480,41 @@ before its script printed a byte. The fix runs each fake once, right after
 writing it and before the clock starts. A file that has been checked starts
 in a few milliseconds from then on.
 
+Two months later the watchdog earned its keep, and showed what it cost. In
+0.3.2's release gate, three of four staged installs on the Mac Studio had a
+VM restarted, each one adding 45 to 70 seconds to a 66-second install
+(#2229). Was 0.3.2 to blame? We ran the published 0.3.1 and 0.3.2 side by
+side, eight and nine fresh installs each. 0.3.1 hit it twice, 0.3.2 not at
+all. That's about one VM start in 25, the same Lima and vz bug as before,
+and nothing to do with the release.
+
+We did learn two new things. First, the serial log never had firmware in it.
+Ubuntu's kernel writes to `tty1` and `ttyAMA0`, and a vz VM has neither, so
+the first byte in `serialv.log` is the login prompt, about 9 seconds after
+the VM starts. Second, the stuck VM wasn't idle. Its Virtualization process
+burned exactly one CPU-second per second for the whole minute: one vCPU
+spinning before userspace, where a healthy VM spends about 9 CPU-seconds
+booting and then goes quiet.
+
+The waste was in the timing. The 60 seconds ran from `limactl start`, and
+Lima spends the first five (more on a slow disk) unpacking the image before
+the VM even exists. Healthy consoles came up within 9.3 seconds of the VM
+starting in all 49 we measured; the stuck ones stayed empty for the whole
+minute. So `start_watched` now waits for the host agent's `ha.pid` (Lima
+writes it once the disk is ready, right before it boots the VM), and only
+then starts its clock. On a Mac that clock is 30 seconds, so a stuck VM
+costs about 30 seconds less, and a slow disk can no longer eat into a
+healthy boot's allowance. On Linux, Lima runs QEMU, which boots more slowly
+and which we didn't measure, so it keeps the full minute. `boot_silence`
+takes the VM type, a two-variant enum, and returns the right `Duration`.
+It's a `const fn`, a function the compiler can run while it builds, so
+`BOOT_SILENCE` is still a plain constant: `cfg!(target_os = "macos")` picks
+this host's VM type at compile time, the same way the VM config does.
+`disk_preparation_does_not_count_towards_the_boot_silence` pins the order: a
+fake `limactl` prepares its disk for 1.5 seconds, then prints its console
+line and writes `ha.pid`. A watchdog timed from the command would fire at 1
+second into an empty console; the one timed from the host agent never fires.
+
 ### Bake the image, don't install at boot
 
 The measurements had one more thing to say. The kernel reached a login prompt
@@ -1641,6 +1676,77 @@ so the signed cold-install gate must exercise it too.
 
 The context also records the other loopback forwards, HTTP ingress on 18080 and the authenticated registry on 15050, so tools don't have to guess guest ports. And the guest's systemd unit mounts bpffs at `/sys/fs/bpf` in an `ExecStartPre` step if the base image didn't, so Bun never starts without the filesystem that holds its eBPF pins.
 
+### A crash in somebody else's event loop
+
+An evaluator on Arch Linux sent us a report we couldn't run (#1495). The
+cluster booted, and about 20 seconds later one node went `Broken`, because
+QEMU had died:
+
+```text
+qemu-system-x86_64: ../net/net.c:2175: net_fill_rstate: Assertion `size == 0' failed.
+```
+
+They'd done the hard part already. The core dump showed QEMU's socket
+network backend calling `recv()`, getting `-1` with `errno` set to `EAGAIN`,
+and passing the `-1` on as a packet length. Lima's `user-v2` network, the one
+that lets our VMs reach each other, hands QEMU exactly that backend:
+`-netdev socket,fd=3`, a Unix socket to Lima's user-mode network daemon. We
+had no Linux desktop with QEMU 11.1, though, so the issue sat parked.
+
+So we built one. The Mac runs Lima's `vz` driver with nested virtualisation,
+which gives a Fedora 44 guest its own `/dev/kvm`. Fedora 45's QEMU 11.1.3
+installs into it, and Lima 2.2.1 inside it runs two Ubuntu VMs on `user-v2`,
+the quickstart's configuration in miniature. The first VM survived its boot;
+the second one aborted during its first boot with the same assertion. After
+that `iperf3` between the two VMs killed one of them every single round.
+
+Reading QEMU's source explained half of it. `net_socket_send()` has let
+`EAGAIN` fall through to the packet parser for years, and `net_fill_rstate()`
+has asserted `size == 0` since 2016, so the bug is old. What's new is that something now
+calls the handler when there's nothing to read. QEMU 10.2 moved its main
+loop onto io_uring when the kernel allows it, rather than glib's `ppoll(2)`,
+and the file descriptor handlers moved with it. Take io_uring away and QEMU
+falls back to `ppoll(2)` without complaint. With `sysctl
+kernel.io_uring_disabled=1`, which keeps io_uring for root only, or `2`,
+which turns it off, the same `iperf3` rounds ran clean. Fedora 44's QEMU 10.2.2
+crashed just like 11.1.3, and Fedora 43's 10.1.5 didn't.
+
+We can't fix QEMU from here, and Lima on Linux has no other network that
+connects VMs without root. What we can do is refuse to start a cluster that
+we know will fall over, and say how to get past it. `preflight::qemu` runs
+`qemu-system-<arch> --version`, reads `/proc/sys/kernel/io_uring_disabled`,
+and hands both to a plain function:
+
+```rust
+fn check_qemu(command: &str, version: Option<QemuVersion>, io_uring: IoUring) -> Result<()> {
+    let Some(version) = version else {
+        return Ok(());
+    };
+    if version < QemuVersion::IO_URING_MAIN_LOOP || io_uring != IoUring::Enabled {
+        return Ok(());
+    }
+    bail!( /* the QEMU version, the issue link and the sysctl that fixes it */ )
+}
+```
+
+`let Some(version) = version else { ... }` is a `let`-`else`: it either
+binds the inner value or runs the block, which has to leave the function. A
+banner we can't parse lets setup carry on, because this check is for one known
+crash and shouldn't turn into a list of approved builds. `version <
+QemuVersion::IO_URING_MAIN_LOOP` compares two structs with `<`.
+`#[derive(PartialOrd, Ord)]` makes that compare the fields in the order
+they're declared (major, then minor, then micro), which is exactly how
+version numbers sort. In Go you'd write the comparison out by hand.
+
+Keeping the decision in a function that takes values rather than running
+commands means the tests are a handful of `assert!`s: Fedora's and Debian's
+banners, a build from git, 10.1 against 10.2, and each io_uring setting.
+Setup checks before it downloads anything, `relish local start` checks again
+in case QEMU was upgraded since, and so does `relish dev create`. The report
+for QEMU's developers names the two places that need a fix: the socket and
+stream backends should return on `EAGAIN`, and the io_uring file descriptor
+monitor shouldn't turn a failed poll into "readable".
+
 ### One clock, not two
 
 The 0.1.5 soak turned up a bug that wasn't in our code at all. On every node,
@@ -1716,6 +1822,87 @@ disables chrony before it seals the image. On real VMs, the soak's guest
 report now prints whether timesyncd or chrony is active, either of which fails
 the check outright, and counts the `SyncTime` steps the guest agent logged since
 the last report. The record lists the total per node.
+
+### Nobody upgrades the guest but us
+
+The clock wasn't the only thing in the guest with a mind of its own. In a
+power-cut endurance run, Bun stopped cleanly and started again in the middle of
+a work period, with nobody touching it. The guest journal had the answer:
+Ubuntu's `apt-daily-upgrade.timer` had run unattended-upgrades, which upgraded
+libc, and needrestart then restarted every service still mapping the old
+library, `reliaburger.service` among them
+([#2274](https://github.com/reliaburger/reliaburger/issues/2274)). The
+workloads came back and nothing was lost, so it wasn't a durability bug. For a
+tester, though, it's an API outage nobody can explain. And an apt run cut short
+by a laptop going to sleep can leave a broken guest behind.
+
+The image build had set `NEEDRESTART_SUSPEND=1`, but only for its own
+`apt-get` calls in the chroot. The VM booted with Ubuntu's defaults.
+
+Why not just keep the updates and stop the restarts? Because the guest is
+disposable. Each release builds its guest image again from a pinned Ubuntu
+image, and a laptop cluster is torn down and rebuilt far more often than a
+server. Updates arrive with releases, the way Bun's own fixes do, and never
+under a running cluster. So `build_guest_image.sh` masks the two apt timers
+and `unattended-upgrades.service` in the chroot. Masking links the unit to
+`/dev/null`, so nothing can start it, not even another unit that wants it;
+disabling would only remove the timers' `[Install]` links. The script then
+checks that each link really is in the image's root, and fails the build if
+not. If the image has needrestart, a drop-in sets `$nrconf{restart} = 'l'`:
+list what would need a restart, restart nothing.
+
+Provisioning does the same at first boot, which covers the stock image of
+development runs and a cluster built from an older guest image:
+
+```rust
+const NO_AUTOMATIC_UPDATES: &str = "systemctl mask apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service\n\
+     systemctl stop apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service || true\n\
+     if dpkg-query -W -f='${db:Status-Abbrev}\\n' needrestart 2>/dev/null | grep -q '^ii'; then\n  \
+     install -d -m 755 /etc/needrestart/conf.d\n  \
+     echo \"\\$nrconf{restart} = 'l';\" | tee /etc/needrestart/conf.d/50-reliaburger.conf >/dev/null\n\
+     fi\n";
+```
+
+It runs before the stock image's `apt-get install`, so a timer can't fire in
+the middle of it. `systemctl mask` succeeds for a unit that isn't installed,
+but `stop` doesn't, hence the `|| true` under `set -eu`. Inside a Rust string
+literal, `\\` is one backslash, so the shell sees `\n` in the `dpkg-query`
+format and `\$` in the double-quoted `echo`, which keeps Bash from expanding
+`$nrconf` as a variable.
+
+The tests reuse the stub harness from the clock fix. The provisioning test
+expects the `mask` call in the stub `systemctl`'s log, a stub `tee` records the
+drop-in's path and contents, and a second run with needrestart reported
+missing expects no drop-in. The guest image test checks the build script masks
+the units after installing packages, checks the masks, and writes the drop-in,
+all before the image is compressed.
+
+The fix was written against an incident on a 24.04 guest, and the quickstart
+guest is 26.04. Does 26.04 even have the same moving parts? We booted the
+pinned 26.04 cloud image and looked. It does: unattended-upgrades 2.12 still
+runs from `apt-daily-upgrade.service` (`apt.systemd.daily install`),
+`unattended-upgrades.service` is still only its shutdown helper, and
+needrestart 3.11 is installed by default, hooked into every dpkg run and still
+reading `conf.d`. Its other timers (`update-notifier-download`, `motd-news`,
+`fwupd-refresh`, Ubuntu Pro's `ua-timer`) fetch data but install nothing.
+Then we built the image with the script, booted it as a quickstart VM, and
+reinstalled libc6 by hand. needrestart printed "Service restarts being
+deferred" with `systemd-logind.service` on the list, and logind kept its PID.
+
+One gap showed up on the way. The script writes the drop-in only if
+`/etc/needrestart` exists, and nothing checked that it landed. 26.04's image
+always has needrestart, so a drop-in that silently went missing would bring
+back exactly the restart we'd just fixed, and the masks' check wouldn't
+notice. So the build now
+asks dpkg whether needrestart is installed in the image and, if it is, fails
+unless the drop-in says `'l'`, the same way it fails over a missing mask. The
+test pulls that check out of the script and runs it against a fake image
+root, with a stub standing in for the chroot: a missing drop-in or one that
+says `'a'` fails, `'l'` passes, and so does a needrestart that was removed
+(`rc`) or never installed.
+
+`relish setup --ssh` doesn't do any of this. A server is the operator's
+machine, and its update policy is the operator's call.
 
 ### Pin a Lima that doesn't leak
 
@@ -1836,7 +2023,7 @@ A quickstart VM has exactly one NIC, so matching on the driver is enough. With i
 
 One more surprise was in our own build, not in Ubuntu. Building `bun` inside a 26.04 VM got us a binary whose eBPF objects kernel 7.0's verifier refused, and Chapter 3 tells that story. Release builds still compile on Ubuntu 22.04 with an older clang, so they weren't affected, but now the build pins the instruction set either way.
 
-What about one package list for the guest and the appliance? mkosi reads its `Packages=` from an INI-style file, not JSON, so generating one from the other would mean a build step for each. We kept the two files and made a test hold them together instead. `test_guest_images.py` parses `image/mkosi.conf` and fails if the guest's packages, less Buildah, aren't exactly the appliance's node packages. Buildah stays guest-only, because the five-minute tour builds images on the laptop cluster.
+What about one package list for the guest and the appliance? mkosi reads its `Packages=` from an INI-style file, not JSON, so generating one from the other would mean a build step for each. We kept the two files and made a test hold them together instead. `test_guest_images.py` parses `image/mkosi.conf` and fails if the guest's packages, less Buildah, aren't exactly the appliance's node packages. Buildah stayed guest-only, because the five-minute tour builds images on the laptop cluster, until the tour reached bare metal and the appliance got it too (chapter 15a, "A tour that couldn't build").
 
 ### Status from any node
 

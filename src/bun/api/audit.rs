@@ -123,6 +123,8 @@ pub(crate) const AUDITED_ROUTES: &[AuditedRoute] = &[
         Operation,
     ),
     audited(Post, "/v1/os/stage", "os.staged", Operation),
+    audited(Post, "/v1/os/boot-logs", "os.boot_logs_set", Operation),
+    audited(Post, "/v1/os/settings", "os.settings_set", Operation),
     audited(
         Post,
         "/v1/os/rollout/start",

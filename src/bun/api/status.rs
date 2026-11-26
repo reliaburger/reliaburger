@@ -42,6 +42,9 @@ pub(super) async fn current_apps_handler(
                     resource,
                     image: spec.image.clone(),
                     fingerprint: app_fingerprint_in(spec, &app_id.namespace),
+                    // The owner lives on the effective spec: a policy
+                    // default can't fill it in, but a claim sets it there.
+                    owner: effective.owner.clone(),
                 },
             );
         }
@@ -53,6 +56,7 @@ pub(super) async fn current_apps_handler(
                     resource,
                     image: None,
                     fingerprint: spec_fingerprint(spec),
+                    owner: None,
                 },
             );
         }
@@ -64,6 +68,7 @@ pub(super) async fn current_apps_handler(
                     resource,
                     image: None,
                     fingerprint: spec_fingerprint(spec),
+                    owner: None,
                 },
             );
         }
@@ -75,6 +80,7 @@ pub(super) async fn current_apps_handler(
                     resource,
                     image: None,
                     fingerprint: spec_fingerprint(spec),
+                    owner: None,
                 },
             );
         }
@@ -116,6 +122,7 @@ pub(super) async fn current_apps_handler(
                 resource,
                 image: spec.image.clone(),
                 fingerprint: crate::config::fingerprint::job_fingerprint(&spec),
+                owner: None,
             },
         );
     }
@@ -363,6 +370,7 @@ pub(super) async fn common_local_statuses(state: &ApiState) -> Vec<InstanceStatu
             age_seconds: None,
             image: None,
             data_on_node: false,
+            sidecars: Vec::new(),
             reason: None,
         };
         if let Some((runtime, physical, binding)) = node.singleton_runtime(id) {
@@ -609,18 +617,7 @@ pub(super) async fn events_handler(
             .into_response();
     }
     let limit = query.limit.unwrap_or(100);
-    if !is_scoped(auth.as_ref()) {
-        return Json(cluster_recent_events(&state, &query, limit).await).into_response();
-    }
-    // A scoped caller's events are a slice of everyone's, so read as many
-    // as the stores keep and take the newest `limit` of that slice.
-    let mut view =
-        cluster_recent_events(&state, &query, crate::bun::events::EVENT_BUFFER_CAP).await;
-    view.events
-        .retain(|event| event_visible(auth.as_ref(), event));
-    let excess = view.events.len().saturating_sub(limit);
-    view.events.drain(..excess);
-    Json(view).into_response()
+    Json(cluster_recent_events(&state, &query, limit, auth.as_ref()).await).into_response()
 }
 
 /// Whether `auth` is limited to some apps or namespaces. The bootstrap
@@ -657,24 +654,37 @@ pub(super) fn event_visible(
     }
 }
 
-/// The newest `limit` events matching `query`, from this node and, unless
-/// the query is `local`, every live member, oldest first.
+/// The newest `limit` events matching `query` that `auth` may see, from
+/// this node and, unless the query is `local`, every live member, oldest
+/// first.
+///
+/// A scoped caller's events are a slice of everyone's (#1125), so each
+/// store is read whole and each node's answer is trimmed to that slice
+/// before the merge takes the newest `limit` (#1322). Trimming after the
+/// merge would let a busy namespace on one node push another node's older
+/// events for this caller out of the window.
 async fn cluster_recent_events(
     state: &ApiState,
     query: &EventsQuery,
     limit: usize,
+    auth: Option<&crate::sesame::auth::AuthContext>,
 ) -> crate::bun::cluster_view::ClusterEvents {
+    let read = if is_scoped(auth) {
+        crate::bun::events::EVENT_BUFFER_CAP
+    } else {
+        limit
+    };
     let local = match &state.events {
         Some(events) => events
             .read()
             .await
-            .recent(limit, query.app.as_deref(), query.severity),
+            .recent(read, query.app.as_deref(), query.severity),
         None => Vec::new(),
     };
     let mut answers = vec![(local_node_name(state), local)];
     let mut warnings = Vec::new();
     if !query.local {
-        let path = peer_events_path(query, limit);
+        let path = peer_events_path(query, read);
         let (peers, failures) = fan_out_to_peers::<crate::bun::cluster_view::ClusterEvents>(
             state,
             &path,
@@ -683,6 +693,9 @@ async fn cluster_recent_events(
         .await;
         answers.extend(peers.into_iter().map(|(node, view)| (node, view.events)));
         warnings = failures;
+    }
+    for (_, events) in &mut answers {
+        events.retain(|event| event_visible(auth, event));
     }
     crate::bun::cluster_view::ClusterEvents {
         events: crate::bun::cluster_view::merge_events(answers, limit),
@@ -849,7 +862,9 @@ pub(super) async fn ws_events_session(mut socket: WebSocket, state: ApiState) {
         local: false,
         follow: false,
     };
-    let backlog = cluster_recent_events(&state, &backlog_query, LIVE_EVENTS_BACKLOG)
+    // The socket refuses scoped tokens before the upgrade, so nothing is
+    // trimmed.
+    let backlog = cluster_recent_events(&state, &backlog_query, LIVE_EVENTS_BACKLOG, None)
         .await
         .events;
     // Sequences are per process, so a member that restarts reuses them; the

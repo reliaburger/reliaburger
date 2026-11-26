@@ -12,8 +12,22 @@ use std::time::Duration;
 mod bun_process;
 #[path = "support/cluster.rs"]
 mod cluster_support;
+#[path = "support/runc_residue.rs"]
+mod runc_residue;
+use runc_residue::test_cgroups::TestCgroups;
 #[path = "support/slow_registry.rs"]
 mod slow_registry;
+
+/// Claim a test's executor slot groups in `default`, which its runner (made
+/// from `data_dir`) names after its private executor identity (#2322).
+fn claim_default_executors(cgroups: &mut TestCgroups, data_dir: &std::path::Path) {
+    let prefix = std::fs::read_to_string(data_dir.join("batch-executor-id")).unwrap();
+    cgroups.claim(
+        std::path::Path::new(runc_residue::test_cgroups::HIERARCHY)
+            .join("default")
+            .join(format!("executor-{}*", prefix.trim())),
+    );
+}
 
 /// Retired, and then forgotten once that retirement is proven (#678).
 async fn assert_retired(runtime: &impl Grill, id: &reliaburger::grill::InstanceId) {
@@ -38,6 +52,8 @@ async fn runc_owned_task_arrays_pack_profiles_reuse_slots_and_retire_cancelled_p
     use tokio_util::sync::CancellationToken;
     assert!(nix::unistd::geteuid().is_root());
     let root = tempfile::tempdir().unwrap();
+    let _cgroups = TestCgroups::namespace("rbtest-batch");
+    let _runc_residue = runc_residue::RuncResidue::new(root.path());
     let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
     let images = ImageStore::new(root.path().join("images"))
         .with_owner_shift(reliaburger::grill::userns::HOST_ID_BASE)
@@ -256,6 +272,8 @@ async fn runc_executor_start_that_misses_its_bound_retries_on_a_fresh_executor()
         .prefix("rb-759-start-")
         .tempdir()
         .unwrap();
+    let _cgroups = TestCgroups::namespace("rbtest-start");
+    let _runc_residue = runc_residue::RuncResidue::new(root.path());
     let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
     let images = ImageStore::new(root.path().join("images"))
         .with_owner_shift(reliaburger::grill::userns::HOST_ID_BASE)
@@ -406,6 +424,8 @@ async fn runc_warm_pinned_executor_cold_starts_make_no_registry_requests() {
         .tempdir()
         .unwrap()
         .keep();
+    runc_residue::sweep_stale();
+    let _cgroups = TestCgroups::namespace("rbtest-warm-pin");
     // Declared before the runtime, so it drops after it: a failed assertion
     // still releases the executors' namespaces for the next runc test.
     let _residue = ExecutorResidue { root: root.clone() };
@@ -469,16 +489,16 @@ async fn runc_warm_pinned_executor_cold_starts_make_no_registry_requests() {
         );
         assert_eq!(attempt.output.head, b"ran", "{attempt:?}");
     }
-    let executors = runtime
-        .launch_inventory()
-        .await
+    // Count cold starts from the pool's own record, not the runtime's
+    // inventory: an executor idle for a second retires while a slower slot
+    // is still starting, so on a loaded host the inventory read after the
+    // burst can miss executors that did cold-start (#2338).
+    let startups = runner
+        .executor_timings(reliaburger::config::job::JobRuntime::SharedRunc)
         .unwrap()
-        .unwrap()
-        .into_iter()
-        .filter(|launch| launch.instance_id.0.contains("__executor-"))
-        .map(|launch| launch.instance_id)
-        .collect::<Vec<_>>();
-    assert_eq!(executors.len(), BURST, "every slot cold-started");
+        .startup
+        .samples;
+    assert_eq!(startups, BURST as u64, "every slot cold-started");
     assert_eq!(
         connections.load(Ordering::SeqCst),
         0,
@@ -492,8 +512,10 @@ async fn runc_warm_pinned_executor_cold_starts_make_no_registry_requests() {
     })
     .await
     .expect("idle executors never retired");
-    for id in &executors {
-        assert_retired(&runtime, id).await;
+    for launch in runtime.launch_inventory().await.unwrap().unwrap() {
+        if launch.instance_id.0.contains("__executor-") {
+            assert_retired(&runtime, &launch.instance_id).await;
+        }
     }
 }
 
@@ -518,6 +540,8 @@ struct SlowColdPull {
     // Last, so it drops after the runtime and still releases what a failed
     // assertion left behind.
     residue: ExecutorResidue,
+    // After the residue, so the executors are gone before their cgroups.
+    _cgroups: TestCgroups,
 }
 
 impl SlowColdPull {
@@ -543,7 +567,9 @@ impl SlowColdPull {
             .tempdir()
             .unwrap()
             .keep();
+        runc_residue::sweep_stale();
         let residue = ExecutorResidue { root: root.clone() };
+        let cgroups = TestCgroups::namespace(namespace);
         let node = root.join("node-0");
         std::fs::create_dir_all(&node).unwrap();
         let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
@@ -600,6 +626,7 @@ impl SlowColdPull {
             budget,
             work,
             residue,
+            _cgroups: cgroups,
         }
     }
 
@@ -734,6 +761,14 @@ async fn runc_delegated_namespace_isolation_and_policy_loss_retire_the_original_
     }
 }
 
+/// How long a delegated task's container may take to start. Alone it starts
+/// in a second or two; in a loaded VM beside a full `make test-linux`, one
+/// runc start alone took more than 20 s (#2267), and a 10 s bound here
+/// failed the test with no fault in it (#2315). The bound only has to catch
+/// a start that never happens.
+#[cfg(feature = "ebpf")]
+const OWNER_START_DEADLINE: Duration = Duration::from_secs(90);
+
 #[cfg(feature = "ebpf")]
 async fn delegated_namespace_isolation_and_policy_loss(isolation: &str) {
     use reliaburger::bun::task_executor::{AttemptOutcome, TaskInvocation, TaskRunner};
@@ -753,6 +788,11 @@ async fn delegated_namespace_isolation_and_policy_loss(isolation: &str) {
         .unwrap()
         .keep();
     let root = root_path.as_path();
+    let namespace = format!("rbtest-job-{}", rand::random::<u32>());
+    let other = format!("rbtest-other-{}", rand::random::<u32>());
+    let hierarchy = std::path::Path::new(runc_residue::test_cgroups::HIERARCHY);
+    let _cgroups = TestCgroups::new([hierarchy.join(&namespace), hierarchy.join(&other)]);
+    let _runc_residue = runc_residue::RuncResidue::new(root);
     eprintln!("namespace fixture ({isolation}): {}", root.display());
     let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
     let images = ImageStore::new(root.join("images"))
@@ -804,8 +844,6 @@ async fn delegated_namespace_isolation_and_policy_loss(isolation: &str) {
             }
         })
     };
-    let namespace = format!("rbtest-job-{}", rand::random::<u32>());
-    let other = format!("rbtest-other-{}", rand::random::<u32>());
     let mut services = ServiceMap::new();
     for ns in [&namespace, &other] {
         services.register_app("web", ns, port, None).unwrap();
@@ -869,13 +907,15 @@ async fn delegated_namespace_isolation_and_policy_loss(isolation: &str) {
             runner
                 .run(
                     &sleeping,
-                    Duration::from_secs(30),
+                    // Past the start deadline below, so the task can't time
+                    // out before the loss is injected.
+                    OWNER_START_DEADLINE * 2,
                     &CancellationToken::new(),
                 )
                 .await
         })
     };
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(OWNER_START_DEADLINE, async {
         loop {
             let mut running = false;
             for owner in runtime.launch_inventory().await.unwrap().unwrap() {
@@ -1019,6 +1059,9 @@ async fn runc_fresh_named_job_task_is_bound_to_its_job_and_egress_before_it_runs
         .unwrap()
         .keep();
     let root = root_path.as_path();
+    let namespace = format!("rbtest-fresh-{}", rand::random::<u32>());
+    let _cgroups = TestCgroups::namespace(&namespace);
+    let _runc_residue = runc_residue::RuncResidue::new(root);
     eprintln!("fresh named job fixture: {}", root.display());
     let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
     let images = ImageStore::new(root.join("images"))
@@ -1079,7 +1122,6 @@ async fn runc_fresh_named_job_task_is_bound_to_its_job_and_egress_before_it_runs
         })
         .collect();
     let host = runtime.dns_gateway_address().unwrap();
-    let namespace = format!("rbtest-fresh-{}", rand::random::<u32>());
     let job = "probe";
     let invocation = |command: String| TaskInvocation {
         template: Some(std::sync::Arc::new(
@@ -1226,6 +1268,8 @@ async fn runc_common_job_api_runs_encrypted_singletons_and_gates_hooks_on_accept
         .tempdir()
         .unwrap()
         .keep();
+    let mut cgroups = TestCgroups::new([]);
+    let _runc_residue = runc_residue::RuncResidue::new(&root);
     eprintln!("common mixed/reuse API fixture: {}", root.display());
     let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
     let images = ImageStore::new(root.as_path().join("images"))
@@ -1307,6 +1351,7 @@ async fn runc_common_job_api_runs_encrypted_singletons_and_gates_hooks_on_accept
     let runner = OwnedRunner::for_data_dir(runtime.clone(), root.as_path())
         .unwrap()
         .with_secrets(council.clone(), ikm);
+    claim_default_executors(&mut cgroups, root.as_path());
     let executor = TaskArrayNode::new(
         TaskArrayNodeConfig::for_data_dir(root.as_path(), host_policy),
         NodeRunner::Owned(Box::new(runner)),
@@ -1520,6 +1565,23 @@ async fn runc_common_job_api_runs_encrypted_singletons_and_gates_hooks_on_accept
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// The PID a command printed with `printf '%s' "$!"` after starting a
+/// background job. The job's shell holds the command's output pipes from
+/// its fork until its own redirections apply, so on a busy host it can
+/// still hold them when the command exits. The executor then stops
+/// draining and says so on stderr (#715), and that marker follows the PID
+/// (#2332). Nothing else may.
+fn background_pid(head: &[u8]) -> u32 {
+    let text = String::from_utf8_lossy(head);
+    let (pid, rest) = text.split_once('\n').unwrap_or((&text, ""));
+    assert!(
+        rest.is_empty() || rest == "[reliaburger: output written after exit truncated]\n",
+        "unexpected output after the PID: {text:?}"
+    );
+    pid.parse()
+        .unwrap_or_else(|error| panic!("no PID in {text:?}: {error}"))
+}
+
 /// Reuse keeps one live container while every command gets independent scratch,
 /// credentials, cgroup limits and whole-tree retirement.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1537,6 +1599,8 @@ async fn runc_reusable_commands_keep_the_container_but_retire_task_state_and_idl
         .tempdir()
         .unwrap()
         .keep();
+    let _cgroups = TestCgroups::namespace("rbtest-reuse");
+    let _runc_residue = runc_residue::RuncResidue::new(&root);
     eprintln!("reusable fixture: {}", root.display());
     let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
     let images = ImageStore::new(root.as_path().join("images"))
@@ -1658,10 +1722,7 @@ async fn runc_reusable_commands_keep_the_container_but_retire_task_state_and_idl
         AttemptOutcome::Exited { code: 0 },
         "{escaped:?}"
     );
-    let descendant: u32 = String::from_utf8(escaped.output.head)
-        .unwrap()
-        .parse()
-        .unwrap();
+    let descendant = background_pid(&escaped.output.head);
     let mut clean = task.clone();
     clean.args = vec![
         "/bin/sh".into(),
@@ -1854,6 +1915,8 @@ async fn runc_mixed_runtimes_run_host_and_container_jobs_and_recover_both_origin
         .tempdir()
         .unwrap()
         .keep();
+    let _cgroups = TestCgroups::namespace("rbtest-mixed");
+    let _runc_residue = runc_residue::RuncResidue::new(&root);
     eprintln!("mixed runtime fixture: {}", root.display());
     let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
     let images = ImageStore::new(root.join("images"))
@@ -1987,6 +2050,8 @@ async fn runc_containers_from_a_runc_agent_are_recovered_by_a_mixed_agent() {
         .tempdir()
         .unwrap()
         .keep();
+    let _cgroups = TestCgroups::namespace("rbtest-switch");
+    let _runc_residue = runc_residue::RuncResidue::new(&root);
     eprintln!("runtime switch fixture: {}", root.display());
     let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
     let images = ImageStore::new(root.join("images"))
@@ -2082,6 +2147,8 @@ async fn runc_array_attempt_can_be_paused_and_resumed() {
         .prefix("rb-704-pause-")
         .tempdir()
         .unwrap();
+    let _cgroups = TestCgroups::namespace("rbtest-pause");
+    let _runc_residue = runc_residue::RuncResidue::new(root.path());
     let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
     let images = ImageStore::new(root.path().join("images"))
         .with_owner_shift(reliaburger::grill::userns::HOST_ID_BASE)
@@ -2220,6 +2287,8 @@ async fn runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_sec
         .tempdir()
         .unwrap()
         .keep();
+    let _cgroups = TestCgroups::namespace("rbtest-reuse");
+    let _runc_residue = runc_residue::RuncResidue::new(&root);
     eprintln!("admission and revocation fixture: {}", root.display());
     let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
     let images = ImageStore::new(root.join("images"))
@@ -2499,6 +2568,7 @@ async fn cgroup_host_jobs_reuse_owned_helpers_with_fresh_processes_and_enforced_
         .unwrap()
         .keep();
     let root = root_path.as_path();
+    let _cgroups = TestCgroups::namespace("rbtest-native");
     eprintln!("native fixture: {}", root.display());
     let runtime = ProcessGrill::with_owner(root.join("owners"), env!("CARGO_BIN_EXE_bun").into());
     let budget = ExecutionBudget::new(Resources::new(1000, 128 << 20, 0));
@@ -2720,6 +2790,7 @@ async fn cgroup_host_jobs_write_the_configured_pids_limit_to_the_command_cgroup(
         .tempdir()
         .unwrap()
         .keep();
+    let _cgroups = TestCgroups::namespace("rbtest-native-pids");
     eprintln!("native pids fixture: {}", root.display());
     let runtime = ProcessGrill::with_owner(root.join("owners"), env!("CARGO_BIN_EXE_bun").into());
     let budget = ExecutionBudget::new(Resources::new(1000, 128 << 20, 0));
@@ -2806,6 +2877,7 @@ async fn cgroup_host_executor_retires_a_dropped_callers_slot_without_a_restart()
         .unwrap()
         .keep();
     eprintln!("native recovery fixture: {}", root.display());
+    let _cgroups = TestCgroups::namespace("rbtest-native-recovery");
     let runtime = ProcessGrill::with_owner(root.join("owners"), env!("CARGO_BIN_EXE_bun").into());
     let budget = ExecutionBudget::new(Resources::new(1000, 128 << 20, 0));
     let runner = Arc::new(
@@ -2894,7 +2966,7 @@ async fn cgroup_host_executor_retires_a_dropped_callers_slot_without_a_restart()
 }
 
 /// A native runner with one slot, so every command reuses the same executor
-/// identity and cgroup path.
+/// identity and cgroup path. Its jobs run in [`native_namespace`].
 fn one_slot_native_runner(
     root: &std::path::Path,
 ) -> (
@@ -2913,11 +2985,21 @@ fn one_slot_native_runner(
         1,
     )
     .with_budget(budget.clone());
-    let template = toml::from_str(
-        "runtime='process'\nexec='/bin/sh'\nnamespace='rbtest-native'\ncpu='100m-1000m'\nmemory='32Mi'",
-    )
+    let template = toml::from_str(&format!(
+        "runtime='process'\nexec='/bin/sh'\nnamespace='{}'\ncpu='100m-1000m'\nmemory='32Mi'",
+        native_namespace(root)
+    ))
     .unwrap();
     (runner, budget, template, runtime)
+}
+
+/// The namespace a [`one_slot_native_runner`] made in `root` runs in. These
+/// tests run in parallel, so each gets its own, and its guard removes only
+/// that test's cgroups (#2322).
+fn native_namespace(root: &std::path::Path) -> String {
+    let name = root.file_name().unwrap().to_string_lossy().to_lowercase();
+    let suffix: String = name.chars().filter(char::is_ascii_alphanumeric).collect();
+    format!("rbtest-native-{suffix}")
 }
 
 fn shell_task(
@@ -2967,6 +3049,7 @@ async fn cgroup_host_executor_never_reuses_a_killed_task_cgroup() {
         .prefix("rb-native-fresh-")
         .tempdir()
         .unwrap();
+    let _cgroups = TestCgroups::namespace(&native_namespace(root.path()));
     let (runner, budget, template, _) = one_slot_native_runner(root.path());
     let cancel = tokio_util::sync::CancellationToken::new();
     let cold = std::time::Instant::now();
@@ -3023,6 +3106,7 @@ async fn cgroup_host_executor_retirement_is_bounded_and_quarantines_the_slot() {
         .prefix("rb-native-stuck-")
         .tempdir()
         .unwrap();
+    let _cgroups = TestCgroups::namespace(&native_namespace(root.path()));
     let (runner, budget, template, _) = one_slot_native_runner(root.path());
     let cancel = tokio_util::sync::CancellationToken::new();
     let first = runner
@@ -3121,6 +3205,7 @@ async fn cgroup_host_executor_drains_output_buffered_at_exit() {
         .prefix("rb-native-drain-")
         .tempdir()
         .unwrap();
+    let _cgroups = TestCgroups::namespace(&native_namespace(root.path()));
     let (runner, budget, template, runtime) = one_slot_native_runner(root.path());
     let cancel = tokio_util::sync::CancellationToken::new();
     let warm = runner
@@ -3187,6 +3272,7 @@ async fn cgroup_host_executor_spawns_without_copy_on_write_faults() {
         .prefix("rb-native-vfork-")
         .tempdir()
         .unwrap();
+    let _cgroups = TestCgroups::namespace(&native_namespace(root.path()));
     let (runner, budget, template, runtime) = one_slot_native_runner(root.path());
     let cancel = tokio_util::sync::CancellationToken::new();
     let run = |index: u32, script: &str| {
@@ -3262,6 +3348,7 @@ async fn cgroup_host_executor_sockets_cannot_be_blocked_by_other_users() {
         .prefix("rb-native-socket-")
         .tempdir()
         .unwrap();
+    let _cgroups = TestCgroups::namespace(&native_namespace(root.path()));
     let (runner, budget, template, runtime) = one_slot_native_runner(root.path());
     let cancel = tokio_util::sync::CancellationToken::new();
     let first = runner
@@ -3330,6 +3417,7 @@ async fn cgroup_host_arrays_advertise_running_commands_not_queued_callers() {
         .prefix("rb-native-slots-")
         .tempdir()
         .unwrap();
+    let _cgroups = TestCgroups::namespace("rbtest-slots");
     let runtime =
         ProcessGrill::with_owner(root.path().join("owners"), env!("CARGO_BIN_EXE_bun").into());
     // Exactly two executors: 100m/32 MiB each plus 10m/8 MiB for the helper.
@@ -3437,6 +3525,7 @@ async fn cgroup_host_busy_slots_count_checked_out_slots_before_the_command_start
         .prefix("rb-native-busy-")
         .tempdir()
         .unwrap();
+    let _cgroups = TestCgroups::namespace(&native_namespace(root.path()));
     let (runner, budget, template, runtime) = one_slot_native_runner(root.path());
     let cancel = tokio_util::sync::CancellationToken::new();
     let mut warm = shell_task(&template, 0, "true");
@@ -3495,6 +3584,7 @@ async fn cgroup_host_executor_adds_no_drain_wait_to_quiet_commands() {
         .prefix("rb-native-latency-")
         .tempdir()
         .unwrap();
+    let _cgroups = TestCgroups::namespace(&native_namespace(root.path()));
     let (runner, budget, template, _) = one_slot_native_runner(root.path());
     let cancel = tokio_util::sync::CancellationToken::new();
     let warm = runner
@@ -3545,6 +3635,11 @@ async fn runc_shared_arrays_across_namespaces_leave_no_executor_metadata_after_r
         .tempdir()
         .unwrap()
         .keep();
+    let hierarchy = std::path::Path::new(runc_residue::test_cgroups::HIERARCHY);
+    let _cgroups = TestCgroups::new(
+        ["rbtest-tenant-a", "rbtest-tenant-b", "rbtest-tenant-c"].map(|name| hierarchy.join(name)),
+    );
+    let _runc_residue = runc_residue::RuncResidue::new(&root);
     eprintln!("executor metadata fixture: {}", root.display());
     let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
     let images = ImageStore::new(root.join("images"))
@@ -3667,6 +3762,8 @@ async fn runc_shared_profile_reports_cgroup_cpu_and_memory() {
         .prefix("rb-684-usage-")
         .tempdir()
         .unwrap();
+    let _cgroups = TestCgroups::namespace("rbtest-usage");
+    let _runc_residue = runc_residue::RuncResidue::new(root.path());
     let image = reliaburger::testkit::pinned_images::PINNED_TEST_WORKLOAD_IMAGE;
     let images = ImageStore::new(root.path().join("images"))
         .with_owner_shift(reliaburger::grill::userns::HOST_ID_BASE)
@@ -3973,6 +4070,7 @@ async fn leader_loss_mid_array(template: serde_json::Value) {
         .tempdir()
         .unwrap()
         .keep();
+    runc_residue::sweep_stale();
     eprintln!("leader-loss fixture: {}", root.display());
     // Declared before the runtime and nodes, so it drops after them: on a
     // failed assertion as on a pass.

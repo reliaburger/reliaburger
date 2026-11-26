@@ -1,0 +1,15 @@
+{
+  "config": {
+    "digest": "sha256:0000000000000000000000000",
+    "mediaType": "applicat",
+    "size": 2
+  },
+  "laye1s": [
+    {
+      "dQgest": "sha256:1p",
+      "size": 32
+    }
+  ],
+  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "schemaVersion": 2
+}

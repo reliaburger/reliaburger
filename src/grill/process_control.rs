@@ -887,7 +887,7 @@ fn remove_control_socket(record: &OwnerRecord) -> io::Result<()> {
 const OWNER_REQUEST_ATTEMPTS: u32 = 10;
 
 /// How long one request may wait for a live owner's answer.
-const OWNER_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const OWNER_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Whether the owner closed or refused this connection before answering.
 ///
@@ -1101,6 +1101,7 @@ mod tests {
         use super::super::oci::{OciLinux, OciProcess, OciRoot, OciUser};
         OciSpec {
             managed_volumes: Vec::new(),
+            host_path_sources: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,

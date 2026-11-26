@@ -66,7 +66,7 @@ Packages=
         iproute2
 ```
 
-`resolute` is 26.04's codename. `Format=disk` produces a whole partitioned disk image, and `SplitArtifacts=` also writes the pieces an update needs as separate files. The boot artefact is a UKI (Unified Kernel Image): the kernel, the initrd and the kernel command line glued into one EFI executable, which systemd-boot starts like any other EFI program. `%i_%v` names it `reliaburger-os_<version>.efi`, a name that matters later. The locked root password means there's no console login at all. The last six packages match the quickstart guest's list, `scripts/release/guest-images.json`, less Buildah, which the guest needs for `relish build`. An appliance cluster builds nothing itself: you build elsewhere and push into Pickle ("A tour that couldn't build", below). From 0.3.0 the quickstart guest runs Ubuntu 26.04 too, so the two channels install the same packages from the same archive and test the same userland. mkosi can't read a JSON file, so rather than generate one list from the other we let a test hold them together: `test_guest_images.py` parses the `Packages=` block and fails if its tail and the guest's list drift apart.
+`resolute` is 26.04's codename. `Format=disk` produces a whole partitioned disk image, and `SplitArtifacts=` also writes the pieces an update needs as separate files. The boot artefact is a UKI (Unified Kernel Image): the kernel, the initrd and the kernel command line glued into one EFI executable, which systemd-boot starts like any other EFI program. `%i_%v` names it `reliaburger-os_<version>.efi`, a name that matters later. The locked root password means there's no console login at all. The last seven packages match the quickstart guest's list, `scripts/release/guest-images.json`, Buildah included, so an appliance cluster can run `relish build` too. It didn't always ("A tour that couldn't build", below). From 0.3.0 the quickstart guest runs Ubuntu 26.04 too, so the two channels install the same packages from the same archive and test the same userland. mkosi can't read a JSON file, so rather than generate one list from the other we let a test hold them together: `test_guest_images.py` parses the `Packages=` block and fails if its tail and the guest's list drift apart.
 
 The kernel package drags in the full `linux-firmware` set, hundreds of megabytes, unless something else provides it. `linux-firmware-minimal` does, and we add back only the Wyse's Realtek NIC firmware (and its Intel graphics firmware on x86-64, in `mkosi.conf.d/10-x86-64.conf`, a drop-in whose `[Match] Architecture=` line applies it to one architecture only).
 
@@ -577,9 +577,71 @@ pub fn sender(&self, address: Ipv4Addr) -> Sender {
 
 The map lives behind a `std::sync::Mutex`, not tokio's. The DHCP side updates it from a synchronous callback, which can't `.await` a tokio lock, and neither side holds it across an `.await`: one lookup or one insert, then it's released. That's the one case where the standard library's mutex is the right tool in async code.
 
-Nothing on this port is authenticated. Anyone on the LAN can send it lines, so the listener only prints and appends, marks a sender it never served as `log <address> (not served):`, and replaces control characters with `?`, so a packet can't clear your terminal or turn it red. Lines go through the same `Log` closure as the DHCP, TFTP and HTTP lines, so they print the same way, and to `<netboot dir>/logs/<mac>.log`, written before the line prints, so a line on the screen is already on disk. For a lab where nothing is being served, `relish machines logs` runs only the listener.
+Nothing on this port is authenticated. Anyone on the LAN can send it lines, so the listener only prints and appends, marks a sender it never served as `log <address> (not served):`, and replaces control characters with `?`, so a packet can't clear your terminal or turn it red. Lines go through the same `Log` closure as the DHCP, TFTP and HTTP lines, so they print the same way, and to `<netboot dir>/logs/<mac>.log`, written before the line prints, so a line on the screen is already on disk. That took a `flush()` as well as the write: tokio's `File` hands each write to a blocking thread and returns before it lands, and a unit test that read the file straight after the second line printed found only the first, once, on a loaded CI runner. For a lab where nothing is being served, `relish machines logs` runs only the listener.
 
-The script's unit tests run it against stubs for `ip`, `modprobe` and `dmesg`, with a temporary directory standing in for configfs, and a UDP socket on loopback as the operator's machine. They check what the script writes, not what systemd and the kernel make of it, which is how `journal+kmsg` got through, and a second slip with it: the installer's copy of the unit had no `[Install]` section, so the preset line `enable reliaburger-netlog.service` enabled nothing, and the installer never streamed. A preset enables a unit through the `WantedBy=` in that section, and a unit without one is "static". So the QEMU tests now run with streaming on. The netboot install test passes `--stream-logs` and wants the installer's lines and the installed system's boot check among relish's, under the VM's MAC. The fallback test writes `netlog.conf` onto the disk's ESP with mtools before the first boot, runs `relish machines logs` beside it, and wants the three failed tries and the fallback in what arrived.
+**A quieter screen.** Streaming everything is right for one Wyse on the bench. Three machines installing at once is another story: each sends its whole `dmesg` backlog, a few hundred lines, then every kernel line after it, and the installer's dozen lines that say what's actually happening scroll past in the middle. The homepage's netboot recording is 110 columns by 32 rows, so it couldn't stream at all. So `--stream-logs` takes a value now. With none, or `=all`, nothing changes. With `=units`, the screen shows only the boot units' lines, the script's own and kernel panics; every line still goes to `os/logs/<mac>.log`, so a lab record loses nothing.
+
+Telling a unit's line from the kernel's is the interesting part, because netconsole sends neither a facility nor a source, only text. The text has structure, though. A kernel line arrives as `[    9.412871] r8169 …`, the timestamp the kernel puts on each console line (the `dmesg` backlog has the same). A unit's line went through journald on its way to the kernel log, and journald puts a syslog tag in front, the program's name and process ID: `[    9.412871] install[412]: reliaburger-install: target /dev/mmcblk0`. The boot check writes to `/dev/kmsg` itself, with no tag. The script's own lines (the hello, the backlog's start and end) carry no timestamp at all. Under all of that, every line our boot units print starts with their own tag: `reliaburger:`, `reliaburger-<unit>:` or bun's `bun:`. The image's tests already lean on it (they wait for `reliaburger: bun healthy`). So `kind` strips the timestamp and the syslog tag if they're there, and calls the line a unit's when the first word of what's left is one of those tags. A kernel line that mentions `reliaburger_fw` or says `reliaburger:` halfway along stays a kernel line, and so does `systemd[1]: Starting reliaburger.service`. A panic, an oops or a `BUG:` always prints, whatever the mode: those are the lines you'd have photographed off the monitor.
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum StreamLogs {
+    #[default]
+    All,
+    Units,
+}
+
+impl StreamLogs {
+    pub fn shows(self, line: &str) -> bool {
+        match self {
+            StreamLogs::All => true,
+            StreamLogs::Units => kind(line) != LineKind::Kernel,
+        }
+    }
+}
+```
+
+`clap::ValueEnum`, which Chapter 1 used for `--output`, makes clap accept `all` and `units` and refuse anything else while it parses, with the list of choices in the error. A flag whose value is optional takes three more settings:
+
+```rust
+#[arg(long, value_name = "WHICH", value_enum,
+      num_args = 0..=1, require_equals = true, default_missing_value = "all")]
+stream_logs: Option<StreamLogs>,
+```
+
+`num_args = 0..=1` says the flag takes zero or one value, and `default_missing_value = "all"` is what clap fills in when it gets zero. The field is an `Option`, so it has three states without a second flag: `None` (no `--stream-logs` at all, nothing streams), `Some(All)` and `Some(Units)`. `require_equals = true` is the one that's easy to forget. Without it, `relish netboot --stream-logs os` would read `os`, the netboot directory, as the flag's value, and fail with "invalid value 'os'". With it, a value has to be written `--stream-logs=units`, and a word after a bare `--stream-logs` stays the positional argument it was. A test pins all of it: `--stream-logs`, `=all`, `=units`, `--stream-logs lab` (directory `lab`, every line) and `=kernel` refused.
+
+The filter sits after the file write in the listener's loop, not before it, so the rule "a line on the screen is already on disk" still holds, and now so does "every line is on disk, on the screen or not". The test sends a mixed boot in one datagram, in both modes, and checks the file holds every line and the screen exactly the ones `shows` keeps. A snapshot test (`insta`) pins what `=units` leaves on screen for that boot: the hello, the backlog markers, the installer, the boot check, bun's start script and bun, and the panic, with no `r8169`, `EXT4-fs` or `audit:`.
+
+The script's unit tests run it against stubs for `ip`, `modprobe` and `dmesg`, with a temporary directory standing in for configfs, and a UDP socket on loopback as the operator's machine. They check what the script writes, not what systemd and the kernel make of it, which is how `journal+kmsg` got through, and a second slip with it: the installer's copy of the unit had no `[Install]` section, so the preset line `enable reliaburger-netlog.service` enabled nothing, and the installer never streamed. A preset enables a unit through the `WantedBy=` in that section, and a unit without one is "static". So the QEMU tests now run with streaming on. The netboot install test passes `--stream-logs` and wants the installer's lines and the installed system's boot check among relish's, under the VM's MAC. The fallback test writes `netlog.conf` onto the disk's ESP with mtools before the first boot, runs `relish machines logs` beside it, and wants every failed try and the fallback in what arrived.
+
+**Changing it later.** `--stream-logs` decides at install time. After that, a lab moves: the laptop gets a new address, or you want the logs off once the machines are in a cupboard. Unplugging a disk to delete a file from its ESP isn't an answer, so `relish os boot-logs --to <address>[:<port>]` and `--off` change it on a claimed cluster. The file stays the only state. relish asks each node's bun (`POST /v1/os/boot-logs`), and bun rewrites or deletes `netlog.conf` on its own ESP, so the next boot, and every boot after an OS update, reads what you set. Nothing goes through Raft: each node's setting lives on that node's disk, which is also the only place its boot can read it before bun starts.
+
+The target is a small type in `src/os/netlog.rs`, shared by bun and relish:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetlogTarget {
+    pub address: Ipv4Addr,
+    pub port: u16,
+}
+
+impl FromStr for NetlogTarget {
+    type Err = NetlogError;
+
+    fn from_str(value: &str) -> Result<Self, NetlogError> { … }
+}
+```
+
+`FromStr` is Rust's "parse me from a string" trait: implementing it is what makes `"10.42.0.1:7000".parse::<NetlogTarget>()` work, and it's also all clap needs to take the type as a flag's value. `to: Option<NetlogTarget>` in the `BootLogs` subcommand means a bad address is refused while the command line is parsed, with clap's usual error, before relish dials anything. The rules are the boot script's: IPv4 only, since netconsole takes nothing else, and 6666 when no port is given. At first they were only nearly the script's. Rust's `u16` parser accepts `+7000`, which the script refuses, and Rust's `Ipv4Addr` refuses `010.0.0.1`, which the script accepted as ten. The review of the 0.3.3 train found both. Accepting leading zeros everywhere would have been the smaller change and the wrong one: `ip route get`, which the script asks for the interface, and bash's `/dev/udp` may read `010` as octal eight, so a node could route to one machine and send to another. So both sides now take digits only, with no sign and no leading zero, in the port as in the address. Rust's `Ipv4Addr` already parses that way, so the change there is a small `decimal` helper for the port, and the script gains a `0?*` pattern (a zero followed by at least one more character) in both checks. Each side's tests carry the same edge cases. The Rust side is stricter in one way: it refuses a broadcast, multicast, unspecified or loopback address, which the script would accept and which would send a node's kernel log to every machine on the LAN, or to nowhere. The parser for `netlog.conf` itself follows the script line for line, and its tests feed it the same kinds of input the script's tests use: comments, carriage returns, unknown keys and a second `target=`. So `relish os boot-logs` shows what the next boot will do, not what we hope it will.
+
+On the wire, the target is the string `"10.42.0.1:6666"`, not an object with two fields. Deriving `Serialize` would have given the object, so the type implements it by hand, in one line: `serializer.collect_str(self)` writes whatever `Display` prints. `Deserialize` goes the other way through `FromStr`, so a node also refuses a bad target in a request body, whoever sent it. The request body is read strictly, too. serde treats a missing `Option` field as `None`, so `{}`, or a misspelt `{"too": …}`, would have meant "off". `#[serde(deny_unknown_fields)]` refuses the misspelling, and a `deserialize_with` function on `target` turns off the missing-means-`None` rule, so off has to be asked for as `"target": null`.
+
+Writing the file is the easy half. A change should also take effect without a reboot, or turning logs on to watch a misbehaving node is no use. So after writing a target, bun restarts `reliaburger-netlog.service` with `systemctl restart`. The script was already written to run twice: it disables a netconsole target before changing it, and its `/run` marker stops it resending the `dmesg` backlog. The restart's hello line reaches the listener within a second. For `--off`, bun deletes the file and writes `0` to the target's `enabled` in configfs. Both are best effort: the file is what matters, so if either fails, the node answers with a `warning` saying the change waits for the next boot, rather than an error that would make you think nothing changed. The file system work runs under `tokio::task::spawn_blocking`, because the ESP is an automount and the first touch may wait for the kernel to mount a FAT partition, which an async task mustn't block on.
+
+The first version restarted the unit with `--no-block`, which returns as soon as systemd has queued the job, and called that success. The review of the 0.3.3 train found the hole: the unit's `ExecStart=-` and the script both treat every failure as fine, because a boot must never fail over its logs. No route to the listener, no netconsole module, a target the kernel refused: each one exits 0, and relish printed "Boot logs go to … from now on" all the same. So now bun waits. The unit is a oneshot, so a plain `systemctl restart` returns once the script has finished, and bun gives it 45 seconds, more than the unit's own `TimeoutStartSec=30`, so systemd gives up on the script before bun gives up on systemd. Then bun reads what the kernel was told: `enabled`, `remote_ip` and `remote_port` in the target's configfs directory. If they don't say "on, to this address and port", the node answers with a warning, and the reason comes from the script itself, its last `reliaburger-netlog:` line in the journal since the restart (`journalctl --since=@<seconds>`). The script's exit code can't say why; its words can. The configfs directory, the restart and the journal reader are all fields of `NetlogPaths`, so the tests point them at a temporary directory, `true` and a `sh -c 'printf …'` that plays the journal.
+
+The routes are guarded differently. Anyone with a token may read where a node sends its logs. Changing it sends the node's whole kernel log, in cleartext, to any address on the LAN, so it takes an unscoped admin, like an OS rollout, and it's audited as `os.boot_logs_set`, with the target (or `off`) in the record's details. The handler adds it with `crate::bun::audit::annotate` once the body has parsed, so the record says where the logs went, not only that something changed. The QEMU OS update test drives it end to end: it turns boot logs on with `relish os boot-logs --to` on the running node, waits for the hello, rolls the update, and wants the new version's boot to stream from the same file, then turns them off and reads `off` back.
 
 What it isn't is log shipping. It's UDP, with no retries and no order beyond the network's, and the lines cross the LAN in cleartext, with addresses and bun's errors in them. That's why it's off unless you ask. A claimed node's logs already go through the cluster's own pipeline.
 
@@ -625,15 +687,15 @@ PathRelativeTo=boot
 MatchPattern=reliaburger-os_@v+@l-@d.efi \
              reliaburger-os_@v+@l.efi \
              reliaburger-os_@v.efi
-# Writable: systemd-boot renames the file to count down its tries (+3-0,
-# +2-1, ...), which a FAT read-only attribute would stop.
+# Writable: systemd-boot renames the file to count down its tries (+2-0,
+# +1-1, +0-2), which a FAT read-only attribute would stop.
 Mode=0644
-TriesLeft=3
+TriesLeft=2
 TriesDone=0
 InstancesMax=2
 ```
 
-On node-05 of the lab cluster, `os-stage` took 14 s end to end, and the new UKI landed as `reliaburger-os_2026.40.23+3-0.efi`.
+On node-05 of the lab cluster, `os-stage` took 14 s end to end, and the new UKI landed as `reliaburger-os_2026.40.23+3-0.efi`. It had three tries then; it has two now, and [the second Wyse run](#the-second-wyse-run) says why.
 
 ### Three tries, then fall back
 
@@ -698,7 +760,7 @@ The good update rolled across all five lab nodes, followers first and the leader
 
 Then the bad one. CI can build an image whose bun never starts (a `workflow_dispatch` input drops in a unit override with `ExecStart=/bin/false`), and we staged it on node-05. Three counted boots each ended with `bun not healthy after 300 s` and a reboot. The UKI ran out of tries at `+0-3`, systemd-boot picked the previous version by itself, and node-05 was healthy 7.6 s into that boot and back in the cluster. From the first try to the fallback took about 15 min 40 s, with no hands. Nearly all of that is the 300 s timeout, three times over, which told us where to tune: a counted boot now gets 120 s, since a healthy lab node answers in 8 to 23 s, and an ordinary boot keeps 300 s because nothing falls back from it. The Wyse will tell us whether 120 s is right for slow hardware. A unit test pins both limits down. The kernel publishes EFI variables as files under `/sys/firmware/efi/efivars`, and the check reads that directory from `BOOT_CHECK_EFIVARS` when it's set. So `image/tests/test_boot_check.py` can make a boot counted by creating one empty file, then check for the counted budget and a reboot, or for 300 s and none.
 
-A test you run by hand proves something once. So CI now runs this one on every x86_64 lab build. The run builds a third image, two versions on, whose bun is broken. The breakage lives in a small tree, `image/tests/broken-bun`, which mkosi adds with a second `--extra-tree`, so this build and the dispatched broken one break bun in exactly the same way. Then `image/tests/os-update.sh --fallback` boots a one-node cluster on the lab build and runs `relish os upgrade` to the broken version, as an operator would. It reuses the update test's harness (the bridge, dnsmasq, the release server, the seeded VM) and differs only in what it waits for. Each boot prints a kernel banner on the serial console, so counting `Linux version` lines says which boot we're in: one before the update, three tries, one back. The test insists on exactly three `bun not healthy after` lines and no healthy one on the broken version. Then it waits for `relish os status` to say the rollout paused because the node booted the old version instead. The hand-run test never checked that part: bun noticing, on its own, that it isn't where it was sent.
+A test you run by hand proves something once. So CI now runs this one on every x86_64 lab build. The run builds a third image, two versions on, whose bun is broken. The breakage lives in a small tree, `image/tests/broken-bun`, which mkosi adds with a second `--extra-tree`, so this build and the dispatched broken one break bun in exactly the same way. Then `image/tests/os-update.sh --fallback` boots a one-node cluster on the lab build and runs `relish os upgrade` to the broken version, as an operator would. It reuses the update test's harness (the bridge, dnsmasq, the release server, the seeded VM) and differs only in what it waits for. Each boot prints a kernel banner on the serial console, so counting `Linux version` lines says which boot we're in: one before the update, three tries, one back. The test insisted on exactly three `bun not healthy after` lines and no healthy one on the broken version (two lines, for two tries, since [the second Wyse run](#the-second-wyse-run)). Then it waits for `relish os status` to say the rollout paused because the node booted the old version instead. The hand-run test never checked that part: bun noticing, on its own, that it isn't where it was sent.
 
 The first green run (7 October, on the train) took 7 min 12 s from `relish os upgrade` to the paused rollout, staging and drain included. The kernel's own clocks show where it went. Each of the three tries reached `bun not healthy after 120 s` about 129 s into its boot, and the fallback boot had bun healthy after 12 s. So the fallback itself, from the reboot into the broken version to healthy on the old one, was a little under 7 minutes, and 6 of those were the boot check doing its job. That's inside the 10 minutes the Wyse has to show, on a VM that boots in 9 s. A Wyse that needs a minute to boot would spend about 3 more, which is why the hardware run, not this one, decides. At first the test only warned past 10 minutes, and a warning is easy to scroll past on a green run. Now it fails: if a VM that boots in 9 s can't fall back in time, the Wyse certainly won't, and we'd rather CI said so than the lab.
 
@@ -711,6 +773,27 @@ if counted; then limit=90; else limit=300; fi
 ```
 
 Two tests hold the trade-off in place, one per side. `test_time_wait.py` reads the budget out of the script and fails unless the 30 s clock wait plus the 3040's 38 s plus a 20 s margin fits inside it. `test_fallback_limit.py` models a Wyse fallback from the lab's timings, 41 s plus three tries of 65 s and the budget, plus 38 s, checks that the model reproduces the measured run to within 10 s at the old 120 s, and fails if the current budget would take it past 10 minutes. CI's VMs boot in 9 s and can't see this; the model is what stands in for the Wyse between hardware runs. It leaves about a minute spare, not much, so a slower unit or a slower kernel is something the lab's fallback step will tell us about first.
+
+### The second Wyse run
+
+The 0.3.2 lab (23 November) redid the fallback on the same hardware with the 90 s budget, and it took 11 min 38 s. Slower than the 10 min 28 s it was meant to improve on. The journal's boot list made the reason plain. Each try now took about 3 min 20 s: 46 s of reboot and firmware, 66 s from the kernel to the check's start, then the 90 s. The 66 s had been about 20 s on the first run's arithmetic. In between, 0.3.2 had added boot-log streaming, and `reliaburger-netlog` runs after `network-online.target` and before the units whose lines it forwards, the boot check among them. So every try now waited for `systemd-networkd-wait-online` (23 s on its own) and for the streamer before the check's clock even started.
+
+The same lab showed the worse half of that ordering. During `relish os upgrade`, one Wyse rebooted into the new version with its network link down, no light on the switch port, and stayed that way for 20 minutes until we power-cycled it. A boot that never reaches `network-online.target` never starts a check ordered after it, so it never fails its tries, so it never falls back. An update that broke networking would have stranded every node it reached.
+
+So the check no longer waits for the network. Its unit has no `After=network-online.target`, and the streamer is no longer ordered before it. That alone wasn't enough, because of where the clock started. The budget had been "90 s from when the check starts", and the check now starts about 25 s earlier, before bun can possibly be up: bun still waits for the network and the clock. The honest measure is from the kernel's start, which `/proc/uptime` already gives us:
+
+```sh
+if counted; then limit=150; else limit=300; fi
+if counted; then deadline=$limit; else deadline=$(( $(uptime_seconds) + limit )); fi
+```
+
+A counted boot has to be healthy 150 s into its life, however long the boot took to reach the check, and the loop always looks at bun at least once, so a check that starts late isn't failed unseen. Other boots keep 300 s from the check's start: on an unclaimed machine the check waits for prepare, maybe for hours, and a deadline measured from boot would be long gone by the time bun starts.
+
+The arithmetic then forced a choice. The slowest healthy boot we know on the 3040 is about 134 s from the kernel: the network about 66 s in, the full 30 s clock wait on a LAN with no NTP server, then bun's 38 s. A broken try costs the budget plus about 46 s of firmware, and the reboot into the new version and the final boot back on the old one add about 107 s. With three tries, fitting in 10 minutes needs each one under about 118 s, below that slowest healthy boot. Something had to give: the margin for slow good updates, the clock wait, or a try. The maintainer took a try. Two tries of 150 s come to about 8 min 20 s on the 3040 and leave the slowest healthy boot 16 s, and one bad boot still doesn't roll a good update back. `test_fallback_limit.py` now models the Wyse from the 0.3.2 run's timings, and reproduces its 698 s with the old ordering before it checks the new one.
+
+Passing the check changed too. On a counted boot it needs the node to have a global IPv4 address, not just bun answering. bun answers on `127.0.0.1`, so a version that broke the network but kept bun alive would have been blessed and kept: a node that's healthy to itself and unreachable to everyone else. An ordinary boot doesn't need the address, because nothing falls back from it, and an unplugged cable isn't the OS's fault. CI tests the case the Wyse hit: `os-update.sh --no-link` rolls a *good* update onto a VM and cuts its link through QEMU's monitor (`set_link n0 off`) the moment the kernel prints `reboot: Restarting system`. It wants two failed tries, the fallback, and, once the link is back, the rollout paused on it.
+
+Moving the check had one side effect on streaming. `reliaburger-netlog` makes the boot units log to the kernel through runtime drop-ins, and a drop-in only reaches a unit when it next starts. The check is already running when the streamer gets there, so it now looks for its own drop-in and, once it's there, writes its lines to `/dev/kmsg` itself, prefixed `reliaburger-boot-check:`. The kernel puts each on the screen once and netconsole sends it, so `relish machines logs` still shows every try.
 
 How the build is broken matters too, and the first way hid a bug. It used to be a unit override, `ExecStart=/bin/false`, so bun's launcher never ran. A real bad release breaks differently: its bun starts, says it's newer, and never answers. The launcher installs a bun from the image only when it's newer than the active one, so that no OS update can undo a bun upgrade, and that rule was the bug. Three failed tries, the fallback to the old OS, and its launcher saw a "newer" bun already active and left it. The fallback boot isn't counted, so nothing rebooted it again: a node with a dead bun and no way in. The review of the 0.3.0 train found it by reading the code.
 
@@ -1122,6 +1205,217 @@ It replaced the context for bare-metal/lab, which no longer worked: /Users/you/l
 
 `relish setup` refused a dead context too ("another cluster owns the active context"), so it got the same check. Only a *missing* file counts. A certificate relish can't read for another reason, say a permissions slip, still marks a context someone may want back, so relish keeps it and says what it couldn't read. `adopt` became a thin wrapper around `adopt_at`, which takes the context's path, because the default path comes from `RELIABURGER_HOME` and changing the environment in a test races every other test in the process. The three tests for `adopt_at` cover no context, a working one (kept) and the lab's case, a context whose cluster directory is gone (replaced, with the line above). In `local_context.rs`, `a_context_whose_ca_is_gone_says_which_context_and_file_and_what_to_do` checks the new error names the cluster, the file and `relish machines claim --create`, and never says "status 0".
 
+### One endpoint is a single point of failure
+
+The 0.3.2 lab found the next one (#2241) the moment we pulled a power cord. The node we pulled, wyse-1, led the council and was also the node relish's context named. wyse-2 won the election in a couple of seconds, term 1 to 2, exactly as Raft promises. And for the next minute and a half, until wyse-1 came back, every `relish nodes` and `relish council` printed this:
+
+```
+error: cannot reach the bun agent at https://10.77.0.11:9117: no answer before the connect timeout; the host may be down, or a firewall may drop packets to that port
+```
+
+The cluster was fine. relish wasn't. A context held one `endpoint`, and that was the end of relish's knowledge of the cluster. So the one moment an operator most wants to watch, a failover, was the one moment relish went blind. A council of three that survives losing any node is worth very little if the tool you drive it with can't.
+
+The fix keeps `endpoint` (node 1, the one relish asks by default) and adds two fields to `LocalContext`:
+
+```rust
+#[serde(default, skip_serializing_if = "Vec::is_empty")]
+pub other_endpoints: Vec<String>,
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub last_answered: Option<String>,
+```
+
+`#[serde(default)]` lets a file without the field load with an empty `Vec` or `None`, and `skip_serializing_if` leaves it out of the file when there's nothing to say, so a laptop cluster's context, which reaches the cluster through one forward, looks exactly as it did. That isn't a compatibility shim: we keep none before 1.0. It's just what "optional" means in serde. A 0.3.2 context still loads and lists one node; the manual says how to add the rest.
+
+`bare_metal::context` fills `other_endpoints` from `fleet.json`, every node after node 1, and `relish setup --ssh` from every machine it set up. Machines added later go in too: `bare_metal::add`, behind both `machines claim` without `--create` and `image seed`, calls `refresh_context_at`, which rewrites the list from the fleet when the saved context is this fleet's cluster's, and leaves any other cluster's alone.
+
+Picking a node happens where the client is built. `BunClient` has about a hundred request methods, each formatting its own URL from `base_url`, so retrying inside every one of them would mean touching all of them. Instead `LocalContext::connect` chooses the endpoint once, before any request:
+
+```rust
+pub fn choose_endpoint(
+    &self,
+    mut probe: impl FnMut(&str) -> Result<(), super::UnreachableCause>,
+) -> Result<EndpointChoice, RelishError> {
+```
+
+`impl FnMut(&str) -> ...` in argument position means "any closure or function the caller likes that takes a `&str`"; the compiler makes one copy of `choose_endpoint` for each type it's called with, so there's no indirection. `FnMut` rather than `Fn` because a test's probe records what it was asked, which mutates its captured state. In production it's `probe_endpoint`, which opens a TCP connection with `TcpStream::connect_timeout` and a 1.5 second limit. A node on the same LAN answers in a millisecond; one with no power never does. `endpoints()` orders the candidates: the one that last answered, then node 1, then the rest. A context with one endpoint isn't probed at all, so nothing changes for it.
+
+A TCP connect proves only that something listens. It doesn't prove the node belongs to our cluster, and it doesn't need to. The command's real request still does the TLS handshake against the cluster's CA, with the same token, so a node that answers with a certificate the CA didn't sign fails the command as before. relish never goes looking for a node it trusts past one it doesn't. Only a node that refuses, or never answers, gets passed over. The suite test `a_node_signed_by_another_ca_is_refused_not_passed_over` holds that line.
+
+When none answer, the error says so and names every endpoint it tried. That needed one more change. A `BunClient` that can't be used keeps its reason and returns it from the first request, and that reason was a `String`, which can only become `RelishError::ClientConfig`. It's now a small enum, `Unusable`, whose second variant carries the attempts, so the first request returns `RelishError::NoEndpointAnswered` and `relish agent` maps it to the `unreachable` code, like a single dead endpoint:
+
+```
+error: cannot reach the cluster: none of the context's 3 endpoints answered
+  https://10.77.0.11:9117: no answer before the connect timeout; ...
+  https://10.77.0.12:9117: connection refused; ...
+  https://10.77.0.13:9117: connection refused; ...
+```
+
+When relish does pass over a node, it says which ones on stderr and which node it used, and `remember_answered` writes that node to `last_answered`, under the context's lock, only if the file still holds the same cluster's context. So only the first command after a node dies pays the 1.5 seconds. Remembering is best effort: a context that's busy just costs the next command the same wait. The registry and ingress forwards follow the API: a bare-metal context points them at node 1's address, which is just as dead, so a forward on the old node's host moves to the host that answered.
+
+The unit tests in `local_context.rs` drive `choose_endpoint` with a probe closure: three endpoints with the first down still answer, and the probe stops at the first that does; none up gives an error listing all three; one endpoint is never probed; the remembered endpoint goes first and is ignored once it's no longer listed. One test uses the real probe against a port that refuses and one that listens. `tests/suite/context_endpoints.rs` runs the real `relish nodes` against a context whose first node refuses and whose second is a TLS stand-in for the cluster, and checks the warning, the answer and the remembered node, then that the next command says nothing. And `make test-cluster` has the lab's case in `cluster_failover.rs`: three wired nodes, the context's first node the leader, killed; the context passes over it, and the node it picks names the new leader.
+
+One client didn't follow along (#2304). `relish mcp`, started from an admin context, makes the agent a read-only token of its own with an admin client, and it built that client once, at startup, on whichever node answered then. Each tool call builds its own client through `BunClient::local`, so the agent's reads fell over, but making or replacing the token kept asking the node `relish mcp` had started on, and printed no warning. Building the admin client for every call would put a probe in front of every tool call that only reuses the stored token, which needs no network at all. So `Managed` keeps the client behind a `tokio::sync::Mutex`, along with the path of the context it came from, and builds it again only when a token request comes back unreachable:
+
+```rust
+if matches!(obtained, Err(CredentialError::Unreachable(_)))
+    && let Some(admin) = self.rebuild_admin().await
+{
+    obtained = credentials::obtain(/* the same arguments, the new client */).await;
+}
+```
+
+`if ... && let Some(admin) = ...` is a *let chain*, new in Rust 2024: the pattern only binds if the condition before it holds, and the body runs only if both do. `rebuild_admin` reads the context again and goes through the same `connect` and `report_fallover` as every other command, inside `spawn_blocking` because the probe blocks. So the warning appears on stderr, which is safe for `relish mcp` since only stdout carries the protocol, and the node that answered is remembered. When no node answers, it returns `None` and the caller keeps the original unreachable error. The test starts two TLS stand-ins that make tokens, builds `Managed` while both are up, stops the first, and asks for a token: it must come from the second node, and the context must remember it.
+
+## A screen with no login
+
+On the Wyse lab's first evening the monitor was the only view of a node that didn't need the laptop, and it showed five lines: name, cluster, address, MAC, and whether bun answered. When a node misbehaved, the next step was always the laptop. So the console grew into a dashboard (#2150), with six tabs: status, metrics, workloads, the cluster, versions and logs.
+
+### Reuse the pattern, not the views
+
+`relish tui` (chapter 13) already has an app loop, a reducer and a test harness, and the plan said to reuse it. We reused the *pattern* and the pieces underneath it, and gave the console its own small state and views. The TUI's views are about a cluster seen from a laptop: lists of apps, a kill key, a scale prompt, a command palette. The console has none of that and must never have the kill key. (It does have a game where shooting an invader can kill an instance, but only once a cluster admin has said so in the council, and through Smoker like any other fault: chapter 8, "Space invaders with live ammunition".) Bolting a "console mode" onto `TuiApp` would put an `if console` into every view. What the two do share, they share for real: `section_lines` and `assess` (the lines `relish status` prints), `run_wtf`, `council_view::survey`, `BunClient`, and the summary fixtures the TUI's snapshot tests already use.
+
+The console lives in `src/appliance/console/`, in six files:
+
+- `state.rs`: `ConsoleState` and the reducer, `ConsoleState::update(Msg)`;
+- `view.rs`: `render(frame, &state)`, and every snapshot test;
+- `invaders.rs`: the hidden seventh tab's game, where things are and what a key does;
+- `local.rs`: what the machine says without bun (versions, `/proc`, the journal);
+- `remote.rs`: what bun says, through relish's client;
+- `mod.rs`: the event loop and the pollers.
+
+### The reducer, again
+
+If you skipped chapter 13: a ratatui program redraws the whole screen from its state on every frame. There's no widget tree that lives between frames, as there would be in GTK or a browser's DOM. Each frame, `render` builds `Paragraph`s and `Block`s, ratatui draws them into a buffer of cells, and compares that buffer with the previous frame's. Only the cells that changed go to the terminal. That's *immediate mode*, and it makes the state the only thing worth testing.
+
+So every input is a message:
+
+```rust
+pub enum Msg {
+    Key(KeyEvent),
+    Tick(u64),
+    Local(LocalStatus),
+    Summary(Result<ClusterSummary, String>),
+    Wtf(WtfCheck),
+    // ...
+    Logs(Result<Vec<String>, String>),
+}
+```
+
+A Rust `enum` is a tagged union, like a C `union` with the tag built in, or a Go interface whose implementations the compiler knows all of. `Result<ClusterSummary, String>` is "a summary or an error message", carried as data, because a failed fetch is something the screen shows, not something to unwind the program over. `update` is one `match`, and the compiler refuses a `match` that forgets a variant, so a new message can't silently do nothing.
+
+Each panel's answer lands in a `Fetched<T>`:
+
+```rust
+pub struct Fetched<T> {
+    pub value: Option<T>,
+    pub at: Option<u64>,
+    pub error: Option<String>,
+}
+```
+
+`<T>` makes it generic: one struct for the summary, the workloads, the council and the logs. A failure records the error and keeps the last good value, so a panel says `can't refresh the workloads: no answer within 10 s (showing 15:06:40)` above the list it still has, rather than going blank whenever the network hiccups.
+
+### Laying out a screen
+
+The screen is four rows: a header, the tab bar, the current tab, a key line.
+
+```rust
+let [header, tabs, body, footer] = Layout::vertical([
+    Constraint::Length(1),
+    Constraint::Length(1),
+    Constraint::Min(3),
+    Constraint::Length(1),
+])
+.areas(frame.area());
+```
+
+`areas` returns an array whose length is the number of constraints, checked at compile time: ask for four areas and bind three names and it doesn't compile. That's a *const generic*, a type parameterised by a number, like `[Rect; 4]`. Go has nothing like it (a slice's length is a run-time fact); C++'s `std::array<T, N>` is the nearest relative.
+
+Each tab is a function from the state to `Vec<Line<'static>>`. A `Line` is a row of `Span`s, each a piece of text with a style. The `'static` lifetime says the lines own their text, so they don't borrow from the state and outlive nothing they shouldn't. That costs a few string copies per frame, and buys views that never fight the borrow checker.
+
+### The Linux console
+
+tty1 isn't a terminal emulator. It has 16 colours and the kernel's font, which covers the PC's old character set and little else. So `view.rs` uses only ASCII, box drawing and the full block `█`. The history under each gauge is ASCII too, one character per sample from ` .:-=+*#`, where a laptop TUI would use braille or eighth-blocks. The colours are the eight named ones, never RGB. A test renders every tab and fails on any other character, which is how the old fallback's `…` got caught: it isn't in the font.
+
+Every state with a colour has a word too. The current tab is in brackets as well as reverse video, and bun is `running` or `not answering` as well as green or red. That's for a monochrome monitor, a photo of the screen, and `/dev/vcs1`, which the CI tests read and which carries no colour at all.
+
+Two more things are different on a VT. There's no alternate screen, so nothing is restored on exit, and nothing needs to be. And kernel messages print straight onto tty1. ratatui only rewrites cells it thinks changed, so a kernel line over a cell the dashboard didn't touch would stay. So every ten seconds the console clears the screen itself and starts a new `Terminal`, whose blank last frame matches the blank screen, so the next frame writes every cell.
+
+That's not `terminal.clear()`, though the first version used it, and the first CI boot showed why not. `clear()` remembers where the cursor was: it writes `ESC [ 6 n`, which asks the terminal to type back the cursor's position, and waits for the answer. On tty1 under systemd the answer never came within crossterm's two seconds, `clear()` returned an error, and the console exited before drawing anything, every five seconds, while the screen kept showing the boot's kernel messages. The unit tests couldn't see it: `TestBackend` answers every question at once. The console now asks the terminal nothing. It builds its `Terminal` with a fixed viewport, `Viewport::Fixed`, sized from `TIOCGWINSZ` on the very device it draws on, an `ioctl` that returns the console's columns and rows without a round trip through the keyboard. crossterm's own size query would look at `/dev/tty` or standard output instead, which the keyless fallback below has neither of. The `unsafe` block around the `ioctl` is the first in the console. Its `// SAFETY:` comment says what makes it sound: the kernel writes one `winsize` into a struct we own, through a descriptor that's open for the call. And losing the keyboard (raw mode refused, or the key stream failing) now costs the keys, never the screen.
+
+### Where the keys come from
+
+The old console only wrote to `/dev/tty1`. A dashboard reads keys, so the unit now hands tty1 to the process as its standard input:
+
+```ini
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+TTYPath=/dev/tty1
+```
+
+`StandardInput=tty` also makes tty1 the process's *controlling terminal*, the one `/dev/tty` names. crossterm, which ratatui drives, reads keys and the screen size from standard input when it's a terminal, and the console draws on `/dev/tty`. Standard output stays the journal's: with `StandardInput=tty`, systemd would otherwise send it to the terminal too, and the launcher's install messages would vanish under the dashboard. `test_console_unit.py` pins all four lines. One bonus of `/dev/tty`: over `ssh -t`, the controlling terminal is your SSH session, so `bun appliance console` draws the dashboard on a laptop. There `q` quits; on tty1 nothing does. The console tells them apart by asking which terminal its standard input is (`ttyname`).
+
+There's a third case, and the review caught it. bun upgrades itself, but the unit file belongs to the OS image. A node on a 0.3.0 to 0.3.2 image that has upgraded to this bun runs the new console under the old unit, with no standard input. Opening `/dev/tty` then fails with `ENXIO` (no controlling terminal), and a console that gave up there would restart every five seconds and show nothing. So `Mode` has three variants: `Kiosk` (tty1, keys, no quitting), `Session` (another terminal, `q` quits) and `ScreenOnly`, which draws on `/dev/tty1` the way the old console did and reads no keys. A screen without keys still beats a black one.
+
+### Asking only for what's on screen
+
+A Wyse 3040 has a four-core Atom, and bun is busy enough. So each source has a poller that asks only while a tab that shows it is on screen, and at once when one comes on, unless it asked within its interval anyway. Intervals follow cost: local reads every 5 s, the summary (which fans out to every node) every 15 s, and `wtf` (a dozen questions per node) every 5 minutes. `bun --version` runs again only when the binary's modification time changes, and the API client, which reads `master.key`, derives two tokens and sets up TLS, is built once and rebuilt only after a request fails.
+
+```rust
+struct Poller {
+    every: Duration,
+    wanted: fn(Tab) -> bool,
+    tab: watch::Receiver<Tab>,
+    cancel: CancellationToken,
+    tx: mpsc::Sender<Msg>,
+}
+```
+
+`fn(Tab) -> bool` is a plain function pointer, as in C. The `|tab| tab == Tab::Logs` passed for it is a closure that captures nothing, and Rust turns those into function pointers for free. A closure that captured something would need a generic or a `Box<dyn Fn>`, which we don't need for a question about the tab alone.
+
+The event loop sends the current tab down a `watch` channel, which holds only its latest value: a poller that missed two tab switches wants to know where we are, not where we've been. In the poller, `*tab.borrow()` copies the `Tab` out in the same statement that borrows it. `Tab` is `Copy`, a few bytes, and the copy means the read lock the borrow holds ends right there (the rule from #1273). The loop itself is a `tokio::select!` over the cancellation token, the interval, and the tab changing. Each fetch races the cancellation token too, and has its own timeout inside (10 s for a request, 30 s for `wtf`, 5 s for a command), so no poller waits for ever.
+
+The machine's load comes from a different kind of source. `sysinfo` reads `/proc` with ordinary blocking calls, and a CPU percentage is the difference between two readings, so the reader keeps state between samples. That's a plain thread, `std::thread::spawn`, sleeping two seconds between samples and handing each one to the async side with `blocking_send`. When the console goes, the channel closes, `blocking_send` fails, and the thread returns. Everything else that touches a file uses `tokio::fs`, `tokio::process` or `spawn_blocking`, which is what the blocking rule (chapter 15) checks.
+
+### A tab the bar doesn't show
+
+The game is a seventh `Tab` variant, `Tab::Invaders`, and an easter egg should stay hidden. So `Tab` has two lists: `ALL`, seven tabs in number-key order, and `SHOWN`, the six the tab bar draws and the arrows step through. `7` picks `ALL[6]`; `Tab` and the arrows step through `SHOWN`, and from the game they land on Status or Logs, as if it sat between the two. Inside the game the reducer offers each key to `game_key` first, which takes `h`, `l`, the arrows, space and `r`, and returns `false` for anything else, so `Tab` and the number keys still leave. The game itself is `invaders::Game`, with no ratatui in it: `fire` and `tick` change positions, and `take_kill` hands the event loop the kill a hit queued in kill mode. The loop sends it on a spawned task, so a slow bun never stops the screen, and the answer comes back as one more message, `Msg::KillAnswered`. The snapshot tests draw the game at 80 by 25 with kill mode off, and with it on after a refused kill.
+
+### A read-only identity nobody has to make
+
+The console has no login, so it can't carry a token a person made, and it shouldn't carry the service token, which is the cluster's own admin. The plan left two options: a root-only Unix socket, or a read-only token minted when the node is seeded. We took a third that needs no minting: derive it.
+
+```rust
+pub fn derive_console_token(service_token: &str) -> Result<String, TokenError> {
+    let bytes = super::crypto::hkdf_derive_key(
+        service_token.as_bytes(),
+        &CONSOLE_TOKEN_SALT,
+        "reliaburger-console-token-v1",
+    )
+    .map_err(|e| TokenError::GenerationFailed(e.to_string()))?;
+    Ok(format!("rbrg_{}", hex::encode(bytes)))
+}
+```
+
+The service token is already derived from the master key with HKDF, and every node holds it. `AuthState::new` derives the console token from it once, and the auth middleware accepts it as `__console`: read-only and unscoped, a principal no stored token can be named after. The console, running as root beside bun, reads `master.key` and takes the same two steps. HKDF is one-way, so the console token gives nothing towards the service token. Every node derives the same value, so `wtf`'s per-node checks work from the console as they do from a laptop. A Unix socket would have been as safe, but `wtf` and the council survey talk to every node over TCP, and a socket only reaches one.
+
+The price is a limitation, and the manual states it. Nothing is stored, so nothing can be revoked: the token is valid on every node for as long as the master key is, which today is the cluster's life, since there's no master-key rotation. Only root on a node can derive it, and root there already holds the master key itself. It's accepted by the API's bearer middleware only. The dashboard login (`/ui/session`) and the registry check stored tokens and the service token, never this one.
+
+Read-only also means `wtf` can't list tokens, which needs an admin. Counted as `relish status` counts it, every console would say `1 unknown` for ever, a permanent false alarm. So the console's `console_check` leaves out the sources only an admin can read (today just `tokens`) and counts the rest.
+
+The console talks to its own bun at the node's LAN address, not loopback. The node's certificate names that address and never loopback (#1508), and the console checks it against the cluster's root CA from the identity directory. Only `/v1/health`, which is public and carries no token, goes to loopback without checking.
+
+### Bun down, old screen
+
+The Status tab asks one question first: does bun answer, and is the machine a node yet? If not, it's the screen the console always had, built only from local reads. That's the screen a boot, a fallback through three bad tries, or a claim needs, and it can't depend on the API it's reporting on. An unclaimed machine's key appears twice: on the `Claim key` line, which `claimed-pair.sh` greps out of `/dev/vcs1`, and in letters five rows tall from a 3 by 5 font in `bigtext.rs`, for reading from across a room full of Wyses.
+
+### Testing a screen you can't see
+
+ratatui's `TestBackend` is a terminal in memory. The tests draw a state into an 80 by 25 one, the Linux console's size, read the cells back as text, and compare them with `insta` snapshots: every tab, and the degraded states (bun down, no cluster yet, an unclaimed machine, a node gossip reports dead, a summary missing a node, a refresh that failed, `journalctl` missing). One more renders at 240 by 67, which is what a 1080p monitor gives the kernel's 8 by 16 font. A reviewer reads a snapshot diff as a screen, which is the point. `state.rs` tests the reducer (keys, scrolling, a failed fetch keeping its last value), and `mod.rs` checks that a poller doesn't ask while its tab is hidden and asks at once when it appears. In CI, `seeded-pair.sh` reads node 1's tty1 after the pair forms and waits for `Cluster HEALTHY` or a worse verdict: that line only appears once the console has reached its bun over TLS as `__console`.
+
+What none of this sees is a real monitor: the font, the colours, whether a 3040's framebuffer gives 80 columns or 240. That check is on the Wyse.
+
 ## A LAN on a laptop
 
 We had no KVM machine and no spare PCs, only CI and one Apple silicon Mac without root. Everything had to run virtualised until the last step.
@@ -1286,7 +1580,7 @@ The console's unit said `After=reliaburger-seed.service`, which reads as harmles
 
 The seed unit's own line, `no seed: unclaimed, claim key … on port 9119`, didn't help either. It goes to `/dev/console`, and that's the last `console=` on the command line, the serial port the 3040 doesn't have. The installer had already met this (see "Booting from a wire" above) and writes to `/dev/tty1` itself.
 
-The fix is to order the console after nothing of ours. It redraws every five seconds and already says "waiting for DHCP" or "not answering" on its own, so starting early costs nothing. We didn't also copy the seed's line to tty1: the console clears tty1 on every redraw, so the line would last five seconds at most.
+The fix is to order the console after nothing of ours. It redrew every five seconds (the dashboard that replaced it polls on the same beat) and already said "waiting for DHCP" or "not answering" on its own, so starting early costs nothing. We didn't also copy the seed's line to tty1: the console cleared tty1 on every redraw, so the line would have lasted five seconds at most.
 
 Starting early did expose something. The console, prepare and bun all start through the same launcher, `/usr/lib/reliaburger/start`, which copies the image's bun into `/var/lib/reliaburger/bin` when it's newer. With the console beside prepare, two launchers could now write the same temporary file at once on a first boot. (The console and bun already started together on a claimed node after an OS update, so the race wasn't entirely new.) So the launcher takes a lock first:
 
@@ -1313,7 +1607,19 @@ That was no surprise to the image. `mkosi.conf` lists the quickstart guest's pac
 
 We could have added Buildah. Its cost isn't only megabytes. Every package goes into both 1.1 GB `/usr` slots, a build pulls a toolchain image and writes layers to an eMMC we're counting writes on, and a multi-platform build on a 2 GB Atom is slow at best. A build also runs whatever `RUN` steps a Dockerfile holds, on the machines that keep the cluster's state. The appliance's whole pitch is that it does one job.
 
-So the appliance stays without it, and the refusal now names the ways out. bun keeps the message in one constant, `NO_BUILDER_ERROR`, rather than inline in the handler, so a test can hold it to its promises: it says appliance nodes never have Buildah, shows `docker push <node>:5050/<name>:<tag>`, points at `relish manual images`, and suggests adding a Linux node with Buildah, since bun hands a build to any peer that reports it. A second test checks that the manual section it names exists, so a renamed heading can't leave the error pointing at nothing. Manual 17 now walks through building the burger on a laptop and pushing it into Pickle before the tour's `relish apply`.
+So for 0.3.2 the appliance stayed without it, and the refusal learnt to name the ways out. bun keeps the message in one constant, `NO_BUILDER_ERROR`, rather than inline in the handler, so a test can hold it to its promises: it shows `docker push <node>:5050/<name>:<tag>`, points at `relish manual images`, and suggests adding a node with Buildah, since bun hands a build to any peer that reports it. A second test checks that the manual section it names exists, so a renamed heading can't leave the error pointing at nothing.
+
+That was the interim fix. A tour whose first step needs a laptop with Docker isn't much of a tour, though, so in 0.3.3 we went back and priced Buildah properly, file by file rather than by reputation.
+
+Ubuntu's `buildah` package says it installs 125 MB. Unpack it and the `buildah` binary is 31 MB. The other 97 MB is `/usr/libexec/buildah`: `imgtype`, `copy`, `tutorial` and five more, Buildah's test helpers, which Debian ships for its own package tests. `strings` on the binary finds no path into that directory, so Buildah never runs them, and one `RemoveFiles=` line drops them from the image. Then there are the dependencies. mkosi installs no Recommends, which is what keeps the image small, but it means we have to name what Buildah can't work without. `containers-common` depends on a virtual package, `container-network-stack`, and we name `netavark` so apt doesn't pick a provider for us; a `RUN` step that uses the network needs it. libgpgme depends on `gnupg | gpg`, and apt takes the first alternative, which is a metapackage that brings GnuPG's agent, key server client and S/MIME tool. Naming `gpg` satisfies the dependency with the bare tool. The rest of the recommends stay out: bun builds with the `vfs` driver (no `fuse-overlayfs`), runs `RUN` steps with the runc the node already has (no `crun`), and never preprocesses a Containerfile (no `cpp`).
+
+The first CI build measured it: the x86-64 `/usr` went from 667 MB to 721 MB, so 54 MB in each 1,100 MB slot. The slot has room, and an OS update still writes only one of them.
+
+The eMMC was the other worry, and it turned out better than feared. Buildah's storage lives in `<storage.data>/buildah`, on the data partition, which is Btrfs. The `vfs` driver makes each layer by copying the layer below it, which sounds like the worst possible thing to do to flash. But containers/storage copies with `FICLONE` first, and on Btrfs that's a reflink: the new layer gets new metadata and shares its parent's blocks. The layers that really get written are the ones pulled and the ones a build makes. The appliance profile already capped the build cache at 1 GiB, so base images stay between builds without filling the disk.
+
+Two things the price doesn't change. A build still runs the Dockerfile's `RUN` steps on a machine that holds the cluster's state, as it does on any node, and manual 17 says so. And an appliance has no emulator, so a multi-platform build can only run `RUN` steps for its own architecture. The burger's Dockerfile cross-compiles (its Go stage runs on `$BUILDPLATFORM` and only `COPY`s into the arm64 image), so the tour doesn't notice.
+
+`test_guest_images.py` used to hold the appliance to "the guest's packages less Buildah"; now it holds it to the guest's packages, full stop. A new check, `image/tests/builder_packages.py`, reads `mkosi.conf` in the unit tests and each built image's manifest in CI: Buildah, its configuration, `netavark`, `gpg` and runc have to be there, the test helpers gone, and GnuPG's agents, `fuse-overlayfs`, `crun` and `cpp` absent, so a dependency change upstream can't quietly bring them back. The manifest check proves the packages are there, not that they work. For that, CI's seeded-pair test, which already boots two appliances into a cluster, now runs the tour's `relish build burger/burger.toml` against them. The runner masquerades the test's bridge so the appliances can pull the Go toolchain image, and the build has to push both platforms into Pickle. The refusal stays for a cluster where no node has Buildah, minus its claim that appliances never do.
 
 ### Reading it all again
 
@@ -1341,10 +1647,10 @@ We went back after the Wyse's first night, this time reading for firmware quirks
 
 ## What's next
 
-The spike's interim record is a pass for everything that can be proven without hardware. Turning it into part of Reliaburger is the [product plan](../plans/archive/2026-10-01-plan-appliance-product.md) for 0.3.0, and these are the big pieces:
+The spike's interim record was a pass for everything that could be proven without hardware. Turning it into part of Reliaburger was the [product plan](../plans/archive/2026-10-01-plan-appliance-product.md) for 0.3.0, and its last step was the hardware.
 
-- **S5, three Dell Wyse 3040s.** The lab has ten, but on 7 October 2026 we decided the release gate needs only three. The go/no-go is 3 of 3 claimed, a working cluster within an hour of power-on, 1.0 GB free per node under the tour, five years of eMMC life, and a fallback within ten minutes. The run covers BIOS setup, PXE on the real Realtek NIC, whether the firmware keeps the boot entry the installer makes, `MemAvailable` under the tour, eMMC writes per day, one OS update across the fleet, and whether Linux 7.0 still hangs on reboot without our `dw_dmac` blacklist. A node that can't reboot can't finish an A/B update, so that last one matters more than it sounds. The run uses only the real commands: `relish netboot` on an M2 MacBook over a USB-C Ethernet adapter, either the home router or the Mac itself for addresses, and `relish machines claim` for the cluster ([the S5 runbook](../plans/2026-10-01-plan-appliance-s5-wyse.md)). We first planned a Raspberry Pi as the lab's own router, to keep the lab off the home network, and dropped it on 8 October 2026 for two setups that need no extra box. On the home network, the rails relish already has protect the rest of the LAN: `--mac`, the yes before a used disk is wiped, and the refusal to start beside another boot server. Isolated, the Mac runs dnsmasq and relish answers on port 4011 beside it ("A lab with no router", above).
-- **`relish netboot` on real firmware.** The first Wyse night found two bugs, both fixed ("The Wyse's first night" and "A driver that needs a driver", above). The rerun on fixed builds, then the three-Wyse gate, are next.
+- **The exit test, on three Dell Wyse 3040s.** The lab had ten, but on 7 October 2026 we decided the gate needs only three, and on 23 November that three are enough for the exit test as a whole. The go/no-go was 3 of 3 claimed, a working cluster within an hour of power-on, 1.0 GB free per node under the workload, five years of eMMC life, and a fallback within ten minutes. It ran twice with only the real commands, `relish netboot` on a MacBook over a USB-C Ethernet adapter with the Mac as the lab's router, and `relish machines claim` for the cluster: on 0.3.0's lab build (20 and 21 November) and again on the released 0.3.2 (23 November). All three machines were claimed both times. The cluster was working 38 minutes after the first power-on the first time and about 25 minutes the second, the lowest `MemAvailable` was 1.38 GB, and a `relish os upgrade` across the three nodes finished with quorum throughout. We had worried whether Linux 7.0 would hang on reboot without our `dw_dmac` blacklist, since a node that can't reboot can't finish an A/B update. With it, warm reboots worked, apart from one installer reboot that hung once and never again (#2163). Two criteria missed. The eMMC writes work out at 2.2 years on the leader, accepted for now and cut in a later release (#2201). The fallback took 10 min 28 s and then 11 min 38 s, which is what ["The second Wyse run"](#the-second-wyse-run) was about. The [Wyse lab record](../qualification/2026-11-20-wyse-3040.md) has every number and the go/no-go.
+- **The fallback on the hardware, again.** Two tries of 150 s, measured from the kernel's start, should bring the 3040 down to about 8 min 20 s, and a node whose network never comes up should now fall back rather than sit there. Both are models and QEMU tests until the Wyses run them (#2143, #2245). The same lab run checks node pressure after a cold boot (#2242), the boot logs on every try (#2149), and the console dashboard (#2150) on real screens.
 - **Raspberry Pis, later (#1971).** Many people will try the appliance on a Pi, and today it can't run there. A Pi boots through its own firmware, not UEFI, and Ubuntu's generic arm64 kernel lacks the Pi's SD and PCIe controllers. Ubuntu runs Pis on a separate kernel, `linux-raspi`. So the Pi 4 and Pi 5 need a second boot platform: an image on that kernel, the Pi's own network boot in `relish netboot`, and A/B updates through the Pi firmware's `tryboot` instead of systemd-boot. A dated plan comes first.
 - **Smaller things with known answers:** a way for the installer to find its server under Secure Boot, which drops the command line iPXE passes.
 

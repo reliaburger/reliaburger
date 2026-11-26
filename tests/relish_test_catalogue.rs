@@ -10,6 +10,9 @@ use std::time::{Duration, Instant};
 #[path = "support/bun_process.rs"]
 mod bun_process;
 #[cfg(target_os = "linux")]
+#[path = "support/test_cgroups.rs"]
+mod test_cgroups;
+#[cfg(target_os = "linux")]
 use bun_process::spawn_bun_with_runtime_port_retry;
 use bun_process::{
     WAIT, assert_success, reserve_address, reserve_ports, run_relish, run_relish_init,
@@ -260,6 +263,64 @@ fn runc_catalogue_deploys_the_exact_image_pushed_to_pickle() {
     qualify_runc_catalogue("image-registry");
 }
 
+/// The namespace cgroups `relish test` runs make, `rbtest-<run id>-<NN>` with
+/// a 32-digit hex run id. Only these catalogue tests run `relish test` under
+/// `make test-linux`, one at a time, so a new one is this test's.
+#[cfg(target_os = "linux")]
+fn catalogue_namespaces() -> std::collections::BTreeSet<String> {
+    let run_namespace = |name: &str| {
+        name.strip_prefix("rbtest-")
+            .and_then(|rest| rest.split_once('-'))
+            .is_some_and(|(run, index)| {
+                run.len() == 32
+                    && run.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    && index.len() == 2
+                    && index.bytes().all(|byte| byte.is_ascii_digit())
+            })
+    };
+    std::fs::read_dir(test_cgroups::HIERARCHY)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| run_namespace(name))
+        .collect()
+}
+
+/// Bun removes a run's namespace cgroup once the run has removed the
+/// namespace's last app (#2324). This checks Bun itself, while it still
+/// runs: the `TestCgroups` guard only removes leftovers after it stops.
+/// Retirement finishes on Bun's loop after the cleanup is confirmed, so
+/// allow it a few seconds.
+#[cfg(target_os = "linux")]
+fn assert_run_namespace_cgroups_removed(before: &std::collections::BTreeSet<String>) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let left: Vec<String> = catalogue_namespaces().difference(before).cloned().collect();
+        if left.is_empty() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            let trees: Vec<String> = left
+                .iter()
+                .map(|namespace| {
+                    let children: Vec<String> =
+                        std::fs::read_dir(format!("{}/{namespace}", test_cgroups::HIERARCHY))
+                            .into_iter()
+                            .flatten()
+                            .flatten()
+                            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                            .collect();
+                    format!("{namespace} {children:?}")
+                })
+                .collect();
+            panic!("relish test left its namespace cgroups behind: {trees:?}");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// The V02 soak ran `relish test --endpoint <a node's forwarded API>` from the
 /// Mac. `--endpoint` bypassed the managed context, so the registry cases
 /// pushed to the node's own listener port, which nothing forwards. Relish now
@@ -320,6 +381,8 @@ fn registry_cases_push_through_the_contexts_forward_with_an_explicit_endpoint() 
         schema: 1,
         owner: "forward-fixture".to_string(),
         endpoint: secure.endpoint.clone(),
+        other_endpoints: Vec::new(),
+        last_answered: None,
         token: secure.token.clone(),
         ca_cert: secure.ca.clone(),
         service_endpoints: reliaburger::bun::capabilities::ServiceEndpoints {
@@ -384,6 +447,10 @@ fn qualify_runc_catalogue(group: &str) {
         nix::unistd::geteuid().is_root(),
         "run this qualification as root"
     );
+    // Declared first, so it drops last, after Bun. Bun removes the run's
+    // namespace cgroups itself (#2324, asserted below); this guard is the
+    // backstop when the test fails part-way (#2322).
+    let mut cgroups = test_cgroups::TestCgroups::new([]);
     let root = tempfile::tempdir().unwrap();
     let cluster_dir = root.path().join("cluster");
     assert_success(
@@ -456,6 +523,7 @@ fn qualify_runc_catalogue(group: &str) {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+    let before = catalogue_namespaces();
     let output = run_relish(&[
         "--endpoint",
         &endpoint,
@@ -473,6 +541,9 @@ fn qualify_runc_catalogue(group: &str) {
         "--parallel",
         "1",
     ]);
+    for namespace in catalogue_namespaces().difference(&before) {
+        cgroups.claim(std::path::Path::new(test_cgroups::HIERARCHY).join(namespace));
+    }
     let report: serde_json::Value =
         serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
             panic!(
@@ -488,6 +559,7 @@ fn qualify_runc_catalogue(group: &str) {
         assert_eq!(case["cleanup"]["status"], "confirmed", "{report}");
     }
     assert_success(&output, "qualify runtime catalogue");
+    assert_run_namespace_cgroups_removed(&before);
     if group == "image-registry" {
         let listed = run_relish(&[
             "--endpoint",
@@ -529,6 +601,9 @@ fn qualify_runc_catalogue(group: &str) {
             "--parallel",
             "1",
         ]);
+        for namespace in catalogue_namespaces().difference(&before) {
+            cgroups.claim(std::path::Path::new(test_cgroups::HIERARCHY).join(namespace));
+        }
         let report: serde_json::Value =
             serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
                 panic!(
@@ -557,5 +632,6 @@ fn qualify_runc_catalogue(group: &str) {
             !output.status.success(),
             "untrusted workload certificate passed"
         );
+        assert_run_namespace_cgroups_removed(&before);
     }
 }

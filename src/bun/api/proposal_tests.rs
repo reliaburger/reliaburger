@@ -1454,7 +1454,8 @@ fn a_clear_refuses_a_fault_that_took_the_same_id_on_another_app() {
     };
     let listed = |service: &str, kind: &str| -> crate::smoker::types::FaultSummary {
         serde_json::from_value(serde_json::json!({
-            "id": 1, "fault_type": kind, "target_service": service, "namespace": "shop",
+            "id": 1, "fault_type": kind, "kind": {"type": "Delay"},
+            "target_service": service, "namespace": "shop",
             "target_instance": null, "target_node": null, "remaining_secs": 100,
             "injected_by": "bob", "node": "node-b",
         }))

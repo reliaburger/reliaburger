@@ -391,6 +391,7 @@ pub fn data_schema(command: CommandName) -> Option<Value> {
         }
         CommandName::Proposals => Some(schema_of::<propose::ProposalsData>()),
         CommandName::Status => Some(schema_of::<crate::relish::status_cmd::StatusData>()),
+        CommandName::Apply => Some(schema_of::<crate::relish::apply_wait::ApplyWaitData>()),
     }
 }
 
@@ -698,7 +699,8 @@ mod tests {
                 "proposals",
                 "withdraw",
                 "undo",
-                "status"
+                "status",
+                "apply",
             ]
         );
         let envelope = &value["data"]["envelope"];

@@ -108,6 +108,12 @@
     "test": "grill::runc::tests::runc_capability_knobs_work_only_where_the_container_owns_the_check"
   },
   {
+    "source": "src/grill/runc.rs",
+    "function": "runc_sysctl_and_device_knobs_take_effect_inside_the_container",
+    "binary": "reliaburger",
+    "test": "grill::runc::tests::runc_sysctl_and_device_knobs_take_effect_inside_the_container"
+  },
+  {
     "source": "src/grill/snapshot.rs",
     "function": "btrfs_snapshot_restore_recovers_corrupted_data",
     "binary": "reliaburger",
@@ -325,6 +331,12 @@
   },
   {
     "source": "tests/cluster_failover.rs",
+    "function": "a_context_whose_first_node_is_down_reaches_the_cluster_through_the_next",
+    "binary": "reliaburger::cluster_failover",
+    "test": "a_context_whose_first_node_is_down_reaches_the_cluster_through_the_next"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
     "function": "an_agent_lease_survives_a_leader_change_and_the_new_leader_expires_it",
     "binary": "reliaburger::cluster_failover",
     "test": "an_agent_lease_survives_a_leader_change_and_the_new_leader_expires_it"
@@ -478,6 +490,12 @@
     "function": "slow_gossip_restart_never_acknowledges_on_the_old_epoch",
     "binary": "reliaburger::council_disaster_recovery",
     "test": "slow_gossip_restart_never_acknowledges_on_the_old_epoch"
+  },
+  {
+    "source": "tests/council_disaster_recovery.rs",
+    "function": "stop_waits_for_a_lingering_task_to_release_the_raft_store",
+    "binary": "reliaburger::council_disaster_recovery",
+    "test": "stop_waits_for_a_lingering_task_to_release_the_raft_store"
   },
   {
     "source": "tests/council_self_healing.rs",
@@ -1224,6 +1242,24 @@
     "test": "published_ports_answer_members_only_and_rewrite_only_local_destinations"
   },
   {
+    "source": "tests/owned_network.rs",
+    "function": "a_sweep_leaves_a_young_unclaimed_test_namespace_alone",
+    "binary": "reliaburger::owned_network",
+    "test": "a_sweep_leaves_a_young_unclaimed_test_namespace_alone"
+  },
+  {
+    "source": "tests/owned_network.rs",
+    "function": "a_sweep_leaves_a_claimed_namespace_alone_and_its_guard_deletes_it",
+    "binary": "reliaburger::owned_network",
+    "test": "a_sweep_leaves_a_claimed_namespace_alone_and_its_guard_deletes_it"
+  },
+  {
+    "source": "tests/owned_network.rs",
+    "function": "a_sweep_releases_the_namespace_of_a_test_that_died",
+    "binary": "reliaburger::owned_network",
+    "test": "a_sweep_releases_the_namespace_of_a_test_that_died"
+  },
+  {
     "source": "tests/owned_rootless.rs",
     "function": "rootless_cluster_refuses_before_ownership_recovery_for_every_selection",
     "binary": "reliaburger::owned_rootless",
@@ -1300,6 +1336,12 @@
     "function": "runc_owned_adoption_validates_generation_and_restores_live_network",
     "binary": "reliaburger::owned_runc",
     "test": "runc_owned_adoption_validates_generation_and_restores_live_network"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_owned_adoption_accepts_a_provider_reference_for_its_resolved_value",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_owned_adoption_accepts_a_provider_reference_for_its_resolved_value"
   },
   {
     "source": "tests/owned_runc.rs",
@@ -1438,6 +1480,12 @@
     "function": "a_scale_through_a_follower_converges_until_the_file_is_applied_again",
     "binary": "reliaburger::placement",
     "test": "a_scale_through_a_follower_converges_until_the_file_is_applied_again"
+  },
+  {
+    "source": "tests/placement.rs",
+    "function": "apply_wait_returns_once_the_apps_run_and_names_what_never_does",
+    "binary": "reliaburger::placement",
+    "test": "apply_wait_returns_once_the_apps_run_and_names_what_never_does"
   },
   {
     "source": "tests/placement.rs",
@@ -1627,6 +1675,12 @@
   },
   {
     "source": "tests/self_upgrade.rs",
+    "function": "single_node_upgrade_adopts_an_app_that_uses_a_secret_provider",
+    "binary": "reliaburger::self_upgrade",
+    "test": "single_node_upgrade_adopts_an_app_that_uses_a_secret_provider"
+  },
+  {
+    "source": "tests/self_upgrade.rs",
     "function": "single_node_rollback_reverts_to_previous_version",
     "binary": "reliaburger::self_upgrade",
     "test": "single_node_rollback_reverts_to_previous_version"
@@ -1765,9 +1819,39 @@
   },
   {
     "source": "tests/owned_runc.rs",
+    "function": "a_bun_restart_adopts_a_sidecar_with_its_process_and_its_instances_network",
+    "binary": "reliaburger::owned_runc",
+    "test": "a_bun_restart_adopts_a_sidecar_with_its_process_and_its_instances_network"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "a_sidecar_that_died_before_adoption_is_refused_and_then_forgotten",
+    "binary": "reliaburger::owned_runc",
+    "test": "a_sidecar_that_died_before_adoption_is_refused_and_then_forgotten"
+  },
+  {
+    "source": "tests/owned_runc.rs",
     "function": "a_record_and_generation_split_by_a_power_cut_retire_and_others_still_adopt",
     "binary": "reliaburger::owned_runc",
     "test": "a_record_and_generation_split_by_a_power_cut_retire_and_others_still_adopt"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_a_panicking_test_leaves_no_container_or_network_behind",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_a_panicking_test_leaves_no_container_or_network_behind"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_a_test_after_an_unguarded_panic_takes_the_same_address",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_a_test_after_an_unguarded_panic_takes_the_same_address"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_a_test_after_a_killed_test_releases_its_root_and_takes_the_same_address",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_a_test_after_a_killed_test_releases_its_root_and_takes_the_same_address"
   },
   {
     "source": "tests/cluster_task_arrays.rs",
@@ -1830,6 +1914,12 @@
     "test": "app_replica_lands_on_the_idle_node_while_another_runs_an_array"
   },
   {
+    "source": "tests/cluster_task_arrays.rs",
+    "function": "app_is_placed_while_job_work_fills_every_node",
+    "binary": "reliaburger::cluster_task_arrays",
+    "test": "app_is_placed_while_job_work_fills_every_node"
+  },
+  {
     "source": "tests/owned_task_arrays.rs",
     "function": "runc_common_job_api_runs_encrypted_singletons_and_gates_hooks_on_accepted_success",
     "binary": "reliaburger::owned_task_arrays",
@@ -1888,6 +1978,30 @@
     "function": "cgroup_deadline_during_cold_preparation_retires_the_context",
     "binary": "reliaburger",
     "test": "bun::reusable_executor::pool::tests::cgroup_deadline_during_cold_preparation_retires_the_context"
+  },
+  {
+    "source": "src/grill/cgroup.rs",
+    "function": "cgroup_guard_removes_its_tree_children_first_once_empty",
+    "binary": "reliaburger",
+    "test": "grill::cgroup::tests::cgroup_guard_removes_its_tree_children_first_once_empty"
+  },
+  {
+    "source": "src/grill/cgroup.rs",
+    "function": "cgroup_guard_removes_every_test_cgroup_its_prefix_claims",
+    "binary": "reliaburger",
+    "test": "grill::cgroup::tests::cgroup_guard_removes_every_test_cgroup_its_prefix_claims"
+  },
+  {
+    "source": "src/grill/cgroup.rs",
+    "function": "cgroup_sweep_removes_only_stale_empty_test_cgroups",
+    "binary": "reliaburger",
+    "test": "grill::cgroup::tests::cgroup_sweep_removes_only_stale_empty_test_cgroups"
+  },
+  {
+    "source": "src/grill/cgroup.rs",
+    "function": "cgroup_controller_enabled_in_a_parent_moves_its_children_mtime_only_once",
+    "binary": "reliaburger",
+    "test": "grill::cgroup::tests::cgroup_controller_enabled_in_a_parent_moves_its_children_mtime_only_once"
   },
   {
     "source": "tests/owned_task_arrays.rs",

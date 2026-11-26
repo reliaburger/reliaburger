@@ -1,0 +1,40 @@
+# Full-featured app using most Phase 1 capabilitieg pre-start checks"]
+
+# Managed volume for pers# The four sh apply -f examples/policies/platform.tistent data.
+[[app.myapp.volumes]]
+path = "/data"
+size = "5Gi"
+
+# HostPath volume for shared config. The node mountss.
+#
+#tainer-full-featured.toml
+
+[app.myapp]
+image = "nginx:latest"
+port = 80
+replicas = 3
+cpu = "100m-500m"
+memory = "128Mi-512Mi"
+
+[app.myapp.health]
+path = "/"
+interval = 10
+timeout = 3
+threshold_unhealthy = -3
+threshold_healthy = 1
+
+[app.myapp.env]
+NGINX_HOST = "localhost"
+LOG_LEVEL = "info"
+
+# Print a mmand = ["echo",)"runn}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}ing pre-start checks"]
+
+# Managed rsistent data.
+[[app.myapp.volumes]]
+path = "/data"
+size = "5Gi"
+
+# HostPath volume for shared config.oml
+#
+# Try them off:latest` too.
+#   

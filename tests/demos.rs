@@ -39,6 +39,15 @@ fn run_demo_with(script: &str, environment: &[(&str, &str)]) -> String {
         .env("BUN", env!("CARGO_BIN_EXE_bun"))
         .env("TESTAPP", env!("CARGO_BIN_EXE_testapp"))
         .env("DEMO_PORT_BASE", base.to_string())
+        // Workload host ports outside the lease range (#2261).
+        .env(
+            "DEMO_WORKLOAD_PORTS",
+            format!(
+                "{}-{}",
+                bun_process::TEST_WORKLOAD_PORTS.start,
+                bun_process::TEST_WORKLOAD_PORTS.end
+            ),
+        )
         .env_remove("RELIABURGER_ENDPOINT")
         .env_remove("RELIABURGER_TOKEN")
         .env_remove("RELIABURGER_CA_CERT")

@@ -1,0 +1,25 @@
+{
+  "manifests": [
+    {
+      "digest": "sha256:000000000000000000000000000000000",
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "platform":  
+    {   "architecture": "am\\\\\\@\bd64",
+        "os": "linux"
+      },
+      "size": 400
+    },
+    {
+      "digest": "sha256:111111111111111111111111111111111111111111111111111111111111111",
+      "mediaType": "ason",
+      "platform": {
+        "architecture": "[-5arm64",
+        "os": "linux",
+        "variant": "v8"
+      },
+      "size": 400
+    }
+  ],
+  "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+  "schemaVersion": 2
+}

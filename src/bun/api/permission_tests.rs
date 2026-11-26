@@ -484,6 +484,7 @@ fn instance(app: &str) -> InstanceStatus {
         age_seconds: None,
         image: None,
         data_on_node: false,
+        sidecars: Vec::new(),
         reason: None,
     }
 }
@@ -501,6 +502,7 @@ fn fault_on(id: u64, service: &str, namespace: Option<&str>) -> crate::smoker::t
         task_index: None,
         id,
         fault_type: "pause".to_string(),
+        kind: crate::smoker::types::FaultKind::Pause,
         target_service: service.to_string(),
         namespace: namespace.map(str::to_string),
         target_instance: None,

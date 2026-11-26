@@ -119,6 +119,12 @@ pub struct ClusterData {
     /// name in different namespaces have separate histories (C3).
     pub deploy_history: HashMap<String, ClusterDeployHistory>,
     pub app_metrics: Option<MetricsQueryResult>,
+    /// The last app spec the Config tab fetched (#1322), with its
+    /// secrets left out. The tab checks it names the app it shows.
+    pub app_spec: Option<crate::bun::spec_read::AppSpecView>,
+    /// Why the Config tab's last fetch failed, when the API answered with
+    /// a refusal rather than going away.
+    pub app_spec_error: Option<AppSpecError>,
     /// Every app the council knows, with the replica count its spec asks
     /// for: where the Instances tab's scale starts from.
     pub desired_apps: Vec<DesiredAppEvidence>,
@@ -193,6 +199,11 @@ pub enum Effect {
         app: String,
         namespace: String,
     },
+    /// Fetch one app's spec for the Config tab (#1322).
+    FetchAppSpec {
+        app: String,
+        namespace: String,
+    },
     /// Send Smoker's kill fault for one instance, as `relish fault kill`
     /// does. Only a `y` at the confirmation prompt queues it.
     KillInstance(InstanceTarget),
@@ -221,6 +232,41 @@ impl ScalePrompt {
             "Scale {} from {} to {}? Applying its file again puts back the file's count. [y/N]",
             self.app, self.from, self.to
         )
+    }
+}
+
+/// Why the spec read for one app failed (#1322). It names its app, so the
+/// Config tab never shows one app's refusal under another's name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppSpecError {
+    pub app: String,
+    pub namespace: String,
+    /// The refusal, for people.
+    pub message: String,
+}
+
+impl AppSpecError {
+    /// The error for an API answer of `status` with `body`: the `error`
+    /// the body's JSON carries, or the body as it came. An empty 404 is a
+    /// node that doesn't know the route at all, which a node on a release
+    /// before 0.3.3 is; a follower whose leader is such a node says so in
+    /// its 404's `error`.
+    pub fn from_answer(app: &str, namespace: &str, status: u16, body: &str) -> Self {
+        let carried = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|json| json.get("error")?.as_str().map(String::from));
+        let message = match carried {
+            Some(error) => format!("{status}: {error}"),
+            None if status == 404 && body.trim().is_empty() => {
+                "this node's release doesn't serve spec reads".to_string()
+            }
+            None => format!("{status}: {body}"),
+        };
+        Self {
+            app: app.to_string(),
+            namespace: namespace.to_string(),
+            message,
+        }
     }
 }
 

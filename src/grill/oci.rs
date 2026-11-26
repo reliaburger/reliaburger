@@ -81,6 +81,15 @@ pub struct OciSpec {
     /// is the operator's and is never chowned, whatever files sit beside it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub managed_volumes: Vec<ManagedVolumeMount>,
+    /// The host paths among [`Self::mounts`]: every volume and config-file
+    /// `source` the app named, as the node's host-path policy approved
+    /// them, recorded when the spec is built. Not part of the OCI runtime
+    /// spec: a restart creates the container from this stored spec, so it
+    /// asks the node's policy about exactly these again (#2335). The other
+    /// bind mounts are the node's own (managed volumes, inline config
+    /// files, the identity directory).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_path_sources: Vec<PathBuf>,
 }
 
 /// A managed volume a spec mounts, as the spec builder named it.
@@ -128,8 +137,46 @@ impl OciSpec {
     /// A live intent keeps the exact spec, so it must be equal. A retired
     /// intent keeps [`OciSpec::without_environment_values`], so everything
     /// except environment values must be equal.
+    ///
+    /// A spec with `PROVIDER[...]` variables is the exception (#2334). The
+    /// supervisor keeps the references, but the runtime is handed, and
+    /// journals, the values the provider gave, with
+    /// [`OciProcess::provider_env`] cleared. So the provider's variables,
+    /// as either side declares them, are compared by name only, and
+    /// everything else must match as above.
     pub fn matches_journal(&self, journal: &OciSpec) -> bool {
-        self == journal || self.without_environment_values() == *journal
+        if self == journal || self.without_environment_values() == *journal {
+            return true;
+        }
+        let declared: Vec<&str> = self
+            .process
+            .provider_env
+            .iter()
+            .chain(&journal.process.provider_env)
+            .map(String::as_str)
+            .collect();
+        if declared.is_empty() {
+            return false;
+        }
+        let launched = self.without_provider_values(&declared);
+        let journal = journal.without_provider_values(&declared);
+        launched == journal || launched.without_environment_values() == journal
+    }
+
+    /// The same spec with each `declared` provider variable cut down to its
+    /// name and no provider declarations: the shape a supervisor's spec
+    /// and the resolved copy a runtime journalled from it share.
+    fn without_provider_values(&self, declared: &[&str]) -> OciSpec {
+        let mut shape = self.clone();
+        for entry in &mut shape.process.env {
+            if let Some((name, _value)) = entry.split_once('=')
+                && declared.contains(&name)
+            {
+                *entry = name.to_string();
+            }
+        }
+        shape.process.provider_env.clear();
+        shape
     }
 }
 
@@ -471,7 +518,7 @@ pub fn generate_oci_spec_with_decryptor(
     let env = build_env_with_decryptor(spec, decryptor)?;
     let provider_env = declared_provider_env(&spec.env);
     let args = build_args(app_name, spec);
-    let (mounts, managed_volumes) = build_mounts(
+    let (mounts, managed_volumes, host_path_sources) = build_mounts(
         spec,
         host_port,
         app_name,
@@ -486,6 +533,7 @@ pub fn generate_oci_spec_with_decryptor(
 
     Ok(OciSpec {
         managed_volumes,
+        host_path_sources,
         reusable_executor: false,
         host_process: spec.exec.is_some() || spec.script.is_some(),
         initialiser: false,
@@ -682,8 +730,9 @@ fn build_mounts(
     namespace: &str,
     instance_id: &str,
     volumes_dir: Option<&Path>,
-) -> (Vec<OciMount>, Vec<ManagedVolumeMount>) {
+) -> (Vec<OciMount>, Vec<ManagedVolumeMount>, Vec<PathBuf>) {
     let mut mounts = standard_mounts();
+    let mut host_paths = Vec::new();
 
     // Config files: read-only bind mounts.
     // Inline content is written to a file under volumes_dir so it can be
@@ -693,6 +742,7 @@ fn build_mounts(
     // rewrites the file under a running instance (#701).
     for cf in &spec.config_file {
         let source = if let Some(ref source_path) = cf.source {
+            host_paths.push(PathBuf::from(source_path));
             Some(PathBuf::from(source_path))
         } else if let Some(ref content) = cf.content {
             let base = volumes_dir
@@ -723,6 +773,7 @@ fn build_mounts(
     for vol in &spec.volumes {
         let host_path = if let Some(source) = &vol.source {
             // HostPath mode: use the explicit host path
+            host_paths.push(source.clone());
             source.clone()
         } else {
             // Managed mode: resolve to a subdirectory under volumes_dir
@@ -769,7 +820,7 @@ fn build_mounts(
         options: vec!["bind".to_string(), "ro".to_string()],
     });
 
-    (mounts, managed)
+    (mounts, managed, host_paths)
 }
 
 /// Standard Linux namespaces for container isolation.
@@ -987,6 +1038,7 @@ pub fn generate_job_oci_spec(
 
     OciSpec {
         managed_volumes: Vec::new(),
+        host_path_sources: Vec::new(),
         reusable_executor: false,
         host_process: spec.is_host(),
         initialiser: false,
@@ -1089,6 +1141,7 @@ pub fn generate_init_oci_spec(
     let from_image = init.image.is_some() || app.process.overrides.is_some();
     OciSpec {
         managed_volumes: Vec::new(),
+        host_path_sources: app.host_path_sources.clone(),
         reusable_executor: false,
         // A host app's init that names no image runs on the host like its
         // app, so the mixed runtime routes it there too (#935).
@@ -1149,6 +1202,15 @@ pub fn sidecar_instance_id(
     crate::grill::InstanceId(format!("{}__sidecar-{name}", parent.0))
 }
 
+/// The instance a sidecar's runtime identity runs beside, and the
+/// sidecar's name: the inverse of [`sidecar_instance_id`]. `None` for an
+/// identity that isn't a sidecar's.
+pub fn sidecar_parent(id: &crate::grill::InstanceId) -> Option<(crate::grill::InstanceId, &str)> {
+    id.0.rsplit_once("__sidecar-")
+        .filter(|(parent, name)| !parent.is_empty() && !name.is_empty())
+        .map(|(parent, name)| (crate::grill::InstanceId(parent.to_string()), name))
+}
+
 /// Generate the OCI spec for `sidecar`, which runs beside instance `parent`
 /// of an app whose own spec is `app` (#1120).
 ///
@@ -1181,6 +1243,9 @@ pub fn generate_sidecar_oci_spec(
     }
     OciSpec {
         managed_volumes: Vec::new(),
+        // The app's mounts, and with them its host paths, which a
+        // sidecar's own restart asks about again (#2335).
+        host_path_sources: app.host_path_sources.clone(),
         reusable_executor: false,
         host_process: false,
         // A sidecar borrows the app's volumes as an init does, so a runtime
@@ -2548,6 +2613,62 @@ mod tests {
             sidecar_instance_id(&parent, "proxy").0,
             "default__web-0__sidecar-proxy"
         );
+        let sidecar = sidecar_instance_id(&parent, "proxy");
+        assert_eq!(sidecar_parent(&sidecar), Some((parent.clone(), "proxy")));
+        assert_eq!(sidecar_parent(&parent), None, "an instance is no sidecar");
+    }
+
+    /// #2335: the spec names the host paths it mounts, so a restart can ask
+    /// about exactly those, and the sidecar and init specs built from it
+    /// carry them with the mounts they copy.
+    #[test]
+    fn the_spec_records_the_apps_host_paths_and_a_sidecar_and_an_init_carry_them() {
+        let app: AppSpec = toml::from_str(
+            r#"
+            image = "web:v1"
+            [[volumes]]
+            source = "/srv/import"
+            path = "/data"
+            [[volumes]]
+            path = "/cache"
+            [[config_file]]
+            source = "/etc/shared/app.yaml"
+            path = "/etc/app.yaml"
+            [[config_file]]
+            content = "a: 1"
+            path = "/etc/inline.yaml"
+            [[sidecar]]
+            name = "proxy"
+            [[init]]
+            command = ["migrate"]
+            "#,
+        )
+        .unwrap();
+        let volumes = tempfile::tempdir().unwrap();
+        let oci = generate_oci_spec(
+            "web",
+            "default",
+            &app,
+            "default__web-0",
+            None,
+            "/cg",
+            Some(volumes.path()),
+            None,
+        );
+        // Only the app's own sources: not the managed volume, the inline
+        // config file's copy or the identity directory, which are the node's.
+        let expected = vec![
+            PathBuf::from("/etc/shared/app.yaml"),
+            PathBuf::from("/srv/import"),
+        ];
+        assert_eq!(oci.host_path_sources, expected);
+        let parent = crate::grill::InstanceId("default__web-0".into());
+        let sidecar = generate_sidecar_oci_spec(&app.sidecar[0], &oci, &parent);
+        assert_eq!(sidecar.host_path_sources, expected);
+        assert_eq!(
+            generate_init_oci_spec(&app.init[0], &oci).host_path_sources,
+            expected
+        );
     }
 
     /// #1122: the gates admitted the app's runtime knobs for the app's own
@@ -2814,6 +2935,80 @@ mod tests {
         let mut moved = spec_with_env(&["SECRET=plaintext"]);
         moved.process.args = vec!["elsewhere".into()];
         assert!(!moved.matches_journal(&journal));
+    }
+
+    /// What the supervisor keeps for a launch with a `PROVIDER[...]`
+    /// variable (#1123): the reference, with the variable declared.
+    fn spec_with_provider(env: &[&str], declared: &[&str]) -> OciSpec {
+        let mut oci = spec_with_env(env);
+        oci.process.provider_env = declared.iter().map(|name| name.to_string()).collect();
+        oci
+    }
+
+    /// The copy a runtime got and journalled: the value resolved, and no
+    /// declaration left.
+    fn resolved(oci: &OciSpec, env: &[&str]) -> OciSpec {
+        let mut launched = oci.clone();
+        launched.process.env = env.iter().map(|entry| entry.to_string()).collect();
+        launched.process.provider_env.clear();
+        launched
+    }
+
+    /// #2334: the record keeps the reference and the journal the value the
+    /// provider gave, so the two must still match, live or retired, from
+    /// either side.
+    #[test]
+    fn a_spec_with_a_provider_reference_matches_its_resolved_journal_copy() {
+        let record = spec_with_provider(
+            &[
+                "DB_PASSWORD=PROVIDER[vault:secret/db#password]",
+                "MODE=plain",
+            ],
+            &["DB_PASSWORD"],
+        );
+        let journal = resolved(&record, &["DB_PASSWORD=s3cret", "MODE=plain"]);
+        assert!(record.matches_journal(&journal));
+        assert!(record.matches_journal(&journal.without_environment_values()));
+        assert!(journal.matches_journal(&record));
+    }
+
+    /// Only the provider's value may differ: every other part of the spec,
+    /// the other variables included, still has to match.
+    #[test]
+    fn a_provider_journal_copy_still_refuses_a_different_request() {
+        let record = spec_with_provider(
+            &[
+                "DB_PASSWORD=PROVIDER[vault:secret/db#password]",
+                "MODE=plain",
+            ],
+            &["DB_PASSWORD"],
+        );
+        let journal = resolved(&record, &["DB_PASSWORD=s3cret", "MODE=plain"]);
+
+        let mut moved = record.clone();
+        moved.process.args = vec!["elsewhere".into()];
+        assert!(!moved.matches_journal(&journal));
+        assert!(!moved.matches_journal(&journal.without_environment_values()));
+
+        let other_mode = spec_with_provider(
+            &[
+                "DB_PASSWORD=PROVIDER[vault:secret/db#password]",
+                "MODE=loud",
+            ],
+            &["DB_PASSWORD"],
+        );
+        assert!(!other_mode.matches_journal(&journal));
+
+        let renamed = spec_with_provider(
+            &["DB_TOKEN=PROVIDER[vault:secret/db#password]", "MODE=plain"],
+            &["DB_TOKEN"],
+        );
+        assert!(!renamed.matches_journal(&journal));
+
+        // A literal value that only looks like a reference isn't resolved
+        // (#1819), so it must match exactly.
+        let literal = spec_with_env(&["DB_PASSWORD=PROVIDER[vault:secret/db#password]"]);
+        assert!(!literal.matches_journal(&resolved(&literal, &["DB_PASSWORD=s3cret"])));
     }
 
     #[test]

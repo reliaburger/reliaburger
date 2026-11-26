@@ -623,9 +623,9 @@ fn check_crashloops(inputs: &WtfInputs, report: &mut WtfReport) {
         // The app's own log line lands in `correlated_events[].message` and
         // inside the finding's `details` sentence, where an agent can't tell
         // it from our words. `relish agent diagnose` moves it into an
-        // `untrusted` object (origin `workload_log`); `wtf`'s own schema
-        // stays as it is.
-        // TODO(#1573): `relish agent logs` wraps every line it returns the same way.
+        // `untrusted` object (origin `workload_log`), the same wrapping
+        // `relish agent logs` gives every line it returns. `wtf` answers a
+        // human, so its own schema keeps the line as written.
         let log = first_error_log(inputs, app, namespace);
         if let Some(log) = log {
             correlated_events.push(CorrelatedEvent {
@@ -782,6 +782,34 @@ fn check_replicas(inputs: &WtfInputs, report: &mut WtfReport) {
         .iter()
         .filter(|app| app_matches(inputs.app.as_deref(), &app.app))
     {
+        // #2335: the app runs, but a sidecar it was deployed with doesn't,
+        // and won't until the app restarts, which the same check refuses.
+        if let Some(first) = app.refused_sidecars.first() {
+            found = true;
+            report.warnings.push(WtfFinding {
+                id: "sidecar-refused".to_string(),
+                title: format!(
+                    "app {}/{} runs without a sidecar the node refused to start again: {}",
+                    app.app, app.namespace, first.reason
+                ),
+                details: app
+                    .refused_sidecars
+                    .iter()
+                    .map(|refused| {
+                        format!(
+                            "{} on {}: {}",
+                            refused.instance, refused.node, refused.reason
+                        )
+                    })
+                    .collect(),
+                suggestion: "list the host path in the node's [storage] allowed_host_paths and \
+                             restart Bun, or change the app's volume or config-file `source` and \
+                             apply it again; the app's own next restart is refused until then"
+                    .to_string(),
+                correlated_events: Vec::new(),
+                affected_resource: app_resource(&app.app, &app.namespace),
+            });
+        }
         let running: u32 = app.running.values().sum();
         if running >= app.desired_replicas {
             continue;
@@ -1979,6 +2007,7 @@ pub(super) mod tests {
                     volume_home_away: None,
                     unschedulable: None,
                     rollout_failed: None,
+                    refused_sidecars: Vec::new(),
                     launch_failures: Vec::new(),
                 }]),
                 alerts: available(Vec::new()),
@@ -3411,6 +3440,56 @@ pub(super) mod tests {
     /// #881: an instance whose binary the node can't run will never start
     /// by waiting. That's critical, and it names the binary and the node.
     #[test]
+    fn a_running_app_with_a_refused_sidecar_is_a_warning_naming_the_reason() {
+        let mut inputs = healthy_inputs();
+        inputs.applications.replicas = available(vec![ReplicaObservation {
+            app: "web".to_string(),
+            namespace: "default".to_string(),
+            desired_replicas: 1,
+            placed: BTreeMap::from([("node-1".to_string(), 1)]),
+            running: BTreeMap::from([("node-1".to_string(), 1)]),
+            unanswered: Vec::new(),
+            blocked: None,
+            volume_home_away: None,
+            unschedulable: None,
+            rollout_failed: None,
+            refused_sidecars: vec![LaunchFailureObservation {
+                node: "node-1".to_string(),
+                instance: "default__web-0__sidecar-proxy".to_string(),
+                reason: "restart of sidecar default__web-0__sidecar-proxy refused".to_string(),
+            }],
+            launch_failures: Vec::new(),
+        }]);
+
+        let report = diagnose(&inputs);
+
+        let finding = report
+            .warnings
+            .iter()
+            .find(|finding| finding.id == "sidecar-refused")
+            .expect("a refused sidecar is a warning");
+        assert!(
+            finding
+                .title
+                .contains("app web/default runs without a sidecar")
+        );
+        assert_eq!(
+            finding.details,
+            [
+                "default__web-0__sidecar-proxy on node-1: restart of sidecar \
+              default__web-0__sidecar-proxy refused"
+            ]
+        );
+        assert!(
+            !report
+                .critical
+                .iter()
+                .any(|finding| finding.id == "launch-failed"),
+            "the app itself runs"
+        );
+    }
+
+    #[test]
     fn a_refused_launch_is_critical_and_names_the_binary() {
         let mut inputs = healthy_inputs();
         inputs.applications.replicas = available(vec![ReplicaObservation {
@@ -3424,6 +3503,7 @@ pub(super) mod tests {
             volume_home_away: None,
             unschedulable: None,
             rollout_failed: None,
+            refused_sidecars: Vec::new(),
             launch_failures: vec![LaunchFailureObservation {
                 node: "node-1".to_string(),
                 instance: "default__ghost-0".to_string(),
@@ -3477,6 +3557,7 @@ pub(super) mod tests {
             volume_home_away: None,
             unschedulable: None,
             rollout_failed: None,
+            refused_sidecars: Vec::new(),
             launch_failures: Vec::new(),
         }]);
 
@@ -3508,6 +3589,7 @@ pub(super) mod tests {
             volume_home_away: None,
             unschedulable: None,
             rollout_failed: None,
+            refused_sidecars: Vec::new(),
             launch_failures: Vec::new(),
         }]);
         let report = diagnose(&inputs);
@@ -3537,6 +3619,7 @@ pub(super) mod tests {
             volume_home_away: None,
             unschedulable: None,
             rollout_failed: None,
+            refused_sidecars: Vec::new(),
             launch_failures: Vec::new(),
         }]);
         let report = diagnose(&inputs);
@@ -3568,6 +3651,7 @@ pub(super) mod tests {
             volume_home_away: None,
             unschedulable: Some(reason.to_string()),
             rollout_failed: None,
+            refused_sidecars: Vec::new(),
             launch_failures: Vec::new(),
         }]);
 
@@ -3610,6 +3694,7 @@ pub(super) mod tests {
             volume_home_away: None,
             unschedulable: None,
             rollout_failed: None,
+            refused_sidecars: Vec::new(),
             launch_failures: Vec::new(),
         }]);
 
@@ -3658,6 +3743,7 @@ pub(super) mod tests {
                 reason: "api-g1-0 failed its health check".to_string(),
                 at_unix_ms: 1,
             }),
+            refused_sidecars: Vec::new(),
             launch_failures: Vec::new(),
         }]);
 
@@ -3693,6 +3779,7 @@ pub(super) mod tests {
             volume_home_away: Some("node-2".to_string()),
             unschedulable: None,
             rollout_failed: None,
+            refused_sidecars: Vec::new(),
             launch_failures: Vec::new(),
         }]);
 
@@ -3737,6 +3824,7 @@ pub(super) mod tests {
             volume_home_away: None,
             unschedulable: None,
             rollout_failed: None,
+            refused_sidecars: Vec::new(),
             launch_failures: Vec::new(),
         }]);
         let report = diagnose(&inputs);
@@ -3758,6 +3846,7 @@ pub(super) mod tests {
             volume_home_away: None,
             unschedulable: None,
             rollout_failed: None,
+            refused_sidecars: Vec::new(),
             launch_failures: Vec::new(),
         }]);
         let report = diagnose(&inputs);

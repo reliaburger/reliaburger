@@ -86,10 +86,15 @@ class DecideTests(unittest.TestCase):
     def test_a_green_run_on_the_commit_skips_the_suite(self):
         self.assertEqual(self.decide([run()]), (1, []))
 
-    def test_merge_queue_and_nightly_runs_count(self):
-        for event in ("merge_group", "schedule"):
-            with self.subTest(event=event):
-                self.assertEqual(self.decide([run(event=event)])[0], 1)
+    def test_nightly_runs_count(self):
+        self.assertEqual(self.decide([run(event="schedule")])[0], 1)
+
+    def test_a_merge_queue_run_never_stands_in_for_a_candidate(self):
+        # The queue doesn't run portable macOS (24 November 2026), so a
+        # candidate can't rest on it, even one whose jobs all claim success.
+        self.assertNotIn("merge_group", FULL_EVENTS)
+        run_id, reasons = self.decide([run(event="merge_group")])
+        self.assertIsNone(run_id)
 
     def test_a_failed_cancelled_or_skipped_required_job_runs_the_suite(self):
         for conclusion in ("failure", "cancelled", "skipped", "timed_out", None):
@@ -140,39 +145,6 @@ class DecideTests(unittest.TestCase):
         record = run()
         del record["run_attempt"]
         self.assertIsNone(self.decide([record])[0])
-
-    def test_a_failed_ubuntu_2604_job_is_reused_with_a_warning(self):
-        # The 26.04 job is advisory until #1943 closes: with continue-on-error
-        # the run still succeeds, and its job's failure only warns.
-        for conclusion in ("failure", "cancelled", "timed_out"):
-            with self.subTest(conclusion=conclusion):
-                run_id, warnings = self.decide([run()], with_job("privileged Linux (Ubuntu 26.04)", conclusion))
-                self.assertEqual(run_id, 1)
-                self.assertEqual(len(warnings), 1)
-                self.assertIn("privileged Linux (Ubuntu 26.04)", warnings[0])
-                self.assertIn("#1943", warnings[0])
-
-    def test_a_missing_ubuntu_2604_job_still_runs_the_suite(self):
-        jobs = [job for job in green_jobs() if job["name"] != "privileged Linux (Ubuntu 26.04)"]
-        self.assertIsNone(self.decide([run()], jobs)[0])
-
-    def test_a_failed_ubuntu_2404_job_still_runs_the_suite(self):
-        run_id, reasons = self.decide([run()], with_job("privileged Linux", "failure"))
-        self.assertIsNone(run_id)
-        self.assertIn("'privileged Linux' finished as failure", reasons[0])
-
-    def test_a_failed_run_runs_the_suite_even_when_only_the_advisory_job_failed(self):
-        # continue-on-error keeps the run green; a red run has another cause.
-        jobs = with_job("privileged Linux (Ubuntu 26.04)", "failure")
-        self.assertIsNone(self.decide([run(conclusion="failure")], jobs)[0])
-
-    def test_only_the_ubuntu_2604_job_is_advisory_and_it_cites_its_issue(self):
-        self.assertEqual(ci_reuse.ADVISORY_JOBS, {"privileged Linux (Ubuntu 26.04)": 1943})
-        self.assertIn("privileged Linux (Ubuntu 26.04)", REQUIRED_JOBS)
-        # The same job the gate treats as advisory, and the one ci.yml lets fail.
-        job = re.search(r"(?ms)^  linux-next:\n(.*?)\n    steps:", CI.read_text()).group(1)
-        self.assertIn("    name: privileged Linux (Ubuntu 26.04)\n", job)
-        self.assertIn("\n    continue-on-error: true", job)
 
     def test_one_green_run_among_failed_ones_is_enough(self):
         runs = [run(1, conclusion="failure"), run(2)]
@@ -355,23 +327,6 @@ class MainTests(unittest.TestCase):
                          (0, "reuse=true\nci_run=7\nci_run_attempt=1\n"))
         self.assertIn("after waiting 5 minutes", self.summary)
 
-    def test_a_reused_run_whose_advisory_job_failed_warns_in_the_build_log(self):
-        jobs = with_job("privileged Linux (Ubuntu 26.04)", "failure")
-        clock = Clock([[]])
-        log = io.StringIO()
-        with tempfile.NamedTemporaryFile("r", suffix=".out") as output, \
-                tempfile.NamedTemporaryFile("r", suffix=".md") as summary, \
-                contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(log):
-            status = main(["--repository", REPOSITORY, "--commit", COMMIT, "--github-output", output.name,
-                           "--step-summary", summary.name],
-                          runs_for=lambda repository, commit: [run(7)], jobs_for=lambda repository, run_id: jobs,
-                          now=clock.now, sleep=clock.sleep)
-            self.assertEqual((status, output.read()), (0, "reuse=true\nci_run=7\nci_run_attempt=1\n"))
-            text = summary.read()
-        self.assertIn("::warning::", log.getvalue())
-        self.assertIn("#1943", log.getvalue())
-        self.assertIn("#1943", text)
-
     def test_the_summary_says_why_the_suite_runs(self):
         self.main(lambda repository, commit: [run(7, conclusion="failure")])
         self.assertIn("ran in this build", self.summary)
@@ -411,6 +366,29 @@ class MainTests(unittest.TestCase):
         self.assertEqual(self.main(clock.runs_for, clock=clock, extra=["--event", "merge_group"])[1],
                          "reuse=false\nci_run=\nci_run_attempt=\n")
         self.assertEqual(clock.calls, 1)
+
+    def test_a_train_push_reuses_a_queue_run_that_skipped_only_portable_macos(self):
+        # select-jobs.sh leaves portable macOS out of every merge group; the
+        # nightly on the newest train runs it (macos-nightly.yml).
+        for conclusion in ("skipped", "success"):
+            with self.subTest(conclusion=conclusion):
+                self.assertEqual(self.main(lambda repository, commit: [run(7, event="merge_group")],
+                                           jobs_for=lambda repository, run_id: with_job("portable macOS",
+                                                                                         conclusion),
+                                           extra=["--event", "merge_group"])[1],
+                                 "reuse=true\nci_run=7\nci_run_attempt=1\n")
+        for conclusion in ("failure", "cancelled"):
+            with self.subTest(conclusion=conclusion):
+                self.assertEqual(self.main(lambda repository, commit: [run(7, event="merge_group")],
+                                           jobs_for=lambda repository, run_id: with_job("portable macOS",
+                                                                                         conclusion),
+                                           extra=["--event", "merge_group"])[1],
+                                 "reuse=false\nci_run=\nci_run_attempt=\n")
+
+    def test_a_candidate_never_reuses_a_run_that_skipped_portable_macos(self):
+        self.assertEqual(self.main(lambda repository, commit: [run(7, event="push")],
+                                   jobs_for=lambda repository, run_id: with_job("portable macOS", "skipped"))[1],
+                         "reuse=false\nci_run=\nci_run_attempt=\n")
 
     def test_a_queue_run_that_skipped_a_job_leaves_the_push_to_run_everything(self):
         # A documentation-only group selects no code jobs (select-jobs.sh).

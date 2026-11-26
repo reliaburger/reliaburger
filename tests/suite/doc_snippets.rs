@@ -404,6 +404,8 @@ enum TomlKind {
     Scenario,
     /// `relish batch submit`: `[[cohort]]` entries.
     Manifest,
+    /// `relish os settings --set`: the cluster's `[appliance]` settings.
+    Appliance,
 }
 
 const WORKLOAD_TABLES: &[&str] = &[
@@ -432,6 +434,8 @@ fn classify(document: &toml::Table) -> BTreeMap<TomlKind, toml::Table> {
     for (key, value) in document {
         let kind = whole.unwrap_or(if WORKLOAD_TABLES.contains(&key.as_str()) {
             TomlKind::Workload
+        } else if key == "appliance" {
+            TomlKind::Appliance
         } else {
             TomlKind::Node
         });
@@ -494,6 +498,11 @@ fn check_toml_part(kind: TomlKind, source: &str) -> Result<(), String> {
         }
         TomlKind::Manifest => {
             toml::from_str::<reliaburger::bun::task_array_api::TaskManifestRequest>(source)
+                .map(drop)
+                .map_err(|error| error.to_string())
+        }
+        TomlKind::Appliance => {
+            reliaburger::appliance::settings::ApplianceSettings::from_toml(source)
                 .map(drop)
                 .map_err(|error| error.to_string())
         }
@@ -642,12 +651,16 @@ fn every_relish_command_in_the_readmes_and_whitepaper_parses() {
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
 
-/// Workload configs, plus the two other files `relish` reads: chaos
-/// scenarios and batch manifests.
+/// Workload configs, plus the other files `relish` reads: chaos
+/// scenarios, batch manifests and the cluster's `[appliance]` settings.
 #[test]
 fn every_workload_toml_snippet_parses_and_validates() {
-    let (checked, failures) =
-        check_toml_snippets(&[TomlKind::Workload, TomlKind::Scenario, TomlKind::Manifest]);
+    let (checked, failures) = check_toml_snippets(&[
+        TomlKind::Workload,
+        TomlKind::Scenario,
+        TomlKind::Manifest,
+        TomlKind::Appliance,
+    ]);
     assert!(checked > 30, "found only {checked} workload blocks");
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
@@ -780,14 +793,28 @@ fn help_text(
 }
 
 /// Whether `flag` is in a help text's option list and, if so, whether it
-/// takes a value.
+/// takes a value from the next word. An optional value written with `=`
+/// (clap prints `--stream-logs[=<WHICH>]`) never does.
 fn option_takes_value(help: &str, flag: &str) -> Option<bool> {
     help.lines()
         .map(str::trim_start)
         .filter(|line| line.starts_with('-'))
         .map(|line| line.split("  ").next().unwrap_or_default())
-        .find(|options| options.split([',', ' ']).any(|name| name == flag))
-        .map(|options| options.contains('<'))
+        .find(|options| {
+            options
+                .split([',', ' '])
+                .any(|name| name.split("[=").next() == Some(flag))
+        })
+        .map(|options| options.contains('<') && !options.contains("[="))
+}
+
+#[test]
+fn an_optional_equals_value_never_takes_the_next_word() {
+    let help = "Options:\n      --stream-logs[=<WHICH>]\n          Stream them\n      --key <FILE>\n          A key\n      --reinstall\n          Again\n";
+    assert_eq!(option_takes_value(help, "--stream-logs"), Some(false));
+    assert_eq!(option_takes_value(help, "--key"), Some(true));
+    assert_eq!(option_takes_value(help, "--reinstall"), Some(false));
+    assert_eq!(option_takes_value(help, "--stream"), None);
 }
 
 /// Check an inline span names a real subcommand with real flags. Leading
@@ -1126,6 +1153,10 @@ fn classifies_node_and_workload_tables() {
     );
     // Misspelt tables go to the node parser, which rejects them by name.
     assert_eq!(kinds("[apps.web]"), vec![TomlKind::Node]);
+    assert_eq!(
+        kinds("[appliance]\nconsole_chaos = true"),
+        vec![TomlKind::Appliance]
+    );
     assert_eq!(
         kinds("name = 's'\n[[step]]\nfault = 'kill'"),
         vec![TomlKind::Scenario]

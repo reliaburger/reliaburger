@@ -66,7 +66,11 @@ Ctrl-C stops the browser connection, leaving the cluster running. Use
 
 There is no Rust build and no repository checkout in the published path.
 Native macOS uses Apple's Virtualization.framework through Lima. Linux needs
-QEMU, KVM access and Lima's host prerequisites already installed. Allow at
+QEMU, KVM access and Lima's host prerequisites already installed. QEMU 10.2
+and later abort under Lima's `user-v2` network while io_uring is open to
+ordinary users ([#1495](https://github.com/reliaburger/reliaburger/issues/1495)),
+so setup refuses that combination; `sudo sysctl -w kernel.io_uring_disabled=1`,
+or QEMU 10.1 or older, gets you past it. Allow at
 least 8 GiB of available memory and 15 GiB of free disk for the default cluster;
 image download time also depends on your connection. The VMs don't install
 anything at first boot, so setup doesn't depend on Ubuntu's package mirrors. No host directories are mounted into the VMs. Managed Lima state lives under
@@ -89,6 +93,18 @@ source: the guest image ships with Ubuntu's time daemon (chrony on 26.04)
 disabled, and provisioning disables chrony or systemd-timesyncd on a stock
 Ubuntu image. With both running, they fought, and the guest clock jumped back
 about 0.1 s every 10 s.
+
+The VMs don't update themselves. The guest image ships with Ubuntu's
+`apt-daily.timer`, `apt-daily-upgrade.timer` and `unattended-upgrades` masked,
+and provisioning masks them on a stock image or an older guest image too.
+Where needrestart is installed, it's set to list the services it would restart
+and restart none. Left on, they upgraded libc in a guest and restarted Bun
+without warning: a short API outage, with every workload restarted
+([#2274](https://github.com/reliaburger/reliaburger/issues/2274)). A laptop
+cluster is disposable, and each release builds its guest image again from a
+pinned Ubuntu image, so the guest's packages change with releases, never under
+a running cluster. Security updates arrive with Reliaburger releases: upgrade
+`relish` and build a fresh cluster to pick them up.
 
 For a smaller single-node cluster:
 

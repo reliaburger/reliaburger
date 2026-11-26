@@ -1,0 +1,10 @@
+# Full
+# container runtime, so  chy = 1
+
+[app.myapp.env]
+DATABASE_URL = "postgres://db:5432/myapp"
+LOG_LEVEL = "info"
+
+# Run databed_"
+exec = "/bin/echo"
+command = ["seeding database..."]

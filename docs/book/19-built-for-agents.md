@@ -1705,6 +1705,218 @@ first four come from each node's share of the summary
 `/v1/cluster/capacity`. `--unhealthy` keeps the nodes that aren't alive, are
 cordoned, are under disk pressure or didn't answer.
 
+### Waiting for an apply: `relish apply --wait`
+
+On a cluster, `relish apply` returns once the council has recorded the
+change, with "the scheduler places them now (watch with `relish apps`)".
+That's honest, and it's annoying. In the 0.3.2 Wyse lab nginx took three
+`relish apps` to come up: down with no node, down on `wyse-1` at 17 s,
+running at 27 s. Every script and checklist that applies something and then
+curls it needs the same loop, and each one writes its own (#2240).
+`--wait` is that loop, once. On the lab's nginx it prints something like
+this:
+
+```text
+$ relish apply --wait nginx.toml
+applied 1 app(s); waiting up to 5m for them to run
+[   1s] nginx: 0/1 running; placed on wyse-1
+[   2s] nginx: 0/1 running; 1 pulling nginx:alpine on wyse-1
+[  21s] nginx: 0/1 running; 1 waiting for the health check on wyse-1
+[  27s] nginx: ready, 1/1 running on wyse-1
+1 app(s) ready in 27s
+```
+
+What does "ready" mean? The first two parts were easy. The app runs as many
+replicas as it wants, and each one has passed its health check: an instance
+only reports `running` after `health-wait`, so counting `running` instances
+is enough. Both come from what `relish apps` already reads, the council's
+desired apps and every node's instances, and the rollup's `reason` helper
+supplies the "why" when the scheduler or a node gave one.
+
+The third part needed the server. Apply a new image to an app that's
+already running, and every one of the old instances is still `running` when
+`apply` returns. Count them and the update is "ready" before it starts. We
+looked for a way to tell old instances from new on the client: the image
+reference misses an env change, and "created after the apply" misses a
+scale change, which keeps its instances. The leader already knows the
+answer, though. Rollouts go node by node (Chapter 7), and when the current
+spec runs healthy on every node it's placed on, the leader commits a
+`RolloutReleased` with it. So the leader answers one more read,
+`GET /v1/diagnostics/rollouts`: for each app, the fingerprint of its
+current spec and whether that's its newest released one.
+
+The first version added a `rolled_out` field to the desired-app evidence
+instead. That looked smaller, but the struct refuses unknown fields
+(`#[serde(deny_unknown_fields)]`) and a non-leader forwards the leader's
+answer, so a 0.3.2 node would have failed to read a 0.3.3 leader's. One
+field would have moved the wire protocol and made every 0.3.2 cluster start
+afresh, just as outside testers were upgrading. A new route breaks no
+decoder: an old node answers it 404, and `relish` reads that as "this
+cluster can't say", going by the instance count alone, as it does on a
+standalone node, whose answer is an empty list. The forwarding code that
+`/v1/diagnostics/apps` had became `read_from_leader`, generic over what it
+decodes:
+
+```rust
+async fn read_from_leader<T: serde::de::DeserializeOwned>(
+    state: &ApiState,
+    council: &crate::council::CouncilNode,
+    directory: Option<&LeaderDirectory>,
+    path: &str,
+    names: LeaderRead,
+) -> Result<T, String> {
+```
+
+`DeserializeOwned` is serde's bound for "a type that can be built from
+JSON without borrowing from the input", which is what you need when the
+bytes go away once the response is read. The caller picks `T` with the
+type it expects back, a list of desired apps or a list of rollouts, and the
+compiler writes a decoder for each.
+
+Counting the replicas had two traps of its own, which the review found.
+The council counts a daemon set (`replicas = "*"`) as one per live node,
+but a node its `placement` rules out never gets one, so `running >=
+desired` never held. An autoscaled app has the same shape from the other
+side: the autoscaler can hold it below the file's `replicas`. Both now go by
+what the scheduler placed, once it placed everything it could. The
+manifest says which kind each app is, so the wait keeps that beside the
+app's name as a small enum, `Count::Fixed`, `Count::PerNode` or
+`Count::Autoscaled`.
+
+A failed rollout ends the wait early. The leader doesn't hand a spec that
+failed to any more nodes until someone applies a different one, so waiting
+out the timeout would only delay the bad news.
+
+The loop takes its observations from a closure, so the tests can feed it a
+script of answers without a cluster:
+
+```rust
+pub async fn wait_until_ready<F, Fut>(
+    targets: &[WaitTarget],
+    timeout: Duration,
+    poll: Duration,
+    mut observe: F,
+    mut progress: impl FnMut(Duration, &AppReadiness),
+) -> WaitReport
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Observation, RelishError>>,
+```
+
+`F: FnMut() -> Fut` says `observe` is something you can call with no
+arguments, more than once, that may change its own captured state as it
+goes (`FnMut`, as opposed to `Fn`, which can't, and `FnOnce`, which can be
+called only once). What it returns is `Fut`, any future that resolves to an
+observation or an error. That's how Rust spells "a callback that returns a
+promise": the function never names the future's concrete type, because
+every `async` block has its own anonymous one. `impl FnMut(...)` in argument
+position is shorthand for the same kind of bound, for `progress`. In
+production `observe` is `|| observe(client)`; in the tests it pops the next
+canned answer off a `VecDeque`. The tests run with
+`#[tokio::test(start_paused = true)]`, so the loop's one-second sleeps take
+no time at all, and `the_wait_returns_once_every_app_is_ready` can assert
+that it returned after exactly three.
+
+A look that fails doesn't end the wait. During a leader election the
+desired apps answer 503 for a second or two, and a node can miss its three
+seconds; the next look usually works, and the last error goes in the
+report if it doesn't.
+
+That rule had a hole the train's review found (#2302). "An old node answers
+404" was true of an old node asked directly, but `relish upgrade` does the
+leader last, so for most of a rolling upgrade a 0.3.3 follower forwards the
+rollouts read to a 0.3.2 leader. The leader answered 404, and
+`read_from_leader` turned every failure into a 503. `observe` treated only a
+404 as "no rollouts read", so every look failed and the wait timed out after
+five minutes with nothing to show. The fix has two halves. The follower now
+passes the leader's 404 on, with an error saying the leader may run an older
+release, so relish sees through the follower what it would see asking the
+old node itself. The spec read (#1322) had grown a sibling of
+`read_from_leader` for the same reason, which returns `Found(T)` or
+`Missing(body)` instead of folding a 404 into its error, and the rollouts
+handler uses it. And `observe` stopped trusting any one status: a rollouts
+read that fails for any reason is no rollouts read, never a failed look.
+
+That left the second half of the same bug: with no rollouts read, an image
+update looked ready at once, because the old version's instances run every
+replica. The image is the one part of an update the instances report, so
+with no read the wait counts only the instances on the applied image. A node
+reports `nginx:1.27@sha256:…` when apply bound the tag to a digest, which
+still names the tag, but pinning can also replace the tag outright
+(`nginx@sha256:…`), and then which tag it was is lost. So the comparison
+answers in three ways, not two:
+
+```rust
+fn runs_image(applied: &str, running: &str) -> Option<bool> {
+```
+
+`Some(true)`, `Some(false)` or `None` for "can't tell". `on_applied_image`
+keeps an app's instances on the applied image, and gives up the moment one
+can't be told, with `?` on an `Option` inside a loop:
+
+```rust
+for row in own {
+    if runs_image(applied, row.instance.image.as_deref()?)? {
+        current.push(*row);
+    }
+}
+```
+
+In a function that returns `Option`, `?` on a `None` returns `None` from
+the whole function, as it returns the error from one that returns `Result`.
+So an instance with no reported image, or one that can't be compared, ends
+the filtering, and the wait falls back to counting every running replica, as
+it does for a process workload with no image at all. That fallback can say
+ready early, so it's never silent: `wait_until_ready` takes a second
+callback that hears a note, or a warning when it fell back, once per wait:
+
+```rust
+match rollouts_notice(targets, &observation) {
+    Some(told @ RolloutsNotice::ByImage(_)) if !noted => {
+```
+
+`told @ pattern` binds the whole value to `told` when it matches the
+pattern, so the arm can hand the notice on without rebuilding it, and the
+`if` guard means the arm matches only the first time. The note goes to
+stderr in every output format: an agent reading the JSON on stdout still
+gets told that `ready` rests on the image alone.
+
+`--wait` is a flag, not `--wait 5m` as the issue suggested. A flag with an
+optional value would read `relish apply --wait app.toml` as a wait of
+"app.toml", so the duration went into its own `--timeout`, which clap makes
+require `--wait`. `--wait` conflicts with `--dry-run`, which applies
+nothing, and with `--rerun-jobs`. Jobs have nothing to wait for: the apply
+submits them, and `relish jobs` follows their runs.
+
+The exit codes follow `relish status --check`. 0 when every app is ready, 1
+when the apply went through but an app wasn't ready in time, and the
+envelope's 3, 4 and 5 when the apply itself failed, in every output format.
+So a script can tell "applied, still converging" from "not applied".
+
+The docs truth pass before 0.3.3's testers caught one of those codes lying.
+The manual's table promised 4 for "someone else's lease", and the apply gave
+5. `failure_exit_code` turned the error into an envelope error with
+`AgentError::from`, which sees only the HTTP status, and a held lease
+answers 409, the same as any other conflict. The agent commands already had
+the fix: `agent::lease::lease_error` reads the 409's JSON, and when its
+`code` is `lease_held` it makes the error `LeaseHeld`, which exits 4 and
+names the holder. The apply's error paths now go through it too, for people
+and for `-o json`. Two tests pin it: a 409 with a lease in its body exits 4,
+with `lease_held` and the holder in the envelope, and a 409 without one is
+still a conflict.
+
+With
+`-o json` it answers in the agent envelope with `command: "apply"`, and,
+like `status`, `ok` is `true` whenever the apply happened. An agent that
+read `ok: false` for a timeout would think nothing changed, and the change
+is the one thing it must know about.
+
+The Wyse lab checklist uses it now, and so does the page the quickstart
+opens, which ships inside the same `relish`. The five-minute tour has to
+wait: its commands may only be ones the release `install.sh` installs has,
+and a test holds it to that, so the tour's first apply trades "give it half
+a minute" for `--wait` once 0.3.3 is out, when the tour is recorded again.
+
 ### What else moved
 
 Changing what `status` prints broke everything that read it. The tour's
@@ -2513,10 +2725,15 @@ runs against whatever this build carries:
   paths were relative to `src/`, which made every path an agent quoted subtly
   wrong.
 - `the_digest_is_the_tarballs`: the recorded digest matches the bytes.
-- `the_bundle_stays_under_six_megabytes_at_release_level`: a debug build
+- `the_bundle_stays_under_seven_megabytes_at_release_level`: a debug build
   compresses at level 3, so the test compresses the tarball at 19 itself and
   checks what a release would embed. The failure message says what to do: drop
-  something from the list, or raise the ceiling on purpose.
+  something from the list, or raise the ceiling on purpose. The ceiling was
+  6 MiB until 0.3.3, when the tree had grown to 6.22 MB and the release's
+  queued pull requests together took it to 6.33 MB. Each passed alone; only
+  the merge queue, testing them together, crossed the line. The biggest single
+  addition was a fuzz corpus, 67 KB compressed, and the fuzz tests read it, so
+  it stays: we raised the ceiling to 7 MiB on purpose instead.
 
 The second kind packs a small tree in a temporary directory, so the result is
 known exactly: two packs of the same files give the same digest and the same
@@ -6753,8 +6970,10 @@ the lock file and returns every other error. Change that match guard to
 `true`, so every error is ignored, and `file_lock::`'s tests still pass.
 Nothing checks that a real failure to remove the file gets reported.
 
-So a pull request that touches `src/`, into `main` or into a release's merge
-train, now gets a mutants job, and the job
+So a mutants job now runs every night on the newest release train,
+mutating what changed under `src/` that day. It ran on every pull request at
+first, until the runners it held made the train's own CI queue behind it.
+The job
 summary lists each mutant its tests missed, with a link that opens a
 pre-filled `missed-mutant` issue. A person files it. The job never does, for
 the same reason `relish agent report` only drafts: nothing posts to GitHub on
@@ -6764,16 +6983,16 @@ The cost shaped most of the design. The crate has about 27,000 mutants, and
 each one rebuilds the crate before its tests run, so a whole-crate run is a
 thousand runner-hours. Four limits keep it affordable:
 
-- **Only the change.** `--in-diff` mutates only the lines a pull request
-  touches, and the weekly run takes only the week's changes on `main`.
-- **A budget.** At most 12 mutants a pull request, as one round-robin shard
+- **Only the change.** `--in-diff` mutates only the lines that changed,
+  and each night's run takes only that day's changes on the newest train.
+- **A budget.** At most 60 mutants a night, as one round-robin shard
   of the list, so the sample spreads over every file instead of using up the
   budget on the first one.
 - **Only the nearby tests.** A mutant in `src/council/network.rs` runs
   `council::`'s unit tests, not the whole suite. A mutant that only an
   integration test catches then shows as missed, and the summary says so.
-- **A clock.** The test step stops itself after 60 minutes and reports what
-  it finished, so a slow run still produces a summary.
+- **A clock.** The test step stops itself after 300 minutes and reports
+  what it finished, so a slow run still produces a summary.
 
 The clock came from the first CI run, which had only the count. Each mutant
 took seven and a half minutes to build, the job hit its 90-minute limit

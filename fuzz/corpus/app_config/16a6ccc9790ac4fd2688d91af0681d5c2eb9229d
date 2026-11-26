@@ -1,0 +1,14 @@
+# Real containers: one ose.
+#
+# Apps in one namespace can't reach apps in another. Here `1cache` li-to cache --to-namespace storage
+
+[namespace.storage]
+[namespace.shop]
+[namespace.t]
+namespace = "shop"
+image = "public.ecr.aws/docker/library/busybox@sha254d30d7710e01fb739c87a8b9299685c63704296b16028"
+command = [
+  "/bin/sh",
+  "-c",
+  "while true; do printf 'PING\\r\\n' | nc -w 2 cache.storage.internal 6379 || echo refused; sleep 1; done",
+]

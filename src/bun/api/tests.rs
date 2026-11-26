@@ -24,7 +24,10 @@ async fn registry_query_response_refuses_an_oversized_catalogue() {
 }
 
 use super::faults::NODE_REQUEST_TIMEOUT;
-use super::node_info::{council_app_evidence, filter_desired_apps_for_scope, valid_path_label};
+use super::node_info::{
+    DESIRED_APPS_FORWARDED_HEADER, council_app_evidence, filter_desired_apps_for_scope,
+    valid_path_label,
+};
 use super::ui::statuses_to_dashboard_apps;
 use super::upgrade::{UPGRADE_FORWARDED_HEADER, check_council_can_roll};
 use super::*;
@@ -2036,15 +2039,10 @@ async fn follower_with_history_of_a_recording_leader(
     (follower, seen, nodes)
 }
 
-/// A three-node council led by node 1, whose API is whatever listens on
-/// `leader_port`. Returns node 2's real router (a follower) with `token` in
-/// its store and `history` as its deploy records, and the council nodes to
-/// shut down.
-async fn follower_of_the_leader_api_on(
-    token: crate::sesame::types::ApiToken,
-    history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
-    leader_port: u16,
-) -> (Router, Vec<Arc<crate::council::CouncilNode>>) {
+/// Three in-memory council nodes, node 1 leading, none of them seeded with
+/// the cluster's security state. Without gossip, a follower finds the
+/// leader's API at its Raft IP (127.0.0.1) and the cluster's API port.
+async fn three_council_nodes() -> Vec<Arc<crate::council::CouncilNode>> {
     use crate::council::CouncilNode;
     use crate::council::log_store::MemLogStore;
     use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
@@ -2087,6 +2085,20 @@ async fn follower_of_the_leader_api_on(
     })
     .await
     .unwrap();
+
+    nodes
+}
+
+/// A three-node council led by node 1, whose API is whatever listens on
+/// `leader_port`. Returns node 2's real router (a follower) with `token` in
+/// its store and `history` as its deploy records, and the council nodes to
+/// shut down.
+async fn follower_of_the_leader_api_on(
+    token: crate::sesame::types::ApiToken,
+    history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
+    leader_port: u16,
+) -> (Router, Vec<Arc<crate::council::CouncilNode>>) {
+    let nodes = three_council_nodes().await;
 
     let (commands, _receiver) = mpsc::channel(4);
     let store = crate::sesame::auth::new_token_store();
@@ -2635,6 +2647,8 @@ const LEADER_ONLY_CALLS: &[(&str, &str, &str)] = &[
     ),
     ("POST", "/v1/upgrade/abort", ""),
     ("GET", "/v1/diagnostics/apps", ""),
+    ("GET", "/v1/diagnostics/rollouts", ""),
+    ("GET", "/v1/apps/web/default/spec", ""),
     ("POST", "/v1/batch/1/cancel", ""),
     ("GET", "/v1/batch/1/results", ""),
     ("GET", "/v1/batch/1/tasks/0/logs", ""),
@@ -5678,8 +5692,10 @@ async fn a_scoped_token_reads_only_its_own_namespaces_events() {
 }
 
 /// Every route that upgrades, rolls back or re-elects the cluster.
-const CLUSTER_ADMIN_ROUTES: [&str; 11] = [
+const CLUSTER_ADMIN_ROUTES: [&str; 13] = [
     "/v1/os/stage",
+    "/v1/os/boot-logs",
+    "/v1/os/settings",
     "/v1/os/rollout/start",
     "/v1/os/rollout/resume",
     "/v1/os/rollout/abort",
@@ -5954,13 +5970,21 @@ async fn workload_admission_fixture(
     (app, council, rx)
 }
 
+/// How long applied jobs get to settle through the common executor. On a
+/// quiet host it takes well under a second, but the path crosses several
+/// Raft writes and the task ledger's commits, and at 12 nextest threads
+/// with the host's disk busy it overran a 5 s bound once in ten runs
+/// (#2305). The wait ends as soon as every job succeeds, and it fails with
+/// its own message before nextest's 60 s kill.
+const SETTLEMENT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(45);
+
 async fn assert_authorised_job_dispatch_and_settlement(
     commands: &mut mpsc::Receiver<WorkloadAdmissionTrace>,
     council: &crate::council::CouncilNode,
     expected: &crate::config::Config,
     _rerun: bool,
 ) {
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(SETTLEMENT_DEADLINE, async {
         loop {
             let desired = council.desired_state().await;
             if expected.job.iter().all(|(name, spec)| {
@@ -7912,6 +7936,8 @@ async fn trust_changing_routes_record_who_called_them() {
 async fn token_create_writes_to_raft_and_returns_plaintext() {
     let (cmd_tx, _cmd_rx) = mpsc::channel(32);
     let council = seeded_council("tokencreate").await;
+    // The nodes have a service token (a master key), so the first API
+    // token doesn't lock them out (#1248).
     let app = router(
         cmd_tx,
         None,
@@ -7921,7 +7947,7 @@ async fn token_create_writes_to_raft_and_returns_plaintext() {
         None,
         Some(Arc::clone(&council)),
         None,
-        None,
+        Some("rbrg_service".into()),
         None,
         None,
         None,
@@ -7953,6 +7979,51 @@ async fn token_create_writes_to_raft_and_returns_plaintext() {
     let stored = council.security_state().await.api_tokens;
     let token = stored.iter().find(|t| t.name == "ci-bot").unwrap();
     assert!(crate::sesame::token::validate_token(plaintext, token).is_ok());
+}
+
+/// #1248: on a plaintext cluster with no master key, the nodes have no
+/// service token and get in only while no credential exists. The first
+/// API token would end that, and every placement poll and rollout report
+/// after it would get 401, so the API refuses to create it and names the
+/// setting that fixes it. Nothing reaches Raft.
+#[tokio::test]
+async fn the_first_token_is_refused_while_the_nodes_have_no_service_token() {
+    let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+    let council = seeded_council("tokencreate-no-key").await;
+    let app = router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::clone(&council)),
+        Some(crate::sesame::auth::new_token_store()),
+        None,
+        None,
+        None,
+        None,
+        9117,
+        None,
+    );
+
+    let response = app
+        .oneshot(
+            axum::http::Request::post("/v1/token/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "name": "first-admin", "role": "admin" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let message = String::from_utf8_lossy(&body);
+    assert!(message.contains("[security] master_key_path"), "{message}");
+    assert!(message.contains("401"), "{message}");
+    assert!(council.security_state().await.api_tokens.is_empty());
 }
 
 #[tokio::test]
@@ -8210,6 +8281,35 @@ async fn apply_invalid_config_returns_400() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    shutdown.cancel();
+}
+
+/// #2296: the spec read's `[redacted]` placeholder, applied back, would
+/// replace the real value, so the apply endpoint refuses it by name.
+#[tokio::test]
+async fn apply_refuses_the_redaction_placeholder_as_a_value() {
+    let (app, shutdown) = test_setup();
+
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/apply")
+                .body(Body::from(
+                    "[app.web]\nimage = \"web:v1\"\n[app.web.env]\nDB_PASSWORD = \"[redacted]\"\n",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        body.contains("app web: env DB_PASSWORD is the redaction placeholder"),
+        "{body}"
+    );
     shutdown.cancel();
 }
 
@@ -10385,6 +10485,64 @@ async fn a_node_that_isnt_an_appliance_refuses_to_stage_an_os() {
     shutdown.cancel();
 }
 
+/// Boot logs live on an appliance's ESP (#2149): any other node says it
+/// has none, both when asked and when told where to send them.
+#[tokio::test]
+async fn a_node_that_isnt_an_appliance_has_no_boot_logs_to_send() {
+    let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (app, shutdown) = setup_with_auth(vec![token], None).await;
+    let (status, body) = post_authenticated(
+        app.clone(),
+        "/v1/os/boot-logs",
+        &plaintext,
+        r#"{"target":"10.42.0.1:6666"}"#,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(String::from_utf8_lossy(&body).contains("isn't an appliance"));
+    let response = app
+        .oneshot(
+            axum::http::Request::get("/v1/os/boot-logs")
+                .header("Authorization", format!("Bearer {plaintext}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    shutdown.cancel();
+}
+
+/// Reading where boot logs go is anyone's; changing it is a cluster
+/// admin's.
+#[tokio::test]
+async fn a_read_only_token_reads_boot_logs_but_cannot_change_them() {
+    let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::ReadOnly);
+    let (app, shutdown) = setup_with_auth(vec![token], None).await;
+    let (status, _) = post_authenticated(
+        app.clone(),
+        "/v1/os/boot-logs",
+        &plaintext,
+        r#"{"target":null}"#,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let response = app
+        .oneshot(
+            axum::http::Request::get("/v1/os/boot-logs")
+                .header("Authorization", format!("Bearer {plaintext}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Past authorisation: refused only because this isn't an appliance.
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    shutdown.cancel();
+}
+
 /// Serve `council`'s router on a local port and return a client for it,
 /// the token that stops the server, and the server task.
 async fn served_client_for_council(
@@ -10676,16 +10834,19 @@ async fn dry_run_endpoint_preserves_namespace_identity_and_caller_scope() {
                     resource: "app.team/web".into(),
                     image: Some("web:v1".into()),
                     fingerprint: Some("team-spec".into()),
+                    owner: None,
                 },
                 CurrentResourceStatus {
                     resource: "app.other/web".into(),
                     image: Some("web:v1".into()),
                     fingerprint: Some("other-spec".into()),
+                    owner: None,
                 },
                 CurrentResourceStatus {
                     resource: "job.team/migrate".into(),
                     image: Some("web:v1".into()),
                     fingerprint: None,
+                    owner: None,
                 },
             ])
             .unwrap();
@@ -12291,4 +12452,832 @@ fn the_token_forward_backstop_outlasts_the_leaders_own_deadlines() {
                 + crate::council::node::WRITE_TIMEOUT
                 + super::identity::TOKEN_REPLICATION_WAIT
     );
+}
+
+/// GET `path` from `app` as `bearer`, and decode the JSON answer.
+async fn get_rollouts(
+    app: &Router,
+    bearer: &str,
+) -> (StatusCode, Vec<crate::bun::diagnostics::RolloutEvidence>) {
+    let (status, body) = send_bounded(
+        app.clone(),
+        "GET",
+        "/v1/diagnostics/rollouts",
+        bearer,
+        "",
+        &[],
+    )
+    .await;
+    let rollouts = if status == StatusCode::OK {
+        serde_json::from_str(&body).unwrap()
+    } else {
+        Vec::new()
+    };
+    (status, rollouts)
+}
+
+/// #2240: the leader says whether each app's current spec has rolled out,
+/// for `relish apply --wait`: not until a `RolloutReleased` names that
+/// spec. An app nobody applied isn't listed, and a scoped token sees only
+/// its own namespace.
+#[tokio::test]
+async fn the_leader_says_whether_each_apps_current_spec_rolled_out() {
+    let council = seeded_council("rollouts-leader").await;
+    let (admin, admin_key) = named_user_token("operator", crate::sesame::types::ApiRole::Admin);
+    let scoped = crate::sesame::token::create_token(
+        "shop-only",
+        crate::sesame::types::ApiRole::ReadOnly,
+        crate::sesame::types::TokenScope {
+            apps: None,
+            namespaces: Some(vec!["shop".to_string()]),
+        },
+        None,
+    )
+    .unwrap();
+    let (app, _shutdown) = setup_with_auth_leases_events_and_council(
+        vec![admin, scoped.token],
+        None,
+        crate::bun::readiness::ReadinessTracker::new(),
+        crate::bun::capabilities::StaticCapabilities::default(),
+        None,
+        None,
+        Some(Arc::clone(&council)),
+    )
+    .await;
+    let (status, body) = send_bounded(
+        app.clone(),
+        "POST",
+        "/v1/apply",
+        &admin_key,
+        "[namespace.shop]\n[app.web]\nimage = 'web:v1'\n[app.cart]\nimage = 'cart:v1'\nnamespace = 'shop'\n",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, rollouts) = get_rollouts(&app, &admin_key).await;
+    assert_eq!(status, StatusCode::OK);
+    let seen: Vec<(&str, &str, bool)> = rollouts
+        .iter()
+        .map(|r| (r.namespace.as_str(), r.app.as_str(), r.rolled_out))
+        .collect();
+    // Sorted by namespace and name; `ghost` was never applied.
+    assert_eq!(seen, [("default", "web", false), ("shop", "cart", false)]);
+
+    let web = crate::meat::AppId::new("web", "default");
+    let spec = council.desired_state().await.apps[&web].clone();
+    assert_eq!(
+        rollouts[0].fingerprint,
+        crate::meat::deploy_types::rollout_fingerprint(&spec)
+    );
+    council
+        .write(crate::council::types::RaftRequest::RolloutReleased {
+            app_id: web,
+            spec: Box::new(spec),
+        })
+        .await
+        .unwrap();
+    let (_, rollouts) = get_rollouts(&app, &admin_key).await;
+    assert!(rollouts[0].rolled_out, "{rollouts:?}");
+    assert!(!rollouts[1].rolled_out, "{rollouts:?}");
+
+    let (status, rollouts) = get_rollouts(&app, &scoped.plaintext).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rollouts.len(), 1, "{rollouts:?}");
+    assert_eq!(rollouts[0].app, "cart");
+}
+
+/// #2240: a follower forwards the rollouts read to the leader, marked so
+/// the leader never forwards it again, and answers with the leader's list.
+#[tokio::test]
+async fn a_follower_forwards_the_rollouts_read_to_the_leader() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let leader_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let leader_port = leader_listener.local_addr().unwrap().port();
+    let marked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = Arc::clone(&marked);
+    let leader = axum::Router::new().route(
+        "/v1/diagnostics/rollouts",
+        axum::routing::get(move |headers: HeaderMap| {
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.store(
+                    headers.contains_key(DESIRED_APPS_FORWARDED_HEADER)
+                        && headers.contains_key(LEADER_FORWARDED_HEADER),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                Json(vec![crate::bun::diagnostics::RolloutEvidence {
+                    app: "web".into(),
+                    namespace: "default".into(),
+                    fingerprint: "f".into(),
+                    rolled_out: true,
+                }])
+            }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(leader_listener, leader).await.unwrap() });
+    let (follower, nodes) = follower_of_the_leader_api_on(admin, None, leader_port).await;
+
+    let (status, rollouts) = get_rollouts(&follower, &admin_key).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rollouts.len(), 1);
+    assert!(rollouts[0].rolled_out);
+    assert!(
+        marked.load(std::sync::atomic::Ordering::SeqCst),
+        "the forward carries both forwarded marks"
+    );
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// #2302: a 0.3.2 leader doesn't serve the rollouts read and answers 404.
+/// A follower passes the 404 on, saying why, so relish sees what it would
+/// see asking the old node itself, not a 503 that fails the whole look.
+#[tokio::test]
+async fn a_follower_passes_on_its_leaders_rollouts_404() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let leader_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let leader_port = leader_listener.local_addr().unwrap().port();
+    // An old release's router: no rollouts route, so axum's empty 404.
+    let leader = axum::Router::new();
+    tokio::spawn(async move { axum::serve(leader_listener, leader).await.unwrap() });
+    let (follower, nodes) = follower_of_the_leader_api_on(admin, None, leader_port).await;
+
+    let (status, reply) = send_bounded(
+        follower,
+        "GET",
+        "/v1/diagnostics/rollouts",
+        &admin_key,
+        "",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{reply}");
+    assert!(reply.contains("may run an older release"), "{reply}");
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// #2240: a node with no council has no rollouts to report: an empty list,
+/// so `relish apply --wait` goes by the instance count.
+#[tokio::test]
+async fn a_node_without_a_council_reports_no_rollouts() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (app, _shutdown) = setup_with_auth_leases_events_and_council(
+        vec![admin],
+        None,
+        crate::bun::readiness::ReadinessTracker::new(),
+        crate::bun::capabilities::StaticCapabilities::default(),
+        None,
+        None,
+        None,
+    )
+    .await;
+    let (status, rollouts) = get_rollouts(&app, &admin_key).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(rollouts.is_empty());
+}
+
+/// A follower of a stub leader whose API is `leader`, and an admin's key.
+async fn follower_of_a_stub_leader(
+    leader: Router,
+) -> (Router, String, Vec<Arc<crate::council::CouncilNode>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, leader).await.unwrap() });
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (follower, nodes) = follower_of_the_leader_api_on(admin, None, port).await;
+    (follower, admin_key, nodes)
+}
+
+/// #1322: a leader that doesn't serve the spec read (an older release
+/// during a rolling upgrade) answers an empty 404. The follower passes the
+/// 404 on and says why, rather than claiming the app doesn't exist.
+#[tokio::test]
+async fn a_follower_says_when_its_leader_does_not_serve_spec_reads() {
+    let (follower, admin_key, nodes) = follower_of_a_stub_leader(Router::new()).await;
+    let (status, reply) = send_bounded(
+        follower,
+        "GET",
+        "/v1/apps/web/default/spec",
+        &admin_key,
+        "",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{reply}");
+    assert!(
+        reply.contains("the leader doesn't serve spec reads; it may run an older release"),
+        "{reply}"
+    );
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// #1322: a leader that has no such app answers a 404 with a reason, and
+/// the follower passes the 404 on.
+#[tokio::test]
+async fn a_follower_passes_on_its_leaders_spec_read_404() {
+    let leader = Router::new().route(
+        "/v1/apps/{app}/{namespace}/spec",
+        axum::routing::get(|| async {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "no app \"web\" in namespace \"default\"" })),
+            )
+        }),
+    );
+    let (follower, admin_key, nodes) = follower_of_a_stub_leader(leader).await;
+    let (status, reply) = send_bounded(
+        follower,
+        "GET",
+        "/v1/apps/web/default/spec",
+        &admin_key,
+        "",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{reply}");
+    assert!(
+        reply.contains(r#"no app \"web\" in namespace \"default\""#),
+        "{reply}"
+    );
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+// --- The appliance console's kill mode (#2151) ---
+
+/// A one-node cluster for the console's kill mode: a seeded council, two
+/// running replicas of `web` on `node-1`, a server test policy that allows
+/// workload faults, and the tokens the tests play with.
+struct ConsoleNode {
+    app: Router,
+    shutdown: CancellationToken,
+    /// The console token, derived from the node's service token.
+    console: String,
+    admin: String,
+    reader: String,
+    /// The process both replicas report as theirs, which a kill signals.
+    process: Option<std::process::Child>,
+    /// The node's event ring, where the audit records land.
+    events: Arc<RwLock<crate::bun::events::EventStore>>,
+}
+
+impl Drop for ConsoleNode {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        if let Some(process) = self.process.as_mut() {
+            let _ = process.kill();
+            let _ = process.wait();
+        }
+    }
+}
+
+/// The instance the tests shoot at, as MockGrill names it.
+const CONSOLE_TARGET: &str = "default__web-0";
+
+async fn console_node(tag: &str) -> ConsoleNode {
+    console_node_on(seeded_council(tag).await, "node-1", 9117).await
+}
+
+/// [`console_node`] on `council`, named `node_name`, finding other nodes'
+/// APIs on `api_port`.
+async fn console_node_on(
+    council: Arc<crate::council::CouncilNode>,
+    node_name: &str,
+    api_port: u16,
+) -> ConsoleNode {
+    let (cmd_tx, cmd_rx) = mpsc::channel(32);
+    let shutdown = CancellationToken::new();
+    let process = std::process::Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .unwrap();
+    let grill = MockGrill::new();
+    grill.set_pid(process.id());
+    let mut agent = BunAgent::new(
+        grill,
+        PortAllocator::new(30000, 31000),
+        cmd_rx,
+        shutdown.clone(),
+    );
+    tokio::spawn(async move {
+        agent.run().await;
+    });
+    let (events, mut deployed) = mpsc::channel(64);
+    cmd_tx
+        .send(AgentCommand::Deploy {
+            config: crate::config::Config::parse(
+                "[app.web]\nimage = \"web:v1\"\nport = 8080\nreplicas = 2\n",
+            )
+            .unwrap(),
+            events,
+        })
+        .await
+        .unwrap();
+    while deployed.recv().await.is_some() {}
+
+    let service = crate::sesame::token::derive_service_token(&[7u8; 32]).unwrap();
+    let console = crate::sesame::token::derive_console_token(&service).unwrap();
+    let (admin_token, admin) =
+        named_user_token("console-admin", crate::sesame::types::ApiRole::Admin);
+    let (reader_token, reader) =
+        named_user_token("console-reader", crate::sesame::types::ApiRole::ReadOnly);
+    let store = crate::sesame::auth::new_token_store();
+    *store.write().await = vec![admin_token, reader_token];
+    let events = Arc::new(RwLock::new(crate::bun::events::EventStore::new()));
+    let app = router_with_upgrade(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(council),
+        Some(store),
+        Some(service),
+        None,
+        None,
+        None,
+        None,
+        api_port,
+        Some(Arc::clone(&events)),
+        None,
+        None,
+        "default".to_string(),
+        Some(node_name.to_string()),
+        crate::bun::build_runner::BuildSettings::with_timeout(900),
+        crate::cluster::ClusterHttp::plaintext(),
+        5050,
+        "http",
+        256 * 1024 * 1024,
+        false,
+        workload_fault_static_capabilities(),
+        crate::bun::readiness::ReadinessTracker::new(),
+        None,
+        None,
+        None,
+        None,
+    );
+    ConsoleNode {
+        app,
+        shutdown,
+        console,
+        admin,
+        reader,
+        process: Some(process),
+        events,
+    }
+}
+
+/// One change to a request, for the tables of widening attempts.
+type ChangeRequest = fn(&mut crate::smoker::types::FaultRequest);
+
+/// The kill the console sends for an invader: `relish fault kill
+/// --instance` for one instance on this node.
+fn console_kill() -> crate::smoker::types::FaultRequest {
+    crate::relish::fault::instance_kill_request(
+        "web",
+        "default",
+        CONSOLE_TARGET,
+        "node-1",
+        "shot down in the invaders game",
+    )
+}
+
+impl ConsoleNode {
+    async fn call(
+        &self,
+        method: &str,
+        uri: &str,
+        bearer: &str,
+        body: String,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = self
+            .app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("authorization", format!("Bearer {bearer}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        let value = serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text));
+        (status, value)
+    }
+
+    async fn set_kill_mode(&self, on: bool) {
+        let (status, body) = self
+            .call(
+                "POST",
+                "/v1/os/settings",
+                &self.admin,
+                serde_json::json!({ "console_chaos": on }).to_string(),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    async fn kill_mode(&self, bearer: &str) -> bool {
+        let (status, body) = self
+            .call("GET", "/v1/os/settings", bearer, String::new())
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["console_chaos"].as_bool().unwrap()
+    }
+
+    async fn console_fault(
+        &self,
+        request: &crate::smoker::types::FaultRequest,
+    ) -> (StatusCode, serde_json::Value) {
+        self.call(
+            "POST",
+            "/v1/fault",
+            &self.console,
+            serde_json::to_string(request).unwrap(),
+        )
+        .await
+    }
+}
+
+#[test]
+fn the_console_may_send_exactly_one_shape_of_fault() {
+    use super::faults::console_kill_refusal;
+    use crate::smoker::types::FaultType;
+
+    let node = Some("node-1");
+    assert_eq!(console_kill_refusal(&console_kill(), node), None);
+    let refused = |change: ChangeRequest| {
+        let mut request = console_kill();
+        change(&mut request);
+        console_kill_refusal(&request, node)
+    };
+    assert!(refused(|r| r.fault_type = FaultType::Kill { count: 0 }).is_some());
+    assert!(refused(|r| r.fault_type = FaultType::Kill { count: 2 }).is_some());
+    assert!(refused(|r| r.fault_type = FaultType::Pause).is_some());
+    assert!(refused(|r| r.fault_type = FaultType::DnsNxdomain).is_some());
+    assert!(refused(|r| r.duration = std::time::Duration::from_secs(60)).is_some());
+    assert!(refused(|r| r.target_instance = None).is_some());
+    assert!(refused(|r| r.target_instance = Some(String::new())).is_some());
+    assert!(refused(|r| r.task_index = Some(0)).is_some());
+    assert!(refused(|r| r.target_node = None).is_some());
+    assert!(refused(|r| r.target_node = Some("node-2".into())).is_some());
+    assert!(refused(|r| r.include_leader = true).is_some());
+    assert!(refused(|r| r.override_safety = true).is_some());
+    assert!(
+        console_kill_refusal(&console_kill(), None).is_some(),
+        "a node with no name can't tell its own instances"
+    );
+}
+
+/// Kill mode is off until a cluster admin turns it on: the console's
+/// kill is refused, and nothing is killed.
+#[tokio::test]
+async fn the_console_cant_kill_while_kill_mode_is_off() {
+    let node = console_node("console-off").await;
+    assert!(!node.kill_mode(&node.console).await, "off by default");
+    let (status, body) = node.console_fault(&console_kill()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.to_string().contains("kill mode is off"), "{body}");
+
+    node.set_kill_mode(true).await;
+    node.set_kill_mode(false).await;
+    let (status, body) = node.console_fault(&console_kill()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "turned off again: {body}");
+}
+
+/// Only an unscoped cluster admin changes the setting; anyone, the
+/// console included, reads it.
+#[tokio::test]
+async fn an_admin_turns_kill_mode_on_and_the_console_reads_it() {
+    let node = console_node("console-settings").await;
+    let on = serde_json::json!({ "console_chaos": true }).to_string();
+    for bearer in [&node.console, &node.reader] {
+        let (status, _) = node
+            .call("POST", "/v1/os/settings", bearer, on.clone())
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    assert!(!node.kill_mode(&node.admin).await);
+
+    node.set_kill_mode(true).await;
+    assert!(node.kill_mode(&node.console).await);
+    assert!(node.kill_mode(&node.reader).await);
+
+    let (status, _) = node
+        .call(
+            "POST",
+            "/v1/os/settings",
+            &node.admin,
+            r#"{"console_choas": true}"#.to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a misspelt key");
+    assert!(node.kill_mode(&node.console).await, "left as it was");
+}
+
+/// In kill mode the console's kill runs the ordinary fault path: Smoker
+/// kills the instance and the fault is the console's.
+#[tokio::test]
+async fn the_console_kills_one_instance_in_kill_mode() {
+    let node = console_node("console-kill").await;
+    node.set_kill_mode(true).await;
+    let (status, body) = node.console_fault(&console_kill()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let summary: crate::smoker::types::FaultSummary = serde_json::from_value(body).unwrap();
+    assert_eq!(summary.injected_by, crate::sesame::auth::CONSOLE_PRINCIPAL);
+    assert_eq!(summary.target_instance.as_deref(), Some(CONSOLE_TARGET));
+    let recorded = node.events.read().await.recent(10, None, None);
+    let injected = recorded
+        .iter()
+        .find(|event| event.action.as_deref() == Some("fault.injected"))
+        .expect("the kill is audited");
+    assert!(
+        injected
+            .principal
+            .as_deref()
+            .is_some_and(|principal| principal.contains(crate::sesame::auth::CONSOLE_PRINCIPAL)),
+        "{injected:?}"
+    );
+    let mut node = node;
+    let process = node.process.as_mut().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while process.try_wait().unwrap().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the instance's process outlived its kill"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Kill mode lets the console send one shape of request, and nothing
+/// wider: every other fault, node, flag or route is still refused.
+#[tokio::test]
+async fn kill_mode_doesnt_widen_what_the_console_may_do() {
+    use crate::smoker::types::FaultType;
+
+    let node = console_node("console-widen").await;
+    node.set_kill_mode(true).await;
+    let widened: Vec<(&str, &str, ChangeRequest)> = vec![
+        (
+            "a counted kill",
+            "the console only kills one instance at a time",
+            |r| r.fault_type = FaultType::Kill { count: 2 },
+        ),
+        (
+            "a kill of every replica",
+            "the console only kills one instance at a time",
+            |r| r.fault_type = FaultType::Kill { count: 0 },
+        ),
+        (
+            "another fault type",
+            "the console only kills one instance at a time",
+            |r| r.fault_type = FaultType::Pause,
+        ),
+        (
+            "a network fault",
+            "the console only kills one instance at a time",
+            |r| r.fault_type = FaultType::DnsNxdomain,
+        ),
+        (
+            "a node fault",
+            "the console only kills one instance at a time",
+            |r| {
+                r.fault_type = FaultType::NodeKill {
+                    kill_containers: true,
+                };
+                r.target_service = String::new();
+            },
+        ),
+        (
+            "a lasting fault",
+            "the console only kills one instance at a time",
+            |r| r.duration = std::time::Duration::from_secs(600),
+        ),
+        (
+            "another node",
+            "the console only kills instances on its own node",
+            |r| r.target_node = Some("node-2".into()),
+        ),
+        (
+            "no node",
+            "the console only kills instances on its own node",
+            |r| r.target_node = None,
+        ),
+        ("no instance", "must name its instance", |r| {
+            r.target_instance = None
+        }),
+        ("a task index", "not job tasks", |r| r.task_index = Some(0)),
+        // Routing would read a bare number as a job's task index.
+        (
+            "a number as the instance",
+            "the console only kills running instances of",
+            |r| r.target_instance = Some("0".into()),
+        ),
+        (
+            "an instance that doesn't run here",
+            "the console only kills running instances of",
+            |r| r.target_instance = Some("default__web-9".into()),
+        ),
+        (
+            "an instance of another app",
+            "the console only kills running instances of",
+            |r| r.target_service = "api".into(),
+        ),
+        (
+            "an instance in another namespace",
+            "the console only kills running instances of",
+            |r| r.namespace = Some("team-b".into()),
+        ),
+        ("the leader", "can't override Smoker's safety rails", |r| {
+            r.include_leader = true
+        }),
+        (
+            "a safety override",
+            "can't override Smoker's safety rails",
+            |r| r.override_safety = true,
+        ),
+    ];
+    for (what, refusal, change) in widened {
+        let mut request = console_kill();
+        change(&mut request);
+        let (status, body) = node.console_fault(&request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{what}: {body}");
+        assert!(body.to_string().contains(refusal), "{what}: {body}");
+    }
+
+    // Other mutating routes stay closed to the read-only console.
+    let (status, _) = node
+        .call("DELETE", "/v1/fault", &node.console, String::new())
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "clearing faults");
+    let (status, _) = node
+        .call(
+            "POST",
+            "/v1/os/settings",
+            &node.console,
+            serde_json::json!({ "console_chaos": false }).to_string(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "changing the setting");
+
+    // The elevation lasts one request: the next is read-only again.
+    let (status, body) = node.console_fault(&console_kill()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _) = node
+        .call("DELETE", "/v1/fault", &node.console, String::new())
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "still read-only afterwards");
+}
+
+/// A standalone node has no council to hold the setting, so it reads kill
+/// mode as off and refuses the console's kill.
+#[tokio::test]
+async fn a_standalone_node_reads_kill_mode_as_off() {
+    let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+    let service = crate::sesame::token::derive_service_token(&[7u8; 32]).unwrap();
+    let console = crate::sesame::token::derive_console_token(&service).unwrap();
+    let app = router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(service),
+        None,
+        None,
+        None,
+        9117,
+        None,
+    );
+    let node = ConsoleNode {
+        app,
+        shutdown: CancellationToken::new(),
+        console: console.clone(),
+        admin: String::new(),
+        reader: String::new(),
+        process: None,
+        events: Arc::new(RwLock::new(crate::bun::events::EventStore::new())),
+    };
+    assert!(!node.kill_mode(&console).await);
+    let (status, body) = node.console_fault(&console_kill()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+/// Two kills in quick succession of a two-replica app: the first leaves
+/// its instance reading `running` until the agent's sweep, but the rail
+/// counts it as gone, so the second is refused and one replica survives.
+/// The same holds from the CLI, through a person's token.
+#[tokio::test]
+async fn two_quick_kills_cant_take_the_last_replica() {
+    let node = console_node("console-race").await;
+    node.set_kill_mode(true).await;
+    let (status, body) = node.console_fault(&console_kill()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let mut second = console_kill();
+    second.target_instance = Some("default__web-1".into());
+    let (status, body) = node.console_fault(&second).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("replica"), "{body}");
+
+    let (status, body) = node
+        .call(
+            "POST",
+            "/v1/fault",
+            &node.admin,
+            serde_json::to_string(&second).unwrap(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "from the CLI: {body}");
+}
+
+/// Node 2 of three council nodes led by node 1, with a stub of the leader's
+/// API on a port of its own. Node 2's replica holds no cluster state, so it
+/// asks the leader for the setting.
+async fn console_follower(leader: Router) -> (ConsoleNode, Vec<Arc<crate::council::CouncilNode>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, leader).await.unwrap() });
+    let nodes = three_council_nodes().await;
+    let node = console_node_on(Arc::clone(&nodes[1]), "node-2", port).await;
+    (node, nodes)
+}
+
+/// A node whose replica holds nothing reads kill mode from the leader,
+/// asking for the leader's own replica (`?local=true`), and admits the
+/// console's kill on the leader's word.
+#[tokio::test]
+async fn a_node_without_the_clusters_state_reads_kill_mode_from_the_leader() {
+    let asked: Arc<tokio::sync::Mutex<Vec<String>>> = Arc::default();
+    let seen = Arc::clone(&asked);
+    let leader = Router::new().route(
+        "/v1/os/settings",
+        axum::routing::get(move |uri: axum::http::Uri| {
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.lock().await.push(uri.to_string());
+                Json(serde_json::json!({ "console_chaos": true }))
+            }
+        }),
+    );
+    let (node, councils) = console_follower(leader).await;
+    assert!(node.kill_mode(&node.console).await);
+    let mut kill = console_kill();
+    kill.target_node = Some("node-2".into());
+    let (status, body) = node.console_fault(&kill).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let asked = asked.lock().await.clone();
+    assert!(!asked.is_empty());
+    assert!(
+        asked.iter().all(|uri| uri == "/v1/os/settings?local=true"),
+        "{asked:?}"
+    );
+    for council in councils {
+        council.shutdown().await.unwrap();
+    }
+}
+
+/// When the leader can't answer, kill mode is off: the read fails, and
+/// the console's kill is refused, saying why.
+#[tokio::test]
+async fn an_unreachable_leader_means_kill_mode_is_off() {
+    let leader = Router::new().route(
+        "/v1/os/settings",
+        axum::routing::get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+    );
+    let (node, councils) = console_follower(leader).await;
+    let (status, _) = node
+        .call("GET", "/v1/os/settings", &node.console, String::new())
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let mut kill = console_kill();
+    kill.target_node = Some("node-2".into());
+    let (status, body) = node.console_fault(&kill).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        body.to_string()
+            .contains("can't read the cluster's [appliance] settings"),
+        "{body}"
+    );
+    for council in councils {
+        council.shutdown().await.unwrap();
+    }
 }

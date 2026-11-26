@@ -5,6 +5,10 @@ expression: "crate::relish::output::format_output(&Injection(first),\nOutputForm
 {
   "id": 1,
   "fault_type": "kill",
+  "kind": {
+    "type": "Kill",
+    "count": 1
+  },
   "target_service": "web",
   "namespace": "default",
   "target_instance": null,
@@ -16,6 +20,10 @@ expression: "crate::relish::output::format_output(&Injection(first),\nOutputForm
     {
       "id": 3,
       "fault_type": "kill",
+      "kind": {
+        "type": "Kill",
+        "count": 1
+      },
       "target_service": "web",
       "namespace": "default",
       "target_instance": null,
