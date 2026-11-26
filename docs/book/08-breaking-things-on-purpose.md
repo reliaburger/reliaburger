@@ -1887,6 +1887,21 @@ any group a live guard claims. "Live" here is a registry file naming the
 guard's process ID and that process's start time from `/proc/<pid>/stat`, so
 a recycled process ID doesn't keep a dead test's claim alive.
 
+One more rule keeps the sweep from removing a group a test made a moment
+ago and hasn't put a process in yet: the whole tree must have gone two
+minutes without changing, by its directories' modification times. The
+sweep's own test fakes that age by setting the times an hour back, and it
+failed now and then in CI
+([#2356](https://github.com/reliaburger/reliaburger/issues/2356)) with one
+stale group kept and the rest swept. The kernel had moved the time forward
+again. Enabling a controller in a parent, as runc does in every parent of a
+container's cgroup, adds that controller's files to each child group, and
+adding a file to a directory updates its modification time. A runc test
+starting beside the sweep test made the stale group look brand new. The
+sweep was right to keep it by its own rule, so the fix is in the test: it
+enables every offered controller in those parents before it ages anything,
+and enabling a controller that's already on adds nothing.
+
 The file lives in `tests/support/` and uses only the standard library,
 because two kinds of tests include it. An integration test pulls it in with
 `#[path = "support/test_cgroups.rs"] mod test_cgroups;`, and the library's
