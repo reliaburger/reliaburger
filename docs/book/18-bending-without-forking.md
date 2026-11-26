@@ -2412,6 +2412,97 @@ no dynamic dispatch, unlike a function pointer in C or a callback in Go.
 `bool::then_some(now)` is `Some(now)` when the bool is true and `None` when
 it isn't.
 
+That version had a gap review found (#2336): every sidecar came back with
+`restarts: 0`, and one that was waiting out a backoff when Bun stopped was
+refused by the runtime (its process was gone), retired, and made due at
+once. So a crash-looping sidecar showed `RESTARTS 0` after every Bun
+restart and skipped its backoff, though the manual says the count is how
+often it restarted on its own.
+
+The fix keeps both in the sidecar's record. `InstanceRecord` gained one
+field, which only a sidecar's record fills in:
+
+```rust
+#[serde(default, skip_serializing_if = "Option::is_none")]
+pub sidecar_restarts: Option<SidecarRestarts>,
+
+pub struct SidecarRestarts {
+    pub count: u32,
+    pub restarted_at_unix_ms: Option<u64>,
+    pub due_at_unix_ms: Option<u64>,
+}
+```
+
+`#[serde(default)]` makes a record without the field, an older Bun's,
+read as `None`. The other direction works because `InstanceRecord` doesn't
+say `#[serde(deny_unknown_fields)]`: serde ignores a field it doesn't know,
+so an older Bun reads a newer record and skips the count. With both
+directions readable, the record format needs no `state` bump in
+`src/compatibility.rs`.
+
+The times are wall-clock milliseconds, not `Instant`s. A Rust `Instant` is
+a reading of the monotonic clock, which only means something inside the
+process that took it; there's no way to serialise one, by design. So the
+record converts each one through "now" on both clocks, `to_unix_ms` on the
+way out and `from_unix_ms` on the way in. A wall clock can step, so a
+backoff read back is clamped to at most a minute from now.
+
+Three writes keep the record current. The full record, written when a
+sidecar starts or restarts, carries the count. A crash the state sweep sees
+calls `record_sidecar_restarts`, which rewrites only that field
+(`update_sidecar_restarts` reads the record, changes it and writes it
+back) with the time the backoff ends. A restart that fails does the same
+with its longer backoff. All three are best effort, like the records
+themselves: a lost write only means the next Bun starts the backoff over.
+
+They mustn't land out of order, though. Each write carries the loop's
+state at the moment it was queued, and the first version gave each its own
+task. Coverage CI, an instrumented build on a busy runner, then caught a
+record that never showed its restart: the crash's write had read the
+record, the restart's whole record had landed, and the crash's write put
+its older count back over it. The fix is one writer.
+`SidecarRecordWriter` holds the sending half of a `tokio::sync::mpsc`
+channel, and a single task drains the other half, one write at a time, so
+the order on disk is the order the loop queued. The loop never waits on a
+record, so the channel is unbounded; a sidecar's backoff bounds how fast
+it fills.
+
+The sender sits in a `std::sync::OnceLock`, which runs its initialiser
+once, on first use, through a shared reference. That matters because
+`record_sidecars` takes `&self`, and spawning the writer needs a running
+Tokio runtime, which the agent's constructor can't count on. When the
+agent is dropped, so is the sender; the writer's `recv()` then returns
+what's still queued and finally `None`, and the task ends after the last
+write has landed. Tests use a `Flush` write that answers through a
+`oneshot` once everything queued before it is on disk, so they wait for
+exactly that rather than polling.
+
+At startup, `register_adopted` takes what the records kept:
+
+```rust
+pub(super) fn register_adopted(
+    &mut self,
+    parent: &InstanceId,
+    specs: &[SidecarSpec],
+    adopted: &HashSet<InstanceId>,
+    restored: &HashMap<InstanceId, SidecarRestarts>,
+    now: Instant,
+    wall_now: SystemTime,
+) -> Result<Vec<InstanceId>, BunError>
+```
+
+Every sidecar gets its count back. One the runtime adopted runs on. One it
+retired whose record says it was in backoff waits out the rest. One it
+retired with no backoff pending was running when the last Bun stopped, so
+it crashed while Bun was down: `register_adopted` calls `mark_exited` on
+it, as the state sweep would have, and it waits the backoff its count
+earns. With no record at all the count is 0 and that backoff is nothing,
+which is what happened before.
+
+`now` and `wall_now` are parameters rather than read inside, so the unit
+test can say "this sidecar's backoff ends twenty seconds from now" exactly,
+with no sleeping.
+
 Last, `finish_sidecar_adoption` kills every kept sidecar that nobody
 adopted (its instance's own adoption failed, say), so no sidecar runs
 beside nothing, and removes every sidecar record but the adopted ones'.
@@ -2453,7 +2544,28 @@ Now each instance's status carries a `sidecars` list, built from the same
 registry the restarts use: a sidecar with a restart in flight is
 `restarting`, one waiting out its backoff is `backoff`, one beside an
 instance that isn't running is `stopped`, and the rest are `running`, each
-with its restart count. `relish apps NAME` prints them under their
+with its restart count.
+
+The first version mapped the instance's state to a `bool`, "has it
+started", and said `stopped` whenever it hadn't. But sidecars start before
+their app, so during a slow app start (a big image to pull, a long init)
+`relish apps` listed running sidecars as `stopped` (#2336). A `bool` had
+too few values for the three answers there are, so it became an enum:
+
+```rust
+pub(super) enum SidecarPhase {
+    Starting,
+    Beside,
+    Stopped,
+}
+```
+
+`SidecarPhase::of` matches every `ContainerState` by name, with no `_`
+arm, so a state added later won't compile until someone decides what its
+sidecars say. Preparing, Initialising and Starting give the new
+`SidecarState::Starting`, shown as `starting`. A sidecar the node gate
+refused (#2335) is checked first: it stays `stopped`, with its reason, in
+every phase, and its record keeps the count the refused restart raised. `relish apps NAME` prints them under their
 instance, and `-o json` carries the list as it is. The list is skipped when
 it's empty, so an app without sidecars answers as it did before.
 
@@ -4082,6 +4194,25 @@ two sidecars, `proxy` and `logs`:
 - `an_instances_status_lists_its_sidecars_with_their_restarts`: the
   instance's status carries its sidecars, `running` with no restarts, then
   `backoff` after `proxy` exits, then `running` with one restart.
+- `a_bun_restart_keeps_a_sidecars_restart_count` (#2336): `proxy` restarts
+  once, Bun restarts, and the adopted `proxy` still says one restart.
+- `a_sidecar_in_backoff_at_a_bun_restart_keeps_its_backoff` (#2336):
+  `proxy` crashes twice, and the second crash writes when its backoff ends.
+  The test stretches that to thirty seconds so it has time to look, then
+  restarts Bun with `proxy`'s process gone. `proxy` isn't created again,
+  says `backoff` with one restart, and is due after thirty seconds, not
+  before.
+- `sidecars_say_starting_while_their_app_starts_slowly` (#2336): with the
+  instance held in Starting, both sidecars say `starting`.
+- `a_crash_write_never_overwrites_a_later_restart_record` (#2336): three
+  rounds of crash then restart, each queueing the crash's write just
+  before the restart's whole record; after each the record says the right
+  count and no backoff, and a last crash's backoff lands on top.
+- `a_rolling_replacements_sidecar_records_name_its_pinned_image` (#2336):
+  the sidecar records a rolling replacement writes name the image the
+  supervisor holds for the instance, which the trust policy may have pinned
+  to a digest, as a fresh instance's records do. They used to copy the
+  spec's.
 
 On Linux, `a_bun_restart_adopts_a_sidecar_with_its_process_and_its_instances_network`
 in `tests/owned_runc.rs` (run with `make test-linux`) does it with real

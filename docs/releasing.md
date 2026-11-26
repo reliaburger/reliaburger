@@ -2453,7 +2453,11 @@ fallback. Development runs (`--development-binaries`) have no release to take a
 built image from, so they boot the pinned upstream image and install the
 packages at first boot. The stock image has no `.link` file, so its first boot
 loses the NIC rename and setup restarts the VM once; later boots are fine. The VM's provisioning script skips `apt` whenever every
-package is already present, so both paths use the same script.
+package is already present, so both paths use the same script. To try a
+changed `build_guest_image.sh` end to end before a release, a development run
+boots the built image from `RELIABURGER_DEV_GUEST_IMAGE`, checked against
+`RELIABURGER_DEV_GUEST_IMAGE_SHA256` ([quickstart.md](quickstart.md#development-qualification)).
+That's integration evidence for the image, not qualification of a signed one.
 
 Packaging generates `install.sh` with the exact native CLI checksums. The
 static `docs/website/install.sh` fetches that versioned installer over HTTPS.

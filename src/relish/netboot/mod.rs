@@ -15,7 +15,8 @@
 //!   machine that has installed already ([`installed`]).
 //!
 //! With `--stream-logs`, a fourth, [`netlog`], listens on UDP 6666 for the
-//! kernel and boot lines the machines send, and prints them among the rest.
+//! kernel and boot lines the machines send, and prints them among the rest
+//! (with `--stream-logs=units`, only the boot units' lines and panics).
 //!
 //! Nothing is served unless [`artefacts`] checked it against a signed
 //! `SHA256SUMS` first. Each server's decisions are pure functions with
@@ -231,9 +232,10 @@ pub struct NetbootOptions {
     pub ipxe: IpxeBuild,
     /// Where the machines get their addresses.
     pub dhcp: DhcpSetup,
-    /// Have the installer stream boot logs here, and listen for them
-    /// (`--stream-logs`, [`netlog`]).
-    pub stream_logs: bool,
+    /// Have the installer stream boot logs here, listen for them, and
+    /// print these of them (`--stream-logs[=WHICH]`, [`netlog`]). `None`:
+    /// no boot logs.
+    pub stream_logs: Option<netlog::StreamLogs>,
 }
 
 /// Why `relish netboot` refused to start or stopped.

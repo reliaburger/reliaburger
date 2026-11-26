@@ -1998,6 +1998,12 @@
     "test": "grill::cgroup::tests::cgroup_sweep_removes_only_stale_empty_test_cgroups"
   },
   {
+    "source": "src/grill/cgroup.rs",
+    "function": "cgroup_controller_enabled_in_a_parent_moves_its_children_mtime_only_once",
+    "binary": "reliaburger",
+    "test": "grill::cgroup::tests::cgroup_controller_enabled_in_a_parent_moves_its_children_mtime_only_once"
+  },
+  {
     "source": "tests/owned_task_arrays.rs",
     "function": "cgroup_host_executor_never_reuses_a_killed_task_cgroup",
     "binary": "reliaburger::owned_task_arrays",

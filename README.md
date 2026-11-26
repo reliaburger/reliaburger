@@ -5,12 +5,10 @@
 # Reliaburger
 
 <!-- hero:start -->
-**The container platform, served ready. Built for humans and their agents.**
+**The container platform built for AI agents to run. From hosts to apps in minutes.**
 
-Kubernetes hands you the ingredients. Reliaburger hands you the burger:
-app scheduling, batch jobs, metrics, logs, service discovery, ingress, mTLS,
-a Docker registry, GitOps and chaos testing, in one Rust agent and one CLI.
-And that CLI speaks to your AI agent too.
+The whole container platform in one binary, designed for AI agents to install,
+operate, debug and improve. The platform team you need, in a box.
 <!-- hero:end -->
 
 **Status:** 0.3.2 was released on 23 November 2026. Until 1.0.0, Reliaburger is good enough for home labs and dev clusters, not for production.
@@ -118,7 +116,7 @@ a read-only token of its own, so an agent never holds admin credentials.
 - **Policies and templates:** CEL rules that refuse, warn or fill in defaults, and typed templates instead of CRDs.
 - **Your own controllers:** an ordinary app with a scoped token, no operator SDK.
 - **Chaos as a command:** `relish fault` injects latency, partitions, kills and pressure, and cleans up after itself.
-- **Bare metal in an hour:** `relish netboot` installs our appliance OS on blank machines over the network, `relish machines claim` brings them into a cluster, and `relish os` rolls an OS update across it one node at a time, with automatic fallback. Each machine's monitor shows a read-only dashboard of the node and its cluster.
+- **Bare metal in an hour:** `relish netboot` installs our appliance OS on blank machines over the network, `relish machines claim` brings them into a cluster, and `relish os` rolls an OS update across it one node at a time, with automatic fallback. Each machine's monitor shows a read-only dashboard of the node and its cluster, with a hidden invaders game whose hits kill real instances through Smoker once a cluster admin turns kill mode on (`relish os settings --set`; 0.3.3, not in 0.3.2).
 - **Self-upgrade:** `relish upgrade` rolls a signed `bun` across the cluster without restarting workloads, and `relish verify` checks every node runs the published release, byte for byte.
 - **Diagnostics for incidents:** `relish wtf` and `relish path` say what's wrong and where. `relish status` sums up the whole cluster on one screen, `relish apps` lists the apps, and `relish timeline` shows what changed before a failure, with the rule and evidence behind each decision.
 - **Built for agents:** `relish agent` answers in bounded JSON, and `relish mcp` serves it over MCP. An agent proposes a change, a person or a policy approves it with `relish proposal approve` or the web dashboard's buttons, `relish undo` puts it back, `relish lease` keeps two of them off the same app, and `relish gym run` tests your own agent on your own cluster.

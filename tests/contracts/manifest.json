@@ -7402,6 +7402,18 @@
             "src/grill/cgroup.rs",
             "tests/support/test_cgroups.rs"
           ]
+        },
+        {
+          "id": "issue-2356-cgroup_controller_enabled_in_a_parent_moves_its_children_mtime_only_once",
+          "binary": "reliaburger",
+          "test": "grill::cgroup::tests::cgroup_controller_enabled_in_a_parent_moves_its_children_mtime_only_once",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/grill/cgroup.rs",
+            "tests/support/test_cgroups.rs"
+          ]
         }
       ],
       "refused_paths": [

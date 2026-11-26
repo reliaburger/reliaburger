@@ -190,6 +190,12 @@ struct SetupOptions {
     #[arg(long, requires = "quickstart")]
     registry_port: Option<u16>,
     /// Use explicitly supplied Linux binaries for development before a release exists.
+    ///
+    /// Development only: such a run never qualifies a release. With
+    /// --quickstart, also set RELIABURGER_DEV_GUEST_IMAGE=<absolute path> and
+    /// RELIABURGER_DEV_GUEST_IMAGE_SHA256=<hex> to boot a locally built guest
+    /// image, checked against that digest, instead of the stock Ubuntu image.
+    /// A quickstart refuses those variables without this flag.
     #[arg(long, requires = "managed")]
     development_binaries: Option<PathBuf>,
     /// HTTPS directory containing unchanged signed release candidate assets.
@@ -1177,10 +1183,20 @@ enum Command {
         mode_dhcp_proxy: bool,
         /// Have each install send the machine's kernel and boot logs here
         /// over UDP 6666, from the installer on and on every boot after,
-        /// and print them as `log <mac>:` lines. The lines cross the LAN in
+        /// and print them as `log <mac>:` lines: all of them, or with
+        /// --stream-logs=units only the boot units' lines (installer, boot
+        /// check, bun, seed, clock wait) and kernel panics. Every line goes
+        /// to DIR/logs/<mac>.log either way. The lines cross the LAN in
         /// cleartext.
-        #[arg(long)]
-        stream_logs: bool,
+        #[arg(
+            long,
+            value_name = "WHICH",
+            value_enum,
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "all"
+        )]
+        stream_logs: Option<reliaburger::relish::netboot::netlog::StreamLogs>,
         /// Trust only this key (ed25519:BASE64) instead of the release keys.
         /// Debug builds only, for tests.
         #[arg(long, hide = true)]
@@ -1654,6 +1670,16 @@ enum OsAction {
     },
     /// The rollout in progress, or the last one.
     Status,
+    /// The cluster's `[appliance]` settings, such as whether the console
+    /// invaders' kill mode is on, or change them: with --set, replace them
+    /// with a file's `[appliance]` section (admin only; audited; a key left
+    /// out is off).
+    Settings {
+        /// TOML file with an `[appliance]` section, such as
+        /// `console_chaos = true`.
+        #[arg(long, value_name = "FILE")]
+        set: Option<PathBuf>,
+    },
     /// Carry on with a paused rollout, retrying the node that stopped it.
     Resume,
     /// Stop the rollout; nodes keep the version they're on.
@@ -1783,7 +1809,7 @@ async fn netboot(
     wipe: Vec<reliaburger::relish::netboot::MacAddress>,
     ipxe: reliaburger::relish::netboot::IpxeBuild,
     dhcp: reliaburger::relish::netboot::DhcpSetup,
-    stream_logs: bool,
+    stream_logs: Option<reliaburger::relish::netboot::netlog::StreamLogs>,
     trust_key: Option<String>,
 ) -> Result<(), reliaburger::relish::RelishError> {
     use reliaburger::relish::netboot::{self, InterfaceChoice, NetbootOptions};
@@ -3725,6 +3751,10 @@ async fn main() -> ExitCode {
                 }
             },
             OsAction::Status => reliaburger::relish::os::status(cli.output).await,
+            OsAction::Settings { set: None } => reliaburger::relish::os::settings(cli.output).await,
+            OsAction::Settings { set: Some(path) } => {
+                reliaburger::relish::os::set_settings(&path, cli.output).await
+            }
             OsAction::Resume => reliaburger::relish::os::resume(cli.output).await,
             OsAction::Abort => reliaburger::relish::os::abort(cli.output).await,
             OsAction::BootLogs { to, off, nodes } => {
@@ -6705,7 +6735,10 @@ mod tests {
         else {
             panic!("expected netboot");
         };
-        assert!(!stream_logs, "boot logs cross the LAN in cleartext: opt-in");
+        assert_eq!(
+            stream_logs, None,
+            "boot logs cross the LAN in cleartext: opt-in"
+        );
         assert_eq!(dir, PathBuf::from("os"));
         assert_eq!((interface, address), (None, None));
         assert_eq!(http_port, 8080);
@@ -6722,11 +6755,38 @@ mod tests {
 
     #[test]
     fn netboot_streams_boot_logs_when_asked() {
-        let cli = parse(&["relish", "netboot", "os", "--stream-logs"]).unwrap();
-        let Command::Netboot { stream_logs, .. } = cli.command else {
-            panic!("expected netboot");
+        use reliaburger::relish::netboot::netlog::StreamLogs;
+        let stream_logs = |args: &[&str]| {
+            let cli = parse(args).unwrap();
+            let Command::Netboot {
+                dir, stream_logs, ..
+            } = cli.command
+            else {
+                panic!("expected netboot");
+            };
+            (dir, stream_logs)
         };
-        assert!(stream_logs);
+        let os = PathBuf::from("os");
+        // No value: every line, as before.
+        assert_eq!(
+            stream_logs(&["relish", "netboot", "os", "--stream-logs"]),
+            (os.clone(), Some(StreamLogs::All))
+        );
+        assert_eq!(
+            stream_logs(&["relish", "netboot", "os", "--stream-logs=all"]),
+            (os.clone(), Some(StreamLogs::All))
+        );
+        assert_eq!(
+            stream_logs(&["relish", "netboot", "os", "--stream-logs=units"]),
+            (os.clone(), Some(StreamLogs::Units))
+        );
+        // The value needs `=`, so a directory after the flag stays the
+        // directory.
+        assert_eq!(
+            stream_logs(&["relish", "netboot", "--stream-logs", "lab"]),
+            (PathBuf::from("lab"), Some(StreamLogs::All))
+        );
+        assert!(parse(&["relish", "netboot", "os", "--stream-logs=kernel"]).is_err());
     }
 
     #[test]

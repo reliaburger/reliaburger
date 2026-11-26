@@ -247,7 +247,11 @@ A Bun restart or self-upgrade adopts running sidecars along with their
 app: each sidecar has an adoption record of its own, and the new Bun checks
 that the process it names is still the one the runtime runs before it takes
 it over. A sidecar that can't be adopted this way, because it crashed while
-Bun was down, say, starts again on Bun's next tick, a second or so later.
+Bun was down, say, starts again after its next backoff, which is at once
+(on Bun's next tick) if it had never restarted. Its record also keeps how
+often it has restarted and when its backoff ends, so a Bun restart changes
+neither: a sidecar in a crash loop keeps its count and waits out the rest of
+its backoff.
 
 `relish apps NAME` lists each instance's sidecars under it, with their
 state and how often each has restarted on its own:
@@ -259,10 +263,14 @@ node-1                   default__api-0       api             default      runni
                          + logs               sidecar                      backoff    -          3        -
 ```
 
-A sidecar is `running`, in `backoff` after it exited, `restarting`, or
-`stopped` while its app isn't running. `-o json` puts the same on each
-instance as `sidecars`, a list of `name`, `id`, `state` and
-`restart_count`.
+A sidecar is `starting` while its app is still being prepared or started
+(sidecars start first), then `running`, in `backoff` after it exited,
+`restarting`, or `stopped` while its app isn't running. One the node refused
+to start again is listed as `refused`, with the reason, whatever its app is
+doing (see [Runtime knobs](10_security.md#runtime-knobs)). A new instance's
+sidecars start at 0, and a crash after ten quiet minutes counts as the first
+again. `-o json` puts the same on each instance as `sidecars`, a list of
+`name`, `id`, `state`, `restart_count` and, for a refused one, `refused`.
 
 ## Config files
 

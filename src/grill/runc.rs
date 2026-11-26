@@ -1827,6 +1827,7 @@ mod tests {
             app_spec: None,
             oci_spec: spec,
             rootless_network: None,
+            sidecar_restarts: None,
         };
         drop(original); // A Bun exec/process death drops the child handle only.
 

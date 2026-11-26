@@ -50,6 +50,13 @@ impl FaultRegistry {
         rule.task_index = request.task_index;
         rule.target_node = request.target_node.clone();
         rule.reason = request.reason.clone();
+        if matches!(rule.fault_type, FaultType::Kill { .. }) {
+            // A kill is instantaneous, but stays listed while its replicas
+            // count as out (`KILL_SETTLE`).
+            rule.expires_at_ns = rule
+                .activated_at_ns
+                .saturating_add(crate::smoker::types::KILL_SETTLE.as_nanos() as u64);
+        }
 
         self.expiry_queue
             .push(Reverse((rule.expires_at_ns, rule.id.0)));
@@ -189,19 +196,21 @@ impl FaultRegistry {
         self.faults.iter()
     }
 
-    /// Count the pause faults on one namespace's service: the replicas the
-    /// replica-minimum rail treats as already out of service.
+    /// Count one namespace's service's replicas that its faults have taken
+    /// out of service: the ones the replica-minimum rail treats as gone.
     ///
-    /// Only a pause keeps a replica out for the fault's lifetime. A kill is
-    /// instantaneous, and a network or resource fault leaves the replica
-    /// running, so counting them refused faults that left plenty of replicas
-    /// serving. A same-named service in another namespace is someone else's.
-    pub fn count_paused(&self, namespace: Option<&str>, service: &str) -> usize {
+    /// A pause keeps a replica out for the fault's lifetime, and a recent
+    /// kill keeps its replicas out while they may still read `running`
+    /// ([`crate::smoker::types::KILL_SETTLE`]). A network or resource fault
+    /// leaves the replica running, so counting it refused faults that left
+    /// plenty of replicas serving. A same-named service in another namespace
+    /// is someone else's.
+    pub fn count_out_of_service(&self, namespace: Option<&str>, service: &str) -> u32 {
         self.faults
             .iter()
             .filter(|f| f.target_service == service && f.namespace.as_deref() == namespace)
-            .filter(|f| matches!(f.fault_type, FaultType::Pause))
-            .count()
+            .map(|f| crate::smoker::types::replicas_out_of_service(&f.fault_type))
+            .fold(0, u32::saturating_add)
     }
 
     /// Read-only library count of faults targeting a specific node.
@@ -501,6 +510,15 @@ mod tests {
         assert_eq!(summaries[1].target_service, "web");
     }
 
+    #[test]
+    fn a_kill_stays_listed_for_the_settle_window() {
+        let mut reg = FaultRegistry::new();
+        let rule = reg.insert(&kill_request("web"));
+        assert!(reg.drain_expired(rule.activated_at_ns + 1).is_empty());
+        let settled = rule.activated_at_ns + crate::smoker::types::KILL_SETTLE.as_nanos() as u64;
+        assert_eq!(reg.drain_expired(settled).len(), 1);
+    }
+
     fn pause_request(service: &str, namespace: &str) -> FaultRequest {
         FaultRequest {
             workload: Default::default(),
@@ -511,8 +529,10 @@ mod tests {
         }
     }
 
+    /// A pause and a recent kill take replicas out; a delay leaves them
+    /// serving (#2151: a kill counts until the sweep can see it).
     #[test]
-    fn rail_counts_only_pauses_as_faulted_replicas() {
+    fn rail_counts_pauses_and_recent_kills_as_faulted_replicas() {
         let mut reg = FaultRegistry::new();
         let in_default = |mut request: FaultRequest| {
             request.namespace = Some("default".into());
@@ -523,9 +543,9 @@ mod tests {
         reg.insert(&pause_request("redis", "default"));
         reg.insert(&pause_request("api", "default"));
 
-        assert_eq!(reg.count_paused(Some("default"), "redis"), 1);
-        assert_eq!(reg.count_paused(Some("default"), "api"), 1);
-        assert_eq!(reg.count_paused(Some("default"), "web"), 0);
+        assert_eq!(reg.count_out_of_service(Some("default"), "redis"), 2);
+        assert_eq!(reg.count_out_of_service(Some("default"), "api"), 1);
+        assert_eq!(reg.count_out_of_service(Some("default"), "web"), 0);
     }
 
     #[test]
@@ -534,8 +554,8 @@ mod tests {
         reg.insert(&pause_request("redis", "team-a"));
         reg.insert(&pause_request("redis", "team-a"));
 
-        assert_eq!(reg.count_paused(Some("team-a"), "redis"), 2);
-        assert_eq!(reg.count_paused(Some("team-b"), "redis"), 0);
+        assert_eq!(reg.count_out_of_service(Some("team-a"), "redis"), 2);
+        assert_eq!(reg.count_out_of_service(Some("team-b"), "redis"), 0);
     }
 
     #[test]

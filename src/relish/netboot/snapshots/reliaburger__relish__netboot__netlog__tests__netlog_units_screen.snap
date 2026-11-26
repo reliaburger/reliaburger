@@ -1,0 +1,14 @@
+---
+source: src/relish/netboot/netlog.rs
+expression: "screen.join(\"\\n\")"
+---
+log 52:54:00:12:34:56: reliaburger-netlog: streaming from 192.168.1.77 (enp1s0 52:54:00:12:34:56) to 192.168.1.20:6666
+log 52:54:00:12:34:56: reliaburger-netlog: the kernel log so far, 812 lines
+log 52:54:00:12:34:56: reliaburger-netlog: end of the kernel log so far
+log 52:54:00:12:34:56: [    9.412871] install[412]: reliaburger-install: target /dev/mmcblk0, 7818 MB
+log 52:54:00:12:34:56: [   31.554310] reliaburger-boot-check: reliaburger: bun healthy on OS 2026.47.228
+log 52:54:00:12:34:56: [   32.100200] start[880]: reliaburger: bun 0.3.3 from the image is now active (was none)
+log 52:54:00:12:34:56: [   33.010101] start[880]: bun: listening on 10.42.0.11:9443
+log 52:54:00:12:34:56: [   41.000000] BUG: kernel NULL pointer dereference, address: 0000000000000008
+log 52:54:00:12:34:56: [   41.000100] Oops: 0002 [#1] PREEMPT SMP NOPTI
+log 52:54:00:12:34:56: [   41.000300] Kernel panic - not syncing: Fatal exception

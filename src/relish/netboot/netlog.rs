@@ -15,6 +15,11 @@
 //! sender it never answered is named by its address. It also appends the
 //! line to `<netboot dir>/logs/<mac>.log`, so a lab record can quote it.
 //!
+//! The screen can show less than the file ([`StreamLogs`]). Three machines
+//! booting send hundreds of kernel lines each, so `--stream-logs=units`
+//! prints only the lines the boot units and this script write, and kernel
+//! panics, and leaves the kernel's other lines to the file ([`kind`]).
+//!
 //! Nothing here is authenticated: anyone on the LAN can send lines, and a
 //! hello can name any MAC. So the listener only prints and appends, it
 //! marks a sender it didn't serve, and it replaces control characters, so a
@@ -168,6 +173,135 @@ pub fn lines(datagram: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// Which boot log lines print on the screen (`relish netboot
+/// --stream-logs[=WHICH]`). Every line goes to the machine's file either
+/// way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum StreamLogs {
+    /// Every line: the kernel's and the boot units'.
+    #[default]
+    All,
+    /// The boot units' lines (the installer, the boot check, bun, the seed,
+    /// the clock wait) and the script's own, such as the hello naming the
+    /// MAC, plus kernel panics. Other kernel lines go only to the file.
+    Units,
+}
+
+impl StreamLogs {
+    /// Whether `line` prints on the screen.
+    pub fn shows(self, line: &str) -> bool {
+        match self {
+            StreamLogs::All => true,
+            StreamLogs::Units => kind(line) != LineKind::Kernel,
+        }
+    }
+}
+
+/// What a boot log line is, as far as the screen cares ([`kind`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineKind {
+    /// A kernel panic, an oops or a `BUG:`: always printed.
+    Panic,
+    /// A line a boot unit or the netlog script wrote.
+    Unit,
+    /// Any other line: the kernel's own, or a program's the image doesn't
+    /// stream on purpose (systemd's before journald starts, say).
+    Kernel,
+}
+
+/// How the start of a panic, an oops or a `BUG:` reads, after the
+/// timestamp. `Kernel panic` also ends a panic (`---[ end Kernel panic`).
+const PANIC_STARTS: [&str; 3] = ["Oops", "BUG:", "Internal error: Oops"];
+const PANIC_ANYWHERE: &str = "Kernel panic";
+
+/// What `line` is. The machine sends three shapes of line, and the
+/// structure, not the wording, tells them apart:
+///
+/// - the kernel's, which netconsole and the `dmesg` backlog prefix with
+///   the kernel's timestamp, `[    9.412871] `;
+/// - a boot unit's, which journald forwards to the kernel log
+///   (`StandardOutput=kmsg` in netlog's drop-in) with a syslog tag after
+///   the timestamp, `install[412]: `, and the boot check writes to
+///   `/dev/kmsg` itself;
+/// - the script's own (the hello, the backlog's markers), sent with no
+///   timestamp at all.
+///
+/// Under the timestamp and tag, every line the image's boot units and the
+/// netlog script write starts with their own tag: `reliaburger:`, or
+/// `reliaburger-<unit>:` (the installer's `reliaburger-install:`, the
+/// boot check's `reliaburger-boot-check:`, the hello's
+/// `reliaburger-netlog:`), or bun's `bun:`. That tag, as the first word of
+/// the message, is what makes a unit line; a kernel line can mention
+/// `reliaburger` anywhere else and stays a kernel line.
+pub fn kind(line: &str) -> LineKind {
+    let message = without_timestamp(line);
+    if PANIC_STARTS.iter().any(|start| message.starts_with(start))
+        || message.contains(PANIC_ANYWHERE)
+    {
+        return LineKind::Panic;
+    }
+    if has_unit_tag(without_syslog_tag(message)) {
+        LineKind::Unit
+    } else {
+        LineKind::Kernel
+    }
+}
+
+/// `line` without the kernel's `[    9.412871] ` in front, if it has one.
+fn without_timestamp(line: &str) -> &str {
+    let Some((stamp, rest)) = line
+        .strip_prefix('[')
+        .and_then(|inside| inside.split_once(']'))
+    else {
+        return line;
+    };
+    let is_stamp = stamp
+        .trim_start()
+        .split_once('.')
+        .is_some_and(|(seconds, fraction)| is_digits(seconds) && is_digits(fraction));
+    if is_stamp { rest.trim_start() } else { line }
+}
+
+/// `message` without the `<identifier>[<pid>]: ` journald puts in front
+/// of a line it forwards to the kernel log, if it has one.
+fn without_syslog_tag(message: &str) -> &str {
+    let Some((tag, rest)) = message.split_once("]: ") else {
+        return message;
+    };
+    match tag.split_once('[') {
+        Some((identifier, pid))
+            if !identifier.is_empty()
+                && !identifier.contains(char::is_whitespace)
+                && is_digits(pid) =>
+        {
+            rest
+        }
+        _ => message,
+    }
+}
+
+/// Whether `message` starts with a boot unit's own tag: `reliaburger:`,
+/// `reliaburger-<unit>:` or `bun:`.
+fn has_unit_tag(message: &str) -> bool {
+    let Some((tag, _)) = message.split_once(':') else {
+        return false;
+    };
+    match tag.strip_prefix("reliaburger") {
+        Some("") => true,
+        Some(rest) => rest.strip_prefix('-').is_some_and(|unit| {
+            !unit.is_empty()
+                && unit
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        }),
+        None => tag == "bun",
+    }
+}
+
+fn is_digits(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// How a line prints among the netboot server's other lines.
 pub fn describe(sender: Sender, line: &str) -> String {
     format!("log {sender}: {line}")
@@ -208,13 +342,14 @@ impl LogFiles {
     }
 }
 
-/// Print each line that arrives on `socket` through `log`, naming its
-/// sender from `peers`, and append it to `logs/<sender>.log` under
-/// `directory` when there is one. Runs until the socket fails.
+/// Append each line that arrives on `socket` to `logs/<sender>.log` under
+/// `directory` when there is one, and print the ones `shown` shows through
+/// `log`, naming the sender from `peers`. Runs until the socket fails.
 pub async fn listen(
     socket: UdpSocket,
     peers: SharedPeers,
     directory: Option<PathBuf>,
+    shown: StreamLogs,
     log: Log,
 ) -> std::io::Result<()> {
     let mut files = LogFiles {
@@ -240,7 +375,9 @@ pub async fn listen(
                     sender.file_name()
                 ));
             }
-            log(describe(sender, &line));
+            if shown.shows(&line) {
+                log(describe(sender, &line));
+            }
         }
     }
 }
@@ -277,7 +414,7 @@ pub async fn run_listener(
             println!("relish machines logs: stopped");
             Ok(())
         }
-        result = listen(socket, peers, directory, log) => Err(NetbootError::ServerStopped {
+        result = listen(socket, peers, directory, StreamLogs::All, log) => Err(NetbootError::ServerStopped {
             reason: match result {
                 Ok(()) => "the boot log listener stopped".to_string(),
                 Err(error) => format!("the boot log listener failed: {error}"),
@@ -423,7 +560,7 @@ mod tests {
         let log: Log = Arc::new(move |line| {
             let _ = tx.send(line);
         });
-        let task = tokio::spawn(listen(socket, peers, None, log));
+        let task = tokio::spawn(listen(socket, peers, None, StreamLogs::All, log));
         let machine = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         machine
             .send_to(format!("{HELLO}\n").as_bytes(), listener)
@@ -475,6 +612,7 @@ mod tests {
             socket,
             peers.clone(),
             Some(directory.path().to_path_buf()),
+            StreamLogs::All,
             log,
         ));
 
@@ -516,6 +654,166 @@ mod tests {
         task.abort();
     }
 
+    // `--stream-logs=units` (#2149 follow-up): what the screen keeps.
+
+    /// A boot as it arrives: the hello and the backlog markers the script
+    /// sends itself, the kernel's lines, the installer's and bun's lines as
+    /// journald forwards them, the boot check's own kmsg lines, and a panic.
+    const MIXED: &[&str] = &[
+        HELLO,
+        "reliaburger-netlog: the kernel log so far, 812 lines",
+        "[    0.000000] Linux version 6.8.0-49-generic (buildd@lcy02-amd64-103)",
+        "[    1.204113] systemd[1]: Detected architecture x86-64.",
+        "[    2.881204] r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full",
+        "reliaburger-netlog: end of the kernel log so far",
+        "[    9.412871] install[412]: reliaburger-install: target /dev/mmcblk0, 7818 MB",
+        "[   10.000001] EXT4-fs (mmcblk0p3): mounted filesystem",
+        "[   31.554310] reliaburger-boot-check: reliaburger: bun healthy on OS 2026.47.228",
+        "[   32.100200] start[880]: reliaburger: bun 0.3.3 from the image is now active (was none)",
+        "[   33.010101] start[880]: bun: listening on 10.42.0.11:9443",
+        "[   40.123456] audit: type=1400 audit(1700000000.000:2): apparmor=\"STATUS\"",
+        "[   41.000000] BUG: kernel NULL pointer dereference, address: 0000000000000008",
+        "[   41.000100] Oops: 0002 [#1] PREEMPT SMP NOPTI",
+        "[   41.000200] RIP: 0010:netlog_demo+0x10/0x20",
+        "[   41.000300] Kernel panic - not syncing: Fatal exception",
+    ];
+
+    #[test]
+    fn the_units_and_the_script_are_unit_lines() {
+        for line in [
+            HELLO,
+            "reliaburger-netlog: the kernel log so far, 812 lines",
+            "[    9.412871] install[412]: reliaburger-install: target /dev/mmcblk0, 7818 MB",
+            "[   31.554310] reliaburger-boot-check: reliaburger: bun healthy on OS 2026.47.228",
+            "[   32.100200] start[880]: reliaburger: bun 0.3.3 from the image is now active",
+            "[   33.010101] start[880]: bun: listening on 10.42.0.11:9443",
+            // Before journald, or from a test, without a timestamp or a tag.
+            "reliaburger: counted boot failed, rebooting",
+        ] {
+            assert_eq!(kind(line), LineKind::Unit, "{line}");
+        }
+    }
+
+    #[test]
+    fn kernel_lines_are_kernel_lines_whatever_they_mention() {
+        for line in [
+            "[    0.000000] Linux version 6.8.0-49-generic",
+            "[    1.204113] systemd[1]: Detected architecture x86-64.",
+            "[    1.204113] systemd[1]: Starting reliaburger.service - Reliaburger bun...",
+            "[    2.881204] r8169 0000:01:00.0 enp1s0: Link is Up - 1Gbps/Full",
+            "[    3.000000] reliaburger_fw: loaded",
+            "[    3.000000] some text that says reliaburger: in the middle",
+            // A netconsole fragment: the rest of a line cut across packets.
+            "Full",
+            // Not a tag: no space before the bracket, or no digits in it.
+            "[    4.000000] start[x]: reliaburger: no pid",
+            "[    4.000000] [reliaburger: odd",
+        ] {
+            assert_eq!(kind(line), LineKind::Kernel, "{line}");
+        }
+    }
+
+    #[test]
+    fn panics_and_oopses_are_panics() {
+        for line in [
+            "[   41.000000] BUG: kernel NULL pointer dereference, address: 0000000000000008",
+            "[   41.000100] Oops: 0002 [#1] PREEMPT SMP NOPTI",
+            "[   41.000100] Internal error: Oops: 96000004 [#1] SMP",
+            "[   41.000300] Kernel panic - not syncing: Fatal exception",
+            "[   41.000400] ---[ end Kernel panic - not syncing: Fatal exception ]---",
+            "Kernel panic - not syncing: VFS: Unable to mount root fs",
+        ] {
+            assert_eq!(kind(line), LineKind::Panic, "{line}");
+        }
+    }
+
+    #[test]
+    fn all_shows_every_line_and_units_hides_only_the_kernels() {
+        for line in MIXED {
+            assert!(StreamLogs::All.shows(line), "{line}");
+            assert_eq!(
+                StreamLogs::Units.shows(line),
+                kind(line) != LineKind::Kernel,
+                "{line}"
+            );
+        }
+        // The hello names the MAC on screen, so the lines after it do too.
+        assert!(StreamLogs::Units.shows(HELLO));
+        assert!(!StreamLogs::Units.shows("[    2.881204] r8169 0000:01:00.0 enp1s0: Link is Up"));
+    }
+
+    #[test]
+    fn units_keeps_the_boot_story_on_screen() {
+        let sender = Sender::Served(MAC);
+        let screen: Vec<String> = MIXED
+            .iter()
+            .filter(|line| StreamLogs::Units.shows(line))
+            .map(|line| describe(sender, line))
+            .collect();
+        insta::assert_snapshot!("netlog_units_screen", screen.join("\n"));
+    }
+
+    /// Send [`MIXED`] to a listener showing `shown`, and return what it
+    /// printed and what it wrote to the machine's file.
+    async fn listen_to_mixed(shown: StreamLogs) -> (Vec<String>, String) {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listener = socket.local_addr().unwrap();
+        let peers = SharedPeers::default();
+        learn(&peers, Ipv4Addr::LOCALHOST, MAC);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let log: Log = Arc::new(move |line| {
+            let _ = tx.send(line);
+        });
+        let task = tokio::spawn(listen(
+            socket,
+            peers,
+            Some(directory.path().to_path_buf()),
+            shown,
+            log,
+        ));
+        let machine = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // One datagram, so loopback can't reorder or drop part of it.
+        machine
+            .send_to(format!("{}\n", MIXED.join("\n")).as_bytes(), listener)
+            .await
+            .unwrap();
+        // The last line is a panic, which every mode prints, and each line
+        // is in the file before it prints: once it has printed, the file
+        // holds everything.
+        let last = describe(Sender::Served(MAC), MIXED[MIXED.len() - 1]);
+        let mut printed = Vec::new();
+        while printed.last() != Some(&last) {
+            let line = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            printed.push(line);
+        }
+        task.abort();
+        let file = directory
+            .path()
+            .join(LOGS_DIRECTORY)
+            .join("52:54:00:12:34:56.log");
+        let written = tokio::fs::read_to_string(&file).await.unwrap();
+        (printed, written)
+    }
+
+    #[tokio::test]
+    async fn every_line_goes_to_the_file_whatever_the_screen_shows() {
+        let everything = format!("{}\n", MIXED.join("\n"));
+        for shown in [StreamLogs::All, StreamLogs::Units] {
+            let (printed, written) = listen_to_mixed(shown).await;
+            assert_eq!(written, everything, "{shown:?}");
+            let expected: Vec<String> = MIXED
+                .iter()
+                .filter(|line| shown.shows(line))
+                .map(|line| describe(Sender::Served(MAC), line))
+                .collect();
+            assert_eq!(printed, expected, "{shown:?}");
+        }
+    }
+
     #[tokio::test]
     async fn without_a_directory_the_listener_only_prints() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -524,7 +822,13 @@ mod tests {
         let log: Log = Arc::new(move |line| {
             let _ = tx.send(line);
         });
-        let task = tokio::spawn(listen(socket, SharedPeers::default(), None, log));
+        let task = tokio::spawn(listen(
+            socket,
+            SharedPeers::default(),
+            None,
+            StreamLogs::All,
+            log,
+        ));
         let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         stranger.send_to(b"hello\n", listener).await.unwrap();
         let line = tokio::time::timeout(Duration::from_secs(5), rx.recv())

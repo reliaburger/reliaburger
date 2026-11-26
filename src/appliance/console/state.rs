@@ -14,12 +14,12 @@ use crate::bun::summary::verdict::WtfCheck;
 use crate::bun::top::TopRow;
 use crate::relish::council_view::CouncilNodeObservation;
 
+use crate::appliance::settings::ApplianceSettings;
+
+use super::invaders::{self, Game};
 use super::local::{LocalStatus, Sample, Versions};
 
 /// The console's tabs, in the order their number keys pick them.
-///
-/// The invaders game (#2150's easter egg, and #2151's kill mode) would be
-/// a seventh variant, reading [`ConsoleState::workloads`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Tab {
     #[default]
@@ -29,17 +29,32 @@ pub enum Tab {
     Cluster,
     Versions,
     Logs,
+    /// The invaders game ([`super::invaders`]), one invader for each
+    /// instance in [`ConsoleState::workloads`]. An easter egg: only its
+    /// number key opens it, and the tab bar and the arrows pass it by.
+    Invaders,
 }
 
 impl Tab {
-    /// Every tab, in order.
-    pub const ALL: [Tab; 6] = [
+    /// The tabs the tab bar shows and the arrows step through.
+    pub const SHOWN: [Tab; 6] = [
         Tab::Status,
         Tab::Metrics,
         Tab::Workloads,
         Tab::Cluster,
         Tab::Versions,
         Tab::Logs,
+    ];
+
+    /// Every tab, in order.
+    pub const ALL: [Tab; 7] = [
+        Tab::Status,
+        Tab::Metrics,
+        Tab::Workloads,
+        Tab::Cluster,
+        Tab::Versions,
+        Tab::Logs,
+        Tab::Invaders,
     ];
 
     /// The tab's name, as its title and the tab bar say it.
@@ -51,10 +66,11 @@ impl Tab {
             Tab::Cluster => "Cluster",
             Tab::Versions => "Versions",
             Tab::Logs => "Logs",
+            Tab::Invaders => "Invaders",
         }
     }
 
-    /// Its number key, 1 to 6.
+    /// Its number key, 1 to 7.
     pub fn number(self) -> usize {
         Tab::ALL
             .iter()
@@ -62,10 +78,17 @@ impl Tab {
             .map_or(1, |index| index + 1)
     }
 
+    /// The shown tab `by` steps away. The game sits between the last tab
+    /// and the first: right from it is Status, left is Logs.
     fn step(self, by: isize) -> Tab {
-        let count = Tab::ALL.len() as isize;
-        let index = (self.number() as isize - 1 + by).rem_euclid(count);
-        Tab::ALL[index as usize]
+        let count = Tab::SHOWN.len() as isize;
+        let from = match self {
+            Tab::Invaders if by > 0 => count - 1,
+            Tab::Invaders => 0,
+            _ => self.number() as isize - 1,
+        };
+        let index = (from + by).rem_euclid(count);
+        Tab::SHOWN[index as usize]
     }
 }
 
@@ -121,6 +144,10 @@ pub struct ConsoleState {
     /// The newest samples, oldest first.
     pub samples: VecDeque<Sample>,
     pub logs: Fetched<Vec<String>>,
+    /// The cluster's `[appliance]` settings, which say whether the
+    /// invaders' kill mode is on.
+    pub settings: Fetched<ApplianceSettings>,
+    pub game: Game,
     /// Lines scrolled back from the newest log line, or down from the top
     /// of a list.
     pub scroll: usize,
@@ -151,6 +178,13 @@ pub enum Msg {
     Versions(Versions),
     Sample(Sample),
     Logs(Result<Vec<String>, String>),
+    Settings(Result<ApplianceSettings, String>),
+    /// What bun said to a kill the invaders sent: the fault's id, or why
+    /// it refused.
+    KillAnswered {
+        instance: String,
+        answer: invaders::KillAnswer,
+    },
 }
 
 impl ConsoleState {
@@ -159,11 +193,22 @@ impl ConsoleState {
         let now = self.now;
         match msg {
             Msg::Key(key) => self.key(key),
-            Msg::Tick(now) => self.now = now,
+            Msg::Tick(now) => {
+                self.now = now;
+                if self.tab == Tab::Invaders {
+                    let count = self.invaders().len();
+                    self.game.tick(count);
+                }
+            }
             Msg::Local(local) => self.local = local,
             Msg::Summary(result) => self.summary.record(*result, now),
             Msg::Wtf(check) => self.wtf = Some(check),
-            Msg::Workloads(result) => self.workloads.record(result, now),
+            Msg::Workloads(result) => {
+                if let Ok(rows) = &result {
+                    self.game.workloads_seen(rows, now);
+                }
+                self.workloads.record(result, now)
+            }
             Msg::Council(result) => self.council.record(result, now),
             Msg::Versions(versions) => self.versions = Some(versions),
             Msg::Sample(sample) => {
@@ -173,7 +218,51 @@ impl ConsoleState {
                 self.samples.push_back(sample);
             }
             Msg::Logs(result) => self.logs.record(result, now),
+            Msg::Settings(result) => self.settings.record(result, now),
+            Msg::KillAnswered { instance, answer } => {
+                self.game.kill_answered(instance, answer, now)
+            }
         }
+    }
+
+    /// Whether a hit kills: the cluster's last answer said
+    /// `console_chaos = true`. Bun checks it again for every kill, so a
+    /// stale `true` here only means a refusal there.
+    pub fn kill_mode(&self) -> bool {
+        self.settings
+            .value
+            .is_some_and(|settings| settings.console_chaos)
+    }
+
+    /// The invaders on the field and waiting, from the workloads list.
+    pub fn invaders(&self) -> Vec<invaders::Invader> {
+        self.workloads
+            .value
+            .as_deref()
+            .map_or_else(Vec::new, |rows| invaders::invaders(rows, &self.game.popped))
+    }
+
+    /// The kill a hit queued in kill mode, for the event loop to send.
+    pub fn take_kill(&mut self) -> Option<invaders::Invader> {
+        self.game.take_kill()
+    }
+
+    /// The game's own keys: the arrows move the cannon instead of
+    /// changing tabs, space fires, `r` brings every invader back. `true`
+    /// when the key was one of them.
+    fn game_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Left | KeyCode::Char('h') => self.game.move_cannon(-1),
+            KeyCode::Right | KeyCode::Char('l') => self.game.move_cannon(1),
+            KeyCode::Char(' ') => {
+                let invaders = self.invaders();
+                let kill_mode = self.kill_mode();
+                self.game.fire(&invaders, kill_mode);
+            }
+            KeyCode::Char('r') => self.game.new_wave(),
+            _ => return false,
+        }
+        true
     }
 
     fn key(&mut self, key: KeyEvent) {
@@ -181,8 +270,11 @@ impl ConsoleState {
             self.quit = true;
             return;
         }
+        if self.tab == Tab::Invaders && self.game_key(key) {
+            return;
+        }
         let tab = match key.code {
-            KeyCode::Char(digit @ '1'..='6') => {
+            KeyCode::Char(digit @ '1'..='7') => {
                 let index = digit as usize - '1' as usize;
                 Some(Tab::ALL[index])
             }
@@ -250,11 +342,113 @@ mod tests {
         press(&mut state, KeyCode::Right);
         assert_eq!(state.tab, Tab::Logs);
         press(&mut state, KeyCode::Tab);
-        assert_eq!(state.tab, Tab::Status);
+        assert_eq!(state.tab, Tab::Status, "the arrows pass the game by");
         press(&mut state, KeyCode::Left);
         assert_eq!(state.tab, Tab::Logs);
         press(&mut state, KeyCode::Char('7'));
-        assert_eq!(state.tab, Tab::Logs, "there's no seventh tab");
+        assert_eq!(state.tab, Tab::Invaders);
+        press(&mut state, KeyCode::BackTab);
+        assert_eq!(state.tab, Tab::Logs);
+        press(&mut state, KeyCode::Char('7'));
+        press(&mut state, KeyCode::Tab);
+        assert_eq!(state.tab, Tab::Status);
+        press(&mut state, KeyCode::Char('7'));
+        assert_eq!(state.tab, Tab::Invaders);
+        press(&mut state, KeyCode::Char('8'));
+        assert_eq!(state.tab, Tab::Invaders, "there's no eighth tab");
+    }
+
+    fn workload(id: &str) -> crate::bun::top::TopRow {
+        crate::bun::top::TopRow {
+            node: "node-1".into(),
+            instance: crate::bun::agent::InstanceStatus {
+                id: id.into(),
+                app_name: "web".into(),
+                namespace: "default".into(),
+                state: "running".into(),
+                restart_count: 0,
+                host_port: None,
+                exit_code: None,
+                pid: None,
+                runtime_unknown: false,
+                status_age_ms: None,
+                age_seconds: None,
+                image: None,
+                data_on_node: false,
+                reason: None,
+                sidecars: Vec::new(),
+            },
+            cpu_percent: None,
+            memory_bytes: None,
+            tasks: None,
+        }
+    }
+
+    /// The Invaders tab with one invader, `web-0`, over the cannon.
+    fn game_with_one_invader() -> ConsoleState {
+        let mut state = ConsoleState {
+            tab: Tab::Invaders,
+            ..ConsoleState::default()
+        };
+        state.update(Msg::Workloads(Ok(vec![workload("default__web-0")])));
+        state.game.cannon = 3;
+        state
+    }
+
+    #[test]
+    fn in_the_game_the_arrows_move_the_cannon_and_tab_still_leaves() {
+        let mut state = game_with_one_invader();
+        press(&mut state, KeyCode::Right);
+        assert_eq!((state.tab, state.game.cannon), (Tab::Invaders, 5));
+        press(&mut state, KeyCode::Left);
+        assert_eq!((state.tab, state.game.cannon), (Tab::Invaders, 3));
+        press(&mut state, KeyCode::Tab);
+        assert_eq!(state.tab, Tab::Status);
+    }
+
+    #[test]
+    fn a_hit_kills_nothing_until_the_cluster_turns_kill_mode_on() {
+        let mut state = game_with_one_invader();
+        assert!(!state.kill_mode());
+        press(&mut state, KeyCode::Char(' '));
+        assert!(state.game.popped.contains("default__web-0"));
+        assert_eq!(state.take_kill(), None);
+        assert!(state.invaders().is_empty(), "the popped invader is gone");
+
+        press(&mut state, KeyCode::Char('r'));
+        state.update(Msg::Settings(Ok(ApplianceSettings {
+            console_chaos: true,
+        })));
+        assert!(state.kill_mode());
+        press(&mut state, KeyCode::Char(' '));
+        let kill = state.take_kill().expect("kill mode queues a kill");
+        assert_eq!(kill.instance, "default__web-0");
+        state.update(Msg::KillAnswered {
+            instance: "default__web-0".into(),
+            answer: invaders::KillAnswer::Refused {
+                reason: "kill mode is off".into(),
+            },
+        });
+        assert_eq!(state.invaders().len(), 1, "a refused kill brings it back");
+    }
+
+    #[test]
+    fn a_failed_settings_read_keeps_kill_mode_as_last_known_and_only_true_is_on() {
+        let mut state = ConsoleState::default();
+        state.update(Msg::Settings(Err("bun isn't answering".into())));
+        assert!(!state.kill_mode(), "unknown is off");
+        state.update(Msg::Settings(Ok(ApplianceSettings::default())));
+        assert!(!state.kill_mode());
+    }
+
+    #[test]
+    fn the_formation_marches_only_while_the_game_shows() {
+        let mut state = game_with_one_invader();
+        state.update(Msg::Tick(1));
+        assert_eq!(state.game.march, 1);
+        press(&mut state, KeyCode::Char('1'));
+        state.update(Msg::Tick(2));
+        assert_eq!(state.game.march, 1);
     }
 
     #[test]
