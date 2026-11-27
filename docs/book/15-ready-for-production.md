@@ -1914,6 +1914,21 @@ itself with the same `candidate.py` and the operator's own login, and says so in
 whether a release works, so they no longer stand between it and its users. A regression they
 find is a bug for the next patch release.
 
+**Run the binary you ship, not just its version.** The gate's staged installs and soaks
+all run on Apple silicon. They exercise the macOS `relish` and, inside the quickstart's VMs,
+the aarch64 `bun`. Nothing ran the x86-64 pair before it was published except `bun
+--version`, which never starts a cluster. CI's tests don't count either: they build debug
+binaries on a newer Ubuntu, and the release is a `--release` build with eBPF on 22.04. A
+glibc symbol 22.04 lacks, or a panic on the start-up path, would have reached the first
+person to run `bun` on an x86-64 server. So the build job now starts each Linux release `bun`
+it has just built, with its own `relish`, on the process runtime, applies one app that
+sleeps, waits for it to run, and deletes it, all before it uploads the artefacts
+([#2486](https://github.com/reliaburger/reliaburger/issues/2486)). It reuses the feature
+demos' one-node cluster, so it's a real `relish init`, mTLS and an admin token, in a few
+seconds. It doesn't load the eBPF object or start runc; those need root,
+and the privileged Linux job tests them from source. The Linux cold installs still run after
+promotion, once per minor release, and the closure record says so.
+
 What we didn't do is move release builds onto the new quiet host. It's tempting, since it's
 fast and it's ours, but a release build is the one place where "who could have touched this
 machine?" must have a boring answer. Hosted runners give that.

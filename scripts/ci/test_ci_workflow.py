@@ -1874,6 +1874,33 @@ class ApplianceTests(unittest.TestCase):
         self.assertIn("disk_from_image", boot)
 
 
+class ReleaseSmokeTests(unittest.TestCase):
+    """The Linux release `bun` runs a workload before it can be promoted.
+
+    Until #2486 the build ran only `bun --version`, and no gate ran the x86-64
+    release pair: Apple silicon runs the aarch64 bun in its VMs, and CI tests
+    debug builds made on another Ubuntu."""
+
+    def setUp(self):
+        self.build = jobs((WORKFLOWS / "build.yml").read_text())["build-binaries"]
+
+    def test_the_release_build_starts_the_linux_bun_it_built(self):
+        step = self.build.split("- name: Start the release bun and run one app")[1].split("\n      - ")[0]
+        self.assertIn("if: runner.os == 'Linux'", step)
+        self.assertIn("scripts/release/smoke-release-bun.sh", step)
+        self.assertIn("target/${{ matrix.target }}/release/bun", step)
+        self.assertIn("target/${{ matrix.target }}/release/relish", step)
+        # Before the artefacts upload, so a bun that can't run never becomes one.
+        self.assertLess(self.build.index("smoke-release-bun.sh"), self.build.index("Upload binary artifacts"))
+
+    def test_the_smoke_script_applies_an_app_and_waits_for_it_to_run(self):
+        script = (REPO / "scripts" / "release" / "smoke-release-bun.sh").read_text()
+        self.assertIn('. "${DEMO_DIR}/lib.sh"', script)
+        self.assertIn("demo_start", script)
+        self.assertIn('"${RELISH}" apply', script)
+        self.assertIn("running", script)
+
+
 class ReleaseKeyEnvironmentTests(unittest.TestCase):
     """RELIABURGER_RELEASE_KEY is a secret of the `release` environment and
     nowhere else, so a job that reads it without naming that environment

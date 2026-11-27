@@ -205,6 +205,16 @@ jobs:
             target/${{ matrix.target }}/release/bun --version
             cp target/${{ matrix.target }}/release/bun dist/bun-${{ matrix.suffix }}
           fi
+      - name: Start the release bun and run one app
+        # `--version` doesn't start a cluster. Run the release pair the way a
+        # server does, on the process runtime, so a bun that can't start or
+        # run a workload never becomes a release asset (#2486).
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          scripts/release/smoke-release-bun.sh \
+            target/${{ matrix.target }}/release/bun \
+            target/${{ matrix.target }}/release/relish
       - name: Record the embedded source bundle's digest
         # The relish just built says what it embeds, and that it came from a
         # clean tree; candidate.py refuses anything else. The candidate job

@@ -1713,8 +1713,16 @@ the real `curl … | sh` install against it on every host we advertise.
    again, and one whose bytes differ stops the run without changing anything.
    A rebuilt candidate (a new attempt) gets its own tag.
 
-3. **Qualify it on every host in the matrix**: macOS on Apple silicon,
-   Linux x86_64 and Linux arm64. From a checkout of the same `main`:
+3. **Qualify the staged install on Apple silicon**, twice. Before
+   promotion this is the only host the staged install runs on; it covers
+   `relish-macos-aarch64` and, inside the quickstart's VMs,
+   `bun-linux-aarch64`. The x86-64 pair is run by the candidate's own
+   `build.yml`: before uploading them, `build-binaries` starts each Linux
+   target's release `bun` with its `relish` and runs one app
+   ([`smoke-release-bun.sh`](../scripts/release/smoke-release-bun.sh),
+   [#2486](https://github.com/reliaburger/reliaburger/issues/2486)), so a
+   green build run is that check. The Linux cold installs come after
+   promotion (below). From a checkout of the same `main`:
 
    ```sh
    scripts/release/qualify-staged-install.sh \
@@ -1741,11 +1749,13 @@ the real `curl … | sh` install against it on every host we advertise.
    debugging (then `relish local destroy --yes` and `relish uninstall --yes`
    with the same `RELIABURGER_HOME`).
 
-   Run it at least twice per host for V04: once with nothing cached (the
-   script always starts empty) and again for repeatability.
+   Run it at least twice for V04: once with nothing cached (the script
+   always starts empty) and again for repeatability.
 
-   The Linux rows of V04 measure the published release on a clean host, once
-   it's promoted. `scripts/release/qualify-cold-install.sh --prepare` installs
+   The Linux rows of V04 measure the published release on a clean host,
+   after promotion, for every minor release; the closure record says whether
+   they ran, or why not, and names the build run whose release-bun step
+   passed. `scripts/release/qualify-cold-install.sh --prepare` installs
    QEMU and opens `/dev/kvm`, pipes `https://reliaburger.com/install.sh` to
    `bash -s -- --laptop --timings` in the real home, checks the cluster,
    destroys it, uninstalls, and diffs the host against how it started. Run it
