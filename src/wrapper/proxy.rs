@@ -187,27 +187,6 @@ struct DrainGuard {
     websocket: bool,
 }
 
-impl DrainGuard {
-    /// Keep ownership of only the candidate at `index` and release the rest
-    /// now. Called once a backend has answered: the unused failover
-    /// candidates must not hold their drains open, or be able to cancel this
-    /// response, for as long as it streams.
-    fn keep_only(&mut self, index: usize) {
-        if index >= self.instance_ids.len() {
-            return;
-        }
-        let kept = self.instance_ids.remove(index);
-        let released = std::mem::replace(&mut self.instance_ids, vec![kept]);
-        // Dropping a guard for the others releases them exactly as a finished
-        // request would.
-        drop(DrainGuard {
-            drains: self.drains.clone(),
-            instance_ids: released,
-            websocket: self.websocket,
-        });
-    }
-}
-
 impl Drop for DrainGuard {
     fn drop(&mut self) {
         let drains = self.drains.clone();
@@ -730,12 +709,15 @@ struct Capture {
     terminate: Vec<CancellationToken>,
 }
 
-/// Pick up to `max` backends from `route` and capture their drain counts.
+/// Pick up to `max` backends from `route` and capture the primary's drain
+/// count.
 ///
 /// The caller holds the routing read lock. Withdrawal takes the write lock
 /// before starting a drain, so it cannot miss a handler that has already
-/// copied an endpoint. `None` means a candidate's drain deadline has passed,
-/// which the caller answers with 503.
+/// copied its primary. Failover candidates are captured only when a request
+/// tries them ([`capture_failover`]), so a drain on one it never uses
+/// neither waits for it nor cancels it (#2469). `None` means the primary's
+/// drain deadline has passed, which the caller answers with 503.
 async fn capture_backends(
     state: &ProxyState,
     route: &super::routing::PathRoute,
@@ -751,7 +733,11 @@ async fn capture_backends(
             terminate: Vec::new(),
         });
     };
-    let instance_ids: Vec<_> = candidates.iter().map(|(id, _)| id.clone()).collect();
+    let instance_ids: Vec<_> = candidates
+        .iter()
+        .take(1)
+        .map(|(id, _)| id.clone())
+        .collect();
     let terminate = drains.capture_requests(&instance_ids, websocket).await?;
     Some(Capture {
         candidates,
@@ -762,6 +748,29 @@ async fn capture_backends(
         }),
         terminate,
     })
+}
+
+/// Capture a failover candidate's drain count as a request moves on to it.
+///
+/// This happens outside the routing lock, so the candidate may have been
+/// withdrawn since it was picked. That is safe: a stopped container refuses
+/// the connection and the request moves on, and a capture on an instance
+/// with no drain is forgotten again when the guard drops. `None` means its
+/// drain deadline has passed: skip it.
+async fn capture_failover(
+    drains: &super::draining::SharedDrains,
+    instance_id: &str,
+) -> Option<(DrainGuard, Vec<CancellationToken>)> {
+    let instance_ids = vec![instance_id.to_string()];
+    let terminate = drains.capture_requests(&instance_ids, false).await?;
+    Some((
+        DrainGuard {
+            drains: drains.clone(),
+            instance_ids,
+            websocket: false,
+        },
+        terminate,
+    ))
 }
 
 /// The answer when a route has no backend to try. An empty list means
@@ -992,8 +1001,8 @@ async fn do_proxy(
     // table may have changed while the body arrived.
     let Capture {
         candidates,
-        guard: drain_guard,
-        terminate,
+        guard: mut drain_guard,
+        mut terminate,
     } = {
         let table = state.routing_table.read().await;
         let Some(route) = table.lookup(&host, &path) else {
@@ -1066,7 +1075,19 @@ async fn do_proxy(
     // connection failure*. A backend that answered (even with a 5xx) may have
     // side effects, so its request is never replayed against another instance;
     // a connection that never opened is always safe to retry (§ retry).
-    for (idx, (_cand_id, cand_addr)) in candidates.iter().enumerate() {
+    for (idx, (cand_id, cand_addr)) in candidates.iter().enumerate() {
+        // The primary was captured under the routing lock. A failover
+        // candidate is captured as the request moves on to it, which also
+        // releases the one before (#2469).
+        if idx > 0
+            && let Some(drains) = &state.drains
+        {
+            let Some((guard, tokens)) = capture_failover(drains, cand_id).await else {
+                continue;
+            };
+            drain_guard = Some(guard);
+            terminate = tokens;
+        }
         let upstream_uri = match build_upstream_uri(cand_addr, &parts.uri) {
             Some(u) => u,
             None => continue,
@@ -1123,12 +1144,8 @@ async fn do_proxy(
                 // The response owns its permit; a bounded upstream pump owns
                 // the drain guard and observes cancellation even when the
                 // client stops polling its body (ING2/DEP5/§5.5). Only this
-                // backend's drain may hold or cancel the stream (T1.7).
-                let mut drain_guard = drain_guard;
-                if let Some(guard) = &mut drain_guard {
-                    guard.keep_only(idx);
-                }
-                let terminate: Vec<_> = terminate.into_iter().nth(idx).into_iter().collect();
+                // backend's drain holds or cancels the stream (T1.7): it is
+                // the only one captured.
                 let stream =
                     guarded_body_stream(resp.bytes_stream(), permit, drain_guard, terminate);
                 return response
@@ -3445,6 +3462,111 @@ mod tests {
             .unwrap()
             .expect("the unused candidate's drain aborted a healthy stream");
         assert_eq!(&body[..], b"first-last");
+
+        shutdown.cancel();
+    }
+
+    /// #2469: while a request waits for its backend's response head, a
+    /// drain on a failover candidate it never tried must neither wait for it
+    /// nor cancel it. Before, every candidate was captured up front, so the
+    /// unused one's drain couldn't finish and its deadline answered the
+    /// healthy request with 503.
+    #[tokio::test]
+    async fn draining_an_unused_failover_candidate_leaves_a_request_awaiting_headers_alone() {
+        use crate::wrapper::draining::{DrainCommand, DrainTracker, SharedDrains};
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Each backend reads the request, says it is serving, and writes
+        // nothing at all until the test lets it finish.
+        let (serving_tx, mut serving_rx) = tokio::sync::mpsc::channel::<String>(2);
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let mut backends = Vec::new();
+        for id in ["default__web-a", "default__web-b"] {
+            let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            backends.push((id, backend.local_addr().unwrap().port()));
+            let serving = serving_tx.clone();
+            let finish = Arc::clone(&finish);
+            tokio::spawn(async move {
+                if let Ok((mut sock, _)) = backend.accept().await {
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let notified = finish.notified();
+                    let _ = serving.send(id.to_string()).await;
+                    notified.await;
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone")
+                        .await;
+                }
+            });
+        }
+
+        let drains = SharedDrains::new(DrainTracker::new(tokio::sync::mpsc::channel(8).0));
+        let shutdown = CancellationToken::new();
+        let bound = bind_proxy_with_drains(
+            WrapperConfig {
+                http_port: 0,
+                https_port: 0,
+                ..WrapperConfig::default()
+            },
+            web_test_table(&backends),
+            Some(drains.clone()),
+            shutdown.clone(),
+        )
+        .await
+        .unwrap();
+        let http_port = bound.http_addr.port();
+        tokio::spawn(async move {
+            bound.serve().await.ok();
+        });
+
+        let request = tokio::spawn(
+            reqwest::Client::new()
+                .get(format!("http://127.0.0.1:{http_port}/"))
+                .header("host", "web.test")
+                .send(),
+        );
+        let serving = tokio::time::timeout(Duration::from_secs(2), serving_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let unused = if serving == "default__web-a" {
+            "default__web-b"
+        } else {
+            "default__web-a"
+        };
+
+        drains
+            .start_drain(&DrainCommand {
+                app_name: "web".to_string(),
+                instance_id: unused.to_string(),
+                timeout: Duration::from_millis(600),
+            })
+            .await;
+        let mut completed = Vec::new();
+        for _ in 0..30 {
+            completed = drains.check_completions().await;
+            if !completed.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            completed,
+            vec![unused.to_string()],
+            "an unused failover candidate's drain waited on a request to another backend"
+        );
+
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        drains.check_completions().await;
+        finish.notify_waiters();
+        let response = tokio::time::timeout(Duration::from_secs(5), request)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(&response.bytes().await.unwrap()[..], b"done");
 
         shutdown.cancel();
     }
