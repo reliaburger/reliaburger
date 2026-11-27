@@ -134,7 +134,18 @@ passes the kernel command line, and with Secure Boot on a UKI ignores it.
   is written, its hash checked and its boot entry made. Fetching the
   installer records nothing, so a machine whose install failed gets the
   install script again. A disk report (`POST /disk`) needs the ticket too,
-  once per ticket. At most 256 tickets are outstanding, each for an hour.
+  once per ticket. At most 256 tickets are outstanding, each for an hour,
+  and a machine holds one: a new ticket cancels its older one.
+- A ticket goes only to the address the machine's latest DHCP request (to
+  UDP 67 or 4011, from an address of its own) came from. A `boot.ipxe` from
+  anywhere else gets the install script without a ticket, and relish logs
+  that it withheld one. So a host that only speaks HTTP can't mark another
+  machine installed, ask a question about its disk, or fill the ticket table.
+  This isn't authentication: DHCP isn't authenticated either, so a host that
+  forges a DHCP request with another machine's MAC, or spoofs its address
+  (which needs ARP spoofing to win the TCP handshake), can still get that
+  machine's ticket. The install LAN is trusted for availability; image
+  integrity doesn't depend on it, since the installer checks signed sums.
 - `--for` doesn't cut an install off: when it's up, relish waits up to 20
   more minutes for installs that were sent the install script and haven't
   reported.

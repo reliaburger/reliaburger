@@ -81,6 +81,9 @@ impl fmt::Display for Sender {
 pub struct Peers {
     answered: HashSet<MacAddress>,
     by_address: HashMap<Ipv4Addr, MacAddress>,
+    /// The address each MAC's latest DHCP request came from. Only DHCP
+    /// sets it, never a hello, which anyone can send.
+    asked_from: HashMap<MacAddress, Ipv4Addr>,
 }
 
 impl Peers {
@@ -93,6 +96,13 @@ impl Peers {
             return;
         }
         self.by_address.insert(address, mac);
+        self.asked_from.insert(mac, address);
+    }
+
+    /// The address `mac`'s latest DHCP request came from, if it sent one
+    /// from an address of its own.
+    pub fn asked_from(&self, mac: MacAddress) -> Option<Ipv4Addr> {
+        self.asked_from.get(&mac).copied()
     }
 
     /// A machine at `address` said hello naming `mac` ([`hello_mac`]).

@@ -15,13 +15,13 @@
 //! reports carry the install ticket its install script was given
 //! ([`InstallTickets`]); a report without that machine's ticket is refused.
 
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -35,6 +35,7 @@ use super::installed::{
     BootClient, BootDecision, DECLINED_SCRIPT, EXIT_SCRIPT, InstallTickets, InstalledRecord,
     NOT_ALLOWED_SCRIPT, decide, install_script,
 };
+use super::netlog::SharedPeers;
 use super::wipe::{
     self, Answer, DiskReport, DiskSession, MAX_REPORT_BYTES, Question, WipeDecision,
 };
@@ -69,6 +70,9 @@ pub struct HttpState {
     pub installs: Mutex<InstallTickets>,
     /// Where the installer sends boot logs (`--stream-logs`), if anywhere.
     pub netlog: Option<SocketAddrV4>,
+    /// The machines the DHCP servers answered, and the address each asked
+    /// from: only that address gets the machine's install ticket.
+    pub peers: SharedPeers,
     /// Where request lines go.
     pub log: Log,
 }
@@ -107,8 +111,17 @@ pub fn router(state: Arc<HttpState>) -> Router {
         .with_state(state)
 }
 
+/// The routes as a service that knows each connection's peer address,
+/// which [`boot_script`] needs: serve it with `axum::serve`.
+pub fn service(
+    state: Arc<HttpState>,
+) -> axum::extract::connect_info::IntoMakeServiceWithConnectInfo<Router, SocketAddr> {
+    router(state).into_make_service_with_connect_info::<SocketAddr>()
+}
+
 async fn boot_script(
     State(state): State<Arc<HttpState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Query(query): Query<BootQuery>,
 ) -> Response {
     let client = query.client();
@@ -128,9 +141,27 @@ async fn boot_script(
     };
     let (script, what) = match decision {
         BootDecision::Install => {
-            // A machine that says who it is gets an install ticket for its
-            // reports; one that doesn't gets none, and is never recorded.
+            // A machine that says who it is, asking from the address its
+            // DHCP request came from, gets an install ticket for its
+            // reports. Anyone else gets the script without one, and is
+            // never recorded: naming a MAC isn't enough to speak for it.
             let named = client.mac.is_some() || client.uuid.is_some();
+            let asked_from = client.mac.and_then(|mac| {
+                state
+                    .peers
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .asked_from(mac)
+            });
+            let booted_here = asked_from.is_some_and(|address| IpAddr::V4(address) == peer.ip());
+            if named && !booted_here {
+                (state.log)(format!(
+                    "http: {client}: boot.ipxe from {}, not the address its DHCP request came from ({}): no install ticket",
+                    peer.ip(),
+                    asked_from.map_or("none seen".to_string(), |a| a.to_string()),
+                ));
+            }
+            let named = named && booted_here;
             let ticket = if named {
                 state
                     .installs
@@ -212,7 +243,8 @@ async fn report_disk(
         }
     };
     // Only the installer relish sent this machine, once: anyone else on
-    // the LAN can name its MAC, but not its install ticket.
+    // the LAN can name its MAC, but only the address that machine's DHCP
+    // request came from was given its install ticket.
     let first = match query.ticket.as_deref() {
         Some(ticket) => {
             state
@@ -453,6 +485,7 @@ async fn remember(state: Arc<HttpState>, client: BootClient) {
 mod tests {
     use super::super::artefacts::{self, fixture};
     use super::super::installed::RECORD_FILE;
+    use super::super::netlog;
     use super::*;
     use axum::http::Request;
     use http_body_util::BodyExt;
@@ -508,19 +541,55 @@ mod tests {
             disks: Mutex::new(DiskSession::default()),
             installs: Mutex::new(InstallTickets::default()),
             netlog: None,
+            peers: SharedPeers::default(),
             log: Arc::new(move |line| sink.lock().unwrap().push(line)),
         });
+        // Each machine the tests boot asked for its address over DHCP first.
+        for mac in [
+            MAC,
+            "52:54:00:00:00:01",
+            "52:54:00:00:00:02",
+            "52:54:00:00:00:03",
+        ] {
+            netlog::learn(&state.peers, address_of(mac), mac.parse().unwrap());
+        }
         Fixture { dir, state, lines }
+    }
+
+    /// The address the fixture's DHCP gave `mac`: 192.168.1.<its last byte>.
+    fn address_of(mac: &str) -> Ipv4Addr {
+        Ipv4Addr::new(192, 168, 1, u8::from_str_radix(&mac[15..], 16).unwrap())
+    }
+
+    /// Where a request for `uri` comes from: the machine its `mac=` names,
+    /// at the address its DHCP request came from.
+    fn requester(uri: &str) -> std::net::SocketAddr {
+        let address = uri
+            .split_once("mac=")
+            .map_or(Ipv4Addr::new(192, 168, 1, 99), |(_, rest)| {
+                address_of(&rest[..17])
+            });
+        std::net::SocketAddr::from((address, 50_000))
     }
 
     async fn get_path(
         state: &Arc<HttpState>,
         uri: &str,
     ) -> (StatusCode, Option<String>, Option<String>, Vec<u8>) {
-        let response = router(state.clone())
-            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
-            .await
-            .unwrap();
+        get_from(state, uri, requester(uri)).await
+    }
+
+    /// GET `uri` over a connection from `from`.
+    async fn get_from(
+        state: &Arc<HttpState>,
+        uri: &str,
+        from: std::net::SocketAddr,
+    ) -> (StatusCode, Option<String>, Option<String>, Vec<u8>) {
+        let mut request = Request::get(uri).body(Body::empty()).unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(from));
+        let response = router(state.clone()).oneshot(request).await.unwrap();
         let status = response.status();
         let header = |name| {
             response
@@ -540,8 +609,15 @@ mod tests {
         (status, content_type, length, body)
     }
 
+    /// iPXE's request for `mac`'s boot script. Each machine has a UUID of
+    /// its own, since a UUID names a machine as surely as its MAC.
     fn boot_uri(mac: &str) -> String {
-        format!("/boot.ipxe?mac={mac}&uuid=4c4c4544-0042-3510-8051-b4c04f4b4e32&arch=x86_64")
+        let uuid = if mac == MAC {
+            "4c4c4544-0042-3510-8051-b4c04f4b4e32".to_string()
+        } else {
+            format!("4c4c4544-0042-3510-8051-b4c04f4b4e{}", &mac[15..])
+        };
+        format!("/boot.ipxe?mac={mac}&uuid={uuid}&arch=x86_64")
     }
 
     /// Ask for `mac`'s boot script, as iPXE does, and return the install
@@ -666,6 +742,45 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("installed; it gets exit from now on")),
             "{lines:?}"
+        );
+    }
+
+    /// Anyone on the LAN can ask for a boot script naming any MAC. Only
+    /// the address that MAC's DHCP request came from gets a ticket in it;
+    /// anyone else gets the install script without one, as a machine that
+    /// doesn't say who it is does.
+    #[tokio::test]
+    async fn a_ticket_is_only_issued_to_the_address_that_booted_the_machine() {
+        let f = fixture_with(vec![], false);
+        netlog::learn(
+            &f.state.peers,
+            Ipv4Addr::new(192, 168, 1, 51),
+            MAC.parse().unwrap(),
+        );
+        let stranger = std::net::SocketAddr::from(([192, 168, 1, 99], 50_000));
+        let (status, _, _, script) = get_from(&f.state, &boot_uri(MAC), stranger).await;
+        assert_eq!(status, StatusCode::OK);
+        let script = String::from_utf8(script).unwrap();
+        assert!(script.contains("installer.efi"), "{script}");
+        assert!(!script.contains("&ticket="), "{script}");
+
+        let machine = std::net::SocketAddr::from(([192, 168, 1, 51], 50_000));
+        let (_, _, _, script) = get_from(&f.state, &boot_uri(MAC), machine).await;
+        assert!(String::from_utf8(script).unwrap().contains("&ticket="));
+    }
+
+    #[tokio::test]
+    async fn a_new_ticket_for_a_machine_cancels_its_older_one() {
+        let f = fixture_with(vec![], false);
+        let first = install_ticket(&f.state, MAC).await;
+        let second = install_ticket(&f.state, MAC).await;
+        assert_eq!(
+            installed(&f.state, &format!("mac={MAC}&ticket={first}")).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            installed(&f.state, &format!("mac={MAC}&ticket={second}")).await,
+            StatusCode::OK
         );
     }
 
