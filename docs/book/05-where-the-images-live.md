@@ -584,7 +584,7 @@ The `if` after a pattern is a *match guard*: the arm only matches when the patte
 
 Here's a subtle one. The unpacked rootfs used to live at `rootfs/{registry}/{repo}/{tag}/`, and unpacking *cleared and recreated* that directory. Now picture a tag move — `web:v1` re-pointed at new content — while a container is running out of the old rootfs. The re-extract does `remove_dir_all` on the directory the running container is living in. Two concurrent pushes to the same tag race the same way.
 
-The fix content-addresses the rootfs: each set of layers unpacks into `…/{tag}/gen-{hash}`, where the hash is derived from the ordered layer digests. Different content lands in a different generation directory. The same content needs one more rule: publish it once, write a completion marker, then reuse it. Re-extracting an “identical” tree still starts by deleting the old one, which removes commands underneath a running container. `ImageStore` serialises generation publication across its clones and treats only a marked generation as reusable. A running container holds the path it was started with, and a tag move simply produces a *new* generation beside it. Nobody deletes anybody's live filesystem.
+The fix content-addresses the rootfs: each set of layers unpacks into `…/{tag}/gen-{hash}`, where the hash is derived from the ordered layer digests. Different content lands in a different generation directory. The same content needs one more rule: publish it once, write a completion marker, then reuse it. Re-extracting an “identical” tree still starts by deleting the old one, which removes commands underneath a running container. `ImageStore` serialises the publication of each generation across its clones and treats only a marked generation as reusable. A running container holds the path it was started with, and a tag move simply produces a *new* generation beside it. Nobody deletes anybody's live filesystem.
 
 That marker turned out to be a promise we hadn't kept. The V02 soak powered a node off a few seconds after it unpacked Redis. When the node came back, `gen-…/.complete` was there and `usr/local/bin/redis-server` was 0 bytes: ext4 had written the tiny marker and was still holding the unpacked data in the page cache when the power went. Every redeploy then failed with `exec format error`, the node never got its pinned workload back, and the agent retried every two seconds. The marker now waits for `syncfs` on the unpacked tree, which flushes the whole filesystem in one call rather than fsyncing thousands of files, and is itself written with the same synced temp-file-and-rename as everything else. Cached blobs got the same treatment: they used to be renamed into place without a sync.
 
@@ -639,6 +639,126 @@ Writable ones fail before pull with an explicit error. That's less convenient,
 but it doesn't quietly turn “rootless” into “every local workload shares one
 writable filesystem”. We can add an unprivileged snapshotter later and keep the
 same ownership contract.
+
+### One lock per generation
+
+That serialisation started life as one node-wide `tokio::sync::Mutex`, taken
+before anything else in `unpack_to`, even the check for the marker (#2456).
+So while a six-gigabyte image unpacked, and then `syncfs` waited for every
+dirty page on the filesystem, a crashed Redis replica whose image was
+unpacked days ago couldn't restart: its create queued behind the same lock
+just to read a marker file. New images unpacked strictly one after another
+too.
+
+Two changes fix it. First, the marker check moved in front of any lock. That's
+safe because of how the marker is written: after the tree is flushed, and
+atomically (temp file, sync, rename), so a reader sees either no marker or
+a marker over a complete tree. A published generation is returned at once,
+whatever else is unpacking. Second, the one lock became one lock per
+generation path, in a `tokio::sync::Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>`.
+The outer lock guards only the map and is held for a lookup. The inner one,
+an `Arc` so it can outlive the lookup, is what an unpack holds while it
+extracts. The unpack checks the marker again once it has the lock, since
+another pull of the same image may have published it meanwhile, and that
+keeps the property the lock was for: a generation is never cleared and
+re-extracted under a running container. Afterwards `retain` drops every entry
+whose `Arc::strong_count` is 1, which means only the map still holds it, so
+the map doesn't grow with every image the node has ever run.
+
+`syncfs` stayed. It still flushes the whole filesystem, but it now holds only
+its own generation's lock, so a slow flush delays that one image and nothing
+else. Flushing each file of the tree instead would avoid waiting for
+unrelated writers, at the cost of thousands of `fsync` calls per image; we'll
+revisit it if the profile says so.
+
+### Generations nobody runs any more
+
+Content-addressing fixed the clobbering, and it also meant nothing ever
+went away. Every new build of `web` unpacked into a new `gen-…` directory,
+three or four times the size of its compressed layers, and no code removed
+the old one. Pickle's garbage collection expires blobs; it never looked at
+`rootfs/`, the cached manifests or the pin metadata beside them. The November
+2026 audit worked it through: a 300 MB image, deployed three times a day on a
+16 GB data disk, fills the disk in about two weeks (#2423). Then pulls, log
+capture and the Raft log all fail with `ENOSPC` on that node.
+
+So who decides that a generation is garbage? Not the image store: it doesn't
+know which containers exist. The runtime does. Every bundle that uses an image
+names its generation in one of two places. A writable container's
+`rootfs-lower` marker holds the canonical lower directory, and a read-only
+container's `config.json` points runc straight at the generation.
+`live_image_generations` in `src/grill/runc.rs` reads both for every bundle
+and hands the set to `ImageStore::collect_rootfs_garbage`, which removes every
+`gen-*` directory not in it. That covers the reusable job executors too,
+since their bundles sit in the same directory. Note the error policy: if one
+`config.json` can't be read, the whole set is refused. A set that's missing
+a running container's root would delete that container's files.
+
+The collector takes each generation's lock before it touches it, with
+`try_lock`: a generation an unpack holds is skipped, not waited for, so a
+collection pass never stalls a pull and a pull waits for at most one removal.
+
+There's a gap between a pull and a bundle, though. `pull_and_unpack` returns
+a generation, and only some time later does `mount_private` write the marker
+that names it. A collection in that window would see an unused generation and
+delete it under a container that is about to start. The store closes the gap
+itself: it records each generation it hands out, and the collector spares
+anything handed out within the last hour. The marker check and the record
+happen under one lock, and so do the collector's own check and its removal of
+the marker. A pull either claims a generation before the collector gets
+there, and the generation stays, or it finds no marker and unpacks afresh.
+
+Removal order matters as much as it did for publication. The collector deletes
+the `.complete` marker first and the tree second. A crash between the two
+leaves a tree with no marker, which the next unpack or the next pass clears.
+The other order could leave a marker over nothing, and the next pull would hand
+out an empty directory. A tree that never got its marker (an unpack that died)
+goes once it's older than an hour. After the generations, the pass removes
+emptied directories, the cached manifests of images with no tree left, and the
+pin metadata that no remaining pinned image's chain (pin, platform manifest,
+config) refers to.
+
+The trigger is the thing that grows the store. Each create from an image
+starts a pass on its own task if the last one began more than an hour ago, or
+at once when the image filesystem is 95% full. `start_collection` returns a
+`tokio::sync::OwnedMutexGuard` (a lock guard that owns its `Arc` instead of
+borrowing it, so it can move into a spawned task) and holds it for the whole
+pass, so two creates never run two passes. A node that stops deploying stops
+collecting, which is fine: it also stops growing.
+
+### How big may an image get?
+
+Collection removes what nobody uses. It can't help with one image that is
+simply too big, and the same audit found that nothing stopped one (#2385).
+Picture a layer that's a 10 MB gzip of a 20 GB file of zeros. It downloads,
+its digest checks out, it's well under `[images] max_storage` (which counts
+compressed bytes), and then the unpacker writes all 20 GB into the node's data
+filesystem. Every other writer on that disk fails with it.
+
+`unpack_layers_with_owner` now takes an `UnpackLimits` and keeps two running
+totals across all of an image's layers: the bytes of file content and the
+number of tar entries. Both are counted from the entry's header *before* the
+entry is written, so the entry that would cross a ceiling never reaches the
+disk. The tar crate's `Entry::size` is already the expanded size for a sparse
+file, which is the number we want: a sparse file of holes costs little on
+disk, but the count stays conservative.
+
+The ceilings are 16 GiB and a million entries, and `unpack_to` lowers the byte
+ceiling further to the image filesystem's free space less 1 GiB, so the
+biggest image a node accepts still leaves room for logs, metrics and the Raft
+log. When an unpack fails, for this reason or any other, `unpack_to` removes
+the partial tree before it returns. Nothing would ever run from it (it has no
+`.complete` marker), so all it could do is take disk.
+
+What this doesn't bound is what a running container writes. A container's
+writable layer is an overlay upper directory on the same data filesystem, and
+an unsized volume is a plain directory, so `dd if=/dev/zero of=/fill` inside a
+container still fills the node's disk. A per-app limit needs either a project
+quota on the upper directory (XFS, or ext4 with `prjquota`) or Btrfs qgroups,
+or the agent measuring each upper directory and stopping the instance that
+passes a limit. The first doesn't work on every filesystem; the second needs a
+policy for what to stop. That's a decision for its own release, and until then
+the manual says plainly that these two are unbounded.
 
 ### One authoritative catalogue
 
