@@ -590,7 +590,16 @@ async fn serve_tcp(
         tokio::select! {
             _ = shutdown.cancelled() => break,
             accepted = listener.accept() => {
-                let Ok((stream, peer)) = accepted else { continue };
+                let (stream, peer) = match accepted {
+                    Ok(pair) => pair,
+                    // Out of descriptors, the connection stays queued and
+                    // an immediate retry fails the same way (#2383).
+                    Err(error) => {
+                        crate::sesame::connection::pause_after_accept_error(&error, &shutdown)
+                            .await;
+                        continue;
+                    }
+                };
                 let Some(share) = shares.try_take(peer.ip()) else {
                     continue;
                 };
