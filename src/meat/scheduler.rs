@@ -10,7 +10,7 @@ use crate::config::app::AppSpec;
 use crate::config::types::Replicas;
 
 use super::cluster_state::ClusterStateCache;
-use super::filter::{WorkloadRequirements, filter_nodes, unplaced_reason};
+use super::filter::{WorkloadRequirements, filter_nodes, passes_filter, unplaced_reason};
 use super::score::score_nodes;
 use super::types::{AppId, Placement, Resources, SchedulingDecision, UnplacedReason};
 
@@ -116,25 +116,29 @@ pub struct Scheduler {
 
 /// The nodes a daemon set can run on, crediting back each node's committed
 /// copy at the footprint it was admitted with (`credit`), so a running copy
-/// never needs room for a second one. Only this eligibility view subtracts
-/// it: the real cache keeps every running allocation, so other applications
-/// can't spend that room. A copy the node runs without a committed placement
-/// (one on its way out) earns no credit.
+/// never needs room for a second one. Only this eligibility check subtracts
+/// it: the cache keeps every running allocation, so other applications can't
+/// spend that room, and it isn't copied to work this out (#2458). A copy the
+/// node runs without a committed placement (one on its way out) earns no
+/// credit.
 pub(crate) fn daemon_candidates(
     cluster: &ClusterStateCache,
     app_id: &AppId,
     credit: &HashMap<super::types::NodeId, Resources>,
     requirements: &WorkloadRequirements,
 ) -> Vec<super::types::NodeId> {
-    let mut available = cluster.clone();
-    for node in cluster.nodes() {
-        if node.replicas_of(app_id) > 0
-            && let Some(committed) = credit.get(&node.node_id)
-        {
-            available.release(&node.node_id, app_id, committed);
-        }
-    }
-    filter_nodes(requirements, &available)
+    cluster
+        .nodes()
+        .filter(|node| {
+            let credit = if node.replicas_of(app_id) > 0 {
+                credit.get(&node.node_id)
+            } else {
+                None
+            };
+            passes_filter(requirements, node, credit)
+        })
+        .map(|node| node.node_id.clone())
+        .collect()
 }
 
 impl Scheduler {
@@ -771,6 +775,43 @@ mod tests {
         let decision = scheduler.schedule_app(&app, &spec).unwrap();
 
         assert_eq!(decision.placements.len(), 3, "daemon on all 3 nodes");
+    }
+
+    /// A node whose committed copy of the daemon set fills it is still a
+    /// candidate: that copy is replaced, not doubled (#433). Working that
+    /// out must not change the cache it reads (#2458).
+    #[test]
+    fn daemon_candidates_match_the_filter_without_changing_the_cache() {
+        let app = AppId::new("monitor", "system");
+        let mut cluster = cluster_3_nodes();
+        // n1 runs the daemon at 1500m and has 500m left; n2 runs another app
+        // and has as little room.
+        let mut n1 = node_state("n1", 2000, 4096, BTreeMap::new());
+        n1.allocated = Resources::new(1500, 0, 0);
+        n1.app_replicas.insert(app.clone(), 1);
+        cluster.set_node(n1);
+        let mut n2 = node_state("n2", 2000, 4096, BTreeMap::new());
+        n2.allocated = Resources::new(1500, 0, 0);
+        n2.app_replicas.insert(AppId::new("other", "system"), 1);
+        cluster.set_node(n2);
+        let credit = HashMap::from([(NodeId::new("n1"), Resources::new(1500, 0, 0))]);
+        let mut spec = default_spec();
+        spec.replicas = Replicas::DaemonSet;
+        spec.cpu = Some(ResourceRange {
+            request: 1000,
+            limit: 1000,
+        });
+        let requirements = WorkloadRequirements::for_app(&spec, false);
+
+        let mut eligible = daemon_candidates(&cluster, &app, &credit, &requirements);
+        eligible.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert_eq!(eligible, [NodeId::new("n1"), NodeId::new("n3")]);
+        let n1 = cluster.get_node(&NodeId::new("n1")).unwrap();
+        assert_eq!(n1.allocated, Resources::new(1500, 0, 0));
+        assert_eq!(n1.replicas_of(&app), 1);
+        let n2 = cluster.get_node(&NodeId::new("n2")).unwrap();
+        assert_eq!(n2.allocated, Resources::new(1500, 0, 0));
     }
 
     #[test]

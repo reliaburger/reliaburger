@@ -756,7 +756,7 @@ When `replicas = "*"` is specified, Meat does not run the placement pipeline. In
 
 Daemon mode is not bin-packed: every qualifying node that has room gets exactly one instance. "Qualifying" is the same `filter_nodes` check fixed replicas pass (`daemon_candidates` in `src/meat/scheduler.rs`), so a node without room for the request, or one that can't run the workload, gets none. This is appropriate for system-level workloads (node exporters, log forwarders, caches).
 
-A node already running the daemon's committed copy doesn't need room for a second one. Eligibility credits that copy back at the footprint it was committed with, in a throwaway view of the cache, and the pass trades it for the new request; the real cache keeps the allocation, so no other app can spend the room (#433). A copy the node runs without a committed placement earns no credit.
+A node already running the daemon's committed copy doesn't need room for a second one. Eligibility credits that copy back at the footprint it was committed with, and the pass trades it for the new request; the cache keeps the allocation, so no other app can spend the room (#433). The credit is taken off a stack copy of the node's two `Resources` values inside the filter check (`passes_filter` in `src/meat/filter.rs`), not off a copy of the cache: cloning the whole cache once per daemon set per tick cost a deep copy of every node record for nothing (#2458). A copy the node runs without a committed placement earns no credit.
 
 ### 5.2 Jobs: the Common Lifecycle
 

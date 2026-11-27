@@ -1203,6 +1203,7 @@ pub fn plan_pass(
     // A stable order so a pass is deterministic (HashMap iteration isn't).
     let mut app_ids: Vec<_> = desired.apps.keys().cloned().collect();
     app_ids.sort_by_key(|a| a.to_string());
+    let overrides = autoscale_overrides(desired);
 
     // Precompute each app's target replica count and whether it is already
     // converged, up front. A placement is only OK if it targets a node still
@@ -1217,11 +1218,7 @@ pub fn plan_pass(
         let override_replicas = if desired.stopped_apps.contains(app_id) {
             Some(0)
         } else {
-            desired
-                .autoscale_overrides
-                .iter()
-                .find(|(k, _)| k == &app_id.to_string())
-                .map(|(_, n)| *n)
+            overrides.get(app_id.to_string().as_str()).copied()
         };
         // A daemon set targets every *eligible* node, so its convergence count
         // is the eligible-node count, not every alive node (M25), plus the
@@ -2145,6 +2142,18 @@ fn scheduler_resources(spec: &AppSpec) -> Resources {
     crate::meat::admission::app_requests(spec)
 }
 
+/// Each autoscaled app's override, keyed by its `name/namespace` string as
+/// desired state stores it. Built once per pass, so finding an app's
+/// override is one lookup, not a scan of the list with an allocation per
+/// entry (#2458).
+fn autoscale_overrides(desired: &crate::council::types::DesiredState) -> HashMap<&str, u32> {
+    desired
+        .autoscale_overrides
+        .iter()
+        .map(|(app, replicas)| (app.as_str(), *replicas))
+        .collect()
+}
+
 /// The replica count the scheduler should target for an app: the
 /// autoscale override if the autoscaler set one, else the spec's own
 /// count (daemon sets fan out to every alive node).
@@ -2189,6 +2198,7 @@ pub fn spawn_autoscaler(
 
             let desired = council.desired_state().await;
             forget_unscaled_apps(&mut tracker, &desired);
+            let overrides = autoscale_overrides(&desired);
             for (app_id, spec) in &desired.apps {
                 let Some(autoscale) = &spec.autoscale else {
                     continue;
@@ -2205,11 +2215,9 @@ pub fn spawn_autoscaler(
 
                 // Baseline the tracker at the current effective replica
                 // count (override if one exists, else the spec's).
-                let baseline = desired
-                    .autoscale_overrides
-                    .iter()
-                    .find(|(k, _)| k == &app_id.to_string())
-                    .map(|(_, n)| *n)
+                let baseline = overrides
+                    .get(app_id.to_string().as_str())
+                    .copied()
                     .unwrap_or(match spec.replicas {
                         Replicas::Fixed(n) => n,
                         Replicas::DaemonSet => continue, // daemon sets don't autoscale
