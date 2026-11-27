@@ -2290,6 +2290,8 @@ Our first version of this had a hole, and CI found it. A lone node restarting in
 
 Two more things were needed to keep it quiet. A short app is never converged, so the pass plans it every tick, and every tick it comes up with the same two placements. Committing those again would add a Raft entry every two seconds for nothing, so the pass compares the plan with what's committed and skips an identical one. And the log: the leader compares the recorded set with the planned one and logs only a change (`shortfall_changes`), with a `placement` event when an app becomes short and when it clears. `cannot_place_is_logged_once_per_change` checks that a steady shortfall says nothing.
 
+The count itself needs a bound, which the November 2026 audit found missing (#2368). `replicas` is a `u32`, and before 0.3.4 nothing stopped an app asking for four billion of them. Only the leader plans, so the leader's `bun` reserved memory for every replica it was asked to place and died, and the next leader read the same desired state and died the same way. Placing what fits doesn't help: an app with no CPU or memory request fits on every node, so the loop never runs out of room. `MAX_REPLICAS` (ten thousand, in `config::types`) is now checked where a count enters: `validate_app` for a file, `scale_refusal` for `relish scale` and a scale proposal, and an `[autoscale] max` too. The rule of thumb is the same in C or Go: a number a user wrote mustn't size an allocation until something has bounded it.
+
 The `check_quota` function is straightforward: for each limit that's set, check if current usage plus the requested resources exceeds it. No limit means unlimited.
 
 ### The cluster state cache

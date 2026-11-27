@@ -286,7 +286,7 @@ is a field the node can't honour; nothing is silently dropped.
 | `command`, `args` | Replace the image's entrypoint and its default arguments (`args` only with an image) |
 | `working_dir` | Absolute working directory inside the container; image apps only |
 | `run_as_user`, `run_as_group` | Container uid and gid, inside its user namespace; refused on `exec` and `script` apps |
-| `replicas` | A count, or `"*"` for one per node. Default 1 |
+| `replicas` | A count from 1 to 10000, or `"*"` for one per node. Default 1 |
 | `port` | Port the app listens on; published on the node and in service discovery |
 | `cpu`, `memory` | Request–limit ranges, such as `"250m-1000m"` and `"256Mi-512Mi"` |
 | `gpu` | Refused above 0 until GPU support lands ([#359](https://github.com/reliaburger/reliaburger/issues/359)) |
@@ -304,7 +304,7 @@ is a field the node can't honour; nothing is silently dropped.
 | `stop_grace` | Time to exit after that signal before the kill, `"1s"` to `"1h"`. Default: the deploy's `drain_timeout`, or 10 s for a plain stop. When Bun shuts down, every stop on the node shares 20 s |
 | `runtime` | A `[app.NAME.runtime]` table: `capabilities` to add, namespaced `sysctls` and `devices` (`path`, `permissions`). Each needs the node's `[runtime]` allowlist and, from a token with a `[permission]` block, `host-exec`; not on `exec` or `script` apps (see `security`) |
 | `pre_stop`, `pre_stop_timeout` | A command run inside each instance before its signal, and its bound (default 30 s, at most an hour). A failure is logged, never fatal. On `exec` and `script` apps it runs on the host and needs an absolute, allowlisted path |
-| `autoscale` | `metric` (`cpu` or `memory`), `target`, `min` (at least 1), `max`, `evaluation_window`, `cooldown`, `scale_down_threshold`. Removing it returns the app to `replicas` |
+| `autoscale` | `metric` (`cpu` or `memory`), `target`, `min` (at least 1), `max` (at most 10000), `evaluation_window`, `cooldown`, `scale_down_threshold`. Removing it returns the app to `replicas` |
 | `ingress` | `host`, `path`, `tls` (`cluster`, `explicit` or `none`), `websocket`, `rate_limit_rps`, `rate_limit_burst` |
 | `firewall` | `allow_from`: apps (or `namespace/app`) allowed to connect |
 | `egress` | `allow`: outside destinations the app may reach. `allow_franchise` is refused |

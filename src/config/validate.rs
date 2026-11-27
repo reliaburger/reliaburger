@@ -430,6 +430,7 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
             name: name.to_string(),
         });
     }
+    validate_app_replicas(name, app)?;
     validate_network_policy(
         &format!("app {name:?}"),
         app.firewall.as_ref(),
@@ -642,6 +643,30 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
         });
     }
 
+    Ok(())
+}
+
+/// Refuse a replica count, fixed or autoscaled, above
+/// [`MAX_REPLICAS`](super::MAX_REPLICAS) (#2368). The leader plans every
+/// replica of a pass in memory, so one absurd count committed to desired
+/// state would take down each leader in turn.
+fn validate_app_replicas(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError> {
+    let max = super::MAX_REPLICAS;
+    let refuse = |field: &str, what: &str, count: u32| ConfigError::Validation {
+        field: field.to_string(),
+        context: format!("app {name:?}"),
+        reason: format!("{what} ({count}) must be at most {max}"),
+    };
+    if let super::Replicas::Fixed(count) = app.replicas
+        && count > max
+    {
+        return Err(refuse("replicas", "replicas", count));
+    }
+    if let Some(autoscale) = &app.autoscale
+        && autoscale.max > max
+    {
+        return Err(refuse("autoscale", "max", autoscale.max));
+    }
     Ok(())
 }
 
@@ -3184,6 +3209,34 @@ exec = "/usr/bin/python3""#,
         assert_app_refused(
             "image = \"web:v1\"\n[app.web.health]\npath = \"/healthz\"",
             "health",
+        );
+    }
+
+    #[test]
+    fn replicas_above_the_limit_are_refused() {
+        // A count in the billions would make the leader plan billions of
+        // replicas in memory (#2368).
+        assert_app_refused("image = \"web:v1\"\nreplicas = 4294967295", "replicas");
+        assert_app_refused(
+            &format!(
+                "image = \"web:v1\"\nreplicas = {}",
+                crate::config::types::MAX_REPLICAS + 1
+            ),
+            "replicas",
+        );
+        validate_app_toml(&format!(
+            "image = \"web:v1\"\nreplicas = {}",
+            crate::config::types::MAX_REPLICAS
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn an_autoscale_max_above_the_replica_limit_is_refused() {
+        assert_app_refused(
+            "image = \"web:v1\"\ncpu = \"100m\"\n[app.web.autoscale]\nmetric = \"cpu\"\n\
+             target = \"70%\"\nmin = 1\nmax = 4294967295",
+            "autoscale",
         );
     }
 
