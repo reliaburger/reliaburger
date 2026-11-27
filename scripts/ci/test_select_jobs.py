@@ -510,6 +510,16 @@ class SelectJobsTests(unittest.TestCase):
         # Only the prefix counts.
         self.assertTrue(self.repo.select(base_sha=self.main, head_ref="fix/0-4-0/x")["heavy"])
 
+    def test_a_0_3_4_batch_branch_runs_only_the_cheap_set(self):
+        # 0.3.4's batch branches are folded into integration PRs and never
+        # get one of their own; one opened by mistake runs the cheap set.
+        self.pull_request("src/lib.rs")
+        found = self.repo.outputs(base_sha=self.main, head_ref="0-3-4/ci-workflows",
+                                  base_ref="release-1-3-4", full_ci=True)
+        self.assertEqual(found, dict({key: "false" for key in ALL}, portable="false", tested_by="",
+                                     lint="true"))
+        self.assertTrue(self.repo.select(base_sha=self.main, head_ref="0-3-4-x")["heavy"])
+
     def test_a_documentation_only_draft_skips_lint_too(self):
         self.pull_request("docs/plans/README.md")
         found = self.repo.outputs(base_sha=self.main, draft=True)

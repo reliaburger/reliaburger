@@ -501,7 +501,7 @@ jobs. What else runs depends on where the change is going:
 | The gate PR labelled `release-gate` | Everything, portable macOS included; the evidence gate refuses less | about 45 minutes, plus any wait for macOS runners |
 | Any other pull request into `main` | The light set plus the heavy suites and the benchmarks the change touches | about 45 minutes |
 | Pull request stacked on any other branch | The light set; the heavy suites only with `full-ci` | about 17 minutes |
-| Draft pull request, or one from a `0-4-0/` branch, whatever its labels | Select jobs, CI policy and lint; the full set for its base once it's marked ready for review | a few minutes |
+| Draft pull request, or one from a `0-4-0/` or `0-3-4/` branch, whatever its labels | Select jobs, CI policy and lint; the full set for its base once it's marked ready for review | a few minutes |
 | Merge-queue group | Everything but portable macOS; only CI policy and the gate when the group changes nothing but documentation | set by acceptance and the privileged Linux jobs instead of portable macOS, plus any wait for runners |
 | Push to a train | Nothing but CI policy and the gate when the merge queue's run on that commit passed every job at its first attempt; portable Linux too when the train's `Cargo.lock`, `Cargo.toml` or `.cargo/config.toml` differs from `main`'s, to save its cache; everything otherwise | a few minutes; about 25 with portable Linux |
 | Push to `main`, nightly, manual, `build.yml`'s candidate build | Everything | about 45 minutes, plus any wait for macOS runners |
@@ -559,6 +559,10 @@ policy and lint (when it changes code) and nothing else, whatever its labels;
 `appliance.yml` builds no image for it and `build.yml` builds nothing.
 `ready_for_review` starts a run with the full set for its base, and
 `converted_to_draft` starts a cheap run that cancels the one still going.
+`select-jobs.sh` treats a `0-3-4/` branch the same way: 0.3.4's batch
+branches reach the train through integration PRs, so a PR of their own is a
+mistake and pays for nothing heavy (`appliance.yml` and `build.yml` still
+build for one).
 
 Both privileged Linux jobs guard their hosted runner the way the 26.04 job
 learned to (#1943). The runner's own processes run at `oom_score_adj` -1000

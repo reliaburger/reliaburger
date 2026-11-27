@@ -39,6 +39,8 @@
 # whose train isn't open yet), runs only the cheap set: CI policy, select jobs
 # and lint, whatever its labels say (maintainer decision of 24 November
 # 2026). Marking a draft ready for review starts a run with the full set.
+# So does one from a `0-3-4/` batch branch: 0.3.4's batches reach the train
+# through integration PRs and never get a PR of their own.
 #
 # Other pull requests are judged by the files they change against their base:
 #
@@ -239,11 +241,11 @@ fi
 
 # A draft, or a 0.4.0 branch: lint alone, when there's code to lint.
 case "${HEAD_REF:-}" in
-    0-4-0/*) parked=true ;;
+    0-4-0/* | 0-3-4/*) parked=true ;;
     *) parked=false ;;
 esac
 if [ "${DRAFT:-false}" = true ] || [ "$parked" = true ]; then
-    echo "a draft or 0-4-0/ pull request runs only the cheap set" >&2
+    echo "a draft, 0-4-0/ or 0-3-4/ pull request runs only the cheap set" >&2
     emit false false false false false false false "" "$code"
     exit 0
 fi
