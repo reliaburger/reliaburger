@@ -11269,6 +11269,7 @@ async fn an_admitted_job_only_apply_owns_its_name_before_executor_dispatch() {
             crate::meat::task_array_store::TaskArrayWrite::DeployBegin {
                 operation_id: "55555555555555555555555555555555".into(),
                 config: Box::new(competing),
+                declared_images: Default::default(),
                 now_epoch_secs: 1,
             },
         )))
@@ -11352,6 +11353,7 @@ async fn seed_finished_hook(council: &crate::council::CouncilNode, failed: bool)
             TaskArrayWrite::DeployBegin {
                 operation_id: HUNG_DEPLOYMENT_ID.into(),
                 config: Box::new(crate::config::Config::parse(HUNG_DEPLOYMENT_MANIFEST).unwrap()),
+                declared_images: Default::default(),
                 now_epoch_secs: 1,
             },
         )))
