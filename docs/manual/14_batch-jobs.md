@@ -550,7 +550,9 @@ node's `allowed_binaries` from that node's capability report; until a node
 has reported, it only knows whether the allowlist names anything. If a node
 hasn't advertised yet, or might allow the binary, the run is admitted, and
 the leader fails it
-within a sync or two once every node it can reach has refused it. The same
+within a sync or two once every node it can reach has refused it. A node that
+stops answering (restarting, say) still holds the run open for the silence
+timeout, 30 seconds by default, in case it's the one node that could run it. The same
 happens when a node leaves or changes its configuration after admission.
 `relish batch-status` and `relish jobs` then show `Failed`, every task not
 run, and a `refused:` line quoting the nodes' reason; the JSON summary

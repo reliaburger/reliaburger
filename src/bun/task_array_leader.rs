@@ -905,6 +905,28 @@ pub fn refusing_holders(
         .collect()
 }
 
+/// The nodes that could still take work this tick: every target, except
+/// one whose sync calls have kept failing for longer than `grace`.
+/// `failing_since` is when each failing node's calls started to fail. A
+/// node restarting or slow for a tick or two still holds a run open, so
+/// the other nodes' refusals can't fail it for good meanwhile (#2371).
+pub fn eligible_nodes(
+    targets: &[NodeId],
+    failing_since: &HashMap<NodeId, Instant>,
+    now: Instant,
+    grace: Duration,
+) -> BTreeSet<NodeId> {
+    targets
+        .iter()
+        .filter(|node| {
+            failing_since
+                .get(*node)
+                .is_none_or(|since| now.saturating_duration_since(*since) <= grace)
+        })
+        .cloned()
+        .collect()
+}
+
 /// Most distinct node reasons an unrunnable run's reason quotes.
 const MAX_UNRUNNABLE_REASONS: usize = 3;
 
@@ -1134,9 +1156,10 @@ pub struct TickInputs<'a> {
     pub silence: Duration,
     /// The leader's wall clock, for the writes.
     pub now_epoch_secs: u64,
-    /// Nodes that could take work: every node the leader syncs whose last
-    /// call didn't fail. A run fails as unrunnable only once each of them
-    /// has refused it for good.
+    /// Nodes that could take work: every node the leader syncs, unless its
+    /// calls have failed for longer than the silence timeout (see
+    /// [`eligible_nodes`]). A run fails as unrunnable only once each of
+    /// them has refused it for good.
     pub eligible: BTreeSet<NodeId>,
 }
 
@@ -1219,9 +1242,10 @@ struct LeaderMemory {
     /// The `known` list each node last acknowledged, so an idle cluster
     /// stops syncing once every node has cleaned up.
     last_known: HashMap<NodeId, Vec<u64>>,
-    /// Nodes whose last sync failed, so a dead node is logged once, not
-    /// every tick.
-    failing: HashSet<NodeId>,
+    /// Nodes whose last sync failed, with when they started failing. A
+    /// dead node is logged once, not every tick, and holds runs open for
+    /// the silence timeout (see [`eligible_nodes`]).
+    failing: HashMap<NodeId, Instant>,
     /// The last cron definition fired, so the next tick starts after it.
     cron_cursor: Option<String>,
     /// Sync calls carried over from earlier ticks.
@@ -1589,8 +1613,9 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
                 answers.push((node, response));
             }
             Err(reason) => {
-                if round.has_active && memory.failing.insert(node.clone()) {
+                if round.has_active && !memory.failing.contains_key(&node) {
                     eprintln!("bun: task arrays: sync with {node} failed: {reason}");
+                    memory.failing.insert(node, Instant::now());
                 }
             }
         }
@@ -1612,15 +1637,13 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
                 .map(|(node, view)| ((*batch_id, node.clone()), view.slots))
         })
         .collect();
-    // A node whose calls fail can't take work, so it doesn't hold a run
-    // open; one whose call is merely still out does, until it answers or
-    // times out.
-    let eligible: BTreeSet<NodeId> = target_nodes
-        .into_iter()
-        .filter(|node| !memory.failing.contains(node))
-        .collect();
-    let last_heard = memory.last_heard.clone();
+    // A node whose call is still out holds a run open until it answers or
+    // times out. One whose calls fail holds it open for the silence
+    // timeout, the same patience a silent holder gets: a restart or one
+    // slow sync mustn't let the other nodes' refusals fail the run.
     let silence = state.task_arrays.silence_timeout;
+    let eligible = eligible_nodes(&target_nodes, &memory.failing, Instant::now(), silence);
+    let last_heard = memory.last_heard.clone();
     let now_epoch_secs = crate::meat::batch_ids::epoch_now_secs();
     // Plan under the state's read lock: nothing is copied but each array's
     // state, and only for arrays that finished a chunk.
@@ -2369,6 +2392,59 @@ mod tests {
         )));
         // Nobody answered at all.
         assert!(!unrunnable(&plan_tick(&arrays, None, &inputs(&[], &heard))));
+    }
+
+    #[test]
+    fn a_node_that_just_missed_a_sync_still_holds_a_run_open() {
+        let arrays = running_arrays(1);
+        let answers = [
+            (node("a"), refusal_for(&arrays, ISOLATION, true)),
+            (node("b"), refusal_for(&arrays, ISOLATION, true)),
+        ];
+        let heard = HashMap::new();
+        let mut tick = inputs(&answers, &heard);
+        let failing_since = HashMap::from([(node("worker"), tick.now)]);
+        tick.eligible = eligible_nodes(
+            &[node("a"), node("b"), node("worker")],
+            &failing_since,
+            tick.now,
+            SILENCE_TIMEOUT,
+        );
+        let writes = plan_tick(&arrays, None, &tick);
+        assert!(
+            !writes
+                .iter()
+                .any(|write| matches!(write, TaskArrayWrite::Unrunnable { .. })),
+            "{writes:?}"
+        );
+    }
+
+    #[test]
+    fn a_node_failing_past_the_silence_timeout_no_longer_holds_a_run_open() {
+        let arrays = running_arrays(1);
+        let answers = [
+            (node("a"), refusal_for(&arrays, ISOLATION, true)),
+            (node("b"), refusal_for(&arrays, ISOLATION, true)),
+        ];
+        let heard = HashMap::new();
+        let mut tick = inputs(&answers, &heard);
+        let now = tick.now + Duration::from_secs(31);
+        let failing_since = HashMap::from([(node("worker"), tick.now)]);
+        tick.eligible = eligible_nodes(
+            &[node("a"), node("b"), node("worker")],
+            &failing_since,
+            now,
+            SILENCE_TIMEOUT,
+        );
+        assert_eq!(tick.eligible, BTreeSet::from([node("a"), node("b")]));
+        let writes = plan_tick(&arrays, None, &tick);
+        assert!(
+            matches!(
+                &writes[..],
+                [TaskArrayWrite::Unrunnable { batch_id: 1, .. }]
+            ),
+            "{writes:?}"
+        );
     }
 
     /// A node that runs every kind of job, with `/usr/bin/render` among

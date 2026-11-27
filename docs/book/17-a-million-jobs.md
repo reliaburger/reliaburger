@@ -1667,9 +1667,45 @@ node's own configuration and runtime) set it.
 The leader decides in `unrunnable_reason`. A run fails when nothing holds its
 chunks, something is still queued, and every *eligible* node answered about
 it this tick with an unrunnable refusal. Eligible means every node the leader
-syncs whose last call didn't fail. A node whose call is still out keeps the
-run open until it answers or times out (three seconds at most), and a dead
-node falls out of gossip membership. The check reads like this:
+syncs, unless its calls have kept failing for longer than the silence timeout
+(30 seconds by default). A node whose call is still out keeps the run open
+until it answers or times out, and a dead node falls out of gossip membership.
+
+The first version dropped a node from the eligible set the moment one call to
+it failed (#2371). That's wrong for the case the rule was built for: if the
+only node that runs host jobs is restarting for an upgrade, one refused
+connection takes it out, the other nodes' refusals are all that's left, and a
+cron run fails for good two seconds before the node is back. Now the leader
+keeps a `HashMap<NodeId, Instant>` of when each node started failing, and a
+small pure function decides who still counts:
+
+```rust
+pub fn eligible_nodes(
+    targets: &[NodeId],
+    failing_since: &HashMap<NodeId, Instant>,
+    now: Instant,
+    grace: Duration,
+) -> BTreeSet<NodeId> {
+    targets
+        .iter()
+        .filter(|node| {
+            failing_since
+                .get(*node)
+                .is_none_or(|since| now.saturating_duration_since(*since) <= grace)
+        })
+        .cloned()
+        .collect()
+}
+```
+
+The grace is the silence timeout, the same patience the leader gives a silent
+holder before it takes its chunks back, so both rules read alike. Being a pure
+function, it's tested without a clock: one test fails a node "zero seconds
+ago" and checks the run stays open, another fails it 31 seconds ago and checks
+the run fails. `Option::is_none_or` is true for `None` and otherwise asks the
+closure, so a node that isn't failing at all passes without a branch.
+
+The check itself reads like this:
 
 ```rust
 for node in eligible {
