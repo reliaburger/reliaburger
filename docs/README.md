@@ -5,8 +5,8 @@ laptop, see the [quickstart guide](quickstart.md). For the architectural vision,
 see the [whitepaper](whitepaper.md); for status and what's next, see the
 [roadmap](roadmap.md).
 
-0.3.2 was released on 23 November 2026. Its signed binaries, guest images and
-installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.2),
+0.3.3 was released on 27 November 2026. Its signed binaries, guest images and
+installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.3),
 and `curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop` installs it
 and builds a laptop cluster; without a flag the installer explains the choices.
 Until 1.0.0 Reliaburger is good enough for home labs and dev clusters, not production. Every
@@ -14,7 +14,7 @@ release follows the same [build, staging and promotion procedure](releasing.md#m
 From 0.2.7, every release file also carries a build provenance
 attestation that anyone can check with `gh attestation verify`, and the macOS `relish` can be
 notarised ([checks a stranger can run](releasing.md#checks-a-stranger-can-run)).
-The limits below are the ones 0.3.2 ships with; the [changelog](../CHANGELOG.md)
+The limits below are the ones 0.3.3 ships with; the [changelog](../CHANGELOG.md)
 says what changed in each release, and the [roadmap](roadmap.md) tracks
 what comes after it. The [feature status page](https://reliaburger.com/features)
 rates every feature Ready, Beta, Alpha or Planned, with its restrictions and open
@@ -35,7 +35,7 @@ and trade-offs against other projects, with dated evidence and explicit release 
 
 ## What's in the binary
 
-This is what 0.3.2, the release the installer fetches, does. Each node runs
+This is what 0.3.3, the release the installer fetches, does. Each node runs
 one agent, `bun`; you drive the cluster with one CLI, `relish`. Scheduling,
 clustering, service discovery, ingress, PKI, secrets, an image registry,
 metrics, logs, GitOps, jobs and fault injection are compiled into that agent,
@@ -67,7 +67,7 @@ council and `relish council recover` rebuilds it from a backup, fencing off the
 old voters if they return; `relish council status` shows every node's view.
 A bare-metal or `setup --ssh` cluster's saved context lists every node, so
 when node 1 is down `relish` falls over to another and says on stderr which
-one it used (0.3.3, not in 0.3.2).
+one it used.
 
 **Service discovery in the kernel.** Every app gets a stable virtual IP and,
 with DNS enabled, a `.internal` name. An eBPF connect hook sends each
@@ -80,8 +80,8 @@ pass through, and connections drain before an instance stops. Each app can
 pick its stop signal, its grace and a pre-stop command, and run sidecars
 that share its network and start before it and stop after it. A Bun restart
 or self-upgrade adopts running sidecars with their app instead of restarting
-them (0.3.3, not in 0.3.2), and `relish apps NAME` lists each instance's sidecars with
-their state and restarts (0.3.3, not in 0.3.2).
+them, and `relish apps NAME` lists each instance's sidecars with
+their state and restarts.
 
 **Security on by default.** A generated cluster requires mTLS between nodes.
 Nodes join with single-use tokens and certificate signing requests.
@@ -128,7 +128,7 @@ a one-node cluster from a checkout, with
 [`examples/gitops/repository`](../examples/gitops/repository), and measure Bun's
 memory and CPU as they go. `relish apply --wait` returns once every app in the
 file runs its replicas, passes its health checks and has finished rolling
-out, and exits 1 naming each app that wasn't ready in time (0.3.3, not in 0.3.2).
+out, and exits 1 naming each app that wasn't ready in time.
 
 **Policies.** `[policy.*]` rules in CEL, such as "apps in `prod` need a memory
 limit", are kept in the council and checked on the leader before an app is
@@ -576,7 +576,7 @@ xcode-select --install
 
 ## Container runtimes (optional)
 
-For 0.3.2, Bun selects Linux runc or the built-in process runtime. macOS containers run through managed Linux VMs. **ProcessGrill** (plain OS processes) is the built-in fallback that works everywhere without extra software — you don't need to install anything else to get started.
+For 0.3.3, Bun selects Linux runc or the built-in process runtime. macOS containers run through managed Linux VMs. **ProcessGrill** (plain OS processes) is the built-in fallback that works everywhere without extra software — you don't need to install anything else to get started.
 
 ### runc (Linux)
 
@@ -615,7 +615,7 @@ or operator firewall rules when diagnosing direct-host connectivity.
 
 ### macOS containers: managed Linux VMs
 
-For 0.3.2, run containers through the [managed laptop quickstart](quickstart.md):
+For 0.3.3, run containers through the [managed laptop quickstart](quickstart.md):
 
 ```sh
 relish setup --quickstart --nodes 3
@@ -626,7 +626,7 @@ foreground process workloads. Direct Apple Container selection is disabled,
 even when its CLI is installed: interrupted CLI requests can outlive Bun and
 mutate the Apple daemon, and their recovery guarantees are not yet complete.
 The adapter and its manual development tests remain in the repository for future
-work; they are outside the 0.3.2 runtime profile.
+work; they are outside the 0.3.3 runtime profile.
 
 ### ProcessGrill (built-in fallback)
 
@@ -646,7 +646,7 @@ sixteen concurrent exec requests, with a five-minute deadline, 64 KiB request
 limit and 1 MiB combined stdout/stderr response limit. Commands inherit the host
 environment and run without container isolation.
 
-**0.3.2 contract: foreground workloads only.** The main process stays under Bun's
+**0.3.3 contract: foreground workloads only.** The main process stays under Bun's
 supervision and children must remain in its supervised process group. A service
 can run unattended and spawn workers; foreground does not mean an open terminal.
 Use the application's foreground/no-daemon option. A shell wrapper should `exec`
@@ -971,9 +971,9 @@ instead, with no distro to install, see
 netboot --stream-logs` prints each machine's kernel and boot logs as it
 installs and boots, so a machine with no serial port needn't be watched on its
 monitor, and `relish os boot-logs --to <address>|--off` turns that on or off
-later on a claimed cluster (0.3.3, not in 0.3.2). Once it's a node, its monitor shows a
+later on a claimed cluster. Once it's a node, its monitor shows a
 read-only dashboard: status, metrics, workloads, the cluster, versions and
-logs, plus a hidden invaders game on `7` (0.3.3, not in 0.3.2). The game's
+logs, plus a hidden invaders game on `7`. The game's
 kill mode, where a hit kills that instance as an audited Smoker fault, stays
 off until a cluster admin sets `[appliance] console_chaos = true` with
 `relish os settings --set FILE`; `relish os settings` shows it. Three Dell Wyse 3040s went from power-on to a
@@ -1707,7 +1707,7 @@ The bun agent exposes a local HTTP API on port 9117:
 | `GET` | `/v1/capabilities/cluster` | Bounded authenticated capability evidence from every expected node |
 | `GET` | `/v1/diagnostics` | Bounded local disk, cgroup throttling and public certificate evidence |
 | `GET` | `/v1/diagnostics/apps` | Desired replicas, scheduled replicas, service exposure and any `RolloutFailed` mark used by diagnostics. A node that isn't the leader forwards the read to the leader, and answers `503` when no leader answers |
-| `GET` | `/v1/apps/{app}/{namespace}/spec` | One app's spec as the cluster runs it, and as declared where the two differ, with env values, config file contents and recognisable secrets redacted (each redacted field is named). Scoped to the token; forwarded to the leader like `/v1/diagnostics/apps`; `404` for an app the cluster doesn't have (0.3.3, not in 0.3.2) |
+| `GET` | `/v1/apps/{app}/{namespace}/spec` | One app's spec as the cluster runs it, and as declared where the two differ, with env values, config file contents and recognisable secrets redacted (each redacted field is named). Scoped to the token; forwarded to the leader like `/v1/diagnostics/apps`; `404` for an app the cluster doesn't have |
 | `GET` | `/v1/diagnostics/rollouts` | Whether each app's current spec has finished rolling out (`rolled_out`, with its `fingerprint`), for `relish apply --wait`. Forwarded to the leader like `/v1/diagnostics/apps`; a node without a council answers an empty list |
 | `POST` | `/v1/path` | Run fixed DNS and TCP probes from a local source workload and return live service/firewall evidence |
 | `POST` | `/v1/test/leases` | Create a policy-authorised, server-owned Phase 15 app lease |
@@ -1981,7 +1981,7 @@ different name or namespace for the other kind.
 
 Release maintainers: see [the build, signing and publication procedure](releasing.md).
 
-Direct Apple Container is disabled for 0.3.2 while interrupted daemon-command
+Direct Apple Container is disabled for 0.3.3 while interrupted daemon-command
 recovery remains unfinished. Use the managed Linux/runc quickstart on macOS.
 
 Node chaos (kill, drain, pressure and council partitions) reserves one cluster-wide

@@ -1,7 +1,7 @@
 # A laptop cluster
 
-The command below installs the published, signed 0.3.2 release
-(23 November 2026) and builds a laptop cluster from it. A laptop cluster is a
+The command below installs the published, signed 0.3.3 release
+(27 November 2026) and builds a laptop cluster from it. A laptop cluster is a
 development cluster: until 1.0.0, Reliaburger is for developers and
 enthusiasts trying it out, not for production. The two cold installs of the
 0.1.0 release candidate on Apple silicon took 178 s and 282 s from the first `curl`

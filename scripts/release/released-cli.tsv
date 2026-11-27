@@ -1,7 +1,7 @@
-# What relish v0.3.2 accepts, read from its -h pages by
+# What relish v0.3.3 accepts, read from its -h pages by
 # scripts/release/released_cli.py. Regenerate it when docs/website/install.sh's
 # default version changes; tests/suite/website.rs checks the two match.
-version	v0.3.2
+version	v0.3.3
 argument	relish agent explain	[ID]
 argument	relish agent lease release	<KIND>
 argument	relish agent lease release	<NAME>
@@ -302,8 +302,10 @@ command	relish netboot
 command	relish nodes
 command	relish os
 command	relish os abort
+command	relish os boot-logs
 command	relish os list
 command	relish os resume
+command	relish os settings
 command	relish os status
 command	relish os upgrade
 command	relish path
@@ -427,7 +429,7 @@ option	relish agent propose	-o,--output	<OUTPUT>
 option	relish agent propose	A key that makes a retry return the proposal already	made	
 option	relish agent propose	API token for authenticating to the agent. Overrides	`RELIABURGER_TOKEN`	
 option	relish agent propose	Answer the whole proposal without storing	it	
-option	relish agent propose	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
+option	relish agent propose	Bun API base URL. Overrides `RELIABURGER_ENDPOINT`,the saved context's endpoints (whose other nodes it falls over to when the first doesn't answer) and the default local address	(`http[s]://127.0.0.1:9117`)	
 option	relish agent propose	For `clear-fault`,the node that holds the fault,when two nodes hold a fault with the same	id	
 option	relish agent propose	How long it may wait for approval: 5m to 24h; 1h when left	out	
 option	relish agent propose	Largest answer to print,in bytes (at least 1024; by default 24576,81920 for `guide` and 40960 for `schema`). A bigger answer is trimmed,marked `truncated`,and says how to get the	rest	
@@ -502,6 +504,8 @@ option	relish agent withdraw	--max-bytes	<MAX_BYTES>
 option	relish apply	--break-lease		
 option	relish apply	--dry-run		
 option	relish apply	--rerun-jobs		
+option	relish apply	--timeout	<DURATION>	
+option	relish apply	--wait		
 option	relish apply	-f,--file	<PATH_OR_URL>	
 option	relish apps	--instances		
 option	relish apps	--namespace	<NAMESPACE>	
@@ -520,7 +524,7 @@ option	relish audit	--until	<UNTIL>
 option	relish audit	-o,--output	<OUTPUT>	
 option	relish audit	A token name or principal	id	
 option	relish audit	API token for authenticating to the agent. Overrides	`RELIABURGER_TOKEN`	
-option	relish audit	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
+option	relish audit	Bun API base URL. Overrides `RELIABURGER_ENDPOINT`,the saved context's endpoints (whose other nodes it falls over to when the first doesn't answer) and the default local address	(`http[s]://127.0.0.1:9117`)	
 option	relish audit	How many of the newest records to show (default 100,at most	10000)	
 option	relish audit	One action (e.g. "app.deleted"),or a family	("fault.*")	
 option	relish audit	Only actions by this kind of principal: human,agent,workload,system,policy or	unknown	
@@ -571,7 +575,7 @@ option	relish ca backup	--passphrase-file	<PASSPHRASE_FILE>
 option	relish ca backup	--recipient	<RECIPIENT>	
 option	relish ca backup	-o,--output	<OUTPUT>	
 option	relish ca backup	API token for authenticating to the agent. Overrides	`RELIABURGER_TOKEN`	
-option	relish ca backup	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
+option	relish ca backup	Bun API base URL. Overrides `RELIABURGER_ENDPOINT`,the saved context's endpoints (whose other nodes it falls over to when the first doesn't answer) and the default local address	(`http[s]://127.0.0.1:9117`)	
 option	relish ca backup	Output format: human,json,or yaml. Every command takes json and yaml except the interactive ones,which refuse them [default: human] [possible values: human,json,yaml]		human,json,yaml
 option	relish ca backup	Path to the cluster CA certificate (PEM). When set,the CLI reaches the agent API over HTTPS. Overrides	`RELIABURGER_CA_CERT`	
 option	relish ca backup	Print help (see more with	'--help')	
@@ -588,7 +592,7 @@ option	relish ca rotate	--role	<ROLE>
 option	relish ca rotate	--root-backup	<ROOT_BACKUP>	
 option	relish ca rotate	-o,--output	<OUTPUT>	
 option	relish ca rotate	API token for authenticating to the agent. Overrides	`RELIABURGER_TOKEN`	
-option	relish ca rotate	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
+option	relish ca rotate	Bun API base URL. Overrides `RELIABURGER_ENDPOINT`,the saved context's endpoints (whose other nodes it falls over to when the first doesn't answer) and the default local address	(`http[s]://127.0.0.1:9117`)	
 option	relish ca rotate	Output format: human,json,or yaml. Every command takes json and yaml except the interactive ones,which refuse them [default: human] [possible values: human,json,yaml]		human,json,yaml
 option	relish ca rotate	Path to the cluster CA certificate (PEM). When set,the CLI reaches the agent API over HTTPS. Overrides	`RELIABURGER_CA_CERT`	
 option	relish ca rotate	Print help (see more with	'--help')	
@@ -602,7 +606,7 @@ option	relish ca verify	--identity	<IDENTITY>
 option	relish ca verify	--passphrase-file	<PASSPHRASE_FILE>	
 option	relish ca verify	-o,--output	<OUTPUT>	
 option	relish ca verify	API token for authenticating to the agent. Overrides	`RELIABURGER_TOKEN`	
-option	relish ca verify	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
+option	relish ca verify	Bun API base URL. Overrides `RELIABURGER_ENDPOINT`,the saved context's endpoints (whose other nodes it falls over to when the first doesn't answer) and the default local address	(`http[s]://127.0.0.1:9117`)	
 option	relish ca verify	Output format: human,json,or yaml. Every command takes json and yaml except the interactive ones,which refuse them [default: human] [possible values: human,json,yaml]		human,json,yaml
 option	relish ca verify	Path to the cluster CA certificate (PEM). When set,the CLI reaches the agent API over HTTPS. Overrides	`RELIABURGER_CA_CERT`	
 option	relish ca verify	Print help (see more with	'--help')	
@@ -623,7 +627,7 @@ option	relish cluster create	-o,--output	<OUTPUT>
 option	relish cluster create	API token for authenticating to the agent. Overrides	`RELIABURGER_TOKEN`	
 option	relish cluster create	Address or network relish runs from	(repeatable)	
 option	relish cluster create	Admit workload and node faults,as the laptop quickstart	does	
-option	relish cluster create	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
+option	relish cluster create	Bun API base URL. Overrides `RELIABURGER_ENDPOINT`,the saved context's endpoints (whose other nodes it falls over to when the first doesn't answer) and the default local address	(`http[s]://127.0.0.1:9117`)	
 option	relish cluster create	Don't wait for confirmation that the master key is backed up (required without a	terminal)	
 option	relish cluster create	How long the seeds' join tokens stay valid (s,m,h or d; at most 7d) [default:	7d]	
 option	relish cluster create	How many voters the council grows to: an odd number from 1 to 7 [default:	5]	
@@ -807,7 +811,7 @@ option	relish init	--recipient	<RECIPIENT>
 option	relish init	--root-backup	<ROOT_BACKUP>	
 option	relish init	-o,--output	<OUTPUT>	
 option	relish init	API token for authenticating to the agent. Overrides	`RELIABURGER_TOKEN`	
-option	relish init	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
+option	relish init	Bun API base URL. Overrides `RELIABURGER_ENDPOINT`,the saved context's endpoints (whose other nodes it falls over to when the first doesn't answer) and the default local address	(`http[s]://127.0.0.1:9117`)	
 option	relish init	Cluster name [default:	default]	
 option	relish init	Generate a development-only config whose internal cluster transports are plaintext. Never use this on a shared	network	
 option	relish init	Node ID for this node [default:	node-01]	
@@ -823,7 +827,7 @@ option	relish join	--identity-dir	<IDENTITY_DIR>
 option	relish join	--node-id	<NODE_ID>	
 option	relish join	--token-file	<TOKEN_FILE>	
 option	relish join	-o,--output	<OUTPUT>	
-option	relish join	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
+option	relish join	Bun API base URL. Overrides `RELIABURGER_ENDPOINT`,the saved context's endpoints (whose other nodes it falls over to when the first doesn't answer) and the default local address	(`http[s]://127.0.0.1:9117`)	
 option	relish join	Directory to write the received identity into. Defaults to `identity` in the current directory (matching `relish	init`)	
 option	relish join	Join token issued by `relish init` or `relish join-token	create`	
 option	relish join	Output format: human,json,or yaml. Every command takes json and yaml except the interactive ones,which refuse them [default: human] [possible values: human,json,yaml]		human,json,yaml
@@ -871,7 +875,7 @@ option	relish machines claim	-o,--output	<OUTPUT>
 option	relish machines claim	API token for authenticating to the agent. Overrides	`RELIABURGER_TOKEN`	
 option	relish machines claim	Address or network relish runs from (with --create;	repeatable)	
 option	relish machines claim	Admit workload and node faults (with	--create)	
-option	relish machines claim	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
+option	relish machines claim	Bun API base URL. Overrides `RELIABURGER_ENDPOINT`,the saved context's endpoints (whose other nodes it falls over to when the first doesn't answer) and the default local address	(`http[s]://127.0.0.1:9117`)	
 option	relish machines claim	Create a new cluster named --name from these machines,node 1	first	
 option	relish machines claim	Don't ask to compare claim keys with the machines'	consoles	
 option	relish machines claim	Don't wait for confirmation that the new cluster's master key is backed up (with --create; required without a	terminal)	
@@ -907,11 +911,15 @@ option	relish netboot	--key	<PEM>
 option	relish netboot	--mac	<MAC>	
 option	relish netboot	--mode-dhcp-proxy		
 option	relish netboot	--reinstall		
-option	relish netboot	--stream-logs		
+option	relish netboot	--stream-logs[=<WHICH>]		all,units
 option	relish netboot	--wipe	<MAC>	
 option	relish nodes	--unhealthy		
+option	relish os boot-logs	--node	<NODE>	
+option	relish os boot-logs	--off		
+option	relish os boot-logs	--to	<ADDRESS[:PORT]>	
 option	relish os list	--channel	<CHANNEL>	
 option	relish os list	--key	<PEM>	
+option	relish os settings	--set	<FILE>	
 option	relish os upgrade	--allow-downgrade		
 option	relish os upgrade	--channel	<CHANNEL>	
 option	relish os upgrade	--key	<PEM>	
@@ -957,7 +965,7 @@ option	relish scale	--replicas	<REPLICAS>
 option	relish scale	-o,--output	<OUTPUT>	
 option	relish scale	API token for authenticating to the agent. Overrides	`RELIABURGER_TOKEN`	
 option	relish scale	Break any agent lease on the app in your way (audited); without it,someone else's lease refuses the change,naming	them	
-option	relish scale	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
+option	relish scale	Bun API base URL. Overrides `RELIABURGER_ENDPOINT`,the saved context's endpoints (whose other nodes it falls over to when the first doesn't answer) and the default local address	(`http[s]://127.0.0.1:9117`)	
 option	relish scale	Namespace the app lives in. Defaults to "default" [default:	default]	
 option	relish scale	Output format: human,json,or yaml. Every command takes json and yaml except the interactive ones,which refuse them [default: human] [possible values: human,json,yaml]		human,json,yaml
 option	relish scale	Path to the cluster CA certificate (PEM). When set,the CLI reaches the agent API over HTTPS. Overrides	`RELIABURGER_CA_CERT`	
@@ -990,14 +998,14 @@ option	relish setup	Accept the default answer to every question	(non-interactive
 option	relish setup	Also print every setup step's timing (always saved as	timings.json)	
 option	relish setup	Boot a secure managed Linux cluster and verify a sample	container	
 option	relish setup	Build a cluster on Linux machines you already have:	user@host,user@host,...	
-option	relish setup	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
+option	relish setup	Bun API base URL. Overrides `RELIABURGER_ENDPOINT`,the saved context's endpoints (whose other nodes it falls over to when the first doesn't answer) and the default local address	(`http[s]://127.0.0.1:9117`)	
 option	relish setup	Directory to install the bun binary into (default:	~/.reliaburger/bin)	
 option	relish setup	Directory to write reliaburger.toml into [default:	.]	
 option	relish setup	HTTPS directory containing unchanged signed release candidate	assets	
 option	relish setup	Host port forwarded to the managed Pickle registry (default:	15050)	
 option	relish setup	Output format: human,json,or yaml. Every command takes json and yaml except the interactive ones,which refuse them [default: human] [possible values: human,json,yaml]		human,json,yaml
 option	relish setup	Path to the cluster CA certificate (PEM). When set,the CLI reaches the agent API over HTTPS. Overrides	`RELIABURGER_CA_CERT`	
-option	relish setup	Print	help	
+option	relish setup	Print help (see more with	'--help')	
 option	relish setup	Release metadata URL [default:	https://github.com/reliaburger/reliaburger/releases/latest/download/metadata.json]	
 option	relish setup	The address peers should use for each machine,comma separated,in the same	order	
 option	relish setup	The cluster's name: `laptop` for a laptop cluster,`servers` for one built over	SSH	
