@@ -79,6 +79,12 @@
   },
   {
     "source": "src/grill/runc.rs",
+    "function": "runc_container_runs_under_seccomp_without_new_privileges",
+    "binary": "reliaburger",
+    "test": "grill::runc::tests::runc_container_runs_under_seccomp_without_new_privileges"
+  },
+  {
+    "source": "src/grill/runc.rs",
     "function": "runc_image_root_binds_port_80_without_being_host_root",
     "binary": "reliaburger",
     "test": "grill::runc::tests::runc_image_root_binds_port_80_without_being_host_root"
