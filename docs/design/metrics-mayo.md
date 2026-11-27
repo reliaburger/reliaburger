@@ -232,11 +232,12 @@ pub enum AlertSeverity { Warning, Critical }
 pub enum AlertState {
     Inactive,
     Pending { since: SystemTime },
-    Firing { since: SystemTime },
+    /// `missed`: evaluations in a row with no reading.
+    Firing { since: SystemTime, missed: u32 },
 }
 ```
 
-A rule fires when the latest value for `metric_name` breaches `threshold` under `operator` continuously for `for_duration`. Evaluation is three-way, not two-way: a *missing* metric is not treated as "recovered" -- a firing alert whose telemetry goes stale stays firing (only a genuine in-range reading resolves it), and a pending alert whose data vanishes drops back to inactive.
+A rule fires when the latest value for `metric_name` breaches `threshold` under `operator` continuously for `for_duration`. Evaluation is three-way, not two-way: a *missing* metric is not treated as "recovered" -- a firing alert whose telemetry goes stale stays firing until a genuine in-range reading resolves it or `MAX_MISSED_EVALUATIONS` (10) evaluations in a row pass without a reading (#2387), and a pending alert whose data vanishes drops back to inactive.
 
 **Status: planned -- not yet implemented:** expression (PromQL) rules with `expr`; the `Info` severity; per-app suppression/tuning (`AlertOverride`, `is_builtin`, `app_overrides`); and the `!=`/`>=`/`<=`/`==` operators (only strict `>` and `<` exist).
 
@@ -323,7 +324,7 @@ An executor's cgroup holds its helper as well as its task groups, so the sample 
 
 **Status: implemented (explicit targets); per-app auto-scrape planned.**
 
-`src/mayo/scrape.rs` provides `parse_prometheus_text`, `scrape_endpoint` (an HTTP GET with a 5s timeout), and `scrape_once`, which Bun's scrape loop calls every `scrape_interval_secs` over the `[[metrics.scrape_targets]]` list -- each target's samples are ingested tagged with its `job`. A target that fails contributes nothing rather than failing the sweep, and an empty target list spawns no loop. Apps opt in with `metrics = {}` on the app spec (`port` defaults to the app's port, `path` to `/metrics`): the node running each instance scrapes it every `app_scrape_interval_secs` (node-wide, 10 by default), so the port needn't be published. Still **planned -- not yet implemented**: a per-app scrape interval, auto-detection of `/metrics` endpoints without the opt-in, `max_samples_per_scrape`, and a scrape-timeout counter.
+`src/mayo/scrape.rs` provides `parse_prometheus_text`, `scrape_endpoint` (an HTTP GET with a 5s timeout), and `scrape_once`, which Bun's scrape loop calls every `scrape_interval_secs` over the `[[metrics.scrape_targets]]` list -- each target's samples are ingested tagged with its `job`. A target that fails contributes nothing rather than failing the sweep, and an empty target list spawns no loop. Apps opt in with `metrics = {}` on the app spec (`port` defaults to the app's port, `path` to `/metrics`): the node running each instance scrapes it every `app_scrape_interval_secs` (node-wide, 10 by default), so the port needn't be published. An app's sample whose name the node writes itself (`is_reserved_metric_name`: the prefixes `node_`, `ingress_`, `ketchup_`, `bun_`, `mayo_`, `discovery_withdrawal_`, and the exact names `up`, `process_cpu_percent`, `process_memory_bytes` and the job metrics) is stored as `exported_<name>`, as a clashing target label is, so an app can't feed the node's alerts or charts (#2387). `[[metrics.scrape_targets]]` are operator config and keep their names. Still **planned -- not yet implemented**: a per-app scrape interval, auto-detection of `/metrics` endpoints without the opt-in, `max_samples_per_scrape`, and a scrape-timeout counter.
 
 ### 5.3 Downsampling
 
@@ -363,7 +364,7 @@ The alert loop runs when `metrics.alerts_enabled` is set (default true), every `
 | `memory_high` | `node_memory_usage_percent` | `> 70` | 10 min | Warning |
 | `disk_high` | `node_disk_usage_percent` | `> 80` | 5 min | Warning |
 
-These are node-level rules against `node_*` metrics, not per-app rules. The state machine is `Inactive → Pending → Firing`, with the stale-telemetry handling described in §4.3.
+These are node-level rules against `node_*` metrics, not per-app rules: a rule on a `node_*` metric reads only series without an `app` label (#2387). The state machine is `Inactive → Pending → Firing`, with the stale-telemetry handling described in §4.3. A firing alert with no reading for `MAX_MISSED_EVALUATIONS` (10) evaluations in a row resolves, and its state is dropped. Bun hands each evaluation's transitions to `WebhookDispatcher::dispatch_all`; a semaphore shared by the dispatcher's clones lets at most `MAX_CONCURRENT_DISPATCHES` (8) deliveries run at once.
 
 Every rule fires on pressure, none on idleness. Up to 0.3.0 a fifth rule, `cpu_idle`, fired when node CPU stayed below 5 % for 30 minutes, labelled "possible zombie". An idle node isn't a fault: it's spare capacity, and it's what every new or quiet cluster looks like, so the rule turned healthy clusters `DEGRADED` in `relish status`, `relish wtf` and the dashboard. We dropped it in 0.3.1 ([#2171](https://github.com/reliaburger/reliaburger/issues/2171)).
 

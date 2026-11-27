@@ -175,12 +175,19 @@ impl JobRunAlert {
 // Webhook dispatcher
 // ---------------------------------------------------------------------------
 
+/// How many transitions one dispatcher, and every clone of it, delivers at
+/// the same time (#2387). The rest wait their turn.
+pub const MAX_CONCURRENT_DISPATCHES: usize = 8;
+
 /// Dispatches alert transitions to configured webhook destinations.
+///
+/// Clones share one bound of [`MAX_CONCURRENT_DISPATCHES`] deliveries.
 #[derive(Clone)]
 pub struct WebhookDispatcher {
     client: reqwest::Client,
     destinations: Vec<AlertDestination>,
     cluster_name: String,
+    slots: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl WebhookDispatcher {
@@ -194,7 +201,19 @@ impl WebhookDispatcher {
             client,
             destinations,
             cluster_name,
+            slots: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DISPATCHES)),
         }
+    }
+
+    /// Dispatch every transition of one evaluation, at most
+    /// [`MAX_CONCURRENT_DISPATCHES`] at once across all clones.
+    pub async fn dispatch_all(&self, transitions: Vec<AlertTransition>) {
+        use futures_util::StreamExt;
+        futures_util::stream::iter(transitions)
+            .for_each_concurrent(MAX_CONCURRENT_DISPATCHES, |transition| async move {
+                self.dispatch(&transition).await;
+            })
+            .await;
     }
 
     /// Dispatch a transition to all matching destinations.
@@ -204,6 +223,9 @@ impl WebhookDispatcher {
     /// PagerDuty gets an Events API v2 event. One generic shape posted to all
     /// three would be silently dropped by Slack and PagerDuty.
     pub async fn dispatch(&self, transition: &AlertTransition) {
+        // The semaphore is never closed, so this can't fail; the permit is
+        // held until every destination has had its post.
+        let _permit = self.slots.acquire().await.ok();
         for dest in &self.destinations {
             if !severity_matches(dest, transition.severity) {
                 continue;
@@ -949,6 +971,67 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["attachments"].is_array());
         assert_eq!(json["attachments"][0]["color"], "danger");
+    }
+
+    /// One evaluation could hand over thousands of transitions, and each got
+    /// its own task posting to every destination at once (#2387).
+    #[tokio::test]
+    async fn dispatch_all_posts_at_most_the_dispatch_limit_at_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let most = Arc::new(AtomicUsize::new(0));
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let handler = {
+            let (in_flight, most, delivered) = (
+                Arc::clone(&in_flight),
+                Arc::clone(&most),
+                Arc::clone(&delivered),
+            );
+            axum::routing::post(move || {
+                let (in_flight, most, delivered) = (
+                    Arc::clone(&in_flight),
+                    Arc::clone(&most),
+                    Arc::clone(&delivered),
+                );
+                async move {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    most.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    delivered.fetch_add(1, Ordering::SeqCst);
+                    "ok"
+                }
+            })
+        };
+        let app = axum::Router::new().route("/hook", handler);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let dest = AlertDestination {
+            dest_type: "webhook".to_string(),
+            url: format!("http://{addr}/hook"),
+            severity: vec![],
+            secret: None,
+        };
+        let dispatcher = WebhookDispatcher::new(reqwest::Client::new(), vec![dest], "prod".into());
+        let transitions = vec![firing_transition(); MAX_CONCURRENT_DISPATCHES * 5];
+        // Two evaluations' batches at once share the one bound.
+        let clone = dispatcher.clone();
+        tokio::join!(
+            dispatcher.dispatch_all(transitions.clone()),
+            clone.dispatch_all(transitions)
+        );
+        server.abort();
+        assert_eq!(
+            delivered.load(Ordering::SeqCst),
+            MAX_CONCURRENT_DISPATCHES * 10
+        );
+        let most = most.load(Ordering::SeqCst);
+        assert!(most <= MAX_CONCURRENT_DISPATCHES, "{most} posts at once");
     }
 
     #[test]

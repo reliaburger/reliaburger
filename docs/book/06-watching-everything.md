@@ -1935,6 +1935,24 @@ struct AlertInstance {
 
 The evaluator keeps a `BTreeMap<AlertInstance, AlertState>`. A `BTreeMap` is sorted, so its keys must be orderable, and deriving `PartialOrd` and `Ord` gives us that: Rust compares fields in declaration order, with no hand-written comparison. Each series now has its own pending timer, firing state and recovery, and only a fresh healthy reading from the *same* series resolves an alert. The labels reach the webhooks too, so resolving A can't close B's PagerDuty incident.
 
+### An app that paged the operator
+
+Per-series alerts opened a hole we found in the November 2026 audit (#2387). The rules choose series by metric name, and an app's scraped samples kept whatever names the app chose. So an app with `metrics = {}` whose `/metrics` page said `node_cpu_usage_percent{shard="0"} 99`, and so on up to the 20,000-sample scrape limit, stored 20,000 series named like the node's CPU gauge. Five minutes later `cpu_throttle` fired 20,000 times, Bun spawned a task per transition to post to every destination, and when the app was deleted the alerts stayed firing, because "firing with no reading" kept firing for ever.
+
+Four changes close it. The scraper now treats a name the node writes itself the way it already treated a clashing label: `node_cpu_usage_percent` from an app is stored as `exported_node_cpu_usage_percent`. `is_reserved_metric_name` lists the node's prefixes (`node_`, `ingress_`, `ketchup_`, `bun_`, `mayo_`, `discovery_withdrawal_`) and, for prefixes apps use too, exact names: `process_cpu_percent` is the node's, but a client library's `process_cpu_seconds_total` keeps its name. `every_metric_the_node_writes_is_reserved` runs the collector and checks each name it produces, so a new node metric can't slip past the list. Second, as defence in depth, a rule on a `node_*` metric reads only series without an `app` label. Third, `Firing` now counts the evaluations in a row with no reading, and resolves at `MAX_MISSED_EVALUATIONS` (10):
+
+```rust
+(AlertState::Firing { since, missed }, None) => {
+    if missed + 1 >= MAX_MISSED_EVALUATIONS {
+        AlertState::Inactive
+    } else {
+        AlertState::Firing { since: *since, missed: missed + 1 }
+    }
+}
+```
+
+The pattern `Firing { since, missed }` binds both fields by reference, because we're matching on `&AlertState`; `*since` copies the `SystemTime` out, and `missed + 1` works on a `&u32` because the arithmetic operators are implemented for references to numbers too. Arms that don't care about the count write `Firing { since, .. }`, where `..` means "and any other fields", so adding the field touched only the arms that build a `Firing`. One reading resets the count, so a gap of a scrape or two still can't resolve an alert. Fourth, Bun hands each evaluation's transitions to `WebhookDispatcher::dispatch_all`, which runs them through `for_each_concurrent`, and every delivery takes a permit from a semaphore the dispatcher's clones share, so at most `MAX_CONCURRENT_DISPATCHES` (8) posts run at once however many evaluations overlap.
+
 ### A test that passed for the wrong reason
 
 A dependency advisory flagged the Thrift crate that Parquet used to decode file metadata: a crafted length could make it reserve absurd amounts of memory. Parquet 59 replaced Thrift with its own decoder, and DataFusion 55 uses Parquet 59, so we upgraded DataFusion by ten major versions. It changed two lines of ours, because we never name `parquet` in `Cargo.toml`; we use DataFusion's re-export (`datafusion::parquet::...`) and always get the version DataFusion was built against. We kept regression tests that corrupt a real Parquet file's metadata and check that the reader refuses it.

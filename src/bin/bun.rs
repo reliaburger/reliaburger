@@ -3614,10 +3614,12 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             eval.evaluate(&latest)
                         };
 
-                        for t in transitions {
+                        // One task per evaluation, not per transition; the
+                        // dispatcher bounds how many posts run at once (#2387).
+                        if !transitions.is_empty() {
                             let d = dispatcher.clone();
                             tokio::spawn(async move {
-                                d.dispatch(&t).await;
+                                d.dispatch_all(transitions).await;
                             });
                         }
                     }
