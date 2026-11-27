@@ -884,6 +884,34 @@ Failed tasks were the other leak. Each kept its output in its own fsynced file, 
 
 Last, task data now counts toward disk pressure. Past a quarter of the filesystem, or with less than a gibibyte free, a worker finishes and reports what it holds but advertises no free slots, so it stops attracting grants before it fails rather than after. Our first version said "95% full", the council's resignation threshold, and promptly stopped every job test on a laptop with 28 GiB free on a 926 GiB disk. On a big disk 5% is millions of tasks of headroom, so the floor is absolute. And `[logs]` and `[metrics]` finally ship size caps (2 GiB and 1 GiB) instead of "unlimited", with `0` kept as a deliberate opt-out. Bun refuses a cap bigger than the filesystem, since that's just "unlimited" in a costume.
 
+How does a worker know how much task data it holds? At first, by walking it:
+a recursive `read_dir` and one `stat` per file, under the task-array directory
+and the audit log, on every leader sync (#2446). That's once a second, while the
+node holds its single sync claim. A run of 65,536 one-task chunks that mostly
+fail keeps one output segment per chunk, and with a cold dentry cache that walk
+can outlast the leader's three-second timeout, after which the next call is
+refused as busy and the healthy node looks dead.
+
+The fix splits the check in two. The free-space floor is one `statvfs`, cheap
+enough for every sync. The byte count is cached on the executor in a small
+`TaskDataSize` behind a tokio `Mutex`: the first sync measures it under the
+claim, so a full node never takes a grant unmeasured, and after that a sync
+uses the last number and, once it's 30 seconds old, spawns one background walk
+on the blocking pool to replace it. A `refreshing` flag keeps it to one walk at
+a time, so a disk that hangs costs one thread, the same promise the sync claim
+makes. The price is that a node may take up to 30 seconds and a sync to notice
+its own data passing the quarter. `a_sync_does_not_walk_the_task_data_tree`
+counts walks across ten syncs over a thousand files (ten before, one now), and
+`a_node_over_its_task_data_limit_stops_offering_slots_within_one_refresh` uses a
+test-only byte offset to push a node over its limit and watches its slots go to
+zero.
+
+The walk itself is a closure the executor hands to `spawn_blocking`, returned
+as `impl FnOnce() -> u64 + Send + 'static`, the same return-position `impl
+Trait` Chapter 7 used for a predicate. The new part is `'static`: the closure
+must own everything it captures (cloned paths and `Arc`s), because it runs on
+another thread and may outlive the sync that started it.
+
 ### Thirty flushes for one echo
 
 `integration::job_runs_to_completion` applies a job that runs `/bin/echo` and

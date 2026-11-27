@@ -482,7 +482,10 @@ bench-task-arrays` fails above either bound). `relish batch results` and
 at most 16 tasks' head and tail per chunk. All of it goes when the run retires. Task data,
 together with the node's audit log, counts toward disk pressure: past a quarter of the filesystem, or with less
 than 1 GiB free, a worker finishes the chunks it holds but advertises no
-free slots, so it takes no new grants until retention frees space.
+free slots, so it takes no new grants until retention frees space. The free
+space is checked on every sync; the size of the task data and audit log is
+measured every 30 seconds, so a worker can take up to that long to notice its
+data passing a quarter of the disk.
 
 After council disaster recovery advances the recovery epoch, workers with old
 array directories stop their attempts and persist a refusal. Old results and

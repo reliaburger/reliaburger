@@ -32,7 +32,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Semaphore};
@@ -605,6 +605,31 @@ pub struct TaskArrayNode {
     /// the disk hang there.
     #[cfg(test)]
     fence_probe: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// The task data's size as last measured (#2446).
+    task_data: Arc<Mutex<TaskDataSize>>,
+    /// How often [`Self::task_data_bytes`] measures it again.
+    task_data_refresh: Duration,
+    /// How many times this node has walked its task data, for tests.
+    #[cfg(test)]
+    walks: Arc<std::sync::atomic::AtomicUsize>,
+    /// Bytes every walk adds, so a test can push a node over its limit.
+    #[cfg(test)]
+    extra_bytes: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// How often a node measures its task data again for disk pressure. A
+/// node may take up to this long, plus a sync, to notice its task data
+/// passing its share of the disk (#2446).
+pub const TASK_DATA_REFRESH: Duration = Duration::from_secs(30);
+
+/// The size of a node's task data and audit log, as last measured.
+#[derive(Default)]
+struct TaskDataSize {
+    bytes: u64,
+    /// When, or `None` before the first measurement.
+    measured: Option<Instant>,
+    /// A measurement is running in the background.
+    refreshing: bool,
 }
 
 impl TaskArrayNode {
@@ -637,6 +662,12 @@ impl TaskArrayNode {
             arrays: Mutex::new(HashMap::new()),
             #[cfg(test)]
             fence_probe: None,
+            task_data: Default::default(),
+            task_data_refresh: TASK_DATA_REFRESH,
+            #[cfg(test)]
+            walks: Default::default(),
+            #[cfg(test)]
+            extra_bytes: Default::default(),
         }
     }
 
@@ -716,9 +747,66 @@ impl TaskArrayNode {
         self.grant_syncs.load(Ordering::Relaxed)
     }
 
-    /// Whether task data and the audit log, or the filesystem holding them,
-    /// are too full to take new grants. Blocking I/O.
-    fn task_data_pressured(root: &Path, audit_dir: Option<&Path>) -> bool {
+    /// Re-measure task data every `refresh` rather than every
+    /// [`TASK_DATA_REFRESH`].
+    pub fn with_task_data_refresh(mut self, refresh: Duration) -> Self {
+        self.task_data_refresh = refresh;
+        self
+    }
+
+    /// How many bytes task data and the audit log hold, for this sync. The
+    /// first sync measures under its claim, so a full node never takes a
+    /// grant unmeasured. Later syncs use the last measurement, and once it
+    /// is older than the refresh interval start a new one in the
+    /// background, one at a time: walking every file can take seconds,
+    /// and the leader gives a sync three (#2446). `None` if the first
+    /// measurement failed.
+    async fn task_data_bytes(&self, claim: &SyncClaim) -> Option<u64> {
+        let mut size = self.task_data.lock().await;
+        let Some(measured) = size.measured else {
+            let bytes = claim.spawn_blocking(self.task_data_walk()).await.ok()?;
+            size.bytes = bytes;
+            size.measured = Some(Instant::now());
+            return Some(bytes);
+        };
+        if measured.elapsed() >= self.task_data_refresh && !size.refreshing {
+            size.refreshing = true;
+            let walk = self.task_data_walk();
+            let cache = Arc::clone(&self.task_data);
+            tokio::spawn(async move {
+                let bytes = tokio::task::spawn_blocking(walk).await;
+                let mut size = cache.lock().await;
+                size.refreshing = false;
+                if let Ok(bytes) = bytes {
+                    size.bytes = bytes;
+                    size.measured = Some(Instant::now());
+                }
+            });
+        }
+        Some(size.bytes)
+    }
+
+    /// A walk of every file under the task data and the audit log, to run
+    /// on the blocking pool.
+    fn task_data_walk(&self) -> impl FnOnce() -> u64 + Send + 'static {
+        let root = self.config.root.clone();
+        let audit_dir = self.config.audit_dir.clone();
+        #[cfg(test)]
+        let (walks, extra) = (Arc::clone(&self.walks), Arc::clone(&self.extra_bytes));
+        move || {
+            let bytes = super::disk_pressure::node_data_bytes(&root, audit_dir.as_deref());
+            #[cfg(test)]
+            let bytes = {
+                walks.fetch_add(1, Ordering::Relaxed);
+                bytes.saturating_add(extra.load(Ordering::Relaxed))
+            };
+            bytes
+        }
+    }
+
+    /// Whether `bytes` of task data and audit log, or the filesystem
+    /// holding them, are too full to take new grants. Blocking I/O.
+    fn task_data_pressured(root: &Path, bytes: u64) -> bool {
         let usage = match super::disk_pressure::FilesystemUsage::of(root) {
             Ok(usage) => usage,
             Err(error) => {
@@ -726,7 +814,6 @@ impl TaskArrayNode {
                 return true;
             }
         };
-        let bytes = super::disk_pressure::node_data_bytes(root, audit_dir);
         super::disk_pressure::task_data_pressured(
             bytes,
             usage,
@@ -870,12 +957,18 @@ impl TaskArrayNode {
         self.compact_finished(&claim, &request.known, &running)
             .await;
         self.telemetry.retain_runs(|id| running.contains(&id));
-        let root = self.config.root.clone();
-        let audit_dir = self.config.audit_dir.clone();
-        let pressured = claim
-            .spawn_blocking(move || Self::task_data_pressured(&root, audit_dir.as_deref()))
-            .await
-            .unwrap_or(true);
+        // The free-space half is one statvfs, so it's checked every sync;
+        // the walk over every file is measured off the sync path (#2446).
+        let pressured = match self.task_data_bytes(&claim).await {
+            Some(bytes) => {
+                let root = self.config.root.clone();
+                claim
+                    .spawn_blocking(move || Self::task_data_pressured(&root, bytes))
+                    .await
+                    .unwrap_or(true)
+            }
+            None => true,
+        };
 
         let mut definitions = self.definitions.lock().await;
         definitions.retain(|id, _| running.contains(id));
@@ -2164,6 +2257,51 @@ mod tests {
         node.sync(&request(Vec::new())).await.unwrap();
         let progress = node.sync(&request(vec![bare])).await.unwrap();
         assert!(progress.arrays[0].template_unknown);
+    }
+
+    /// #2446: the walk over every task-data file runs off the sync path,
+    /// at most once per refresh interval, not on every sync.
+    #[tokio::test]
+    async fn a_sync_does_not_walk_the_task_data_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let kept = root.path().join("7");
+        std::fs::create_dir_all(&kept).unwrap();
+        for file in 0..1000 {
+            std::fs::write(kept.join(format!("{file}.seg")), b"x").unwrap();
+        }
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        let request = NodeSyncRequest {
+            known: vec![7],
+            ..NodeSyncRequest::default()
+        };
+        for _ in 0..10 {
+            node.sync(&request).await.unwrap();
+        }
+        assert_eq!(node.walks.load(Ordering::Relaxed), 1);
+    }
+
+    /// #2446: a node that passes its task-data limit stops offering slots
+    /// within one refresh interval (and a sync).
+    #[tokio::test]
+    async fn a_node_over_its_task_data_limit_stops_offering_slots_within_one_refresh() {
+        let refresh = Duration::from_millis(50);
+        let root = tempfile::tempdir().unwrap();
+        let node =
+            fake_node(root.path(), FakeRunner::always_succeeds()).with_task_data_refresh(refresh);
+        let request = request(vec![assignment(1, 20, &[])]);
+        let slots = |response: NodeSyncResponse| response.arrays[0].slots;
+        assert!(slots(node.sync(&request).await.unwrap()) > 0);
+        node.extra_bytes.store(u64::MAX / 2, Ordering::Relaxed);
+        // Until the interval passes, the last measurement stands.
+        assert!(slots(node.sync(&request).await.unwrap()) > 0);
+        let start = Instant::now();
+        while slots(node.sync(&request).await.unwrap()) > 0 {
+            assert!(
+                start.elapsed() < refresh + Duration::from_secs(5),
+                "still offering slots"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]
