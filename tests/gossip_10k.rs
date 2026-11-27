@@ -40,13 +40,17 @@ async fn observer_with_members(
     network: &InMemoryNetwork,
     cluster_size: usize,
 ) -> MustardNode<InMemoryTransport> {
+    observer_with_config(network, cluster_size, GossipConfig::default()).await
+}
+
+/// [`observer_with_members`] with its own gossip config.
+async fn observer_with_config(
+    network: &InMemoryNetwork,
+    cluster_size: usize,
+    config: GossipConfig,
+) -> MustardNode<InMemoryTransport> {
     let transport = network.register(address(0)).await;
-    let mut observer = MustardNode::new(
-        NodeId::new("n0"),
-        address(0),
-        GossipConfig::default(),
-        transport,
-    );
+    let mut observer = MustardNode::new(NodeId::new("n0"), address(0), config, transport);
 
     let updates: Vec<_> = (1..cluster_size)
         .map(|index| MembershipUpdate {
@@ -108,6 +112,59 @@ async fn one_node_handles_10k_member_protocol_state() {
         "one node ingested {cluster_size} members in {ingest_elapsed:.1?}; first dissemination of every update took {:.1?} across {batches} batches",
         dissemination_started.elapsed()
     );
+}
+
+/// #2442: a node joining a 10,000-member cluster used to need on the
+/// order of 10,000 / 64 exchanges at the 10 s anti-entropy interval. A
+/// request that says it knows almost nobody is answered with pages of the
+/// whole table, so it takes ceil(10,000 / 512) exchanges, one per protocol
+/// period, to see every member.
+#[tokio::test]
+async fn a_joiner_sees_a_10k_member_cluster_in_twenty_exchanges() {
+    let cluster_size = 10_000;
+    let network = InMemoryNetwork::new();
+    let config = GossipConfig {
+        protocol_interval: std::time::Duration::from_millis(2),
+        ..GossipConfig::default()
+    };
+    let joiner = network.register(address(cluster_size + 1)).await;
+    let mut observer = observer_with_config(&network, cluster_size, config).await;
+    let mut seen = HashSet::with_capacity(cluster_size);
+    let mut exchanges = 0;
+    while seen.len() < cluster_size {
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        observer
+            .handle_message(
+                address(cluster_size + 1),
+                GossipMessage::new(
+                    NodeId::new("joiner"),
+                    1,
+                    GossipPayload::Sync {
+                        entries: vec![],
+                        floors: vec![],
+                        wants_reply: true,
+                        known_members: seen.len() as u32,
+                    },
+                ),
+            )
+            .await;
+        while let Some((_, reply)) = joiner.try_recv() {
+            seen.extend(
+                reply
+                    .payload
+                    .updates()
+                    .iter()
+                    .map(|update| update.node_id.clone()),
+            );
+        }
+        exchanges += 1;
+        assert!(
+            exchanges <= 20,
+            "{exchanges} exchanges taught the joiner {} of {cluster_size} members",
+            seen.len()
+        );
+    }
+    eprintln!("a joiner saw all {cluster_size} members in {exchanges} exchanges");
 }
 
 /// `run` publishes the membership after every datagram (#2439). With
@@ -174,6 +231,8 @@ async fn push_pull_with_10k_members_is_bounded_and_sweeps_the_table() {
                         entries: vec![],
                         floors: vec![],
                         wants_reply: true,
+                        // A member in steady state, not a joiner.
+                        known_members: cluster_size as u32,
                     },
                 ),
             )

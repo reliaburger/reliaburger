@@ -235,6 +235,11 @@ pub enum GossipPayload {
         floors: Vec<SequenceFloor>,
         /// Whether the receiver should answer with its own table.
         wants_reply: bool,
+        /// How many members the sender's table holds. A peer that knows more
+        /// than a window fewer than the receiver is joining, and a request from it is
+        /// answered with a page of the whole table rather than one
+        /// anti-entropy window (#2442).
+        known_members: u32,
     },
     /// "Your datagram was no newer than what I hold for you." The answer to
     /// a datagram dropped by the freshness check, so a node that restarted
@@ -709,6 +714,7 @@ mod tests {
                 entries,
                 floors: vec![],
                 wants_reply,
+                known_members: u32::MAX,
             },
         )
     }
@@ -785,6 +791,7 @@ mod tests {
                 entries: vec![],
                 floors,
                 wants_reply: false,
+                known_members: u32::MAX,
             },
         );
         msg.sequence = u64::MAX;

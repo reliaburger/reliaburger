@@ -137,6 +137,7 @@ Node A                                   Node B (random live peer)
 - **Merge.** Each entry goes through the same `apply_update`/`resolve_conflict` path as a piggybacked update (incarnation first, then `Dead`/`Left` > `Suspect` > `Alive`), so a stale table can never resurrect a dead node or undo a refutation, and an entry about ourselves in `Suspect`/`Dead`/`Left` triggers the usual refutation. An unknown member is only added when `Alive`. Entries that change the table are re-queued for piggybacking.
 - **Floors.** After its entries, each side sends the sequence floors it keeps for reaped members (§8.1), in datagrams of their own: at most `MAX_PIGGYBACK_UPDATES` per datagram and `MAX_SYNC_FLOORS` (16) per exchange, rotating through a larger set like the table.
 - **Bounds.** Sync rides the existing authenticated UDP transport (the message HMAC covers the entries). A datagram carries at most `MAX_PIGGYBACK_UPDATES` (8) entries and no directory extension, which stays under 1,400 bytes even with 63-byte names and IPv6 addresses. `[node] name` is held to one DNS label (63 bytes) at start-up, and the datagrams are built by bytes as well as by count (`sync_datagrams`), so a peer with a longer name, which no valid config produces, costs an extra datagram instead of making every sync too large to send (#2394). One side of an exchange is at most `MAX_SYNC_DATAGRAMS` (8) datagrams, so `MAX_SYNC_ENTRIES` (64) entries. A table that fits goes whole every time. A larger one goes as a rotating window over the table sorted by node id, so a 10,000-member table is covered in 157 exchanges, and `tests/gossip_10k.rs` pins both the per-exchange cap and the sweep.
+- **Join pages (#2442).** Every `Sync` datagram says how many members its sender knows (`known_members`). A request from a peer that knows more than a window fewer members than we do is a joiner's, and it's answered with a page of the whole table sorted by node id: up to `MAX_JOIN_SYNC_DATAGRAMS` (64) datagrams, 512 entries, about 90 KB, which a default UDP receive buffer takes as one burst. The answering node keeps a cursor per joiner (at most 64 joiners, the one served longest ago forgotten first), so the next page carries on where the last stopped, and serves a joiner at most one page per half protocol period, so a peer repeating its request can't turn each datagram into a page. The joiner, while each exchange teaches it at least a window of new members, syncs again on its next cycle with the same peer instead of waiting `push_pull_interval`. A joiner therefore sees a 10,000-member cluster in 20 exchanges, about ten seconds (`a_joiner_sees_a_10k_member_cluster_in_twenty_exchanges`), where one 64-entry window per 10 s took on the order of N/64 exchanges and many minutes. A member in steady state still gets the 64-entry window.
 - **Why UDP, not TCP.** memberlist sends the whole table over TCP and scales its interval with log N because the exchange grows with the cluster. Mustard has no gossip stream transport, and adding one means a listener, framing and authentication for a single message type. A capped exchange keeps the per-node cost flat (about 16 datagrams per 10 s, sent and answered, plus up to four of sequence floors, §8.1), so the interval needn't scale. The price is that a 10,000-member cluster sweeps its table over many exchanges, so there anti-entropy is a slow backstop and piggybacking does the real work; in a small cluster every exchange is a full resync.
 - **Loss.** Only the first datagram asks for a reply, and a reply never asks for one, so an exchange is one push and one pull. A lost datagram costs that part of one exchange; the next interval tries again.
 
@@ -374,6 +375,9 @@ enum GossipPayload {
         entries: Vec<MembershipUpdate>,
         floors: Vec<SequenceFloor>,
         wants_reply: bool,
+        /// How many members the sender knows: a joiner's request is
+        /// answered with a page of the whole table (§3.2, "Join pages").
+        known_members: u32,
     },
     /// The answer to a datagram dropped as no fresher than what the
     /// sender holds (§8.1): the receiver refutes past `held_incarnation`
@@ -662,7 +666,7 @@ struct EncryptedRecoveryCandidateList {
 | Layer | Transport | Encoding | Max Message Size |
 |-------|-----------|----------|------------------|
 | Mustard gossip (PING/ACK/PING-REQ, including join via seed PING) | UDP | postcard (serde) | 1400 bytes (avoids IP fragmentation); piggybacked updates fill the room left after the header and directory extension |
-| Mustard anti-entropy (Sync push-pull) | UDP | postcard (serde) | 1400 bytes per datagram, at most 8 datagrams (64 entries) per side per exchange |
+| Mustard anti-entropy (Sync push-pull) | UDP | postcard (serde) | 1400 bytes per datagram, at most 8 datagrams (64 entries) per side per exchange; a join page is at most 64 datagrams (512 entries) |
 | Raft (AppendEntries, Vote, InstallSnapshot, CouncilVoters) | TCP + mTLS, connections pooled and reused across RPCs (§3.3) | JSON (serde), length-prefixed, in an envelope carrying the compatibility version and recovery epoch | 64 MiB per frame (snapshots can be large) |
 | Reporting tree (StateReports) | TCP + mTLS | postcard | 1 MiB (bounded by max events per report) |
 
@@ -690,7 +694,10 @@ Two separate things are called "join", and they are not the same step.
    There is NO TCP JOIN message.
 3. On its next cycle N has a live peer and its first anti-entropy
    push-pull is due: it pushes its table to the seed and pulls the
-   seed's (bounded, see §3.2), so it learns the cluster in one exchange.
+   seed's. A table of up to 512 members comes back whole in that
+   exchange; a larger one comes a 512-entry page per exchange, one
+   exchange per cycle with the same seed, until N has caught up (§3.2,
+   "Join pages"): 20 exchanges at 10,000 members.
 4. N runs the SWIM protocol period loop:
    - Each period: pick a random node, PING it (UDP)
    - Piggyback own ALIVE state on all messages

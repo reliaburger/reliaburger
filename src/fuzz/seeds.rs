@@ -99,6 +99,7 @@ fn gossip() -> Vec<Seed> {
             expires_in_secs: 3600,
         }],
         wants_reply: true,
+        known_members: 2,
     });
     let stale = message(GossipPayload::Stale {
         held_incarnation: 4,

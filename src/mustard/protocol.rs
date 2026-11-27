@@ -68,6 +68,22 @@ const MAX_SEQUENCE_FLOORS: usize = 1024;
 /// set goes out as a rotating window, like the membership table.
 const MAX_SYNC_FLOORS: usize = MAX_PIGGYBACK_UPDATES * 2;
 
+/// Most datagrams in one page of a join sync (#2442). A peer whose table is
+/// under half ours is joining, and one 64-entry window per exchange made
+/// its join time grow with the cluster. A page is 512 entries, about
+/// 90 KB: small enough for a default UDP receive buffer to take as one
+/// burst, so a joiner learns a 10,000-member cluster in 20 exchanges, one
+/// per protocol period, instead of hundreds at the 10 s anti-entropy
+/// interval.
+const MAX_JOIN_SYNC_DATAGRAMS: usize = 64;
+
+/// Most entries in one page of a join sync.
+const MAX_JOIN_SYNC_ENTRIES: usize = MAX_PIGGYBACK_UPDATES * MAX_JOIN_SYNC_DATAGRAMS;
+
+/// Most joining peers whose page cursor a node keeps. Past this the one
+/// served longest ago is forgotten, and restarts from the first page.
+const MAX_JOIN_CURSORS: usize = 64;
+
 /// Shortest gap between two [`GossipPayload::Stale`] answers to one sender,
 /// so a stream of old datagrams draws one answer a second, not one each.
 const STALE_ANSWER_INTERVAL: Duration = Duration::from_secs(1);
@@ -343,6 +359,14 @@ pub struct MustardNode<T: MustardTransport> {
     /// When the next anti-entropy push-pull is due. Starts at creation, so
     /// the first cycle with a live peer syncs: that is the join sync.
     next_push_pull: Instant,
+    /// The peer of the last push-pull this node started, and how many
+    /// members it knew then. While each exchange teaches it at least a
+    /// window's worth of new members it is still joining: it syncs again
+    /// on the next cycle, with the same peer, for that peer's next page.
+    last_push_pull: Option<(SocketAddr, usize)>,
+    /// Per joining peer: where its next page of our table starts, and when
+    /// we last served it one.
+    join_cursors: HashMap<NodeId, (usize, Instant)>,
     /// Where the next outgoing window of the membership table starts, for
     /// tables larger than one exchange carries (`MAX_SYNC_ENTRIES`).
     sync_cursor: usize,
@@ -430,6 +454,8 @@ impl<T: MustardTransport> MustardNode<T> {
             node_gate: crate::smoker::node_fault::NodeTransportGate::new(),
             rng: rand::make_rng(),
             next_push_pull: Instant::now(),
+            last_push_pull: None,
+            join_cursors: HashMap::new(),
             sync_cursor: 0,
             sequences: HashMap::new(),
             sequence_floors: HashMap::new(),
@@ -1032,8 +1058,12 @@ impl<T: MustardTransport> MustardNode<T> {
         self.ping_rejoin_contact().await;
 
         // An isolated node stays due, so it syncs with the first peer it
-        // finds rather than a whole interval later.
-        if now >= self.next_push_pull && self.push_pull().await {
+        // finds rather than a whole interval later. A joiner still learning
+        // a page per exchange syncs again straight away (#2442).
+        let joining = self.last_push_pull.is_some_and(|(_, known)| {
+            self.membership.len() >= known.saturating_add(MAX_SYNC_ENTRIES)
+        });
+        if (joining || now >= self.next_push_pull) && self.push_pull(joining).await {
             self.next_push_pull = now + self.config.push_pull_interval;
         }
 
@@ -1456,6 +1486,7 @@ impl<T: MustardTransport> MustardNode<T> {
             GossipPayload::Sync {
                 floors,
                 wants_reply,
+                known_members,
                 ..
             } => {
                 if let Some(sender) = &self.synced_watch {
@@ -1466,7 +1497,8 @@ impl<T: MustardTransport> MustardNode<T> {
                 // Answer a request with our own table; never answer a reply,
                 // or two nodes would bounce their tables back and forth.
                 if *wants_reply {
-                    self.send_membership(from, false).await;
+                    self.answer_sync(from, &message.sender, *known_members, now)
+                        .await;
                 }
             }
             GossipPayload::Stale {
@@ -1615,7 +1647,10 @@ impl<T: MustardTransport> MustardNode<T> {
     /// Both sides merge under the ordinary SWIM precedence, so a stale entry
     /// can't resurrect a dead node or undo a refutation. Returns `false` when
     /// there is no live peer to sync with.
-    pub async fn push_pull(&mut self) -> bool {
+    ///
+    /// `same_peer` asks for the peer of the last exchange, while it's still
+    /// alive: a joiner pages through one peer's table (#2442).
+    pub async fn push_pull(&mut self, same_peer: bool) -> bool {
         let mut candidates: Vec<_> = self
             .membership
             .alive_members()
@@ -1624,11 +1659,86 @@ impl<T: MustardTransport> MustardNode<T> {
             .map(|m| (m.node_id.clone(), m.address))
             .collect();
         candidates.sort_unstable();
-        let Some((_, address)) = candidates.choose(&mut self.rng).cloned() else {
+        let last = self
+            .last_push_pull
+            .map(|(address, _)| address)
+            .filter(|address| same_peer && candidates.iter().any(|(_, a)| a == address));
+        let Some(address) = last.or_else(|| {
+            candidates
+                .choose(&mut self.rng)
+                .map(|(_, address)| *address)
+        }) else {
             return false;
         };
-        self.send_membership(address, true).await;
+        self.last_push_pull = Some((address, self.membership.len()));
+        let window = self.membership_window();
+        self.send_membership(address, true, window, MAX_SYNC_DATAGRAMS)
+            .await;
         true
+    }
+
+    /// Answer a push-pull request from `requester`, which knows
+    /// `known_members` members: a page of our whole table if it's joining
+    /// (it knows more than a window fewer members than we do), otherwise one
+    /// anti-entropy window. A joiner gets at most one
+    /// page per half protocol period, so a peer repeating requests can't
+    /// turn one datagram into a page every time (#2442).
+    async fn answer_sync(
+        &mut self,
+        to: SocketAddr,
+        requester: &NodeId,
+        known_members: u32,
+        now: Instant,
+    ) {
+        let ours = self.membership.len();
+        let known = usize::try_from(known_members).unwrap_or(usize::MAX);
+        let joining = ours > MAX_SYNC_ENTRIES && known.saturating_add(MAX_SYNC_ENTRIES) < ours;
+        let paced = self.join_cursors.get(requester).is_some_and(|(_, served)| {
+            now.saturating_duration_since(*served) < self.config.protocol_interval / 2
+        });
+        if !joining || paced {
+            let window = self.membership_window();
+            self.send_membership(to, false, window, MAX_SYNC_DATAGRAMS)
+                .await;
+            return;
+        }
+        let mut entries: Vec<MembershipUpdate> = self
+            .membership
+            .iter()
+            .map(|m| MembershipUpdate {
+                node_id: m.node_id.clone(),
+                address: m.address,
+                state: m.state,
+                incarnation: m.incarnation,
+            })
+            .collect();
+        entries.sort_unstable_by(|a, b| a.node_id.cmp(&b.node_id));
+        let start = self
+            .join_cursors
+            .get(requester)
+            .map_or(0, |(cursor, _)| *cursor);
+        let start = if start >= entries.len() { 0 } else { start };
+        let page: Vec<MembershipUpdate> = entries
+            .into_iter()
+            .skip(start)
+            .take(MAX_JOIN_SYNC_ENTRIES)
+            .collect();
+        let sent = self
+            .send_membership(to, false, page, MAX_JOIN_SYNC_DATAGRAMS)
+            .await;
+        if self.join_cursors.len() >= MAX_JOIN_CURSORS && !self.join_cursors.contains_key(requester)
+        {
+            let oldest = self
+                .join_cursors
+                .iter()
+                .min_by_key(|(_, (_, served))| *served)
+                .map(|(node, _)| node.clone());
+            if let Some(oldest) = oldest {
+                self.join_cursors.remove(&oldest);
+            }
+        }
+        self.join_cursors
+            .insert(requester.clone(), (start + sent, now));
     }
 
     /// Send our membership table to `target` as a burst of `Sync` datagrams,
@@ -1638,25 +1748,38 @@ impl<T: MustardTransport> MustardNode<T> {
     /// Sync datagrams go out unstamped: the directory extension can take
     /// ~1,100 bytes with a full label set, and every probe already carries it,
     /// so the whole UDP budget goes to membership entries instead.
-    async fn send_membership(&mut self, target: SocketAddr, wants_reply: bool) {
-        let window = self.membership_window();
-        let mut syncs = self.sync_datagrams(window, |entries, first| GossipPayload::Sync {
+    ///
+    /// Sends `entries` in at most `max_datagrams` datagrams, and returns how
+    /// many of them went.
+    async fn send_membership(
+        &mut self,
+        target: SocketAddr,
+        wants_reply: bool,
+        entries: Vec<MembershipUpdate>,
+        max_datagrams: usize,
+    ) -> usize {
+        let known_members = u32::try_from(self.membership.len()).unwrap_or(u32::MAX);
+        let mut syncs = self.sync_datagrams(entries, |entries, first| GossipPayload::Sync {
             entries,
             floors: vec![],
             wants_reply: wants_reply && first,
+            known_members,
         });
-        syncs.truncate(MAX_SYNC_DATAGRAMS);
+        syncs.truncate(max_datagrams);
+        let sent = syncs.iter().map(|sync| sync.payload.updates().len()).sum();
         let floors = self.floor_window(Instant::now());
         syncs.extend(
             self.sync_datagrams(floors, |floors, _| GossipPayload::Sync {
                 entries: vec![],
                 floors,
                 wants_reply: false,
+                known_members,
             }),
         );
         for sync in &syncs {
             self.send(target, sync).await;
         }
+        sent
     }
 
     /// Pack `items` in order into `Sync` datagrams of at most
@@ -2873,7 +2996,7 @@ mod tests {
                     let _ = node.transport.send(target_addr, &ping).await;
                 }
                 if push_pull_due {
-                    node.push_pull().await;
+                    node.push_pull(false).await;
                 }
             }
 
@@ -2914,6 +3037,7 @@ mod tests {
                 entries,
                 floors: vec![],
                 wants_reply,
+                known_members: 1,
             },
         )
     }
@@ -3093,7 +3217,10 @@ mod tests {
             );
         }
 
-        node.send_membership(addr(2), false).await;
+        let window = node.membership_window();
+
+        node.send_membership(addr(2), false, window, MAX_SYNC_DATAGRAMS)
+            .await;
 
         let mut seen = std::collections::HashSet::new();
         while let Some((_, message)) = peer.try_recv() {
@@ -3166,6 +3293,137 @@ mod tests {
             serve(&mut seed, Duration::from_millis(100))
         );
         assert_eq!(requests, 0, "push-pull ran again before its interval");
+    }
+
+    /// #2442: a joiner learnt at most one 64-entry window per exchange, one
+    /// exchange per 10 s, so its join time grew with the cluster.
+    #[tokio::test]
+    async fn a_joiner_learns_a_cluster_larger_than_one_sync_window_promptly() {
+        let net = InMemoryNetwork::new();
+        let joiner_transport = net.register(addr(1)).await;
+        let seed_transport = net.register(addr(2)).await;
+        let mut seed =
+            MustardNode::new(NodeId::new("seed"), addr(2), fast_config(), seed_transport);
+        for i in 0..500u16 {
+            seed.membership.add_node(
+                NodeId::new(format!("m{i:04}")),
+                addr(1000 + i),
+                1,
+                BTreeMap::new(),
+                Instant::now(),
+            );
+        }
+        assert!(seed.dissemination.is_empty());
+        let mut joiner = MustardNode::new(
+            NodeId::new("joiner"),
+            addr(1),
+            fast_config(),
+            joiner_transport,
+        );
+        joiner.add_seed(NodeId::new("seed"), addr(2));
+        let ((), requests) = tokio::join!(
+            joiner.run_one_cycle(),
+            serve(&mut seed, Duration::from_millis(100))
+        );
+        assert_eq!(requests, 1);
+        serve(&mut joiner, Duration::from_millis(50)).await;
+        assert!(
+            joiner.membership.len() >= 500,
+            "the joiner knows {} members after one exchange",
+            joiner.membership.len()
+        );
+    }
+
+    /// A table bigger than one join page is swept page by page, one per
+    /// cycle, with the same peer, and the joiner then falls back to the
+    /// anti-entropy interval.
+    #[tokio::test]
+    async fn a_joiner_pages_through_a_table_larger_than_a_join_page() {
+        let net = InMemoryNetwork::new();
+        let joiner_transport = net.register(addr(1)).await;
+        let seed_transport = net.register(addr(2)).await;
+        let mut seed =
+            MustardNode::new(NodeId::new("seed"), addr(2), fast_config(), seed_transport);
+        let size = MAX_JOIN_SYNC_ENTRIES * 2 + 100;
+        for i in 0..size {
+            seed.membership.add_node(
+                NodeId::new(format!("m{i:05}")),
+                addr(1000 + i as u16),
+                1,
+                BTreeMap::new(),
+                Instant::now(),
+            );
+        }
+        let mut joiner = MustardNode::new(
+            NodeId::new("joiner"),
+            addr(1),
+            fast_config(),
+            joiner_transport,
+        );
+        joiner.add_seed(NodeId::new("seed"), addr(2));
+        let mut exchanges = 0;
+        for _ in 0..5 {
+            let ((), requests) = tokio::join!(
+                joiner.run_one_cycle(),
+                serve(&mut seed, Duration::from_millis(100))
+            );
+            exchanges += requests;
+            serve(&mut joiner, Duration::from_millis(50)).await;
+        }
+        assert!(
+            joiner.membership.len() >= size,
+            "the joiner knows {} of {size} members after {exchanges} exchanges",
+            joiner.membership.len()
+        );
+        assert!(
+            exchanges <= 4,
+            "{exchanges} exchanges: it kept syncing after it caught up"
+        );
+    }
+
+    /// A peer that already knows most of the table gets the ordinary
+    /// window, and a joiner asking again inside half a protocol period gets
+    /// the window too, so one request can't keep drawing whole pages.
+    #[tokio::test]
+    async fn a_join_page_goes_only_to_a_joiner_and_is_paced() {
+        let net = InMemoryNetwork::new();
+        let requester = net.register(addr(1)).await;
+        let seed_transport = net.register(addr(2)).await;
+        let mut config = fast_config();
+        config.protocol_interval = Duration::from_secs(60);
+        let mut seed = MustardNode::new(NodeId::new("seed"), addr(2), config, seed_transport);
+        for i in 0..500u16 {
+            seed.membership.add_node(
+                NodeId::new(format!("m{i:04}")),
+                addr(1000 + i),
+                1,
+                BTreeMap::new(),
+                Instant::now(),
+            );
+        }
+        let request = |known_members| {
+            GossipMessage::new(
+                NodeId::new("asker"),
+                1,
+                GossipPayload::Sync {
+                    entries: vec![],
+                    floors: vec![],
+                    wants_reply: true,
+                    known_members,
+                },
+            )
+        };
+        let entries_for = async |seed: &mut MustardNode<InMemoryTransport>, known| {
+            seed.handle_message(addr(1), request(known)).await;
+            let mut entries = 0;
+            while let Some((_, reply)) = requester.try_recv() {
+                entries += reply.payload.updates().len();
+            }
+            entries
+        };
+        assert_eq!(entries_for(&mut seed, 480).await, MAX_SYNC_ENTRIES);
+        assert!(entries_for(&mut seed, 1).await > MAX_SYNC_ENTRIES);
+        assert_eq!(entries_for(&mut seed, 1).await, MAX_SYNC_ENTRIES);
     }
 
     // -- directory extension propagation (12b.2) ------------------------------
@@ -3811,6 +4069,7 @@ mod tests {
                     expires_in_secs: 60,
                 }],
                 wants_reply: false,
+                known_members: 0,
             },
         );
         node.handle_message(addr(2), sync).await;
@@ -4434,7 +4693,10 @@ mod tests {
         hear_then_reap(&mut old_hand, std::slice::from_ref(&recorded)).await;
 
         // The joiner's first anti-entropy exchange with a member.
-        old_hand.send_membership(addr(3), false).await;
+        let window = old_hand.membership_window();
+        old_hand
+            .send_membership(addr(3), false, window, MAX_SYNC_DATAGRAMS)
+            .await;
         let mut floors_seen = 0;
         while let Some((from, message)) = joiner.transport.try_recv() {
             if let GossipPayload::Sync {
@@ -4473,7 +4735,9 @@ mod tests {
         b.membership.declare_dead(&NodeId::new("peer"));
 
         // An exchange while the member is down but not yet reaped.
-        b.send_membership(addr(1), false).await;
+        let window = b.membership_window();
+        b.send_membership(addr(1), false, window, MAX_SYNC_DATAGRAMS)
+            .await;
         while let Some((from, message)) = a.transport.try_recv() {
             a.handle_message(from, message).await;
         }
@@ -4643,7 +4907,10 @@ mod tests {
         let mut joiner = MustardNode::new(NodeId::new("j"), addr(3), fast_config(), tj);
         let recorded = ping_from("peer");
         hear_then_reap(&mut old_hand, std::slice::from_ref(&recorded)).await;
-        old_hand.send_membership(addr(3), false).await;
+        let window = old_hand.membership_window();
+        old_hand
+            .send_membership(addr(3), false, window, MAX_SYNC_DATAGRAMS)
+            .await;
         deliver(&mut joiner).await;
 
         let mut restarted = MustardNode::new(NodeId::new("peer"), addr(2), fast_config(), tb);
