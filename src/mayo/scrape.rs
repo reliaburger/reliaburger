@@ -630,6 +630,43 @@ instance{instance=\"self-reported\"} 1
         assert!(!is_reserved_metric_name("process_cpu_seconds_total"));
     }
 
+    /// One sample over the limit fails the whole scrape: nothing but
+    /// `up = 0` is stored (#2521 documents it).
+    #[tokio::test]
+    async fn a_scrape_over_the_sample_limit_is_refused_whole() {
+        let body: String = (0..=MAX_SAMPLES_PER_SCRAPE)
+            .map(|n| format!("big{{n=\"{n}\"}} 1\n"))
+            .collect();
+        let address = serve_metrics(Box::leak(body.into_boxed_str())).await;
+        let url = format!("http://{address}/metrics");
+        let refused = fetch_metrics(&reqwest::Client::new(), &url, Duration::from_secs(5)).await;
+        assert!(
+            matches!(refused, Err(ScrapeError::TooManySamples(count)) if count == MAX_SAMPLES_PER_SCRAPE + 1),
+            "{:?}",
+            refused.map(|metrics| metrics.len())
+        );
+
+        let (_dir, store) = store();
+        let summary = scrape_app_targets(
+            &store,
+            &reqwest::Client::new(),
+            &[target(address, "web-0")],
+            "node-a",
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(
+            summary,
+            AppScrapeSummary {
+                ingested: 1,
+                failed: 1
+            }
+        );
+        let rows = rows(store).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].1.as_str(), rows[0].3), ("up", 0.0));
+    }
+
     #[tokio::test]
     async fn a_failing_scrape_records_up_zero_and_no_samples() {
         // Keep the listener bound and drop every connection unanswered. A port

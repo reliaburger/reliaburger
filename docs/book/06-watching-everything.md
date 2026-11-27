@@ -165,7 +165,7 @@ A *stream* is the async cousin of an iterator: it yields values over time, and y
 
 The first version borrowed `target` and `client` inside the future instead of owning them. It compiled as a plain function and failed the moment the loop ran inside `tokio::spawn`, with the wonderfully opaque "implementation of `FnOnce` is not general enough". The borrowed version ties each future's lifetime to the function's borrows, and the compiler can't prove that combination is `Send` (safe to move between threads, which the multi-threaded runtime requires). Giving every future its own copy fixed it. A `reqwest::Client` is an `Arc` inside, so cloning it costs a reference count, not a connection pool.
 
-Each fetch is also bounded three ways: a timeout (half the interval, at most five seconds), an 8 MiB body cap, and a 20,000-sample cap. The endpoint belongs to the app, and a node shouldn't buffer whatever an app feels like sending.
+Each fetch is also bounded three ways: a timeout (half the interval, at most five seconds), an 8 MiB body cap, and a 20,000-sample cap. The endpoint belongs to the app, and a node shouldn't buffer whatever an app feels like sending. A scrape over either cap fails whole, the way Prometheus's `sample_limit` does: storing the first 20,000 samples would keep an arbitrary subset of the app's series and hide that anything was cut, so nothing is stored and `up` reads 0. `a_scrape_over_the_sample_limit_is_refused_whole` serves 20,001 samples and checks exactly that.
 
 ### Labels are the whole point
 

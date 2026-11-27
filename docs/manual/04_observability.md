@@ -269,6 +269,10 @@ app's page in the web dashboard charts the same data, one line per instance.
 Axes and legends pick a readable unit (`12 MiB`, `300 µs`, `1.5k req/s`),
 and the legend shows each line's newest value until you hover over a point.
 
+A scrape takes at most an 8 MiB response and 20,000 samples; one over either
+limit fails whole, so nothing from it is stored, `up` is 0 for that instance
+and Bun logs the reason. The limits are fixed, not settings.
+
 An app can't use the names the node writes for itself: anything starting
 `node_`, `ingress_`, `ketchup_`, `bun_`, `mayo_` or
 `discovery_withdrawal_`, plus `up`, `process_cpu_percent`,

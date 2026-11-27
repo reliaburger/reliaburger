@@ -18,7 +18,7 @@ Mayo is Reliaburger's embedded, per-node metrics store. It provides a metrics pi
 
 The result is a batteries-included metrics store embedded in the single Bun binary, with no external database and no configuration for the common case.
 
-A note on this document: the storage engine is **Parquet + DataFusion SQL**, not a custom Gorilla/ULID TSDB, and the query language is **SQL**, not PromQL. Several capabilities are now wired: outbound Prometheus scraping of `[[metrics.scrape_targets]]`, cross-council query fan-out and merge, ingress request/response counters, and rollup retention pruning. Others the original design imagined -- remote-read federation, tiered downsampling, PromQL alert expressions, per-app alert tuning -- remain **not wired into a running system** and are each flagged below with **Status: planned -- not yet implemented.**
+A note on this document: the storage engine is **Parquet + DataFusion SQL**, not a custom Gorilla/ULID TSDB, and the internal query language is **SQL** (DataFusion over Parquet), not PromQL. SQL is internal: the HTTP metrics API takes a metric name, a time range and an app, never SQL (the one route that accepts SQL, `/v1/logs/sql`, is for logs). Several capabilities are now wired: outbound Prometheus scraping of `[[metrics.scrape_targets]]`, cross-council query fan-out and merge, ingress request/response counters, and rollup retention pruning. Others the original design imagined -- remote-read federation, tiered downsampling, PromQL alert expressions, per-app alert tuning -- remain **not wired into a running system** and are each flagged below with **Status: planned -- not yet implemented.**
 
 ---
 
@@ -324,7 +324,7 @@ An executor's cgroup holds its helper as well as its task groups, so the sample 
 
 **Status: implemented (explicit targets); per-app auto-scrape planned.**
 
-`src/mayo/scrape.rs` provides `parse_prometheus_text`, `scrape_endpoint` (an HTTP GET with a 5s timeout), and `scrape_once`, which Bun's scrape loop calls every `scrape_interval_secs` over the `[[metrics.scrape_targets]]` list -- each target's samples are ingested tagged with its `job`. A target that fails contributes nothing rather than failing the sweep, and an empty target list spawns no loop. Apps opt in with `metrics = {}` on the app spec (`port` defaults to the app's port, `path` to `/metrics`): the node running each instance scrapes it every `app_scrape_interval_secs` (node-wide, 10 by default), so the port needn't be published. An app's sample whose name the node writes itself (`is_reserved_metric_name`: the prefixes `node_`, `ingress_`, `ketchup_`, `bun_`, `mayo_`, `discovery_withdrawal_`, and the exact names `up`, `process_cpu_percent`, `process_memory_bytes` and the job metrics) is stored as `exported_<name>`, as a clashing target label is, so an app can't feed the node's alerts or charts (#2387). `[[metrics.scrape_targets]]` are operator config and keep their names. Still **planned -- not yet implemented**: a per-app scrape interval, auto-detection of `/metrics` endpoints without the opt-in, `max_samples_per_scrape`, and a scrape-timeout counter.
+`src/mayo/scrape.rs` provides `parse_prometheus_text`, `scrape_endpoint` (an HTTP GET with a 5s timeout), and `scrape_once`, which Bun's scrape loop calls every `scrape_interval_secs` over the `[[metrics.scrape_targets]]` list -- each target's samples are ingested tagged with its `job`. A target that fails contributes nothing rather than failing the sweep, and an empty target list spawns no loop. Apps opt in with `metrics = {}` on the app spec (`port` defaults to the app's port, `path` to `/metrics`): the node running each instance scrapes it every `app_scrape_interval_secs` (node-wide, 10 by default), so the port needn't be published. An app's sample whose name the node writes itself (`is_reserved_metric_name`: the prefixes `node_`, `ingress_`, `ketchup_`, `bun_`, `mayo_`, `discovery_withdrawal_`, and the exact names `up`, `process_cpu_percent`, `process_memory_bytes` and the job metrics) is stored as `exported_<name>`, as a clashing target label is, so an app can't feed the node's alerts or charts (#2387). `[[metrics.scrape_targets]]` are operator config and keep their names. Every scrape, of an app or a static target, is capped at an 8 MiB body and 20,000 samples (`MAX_BODY_BYTES`, `MAX_SAMPLES_PER_SCRAPE` in `src/mayo/scrape.rs`; fixed constants, not settings). A scrape over either limit fails whole: nothing from it is stored, an app instance's `up` is 0, and Bun writes one line to stderr. Still **planned -- not yet implemented**: a per-app scrape interval, auto-detection of `/metrics` endpoints without the opt-in, and a scrape-timeout counter.
 
 ### 5.3 Downsampling
 
@@ -461,7 +461,7 @@ max_storage_mb = 1024
 
 ### 6.2 Scraping Configuration
 
-**Status: partially implemented.** `scrape_interval_secs` now drives the scrape loop and `[[metrics.scrape_targets]]` declares the endpoints (see §5.2). Still absent: per-app `metrics`/`metrics_interval`, a `[metrics.scrape]` block, and a `max_samples_per_scrape` limit.
+**Status: partially implemented.** `scrape_interval_secs` now drives the scrape loop and `[[metrics.scrape_targets]]` declares the endpoints (see §5.2). Still absent: per-app `metrics`/`metrics_interval`, a `[metrics.scrape]` block, and a configurable sample limit (the 20,000-sample and 8 MiB caps are fixed constants, §5.2).
 
 ### 6.3 Alert Configuration (`[alerts]`)
 
@@ -539,7 +539,7 @@ Today the parent is always the current leader, so a reassignment is a leader cha
 - **Internal API:** the `/v1/metrics*` and `/v1/alerts` routes require an authenticated token (`AnyToken` in `src/bun/authz.rs`); inter-node transports are secured by the Sesame PKI where mTLS is enabled.
 - **Per-namespace isolation:** `/v1/metrics/app/{app}/{namespace}` enforces tenant scope via `authorize_scoped`, and every path/name segment that reaches SQL is escaped (single quotes doubled), so a scoped token cannot read another tenant's metrics and a crafted `?name=` cannot break out of the string literal. This is **shipped**, not future.
 - **Prometheus remote-read auth: Status: planned -- not yet implemented** (there is no remote-read endpoint, §3.4).
-- **`max_samples_per_scrape` / label scrubbing:** planned -- not yet implemented. The scrape loop (§5.2) ingests every sample a target returns; there is no per-scrape sample cap or label scrubbing yet.
+- **Scrape limits / label scrubbing:** a scrape is capped at 8 MiB and 20,000 samples (`MAX_BODY_BYTES`, `MAX_SAMPLES_PER_SCRAPE` in `src/mayo/scrape.rs`), and one over either fails whole (§5.2). An app still chooses its own metric names and labels, apart from the names the node reserves (#2387); label scrubbing is planned -- not yet implemented.
 
 ### 8.2 Alert Webhook Authentication
 
