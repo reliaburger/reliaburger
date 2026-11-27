@@ -538,6 +538,14 @@ the push to `main` runs it, and a candidate build only reuses a push or
 nightly run in which `portable macOS` passed; otherwise `validate-release`
 runs all of `ci.yml`, macOS included.
 
+A nightly like this runs only once it's on `main`. GitHub runs a `schedule`
+trigger, and offers `workflow_dispatch`, from the default branch's copy of a
+workflow, so `macos-nightly.yml` did nothing while it sat on the 0.3.3 train
+([#2481](https://github.com/reliaburger/reliaburger/issues/2481)). A new or
+changed schedule-only workflow goes to `main` in its own PR, and
+`open_train.py` refuses to open a train while one is missing from `main`
+([a schedule-only workflow lives on `main`](releasing.md#merge-trains-and-their-ci)).
+
 **Drafts and 0.4.0 work run the cheap set** (same decision). A draft pull
 request, and one whose head branch starts with `0-4-0/`, runs select jobs, CI
 policy and lint (when it changes code) and nothing else, whatever its labels;

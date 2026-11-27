@@ -136,6 +136,18 @@ The qualification scripts install staged builds on the hosts in the matrix
 and never read a merge-queue run, so nothing there relied on the queue's
 macOS job.
 
+**A schedule-only workflow lives on `main`.** GitHub runs a `schedule`
+trigger, and offers `workflow_dispatch`, from the default branch's copy of
+the workflow only. `macos-nightly.yml`, `fuzz.yml` and `mutants.yml` pick
+the newest train themselves once they run, but a change to one of them takes
+effect only when it's on `main`: `macos-nightly.yml` sat on the 0.3.3 train
+for days, never ran, and couldn't be dispatched
+([#2481](https://github.com/reliaburger/reliaburger/issues/2481)). So a new
+or changed schedule-only workflow goes to `main` in its own small PR, not
+with the train, and the train carries the same copy so the gate PR doesn't
+undo it. `open_train.py` refuses to open a train while the local tree has a
+schedule-only workflow `main` lacks.
+
 Drafts, and pull requests from a `0-4-0/` branch, run only select jobs, CI
 policy and lint until they're marked ready for review
 ([which jobs run](testing.md#which-jobs-a-pull-request-runs)).
@@ -158,7 +170,11 @@ python3 scripts/release/open_train.py release-X-Y-Z --milestone X.Y.Z [--from re
 The dry run reads what it needs and prints every write it would make,
 including the ruleset's new body, and makes none. Without `--dry-run`, the
 script does the four steps in order and skips any that's already done, so
-running it again finishes what a failed run started:
+running it again finishes what a failed run started. Before step 1 it lists
+`main`'s workflows and stops if a schedule-only one in the local tree (only
+`schedule` or `workflow_dispatch` starts it) isn't there, naming it; the dry
+run names it and goes on
+([a schedule-only workflow lives on `main`](#merge-trains-and-their-ci)):
 
 1. **Create the branch** `release-X-Y-Z` from `--from`: the previous
    train's frozen tip, or `main` (the default) once the previous release is

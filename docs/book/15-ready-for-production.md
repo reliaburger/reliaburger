@@ -1689,6 +1689,18 @@ The candidate build rests only on a push or nightly run in which `portable macOS
 runs `ci.yml` itself. What we gave up is a day: a macOS break can now sit on a train until the
 nightly finds it, instead of being refused at the door.
 
+Except the nightly didn't run. Not once. We'd reasoned our way to a separate workflow precisely
+because GitHub schedules from the default branch, and then merged that workflow into the train,
+not `main`. A scheduled workflow GitHub can't see on `main` doesn't exist as far as GitHub is
+concerned: `gh run list --workflow macos-nightly.yml` answered "workflow not found on the
+default branch", and it couldn't be started by hand either. The train got macOS runs only by
+accident, on the two pushes that followed a docs-only merge group
+([#2481](https://github.com/reliaburger/reliaburger/issues/2481)). The fix is a rule and a check.
+The rule: a schedule-only workflow (one that only `schedule` or `workflow_dispatch` starts) goes
+to `main` in its own small PR. The check: `open_train.py` lists `main`'s workflows before it
+writes anything, and refuses to open a train while the local tree has a schedule-only one that
+`main` lacks.
+
 What didn't we do? We didn't make the macOS job `continue-on-error` in the queue: it would
 still take a runner for an hour and still set each group's length, only without counting. We
 didn't shard it again: three shards each compiled the whole crate, which is why it became one
