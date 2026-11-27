@@ -121,6 +121,10 @@ pub struct RollupStore {
     /// Rows frozen for a flush being written outside the store lock, kept
     /// until their file is written (#2443).
     pending: Option<RollupPendingFlush>,
+    /// Parks each query of a snapshot this store hands out, so a test can
+    /// check what a caller holds while its query runs (#2530).
+    #[cfg(test)]
+    query_gate: Option<Arc<super::store::QueryGate>>,
 }
 
 /// A batch of rollups frozen for one flush, written with
@@ -183,7 +187,15 @@ impl RollupStore {
             index: SourceIndex::default(),
             max_buffer_rows: MAX_BUFFER_ROWS,
             pending: None,
+            #[cfg(test)]
+            query_gate: None,
         }
+    }
+
+    /// Park every query of this store's later snapshots at `gate`.
+    #[cfg(test)]
+    pub(crate) fn set_query_gate(&mut self, gate: Arc<super::store::QueryGate>) {
+        self.query_gate = Some(gate);
     }
 
     /// Seed the idempotency tracker from Parquet already on disk (M17).
@@ -437,6 +449,8 @@ impl RollupStore {
             sources: Arc::new(sources),
             memory,
             index: self.index.clone(),
+            #[cfg(test)]
+            query_gate: self.query_gate.clone(),
         })
     }
 
@@ -564,6 +578,8 @@ pub struct RollupSnapshot {
     sources: Arc<Vec<ParquetSource>>,
     memory: Option<RecordBatch>,
     index: SourceIndex,
+    #[cfg(test)]
+    query_gate: Option<Arc<super::store::QueryGate>>,
 }
 
 impl RollupSnapshot {
@@ -812,6 +828,8 @@ impl RollupSnapshot {
         );
 
         let ctx = self.session()?;
+        #[cfg(test)]
+        super::store::QueryGate::pass(&self.query_gate).await;
         let batches = super::store::collect_sql(&ctx, &sql).await?;
 
         let mut results = Vec::new();

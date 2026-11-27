@@ -287,11 +287,34 @@ pub(super) async fn top_handler(
     Json(crate::bun::top::ClusterTop { rows, warnings }).into_response()
 }
 
+/// The CPU and memory samples since `since` in this node's metrics store,
+/// newest per instance. The store's read guard is held only to copy a
+/// snapshot, in one statement, not through the query (#2530): `relish top`
+/// used to hold it through its query, and the collector's write and every
+/// read queued behind that write waited for it. Missing samples give an
+/// empty map.
+pub(super) async fn latest_local_usage(
+    mayo: &tokio::sync::RwLock<crate::mayo::store::MayoStore>,
+    since: u64,
+) -> std::collections::HashMap<(String, u32), crate::bun::top::Usage> {
+    use crate::bun::top::{CPU_METRIC, MEMORY_METRIC};
+    let Ok(snapshot) = mayo.read().await.snapshot_since(since).await else {
+        return std::collections::HashMap::new();
+    };
+    match snapshot
+        .query_names_since(&[CPU_METRIC, MEMORY_METRIC], since)
+        .await
+    {
+        Ok(samples) => crate::bun::top::latest_usage(&samples),
+        Err(_) => std::collections::HashMap::new(),
+    }
+}
+
 /// This node's workloads joined to their latest samples in its own store.
 pub(super) async fn local_top_rows(
     state: &ApiState,
 ) -> Result<Vec<crate::bun::top::TopRow>, String> {
-    use crate::bun::top::{CPU_METRIC, MEMORY_METRIC, USAGE_WINDOW_SECS};
+    use crate::bun::top::USAGE_WINDOW_SECS;
 
     let statuses = local_statuses(state).await?;
     let usage = match &state.mayo {
@@ -303,15 +326,7 @@ pub(super) async fn local_top_rows(
                 .saturating_sub(USAGE_WINDOW_SECS);
             // Missing samples leave the columns empty; they don't hide the
             // workloads themselves.
-            match mayo
-                .read()
-                .await
-                .query_names_since(&[CPU_METRIC, MEMORY_METRIC], since)
-                .await
-            {
-                Ok(samples) => crate::bun::top::latest_usage(&samples),
-                Err(_) => std::collections::HashMap::new(),
-            }
+            latest_local_usage(mayo, since).await
         }
         None => std::collections::HashMap::new(),
     };

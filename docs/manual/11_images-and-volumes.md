@@ -53,7 +53,12 @@ media types (`application/vnd.oci.image.layer.v1.tar`, `…tar+gzip`,
 so images BuildKit builds with `compression=zstd` run as they are. A pull
 refuses any other layer type before downloading it, naming the type, for
 example `layer sha256:… has media type application/vnd.oci.image.layer.v1.tar+bzip2,
-which no node can unpack`. Foreign (non-distributable) layers aren't supported.
+which no node can unpack`. `relish apply` refuses such an image too, before
+anything is scheduled, with the same message: it reads the layers from
+Pickle's catalogue when the image is there, and otherwise asks the registry
+for the manifest. If the registry doesn't answer in time, the apply goes
+ahead and the pull refuses the image on the node instead. Foreign
+(non-distributable) layers aren't supported.
 
 Layers stream to disk as they arrive, so a large image doesn't need its
 size in memory, and a slow link isn't a problem while bytes keep coming: an
@@ -225,6 +230,14 @@ grill: image collection removed 3 generation(s), 0 partial tree(s), 3 manifest(s
 
 An image that's collected and needed again later is pulled and unpacked
 again, from the blob store if its layers are still there.
+
+`relish images` shows how much disk each image's unpacked copies take on the
+node you asked, in its UNPACKED column (`-` for an image that node hasn't
+unpacked). `relish wtf` warns with `image-collection-failing` when a node's
+last collection failed, or was refused because the node couldn't read one of
+its container bundles' specs and so couldn't tell which images are in use:
+such a node removes nothing until a pass works. A nearly full image
+filesystem is the `disk-high` finding on the `images` domain.
 
 ### What bounds disk use on a node
 

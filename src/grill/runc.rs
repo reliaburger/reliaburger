@@ -576,32 +576,26 @@ impl RuncGrill {
             let Some(_pass) = store.start_collection(IMAGE_COLLECTION_INTERVAL).await else {
                 return;
             };
-            let live =
-                match tokio::task::spawn_blocking(move || live_image_generations(&bundle_base))
-                    .await
-                    .map_err(std::io::Error::other)
-                    .and_then(|live| live)
-                {
-                    Ok(live) => live,
-                    Err(error) => {
-                        eprintln!("warning: image collection skipped: {error}");
-                        return;
-                    }
-                };
-            match store
-                .collect_rootfs_garbage(&live, IMAGE_COLLECTION_GRACE)
+            let live = tokio::task::spawn_blocking(move || live_image_generations(&bundle_base))
                 .await
+                .map_err(std::io::Error::other)
+                .and_then(|live| live);
+            // `run_collection` records how the pass went for `relish wtf`
+            // (#2524), including a live set it couldn't read.
+            let now = crate::meat::batch_ids::epoch_now_secs();
+            if let Some(report) = store
+                .run_collection(live, IMAGE_COLLECTION_GRACE, now)
+                .await
+                && report != super::image::RootfsGcReport::default()
             {
-                Ok(report) if report != super::image::RootfsGcReport::default() => eprintln!(
+                eprintln!(
                     "grill: image collection removed {} generation(s), {} partial tree(s), \
                      {} manifest(s) and {} metadata file(s)",
                     report.generations_removed,
                     report.partials_removed,
                     report.manifests_removed,
                     report.metadata_removed
-                ),
-                Ok(_) => {}
-                Err(error) => eprintln!("warning: image collection failed: {error}"),
+                );
             }
         });
     }

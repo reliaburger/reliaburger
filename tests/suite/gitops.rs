@@ -423,7 +423,12 @@ impl reliaburger::pickle::upstream::UpstreamRegistry for FixedRegistry {
         'a,
         reliaburger::pickle::upstream::UpstreamManifest,
     > {
-        unimplemented!("binding only asks for the digest")
+        // No manifest: apply's layer check (#2528) is skipped.
+        Box::pin(async {
+            Err(reliaburger::pickle::types::PickleError::ReplicationFailed(
+                "no manifest".into(),
+            ))
+        })
     }
 
     fn fetch_root<'a>(

@@ -634,6 +634,7 @@ mod tests {
                     reason: "node node-3: disks: timed out".to_string(),
                 },
                 export_holds: available(Vec::new()),
+                image_collection: available(Vec::new()),
                 certificates: available(Vec::new()),
                 registry: available(Vec::new()),
                 tokens: available(Vec::new()),

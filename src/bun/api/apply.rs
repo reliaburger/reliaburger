@@ -31,7 +31,9 @@ pub(crate) async fn bind_images(
 /// stream's `Error` event instead (#2157), so both paths name the same one.
 pub(crate) fn bind_error_status(error: &BindError) -> StatusCode {
     match error {
-        BindError::InvalidReference { .. } => StatusCode::BAD_REQUEST,
+        BindError::InvalidReference { .. } | BindError::Unpackable { .. } => {
+            StatusCode::BAD_REQUEST
+        }
         BindError::NotInPickle { .. } | BindError::NoSuchImage { .. } => StatusCode::NOT_FOUND,
         BindError::Unresolved { .. } => StatusCode::BAD_GATEWAY,
         BindError::NotAllowed(_) => StatusCode::FORBIDDEN,

@@ -102,7 +102,9 @@ pub struct ArrayAssignment {
     pub batch_id: u64,
     /// Count and policy.
     pub spec: TaskArraySpec,
-    /// Host binary every task runs.
+    /// Host binary every task runs. Empty when `template` is sent: the
+    /// node derives it (see [`ArrayAssignment::derive_definition`]); only a
+    /// run with no template carries it on the wire.
     #[serde(default, skip_serializing_if = "path_is_empty")]
     pub program: PathBuf,
     /// Argument template, with `{index}` placeholders.
@@ -121,6 +123,46 @@ pub struct ArrayAssignment {
     /// Labels for this node's job metrics: never a task index or run id.
     #[serde(default)]
     pub labels: crate::mayo::job_metrics::JobLabels,
+}
+
+impl ArrayAssignment {
+    /// Work out `program`, `args` and `env` from `template`, the way the
+    /// leader used to before sending all four (#2532): `exec`, or
+    /// `/bin/sh -c` for a script; `command` as the arguments; the plain
+    /// environment plus `RELIABURGER_JOB_NAME`. An assignment with no
+    /// template carries its program itself and is left alone.
+    pub fn derive_definition(&mut self) {
+        let Some(template) = &self.template else {
+            return;
+        };
+        self.program = template.exec.clone().unwrap_or_else(|| {
+            if template.script.is_some() {
+                "/bin/sh".into()
+            } else {
+                PathBuf::new()
+            }
+        });
+        self.args = template
+            .script
+            .as_ref()
+            .map(|script| vec!["-c".into(), script.clone()])
+            .unwrap_or_else(|| template.command.clone().unwrap_or_default());
+        self.env = template
+            .env
+            .iter()
+            .filter_map(|(key, value)| match value {
+                crate::config::types::EnvValue::Plain(value) => Some((key.clone(), value.clone())),
+                // The owned runner decrypts the original template at execution.
+                crate::config::types::EnvValue::Encrypted(_) => None,
+                // Validation refuses provider values in jobs (#1123).
+                crate::config::types::EnvValue::Provider(_) => None,
+            })
+            .chain(std::iter::once((
+                "RELIABURGER_JOB_NAME".into(),
+                self.labels.definition.clone(),
+            )))
+            .collect();
+    }
 }
 
 /// Whether `path` is empty, for leaving it out of the wire format.
@@ -493,6 +535,16 @@ fn with_definition<'a>(
 ) -> Option<std::borrow::Cow<'a, ArrayAssignment>> {
     use std::borrow::Cow;
     if !assignment.template_known {
+        // A template comes alone: what derives from it is worked out here,
+        // once, and kept with it (#2532).
+        let assignment = match assignment.template {
+            Some(_) => {
+                let mut full = assignment.clone();
+                full.derive_definition();
+                Cow::Owned(full)
+            }
+            None => Cow::Borrowed(assignment),
+        };
         definitions.insert(
             assignment.batch_id,
             RunDefinition {
@@ -502,7 +554,7 @@ fn with_definition<'a>(
                 env: assignment.env.clone(),
             },
         );
-        return Some(Cow::Borrowed(assignment));
+        return Some(assignment);
     }
     let definition = definitions.get(&assignment.batch_id)?;
     Some(Cow::Owned(ArrayAssignment {
@@ -2266,6 +2318,34 @@ mod tests {
         node.sync(&request(Vec::new())).await.unwrap();
         let progress = node.sync(&request(vec![bare])).await.unwrap();
         assert!(progress.arrays[0].template_unknown);
+    }
+
+    /// #2532: the leader sends a run's template without the program,
+    /// arguments and environment it derives from it. The node works them
+    /// out, runs the tasks, and keeps them for calls that leave it all out.
+    #[tokio::test]
+    async fn a_node_derives_the_program_from_a_template_sent_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        let mut alone = assignment(1, 20, &[(0, 1)]);
+        alone.template = Some(Box::new(
+            toml::from_str(&format!(
+                "runtime='process'\nexec='{BINARY}'\ncommand=['-c','exit 0']"
+            ))
+            .unwrap(),
+        ));
+        alone.program = PathBuf::new();
+        alone.args.clear();
+        let progress = sync_until_finished(&node, &request(vec![alone]), 1).await;
+        assert!(progress.refused.is_none(), "{progress:?}");
+        assert!(!progress.unrunnable, "{progress:?}");
+        let mut bare = assignment(1, 20, &[(0, 1), (1, 1)]);
+        bare.template_known = true;
+        bare.program = PathBuf::new();
+        bare.args.clear();
+        let progress = sync_until_finished(&node, &request(vec![bare]), 2).await;
+        assert!(!progress.template_unknown);
+        assert!(progress.refused.is_none(), "{progress:?}");
     }
 
     /// #2446: the walk over every task-data file runs off the sync path,

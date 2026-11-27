@@ -7462,6 +7462,33 @@ async fn the_metrics_query_handler_releases_the_store_before_it_queries() {
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
 }
 
+/// #2530: `relish top`'s local rows held the metrics store's read guard
+/// through their query, so the collector's write waited for it. A write
+/// now goes through while that query runs.
+#[tokio::test]
+async fn relish_top_releases_the_metrics_store_before_it_queries() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = crate::mayo::store::MayoStore::new(dir.path().to_path_buf());
+    store.insert(
+        &crate::mayo::types::MetricKey::simple(crate::bun::top::CPU_METRIC),
+        crate::mayo::types::Sample::at(1, 1.0),
+    );
+    let gate = Arc::new(crate::mayo::store::QueryGate::default());
+    store.set_query_gate(Arc::clone(&gate));
+    let mayo = Arc::new(RwLock::new(store));
+    let reader = Arc::clone(&mayo);
+    let query = tokio::spawn(async move { super::status::latest_local_usage(&reader, 0).await });
+    gate.entered.notified().await;
+    let write = tokio::time::timeout(std::time::Duration::from_millis(200), mayo.write()).await;
+    assert!(
+        write.is_ok(),
+        "a write waited for relish top's query to finish"
+    );
+    drop(write);
+    gate.release.notify_one();
+    query.await.unwrap();
+}
+
 /// #2451: `/v1/metrics/cluster` with no `start` read the whole rollup
 /// retention, which is what a dashboard's first request looks like. It now
 /// reads the last hour.
