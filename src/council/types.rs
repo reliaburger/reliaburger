@@ -1102,6 +1102,56 @@ pub const SNAPSHOT_CHUNK_TIMEOUT_MS: u64 = 10_000;
 /// to resend.
 pub const SNAPSHOT_CHUNK_BYTES: u64 = 256 * 1024;
 
+/// The most log entries openraft puts in one AppendEntries (#2370).
+///
+/// openraft's own default, set here so the batch count is a decision. Bytes
+/// are bounded separately, by [`LOG_READ_BUDGET_BYTES`].
+pub const MAX_PAYLOAD_ENTRIES: u64 = 300;
+
+/// The stored bytes of log entries a bounded log read returns, unless the
+/// first entry alone is larger (#2370).
+///
+/// openraft reads each AppendEntries batch through
+/// `limited_get_log_entries`, and gives the RPC `heartbeat_interval`
+/// (150 ms) to complete. 4 MiB crosses a 1 Gbit/s link in about 35 ms, so a
+/// batch of large entries fits its deadline with room for encoding and the
+/// follower's fsync. Entries are stored as JSON, the encoding they travel
+/// in, so stored bytes are close to frame bytes.
+pub const LOG_READ_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+
+/// The largest request, as JSON, a council write accepts (#2370).
+///
+/// An entry that can't fit an AppendEntries frame could never replicate,
+/// and every later commit would wait behind it. 32 MiB leaves room under
+/// the transport's send limit (48 MiB) and its receive limit (64 MiB), and
+/// above the largest entry the council admits on purpose: a placement pass
+/// of 131,072 placements is about 20 MB.
+pub const MAX_ENTRY_BYTES: usize = 32 * 1024 * 1024;
+
+/// The length of `value` encoded as JSON, counted without building the
+/// encoding.
+pub fn json_len<T: Serialize>(value: &T) -> usize {
+    /// A writer that keeps only the count of bytes written to it.
+    struct ByteCounter(usize);
+
+    impl std::io::Write for ByteCounter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = ByteCounter(0);
+    // A failure to serialise means the value can't be encoded at all; the
+    // write path then fails at the log store's own encode, with its error.
+    let _ = serde_json::to_writer(&mut counter, value);
+    counter.0
+}
+
 impl CouncilConfig {
     /// Convert to an `openraft::Config`.
     pub fn to_openraft_config(&self) -> openraft::Config {
@@ -1113,6 +1163,7 @@ impl CouncilConfig {
             max_in_snapshot_log_to_keep: self.max_in_snapshot_log_to_keep,
             install_snapshot_timeout: SNAPSHOT_CHUNK_TIMEOUT_MS,
             snapshot_max_chunk_size: SNAPSHOT_CHUNK_BYTES,
+            max_payload_entries: MAX_PAYLOAD_ENTRIES,
             ..Default::default()
         }
     }

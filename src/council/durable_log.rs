@@ -21,7 +21,7 @@ use openraft::storage::{LogFlushed, LogState, RaftLogStorage};
 use openraft::{Entry, LogId, RaftLogReader, StorageError, StorageIOError, Vote};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
-use super::types::TypeConfig;
+use super::types::{LOG_READ_BUDGET_BYTES, TypeConfig};
 use crate::sesame::raft_encryption::{self, EncryptedEntry};
 
 /// Log entries: index → JSON `Entry`, or the marker byte and a postcard
@@ -254,9 +254,13 @@ impl DurableLogStore {
         }
     }
 
+    /// Read the entries in `range`, in order, stopping before the entry that
+    /// would take their stored bytes past `budget`. The first entry is always
+    /// read, however large, so a non-empty range never reads as empty.
     fn read_range<RB: RangeBounds<u64>>(
         &self,
         range: RB,
+        budget: usize,
     ) -> Result<Vec<Entry<TypeConfig>>, StorageError<u64>> {
         let bounds = (
             copy_bound(range.start_bound()),
@@ -265,9 +269,15 @@ impl DurableLogStore {
         let rtx = self.db.begin_read().map_err(read_err)?;
         let t = rtx.open_table(ENTRIES).map_err(read_err)?;
         let mut out = Vec::new();
+        let mut bytes = 0usize;
         for row in t.range::<u64>(bounds).map_err(read_err)? {
             let (_, v) = row.map_err(read_err)?;
-            out.push(self.decode_value(v.value())?);
+            let stored = v.value();
+            bytes = bytes.saturating_add(stored.len());
+            if bytes > budget && !out.is_empty() {
+                break;
+            }
+            out.push(self.decode_value(stored)?);
         }
         Ok(out)
     }
@@ -336,7 +346,19 @@ impl RaftLogReader<TypeConfig> for DurableLogReader {
         &mut self,
         range: RB,
     ) -> Result<Vec<Entry<TypeConfig>>, StorageError<u64>> {
-        self.store.read_range_blocking(range).await
+        self.store.read_range_blocking(range, usize::MAX).await
+    }
+
+    /// The entries openraft puts in one AppendEntries: at most
+    /// [`LOG_READ_BUDGET_BYTES`] of them, and never none (#2370).
+    async fn limited_get_log_entries(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<Entry<TypeConfig>>, StorageError<u64>> {
+        self.store
+            .read_range_blocking(start..end, LOG_READ_BUDGET_BYTES)
+            .await
     }
 }
 
@@ -345,7 +367,16 @@ impl RaftLogReader<TypeConfig> for DurableLogStore {
         &mut self,
         range: RB,
     ) -> Result<Vec<Entry<TypeConfig>>, StorageError<u64>> {
-        self.read_range_blocking(range).await
+        self.read_range_blocking(range, usize::MAX).await
+    }
+
+    async fn limited_get_log_entries(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<Entry<TypeConfig>>, StorageError<u64>> {
+        self.read_range_blocking(start..end, LOG_READ_BUDGET_BYTES)
+            .await
     }
 }
 
@@ -357,13 +388,14 @@ impl DurableLogStore {
     async fn read_range_blocking<RB: RangeBounds<u64>>(
         &self,
         range: RB,
+        budget: usize,
     ) -> Result<Vec<Entry<TypeConfig>>, StorageError<u64>> {
         let bounds = (
             copy_bound(range.start_bound()),
             copy_bound(range.end_bound()),
         );
         let store = self.clone();
-        run_blocking(move || store.read_range(bounds)).await
+        run_blocking(move || store.read_range(bounds, budget)).await
     }
 }
 
@@ -540,6 +572,55 @@ mod tests {
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].log_id.index, 1);
         assert_eq!(entries[2].log_id.index, 3);
+    }
+
+    fn config_entry(index: u64, value_bytes: usize) -> Entry<TypeConfig> {
+        Entry {
+            log_id: log_id(1, index),
+            payload: EntryPayload::Normal(crate::council::types::RaftRequest::ConfigSet {
+                key: format!("key-{index}"),
+                value: "x".repeat(value_bytes),
+            }),
+        }
+    }
+
+    /// #2370: openraft asks for up to 300 entries per AppendEntries and
+    /// nothing bounded their bytes, so a batch of large entries made a frame
+    /// the receiver drops, for ever.
+    #[tokio::test]
+    async fn a_bounded_read_stops_at_the_byte_budget_but_returns_at_least_one_entry() {
+        use crate::council::types::LOG_READ_BUDGET_BYTES;
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DurableLogStore::open(dir.path().join("store.redb")).unwrap();
+        let mib = 1024 * 1024;
+        store
+            .write_entries((1..=10).map(|index| config_entry(index, mib)))
+            .unwrap();
+
+        let mut reader = store.get_log_reader().await;
+        let entries = reader.limited_get_log_entries(1, 11).await.unwrap();
+        assert!(!entries.is_empty());
+        assert!(
+            entries.len() <= LOG_READ_BUDGET_BYTES / mib,
+            "{} entries of 1 MiB came back for a {LOG_READ_BUDGET_BYTES}-byte budget",
+            entries.len()
+        );
+        for (offset, entry) in entries.iter().enumerate() {
+            assert_eq!(entry.log_id.index, 1 + offset as u64);
+        }
+
+        // One entry bigger than the whole budget still comes back, alone:
+        // openraft needs a non-empty answer for a non-empty range.
+        store
+            .write_entries(vec![config_entry(11, LOG_READ_BUDGET_BYTES + mib)])
+            .unwrap();
+        let entries = reader.limited_get_log_entries(11, 12).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].log_id.index, 11);
+        // The same holds from the store itself.
+        let entries = store.limited_get_log_entries(10, 12).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].log_id.index, 10);
     }
 
     #[test]

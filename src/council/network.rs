@@ -8,7 +8,9 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError, Unreachable};
+use openraft::error::{
+    InstallSnapshotError, NetworkError, PayloadTooLarge, RPCError, RaftError, Unreachable,
+};
 use openraft::network::RPCOption;
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
@@ -242,6 +244,18 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Maximum Raft RPC payload size (64 MiB — snapshots can be large).
 const MAX_RAFT_RPC_SIZE: usize = 64 * 1024 * 1024;
+
+/// The largest frame this node sends (#2370).
+///
+/// Below [`MAX_RAFT_RPC_SIZE`], so a frame a peer would drop is never
+/// written, and above [`MAX_ENTRY_BYTES`](super::types::MAX_ENTRY_BYTES),
+/// so a single entry the council accepted always fits. An AppendEntries
+/// over it fails with `PayloadTooLarge`, and openraft retries with fewer
+/// entries.
+const RAFT_SEND_LIMIT_BYTES: usize = 48 * 1024 * 1024;
+
+const _: () = assert!(super::types::MAX_ENTRY_BYTES < RAFT_SEND_LIMIT_BYTES);
+const _: () = assert!(RAFT_SEND_LIMIT_BYTES < MAX_RAFT_RPC_SIZE);
 
 /// How long the accept side waits for a peer to finish its mTLS handshake,
 /// and how long it may spend serving one request, before dropping the
@@ -1151,6 +1165,33 @@ impl RaftNetworkFactory<TypeConfig> for TcpRaftNetworkFactory {
     }
 }
 
+/// Why an outbound Raft RPC failed before it got an answer.
+enum SendError {
+    /// The peer couldn't be reached, or the exchange failed.
+    Unreachable(Unreachable),
+    /// The encoded frame is over [`RAFT_SEND_LIMIT_BYTES`], so it was never
+    /// sent (#2370).
+    TooLarge { bytes: usize },
+}
+
+impl SendError {
+    /// The error for an RPC that can't shrink its payload.
+    fn into_unreachable(self) -> Unreachable {
+        match self {
+            Self::Unreachable(error) => error,
+            Self::TooLarge { bytes } => Unreachable::new(&RouterError(format!(
+                "frame of {bytes} bytes is over the {RAFT_SEND_LIMIT_BYTES}-byte send limit"
+            ))),
+        }
+    }
+}
+
+impl From<Unreachable> for SendError {
+    fn from(error: Unreachable) -> Self {
+        Self::Unreachable(error)
+    }
+}
+
 /// A client for one Raft peer (plain TCP or mTLS). It sends each RPC over a
 /// pooled connection when one is fit for reuse, and dials otherwise (#928).
 pub struct TcpRaftNetwork {
@@ -1187,22 +1228,28 @@ impl TcpRaftNetwork {
     /// peers. openraft also drops this future at its own, shorter deadlines;
     /// that is safe, because the connection in use is dropped with it.
     async fn rpc(&self, rpc: RaftRpc) -> Result<RaftRpcResponse, Unreachable> {
+        self.rpc_sized(rpc)
+            .await
+            .map_err(SendError::into_unreachable)
+    }
+
+    /// [`Self::rpc`], telling a frame too large to send apart from a peer
+    /// that can't be reached, so an AppendEntries can ask for a smaller
+    /// batch (#2370).
+    async fn rpc_sized(&self, rpc: RaftRpc) -> Result<RaftRpcResponse, SendError> {
         if self.node_gate.is_quiesced() {
-            return Err(Unreachable::new(&RouterError(
-                "node transport quiesced".into(),
-            )));
+            return Err(Unreachable::new(&RouterError("node transport quiesced".into())).into());
         }
         // Check blocklist for chaos testing
         if self.blocklist.read().await.contains(&self.target_addr) {
-            return Err(Unreachable::new(&RouterError(
-                "blocked by chaos partition".into(),
-            )));
+            return Err(Unreachable::new(&RouterError("blocked by chaos partition".into())).into());
         }
 
         let Some(claim) = self.fence.outbound_claim() else {
             return Err(Unreachable::new(&RouterError(
                 "recovery fence: this node is not serving raft".into(),
-            )));
+            ))
+            .into());
         };
 
         // Wrap the entire RPC in a timeout — covers connect, write, and read.
@@ -1231,7 +1278,8 @@ impl TcpRaftNetwork {
             }
             return Err(Unreachable::new(&RouterError(format!(
                 "peer refused the rpc under the recovery fence (its epoch {recovery_epoch})"
-            ))));
+            )))
+            .into());
         }
         Ok(response)
     }
@@ -1257,7 +1305,7 @@ impl TcpRaftNetwork {
         &self,
         rpc: RaftRpc,
         claim: RecoveryClaim,
-    ) -> Result<RaftRpcResponse, Unreachable> {
+    ) -> Result<RaftRpcResponse, SendError> {
         // JSON to match handle_raft_frame (self-describing; see there). The RPC
         // is wrapped in a `RaftRpcEnvelope` stamped with this node's recovery
         // epoch (C5) so the accept side can fence off a different-epoch peer.
@@ -1269,6 +1317,14 @@ impl TcpRaftNetwork {
         };
         let payload = serde_json::to_vec(&envelope)
             .map_err(|e| Unreachable::new(&RouterError(format!("serialize: {e}"))))?;
+        // A peer drops a frame over MAX_RAFT_RPC_SIZE and closes the
+        // connection, which looks like an unreachable peer, so openraft
+        // would send the same batch again for ever. Refuse it here instead.
+        if payload.len() > RAFT_SEND_LIMIT_BYTES {
+            return Err(SendError::TooLarge {
+                bytes: payload.len(),
+            });
+        }
 
         let check = ReuseCheck {
             current_identity: self.identity.as_ref().map(|identity| identity.snapshot()),
@@ -1365,12 +1421,24 @@ impl RaftNetwork<TypeConfig> for TcpRaftNetwork {
         rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, CouncilNodeInfo, RaftError<u64>>> {
-        match self.rpc(RaftRpc::AppendEntries(rpc)).await {
+        let sent = u64::try_from(rpc.entries.len()).unwrap_or(u64::MAX);
+        match self.rpc_sized(RaftRpc::AppendEntries(rpc)).await {
             Ok(RaftRpcResponse::AppendEntries(resp)) => Ok(resp),
             Ok(_) => Err(RPCError::Unreachable(Unreachable::new(&RouterError(
                 "unexpected response type".into(),
             )))),
-            Err(e) => Err(RPCError::Unreachable(e)),
+            // Ask for half the batch. One entry always fits: a write over
+            // MAX_ENTRY_BYTES never reaches the log.
+            Err(SendError::TooLarge { bytes }) => {
+                eprintln!(
+                    "raft: an append of {sent} entries is {bytes} bytes, over the \
+                     {RAFT_SEND_LIMIT_BYTES}-byte send limit; asking for a smaller batch"
+                );
+                Err(RPCError::PayloadTooLarge(
+                    PayloadTooLarge::new_entries_hint((sent / 2).max(1)),
+                ))
+            }
+            Err(SendError::Unreachable(e)) => Err(RPCError::Unreachable(e)),
         }
     }
 
@@ -1719,6 +1787,43 @@ mod tests {
     #[test]
     fn decode_and_admit_rejects_a_malformed_frame() {
         assert!(decode_and_admit(b"not json", &RecoveryFence::serving(0)).is_none());
+    }
+
+    /// #2370: a batch too big for one frame used to be written anyway; the
+    /// receiver dropped it, the sender saw `Unreachable`, and openraft sent
+    /// the same batch again for ever. `PayloadTooLarge` makes it send fewer.
+    #[tokio::test]
+    async fn an_append_too_large_for_a_frame_asks_openraft_for_a_smaller_batch() {
+        use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+        let entry_bytes = RAFT_SEND_LIMIT_BYTES / 4 + 1024 * 1024;
+        let entries: Vec<Entry<TypeConfig>> = (1..=4)
+            .map(|index| Entry {
+                log_id: LogId::new(CommittedLeaderId::new(1, 1), index),
+                payload: EntryPayload::Normal(crate::council::types::RaftRequest::ConfigSet {
+                    key: format!("key-{index}"),
+                    value: "x".repeat(entry_bytes),
+                }),
+            })
+            .collect();
+        // Nothing listens on the discard port: the size check must come
+        // before any dial.
+        let mut network = TcpRaftNetworkFactory::new(1)
+            .new_client(2, &peer_info("127.0.0.1:9".parse().unwrap()))
+            .await;
+        let request = AppendEntriesRequest {
+            vote: openraft::Vote::new_committed(1, 1),
+            prev_log_id: None,
+            entries,
+            leader_commit: None,
+        };
+        let option = RPCOption::new(Duration::from_secs(10));
+        match network.append_entries(request, option).await {
+            Err(RPCError::PayloadTooLarge(too_large)) => {
+                assert_eq!(too_large.entries_hint(), 2);
+            }
+            Err(other) => panic!("an oversized batch failed with {other}"),
+            Ok(_) => panic!("an oversized batch was answered"),
+        }
     }
 
     // -----------------------------------------------------------------------
