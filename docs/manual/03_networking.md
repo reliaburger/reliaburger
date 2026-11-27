@@ -8,6 +8,11 @@ a healthy backend, wherever it runs. Services are TCP-only. The hook rewrites
 `connect()` calls, so UDP sent with `sendto()` to a VIP never reaches a
 backend, and published host ports are DNAT'd for TCP alone.
 
+Apps that open IPv6 sockets and reach IPv4 addresses through them (Java and
+.NET do by default) work too: the hook also rewrites a VIP written as
+`::ffff:127.128.x.y`. Before 0.3.4 it didn't, and those apps needed
+`-Djava.net.preferIPv4Stack=true` or `DOTNET_SYSTEM_NET_DISABLEIPV6=1`.
+
 ```sh
 relish resolve web                    # VIP and healthy backends for an app
 relish resolve web --namespace shop   # needed when two namespaces both run a web
@@ -38,6 +43,12 @@ split-horizon and corporate DNS keep working and nothing leaks to a public
 resolver. Set `upstream` to send them somewhere else. If DNS is on and there's
 no usable resolver (no `nameserver` lines, or only Bun's own address), Bun
 refuses to start and names `[dns] upstream`.
+
+Bun forwards at most 64 external lookups at once per node, and one container
+(one source address) can hold at most 16 of them; past that it gets SERVFAIL
+straight away. A resolver that didn't answer is tried after the others for
+10 seconds. Positive answers are cached for their TTL, at most 30 seconds, so
+a changed external record can take that long to reach containers.
 
 ## Who may connect
 

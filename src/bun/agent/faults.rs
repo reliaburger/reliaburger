@@ -762,25 +762,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// The block device (`major:minor`) backing this node's workload storage,
-    /// used to key an `io.max` throttle. cgroup v2 `io.max` is per-device, so
-    /// a throttle must name one. We resolve the device under the volumes dir
-    /// where workloads write; if it can't be determined we fall back to the
-    /// common `8:0` (first SCSI/SATA disk), which the operator can override by
-    /// running on a host whose data disk is `8:0`.
-    pub(super) fn io_device_major_minor(&self) -> String {
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::fs::MetadataExt;
-            // BLOCKING-OK: one stat of the volumes directory, whose inode the kernel has cached since startup; only a disk-throttle fault asks (#1887)
-            if let Ok(meta) = std::fs::metadata(&self.volumes_dir) {
-                let dev = meta.dev();
-                // Linux encodes major:minor in st_dev; unpack per libc rules.
-                let major = (dev >> 8) & 0xfff;
-                let minor = (dev & 0xff) | ((dev >> 12) & 0xfff00);
-                return format!("{major}:{minor}");
-            }
-        }
-        "8:0".to_string()
+    /// used to key an `io.max` throttle. cgroup v2 `io.max` is per-device and
+    /// takes whole disks only, so a volumes directory on a partition names its
+    /// disk. A directory on no block device (Btrfs, overlayfs, tmpfs) can't be
+    /// throttled, and the operator hears why (#2463).
+    pub(super) fn io_device_major_minor(&self) -> Result<String, String> {
+        // BLOCKING-OK: one stat of the volumes directory, whose inode the kernel has cached since startup, and two sysfs reads, which are kernel memory; only a disk-throttle fault asks (#1887)
+        crate::smoker::resource::throttle_device_of(&self.volumes_dir)
     }
 
     /// Serialise the fence with activation and retain ownership if cleanup

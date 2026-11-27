@@ -43,6 +43,56 @@ pub fn apply_disk_io_throttle(
     Ok(())
 }
 
+/// The major and minor numbers packed into a `st_dev`, unpacked as
+/// glibc's `gnu_dev_major` and `gnu_dev_minor` do.
+pub fn device_numbers(dev: u64) -> (u32, u32) {
+    let major = ((dev >> 32) & 0xffff_f000) | ((dev >> 8) & 0xfff);
+    let minor = ((dev >> 12) & 0xffff_ff00) | (dev & 0xff);
+    (major as u32, minor as u32)
+}
+
+/// The whole disk (`major:minor`) that device `major:minor` belongs to, as
+/// `sys_dev_block` (normally `/sys/dev/block`) describes it: a partition's
+/// parent disk, or the device itself when it isn't a partition (a disk,
+/// or a device-mapper volume such as LVM or LUKS).
+///
+/// cgroup v2 `io.max` accepts only whole devices, and refuses a partition
+/// with `ENODEV` (#2463). `None` means there's no block device: Btrfs,
+/// overlayfs and tmpfs report an anonymous device with major 0.
+pub fn whole_disk_of(sys_dev_block: &Path, major: u32, minor: u32) -> Option<String> {
+    let entry = sys_dev_block
+        .join(format!("{major}:{minor}"))
+        .canonicalize()
+        .ok()?;
+    let disk = if entry.join("partition").exists() {
+        entry.parent()?
+    } else {
+        &entry
+    };
+    let dev = std::fs::read_to_string(disk.join("dev")).ok()?;
+    Some(dev.trim().to_string())
+}
+
+/// The device an `io.max` throttle for files under `directory` names, or
+/// why there isn't one.
+pub fn throttle_device_of(directory: &Path) -> Result<String, String> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(directory).map_err(|error| {
+        format!(
+            "disk-io fault: cannot stat {}: {error}",
+            directory.display()
+        )
+    })?;
+    let (major, minor) = device_numbers(metadata.dev());
+    whole_disk_of(Path::new("/sys/dev/block"), major, minor).ok_or_else(|| {
+        format!(
+            "disk-io fault: {} is not on a block device this node can throttle \
+             (device {major}:{minor}; Btrfs, overlayfs and tmpfs have none)",
+            directory.display()
+        )
+    })
+}
+
 /// Remove disk I/O throttle (restore unlimited).
 #[cfg(target_os = "linux")]
 pub fn remove_disk_io_throttle(
@@ -557,6 +607,97 @@ mod tests {
             "max"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A fake `/sys/dev/block`: disk `vda` (253:0) with partition `vda1`
+    /// (253:1), and device-mapper `dm-0` (252:0), which has no partitions.
+    fn fake_sys_dev_block() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let devices = dir.path().join("devices");
+        for (path, dev) in [("vda", "253:0"), ("vda/vda1", "253:1"), ("dm-0", "252:0")] {
+            std::fs::create_dir_all(devices.join(path)).unwrap();
+            std::fs::write(devices.join(path).join("dev"), format!("{dev}\n")).unwrap();
+            std::os::unix::fs::symlink(devices.join(path), dir.path().join(dev)).unwrap();
+        }
+        std::fs::write(devices.join("vda/vda1/partition"), "1\n").unwrap();
+        dir
+    }
+
+    /// #2463: cgroup v2 `io.max` takes whole disks only, so a volumes
+    /// directory on a partition is throttled through its disk.
+    #[test]
+    fn a_partition_resolves_to_its_whole_disk() {
+        let sys = fake_sys_dev_block();
+        assert_eq!(whole_disk_of(sys.path(), 253, 1).as_deref(), Some("253:0"));
+        assert_eq!(whole_disk_of(sys.path(), 253, 0).as_deref(), Some("253:0"));
+        assert_eq!(whole_disk_of(sys.path(), 252, 0).as_deref(), Some("252:0"));
+        // Btrfs, overlayfs and tmpfs report an anonymous device (major 0),
+        // which has no block device to throttle.
+        assert_eq!(whole_disk_of(sys.path(), 0, 42), None);
+    }
+
+    /// `st_dev` packs major and minor the way glibc's `makedev` does,
+    /// with the high bits of each above the classic 8:8 layout.
+    #[test]
+    fn st_dev_unpacks_major_and_minor_like_glibc() {
+        fn makedev(major: u64, minor: u64) -> u64 {
+            ((major & 0xfff) << 8)
+                | ((major & 0xffff_f000) << 32)
+                | (minor & 0xff)
+                | ((minor & 0xffff_ff00) << 12)
+        }
+        assert_eq!(device_numbers(0xfd01), (253, 1));
+        for (major, minor) in [(8, 1), (259, 300), (0x1_2345, 0x10_0000)] {
+            assert_eq!(
+                device_numbers(makedev(major, minor)),
+                (major as u32, minor as u32)
+            );
+        }
+    }
+
+    /// #2463: a directory with no block device under it (tmpfs, for one)
+    /// is refused with the reason, not written as a bad `io.max` line.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_directory_on_tmpfs_has_no_device_to_throttle() {
+        let error = throttle_device_of(Path::new("/proc")).unwrap_err();
+        assert!(error.contains("/proc"), "{error}");
+        assert!(error.contains("not on a block device"), "{error}");
+    }
+
+    /// #2463: what the throttle writes is accepted by a real cgroup's
+    /// `io.max`, for the device under the temp directory, which on most
+    /// hosts (the Lima VM, cloud images) is a partition.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires linux cgroup-v2 write access (RELIABURGER_CGROUP_TESTS=1); run with make test-linux"]
+    fn cgroup_disk_io_throttle_is_accepted_by_a_real_cgroup() {
+        assert!(
+            std::env::var("RELIABURGER_CGROUP_TESTS").is_ok(),
+            "run via `make test-linux` (needs RELIABURGER_CGROUP_TESTS=1)"
+        );
+        let root = Path::new("/sys/fs/cgroup");
+        let controllers = std::fs::read_to_string(root.join("cgroup.subtree_control")).unwrap();
+        if !controllers.split_whitespace().any(|name| name == "io") {
+            std::fs::write(root.join("cgroup.subtree_control"), "+io").unwrap();
+        }
+        let cgroup = root.join(format!("rb-io-test-{}", std::process::id()));
+        std::fs::create_dir_all(&cgroup).unwrap();
+        let device = throttle_device_of(&std::env::temp_dir()).unwrap();
+
+        let applied = apply_disk_io_throttle(&cgroup, 1024 * 1024, false, &device);
+        let io_max = std::fs::read_to_string(cgroup.join("io.max")).unwrap_or_default();
+        let removed = remove_disk_io_throttle(&cgroup, &device);
+        let after = std::fs::read_to_string(cgroup.join("io.max")).unwrap_or_default();
+        std::fs::remove_dir(&cgroup).ok();
+
+        applied.unwrap_or_else(|e| panic!("io.max refused {device}: {e}"));
+        assert!(
+            io_max.contains(&format!("{device} rbps=1048576 wbps=1048576")),
+            "{io_max}"
+        );
+        removed.unwrap();
+        assert!(!after.contains("rbps=1048576"), "{after}");
     }
 
     #[cfg(target_os = "linux")]

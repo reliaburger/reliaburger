@@ -409,6 +409,136 @@ async fn ebpf_connect_to_vip_rewrites_destination() {
     ebpf.detach().unwrap();
 }
 
+/// The address a dual-stack (`AF_INET6`) socket uses to reach an IPv4
+/// destination: `::ffff:a.b.c.d`. The kernel runs `cgroup/connect6`, not
+/// `connect4`, for it (#2460).
+fn v4_mapped(address: SocketAddr) -> SocketAddr {
+    match address {
+        SocketAddr::V4(v4) => SocketAddr::V6(std::net::SocketAddrV6::new(
+            v4.ip().to_ipv6_mapped(),
+            v4.port(),
+            0,
+            0,
+        )),
+        SocketAddr::V6(_) => address,
+    }
+}
+
+/// #2460: a JVM or .NET app opens `AF_INET6` sockets by default and connects
+/// to `::ffff:<VIP>`. connect6 must rewrite that to a backend just as
+/// connect4 rewrites the plain VIP.
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
+async fn a_v4_mapped_connect_to_a_vip_reaches_a_backend() {
+    let mut ebpf = load_ebpf();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let backend_port = listener.local_addr().unwrap().port();
+    let service = ServiceId::new("default", "test-service-mapped");
+    let empty = ServiceId::new("default", "test-service-mapped-empty");
+    let vip = VirtualIP::from_service_id(&service);
+    let service_port: u16 = 9999;
+    let mut services = ServiceMap::new();
+    services
+        .register_app("test-service-mapped", "default", service_port, None)
+        .unwrap();
+    services
+        .register_app("test-service-mapped-empty", "default", 7777, None)
+        .unwrap();
+    services
+        .add_backend(
+            &service,
+            BackendInstance {
+                instance_id: "mapped-0".to_string(),
+                node_ip: Ipv4Addr::LOCALHOST,
+                host_port: backend_port,
+                healthy: true,
+                local: false,
+            },
+        )
+        .unwrap();
+    let mut maps = BpfServiceMap::new();
+    maps.sync_from_service_map(&services, &mut ebpf).unwrap();
+
+    let mapped = v4_mapped(SocketAddr::new(vip.0.into(), service_port));
+    let result = TcpStream::connect_timeout(&mapped, Duration::from_secs(2));
+    let empty_address = v4_mapped(SocketAddr::new(
+        VirtualIP::from_service_id(&empty).0.into(),
+        7777,
+    ));
+    let no_backend = TcpStream::connect_timeout(&empty_address, Duration::from_secs(2));
+    ebpf.detach().unwrap();
+
+    let stream =
+        result.unwrap_or_else(|e| panic!("v4-mapped connect to VIP {vip} was not rewritten: {e}"));
+    assert_eq!(
+        stream.peer_addr().unwrap().port(),
+        backend_port,
+        "the connection reached the backend"
+    );
+    assert_eq!(
+        no_backend.unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "a VIP with no backend is refused over IPv6 as over IPv4"
+    );
+}
+
+/// #2460: the view-lease fence (and, through the same helper, a Smoker
+/// partition or drop fault) applies to a v4-mapped connect too, so a
+/// dual-stack socket can't reach a remote backend the leader may have
+/// reused.
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
+async fn a_lapsed_view_lease_refuses_a_v4_mapped_remote_vip() {
+    use reliaburger::onion::lease::{ViewLease, boot_clock_ns};
+    use reliaburger::onion::types::ViewLeaseValue;
+
+    let mut ebpf = load_ebpf();
+    let remote = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let service = ServiceId::new("default", "lease-mapped-remote");
+    let mut services = ServiceMap::new();
+    services
+        .register_app("lease-mapped-remote", "default", 9996, None)
+        .unwrap();
+    services
+        .add_backend(
+            &service,
+            BackendInstance {
+                instance_id: "mapped-remote".to_string(),
+                node_ip: Ipv4Addr::LOCALHOST,
+                host_port: remote.local_addr().unwrap().port(),
+                healthy: true,
+                local: false,
+            },
+        )
+        .unwrap();
+    let mut maps = BpfServiceMap::new();
+    maps.sync_from_service_map(&services, &mut ebpf).unwrap();
+    let address = v4_mapped(SocketAddr::new(
+        VirtualIP::from_service_id(&service).0.into(),
+        9996,
+    ));
+    let connect = || TcpStream::connect_timeout(&address, Duration::from_secs(2));
+
+    let lease = ViewLease::default();
+    lease.enforce();
+    lease.renew(boot_clock_ns());
+    maps.write_view_lease(&mut ebpf, ViewLeaseValue::from_lease(&lease))
+        .unwrap();
+    let current = connect();
+    lease.expire();
+    maps.write_view_lease(&mut ebpf, ViewLeaseValue::from_lease(&lease))
+        .unwrap();
+    let lapsed = connect();
+    ebpf.detach().unwrap();
+
+    assert!(current.is_ok(), "a current lease routes: {current:?}");
+    assert_eq!(
+        lapsed.unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "a lapsed lease refuses a remote backend over IPv6 as over IPv4"
+    );
+}
+
 /// Z6.7: once a cluster node's view lease lapses, the leader may discharge it
 /// and let other nodes reuse the remote addresses its maps still name. Only
 /// this node can reuse the address of a backend running here, so from then

@@ -25,7 +25,7 @@ Onion also enforces namespace isolation and per-app firewall rules at the `conne
 
 ### Kernel
 
-- **Linux kernel 5.8+** (mandatory). The shipped connect-rewrite program uses the `BPF_CGROUP_INET4_CONNECT` hook, available since kernel 5.7, and its view-lease check reads `bpf_ktime_get_boot_ns()`, available since 5.8 (§7.6). The loader (`src/onion/ebpf/loader.rs`) also attaches three more programs — `connect6`, `sendmsg4`, and `sendmsg6` — as **policy enforcement** for IPv6 and unconnected UDP: egress allowlists, and namespace isolation for v4-mapped addresses and UDP. These are best-effort at load: `connect4` is mandatory (its failure aborts the load), while the other three log and continue on attach failure and expose their state via `connect6_attached()` / `sendmsg4_attached()` / `sendmsg6_attached()`. A node missing any of them can't enforce an allowlist or isolation, so it refuses egress allowlists and `allow_from`. Note that VIP rewrite (the service-discovery half) is IPv4/TCP-`connect()` only; the v6 and sendmsg hooks enforce policy, they do not do VIP load-balancing. (The `RECVMSG` response-injection hook belonged to the abandoned in-kernel DNS program, §3; DNS now runs in userspace and needs no BPF hook.) With `[ebpf]` enabled on rootful runc (what `relish init` writes there), Bun refuses to start when the program fails to load, which includes an older kernel; elsewhere eBPF stays off and the node enforces no namespace policy.
+- **Linux kernel 5.8+** (mandatory). The shipped connect-rewrite program uses the `BPF_CGROUP_INET4_CONNECT` hook, available since kernel 5.7, and its view-lease check reads `bpf_ktime_get_boot_ns()`, available since 5.8 (§7.6). The loader (`src/onion/ebpf/loader.rs`) also attaches three more programs — `connect6`, `sendmsg4`, and `sendmsg6` — as **policy enforcement** for IPv6 and unconnected UDP: egress allowlists, and namespace isolation for v4-mapped addresses and UDP. These are best-effort at load: `connect4` is mandatory (its failure aborts the load), while the other three log and continue on attach failure and expose their state via `connect6_attached()` / `sendmsg4_attached()` / `sendmsg6_attached()`. A node missing any of them can't enforce an allowlist or isolation, so it refuses egress allowlists and `allow_from`. VIP rewrite (the service-discovery half) is TCP-`connect()` only, to IPv4 VIPs: `connect4` rewrites them, and `connect6` rewrites the same VIP when a dual-stack (`AF_INET6`) socket connects to it v4-mapped (`::ffff:127.128.x.y`), which is the JVM's and .NET's default (#2460). Both call one inlined helper, so the view lease, Smoker faults and isolation apply alike. A node whose `connect6` failed to attach can't route those sockets. The sendmsg hooks enforce policy only; there's no UDP rewrite. (The `RECVMSG` response-injection hook belonged to the abandoned in-kernel DNS program, §3; DNS now runs in userspace and needs no BPF hook.) With `[ebpf]` enabled on rootful runc (what `relish init` writes there), Bun refuses to start when the program fails to load, which includes an older kernel; elsewhere eBPF stays off and the node enforces no namespace policy.
 - **BPF Type Format (BTF)** enabled in the kernel (`CONFIG_DEBUG_INFO_BTF=y`). Required for CO-RE (Compile Once, Run Everywhere) portability of eBPF programs across kernel versions. Most distribution kernels since Ubuntu 20.10, Fedora 33, and Debian 12 ship with BTF enabled.
 - **cgroup v2** mounted at `/sys/fs/cgroup`. Required for cgroup-scoped eBPF program attachment and for identifying the source application by cgroup ID in the firewall path.
 - **Rootful runc for transparent DNS.** Rootless runc, ProcessGrill and Apple Container don't yet install a supervised workload resolver. Bun refuses `[dns] enabled = true` with those runtimes before adoption or workload creation.
@@ -49,7 +49,13 @@ The hierarchical reporting tree is the source of truth for service map updates. 
 
 ## 3. Architecture
 
-Onion consists of one eBPF program (`onion_connect`) and the BPF hash maps that feed it, plus a userspace DNS responder, all managed by the Bun agent process.
+Onion consists of one eBPF object (`onion_connect.bpf.o`) with four programs, the BPF maps that feed them, and a userspace DNS responder, all managed by the Bun agent process. The loader attaches all four at the root cgroup v2:
+
+- `onion_connect` on `cgroup/connect4`: rewrites a TCP `connect()` to a VIP and applies namespace isolation and the egress allowlist to other IPv4 destinations (Program 2 below).
+- `onion_connect6` on `cgroup/connect6`: rewrites a v4-mapped VIP (`::ffff:127.128.x.y`) from a dual-stack socket the same way, and applies the same policy to IPv6 and v4-mapped destinations, so IPv6 isn't a way around it.
+- `onion_sendmsg4` and `onion_sendmsg6` on `cgroup/sendmsg4` and `cgroup/sendmsg6`: apply namespace isolation and the egress allowlist to unconnected UDP (`sendto()`), which never runs a connect hook. They rewrite nothing: a VIP is TCP only.
+
+`connect4` is mandatory; the other three are best-effort at load, and a node missing any of them refuses egress allowlists and `allow_from` (§2).
 
 > **Decision log — the `onion_dns` eBPF program below was never shipped.** The `onion_dns` program, its `BPF_CGROUP_UDP4_SENDMSG`/`RECVMSG` hooks, and the `dns_map` it reads are the *original* in-kernel DNS design. We built and abandoned it because those hooks can't read the DNS payload (see §1). The live implementation is a supervised userspace UDP/TCP responder (`src/onion/dns.rs`), with a per-instance resolver file mounted into rootful runc workloads. The kernel listings are preserved for teaching, not as a description of the running binary. 0.2.1 deleted the leftovers (#700): `ebpf/onion_dns.bpf.c` is no longer compiled, and the `dns_map` key and value types are gone from `ebpf/onion_common.h` and `src/onion/types.rs`. The later TC proof demonstrates that packet-hook synthesis is feasible, but it remains review evidence rather than production code.
 
@@ -62,9 +68,9 @@ Onion consists of one eBPF program (`onion_connect`) and the BPF hash maps that 
 - Trigger: Any UDP `sendmsg()` call targeting destination port 53
 - Behaviour: Inspects the DNS query payload. If the queried name ends with `.internal`, looks up the name in `dns_map` and synthesizes a DNS response containing the mapped virtual IP. If the name is not `.internal`, the call passes through untouched to the host's configured upstream DNS resolver.
 
-**Program 2: `onion_connect` (connect rewrite)**
+**Program 2: `onion_connect` (connect rewrite), with `onion_connect6` for v4-mapped VIPs**
 
-- Hook type: `BPF_CGROUP_INET4_CONNECT`
+- Hook type: `BPF_CGROUP_INET4_CONNECT` (and `BPF_CGROUP_INET6_CONNECT` for `onion_connect6`)
 - Attachment point: root cgroup v2 (`/sys/fs/cgroup`)
 - Trigger: Any `connect()` syscall
 - Behaviour: Checks whether the destination IP falls within the virtual IP range (127.128.0.0/16). If yes, looks up `(vip, port)` in `backend_map`, selects a healthy backend via round-robin, checks namespace isolation and `firewall_map`, then rewrites the destination address and port to the selected backend's real `host_ip:host_port`. If the VIP is not found or no healthy backends exist, the hook denies the connection by returning 0, which the kernel surfaces to `connect()` as `EPERM`. A destination outside the VIP range is never rewritten, but when `destination_map` says a workload owns it (a backend's container address, a published host port, any port of a container address), the same namespace check applies before the caller's egress allowlist does.
@@ -748,7 +754,7 @@ The health status of each backend is maintained by Bun based on the health check
 
 The eBPF programs are designed to be invisible for non-cluster traffic:
 
-- **DNS:** Only queries for names ending in `.internal` are answered locally. Bun's responder forwards all other DNS queries (`api.stripe.com`, `s3.amazonaws.com`, etc.) to the host's resolvers: the `nameserver` lines of `/etc/resolv.conf`, read at start, tried in order, skipping the responder's own address. `[dns] upstream` overrides them, and with no usable resolver Bun refuses to start.
+- **DNS:** Only queries for names ending in `.internal` are answered locally. Bun's responder forwards all other DNS queries (`api.stripe.com`, `s3.amazonaws.com`, etc.) to the host's resolvers: the `nameserver` lines of `/etc/resolv.conf`, read at start, tried in order, skipping the responder's own address. `[dns] upstream` overrides them, and with no usable resolver Bun refuses to start. An upstream that timed out goes after the others for 10 s, so a dead first resolver costs one slow lookup, not every one. Forwards share 64 UDP slots and 64 TCP connections per node, and one source address holds at most 16 of either (SERVFAIL past that). A positive answer (NOERROR with records, not truncated, at most 1,232 bytes) is cached for its smallest TTL, capped at 30 s, up to 1,024 entries, keyed by name, type and the client's EDNS; negative answers aren't cached (#2384).
 - **Connect:** Only connections to IPs in the `127.128.0.0/16` range are rewritten. Other `connect()` calls (to real IPs, to `127.0.0.1`, to external addresses) are never rewritten; a namespaced caller is refused one only when `destination_map` names another namespace's workload there, or its egress allowlist doesn't list it.
 
 Because Reliaburger does not use an overlay network, containers have direct outbound access to external services via the host network stack, subject to the same hooks' egress allowlists. An allowlist always permits the node's DNS responder on port 53.
@@ -776,13 +782,19 @@ Expanding the VIP range or the kernel backend pool means changing the constant a
 
 ```toml
 [ebpf]
-# Directory containing compiled eBPF object files.
-# Default: "/var/lib/reliaburger/ebpf/"
-program_dir = "/var/lib/reliaburger/ebpf/"
+# Load and attach the eBPF programs at startup. Default: false.
+enabled = true
 
-# Cgroup v2 mount point for eBPF program attachment.
-# Default: "/sys/fs/cgroup"
+# Load the object from this directory instead of the one embedded in the
+# binary (development only). Default: unset, which uses the embedded object.
+# program_dir = "target/ebpf"
+
+# Cgroup v2 mount point the hooks attach to. Default: "/sys/fs/cgroup".
 cgroup_path = "/sys/fs/cgroup"
+
+# Seconds between sweeps that reconcile the kernel maps with live instances.
+# 0 disables the sweep. Default: 60.
+sweep_interval_secs = 60
 ```
 
 The host port range Onion references for backend map entries is not an
@@ -1196,7 +1208,7 @@ The current design focuses on TCP (`connect()` interception). For UDP services:
 
 ### 13.2 IPv6 Support
 
-IPv6 is split: the **firewall/egress** hooks (`connect6`, `sendmsg6`) ship and are attached by the loader today, but **VIP service discovery** (the `127.128.0.0/16` rewrite) is IPv4-only, riding `BPF_CGROUP_INET4_CONNECT`.
+IPv6 is split: the **firewall/egress** hooks (`connect6`, `sendmsg6`) ship and are attached by the loader today, but **VIP service discovery** (the `127.128.0.0/16` rewrite) has IPv4 VIPs only. `connect6` rewrites a v4-mapped VIP (`::ffff:127.128.x.y`), so dual-stack sockets reach services (#2460); there are no IPv6 VIPs.
 
 - **Question:** When is IPv6 *service discovery* needed? An IPv6 VIP data plane would require rewrite logic in the already-attached `connect6` program and a VIP range within the IPv6 loopback/ULA space (`::1/128` is a single address; an alternative like `fd00::/8` could be used).
 - **Current position:** IPv6 egress-policy enforcement is shipped; IPv6 VIP load-balancing is deferred. IPv4 service discovery covers the vast majority of use cases, and host-to-host communication can use IPv6 independently.

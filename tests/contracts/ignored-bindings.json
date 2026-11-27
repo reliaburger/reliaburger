@@ -240,6 +240,12 @@
     "test": "smoker::resource::tests::cgroup_disk_io_throttle_applies_and_removes"
   },
   {
+    "source": "src/smoker/resource.rs",
+    "function": "cgroup_disk_io_throttle_is_accepted_by_a_real_cgroup",
+    "binary": "reliaburger",
+    "test": "smoker::resource::tests::cgroup_disk_io_throttle_is_accepted_by_a_real_cgroup"
+  },
+  {
     "source": "src/bun/agent/tests/cgroup_faults.rs",
     "function": "cpu_fault_round_trip_restores_cpu_max",
     "binary": "reliaburger",
@@ -595,9 +601,21 @@
   },
   {
     "source": "tests/ebpf.rs",
+    "function": "a_v4_mapped_connect_to_a_vip_reaches_a_backend",
+    "binary": "reliaburger::ebpf",
+    "test": "a_v4_mapped_connect_to_a_vip_reaches_a_backend"
+  },
+  {
+    "source": "tests/ebpf.rs",
     "function": "a_lapsed_view_lease_routes_only_to_local_backends",
     "binary": "reliaburger::ebpf",
     "test": "a_lapsed_view_lease_routes_only_to_local_backends"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "a_lapsed_view_lease_refuses_a_v4_mapped_remote_vip",
+    "binary": "reliaburger::ebpf",
+    "test": "a_lapsed_view_lease_refuses_a_v4_mapped_remote_vip"
   },
   {
     "source": "tests/ebpf.rs",
