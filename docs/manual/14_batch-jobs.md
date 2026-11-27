@@ -427,7 +427,10 @@ gossip, but its API doesn't answer) delays only its own grants: the others are
 planned from the answers that arrived, and the slow node's call carries over
 into later ticks rather than being repeated. Its chunks stay with it until it
 has been silent for 30 seconds, then go to other nodes at the next attempt, as
-for a node that left.
+for a node that left. The same happens, after three ticks, to a node that keeps
+reporting a finished chunk the leader can't accept (its counts don't add up);
+the leader's log names the run, chunk, attempt, node and reason once, in a
+line starting `bun: task array N: refused chunk`.
 
 Small chunks spread across many nodes are safe for the replicated state. The
 leader records which node and grant finished each chunk, and once that record

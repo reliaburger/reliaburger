@@ -691,16 +691,65 @@ pub fn plan_sync_within(
     replay_unknown: bool,
     room: u64,
 ) -> (Option<TaskArrayWrite>, FittedGrants) {
+    plan_sync_reporting(
+        batch_id,
+        record,
+        answers,
+        replay_unknown,
+        room,
+        &mut Vec::new(),
+    )
+}
+
+/// A finished chunk the leader's state refused, reported by the node that
+/// holds it at its current attempt (#2372). The node reports it again on
+/// every sync, so left alone the chunk would stay held for ever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedReport {
+    /// The run.
+    pub batch_id: u64,
+    /// The node that reported it.
+    pub node: NodeId,
+    /// The chunk.
+    pub chunk: ChunkId,
+    /// The attempt it reported.
+    pub attempt: u64,
+    /// Why the state refused it.
+    pub reason: crate::meat::task_array_state::TaskArrayError,
+}
+
+/// [`plan_sync_within`], also adding to `refused` each report the state
+/// refused from a node that holds the chunk at its current attempt. A
+/// stale attempt or a chunk the node no longer holds isn't added: the
+/// leader re-granted it, and the node forgets the result by itself.
+pub fn plan_sync_reporting(
+    batch_id: u64,
+    record: &TaskArrayRecord,
+    answers: &[(NodeId, &ArrayProgress)],
+    replay_unknown: bool,
+    room: u64,
+    refused: &mut Vec<RefusedReport>,
+) -> (Option<TaskArrayWrite>, FittedGrants) {
+    use crate::meat::task_array_state::TaskArrayError;
     // Copy the state only if some chunk finished: most ticks for most
     // arrays only top nodes up, and that plans against the state as it is.
     let mut preview = std::borrow::Cow::Borrowed(&record.state);
     let mut results = Vec::new();
     for (node, progress) in answers {
         for result in &progress.finished {
-            if !record.state.done().contains(result.chunk.0)
-                && preview.to_mut().complete(node, result).is_ok()
-            {
-                results.push((node.clone(), result.clone()));
+            if record.state.done().contains(result.chunk.0) {
+                continue;
+            }
+            match preview.to_mut().complete(node, result) {
+                Ok(_) => results.push((node.clone(), result.clone())),
+                Err(TaskArrayError::NotHeld { .. } | TaskArrayError::StaleAttempt { .. }) => {}
+                Err(reason) => refused.push(RefusedReport {
+                    batch_id,
+                    node: node.clone(),
+                    chunk: result.chunk,
+                    attempt: result.attempt,
+                    reason,
+                }),
             }
         }
     }
@@ -779,13 +828,15 @@ impl GrantBudget {
         record: &TaskArrayRecord,
         answers: &[(NodeId, &ArrayProgress)],
         replay_unknown: bool,
+        refused: &mut Vec<RefusedReport>,
     ) -> (
         Option<TaskArrayWrite>,
         Option<crate::meat::quota::QuotaError>,
     ) {
         let per_task = task_reservation(&record.template);
         let room = self.ledger.room_for_tasks(&record.namespace, &per_task);
-        let (write, fitted) = plan_sync_within(batch_id, record, answers, replay_unknown, room);
+        let (write, fitted) =
+            plan_sync_reporting(batch_id, record, answers, replay_unknown, room, refused);
         self.ledger
             .charge_tasks(&record.namespace, &per_task, fitted.started);
         let blocked = fitted.held_back.and_then(|tasks| {
@@ -1161,6 +1212,55 @@ pub struct TickInputs<'a> {
     /// [`eligible_nodes`]). A run fails as unrunnable only once each of
     /// them has refused it for good.
     pub eligible: BTreeSet<NodeId>,
+    /// Holders (run, node) whose report of a chunk the state has refused
+    /// [`REFUSALS_BEFORE_REQUEUE`] ticks running (see [`RefusedReports`]).
+    /// Their chunks go back to the queue like a refusing holder's.
+    pub stuck: BTreeSet<(u64, NodeId)>,
+}
+
+/// Ticks in a row a holder may report a chunk the state refuses before
+/// the leader takes its chunks back (#2372).
+pub const REFUSALS_BEFORE_REQUEUE: u32 = 3;
+
+/// How many ticks running each (run, node, chunk, attempt) report has been
+/// refused. A report that isn't refused on a tick starts again from zero.
+#[derive(Debug, Default)]
+pub struct RefusedReports {
+    streaks: HashMap<(u64, NodeId, ChunkId, u64), u32>,
+}
+
+impl RefusedReports {
+    /// Count this tick's refused reports, and return the ones refused for
+    /// the first time, for the caller to log once.
+    pub fn observe<'a>(&mut self, refused: &'a [RefusedReport]) -> Vec<&'a RefusedReport> {
+        let mut streaks = HashMap::with_capacity(refused.len());
+        let mut first_seen = Vec::new();
+        for report in refused {
+            let key = (
+                report.batch_id,
+                report.node.clone(),
+                report.chunk,
+                report.attempt,
+            );
+            let streak = self.streaks.get(&key).copied().unwrap_or(0);
+            if streak == 0 {
+                first_seen.push(report);
+            }
+            streaks.insert(key, streak.saturating_add(1));
+        }
+        self.streaks = streaks;
+        first_seen
+    }
+
+    /// The holders whose report has been refused long enough that their
+    /// chunks should go back to the queue.
+    pub fn stuck(&self) -> BTreeSet<(u64, NodeId)> {
+        self.streaks
+            .iter()
+            .filter(|(_, streak)| **streak >= REFUSALS_BEFORE_REQUEUE)
+            .map(|((batch_id, node, _, _), _)| (*batch_id, node.clone()))
+            .collect()
+    }
 }
 
 /// Every progress write one tick makes, for every running array, in the
@@ -1171,8 +1271,19 @@ pub struct TickInputs<'a> {
 /// grants stay within namespace quotas (see [`GrantBudget`]).
 pub fn plan_tick(
     arrays: &TaskArrays,
+    budget: Option<&mut GrantBudget>,
+    inputs: &TickInputs<'_>,
+) -> Vec<TaskArrayWrite> {
+    plan_tick_reporting(arrays, budget, inputs, &mut Vec::new())
+}
+
+/// [`plan_tick`], also adding to `refused` every chunk report the state
+/// refused (see [`plan_sync_reporting`]).
+pub fn plan_tick_reporting(
+    arrays: &TaskArrays,
     mut budget: Option<&mut GrantBudget>,
     inputs: &TickInputs<'_>,
+    refused: &mut Vec<RefusedReport>,
 ) -> Vec<TaskArrayWrite> {
     let mut writes = Vec::new();
     for (batch_id, record) in arrays.active() {
@@ -1205,6 +1316,16 @@ pub fn plan_tick(
             inputs.silence,
         );
         lost.extend(refusing_holders(record, &for_array));
+        // A holder whose chunk report the state keeps refusing (#2372).
+        let stuck: Vec<NodeId> = record
+            .state
+            .holders()
+            .filter(|node| {
+                inputs.stuck.contains(&(batch_id, (*node).clone())) && !lost.contains(node)
+            })
+            .cloned()
+            .collect();
+        lost.extend(stuck);
         for node in lost {
             if replay_unknown {
                 writes.push(TaskArrayWrite::Requeue {
@@ -1217,11 +1338,18 @@ pub fn plan_tick(
             }
         }
         let (sync, blocked) = match budget.as_deref_mut() {
-            Some(budget) => budget.plan(batch_id, record, &for_array, replay_unknown),
-            None => (
-                plan_sync(batch_id, record, &for_array, replay_unknown),
-                None,
-            ),
+            Some(budget) => budget.plan(batch_id, record, &for_array, replay_unknown, refused),
+            None => {
+                let (write, _) = plan_sync_reporting(
+                    batch_id,
+                    record,
+                    &for_array,
+                    replay_unknown,
+                    u64::MAX,
+                    refused,
+                );
+                (write, None)
+            }
         };
         if let Some(mut write) = sync {
             write.stamp(inputs.now_epoch_secs);
@@ -1246,6 +1374,8 @@ struct LeaderMemory {
     /// dead node is logged once, not every tick, and holds runs open for
     /// the silence timeout (see [`eligible_nodes`]).
     failing: HashMap<NodeId, Instant>,
+    /// Chunk reports the state keeps refusing, per holder (#2372).
+    refused: RefusedReports,
     /// The last cron definition fired, so the next tick starts after it.
     cron_cursor: Option<String>,
     /// Sync calls carried over from earlier ticks.
@@ -1647,7 +1777,8 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
     let now_epoch_secs = crate::meat::batch_ids::epoch_now_secs();
     // Plan under the state's read lock: nothing is copied but each array's
     // state, and only for arrays that finished a chunk.
-    let Some(writes) = read_control(state, move |view| {
+    let stuck = memory.refused.stuck();
+    let Some((writes, refused)) = read_control(state, move |view| {
         let mut budget = view.desired.and_then(|desired| {
             GrantBudget::new(
                 &desired.namespaces,
@@ -1664,13 +1795,22 @@ async fn leader_tick(state: &ApiState, memory: &mut LeaderMemory) {
             silence,
             now_epoch_secs,
             eligible,
+            stuck,
         };
-        plan_tick(view.arrays, budget.as_mut(), &inputs)
+        let mut refused = Vec::new();
+        let writes = plan_tick_reporting(view.arrays, budget.as_mut(), &inputs, &mut refused);
+        (writes, refused)
     })
     .await
     else {
         return;
     };
+    for report in memory.refused.observe(&refused) {
+        eprintln!(
+            "bun: task array {}: refused chunk {} (attempt {}) from {}: {}; its chunks go back to the queue after {REFUSALS_BEFORE_REQUEUE} ticks of this",
+            report.batch_id, report.chunk.0, report.attempt, report.node, report.reason
+        );
+    }
     if writes.is_empty() {
         return;
     }
@@ -2199,7 +2339,7 @@ mod tests {
         let mut budget =
             GrantBudget::new(&quota_namespaces("2"), &placements, &arrays, |_, _| Some(4)).unwrap();
         let record = arrays.get(1).unwrap();
-        let (write, blocked) = budget.plan(1, record, &answers, true);
+        let (write, blocked) = budget.plan(1, record, &answers, true, &mut Vec::new());
         let Some(TaskArrayWrite::Sync { grants, .. }) = write else {
             panic!("expected a sync");
         };
@@ -2228,7 +2368,7 @@ mod tests {
         )]);
         let mut budget =
             GrantBudget::new(&quota_namespaces("2"), &placements, &arrays, |_, _| Some(4)).unwrap();
-        let (write, blocked) = budget.plan(1, record, &answers, true);
+        let (write, blocked) = budget.plan(1, record, &answers, true, &mut Vec::new());
         assert_eq!(write, None);
         assert!(blocked.is_some());
 
@@ -2294,6 +2434,7 @@ mod tests {
             silence: SILENCE_TIMEOUT,
             now_epoch_secs: 7,
             eligible: answers.iter().map(|(node, _)| node.clone()).collect(),
+            stuck: BTreeSet::new(),
         }
     }
 
@@ -2663,6 +2804,44 @@ mod tests {
             matches!(&writes[..], [TaskArrayWrite::Unrunnable { .. }]),
             "{writes:?}"
         );
+    }
+
+    /// #2372: a node that keeps reporting a chunk the state refuses (here
+    /// one task short) is neither silent nor refusing. After a few ticks
+    /// of it, its chunks go back to the queue.
+    #[test]
+    fn a_refused_chunk_report_goes_back_to_the_queue_instead_of_hanging() {
+        let mut arrays = running_arrays(1);
+        let heard = HashMap::new();
+        let first = [(node("a"), answer_for(&arrays, &node("a"), 10))];
+        for entry in tick_entries(plan_tick(&arrays, None, &inputs(&first, &heard))) {
+            arrays.apply(&entry, || 0).unwrap();
+        }
+        let attempt = arrays.get(1).unwrap().state.attempt_of(ChunkId(0));
+        let short = NodeSyncResponse {
+            arrays: vec![progress(0, vec![done(0, attempt, 9)])],
+        };
+        let answers = [(node("a"), short)];
+        let requeued = |writes: &[TaskArrayWrite]| {
+            writes.iter().any(|write| {
+                matches!(write, TaskArrayWrite::Requeue { batch_id: 1, node: lost, .. } if *lost == node("a"))
+            })
+        };
+        let mut reports = RefusedReports::default();
+        for tick in 0..REFUSALS_BEFORE_REQUEUE {
+            let mut inputs = inputs(&answers, &heard);
+            inputs.stuck = reports.stuck();
+            let mut refused = Vec::new();
+            let writes = plan_tick_reporting(&arrays, None, &inputs, &mut refused);
+            assert!(!requeued(&writes), "tick {tick}: {writes:?}");
+            assert_eq!(refused.len(), 1, "tick {tick}");
+            let first_seen = reports.observe(&refused);
+            assert_eq!(first_seen.len(), usize::from(tick == 0), "logged once");
+        }
+        let mut inputs = inputs(&answers, &heard);
+        inputs.stuck = reports.stuck();
+        let writes = plan_tick_reporting(&arrays, None, &inputs, &mut Vec::new());
+        assert!(requeued(&writes), "{writes:?}");
     }
 
     #[test]

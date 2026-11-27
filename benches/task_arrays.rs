@@ -230,6 +230,7 @@ fn tick(arrays: &mut TaskArrays, answers: &[(NodeId, NodeSyncResponse)]) -> usiz
         silence: Duration::from_secs(30),
         now_epoch_secs: 2,
         eligible: answers.iter().map(|(node, _)| node.clone()).collect(),
+        stuck: Default::default(),
     };
     let entries = tick_entries(plan_tick(arrays, None, &inputs));
     for entry in &entries {
