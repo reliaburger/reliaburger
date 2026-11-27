@@ -1389,6 +1389,20 @@ queue group for 18 instead of 20. A queue group that changes only documentation 
 code jobs as a pull request does, since its code is the code of the group in front of it.
 Two of the window's 32 groups would have.
 
+"Only documentation" turned out to be the risky phrase. `is_docs_only` named a few files
+under `docs/` that tests read, then called the rest documentation. But the suite reads the
+release log, the book chapters and the qualification records, relish's concept-budget test
+reads `docs/testing/concept-budget.json`, and relish packs the book, the design docs and
+`testing.md` into its source bundle. A pull request that edited one of those ran no Rust test,
+nor did its queue group, and the first run to notice was the push after it landed, with the
+train already red for every group behind it
+([#2485](https://github.com/reliaburger/reliaburger/issues/2485)). So the rule is inverted:
+under `docs/`, only the plans, talks, research notes and the PDF configuration are
+documentation, and everything else is code until shown otherwise. A list of exceptions
+rots the day a new test reads a new file; a list of things nothing reads rots much more
+slowly. A test also greps `src/` and `tests/` for `"docs/...` literals and asserts that none
+of them names a file the selector would skip.
+
 Together that's about a quarter of the window's runner-minutes, 5,700 of 22,120, that no
 longer compete with the PRs an author is waiting for. What we didn't do matters as much.
 Portable macOS, 52 to 57 minutes with a warm cache, still sets the length of every queue

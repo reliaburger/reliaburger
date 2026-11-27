@@ -715,6 +715,21 @@ A queue group that changes only documentation runs no code job either (two of
 the window's 32 groups): its code is its base's, which the run before it is
 testing. Scripts are code here, since the jobs run them.
 
+"Documentation" is narrower than everything under `docs/`
+([#2485](https://github.com/reliaburger/reliaburger/issues/2485)): it's
+`docs/plans/`, `docs/talks/`, `docs/research/`, `docs/_quarto/`, and Markdown
+outside `docs/`, `src/` and `tests/` other than the README, `CLAUDE.md`,
+`CONTRIBUTING.md`, `SECURITY.md` and `AGENTS.md` (so `CHANGELOG.md`, whose
+test runs in CI policy anyway). Everything else under `docs/` is read by a
+test or packed into relish: the manual, the book, the design docs, the
+release log, this file, the flakes register, the qualification records and
+`docs/testing/concept-budget.json`. A change to one ran no Rust test before,
+landed, and turned the train red on the push after it. `is_docs_only` in
+`scripts/ci/select-jobs.sh` holds the list, and
+`test_no_docs_path_named_by_a_test_is_docs_only` fails when a `"docs/..."`
+literal in `src/` or `tests/` names a file the list calls documentation. The
+price is portable Linux on every book or design-doc PR.
+
 What's left is mostly the queue's own settings, which only the maintainer can
 change: building eight groups at once (`max_entries_to_build` in the "release
 trains merge queue" ruleset) meant up to 144 jobs; it builds three since 24

@@ -93,7 +93,10 @@ treats the three kinds of run differently ([which jobs run](testing.md#which-job
   macOS runs on the newest train every night instead
   ([`macos-nightly.yml`](../.github/workflows/macos-nightly.yml), maintainer
   decision of 24 November 2026). A group that changes
-  only documentation runs no code job: its code is its base's. When the
+  only documentation (plans, talks, research notes, the changelog; not the
+  book, the manual or anything else a test or relish reads,
+  [which jobs run](testing.md#which-jobs-a-pull-request-runs)) runs no code
+  job: its code is its base's. When the
   queue drops a group, `queue-sweep.yml` cancels its run
   ([what a merge costs](testing.md#what-a-merge-costs-in-runners)).
 - **The push to the train** runs nothing but CI policy when the queue's run
