@@ -2466,7 +2466,8 @@ mod tests {
 
         // A small limit of its own keeps the bomb cheap for the test host.
         // The bomb runs through exec, so the shell that dies on a failed
-        // fork isn't the container's init.
+        // fork isn't the container's init. Its children let go of exec's
+        // output, or exec would wait for them.
         start(
             &ids[1],
             format!("image = \"{ALPINE_IMAGE}\"\npids = 32\ncommand = [\"sleep\", \"3614\"]\n"),
@@ -2478,7 +2479,7 @@ mod tests {
                 &[
                     "/bin/sh".to_string(),
                     "-c".to_string(),
-                    "for i in $(seq 1 64); do sleep 600 & done; true".to_string(),
+                    "for i in $(seq 1 64); do sleep 600 >/dev/null 2>&1 & done; true".to_string(),
                 ],
             )
             .await;
