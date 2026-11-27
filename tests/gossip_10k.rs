@@ -17,7 +17,7 @@ use reliaburger::meat::NodeId;
 use reliaburger::mustard::{
     GossipConfig, GossipMessage, GossipPayload, InMemoryNetwork, InMemoryTransport,
     MAX_PIGGYBACK_UPDATES, MAX_SYNC_DATAGRAMS, MAX_SYNC_ENTRIES, MembershipUpdate, MustardNode,
-    NodeState,
+    MustardTransport, NodeState,
 };
 
 #[path = "../benches/support/gossip.rs"]
@@ -165,4 +165,136 @@ async fn push_pull_with_10k_members_is_bounded_and_sweeps_the_table() {
         );
     }
     eprintln!("{exchanges} bounded push-pull replies swept all {cluster_size} members");
+}
+
+/// How many protocol rounds a healthy node's refutation takes to reach
+/// every live member while each of them still has a correlated failure's
+/// `Dead` rumours to send (#2441).
+///
+/// `cluster_size` nodes all know each other; `dead` of them died together,
+/// so every survivor holds them `Dead` with a full broadcast budget queued.
+/// Node `h` was suspected at incarnation 1 and refutes. Each round, every
+/// survivor sends one PING to a peer chosen from `seed`, and every PING is
+/// answered with an ACK, each carrying what the sender's queue selects.
+async fn rounds_for_a_refutation_behind_a_failure_backlog(
+    cluster_size: usize,
+    dead: usize,
+    seed: u64,
+) -> Option<usize> {
+    let network = InMemoryNetwork::new();
+    let names: Vec<NodeId> = (0..cluster_size)
+        .map(|index| NodeId::new(format!("n{index}")))
+        .collect();
+    let survivors = cluster_size - dead;
+    let mut nodes = Vec::with_capacity(survivors);
+    for (index, name) in names.iter().enumerate().take(survivors) {
+        let transport = network.register(address(index)).await;
+        let mut node = MustardNode::new(
+            name.clone(),
+            address(index),
+            GossipConfig::default(),
+            transport,
+        );
+        let now = Instant::now();
+        for (peer, peer_name) in names.iter().enumerate() {
+            if peer != index {
+                node.membership.add_node(
+                    peer_name.clone(),
+                    address(peer),
+                    1,
+                    Default::default(),
+                    now,
+                );
+            }
+        }
+        for (peer, peer_name) in names.iter().enumerate().skip(survivors) {
+            node.membership.declare_dead(peer_name);
+            node.dissemination.enqueue(
+                MembershipUpdate {
+                    node_id: peer_name.clone(),
+                    address: address(peer),
+                    state: NodeState::Dead,
+                    incarnation: 1,
+                },
+                cluster_size,
+            );
+        }
+        nodes.push(node);
+    }
+    // Node 0 is `h`. Everyone holds it Suspect; it hears the claim and
+    // refutes to incarnation 2.
+    let h = names[0].clone();
+    for node in nodes.iter_mut().skip(1) {
+        node.membership.suspect(&h);
+    }
+    let claim = GossipMessage::new(
+        names[1].clone(),
+        1,
+        GossipPayload::Ping {
+            updates: vec![MembershipUpdate {
+                node_id: h.clone(),
+                address: address(0),
+                state: NodeState::Suspect,
+                incarnation: 1,
+            }],
+        },
+    );
+    nodes[0].handle_message(address(1), claim).await;
+    assert_eq!(nodes[0].incarnation, 2);
+    while nodes[1].transport.try_recv().is_some() {}
+
+    let mut state = seed;
+    for round in 1..=200 {
+        for index in 0..survivors {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let mut target = (state >> 33) as usize % (survivors - 1);
+            if target >= index {
+                target += 1;
+            }
+            let node = &mut nodes[index];
+            let ping = GossipMessage::new(
+                node.node_id.clone(),
+                node.incarnation,
+                GossipPayload::Ping {
+                    updates: node.dissemination.select_updates(),
+                },
+            );
+            node.transport.send(address(target), &ping).await.unwrap();
+        }
+        // PINGs, then the ACKs they draw.
+        for _ in 0..2 {
+            for node in nodes.iter_mut() {
+                while let Some((from, message)) = node.transport.try_recv() {
+                    node.handle_message(from, message).await;
+                }
+            }
+        }
+        let everyone_heard = nodes.iter().skip(1).all(|node| {
+            node.membership
+                .get(&h)
+                .is_some_and(|member| member.state == NodeState::Alive && member.incarnation == 2)
+        });
+        if everyone_heard {
+            return Some(round);
+        }
+    }
+    None
+}
+
+/// #2441: a refutation relayed by a peer used to wait behind every queued
+/// `Dead` there, so after a correlated failure it reached the cluster only
+/// as fast as the refuting node could ping, while the suspicion timers ran.
+/// It has to beat the 5 s suspicion timeout: ten 500 ms rounds.
+#[tokio::test]
+async fn a_refutation_outruns_a_correlated_failures_backlog() {
+    for seed in [1, 2, 3] {
+        let rounds = rounds_for_a_refutation_behind_a_failure_backlog(300, 30, seed).await;
+        eprintln!("seed {seed}: refutation reached every survivor in {rounds:?} rounds");
+        assert!(
+            rounds.is_some_and(|rounds| rounds <= 10),
+            "seed {seed}: the refutation took {rounds:?} rounds, past the suspicion timeout"
+        );
+    }
 }

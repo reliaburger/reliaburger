@@ -244,13 +244,13 @@ impl NodeState {
 
 Dead and suspect updates jump the queue. If the queue is full and we have to choose between telling people about a new join and telling them about a failure, the failure wins. Failure detection is time-sensitive; join announcements can wait.
 
-There's one update that has to beat even a failure, and the first version got it wrong. When peers suspect *us*, we refute with "I'm alive at a higher incarnation", which is an `Alive`, priority 1. Picture a rack failure: forty Dead and Suspect rumours in the queue, eight going out per message, and somewhere behind them a healthy node's refutation. It waits five messages while its suspicion timer runs, and if the timer wins, a node that was never down gets declared dead and then has to fight its way back. So the queue now has a separate lane: `enqueue_refutation` marks the update, and the ordering puts the refutation flag before everything else:
+There's one update that has to beat even a failure, and the first version got it wrong. When peers suspect *us*, we refute with "I'm alive at a higher incarnation", which is an `Alive`, priority 1. Picture a rack failure: forty Dead and Suspect rumours in the queue, eight going out per message, and somewhere behind them a healthy node's refutation. It waits five messages while its suspicion timer runs, and if the timer wins, a node that was never down gets declared dead and then has to fight its way back. So the queue now has a separate lane: `enqueue_urgent` marks the update, and the ordering puts the urgent flag before everything else:
 
 ```rust
 impl Ord for QueuedUpdate {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.refutation
-            .cmp(&other.refutation)
+        self.urgent
+            .cmp(&other.urgent)
             .then_with(|| /* state priority */)
             .then_with(|| /* remaining broadcasts */)
     }
@@ -258,6 +258,10 @@ impl Ord for QueuedUpdate {
 ```
 
 `bool` implements `Ord` with `false < true`, and `BinaryHeap` pops the *largest* element, so `true` comes out first. `then_with` only runs its closure when the comparison so far is `Equal`, which is how you chain tie-breakers without nested `if`s.
+
+That lane was first called `enqueue_refutation`, and only the refuting node used it. An audit in 0.3.4 asked what happens one hop later (#2441). A peer that hears the refutation re-queues "h Alive at 2" with plain `enqueue`, at priority 1, behind its own backlog. After 100 of 1,000 nodes die together, that backlog is 100 `Dead` rumours with 30 broadcasts each: 3,000 sends at eight per datagram, over a minute. So the refutation travelled only as fast as h itself could ping, about five peers a second, while every other node's five-second suspicion timer ran. A seeded simulation in `tests/gossip_10k.rs`, `a_refutation_outruns_a_correlated_failures_backlog`, shows it: 300 nodes, 30 dead, and after 20 rounds (ten seconds) only 29 survivors had heard the refutation.
+
+The fix ranks an `Alive` that overturns a failure the same at every hop. `handle_message` checks the member's state before applying the update, and when it goes from `Suspect`, `Dead` or `Left` to `Alive`, it re-queues with `enqueue_urgent`, hence the rename. The simulation then turned up a second, quieter hole. The peers that hear the refutation *from h itself* never re-queued it at all: `add_node` registers the sender first and already raises its incarnation and state, so by the time the same `Alive` is read from the piggyback list there's nothing left to change, and a change is what triggers a re-queue. Those peers now notice that the sender was down or suspect to them at a lower incarnation and queue its `Alive` as urgent too. A plain join, an unknown node turning up `Alive`, stays at normal priority, or a mass join would starve failure news. The same simulation now finishes inside the ten-round budget for three seeds. One more small change: a node probing a target it already holds `Suspect` now says so in the PING, as its ACKs already did, so the target hears the claim from its suspecter and refutes straight away.
 
 The other half is superseding. The queue used to happily send `n1 Suspect@5` after it already held `n1 Alive@6`: both went out, the stale one first because Suspect outranks Alive, and every receiver discarded it after spending datagram space on it. Now the queue keeps the best-ranked update it holds for each node (incarnation first, then state, the same order `resolve_conflict` uses) in a `HashMap`. An update that ranks below what's held is never queued, and an older entry that's still in the heap is thrown away when it's popped rather than sent. Why not remove it from the heap straight away? Because a binary heap can't find an element without scanning all of it, and on a 10,000-member cluster's first dissemination that's 10,000 scans of 10,000 entries. Marking stale and skipping later costs one hash lookup.
 
@@ -483,7 +487,7 @@ fn refute(&mut self) {
 }
 ```
 
-Bump incarnation, then broadcast "I'm alive at a higher incarnation." Since higher incarnations always win in conflict resolution, this overrides the Suspect update across the entire cluster. Today the refutation goes through `enqueue_refutation`, so it rides the very next outgoing message whatever else is queued. (The listing above is the first version, which used plain `enqueue` and, as we saw in the dissemination section, could queue the refutation behind a backlog of other nodes' failures.)
+Bump incarnation, then broadcast "I'm alive at a higher incarnation." Since higher incarnations always win in conflict resolution, this overrides the Suspect update across the entire cluster. Today the refutation goes through `enqueue_urgent`, so it rides the very next outgoing message whatever else is queued. (The listing above is the first version, which used plain `enqueue` and, as we saw in the dissemination section, could queue the refutation behind a backlog of other nodes' failures.)
 
 The refutation jumps past the claim, `max(own, offending) + 1`, so a node that restarted at 1 while its peers hold it `Dead` at 50 wins in one step. The claim's incarnation comes straight off the wire, though, and an audit in 0.3.4 asked what a claim at `u64::MAX` does to that `+ 1` (#2395). In C an unsigned overflow silently wraps. Rust is stricter, and also less uniform than you might expect: a debug or test build checks every `+` and panics on overflow ("attempt to add with overflow"), while a release build, by default, skips the check and wraps. So the same claim killed the gossip task in our tests and, in production, wrapped the node's incarnation to 0, a refutation that loses to the claim everywhere. Neither is acceptable from one datagram.
 

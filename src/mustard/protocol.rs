@@ -1013,7 +1013,9 @@ impl<T: MustardTransport> MustardNode<T> {
             return;
         };
 
-        let ping = self.probe_message(GossipPayload::Ping { updates: vec![] }, None);
+        // Carry our claim about the target, if it isn't Alive to us, so a
+        // suspected target hears it from its suspecter and refutes (#2441).
+        let ping = self.probe_message(GossipPayload::Ping { updates: vec![] }, Some(&target_id));
         self.send(target_addr, &ping).await;
 
         // Wait for ACK
@@ -1293,6 +1295,15 @@ impl<T: MustardTransport> MustardNode<T> {
                 self.rejoin_contacts.pop_front();
             }
         }
+        // Whether the sender was down or suspect to us at a lower
+        // incarnation: then this datagram is its refutation or its return,
+        // which `add_node` applies directly, so nothing below would re-queue
+        // it (#2441).
+        let overturned = self.membership.get(&message.sender).is_some_and(|member| {
+            member.state != NodeState::Alive
+                && member.state != NodeState::Left
+                && message.incarnation > member.incarnation
+        });
         let is_new = self.membership.add_node(
             message.sender.clone(),
             from,
@@ -1312,17 +1323,21 @@ impl<T: MustardTransport> MustardNode<T> {
             member.labels = extension.labels.clone();
         }
 
-        // Disseminate newly discovered nodes so the whole cluster learns
-        if is_new {
-            self.dissemination.enqueue(
-                MembershipUpdate {
-                    node_id: message.sender.clone(),
-                    address: from,
-                    state: NodeState::Alive,
-                    incarnation: message.incarnation,
-                },
-                self.membership.len(),
-            );
+        // Disseminate newly discovered nodes so the whole cluster learns,
+        // and a peer's refutation or return ahead of everything else.
+        if is_new || overturned {
+            let update = MembershipUpdate {
+                node_id: message.sender.clone(),
+                address: from,
+                state: NodeState::Alive,
+                incarnation: message.incarnation,
+            };
+            let size = self.membership.len();
+            if overturned {
+                self.dissemination.enqueue_urgent(update, size);
+            } else {
+                self.dissemination.enqueue(update, size);
+            }
         }
 
         // Process piggybacked updates
@@ -1336,11 +1351,22 @@ impl<T: MustardTransport> MustardNode<T> {
             if self.tombstoned(update, now) {
                 continue;
             }
+            let was_down_or_suspect = self
+                .membership
+                .get(&update.node_id)
+                .is_some_and(|member| member.state != NodeState::Alive);
             let changed = self.membership.apply_update(update, now);
             if changed {
-                // Re-disseminate to other nodes
-                self.dissemination
-                    .enqueue(update.clone(), self.membership.len());
+                // Re-disseminate to other nodes. An Alive that overturns a
+                // failure claim goes first at every hop (#2441), or the
+                // suspicion timers win the race while it waits behind a
+                // correlated failure's rumours.
+                let size = self.membership.len();
+                if was_down_or_suspect && update.state == NodeState::Alive {
+                    self.dissemination.enqueue_urgent(update.clone(), size);
+                } else {
+                    self.dissemination.enqueue(update.clone(), size);
+                }
             }
 
             // If we're being suspected, declared dead, or reported as having
@@ -1555,7 +1581,7 @@ impl<T: MustardTransport> MustardNode<T> {
         // Ahead of every queued Suspect and Dead: a falsely suspected node
         // that waits behind a rack failure's backlog flaps.
         self.dissemination
-            .enqueue_refutation(update, self.membership.len());
+            .enqueue_urgent(update, self.membership.len());
     }
 
     /// Start an anti-entropy exchange with one random live peer.
@@ -3676,6 +3702,116 @@ mod tests {
             "an implausible floor was kept"
         );
         assert_eq!(node.implausible.total, 3);
+    }
+
+    /// #2441: a relay that hears a refutation passes it on ahead of a
+    /// correlated failure's Dead rumours, as the refuting node does.
+    #[tokio::test]
+    async fn an_alive_that_overturns_a_failure_is_relayed_before_unrelated_failures() {
+        let net = InMemoryNetwork::new();
+        let t = net.register(addr(1)).await;
+        let mut relay = MustardNode::new(NodeId::new("relay"), addr(1), fast_config(), t);
+        for (name, port) in [("h", 3), ("peer", 2)] {
+            relay.membership.add_node(
+                NodeId::new(name),
+                addr(port),
+                1,
+                BTreeMap::new(),
+                Instant::now(),
+            );
+        }
+        relay.membership.suspect(&NodeId::new("h"));
+        for i in 0..16 {
+            relay.dissemination.enqueue(
+                MembershipUpdate {
+                    node_id: NodeId::new(format!("n{i}")),
+                    address: addr(100 + i),
+                    state: NodeState::Dead,
+                    incarnation: 1,
+                },
+                100,
+            );
+        }
+        let refutation = MembershipUpdate {
+            node_id: NodeId::new("h"),
+            address: addr(3),
+            state: NodeState::Alive,
+            incarnation: 2,
+        };
+        let ping = GossipMessage::new(
+            NodeId::new("peer"),
+            1,
+            GossipPayload::Ping {
+                updates: vec![refutation.clone()],
+            },
+        );
+        relay.handle_message(addr(2), ping).await;
+        let selected = relay.dissemination.select_updates();
+        assert_eq!(selected.first(), Some(&refutation));
+    }
+
+    /// #2441: the peers a refuting node reaches directly applied its
+    /// refutation in `add_node` and passed nothing on, so it spread only as
+    /// fast as the node itself could ping. They now pass it on first.
+    #[tokio::test]
+    async fn a_refutation_heard_from_the_node_itself_is_passed_on_first() {
+        let net = InMemoryNetwork::new();
+        let t = net.register(addr(1)).await;
+        let mut relay = MustardNode::new(NodeId::new("relay"), addr(1), fast_config(), t);
+        relay.membership.add_node(
+            NodeId::new("h"),
+            addr(3),
+            1,
+            BTreeMap::new(),
+            Instant::now(),
+        );
+        relay.membership.suspect(&NodeId::new("h"));
+        for i in 0..16 {
+            relay.dissemination.enqueue(
+                MembershipUpdate {
+                    node_id: NodeId::new(format!("n{i}")),
+                    address: addr(100 + i),
+                    state: NodeState::Dead,
+                    incarnation: 1,
+                },
+                100,
+            );
+        }
+        let ping = GossipMessage::new(NodeId::new("h"), 2, GossipPayload::Ping { updates: vec![] });
+        relay.handle_message(addr(3), ping).await;
+        let selected = relay.dissemination.select_updates();
+        let first = selected.first().expect("something to send");
+        assert_eq!(
+            (&first.node_id, first.state, first.incarnation),
+            (&NodeId::new("h"), NodeState::Alive, 2)
+        );
+    }
+
+    /// #2441: a prober that holds its target Suspect says so in the probe,
+    /// so the target hears the claim from its suspecter and refutes, as the
+    /// ACK path already did.
+    #[tokio::test]
+    async fn a_direct_probe_carries_the_claim_about_its_target() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let t2 = net.register(addr(2)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        node.membership.add_node(
+            NodeId::new("n2"),
+            addr(2),
+            3,
+            BTreeMap::new(),
+            Instant::now(),
+        );
+        node.membership.suspect(&NodeId::new("n2"));
+        node.next_push_pull = Instant::now() + Duration::from_secs(3600);
+        node.run_one_cycle().await;
+        let (_, probe) = t2.try_recv().expect("n2 was probed");
+        assert!(matches!(probe.payload, GossipPayload::Ping { .. }));
+        let claim = &probe.payload.updates()[0];
+        assert_eq!(claim.node_id, NodeId::new("n2"));
+        assert_eq!(claim.state, NodeState::Suspect);
+        assert_eq!(claim.incarnation, 3);
     }
 
     /// O9: refuting told the cluster we're alive but left our own record
