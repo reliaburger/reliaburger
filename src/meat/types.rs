@@ -197,6 +197,17 @@ pub struct SchedulingDecision {
     pub placements: Vec<Placement>,
 }
 
+/// The most decisions one placement pass may carry. The council refuses a
+/// larger `SchedulingDecisions` entry, and the leader's planner stops adding
+/// decisions here, so a pass that touches more apps commits the first ones
+/// and leaves the rest for the next tick (#2366).
+pub const MAX_PASS_DECISIONS: usize = 4096;
+
+/// The most placements, summed over its decisions, one placement pass may
+/// carry. A pass of a single decision may hold more: an app is never too big
+/// to place on its own, only too big to share a pass (#2366).
+pub const MAX_PASS_PLACEMENTS: usize = 131_072;
+
 /// A single replica placement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Placement {

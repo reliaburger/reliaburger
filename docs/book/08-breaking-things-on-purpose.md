@@ -2169,6 +2169,42 @@ committed reservation still stays reserved, because timing out the caller
 doesn't prove Raft refused the write. The ordinary scheduler bounds its
 whole-pass proposal and replans from committed state on the next tick.
 
+"Bounds" was a promise the code didn't keep until 0.3.4. The state machine
+refused a pass of more than 4,096 decisions or 131,072 placements, and the
+planner, `plan_pass` in `src/cluster/orchestrate.rs`, had no such cap: it
+made one decision for every app whose placements changed. A zone failure that
+moved 5,000 apps planned 5,000 decisions, the council refused them all, and
+the next tick planned the same 5,000 from the same committed state, for ever
+([#2366](https://github.com/reliaburger/reliaburger/issues/2366)). Both
+numbers are now constants beside `SchedulingDecision` in `src/meat/types.rs`,
+`MAX_PASS_DECISIONS` and `MAX_PASS_PLACEMENTS`, and both sides read them.
+Before the planner plans an app that needs a decision, it checks that the
+decision would still fit, and an app that wouldn't is deferred to the next
+pass:
+
+```rust
+if decisions.len() >= crate::meat::types::MAX_PASS_DECISIONS
+    || (!decisions.is_empty()
+        && placements_in_pass.saturating_add(want)
+            > crate::meat::types::MAX_PASS_PLACEMENTS)
+{
+    deferred += 1;
+    // ... keep the app's recorded quota and shortfall reasons
+    continue;
+}
+```
+
+Checking before planning works because a decision never holds more than the
+app's `want` placements, and it means a deferred app reserves nothing in the
+pass's cache. `saturating_add` stops at `usize::MAX` instead of wrapping, so
+even an absurd `want` can't make the sum look small. Apps go in name order and
+the ones just committed converge, so the next pass starts where this one
+stopped. One app can be too big to share a pass, a daemon set on more than
+131,072 nodes, so the state machine now admits a pass of a single decision of
+any size. The tests plan 5,000 one-replica apps and 140 daemon sets on 1,000
+nodes, and check that each pass fits and that the passes after it finish the
+job.
+
 The fixtures taught us that "nobody else is writing" is never a safe
 assumption. A leader's job loop commits entries of its own, a cron observation
 on its first tick and again every minute. A fixture that read the position

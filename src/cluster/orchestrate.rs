@@ -516,6 +516,7 @@ pub fn spawn_leader_scheduler(
                 quota_blocked,
                 unschedulable,
                 provenance,
+                deferred,
             } = plan_pass(
                 &mut cache,
                 &desired,
@@ -568,6 +569,12 @@ pub fn spawn_leader_scheduler(
                 };
                 let _ = request.response.send(result);
                 continue;
+            }
+
+            if deferred > 0 {
+                eprintln!(
+                    "scheduler: placement pass is full; {deferred} apps wait for the next pass"
+                );
             }
 
             // A pass owns one original revision, even if unrelated entries
@@ -804,6 +811,11 @@ pub struct PassPlan {
     /// Why each app in `decisions` went where it did: the decision the
     /// leader records once the placements commit.
     pub provenance: BTreeMap<crate::meat::types::AppId, crate::bun::decisions::Decision>,
+    /// Apps that needed a decision but didn't fit in this pass, because it
+    /// reached [`crate::meat::types::MAX_PASS_DECISIONS`] or
+    /// [`crate::meat::types::MAX_PASS_PLACEMENTS`]. The next pass plans them
+    /// (#2366).
+    pub deferred: usize,
 }
 
 /// The `QuotaBlocked` write that brings the recorded reasons in line with
@@ -1136,6 +1148,12 @@ pub fn plan_pass(
     let mut quota_blocked = BTreeMap::new();
     let mut unschedulable = BTreeMap::new();
     let mut provenance = BTreeMap::new();
+    // What this pass will commit, held under the council's admission limits
+    // (#2366). The pass is one Raft entry, refused whole when it's over
+    // either; since every pass plans from committed state, the same
+    // oversized pass would be refused every tick and nothing would place.
+    let mut placements_in_pass = 0usize;
+    let mut deferred = 0usize;
     // A stable order so a pass is deterministic (HashMap iteration isn't).
     let mut app_ids: Vec<_> = desired.apps.keys().cloned().collect();
     app_ids.sort_by_key(|a| a.to_string());
@@ -1233,6 +1251,29 @@ pub fn plan_pass(
     } in planned
     {
         if converged {
+            continue;
+        }
+
+        // A full pass leaves the rest to the next one. A decision holds at
+        // most `want` placements, so checking before planning keeps the pass
+        // under both limits without planning what it can't commit. Apps go
+        // in name order and the committed ones converge, so the next pass
+        // starts where this one stopped. An app too big to share a pass
+        // goes alone: the council admits a single decision of any size.
+        if decisions.len() >= crate::meat::types::MAX_PASS_DECISIONS
+            || (!decisions.is_empty()
+                && placements_in_pass.saturating_add(want)
+                    > crate::meat::types::MAX_PASS_PLACEMENTS)
+        {
+            deferred += 1;
+            // Keep what the council already says about it, so a deferred app
+            // neither loses its recorded reason nor writes a new one.
+            if let Some(reason) = desired.quota_blocked.get(app_id) {
+                quota_blocked.insert(app_id.clone(), reason.clone());
+            }
+            if let Some(short) = desired.unschedulable.get(app_id) {
+                unschedulable.insert(app_id.clone(), *short);
+            }
             continue;
         }
 
@@ -1412,6 +1453,7 @@ pub fn plan_pass(
             if let Some(decision) = placement_provenance(&why) {
                 provenance.insert(app_id.clone(), decision);
             }
+            placements_in_pass = placements_in_pass.saturating_add(placements.len());
             decisions.push(crate::meat::types::SchedulingDecision {
                 app_id: app_id.clone(),
                 placements,
@@ -1423,6 +1465,7 @@ pub fn plan_pass(
         quota_blocked,
         unschedulable,
         provenance,
+        deferred,
     }
 }
 
@@ -8918,6 +8961,116 @@ image = "busybox:latest"
             1,
             "an app within its namespace budget must be admitted"
         );
+    }
+
+    // -- #2366: a pass never plans more than the council admits ------------
+
+    /// `count` one-replica apps named `app-0000` onwards on one huge node.
+    fn many_apps(count: usize) -> (ClusterStateCache, DesiredState, HashSet<NodeId>) {
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("big", 10_000_000, BTreeMap::new()));
+        let mut desired = DesiredState::default();
+        for i in 0..count {
+            desired
+                .apps
+                .insert(AppId::new(format!("app-{i:04}"), "default"), app_spec(1, 1));
+        }
+        (cache, desired, HashSet::from([NodeId::new("big")]))
+    }
+
+    /// Commit `decisions` the way the state machine applies them.
+    fn commit(desired: &mut DesiredState, decisions: Vec<crate::meat::types::SchedulingDecision>) {
+        for decision in decisions {
+            desired
+                .scheduling
+                .insert(decision.app_id, decision.placements);
+        }
+    }
+
+    /// 5,000 apps that each need a placement make a pass the council would
+    /// refuse whole, every tick. The planner stops at the council's limit.
+    #[test]
+    fn a_pass_never_plans_more_than_the_state_machine_admits() {
+        let (mut cache, desired, alive) = many_apps(5000);
+        let members = PassMembers {
+            alive,
+            ..Default::default()
+        };
+        let plan = plan_pass(
+            &mut cache,
+            &desired,
+            &members,
+            &mut QuotaLedger::default(),
+            false,
+        );
+        assert_eq!(plan.decisions.len(), crate::meat::types::MAX_PASS_DECISIONS);
+        assert_eq!(plan.deferred, 5000 - crate::meat::types::MAX_PASS_DECISIONS);
+        assert_eq!(plan.decisions[0].app_id, AppId::new("app-0000", "default"));
+    }
+
+    /// The apps a full pass left out are planned by the next one, and the
+    /// one after that has nothing left to do.
+    #[test]
+    fn apps_left_out_of_a_full_pass_are_planned_on_the_next_one() {
+        let (mut cache, mut desired, alive) = many_apps(5000);
+        let first = plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+        commit(&mut desired, first);
+
+        let (mut cache, _, _) = many_apps(0);
+        let second =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+        assert_eq!(second.len(), 5000 - crate::meat::types::MAX_PASS_DECISIONS);
+        assert!(
+            second
+                .iter()
+                .all(|d| !desired.scheduling.contains_key(&d.app_id)),
+            "the second pass plans only the apps the first left out"
+        );
+        commit(&mut desired, second);
+
+        let (mut cache, _, _) = many_apps(0);
+        let third = plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+        assert!(third.is_empty(), "{} decisions", third.len());
+        assert_eq!(desired.scheduling.len(), 5000);
+    }
+
+    /// 140 daemon sets on 1,000 nodes carry 140,000 placements, more than a
+    /// pass may hold. The pass takes as many whole daemon sets as fit.
+    #[test]
+    fn a_pass_never_plans_more_placements_than_the_state_machine_admits() {
+        let mut cache = ClusterStateCache::new();
+        let mut alive = HashSet::new();
+        for i in 0..1000 {
+            let name = format!("n{i:04}");
+            cache.set_node(sched_node(&name, 1_000_000, BTreeMap::new()));
+            alive.insert(NodeId::new(&name));
+        }
+        let mut desired = DesiredState::default();
+        for i in 0..140 {
+            let mut spec = app_spec(1, 1);
+            spec.replicas = Replicas::DaemonSet;
+            desired
+                .apps
+                .insert(AppId::new(format!("daemon-{i:03}"), "default"), spec);
+        }
+        let members = PassMembers {
+            alive,
+            ..Default::default()
+        };
+        let plan = plan_pass(
+            &mut cache,
+            &desired,
+            &members,
+            &mut QuotaLedger::default(),
+            false,
+        );
+        let placements: usize = plan.decisions.iter().map(|d| d.placements.len()).sum();
+        assert!(
+            placements <= crate::meat::types::MAX_PASS_PLACEMENTS,
+            "{placements} placements"
+        );
+        assert_eq!(plan.decisions.len(), 131);
+        assert_eq!(plan.deferred, 9);
     }
 }
 

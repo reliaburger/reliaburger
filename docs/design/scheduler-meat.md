@@ -738,6 +738,10 @@ replicas from 0.
 
 Node reports lag the council. A placement committed a tick ago isn't in its node's report yet, so the pass that starts from the reports would see free room and place a second app into it. Before admitting anything, each pass rebuilds the missing reservations: for every committed placement beyond the replicas its node reports, it reserves the committed footprint in the pass's cache (#432).
 
+#### Pass Limits
+
+A pass commits as one `SchedulingDecisions` entry, and the council refuses an entry of more than `MAX_PASS_DECISIONS` (4,096) decisions or `MAX_PASS_PLACEMENTS` (131,072) placements in total. Both constants live in `src/meat/types.rs`, and the state machine and `plan_pass` read the same ones (#2366). Before it plans an app that needs a decision, the pass checks that the decision fits: a decision holds at most the app's wanted count of placements, so the check needs no planning. An app that doesn't fit is deferred: it gets no decision, keeps whatever quota or shortfall reason the council already records for it, and counts in `PassPlan::deferred`. The leader logs one line for a pass that deferred anything, with the count. Apps are planned in name order and the committed ones converge, so the next pass, two seconds later, starts where this one stopped; 5,000 apps that all need a decision place in two passes instead of being refused whole every tick. A pass of a single decision may hold any number of placements, so an app with more than 131,072 replicas, or a daemon set on more nodes than that, places on its own pass rather than never.
+
 #### Daemon Mode (`replicas = "*"`)
 
 When `replicas = "*"` is specified, Meat does not run the placement pipeline. Instead:
