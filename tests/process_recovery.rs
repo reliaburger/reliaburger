@@ -1225,6 +1225,72 @@ async fn exec_output_file_never_grows_past_its_limit() {
     assert!(output.ends_with(CUT_MARKER), "not cut");
 }
 
+/// `voluntary_ctxt_switches` of `pid`: how many times it has gone to sleep.
+#[cfg(target_os = "linux")]
+fn voluntary_switches(pid: u32) -> u64 {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// #2447: an owner whose workload is idle sleeps until something happens,
+/// rather than waking a hundred times a second to look.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_idle_owner_does_not_wake_on_a_timer() {
+    let directory = tempfile::tempdir().unwrap();
+    let grill = runtime(directory.path());
+    let id = InstanceId("default__idle-owner-0".into());
+    grill.create(&id, &spec("sleep 60")).await.unwrap();
+    grill.start(&id).await.unwrap();
+    let (record, _) = owner_file(directory.path(), &id);
+    let record: serde_json::Value = serde_json::from_str(&record).unwrap();
+    let workload = record["phase"]["pid"].as_u64().unwrap();
+    // The workload is the owner's child: field 4 of its stat, after the
+    // parenthesised name.
+    let stat = std::fs::read_to_string(format!("/proc/{workload}/stat")).unwrap();
+    let owner: u32 = stat[stat.rfind(')').unwrap() + 1..]
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    // Let the start's own traffic settle first.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let before = voluntary_switches(owner);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let woken = voluntary_switches(owner) - before;
+    // What one owner costs in memory, for the design doc's per-app figure.
+    let memory = std::fs::read_to_string(format!("/proc/{owner}/smaps_rollup")).unwrap_or_default();
+    let proportional = memory.lines().find(|line| line.starts_with("Pss:"));
+    grill.kill(&id).await.unwrap();
+    stopped(&grill, &id).await;
+    eprintln!("the idle owner woke {woken} times in 2 s; {proportional:?}");
+    assert!(woken < 40, "the idle owner woke {woken} times in 2 s");
+}
+
+/// #2447: an owner that sleeps until something happens still sees its
+/// workload exit at once.
+#[tokio::test]
+async fn an_owner_sees_its_workload_exit_promptly() {
+    let directory = tempfile::tempdir().unwrap();
+    let grill = runtime(directory.path());
+    let id = InstanceId("default__prompt-exit-0".into());
+    grill.create(&id, &spec("sleep 1")).await.unwrap();
+    grill.start(&id).await.unwrap();
+    let started = std::time::Instant::now();
+    stopped(&grill, &id).await;
+    let took = started.elapsed();
+    // One second of sleep, then the exit: well inside the owner's long
+    // safety-net wait, so only a prompt wake-up gets here in time.
+    assert!(took < Duration::from_secs(3), "exit seen after {took:?}");
+}
+
 #[tokio::test]
 async fn killed_exec_caller_closes_ownership_without_stopping_application() {
     const DIRECTORY: &str = "RELIABURGER_EXEC_CALLER_DIRECTORY";

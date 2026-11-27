@@ -29,8 +29,9 @@ const EXEC_LIMIT: usize = 16;
 pub(crate) const OWNER_EXEC_DEADLINE: Duration = Duration::from_secs(320);
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 
-extern "C" fn cancel(_: nix::libc::c_int) {
+extern "C" fn cancel(signal: nix::libc::c_int) {
     CANCELLED.store(true, Ordering::Relaxed);
+    super::wake(signal);
 }
 
 /// Let a retained parent request group retirement without killing its owner.
@@ -340,6 +341,12 @@ impl OutputDrain {
             kept: 0,
         };
         Ok((drain, sink))
+    }
+
+    /// The pipe to wait on while the command may still write to it.
+    pub(super) fn source(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        use std::os::fd::AsFd;
+        self.source.as_ref().map(AsFd::as_fd)
     }
 
     /// Move whatever the pipe holds now into the file, up to the cap.
