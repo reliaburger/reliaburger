@@ -1876,6 +1876,43 @@ class DeadTriggerTests(unittest.TestCase):
                 self.assertNotIn("feat/appliance-", path.read_text())
 
 
+class ManualGateTests(unittest.TestCase):
+    """Every make target that runs ignored tests has someone who runs it (#2489).
+
+    The ignored-test owner check accepts any existing make target, so a
+    target no workflow runs and no document assigns looks owned while
+    nothing executes it.
+    """
+
+    # The union of test-upgrade-node and test-upgrade-cluster, which CI runs.
+    UNION_TARGETS = {"test-upgrade"}
+
+    def manual_table(self):
+        text = (REPO / "docs" / "testing.md").read_text()
+        start = text.index("Gates CI can't run are manual")
+        table = text[start:text.index("\n\n###", start)]
+        return {match.group(1): match.group(2) for match in
+                re.finditer(r"(?m)^\| `make ([a-z0-9-]+)`[^|]*\|[^|]*\| ([^|]+) \|$", table)}
+
+    def test_the_hollow_node_checks_have_an_owner_and_a_cadence(self):
+        row = self.manual_table().get("test-hollow")
+        self.assertIsNotNone(row, "docs/testing.md's manual gates list make test-hollow")
+        self.assertIn("maintainer", row)
+        self.assertIn("before any release", row)
+
+    def test_every_ignored_test_gate_is_run_by_a_workflow_or_a_named_person(self):
+        import ignored_owners
+        workflows = "\n".join(path.read_text() for path in sorted(WORKFLOWS.glob("*.yml")))
+        manual = self.manual_table()
+        # The evidence owners ci.yml runs through workflow_adapter.py.
+        owned, _ = ignored_owners.ci_owners(REPO)
+        for gate in sorted(ignored_owners.make_gates(REPO) - self.UNION_TARGETS):
+            with self.subTest(gate=gate):
+                in_a_workflow = gate in owned or re.search(rf"\bmake {re.escape(gate)}(?![\w-])", workflows)
+                self.assertTrue(in_a_workflow or gate in manual,
+                                f"make {gate} runs ignored tests, but no workflow runs it and "
+                                "docs/testing.md's manual gates don't say who does")
+
 class ActionPinTests(unittest.TestCase):
     """A third-party action runs the commit we reviewed, not whatever its tag points at now (#2405).
 

@@ -10773,7 +10773,16 @@ with someone else's build measures that build.
 
 ### What we found
 
-Twenty nodes is a check (`make test-hollow`). The measured runs went through
+Twenty nodes is a check (`make test-hollow`), and so, later, was a hundred nodes holding a
+thousand apps, against the cluster summary's 1 s budget. For a while nobody ran either. The
+ignored-test owner check was satisfied, because the reason names a `make` target that exists,
+and the design doc said "Manual", but no document said whose hand and when
+([#2489](https://github.com/reliaburger/reliaburger/issues/2489)). "Manual" without a name is
+"never". The target now has a row in `testing.md`'s table of manual gates, with the maintainer
+as owner and the changes that call for a run, and a test fails when a `make` target that runs
+ignored tests is in neither a workflow nor that table. Putting it in CI is the better answer,
+but the hundred-node budget has never been timed on a hosted runner, and a 1 s budget measured
+on a Mac Studio is a guess about a two-core VM. The measured runs went through
 `scripts/release/qualify-hollow-nodes.sh` on an M1 Max with 64 GB, one size at
 a time ([record](../qualification/2026-10-28-hollow-nodes.md)):
 
