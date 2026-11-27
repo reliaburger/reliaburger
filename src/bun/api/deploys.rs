@@ -376,12 +376,15 @@ pub(super) async fn deploys_history_handler(
     let mut view = cluster_deploy_history(&state, &app, namespace, query.local).await;
     // Each entry carries the spec it deployed, and the spec is where an
     // app's secrets live. Leave them out as the spec route does (#2400).
-    // Only a peer node, reading history for a rollback it will apply,
-    // gets the spec whole; an in-process rollback never comes through here.
-    let is_peer = auth
+    // A peer node, reading history for a rollback it will apply, gets the
+    // spec whole: as the service principal, or with no `AuthContext` at
+    // all on a node with no tokens yet, where nothing is access-controlled
+    // and a peer has no token to send. An in-process rollback never comes
+    // through here.
+    let whole = auth
         .as_deref()
-        .is_some_and(|context| context.token_name == crate::sesame::auth::SYSTEM_PRINCIPAL);
-    if !is_peer {
+        .is_none_or(|context| context.token_name == crate::sesame::auth::SYSTEM_PRINCIPAL);
+    if !whole {
         for entry in &mut view.history {
             if let Some(spec) = entry.row.spec.as_mut() {
                 **spec = crate::bun::spec_read::redact_spec(spec, "spec", &mut Vec::new());

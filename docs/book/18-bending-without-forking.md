@@ -3673,7 +3673,12 @@ if let Some(spec) = entry.row.spec.as_mut() {
 `AppSpec`: one through the reference, one through the box. The exception
 is there because nodes read each other's history over this same route, and
 a rollback applies what they return; a peer that got `[redacted]` back
-would roll the app onto the placeholder. A rollback on the node you asked
+would roll the app onto the placeholder. The first version forgot the
+cluster with no tokens yet, where a peer sends no token at all and the
+handler sees no `AuthContext`: `make test-cluster` caught a rollback
+restoring `VERSION = "[redacted]"`. With no tokens nothing is
+access-controlled anyway, so `Option::is_none_or` now reads "no caller, or
+the service principal" in one call. A rollback on the node you asked
 calls `cluster_deploy_history` in-process, and only the handler redacts,
 so that path never sees a redacted spec. The dashboard's env page followed
 the same rule for the same reason: a browser session is read-only, so

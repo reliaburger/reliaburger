@@ -257,11 +257,24 @@ fn history_entry_with_secrets() -> DeployHistoryEntry {
 /// any caller but a peer node (#2400).
 #[tokio::test]
 async fn deploy_history_leaves_out_env_values_and_config_content() {
+    let reader = crate::sesame::token::create_token(
+        "reader",
+        crate::sesame::types::ApiRole::ReadOnly,
+        crate::sesame::types::TokenScope::default(),
+        None,
+    )
+    .unwrap();
     let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new()));
     setup.history = vec![history_entry_with_secrets()];
+    setup.tokens = vec![reader.token.clone()];
     let app = setup.router().await;
 
-    let (status, body) = get(app, "/v1/deploys/history/web?namespace=default", None).await;
+    let (status, body) = get(
+        app,
+        "/v1/deploys/history/web?namespace=default",
+        Some(&reader.plaintext),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let body = String::from_utf8(body).unwrap();
     assert!(!body.contains("hunter2"), "{body}");
@@ -275,18 +288,25 @@ async fn deploy_history_leaves_out_env_values_and_config_content() {
 
 /// A rollback picks its target from every node's history, read over this
 /// same route with the node's service token, and applies it. A peer must
-/// still get the spec as it was deployed (#2400).
+/// still get the spec as it was deployed (#2400), and so must one on a
+/// cluster with no tokens yet, which has no token to send.
 #[tokio::test]
 async fn a_peer_reading_history_for_a_rollback_still_gets_the_full_spec() {
+    for service_token in [Some("rbrg_service"), None] {
+        a_peer_gets_the_full_spec(service_token).await;
+    }
+}
+
+async fn a_peer_gets_the_full_spec(service_token: Option<&str>) {
     let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new()));
     setup.history = vec![history_entry_with_secrets()];
-    setup.service_token = Some("rbrg_service".to_string());
+    setup.service_token = service_token.map(str::to_string);
     let app = setup.router().await;
 
     let (status, body) = get(
         app,
         "/v1/deploys/history/web?namespace=default&local=true",
-        Some("rbrg_service"),
+        service_token,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
