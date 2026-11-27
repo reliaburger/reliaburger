@@ -47,6 +47,7 @@ fn node(root: &Path, delay: Duration, concurrency: u32) -> TaskArrayNode {
 fn assignment(id: u64, count: u32, attempt: u64) -> ArrayAssignment {
     ArrayAssignment {
         template: None,
+        template_known: false,
         batch_id: id,
         resources: reliaburger::meat::Resources::new(1000, 64 << 20, 0),
         spec: TaskArraySpec {
