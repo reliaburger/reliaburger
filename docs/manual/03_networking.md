@@ -209,6 +209,17 @@ If a route that slipped past those checks reaches the cluster anyway (say, one
 written before them), every node skips that one route, logs it with its app and
 namespace, and keeps serving discovery and ingress for every other app.
 
+Each ingress node also checks every backend it routes to: every 5 seconds it
+sends `GET /` and waits up to 2 seconds. Any HTTP answer counts, a 404 or a
+503 included, because the check asks only whether this node can reach the
+instance; your app's own health check (`[app.web.health]`) decides whether
+it's well. After three checks in a row get no answer (connection refused,
+timed out or closed unanswered), the node stops sending that instance
+requests and logs
+`wrapper: web-1 at 10.0.0.5:30001 is unreachable from this node: ...`. Two
+answered checks bring it back, with another log line. The other nodes decide
+for themselves. When no instance of a route is left, the route answers 502.
+
 A request body is read whole before the ingress contacts your app, so it can
 retry another instance if the first one can't be reached. Three limits guard
 that buffer. A body over `[ingress] max_request_body_bytes` (10 MiB) gets 413.

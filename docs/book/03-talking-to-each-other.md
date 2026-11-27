@@ -999,6 +999,18 @@ futures_util::stream::iter(targets)
 
 A *stream* is the async cousin of an iterator, and `buffer_unordered(32)` keeps up to 32 of the probe futures running at once, yielding each result as it lands; in Go you'd write a worker pool with a semaphore. Chapter 6 uses the same shape for metric scrapes and explains it in more detail. A sweep over silent backends now costs one timeout per 32 of them. The verdicts are applied together: the loop asks under the read lock whether any of them changes a backend (`health_differs`), and only then takes the write lock, once, for the whole batch. A quiet sweep never makes a request wait. The test gives the loop eight listeners that accept and never answer, a 200 ms timeout, and 800 ms to mark all eight down; one at a time it needed 1.6 s.
 
+The probe also had the wrong idea of failure. It counted a 5xx as "unreachable", so an API whose framework answers `GET /` with 501, because it has no handler there, deployed green, passed its own health check on `/healthz`, and then got 502 on every path through every ingress node, with nothing in the logs naming the probe (#2464). But the probe exists to answer one question the service map can't: can *this node* reach that instance? A 501 answers it. The app's own health check covers "is the app well", and its verdict already arrives as `Backend::healthy`. So any HTTP response now passes, and only a refused connection, a connection closed without an answer, or a timeout fails:
+
+```rust
+match tokio::time::timeout(timeout, client.get(&url).send()).await {
+    Ok(Ok(_)) => Ok(()),
+    Ok(Err(error)) => Err(ProbeFailure::Request(error.to_string())),
+    Err(_) => Err(ProbeFailure::Timeout),
+}
+```
+
+The nested `Ok(Ok(_))` reads from the outside in: the timeout didn't fire, and the request got a response. `ProbeFailure` carries the reason so the loop can log a backend's flip out of rotation, and its recovery, with the cause. We considered probing the app's declared health path instead. Every ingress node would need that path, plus the health port and protocol, which can differ from the app's port, so the endpoint catalogue would grow a field on the wire and on disk, all to ask a question the app's own health check already answers. The tests that used a backend answering 500 as their "dead" backend now use a listener that closes each connection unanswered, which is what a dead backend looks like from the network.
+
 ### Connection draining
 
 When an app is being redeployed (rolling update), the old instances need to finish serving in-flight requests before they're stopped. This is the drain protocol:

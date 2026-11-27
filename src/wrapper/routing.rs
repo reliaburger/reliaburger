@@ -702,14 +702,19 @@ fn build_rate_limit(
     Ok(Some(RateLimitConfig { rps, burst }))
 }
 
-/// Configuration for Wrapper's active L7 health probes.
+/// Configuration for Wrapper's active reachability probes.
+///
+/// A probe asks one thing: can this node reach the backend? Any HTTP answer,
+/// a 5xx included, says yes. Whether the app itself is well is its own
+/// health check's question, and that verdict arrives through the service map
+/// as [`Backend::healthy`].
 #[derive(Debug, Clone)]
 pub struct HealthProbeConfig {
     /// How often to probe every backend.
     pub interval: Duration,
     /// Per-probe timeout.
     pub timeout: Duration,
-    /// HTTP path to GET when probing.
+    /// HTTP path to GET when probing. Its status doesn't matter.
     pub path: String,
     /// Consecutive failures before a backend is marked locally unhealthy.
     pub threshold_unhealthy: u32,
@@ -811,7 +816,15 @@ impl ProbeTracker {
         None
     }
 
-    fn record_endpoint(&mut self, instance_id: &str, address: SocketAddr, success: bool) -> bool {
+    /// Record a probe of `instance_id` at `address`, starting afresh when
+    /// the instance has moved. Returns the current verdict and, as
+    /// [`record`](Self::record) does, the flip this probe caused, if any.
+    fn record_endpoint(
+        &mut self,
+        instance_id: &str,
+        address: SocketAddr,
+        success: bool,
+    ) -> (bool, Option<bool>) {
         if self
             .addresses
             .insert(instance_id.to_owned(), address)
@@ -819,10 +832,12 @@ impl ProbeTracker {
         {
             self.states.remove(instance_id);
         }
-        self.record(instance_id, success);
-        self.states
+        let flipped = self.record(instance_id, success);
+        let healthy = self
+            .states
             .get(instance_id)
-            .is_none_or(|state| state.locally_healthy)
+            .is_none_or(|state| state.locally_healthy);
+        (healthy, flipped)
     }
 
     /// Drop tracker state for instances no longer present in `live`.
@@ -836,20 +851,42 @@ impl ProbeTracker {
     }
 }
 
-/// Probe one backend once. Success means it answered with a non-5xx status.
+/// Why a probe failed to reach a backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProbeFailure {
+    /// No answer within the probe timeout.
+    Timeout,
+    /// The connection or the HTTP exchange failed.
+    Request(String),
+}
+
+impl std::fmt::Display for ProbeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProbeFailure::Timeout => f.write_str("no answer within the probe timeout"),
+            ProbeFailure::Request(reason) => f.write_str(reason),
+        }
+    }
+}
+
+/// Probe one backend once. Any HTTP response, a 5xx included, is success.
 ///
-/// A connection failure, timeout, or 5xx all count as a failed probe: from
-/// this node's point of view the backend can't serve a request right now.
+/// The probe checks that this node can reach the backend. A connect failure,
+/// a timeout or a broken HTTP exchange fails it. A status doesn't: an app
+/// with no handler at the probe path may answer 501 there while its own
+/// health check passes, and counting that as a failure made the whole route
+/// answer 502 (#2464).
 async fn probe_backend_once(
     client: &reqwest::Client,
     addr: SocketAddr,
     path: &str,
     timeout: Duration,
-) -> bool {
+) -> Result<(), ProbeFailure> {
     let url = format!("http://{addr}{path}");
     match tokio::time::timeout(timeout, client.get(&url).send()).await {
-        Ok(Ok(resp)) => !resp.status().is_server_error(),
-        _ => false,
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(ProbeFailure::Request(error.to_string())),
+        Err(_) => Err(ProbeFailure::Timeout),
     }
 }
 
@@ -892,8 +929,20 @@ pub async fn run_health_probes(
         };
         let verdicts: Vec<(String, SocketAddr, bool)> = results
             .into_iter()
-            .map(|(instance_id, addr, ok)| {
-                let now_healthy = tracker.record_endpoint(&instance_id, addr, ok);
+            .map(|(instance_id, addr, outcome)| {
+                let (now_healthy, flipped) =
+                    tracker.record_endpoint(&instance_id, addr, outcome.is_ok());
+                match (flipped, &outcome) {
+                    (Some(false), Err(reason)) => eprintln!(
+                        "wrapper: {instance_id} at {addr} is unreachable from this node: {reason}"
+                    ),
+                    (Some(true), _) => {
+                        eprintln!(
+                            "wrapper: {instance_id} at {addr} is reachable from this node again"
+                        )
+                    }
+                    _ => {}
+                }
                 (instance_id, addr, now_healthy)
             })
             .collect();
@@ -918,12 +967,12 @@ pub async fn run_health_probes(
 const PROBE_CONCURRENCY: usize = 32;
 
 /// Probe every target concurrently, at most [`PROBE_CONCURRENCY`] at a time,
-/// and return each `(instance_id, address, reachable)` in completion order.
+/// and return each `(instance_id, address, outcome)` in completion order.
 async fn probe_all(
     client: &reqwest::Client,
     targets: Vec<(String, SocketAddr)>,
     config: &HealthProbeConfig,
-) -> Vec<(String, SocketAddr, bool)> {
+) -> Vec<(String, SocketAddr, Result<(), ProbeFailure>)> {
     use futures_util::StreamExt;
 
     futures_util::stream::iter(targets)
@@ -1777,32 +1826,41 @@ mod tests {
         assert_eq!(table.lookup("myapp.com", "/").unwrap().healthy_count(), 1);
     }
 
+    /// A backend whose reachability a test switches: while `reachable` is
+    /// false it accepts each connection and closes it unanswered, which fails
+    /// a probe; while true it answers 200. `requests` counts connections.
+    async fn switchable_backend(
+        reachable: Arc<std::sync::atomic::AtomicBool>,
+        requests: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                requests.fetch_add(1, Ordering::SeqCst);
+                if !reachable.load(Ordering::SeqCst) {
+                    continue;
+                }
+                let mut head = [0u8; 1024];
+                let _ = socket.read(&mut head).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+        (port, task)
+    }
+
     #[tokio::test]
     async fn continued_failed_probes_exclude_a_backend_after_table_replacement_and_allow_recovery()
     {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         let reachable = Arc::new(AtomicBool::new(false));
         let requests = Arc::new(AtomicUsize::new(0));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let healthy = reachable.clone();
-        let counted = requests.clone();
-        let app = axum::Router::new().route(
-            "/",
-            axum::routing::get(move || {
-                let healthy = healthy.clone();
-                let counted = counted.clone();
-                async move {
-                    counted.fetch_add(1, Ordering::SeqCst);
-                    if healthy.load(Ordering::SeqCst) {
-                        axum::http::StatusCode::OK
-                    } else {
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR
-                    }
-                }
-            }),
-        );
-        let backend = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (port, backend) = switchable_backend(reachable.clone(), requests.clone()).await;
         let mut map = ServiceMap::new();
         map.register_app("web", "default", 80, None).unwrap();
         map.add_backend(
@@ -1884,6 +1942,84 @@ mod tests {
         shutdown.cancel();
         probes.await.unwrap();
         backend.abort();
+    }
+
+    /// A backend that answers every HTTP request with `status`.
+    async fn backend_answering(
+        status: axum::http::StatusCode,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = axum::Router::new().fallback(move || async move { status });
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (port, task)
+    }
+
+    /// A table with one route, `web.test`, over `web-0` on `127.0.0.1:port`.
+    fn one_backend_table(port: u16) -> RoutingTable {
+        let mut map = ServiceMap::new();
+        map.register_app("web", "default", 80, None).unwrap();
+        map.add_backend(
+            &ServiceId::new("default", "web"),
+            BackendInstance {
+                instance_id: "web-0".into(),
+                node_ip: Ipv4Addr::LOCALHOST,
+                host_port: port,
+                healthy: true,
+                local: true,
+            },
+        )
+        .unwrap();
+        let configs = HashMap::from([(ns_key("default", "web"), spec_with_path("web.test", "/"))]);
+        let mut table = RoutingTable::new();
+        table.rebuild(&map, &configs).unwrap();
+        table
+    }
+
+    /// Run the probe loop over `table` for `duration`, then return the
+    /// route's routable backend count.
+    async fn routable_after_probing(table: RoutingTable, duration: Duration) -> usize {
+        let table = Arc::new(RwLock::new(table));
+        let shutdown = CancellationToken::new();
+        let probes = tokio::spawn(run_health_probes(
+            table.clone(),
+            HealthProbeConfig {
+                interval: Duration::from_millis(20),
+                timeout: Duration::from_millis(200),
+                ..Default::default()
+            },
+            shutdown.clone(),
+        ));
+        tokio::time::sleep(duration).await;
+        shutdown.cancel();
+        probes.await.unwrap();
+        table
+            .read()
+            .await
+            .lookup("web.test", "/")
+            .unwrap()
+            .healthy_count()
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_answers_5xx_at_the_probe_path_stays_routable() {
+        // An app with no handler at `/` may answer 500, 501 or 503 there
+        // while its own health check passes. It's reachable, so it stays.
+        let (port, server) = backend_answering(axum::http::StatusCode::SERVICE_UNAVAILABLE).await;
+        let routable =
+            routable_after_probing(one_backend_table(port), Duration::from_millis(300)).await;
+        server.abort();
+        assert_eq!(routable, 1);
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_refuses_connections_is_taken_out_of_rotation() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let routable =
+            routable_after_probing(one_backend_table(port), Duration::from_millis(300)).await;
+        assert_eq!(routable, 0);
     }
 
     /// A listener that accepts connections and never answers them, so every
@@ -1998,32 +2134,37 @@ mod tests {
         let new = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let old_port = old.local_addr().unwrap().port();
         let new_port = new.local_addr().unwrap().port();
-        let gated =
-            |entered: Arc<tokio::sync::Notify>, release: Arc<tokio::sync::Notify>, status| {
-                axum::Router::new().route(
-                    "/",
-                    axum::routing::get(move || {
-                        let entered = entered.clone();
-                        let release = release.clone();
-                        async move {
-                            entered.notify_one();
-                            release.notified().await;
-                            status
-                        }
-                    }),
-                )
-            };
-        let old_app = gated(
-            old_entered.clone(),
-            old_release.clone(),
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-        );
+        let gated = |entered: Arc<tokio::sync::Notify>,
+                     release: Arc<tokio::sync::Notify>,
+                     status: axum::http::StatusCode| {
+            axum::Router::new().route(
+                "/",
+                axum::routing::get(move || {
+                    let entered = entered.clone();
+                    let release = release.clone();
+                    async move {
+                        entered.notify_one();
+                        release.notified().await;
+                        status
+                    }
+                }),
+            )
+        };
         let new_app = gated(
             new_entered.clone(),
             new_release.clone(),
             axum::http::StatusCode::OK,
         );
-        let old_server = tokio::spawn(async move { axum::serve(old, old_app).await.unwrap() });
+        // The old endpoint fails its probe for real: it holds the connection
+        // until released, then closes it without an answer.
+        let (entered, release) = (old_entered.clone(), old_release.clone());
+        let old_server = tokio::spawn(async move {
+            while let Ok((socket, _)) = old.accept().await {
+                entered.notify_one();
+                release.notified().await;
+                drop(socket);
+            }
+        });
         let new_server = tokio::spawn(async move { axum::serve(new, new_app).await.unwrap() });
         let mut map = ServiceMap::new();
         map.register_app("web", "default", 80, None).unwrap();
