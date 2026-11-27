@@ -1,6 +1,5 @@
 ---
 source: src/relish/wtf_cmd.rs
-assertion_line: 683
 expression: "human(&mixed_report(), WtfView::Explain)"
 ---
 Reliaburger diagnosis: test (2 nodes)
@@ -56,9 +55,11 @@ council: ok
   tests: Reads the council membership and every node's own view of it. No
          leader, fewer members answering than a majority (members / 2 + 1), two
          leaders, two recovery epochs or a fenced node is critical; a missing
-         member while quorum holds, or a voter applying the log more slowly than
-         the others, is a warning. A standalone node needs no council and is OK.
+         member while quorum holds, a voter applying the log more slowly than
+         the others, or a retired-identity list 90% full, is a warning. A
+         standalone node needs no council and is OK.
   threshold: 100 (VOTER_LAG_WARNING): applied log entries behind the furthest voter
+  threshold: 90% (RETIRED_IDENTITY_WARNING_PERCENT): of the 65,536 retired identities a cluster can hold
   docs: https://github.com/reliaburger/reliaburger/blob/main/docs/manual/12_operations.md#a-walk-through-a-recovery
   manual: relish manual operations
 
