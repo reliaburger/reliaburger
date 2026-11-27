@@ -129,19 +129,17 @@ Cooldown adds a time buffer: 3 minutes between consecutive scale events for the 
 
 Can you see the problem? The git repo says `replicas = 3`. The autoscaler says `replicas = 7`. Who wins?
 
-Both. The trick is to treat them as different concerns. The git value is the *baseline*. The autoscaler's adjustment is a *runtime override*. When Lettuce syncs, it compares the git value against the *previous git value*, not the runtime count. If the git value hasn't changed, the autoscaler's override is left alone. If the git value *has* changed (from 3 to 5, say), the autoscaler's baseline resets to 5.
+Both. The trick is to treat them as different concerns. The git value is the *baseline*. The autoscaler's adjustment is a *runtime override*, kept in desired state beside the spec (`DesiredState::autoscale_overrides`). The council decides when an override still stands, in `apply_app_spec`: a write that changes the app's `replicas` drops it, because the operator has re-declared the count; a write that removes `[autoscale]` drops it too, and one that narrows the bounds clamps it. A GitOps re-sync that writes the same spec again leaves it alone. Deleting the app drops it, so a re-created app starts from its own spec.
+
+The leader's autoscale loop keeps its own memory beside that, an `AutoscaleTracker` with one `AutoscaleState` per app: the baseline, the current count and when it last scaled, which is what the cooldown reads. That memory had the same blind spot the override once had. Nothing ever removed an entry, so an app deleted at 12:01 and applied again under the same name sat inside the old app's ten-minute cooldown while its metric screamed, and the map grew by one entry for every app name that ever autoscaled ([#2434](https://github.com/reliaburger/reliaburger/issues/2434)). Each tick now starts by forgetting every app that doesn't autoscale any more:
 
 ```rust
-pub fn update_baseline(&mut self, app_id: &AppId, new_baseline: u32) {
-    if let Some(state) = self.states.get_mut(app_id) {
-        state.baseline_replicas = new_baseline;
-        state.current_replicas = new_baseline;
-        state.last_scale_event = None;
-    }
+pub fn retain_apps(&mut self, live: &std::collections::HashSet<AppId>) {
+    self.states.retain(|app_id, _| live.contains(app_id));
 }
 ```
 
-The `AutoscaleTracker` stores both the baseline (from git/config) and the current count (from the autoscaler). The `get_override` method returns `Some(n)` only if the current count differs from the baseline. Lettuce checks this to avoid resetting runtime adjustments.
+`HashMap::retain`, which earlier chapters used on vectors, keeps the entries the closure says yes to, in place. The gap left is small and documented in the test: an app deleted and applied again within one autoscale interval never leaves the desired state between two ticks, so it keeps its entry. The test, `an_app_that_stopped_autoscaling_is_forgotten`, scales an app, re-applies it without `[autoscale]`, and checks the next tick finds no cooldown. Two tracker methods, `update_baseline` and `get_override`, went at the same time: an earlier version of this section said GitOps called them, but nothing ever did, because the council's override rules above do that job.
 
 ### Configuration
 
@@ -756,6 +754,25 @@ Init containers broke that rule for longer than anyone noticed. The importer kep
 `envFrom` used to vanish without a word. Now a `configMapRef` to a ConfigMap in the same input and namespace is flattened into `env`, applying its `prefix`, with explicit `env` entries winning the way they do in Kubernetes. That's still reported: a later edit to the ConfigMap won't reach the app any more, and the operator should know the link is gone. A `secretRef`, or a ConfigMap that isn't in the input, gets a warning naming it.
 
 Jobs had the same disease. A `completions: 50` Job imported as a single run, silently. `backoffLimit` and the pod's `activeDeadlineSeconds` now map onto `max_attempts` and `task_timeout_secs`, the run-policy fields 0.2.0 added (`backoffLimit` counts retries, so it's off by one from attempts, and anything above 9 is capped at Reliaburger's limit of 10, with a warning). A Job-wide `activeDeadlineSeconds` becomes the per-attempt timeout, with a warning, because the two don't mean the same thing. Everything else that changes how often a job runs (`completions`, `parallelism`, `completionMode`, a CronJob's `timeZone` and `startingDeadlineSeconds`) and everything a job's pod carries that a `[job.*]` can't (`workingDir`, the user, `nodeSelector`, tolerations, affinity, sidecars, volumes) gets a warning per field.
+
+Every one of those fixes added a warning for one field, and that's how the problem kept coming back. The November 2026 audit (#2461) counted the fields still dropped without a word: a StatefulSet's `volumeClaimTemplates` and every container's `volumeMounts`, so the usual Postgres StatefulSet imported as an app with no volume and a report that never mentioned storage; `imagePullSecrets`; `hostNetwork`; `startupProbe`; the hardening half of `securityContext`; a `Recreate` strategy. For a plain Deployment the report could be empty, and `--strict`, the CI gate, passed. Thirty more `if` statements would have fixed that list and left the next one.
+
+So the importer now checks itself. After it converts a resource it serialises the typed object back to JSON (`serde_json::to_value` works on any `Serialize` type, and the `k8s_openapi` types are all `Serialize`) and walks every field against a table of rules for that kind:
+
+```rust
+enum FieldUse {
+    Read,
+    Ignored,
+    Dropped { when: Values, why: &'static str },
+}
+
+struct FieldRule {
+    path: String,
+    field_use: FieldUse,
+}
+```
+
+`Read` means a conversion maps the field or already reports it in its own words. `Ignored` is for fields with nothing to lose: metadata, `status`, selectors, history limits. `Dropped` is reported, unless `when` says its value is the Kubernetes default, and `why` says what to do instead. A path such as `spec.template.spec.containers[*].volumeMounts[*].mountPath` uses `[*]` for any element, `[0]` for the first and `[+]` for the rest, which is how the first container (the app) and the others (sidecars) get different rules. The walk descends while some rule reaches deeper, applies the longest rule that matches, and reports anything no rule covers as `PATH = VALUE is not imported`. That last part is the point. The default is to warn, so a field Kubernetes adds next year shows up in the report instead of vanishing. `an_ordinary_deployment_imports_without_a_warning` keeps the other side honest: a Deployment as `kubectl get -o yaml` prints it, defaults and all, still imports with an empty report, so the walk doesn't bury the warnings that matter.
 
 ### The migration report
 

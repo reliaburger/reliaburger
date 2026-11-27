@@ -122,7 +122,10 @@ fn fixture() -> Fixture {
 /// build: a shell script padded with a comment. Written to `path`, signed,
 /// and dropped, so none of it is live when the measurement starts.
 fn write_candidate(fixture: &Fixture, path: &Path) -> (String, String, String) {
-    let formats = serde_json::to_string(&reliaburger::compatibility::CURRENT).unwrap();
+    let formats = serde_json::to_string(&reliaburger::upgrade::CompatibilityAnswer::this_binary(
+        "0.2.0".parse().unwrap(),
+    ))
+    .unwrap();
     let mut binary = format!("#!/bin/sh\nprintf '%s' '{formats}'\nexit 0\n").into_bytes();
     binary.resize(BINARY_BYTES, b'#');
     std::fs::write(path, &binary).unwrap();

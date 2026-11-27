@@ -216,7 +216,7 @@ Query operations are initiated via `relish logs` (CLI), the Brioche UI, or the H
 ```bash
 relish logs web
 ```
-Without `-f`, this is a **one-shot fetch**, not a tail/follow. It returns the (optionally `--tail`-limited) current logs and exits. It first tries the cross-node query endpoint (`/v1/logs/query/...`), which fans out over HTTP to the nodes running the app and merge-sorts by timestamp (§3.7).
+Without `-f`, this is a **one-shot fetch**, not a tail/follow. It returns the newest lines and exits: `--tail` of them, or `DEFAULT_LOG_QUERY_ROWS` (10,000) without one, and never more than `MAX_LOG_QUERY_ROWS` (100,000) (#2382). It first tries the cross-node query endpoint (`/v1/logs/query/...`), which fans out over HTTP to the nodes running the app and merge-sorts by timestamp (§3.7). The entry node sends every node that limit as its tail, trims the merged answer to it, and adds `LogQueryWarning::Truncated { limit }` when the answer met a limit the caller didn't choose; `relish logs` prints it as a `warning:`. Each node's query runs under the 256 MiB working-memory pool and an 8-second deadline (`LOG_QUERY_DEADLINE`); past it the node answers 400 `QueryRejected` asking for a narrower query. The handlers query a `LogSnapshot` (`LogStore::snapshot()`), taken in one statement so the store's read guard is dropped before the query runs: the log drain takes the write lock once per line, and a guard held through a slow query would stall ingestion (#2449).
 
 **Follow:**
 ```bash
@@ -367,7 +367,7 @@ If flushing can't keep up for long (a failing disk, or a burst bigger than the e
 
 ### 8.1 Log Access Control
 
-**What ships:** the log routes require an authenticated token (`AnyToken` in `src/bun/authz.rs`). The per-app routes (`/v1/logs/{app}/{namespace}`, `/v1/logs/entries/...`, `/v1/logs/query/...`, and the follow/WebSocket variants) additionally enforce **tenant scope** via `authorize_scoped` before serving -- a scoped token can only read logs for its own namespace/app, and the scope check for a follow socket runs *before* the upgrade. The raw-SQL endpoint `/v1/logs/sql` reads across every tenant, so it deliberately **refuses scoped tokens** (it takes no app to scope by) and caps results (`MAX_LOG_SQL_ROWS`, a 256 MiB working-memory limit, read-only `SELECT`/`WITH` only).
+**What ships:** the log routes require an authenticated token (`AnyToken` in `src/bun/authz.rs`). The per-app routes (`/v1/logs/{app}/{namespace}`, `/v1/logs/entries/...`, `/v1/logs/query/...`, and the follow/WebSocket variants) additionally enforce **tenant scope** via `authorize_scoped` before serving -- a scoped token can only read logs for its own namespace/app, and the scope check for a follow socket runs *before* the upgrade. The raw-SQL endpoint `/v1/logs/sql` reads across every tenant, so it deliberately **refuses scoped tokens** (it takes no app to scope by) and caps results (`MAX_LOG_SQL_ROWS`, a 256 MiB working-memory limit, one target partition, the 8-second `LOG_QUERY_DEADLINE`, read-only `SELECT`/`WITH` only).
 
 **Status of the `logs:read`/`logs:export`/`logs:admin` permission model, the `viewer` role's line-limit, and per-permission scoping: planned -- not yet implemented.** There are no `logs:*` permissions; access is the `AnyToken` + tenant-scope model above.
 

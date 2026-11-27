@@ -470,6 +470,56 @@ fn correlate_and_convert(resources: Vec<K8sResource>) -> (Config, MigrationRepor
         });
     }
 
+    // Everything the conversions above didn't read (#2461). A Service,
+    // Ingress or HPA that attached to nothing was reported as dropped
+    // already, so only the ones that were imported are walked.
+    for (key, deploy) in &deployments {
+        let rules = deployment_rules(deploy);
+        report_unread_fields(&key.label("Deployment"), deploy, &rules, &mut report);
+    }
+    for (key, ds) in &daemonsets {
+        let rules = daemonset_rules(ds);
+        report_unread_fields(&key.label("DaemonSet"), ds, &rules, &mut report);
+    }
+    for (key, ss) in &statefulsets {
+        let rules = statefulset_rules(ss);
+        report_unread_fields(&key.label("StatefulSet"), ss, &rules, &mut report);
+    }
+    let rules = service_rules();
+    for (key, svc) in &services {
+        if service_targets
+            .get(key)
+            .is_some_and(|targets| !targets.is_empty())
+        {
+            report_unread_fields(&key.label("Service"), svc, &rules, &mut report);
+        }
+    }
+    let rules = ingress_rules();
+    for key in &used_ingresses {
+        if let Some(ing) = ingresses.get(key) {
+            report_unread_fields(&key.label("Ingress"), ing, &rules, &mut report);
+        }
+    }
+    let rules = hpa_rules();
+    for key in &used_hpas {
+        if let Some(hpa) = hpas.get(key) {
+            report_unread_fields(
+                &key.label("HorizontalPodAutoscaler"),
+                hpa,
+                &rules,
+                &mut report,
+            );
+        }
+    }
+    let rules = job_rules();
+    for (key, job) in &jobs {
+        report_unread_fields(&key.label("Job"), job, &rules, &mut report);
+    }
+    let rules = cronjob_rules();
+    for (key, cj) in &cronjobs {
+        report_unread_fields(&key.label("CronJob"), cj, &rules, &mut report);
+    }
+
     (config, report)
 }
 
@@ -675,6 +725,19 @@ fn pod_spec_to_app(
             resource: resource.to_string(),
             message: "livenessProbe is not imported (only readinessProbe maps to a health check)"
                 .to_string(),
+        });
+    }
+    if let Some(probe) = container.and_then(|c| c.startup_probe.as_ref()) {
+        // Kubernetes' defaults: three failures, ten seconds apart.
+        let seconds = i64::from(probe.initial_delay_seconds.unwrap_or(0))
+            + i64::from(probe.failure_threshold.unwrap_or(3))
+                * i64::from(probe.period_seconds.unwrap_or(10));
+        report.warnings.push(MigrationWarning {
+            resource: resource.to_string(),
+            message: format!(
+                "startupProbe is not imported; to give the app the same {seconds}s to start \
+                 before its health check counts, set [health] initial_delay = {seconds}"
+            ),
         });
     }
     app.env = import_env(resource, metadata_namespace, container, configmaps, report);
@@ -1406,6 +1469,25 @@ fn deployment_to_app(
     // strategies are different types with no Reliaburger equivalent).
     if let Some(strategy) = spec.and_then(|s| s.strategy.as_ref()) {
         if let Some(rolling) = &strategy.rolling_update {
+            use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+            for (field, value, key) in [
+                ("maxSurge", &rolling.max_surge, "max_surge"),
+                (
+                    "maxUnavailable",
+                    &rolling.max_unavailable,
+                    "max_unavailable",
+                ),
+            ] {
+                if let Some(IntOrString::String(percent)) = value {
+                    report.warnings.push(MigrationWarning {
+                        resource: resource.to_string(),
+                        message: format!(
+                            "rollingUpdate {field} {percent} is not imported; [deploy] {key} \
+                             is a count of instances, so set one"
+                        ),
+                    });
+                }
+            }
             app.deploy = Some(DeploySpec {
                 strategy: Some(crate::meat::deploy_types::DeployStrategy::Rolling),
                 max_surge: rolling.max_surge.as_ref().and_then(|v| match v {
@@ -1893,7 +1975,21 @@ fn apply_hpa(
                 (name, target_val)
             })
         })
-        .unwrap_or_else(|| ("cpu".to_string(), "70%".to_string()));
+        .unwrap_or_else(|| {
+            let first = spec.metrics.as_ref().and_then(|metrics| metrics.first());
+            let what = match first {
+                Some(metric) => format!("its first metric is a {} metric", metric.type_),
+                None => "it names no metric".to_string(),
+            };
+            report.warnings.push(MigrationWarning {
+                resource: resource.to_string(),
+                message: format!(
+                    "{what}, which [autoscale] can't scale on; imported as cpu 70%, so \
+                     check it before applying"
+                ),
+            });
+            ("cpu".to_string(), "70%".to_string())
+        });
 
     let autoscale = AutoscaleSpec {
         metric,
@@ -2207,6 +2303,785 @@ fn cronjob_to_jobspec(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Fields the importer doesn't read (#2461)
+// ---------------------------------------------------------------------------
+//
+// The conversion functions above read the fields they know. Every other
+// field used to vanish without a word, so after a resource is converted we
+// serialise it back to JSON and walk it against a table of rules. A field no
+// rule covers gets the generic warning, so a field Kubernetes adds next year
+// is reported by default instead of dropped in silence.
+
+/// What the importer does with one field, and everything beneath it.
+#[derive(Debug, Clone, Copy)]
+enum FieldUse {
+    /// A conversion function maps it, or already reports it in its own words.
+    Read,
+    /// Nothing is lost without it: status, bookkeeping, or history that
+    /// Reliaburger keeps its own way.
+    Ignored,
+    /// Not imported. `when` says which values are worth a warning (a field
+    /// left at its Kubernetes default loses nothing), and `why`, when not
+    /// empty, says what to do instead.
+    Dropped { when: Values, why: &'static str },
+}
+
+/// Which values of a dropped field are reported.
+#[derive(Debug, Clone, Copy)]
+enum Values {
+    Any,
+    /// Any value but these, given as JSON scalars print (`"TCP"`, `false`).
+    Except(&'static [&'static str]),
+    /// Only these.
+    Only(&'static [&'static str]),
+}
+
+/// A rule: a field path and what the importer does with it. A path is
+/// dot-separated keys, and an array index is `[*]` (any element), `[0]`
+/// (the first) or `[+]` (any after the first). A rule covers the field and
+/// everything beneath it; the longest rule that matches wins.
+struct FieldRule {
+    path: String,
+    field_use: FieldUse,
+}
+
+fn rule(path: impl Into<String>, field_use: FieldUse) -> FieldRule {
+    FieldRule {
+        path: path.into(),
+        field_use,
+    }
+}
+
+const fn dropped(why: &'static str) -> FieldUse {
+    FieldUse::Dropped {
+        when: Values::Any,
+        why,
+    }
+}
+
+const fn unless_default(defaults: &'static [&'static str]) -> FieldUse {
+    FieldUse::Dropped {
+        when: Values::Except(defaults),
+        why: "",
+    }
+}
+
+const HARDENING: &str = "Reliaburger runs every container in its own user namespace \
+     with Docker's default capabilities, and sets no seccomp profile, read-only root \
+     filesystem or no-new-privileges flag";
+const HOST_NAMESPACE: &str = "Reliaburger has no host namespaces: the app runs in its own";
+const NO_API_ACCESS: &str = "a workload gets no Kubernetes API credentials";
+const STORAGE: &str = "declare a [[app.<name>.volumes]] entry for each mount path; \
+     without one the data lives in the container and is lost on restart \
+     (manual: images and volumes)";
+
+/// One segment of a field's path while walking.
+#[derive(Debug, Clone, PartialEq)]
+enum PathStep {
+    Key(String),
+    Index(usize),
+}
+
+/// One segment of a rule's path.
+#[derive(Debug, Clone, PartialEq)]
+enum PatternStep {
+    Key(String),
+    AnyIndex,
+    FirstIndex,
+    LaterIndex,
+}
+
+fn parse_pattern(path: &str) -> Vec<PatternStep> {
+    let mut steps = Vec::new();
+    for part in path.split('.').filter(|part| !part.is_empty()) {
+        let (key, index) = match part.split_once('[') {
+            Some((key, index)) => (key, Some(index.trim_end_matches(']'))),
+            None => (part, None),
+        };
+        if !key.is_empty() {
+            steps.push(PatternStep::Key(key.to_string()));
+        }
+        match index {
+            Some("0") => steps.push(PatternStep::FirstIndex),
+            Some("+") => steps.push(PatternStep::LaterIndex),
+            Some(_) => steps.push(PatternStep::AnyIndex),
+            None => {}
+        }
+    }
+    steps
+}
+
+fn step_matches(pattern: &PatternStep, step: &PathStep) -> bool {
+    match (pattern, step) {
+        (PatternStep::Key(want), PathStep::Key(have)) => want == have,
+        (PatternStep::AnyIndex, PathStep::Index(_)) => true,
+        (PatternStep::FirstIndex, PathStep::Index(index)) => *index == 0,
+        (PatternStep::LaterIndex, PathStep::Index(index)) => *index > 0,
+        _ => false,
+    }
+}
+
+/// Whether `pattern` matches the first `pattern.len()` steps of `path`.
+fn pattern_covers(pattern: &[PatternStep], path: &[PathStep]) -> bool {
+    pattern.len() <= path.len()
+        && pattern
+            .iter()
+            .zip(path)
+            .all(|(pattern, step)| step_matches(pattern, step))
+}
+
+/// A field the importer dropped: its path as a reader would write it, its
+/// value when it's a scalar, and what to do instead.
+struct UnreadField {
+    path: String,
+    value: Option<String>,
+    why: &'static str,
+}
+
+impl UnreadField {
+    fn message(&self) -> String {
+        let mut message = self.path.clone();
+        if let Some(value) = &self.value {
+            message.push_str(&format!(" = {value}"));
+        }
+        message.push_str(" is not imported");
+        if !self.why.is_empty() {
+            message.push_str("; ");
+            message.push_str(self.why);
+        }
+        message
+    }
+}
+
+/// Walk `value` and list every field no rule reads or ignores.
+fn unread_fields(value: &serde_json::Value, rules: &[FieldRule]) -> Vec<UnreadField> {
+    let patterns: Vec<(Vec<PatternStep>, FieldUse)> = rules
+        .iter()
+        .map(|rule| (parse_pattern(&rule.path), rule.field_use))
+        .collect();
+    let mut unread = Vec::new();
+    walk_fields(
+        value,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        &patterns,
+        &mut unread,
+    );
+    unread
+}
+
+fn walk_fields(
+    value: &serde_json::Value,
+    path: &mut Vec<PathStep>,
+    shown: &mut Vec<String>,
+    patterns: &[(Vec<PatternStep>, FieldUse)],
+    unread: &mut Vec<UnreadField>,
+) {
+    use serde_json::Value;
+    let empty = match value {
+        Value::Null => true,
+        Value::Object(map) => map.is_empty(),
+        Value::Array(items) => items.is_empty(),
+        _ => false,
+    };
+    if empty {
+        return;
+    }
+    // A rule further down means this field is only partly read: look at
+    // each child on its own.
+    let deeper = patterns.iter().any(|(pattern, _)| {
+        pattern.len() > path.len() && pattern_covers(&pattern[..path.len()], path)
+    });
+    if deeper && (value.is_object() || value.is_array()) {
+        walk_children(value, path, shown, patterns, unread);
+        return;
+    }
+    let field_use = patterns
+        .iter()
+        .filter(|(pattern, _)| pattern_covers(pattern, path))
+        .max_by_key(|(pattern, _)| pattern.len())
+        .map(|(_, field_use)| *field_use);
+    let scalar = match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Bool(_) | Value::Number(_) => Some(value.to_string()),
+        _ => None,
+    };
+    let why = match field_use {
+        Some(FieldUse::Read | FieldUse::Ignored) => return,
+        Some(FieldUse::Dropped { when, why }) => {
+            let listed = |values: &[&str]| {
+                scalar
+                    .as_deref()
+                    .is_some_and(|scalar| values.contains(&scalar))
+            };
+            let reported = match when {
+                Values::Any => true,
+                Values::Except(defaults) => !listed(defaults),
+                Values::Only(values) => listed(values),
+            };
+            if !reported {
+                return;
+            }
+            why
+        }
+        None => "",
+    };
+    unread.push(UnreadField {
+        path: shown.concat(),
+        value: scalar.map(|text| {
+            if text.chars().count() > 60 {
+                format!("{}...", text.chars().take(60).collect::<String>())
+            } else {
+                text
+            }
+        }),
+        why,
+    });
+}
+
+fn walk_children(
+    value: &serde_json::Value,
+    path: &mut Vec<PathStep>,
+    shown: &mut Vec<String>,
+    patterns: &[(Vec<PatternStep>, FieldUse)],
+    unread: &mut Vec<UnreadField>,
+) {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                path.push(PathStep::Key(key.clone()));
+                shown.push(if shown.is_empty() {
+                    key.clone()
+                } else {
+                    format!(".{key}")
+                });
+                walk_fields(child, path, shown, patterns, unread);
+                path.pop();
+                shown.pop();
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                // A container is easier to find by its name than by its
+                // position: `containers[proxy]`.
+                let label = child
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|_| {
+                        matches!(path.last(), Some(PathStep::Key(key)) if key.ends_with("ontainers"))
+                    })
+                    .map_or_else(|| index.to_string(), str::to_string);
+                path.push(PathStep::Index(index));
+                shown.push(format!("[{label}]"));
+                walk_fields(child, path, shown, patterns, unread);
+                path.pop();
+                shown.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Rules every kind shares: the envelope and metadata carry nothing a
+/// workload runs with, beyond the name and namespace the importer reads.
+fn envelope_rules() -> Vec<FieldRule> {
+    vec![
+        rule("apiVersion", FieldUse::Ignored),
+        rule("kind", FieldUse::Ignored),
+        rule("metadata", FieldUse::Ignored),
+        rule("status", FieldUse::Ignored),
+    ]
+}
+
+/// Rules for a pod template at `template`. An app reads every container
+/// (the first is the app, the rest sidecars); a job reads only the first
+/// and reports the rest. `native_sidecars` are the indexes of the init
+/// containers that are native sidecars, whose resources an app reads.
+fn pod_template_rules(template: &str, job: bool, native_sidecars: &[usize]) -> Vec<FieldRule> {
+    use FieldUse::{Ignored, Read};
+    let pod = format!("{template}.spec");
+    let main = format!("{pod}.containers[0]");
+    // An app's sidecars keep these fields; a job drops its other containers.
+    let each = if job {
+        main.clone()
+    } else {
+        format!("{pod}.containers[*]")
+    };
+    let mut rules = vec![
+        // Labels pick the Service; scrape annotations are read; the rest
+        // (restartedAt and the like) carry nothing.
+        rule(format!("{template}.metadata"), Ignored),
+        rule(format!("{each}.name"), Read),
+        rule(format!("{each}.image"), Read),
+        rule(format!("{each}.command"), Read),
+        rule(format!("{each}.args"), Read),
+        rule(format!("{each}.env"), Read),
+        rule(format!("{each}.envFrom"), Read),
+        rule(format!("{each}.resources"), Read),
+        rule(format!("{main}.workingDir"), Read),
+        rule(format!("{main}.securityContext.runAsUser"), Read),
+        rule(format!("{main}.securityContext.runAsGroup"), Read),
+        rule(format!("{main}.securityContext.capabilities"), Read),
+        rule(format!("{main}.securityContext.privileged"), Read),
+        rule(
+            format!("{main}.securityContext.readOnlyRootFilesystem"),
+            FieldUse::Dropped {
+                when: Values::Except(&["false"]),
+                why: HARDENING,
+            },
+        ),
+        rule(
+            format!("{main}.securityContext.allowPrivilegeEscalation"),
+            dropped(HARDENING),
+        ),
+        rule(
+            format!("{main}.securityContext.runAsNonRoot"),
+            FieldUse::Dropped {
+                when: Values::Except(&["false"]),
+                why: HARDENING,
+            },
+        ),
+        rule(
+            format!("{main}.securityContext.seccompProfile"),
+            dropped(HARDENING),
+        ),
+        rule(
+            format!("{main}.imagePullPolicy"),
+            FieldUse::Dropped {
+                when: Values::Except(&["IfNotPresent"]),
+                why: "Reliaburger binds an image to its digest at apply and doesn't pull it again",
+            },
+        ),
+        rule(
+            format!("{main}.terminationMessagePath"),
+            unless_default(&["/dev/termination-log"]),
+        ),
+        rule(
+            format!("{main}.terminationMessagePolicy"),
+            unless_default(&["File"]),
+        ),
+        rule(
+            format!("{main}.ports[*].hostPort"),
+            dropped("Reliaburger publishes no host ports; route through [app.<name>.ingress]"),
+        ),
+        rule(
+            format!("{main}.ports[*].hostIP"),
+            dropped("Reliaburger publishes no host ports"),
+        ),
+        rule(format!("{pod}.tolerations"), Read),
+        rule(format!("{pod}.affinity"), Read),
+        rule(format!("{pod}.topologySpreadConstraints"), Read),
+        rule(format!("{pod}.volumes"), Read),
+        rule(format!("{pod}.nodeSelector"), Read),
+        rule(format!("{pod}.securityContext.fsGroup"), Read),
+        rule(format!("{pod}.securityContext.runAsUser"), Read),
+        rule(format!("{pod}.securityContext.runAsGroup"), Read),
+        rule(format!("{pod}.securityContext.sysctls"), Read),
+        rule(
+            format!("{pod}.securityContext.runAsNonRoot"),
+            FieldUse::Dropped {
+                when: Values::Except(&["false"]),
+                why: HARDENING,
+            },
+        ),
+        rule(
+            format!("{pod}.securityContext.seccompProfile"),
+            dropped(HARDENING),
+        ),
+        rule(
+            format!("{pod}.imagePullSecrets"),
+            dropped(
+                "Reliaburger pulls with the registry credentials configured on each node \
+                 (manual: images and volumes); without them the pull fails",
+            ),
+        ),
+        rule(
+            format!("{pod}.hostNetwork"),
+            FieldUse::Dropped {
+                when: Values::Except(&["false"]),
+                why: HOST_NAMESPACE,
+            },
+        ),
+        rule(
+            format!("{pod}.hostPID"),
+            FieldUse::Dropped {
+                when: Values::Except(&["false"]),
+                why: HOST_NAMESPACE,
+            },
+        ),
+        rule(
+            format!("{pod}.hostIPC"),
+            FieldUse::Dropped {
+                when: Values::Except(&["false"]),
+                why: HOST_NAMESPACE,
+            },
+        ),
+        rule(
+            format!("{pod}.serviceAccountName"),
+            FieldUse::Dropped {
+                when: Values::Except(&["default"]),
+                why: NO_API_ACCESS,
+            },
+        ),
+        rule(
+            format!("{pod}.serviceAccount"),
+            FieldUse::Dropped {
+                when: Values::Except(&["default"]),
+                why: NO_API_ACCESS,
+            },
+        ),
+        rule(
+            format!("{pod}.automountServiceAccountToken"),
+            FieldUse::Dropped {
+                when: Values::Except(&["false"]),
+                why: NO_API_ACCESS,
+            },
+        ),
+        rule(
+            format!("{pod}.dnsPolicy"),
+            unless_default(&["ClusterFirst"]),
+        ),
+        rule(
+            format!("{pod}.schedulerName"),
+            unless_default(&["default-scheduler"]),
+        ),
+        // Reliaburger never injects service variables; apps call services
+        // by name.
+        rule(format!("{pod}.enableServiceLinks"), Ignored),
+    ];
+    if job {
+        rules.extend([
+            // A job has no volumes; the warning about pod volumes covers
+            // what mounts them.
+            rule(format!("{main}.volumeMounts"), Read),
+            // The job reports each of these in its own words.
+            rule(format!("{pod}.containers[+]"), Read),
+            rule(format!("{pod}.initContainers"), Read),
+            // A job's retries are its max_attempts, whatever the policy.
+            rule(format!("{pod}.restartPolicy"), Ignored),
+            rule(format!("{pod}.activeDeadlineSeconds"), Read),
+        ]);
+    } else {
+        rules.extend([
+            rule(format!("{each}.volumeMounts[*]"), Ignored),
+            rule(
+                format!("{each}.volumeMounts[*].mountPath"),
+                dropped(STORAGE),
+            ),
+            rule(format!("{main}.ports[*].containerPort"), Read),
+            rule(format!("{main}.ports[*].name"), Read),
+            rule(
+                format!("{main}.ports[*].protocol"),
+                unless_default(&["TCP"]),
+            ),
+            rule(format!("{main}.readinessProbe"), Read),
+            rule(format!("{main}.livenessProbe"), Read),
+            rule(format!("{main}.startupProbe"), Read),
+            rule(format!("{main}.lifecycle"), Read),
+            rule(format!("{pod}.initContainers[*].name"), Read),
+            rule(format!("{pod}.initContainers[*].image"), Read),
+            rule(format!("{pod}.initContainers[*].command"), Read),
+            rule(format!("{pod}.initContainers[*].args"), Read),
+            rule(format!("{pod}.initContainers[*].env"), Read),
+            rule(format!("{pod}.initContainers[*].envFrom"), Read),
+            rule(format!("{pod}.initContainers[*].restartPolicy"), Read),
+            rule(format!("{pod}.terminationGracePeriodSeconds"), Read),
+            rule(format!("{pod}.restartPolicy"), unless_default(&["Always"])),
+        ]);
+        rules.extend(
+            native_sidecars
+                .iter()
+                .map(|index| rule(format!("{pod}.initContainers[{index}].resources"), Read)),
+        );
+    }
+    rules
+}
+
+/// Indexes of a pod's native sidecars among its init containers.
+fn native_sidecar_indexes(pod_spec: Option<&k8s_openapi::api::core::v1::PodSpec>) -> Vec<usize> {
+    pod_spec
+        .and_then(|ps| ps.init_containers.as_ref())
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter(|(_, container)| is_native_sidecar(container))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn deployment_rules(deploy: &Deployment) -> Vec<FieldRule> {
+    use FieldUse::{Ignored, Read};
+    let pod_spec = deploy.spec.as_ref().and_then(|s| s.template.spec.as_ref());
+    let mut rules = envelope_rules();
+    rules.extend(pod_template_rules(
+        "spec.template",
+        false,
+        &native_sidecar_indexes(pod_spec),
+    ));
+    rules.extend([
+        rule("spec.replicas", Read),
+        rule("spec.selector", Ignored),
+        rule(
+            "spec.strategy.type",
+            FieldUse::Dropped {
+                when: Values::Except(&["RollingUpdate"]),
+                why: "Reliaburger always rolls; to replace every instance at once, set \
+                      [deploy] max_surge = 0 and max_unavailable to the replica count",
+            },
+        ),
+        // Whole numbers are read; a percentage gets its own warning.
+        rule("spec.strategy.rollingUpdate.maxSurge", Read),
+        rule("spec.strategy.rollingUpdate.maxUnavailable", Read),
+        rule("spec.minReadySeconds", unless_default(&["0"])),
+        // Reliaburger keeps its own deploy history (`relish history`).
+        rule("spec.revisionHistoryLimit", Ignored),
+        rule(
+            "spec.progressDeadlineSeconds",
+            FieldUse::Dropped {
+                when: Values::Except(&["600"]),
+                why: "set [deploy] health_timeout instead",
+            },
+        ),
+        rule("spec.paused", unless_default(&["false"])),
+    ]);
+    rules
+}
+
+fn daemonset_rules(ds: &DaemonSet) -> Vec<FieldRule> {
+    use FieldUse::Ignored;
+    let pod_spec = ds.spec.as_ref().and_then(|s| s.template.spec.as_ref());
+    let mut rules = envelope_rules();
+    rules.extend(pod_template_rules(
+        "spec.template",
+        false,
+        &native_sidecar_indexes(pod_spec),
+    ));
+    rules.extend([
+        rule("spec.selector", Ignored),
+        rule(
+            "spec.updateStrategy.type",
+            unless_default(&["RollingUpdate"]),
+        ),
+        rule(
+            "spec.updateStrategy.rollingUpdate.maxUnavailable",
+            unless_default(&["1"]),
+        ),
+        rule(
+            "spec.updateStrategy.rollingUpdate.maxSurge",
+            unless_default(&["0"]),
+        ),
+        rule("spec.minReadySeconds", unless_default(&["0"])),
+        rule("spec.revisionHistoryLimit", Ignored),
+    ]);
+    rules
+}
+
+fn statefulset_rules(ss: &StatefulSet) -> Vec<FieldRule> {
+    use FieldUse::{Ignored, Read};
+    let pod_spec = ss.spec.as_ref().and_then(|s| s.template.spec.as_ref());
+    let mut rules = envelope_rules();
+    rules.extend(pod_template_rules(
+        "spec.template",
+        false,
+        &native_sidecar_indexes(pod_spec),
+    ));
+    rules.extend([
+        rule("spec.replicas", Read),
+        rule("spec.selector", Ignored),
+        // The StatefulSet's own warning says ordering and stable network
+        // ids are lost.
+        rule("spec.serviceName", Read),
+        rule("spec.podManagementPolicy", Read),
+        rule(
+            "spec.updateStrategy.type",
+            unless_default(&["RollingUpdate"]),
+        ),
+        rule(
+            "spec.updateStrategy.rollingUpdate.partition",
+            unless_default(&["0"]),
+        ),
+        rule(
+            "spec.updateStrategy.rollingUpdate.maxUnavailable",
+            unless_default(&["1"]),
+        ),
+        rule("spec.minReadySeconds", unless_default(&["0"])),
+        rule("spec.revisionHistoryLimit", Ignored),
+        rule(
+            "spec.volumeClaimTemplates",
+            dropped(
+                "a claim template has no Reliaburger equivalent; declare a \
+                 [[app.<name>.volumes]] entry for each mount path, or the data lives in \
+                 the container and is lost on restart",
+            ),
+        ),
+        // Only meaningful with the claims reported above.
+        rule("spec.persistentVolumeClaimRetentionPolicy", Ignored),
+    ]);
+    rules
+}
+
+fn service_rules() -> Vec<FieldRule> {
+    use FieldUse::{Ignored, Read};
+    let mut rules = envelope_rules();
+    rules.extend([
+        rule("spec.selector", Read),
+        rule("spec.ports[0].port", Read),
+        rule("spec.ports[0].targetPort", Read),
+        rule("spec.ports[0].name", Read),
+        // Every port after the first has its own "dropped" warning.
+        rule("spec.ports[+]", Read),
+        rule("spec.ports[*].protocol", unless_default(&["TCP"])),
+        rule(
+            "spec.ports[*].nodePort",
+            dropped("Reliaburger has no node ports; route through [app.<name>.ingress]"),
+        ),
+        rule(
+            "spec.type",
+            FieldUse::Dropped {
+                when: Values::Except(&["ClusterIP"]),
+                why: "Reliaburger has no node ports or load balancers; route through \
+                      [app.<name>.ingress]",
+            },
+        ),
+        rule(
+            "spec.clusterIP",
+            FieldUse::Dropped {
+                when: Values::Only(&["None"]),
+                why: "a headless Service has no equivalent: every app gets a virtual IP",
+            },
+        ),
+        rule("spec.clusterIPs", Ignored),
+        rule("spec.ipFamilies", Ignored),
+        rule("spec.ipFamilyPolicy", Ignored),
+        rule(
+            "spec.sessionAffinity",
+            FieldUse::Dropped {
+                when: Values::Except(&["None"]),
+                why: "Reliaburger balances each connection on its own",
+            },
+        ),
+        rule("spec.internalTrafficPolicy", unless_default(&["Cluster"])),
+        rule("spec.externalTrafficPolicy", unless_default(&["Cluster"])),
+        rule("spec.publishNotReadyAddresses", unless_default(&["false"])),
+    ]);
+    rules
+}
+
+fn ingress_rules() -> Vec<FieldRule> {
+    use FieldUse::{Ignored, Read};
+    let mut rules = envelope_rules();
+    rules.extend([
+        rule("spec.rules[0].host", Read),
+        rule("spec.rules[0].http.paths[0].path", Read),
+        rule("spec.rules[0].http.paths[0].pathType", Read),
+        rule("spec.rules[0].http.paths[0].backend.service.name", Read),
+        // The app has one port, which the Service already chose.
+        rule("spec.rules[0].http.paths[0].backend.service.port", Ignored),
+        // Each of these has its own warning.
+        rule("spec.rules[0].http.paths[+]", Read),
+        rule("spec.rules[+]", Read),
+        rule("spec.defaultBackend", Read),
+        rule("spec.ingressClassName", Read),
+        rule("spec.tls", Read),
+    ]);
+    rules
+}
+
+fn hpa_rules() -> Vec<FieldRule> {
+    use FieldUse::Read;
+    let mut rules = envelope_rules();
+    rules.extend([
+        rule("spec.scaleTargetRef", Read),
+        rule("spec.minReplicas", Read),
+        rule("spec.maxReplicas", Read),
+        rule("spec.metrics[0].type", Read),
+        rule("spec.metrics[0].resource.name", Read),
+        rule("spec.metrics[0].resource.target.averageUtilization", Read),
+        rule(
+            "spec.metrics[0].resource.target.type",
+            unless_default(&["Utilization"]),
+        ),
+        // `apply_hpa` reports a first metric it can't scale on.
+        rule("spec.metrics[0].pods", Read),
+        rule("spec.metrics[0].object", Read),
+        rule("spec.metrics[0].external", Read),
+        rule("spec.metrics[0].containerResource", Read),
+        rule(
+            "spec.metrics[+]",
+            dropped("only the first metric is imported; [autoscale] scales on one"),
+        ),
+        rule(
+            "spec.behavior",
+            dropped("[autoscale] cooldown and evaluation_window take its place"),
+        ),
+    ]);
+    rules
+}
+
+/// Rules for a Job's spec at `spec`, the Job itself or a CronJob's template.
+fn job_spec_rules(spec: &str) -> Vec<FieldRule> {
+    use FieldUse::{Ignored, Read};
+    let mut rules = pod_template_rules(&format!("{spec}.template"), true, &[]);
+    rules.extend([
+        rule(format!("{spec}.backoffLimit"), Read),
+        rule(format!("{spec}.activeDeadlineSeconds"), Read),
+        rule(format!("{spec}.completions"), Read),
+        rule(format!("{spec}.parallelism"), Read),
+        rule(format!("{spec}.completionMode"), Read),
+        rule(format!("{spec}.podFailurePolicy"), Read),
+        rule(format!("{spec}.selector"), Ignored),
+        rule(format!("{spec}.manualSelector"), Ignored),
+        // Reliaburger keeps its own bounded history of runs.
+        rule(format!("{spec}.ttlSecondsAfterFinished"), Ignored),
+        rule(format!("{spec}.suspend"), unless_default(&["false"])),
+    ]);
+    rules
+}
+
+fn job_rules() -> Vec<FieldRule> {
+    let mut rules = envelope_rules();
+    rules.extend(job_spec_rules("spec"));
+    rules
+}
+
+fn cronjob_rules() -> Vec<FieldRule> {
+    use FieldUse::{Ignored, Read};
+    let mut rules = envelope_rules();
+    rules.extend(job_spec_rules("spec.jobTemplate.spec"));
+    rules.extend([
+        rule("spec.jobTemplate.metadata", Ignored),
+        rule("spec.schedule", Read),
+        rule("spec.suspend", Read),
+        rule("spec.concurrencyPolicy", Read),
+        rule("spec.timeZone", Read),
+        rule("spec.startingDeadlineSeconds", Read),
+        rule("spec.successfulJobsHistoryLimit", Ignored),
+        rule("spec.failedJobsHistoryLimit", Ignored),
+    ]);
+    rules
+}
+
+/// Report every field of `object` that `rules` neither read nor ignore,
+/// under `resource`.
+fn report_unread_fields<T: serde::Serialize>(
+    resource: &str,
+    object: &T,
+    rules: &[FieldRule],
+    report: &mut MigrationReport,
+) {
+    let Ok(value) = serde_json::to_value(object) else {
+        return;
+    };
+    for field in unread_fields(&value, rules) {
+        report.warnings.push(MigrationWarning {
+            resource: resource.to_string(),
+            message: field.message(),
+        });
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2608,6 +3483,586 @@ spec:
                 .iter()
                 .any(|w| w.resource.contains("StatefulSet") && w.message.contains("ordering"))
         );
+    }
+
+    /// Every warning message for `yaml`, one string.
+    /// Every warning message for `yaml`, one string.
+    fn report_text(yaml: &str) -> String {
+        warnings_of(&import_from_yaml(yaml).unwrap()).join("\n")
+    }
+
+    fn assert_warns(yaml: &str, fields: &[&str]) {
+        let warnings = report_text(yaml);
+        for field in fields {
+            assert!(
+                warnings.contains(field),
+                "no warning names {field}:\n{warnings}"
+            );
+        }
+    }
+
+    const POSTGRES_STATEFULSET: &str = r#"
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pg
+spec:
+  serviceName: pg
+  replicas: 1
+  selector:
+    matchLabels: {app: pg}
+  template:
+    metadata:
+      labels: {app: pg}
+    spec:
+      containers:
+      - name: pg
+        image: postgres:17
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ReadWriteOnce]
+      resources:
+        requests:
+          storage: 10Gi
+"#;
+
+    pub(super) const PRIVATE_REGISTRY_DEPLOYMENT: &str = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  selector:
+    matchLabels: {app: api}
+  template:
+    metadata:
+      labels: {app: api}
+    spec:
+      imagePullSecrets:
+      - name: regcred
+      containers:
+      - name: api
+        image: registry.example.com/team/api:1.4
+"#;
+
+    #[test]
+    fn a_statefulset_volume_claim_template_is_reported() {
+        // The usual database StatefulSet imported with no volume and no
+        // word about storage (#2461).
+        assert_warns(
+            POSTGRES_STATEFULSET,
+            &[
+                "volumeClaimTemplates",
+                "volumeMounts",
+                "/var/lib/postgresql/data",
+            ],
+        );
+    }
+
+    #[test]
+    fn image_pull_secrets_are_reported() {
+        let warnings = report_text(PRIVATE_REGISTRY_DEPLOYMENT);
+        assert!(warnings.contains("imagePullSecrets"), "{warnings}");
+    }
+
+    #[test]
+    fn host_namespaces_and_host_ports_are_reported() {
+        assert_warns(
+            r#"
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-agent
+spec:
+  selector:
+    matchLabels: {app: node-agent}
+  template:
+    metadata:
+      labels: {app: node-agent}
+    spec:
+      hostNetwork: true
+      hostPID: true
+      containers:
+      - name: agent
+        image: example/agent:2
+        ports:
+        - containerPort: 9100
+          hostPort: 9100
+"#,
+            &["hostNetwork", "hostPID", "hostPort"],
+        );
+    }
+
+    #[test]
+    fn startup_probe_hardening_and_recreate_are_reported() {
+        assert_warns(
+            r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: web}
+  template:
+    metadata:
+      labels: {app: web}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+      - name: web
+        image: example/web:3
+        ports:
+        - containerPort: 8080
+        startupProbe:
+          httpGet: {path: /healthz, port: 8080}
+          failureThreshold: 30
+          periodSeconds: 10
+        securityContext:
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+"#,
+            &[
+                "startupProbe",
+                "initial_delay = 300",
+                "readOnlyRootFilesystem",
+                "allowPrivilegeEscalation",
+                "runAsNonRoot",
+                "seccompProfile",
+                "Recreate",
+            ],
+        );
+    }
+
+    #[test]
+    fn a_sidecars_dropped_fields_are_reported() {
+        assert_warns(
+            r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  selector:
+    matchLabels: {app: web}
+  template:
+    metadata:
+      labels: {app: web}
+    spec:
+      containers:
+      - name: web
+        image: example/web:3
+      - name: proxy
+        image: example/proxy:1
+        readinessProbe:
+          httpGet: {path: /ready, port: 15000}
+        securityContext:
+          runAsUser: 1337
+"#,
+            &[
+                "containers[proxy].readinessProbe",
+                "containers[proxy].securityContext",
+            ],
+        );
+    }
+
+    #[test]
+    fn an_hpa_without_a_resource_metric_is_reported() {
+        assert_warns(
+            r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  selector:
+    matchLabels: {app: web}
+  template:
+    metadata:
+      labels: {app: web}
+    spec:
+      containers:
+      - name: web
+        image: example/web:3
+        resources:
+          requests: {cpu: 100m}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: web
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: web}
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+  - type: Pods
+    pods:
+      metric: {name: requests_per_second}
+      target: {type: AverageValue, averageValue: "100"}
+"#,
+            &["Pods metric", "cpu 70%"],
+        );
+    }
+
+    #[test]
+    fn a_percentage_surge_and_extra_service_fields_are_reported() {
+        assert_warns(
+            r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 25%, maxUnavailable: 25%}
+  selector:
+    matchLabels: {app: web}
+  template:
+    metadata:
+      labels: {app: web}
+    spec:
+      containers:
+      - name: web
+        image: example/web:3
+        ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  type: NodePort
+  sessionAffinity: ClientIP
+  selector: {app: web}
+  ports:
+  - port: 8080
+    nodePort: 30080
+"#,
+            &[
+                "maxSurge",
+                "maxUnavailable",
+                "NodePort",
+                "sessionAffinity",
+                "nodePort",
+            ],
+        );
+    }
+
+    /// A Deployment whose pod sets every `PodSpec` field, and whose app
+    /// container and sidecar set every `Container` field (Kubernetes 1.36),
+    /// each to a value that isn't the default.
+    const EVERY_POD_FIELD: &str = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  selector:
+    matchLabels: {app: web}
+  template:
+    metadata:
+      labels: {app: web}
+    spec:
+      activeDeadlineSeconds: 60
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions: [{key: zone, operator: In, values: [a]}]
+      automountServiceAccountToken: true
+      dnsConfig: {nameservers: [1.1.1.1]}
+      dnsPolicy: None
+      enableServiceLinks: true
+      ephemeralContainers: [{name: debug, image: busybox:1}]
+      hostAliases: [{ip: 10.0.0.1, hostnames: [db]}]
+      hostIPC: true
+      hostNetwork: true
+      hostPID: true
+      hostUsers: false
+      hostname: web-0
+      hostnameOverride: web-zero
+      imagePullSecrets: [{name: regcred}]
+      initContainers:
+      - name: migrate
+        image: example/migrate:1
+        command: [migrate]
+      nodeName: node-7
+      nodeSelector: {zone: a}
+      os: {name: linux}
+      overhead: {cpu: 250m}
+      preemptionPolicy: Never
+      priority: 1000
+      priorityClassName: high
+      readinessGates: [{conditionType: example.com/ready}]
+      resourceClaims: [{name: gpu, resourceClaimName: gpu-claim}]
+      resources: {limits: {cpu: "2"}}
+      restartPolicy: OnFailure
+      runtimeClassName: kata
+      schedulerName: custom
+      schedulingGates: [{name: wait}]
+      schedulingGroup: {podGroupName: batch}
+      securityContext:
+        appArmorProfile: {type: RuntimeDefault}
+        fsGroup: 2000
+        fsGroupChangePolicy: OnRootMismatch
+        runAsGroup: 3000
+        runAsNonRoot: true
+        runAsUser: 1000
+        seLinuxChangePolicy: Recursive
+        seLinuxOptions: {level: "s0:c1"}
+        seccompProfile: {type: RuntimeDefault}
+        supplementalGroups: [4000]
+        supplementalGroupsPolicy: Strict
+        sysctls: [{name: net.core.somaxconn, value: "1024"}]
+        windowsOptions: {runAsUserName: web}
+      serviceAccount: web
+      serviceAccountName: web
+      setHostnameAsFQDN: true
+      shareProcessNamespace: true
+      subdomain: web
+      terminationGracePeriodSeconds: 45
+      tolerations: [{key: dedicated, operator: Exists}]
+      topologySpreadConstraints:
+      - {maxSkew: 1, topologyKey: zone, whenUnsatisfiable: DoNotSchedule}
+      volumes: [{name: data, emptyDir: {}}]
+      containers:
+      - name: web
+        image: example/web:3
+        command: [web]
+        args: [--port, "8080"]
+        env: [{name: MODE, value: prod}]
+        envFrom: [{prefix: X_, configMapRef: {name: missing}}]
+        imagePullPolicy: Always
+        lifecycle: {postStart: {exec: {command: [warm]}}}
+        livenessProbe: {httpGet: {path: /live, port: 8080}}
+        ports:
+        - {name: http, containerPort: 8080, hostPort: 80, hostIP: 0.0.0.0, protocol: UDP}
+        readinessProbe: {httpGet: {path: /ready, port: 8080}}
+        resizePolicy: [{resourceName: cpu, restartPolicy: RestartContainer}]
+        resources: {requests: {cpu: 100m}}
+        restartPolicy: Always
+        restartPolicyRules: [{action: Restart, exitCodes: {operator: In, values: [42]}}]
+        securityContext:
+          allowPrivilegeEscalation: false
+          appArmorProfile: {type: RuntimeDefault}
+          capabilities: {add: [NET_ADMIN]}
+          privileged: false
+          procMount: Unmasked
+          readOnlyRootFilesystem: true
+          runAsGroup: 3000
+          runAsNonRoot: true
+          runAsUser: 1000
+          seLinuxOptions: {level: "s0:c1"}
+          seccompProfile: {type: RuntimeDefault}
+          windowsOptions: {runAsUserName: web}
+        startupProbe: {httpGet: {path: /start, port: 8080}, failureThreshold: 30}
+        stdin: true
+        stdinOnce: true
+        terminationMessagePath: /var/log/termination
+        terminationMessagePolicy: FallbackToLogsOnError
+        tty: true
+        volumeDevices: [{name: block, devicePath: /dev/xvda}]
+        volumeMounts: [{name: data, mountPath: /data}]
+        workingDir: /srv
+      - name: proxy
+        image: example/web:3
+        command: [web]
+        args: [--port, "8080"]
+        env: [{name: MODE, value: prod}]
+        envFrom: [{prefix: X_, configMapRef: {name: missing}}]
+        imagePullPolicy: Always
+        lifecycle: {postStart: {exec: {command: [warm]}}}
+        livenessProbe: {httpGet: {path: /live, port: 8080}}
+        ports:
+        - {name: http, containerPort: 8080, hostPort: 80, hostIP: 0.0.0.0, protocol: UDP}
+        readinessProbe: {httpGet: {path: /ready, port: 8080}}
+        resizePolicy: [{resourceName: cpu, restartPolicy: RestartContainer}]
+        resources: {requests: {cpu: 100m}}
+        restartPolicy: Always
+        restartPolicyRules: [{action: Restart, exitCodes: {operator: In, values: [42]}}]
+        securityContext:
+          allowPrivilegeEscalation: false
+          appArmorProfile: {type: RuntimeDefault}
+          capabilities: {add: [NET_ADMIN]}
+          privileged: false
+          procMount: Unmasked
+          readOnlyRootFilesystem: true
+          runAsGroup: 3000
+          runAsNonRoot: true
+          runAsUser: 1000
+          seLinuxOptions: {level: "s0:c1"}
+          seccompProfile: {type: RuntimeDefault}
+          windowsOptions: {runAsUserName: web}
+        startupProbe: {httpGet: {path: /start, port: 8080}, failureThreshold: 30}
+        stdin: true
+        stdinOnce: true
+        terminationMessagePath: /var/log/termination
+        terminationMessagePolicy: FallbackToLogsOnError
+        tty: true
+        volumeDevices: [{name: block, devicePath: /dev/xvda}]
+        volumeMounts: [{name: data, mountPath: /data}]
+        workingDir: /srv
+"#;
+
+    #[test]
+    fn every_field_of_a_full_pod_spec_is_consumed_or_reported() {
+        // The structural check behind #2461: a field the importer neither
+        // maps nor reports is a silent drop. Each field of the manifest
+        // above must be read (the reviewed lists below) or named in a
+        // warning.
+        const POD_READ: &[&str] = &[
+            "affinity",
+            "containers",
+            "enableServiceLinks",
+            "initContainers",
+            "nodeSelector",
+            "terminationGracePeriodSeconds",
+            "tolerations",
+            "topologySpreadConstraints",
+            "volumes",
+        ];
+        const POD_SECURITY_READ: &[&str] = &["fsGroup", "runAsGroup", "runAsUser", "sysctls"];
+        const APP_CONTAINER_READ: &[&str] = &[
+            "args",
+            "command",
+            "env",
+            "envFrom",
+            "image",
+            "lifecycle",
+            "livenessProbe",
+            "name",
+            "readinessProbe",
+            "resources",
+            "startupProbe",
+            "workingDir",
+        ];
+        const CONTAINER_SECURITY_READ: &[&str] =
+            &["capabilities", "privileged", "runAsGroup", "runAsUser"];
+        const SIDECAR_READ: &[&str] = &[
+            "args",
+            "command",
+            "env",
+            "envFrom",
+            "image",
+            "name",
+            "resources",
+        ];
+
+        let warnings = report_text(EVERY_POD_FIELD);
+        let manifest: serde_json::Value = yaml_serde::from_str(EVERY_POD_FIELD).unwrap();
+        let pod = &manifest["spec"]["template"]["spec"];
+        let keys = |value: &serde_json::Value| -> Vec<String> {
+            value.as_object().unwrap().keys().cloned().collect()
+        };
+        let mut missing = Vec::new();
+        let mut check = |path: String, field: &str, read: &[&str]| {
+            if !read.contains(&field) && !warnings.contains(&format!("{path}.{field}")) {
+                missing.push(format!("{path}.{field}"));
+            }
+        };
+        let base = "spec.template.spec";
+        for field in keys(pod) {
+            if field != "securityContext" {
+                check(base.to_string(), &field, POD_READ);
+            }
+        }
+        for field in keys(&pod["securityContext"]) {
+            check(format!("{base}.securityContext"), &field, POD_SECURITY_READ);
+        }
+        for (name, read) in [("web", APP_CONTAINER_READ), ("proxy", SIDECAR_READ)] {
+            let index = usize::from(name == "proxy");
+            let container = &pod["containers"][index];
+            let path = format!("{base}.containers[{name}]");
+            for field in keys(container) {
+                if field == "securityContext" && name == "web" {
+                    for inner in keys(&container[&field]) {
+                        check(
+                            format!("{path}.securityContext"),
+                            &inner,
+                            CONTAINER_SECURITY_READ,
+                        );
+                    }
+                } else if field == "ports" && name == "web" {
+                    for inner in keys(&container["ports"][0]) {
+                        check(
+                            format!("{path}.ports[0]"),
+                            &inner,
+                            &["containerPort", "name"],
+                        );
+                    }
+                } else if field == "volumeMounts" {
+                    check(path.clone(), "volumeMounts[0].mountPath", &[]);
+                } else {
+                    check(path.clone(), &field, read);
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "neither read nor reported: {missing:#?}\n{warnings}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_deployment_imports_without_a_warning() {
+        // Fields at their Kubernetes defaults lose nothing, so they say
+        // nothing: the walk must not drown the report.
+        let warnings = report_text(
+            r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  labels: {app: web}
+  annotations: {deployment.kubernetes.io/revision: "3"}
+spec:
+  replicas: 2
+  revisionHistoryLimit: 10
+  progressDeadlineSeconds: 600
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+  selector:
+    matchLabels: {app: web}
+  template:
+    metadata:
+      labels: {app: web}
+      annotations: {kubectl.kubernetes.io/restartedAt: "2026-01-01T00:00:00Z"}
+    spec:
+      restartPolicy: Always
+      dnsPolicy: ClusterFirst
+      schedulerName: default-scheduler
+      terminationGracePeriodSeconds: 30
+      securityContext: {}
+      containers:
+      - name: web
+        image: example/web:3
+        imagePullPolicy: IfNotPresent
+        terminationMessagePath: /dev/termination-log
+        terminationMessagePolicy: File
+        ports:
+        - containerPort: 8080
+          protocol: TCP
+        readinessProbe:
+          httpGet: {path: /healthz, port: 8080, scheme: HTTP}
+          periodSeconds: 10
+        resources:
+          requests: {cpu: 100m, memory: 64Mi}
+"#,
+        );
+        assert!(warnings.is_empty(), "{warnings}");
     }
 
     #[test]

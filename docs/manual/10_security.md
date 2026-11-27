@@ -1086,8 +1086,17 @@ cluster running:
 ```sh
 relish secret pubkey                  # ask the cluster
 relish secret pubkey cluster          # offline, from `relish init` output
-relish secret encrypt --pubkey "$(relish secret pubkey)" 'the plaintext'
+relish secret encrypt --pubkey "$(relish secret pubkey)" --value-file db-password.txt
+printf %s "$DB_PASSWORD" | relish secret encrypt --pubkey "$(relish secret pubkey)"
 ```
+
+`secret encrypt` reads the value from `--value-file`, or from standard input
+when you give it neither a file nor a value. At a terminal it asks for the
+value without echoing it. One trailing newline is dropped, so a file written
+by an editor or `echo` works. A value can also go on the command line
+(`relish secret encrypt --pubkey KEY VALUE`), but other users on the
+machine can see it in the process list while the command runs, and your shell
+history keeps it, so keep that form for values that aren't secret.
 
 `examples/phase-1/container-secrets.toml` is a job that reads an encrypted
 value and prints its length, never the value; its header has the commands.
@@ -1146,7 +1155,7 @@ starting:
 
 ```sh
 relish secret pubkey --namespace team-a
-relish secret encrypt --pubkey "$(relish secret pubkey --namespace team-a)" 'the plaintext'
+relish secret encrypt --pubkey "$(relish secret pubkey --namespace team-a)" --value-file db-password.txt
 ```
 
 The re-seal covers apps only. Encrypt a job's values in an opted-in
@@ -1402,11 +1411,12 @@ Rotating the root itself isn't supported yet.
 
 ## Workload identity
 
-Every container gets a SPIFFE identity, `spiffe://CLUSTER/ns/NAMESPACE/app/NAME`
-(or `/job/NAME`), and its credentials appear read-only in
+Every app instance on a cluster gets a SPIFFE identity,
+`spiffe://CLUSTER/ns/NAMESPACE/app/NAME`, and its credentials appear read-only in
 `/run/reliaburger/identity/`: `cert.pem`, `key.pem`, `ca.pem`, `bundle.pem`,
 `token`, an OIDC JWT, and `api-token`, a second JWT for the Reliaburger API
-alone. Use the certificate for mTLS between your services.
+alone. Use the certificate for mTLS between your services. Job tasks don't
+get an identity yet, and a standalone node issues none.
 `ca.pem` is a bundle: every Workload CA the cluster trusts, then the root.
 Usually that's one of each, but while a Workload CA rotation is in progress it
 holds the old CA and the new one, so verify peers against the whole file, not

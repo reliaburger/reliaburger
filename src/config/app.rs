@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use super::types::{ConfigFileSpec, EnvValue, Replicas, ResourceRange, VolumeSpec};
+use super::types::{ConfigFileSpec, EnvValue, MAX_REPLICAS, Replicas, ResourceRange, VolumeSpec};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -204,6 +204,8 @@ impl AppSpec {
             Some(ScaleRefusal::Autoscaled)
         } else if self.replicas == Replicas::DaemonSet {
             Some(ScaleRefusal::DaemonSet)
+        } else if replicas > MAX_REPLICAS {
+            Some(ScaleRefusal::TooMany)
         } else {
             None
         }
@@ -528,6 +530,8 @@ pub enum ScaleRefusal {
     Autoscaled,
     /// It runs one replica on every node, so there's no count to set.
     DaemonSet,
+    /// The count is above [`MAX_REPLICAS`].
+    TooMany,
 }
 
 impl ScaleRefusal {
@@ -537,6 +541,7 @@ impl ScaleRefusal {
             ScaleRefusal::ToZero => "scale_to_zero",
             ScaleRefusal::Autoscaled => "autoscaled",
             ScaleRefusal::DaemonSet => "daemon",
+            ScaleRefusal::TooMany => "too_many_replicas",
         }
     }
 }
@@ -560,6 +565,19 @@ mod tests {
         let app = parse_app("image = \"web:v1\"\nreplicas = 2");
         assert_eq!(app.scale_refusal(1), None);
         assert_eq!(app.scale_refusal(40), None);
+        assert_eq!(app.scale_refusal(MAX_REPLICAS), None);
+    }
+
+    #[test]
+    fn a_count_above_the_limit_is_refused() {
+        // One typo in `relish scale` must not make every leader in turn
+        // plan billions of replicas (#2368).
+        let app = parse_app("image = \"web:v1\"\nreplicas = 2");
+        assert_eq!(app.scale_refusal(u32::MAX), Some(ScaleRefusal::TooMany));
+        assert_eq!(
+            app.scale_refusal(MAX_REPLICAS + 1),
+            Some(ScaleRefusal::TooMany)
+        );
     }
 
     #[test]

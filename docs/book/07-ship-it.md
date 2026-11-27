@@ -87,6 +87,18 @@ Read `if let Some(ref s) = spec.strategy && s == "blue-green"` as: "if the strat
 
 `parse_duration` is a small helper that turns `"30s"` or `"5m"` into a `Duration`. It returns `Option<Duration>` rather than erroring, so a malformed string simply leaves the default in place — the second half of the let-chain (`&& let Some(d) = parse_duration(s)`) only assigns when parsing succeeds.
 
+The minutes and hours branches multiply, and the November 2026 audit caught them multiplying carelessly (#2480):
+
+```rust
+} else if let Some(mins) = s.strip_suffix('m') {
+    mins.parse::<u64>()
+        .ok()
+        .and_then(|m| m.checked_mul(60))
+        .map(Duration::from_secs)
+```
+
+The first version said `m * 60`. Rust checks integer overflow in debug and test builds and panics; a release build (unless `overflow-checks` is on in the profile, and ours isn't) wraps around like C. So `"307445734561825861m"` panicked in a test and became 44 seconds in production, a value that then passed validation. `checked_mul` returns `Option<u64>`, `None` on overflow, and `and_then` threads that `None` through, so an unrepresentable duration is refused like any other bad string. When you want the arithmetic to fail rather than clamp, `checked_*` is the family to reach for; `saturating_*` (below) is for when the limit is a fine answer.
+
 ## The rolling sequence
 
 Each instance replacement follows five sub-steps:
@@ -307,6 +319,8 @@ The five sub-steps are spread over three functions. `start_replacement` starts t
 The CLI is a thin client over the agent's HTTP API. On a single node, `relish deploy` streams the agent's progress lines to your terminal as the rollout goes ("starting new instance", "healthy ✓", "stopping old instance") and ends with a one-line summary, `deploy started: N instance(s): …`. On a cluster it can't: the API returns as soon as the council has recorded the spec, and each node rolls its share later, so you get one line and watch the rest with `relish status`. `relish history <app>` prints the sliding window of past deploys. And `relish lint` validates an app's config, including the deploy section, before you ship it.
 
 That last claim used to be half true. `strategy` was a free string, and anything but `"blue-green"` meant rolling, so `"bluegreen"` rolled without a word. A `drain_timeout` of `"1m30s"` or `"500ms"` failed to parse and quietly became the 30-second default. Neither reached `relish lint`. Now `strategy` deserialises into the `DeployStrategy` enum, with `#[serde(rename_all = "kebab-case")]` mapping `BlueGreen` to `"blue-green"`, so an unknown value fails to parse at all; and `DeployConfig::parse` refuses a duration that doesn't parse, the same "refuse, don't clamp" rule `[autoscale]` follows. `unknown_deploy_strategy_is_rejected` and `unparseable_drain_timeout_is_rejected` pin both.
+
+A duration that parses can still be absurd. The deploy worker turns `health_timeout` into a deadline with `Instant::now() + wait`, and `impl Add<Duration> for Instant` panics when the sum doesn't fit, which a value like `"9223372036854775807s"` guarantees. The panic killed that app's deploy worker part-way through a rollout, with the replacement running beside the old instances and no rollback (#2378). `DeployConfig::parse` now caps both timeouts, at a day for `health_timeout` (the same bound as `[health] initial_delay`) and an hour for `drain_timeout` (the same as `stop_grace`), and names the cap when it refuses one. `an_over_long_deploy_timeout_is_refused` pins it. The general lesson for C and Go readers: `Instant + Duration` is checked arithmetic that panics; `Instant::checked_add` is the form that hands you an `Option` instead.
 
 `relish rollback <app>` deserves its own paragraph, because for a long time it was a lie. The command read the last successful entry from history and *printed* the image name, followed by "(use `relish apply` with the previous config to rollback)". It rolled nothing back; it told you to. Worse, it couldn't have worked even if it tried: the deploy history stored the image string but not the *spec*, so there was nothing to re-apply. And the fresh-deploy path — the very first deploy of an app — recorded no history at all, so a two-deploy app only had one entry.
 
@@ -1198,6 +1212,26 @@ let mut quotas = crate::meat::quota::ledger_from_namespaces(&desired.namespaces)
 ```
 
 Declare a namespace with `cpu = "2000m"`, apply an app that wants three replicas at 800 millicores each, and the scheduler does the arithmetic — 2,400 > 2,000 — and refuses the placement with a clear reason in the log, instead of over-committing the budget you set. A namespace with headroom admits the same app without complaint. The enforcement was built and proven long ago; all this theme did was hand it the numbers.
+
+The arithmetic needs the right "already used", though, and for a long time it
+had the wrong one. The pass charged the ledger with every *converged* app's
+footprint and then admitted each unconverged app for all of its replicas. Say
+`prod` has 4,000 millicores, app `a` runs three 1,000m replicas, and you scale
+it to five. `a` isn't converged any more, so it wasn't charged; the quota
+refused its five (0 + 5,000 > 4,000), and its three running replicas vanished
+from the books. A new app `b` with two replicas then fitted into a ledger that
+said 0, and `prod` ran 5,000m against its 4,000m
+([#2462](https://github.com/reliaburger/reliaburger/issues/2462)). Losing a
+node did the same to `max_apps`: re-placed apps weren't counted as apps.
+
+Now the ledger is charged with every app's committed placements first, at the
+footprint each was committed with, converged or not, because that's what runs.
+Then an app is admitted only for what it adds: the resources it wants over
+what it was committed with, and the replicas over the ones it has. A scale-up
+of `a` from three to five asks for 2,000m on top of 3,000m, and a replacement
+for a replica lost with its node adds nothing, so it's never refused, even in
+a namespace whose quota was cut below what it already runs. The quota still
+never stops something that's running; it only stops growth.
 
 ## A deploy owns what it starts
 

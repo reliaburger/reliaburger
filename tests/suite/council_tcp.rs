@@ -133,8 +133,12 @@ async fn make_node_tls(
     let raft = council.raft().clone();
     let contact = council.leader_contact();
     let sd = shutdown.clone();
+    // A fresh node expects the council that will add it: node 1, which
+    // every test here grows from (#2397).
+    let admission = reliaburger::council::admission::RaftAdmission::without_vouching()
+        .expecting(expecting(&[(1, "n1")]));
     tokio::spawn(async move {
-        reliaburger::council::network::serve_raft_rpc_with_node_gate(
+        reliaburger::council::network::serve_raft_rpc_with_admission(
             listener,
             raft,
             contact,
@@ -144,10 +148,30 @@ async fn make_node_tls(
             reliaburger::smoker::node_fault::NodeTransportGate::new(),
             None,
             reliaburger::council::network::RaftBlocklist::default(),
+            admission,
         )
         .await;
     });
     (council, bound)
+}
+
+/// An expected council naming `voters` (Raft id and node name). The
+/// addresses are placeholders: nothing here dials them.
+fn expecting(voters: &[(u64, &str)]) -> reliaburger::council::admission::ExpectedCouncil {
+    reliaburger::council::admission::ExpectedCouncil::new(
+        voters
+            .iter()
+            .map(|(id, name)| {
+                (
+                    *id,
+                    CouncilNodeInfo {
+                        addr: addr(1),
+                        name: (*name).to_string(),
+                    },
+                )
+            })
+            .collect(),
+    )
 }
 
 async fn make_node(id: u64, shutdown: &CancellationToken) -> Node {
@@ -515,8 +539,12 @@ async fn raft_rpc_closes_an_open_connection_once_its_peer_is_revoked() {
     let contact = council.leader_contact();
     let serving = shutdown.clone();
     let serving_crl = crl.clone();
+    // The fresh server expects the council `{2}`, so n2's vote is served
+    // until n2 is revoked (#2397).
+    let admission = reliaburger::council::admission::RaftAdmission::without_vouching()
+        .expecting(expecting(&[(2, "n2")]));
     tokio::spawn(async move {
-        reliaburger::council::network::serve_raft_rpc_with_node_gate(
+        reliaburger::council::network::serve_raft_rpc_with_admission(
             listener,
             raft,
             contact,
@@ -526,6 +554,7 @@ async fn raft_rpc_closes_an_open_connection_once_its_peer_is_revoked() {
             reliaburger::smoker::node_fault::NodeTransportGate::new(),
             Some(serving_crl),
             reliaburger::council::network::RaftBlocklist::default(),
+            admission,
         )
         .await;
     });
@@ -709,6 +738,18 @@ async fn council_node_over_mtls(
     fence: RecoveryFence,
     shutdown: &CancellationToken,
 ) -> (CouncilNode, SocketAddr) {
+    council_node_over_mtls_expecting(tls, members, &[], fence, shutdown).await
+}
+
+/// [`council_node_over_mtls`], expecting the council `expected` while it
+/// has none of its own.
+async fn council_node_over_mtls_expecting(
+    tls: &TlsSetup,
+    members: &[(u64, &str)],
+    expected: &[(u64, &str)],
+    fence: RecoveryFence,
+    shutdown: &CancellationToken,
+) -> (CouncilNode, SocketAddr) {
     let identity = tls.identity("n1", 10);
     let acceptor = tokio_rustls::TlsAcceptor::from(
         reliaburger::sesame::mtls::build_mtls_server_config(&identity, CrlHandle::default())
@@ -739,8 +780,10 @@ async fn council_node_over_mtls(
     let raft = council.raft().clone();
     let contact = council.leader_contact();
     let serving = shutdown.clone();
+    let admission = reliaburger::council::admission::RaftAdmission::without_vouching()
+        .expecting(expecting(expected));
     tokio::spawn(async move {
-        reliaburger::council::network::serve_raft_rpc_with_node_gate(
+        reliaburger::council::network::serve_raft_rpc_with_admission(
             listener,
             raft,
             contact,
@@ -750,6 +793,7 @@ async fn council_node_over_mtls(
             reliaburger::smoker::node_fault::NodeTransportGate::new(),
             None,
             reliaburger::council::network::RaftBlocklist::default(),
+            admission,
         )
         .await;
     });
@@ -906,9 +950,11 @@ async fn an_older_epoch_from_outside_the_council_is_told_the_newer_one() {
     shutdown.cancel();
 }
 
-/// A fresh node has no council to check against: the first leader to
-/// replicate to it is how it joins. It still serves any node certificate,
-/// and adopts the epoch of the council that reaches it.
+/// A fresh node has no council of its own: the first leader to replicate to
+/// it is how it joins. It serves that leader when it is a voter of the
+/// council it expects (the one the join bundle named), and adopts that
+/// council's epoch. The same RPC with another node's certificate is refused
+/// (#2397).
 #[tokio::test]
 async fn a_fresh_node_serves_the_council_that_adds_it() {
     let shutdown = CancellationToken::new();
@@ -921,7 +967,18 @@ async fn a_fresh_node_serves_the_council_that_adds_it() {
         },
         None,
     );
-    let (_council, bound) = council_node_over_mtls(&tls, &[], fence.clone(), &shutdown).await;
+    let (_council, bound) =
+        council_node_over_mtls_expecting(&tls, &[], &[(5, "n5")], fence.clone(), &shutdown).await;
+
+    let impostor = tls.identity("n9", 19);
+    let mut stream = connect_as(&impostor, bound).await;
+    assert!(
+        ask(&mut stream, &rpc_frame(2, append_from(5)))
+            .await
+            .is_none(),
+        "a certificate must not speak for the expected leader"
+    );
+    assert_eq!(fence.snapshot().claimed_epoch(), None);
 
     let leader = tls.identity("n5", 15);
     let mut stream = connect_as(&leader, bound).await;
@@ -933,6 +990,41 @@ async fn a_fresh_node_serves_the_council_that_adds_it() {
         "{answer}"
     );
     assert_eq!(fence.snapshot().claimed_epoch(), Some(2));
+
+    shutdown.cancel();
+}
+
+/// A node with no council takes replication only from a voter of the
+/// council it expects. `n9` holds a valid node certificate and names itself
+/// leader, but nobody vouches for it: none of its RPCs is answered, and its
+/// epoch is never adopted (#2397).
+#[tokio::test]
+async fn a_node_with_no_council_refuses_a_leader_nobody_vouches_for() {
+    let shutdown = CancellationToken::new();
+    let tls = TlsSetup::new();
+    let fence = RecoveryFence::new(
+        reliaburger::council::fence::FenceSnapshot {
+            epoch: 0,
+            recovery_id: None,
+            state: reliaburger::council::fence::FenceState::Unclaimed,
+        },
+        None,
+    );
+    let (_council, bound) = council_node_over_mtls(&tls, &[], fence.clone(), &shutdown).await;
+
+    let outsider = tls.identity("n9", 19);
+    for (kind, rpc) in [
+        ("append", append_from(9)),
+        ("snapshot", snapshot_from(9)),
+        ("vote", vote_from(9)),
+    ] {
+        let mut stream = connect_as(&outsider, bound).await;
+        assert!(
+            ask(&mut stream, &rpc_frame(2, rpc)).await.is_none(),
+            "a {kind} from a leader nobody vouches for must not be served"
+        );
+    }
+    assert_eq!(fence.snapshot().claimed_epoch(), None);
 
     shutdown.cancel();
 }
@@ -1036,6 +1128,20 @@ async fn serve_with_vouching(
     identity: &NodeIdentity,
     shutdown: &CancellationToken,
 ) -> SocketAddr {
+    serve_with_vouching_expecting(council, id, identity, BTreeMap::new(), shutdown)
+        .await
+        .0
+}
+
+/// [`serve_with_vouching`], expecting the council `expected` while the node
+/// has none of its own. Returns the check too, so a test can refresh it.
+async fn serve_with_vouching_expecting(
+    council: &CouncilNode,
+    id: u64,
+    identity: &NodeIdentity,
+    expected: BTreeMap<u64, CouncilNodeInfo>,
+    shutdown: &CancellationToken,
+) -> (SocketAddr, reliaburger::council::admission::RaftAdmission) {
     let acceptor = tokio_rustls::TlsAcceptor::from(
         reliaburger::sesame::mtls::build_mtls_server_config(identity, CrlHandle::default())
             .unwrap(),
@@ -1046,7 +1152,11 @@ async fn serve_with_vouching(
     );
     let admission = reliaburger::council::admission::RaftAdmission::new(
         TcpRaftNetworkFactory::new_tls(id, connector),
-    );
+    )
+    .expecting(reliaburger::council::admission::ExpectedCouncil::new(
+        expected,
+    ));
+    let check = admission.clone();
     let listener = tokio::net::TcpListener::bind(addr(0)).await.unwrap();
     let bound = listener.local_addr().unwrap();
     let raft = council.raft().clone();
@@ -1067,7 +1177,7 @@ async fn serve_with_vouching(
         )
         .await;
     });
-    bound
+    (bound, check)
 }
 
 /// Send `frame` on a fresh connection as `identity` until it is answered or
@@ -1143,6 +1253,124 @@ async fn a_member_whose_view_is_behind_admits_a_leader_its_voters_name() {
         "a vouched node's id doesn't admit another node's certificate"
     );
 
+    shutdown.cancel();
+}
+
+/// A node with no council expects the council it joined (voter 1). A
+/// leader that came later (node 3) is a stranger to it until voter 1 names
+/// it; then it is served. A node nobody names stays refused, and a refresh
+/// of the expected council picks up what voter 1 names now (#2397).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_with_no_council_serves_a_leader_its_expected_voters_name() {
+    let shutdown = CancellationToken::new();
+    let tls = TlsSetup::new();
+
+    let voucher = lone_council(1).await;
+    let voucher_address =
+        serve_with_vouching(&voucher, 1, &tls.identity("n1", 10), &shutdown).await;
+    voucher
+        .initialize(BTreeMap::from([
+            (1, info_at(1, voucher_address)),
+            (3, info_at(3, addr(1))),
+        ]))
+        .await
+        .unwrap();
+
+    let seatless = lone_council(2).await;
+    let (seatless_address, check) = serve_with_vouching_expecting(
+        &seatless,
+        2,
+        &tls.identity("n2", 11),
+        BTreeMap::from([(1, info_at(1, voucher_address))]),
+        &shutdown,
+    )
+    .await;
+
+    let leader = tls.identity("n3", 12);
+    let mut stream = connect_as(&leader, seatless_address).await;
+    assert!(
+        ask(&mut stream, &rpc_frame(0, append_from(3)))
+            .await
+            .is_none(),
+        "a leader the expected council doesn't name isn't served before a voter names it"
+    );
+    assert!(
+        answered_within(&leader, seatless_address, &rpc_frame(0, append_from(3)), 50).await,
+        "the leader voter 1 names must be served"
+    );
+    let outsider = tls.identity("n9", 19);
+    assert!(
+        !answered_within(
+            &outsider,
+            seatless_address,
+            &rpc_frame(0, append_from(9)),
+            20
+        )
+        .await,
+        "a node no voter names must stay refused"
+    );
+
+    // A heartbeat carries no membership, so the node still has no council
+    // of its own: a refresh asks voter 1, and expects what it names now.
+    check
+        .refresh_expected_council(seatless.raft())
+        .await
+        .unwrap();
+    let names: BTreeSet<String> = check
+        .expected_council()
+        .roster()
+        .await
+        .into_values()
+        .map(|voter| voter.name)
+        .collect();
+    assert_eq!(names, BTreeSet::from(["n1".to_string(), "n3".to_string()]));
+
+    shutdown.cancel();
+}
+
+/// Over the real transport: a node whose council is `{5, 2}` asks voter 2
+/// which epoch it serves when gossip claims a newer one (#2406). A voter
+/// still on the node's epoch leaves it serving; one serving a newer epoch
+/// refuses the question, names that epoch, and the node fences itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn asking_the_voters_fences_a_node_only_when_one_serves_a_newer_epoch() {
+    let shutdown = CancellationToken::new();
+    let tls = TlsSetup::new();
+    for (voter_epoch, fenced_by) in [(0, None), (1, Some(1))] {
+        // The voter's own council is `{1}`; the asker knows it as voter 2.
+        // The asker's dial isn't bound to a node id here.
+        let (_voter, voter_address) = council_node_over_mtls(
+            &tls,
+            &[(1, "n1")],
+            RecoveryFence::serving(voter_epoch),
+            &shutdown,
+        )
+        .await;
+        let asker = lone_council(5).await;
+        asker
+            .initialize(BTreeMap::from([
+                (5, info_at(5, addr(1))),
+                (2, info_at(2, voter_address)),
+            ]))
+            .await
+            .unwrap();
+        let fence = RecoveryFence::serving(0);
+        let identity = tls.identity("n5", 15);
+        let connector = tokio_rustls::TlsConnector::from(
+            reliaburger::sesame::mtls::build_mtls_client_config(&identity, CrlHandle::default())
+                .unwrap(),
+        );
+        let admission = reliaburger::council::admission::RaftAdmission::new(
+            TcpRaftNetworkFactory::new_tls(5, connector).with_fence(fence.clone()),
+        );
+        admission.ask_voters_for_their_epoch(asker.raft()).await;
+        assert_eq!(
+            fence.snapshot().fenced_by(),
+            fenced_by,
+            "voter on epoch {voter_epoch}"
+        );
+        asker.shutdown().await.ok();
+    }
     shutdown.cancel();
 }
 
@@ -1251,7 +1479,9 @@ async fn start_vouching_node(
     );
     let factory = TcpRaftNetworkFactory::new_tls(id, connector);
     let blocklist = factory.blocklist();
-    let admission = reliaburger::council::admission::RaftAdmission::new(factory.clone());
+    // Every node here starts fresh and is added by node 1 (#2397).
+    let admission = reliaburger::council::admission::RaftAdmission::new(factory.clone())
+        .expecting(expecting(&[(1, "n1")]));
     let council = Arc::new(
         CouncilNode::new(id, CouncilConfig::default(), factory, log, state, None)
             .await

@@ -25,6 +25,7 @@ pub mod store;
 pub mod types;
 pub mod version;
 
+pub use compatibility::CompatibilityAnswer;
 pub use error::UpgradeError;
 pub use version::{BinaryVersion, resolve_running_version};
 

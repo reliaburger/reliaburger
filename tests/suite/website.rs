@@ -924,6 +924,50 @@ fn the_site_and_docs_announce_the_version_the_installer_installs() {
     }
 }
 
+/// A comparison page may say it describes the release the public installer
+/// installs only while that's true. They were written against 0.2.2 and
+/// still said so when the installer had moved six releases on (#2496).
+#[test]
+fn comparison_pages_only_claim_the_installed_release_when_they_describe_it() {
+    let default = installer_default();
+    let installed = versions_named(default.trim_start_matches('v'));
+    let directory = repository().join("docs/website/compare");
+    let mut pages: Vec<PathBuf> = std::fs::read_dir(&directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "html")
+        })
+        .collect();
+    pages.sort();
+    assert!(!pages.is_empty(), "no comparison pages found");
+    let mut wrong = Vec::new();
+    for page in pages {
+        let text = decode(&strip_tags(&std::fs::read_to_string(&page).unwrap()));
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        // A full stop ends a sentence only before a space: "0.2.2" stays whole.
+        for sentence in text.split(". ") {
+            if !(sentence.contains("installer installs") || sentence.contains("installs released"))
+            {
+                continue;
+            }
+            let named = versions_named(sentence);
+            if named.is_empty() || named.iter().any(|version| installed[..] != [*version]) {
+                wrong.push(format!(
+                    "{}: {sentence:?}",
+                    page.file_name().unwrap().to_string_lossy()
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "these sentences say the installer ({default}) installs another release:\n{}",
+        wrong.join("\n")
+    );
+}
+
 /// Every command snippet gets a copy button from the page's script, so
 /// without JavaScript there's no dead button, just selectable text (#280).
 #[test]

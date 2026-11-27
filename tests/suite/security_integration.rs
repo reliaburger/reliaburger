@@ -324,7 +324,16 @@ async fn spawn_issuer(
         })();
 
         match issued {
-            Ok(result) => Json(join::JoinBundle::from_result(&result)).into_response(),
+            Ok(result) => Json(join::JoinBundle::from_result(&result).with_council(
+                std::collections::BTreeMap::from([(
+                    7,
+                    reliaburger::council::types::CouncilNodeInfo {
+                        addr: "10.0.0.7:9118".parse().unwrap(),
+                        name: "node-01".into(),
+                    },
+                )]),
+            ))
+            .into_response(),
             Err(e) => (
                 axum::http::StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "error": e.to_string() })),
@@ -368,9 +377,15 @@ async fn joiner_persists_the_identity_returned_by_a_remote_member() {
     let (url, server) = spawn_issuer(state, ikm).await;
 
     let client = reqwest::Client::new();
-    let identity = join::request_join(&client, &url, &token, "node-02", None)
+    let enrolment = join::request_join(&client, &url, &token, "node-02", None)
         .await
         .expect("join should succeed");
+    // The bundle names the council the node should expect (#2397).
+    assert_eq!(
+        enrolment.council.get(&7).map(|voter| voter.name.as_str()),
+        Some("node-01")
+    );
+    let identity = enrolment.identity;
     assert_eq!(identity.node_id, "node-02");
 
     // Persist and reload, proving the round trip lands on disk usable.
@@ -401,7 +416,8 @@ async fn joiner_checks_compatibility_while_the_members_binary_hash_is_still_runn
     )
     .await
     .expect("the join waited on the member's /v1/version")
-    .expect("join should succeed");
+    .expect("join should succeed")
+    .identity;
     assert_eq!(identity.node_id, "node-02");
 
     server.abort();
@@ -731,4 +747,109 @@ async fn audit_log_lists_a_token_creation_after_a_bun_restart() {
         Some("operator")
     );
     council.shutdown().await.unwrap();
+}
+
+/// A node with no Raft seat fetches its security state (API tokens, CRL,
+/// trust set) from whichever node gossip names as leader (#1477). Gossip is
+/// authenticated only by a key every node holds, so that name proves
+/// nothing (#2406): the node must take a view only from a voter of the
+/// council it knows, over TLS bound to that voter's node id, and must not
+/// even connect (and send its service token) anywhere else.
+#[tokio::test]
+async fn a_seatless_node_takes_no_security_view_from_a_node_that_is_not_a_voter() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let hierarchy = ca::generate_ca_hierarchy("security-view-test", b"ikm").unwrap();
+    let identity = |node_id: &str, serial: u64| {
+        let (cert_der, key_der, serial) = ca::issue_node_cert(
+            node_id,
+            SerialNumber(serial),
+            &hierarchy.node.signing_keypair,
+            &hierarchy.node.certificate_params,
+        )
+        .unwrap();
+        let now = SystemTime::now();
+        reliaburger::sesame::identity_store::NodeIdentity {
+            node_id: node_id.to_string(),
+            certificate_der: cert_der,
+            private_key_der: key_der,
+            serial,
+            ca_generation: 0,
+            trust: reliaburger::sesame::trust::TrustSet::single(
+                hierarchy.node.ca.certificate_der.clone(),
+                hierarchy.root.ca.certificate_der.clone(),
+            ),
+            node_ca_der: hierarchy.node.ca.certificate_der.clone(),
+            root_ca_der: hierarchy.root.ca.certificate_der.clone(),
+            not_before: now,
+            not_after: now + Duration::from_secs(365 * 24 * 3600),
+        }
+    };
+
+    // `n9` holds a valid node certificate and answers on its API port.
+    let impostor = identity("n9", 19);
+    let acceptor = tokio_rustls::TlsAcceptor::from(
+        reliaburger::sesame::mtls::build_mtls_server_config(
+            &impostor,
+            reliaburger::sesame::mtls::CrlHandle::default(),
+        )
+        .unwrap(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&connections);
+    let server = tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let _ = acceptor.accept(tcp).await;
+        }
+    });
+
+    // The seatless node `n5` expects the council `{1: n1}`.
+    let directory = tempfile::tempdir().unwrap();
+    reliaburger::sesame::identity_store::save(directory.path(), &identity("n5", 15)).unwrap();
+    let live = reliaburger::sesame::credentials::LiveNodeIdentity::load(directory.path()).unwrap();
+    let council = reliaburger::council::CouncilNode::new(
+        5,
+        reliaburger::council::types::CouncilConfig::default(),
+        reliaburger::council::network::TcpRaftNetworkFactory::new(5),
+        reliaburger::council::log_store::MemLogStore::new(),
+        reliaburger::council::state_machine::CouncilStateMachine::new(),
+        None,
+    )
+    .await
+    .unwrap();
+    let expected =
+        reliaburger::council::admission::ExpectedCouncil::new(std::collections::BTreeMap::from([
+            (
+                1,
+                reliaburger::council::types::CouncilNodeInfo {
+                    addr: "127.0.0.1:1".parse().unwrap(),
+                    name: "n1".into(),
+                },
+            ),
+        ]));
+    let client = reliaburger::sesame::security_view::SecurityViewClient::new(
+        &live,
+        reliaburger::sesame::mtls::CrlHandle::default(),
+        "service-token",
+        expected,
+    )
+    .unwrap();
+
+    // Gossip names `n9` as leader: it isn't a voter, so nothing is sent.
+    let refused = client.fetch(&council, "n9", address).await.unwrap_err();
+    assert!(refused.contains("not a council voter"), "{refused}");
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        0,
+        "the service token went to a node that is not a voter"
+    );
+    // Gossip names voter `n1` but gives n9's address: the TLS connection is
+    // bound to n1, so n9's certificate is refused.
+    assert!(client.fetch(&council, "n1", address).await.is_err());
+    council.shutdown().await.ok();
+    server.abort();
 }

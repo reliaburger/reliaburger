@@ -59,10 +59,13 @@ pub struct NodeRetirement {
     pub released_endpoint_consumer: bool,
 }
 
-/// Accept bounded, printable identities without interpreting them as URL paths.
+/// Accept only identities a node could have started with: one DNS label,
+/// the rule `[node] name` follows (#2394).
 pub fn validate_node_id(node_id: &str) -> Result<(), &'static str> {
-    if node_id.is_empty() || node_id.len() > 256 || node_id.chars().any(char::is_control) {
-        return Err("node identity must contain 1 to 256 printable bytes");
+    if !crate::config::node::is_valid_node_name(node_id) {
+        return Err(
+            "node identity must be one DNS label: 1 to 63 lowercase letters, digits and '-'",
+        );
     }
     Ok(())
 }
@@ -98,6 +101,10 @@ mod tests {
             },
             DecommissionRequest {
                 node_id: "worker\nother".into(),
+                ..good.clone()
+            },
+            DecommissionRequest {
+                node_id: "a".repeat(64),
                 ..good.clone()
             },
         ] {

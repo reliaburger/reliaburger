@@ -87,48 +87,60 @@ pub fn check_quota(
     new_replicas: u32,
     is_new_app: bool,
 ) -> Result<(), QuotaError> {
-    // Saturating arithmetic throughout: a spec asking for an absurd
-    // per-replica resource times a large replica count must reject
-    // cleanly, never wrap (DEP9). A saturated total still exceeds any
-    // real limit, so the check stays correct.
+    check_totals(
+        quota,
+        usage,
+        &requested.saturating_mul(new_replicas),
+        new_replicas,
+        is_new_app,
+    )
+}
+
+/// Check whether adding `requested` in total, as `new_replicas` more
+/// replicas, would exceed the namespace quota. Totals saturate rather than
+/// wrap (DEP9): a saturated total still exceeds any real limit. Adding nothing of a resource
+/// never exceeds its limit, even in a namespace already over it: an app
+/// that keeps or shrinks what it runs is never refused (#2462).
+fn check_totals(
+    quota: &NamespaceQuota,
+    usage: &NamespaceUsage,
+    requested: &Resources,
+    new_replicas: u32,
+    is_new_app: bool,
+) -> Result<(), QuotaError> {
     if let Some(limit) = quota.max_cpu_millicores {
-        let requested_total = requested
+        let total = usage
             .cpu_millicores
-            .saturating_mul(u64::from(new_replicas));
-        let total = usage.cpu_millicores.saturating_add(requested_total);
-        if total > limit {
+            .saturating_add(requested.cpu_millicores);
+        if requested.cpu_millicores > 0 && total > limit {
             return Err(QuotaError::CpuExceeded {
                 namespace: quota.namespace.clone(),
                 current: usage.cpu_millicores,
-                requested: requested_total,
+                requested: requested.cpu_millicores,
                 limit,
             });
         }
     }
 
     if let Some(limit) = quota.max_memory_bytes {
-        let requested_total = requested
-            .memory_bytes
-            .saturating_mul(u64::from(new_replicas));
-        let total = usage.memory_bytes.saturating_add(requested_total);
-        if total > limit {
+        let total = usage.memory_bytes.saturating_add(requested.memory_bytes);
+        if requested.memory_bytes > 0 && total > limit {
             return Err(QuotaError::MemoryExceeded {
                 namespace: quota.namespace.clone(),
                 current: usage.memory_bytes,
-                requested: requested_total,
+                requested: requested.memory_bytes,
                 limit,
             });
         }
     }
 
     if let Some(limit) = quota.max_gpus {
-        let requested_total = requested.gpus.saturating_mul(new_replicas);
-        let total = usage.gpus.saturating_add(requested_total);
-        if total > limit {
+        let total = usage.gpus.saturating_add(requested.gpus);
+        if requested.gpus > 0 && total > limit {
             return Err(QuotaError::GpuExceeded {
                 namespace: quota.namespace.clone(),
                 current: usage.gpus,
-                requested: requested_total,
+                requested: requested.gpus,
                 limit,
             });
         }
@@ -147,7 +159,7 @@ pub fn check_quota(
 
     if let Some(limit) = quota.max_replicas {
         let total = usage.replica_count.saturating_add(new_replicas);
-        if total > limit {
+        if new_replicas > 0 && total > limit {
             return Err(QuotaError::MaxReplicasExceeded {
                 namespace: quota.namespace.clone(),
                 current: usage.replica_count,
@@ -249,18 +261,45 @@ impl QuotaLedger {
         Ok(())
     }
 
-    /// Record an already-committed app's footprint without an admission
-    /// check, so the ledger reflects real namespace usage before any new app
-    /// is admitted.
+    /// Record one app's committed placements, `footprints` being the
+    /// resources each was committed with, without an admission check. The
+    /// app counts once, each placement as a replica.
     ///
-    /// The leader's scheduling pass skips apps that are already converged, so
-    /// they never reach [`Self::try_admit`]; seeding them here first is what stops a
-    /// namespace's budget being bypassed once its apps converge (a later new
-    /// app would otherwise be checked against a clean slate). Already-running
-    /// apps are never rejected — hence no check.
-    pub fn charge_committed(&mut self, namespace: &str, per_replica: &Resources, replicas: u32) {
+    /// The leader charges every app's committed placements before admitting
+    /// anything, converged or not, because they run whatever this pass
+    /// decides (#2462). Charging only converged apps let a scale-up the
+    /// quota refused, or an app that lost a node, vanish from the ledger, and
+    /// the next app was admitted into the room its running replicas use.
+    /// Already-running replicas are never rejected, hence no check.
+    pub fn charge_committed_placements<'a>(
+        &mut self,
+        namespace: &str,
+        footprints: impl IntoIterator<Item = &'a Resources>,
+    ) {
         let entry = self.usage.entry(namespace.to_string()).or_default();
-        accumulate(entry, per_replica, replicas, true);
+        for footprint in footprints {
+            accumulate(entry, footprint, 1, false);
+        }
+        entry.app_count = entry.app_count.saturating_add(1);
+    }
+
+    /// Admit what an app adds to its committed footprint: `growth` in total
+    /// resources and `new_replicas` more replicas, plus one app when
+    /// `is_new_app`. Records the growth on admission; returns the quota
+    /// error without recording anything on rejection.
+    pub fn try_admit_growth(
+        &mut self,
+        namespace: &str,
+        growth: &Resources,
+        new_replicas: u32,
+        is_new_app: bool,
+    ) -> Result<(), QuotaError> {
+        let entry = self.usage.entry(namespace.to_string()).or_default();
+        if let Some(quota) = self.quotas.get(namespace) {
+            check_totals(quota, entry, growth, new_replicas, is_new_app)?;
+        }
+        add_usage(entry, growth, new_replicas, is_new_app);
+        Ok(())
     }
 
     /// Record `tasks` job attempts already in flight, each reserving
@@ -377,17 +416,20 @@ pub fn same_limit(a: &QuotaError, b: &QuotaError) -> bool {
 
 /// Add `replicas` of `per_replica` (and, when `count_app`, one app) to `entry`.
 fn accumulate(entry: &mut NamespaceUsage, per_replica: &Resources, replicas: u32, count_app: bool) {
-    entry.cpu_millicores = entry.cpu_millicores.saturating_add(
-        per_replica
-            .cpu_millicores
-            .saturating_mul(u64::from(replicas)),
+    add_usage(
+        entry,
+        &per_replica.saturating_mul(replicas),
+        replicas,
+        count_app,
     );
-    entry.memory_bytes = entry
-        .memory_bytes
-        .saturating_add(per_replica.memory_bytes.saturating_mul(u64::from(replicas)));
-    entry.gpus = entry
-        .gpus
-        .saturating_add(per_replica.gpus.saturating_mul(replicas));
+}
+
+/// Add `total` resources, `replicas` replicas and, when `count_app`, one app
+/// to `entry`.
+fn add_usage(entry: &mut NamespaceUsage, total: &Resources, replicas: u32, count_app: bool) {
+    entry.cpu_millicores = entry.cpu_millicores.saturating_add(total.cpu_millicores);
+    entry.memory_bytes = entry.memory_bytes.saturating_add(total.memory_bytes);
+    entry.gpus = entry.gpus.saturating_add(total.gpus);
     entry.replica_count = entry.replica_count.saturating_add(replicas);
     if count_app {
         entry.app_count = entry.app_count.saturating_add(1);

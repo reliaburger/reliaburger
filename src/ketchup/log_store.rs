@@ -49,6 +49,46 @@ pub const MAX_LOG_SQL_ROWS: usize = 10_000;
 /// than exhausting the agent's memory.
 pub const LOG_SQL_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 
+/// Lines a log query returns when the caller names no tail (#2382): the
+/// newest ones, so `relish logs web` shows what's happening now instead of
+/// sorting the app's whole history.
+pub const DEFAULT_LOG_QUERY_ROWS: usize = 10_000;
+
+/// The most lines one log query returns, however large a tail it asks for
+/// (#2382).
+pub const MAX_LOG_QUERY_ROWS: usize = 100_000;
+
+/// How long one log query may run before it is refused (#2382). Under the
+/// cross-node fan-out's ten-second wait, so a node answers "narrow the
+/// query" before the caller gives up on it.
+pub const LOG_QUERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// The lines a query with `tail` returns at most: the tail, or
+/// [`DEFAULT_LOG_QUERY_ROWS`] without one, never above
+/// [`MAX_LOG_QUERY_ROWS`].
+pub fn query_row_limit(tail: Option<usize>) -> usize {
+    tail.unwrap_or(DEFAULT_LOG_QUERY_ROWS)
+        .min(MAX_LOG_QUERY_ROWS)
+}
+
+/// Run `query`, refusing it if it takes longer than `deadline` (#2382).
+/// Dropping the query's future cancels it.
+async fn within_deadline<T>(
+    deadline: std::time::Duration,
+    query: impl std::future::Future<Output = Result<T, KetchupError>>,
+) -> Result<T, KetchupError> {
+    tokio::time::timeout(deadline, query)
+        .await
+        .unwrap_or_else(|_| {
+            Err(KetchupError::QueryRejected {
+                reason: format!(
+                    "the query ran past its {} s limit; narrow it with a time range, a grep or a tail",
+                    deadline.as_secs()
+                ),
+            })
+        })
+}
+
 /// Convert collected RecordBatches to JSON objects (one per row), mapping
 /// `UInt64`/`Utf8` columns to numbers/strings.
 fn batches_to_json(batches: &[RecordBatch]) -> Vec<serde_json::Value> {
@@ -723,7 +763,9 @@ impl DropMarker {
 /// unflushed buffer. Persisted logs survive restarts and in-memory use stays
 /// bounded to the buffer.
 pub struct LogStore {
-    buffer: Vec<BufferedLogEntry>,
+    /// Unflushed lines, oldest first. A ring buffer, so shedding the oldest
+    /// when full moves nothing (#2450).
+    buffer: std::collections::VecDeque<BufferedLogEntry>,
     pending: Option<LogPendingFlush>,
     data_dir: PathBuf,
     /// Seeded past any existing `logs_NNNNNN.parquet` so restarts don't clobber.
@@ -752,7 +794,7 @@ impl LogStore {
         let flush_counter = next_flush_counter(&data_dir, "logs");
         let ingested = IngestCheckpoint::load(&data_dir);
         Self {
-            buffer: Vec::new(),
+            buffer: std::collections::VecDeque::new(),
             pending: None,
             data_dir,
             flush_counter,
@@ -903,7 +945,7 @@ impl LogStore {
             line: line.to_string(),
         };
         self.buffer_bytes += entry.size();
-        self.buffer.push(entry);
+        self.buffer.push_back(entry);
         self.shed_overflow();
     }
 
@@ -922,18 +964,15 @@ impl LogStore {
             .map_or((0, 0), |pending| (pending.batch.num_rows(), pending.bytes));
         let row_limit = self.limits.max_rows.saturating_sub(pending_rows);
         let byte_limit = self.limits.max_bytes.saturating_sub(pending_bytes);
-        let mut rows = self.buffer.len();
-        let mut bytes = self.buffer_bytes;
         let mut overflow = 0;
-        while overflow < self.buffer.len() && (rows > row_limit || bytes > byte_limit) {
-            rows -= 1;
-            bytes -= self.buffer[overflow].size();
+        // `pop_front` on a `VecDeque` is O(1); the `Vec` this used to be
+        // moved every remaining line on each shed (#2450).
+        while self.buffer.len() > row_limit || self.buffer_bytes > byte_limit {
+            let Some(entry) = self.buffer.pop_front() else {
+                break;
+            };
             overflow += 1;
-        }
-        if overflow == 0 {
-            return;
-        }
-        for entry in self.buffer.drain(0..overflow) {
+            self.buffer_bytes -= entry.size();
             let owner = (entry.app, entry.namespace, entry.instance);
             // Lines arrive in sequence order, so the last one shed is where
             // the gap ends.
@@ -946,7 +985,6 @@ impl LogStore {
             marker.timestamp = entry.timestamp;
             marker.sequence = entry.sequence;
         }
-        self.buffer_bytes = bytes;
         self.dropped_lines += overflow as u64;
         self.dropped_unreported += overflow as u64;
     }
@@ -1113,13 +1151,8 @@ impl LogStore {
     }
 
     /// Build a DataFusion session exposing a `logs` table over the on-disk
-    /// Parquet directory unioned with the unflushed buffer.
-    async fn session(&self) -> Result<SessionContext, KetchupError> {
-        self.session_with_memory_limit(None).await
-    }
-
-    /// As [`session`](Self::session), optionally capping the query's working
-    /// memory. A limit makes a runaway aggregation or sort *error* instead of
+    /// Parquet directory unioned with the unflushed buffer, optionally
+    /// capping the query's working memory. A limit makes a runaway aggregation or sort *error* instead of
     /// exhausting the host (OBS5).
     async fn session_with_memory_limit(
         &self,
@@ -1127,10 +1160,15 @@ impl LogStore {
     ) -> Result<SessionContext, KetchupError> {
         // Read Parquet string columns as `Utf8`, not `Utf8View`, so on-disk
         // batches share the canonical `log_schema` with the in-memory buffer.
-        let config = SessionConfig::new().set_bool(
+        let mut config = SessionConfig::new().set_bool(
             "datafusion.execution.parquet.schema_force_view_types",
             false,
         );
+        if memory_limit_bytes.is_some() {
+            // One partition, as Mayo's streaming session uses: a bounded
+            // query shouldn't fan out over a thread per CPU (#2382).
+            config = config.with_target_partitions(1);
+        }
         let ctx = if let Some(limit) = memory_limit_bytes {
             let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
                 .with_memory_limit(limit, 1.0)
@@ -1210,6 +1248,78 @@ impl LogStore {
         Ok(ctx)
     }
 
+    /// What one query reads, captured now: the Parquet directory and a
+    /// copy of the unflushed lines, as a session limited to
+    /// [`LOG_SQL_MEMORY_LIMIT_BYTES`]. Take it in one statement, so the
+    /// store's read guard is dropped at the semicolon, then query it holding
+    /// nothing:
+    ///
+    /// ```ignore
+    /// let snapshot = log_store.read().await.snapshot().await?;
+    /// let entries = snapshot.query_with("web", "default", &filter).await?;
+    /// ```
+    ///
+    /// The log drain asks for the write lock once per line, and tokio's
+    /// `RwLock` is fair, so a query that held the guard stalled ingestion
+    /// and every read queued behind it (#2449).
+    pub async fn snapshot(&self) -> Result<LogSnapshot, KetchupError> {
+        Ok(LogSnapshot {
+            ctx: self
+                .session_with_memory_limit(Some(LOG_SQL_MEMORY_LIMIT_BYTES))
+                .await?,
+        })
+    }
+
+    /// See [`LogSnapshot::query_sql_json_bounded`].
+    pub async fn query_sql_json_bounded(
+        &self,
+        sql: &str,
+    ) -> Result<Vec<serde_json::Value>, KetchupError> {
+        self.snapshot().await?.query_sql_json_bounded(sql).await
+    }
+
+    /// See [`LogSnapshot::query_sql`].
+    pub async fn query_sql(&self, sql: &str) -> Result<Vec<LogEntry>, KetchupError> {
+        self.snapshot().await?.query_sql(sql).await
+    }
+
+    /// See [`LogSnapshot::query`].
+    pub async fn query(
+        &self,
+        app: &str,
+        namespace: &str,
+        start: Option<u64>,
+        end: Option<u64>,
+        grep: Option<&str>,
+        tail: Option<usize>,
+    ) -> Result<Vec<LogEntry>, KetchupError> {
+        self.snapshot()
+            .await?
+            .query(app, namespace, start, end, grep, tail)
+            .await
+    }
+
+    /// See [`LogSnapshot::query_with`].
+    pub async fn query_with(
+        &self,
+        app: &str,
+        namespace: &str,
+        filter: &LogFilter,
+    ) -> Result<Vec<LogEntry>, KetchupError> {
+        self.snapshot()
+            .await?
+            .query_with(app, namespace, filter)
+            .await
+    }
+}
+
+/// What [`LogStore::snapshot`] captured: the session one query runs on,
+/// independent of the store's lock.
+pub struct LogSnapshot {
+    ctx: SessionContext,
+}
+
+impl LogSnapshot {
     /// Query logs using SQL under safety bounds (OBS5).
     ///
     /// The public `/v1/logs/sql` endpoint used to hand `?q=` straight to
@@ -1227,9 +1337,7 @@ impl LogStore {
         &self,
         sql: &str,
     ) -> Result<Vec<serde_json::Value>, KetchupError> {
-        let ctx = self
-            .session_with_memory_limit(Some(LOG_SQL_MEMORY_LIMIT_BYTES))
-            .await?;
+        let ctx = &self.ctx;
 
         // Reject non-read statements up front, before planning, so an error
         // message names the problem clearly.
@@ -1250,14 +1358,15 @@ impl LogStore {
         // table to read other data. Cap the result set by wrapping the query
         // in an outer LIMIT, which bounds rows regardless of the inner query.
         let bounded = format!("SELECT * FROM ({trimmed}) AS bounded LIMIT {MAX_LOG_SQL_ROWS}");
-        let df = ctx
-            .sql(&bounded)
-            .await
-            .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
+        let batches = within_deadline(LOG_QUERY_DEADLINE, async {
+            ctx.sql(&bounded)
+                .await
+                .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?
+                .collect()
+                .await
+                .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))
+        })
+        .await?;
 
         Ok(batches_to_json(&batches))
     }
@@ -1266,18 +1375,20 @@ impl LogStore {
     ///
     /// The query must select at least `timestamp`, `stream` and `line`; see
     /// [`batches_to_entries`] for how the optional columns are read.
+    ///
+    /// The query runs under [`LOG_SQL_MEMORY_LIMIT_BYTES`] of working memory
+    /// and is refused after [`LOG_QUERY_DEADLINE`] (#2382).
     pub async fn query_sql(&self, sql: &str) -> Result<Vec<LogEntry>, KetchupError> {
-        let ctx = self.session().await?;
-        let df = ctx
-            .sql(sql)
-            .await
-            .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
-
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
-
+        let ctx = &self.ctx;
+        let batches = within_deadline(LOG_QUERY_DEADLINE, async {
+            ctx.sql(sql)
+                .await
+                .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?
+                .collect()
+                .await
+                .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))
+        })
+        .await?;
         batches_to_entries(&batches)
     }
 
@@ -1306,9 +1417,11 @@ impl LogStore {
     /// Query one app's logs through `filter`, oldest first.
     ///
     /// Rows come back in ingest order (`sequence`), which is emission order
-    /// per instance. With `tail`, only the newest `tail` matching rows come
-    /// back, still oldest first. `grep` is a regular expression; one that
-    /// doesn't compile is refused before any query runs.
+    /// per instance. Only the newest [`query_row_limit`] matching rows come
+    /// back, still oldest first: `tail` of them, or
+    /// [`DEFAULT_LOG_QUERY_ROWS`] without one (#2382). `grep` is a regular
+    /// expression; one that doesn't compile is refused before any query
+    /// runs.
     pub async fn query_with(
         &self,
         app: &str,
@@ -1347,20 +1460,20 @@ impl LogStore {
             "SELECT timestamp, app, namespace, stream, line, sequence, instance \
              FROM logs WHERE {where_clause}"
         );
-        // A tail takes the newest rows, then puts them back in order.
-        let sql = match filter.tail {
-            Some(tail) => format!(
-                "SELECT * FROM ({select} ORDER BY sequence DESC LIMIT {tail}) AS tailed \
-                 ORDER BY sequence"
-            ),
-            None => format!("{select} ORDER BY sequence"),
-        };
+        // Every query takes the newest rows, then puts them back in order:
+        // without a limit, one request sorted the app's whole history in
+        // memory (#2382).
+        let limit = query_row_limit(filter.tail);
+        let sql = format!(
+            "SELECT * FROM ({select} ORDER BY sequence DESC LIMIT {limit}) AS tailed \
+             ORDER BY sequence"
+        );
         self.query_sql(&sql).await
     }
 }
 
 /// What a log query keeps. Every field narrows the result; the default keeps
-/// everything.
+/// the newest [`DEFAULT_LOG_QUERY_ROWS`] lines.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LogFilter {
     /// Seconds since the epoch, inclusive.
@@ -1373,7 +1486,9 @@ pub struct LogFilter {
     pub instance: Option<String>,
     /// Only the lines written to this stream.
     pub stream: Option<LogStream>,
-    /// Only the newest N matching lines.
+    /// Only the newest N matching lines. Without it a query returns the
+    /// newest [`DEFAULT_LOG_QUERY_ROWS`]; above [`MAX_LOG_QUERY_ROWS`] it
+    /// is clamped.
     pub tail: Option<usize>,
 }
 
@@ -1818,7 +1933,7 @@ mod tests {
         }
         assert!(store.buffer_bytes <= 64 * 1024, "{}", store.buffer_bytes);
         assert!(store.buffer_len() < 100);
-        assert!(store.buffer.last().unwrap().line.starts_with("99 "));
+        assert!(store.buffer.back().unwrap().line.starts_with("99 "));
     }
 
     /// A burst that outruns flushing sheds the oldest buffered lines. They
@@ -1851,6 +1966,36 @@ mod tests {
             ]
         );
         assert_eq!(store.dropped_lines(), 3);
+    }
+
+    /// #2450: a full buffer shed its oldest line with `Vec::drain`, which
+    /// moved every other line down, under the write lock and once per
+    /// ingested line. Shedding now moves nothing, and keeps the newest.
+    #[tokio::test]
+    async fn shedding_from_a_full_log_buffer_moves_nothing_and_keeps_the_newest() {
+        let (mut store, _dir) = test_store();
+        store.limits = BufferLimits {
+            max_rows: 100,
+            max_bytes: usize::MAX,
+            flush_rows: usize::MAX,
+            flush_bytes: usize::MAX,
+        };
+        for n in 1..=250 {
+            store.append_at(n, "web", "default", LogStream::Stdout, &format!("{n}"));
+        }
+        assert_eq!(store.buffer_len(), 100);
+        store.flush().await.unwrap();
+        let entries = store
+            .query("web", "default", None, None, None, None)
+            .await
+            .unwrap();
+        let kept: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry.line.as_str())
+            .filter(|line| !line.contains("dropped"))
+            .collect();
+        let expected: Vec<String> = (151..=250).map(|n| n.to_string()).collect();
+        assert_eq!(kept, expected);
     }
 
     /// The first fix held a capture's checkpoint at the first shed line for
@@ -2457,6 +2602,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results.len(), 3);
+    }
+
+    /// #2382: a query with no tail used to sort and return every line the
+    /// app ever wrote. It now keeps the newest `DEFAULT_LOG_QUERY_ROWS`.
+    #[tokio::test]
+    async fn a_query_without_a_tail_returns_at_most_the_default_row_cap() {
+        let (mut store, _dir) = test_store();
+        for _ in 0..DEFAULT_LOG_QUERY_ROWS + 10 {
+            store.append("web", "default", LogStream::Stdout, "x");
+        }
+        let newest = store.ingested.last_sequence;
+
+        let entries = store
+            .query_with("web", "default", &LogFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), DEFAULT_LOG_QUERY_ROWS);
+        assert_eq!(entries.last().unwrap().sequence, newest, "newest kept");
+        assert!(
+            entries
+                .windows(2)
+                .all(|pair| pair[0].sequence < pair[1].sequence),
+            "still oldest first"
+        );
+    }
+
+    /// #2382: a tail above the maximum is clamped to it.
+    #[test]
+    fn a_tail_is_clamped_to_the_maximum() {
+        assert_eq!(query_row_limit(None), DEFAULT_LOG_QUERY_ROWS);
+        assert_eq!(query_row_limit(Some(5)), 5);
+        assert_eq!(query_row_limit(Some(usize::MAX)), MAX_LOG_QUERY_ROWS);
+    }
+
+    /// #2382: a query that runs past its deadline is refused within it, as
+    /// the caller's mistake, instead of holding the node until it ends.
+    #[tokio::test]
+    async fn a_query_past_its_deadline_is_refused_within_the_deadline() {
+        let started = std::time::Instant::now();
+        let result: Result<(), KetchupError> = within_deadline(
+            std::time::Duration::from_millis(50),
+            std::future::pending::<Result<(), KetchupError>>(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(KetchupError::QueryRejected { .. })),
+            "{result:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[tokio::test]

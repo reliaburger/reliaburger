@@ -60,6 +60,11 @@ impl LiveNodeIdentity {
         })
     }
 
+    /// The directory this identity was loaded from and is saved to.
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
     /// Read a coherent identity snapshot, including its signed validity dates.
     pub fn snapshot(&self) -> Arc<NodeIdentity> {
         Arc::clone(&self.current.borrow().identity)

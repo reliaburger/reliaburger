@@ -48,8 +48,9 @@ pub enum JoinError {
         "node id {node_id:?} has the same Raft id as existing node {existing:?}; join under another name"
     )]
     RaftIdCollision { node_id: String, existing: String },
-    #[error("join token node id must not be empty")]
-    EmptyNodeId,
+    /// The node id isn't one DNS label (#2394).
+    #[error("invalid node id: {0}")]
+    InvalidNodeId(&'static str),
     #[error("no Node CA found in security state")]
     NoNodeCa,
     #[error("Node CA private key is not available")]
@@ -129,6 +130,20 @@ pub struct JoinBundle {
     pub trusted_node_cas_b64: Vec<String>,
     /// Base64 DER of every root the council trusts.
     pub trusted_roots_b64: Vec<String>,
+    /// The council's voters when the leader issued the certificate (#2397).
+    /// A node with no council of its own takes Raft replication only from
+    /// these, or from voters they vouch for. Empty in a renewal.
+    pub council: crate::council::admission::CouncilRoster,
+}
+
+/// What a successful enrolment hands the joiner: its identity, and the
+/// council it should expect to hear from (#2397).
+#[derive(Debug)]
+pub struct Enrolment {
+    /// The node's new identity, to save with `identity_store::save`.
+    pub identity: NodeIdentity,
+    /// The council's voters, to save with `ExpectedCouncil::save` beside it.
+    pub council: crate::council::admission::CouncilRoster,
 }
 
 /// Errors from the joiner side of the ceremony.
@@ -143,6 +158,12 @@ pub enum JoinClientError {
     Incompatible(#[from] crate::compatibility::CompatibilityError),
     #[error("malformed join bundle: {0}")]
     Malformed(String),
+    /// The node id isn't one DNS label (#2394); nothing was sent.
+    #[error("invalid node id {node_id:?}: {reason}")]
+    InvalidNodeId {
+        node_id: String,
+        reason: &'static str,
+    },
     #[error(
         "root CA fingerprint mismatch: member offered {offered}, expected {expected} — refusing to trust"
     )]
@@ -172,7 +193,15 @@ impl JoinBundle {
                 .iter()
                 .map(|der| BASE64.encode(der))
                 .collect(),
+            council: Default::default(),
         }
+    }
+
+    /// The same bundle, naming `council` as the voters the joiner should
+    /// expect.
+    pub fn with_council(mut self, council: crate::council::admission::CouncilRoster) -> Self {
+        self.council = council;
+        self
     }
 
     /// Decode the bundle into an on-disk [`NodeIdentity`], supplying the
@@ -328,7 +357,7 @@ pub async fn request_join(
     token: &str,
     node_id: &str,
     expected_fingerprint: Option<&str>,
-) -> Result<NodeIdentity, JoinClientError> {
+) -> Result<Enrolment, JoinClientError> {
     // Ask the pinned member for its formats before sending the one-time
     // credential. Its CA endpoint reports them and answers at once. Not
     // `/v1/version`: that reports the member's binary hash, and a member
@@ -380,7 +409,7 @@ pub async fn request_join(
         return Err(JoinClientError::Rejected(format!("{status}: {body}")));
     }
 
-    let bundle: JoinBundle = response
+    let mut bundle: JoinBundle = response
         .json()
         .await
         .map_err(|e| JoinClientError::Malformed(e.to_string()))?;
@@ -395,7 +424,9 @@ pub async fn request_join(
         }
     }
 
-    bundle.into_identity(private_key_der)
+    let council = std::mem::take(&mut bundle.council);
+    let identity = bundle.into_identity(private_key_der)?;
+    Ok(Enrolment { identity, council })
 }
 
 /// Pre-validate a join token against the replicated security state.
@@ -410,6 +441,8 @@ pub fn check_join_token(
     requested_node_id: &str,
     state: &SecurityState,
 ) -> Result<[u8; 32], JoinError> {
+    crate::cluster::retirement::validate_node_id(requested_node_id)
+        .map_err(JoinError::InvalidNodeId)?;
     if state.crl.retired_nodes.contains_key(requested_node_id) {
         return Err(JoinError::NodeRetired);
     }
@@ -568,9 +601,7 @@ fn mint_join_token(
             seconds: ttl.as_secs(),
         });
     }
-    if node_id.is_empty() {
-        return Err(JoinError::EmptyNodeId);
-    }
+    crate::cluster::retirement::validate_node_id(node_id).map_err(JoinError::InvalidNodeId)?;
     let (plaintext, hash) = ca::generate_join_token()?;
     let join_token = JoinToken {
         token_hash: hash,
@@ -583,13 +614,16 @@ fn mint_join_token(
 }
 
 /// Enrol this machine as `node_id` through the member at `member_base`
-/// (`https://<host>:9117`), and return its new identity.
+/// (`https://<host>:9117`), and return its new identity with the council it
+/// should expect.
 ///
 /// Phase 1 fetches the cluster's public CA over trust-on-first-use: a
 /// joiner has no CA yet, and the CA reveals nothing. A pinned
 /// `expected_fingerprint` that doesn't match stops here, before the token is
 /// sent, so a man-in-the-middle can't capture a token the real cluster
-/// never consumed. Phase 2 sends the token only over a connection whose
+/// never consumed. With no pin (`relish join --insecure-trust-first-ca`)
+/// that protection is gone, so the offered fingerprint is printed, as a
+/// warning, before the token is sent (#2410). Phase 2 sends the token only over a connection whose
 /// server certificate chains to that CA. `relish join` and an appliance's
 /// `bun appliance prepare` both enrol this way.
 pub async fn enrol(
@@ -597,7 +631,15 @@ pub async fn enrol(
     token: &str,
     node_id: &str,
     expected_fingerprint: Option<&str>,
-) -> Result<NodeIdentity, JoinClientError> {
+) -> Result<Enrolment, JoinClientError> {
+    // A name the cluster would refuse (#2394) never reaches it, so the
+    // token isn't spent on it.
+    crate::cluster::retirement::validate_node_id(node_id).map_err(|reason| {
+        JoinClientError::InvalidNodeId {
+            node_id: node_id.to_string(),
+            reason,
+        }
+    })?;
     let base = member_base.trim_end_matches('/');
     let tofu_client = crate::http_client::builder()
         .danger_accept_invalid_certs(true)
@@ -606,13 +648,21 @@ pub async fn enrol(
         .map_err(|e| JoinClientError::Transport(e.to_string()))?;
     let ca = fetch_ca(&tofu_client, &format!("{base}/v1/cluster/ca")).await?;
     let offered = ca.root_ca_fingerprint()?;
-    if let Some(expected) = expected_fingerprint
-        && offered != expected
-    {
-        return Err(JoinClientError::FingerprintMismatch {
-            offered,
-            expected: expected.to_string(),
-        });
+    match expected_fingerprint {
+        Some(expected) if offered != expected => {
+            return Err(JoinClientError::FingerprintMismatch {
+                offered,
+                expected: expected.to_string(),
+            });
+        }
+        Some(_) => {}
+        // Said before the token is sent, so an operator who opted out of
+        // the pin can still see what they are trusting (#2410).
+        None => eprintln!(
+            "warning: trusting root CA {offered}, offered by {base}, without verifying it; \
+             the join token goes to whoever holds that CA. Compare it with the root CA \
+             fingerprint `relish init` printed, and pass --ca-fingerprint next time"
+        ),
     }
     let trust = ca.decode()?;
     let pinned_client = super::mtls::build_ca_pinned_client(trust)
@@ -991,7 +1041,7 @@ mod tests {
         ));
         assert!(matches!(
             create_seed_join_token(week, ""),
-            Err(JoinError::EmptyNodeId)
+            Err(JoinError::InvalidNodeId(_))
         ));
     }
 
@@ -1121,7 +1171,56 @@ mod tests {
     #[test]
     fn create_join_token_refuses_an_empty_node_id() {
         let err = create_join_token(DEFAULT_JOIN_TOKEN_TTL, "").unwrap_err();
-        assert!(matches!(err, JoinError::EmptyNodeId));
+        assert!(matches!(err, JoinError::InvalidNodeId(_)));
+    }
+
+    /// A node's name is one DNS label (#2394), so a token, an issue and an
+    /// enrolment for any other name are refused before anything is minted,
+    /// signed or sent.
+    #[tokio::test]
+    async fn the_join_path_refuses_a_node_id_that_is_not_one_dns_label() {
+        let long = "a".repeat(64);
+        for bad in [
+            "Node-02",
+            "node_02",
+            "-node",
+            "node-",
+            "node.02",
+            long.as_str(),
+        ] {
+            assert!(
+                matches!(
+                    create_join_token(DEFAULT_JOIN_TOKEN_TTL, bad),
+                    Err(JoinError::InvalidNodeId(_))
+                ),
+                "token minted for {bad:?}"
+            );
+            assert!(
+                matches!(
+                    create_seed_join_token(DEFAULT_JOIN_TOKEN_TTL, bad),
+                    Err(JoinError::InvalidNodeId(_))
+                ),
+                "seed token minted for {bad:?}"
+            );
+            let (state, token, _) = setup_with_known_key();
+            assert!(
+                matches!(
+                    check_join_token(&token, bad, &state),
+                    Err(JoinError::InvalidNodeId(_))
+                ),
+                "join checked for {bad:?}"
+            );
+            // The enrolment refuses before it dials anyone: the address is
+            // unroutable, so reaching the network would fail differently.
+            let error = enrol("https://192.0.2.1:9117", "t", bad, Some("sha256:ab"))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, JoinClientError::InvalidNodeId { .. }),
+                "enrolment for {bad:?}: {error}"
+            );
+        }
+        assert!(create_join_token(DEFAULT_JOIN_TOKEN_TTL, "node-02").is_ok());
     }
 
     #[test]

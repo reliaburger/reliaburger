@@ -439,6 +439,10 @@ build job sets `RELIABURGER_REQUIRE_CLEAN_SOURCE=1`, so `build.rs` fails the
 build when git lists any change in the embedded paths: a release bundle is
 exactly its commit.
 
+Bun decodes zstd image layers with the same `zstd` crate
+([#2465](https://github.com/reliaburger/reliaburger/issues/2465)), so the
+release targets must keep building it with `default-features = false`.
+
 From 0.2.8 `candidate.json` names the bundle too, as `source_digest`
 ([#1694](https://github.com/reliaburger/reliaburger/issues/1694)). Each build
 job runs `relish agent source version --offline` on the `relish` it built and
@@ -921,6 +925,25 @@ it records a run.
 
 The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
 same steps and the same losses.
+
+Three things to check before you start the fresh cluster:
+
+- **Node names.** `[node] name` must be one DNS label: 1 to 63 lowercase
+  letters, digits and `-`. Bun refuses to start otherwise, and
+  `relish join-token create` and `relish join` refuse such a name
+  ([#2394](https://github.com/reliaburger/reliaburger/issues/2394)). Rename
+  any node that breaks the rule.
+- **Joining.** `relish join` needs `--ca-fingerprint` (or
+  `--insecure-trust-first-ca`, which prints the offered fingerprint), and
+  writes `council.json` beside the node's identity. Keep the identity
+  directory whole when you move it: a node with no council seat takes Raft
+  replication only from the council that file names
+  ([#2397](https://github.com/reliaburger/reliaburger/issues/2397),
+  [#2410](https://github.com/reliaburger/reliaburger/issues/2410)).
+- **Self-upgrade.** `bun --compatibility` now prints the binary's version
+  too, which a 0.3.3 Bun can't read, so a 0.3.3 node can't stage a 0.3.4
+  binary with `relish upgrade` even apart from the format bump
+  ([#2403](https://github.com/reliaburger/reliaburger/issues/2403)).
 
 ## Signing identity
 
@@ -2322,6 +2345,15 @@ the real `curl … | sh` install against it on every host we advertise.
     [`features.yml`](../.github/workflows/features.yml) fails until they're
     fixed. `scripts/ci/test_features_page.py` fails while the TOML names a
     release other than the bootstrap's default.
+
+    Don't leave those rows for after the release. At code freeze, run
+    `python3 scripts/ci/features_page.py check-issues` and
+    `python3 scripts/ci/features_page.py check-closing N...` with the gate
+    PR's `Fixes` numbers, and update every row that links an issue the gate
+    closes on the train before the gate PR merges: `features.yml`'s
+    `closing` job refuses the gate PR otherwise. A row fix after the release
+    goes to main directly, not to the next train
+    ([#2492](https://github.com/reliaburger/reliaburger/issues/2492)).
 
     Add the release's paragraph to the top of the
     [release log](release-log.md): the promotion date, how long qualifying it

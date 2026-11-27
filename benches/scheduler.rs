@@ -7,6 +7,10 @@
 //!   decisions per second; its inverse is the cost of one decision.
 //! - `plan_pass/converged`: the same cluster once every app is placed. The
 //!   leader runs this pass every tick, so it is the steady-state cost.
+//! - `plan_pass/converged_daemons`: that cluster with 10 converged daemon
+//!   sets as well, the cost a daemon set adds to every tick (#2458).
+//! - `plan_pass/converged_overrides`: 1,000 converged one-replica apps, 200
+//!   of them with an autoscale override (#2458).
 //!
 //! Run with `make bench` or `cargo bench --bench scheduler`.
 
@@ -141,5 +145,111 @@ fn bench_plan_pass(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_plan_pass);
+/// Plan `desired` on `start` once and commit it, so the next pass finds
+/// every app placed.
+fn converge(
+    start: &ClusterStateCache,
+    members: &PassMembers,
+    desired: &DesiredState,
+) -> DesiredState {
+    let mut placed = desired.clone();
+    let plan = plan_pass(
+        &mut start.clone(),
+        &placed,
+        members,
+        &mut QuotaLedger::default(),
+        false,
+    );
+    for decision in plan.decisions {
+        placed
+            .scheduling
+            .insert(decision.app_id, decision.placements);
+    }
+    placed
+}
+
+/// The converged pass's cost for what every tick re-checks: daemon sets and
+/// autoscale overrides (#2458).
+fn bench_converged_extras(c: &mut Criterion) {
+    let mut group = c.benchmark_group("plan_pass");
+    group.sample_size(10);
+    for &nodes in &[1_000usize, 10_000] {
+        let start = cluster(nodes);
+        let members = members(&start);
+        let mut daemons = desired();
+        for index in 0..10 {
+            let spec: AppSpec = toml::from_str(&format!(
+                "image = \"daemon{index}:1\"\nreplicas = \"*\"\ncpu = \"10m\"\nmemory = \"16Mi\""
+            ))
+            .expect("a valid daemon spec");
+            daemons
+                .apps
+                .insert(AppId::new(format!("daemon{index}"), "system"), spec);
+        }
+        let placed = converge(&start, &members, &daemons);
+        group.throughput(Throughput::Elements(placed.apps.len() as u64));
+        group.bench_with_input(
+            BenchmarkId::new("converged_daemons", nodes),
+            &nodes,
+            |b, _| {
+                b.iter_batched(
+                    || start.clone(),
+                    |mut cache| {
+                        let plan = plan_pass(
+                            &mut cache,
+                            &placed,
+                            &members,
+                            &mut QuotaLedger::default(),
+                            false,
+                        );
+                        assert!(plan.decisions.is_empty(), "{:?}", plan.decisions.len());
+                        plan
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+    }
+
+    let start = cluster(1_000);
+    let members = members(&start);
+    let mut many = DesiredState::default();
+    for index in 0..1_000 {
+        let spec: AppSpec = toml::from_str(&format!(
+            "image = \"small{index}:1\"\nreplicas = 1\ncpu = \"10m\"\nmemory = \"16Mi\""
+        ))
+        .expect("a valid app spec");
+        let app = AppId::new(format!("small{index:04}"), "default");
+        if index % 5 == 0 {
+            many.autoscale_overrides.push((app.to_string(), 1));
+        }
+        many.apps.insert(app, spec);
+    }
+    let placed = converge(&start, &members, &many);
+    group.throughput(Throughput::Elements(placed.apps.len() as u64));
+    group.bench_with_input(
+        BenchmarkId::new("converged_overrides", 1_000),
+        &1_000,
+        |b, _| {
+            b.iter_batched(
+                || start.clone(),
+                |mut cache| {
+                    let plan = plan_pass(
+                        &mut cache,
+                        &placed,
+                        &members,
+                        &mut QuotaLedger::default(),
+                        false,
+                    );
+                    assert!(plan.decisions.is_empty());
+                    plan
+                },
+                BatchSize::LargeInput,
+            );
+        },
+    );
+    group.finish();
+}
+
+criterion_group!(benches, bench_plan_pass, bench_converged_extras);
 criterion_main!(benches);

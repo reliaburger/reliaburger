@@ -188,7 +188,7 @@ fn cluster_source_for(registry: &Registry) -> reliaburger::pickle::p2p::ClusterS
         upstream: None,
         pull_through: false,
         cache_recheck_secs: 3600,
-        fill_lock: tokio::sync::Mutex::new(()),
+        fill_locks: Default::default(),
     }
 }
 

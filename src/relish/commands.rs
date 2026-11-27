@@ -1551,7 +1551,7 @@ pub async fn join(
     let dir = identity_dir
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("identity"));
-    let identity = crate::sesame::join::enrol(&base, token, node_id, ca_fingerprint)
+    let enrolment = crate::sesame::join::enrol(&base, token, node_id, ca_fingerprint)
         .await
         .map_err(|e| match e {
             crate::sesame::join::JoinClientError::FingerprintMismatch { offered, expected } => {
@@ -1563,9 +1563,15 @@ pub async fn join(
             other => RelishError::JoinFailed(other.to_string()),
         })?;
 
+    let identity = &enrolment.identity;
     let fingerprint = crate::sesame::identity_store::root_ca_fingerprint(&identity.root_ca_der);
-    crate::sesame::identity_store::save(&dir, &identity)
+    crate::sesame::identity_store::save(&dir, identity)
         .map_err(|e| RelishError::JoinFailed(format!("failed to persist identity: {e}")))?;
+    // The node takes Raft replication only from this council, or from
+    // voters it vouches for, until it has one of its own (#2397).
+    // BLOCKING-OK: relish CLI, one small file written once, nothing else on its runtime
+    crate::council::admission::ExpectedCouncil::save(&dir, &enrolment.council)
+        .map_err(|e| RelishError::JoinFailed(format!("failed to save the council: {e}")))?;
 
     print_output(
         &JoinReport {
@@ -4609,6 +4615,55 @@ fn resolve_secret_pubkey(dir: &Path) -> Result<String, RelishError> {
 ///
 /// `-o json` prints `{"encrypted": "ENC[AGE:...]"}`; the plaintext is never
 /// echoed back.
+/// Largest plaintext `relish secret encrypt` reads from a file or
+/// standard input.
+const MAX_SECRET_VALUE_BYTES: u64 = 1024 * 1024;
+
+/// The value to encrypt, read from `path` (#2407): a file keeps it out of
+/// the process list and shell history, where an argument shows.
+pub fn read_secret_value_file(path: &Path) -> Result<String, RelishError> {
+    let file = std::fs::File::open(path)?;
+    secret_value_from(file)
+}
+
+/// The value to encrypt, read from standard input; asked for with echo off
+/// when standard input is a terminal.
+pub fn read_secret_value_stdin() -> Result<String, RelishError> {
+    use std::io::IsTerminal as _;
+    if std::io::stdin().is_terminal() {
+        use age::secrecy::ExposeSecret as _;
+        let value = crate::relish::ca_cmd::prompt_secret("Value to encrypt: ")?;
+        return secret_value_from(value.expose_secret().as_bytes());
+    }
+    secret_value_from(std::io::stdin().lock())
+}
+
+/// Read a secret value of at most [`MAX_SECRET_VALUE_BYTES`], dropping one
+/// trailing newline (`\n` or `\r\n`, as `echo` and editors leave) and
+/// refusing an empty value.
+fn secret_value_from(reader: impl std::io::Read) -> Result<String, RelishError> {
+    use std::io::Read as _;
+    let mut value = String::new();
+    reader
+        .take(MAX_SECRET_VALUE_BYTES + 1)
+        .read_to_string(&mut value)?;
+    let refuse = |reason: &str| RelishError::InvalidFlag {
+        flag: "value".to_string(),
+        reason: reason.to_string(),
+    };
+    if value.len() as u64 > MAX_SECRET_VALUE_BYTES {
+        return Err(refuse("the value is larger than 1 MiB"));
+    }
+    let trimmed = value
+        .strip_suffix("\r\n")
+        .or_else(|| value.strip_suffix('\n'))
+        .unwrap_or(&value);
+    if trimmed.is_empty() {
+        return Err(refuse("the value to encrypt is empty"));
+    }
+    Ok(trimmed.to_string())
+}
+
 pub fn secret_encrypt(pubkey: &str, value: &str, output: OutputFormat) -> Result<(), RelishError> {
     use crate::sesame::secret::encrypt_secret;
 
@@ -4824,7 +4879,9 @@ pub async fn join_token_create(
         "Join token created for {node_id} (expires in {}).",
         format_ttl(ttl_seconds)
     );
-    eprintln!("The joining node must enrol with `relish join --node-id {node_id}`.");
+    eprintln!(
+        "The joining node must enrol with `relish join --node-id {node_id} --ca-fingerprint <root CA fingerprint>`."
+    );
     eprintln!("The plaintext is shown once:");
     print_output(
         &JoinTokenReport {
@@ -5559,6 +5616,28 @@ mod tests {
             result.is_err(),
             "a failed live comparison became an offline create plan"
         );
+    }
+
+    #[test]
+    fn secret_value_file_is_read_without_its_trailing_newline() {
+        // `printf` and `echo` both work: one trailing newline is dropped
+        // (#2407).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("value");
+        for (contents, want) in [
+            ("hunter2\n", "hunter2"),
+            ("hunter2", "hunter2"),
+            ("hunter2\r\n", "hunter2"),
+            ("two\nlines\n", "two\nlines"),
+            (" spaced \n\n", " spaced \n"),
+        ] {
+            std::fs::write(&path, contents).unwrap();
+            assert_eq!(read_secret_value_file(&path).unwrap(), want, "{contents:?}");
+        }
+        for empty in ["", "\n"] {
+            std::fs::write(&path, empty).unwrap();
+            assert!(read_secret_value_file(&path).is_err(), "{empty:?}");
+        }
     }
 
     #[tokio::test]

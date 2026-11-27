@@ -69,7 +69,10 @@ fn fixture() -> Fixture {
     // It answers the compatibility query and fails anything else. Once it is
     // staged, the test overwrites it so the exec itself fails and this test
     // process carries on; that failure is what shows the exec was tried.
-    let formats = serde_json::to_string(&crate::compatibility::CURRENT).unwrap();
+    let formats = serde_json::to_string(&crate::upgrade::CompatibilityAnswer::this_binary(
+        "0.2.0".parse().unwrap(),
+    ))
+    .unwrap();
     let binary =
         format!("#!/bin/sh\n[ \"$1\" = --compatibility ] || exit 1\ndir=${{0%/*}}\nprintf '%s' reached > \"$dir/probe-entered\"\nprintf '%s' '{formats}'\n")
             .into_bytes();

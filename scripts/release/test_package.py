@@ -257,9 +257,11 @@ exit 1
                 self.assertEqual(result.returncode, 2, result.stderr)
                 choices = result.stdout.decode()
                 for promise in ("--laptop", "Lima", "docs/linux-servers.md", "relish init", "relish join",
-                                "--install-only", "Netboot", "not for production",
+                                "--install-only", "Netboot", "relish netboot", "not for production",
                                 "curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop"):
                     self.assertIn(promise, choices)
+                # Netboot shipped in 0.3.0 (#2495).
+                self.assertNotIn("not built", choices)
                 self.assertIn("Nothing was installed", choices)
                 self.assertFalse(calls.exists(), "the installer downloaded something without a mode")
                 self.assertFalse((home / ".reliaburger").exists(), "the installer made a store without a mode")

@@ -632,7 +632,7 @@ mod tests {
                 title: format!("node {node} filesystem for images is {percent}% full"),
                 details: Vec::new(),
                 suggestion: format!(
-                    "node {node} disk is at {percent}%; prune images (`relish pickle gc`) or logs"
+                    "node {node} disk is at {percent}%; list images with `relish images`, delete tags you no longer need with `relish images delete <repository:tag>` (untagged images expire after [images] gc_retain_days), or lower log and metric retention in node.toml"
                 ),
                 correlated_events: Vec::new(),
                 affected_resource: format!("node.{node}"),

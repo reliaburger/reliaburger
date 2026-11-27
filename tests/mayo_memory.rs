@@ -117,7 +117,9 @@ async fn periodic_cycle(
     let before = LIVE.load(Ordering::Relaxed);
     PEAK.store(before, Ordering::Relaxed);
     let latest = gather_latest_values(store, now).await;
-    let rollup = rollups.generate(&*store.read().await, now).await.unwrap();
+    let snapshot = store.read().await.snapshot().await.unwrap();
+    let rollup = rollups.generate(&snapshot, now).await.unwrap();
+    drop(snapshot);
     assert!(!latest.is_empty(), "the alert read found no fresh series");
     assert!(!rollup.entries.is_empty(), "the rollup found no samples");
     drop((latest, rollup));
@@ -304,6 +306,7 @@ fn rollups_for_minute(keys: &[MetricKey], minute: u64) -> Vec<NodeRollup> {
         .map(|node| NodeRollup {
             node_id: NodeId::new(format!("node-{node}")),
             timestamp: minute,
+            part: 0,
             entries: keys
                 .iter()
                 .enumerate()

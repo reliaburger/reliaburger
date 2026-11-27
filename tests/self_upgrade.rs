@@ -412,7 +412,8 @@ command = ["--mode", "healthy", "--port", "{port}"]
                 let rest = name.strip_prefix("bun-")?;
                 (!rest.ends_with(".sig")
                     && !rest.ends_with(".version")
-                    && !rest.ends_with(".fail-boot"))
+                    && !rest.ends_with(".fail-boot")
+                    && !rest.ends_with(".fail-early"))
                 .then(|| rest.to_string())
             })
             .collect();
@@ -852,6 +853,67 @@ async fn failed_upgrade_triggers_automatic_rollback() {
 
     // The workload never noticed: it was reparented during the crash loop
     // and adopted back by the reverted binary.
+    let pid_after = harness.workload_pid("web").await;
+    assert_eq!(
+        pid_before, pid_after,
+        "workload was restarted by the failed upgrade"
+    );
+
+    harness.shutdown().await;
+}
+
+/// #2415: a new version that exits before it has even read its config
+/// still burns a boot attempt on every start, so the crash loop ends in a
+/// revert with no operator help. Before the fix the boot count lived after
+/// config load, and this node restarted `v0.2.0` for ever.
+#[tokio::test]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and real bun processes; run with make test-upgrade-node"]
+async fn an_upgrade_that_fails_before_config_load_reverts_by_itself() {
+    assert!(
+        upgrade_tests_enabled(),
+        "set RELIABURGER_UPGRADE_TESTS=1 before running ignored upgrade tests"
+    );
+    let _serial = SERIAL.lock().await;
+    let mut harness = RealNodeHarness::start().await;
+    harness.deploy_testapp("web").await;
+    let pid_before = harness.workload_pid("web").await;
+
+    // Poison v0.2.0 so it exits before it loads its config, where a
+    // renamed key or a stricter validation would stop a real release.
+    std::fs::write(harness.bin_dir.join("bun-v0.2.0.fail-early"), "").unwrap();
+
+    let directive = harness.directive("v0.2.0", "up-early");
+    assert_eq!(harness.post_upgrade(&directive).await, 202);
+
+    harness.wait_for_version("v0.1.0").await;
+    harness.wait_upgrade_settled().await;
+    let target = std::fs::read_link(harness.bin_dir.join("bun")).unwrap();
+    assert_eq!(target, Path::new("bun-v0.1.0"));
+    assert!(
+        !harness.bin_dir.join(".bun.upgrade-pending").exists(),
+        "the completed revert must remove the boot-count pointer"
+    );
+
+    let status: serde_json::Value = harness
+        .client
+        .get(harness.url("/v1/upgrade/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let outcomes: Vec<&str> = status["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["outcome"].as_str())
+        .collect();
+    assert!(
+        outcomes.contains(&"Reverted"),
+        "expected a Reverted history entry, got {outcomes:?}"
+    );
+
     let pid_after = harness.workload_pid("web").await;
     assert_eq!(
         pid_before, pid_after,

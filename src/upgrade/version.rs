@@ -92,6 +92,23 @@ pub fn resolve_running_version(exe_path: &Path) -> BinaryVersion {
     compiled_version()
 }
 
+/// The development override for the binary at `path`: its `.version`
+/// sidecar, in debug builds only.
+///
+/// A candidate is queried as a private copy, which has no sidecar, so it
+/// reports the compiled version. The upgrade tests give one compiled binary
+/// several versions with sidecars beside the store's files, and after the
+/// swap the running version comes from that sidecar. The candidate check
+/// reads the same sidecar, so it expects what the swapped-in binary will
+/// report. Release builds always return `None`.
+pub fn development_version_override(path: &Path) -> Option<BinaryVersion> {
+    if cfg!(debug_assertions) {
+        sidecar_version(path)
+    } else {
+        None
+    }
+}
+
 /// The version compiled into this binary.
 pub fn compiled_version() -> BinaryVersion {
     // Cargo guarantees CARGO_PKG_VERSION is valid semver, so this cannot fail.

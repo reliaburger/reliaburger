@@ -105,8 +105,9 @@ it.
 Push once and nodes pull layers from each other. It also caches upstream
 registries, and `relish build` builds images from your config straight into it.
 
-**Metrics, logs and alerts, nothing to install.** Each node scrapes its own
-workloads, including anything with `prometheus.io` annotations. Alert rules
+**Metrics, logs and alerts, nothing to install.** Each node scrapes the apps
+that ask for it with `metrics = {}`; an imported Kubernetes manifest gets that
+from its `prometheus.io` annotations. Alert rules
 evaluate in the agent and call webhooks, optionally HMAC-signed. Logs are
 captured on each node, streamed cluster-wide with `relish logs -f`, and
 exported as Parquet to disk or object storage, where SQL can query them.
@@ -309,7 +310,8 @@ and its trade-offs; the [design docs](design/) cover each subsystem.
 - **Kubernetes import covers the kinds listed [above](#whats-in-the-binary).**
   Anything else is reported, not applied.
 - **Cron doesn't catch up.** It skips firings missed during a crash, and a job
-  whose outcome is unknown waits for `relish apply <file> --rerun-jobs`.
+  whose outcome is unknown skips its later firings until you settle it with
+  `relish batch replay` ([Jobs and cron](#jobs-and-cron)).
 
 ## Operating notes
 
@@ -2002,8 +2004,11 @@ fetch it; deployments still require their normal permissions.
 configured endpoint, token and CA:
 
 ```sh
-relish secret encrypt --pubkey "$(relish secret pubkey)" 'value'
+relish secret encrypt --pubkey "$(relish secret pubkey)" --value-file db-password.txt
 ```
+
+`secret encrypt` reads the value from `--value-file`, or from standard input,
+so it stays out of your shell history and the process list.
 
 Use the resulting `ENC[AGE:...]` string in an app environment variable. A
 follower may briefly report the previous generation during rotation; fetch
