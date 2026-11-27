@@ -1883,6 +1883,7 @@ Process workloads get none of this: they're host processes (#360, #714), and the
 | Apps per node | 500 | Design goal from Section 2 |
 | Per-app overhead (Bun tracking) | < 1ms | Sub-millisecond at 500 apps |
 | Memory per app (Bun tracking) | ~1.2 MB | Measured: 312 MB at 500 apps vs 48 MB idle = ~528 KB tracking + workload overhead |
+| Memory per app (its owner process) | ~40 MB PSS, debug build | Measured in the Lima VM (#2447): `Pss` in `/proc/<owner>/smaps_rollup` of an idle owner, 39.7 MB in a debug build; a release build maps a smaller binary. Not counted in Bun's own memory |
 | Bun agent memory (idle) | ~48 MB | Baseline: Tokio runtime, eBPF management, gossip and Raft, config |
 | Bun agent memory (500 apps) | ~312 MB | Scales linearly with app count |
 | eBPF service map entries | 500/node, 5M cluster-wide (10K nodes) | One entry per workload instance |
