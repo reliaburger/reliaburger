@@ -1314,6 +1314,19 @@ The routing table's round-robin counter uses `AtomicU64` with `Ordering::Relaxed
 
 Why relaxed? Because we don't care about precise ordering between threads. If two requests arrive simultaneously and both increment the counter, they'll pick different backends — that's the desired outcome. We're not coordinating anything; we're distributing load. The weaker memory ordering means no cache-line bouncing on most architectures.
 
+The counter had a weakness that ordering has nothing to do with: it lived in the route, and the route didn't survive a rebuild. Any deploy, health flip or catalogue change anywhere in the cluster rebuilds the whole table, and every rebuilt route started its counter at 0 again. A route with fewer requests than rebuilds then sent almost all of them to its first backend, while the other replicas sat idle (#2454). The kernel had the same bug in its own counter: every write of a service's `backend_map` entry set `rr_index` back to 0. Now `rebuild` and `replace` copy each route's position into the new route with the same host and path prefix, and the BPF map writers read the old entry first and keep its index through `carry_round_robin`:
+
+```rust
+pub fn carry_round_robin(previous: Option<&BackendValue>, new: BackendValue) -> BackendValue {
+    BackendValue {
+        rr_index: previous.map_or(new.rr_index, |previous| previous.rr_index),
+        ..new
+    }
+}
+```
+
+`..new` is the struct update syntax from Chapter 1: every field we didn't name comes from `new`. `map_or` is the `Option` version of "if present, transform it, else use this default". The read and the write aren't atomic against the connect hook, which may advance the index in between, so a few increments can be lost; for spreading load that doesn't matter. Keeping the helper pure lets a unit test check it without a kernel, and `a_rewritten_backend_entry_keeps_its_round_robin_position` in `tests/ebpf.rs` checks the real map: four connections to a VIP, each followed by a rewrite of its entry, must reach both backends.
+
 ### `#[repr(C)]` is your FFI contract
 
 Without `#[repr(C)]`, Rust will reorder struct fields for alignment efficiency. That's great for pure-Rust code and terrible for eBPF maps, where the kernel reads raw bytes at fixed offsets. Every struct shared between Rust and BPF gets `#[repr(C)]` and explicit `_pad` fields. If you forget, the kernel reads garbage from the map — and debugging "why does my BPF program think the port is 0?" is not fun.

@@ -101,7 +101,7 @@ The routing table is an in-memory data structure mapping `(host, path_prefix)` p
 2. Look up the host in a `HashMap<String, Vec<PathRoute>>`. This is an exact match (no wildcard host matching in v1).
 3. Within the matched host, iterate `PathRoute` entries sorted by path length descending (longest prefix match). The first matching prefix wins.
 4. The matched `PathRoute` contains a `BackendPool` with a list of healthy backend addresses.
-5. Select a backend using **unweighted round-robin** — the only strategy implemented today (`PathRoute::select_backend`). Weighted round-robin, least-connections, and consistent-hash are planned (see §4).
+5. Select a backend using **unweighted round-robin** — the only strategy implemented today (`PathRoute::select_backend`). Weighted round-robin, least-connections, and consistent-hash are planned (see §4). A route keeps its round-robin position through table rebuilds and replacements, matched by host and path prefix, so a quiet route doesn't restart at its first backend each time the table changes (#2454).
 
 **Routing table updates:**
 

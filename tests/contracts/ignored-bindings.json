@@ -601,6 +601,12 @@
   },
   {
     "source": "tests/ebpf.rs",
+    "function": "a_rewritten_backend_entry_keeps_its_round_robin_position",
+    "binary": "reliaburger::ebpf",
+    "test": "a_rewritten_backend_entry_keeps_its_round_robin_position"
+  },
+  {
+    "source": "tests/ebpf.rs",
     "function": "ebpf_connect_to_vip_no_backends_refused",
     "binary": "reliaburger::ebpf",
     "test": "ebpf_connect_to_vip_no_backends_refused"

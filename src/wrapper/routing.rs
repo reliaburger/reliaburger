@@ -253,7 +253,11 @@ impl RoutingTable {
 
     /// Take `other`'s routes, keeping this table's [`CertificateModes`] and
     /// publishing the new modes to it.
-    pub fn replace(&mut self, other: RoutingTable) {
+    ///
+    /// Each route keeps its round-robin position from this table, so a quiet
+    /// route doesn't restart at its first backend on every replacement.
+    pub fn replace(&mut self, mut other: RoutingTable) {
+        other.inherit_round_robin(self);
         self.routes = other.routes;
         self.publish_certificate_modes();
     }
@@ -314,6 +318,7 @@ impl RoutingTable {
         }
 
         self.inherit_local_health(&previous);
+        self.inherit_round_robin(&previous);
 
         // Sort each host's routes longest-prefix first, breaking ties on the
         // path then app name so equal-length routes have a deterministic order
@@ -442,6 +447,27 @@ impl RoutingTable {
         {
             if let Some(healthy) = known.get(&(backend.instance_id.as_str(), backend.addr)) {
                 backend.locally_healthy = *healthy;
+            }
+        }
+    }
+
+    /// Carry each route's round-robin position over from `previous`, matched
+    /// by host and path prefix.
+    ///
+    /// The table is rebuilt on any deploy, health or catalogue change in the
+    /// cluster. A route that restarted at 0 each time sent nearly every
+    /// request to its first backend whenever rebuilds outpaced its requests
+    /// (#2454).
+    fn inherit_round_robin(&mut self, previous: &RoutingTable) {
+        let positions: HashMap<RouteKey, u64> = previous
+            .routes
+            .values()
+            .flatten()
+            .map(|route| (route.route_key(), route.rr_counter.load(Ordering::Relaxed)))
+            .collect();
+        for route in self.routes.values_mut().flatten() {
+            if let Some(position) = positions.get(&route.route_key()) {
+                route.rr_counter.store(*position, Ordering::Relaxed);
             }
         }
     }
@@ -1086,6 +1112,43 @@ mod tests {
         assert_eq!(b1, b3);
         assert_eq!(b2, b4);
         assert_ne!(b1, b2);
+    }
+
+    #[test]
+    fn round_robin_position_survives_a_rebuild() {
+        let (map, configs) = setup_map_and_configs();
+        let mut table = RoutingTable::new();
+        table.rebuild(&map, &configs).unwrap();
+
+        let mut picked = std::collections::HashSet::new();
+        for _ in 0..4 {
+            let route = table.lookup("myapp.com", "/").unwrap();
+            picked.insert(route.select_backend().unwrap().instance_id.clone());
+            table.rebuild(&map, &configs).unwrap();
+        }
+        assert_eq!(picked.len(), 2, "every rebuild restarted at one backend");
+    }
+
+    #[test]
+    fn round_robin_position_survives_a_table_replacement() {
+        // The agent builds a fresh table and swaps it in with `replace`.
+        let (map, configs) = setup_map_and_configs();
+        let mut table = RoutingTable::new();
+        table.rebuild(&map, &configs).unwrap();
+
+        let mut picked = std::collections::HashSet::new();
+        for _ in 0..4 {
+            let route = table.lookup("myapp.com", "/").unwrap();
+            picked.insert(route.select_backend().unwrap().instance_id.clone());
+            let mut fresh = RoutingTable::new();
+            fresh.rebuild(&map, &configs).unwrap();
+            table.replace(fresh);
+        }
+        assert_eq!(
+            picked.len(),
+            2,
+            "every replacement restarted at one backend"
+        );
     }
 
     #[test]
