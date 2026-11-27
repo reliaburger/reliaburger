@@ -9,6 +9,8 @@
 /// - one leader tick (plan every array's writes, batch them, apply the
 ///   entry) with 64 concurrent arrays on 3 nodes, and with one array of
 ///   one-task chunks on 10 nodes, the shape that splits state the most;
+/// - the leader's sync requests for 128 runs on 200 nodes, with every
+///   template and in the steady state (#2444);
 /// - the node pool's overhead per task with a zero-cost fake runner (the
 ///   ceiling a real process can't beat);
 /// - the fork/exec floor of this machine: `/usr/bin/true` through the
@@ -28,7 +30,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use reliaburger::bun::task_array_leader::{TickInputs, plan_tick, tick_entries};
+use reliaburger::bun::task_array_leader::{
+    RequestPlan, TemplatesSent, TickInputs, plan_tick, sync_request_for, tick_entries,
+};
 use reliaburger::bun::task_array_node::{
     ACTIVE_STORAGE_BYTES_PER_TASK, ArrayProgress, NodeArrayCounters, NodeSyncResponse,
     STORAGE_BYTES_PER_TASK,
@@ -186,6 +190,7 @@ fn answers(arrays: &TaskArrays, nodes: usize) -> Vec<(NodeId, NodeSyncResponse)>
                         slots: 16,
                         refused: None,
                         unrunnable: false,
+                        template_unknown: false,
                         finished: record
                             .state
                             .held_by(&node)
@@ -281,6 +286,72 @@ fn bench_tick(c: &mut Criterion) {
             )
         });
     }
+    group.finish();
+}
+
+/// The leader's sync requests at the active-run cap (#2444): 128 runs with
+/// 1 KiB templates and 200 nodes. `every_template_every_node` is what each
+/// tick built under the state lock before; `steady_plan` is what it copies
+/// under the lock now, once every node has every template, and
+/// `steady_requests` the requests it builds from that after the lock.
+fn bench_sync_requests(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sync_requests");
+    group.sample_size(10);
+    let mut arrays = TaskArrays::default();
+    for id in 1..=128u64 {
+        let template = format!(
+            "runtime = 'process'\nexec = '/usr/bin/true'\n[env]\nPAD = '{}'",
+            "x".repeat(1024)
+        );
+        let register = TaskArrayWrite::Register {
+            name: format!("bench-{id}"),
+            namespace: "default".into(),
+            template: Box::new(toml::from_str(&template).unwrap()),
+            spec: TaskArraySpec {
+                chunk_size: 1024,
+                ..TaskArraySpec::with_count(100_000)
+            },
+            submitted_at_epoch_secs: 1,
+        };
+        arrays.apply(&register, || id).unwrap();
+    }
+    let nodes: Vec<NodeId> = (0..200).map(|i| NodeId::new(format!("n{i:03}"))).collect();
+    let mut sent = TemplatesSent::default();
+    for node in &nodes {
+        sent.mark(node, &sync_request_for(&arrays, node));
+    }
+    let first: usize = nodes
+        .iter()
+        .map(|node| serde_json::to_vec(&sync_request_for(&arrays, node)).map_or(0, |b| b.len()))
+        .sum();
+    let plan = RequestPlan::read(&arrays, &nodes, &sent);
+    let steady: usize = nodes
+        .iter()
+        .map(|node| serde_json::to_vec(&plan.request_for(node, &sent)).map_or(0, |b| b.len()))
+        .sum();
+    eprintln!(
+        "sync_requests: {first} bytes to 200 nodes with every template, {steady} in the steady state"
+    );
+    group.throughput(Throughput::Elements(nodes.len() as u64));
+    group.bench_function("every_template_every_node", |b| {
+        b.iter(|| {
+            nodes
+                .iter()
+                .map(|node| sync_request_for(&arrays, node).arrays.len())
+                .sum::<usize>()
+        })
+    });
+    group.bench_function("steady_plan", |b| {
+        b.iter(|| RequestPlan::read(&arrays, &nodes, &sent))
+    });
+    group.bench_function("steady_requests", |b| {
+        b.iter(|| {
+            nodes
+                .iter()
+                .map(|node| plan.request_for(node, &sent).arrays.len())
+                .sum::<usize>()
+        })
+    });
     group.finish();
 }
 
@@ -449,6 +520,7 @@ criterion_group!(
     bench_index_set,
     bench_leader,
     bench_tick,
+    bench_sync_requests,
     bench_executor,
     bench_storage
 );

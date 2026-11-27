@@ -70,7 +70,8 @@ pub const ACTIVE_STORAGE_BYTES_PER_TASK: u64 = 50;
 pub const RESULT_PAGE_SPAN: u32 = 4096;
 
 /// Largest leader sync call a node accepts. Every active run's template
-/// rides in it, so it must cover the active-run cap at the largest template
+/// rides in the first call that tells a node about the run (#2444), so it
+/// must cover the active-run cap at the largest template
 /// (`control_state_stays_within_budget_at_the_global_cap` checks that).
 pub const MAX_SYNC_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 
@@ -87,7 +88,14 @@ pub struct HeldChunk {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArrayAssignment {
     /// Owned container template; host assignments retain the allowlist gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template: Option<Box<crate::config::job::JobSpec>>,
+    /// The leader sent this node the run's definition (`template`,
+    /// `program`, `args` and `env`) in an earlier call, so this one leaves
+    /// it out and the node uses its own copy (#2444). A node without one
+    /// answers [`ArrayProgress::template_unknown`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub template_known: bool,
     /// Per-task resource request; a queued chunk does not reserve this multiplied by its size.
     pub resources: crate::meat::Resources,
     /// The array's batch id.
@@ -95,12 +103,16 @@ pub struct ArrayAssignment {
     /// Count and policy.
     pub spec: TaskArraySpec,
     /// Host binary every task runs.
+    #[serde(default, skip_serializing_if = "path_is_empty")]
     pub program: PathBuf,
     /// Argument template, with `{index}` placeholders.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
     /// Plain environment variables from the template.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<(String, String)>,
     /// Chunks this node holds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub held: Vec<HeldChunk>,
     /// The array has stopped: finish nothing new, report what's held.
     pub stopping: bool,
@@ -109,6 +121,11 @@ pub struct ArrayAssignment {
     /// Labels for this node's job metrics: never a task index or run id.
     #[serde(default)]
     pub labels: crate::mayo::job_metrics::JobLabels,
+}
+
+/// Whether `path` is empty, for leaving it out of the wire format.
+fn path_is_empty(path: &Path) -> bool {
+    path.as_os_str().is_empty()
 }
 
 /// Orders cluster recovery, leadership and committed assignment revisions.
@@ -258,6 +275,10 @@ pub struct ArrayProgress {
     /// leader fails a run every node refuses this way (#777).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unrunnable: bool,
+    /// The assignment left the run's definition out and this node has no
+    /// copy of it, so the leader must send it again (#2444).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub template_unknown: bool,
     /// Chunks finished at the attempt the leader asked for, not yet
     /// retired. Sent on every sync until the leader stops listing them.
     pub finished: Vec<ChunkResult>,
@@ -454,6 +475,49 @@ struct ArrayRun {
     failure: Arc<Mutex<Option<String>>>,
 }
 
+/// How to run one array's tasks: the part of its assignment the leader
+/// sends a node only once (#2444).
+struct RunDefinition {
+    template: Option<Box<crate::config::job::JobSpec>>,
+    program: PathBuf,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+}
+
+/// `assignment` with its run's definition: as sent, keeping a copy for
+/// later calls, or filled in from that copy when the leader left it out.
+/// `None` when it was left out and this node has no copy.
+fn with_definition<'a>(
+    definitions: &mut HashMap<u64, RunDefinition>,
+    assignment: &'a ArrayAssignment,
+) -> Option<std::borrow::Cow<'a, ArrayAssignment>> {
+    use std::borrow::Cow;
+    if !assignment.template_known {
+        definitions.insert(
+            assignment.batch_id,
+            RunDefinition {
+                template: assignment.template.clone(),
+                program: assignment.program.clone(),
+                args: assignment.args.clone(),
+                env: assignment.env.clone(),
+            },
+        );
+        return Some(Cow::Borrowed(assignment));
+    }
+    let definition = definitions.get(&assignment.batch_id)?;
+    Some(Cow::Owned(ArrayAssignment {
+        template: definition.template.clone(),
+        template_known: false,
+        program: definition.program.clone(),
+        args: definition.args.clone(),
+        env: definition.env.clone(),
+        held: assignment.held.clone(),
+        spec: assignment.spec.clone(),
+        labels: assignment.labels.clone(),
+        ..*assignment
+    }))
+}
+
 /// The one sync allowed on this node's disk at a time (#770).
 ///
 /// A sync holds it while it runs, and so does every blocking disk call the
@@ -532,6 +596,8 @@ pub struct TaskArrayNode {
     root_durable: Arc<std::sync::atomic::AtomicBool>,
     /// One permit, for [`SyncClaim`].
     sync_gate: Arc<Semaphore>,
+    /// Each running array's definition, as the leader sent it once (#2444).
+    definitions: Mutex<HashMap<u64, RunDefinition>>,
     /// Fires when Bun starts stopping: no array starts another attempt
     /// (#1965).
     draining: CancellationToken,
@@ -565,6 +631,7 @@ impl TaskArrayNode {
             grant_syncs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             root_durable: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sync_gate: Arc::new(Semaphore::new(1)),
+            definitions: Mutex::new(HashMap::new()),
             draining: CancellationToken::new(),
             runner: Arc::new(runner),
             arrays: Mutex::new(HashMap::new()),
@@ -810,8 +877,21 @@ impl TaskArrayNode {
             .await
             .unwrap_or(true);
 
+        let mut definitions = self.definitions.lock().await;
+        definitions.retain(|id, _| running.contains(id));
         let mut response = NodeSyncResponse::default();
         for assignment in &request.arrays {
+            let Some(assignment) = with_definition(&mut definitions, assignment) else {
+                response.arrays.push(ArrayProgress {
+                    template_unknown: true,
+                    ..refused(
+                        assignment.batch_id,
+                        "this node has no copy of the run's template yet".into(),
+                    )
+                });
+                continue;
+            };
+            let assignment = assignment.as_ref();
             if let Err(reason) = self.admit(assignment) {
                 response.arrays.push(ArrayProgress {
                     unrunnable: true,
@@ -1312,6 +1392,7 @@ impl TaskArrayNode {
             },
             refused: None,
             unrunnable: false,
+            template_unknown: false,
             finished,
             counters: NodeArrayCounters {
                 running: callers,
@@ -1603,6 +1684,7 @@ fn refused(batch_id: u64, reason: String) -> ArrayProgress {
         slots: 0,
         refused: Some(reason),
         unrunnable: false,
+        template_unknown: false,
         finished: Vec::new(),
         counters: NodeArrayCounters::default(),
     }
@@ -1834,6 +1916,7 @@ mod tests {
     fn assignment(batch_id: u64, count: u32, held: &[(u32, u64)]) -> ArrayAssignment {
         ArrayAssignment {
             template: None,
+            template_known: false,
             batch_id,
             resources: crate::meat::Resources::new(1000, 64 << 20, 0),
             spec: TaskArraySpec {
@@ -2052,6 +2135,35 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    /// #2444: the leader sends a run's definition once. A node keeps it
+    /// for later calls that leave it out, and says so when it has none.
+    #[tokio::test]
+    async fn a_node_keeps_a_runs_template_for_calls_that_leave_it_out() {
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        let full = assignment(1, 20, &[(0, 1)]);
+        let mut bare = assignment(1, 20, &[(0, 1), (1, 1)]);
+        bare.template_known = true;
+        bare.program = PathBuf::new();
+        bare.args.clear();
+        // Never sent: the node asks for it, and isn't refusing for good.
+        let progress = node.sync(&request(vec![bare.clone()])).await.unwrap();
+        let progress = &progress.arrays[0];
+        assert!(progress.template_unknown);
+        assert!(!progress.unrunnable);
+        assert_eq!(progress.slots, 0);
+        // Sent once, then left out: the node runs both chunks.
+        let progress = node.sync(&request(vec![full])).await.unwrap();
+        assert!(!progress.arrays[0].template_unknown);
+        let progress = sync_until_finished(&node, &request(vec![bare.clone()]), 2).await;
+        assert!(!progress.template_unknown);
+        assert!(progress.slots > 0);
+        // A run the leader stops listing is forgotten.
+        node.sync(&request(Vec::new())).await.unwrap();
+        let progress = node.sync(&request(vec![bare])).await.unwrap();
+        assert!(progress.arrays[0].template_unknown);
     }
 
     #[tokio::test]

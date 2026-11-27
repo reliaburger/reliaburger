@@ -1624,6 +1624,45 @@ all four cases. What the folded page can't do is tell a node that lost its
 ledger from one that never had it: both say "not found". The manual's rule
 still holds, never read missing detail as success.
 
+One cost was still there in November 2026 (#2444). Every tick, the leader built
+a sync request for every node, and each request carried every active run's
+whole job template (up to 16 KiB), plus the program, arguments and
+environment derived from it. It did that under the council state's read lock,
+which a Raft apply waits behind, and did it all again after the tick committed,
+for the follow-up calls. Two hundred nodes and 128 active runs made 25,600
+template copies a tick, twice, and each node got up to 2 MiB a second it had
+already seen.
+
+A run's template never changes, so a node only needs it once. The leader now
+keeps a `TemplatesSent` record in its memory: which runs each node has been
+sent. A later request sets `template_known` on the assignment and leaves
+`template`, `program`, `args` and `env` empty. The node keeps a copy of each
+running array's definition and fills them back in. A node that has no copy
+(it restarted, or the first call carrying it failed) answers
+`template_unknown`, and the leader forgets that one entry and sends it again on
+the next tick. A failed call forgets everything sent to that node, and a new
+leader starts with an empty record, so the worst a lost copy costs is a tick.
+The node treats a run it can't describe the way it treats a passing fault:
+zero slots, not a refusal for good, so the unrunnable rule above never fires
+on it.
+
+The lock went the same way. Inside `read_control` the leader now builds a
+`RequestPlan`: per active run, one shared assignment with no held chunks and
+each holder's chunks. The template is copied once per run, and only while some
+node still lacks it; in the steady state, not at all. The per-node requests are
+built from the plan after the lock is released, so `requests_for` no longer
+runs under it. The manifest profile map, which the old code rebuilt for every
+node, is built once per plan.
+
+The two new fields are an incompatible wire change: an older node would read a
+request with no template and no program as a host job with an empty binary.
+That's what the `protocol` number in `src/compatibility.rs` is for, and before
+1.0 a bump means a fresh cluster, not a compatibility shim. The test pins the
+size rather than the mechanism: `a_node_that_already_has_a_template_is_not_sent_it_again`
+checks that the second request for eight runs is under a quarter of the first,
+and `control_state_stays_within_budget_at_the_global_cap` now checks that a
+node's steady-state call at the 128-run cap stays under 64 KiB.
+
 The Criterion suite now has a `leader_tick` group, so the cost is a number,
 not a hunch (`make bench-task-arrays`): one tick for sixty-four arrays on three
 nodes, and one for a single array of one-task chunks on ten nodes, planned,

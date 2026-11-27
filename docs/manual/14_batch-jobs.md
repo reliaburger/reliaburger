@@ -421,7 +421,8 @@ costs up to one node's slots at once, so set `--concurrency` (per-node
 concurrency) low enough for one node's share to fit the quota.
 
 The leader syncs every node once a second and writes one Raft entry per tick
-for all running arrays together, however many there are. It waits for the
+for all running arrays together, however many there are. A run's template goes
+to each node once; later syncs carry only the node's chunks of it. It waits for the
 nodes' answers for half a second at most. A node that's slow or hung (still in
 gossip, but its API doesn't answer) delays only its own grants: the others are
 planned from the answers that arrived, and the slow node's call carries over
