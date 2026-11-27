@@ -4098,6 +4098,7 @@ async fn a_restore_is_refused_while_an_instance_awaits_its_restart() {
             state: ContainerState::Stopped,
             health_counters: Default::default(),
             restart_count: 1,
+            backoff_step: 1,
             last_restart: Some(Instant::now()),
             host_port: None,
             container_ip: None,
