@@ -1012,7 +1012,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let mode =
             |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(bundle), 0o711, "bundle directory mode");
+        // Root's, and at most container root's group may pass through
+        // (#2412): 0710 on a rootful grill, 0700 on a rootless one.
+        assert_eq!(mode(bundle) & 0o767, 0o700, "bundle directory mode");
         assert_eq!(mode(&bundle.join("config.json")), 0o600, "config.json mode");
     }
 
@@ -2463,28 +2465,29 @@ mod tests {
         let default_limit = std::fs::read_to_string(host_cgroup(&ids[0]).join("pids.max")).unwrap();
 
         // A small limit of its own keeps the bomb cheap for the test host.
+        // The bomb runs through exec, so the shell that dies on a failed
+        // fork isn't the container's init.
         start(
             &ids[1],
-            format!(
-                "image = \"{ALPINE_IMAGE}\"\npids = 32\n\
-                 command = [\"/bin/sh\", \"-c\", \"while :; do sleep 600 & done\"]\n"
-            ),
+            format!("image = \"{ALPINE_IMAGE}\"\npids = 32\ncommand = [\"sleep\", \"3614\"]\n"),
         )
         .await;
-        let events = host_cgroup(&ids[1]).join("pids.events");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let refused = loop {
-            let text = std::fs::read_to_string(&events).unwrap_or_default();
-            let refused: u64 = text
-                .lines()
-                .find_map(|line| line.strip_prefix("max "))
-                .and_then(|count| count.trim().parse().ok())
-                .unwrap_or(0);
-            if refused > 0 || std::time::Instant::now() > deadline {
-                break refused;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        };
+        let _ = grill
+            .exec(
+                &ids[1],
+                &[
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "for i in $(seq 1 64); do sleep 600 & done; true".to_string(),
+                ],
+            )
+            .await;
+        let events = std::fs::read_to_string(host_cgroup(&ids[1]).join("pids.events")).unwrap();
+        let refused: u64 = events
+            .lines()
+            .find_map(|line| line.strip_prefix("max "))
+            .and_then(|count| count.trim().parse().ok())
+            .unwrap_or(0);
         let bomb_limit = std::fs::read_to_string(host_cgroup(&ids[1]).join("pids.max")).unwrap();
 
         // The node can still fork runc for another container.

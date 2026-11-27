@@ -36,11 +36,6 @@ pub(crate) fn create_private_directory(
     bundle: &Path,
     container_group: Option<u32>,
 ) -> io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(bundle)?;
     if let Some(base) = bundle.parent() {
         close_to_other_users(base, container_group)?;
     }
@@ -61,10 +56,16 @@ pub(crate) fn close_to_other_users(
     container_group: Option<u32>,
 ) -> io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(directory)?;
+    // Only `directory` itself is closed: a parent this creates gets the
+    // usual mode, as on a fresh node's `/var/lib/reliaburger/images`.
+    if let Some(parent) = directory.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists && directory.is_dir() => {}
+        Err(error) => return Err(error),
+    }
     // Group first, then mode: the directory is never open to a group it
     // doesn't belong to yet.
     let mode = match container_group {
