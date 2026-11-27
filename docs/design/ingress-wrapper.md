@@ -56,7 +56,7 @@ If no ingress routes are configured in any app spec, Wrapper still binds its por
 
 Wrapper binds two TCP listeners on the host network namespace:
 
-- **Port 80 (HTTP)**: Serves plain-HTTP routes and issues HTTP 308 redirects for every path on routes that require TLS. There is no ACME challenge exception in v1.
+- **Port 80 (HTTP)**: Serves plain-HTTP routes and issues HTTP 308 redirects for every path on routes that require TLS. There is no ACME challenge exception in v1. The redirect keeps the client's host. When the `Host` named a port, the redirect names the HTTPS listener's port instead (left out when it is 443); a `Host` with no port redirects with none, which is right behind a port mapping (#2471).
 - **Port 443 (HTTPS)**: The primary listener. Terminates TLS using `rustls`, performs SNI-based certificate selection, and routes the decrypted request to the appropriate backend.
 
 Both ports are configurable via `node.toml`:
@@ -67,9 +67,9 @@ http_port = 80
 https_port = 443
 ```
 
-Each listener spawns a tokio task per accepted connection. Drain coordination doesn't track connections. It counts requests per backend instance: `SharedDrains` (`src/wrapper/draining.rs`) is a drain tracker behind an `Arc<Mutex<_>>`, and each request captures its backend's count under the routing table's read lock, so a drain started under the write lock can't miss it.
+Each listener spawns a tokio task per accepted connection. Drain coordination doesn't track connections. It counts requests per backend instance: `SharedDrains` (`src/wrapper/draining.rs`) is a drain tracker behind an `Arc<Mutex<_>>`, and each request captures its primary backend's count under the routing table's read lock, so a drain started under the write lock can't miss it. A plain request captures only once its body has arrived, under a second read of the table: a slow upload holds no drain open (#2381). A failover candidate is captured only when the request moves on to it, which releases the one before, so a drain on a candidate the request never tried neither waits for it nor cancels it (#2469). That late capture happens outside the lock; a candidate withdrawn in between refuses the connection and the request moves on.
 
-Every accepted connection gets the deadlines in `sesame::connection::ConnectionTimeouts::PRODUCTION`, shared with Bun's API and registry listeners: a 10 s TLS handshake (`tls_handshake_timeout`), 75 s for the first request byte and for each HTTP/1 request head (which also closes idle keep-alive connections), HTTP/2 pings every 30 s with a 20 s ack deadline, a 300 s write-stall limit for responses and WebSockets nobody reads, and TCP keepalive (60 s idle, 15 s probes). A streaming response or a quiet WebSocket is never closed for being idle; only a stalled write ends it. TLS connections still retire after one hour. The stream wrappers that enforce the first-byte, write-stall and lifetime limits forward the socket's vectored writes (`is_write_vectored`, `poll_write_vectored`): without them Hyper copies every response body into a per-connection write buffer that it never shrinks, so each idle keep-alive connection kept the capacity of its largest answer (#892).
+Every accepted connection gets the deadlines in `sesame::connection::ConnectionTimeouts::PRODUCTION`, shared with Bun's API and registry listeners: a 10 s TLS handshake (`tls_handshake_timeout`), 75 s for the first request byte and for each HTTP/1 request head (which also closes idle keep-alive connections), HTTP/2 pings every 30 s with a 20 s ack deadline, a 300 s write-stall limit for responses and WebSockets nobody reads, and TCP keepalive (60 s idle, 15 s probes). A quiet WebSocket is never closed for being idle; only a stalled write ends it. A proxied HTTP response is different: both upstream HTTP clients abort after 30 s without a byte from the backend, before the response head (the client gets 502) or between body chunks (the client's body ends with an error). A response that keeps sending, a server-sent event every few seconds say, has no total lifetime. The 30 s is fixed today; #1215 plans to make it configurable per route. The ingress handler adds three limits of its own on request bodies, which it buffers whole so it can replay one against a failover backend: a body over `max_request_body_bytes` (10 MiB) gets 413, a body that sends nothing for `request_body_idle` (30 s) gets 408, and every body being buffered shares `request_body_budget_bytes` (256 MiB, counted in KiB on a semaphore), so a request whose declared body won't fit gets 503 before any of it is read (#2381). The API and registry listeners set no body deadline: they stream long uploads. TLS connections still retire after one hour. The stream wrappers that enforce the first-byte, write-stall and lifetime limits forward the socket's vectored writes (`is_write_vectored`, `poll_write_vectored`): without them Hyper copies every response body into a per-connection write buffer that it never shrinks, so each idle keep-alive connection kept the capacity of its largest answer (#892).
 
 ```
                     ┌─────────────────────────────────────────────┐
@@ -525,7 +525,7 @@ Every inbound HTTPS request follows this path:
     b. If pool empty: respond 502 Bad Gateway
     c. Select backend by unweighted round-robin (the only strategy implemented; no strategy setting is exposed)
 8.  Proxy the request:
-    a. Replace the client's `X-Forwarded-For`, `X-Forwarded-Proto`, `Forwarded` and `X-Real-IP` with the proxy's own view of the connection, and set `X-Request-ID` to the client's value or a new 128-bit random id. A WebSocket upgrade gets the same headers (F08, #369).
+    a. Replace the client's `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host`, `X-Forwarded-Port`, `Forwarded` and `X-Real-IP` with the proxy's own view of the connection, send the client's `Host`, and set `X-Request-ID` to the client's value or a new 128-bit random id. A WebSocket upgrade gets the same headers (F08, #369; §8.4).
     b. Forward the request to backend_addr
     c. Stream the response back to the client
 9.  Connection accounting:
@@ -630,7 +630,7 @@ When Wrapper receives a request with `Connection: Upgrade` and `Upgrade: websock
 1. Wrapper validates the `Sec-WebSocket-Key` header is present.
 2. Wrapper selects a backend from the pool (same algorithm as HTTP).
 3. Wrapper forwards the upgrade request to the backend.
-4. If the backend responds with `101 Switching Protocols`, Wrapper enters bidirectional byte-level proxying (no HTTP framing).
+4. If the backend responds with `101 Switching Protocols`, Wrapper enters bidirectional byte-level proxying (no HTTP framing). Any other final status (a `401`, `403`, `429`, a redirect) is relayed to the client with its end-to-end headers and up to 64 KiB of its body, read within what is left of the 30 s handshake deadline (#2470). A connect failure, a handshake timeout, an unparsable head or another `1xx` status gets `502`.
 5. The connection is tracked as `is_websocket: true` in the connection tracker.
 6. WebSocket connections are long-lived. At a drain deadline the splice sends the client a Close 1001 (Going Away) frame, then closes both sockets (§5.5).
 
@@ -734,6 +734,24 @@ https_port = 443
 # Required by routes using tls = "explicit".
 tls_cert = "/etc/reliaburger/ingress/fullchain.pem"
 tls_key = "/etc/reliaburger/ingress/private-key.pem"
+
+# Requests in flight at once, WebSockets included; past it, 503.
+# This counts requests, not connections. Default: 10000.
+max_connections = 10000
+
+# Connections both listeners hold open between them; one accepted past
+# it is closed at once (#2383). Default: 32768.
+max_open_connections = 32768
+
+# TLS handshakes in progress from one client address; past it, that
+# client's next connection is dropped (#2383). Default: 16.
+max_tls_handshakes_per_source = 16
+
+# Largest request body forwarded (413 past it), and the bytes every body
+# being buffered may hold between them (503 past it) (#2381).
+# Defaults: 10 MiB and 256 MiB.
+max_request_body_bytes = 10485760
+request_body_budget_bytes = 268435456
 
 # Default drain timeout for rolling deploys.
 # Per-app drain_timeout in the app spec overrides this.
@@ -853,23 +871,24 @@ Limitations:
 - IP-based only. Cannot rate limit by API key, user identity, or other application-level attributes.
 - Doesn't protect against volumetric attacks that saturate network bandwidth before reaching Wrapper.
 
+Below the rate limiter, the listeners bound what a flood can cost Bun itself (#2383). The two listeners share a cap on open connections (`max_open_connections`, 32,768); a connection accepted past it is closed before it costs a task. `max_connections` (10,000) is a separate cap on requests in flight. The TLS listener allows 512 handshakes in progress, and at most `max_tls_handshakes_per_source` (16) from one client address, so one host opening silent sockets can't keep every slot full. When `accept` fails because the process is out of file descriptors or kernel memory (`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`), every accept loop in `sesame::connection` and the ingress pauses 100 ms instead of retrying at once: the pending connection stays queued, so an immediate retry fails the same way and spins a core. The API and registry listeners share the back-off but have no connection cap.
+
 For production deployments facing DDoS risk, operators should place a dedicated DDoS mitigation service (Cloudflare, AWS Shield, etc.) in front of the cluster. Wrapper's rate limiting protects against application-layer abuse, not network-layer floods.
 
 ### 8.4 Header Security
 
-Wrapper adds the following headers to proxied requests today (`forwarded_headers` in `src/wrapper/proxy.rs`):
+Wrapper sets these on every proxied request and WebSocket upgrade, from its own view of the connection (`forwarded_headers` and `UpstreamRequest::build` in `src/wrapper/proxy.rs`, `build_upgrade_request` in `src/wrapper/websocket.rs`):
 
-- `X-Forwarded-For`: Client IP appended to any existing chain.
-- `X-Forwarded-Proto`: `https`.
+- `Host` and `X-Forwarded-Host`: the host the client asked for, as it sent it (its `Host` header, or the HTTP/2 `:authority`), never the backend's address (#2404).
+- `X-Forwarded-For`: the TCP peer's address. It replaces anything the client sent; there is no chain.
+- `X-Forwarded-Proto`: `http` or `https`, the listener the request arrived on.
+- `X-Forwarded-Port`: the port of that listener.
+- `X-Real-IP`: the TCP peer's address.
+- `X-Request-ID`: the client's own if it sent a non-empty one, otherwise 32 random hex digits (a random `u128`, not a UUID).
 
-Planned, not yet added:
+Wrapper drops these from client requests (`is_forwarded_header`), so a backend can trust the values above: `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host`, `X-Forwarded-Port`, `Forwarded` and `X-Real-IP`. It also drops the hop-by-hop set, anything the client's `Connection` header names, and the node dashboard's session cookie.
 
-- `X-Real-IP`: Client's direct IP address.
-- `X-Request-ID`: Unique request identifier (UUID v4) if not already present.
-
-Wrapper strips the following headers from client requests before proxying:
-
-- `X-Forwarded-For` (replaced with accurate value to prevent spoofing, unless the peer IP is in a configured trusted proxy CIDR range).
+There is no trusted-proxy setting. Behind another proxy or a load balancer, the backend sees that proxy's address in `X-Forwarded-For` and `X-Real-IP`, and the rate limiter buckets every client behind it together (§5.1 step 6a).
 
 ---
 

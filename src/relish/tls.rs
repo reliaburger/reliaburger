@@ -7,8 +7,10 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, RootCertStore, SignatureScheme};
 
 /// Build a client that verifies certificate chains against only the supplied
-/// cluster CAs. Cluster nodes are reached through forwarded IP addresses, so
-/// their node-name certificates cannot use ordinary DNS-name verification.
+/// cluster CAs, and accepts only a cluster node's certificate. Cluster nodes
+/// are reached through forwarded IP addresses, so their node-name
+/// certificates cannot use ordinary DNS-name verification; the node-id URI
+/// SAN stands in for the name (#2396).
 pub(super) fn cluster_config(roots: RootCertStore) -> Result<Arc<rustls::ClientConfig>, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier = ClusterCaVerifier {
@@ -23,6 +25,12 @@ pub(super) fn cluster_config(roots: RootCertStore) -> Result<Arc<rustls::ClientC
         .with_no_client_auth();
     Ok(Arc::new(config))
 }
+
+/// The server's certificate chains to the cluster CA but isn't a node's: a
+/// workload's or an ingress certificate, say.
+#[derive(Debug, thiserror::Error)]
+#[error("the server's certificate is not a cluster node's")]
+struct NotANodeCertificate;
 
 #[derive(Debug)]
 struct ClusterCaVerifier {
@@ -47,6 +55,16 @@ impl ServerCertVerifier for ClusterCaVerifier {
             now,
             self.algorithms.all,
         )?;
+        // The root also signs the Workload and Ingress CAs, whose leaves
+        // carry server auth and whose keys live in workloads. Only a node
+        // certificate carries a node-id URI SAN, and only the Node CA signs
+        // one, so this is what makes the server a node and not merely
+        // "something under the root". The bearer token goes out only after.
+        if crate::sesame::mtls::node_id_from_leaf(leaf).is_none() {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::Other(rustls::OtherError(Arc::new(NotANodeCertificate))),
+            ));
+        }
         Ok(ServerCertVerified::assertion())
     }
 

@@ -521,8 +521,9 @@ fn summarise(rejected: &[RejectedRoute]) -> String {
 ///
 /// Only a port of digits is stripped (RFC 3986's `port = *DIGIT`). Any
 /// other tail stays on the host, so a Host header that isn't `host[:port]`
-/// matches no route; the HTTPS redirect repeats the Host header, so only a
-/// well-formed one may reach it.
+/// matches no route. The HTTPS redirect builds its target from the routed
+/// Host, keeping the name and swapping a port for the HTTPS listener's
+/// (#2471), so only a well-formed one may reach it.
 fn normalise_host(host: &str) -> String {
     let host = host.trim().to_lowercase();
     let (name, tail) = if let Some(rest) = host.strip_prefix('[') {

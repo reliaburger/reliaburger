@@ -1,6 +1,6 @@
 [package]
 name = "reliaburger"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 rust-version = "1.97"
 license = "Apache-2.0"
@@ -271,4 +271,8 @@ harness = false
 
 [[bench]]
 name = "policy"
+harness = false
+
+[[bench]]
+name = "wrapper_drains"
 harness = false
