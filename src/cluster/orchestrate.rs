@@ -9239,6 +9239,86 @@ image = "busybox:latest"
         assert_eq!(state.current_replicas, 2);
     }
 
+    // -- #2476: a reported GPU instance is counted once ----------------------
+
+    #[test]
+    fn a_reported_gpu_instance_is_not_reserved_a_second_time() {
+        let members = vec![member("gpu", 1)];
+        let mut gpu = report(4000, 0);
+        gpu.resource_usage.gpu_total = 2;
+        gpu.resource_usage.gpu_used = 1;
+        let mut train = running_app("default", "train", 31000, true);
+        train.port = None;
+        gpu.running_apps.push(train);
+        let reports = AggregatedState {
+            leadership_epoch: None,
+            receive_deadlines: HashMap::from([(
+                NodeId::new("gpu"),
+                tokio::time::Instant::now() + Duration::from_secs(30),
+            )]),
+            reports: HashMap::from([(NodeId::new("gpu"), gpu)]),
+            stale_nodes: vec![],
+            stale_since: Default::default(),
+            capabilities: HashMap::new(),
+            readiness: HashMap::new(),
+        };
+        let mut cache = build_cluster_cache(&members, &reports);
+        let mut desired = DesiredState::default();
+        desired.scheduling.insert(
+            AppId::new("train", "default"),
+            vec![crate::meat::types::Placement {
+                node_id: NodeId::new("gpu"),
+                resources: Resources::new(0, 0, 1),
+                ordinal: 0,
+            }],
+        );
+
+        crate::meat::admission::reserve_commitments(&mut cache, &desired);
+
+        assert_eq!(
+            cache.get_node(&NodeId::new("gpu")).unwrap().allocated.gpus,
+            1
+        );
+    }
+
+    /// A committed GPU instance the node hasn't reported yet is reserved
+    /// in full: its GPUs aren't in the node's reported total.
+    #[test]
+    fn an_unreported_gpu_instance_is_reserved() {
+        let members = vec![member("gpu", 1)];
+        let mut gpu = report(4000, 0);
+        gpu.resource_usage.gpu_total = 2;
+        let reports = AggregatedState {
+            leadership_epoch: None,
+            receive_deadlines: HashMap::from([(
+                NodeId::new("gpu"),
+                tokio::time::Instant::now() + Duration::from_secs(30),
+            )]),
+            reports: HashMap::from([(NodeId::new("gpu"), gpu)]),
+            stale_nodes: vec![],
+            stale_since: Default::default(),
+            capabilities: HashMap::new(),
+            readiness: HashMap::new(),
+        };
+        let mut cache = build_cluster_cache(&members, &reports);
+        let mut desired = DesiredState::default();
+        desired.scheduling.insert(
+            AppId::new("train", "default"),
+            vec![crate::meat::types::Placement {
+                node_id: NodeId::new("gpu"),
+                resources: Resources::new(0, 0, 1),
+                ordinal: 0,
+            }],
+        );
+
+        crate::meat::admission::reserve_commitments(&mut cache, &desired);
+
+        assert_eq!(
+            cache.get_node(&NodeId::new("gpu")).unwrap().allocated.gpus,
+            1
+        );
+    }
+
     // -- #2366: a pass never plans more than the council admits ------------
 
     /// `count` one-replica apps named `app-0000` onwards on one huge node.

@@ -2262,6 +2262,8 @@ The tests read like the issue: an over-quota app shows its reason, the reason cl
 
 The leader tallies each namespace's usage once per scheduling pass and adds every app it admits as it goes, so two apps admitted in the same pass can't each squeeze under a limit they exceed together. It also skips nodes cordoned by an in-progress upgrade before selecting.
 
+The node view the pass starts from mixes two sources, and they have to agree on what they've already counted. A node's report gives its allocated totals, and each running instance's CPU and memory; the pass then reserves every committed placement, adding only what the report doesn't cover yet. GPUs broke that bargain: the node's total includes every instance's GPUs, but the per-instance report has no GPU field, so each instance looked as if it held none and its GPUs were reserved a second time ([#2476](https://github.com/reliaburger/reliaburger/issues/2476)). Nothing can request a GPU yet, so no cluster hit it, but a two-GPU node running one GPU app would have looked full. `reserve_committed_instance` now treats a reported instance's GPUs as already in the total. We didn't add the field to the report: that's a wire change, and it belongs with GPU requests themselves.
+
 ### Placing what fits
 
 A quota isn't the only reason an app can't get all its replicas. Ask for three replicas in a cluster with room for two, and until 0.2.1 you got none: `schedule_fixed` returned an error at the first replica that didn't fit, the pass threw away the two it had already placed, and the leader logged `cannot place web` every two seconds. Nothing recorded the reason anywhere `relish status` could see.
