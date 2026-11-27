@@ -193,6 +193,35 @@ pub struct SlotPaths {
     /// Succeeds once this boot is blessed (`boot-complete.target` reached),
     /// as argv.
     pub boot_complete: Vec<String>,
+    /// How long staging waits on the network and on its commands.
+    pub timeouts: StagingTimeouts,
+}
+
+/// How long staging waits before it gives up and reports `Failed`, so a
+/// stalled download or a hung command ends the update instead of leaving
+/// the node in `Staging` until bun restarts.
+#[derive(Debug, Clone, Copy)]
+pub struct StagingTimeouts {
+    /// To connect to the release's host.
+    pub connect: std::time::Duration,
+    /// Between two reads of a download. There's no limit on a whole
+    /// download: a gigabyte over a slow link takes many minutes.
+    pub idle: std::time::Duration,
+    /// For `systemd-sysupdate` to write the slot.
+    pub sysupdate: std::time::Duration,
+    /// For the reboot command to return.
+    pub reboot: std::time::Duration,
+}
+
+impl Default for StagingTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: std::time::Duration::from_secs(30),
+            idle: std::time::Duration::from_secs(60),
+            sysupdate: std::time::Duration::from_secs(20 * 60),
+            reboot: std::time::Duration::from_secs(2 * 60),
+        }
+    }
 }
 
 impl Default for SlotPaths {
@@ -215,6 +244,7 @@ impl Default for SlotPaths {
                 "-q".into(),
                 "boot-complete.target".into(),
             ],
+            timeouts: StagingTimeouts::default(),
         }
     }
 }
@@ -300,12 +330,13 @@ impl OsSlot {
         if !*trial {
             return false;
         }
-        let blessed = tokio::time::timeout(
+        let blessed = run(
+            &self.paths.boot_complete,
+            &[],
             std::time::Duration::from_secs(5),
-            run(&self.paths.boot_complete, &[]),
         )
         .await
-        .is_ok_and(|done| done.is_ok());
+        .is_ok();
         if !blessed {
             return true;
         }
@@ -383,7 +414,7 @@ impl OsSlot {
         }
         if rebooting {
             eprintln!("bun: os update: {target} staged; rebooting into it");
-            if let Err(error) = run(&self.paths.reboot, &[]).await {
+            if let Err(error) = run(&self.paths.reboot, &[], self.paths.timeouts.reboot).await {
                 let failed = OsUpdateState::Failed {
                     target,
                     reason: format!("rebooting: {error}"),
@@ -398,13 +429,18 @@ impl OsSlot {
     async fn stage(&self, directive: &OsDirective) -> Result<(), String> {
         let version = &directive.version;
         let url = |file: &str| asset_url(&directive.channel_url, version, &self.arch, file);
+        let timeouts = self.paths.timeouts;
+        // No total timeout: a gigabyte over a slow link takes many minutes.
+        // `read_timeout` is reqwest's idle timeout between reads.
         let client = crate::http_client::builder()
             .user_agent("bun")
+            .connect_timeout(timeouts.connect)
+            .read_timeout(timeouts.idle)
             .build()
             .map_err(|e| e.to_string())?;
         let sums_name = format!("reliaburger-os_{version}.SHA256SUMS");
-        let sums = fetch(&client, &url(&sums_name)?).await?;
-        let signature = fetch(&client, &url(&format!("{sums_name}.sig"))?).await?;
+        let sums = fetch(&client, &url(&sums_name)?, timeouts.idle).await?;
+        let signature = fetch(&client, &url(&format!("{sums_name}.sig"))?, timeouts.idle).await?;
         let entries = signed_sums(&sums_name, &sums, &signature, &self.keys)
             .map_err(|e: OsError| e.to_string())?;
         let files = wanted(&entries, version)?;
@@ -415,7 +451,8 @@ impl OsSlot {
             .map_err(|e| e.to_string())??;
         for file in &files {
             eprintln!("bun: os update: fetching {file}");
-            let digest = download(&client, &url(file)?, &incoming.join(file)).await?;
+            let digest =
+                download(&client, &url(file)?, &incoming.join(file), timeouts.idle).await?;
             check_asset(&entries, &sums_name, file, &digest).map_err(|e| e.to_string())?;
         }
         // The signed sums name no architecture, and both builds name their
@@ -430,7 +467,12 @@ impl OsSlot {
             .await
             .map_err(|e| e.to_string())??;
         eprintln!("bun: os update: {version} checked; running systemd-sysupdate");
-        run(&self.paths.sysupdate, &[version.as_str()]).await
+        run(
+            &self.paths.sysupdate,
+            &[version.as_str()],
+            timeouts.sysupdate,
+        )
+        .await
     }
 }
 
@@ -511,13 +553,22 @@ fn set_private(_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-async fn run(argv: &[String], extra: &[&str]) -> Result<(), String> {
+/// The most [`fetch`] reads: `SHA256SUMS` and its signature are a few KiB.
+const MAX_FETCH_BYTES: usize = 1024 * 1024;
+
+/// Run `argv` with `extra` arguments, giving up after `limit`. The child is
+/// killed when it's given up on, so a hung `systemd-sysupdate` doesn't
+/// outlive the update it belonged to.
+async fn run(argv: &[String], extra: &[&str], limit: std::time::Duration) -> Result<(), String> {
     let (program, args) = argv.split_first().ok_or_else(|| "no command".to_string())?;
     let output = tokio::process::Command::new(program)
         .args(args)
         .args(extra)
-        .output()
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(limit, output)
         .await
+        .map_err(|_| format!("{program} didn't finish within {} s", limit.as_secs_f32()))?
         .map_err(|e| format!("{program}: {e}"))?;
     if output.status.success() {
         Ok(())
@@ -529,7 +580,39 @@ async fn run(argv: &[String], extra: &[&str]) -> Result<(), String> {
     }
 }
 
-async fn fetch(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
+/// The next chunk of a download, or an error once none has arrived for
+/// `idle`. The client's own read timeout should fire first; this holds the
+/// bound whatever the client does.
+async fn next_chunk<S, Chunk>(
+    stream: &mut S,
+    url: &str,
+    idle: std::time::Duration,
+) -> Result<Option<Chunk>, String>
+where
+    S: futures_util::Stream<Item = reqwest::Result<Chunk>> + Unpin,
+{
+    match tokio::time::timeout(idle, stream.next()).await {
+        Err(_) => Err(format!(
+            "{url}: download stalled for {} s",
+            idle.as_secs_f32()
+        )),
+        Ok(None) => Ok(None),
+        Ok(Some(chunk)) => chunk.map(Some).map_err(|e| {
+            if e.is_timeout() {
+                format!("{url}: download stalled for {} s", idle.as_secs_f32())
+            } else {
+                format!("{url}: {e}")
+            }
+        }),
+    }
+}
+
+/// A small file, whole: at most [`MAX_FETCH_BYTES`].
+async fn fetch(
+    client: &reqwest::Client,
+    url: &str,
+    idle: std::time::Duration,
+) -> Result<Vec<u8>, String> {
     let response = client
         .get(url)
         .send()
@@ -538,15 +621,24 @@ async fn fetch(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
     if !response.status().is_success() {
         return Err(format!("{url}: {}", response.status()));
     }
-    Ok(response
-        .bytes()
-        .await
-        .map_err(|e| format!("{url}: {e}"))?
-        .to_vec())
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = next_chunk(&mut stream, url, idle).await? {
+        if body.len() + chunk.len() > MAX_FETCH_BYTES {
+            return Err(format!("{url}: larger than {MAX_FETCH_BYTES} bytes"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// Stream `url` into `path`, returning its SHA-256.
-async fn download(client: &reqwest::Client, url: &str, path: &Path) -> Result<String, String> {
+async fn download(
+    client: &reqwest::Client,
+    url: &str,
+    path: &Path,
+    idle: std::time::Duration,
+) -> Result<String, String> {
     let response = client
         .get(url)
         .send()
@@ -560,8 +652,7 @@ async fn download(client: &reqwest::Client, url: &str, path: &Path) -> Result<St
         .map_err(|e| format!("{}: {e}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("{url}: {e}"))?;
+    while let Some(chunk) = next_chunk(&mut stream, url, idle).await? {
         hasher.update(&chunk);
         file.write_all(&chunk)
             .await
@@ -919,6 +1010,7 @@ mod tests {
             reboot: record("reboot"),
             boot_count: dir.join("LoaderBootCountPath"),
             boot_complete: vec!["true".into()],
+            ..SlotPaths::default()
         }
     }
 
@@ -1022,6 +1114,75 @@ mod tests {
         assert!(!log.exists(), "neither sysupdate nor the reboot ran");
     }
 
+    /// A connection that stops delivering bytes without closing (a
+    /// middlebox dropped the flow) used to leave the node in `Staging` for
+    /// good, answering every retry with "in progress".
+    #[tokio::test]
+    async fn a_stalled_download_fails_the_update_instead_of_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let (signing, public) = keypair();
+        let version = "2026.42.0";
+        let files = release_files(version, pe_header(0x8664));
+        let stalled = files[1].0.clone();
+        let channel_url = serve_release(version, &files, signing, Some(&stalled)).await;
+        let log = dir.path().join("commands.log");
+        let mut paths = recording_paths(dir.path());
+        paths.timeouts.idle = std::time::Duration::from_millis(200);
+        let slot = OsSlot::new(paths, "x86_64", vec![public], Some("2026.41.0".into()));
+        slot.begin(&directive(version, channel_url)).await.unwrap();
+
+        let state = settled(&slot, &log).await;
+        assert!(
+            matches!(&state, OsUpdateState::Failed { reason, .. } if reason.contains("stalled")),
+            "{state:?}"
+        );
+        assert!(!log.exists(), "neither sysupdate nor the reboot ran");
+    }
+
+    #[tokio::test]
+    async fn a_sysupdate_that_never_exits_fails_the_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let (signing, public) = keypair();
+        let version = "2026.42.0";
+        let files = release_files(version, pe_header(0x8664));
+        let channel_url = serve_release(version, &files, signing, None).await;
+        let log = dir.path().join("commands.log");
+        let mut paths = recording_paths(dir.path());
+        paths.sysupdate = vec!["sh".into(), "-c".into(), "sleep 3600".into(), "sh".into()];
+        paths.timeouts.sysupdate = std::time::Duration::from_millis(300);
+        let slot = OsSlot::new(paths, "x86_64", vec![public], Some("2026.41.0".into()));
+        slot.begin(&directive(version, channel_url)).await.unwrap();
+
+        let state = settled(&slot, &log).await;
+        assert!(
+            matches!(&state, OsUpdateState::Failed { reason, .. } if reason.contains("didn't finish")),
+            "{state:?}"
+        );
+        assert!(!log.exists(), "the node didn't reboot");
+    }
+
+    /// `SHA256SUMS` and its signature are a few KiB; a host that answers
+    /// with an endless body is refused, not read into memory.
+    #[tokio::test]
+    async fn an_oversized_sums_file_is_refused() {
+        let app = axum::Router::new().route(
+            "/big",
+            axum::routing::get(|| async { vec![b'x'; 2 * 1024 * 1024] }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let client = reqwest::Client::new();
+        let error = fetch(
+            &client,
+            &format!("http://{address}/big"),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("larger than"), "{error}");
+    }
+
     #[tokio::test]
     async fn a_release_signed_by_another_key_is_never_staged() {
         let dir = tempfile::tempdir().unwrap();
@@ -1048,6 +1209,7 @@ mod tests {
             reboot: vec!["false".into()],
             boot_count: dir.path().join("LoaderBootCountPath"),
             boot_complete: vec!["true".into()],
+            timeouts: StagingTimeouts::default(),
         };
         let slot = OsSlot::new(paths, "x86_64", vec![other_public], Some("0".into()));
         let directive = OsDirective {

@@ -887,6 +887,18 @@ Two Rust habits keep a hostile file from crashing it. Indexing a slice with `hea
 
 The other fix would bind the architecture into what's signed: the leader could pass the channel's per-architecture `sums_sha256` in the directive. That changes the cluster's wire format, and the PE check closes the hole without one, so it waits.
 
+And none of it may wait for ever. The first version built its HTTP client with no timeouts at all (the shared builder leaves them to the caller, on purpose) and ran `systemd-sysupdate` with no deadline. Picture a CDN connection that stops sending halfway through the 500 MB `/usr` image without closing: `stream.next().await` never returns, the node sits in `Staging`, and it answers every retry from the leader with "in progress". After 45 minutes the rollout pauses, `resume` re-sends the directive, the node says "in progress" again, and only restarting bun gets it out. So every wait now has a bound. The client gets a 30 s connect timeout and reqwest's `read_timeout`, which is an *idle* timeout between reads rather than a total, because a gigabyte over a slow link legitimately takes many minutes. On top of that each chunk is awaited through `tokio::time::timeout`, so the bound holds whatever the client does:
+
+```rust
+match tokio::time::timeout(idle, stream.next()).await {
+    Err(_) => Err(format!("{url}: download stalled for {} s", idle.as_secs_f32())),
+    Ok(None) => Ok(None),
+    Ok(Some(chunk)) => chunk.map(Some).map_err(|e| /* ... */),
+}
+```
+
+`timeout` wraps any future and hands back a `Result`: `Err(Elapsed)` if time ran out first, otherwise `Ok` of whatever the future returned, here the stream's `Option` of a `Result`. Three layers of wrapping look fussy, but each `match` arm is one distinct outcome, and the compiler won't let us forget one. Commands get the same treatment, with `kill_on_drop(true)` on the child: when the timeout gives up on `output()`, the future is dropped, and dropping it kills `systemd-sysupdate` instead of leaving it to write a slot behind our back. Every one of these ends the update as `Failed` with the reason, which the leader's watch reports straight away, and a `resume` starts a fresh attempt.
+
 Before it reboots, the node writes what it's doing to `/var/lib/reliaburger/os-update.json`: `{"state": "rebooting", "target": "2026.42.0"}`. That one file answers the hard question after the reboot. If the node comes up on 2026.42.0 and the boot gets blessed, the update worked. If it comes up on anything else, it was a fallback, and bun says so in `/v1/version`:
 
 ```rust

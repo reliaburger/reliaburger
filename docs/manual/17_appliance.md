@@ -1075,7 +1075,10 @@ or two later. While a node drains and updates it takes no new work, and
 
 If a node comes back on its old version, because the new one failed its boot
 check on both tries, or doesn't come back within 45 minutes, the rollout
-pauses and `relish os status` says which node and why. `relish os resume`
+pauses and `relish os status` says which node and why. A download that
+stops delivering bytes for a minute (`download stalled for 60 s`), or a
+`systemd-sysupdate` that runs past 20 minutes, fails the node's update with
+that reason, so the rollout pauses on it at once rather than after 45 minutes. `relish os resume`
 tries that node again; `relish os abort` stops, leaving each node on the
 version it has. A node that's already on the target is skipped, so after
 adding machines from an older image, run `relish os upgrade` again to bring

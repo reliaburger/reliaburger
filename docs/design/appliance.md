@@ -502,6 +502,14 @@ appliance or is already updating to another version. Then, off the request:
    off, because bun has already checked every byte.
 4. Reboot.
 
+Every step is bounded, so staging ends in `Rebooting` or `Failed`, never in a
+`Staging` only a bun restart clears: 30 s to connect, 60 s with no bytes
+arriving on a download (there's no limit on a whole download), 1 MiB for
+`SHA256SUMS` and its signature, 20 minutes for `systemd-sysupdate` and 2 for
+the reboot command, whose child is killed when it runs over. The defaults are
+`StagingTimeouts`; tests shorten them. A `Failed` node pauses the rollout with
+its reason, and `resume` starts a fresh attempt.
+
 The node's progress is in `/var/lib/reliaburger/os-update.json` (Idle,
 Staging, Rebooting, Failed) and in `/v1/version` as `os_version` and
 `os_update`.
