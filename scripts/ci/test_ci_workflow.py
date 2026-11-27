@@ -502,6 +502,21 @@ class TrainAndQueueTests(unittest.TestCase):
         # for a merge group.
         self.assertIn("    if: needs.changes.outputs.macos == 'true'\n", self.jobs["macos"])
 
+    def test_every_nightly_that_replaced_a_pull_request_job_tests_the_newest_train(self):
+        # macOS left the queue, and fuzzing and mutants left pull requests,
+        # on 24 November 2026 for nightlies. A scheduled run checks out main,
+        # so each must switch to the train itself, or train work goes
+        # untested until the gate PR merges (#2482).
+        for name in ("macos-nightly.yml", "fuzz.yml", "mutants.yml"):
+            with self.subTest(workflow=name):
+                text = (WORKFLOWS / name).read_text()
+                triggers = text.split("\njobs:")[0]
+                self.assertRegex(triggers, r"\n  schedule:\n(    #.*\n)*    - cron: \"[^\"]* \* \* \*\"")
+                self.assertNotIn("pull_request", triggers)
+                self.assertIn("fetch-depth: 0", text)
+                self.assertIn("git branch -r --list 'origin/release-*'", text)
+                self.assertIn("sort -V | tail -n 1", text)
+
     def test_a_merge_group_is_judged_against_the_commit_it_sits_on(self):
         self.assertIn("BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}",
                       self.jobs["changes"])
