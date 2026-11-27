@@ -1577,6 +1577,21 @@ page and the logs endpoint ask every node for that grant instead of one.
 after a round trip through JSON: the attempt always survives, and the owner is
 either right or absent.
 
+Asking every node had a side effect (#2473). A node that
+never ran any of the array answers "not found", and the results handler filed
+that answer under `unreachable`, the list for nodes whose tasks are missing.
+On a 30-node cluster where ten nodes ran a folded array, a complete page came
+back listing twenty healthy nodes as unreachable. Now a small `node_answer`
+function decides what each answer means, and it needs one more fact: whether
+the node was asked because the record names it as an owner. A named owner that
+holds nothing really has lost its detail, so it's still listed. Any node whose
+call fails is listed too. A node asked only because the owners are forgotten,
+and that holds nothing, just has nothing to add. The test
+`a_node_holding_nothing_for_a_folded_array_is_not_reported_unreachable` checks
+all four cases. What the folded page can't do is tell a node that lost its
+ledger from one that never had it: both say "not found". The manual's rule
+still holds, never read missing detail as success.
+
 The Criterion suite now has a `leader_tick` group, so the cost is a number,
 not a hunch (`make bench-task-arrays`): one tick for sixty-four arrays on three
 nodes, and one for a single array of one-task chunks on ten nodes, planned,

@@ -274,7 +274,7 @@ contact at most eight workers. A page can end earlier when tiny chunks span
 more workers. An
 empty failure page can still contain `next_after`: continue with that cursor.
 Only the worker and grant whose completion was accepted can supply an outcome
-or retained task output. Unreachable workers are explicit. Singletons keep bounded successful output as
+or retained task output. Unreachable workers are explicit: `unreachable` lists every worker whose call failed and every recorded owner that no longer holds its results. Once a run has passed 4,096 accepted ranges the cluster stops recording which worker ran each chunk and asks every worker; one that never ran the array isn't listed, so a lost worker's tasks can then be missing without a name beside them. Singletons keep bounded successful output as
 well as failure output; larger arrays discard successful output. Control reports keep exact failure counts and at most 256 index
 ranges per chunk; indexed detail remains available beyond that preview.
 Retained output keeps a bounded head and tail. Each chunk keeps the output
