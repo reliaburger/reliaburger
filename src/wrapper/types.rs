@@ -93,7 +93,9 @@ pub struct WrapperConfig {
     pub http_port: u16,
     /// HTTPS listen port (default: 443).
     pub https_port: u16,
-    /// Maximum concurrent proxy connections (default: 10,000).
+    /// Maximum requests in flight at once, WebSocket splices included
+    /// (default: 10,000). A request past it is answered 503. This counts
+    /// requests, not open connections.
     pub max_connections: usize,
     /// Path to a TLS certificate PEM file. If not set, a self-signed
     /// cert is generated on startup.
@@ -104,6 +106,10 @@ pub struct WrapperConfig {
     /// A request whose body exceeds this is rejected with 413. Response
     /// bodies stream and are not bounded by this (ING3).
     pub max_request_body_bytes: usize,
+    /// How many bytes all request bodies being buffered may hold between
+    /// them (default: 256 MiB). A request whose body won't fit in what is
+    /// left is answered 503 before its body is read (#2381).
+    pub request_body_budget_bytes: usize,
     /// Maximum number of TLS handshakes in progress at once. Slow or
     /// malicious handshakers beyond this are dropped rather than allowed
     /// to pile up tasks (ING2).
@@ -111,6 +117,14 @@ pub struct WrapperConfig {
     /// How long a single TLS handshake may take before the connection is
     /// dropped (ING2).
     pub tls_handshake_timeout: std::time::Duration,
+    /// Maximum connections the two ingress listeners hold open between them
+    /// (default: 32,768). A connection accepted past it is closed at once
+    /// (#2383).
+    pub max_open_connections: usize,
+    /// How many of the `max_tls_handshakes` slots one client address may
+    /// hold at once (default: 16). Past it, that client's next connection is
+    /// dropped, so one host can't keep every slot full (#2383).
+    pub max_tls_handshakes_per_source: usize,
 }
 
 impl Default for WrapperConfig {
@@ -122,8 +136,11 @@ impl Default for WrapperConfig {
             tls_cert_path: None,
             tls_key_path: None,
             max_request_body_bytes: 10 * 1024 * 1024,
+            request_body_budget_bytes: 256 * 1024 * 1024,
             max_tls_handshakes: 512,
             tls_handshake_timeout: std::time::Duration::from_secs(10),
+            max_open_connections: 32_768,
+            max_tls_handshakes_per_source: 16,
         }
     }
 }
