@@ -74,10 +74,11 @@ async fn settled_applied(node: &CouncilNode) -> openraft::LogId<u64> {
     settled.last_applied.unwrap()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_learner_installing_a_snapshot_gets_every_entry_applied_after_it() {
-    let router = InMemoryRaftRouter::new();
-    let leader = start(1, &router).await;
+/// Start node 1 as a single-voter leader, write `before`, snapshot it and
+/// purge the log the snapshot covers, so a member that joins later can only
+/// get `before` from the snapshot.
+async fn compacted_leader(router: &InMemoryRaftRouter) -> CouncilNode {
+    let leader = start(1, router).await;
     leader
         .initialize(BTreeMap::from([(1, info(1))]))
         .await
@@ -91,7 +92,6 @@ async fn a_learner_installing_a_snapshot_gets_every_entry_applied_after_it() {
     .unwrap()
     .unwrap();
 
-    // Compact: snapshot after "before", then purge the log it covers.
     write(&leader, "before").await;
     let snapshot_index = settled_applied(&leader).await.index;
     leader.raft().trigger().snapshot().await.unwrap();
@@ -115,6 +115,13 @@ async fn a_learner_installing_a_snapshot_gets_every_entry_applied_after_it() {
     .await
     .unwrap()
     .unwrap();
+    leader
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_learner_installing_a_snapshot_gets_every_entry_applied_after_it() {
+    let router = InMemoryRaftRouter::new();
+    let leader = compacted_leader(&router).await;
 
     // The leader applies past its snapshot, as any busy council does.
     for key in ["after-1", "after-2", "after-3"] {
@@ -145,6 +152,39 @@ async fn a_learner_installing_a_snapshot_gets_every_entry_applied_after_it() {
              didn't hold, so they were never replicated"
         );
     }
+
+    let _ = learner.shutdown().await;
+    let _ = leader.shutdown().await;
+}
+
+/// #2367: each snapshot chunk used to get openraft's default 200 ms, and a
+/// chunk that missed it restarted the whole install from offset 0. On a link
+/// where a chunk takes 400 ms the learner never caught up, so it was never
+/// promoted and a council that lost a voter couldn't replace it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_learner_installs_a_snapshot_over_a_link_slower_than_a_heartbeat() {
+    let router = InMemoryRaftRouter::new();
+    let leader = compacted_leader(&router).await;
+    router.delay_snapshots(Duration::from_millis(400)).await;
+
+    let learner = start(2, &router).await;
+    tokio::time::timeout(Duration::from_secs(10), leader.add_learner(2, info(2)))
+        .await
+        .expect("adding the learner timed out")
+        .unwrap();
+    let installed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if learner.desired_state().await.config.contains_key("before") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        installed.is_ok(),
+        "the learner never installed the snapshot over a link where a chunk takes 400 ms"
+    );
 
     let _ = learner.shutdown().await;
     let _ = leader.shutdown().await;

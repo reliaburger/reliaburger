@@ -60,6 +60,9 @@ type RegisteredNode = (Raft<TypeConfig>, LeaderContact);
 pub struct InMemoryRaftRouter {
     rafts: Arc<Mutex<HashMap<u64, RegisteredNode>>>,
     partitions: Arc<Mutex<HashSet<(u64, u64)>>>,
+    /// How long each snapshot chunk takes to arrive, in microseconds, as on
+    /// a slow link (#2367).
+    snapshot_delay_micros: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl fmt::Debug for InMemoryRaftRouter {
@@ -90,6 +93,14 @@ impl InMemoryRaftRouter {
         let mut parts = self.partitions.lock().await;
         parts.insert((a, b));
         parts.insert((b, a));
+    }
+
+    /// Make every later snapshot chunk take `delay` to arrive, as on a link
+    /// slower than a heartbeat (#2367).
+    pub async fn delay_snapshots(&self, delay: std::time::Duration) {
+        let micros = u64::try_from(delay.as_micros()).unwrap_or(u64::MAX);
+        self.snapshot_delay_micros
+            .store(micros, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Heal all partitions.
@@ -194,6 +205,13 @@ impl RaftNetwork<TypeConfig> for InMemoryRaftNetwork {
             .lookup(self.source_id, self.target)
             .await
             .map_err(RPCError::Unreachable)?;
+        let delay = self
+            .router
+            .snapshot_delay_micros
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_micros(delay)).await;
+        }
         raft.install_snapshot(rpc)
             .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))
@@ -253,12 +271,81 @@ const MAX_RAFT_CONNECTIONS: usize = 64;
 pub enum RaftRpc {
     AppendEntries(AppendEntriesRequest<TypeConfig>),
     Vote(VoteRequest<u64>),
-    InstallSnapshot(InstallSnapshotRequest<TypeConfig>),
+    /// One snapshot chunk. Its bytes travel as base64 ([`snapshot_chunk_wire`]).
+    InstallSnapshot(#[serde(with = "snapshot_chunk_wire")] InstallSnapshotRequest<TypeConfig>),
     /// Which nodes are voters in your council? A member whose view of the
     /// membership is behind asks this of the voters it knows before it
     /// admits a leader it has never heard of (see [`super::admission`]).
     /// It reaches no Raft state and never moves the recovery fence.
     CouncilVoters,
+}
+
+/// The wire form of an `InstallSnapshotRequest`, with its chunk as base64
+/// (#2367).
+///
+/// openraft's request holds the chunk as a `Vec<u8>`, and `serde_json`
+/// writes that as an array of decimal numbers: about 3.6 bytes of frame per
+/// byte of snapshot. The request is openraft's type, so we can't put a
+/// `#[serde(with)]` on its field. Instead `RaftRpc::InstallSnapshot` uses
+/// this module, which serialises a local mirror of the request whose `data`
+/// is a base64 string, a third larger than the chunk.
+mod snapshot_chunk_wire {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use openraft::raft::InstallSnapshotRequest;
+    use openraft::{SnapshotMeta, Vote};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::super::types::{CouncilNodeInfo, TypeConfig};
+
+    /// Borrows everything but the chunk, which it holds encoded.
+    #[derive(Serialize)]
+    struct Outgoing<'a> {
+        vote: &'a Vote<u64>,
+        meta: &'a SnapshotMeta<u64, CouncilNodeInfo>,
+        offset: u64,
+        data: String,
+        done: bool,
+    }
+
+    #[derive(Deserialize)]
+    struct Incoming {
+        vote: Vote<u64>,
+        meta: SnapshotMeta<u64, CouncilNodeInfo>,
+        offset: u64,
+        data: String,
+        done: bool,
+    }
+
+    pub(super) fn serialize<S: Serializer>(
+        request: &InstallSnapshotRequest<TypeConfig>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        Outgoing {
+            vote: &request.vote,
+            meta: &request.meta,
+            offset: request.offset,
+            data: BASE64.encode(&request.data),
+            done: request.done,
+        }
+        .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<InstallSnapshotRequest<TypeConfig>, D::Error> {
+        let incoming = Incoming::deserialize(deserializer)?;
+        let data = BASE64
+            .decode(incoming.data)
+            .map_err(serde::de::Error::custom)?;
+        Ok(InstallSnapshotRequest {
+            vote: incoming.vote,
+            meta: incoming.meta,
+            offset: incoming.offset,
+            data,
+            done: incoming.done,
+        })
+    }
 }
 
 /// A Raft RPC stamped with the sender's recovery epoch (C5, #424).
@@ -1465,6 +1552,57 @@ mod tests {
                 )),
             )),
         }
+    }
+
+    /// A snapshot chunk of `len` bytes of JSON text, as the state machine's
+    /// snapshot is.
+    fn snapshot_chunk(len: usize) -> InstallSnapshotRequest<TypeConfig> {
+        let text = br#"{"config":{"key-0042":"value"},"apps":[1,2,3]},"#;
+        InstallSnapshotRequest {
+            vote: openraft::Vote::new_committed(3, 7),
+            meta: Default::default(),
+            offset: 4096,
+            data: text.iter().copied().cycle().take(len).collect(),
+            done: false,
+        }
+    }
+
+    fn snapshot_envelope(len: usize) -> RaftRpcEnvelope {
+        RaftRpcEnvelope {
+            compatibility: crate::compatibility::CURRENT,
+            sender_recovery_epoch: 0,
+            sender_recovery_id: None,
+            rpc: RaftRpc::InstallSnapshot(snapshot_chunk(len)),
+        }
+    }
+
+    /// #2367: `serde_json` writes a `Vec<u8>` as an array of decimal
+    /// numbers, about 3.6 bytes of frame per byte of snapshot. The chunk's
+    /// bytes travel as base64 instead, a third larger.
+    #[test]
+    fn an_install_snapshot_frame_is_at_most_a_little_larger_than_its_chunk() {
+        let chunk = 64 * 1024;
+        let frame = serde_json::to_vec(&snapshot_envelope(chunk)).unwrap();
+        assert!(
+            frame.len() * 10 <= chunk * 14,
+            "a {chunk}-byte chunk made a {}-byte frame",
+            frame.len()
+        );
+    }
+
+    #[test]
+    fn an_install_snapshot_chunk_round_trips_through_its_frame() {
+        let frame = serde_json::to_vec(&snapshot_envelope(1000)).unwrap();
+        let (_, rpc) = decode_envelope(&frame).unwrap();
+        let RaftRpc::InstallSnapshot(decoded) = rpc else {
+            panic!("decoded another rpc");
+        };
+        let sent = snapshot_chunk(1000);
+        assert_eq!(decoded.data, sent.data);
+        assert_eq!(decoded.offset, sent.offset);
+        assert_eq!(decoded.vote, sent.vote);
+        assert_eq!(decoded.meta, sent.meta);
+        assert_eq!(decoded.done, sent.done);
     }
 
     #[test]

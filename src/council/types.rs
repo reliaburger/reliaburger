@@ -1084,6 +1084,24 @@ impl Default for CouncilConfig {
     }
 }
 
+/// How long one snapshot chunk may take to be sent, received, decoded and
+/// answered, in milliseconds (#2367).
+///
+/// openraft's default is 200 ms, and a chunk that misses it restarts the
+/// whole install from offset 0, so a member on a slow link (or a slow CPU)
+/// that needed a snapshot never caught up. The last chunk also waits for the
+/// follower to decode the whole state and fsync it. Ten seconds is the
+/// transport's own bound on any RPC.
+pub const SNAPSHOT_CHUNK_TIMEOUT_MS: u64 = 10_000;
+
+/// The most snapshot bytes one chunk carries (#2367).
+///
+/// openraft's default is 3 MiB. 256 KiB is about 342 KiB on the wire as
+/// base64: under 300 ms on a 10 Mbit/s link, so a chunk fits its deadline
+/// with a wide margin even on a poor link, and a failed chunk costs little
+/// to resend.
+pub const SNAPSHOT_CHUNK_BYTES: u64 = 256 * 1024;
+
 impl CouncilConfig {
     /// Convert to an `openraft::Config`.
     pub fn to_openraft_config(&self) -> openraft::Config {
@@ -1093,6 +1111,8 @@ impl CouncilConfig {
             election_timeout_max: self.election_timeout_max_ms,
             snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(self.snapshot_threshold),
             max_in_snapshot_log_to_keep: self.max_in_snapshot_log_to_keep,
+            install_snapshot_timeout: SNAPSHOT_CHUNK_TIMEOUT_MS,
+            snapshot_max_chunk_size: SNAPSHOT_CHUNK_BYTES,
             ..Default::default()
         }
     }
@@ -1378,6 +1398,24 @@ mod tests {
         assert_eq!(cfg.election_timeout_max_ms, 2000);
         assert_eq!(cfg.snapshot_threshold, 10_000);
         assert_eq!(cfg.max_in_snapshot_log_to_keep, 1000);
+    }
+
+    /// #2367: openraft's defaults give each snapshot chunk 200 ms and make
+    /// it 3 MiB, so a chunk on a slow link never arrives in time and the
+    /// install restarts from offset 0 for ever.
+    #[test]
+    fn a_snapshot_chunk_gets_seconds_and_fits_a_slow_link() {
+        let config = CouncilConfig::default().to_openraft_config();
+        assert!(
+            config.install_snapshot_timeout >= 10_000,
+            "a snapshot chunk gets {} ms",
+            config.install_snapshot_timeout
+        );
+        assert!(
+            config.snapshot_max_chunk_size <= 256 * 1024,
+            "a snapshot chunk is {} bytes",
+            config.snapshot_max_chunk_size
+        );
     }
 
     #[test]

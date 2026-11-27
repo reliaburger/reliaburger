@@ -2453,6 +2453,29 @@ The second guard is defence in depth. Every request one node forwards to the lea
 
 The tests build the gap with the in-memory Raft router. Three nodes elect node 1, then the router partitions node 1 from both followers and the test waits until `is_leader` fails while `current_leader` still answers `Some(1)`. Node 1's API port is a bare TCP listener that counts every connection it accepts. `a_leader_without_quorum_answers_503_instead_of_forwarding_to_itself` sends apply, stop, batch submit, batch status, upgrade start and abort, the desired-apps read and a build signature to node 1, expects 503 from each, and expects the counter to read zero. Before the fix, the first call came back 502: node 1 had connected to itself, and the counting listener hung up. `a_follower_never_forwards_a_request_another_node_already_forwarded` sends the same calls with the header to a healthy follower, whose leader is a fake that records what reaches it, and expects 503 from each and nothing recorded. `a_follower_marks_every_request_it_forwards_to_the_leader` checks the other side: the fake leader sees the header on everything it receives.
 
+### Deadlines we didn't choose
+
+`CouncilConfig::to_openraft_config` used to set five fields and take openraft's defaults for everything else. Defaults are someone else's guess about your system, and two of openraft's govern snapshot transfer. Each snapshot chunk got `install_snapshot_timeout`, 200 ms, to be sent, received, decoded and answered, and a chunk was up to `snapshot_max_chunk_size`, 3 MiB. A chunk that missed its 200 ms didn't get retried on its own. openraft dropped the RPC and the next attempt started again from offset 0, so a member that needed a snapshot over a slow link failed in exactly the same place for ever. That member is usually the one you need most: a fresh node replacing a dead voter, after the leader has already purged the log it would otherwise replay. It never caught up, so it was never promoted, and the council stayed one failure from losing quorum ([#2367](https://github.com/reliaburger/reliaburger/issues/2367)).
+
+Our transport made it worse. The chunk's bytes are a `Vec<u8>`, and `serde_json` writes a `Vec<u8>` as an array of decimal numbers: `[123,34,97,...]`. The snapshot is itself JSON text, so most of its bytes are two or three digits plus a comma, about 3.6 bytes of frame per byte of snapshot. A 3 MiB chunk became an 11 MiB frame.
+
+Both defaults are now our own decisions, as named constants with the reasoning beside them. A chunk gets 10 seconds (`SNAPSHOT_CHUNK_TIMEOUT_MS`, the transport's own bound on any RPC) and carries 256 KiB (`SNAPSHOT_CHUNK_BYTES`), under 300 ms of transfer even on a 10 Mbit/s link. The last chunk also waits while the follower decodes the whole state and fsyncs it, which is why seconds rather than milliseconds.
+
+The encoding needed a Rust trick we haven't used yet. The obvious fix is to tell serde "write this field as base64", and serde has an attribute for it: `#[serde(with = "module")]` on a field makes serde call `module::serialize` and `module::deserialize` for that field instead of the type's own implementation. But the field is `InstallSnapshotRequest::data`, and `InstallSnapshotRequest` belongs to openraft. We can't add attributes to another crate's struct. What we can do is put the attribute one level up, on the variant of our own enum that carries the request:
+
+```rust
+pub enum RaftRpc {
+    AppendEntries(AppendEntriesRequest<TypeConfig>),
+    Vote(VoteRequest<u64>),
+    InstallSnapshot(#[serde(with = "snapshot_chunk_wire")] InstallSnapshotRequest<TypeConfig>),
+    CouncilVoters,
+}
+```
+
+`snapshot_chunk_wire` serialises a local mirror of the request. On the way out it *borrows* the vote and the metadata (`&'a Vote<u64>`, a struct with a lifetime parameter, so the mirror can't outlive the request it points into) and holds only the chunk, freshly encoded as a base64 `String`. On the way in it reads an owned mirror and decodes the string back into bytes. Everyone else still builds and matches `RaftRpc::InstallSnapshot(InstallSnapshotRequest { .. })` exactly as before; only the bytes on the wire changed. `an_install_snapshot_frame_is_at_most_a_little_larger_than_its_chunk` encodes a 64 KiB chunk and holds the frame under 1.4 times that, and `an_install_snapshot_chunk_round_trips_through_its_frame` checks nothing is lost. The wire format changed, so `protocol` in `CURRENT` went up with it: nodes on either side of the change refuse each other.
+
+The behaviour test needed a slow link, and the in-memory router had none. `InMemoryRaftRouter::delay_snapshots` makes each chunk sleep before it reaches the follower. `a_learner_installs_a_snapshot_over_a_link_slower_than_a_heartbeat` compacts a leader's log, delays every chunk by 400 ms and adds a learner. With openraft's 200 ms the learner never held the key written before the snapshot; with ours it has it in well under a second.
+
 ### The ClusterHandle
 
 The agent needs to answer questions like "who's in the cluster?" and "who's the leader?" without holding mutable borrows on gossip or Raft. We use watch channels for this.
