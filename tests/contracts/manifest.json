@@ -4332,6 +4332,17 @@
           ]
         },
         {
+          "id": "legacy-ci-reliaburger-smoker-resource-tests-cgroup_disk_io_throttle_is_accepted_by_a_real_cgroup",
+          "binary": "reliaburger",
+          "test": "smoker::resource::tests::cgroup_disk_io_throttle_is_accepted_by_a_real_cgroup",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/smoker/resource.rs"
+          ]
+        },
+        {
           "id": "legacy-ci-reliaburger-autoscale_memory-runc_autoscaler_scales_up_on_real_memory_growth",
           "binary": "reliaburger::autoscale_memory",
           "test": "runc_autoscaler_scales_up_on_real_memory_growth",

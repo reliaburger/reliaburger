@@ -916,6 +916,8 @@ after an abrupt termination.
 
 Bun writes to the `blkio` cgroup controller for the target container, using the kernel's native I/O throttling mechanism.
 
+The device is the whole disk under the node's volumes directory: Bun reads the directory's `st_dev`, then `/sys/dev/block/MAJOR:MINOR`, and a partition (an entry with a `partition` file) resolves to its parent disk, because `io.max` refuses a partition with `ENODEV`. A directory with no block device (major 0: Btrfs, overlayfs, tmpfs) gets a refusal naming the directory and device; there is no `8:0` fallback (`smoker::resource::throttle_device_of`, #2463). Device-mapper volumes (LVM, LUKS) are whole devices already.
+
 ```rust
 /// Apply disk I/O throttle to a container via blkio cgroup.
 /// `bytes_per_sec`: maximum throughput in bytes/sec.
