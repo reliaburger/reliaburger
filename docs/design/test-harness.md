@@ -332,9 +332,15 @@ Only `task_arrays` is compared with a baseline.
 
 `cargo-llvm-cov` runs the portable suite once, instrumented, and writes LCOV and HTML
 artefacts. On Linux that run is also the test gate and the portable JUnit source, so the suite isn't
-compiled and run a second time uninstrumented. The measured Linux CI line baseline is 79.65%, so CI starts at 78.65%,
-one percentage point lower. Raise it when coverage improves; do not lower it to land
-unrelated work.
+compiled and run a second time uninstrumented. The first measured Linux CI line baseline was 79.65%
+(July 2026), so CI started at 78.65%, one percentage point lower. By November the suite
+covered 88.60% of lines in each of the six green `push` runs of `ci.yml` from 26 and 27
+November (runs 45803622920 to 46025070846, summing `LH` and `LF` in each `coverage`
+artefact's `lcov.info`; the lowest,
+[45850762788](https://github.com/reliaburger/reliaburger/actions/runs/45850762788) on
+`release-1-3-3`, had 311,215 of 351,277 lines, 88.595%), so the floor is now 87.60% (#2487). Raise it when coverage improves; never
+lower it to land unrelated work. Each minor release revisits it after the tag, from that
+release's last green `portable Linux` run ([release step 10](../releasing.md#staging-a-candidate)).
 
 ## Finite inventory and authority
 

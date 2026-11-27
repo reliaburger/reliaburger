@@ -3,7 +3,7 @@
 CARGO = cargo
 NEXTEST_PROFILE ?= default
 NEXTEST = $(CARGO) nextest run --profile $(NEXTEST_PROFILE) --no-tests=fail
-COVERAGE_MIN_LINES ?= 78.65
+COVERAGE_MIN_LINES ?= 87.60
 # Crash-recovery tests SIGKILL instrumented Bun, owner and workload processes
 # on purpose; one killed while it writes its profile at exit leaves a
 # truncated .profraw. Skip unreadable profiles with a warning instead of

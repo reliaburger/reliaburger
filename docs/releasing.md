@@ -2328,6 +2328,12 @@ the real `curl … | sh` install against it on every host we advertise.
     took and how many candidates, what each soak found and what fixed it, and
     any known issue it ships with, linking the records from step 6. When the
     profile from step 9 is in, add one line from its answer.
+
+    For a minor release, revisit the coverage floor: read the line coverage
+    of the release commit's last green `portable Linux` run (the `coverage`
+    artefact's `lcov.info`; [how](design/test-harness.md#benchmarks-and-coverage)), and when
+    it sits more than about a point above `COVERAGE_MIN_LINES`, raise the floor
+    to the figure minus one point. Never lower it.
     `scripts/ci/test_changelog.py` fails while a release in the log has no
     dated section in [`CHANGELOG.md`](../CHANGELOG.md) (step 8).
 

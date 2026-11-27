@@ -675,7 +675,7 @@ real world it touched.
 `cargo-llvm-cov` instruments the compiled programme and records which source regions execute.
 Our `make coverage` runs the portable suite once under instrumentation and writes an LCOV
 report; `make coverage-html` turns the same counters into HTML when someone wants to read them. On Linux CI that same run is the test gate, so we don't pay for the suite twice. The first combined Linux CI measurement covered
-79.65% of lines, so CI starts at 78.65%, one percentage point lower, and can ratchet upwards.
+79.65% of lines, so CI started at 78.65%, one percentage point lower, and can ratchet upwards. It took until November for anyone to turn the ratchet. By then the suite covered 88.60% of lines, so the floor sat ten points under it, and a new subsystem with a fifth of its lines tested would have passed. The floor is now 87.60%, and every minor release reads its last `portable Linux` run and raises the floor again if coverage has risen (#2487). A floor that only goes up is only useful if somebody pushes it.
 
 Instrumented programmes write their counters to a `.profraw` file as they exit. Our
 crash-recovery tests SIGKILL instrumented Bun processes on purpose, and one day a kill landed
