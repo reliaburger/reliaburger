@@ -293,6 +293,19 @@ pub struct Compatibility {
 /// string, not a JSON array of numbers (`snapshot_chunk_wire` in
 /// `src/council/network.rs`), so nodes on either side of the change can't
 /// exchange snapshots (#2367).
+/// `JoinBundle` carries `council`, the expected council's voters and their
+/// Raft addresses, and `RaftRpcResponse::CouncilVoters` names each voter
+/// with its address (`CouncilNodeInfo`), not just its name. A node keeps the
+/// expected council in a new `council.json` in its identity directory and,
+/// with no council seat, takes Raft replication only from that council
+/// (#2397).
+/// The state machine admits a `SchedulingDecisions` pass of a single
+/// decision whatever its placement count, where 0.3.3 refused one above
+/// 131,072 placements, so the two would apply the same entry differently
+/// (#2366).
+/// `NodeRollup` carries a `part` number, so a minute too large for one
+/// report frame goes out in parts and the council's rollup dedup key is
+/// `(node, window, part)` (#2426).
 ///
 /// Bumping either number makes the checked-in gossip and Raft fuzz seeds
 /// stale: run `make fuzz-corpus-seed` in the same change (#1941). Keep the
