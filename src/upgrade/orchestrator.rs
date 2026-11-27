@@ -583,7 +583,16 @@ pub fn build_directive(state: &ClusterUpgradeState, binary: &PlatformBinary) -> 
     }
 }
 
+/// Move `record` into `phase`, stamping when it entered it.
+///
+/// Setting the phase it's already in changes nothing, `since` included, so
+/// `since` keeps meaning "when this node entered its phase", and a tick that
+/// only re-confirms a Healthy node returns an equal run, which the driver
+/// doesn't write to Raft (#2422).
 fn set_phase(record: &mut NodeUpgradeRecord, phase: NodeUpgradePhase, now: SystemTime) {
+    if record.phase == phase {
+        return;
+    }
     record.phase = phase;
     record.since = Some(now);
     // Every phase set here leaves Pending, so any retry bookkeeping is over.
@@ -1625,6 +1634,35 @@ mod tests {
         ) -> Result<(), DirectiveError> {
             std::future::pending().await
         }
+    }
+
+    /// #2422: re-polling a node that is still Healthy changed its `since`,
+    /// so every 3 s tick wrote a full copy of the run to Raft for nothing.
+    /// A tick that changes nothing must return the run it was given.
+    #[tokio::test]
+    async fn a_tick_that_changes_nothing_leaves_the_run_equal() {
+        let control = MockControl::default();
+        control.set("addr-w1", "0.2.0", true, false);
+        control.set("addr-w2", "0.1.0", true, true);
+        let t0 = SystemTime::now() - Duration::from_secs(10);
+        let mut state = cluster_state(
+            vec![
+                record("w1", NodeRole::Worker, NodeUpgradePhase::Healthy),
+                record("w2", NodeRole::Worker, NodeUpgradePhase::Verifying),
+            ],
+            1,
+        );
+        for node in &mut state.nodes {
+            node.since = Some(t0);
+        }
+        state.nodes[0].from_version = Some(v("0.1.0"));
+        state.nodes[0].platform = Some("linux-x86_64".to_string());
+        state.nodes[1].from_version = Some(v("0.1.0"));
+        state.nodes[1].platform = Some("linux-x86_64".to_string());
+
+        let next = step(state.clone(), &control, &context()).await;
+
+        assert_eq!(next, state);
     }
 
     #[tokio::test]
