@@ -704,20 +704,25 @@ impl DeployHistoryEntry {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Parse a duration string like "30s", "5m", "1h".
+/// Parse a duration string like "30s", "5m", "1h". `None` when it doesn't
+/// parse, or when it is more seconds than a `u64` holds.
 pub fn parse_duration(s: &str) -> Option<Duration> {
     let s = s.trim();
     if let Some(secs) = s.strip_suffix('s') {
         secs.parse::<u64>().ok().map(Duration::from_secs)
     } else if let Some(mins) = s.strip_suffix('m') {
+        // `checked_mul` is `None` on overflow, where `*` panics in a debug
+        // build and wraps in a release one (#2480).
         mins.parse::<u64>()
             .ok()
-            .map(|m| Duration::from_secs(m * 60))
+            .and_then(|m| m.checked_mul(60))
+            .map(Duration::from_secs)
     } else if let Some(hours) = s.strip_suffix('h') {
         hours
             .parse::<u64>()
             .ok()
-            .map(|h| Duration::from_secs(h * 3600))
+            .and_then(|h| h.checked_mul(3600))
+            .map(Duration::from_secs)
     } else {
         s.parse::<u64>().ok().map(Duration::from_secs)
     }
@@ -1019,6 +1024,20 @@ mod tests {
     #[test]
     fn parse_duration_invalid() {
         assert_eq!(parse_duration("abc"), None);
+    }
+
+    #[test]
+    fn parse_duration_refuses_a_value_that_overflows() {
+        // `m * 60` used to panic in a test build and wrap in a release
+        // build: "307445734561825861m" became 44 seconds (#2480, #2378).
+        assert_eq!(parse_duration("400000000000000000m"), None);
+        assert_eq!(parse_duration("307445734561825861m"), None);
+        assert_eq!(parse_duration("5124095576030432h"), None);
+        assert_eq!(parse_duration("18446744073709551615h"), None);
+        assert_eq!(
+            parse_duration("18446744073709551615s"),
+            Some(Duration::from_secs(u64::MAX))
+        );
     }
 
     // -- History entry ---

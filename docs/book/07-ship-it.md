@@ -87,6 +87,18 @@ Read `if let Some(ref s) = spec.strategy && s == "blue-green"` as: "if the strat
 
 `parse_duration` is a small helper that turns `"30s"` or `"5m"` into a `Duration`. It returns `Option<Duration>` rather than erroring, so a malformed string simply leaves the default in place — the second half of the let-chain (`&& let Some(d) = parse_duration(s)`) only assigns when parsing succeeds.
 
+The minutes and hours branches multiply, and the November 2026 audit caught them multiplying carelessly (#2480):
+
+```rust
+} else if let Some(mins) = s.strip_suffix('m') {
+    mins.parse::<u64>()
+        .ok()
+        .and_then(|m| m.checked_mul(60))
+        .map(Duration::from_secs)
+```
+
+The first version said `m * 60`. Rust checks integer overflow in debug and test builds and panics; a release build (unless `overflow-checks` is on in the profile, and ours isn't) wraps around like C. So `"307445734561825861m"` panicked in a test and became 44 seconds in production, a value that then passed validation. `checked_mul` returns `Option<u64>`, `None` on overflow, and `and_then` threads that `None` through, so an unrepresentable duration is refused like any other bad string. When you want the arithmetic to fail rather than clamp, `checked_*` is the family to reach for; `saturating_*` (below) is for when the limit is a fine answer.
+
 ## The rolling sequence
 
 Each instance replacement follows five sub-steps:
