@@ -1460,6 +1460,35 @@ A deadline bounds time. It doesn't bound memory: a thousand clients each trickli
 
 The third change is about drains. The proxy used to capture its backends' drain counts before reading the body, so a stalled upload made every rollout of that app wait its full `drain_timeout`. Now a plain request picks its backends only once the body is in hand, under a second read of the routing table. A WebSocket sends no body, so it still captures up front. `a_stalled_upload_holds_no_drain_open` starts an upload, waits until the handler has reserved budget for it (proof it's reading the body), retires the backend and checks the drain completes at once. The old code captured the count before the body, so that drain would have waited out its deadline.
 
+### Counting connections, not just requests (0.3.4 audit fix)
+
+Remember the 10,000-permit semaphore from "Holding the permit for as long as it matters"? The config called it `max_connections`, and it counted requests. The same audit ([#2383](https://github.com/reliaburger/reliaburger/issues/2383)) pointed out that nothing counted connections. A client that opens a socket, sends one byte (which switches off the first-byte timer) and reopens it every 75 seconds costs a task and Hyper's buffers per socket, and the plain listener would spawn those until Bun ran out of file descriptors. At that point the accept loop met its second problem:
+
+```rust
+let Ok((tcp, remote)) = accepted else { continue };
+```
+
+`EMFILE` doesn't consume the pending connection. It's still queued, the listener is still readable, and `accept` fails the same way on the very next call: three accept loops (plain HTTP, HTTPS, DNS over TCP) spinning three cores until something else frees a descriptor. And the 512 TLS handshake slots were first come, first served, so one host opening 52 silent sockets a second kept all 512 full and every real HTTPS client was dropped.
+
+Three small fixes, one per gap. `serve_router_plain_capped` takes a `Semaphore` of open connections and grabs an owned permit with `try_acquire_owned` before it spawns anything. The permit moves into the connection's task, so it comes back when the connection closes, by the same RAII trick as the request permit. When none is free, the loop just `continue`s, and dropping `tcp` closes the socket. The ingress's two listeners share one semaphore (`max_open_connections`, 32,768); the API and registry keep using `serve_router_plain`, which has no cap, because limiting the API quietly is the last thing you want while debugging a flood.
+
+The back-off is a pure function, because `EMFILE` is miserable to provoke in a portable test:
+
+```rust
+pub fn accept_backoff(error: &io::Error) -> Option<Duration> {
+    const PAUSE: Duration = Duration::from_millis(100);
+    let exhausted = [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM];
+    error
+        .raw_os_error()
+        .filter(|code| exhausted.contains(code))
+        .map(|_| PAUSE)
+}
+```
+
+`raw_os_error()` is the errno behind an `io::Error`, if there is one. `Option::filter` keeps the value only when the closure says yes, and `map` turns a surviving errno into the pause. The `libc` constants matter here: `ENOBUFS` is 105 on Linux and 55 on macOS, so a hard-coded number would be wrong on one of them. Every accept loop calls `pause_after_accept_error`, which sleeps for that long unless shutdown fires first. A connection the peer aborted (`ECONNABORTED`) is that one socket's problem, so the loop carries on at once.
+
+The per-source share is the only place in the ingress that uses `std::sync::Mutex` rather than tokio's. `HandshakeSources` keeps a `HashMap<IpAddr, usize>` of handshakes in progress, and `try_take` hands out a `SourceSlot` whose `Drop` counts it back down. `Drop` can't `.await`, so a tokio mutex would mean spawning a task per handshake just to subtract one. A std mutex held for one map update, never across an `.await`, is the right tool, and the project's rule says to leave a comment saying so, which it does. A source past its share of 16 has its connection dropped on the spot, so the slots it can't take stay free for everyone else. The test, `one_source_cannot_hold_every_handshake_slot`, opens four silent sockets with a share of two and checks the last two close at once rather than after the 30-second handshake deadline. Then it runs a real handshake from `127.0.0.2`. Linux has the whole of `127.0.0.0/8` on loopback; macOS has only `127.0.0.1`, so there the test says so and skips that half.
+
 ### Don't let the client lie about who it is (post-audit fix)
 
 A backend behind a proxy often wants to know the real client's IP and whether the original request was HTTPS. The convention is the `X-Forwarded-For` and `X-Forwarded-Proto` headers, and the proxy is supposed to *set* them. Our header-copy loop forwarded them instead — including any the client sent. So a client could send `X-Forwarded-For: 10.0.0.1` and the backend would believe it came from `10.0.0.1`, defeating every IP allowlist or audit log that trusted the header.

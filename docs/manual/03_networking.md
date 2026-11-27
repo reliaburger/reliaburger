@@ -215,6 +215,14 @@ max_request_body_bytes = 1048576     # 1 MiB
 request_body_budget_bytes = 67108864 # 64 MiB shared by every upload
 ```
 
+A node holds at most `[ingress] max_open_connections` (32,768) connections
+across its two ingress listeners and closes any past that at once.
+`max_connections` (10,000) counts requests in flight, not connections. One
+client address may have 16 TLS handshakes in progress
+(`max_tls_handshakes_per_source`); behind a load balancer that doesn't pass the
+client's address through, every client shares the balancer's address, so raise
+it there.
+
 Streaming responses pass through, and so do WebSockets on routes that allow
 them. A stopping instance drains its connections before it goes. A WebSocket
 still open when the drain timeout ends gets a Close frame with code 1001

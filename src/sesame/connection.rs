@@ -1,5 +1,6 @@
 //! Connection deadlines for Bun's HTTP listeners (API, registry, ingress):
-//! handshake, idle, stall and lifetime limits, plus the shared accept loops.
+//! handshake, idle, stall and lifetime limits, plus the shared accept loops
+//! and their back-off when the process runs out of descriptors.
 
 use std::future::Future;
 use std::io;
@@ -418,36 +419,104 @@ pub async fn serve_http_connection<I>(
     let _ = tokio::time::timeout(TLS_CONNECTION_DRAIN_GRACE, connection).await;
 }
 
+/// How long an accept loop should pause after `error` before accepting
+/// again, or `None` to carry on at once.
+///
+/// Running out of file descriptors (`EMFILE`, `ENFILE`) or kernel memory
+/// (`ENOBUFS`, `ENOMEM`) leaves the pending connection queued, so the
+/// listener stays readable and an immediate retry fails the same way: the
+/// loop would spin a core until something else frees a descriptor (#2383).
+/// Any other error belongs to the one connection that failed.
+pub fn accept_backoff(error: &io::Error) -> Option<Duration> {
+    const PAUSE: Duration = Duration::from_millis(100);
+    let exhausted = [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM];
+    error
+        .raw_os_error()
+        .filter(|code| exhausted.contains(code))
+        .map(|_| PAUSE)
+}
+
+/// Pause an accept loop after `error`, as [`accept_backoff`] says, unless
+/// `shutdown` fires first.
+pub async fn pause_after_accept_error(
+    error: &io::Error,
+    shutdown: &tokio_util::sync::CancellationToken,
+) {
+    if let Some(pause) = accept_backoff(error) {
+        tokio::select! {
+            _ = shutdown.cancelled() => {}
+            _ = tokio::time::sleep(pause) => {}
+        }
+    }
+}
+
 /// Serve an axum router over plain TCP with the given deadlines.
 ///
 /// This replaces `axum::serve`, which has no way to set Hyper's timers. Every
 /// request carries the client's address as
 /// `axum::extract::ConnectInfo<SocketAddr>`. Runs until `shutdown` is
-/// cancelled.
+/// cancelled. It sets no cap on open connections: Bun's API and registry
+/// listeners use it. The ingress uses [`serve_router_plain_capped`].
 pub async fn serve_router_plain(
     listener: tokio::net::TcpListener,
     router: axum::Router,
     timeouts: ConnectionTimeouts,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
+    serve_plain(listener, router, timeouts, None, shutdown).await;
+}
+
+/// [`serve_router_plain`], holding at most as many connections open as
+/// `connections` has permits. A connection accepted when none is free is
+/// closed at once, before it costs a task (#2383).
+pub async fn serve_router_plain_capped(
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+    timeouts: ConnectionTimeouts,
+    connections: std::sync::Arc<tokio::sync::Semaphore>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    serve_plain(listener, router, timeouts, Some(connections), shutdown).await;
+}
+
+async fn serve_plain(
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+    timeouts: ConnectionTimeouts,
+    connections: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return,
             accepted = listener.accept() => {
-                // Transient accept errors (EMFILE, resets) must not stop the
-                // listener; skip and keep accepting.
-                let Ok((tcp, remote)) = accepted else { continue };
+                // Accept errors must not stop the listener: back off when
+                // the process is out of descriptors, and keep accepting.
+                let (tcp, remote) = match accepted {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        pause_after_accept_error(&error, &shutdown).await;
+                        continue;
+                    }
+                };
+                let permit = match &connections {
+                    Some(connections) => match std::sync::Arc::clone(connections).try_acquire_owned() {
+                        Ok(permit) => Some(permit),
+                        // At the cap: dropping `tcp` closes the socket.
+                        Err(_) => continue,
+                    },
+                    None => None,
+                };
                 let _ = configure_accepted_socket(&tcp, &timeouts);
                 let router = router
                     .clone()
                     .layer(axum::Extension(axum::extract::ConnectInfo(remote)));
-                tokio::spawn(serve_http_connection(
-                    tcp,
-                    router,
-                    timeouts,
-                    None,
-                    shutdown.clone(),
-                ));
+                let shutdown = shutdown.clone();
+                tokio::spawn(async move {
+                    // Held until the connection closes.
+                    let _permit = permit;
+                    serve_http_connection(tcp, router, timeouts, None, shutdown).await;
+                });
             }
         }
     }
@@ -497,7 +566,13 @@ async fn serve_router_over_tls_with_clock<F>(
         tokio::select! {
             _ = shutdown.cancelled() => return,
             accepted = listener.accept() => {
-                let Ok((tcp, remote)) = accepted else { continue };
+                let (tcp, remote) = match accepted {
+                    Ok(pair) => pair,
+                    Err(error) => {
+                        pause_after_accept_error(&error, &shutdown).await;
+                        continue;
+                    }
+                };
                 let _ = configure_accepted_socket(&tcp, &timeouts);
                 tokio::spawn(serve_tls_connection(
                     tcp,
@@ -556,6 +631,19 @@ async fn serve_tls_connection<F>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2383: running out of descriptors or kernel memory leaves the
+    /// listener readable, so retrying at once spins a core. Those errors back
+    /// off; a connection the peer aborted is that one socket's problem.
+    #[test]
+    fn accept_backs_off_when_descriptors_run_out() {
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            let error = io::Error::from_raw_os_error(errno);
+            assert!(accept_backoff(&error).is_some(), "{error}");
+        }
+        let aborted = io::Error::from(io::ErrorKind::ConnectionAborted);
+        assert_eq!(accept_backoff(&aborted), None);
+    }
     use crate::sesame::{
         ca, cert, credentials::LiveNodeIdentity, identity_store, identity_store::NodeIdentity,
         mtls, renewal::TlsPeerCertificate, types::SerialNumber,

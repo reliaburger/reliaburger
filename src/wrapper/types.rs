@@ -117,6 +117,14 @@ pub struct WrapperConfig {
     /// How long a single TLS handshake may take before the connection is
     /// dropped (ING2).
     pub tls_handshake_timeout: std::time::Duration,
+    /// Maximum connections the two ingress listeners hold open between them
+    /// (default: 32,768). A connection accepted past it is closed at once
+    /// (#2383).
+    pub max_open_connections: usize,
+    /// How many of the `max_tls_handshakes` slots one client address may
+    /// hold at once (default: 16). Past it, that client's next connection is
+    /// dropped, so one host can't keep every slot full (#2383).
+    pub max_tls_handshakes_per_source: usize,
 }
 
 impl Default for WrapperConfig {
@@ -131,6 +139,8 @@ impl Default for WrapperConfig {
             request_body_budget_bytes: 256 * 1024 * 1024,
             max_tls_handshakes: 512,
             tls_handshake_timeout: std::time::Duration::from_secs(10),
+            max_open_connections: 32_768,
+            max_tls_handshakes_per_source: 16,
         }
     }
 }

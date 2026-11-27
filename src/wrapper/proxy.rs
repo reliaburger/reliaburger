@@ -209,7 +209,12 @@ pub struct BoundProxy {
     /// Bounds concurrent TLS handshakes so a slow-handshake flood can't
     /// pile up tasks (ING2).
     handshake_limit: Arc<Semaphore>,
+    /// Handshakes in progress per client address, so one host can't hold
+    /// every handshake slot (#2383).
+    handshake_sources: HandshakeSources,
     handshake_timeout: std::time::Duration,
+    /// Bounds the connections both listeners hold open (#2383).
+    open_connections: Arc<Semaphore>,
     connection_timeouts: ConnectionTimeouts,
     state: Arc<ProxyState>,
     shutdown: CancellationToken,
@@ -330,7 +335,11 @@ pub async fn bind_proxy_with_tls(
         tls_acceptor,
         file_cert_resolver,
         handshake_limit: Arc::new(Semaphore::new(config.max_tls_handshakes)),
+        handshake_sources: HandshakeSources::new(config.max_tls_handshakes_per_source),
         handshake_timeout: config.tls_handshake_timeout,
+        open_connections: Arc::new(Semaphore::new(
+            config.max_open_connections.min(Semaphore::MAX_PERMITS),
+        )),
         connection_timeouts: ConnectionTimeouts::PRODUCTION,
         state,
         shutdown,
@@ -385,11 +394,13 @@ impl BoundProxy {
             }))
             .with_state(Arc::clone(&self.state));
 
+        let plain_connections = Arc::clone(&self.open_connections);
         let http = async {
-            crate::sesame::connection::serve_router_plain(
+            crate::sesame::connection::serve_router_plain_capped(
                 self.http_listener,
                 http_router,
                 self.connection_timeouts,
+                plain_connections,
                 self.shutdown.clone(),
             )
             .await;
@@ -400,7 +411,11 @@ impl BoundProxy {
             self.https_listener,
             self.tls_acceptor,
             https_router,
-            self.handshake_limit,
+            TlsAdmission {
+                open_connections: self.open_connections,
+                handshake_limit: self.handshake_limit,
+                handshake_sources: self.handshake_sources,
+            },
             ConnectionTimeouts {
                 tls_handshake: self.handshake_timeout,
                 ..self.connection_timeouts
@@ -420,17 +435,85 @@ impl BoundProxy {
     }
 }
 
+/// TLS handshakes in progress, counted per client address (#2383).
+///
+/// A plain `std::sync::Mutex`, not tokio's: it is taken only in the accept
+/// loop and in [`SourceSlot`]'s `Drop`, both synchronous, and held for one
+/// map update. `Drop` can't `.await`, so a tokio mutex would need a spawned
+/// task per handshake just to count down.
+#[derive(Clone)]
+struct HandshakeSources {
+    in_progress: Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>>,
+    per_source: usize,
+}
+
+impl HandshakeSources {
+    fn new(per_source: usize) -> Self {
+        Self {
+            in_progress: Arc::default(),
+            per_source,
+        }
+    }
+
+    /// Take a handshake slot for `source`, or `None` when it already holds
+    /// its share.
+    fn try_take(&self, source: std::net::IpAddr) -> Option<SourceSlot> {
+        let mut in_progress = self.in_progress.lock().ok()?;
+        let count = in_progress.entry(source).or_insert(0);
+        if *count >= self.per_source {
+            return None;
+        }
+        *count += 1;
+        Some(SourceSlot {
+            sources: self.clone(),
+            source,
+        })
+    }
+}
+
+/// One client's handshake slot, handed back when the handshake ends.
+struct SourceSlot {
+    sources: HandshakeSources,
+    source: std::net::IpAddr,
+}
+
+impl Drop for SourceSlot {
+    fn drop(&mut self) {
+        let Ok(mut in_progress) = self.sources.in_progress.lock() else {
+            return;
+        };
+        if let Some(count) = in_progress.get_mut(&self.source) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                in_progress.remove(&self.source);
+            }
+        }
+    }
+}
+
+/// The limits the TLS accept loop applies before it spends work on a
+/// connection.
+struct TlsAdmission {
+    /// Open connections, shared with the plain listener.
+    open_connections: Arc<Semaphore>,
+    /// Handshakes in progress from every client.
+    handshake_limit: Arc<Semaphore>,
+    /// Handshakes in progress per client address.
+    handshake_sources: HandshakeSources,
+}
+
 /// Accept TLS connections and serve them through the router.
 ///
-/// Two protections keep a slow or malicious handshaker from exhausting the
-/// process (ING2): a semaphore bounds how many handshakes run at once, and
-/// each handshake is wrapped in a deadline so a peer that opens a socket and
-/// then stalls is dropped rather than holding a task forever.
+/// Three protections keep a slow or malicious handshaker from exhausting the
+/// process (ING2, #2383): a cap on open connections, a semaphore bounding how
+/// many handshakes run at once with a share per client address, and a
+/// deadline on each handshake, so a peer that opens a socket and then stalls
+/// is dropped rather than holding a task forever.
 async fn serve_tls(
     listener: TcpListener,
     acceptor: tokio_rustls::TlsAcceptor,
     router: axum::Router,
-    handshake_limit: Arc<Semaphore>,
+    admission: TlsAdmission,
     timeouts: ConnectionTimeouts,
     shutdown: CancellationToken,
 ) -> Result<(), WrapperError> {
@@ -440,17 +523,25 @@ async fn serve_tls(
             accepted = listener.accept() => {
                 let (tcp, remote) = match accepted {
                     Ok(pair) => pair,
-                    // Transient accept errors (EMFILE, resets) must not
-                    // kill the ingress; skip and keep accepting.
-                    Err(_) => continue,
+                    // Accept errors must not kill the ingress: back off when
+                    // the process is out of descriptors, and keep accepting.
+                    Err(error) => {
+                        crate::sesame::connection::pause_after_accept_error(&error, &shutdown).await;
+                        continue;
+                    }
                 };
 
-                // Grab a handshake permit before spending any work on this
-                // connection. If none is free we're already at the flood cap,
-                // so drop the connection rather than queueing tasks.
-                let permit = match Arc::clone(&handshake_limit).try_acquire_owned() {
-                    Ok(permit) => permit,
-                    Err(_) => continue,
+                // Take every permit before spending any work on this
+                // connection. If one is missing we're at a cap, so drop the
+                // connection rather than queueing tasks.
+                let Ok(connection_permit) = Arc::clone(&admission.open_connections).try_acquire_owned() else {
+                    continue;
+                };
+                let Some(source_slot) = admission.handshake_sources.try_take(remote.ip()) else {
+                    continue;
+                };
+                let Ok(handshake_permit) = Arc::clone(&admission.handshake_limit).try_acquire_owned() else {
+                    continue;
                 };
 
                 let _ = crate::sesame::connection::configure_accepted_socket(&tcp, &timeouts);
@@ -460,13 +551,15 @@ async fn serve_tls(
                 let acceptor = acceptor.clone();
                 let connection_shutdown = shutdown.clone();
                 tokio::spawn(async move {
-                    // Hold the handshake permit only until the handshake
+                    let _connection_permit = connection_permit;
+                    // Hold the handshake slots only until the handshake
                     // resolves; the request itself is bounded separately.
                     let handshake = tokio::time::timeout(
                         timeouts.tls_handshake,
                         acceptor.accept(tcp),
                     ).await;
-                    drop(permit);
+                    drop(handshake_permit);
+                    drop(source_slot);
                     let tls_stream = match handshake {
                         Ok(Ok(stream)) => stream,
                         // handshake failed or timed out; drop the connection
@@ -2703,6 +2796,83 @@ mod tests {
             .expect("a real handshake after the deadline must succeed");
         assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
 
+        shutdown.cancel();
+    }
+
+    /// #2383: one client can hold only its share of the TLS handshake slots.
+    /// Past the share, its next silent socket is dropped at once instead of
+    /// taking another slot for the whole handshake deadline, so the slots
+    /// left over still serve everyone else.
+    #[tokio::test]
+    async fn one_source_cannot_hold_every_handshake_slot() {
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        let routing_table = Arc::new(RwLock::new(RoutingTable::new()));
+        let shutdown = CancellationToken::new();
+        let bound = bind_proxy(
+            WrapperConfig {
+                http_port: 0,
+                https_port: 0,
+                max_tls_handshakes: 4,
+                max_tls_handshakes_per_source: 2,
+                tls_handshake_timeout: Duration::from_secs(30),
+                ..WrapperConfig::default()
+            },
+            routing_table,
+            shutdown.clone(),
+        )
+        .await
+        .unwrap();
+        let https_port = bound.https_addr.port();
+        tokio::spawn(async move {
+            bound.serve().await.ok();
+        });
+
+        let mut silent = Vec::new();
+        for _ in 0..4 {
+            silent.push(
+                tokio::net::TcpStream::connect(("127.0.0.1", https_port))
+                    .await
+                    .unwrap(),
+            );
+        }
+        // The first two hold this source's share. The other two are dropped
+        // at once, long before the 30 s handshake deadline.
+        for mut sock in silent.drain(2..) {
+            let mut buf = [0u8; 16];
+            let closed = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf)).await;
+            assert!(
+                matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+                "a source past its share kept another handshake slot: {closed:?}"
+            );
+        }
+
+        // Another source still gets a slot. macOS has no 127.0.0.2 unless
+        // someone adds it, so this half runs where the address exists.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        if socket.bind("127.0.0.2:0".parse().unwrap()).is_err() {
+            eprintln!("skipping the second-source handshake: 127.0.0.2 is not configured");
+            shutdown.cancel();
+            return;
+        }
+        drop(socket);
+        let client = crate::http_client::builder()
+            .danger_accept_invalid_certs(true)
+            .local_address(std::net::IpAddr::from([127, 0, 0, 2]))
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        // An empty routing table answers 404, which proves the handshake
+        // completed and HTTP flowed over it.
+        let response = client
+            .get(format!("https://127.0.0.1:{https_port}/"))
+            .header("host", "web.test")
+            .send()
+            .await
+            .expect("a second source was refused while the first held only its share");
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+        drop(silent);
         shutdown.cancel();
     }
 

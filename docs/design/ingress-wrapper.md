@@ -735,6 +735,24 @@ https_port = 443
 tls_cert = "/etc/reliaburger/ingress/fullchain.pem"
 tls_key = "/etc/reliaburger/ingress/private-key.pem"
 
+# Requests in flight at once, WebSockets included; past it, 503.
+# This counts requests, not connections. Default: 10000.
+max_connections = 10000
+
+# Connections both listeners hold open between them; one accepted past
+# it is closed at once (#2383). Default: 32768.
+max_open_connections = 32768
+
+# TLS handshakes in progress from one client address; past it, that
+# client's next connection is dropped (#2383). Default: 16.
+max_tls_handshakes_per_source = 16
+
+# Largest request body forwarded (413 past it), and the bytes every body
+# being buffered may hold between them (503 past it) (#2381).
+# Defaults: 10 MiB and 256 MiB.
+max_request_body_bytes = 10485760
+request_body_budget_bytes = 268435456
+
 # Default drain timeout for rolling deploys.
 # Per-app drain_timeout in the app spec overrides this.
 # Default: "30s".
@@ -852,6 +870,8 @@ Limitations:
 - Per-node, not cluster-wide. A distributed attack hitting all nodes bypasses per-node limits.
 - IP-based only. Cannot rate limit by API key, user identity, or other application-level attributes.
 - Doesn't protect against volumetric attacks that saturate network bandwidth before reaching Wrapper.
+
+Below the rate limiter, the listeners bound what a flood can cost Bun itself (#2383). The two listeners share a cap on open connections (`max_open_connections`, 32,768); a connection accepted past it is closed before it costs a task. `max_connections` (10,000) is a separate cap on requests in flight. The TLS listener allows 512 handshakes in progress, and at most `max_tls_handshakes_per_source` (16) from one client address, so one host opening silent sockets can't keep every slot full. When `accept` fails because the process is out of file descriptors or kernel memory (`EMFILE`, `ENFILE`, `ENOBUFS`, `ENOMEM`), every accept loop in `sesame::connection` and the ingress pauses 100 ms instead of retrying at once: the pending connection stays queued, so an immediate retry fails the same way and spins a core. The API and registry listeners share the back-off but have no connection cap.
 
 For production deployments facing DDoS risk, operators should place a dedicated DDoS mitigation service (Cloudflare, AWS Shield, etc.) in front of the cluster. Wrapper's rate limiting protects against application-layer abuse, not network-layer floods.
 
