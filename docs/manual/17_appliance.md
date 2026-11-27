@@ -156,11 +156,12 @@ A few options for real networks:
 Trust the install LAN. The installer checks every byte of the image it
 writes, so nobody on the LAN can make a machine install something else. But
 relish believes a machine's reports (its used disk, and that it installed)
-only from the address that machine's own DHCP request came from, and DHCP
-itself isn't authenticated: a host on the LAN that forges DHCP requests can
-still stall an install. If the log says `no install ticket` for a machine
-you're installing, its boot script came from another address than its DHCP
-request; it installs, but relish can't record it or ask you about its disk.
+only from the address that machine's own DHCP request came from or asked
+for, and DHCP itself isn't authenticated: a host on the LAN that forges DHCP
+requests can still stall an install. If the log says `no install ticket` for
+a machine you're installing, its boot script came from another address than
+its DHCP request; it installs, but relish can't record it or ask you about
+its disk.
 - `--http-port 8081` serves HTTP on another port than 8080, for a serving
   machine where 8080 is taken. The machines are told the port, so nothing
   else changes. Open that port instead of 8080 in its firewall.

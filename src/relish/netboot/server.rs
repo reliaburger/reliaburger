@@ -428,7 +428,11 @@ async fn dhcp_loop(
         port,
         context,
         move |line| log(line),
-        move |address, mac| netlog::learn(&peers, address, mac),
+        {
+            let peers = peers.clone();
+            move |address, mac| netlog::learn(&peers, address, mac)
+        },
+        move |address, mac| netlog::requested(&peers, address, mac),
     )
     .await
 }
