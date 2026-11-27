@@ -146,7 +146,11 @@ pub(crate) fn remove(raft: &Path) -> io::Result<()> {
     sync_dir(parent)
 }
 
-pub(crate) fn replace(raft: &Path, state: DesiredState) -> io::Result<()> {
+pub(crate) fn replace(
+    raft: &Path,
+    state: DesiredState,
+    previous_council: &crate::council::admission::CouncilRoster,
+) -> io::Result<()> {
     let _guard = lock(raft)?;
     finish_pending(raft)?;
     fs::create_dir_all(raft)?;
@@ -162,6 +166,9 @@ pub(crate) fn replace(raft: &Path, state: DesiredState) -> io::Result<()> {
     let db = redb::Database::create(replacement.join("snapshot.redb")).map_err(io_error)?;
     CouncilStateMachine::persist_recovered_snapshot(&db, state).map_err(io_error)?;
     drop(db);
+    // Node-local, beside the fence record the new council will write: the
+    // voters of the council this recovery replaces (#2406).
+    crate::council::admission::save_previous_council(&replacement, previous_council)?;
     validate_replacement(&replacement)?;
     sync_dir(&replacement)?;
     sync_dir(stage.path())?;
@@ -230,7 +237,7 @@ mod tests {
         for boundary in 0..3 {
             let root = tempfile::tempdir().unwrap();
             let raft = root.path().join("raft");
-            replace(&raft, DesiredState::default()).unwrap();
+            replace(&raft, DesiredState::default(), &Default::default()).unwrap();
             fs::write(raft.join("original-evidence"), b"keep me").unwrap();
             let transaction = root.path().join(".raft-recovery-interrupted");
             let replacement = transaction.join("replacement");
