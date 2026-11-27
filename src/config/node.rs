@@ -726,6 +726,39 @@ impl Default for ClusterSection {
     }
 }
 
+/// Longest node name: one DNS label. Gossip's sync datagrams, SPIFFE ids
+/// and file paths all carry the name, and the UDP budget assumes this much.
+pub const MAX_NODE_NAME_BYTES: usize = 63;
+
+/// Whether `name` is a valid node name: one DNS label of 1 to 63 bytes,
+/// lowercase ASCII letters, digits and `-`, not starting or ending with
+/// `-` (#2394).
+pub fn is_valid_node_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_NODE_NAME_BYTES
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+impl NodeSection {
+    /// Refuse a `name` that isn't one DNS label. An unset name is fine:
+    /// Bun uses `node-<gossip_port>`.
+    pub fn validate(&self) -> Result<(), super::error::ConfigError> {
+        match &self.name {
+            Some(name) if !is_valid_node_name(name) => {
+                Err(super::error::ConfigError::InvalidValue {
+                    field: "node.name".to_string(),
+                    value: name.clone(),
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 impl ClusterSection {
     /// Validate the cluster name used as the SPIFFE trust domain.
     pub fn validate(&self) -> Result<(), super::error::ConfigError> {
@@ -1878,6 +1911,46 @@ mod tests {
             let mut invalid = NodeConfig::default();
             invalid.cluster.name = name.to_string();
             assert!(invalid.cluster.validate().is_err(), "accepted {name:?}");
+        }
+    }
+
+    fn node_name_error(name: &str) -> Option<super::super::error::ConfigError> {
+        let quoted = toml::Value::String(name.to_string()).to_string();
+        let config = NodeConfig::parse(&format!("[node]\nname = {quoted}")).unwrap();
+        config.validate().err()
+    }
+
+    #[test]
+    fn a_node_name_longer_than_a_dns_label_is_refused() {
+        // Gossip sync datagrams and SPIFFE ids assume a name of at most 63
+        // bytes (#2394).
+        let error = node_name_error(&"a".repeat(64)).expect("64 bytes accepted");
+        assert!(
+            matches!(&error, super::super::error::ConfigError::InvalidValue { field, .. }
+                if field == "node.name"),
+            "{error:?}"
+        );
+        assert!(node_name_error(&"a".repeat(63)).is_none());
+    }
+
+    #[test]
+    fn a_node_name_with_a_control_character_is_refused() {
+        for name in [
+            "node\n1",
+            "node\u{7f}",
+            "",
+            "Node-1",
+            "node_1",
+            "-node",
+            "node-",
+            "node.example",
+            "node 1",
+        ] {
+            let error = node_name_error(name).unwrap_or_else(|| panic!("accepted {name:?}"));
+            assert!(error.to_string().contains("node.name"), "{name:?}: {error}");
+        }
+        for name in ["node-1", "home-2", "w1", "0"] {
+            assert!(node_name_error(name).is_none(), "refused {name:?}");
         }
     }
 

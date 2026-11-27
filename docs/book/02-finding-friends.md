@@ -809,7 +809,7 @@ pub enum GossipPayload {
 }
 ```
 
-The node that starts the exchange sends its table as a burst of `Sync` datagrams, and only the first one sets `wants_reply`. The peer merges the entries and answers once with its own table, with `wants_reply` always `false`. That rule matters more than it looks. If a reply could ask for a reply, two nodes would bounce their tables back and forth for ever.
+The node that starts the exchange sends its table as a burst of `Sync` datagrams, and only the first one sets `wants_reply`. The burst used to be cut by count alone, eight entries a datagram, on the assumption that a node name is at most 63 bytes. Nothing enforced that, and the November 2026 audit worked out that 150-byte names push every sync datagram past the 1,400-byte limit (#2394). The transport refuses those, so anti-entropy quietly stopped while probes, which already filled by bytes, carried on. Two fixes close it: `[node] name` must now be one DNS label, checked when Bun starts, and `sync_datagrams` fills each datagram while `encoded_len()` still fits, starting a new one when the next entry doesn't. It takes the payload as a closure, `impl Fn(Vec<T>, bool) -> GossipPayload`, so the one packing loop serves both the membership entries and the sequence floors. The peer merges the entries and answers once with its own table, with `wants_reply` always `false`. That rule matters more than it looks. If a reply could ask for a reply, two nodes would bounce their tables back and forth for ever.
 
 How do the entries get merged? Exactly like piggybacked updates, and this is the part that makes push-pull safe. `GossipPayload::updates()` returns a `Sync`'s entries alongside every other variant's updates:
 
