@@ -137,7 +137,12 @@ passes the kernel command line, and with Secure Boot on a UKI ignores it.
   once per ticket. At most 256 tickets are outstanding, each for an hour,
   and a machine holds one: a new ticket cancels its older one.
 - A ticket goes only to the address the machine's latest DHCP request (to
-  UDP 67 or 4011, from an address of its own) came from. A `boot.ipxe` from
+  UDP 67 or 4011, from an address of its own) came from, or asked the LAN's
+  DHCP server for (option 50 in a broadcast DHCPREQUEST, ciaddr still
+  0.0.0.0). iPXE takes its boot file from relish's proxy offer and its
+  address from the LAN's server, and that address needn't be the one the
+  firmware asked from on 4011: in CI's reinstall the firmware asked from
+  `.111` and iPXE fetched `boot.ipxe` from `.110`. A `boot.ipxe` from
   anywhere else gets the install script without a ticket, and relish logs
   that it withheld one. So a host that only speaks HTTP can't mark another
   machine installed, ask a question about its disk, or fill the ticket table.

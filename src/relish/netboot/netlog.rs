@@ -98,8 +98,9 @@ impl fmt::Display for Sender {
 pub struct Peers {
     answered: HashSet<MacAddress>,
     by_address: HashMap<Ipv4Addr, MacAddress>,
-    /// The address each MAC's latest DHCP request came from. Only DHCP
-    /// sets it, never a hello, which anyone can send.
+    /// The address each MAC's latest DHCP request came from, or asked the
+    /// LAN's server for. Only DHCP sets it, never a hello, which anyone can
+    /// send.
     asked_from: HashMap<MacAddress, Ipv4Addr>,
 }
 
@@ -116,8 +117,23 @@ impl Peers {
         self.asked_from.insert(mac, address);
     }
 
-    /// The address `mac`'s latest DHCP request came from, if it sent one
-    /// from an address of its own.
+    /// `mac` asked the LAN's DHCP server for `address` (option 50 in a
+    /// broadcast DHCPREQUEST, [`super::dhcp::requested_address`]). iPXE
+    /// takes its boot file from this process's proxy offer and its address
+    /// from that server, so this is the address it fetches `boot.ipxe`
+    /// from, and it may not be the one the firmware asked from on 4011.
+    /// Only a machine this process answered moves; a request names any
+    /// MAC it likes.
+    pub fn requested(&mut self, address: Ipv4Addr, mac: MacAddress) {
+        if !self.answered.contains(&mac) || address.is_unspecified() || address.is_broadcast() {
+            return;
+        }
+        self.by_address.insert(address, mac);
+        self.asked_from.insert(mac, address);
+    }
+
+    /// The address `mac`'s latest DHCP request came from or asked for, if
+    /// it named one of its own.
     pub fn asked_from(&self, mac: MacAddress) -> Option<Ipv4Addr> {
         self.asked_from.get(&mac).copied()
     }
@@ -157,6 +173,14 @@ pub fn learn(peers: &SharedPeers, address: Ipv4Addr, mac: MacAddress) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .learn(address, mac);
+}
+
+/// Remember that `mac` asked the LAN's DHCP server for `address`.
+pub fn requested(peers: &SharedPeers, address: Ipv4Addr, mac: MacAddress) {
+    peers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .requested(address, mac);
 }
 
 /// Who sent `line` from `address`, after learning from it if it's a hello.
@@ -588,6 +612,35 @@ mod tests {
             peers.sender(Ipv4Addr::UNSPECIFIED),
             Sender::NotServed(Ipv4Addr::UNSPECIFIED)
         );
+    }
+
+    /// The reinstall boot in CI (#2389, run 46076493713): the firmware
+    /// asked on 4011 from 10.42.0.111, then iPXE took 10.42.0.110 from the
+    /// LAN's server and fetched boot.ipxe from there. The address iPXE
+    /// requested is the machine's latest, so it's the one with the ticket.
+    #[test]
+    fn the_address_ipxe_requests_replaces_the_one_the_firmware_asked_from() {
+        let mut peers = Peers::default();
+        peers.learn(Ipv4Addr::UNSPECIFIED, MAC);
+        peers.learn(Ipv4Addr::new(10, 42, 0, 111), MAC);
+        peers.requested(Ipv4Addr::new(10, 42, 0, 110), MAC);
+        assert_eq!(peers.asked_from(MAC), Some(Ipv4Addr::new(10, 42, 0, 110)));
+    }
+
+    /// A request names any MAC it likes: it only moves a machine this
+    /// process answered, and an address-less request moves nothing.
+    #[test]
+    fn a_requested_address_only_counts_for_a_machine_this_process_answered() {
+        let mut peers = Peers::default();
+        peers.requested(Ipv4Addr::new(10, 42, 0, 110), MAC);
+        assert_eq!(peers.asked_from(MAC), None);
+        let stranger = Ipv4Addr::new(10, 42, 0, 110);
+        assert_eq!(peers.sender(stranger), Sender::NotServed(stranger));
+
+        peers.learn(Ipv4Addr::new(10, 42, 0, 111), MAC);
+        peers.requested(Ipv4Addr::UNSPECIFIED, MAC);
+        peers.requested(Ipv4Addr::BROADCAST, MAC);
+        assert_eq!(peers.asked_from(MAC), Some(Ipv4Addr::new(10, 42, 0, 111)));
     }
 
     /// The line `/usr/lib/reliaburger/netlog` sends first on every boot.

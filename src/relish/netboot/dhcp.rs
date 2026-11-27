@@ -481,16 +481,41 @@ pub fn address_server(reply: &Message, xid: u32, source: Ipv4Addr) -> Option<Ipv
     server_identifier(reply).or(Some(source))
 }
 
+/// The MAC of a PXE client asking a DHCP server for an address, and that
+/// address: a DHCPREQUEST in the SELECTING or INIT-REBOOT state (RFC 2131
+/// section 4.3.2), which names it in option 50 while ciaddr is still
+/// 0.0.0.0. Such a request is broadcast, so relish hears it even when it's
+/// for the LAN's own server. iPXE takes its address from that server and
+/// fetches `boot.ipxe` from it, which may not be the address the firmware
+/// asked from on 4011 (#2389).
+pub fn requested_address(request: &Message) -> Option<(MacAddress, Ipv4Addr)> {
+    if request.opts().msg_type() != Some(MessageType::Request) || !request.ciaddr().is_unspecified()
+    {
+        return None;
+    }
+    match class_identifier(request) {
+        Some(class) if class.starts_with(b"PXEClient") || class.starts_with(b"HTTPClient") => {}
+        _ => return None,
+    }
+    let mac = client_mac(request)?;
+    match request.opts().get(OptionCode::RequestedIpAddress) {
+        Some(DhcpOption::RequestedIpAddress(address)) => Some((mac, *address)),
+        _ => None,
+    }
+}
+
 /// Answer PXE requests arriving on `socket` until it fails. Each answer
 /// and each refusal worth knowing about goes to `log`, and each answered
 /// client's source address and MAC to `seen` (unspecified before the client
-/// has an address).
+/// has an address). The address a PXE client asks a DHCP server for, ours
+/// or not, goes to `requested` ([`requested_address`]).
 pub async fn serve(
     socket: Arc<UdpSocket>,
     port: ListenPort,
     context: Arc<DhcpContext>,
     log: impl Fn(String),
     seen: impl Fn(Ipv4Addr, MacAddress),
+    requested: impl Fn(Ipv4Addr, MacAddress),
 ) -> std::io::Result<()> {
     let mut buffer = vec![0u8; 1500];
     loop {
@@ -501,6 +526,9 @@ pub async fn serve(
         let Some(request) = decode(&buffer[..len]) else {
             continue;
         };
+        if let Some((mac, address)) = requested_address(&request) {
+            requested(address, mac);
+        }
         match answer(&request, port, &context) {
             Ok(answer) => {
                 let Some(bytes) = encode(&answer.reply) else {
@@ -1003,6 +1031,7 @@ mod tests {
             move |address, mac| {
                 let _ = seen_tx.send((address, mac));
             },
+            |_, _| {},
         ));
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
@@ -1043,6 +1072,74 @@ mod tests {
             (Ipv4Addr::LOCALHOST, MacAddress(MAC))
         );
         assert!(seen.try_recv().is_err(), "only answered clients are seen");
+        task.abort();
+    }
+
+    /// iPXE takes its boot file from relish's proxy offer and its address
+    /// from the LAN's DHCP server, so the only place relish sees the
+    /// address iPXE fetches boot.ipxe from is iPXE's broadcast
+    /// DHCPREQUEST to that server (#2389). The reinstall boot in CI asked
+    /// on 4011 from 10.42.0.111, then iPXE requested 10.42.0.110.
+    #[tokio::test]
+    async fn the_address_a_pxe_client_requests_from_another_server_is_passed_on() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server = socket.local_addr().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (requested_tx, mut requested) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(serve(
+            socket,
+            ListenPort::Dhcp,
+            Arc::new(context()),
+            move |line| {
+                let _ = tx.send(line);
+            },
+            |_, _| {},
+            move |address, mac| {
+                let _ = requested_tx.send((address, mac));
+            },
+        ));
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ipxe_request = |class: &[u8], ciaddr: Ipv4Addr| {
+            let mut message = request(MessageType::Request, class, Some(7));
+            message.set_ciaddr(ciaddr);
+            let options = message.opts_mut();
+            options.insert(DhcpOption::UserClass(b"iPXE".to_vec()));
+            options.insert(DhcpOption::ServerIdentifier(Ipv4Addr::new(10, 42, 0, 2)));
+            options.insert(DhcpOption::RequestedIpAddress(Ipv4Addr::new(
+                10, 42, 0, 110,
+            )));
+            message
+        };
+        for message in [
+            // A laptop's request names its address too, but it isn't PXE.
+            ipxe_request(b"MSFT 5.0", Ipv4Addr::UNSPECIFIED),
+            // A renewal has an address already: option 50 means nothing.
+            ipxe_request(b"PXEClient:Arch:00007", Ipv4Addr::new(10, 42, 0, 111)),
+            ipxe_request(b"PXEClient:Arch:00007", Ipv4Addr::UNSPECIFIED),
+        ] {
+            client
+                .send_to(&encode(&message).unwrap(), server)
+                .await
+                .unwrap();
+        }
+
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), requested.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(seen, (Ipv4Addr::new(10, 42, 0, 110), MacAddress(MAC)));
+        // The request is for the other server: relish doesn't answer it.
+        let mut buffer = vec![0u8; 1500];
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                client.recv_from(&mut buffer)
+            )
+            .await
+            .is_err()
+        );
+        assert!(requested.try_recv().is_err(), "only the PXE request counts");
+        assert!(rx.try_recv().is_err(), "nothing worth logging");
         task.abort();
     }
 
