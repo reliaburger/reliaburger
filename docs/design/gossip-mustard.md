@@ -687,7 +687,7 @@ Two separate things are called "join", and they are not the same step.
 
 **Node departure (graceful):**
 
-Leave is **immediate**. There is no `LEAVING` state, no drain-wait, and no `relish drain` command. The SWIM state machine has four states only — `Alive`, `Suspect`, `Dead`, `Left` — with no intermediate draining state.
+Leave is **immediate**. There is no `LEAVING` state, no drain-wait, and no `relish drain` command (planned, #656). The SWIM state machine has four states only — `Alive`, `Suspect`, `Dead`, `Left` — with no intermediate draining state.
 
 ```
 1. Bun receives SIGTERM.

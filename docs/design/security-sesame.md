@@ -15,7 +15,7 @@ Sesame is not a separate binary or sidecar. It is compiled into the single `reli
 - **Secret encryption.** Asymmetric age encryption for secrets checked into git. Namespace-scoped keypairs for multi-tenant isolation.
 - **Data at rest encryption (Raft log entries only).** Raft log entries are encrypted with AES-256-GCM under a key derived (HKDF-SHA256, fresh salt per entry) from the cluster master key, which is stored on the node. `snapshot.redb` and the vote and log-position metadata are plaintext, and a cluster without a master key writes a plaintext log. This protects a stolen disk or copied log, not a node whose root is compromised. Snapshot encryption with a TPM- or identity-derived key is deferred to #1775; TPM sealing is not implemented.
 - **Network security.** nftables perimeter firewall, eBPF inter-app firewall, egress allowlists, namespace isolation -- all managed automatically by Bun.
-- **Certificate revocation.** CRL distribution for long-lived node certificates.
+- **Certificate revocation.** Every mTLS handshake checks the peer against the CRL and the retired-node list in Raft (§5.7). Retiring a node by name with `relish decommission-node` ships; revoking a single certificate by serial, `relish ca revoke`, is planned (#362).
 
 **Design principles:**
 
@@ -508,8 +508,13 @@ pub enum AgeKeyScope {
 
 ### 4.6 Certificate Revocation List
 
+> **As built.** The CRL lives in `SecurityState` in Raft, beside the retired
+> node ids that `relish decommission-node` records, and every node refreshes
+> its copy from Raft every five seconds (§5.7). The listing is the original
+> design. No command adds a serial to it yet (#362, planned).
+
 ```rust
-/// The cluster's certificate revocation list, distributed via the reporting tree.
+/// The cluster's certificate revocation list, replicated through Raft.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Crl {
     /// The list of revoked certificate serial numbers.
@@ -1320,14 +1325,33 @@ On each council node (intended design; step 1 differs today, see the status note
 
 ### 5.7 CRL Distribution
 
-1. An operator runs `relish ca revoke --node node-07`.
+> **Status: the check ships; revocation by serial is planned (#362).** What
+> runs today:
+>
+> - `SecurityState` in Raft holds the CRL and the retired node ids.
+> - Every node refreshes its copy from its Raft replica (or the leader's view)
+>   every `SECURITY_REFRESH_INTERVAL`, five seconds (`src/bin/bun.rs`), and
+>   caches it in memory (`CrlHandle` in `src/sesame/mtls.rs`).
+> - Every inbound mTLS handshake, and every use of a long-lived Raft
+>   connection (#928), checks the peer's chain: a certificate naming a
+>   retired node id is refused whatever its serial, and so is any serial on
+>   the CRL.
+> - `relish decommission-node <node> --workloads-stopped --reason "..."` is
+>   the supported way to expel a node. It retires the node's id, so its
+>   certificates are refused within one refresh, and the node can only come
+>   back through fresh enrolment.
+>
+> Nothing adds a serial to the CRL yet: `RevokeCertificate` has an apply arm
+> but no caller. The steps below are the planned `relish ca revoke` flow.
+
+1. An operator runs `relish ca revoke --node node-07` *(planned, #362)*.
 2. The leader adds the node's certificate serial number to the CRL in Raft.
-3. The updated CRL is distributed to all nodes via the hierarchical reporting tree (the same tree used for health reporting and scheduling state).
+3. Each node picks up the updated CRL at its next five-second refresh from Raft. (An earlier draft distributed it over the reporting tree; it doesn't.)
 4. Each node caches the CRL in memory.
 5. On every inbound mTLS handshake, the node checks the peer's certificate serial against the CRL. If the serial is present, the handshake is rejected.
 6. The revoked node is effectively expelled from the cluster. It cannot communicate with any other node. It must re-join via a new join token.
 
-**CRL propagation time:** The reporting tree distributes the CRL within seconds (measured at < 2 seconds in the target cluster size of ~200 nodes). The CRL is small -- just a list of serial numbers and metadata.
+**CRL propagation time:** at most one refresh interval, five seconds, after the Raft entry commits on a node's replica. The CRL is small -- just a list of serial numbers and metadata.
 
 ### 5.7a Workload Signing-Key Rotation (#709)
 
@@ -1869,7 +1893,7 @@ council_size = 3
 **Response:**
 
 1. Immediately run `relish ca rotate --role ROLE --root-backup FILE` for the compromised intermediate CA (§5.8). Root rotation is planned ([#362](https://github.com/reliaburger/reliaburger/issues/362)).
-2. Revoke all certificates issued by the compromised CA (via the CRL, §5.7).
+2. Retiring the old intermediate is what stops its certificates: once its `Retiring` window ends, verifiers no longer trust it (§5.8). Revoking every certificate it issued, by serial, is planned ([#362](https://github.com/reliaburger/reliaburger/issues/362)). A node you believe holds the key is expelled with `relish decommission-node` (§5.7).
 3. The dual-signing period ensures existing legitimate certificates continue working during the transition.
 4. Investigate how the key was exfiltrated. Council nodes should have restricted access. At-rest encryption covers Raft log entries only, under the master key on the same host (§5.6); TPM sealing is planned hardening, not yet active.
 
@@ -1886,21 +1910,22 @@ council_size = 3
 - Tokens are single-use: once consumed, a second use is rejected.
 - Tokens are short-lived: default 15 minutes.
 - Tokens are output to stderr only, never written to disk or structured logs.
-- If `node_attestation = "tpm"` is enabled, the token alone is insufficient -- the attacker also needs a trusted TPM.
-- If a leak is suspected before the token is consumed: no action needed if the TTL has expired. If the TTL has not expired, generate a new token and do not use the leaked one. There is no explicit "revoke token" command because the token auto-expires.
-- If a rogue node has already joined: `relish ca revoke --node <rogue-node>` immediately expels it.
+- Each token enrols exactly one node id, the one it was created for.
+- TPM attestation, where the token alone wouldn't be enough, is planned.
+- If a leak is suspected before the token is consumed: `relish join-token revoke <node-id>` revokes every unused token for that node id. Once the TTL has passed, the token is useless anyway.
+- If a rogue node has already joined: `relish decommission-node <rogue-node> --workloads-stopped --reason "..."` retires its id, and every node refuses its certificate within five seconds (§5.7). Revoking its certificate by serial with `relish ca revoke` is planned (#362).
 
 ### 7.4 CRL Propagation Delay
 
-**Scenario:** A node's certificate is revoked, but some nodes have not yet received the updated CRL.
+**Scenario:** A node is retired with `relish decommission-node` (or, once #362 lands, a certificate is revoked), but some nodes have not yet picked up the change.
 
-**Impact:** The revoked node can still communicate with nodes that have a stale CRL. In the target cluster size (~200 nodes), the reporting tree distributes the CRL in under 2 seconds, so the window is very narrow.
+**Impact:** The retired node can still communicate with nodes that hold the old state. Each node refreshes the CRL and the retired-node list from its Raft replica every five seconds, so the window is one refresh interval after the entry reaches that node's replica.
 
 **Mitigations:**
 
-- The reporting tree is the fastest distribution mechanism in the cluster (sub-second for small payloads).
-- Nodes that are temporarily unreachable (and thus miss the CRL update) will receive the updated CRL when they reconnect and sync state.
-- For critical revocations, `relish ca revoke` outputs the CRL distribution status, confirming which nodes have acknowledged receipt.
+- A long-lived Raft connection is re-checked before each use, not only at its handshake (#928).
+- Nodes that are temporarily unreachable (and thus miss the update) pick it up from Raft when they reconnect and catch up.
+- A `relish ca revoke` that reports which nodes have acknowledged the new CRL is planned (#362).
 
 ### 7.5 Raft Log Encryption Key Loss
 
@@ -1977,7 +2002,7 @@ The threat model assumes:
 
 **Response:**
 
-1. `relish ca revoke --node <compromised-node>` -- immediately expels the node.
+1. Stop or fence the node, then `relish decommission-node <compromised-node> --workloads-stopped --reason "..."`: every node refuses its certificates within five seconds (§5.7). Revoking them by serial with `relish ca revoke` is planned (#362). Because a node can unwrap the CA keys today (see the note above), also rotate the intermediates with `relish ca rotate` (§5.8).
 2. Workload certificates for that node expire within 1 hour (or sooner if council stops renewing them).
 3. Rotate any secrets that were exposed to workloads on that node.
 
@@ -2156,8 +2181,8 @@ Decrypted values are held in memory and injected as env vars. There is no per-re
 
 ### 10.6 CRL Distribution
 
-- **Revocation test:** Join a node, revoke its certificate, attempt communication from the revoked node. Verify rejection on all other nodes.
-- **Propagation timing test:** Revoke a certificate and measure the time until all nodes have the updated CRL. Verify sub-2-second propagation for clusters up to 200 nodes.
+- **Revocation test:** Join a node, retire it with `relish decommission-node`, attempt communication from it. Verify rejection on all other nodes. The unit form is `retired_node_identity_refuses_every_serial_and_allows_fresh_enrolment` (`src/sesame/mtls.rs`). Revoking by serial is planned with `relish ca revoke` (#362).
+- **Propagation timing test:** Retire a node and measure the time until every node refuses it. Verify it's within one five-second refresh after the entry commits.
 - **Stale CRL test:** Disconnect a node before CRL distribution, then reconnect. Verify that the node receives the updated CRL on reconnection.
 
 ### 10.7 Audit Logging
@@ -2250,7 +2275,7 @@ Reliaburger's age-based secret encryption is much simpler than Vault but covers 
 | **rcgen** | X.509 certificate generation and CSR creation. | Used by `relish init` for CA generation and by Bun for creating workload CSRs. |
 | **ring** | Cryptographic primitives: ECDSA key generation, AES-256-GCM encryption/decryption, HKDF key derivation, SHA-256 hashing (including API and join token digests). | The core crypto library. No unsafe code, constant-time operations. |
 | **age** | Asymmetric encryption for secrets (`ENC[AGE:...]` values). | Rust implementation of the age encryption format. Used for secret encryption/decryption and root CA key sealing. |
-| **x509-parser** | Parsing and validating X.509 certificates and CRLs. | Used for certificate chain validation, CRL parsing, and `relish ca status` output. |
+| **x509-parser** | Parsing and validating X.509 certificates and CRLs. | Used for certificate chain validation and CRL parsing. `relish ca status` is planned (#362). |
 | **pem** | PEM encoding/decoding for certificates and keys. | Used for writing certificate files to workload identity mounts. |
 
 ---
