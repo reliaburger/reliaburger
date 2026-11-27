@@ -955,17 +955,21 @@ async fn handle_raft_frame<S: AsyncWrite + Unpin>(
 /// Answer a [`RaftRpc::CouncilVoters`] question with this node's council.
 ///
 /// Only a node serving Raft at the asker's own epoch answers: a probing or
-/// fenced node's membership may be a replaced council's. An asker on an
-/// older epoch is told the newer one, as any outsider is. The answer reaches
-/// no Raft state and never moves the fence.
+/// fenced node's membership may be a replaced council's. Any other asker is
+/// told what the fence would tell a member, `Fenced` with the newest epoch
+/// this node knows and its own recovery id when that epoch is its own, so an
+/// asker on an older epoch fences itself, and one on the same epoch from
+/// another recovery sees the split (#694, #2406). The answer reaches no Raft
+/// state and never moves this node's fence.
 async fn answer_council_voters<S: AsyncWrite + Unpin>(
     stream: &mut S,
     raft: &Raft<TypeConfig>,
     fence: &RecoveryFence,
     claim: RecoveryClaim,
 ) -> bool {
-    if fence.peek(claim) != Admission::Serve {
-        if let Some(newest) = fence.refusal_for_outsider(claim) {
+    match fence.peek(claim) {
+        Admission::Serve => {}
+        Admission::Refuse { newest } => {
             write_response(
                 stream,
                 RaftRpcResponse::Fenced {
@@ -974,8 +978,9 @@ async fn answer_council_voters<S: AsyncWrite + Unpin>(
                 },
             )
             .await;
+            return false;
         }
-        return false;
+        Admission::Adopted => return false,
     }
     let Some(roster) = super::admission::council_roster(raft).await else {
         return false;
