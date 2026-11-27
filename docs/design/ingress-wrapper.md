@@ -175,7 +175,12 @@ grow the in-memory cache without limit. An SNI for any other host — and a
 handshake with no SNI at all — is served the self-signed development
 certificate instead; a client that validates the hostname rejects it, so an
 unconfigured host can never obtain a trusted cluster certificate. The cache is
-additionally capped as defence in depth.
+additionally capped at 1,024 hosts (`MAX_SNI_CACHE`) as defence in depth. When
+it's full, a new host first evicts every entry whose host no longer has a
+`tls = "cluster"` route and every expired leaf, then, if all entries are still
+live, the least recently used one. Before #2430 a full cache refused new hosts,
+so a cluster that had served 1,024 preview hosts signed a fresh leaf on every
+handshake for the 1,025th, on a runtime worker thread.
 
 This currently requires the ingress node to have council state and the
 wrapping key material. If it doesn't, `cluster` hosts get the listener's
