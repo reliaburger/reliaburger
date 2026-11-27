@@ -176,7 +176,7 @@ async fn owned_follow_node(
 
 /// Get logs for an app.
 ///
-/// Supports `?tail=N` to return only the last N lines, and
+/// Supports `?tail=N` to return only the last N lines of each instance, and
 /// `?follow=true` to stream new lines as an SSE stream.
 pub(super) async fn logs_handler(
     watch: Option<axum::Extension<crate::sesame::auth::CredentialWatch>>,
