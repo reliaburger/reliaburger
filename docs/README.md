@@ -2003,8 +2003,11 @@ fetch it; deployments still require their normal permissions.
 configured endpoint, token and CA:
 
 ```sh
-relish secret encrypt --pubkey "$(relish secret pubkey)" 'value'
+relish secret encrypt --pubkey "$(relish secret pubkey)" --value-file db-password.txt
 ```
+
+`secret encrypt` reads the value from `--value-file`, or from standard input,
+so it stays out of your shell history and the process list.
 
 Use the resulting `ENC[AGE:...]` string in an app environment variable. A
 follower may briefly report the previous generation during rotation; fetch
