@@ -307,6 +307,38 @@ pub type ClusterFetchFuture<'a> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<Option<LocalImageBlobs>, String>> + Send + 'a>,
 >;
 
+/// Most bytes of file content one unpack may write, across all of an
+/// image's layers (#2385). A gzip of zeros expands about a thousandfold,
+/// so a layer's compressed size says nothing about this.
+pub const MAX_UNPACKED_BYTES: u64 = 16 << 30;
+
+/// Most tar entries one unpack may read, across all of an image's layers,
+/// whiteouts and skipped device nodes included.
+pub const MAX_UNPACKED_ENTRIES: u64 = 1_000_000;
+
+/// Free space an unpack always leaves on the image filesystem, so a large
+/// image can't take the room logs, metrics and the Raft log need.
+pub const UNPACK_FREE_RESERVE_BYTES: u64 = 1 << 30;
+
+/// Ceilings on what one unpack may write (#2385).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnpackLimits {
+    /// Bytes of file content, counted from each entry's header before it is
+    /// written (a sparse file counts its full size).
+    pub max_bytes: u64,
+    /// Tar entries read.
+    pub max_entries: u64,
+}
+
+impl Default for UnpackLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: MAX_UNPACKED_BYTES,
+            max_entries: MAX_UNPACKED_ENTRIES,
+        }
+    }
+}
+
 /// Content-addressed image store on disk.
 ///
 /// Disk layout:
@@ -339,6 +371,8 @@ pub struct ImageStore {
     owner_shift: Option<u32>,
     /// Registries tried before the origin for digest-pinned images.
     mirrors: ImageMirrors,
+    /// Ceilings on each unpack, before the free-space reserve lowers them.
+    unpack_limits: UnpackLimits,
     /// When each generation was last handed to a caller. A caller names
     /// the generation in its bundle only after `pull_and_unpack` returns, so
     /// until then this record is what keeps the collector off it (#2423).
@@ -363,6 +397,7 @@ impl ImageStore {
             unpack_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             owner_shift: None,
             mirrors: ImageMirrors::default(),
+            unpack_limits: UnpackLimits::default(),
             handed_out: std::sync::Arc::default(),
             last_collection: std::sync::Arc::default(),
         }
@@ -379,6 +414,29 @@ impl ImageStore {
         self.blob_store
             .set(store)
             .map_err(|_| "runtime blob store already configured".into())
+    }
+
+    /// Unpack with `limits` instead of the defaults.
+    pub fn with_unpack_limits(mut self, limits: UnpackLimits) -> Self {
+        self.unpack_limits = limits;
+        self
+    }
+
+    /// The limits for the next unpack: the store's own, with the byte ceiling
+    /// lowered to the image filesystem's free space less
+    /// [`UNPACK_FREE_RESERVE_BYTES`]. A filesystem that can't be measured
+    /// leaves the store's limits as they are.
+    async fn unpack_limits_now(&self) -> UnpackLimits {
+        let mut limits = self.unpack_limits;
+        if let Ok(usage) =
+            crate::bun::disk_pressure::FilesystemUsage::measure(&self.store_root).await
+        {
+            let room = usage
+                .available_bytes
+                .saturating_sub(UNPACK_FREE_RESERVE_BYTES);
+            limits.max_bytes = limits.max_bytes.min(room);
+        }
+        limits
     }
 
     /// Try `mirrors` before an image's own registry for digest-pinned pulls.
@@ -433,8 +491,22 @@ impl ImageStore {
         }
         let target = generation.clone();
         let owner_shift = self.owner_shift;
+        let limits = self.unpack_limits_now().await;
         tokio::task::spawn_blocking(move || {
-            unpack_layers_with_owner(&layer_paths, &target, owner_shift)?;
+            if let Err(error) = unpack_layers_with_owner(&layer_paths, &target, owner_shift, limits)
+            {
+                // Nothing runs from a generation without its marker: the
+                // partial tree is only disk taken (#2385).
+                if let Err(cleanup) = std::fs::remove_dir_all(&target)
+                    && cleanup.kind() != std::io::ErrorKind::NotFound
+                {
+                    eprintln!(
+                        "warning: could not remove partial image tree {}: {cleanup}",
+                        target.display()
+                    );
+                }
+                return Err(error);
+            }
             // The marker is the only thing a later pull checks. Flush the
             // unpacked tree before writing it: after a power cut the V02 soak
             // found `.complete` present and `redis-server` empty, and every
@@ -1043,15 +1115,18 @@ fn sha256_hex(data: &[u8]) -> String {
 /// A whiteout never follows a symlink, and never removes an entry of its
 /// own layer, wherever it sits in the layer's tar.
 pub fn unpack_layers(layer_paths: &[PathBuf], rootfs: &Path) -> Result<(), ImageError> {
-    unpack_layers_with_owner(layer_paths, rootfs, None)
+    unpack_layers_with_owner(layer_paths, rootfs, None, UnpackLimits::default())
 }
 
 /// [`unpack_layers`], optionally shifting every entry's owner by
-/// `owner_shift` (the layer's uid 0 becomes host uid `owner_shift`).
+/// `owner_shift` (the layer's uid 0 becomes host uid `owner_shift`), and
+/// failing once the layers together pass either of `limits`. A failed
+/// unpack leaves what it had written; the caller removes it.
 pub fn unpack_layers_with_owner(
     layer_paths: &[PathBuf],
     rootfs: &Path,
     owner_shift: Option<u32>,
+    limits: UnpackLimits,
 ) -> Result<(), ImageError> {
     // Clear and recreate rootfs
     if rootfs.exists() {
@@ -1065,6 +1140,7 @@ pub fn unpack_layers_with_owner(
         reason: format!("failed to create rootfs: {e}"),
     })?;
 
+    let (mut bytes, mut entries) = (0u64, 0u64);
     for layer_path in layer_paths {
         let digest = layer_path
             .file_name()
@@ -1093,6 +1169,28 @@ pub fn unpack_layers_with_owner(
                 digest: digest.clone(),
                 reason: format!("failed to read tar entry: {e}"),
             })?;
+            // Count before writing: the entry that crosses a ceiling is
+            // never written. `size` is the expanded size of a sparse file.
+            entries += 1;
+            bytes = bytes.saturating_add(entry.size());
+            if entries > limits.max_entries {
+                return Err(ImageError::UnpackFailed {
+                    digest,
+                    reason: format!(
+                        "the image has more than {} entries, the unpack ceiling",
+                        limits.max_entries
+                    ),
+                });
+            }
+            if bytes > limits.max_bytes {
+                return Err(ImageError::UnpackFailed {
+                    digest,
+                    reason: format!(
+                        "the image expands past the unpack ceiling of {} bytes",
+                        limits.max_bytes
+                    ),
+                });
+            }
 
             let path = entry.path().map_err(|e| ImageError::UnpackFailed {
                 digest: digest.clone(),
@@ -1669,6 +1767,92 @@ mod tests {
         assert!(store.start_collection(Duration::ZERO).await.is_some());
     }
 
+    /// Apparent bytes of every regular file under `root`.
+    fn tree_bytes(root: &Path) -> u64 {
+        let mut total = 0;
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let metadata = entry.metadata().unwrap();
+                if metadata.is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    total += metadata.len();
+                }
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn unpack_refuses_a_layer_that_expands_past_its_ceiling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = tmp.path().join("zeros.tar.gz");
+        // 8 MiB of zeros compresses to a few kilobytes.
+        create_test_layer(&layer, &[("fill", &vec![0u8; 8 << 20])]);
+        assert!(std::fs::metadata(&layer).unwrap().len() < 1 << 20);
+        let rootfs = tmp.path().join("rootfs");
+
+        let limits = UnpackLimits {
+            max_bytes: 1 << 20,
+            max_entries: 1_000,
+        };
+        let result = unpack_layers_with_owner(&[layer], &rootfs, None, limits);
+
+        match result {
+            Err(ImageError::UnpackFailed { reason, .. }) => {
+                assert!(reason.contains("1048576"), "{reason}")
+            }
+            other => panic!("expected the ceiling to refuse the layer, got {other:?}"),
+        }
+        assert!(tree_bytes(&rootfs) < 2 << 20);
+    }
+
+    #[test]
+    fn unpack_refuses_more_entries_than_its_ceiling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = tmp.path().join("many.tar.gz");
+        let names: Vec<String> = (0..10_000).map(|index| format!("f/{index}")).collect();
+        let files: Vec<(&str, &[u8])> =
+            names.iter().map(|name| (name.as_str(), &b""[..])).collect();
+        create_test_layer(&layer, &files);
+        let rootfs = tmp.path().join("rootfs");
+
+        let limits = UnpackLimits {
+            max_bytes: 1 << 30,
+            max_entries: 1_000,
+        };
+        let result = unpack_layers_with_owner(&[layer], &rootfs, None, limits);
+
+        match result {
+            Err(ImageError::UnpackFailed { reason, .. }) => {
+                assert!(reason.contains("1000 entries"), "{reason}")
+            }
+            other => panic!("expected the ceiling to refuse the layer, got {other:?}"),
+        }
+        let written = std::fs::read_dir(rootfs.join("f")).unwrap().count();
+        assert!(written <= 1_000, "{written} files written");
+    }
+
+    #[tokio::test]
+    async fn a_refused_unpack_leaves_no_partial_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = blob_layer(tmp.path(), "zeros", &[("fill", &vec![0u8; 4 << 20])]);
+        let store = ImageStore::new(tmp.path().join("store")).with_unpack_limits(UnpackLimits {
+            max_bytes: 1 << 20,
+            max_entries: 1_000,
+        });
+        let tag_root = tmp.path().join("store/rootfs/docker.io/acme/web/v1");
+        let generation = store.rootfs_generation_path(&tag_root, std::slice::from_ref(&layer));
+
+        assert!(store.unpack_to(vec![layer], tag_root).await.is_err());
+        assert!(!generation.exists(), "the partial tree stays on disk");
+        assert!(!generation.with_extension("complete").exists());
+    }
+
     #[test]
     fn rootfs_path_from_reference() {
         let store = ImageStore::new(PathBuf::from("/tmp/images"));
@@ -2142,7 +2326,7 @@ mod tests {
             tar.into_inner().unwrap().finish().unwrap();
         }
         let rootfs = tmp.path().join("rootfs");
-        unpack_layers_with_owner(&[layer], &rootfs, Some(base)).unwrap();
+        unpack_layers_with_owner(&[layer], &rootfs, Some(base), UnpackLimits::default()).unwrap();
 
         let data = std::fs::metadata(rootfs.join("data")).unwrap();
         assert_eq!((data.uid(), data.gid()), (base + 999, base + 1000));

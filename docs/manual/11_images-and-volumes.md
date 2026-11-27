@@ -196,6 +196,21 @@ grill: image collection removed 3 generation(s), 0 partial tree(s), 3 manifest(s
 An image that's collected and needed again later is pulled and unpacked
 again, from the blob store if its layers are still there.
 
+### What bounds disk use on a node
+
+| What | Bounded by |
+|------|------------|
+| Compressed image layers, uploads | `[images] max_storage` and expiry (above) |
+| One image's unpacked size | 16 GiB and a million files, and never more than the image filesystem's free space less 1 GiB; a bigger image fails to unpack with `the image expands past the unpack ceiling of N bytes` and leaves nothing behind |
+| Unpacked images nobody uses | the runtime's collection (above) |
+| A volume with a `size` | its size (see [volumes](#volumes)) |
+| What a container writes to its own filesystem | nothing yet |
+| A volume without a `size` | nothing yet |
+
+The last two share the node's data filesystem with everything else, so a
+container that writes without stopping can fill it. Give volumes a `size`,
+and keep an eye on `relish wtf`, which warns as the disk fills.
+
 ### Lost images
 
 An image is *lost* when some layer it needs has no live copy left, for

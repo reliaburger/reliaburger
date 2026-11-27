@@ -691,6 +691,40 @@ borrowing it, so it can move into a spawned task) and holds it for the whole
 pass, so two creates never run two passes. A node that stops deploying stops
 collecting, which is fine: it also stops growing.
 
+### How big may an image get?
+
+Collection removes what nobody uses. It can't help with one image that is
+simply too big, and the same audit found that nothing stopped one (#2385).
+Picture a layer that's a 10 MB gzip of a 20 GB file of zeros. It downloads,
+its digest checks out, it's well under `[images] max_storage` (which counts
+compressed bytes), and then the unpacker writes all 20 GB into the node's data
+filesystem. Every other writer on that disk fails with it.
+
+`unpack_layers_with_owner` now takes an `UnpackLimits` and keeps two running
+totals across all of an image's layers: the bytes of file content and the
+number of tar entries. Both are counted from the entry's header *before* the
+entry is written, so the entry that would cross a ceiling never reaches the
+disk. The tar crate's `Entry::size` is already the expanded size for a sparse
+file, which is the number we want: a sparse file of holes costs little on
+disk, but the count stays conservative.
+
+The ceilings are 16 GiB and a million entries, and `unpack_to` lowers the byte
+ceiling further to the image filesystem's free space less 1 GiB, so the
+biggest image a node accepts still leaves room for logs, metrics and the Raft
+log. When an unpack fails, for this reason or any other, `unpack_to` removes
+the partial tree before it returns. Nothing would ever run from it (it has no
+`.complete` marker), so all it could do is take disk.
+
+What this doesn't bound is what a running container writes. A container's
+writable layer is an overlay upper directory on the same data filesystem, and
+an unsized volume is a plain directory, so `dd if=/dev/zero of=/fill` inside a
+container still fills the node's disk. A per-app limit needs either a project
+quota on the upper directory (XFS, or ext4 with `prjquota`) or Btrfs qgroups,
+or the agent measuring each upper directory and stopping the instance that
+passes a limit. The first doesn't work on every filesystem; the second needs a
+policy for what to stop. That's a decision for its own release, and until then
+the manual says plainly that these two are unbounded.
+
 ### One authoritative catalogue
 
 Pickle has two catalogues: the council's Raft-replicated `manifest_catalog`, and each node's local `PickleState::catalog`. The push path proposes to Raft; the read path — `manifest_get` and `tags_list` — read the *local* one. So a manifest a peer committed to Raft was invisible on a node that hadn't received the original PUT, until a heal tick happened to reconcile it. Push on node A, `docker pull` from node B, get a 404.

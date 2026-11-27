@@ -198,6 +198,8 @@ The runtime's `ImageStore` keeps three more trees beside `blobs/`, which Pickle'
 
 A generation is published once: the tree is unpacked, the filesystem is synced, then the `.complete` marker is written atomically. Only a marked generation is reused or handed out.
 
+An unpack is bounded (#2385): `UnpackLimits` caps the file content (each entry's header size, the expanded size for sparse files) and the number of tar entries across all of an image's layers, counted before each entry is written. The defaults are 16 GiB (`MAX_UNPACKED_BYTES`) and 1,000,000 entries (`MAX_UNPACKED_ENTRIES`), and `unpack_to` lowers the byte ceiling to the image filesystem's free space less 1 GiB (`UNPACK_FREE_RESERVE_BYTES`). A failed unpack removes its partial tree before returning. A container's overlay upper directory and unsized volumes are not bounded; see the manual's "What bounds disk use on a node".
+
 The runc runtime collects what no container uses (#2423). After each create from an image it starts `ImageStore::collect_rootfs_garbage` on its own task when the last pass began over an hour ago, or at once when the image filesystem is at least 95% full (`FilesystemUsage::is_pressured`). The live set is every bundle's `rootfs-lower` marker (writable overlays) and `config.json` `root.path` (read-only roots), read by `grill::runc::live_image_generations`; an unreadable bundle spec aborts the pass. A pass:
 
 1. Holds the unpack lock, so nothing is published or cleared meanwhile.
