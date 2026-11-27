@@ -137,7 +137,8 @@ impl PickleState {
 
     /// The 403 for a writer whose `[permission]` block doesn't grant
     /// `deploy` on `repository` (#2398). The block comes from this node's
-    /// replica of the desired state; only the writer's own entry is copied
+    /// replica of the desired state, or from the leader's view on a node
+    /// with no Raft seat (#2538); only the writer's own entry is copied
     /// out. Without a council handle (a standalone registry) there are no
     /// blocks to apply.
     // `Response` is large but it IS the HTTP reply to send on failure.
@@ -157,9 +158,7 @@ impl PickleState {
             return Ok(());
         }
         let name = principal.token_name.clone();
-        let block = council
-            .read_desired(|state| state.permissions.get(&name).cloned())
-            .await;
+        let block = council.permission(&name).await;
         let permissions = block.map(|spec| (name, spec)).into_iter().collect();
         super::registry_auth::check_repository_permission(
             Some(principal),

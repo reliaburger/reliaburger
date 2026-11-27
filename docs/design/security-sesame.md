@@ -215,7 +215,13 @@ linearizably and checks the caller's node certificate as renewal does. The
 view keeps the CA certificates, API token hashes, the CRL, node leaf records,
 the wrapped age keys and the wrapped Ingress CA key. It drops the root, Node
 and Workload CA keys, the OIDC signing key, join tokens, secret seals,
-pending intermediates and the serial counter.
+pending intermediates and the serial counter. Beside the security state, the
+view carries every `[permission]` block from the desired state (#2538). The
+blocks narrow the tokens the view hands over, so without them a seatless node
+treated a narrowed token as unrestricted on both the API and the registry.
+`CouncilNode::permissions` and `CouncilNode::permission` answer from the
+replica, or from the adopted view on a node whose replica holds no security
+state, and both `permission_map` and Pickle's write gate read through them.
 
 Where the leader is comes from gossip, and gossip is authenticated only by
 a key every node holds, so a forged leader hint could have pointed seatless

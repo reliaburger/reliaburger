@@ -913,6 +913,23 @@ pub async fn security_state(&self) -> SecurityState {
 
 `unwrap_or(local)` returns the empty local state when no view has arrived yet, so a reader never waits here. Bun's five-second security refresh fetches the view whenever its replica holds nothing, and keeps the last one if the leader can't be reached, the way a follower that can't reach quorum keeps its replica. A token revoked on the leader stops working on the node within one refresh.
 
+"Nothing had to change" turned out to be one thing too generous. A token's `[permission]` block (later in this chapter) doesn't live in the security state; it's desired state, applied with the manifest that declares it. So the view brought a seatless node every token and none of the blocks that narrow them, and that node treated a token limited to `ns-a` as one that could deploy and push anywhere (#2538). The registry batch found it while wiring the blocks into `docker push` (#2398). Now the view carries the blocks too, and the council handle answers for them the way it answers for tokens:
+
+```rust
+pub async fn permissions(&self) -> BTreeMap<String, PermissionSpec> {
+    if !self.holds_security_state().await
+        && let Some(view) = self.leader_security_view.read().await.as_ref()
+    {
+        return view.permissions.clone();
+    }
+    self.state_machine
+        .read_desired(|state| state.permissions.clone())
+        .await
+}
+```
+
+That's a let-chain (chapter 7) guarding a lock: the read guard lives only as long as the `if`, so the early `return` clones the map out before the lock is let go. It falls back to the replica when no view has arrived, not to an empty map, because a seated node that has never had a token still has its blocks there. The test, `a_node_without_a_seat_enforces_the_leaders_permission_blocks`, fetches a real view from the leader's endpoint, hands it to a node with no seat, and drives that node's own API and registry with a real bearer token: `apply` into `ns-b` and a push to `ns-b/app` both get 403, and a push to `ns-a/app` gets past the gate. Before the fix the apply got as far as looking for a leader, and the push as far as committing.
+
 The weak link was "the leader". A node with no seat has no Raft metrics, so it learns who leads from the gossip leader hint, and the first version sent its service token to whatever address that hint named, over TLS that accepted any node certificate. Every node holds the gossip key, so one compromised worker could name itself leader and hand every seatless node its own tokens and CA (#2406). Now `SecurityViewClient::fetch` takes the node id the hint names along with its address. It refuses before connecting unless that node is a voter of the council this node knows, its own membership or, with no seat, the expected council `relish join` saved (Chapter 2, "Council membership check"), and the TLS connection is bound to that node id, so a voter's name with an impostor's address fails the handshake. `leader_api_target` returns the pair, and `leader_api_address` is now a one-line wrapper around it for callers that only need the address.
 
 ### Evaluating a policy isn't enforcing it

@@ -248,7 +248,6 @@ async fn a_node_without_a_seat_reads_the_leaders_view_and_follows_revocations() 
         .await
         .1
         .unwrap()
-        .security
     };
     outsider.adopt_leader_security_view(view().await).await;
     assert_eq!(names(&outsider.api_tokens().await), ["ops", "ci"]);
@@ -273,13 +272,153 @@ async fn a_node_without_a_seat_reads_the_leaders_view_and_follows_revocations() 
 
     // A node whose replica holds the state reads its own, whatever it was given.
     leader
-        .adopt_leader_security_view(SecurityState::default())
+        .adopt_leader_security_view(SecurityView {
+            compatibility: reliaburger::compatibility::CURRENT,
+            security: SecurityState::default(),
+            permissions: BTreeMap::new(),
+        })
         .await;
     assert!(leader.holds_security_state().await);
     assert_eq!(
         leader.security_state().await.certificate_authorities.len(),
         3
     );
+    leader.shutdown().await.unwrap();
+    outsider.shutdown().await.unwrap();
+}
+
+/// #2538: a node with no Raft seat enforces a token's `[permission]` block as
+/// a voter does. Its replica holds no permissions, so the block has to come
+/// with the leader's view; without it, a token narrowed to `ns-a` deployed
+/// and pushed to any namespace through that node.
+#[tokio::test]
+async fn a_node_without_a_seat_enforces_the_leaders_permission_blocks() {
+    use reliaburger::pickle::{
+        api::PickleState,
+        registry_auth::{DEFAULT_UPLOAD_TTL, QuotaConfig, UploadSessions},
+        store::{BlobStore, compute_sha256},
+        types::ManifestCatalog,
+    };
+    let hierarchy = ca::generate_ca_hierarchy("view", &IKM).unwrap();
+    let leader = council(&hierarchy, true).await;
+    let created = reliaburger::sesame::token::create_token(
+        "ci-a",
+        ApiRole::Deployer,
+        TokenScope::default(),
+        None,
+    )
+    .unwrap();
+    leader
+        .write(RaftRequest::CreateApiToken(created.token.clone()))
+        .await
+        .unwrap();
+    leader
+        .write(RaftRequest::PermissionSpec {
+            name: "ci-a".into(),
+            spec: Box::new(reliaburger::config::PermissionSpec {
+                actions: vec!["deploy".into()],
+                apps: vec!["*".into()],
+                namespaces: Some(vec!["ns-a".into()]),
+            }),
+        })
+        .await
+        .unwrap();
+
+    let outsider = council(&hierarchy, false).await;
+    let (status, view) = get_view(
+        router(Arc::clone(&leader), Some(peer(&hierarchy, 10))),
+        Some("internal-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    outsider.adopt_leader_security_view(view.unwrap()).await;
+    assert!(!outsider.holds_security_state().await);
+    // Bun's token refresh fills the store the API and the registry share.
+    let tokens = reliaburger::sesame::auth::new_token_store();
+    *tokens.write().await = outsider.api_tokens().await;
+
+    // The API: a deploy into `ns-b` is refused by the block.
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let api = reliaburger::bun::api::router(
+        tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::clone(&outsider)),
+        Some(tokens.clone()),
+        Some("internal-token".into()),
+        None,
+        None,
+        None,
+        0,
+        None,
+    );
+    let response = api
+        .oneshot(
+            Request::post("/v1/apply")
+                .header("authorization", format!("Bearer {}", created.plaintext))
+                .body(Body::from(
+                    "[app.web]\nimage = \"busybox:1.36\"\nnamespace = \"ns-b\"\n",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains("does not grant deploy"), "{body}");
+
+    // The registry: a push to `ns-b/app` is refused; one to `ns-a/app` gets
+    // past the block (it fails later, with no leader to commit to).
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(BlobStore::new(root.path().join("blobs")));
+    let config = compute_sha256(b"config");
+    store.write_blob(b"config", &config).unwrap();
+    let manifest = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"digest": config.as_str(), "size": 6}, "layers": []
+    }))
+    .unwrap();
+    let registry = reliaburger::pickle::api::router(PickleState {
+        store,
+        catalog: Arc::new(tokio::sync::RwLock::new(ManifestCatalog::default())),
+        node_raft_id: 8,
+        council: Some(Arc::clone(&outsider)),
+        forwarder: None,
+        test_leases: Default::default(),
+        repository_writers: Default::default(),
+        persist_path: None,
+        auth: Some(reliaburger::sesame::auth::AuthState::new(tokens, None)),
+        require_read_auth: false,
+        allow_unauthenticated_bootstrap: false,
+        quota: QuotaConfig::default(),
+        sessions: UploadSessions::new(DEFAULT_UPLOAD_TTL),
+    });
+    let push = |repository: &str| {
+        Request::put(format!("/v2/{repository}/manifests/v1"))
+            .header("authorization", format!("Bearer {}", created.plaintext))
+            .header("content-type", "application/vnd.oci.image.manifest.v1+json")
+            .body(Body::from(manifest.clone()))
+            .unwrap()
+    };
+    let refused = registry.clone().oneshot(push("ns-b/app")).await.unwrap();
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    let granted = tokio::time::timeout(
+        Duration::from_secs(30),
+        registry.clone().oneshot(push("ns-a/app")),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_ne!(granted.status(), StatusCode::FORBIDDEN);
+    assert_ne!(granted.status(), StatusCode::UNAUTHORIZED);
+
     leader.shutdown().await.unwrap();
     outsider.shutdown().await.unwrap();
 }
