@@ -99,6 +99,12 @@ another firewall's rules, so a node can reach its containers while
 container-to-container traffic is still dropped. The
 [runc notes](README.md#runc-linux) cover what to check.
 
+Containers on a node get addresses from a `/23` inside `10.0.0.0/8`. Bun
+picks it the first time it starts containers, passing over any `/23` that
+overlaps a network the host is on, and keeps it from then on, so renaming a
+host doesn't strand its containers. Container addresses never leave their
+node.
+
 Bun's own check for published container ports is a forward-hook chain at
 priority -10 in its `reliaburger_fw` table. nftables runs every table's chain
 on a hook independently: an `accept` in one only hands the packet to the next,
