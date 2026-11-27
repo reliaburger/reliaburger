@@ -64,6 +64,9 @@ pub struct CouncilNodeObservation {
     /// How many voters the council grows to, when the cluster set a size.
     #[serde(default)]
     pub council_size: Option<crate::council::CouncilSize>,
+    /// How full its retired-identity list is (#2375).
+    #[serde(default)]
+    pub retired_identities: Option<crate::cluster::retirement::RetiredIdentities>,
 }
 
 impl CouncilNodeObservation {
@@ -90,6 +93,7 @@ impl CouncilNodeObservation {
                 })
                 .collect(),
             council_size: status.council_size,
+            retired_identities: status.retired_identities,
         }
     }
 
@@ -109,6 +113,7 @@ impl CouncilNodeObservation {
             last_log_index: None,
             members: Vec::new(),
             council_size: None,
+            retired_identities: None,
         }
     }
 
@@ -225,6 +230,9 @@ pub struct CouncilSummary {
     /// they keep retrying, but a restart now would forget the fence.
     #[serde(default)]
     pub fence_unpersisted: Vec<(String, String)>,
+    /// How full the newest council's retired-identity list is (#2375).
+    #[serde(default)]
+    pub retired_identities: Option<crate::cluster::retirement::RetiredIdentities>,
 }
 
 impl CouncilSummary {
@@ -324,6 +332,9 @@ impl CouncilSummary {
                 "voter(s) not applying the log: {}",
                 describe_lagging(&self.lagging)
             ));
+        }
+        if let Some(retired) = self.retired_identities.filter(|r| r.nearly_full()) {
+            warnings.push(describe_retired_identities(&retired));
         }
         warnings
     }
@@ -429,6 +440,7 @@ pub fn summarise(observations: &[CouncilNodeObservation]) -> CouncilSummary {
         .cloned()
         .collect();
     let lagging = lagging_voters(&serving, &voters);
+    let retired_identities = authority.and_then(|o| o.retired_identities);
 
     let unanswered = observations
         .iter()
@@ -458,7 +470,19 @@ pub fn summarise(observations: &[CouncilNodeObservation]) -> CouncilSummary {
         lagging,
         unanswered,
         fence_unpersisted,
+        retired_identities,
     }
+}
+
+/// The warning for a retired-identity list near its limit (#2375).
+pub fn describe_retired_identities(
+    retired: &crate::cluster::retirement::RetiredIdentities,
+) -> String {
+    format!(
+        "{} of {} retired node identities are used; at the limit `relish decommission-node` \
+         is refused",
+        retired.count, retired.limit
+    )
 }
 
 /// A one-line council header, plus a warning line for each problem. Empty
@@ -537,6 +561,13 @@ pub fn render_council_status(
         .find_map(|node| node.council_size)
     {
         let _ = writeln!(out, "Size:    up to {size} voters");
+    }
+    if let Some(retired) = summary.retired_identities {
+        let _ = writeln!(
+            out,
+            "Retired: {} of {} node identities",
+            retired.count, retired.limit
+        );
     }
     out.push('\n');
 
@@ -645,6 +676,7 @@ mod tests {
                 member("node-3", true),
             ],
             council_size: None,
+            retired_identities: None,
         }
     }
 

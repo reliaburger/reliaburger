@@ -16,7 +16,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::oci::{OciCapabilities, OciIdMapping, OciNamespace, OciSpec};
+use super::oci::{OciCapabilities, OciIdMapping, OciMount, OciNamespace, OciSpec};
 
 /// First host uid (and gid) of the node's container range.
 ///
@@ -54,11 +54,46 @@ const DEFAULT_CAPABILITIES: &[&str] = &[
     "CAP_SYS_CHROOT",
 ];
 
+/// What runc hides from a container: the `/proc` and `/sys` files that
+/// describe or reach the node's hardware and kernel rather than the
+/// container. Docker's and containerd's default list, plus the node's
+/// security and BPF file systems, which the read-only bind of the host's
+/// `/sys` would otherwise show. A file becomes `/dev/null` and a directory an
+/// empty tmpfs; a path the kernel doesn't have is skipped.
+const MASKED_PATHS: &[&str] = &[
+    "/proc/acpi",
+    "/proc/asound",
+    "/proc/interrupts",
+    "/proc/kcore",
+    "/proc/keys",
+    "/proc/latency_stats",
+    "/proc/sched_debug",
+    "/proc/scsi",
+    "/proc/timer_list",
+    "/proc/timer_stats",
+    "/sys/devices/virtual/powercap",
+    "/sys/firmware",
+    "/sys/fs/bpf",
+    "/sys/kernel/security",
+];
+
+/// What runc makes read-only inside a container: the `/proc` files that
+/// change kernel settings or poke the kernel directly (Docker's list).
+const READONLY_PATHS: &[&str] = &[
+    "/proc/bus",
+    "/proc/fs",
+    "/proc/irq",
+    "/proc/sys",
+    "/proc/sysrq-trigger",
+];
+
 /// Why a container can't run in the node's user namespace.
 #[derive(Debug, thiserror::Error)]
 pub enum UserNamespaceError {
     #[error("container {kind} {id} is outside the mapped range 0..{CONTAINER_ID_COUNT}")]
     IdOutOfRange { kind: &'static str, id: u32 },
+    #[error(transparent)]
+    Seccomp(#[from] super::seccomp::SeccompError),
 }
 
 /// The host uid or gid that container id `id` maps to.
@@ -72,12 +107,17 @@ pub fn container_id(id: u32) -> Option<u32> {
         .filter(|offset| *offset < CONTAINER_ID_COUNT)
 }
 
-/// Put a rootful container in the node's user namespace.
+/// Put a rootful container in the node's user namespace and confine it.
 ///
 /// Adds the `user` namespace and its id mappings, grants Docker's default
 /// capabilities, and swaps `/sys` for a read-only bind of the host's:
 /// the kernel only lets a user namespace mount a fresh sysfs when it also
 /// owns the network namespace, and ours is created by the node beforehand.
+///
+/// Then it confines the container (#2402): a cgroup namespace with the
+/// container's own cgroup mounted over the host's `/sys/fs/cgroup`, the
+/// default seccomp filter for its capabilities, `no_new_privs`, and
+/// [`MASKED_PATHS`] and [`READONLY_PATHS`].
 pub fn apply(spec: &mut OciSpec) -> Result<(), UserNamespaceError> {
     let user = &spec.process.user;
     if host_id(user.uid).is_none() {
@@ -126,6 +166,7 @@ pub fn apply(spec: &mut OciSpec) -> Result<(), UserNamespaceError> {
         DEFAULT_CAPABILITIES
     };
     let capabilities: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+    spec.linux.seccomp = Some(super::seccomp::default_profile(&capabilities)?);
     spec.process.capabilities = Some(OciCapabilities {
         bounding: capabilities.clone(),
         effective: capabilities.clone(),
@@ -133,7 +174,62 @@ pub fn apply(spec: &mut OciSpec) -> Result<(), UserNamespaceError> {
     });
 
     bind_host_sys(spec);
+    confine(spec);
     Ok(())
+}
+
+/// The confinement that needs no capability set: `no_new_privs`, the
+/// masked and read-only paths, and a cgroup namespace with the container's
+/// own cgroup over the host tree that the `/sys` bind brings in.
+fn confine(spec: &mut OciSpec) {
+    spec.process.no_new_privileges = true;
+    spec.linux.masked_paths = MASKED_PATHS.iter().map(|p| p.to_string()).collect();
+    spec.linux.readonly_paths = READONLY_PATHS.iter().map(|p| p.to_string()).collect();
+    if spec.reusable_executor {
+        // A shared-runc executor starts each task straight into a sibling
+        // of its own cgroup with `CLONE_INTO_CGROUP`, and the kernel refuses
+        // a target outside the caller's cgroup namespace with `ENOENT`. So
+        // the executor gets no cgroup namespace; it needs no cgroup path
+        // either (Bun hands it the task cgroup as a file descriptor), so the
+        // node's tree is masked instead.
+        spec.linux.masked_paths.push("/sys/fs/cgroup".to_string());
+        return;
+    }
+    if !spec
+        .linux
+        .namespaces
+        .iter()
+        .any(|ns| ns.ns_type == "cgroup")
+    {
+        spec.linux.namespaces.push(OciNamespace {
+            ns_type: "cgroup".to_string(),
+            path: None,
+        });
+    }
+    // A cgroup mount in a cgroup namespace shows the container's own cgroup
+    // as the root, so no container sees another's names or statistics. It
+    // must come after the `/sys` bind it covers: runc mounts in order.
+    let cgroup = Path::new("/sys/fs/cgroup");
+    if spec.mounts.iter().any(|mount| mount.destination == cgroup) {
+        return;
+    }
+    let after_sys = spec
+        .mounts
+        .iter()
+        .position(|mount| mount.destination == Path::new("/sys"))
+        .map_or(spec.mounts.len(), |sys| sys + 1);
+    spec.mounts.insert(
+        after_sys,
+        OciMount {
+            destination: cgroup.to_path_buf(),
+            source: Some(PathBuf::from("cgroup")),
+            mount_type: Some("cgroup".to_string()),
+            options: ["nosuid", "noexec", "nodev", "relatime", "ro"]
+                .iter()
+                .map(|option| option.to_string())
+                .collect(),
+        },
+    );
 }
 
 /// Replace the spec's `/sys` mount with a read-only bind of the host's.
@@ -309,6 +405,70 @@ mod tests {
         assert_eq!(sys.source.as_deref(), Some(Path::new("/sys")));
         assert!(sys.options.iter().any(|option| option == "rbind"));
         assert!(sys.options.iter().any(|option| option == "ro"));
+    }
+
+    #[test]
+    fn a_user_namespaced_container_is_confined_by_seccomp_and_masked_paths() {
+        let mut spec = spec();
+        apply(&mut spec).unwrap();
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["process"]["noNewPrivileges"], true);
+        assert_eq!(json["linux"]["seccomp"]["defaultAction"], "SCMP_ACT_ERRNO");
+        let masked = json["linux"]["maskedPaths"].as_array().cloned();
+        assert!(
+            masked
+                .unwrap_or_default()
+                .iter()
+                .any(|path| path == "/proc/kcore"),
+            "{json}"
+        );
+        let namespaces = json["linux"]["namespaces"].as_array().cloned();
+        assert!(
+            namespaces
+                .unwrap_or_default()
+                .iter()
+                .any(|ns| ns["type"] == "cgroup"),
+            "{json}"
+        );
+        // The host's /sys is bound recursively, so a later mount must cover
+        // its cgroup tree with the container's own.
+        let sys = spec
+            .mounts
+            .iter()
+            .position(|mount| mount.destination == Path::new("/sys"))
+            .unwrap();
+        let cgroup = spec
+            .mounts
+            .iter()
+            .position(|mount| mount.destination == Path::new("/sys/fs/cgroup"));
+        assert!(
+            cgroup.is_some_and(|cgroup| cgroup > sys),
+            "{:?}",
+            spec.mounts
+        );
+    }
+
+    #[test]
+    fn a_shared_executor_gets_no_cgroup_namespace_and_a_masked_cgroup_tree() {
+        let mut executor = spec();
+        executor.reusable_executor = true;
+        apply(&mut executor).unwrap();
+        assert!(
+            !executor
+                .linux
+                .namespaces
+                .iter()
+                .any(|ns| ns.ns_type == "cgroup")
+        );
+        assert!(
+            executor
+                .linux
+                .masked_paths
+                .iter()
+                .any(|path| path == "/sys/fs/cgroup")
+        );
+        assert!(executor.process.no_new_privileges);
+        assert!(executor.linux.seccomp.is_some());
     }
 
     #[test]

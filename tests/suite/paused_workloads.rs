@@ -43,6 +43,7 @@ fn workload(script: &str) -> OciSpec {
             readonly: false,
         },
         process: OciProcess {
+            no_new_privileges: false,
             rlimits: Vec::new(),
             args: vec!["/bin/sh".into(), "-c".into(), script.into()],
             env: Vec::new(),
@@ -55,6 +56,9 @@ fn workload(script: &str) -> OciSpec {
         },
         mounts: vec![],
         linux: OciLinux {
+            seccomp: None,
+            masked_paths: Vec::new(),
+            readonly_paths: Vec::new(),
             namespaces: vec![],
             resources: None,
             cgroups_path: None,

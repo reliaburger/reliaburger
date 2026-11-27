@@ -498,6 +498,16 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
             reason: "args and working_dir apply to image workloads, not exec or script".to_string(),
         });
     }
+    // A host app runs on the node, outside any container cgroup (#2386).
+    if (app.exec.is_some() || app.script.is_some()) && app.pids.is_some() {
+        return Err(ConfigError::Validation {
+            field: "pids".to_string(),
+            context: format!("app {name:?}"),
+            reason: "pids limits an image container's processes; an exec or script app runs \
+                     on the node, where there's no container cgroup to hold it"
+                .to_string(),
+        });
+    }
     if let Some(dir) = &app.working_dir
         && !dir.is_absolute()
     {
@@ -1485,6 +1495,13 @@ mod tests {
             "{}",
             warnings[0]
         );
+    }
+
+    #[test]
+    fn a_host_app_cannot_set_a_pids_limit() {
+        let app: AppSpec = toml::from_str("exec = \"/usr/bin/true\"\npids = 64").unwrap();
+        let error = config_with_app("worker", app).validate().unwrap_err();
+        assert!(error.to_string().contains("pids"), "{error}");
     }
 
     #[test]

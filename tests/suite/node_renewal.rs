@@ -1013,7 +1013,7 @@ async fn worker_waits_until_midpoint_then_retries_failed_persistence_without_pub
         .replace(
             worker_identity(&hierarchy, 20, true),
             &reliaburger::sesame::trust::TrustSet::from_state(
-                &fixture.council.security_state().await,
+                &*fixture.council.security_state().await,
             )
             .unwrap(),
         )
@@ -1101,7 +1101,7 @@ async fn worker_renews_a_short_override_leaf_at_its_midpoint() {
         .replace(
             windowed_identity(&hierarchy, 20, -442, 458),
             &reliaburger::sesame::trust::TrustSet::from_state(
-                &fixture.council.security_state().await,
+                &*fixture.council.security_state().await,
             )
             .unwrap(),
         )
@@ -1173,7 +1173,7 @@ async fn worker_replaces_a_year_long_leaf_once_half_its_ceiling_has_passed() {
         .replace(
             windowed_identity(&hierarchy, 20, -2000, YEAR_SECS),
             &reliaburger::sesame::trust::TrustSet::from_state(
-                &fixture.council.security_state().await,
+                &*fixture.council.security_state().await,
             )
             .unwrap(),
         )
@@ -1206,7 +1206,7 @@ async fn worker_does_not_spin_when_the_leader_signs_longer_than_its_ceiling() {
         .replace(
             windowed_identity(&hierarchy, 20, -2000, YEAR_SECS),
             &reliaburger::sesame::trust::TrustSet::from_state(
-                &fixture.council.security_state().await,
+                &*fixture.council.security_state().await,
             )
             .unwrap(),
         )

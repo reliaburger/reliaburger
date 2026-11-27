@@ -1543,12 +1543,23 @@ async fn reconcile_council_once(
     disk_pressured: &BTreeSet<u64>,
 ) {
     let now = Instant::now();
-    let retired = council.security_state().await.crl.retired_nodes;
-    if retired.contains_key(&self_info.name) {
+    // Only the retired names, copied out under the lock (#2436).
+    let retired: BTreeSet<String> = council
+        .read_desired(|state| {
+            state
+                .security_state
+                .crl
+                .retired_nodes
+                .keys()
+                .cloned()
+                .collect()
+        })
+        .await;
+    if retired.contains(&self_info.name) {
         return;
     }
     let mut snapshot = membership_rx.borrow().clone();
-    snapshot.retain(|member| !retired.contains_key(&member.node_id.0));
+    snapshot.retain(|member| !retired.contains(&member.node_id.0));
     let directory = council_directory(&snapshot, self_id, self_info, port_offset, now);
 
     let metrics = council.metrics().borrow().clone();
@@ -1680,7 +1691,7 @@ async fn reconcile_council_once(
     if !change_in_flight {
         let retired_ids: BTreeSet<u64> = membership
             .nodes()
-            .filter(|(_, node)| retired.contains_key(&node.name))
+            .filter(|(_, node)| retired.contains(&node.name))
             .map(|(id, _)| *id)
             .collect();
         if !voters.is_disjoint(&retired_ids) {

@@ -394,28 +394,12 @@ pub fn spawn_leader_scheduler(
                     None
                 }
             };
-            // The state machine plans with these exact inputs, so a full
-            // ledger would only commit another refusal every tick.
-            if let Some(catalog) = catalog
-                && desired.endpoint_catalog != catalog
-                && !matches!(
-                    desired.endpoint_withdrawals.plan_publication(
-                        &desired.endpoint_catalog,
-                        &catalog,
-                        &desired.endpoint_consumers,
-                    ),
-                    Err(crate::onion::withdrawal::WithdrawalError::CapacityReached)
-                )
+            if let Some(publication) =
+                catalog.and_then(|catalog| endpoint_publication(&desired, catalog))
             {
                 wrote = true;
                 match council
-                    .write_within(
-                        SCHEDULER_WRITE_TIMEOUT,
-                        RaftRequest::PublishEndpoints {
-                            expected_generation: desired.endpoint_withdrawals.generation,
-                            catalog: Box::new(catalog),
-                        },
-                    )
+                    .write_within(SCHEDULER_WRITE_TIMEOUT, publication)
                     .await
                 {
                     // A committed request can still be refused by the state
@@ -2358,6 +2342,36 @@ fn aggregate_is_for_app(labels_json: &str, app_id: &crate::meat::types::AppId) -
         .ok()
         .and_then(|v| v.get("app").and_then(|a| a.as_str()).map(String::from))
         .is_some_and(|app_label| app_label == qualified)
+}
+
+/// The entry that publishes `next` as the endpoint catalogue, or `None`
+/// when nothing changed or the withdrawal ledger is full. The state machine
+/// plans with these exact inputs, so a full ledger would only commit
+/// another refusal every tick.
+///
+/// The entry carries only the services that differ from the committed
+/// catalogue (#2438): one backend's health flipping writes one service into
+/// the Raft log, not every service in the cluster.
+fn endpoint_publication(
+    desired: &crate::council::types::DesiredState,
+    next: crate::onion::catalog::EndpointCatalog,
+) -> Option<RaftRequest> {
+    if *desired.endpoint_catalog == next
+        || matches!(
+            desired.endpoint_withdrawals.plan_publication(
+                &desired.endpoint_catalog,
+                &next,
+                &desired.endpoint_consumers,
+            ),
+            Err(crate::onion::withdrawal::WithdrawalError::CapacityReached)
+        )
+    {
+        return None;
+    }
+    Some(RaftRequest::PublishEndpoints {
+        expected_generation: desired.endpoint_withdrawals.generation,
+        changes: Box::new(desired.endpoint_catalog.changes_to(&next)),
+    })
 }
 
 /// Build the cluster-wide service endpoint catalogue from node reports.
@@ -6034,7 +6048,7 @@ image = "busybox:latest"
                     )
                     .unwrap();
             } else {
-                desired.endpoint_catalog = original.clone();
+                desired.endpoint_catalog = original.clone().into();
             }
             desired.apps.insert(
                 crate::meat::types::AppId::new("new", "default"),
@@ -6070,7 +6084,8 @@ image = "busybox:latest"
         desired.producer_retirements = desired
             .producer_retirements
             .plan_retirement("a", &execution)
-            .unwrap();
+            .unwrap()
+            .into();
         let mut successor = execution.clone();
         successor.generation = "b".repeat(64).try_into().unwrap();
         for original in [None, Some(execution), Some(successor.clone())] {
@@ -6086,6 +6101,45 @@ image = "busybox:latest"
                 usize::from(original == Some(successor.clone()))
             );
         }
+    }
+
+    /// #2438: a backend's health flipping publishes that service, not the
+    /// whole catalogue: the Raft entry stays small however many services
+    /// the cluster runs.
+    #[test]
+    fn one_backends_health_flip_is_published_as_a_small_entry() {
+        use crate::onion::catalog::{CatalogBackend, EndpointCatalog};
+        use crate::onion::service_id::ServiceId;
+        let services = |flipped: bool| {
+            (0..200).map(move |service| {
+                let backends = (0..10)
+                    .map(|backend| CatalogBackend {
+                        execution: None,
+                        node_id: format!("node-{backend}"),
+                        node_ip: std::net::Ipv4Addr::new(10, 0, 0, backend + 1),
+                        host_port: 30000 + u16::from(backend),
+                        healthy: !(flipped && service == 7 && backend == 3),
+                    })
+                    .collect();
+                (
+                    ServiceId::new("default", format!("svc-{service}")),
+                    8080,
+                    backends,
+                )
+            })
+        };
+        let desired = crate::council::types::DesiredState {
+            endpoint_catalog: EndpointCatalog::rebuild(services(false)).unwrap().into(),
+            ..Default::default()
+        };
+        let next = desired.endpoint_catalog.reconcile(services(true)).unwrap();
+        let publication = endpoint_publication(&desired, next).expect("a change publishes");
+        let size = serde_json::to_vec(&publication).unwrap().len();
+        assert!(size < 4096, "a one-backend change took {size} bytes");
+        assert_eq!(
+            endpoint_publication(&desired, EndpointCatalog::clone(&desired.endpoint_catalog)),
+            None
+        );
     }
 
     #[test]
@@ -6187,7 +6241,7 @@ image = "busybox:latest"
 
         // Widening the list changes the committed catalogue, so every node
         // is sent the new one.
-        desired.endpoint_catalog = catalog.clone();
+        desired.endpoint_catalog = catalog.clone().into();
         desired.apps.insert(
             crate::meat::types::AppId::new("db", "backend"),
             spec_from_toml(
@@ -6232,7 +6286,9 @@ image = "busybox:latest"
             healthy: true,
         };
         desired.endpoint_catalog =
-            build_endpoint_catalog(&[], &AggregatedState::default(), &desired).unwrap();
+            build_endpoint_catalog(&[], &AggregatedState::default(), &desired)
+                .unwrap()
+                .into();
         desired
             .endpoint_catalog
             .services
@@ -6292,7 +6348,8 @@ image = "busybox:latest"
         retiring.producer_retirements = retiring
             .producer_retirements
             .plan_retirement("node-b", &execution)
-            .unwrap();
+            .unwrap()
+            .into();
         let catalog = build_endpoint_catalog(&members, &reports, &retiring).unwrap();
         assert!(catalog.services["default__redis"].backends.is_empty());
 
@@ -6332,7 +6389,9 @@ image = "busybox:latest"
         };
         let (predecessor, running) = (execution("a"), execution("b"));
         desired.endpoint_catalog =
-            build_endpoint_catalog(&[], &AggregatedState::default(), &desired).unwrap();
+            build_endpoint_catalog(&[], &AggregatedState::default(), &desired)
+                .unwrap()
+                .into();
         desired
             .endpoint_catalog
             .services
@@ -9513,7 +9572,9 @@ mod audit_stale_endpoints {
         // report was fresh.
         let mut fresh = reports.clone();
         fresh.stale_nodes.clear();
-        desired.endpoint_catalog = build_endpoint_catalog(&members, &fresh, &desired).unwrap();
+        desired.endpoint_catalog = build_endpoint_catalog(&members, &fresh, &desired)
+            .unwrap()
+            .into();
         assert_eq!(backends(&desired.endpoint_catalog).len(), 1);
 
         // Its payload is evicted but the node stays stale: withdrawn, not carried.

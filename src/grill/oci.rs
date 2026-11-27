@@ -33,6 +33,14 @@ pub const HOST_ROOT: &str = "proc-grill:host";
 /// only orders the node-wide one.
 pub const WORKLOAD_OOM_SCORE_ADJ: i32 = 500;
 
+/// The `pids.max` an image app's container and each of its sidecars get
+/// when they don't set `pids` (#2386). Enough for a JVM or a database with
+/// hundreds of connections, and far below a node's process table, so one
+/// fork bomb or leaking thread pool can't stop Bun from forking `runc` to
+/// stop it. An init container runs in its app's cgroup, so it gets the
+/// app's limit. Jobs keep their own rule: none unless they set `pids`.
+pub const DEFAULT_CONTAINER_PIDS: u32 = 4096;
+
 /// A simplified OCI runtime specification.
 ///
 /// Contains the fields Reliaburger actually uses. Additional fields
@@ -228,6 +236,16 @@ pub struct OciProcess {
         skip_serializing_if = "Option::is_none"
     )]
     pub oom_score_adj: Option<i32>,
+    /// Set `no_new_privs` on the process (the OCI `noNewPrivileges`
+    /// field), so no set-id binary or file capability can raise its
+    /// privileges after it starts. Rootful runc sets it on every container
+    /// (#2402).
+    #[serde(
+        rename = "noNewPrivileges",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub no_new_privileges: bool,
     /// What the workload asked for before its image config fills the gaps.
     ///
     /// Not part of the OCI runtime spec. `Some` means `args`, `env`, `cwd`
@@ -316,6 +334,69 @@ pub struct OciLinux {
     /// Device nodes runc creates or binds in the container (#1122).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub devices: Vec<OciDevice>,
+    /// The system-call filter (#2402): rootful runc sets
+    /// [`super::seccomp::default_profile`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seccomp: Option<OciSeccomp>,
+    /// Paths runc hides from the container: a file becomes `/dev/null`, a
+    /// directory an empty read-only tmpfs.
+    #[serde(rename = "maskedPaths", default, skip_serializing_if = "Vec::is_empty")]
+    pub masked_paths: Vec<String>,
+    /// Paths runc remounts read-only inside the container.
+    #[serde(
+        rename = "readonlyPaths",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub readonly_paths: Vec<String>,
+}
+
+/// A seccomp filter (the OCI `linux.seccomp` block).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OciSeccomp {
+    /// What a call no rule names gets, such as `SCMP_ACT_ERRNO`.
+    #[serde(rename = "defaultAction")]
+    pub default_action: String,
+    /// The errno a refused call returns when `default_action` is
+    /// `SCMP_ACT_ERRNO`.
+    #[serde(
+        rename = "defaultErrnoRet",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub default_errno_ret: Option<u32>,
+    /// The architectures the filter covers, such as `SCMP_ARCH_X86_64`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub architectures: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub syscalls: Vec<OciSyscall>,
+}
+
+/// One rule of a seccomp filter: `action` for the calls in `names` whose
+/// arguments match every entry of `args`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OciSyscall {
+    pub names: Vec<String>,
+    pub action: String,
+    #[serde(rename = "errnoRet", default, skip_serializing_if = "Option::is_none")]
+    pub errno_ret: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<OciSeccompArg>,
+}
+
+/// A condition on one argument of a call, such as "argument 0 equals 10".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OciSeccompArg {
+    pub index: u32,
+    pub value: u64,
+    #[serde(rename = "valueTwo", default, skip_serializing_if = "is_zero")]
+    pub value_two: u64,
+    /// The comparison, such as `SCMP_CMP_EQ` or `SCMP_CMP_MASKED_EQ`.
+    pub op: String,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// A device node in the container (the OCI `linux.devices` entry).
@@ -551,6 +632,7 @@ pub fn generate_oci_spec_with_decryptor(
             readonly: false,
         },
         process: OciProcess {
+            no_new_privileges: false,
             rlimits: Vec::new(),
             args,
             env,
@@ -573,6 +655,9 @@ pub fn generate_oci_spec_with_decryptor(
         },
         mounts,
         linux: OciLinux {
+            seccomp: None,
+            masked_paths: Vec::new(),
+            readonly_paths: Vec::new(),
             namespaces,
             resources,
             cgroups_path: Some(hierarchy_cgroup_path(cgroup_path)),
@@ -941,11 +1026,22 @@ pub fn explain_runc_init_oom(runc_stderr: &str, memory_limit: Option<u64>) -> Op
     ))
 }
 
+/// An app's resource block. A host app runs on the node, outside any
+/// container cgroup, so it gets no process limit; an image app gets its own
+/// `pids` or [`DEFAULT_CONTAINER_PIDS`].
 fn build_resources(spec: &AppSpec) -> Option<OciResources> {
-    build_resources_from_ranges(spec.cpu.as_ref(), spec.memory.as_ref())
+    let host = spec.exec.is_some() || spec.script.is_some();
+    let pids = (!host).then(|| container_pids(spec.pids));
+    build_resources_from_ranges(spec.cpu.as_ref(), spec.memory.as_ref(), pids)
 }
 
-/// Build the OCI resource block from CPU and memory ranges.
+/// A container's `pids.max`: what it asked for, or the default.
+fn container_pids(asked: Option<crate::config::types::PidsLimit>) -> u32 {
+    asked.map_or(DEFAULT_CONTAINER_PIDS, |limit| limit.get())
+}
+
+/// Build the OCI resource block from CPU and memory ranges and a process
+/// limit. `None` when none of them is set.
 ///
 /// Hard limits go into the `cpu`/`memory` blocks; a CPU request goes into
 /// the `unified` map as `cpu.weight`, and only when it is actually declared
@@ -961,6 +1057,7 @@ fn build_resources(spec: &AppSpec) -> Option<OciResources> {
 fn build_resources_from_ranges(
     cpu: Option<&ResourceRange>,
     memory: Option<&ResourceRange>,
+    pids: Option<u32>,
 ) -> Option<OciResources> {
     let mut unified = BTreeMap::new();
 
@@ -983,9 +1080,13 @@ fn build_resources_from_ranges(
         limit: range.limit as i64,
     });
 
-    if cpu_res.is_some() || memory_res.is_some() || !unified.is_empty() {
+    let pids = pids.map(|limit| OciPidsResources {
+        limit: i64::from(limit),
+    });
+
+    if cpu_res.is_some() || memory_res.is_some() || pids.is_some() || !unified.is_empty() {
         Some(OciResources {
-            pids: None,
+            pids,
             cpu: cpu_res,
             memory: memory_res,
             unified,
@@ -1007,7 +1108,13 @@ pub fn generate_job_oci_spec(
     cgroup_path: &str,
     netns_path: Option<&str>,
 ) -> OciSpec {
-    let mut resources = build_resources_from_ranges(spec.cpu.as_ref(), spec.memory.as_ref());
+    // Only a reused executor's commands get a default; a fresh container
+    // without `pids` keeps no limit, like one without `cpu` or `memory`.
+    let mut resources = build_resources_from_ranges(
+        spec.cpu.as_ref(),
+        spec.memory.as_ref(),
+        spec.pids.map(|limit| limit.get()),
+    );
     if spec.image.is_some()
         && spec.exec.is_none()
         && spec.script.is_none()
@@ -1020,22 +1127,6 @@ pub fn generate_job_oci_spec(
             .unified
             .insert("memory.swap.max".into(), "0".into());
     }
-    if let Some(limit) = spec.pids {
-        // Only a reused executor's commands get a default; a fresh container
-        // without `pids` keeps no limit, like one without `cpu` or `memory`.
-        resources
-            .get_or_insert_with(|| OciResources {
-                cpu: None,
-                memory: None,
-                pids: None,
-                unified: BTreeMap::new(),
-                devices: Vec::new(),
-            })
-            .pids = Some(OciPidsResources {
-            limit: i64::from(limit.get()),
-        });
-    }
-
     OciSpec {
         managed_volumes: Vec::new(),
         host_path_sources: Vec::new(),
@@ -1055,6 +1146,9 @@ pub fn generate_job_oci_spec(
         process: job_process(spec),
         mounts: standard_mounts(),
         linux: OciLinux {
+            seccomp: None,
+            masked_paths: Vec::new(),
+            readonly_paths: Vec::new(),
             namespaces: standard_namespaces(netns_path),
             resources,
             cgroups_path: Some(hierarchy_cgroup_path(cgroup_path)),
@@ -1098,6 +1192,7 @@ pub fn job_process(spec: &JobSpec) -> OciProcess {
     };
 
     OciProcess {
+        no_new_privileges: false,
         rlimits: Vec::new(),
         args,
         env,
@@ -1139,19 +1234,30 @@ pub fn generate_init_oci_spec(
     // An image's config fills in what the init doesn't set, as it does for
     // the app; a bare root filesystem has no config to read.
     let from_image = init.image.is_some() || app.process.overrides.is_some();
+    let host_process = app.host_process && init.image.is_none();
+    // The init runs in the app's cgroup before the app does, so it gets the
+    // app's process limit (#2386); one on the host gets none.
+    let app_pids = app
+        .linux
+        .resources
+        .as_ref()
+        .and_then(|resources| resources.pids.as_ref())
+        .and_then(|pids| u32::try_from(pids.limit).ok());
+    let pids = (!host_process).then(|| app_pids.unwrap_or(DEFAULT_CONTAINER_PIDS));
     OciSpec {
         managed_volumes: Vec::new(),
         host_path_sources: app.host_path_sources.clone(),
         reusable_executor: false,
         // A host app's init that names no image runs on the host like its
         // app, so the mixed runtime routes it there too (#935).
-        host_process: app.host_process && init.image.is_none(),
+        host_process,
         initialiser: true,
         root: OciRoot {
             path: root,
             readonly: false,
         },
         process: OciProcess {
+            no_new_privileges: false,
             rlimits: Vec::new(),
             args: init.command.clone(),
             env: layered_env(&app.process.env, &init.env),
@@ -1170,8 +1276,11 @@ pub fn generate_init_oci_spec(
         },
         mounts: app.mounts.clone(),
         linux: OciLinux {
+            seccomp: None,
+            masked_paths: Vec::new(),
+            readonly_paths: Vec::new(),
             namespaces: standard_namespaces(None),
-            resources: None,
+            resources: build_resources_from_ranges(None, None, pids),
             cgroups_path: app.linux.cgroups_path.clone(),
             uid_mappings: None,
             gid_mappings: None,
@@ -1257,6 +1366,7 @@ pub fn generate_sidecar_oci_spec(
             readonly: false,
         },
         process: OciProcess {
+            no_new_privileges: false,
             rlimits: Vec::new(),
             args: sidecar
                 .command
@@ -1281,8 +1391,15 @@ pub fn generate_sidecar_oci_spec(
         },
         mounts: app.mounts.clone(),
         linux: OciLinux {
+            seccomp: None,
+            masked_paths: Vec::new(),
+            readonly_paths: Vec::new(),
             namespaces,
-            resources: build_resources_from_ranges(sidecar.cpu.as_ref(), sidecar.memory.as_ref()),
+            resources: build_resources_from_ranges(
+                sidecar.cpu.as_ref(),
+                sidecar.memory.as_ref(),
+                Some(container_pids(sidecar.pids)),
+            ),
             cgroups_path: app
                 .linux
                 .cgroups_path
@@ -1932,7 +2049,7 @@ mod tests {
             request: 1000,
             limit: u64::MAX,
         };
-        let resources = build_resources_from_ranges(Some(&range), None).unwrap();
+        let resources = build_resources_from_ranges(Some(&range), None, None).unwrap();
         assert!(resources.cpu.is_none());
         assert_eq!(
             resources.unified.get("cpu.weight").map(String::as_str),
@@ -2076,7 +2193,7 @@ mod tests {
     }
 
     #[test]
-    fn generate_without_resources_has_no_resources_block() {
+    fn generate_without_resources_has_only_the_default_process_limit() {
         let spec = minimal_app();
         let oci = generate_oci_spec(
             "web",
@@ -2088,7 +2205,15 @@ mod tests {
             None,
             None,
         );
-        assert!(oci.linux.resources.is_none());
+        let resources = oci.linux.resources.unwrap();
+        assert_eq!((resources.cpu, resources.memory), (None, None));
+        assert!(resources.unified.is_empty());
+        assert_eq!(
+            resources.pids,
+            Some(OciPidsResources {
+                limit: i64::from(DEFAULT_CONTAINER_PIDS)
+            })
+        );
     }
 
     #[test]
@@ -2444,6 +2569,49 @@ mod tests {
         );
         assert!(oci.process.env.is_empty());
         assert!(oci.linux.resources.is_none());
+    }
+
+    /// #2386: one fork bomb in one container used to be able to fill the
+    /// node's process table.
+    #[test]
+    fn an_image_app_container_gets_a_default_pids_limit() {
+        let pids = |oci: &OciSpec| oci.linux.resources.as_ref().and_then(|r| r.pids.clone());
+        let app = app_oci(&minimal_app());
+        assert_eq!(pids(&app), Some(OciPidsResources { limit: 4096 }));
+        // A limit alone sets no CPU or memory limit.
+        let resources = app.linux.resources.clone().unwrap();
+        assert_eq!((resources.cpu, resources.memory), (None, None));
+
+        let parent = crate::grill::InstanceId("default__web-0".into());
+        let proxy = generate_sidecar_oci_spec(&sidecar("name = \"proxy\""), &app, &parent);
+        assert_eq!(pids(&proxy), Some(OciPidsResources { limit: 4096 }));
+        // An init runs in the app's cgroup, so it gets the app's limit.
+        let init = generate_init_oci_spec(&init_container(None, &["true"]), &app);
+        assert_eq!(pids(&init), Some(OciPidsResources { limit: 4096 }));
+
+        // A host app runs on the node, where no container cgroup exists.
+        let host = spec_for("exec = \"/usr/bin/true\"");
+        assert_eq!(host.linux.resources, None);
+        let host_init = generate_init_oci_spec(&init_container(None, &["true"]), &host);
+        assert_eq!(host_init.linux.resources, None);
+    }
+
+    #[test]
+    fn an_app_can_set_its_own_pids_limit() {
+        let pids = |oci: &OciSpec| oci.linux.resources.as_ref().and_then(|r| r.pids.clone());
+        let app = spec_for("image = 'x:1'\npids = 512");
+        assert_eq!(pids(&app), Some(OciPidsResources { limit: 512 }));
+        let raised = spec_for("image = 'x:1'\npids = 32768\nmemory = '64Mi-1Gi'");
+        assert_eq!(pids(&raised), Some(OciPidsResources { limit: 32768 }));
+        assert!(raised.linux.resources.unwrap().memory.is_some());
+        let init = generate_init_oci_spec(&init_container(None, &["true"]), &app);
+        assert_eq!(pids(&init), Some(OciPidsResources { limit: 512 }));
+
+        // A sidecar has its own cgroup and its own `pids`.
+        let parent = crate::grill::InstanceId("default__web-0".into());
+        let proxy =
+            generate_sidecar_oci_spec(&sidecar("name = \"proxy\"\npids = 128"), &app, &parent);
+        assert_eq!(pids(&proxy), Some(OciPidsResources { limit: 128 }));
     }
 
     #[test]

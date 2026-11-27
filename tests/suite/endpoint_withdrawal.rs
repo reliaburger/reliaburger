@@ -164,7 +164,13 @@ async fn seed_withdrawals(council: &CouncilNode) {
             council
                 .write(RaftRequest::PublishEndpoints {
                     expected_generation: generation as u64,
-                    catalog: Box::new(catalog),
+                    changes: Box::new(
+                        council
+                            .desired_state()
+                            .await
+                            .endpoint_catalog
+                            .changes_to(&catalog),
+                    ),
                 })
                 .await
                 .unwrap(),
@@ -470,7 +476,13 @@ async fn producer_release_requires_authenticated_identity_and_every_consumer_rec
     council
         .write(RaftRequest::PublishEndpoints {
             expected_generation: 0,
-            catalog: Box::new(catalog.clone()),
+            changes: Box::new(
+                council
+                    .desired_state()
+                    .await
+                    .endpoint_catalog
+                    .changes_to(&catalog.clone()),
+            ),
         })
         .await
         .unwrap();
@@ -508,7 +520,13 @@ async fn producer_release_requires_authenticated_identity_and_every_consumer_rec
         council
             .write(RaftRequest::PublishEndpoints {
                 expected_generation: 2,
-                catalog: Box::new(catalog)
+                changes: Box::new(
+                    council
+                        .desired_state()
+                        .await
+                        .endpoint_catalog
+                        .changes_to(&catalog),
+                ),
             })
             .await
             .unwrap(),
@@ -545,7 +563,13 @@ async fn a_repeated_producer_release_commits_no_new_log_entry() {
     council
         .write(RaftRequest::PublishEndpoints {
             expected_generation: 0,
-            catalog: Box::new(catalog),
+            changes: Box::new(
+                council
+                    .desired_state()
+                    .await
+                    .endpoint_catalog
+                    .changes_to(&catalog),
+            ),
         })
         .await
         .unwrap();
@@ -709,7 +733,13 @@ async fn a_lapsed_consumer_is_discharged_and_the_producer_release_confirms() {
     council
         .write(RaftRequest::PublishEndpoints {
             expected_generation: 0,
-            catalog: Box::new(catalog),
+            changes: Box::new(
+                council
+                    .desired_state()
+                    .await
+                    .endpoint_catalog
+                    .changes_to(&catalog),
+            ),
         })
         .await
         .unwrap();

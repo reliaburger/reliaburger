@@ -406,6 +406,7 @@ mod tests {
 
     fn provisional(app_env: &[&str], overrides: ProcessOverrides) -> OciProcess {
         OciProcess {
+            no_new_privileges: false,
             rlimits: Vec::new(),
             args: Vec::new(),
             env: app_env.iter().map(|entry| entry.to_string()).collect(),

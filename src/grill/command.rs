@@ -150,6 +150,7 @@ impl OwnedCommands {
                 readonly: false,
             },
             process: OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args: std::iter::once(program.to_owned())
                     .chain(arguments.iter().cloned())
@@ -167,6 +168,9 @@ impl OwnedCommands {
             },
             mounts: Vec::new(),
             linux: OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: Vec::new(),
                 resources: None,
                 cgroups_path: None,

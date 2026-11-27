@@ -152,6 +152,15 @@ A few options for real networks:
   `--interface eth0` (or `--address 192.168.1.20`).
 - `--mac d8:9e:f3:12:34:56`, once per machine, answers only those machines.
   Anything else on the LAN that network-boots is left alone.
+
+Trust the install LAN. The installer checks every byte of the image it
+writes, so nobody on the LAN can make a machine install something else. But
+relish believes a machine's reports (its used disk, and that it installed)
+only from the address that machine's own DHCP request came from, and DHCP
+itself isn't authenticated: a host on the LAN that forges DHCP requests can
+still stall an install. If the log says `no install ticket` for a machine
+you're installing, its boot script came from another address than its DHCP
+request; it installs, but relish can't record it or ask you about its disk.
 - `--http-port 8081` serves HTTP on another port than 8080, for a serving
   machine where 8080 is taken. The machines are told the port, so nothing
   else changes. Open that port instead of 8080 in its firewall.
@@ -423,7 +432,9 @@ The machine's first line on
 each boot names its MAC, so it keeps its name when your router gives the
 installed system a different address from the one it network-booted with. A
 line from a machine `relish netboot` didn't answer shows as
-`log <address> (not served):`.
+`log <address> (not served):`, and goes to `os/logs/unserved.log` with the
+address in front, one file for all such senders. Each file stops growing at
+64 MiB, and relish says so once; later lines only print.
 
 - The installer writes your machine's address into `reliaburger/netlog.conf`
   on the installed disk's EFI partition. On each boot, once the network is up,
@@ -445,7 +456,7 @@ relish machines logs --interface en7 --dir os
 
 It listens on UDP 6666 until Ctrl-C. Without `--dir` it only prints. It
 answered no machine, so it names each line by its address, marked
-`(not served)`.
+`(not served)`, and with `--dir` every line goes to `os/logs/unserved.log`.
 
 #### Turn boot logs on or off later
 
@@ -1065,8 +1076,9 @@ leader takes the nodes in turn: workers first, then the council (only while
 the others can keep a majority), and itself last. For each node it first
 moves the workloads it can elsewhere, then tells the node to update. The node
 downloads the release from GitHub, checks its signature against the key its
-own image carries and every file against the release's `SHA256SUMS`, writes
-it into the spare slot and reboots. Once it's healthy on the new version, the
+own image carries and every file against the release's `SHA256SUMS`, checks
+that the UKI is built for its own architecture, writes it into the spare slot
+and reboots. Once it's healthy on the new version, the
 leader moves on. Apps with a managed volume or a host-path mount (a volume
 with a `source`) stay with their data and are back when the node is, a minute
 or two later. While a node drains and updates it takes no new work, and
@@ -1074,7 +1086,10 @@ or two later. While a node drains and updates it takes no new work, and
 
 If a node comes back on its old version, because the new one failed its boot
 check on both tries, or doesn't come back within 45 minutes, the rollout
-pauses and `relish os status` says which node and why. `relish os resume`
+pauses and `relish os status` says which node and why. A download that
+stops delivering bytes for a minute (`download stalled for 60 s`), or a
+`systemd-sysupdate` that runs past 20 minutes, fails the node's update with
+that reason, so the rollout pauses on it at once rather than after 45 minutes. `relish os resume`
 tries that node again; `relish os abort` stops, leaving each node on the
 version it has. A node that's already on the target is skipped, so after
 adding machines from an older image, run `relish os upgrade` again to bring

@@ -547,6 +547,22 @@ fn check_council_split(council: &CouncilObservation, report: &mut WtfReport) -> 
             affected_resource: "council".to_string(),
         });
     }
+    if let Some(retired) = summary.retired_identities.filter(|r| r.nearly_full()) {
+        healthy = false;
+        report.warnings.push(WtfFinding {
+            id: "council-retired-identities-nearly-full".to_string(),
+            title: "the retired node identity list is nearly full".to_string(),
+            details: vec![crate::relish::council_view::describe_retired_identities(
+                &retired,
+            )],
+            suggestion: "retired identities are permanent, so a retired name is never reused; \
+                         reuse names of nodes that are coming back instead of retiring them, \
+                         and raise the limit with the maintainers if a cluster really needs more"
+                .to_string(),
+            correlated_events: Vec::new(),
+            affected_resource: "council".to_string(),
+        });
+    }
     if summary.leaders.len() > 1 {
         healthy = false;
         report.critical.push(WtfFinding {
@@ -2563,6 +2579,7 @@ pub(super) mod tests {
                 voter: true,
             }],
             council_size: None,
+            retired_identities: None,
         }
     }
 
@@ -2676,6 +2693,38 @@ pub(super) mod tests {
             .find(|item| item.id == "council-voter-lagging")
             .unwrap();
         assert_eq!(finding.details, vec!["node-3 (applied 2827, 1149 behind)"]);
+        assert!(!report.ok.iter().any(|ok| ok.id == "council"));
+    }
+
+    /// #2375: a retired-identity list at 90% of its limit is a warning,
+    /// before decommissioning starts to be refused; below it, nothing.
+    #[test]
+    fn wtf_warns_when_the_retired_identity_list_is_nearly_full() {
+        use crate::bun::agent::CouncilRole;
+        use crate::cluster::retirement::{MAX_RETIRED_NODES, RetiredIdentities};
+        let council_with = |count: usize| {
+            let mut leader = council_node("node-1", CouncilRole::Leader, 0, None, Some("node-1"));
+            leader.retired_identities = Some(RetiredIdentities::of(count));
+            council_with_nodes(vec![leader])
+        };
+        let mut inputs = healthy_inputs();
+        inputs.cluster.council = council_with(3);
+        let report = diagnose(&inputs);
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|item| item.id == "council-retired-identities-nearly-full")
+        );
+
+        inputs.cluster.council = council_with(MAX_RETIRED_NODES - 10);
+        let report = diagnose(&inputs);
+        let finding = report
+            .warnings
+            .iter()
+            .find(|item| item.id == "council-retired-identities-nearly-full")
+            .unwrap();
+        assert!(finding.details[0].starts_with("65526 of 65536"));
         assert!(!report.ok.iter().any(|ok| ok.id == "council"));
     }
 

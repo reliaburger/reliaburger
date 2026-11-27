@@ -854,6 +854,9 @@ impl<R: TaskRunner> TaskPool<R> {
             .collect();
         let work = Arc::new(work.clone());
         let mut running = JoinSet::new();
+        // Each spawned task's index, so one that panics still gets a record.
+        let mut started: std::collections::HashMap<tokio::task::Id, u32> =
+            std::collections::HashMap::new();
         let mut records = Vec::with_capacity(indices.len());
         for index in indices {
             let permit = tokio::select! {
@@ -891,7 +894,7 @@ impl<R: TaskRunner> TaskPool<R> {
             let outcomes = outcomes.clone();
             let task_grant = work.grant_attempt;
             let used = used.get(&index).copied().unwrap_or(0);
-            running.spawn(async move {
+            let handle = running.spawn(async move {
                 let mut record = task.run(index, permit, used).await;
                 record.grant_attempt = task_grant;
                 if let Some(sender) = outcomes {
@@ -908,23 +911,55 @@ impl<R: TaskRunner> TaskPool<R> {
                 drop(pending_permit);
                 record
             });
-            while let Some(done) = running.try_join_next() {
-                records.extend(done.ok());
+            started.insert(handle.id(), index);
+            while let Some(done) = running.try_join_next_with_id() {
+                records.push(joined(&work, &mut started, done));
             }
         }
         // Every task holds a slot or has ended: the next chunk may start.
         drop(turn);
-        // A task only fails to join if it panicked; its index then shows
-        // up as missing, and the leader refuses the miscounted chunk
-        // rather than retiring it.
-        while let Some(done) = running.join_next().await {
-            records.extend(done.ok());
+        while let Some(done) = running.join_next_with_id().await {
+            records.push(joined(&work, &mut started, done));
         }
         records.sort_by_key(|record| record.index);
         let in_chunk = |record: &&TaskRecord| work.spec.chunk_of(record.index) == Some(work.chunk);
         ChunkOutcome {
             result: summarise(&work, finished.iter().filter(in_chunk).chain(&records)),
             records,
+        }
+    }
+}
+
+/// The record of one joined task. A task only fails to join if it
+/// panicked (nothing aborts them); its outcome is then unknown, so it
+/// counts as failed. Without a record the chunk's counts wouldn't add up
+/// and the leader would refuse it on every sync (#2372).
+fn joined(
+    work: &ChunkWork,
+    started: &mut std::collections::HashMap<tokio::task::Id, u32>,
+    done: Result<(tokio::task::Id, TaskRecord), tokio::task::JoinError>,
+) -> TaskRecord {
+    match done {
+        Ok((id, record)) => {
+            started.remove(&id);
+            record
+        }
+        Err(error) => {
+            let index = started.remove(&error.id()).unwrap_or_default();
+            eprintln!(
+                "bun: task array {}: chunk {} task {index} failed to finish: {error}",
+                work.batch_id, work.chunk.0
+            );
+            TaskRecord {
+                grant_attempt: work.grant_attempt,
+                index,
+                attempts: 1,
+                outcome: TaskFinal::Failed,
+                exit_code: None,
+                run_ms: 0,
+                output: None,
+                retry_causes: RetryCauses::default(),
+            }
         }
     }
 }
@@ -1738,6 +1773,44 @@ mod tests {
         let indices: Vec<u32> = outcome.records.iter().map(|r| r.index).collect();
         assert_eq!(indices, (2000..2500).collect::<Vec<_>>());
         assert_eq!(runner.attempts(), 500);
+    }
+
+    /// #2372: a task whose future panics still gets a record, so the
+    /// chunk's counts add up and the leader can retire it.
+    #[tokio::test]
+    async fn a_task_that_panics_is_still_accounted_for_in_its_chunk() {
+        struct PanicsOnTwo;
+        impl TaskRunner for PanicsOnTwo {
+            async fn run(
+                &self,
+                task: &TaskInvocation,
+                _: Duration,
+                _: &CancellationToken,
+            ) -> Attempt {
+                assert_ne!(task.index, 2, "a runner bug");
+                Attempt {
+                    outcome: AttemptOutcome::Exited { code: 0 },
+                    output: CapturedOutput::default(),
+                    ran: None,
+                }
+            }
+        }
+        let pool = TaskPool::new(Arc::new(PanicsOnTwo), fast(4));
+        let outcome = pool
+            .run_chunk(&work(5, 5, 0), &CancellationToken::new())
+            .await;
+        let result = &outcome.result;
+        assert_eq!(result.succeeded + result.failed_count + result.not_run, 5);
+        assert_eq!(result.failed_count, 1);
+        assert!(result.failed_indices.contains(2));
+        let panicked = outcome
+            .records
+            .iter()
+            .find(|record| record.index == 2)
+            .expect("a record for the panicked task");
+        assert_eq!(panicked.outcome, TaskFinal::Failed);
+        assert_eq!(panicked.grant_attempt, 1);
+        assert_eq!(outcome.records.len(), 5);
     }
 
     #[tokio::test]

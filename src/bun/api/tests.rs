@@ -2325,6 +2325,62 @@ async fn a_follower_forwards_a_scale_to_the_leader_with_its_body() {
     }
 }
 
+/// A scale's progress stream ends once the token that started it expires,
+/// as apply's and rollback's do (#2399), with the farewell that says the
+/// scale carries on (#2526). The leader here streams for ever, so only the
+/// credential check can end the follower's answer.
+#[tokio::test]
+async fn a_scale_progress_stream_ends_once_its_token_expires() {
+    let created = crate::sesame::token::create_token(
+        "brief",
+        crate::sesame::types::ApiRole::Deployer,
+        crate::sesame::types::TokenScope::default(),
+        Some(std::time::SystemTime::now() + std::time::Duration::from_secs(2)),
+    )
+    .unwrap();
+    let leader_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let leader_port = leader_listener.local_addr().unwrap().port();
+    let leader = axum::Router::new().fallback(|| async {
+        let first = futures_util::stream::once(async {
+            Ok::<_, std::convert::Infallible>(
+                axum::response::sse::Event::default()
+                    .data(r#"{"type":"progress","message":"web: committed"}"#),
+            )
+        });
+        Sse::new(first.chain(futures_util::stream::pending())).into_response()
+    });
+    tokio::spawn(async move { axum::serve(leader_listener, leader).await.unwrap() });
+    let (follower, nodes) =
+        follower_of_the_leader_api_on(created.token.clone(), None, leader_port).await;
+
+    let request = axum::http::Request::post("/v1/scale/web/default")
+        .header("authorization", format!("Bearer {}", created.plaintext))
+        .extension(axum::extract::ConnectInfo(
+            "203.0.113.9:40000".parse::<std::net::SocketAddr>().unwrap(),
+        ))
+        .body(Body::from(r#"{"replicas":3}"#))
+        .unwrap();
+    let response = follower.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        response.into_body().collect(),
+    )
+    .await
+    .expect("the scale stream outlived its expired token")
+    .unwrap()
+    .to_bytes();
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("web: committed"), "{text}");
+    assert!(
+        text.contains(crate::sesame::auth::CREDENTIAL_ENDED_MESSAGE),
+        "{text}"
+    );
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn a_follower_forwards_upgrade_control_calls_to_the_leader_with_the_callers_token() {
     let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
@@ -3176,7 +3232,7 @@ async fn a_settled_leader_rotates_the_signing_key_after_a_missed_heartbeat_round
     assert_eq!(status, StatusCode::OK, "rotate: {reply}");
     let rotated = nodes[0].security_state().await;
     assert_ne!(
-        rotated.oidc_signing_config.unwrap().key_id,
+        rotated.oidc_signing_config.as_ref().unwrap().key_id,
         old.key_id,
         "the signing key didn't change"
     );
@@ -3872,6 +3928,7 @@ async fn placements_expose_only_the_consumers_original_withdrawal_generations() 
     let mut catalog = EndpointCatalog::default();
     let mut originals = Vec::new();
     for generation in 1..=3_u64 {
+        let previous = catalog.clone();
         catalog = catalog
             .reconcile([(
                 ServiceId::new("default", "web"),
@@ -3892,7 +3949,7 @@ async fn placements_expose_only_the_consumers_original_withdrawal_generations() 
             council
                 .write(RaftRequest::PublishEndpoints {
                     expected_generation: generation - 1,
-                    catalog: Box::new(catalog.clone()),
+                    changes: Box::new(previous.changes_to(&catalog)),
                 })
                 .await
                 .unwrap(),
@@ -3970,7 +4027,7 @@ async fn placements_expose_only_the_consumers_original_withdrawal_generations() 
         council
             .write(RaftRequest::PublishEndpoints {
                 expected_generation: 3,
-                catalog: Box::new(EndpointCatalog::default()),
+                changes: Box::new(catalog.changes_to(&EndpointCatalog::default())),
             })
             .await
             .unwrap(),
@@ -5315,7 +5372,7 @@ async fn namespace_rotation_and_finalise_are_per_namespace_and_audited() {
         keys
     };
     assert_eq!(
-        generations(&council.security_state().await),
+        generations(&*council.security_state().await),
         [
             ("cluster".to_string(), 0, false),
             ("team-a".to_string(), 0, true),
@@ -5334,7 +5391,7 @@ async fn namespace_rotation_and_finalise_are_per_namespace_and_audited() {
     .await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     assert_eq!(
-        generations(&council.security_state().await),
+        generations(&*council.security_state().await),
         [
             ("cluster".to_string(), 0, false),
             ("team-a".to_string(), 1, false),
@@ -8288,7 +8345,7 @@ async fn token_create_writes_to_raft_and_returns_plaintext() {
 
     // The token landed in Raft, and the returned plaintext validates
     // against the stored hash.
-    let stored = council.security_state().await.api_tokens;
+    let stored = council.security_state().await.api_tokens.clone();
     let token = stored.iter().find(|t| t.name == "ci-bot").unwrap();
     assert!(crate::sesame::token::validate_token(plaintext, token).is_ok());
 }
@@ -8383,7 +8440,7 @@ async fn join_token_create_returns_two_distinct_plaintexts_and_stores_only_hashe
     }
     assert_ne!(plaintexts[0], plaintexts[1]);
 
-    let stored = council.security_state().await.join_tokens;
+    let stored = council.security_state().await.join_tokens.clone();
     assert_eq!(stored.len(), 2, "init mints none; two new tokens");
     for plaintext in &plaintexts {
         assert!(
@@ -10332,29 +10389,33 @@ async fn webhook_rejects_a_bad_signature_without_triggering_a_sync() {
 #[tokio::test]
 async fn webhook_full_queue_is_bounded_and_delivery_can_be_retried() {
     let (app, mut receiver, shutdown) = webhook_setup("hooksecret", 100);
-    let body = br#"{"after":"abc123"}"#;
+    // Each delivery is a distinct push: a repeated body is a replay (#2408).
+    let body = |id: usize| format!(r#"{{"after":"abc{id}"}}"#).into_bytes();
     let headers = |id: usize| {
         vec![
-            ("x-hub-signature-256", github_signature("hooksecret", body)),
+            (
+                "x-hub-signature-256",
+                github_signature("hooksecret", &body(id)),
+            ),
             ("x-github-delivery", format!("queue-{id}")),
         ]
     };
     for id in 0..4 {
         assert_eq!(
-            post_webhook(&app, body, &headers(id)).await,
+            post_webhook(&app, &body(id), &headers(id)).await,
             StatusCode::ACCEPTED
         );
     }
     let status = tokio::time::timeout(
         std::time::Duration::from_millis(500),
-        post_webhook(&app, body, &headers(4)),
+        post_webhook(&app, &body(4), &headers(4)),
     )
     .await
     .expect("full queue must not stall the request");
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     receiver.recv().await.unwrap();
     assert_eq!(
-        post_webhook(&app, body, &headers(4)).await,
+        post_webhook(&app, &body(4), &headers(4)).await,
         StatusCode::ACCEPTED
     );
     shutdown.cancel();
@@ -10459,13 +10520,15 @@ async fn webhook_rate_limit_trips_on_a_flood() {
         .await,
         StatusCode::ACCEPTED
     );
-    // Second, fresh delivery id but the per-minute slot is used → 429.
+    // Second, a new push with a fresh delivery id, but the per-minute
+    // slot is used → 429.
+    let second = br#"{"after":"def"}"#;
     assert_eq!(
         post_webhook(
             &app,
-            body,
+            second,
             &[
-                ("x-hub-signature-256", sig),
+                ("x-hub-signature-256", github_signature(secret, second)),
                 ("x-github-delivery", "d-2".to_string())
             ]
         )
@@ -11987,6 +12050,86 @@ async fn a_follower_forwards_the_signed_webhook_and_handover_keeps_its_admitted_
     }
 }
 
+/// A single-node council that leads, with a GitOps config whose webhook
+/// secret is `secret`, sealed under the cluster master key.
+async fn council_with_gitops_secret(tag: &str, secret: &str) -> Arc<crate::council::CouncilNode> {
+    let council = seeded_council_with_ikm(tag).await;
+    let config: crate::lettuce::types::GitOpsConfig = toml::from_str(&format!(
+        "repo = \"https://example.invalid/config\"\nwebhook_secret = \"{secret}\"\n"
+    ))
+    .unwrap();
+    let stored = crate::lettuce::types::StoredGitOpsConfig::seal(
+        &config,
+        council.wrapping_ikm().map(|key| key.as_slice()),
+    )
+    .unwrap();
+    council
+        .write(crate::council::types::RaftRequest::GitOpsConfigSet {
+            config: Some(Box::new(stored)),
+            seed: false,
+        })
+        .await
+        .unwrap();
+    council
+}
+
+/// #2388: the webhook route is public, so a request that fails the
+/// signature check must cost the node as little as possible. It used to
+/// clone the whole desired state to read one field before checking.
+#[tokio::test]
+async fn a_webhook_with_a_bad_signature_never_clones_the_desired_state() {
+    let council = council_with_gitops_secret("webhook-bad-sig-clone", "secret").await;
+    let (app, mut receiver, shutdown) =
+        webhook_setup_for_council("other-local-secret", 10, Some(council.clone()));
+    let before = council.full_desired_reads();
+    let status = post_webhook(
+        &app,
+        br#"{"after":"abc"}"#,
+        &[
+            ("x-hub-signature-256", "sha256=00".to_string()),
+            ("x-github-delivery", "d1".to_string()),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        council.full_desired_reads(),
+        before,
+        "a junk webhook cloned the whole desired state"
+    );
+    assert!(receiver.try_recv().is_err());
+    shutdown.cancel();
+    council.shutdown().await.unwrap();
+}
+
+/// #2388: a genuine delivery reads only the GitOps config too, and is
+/// checked against the cluster's secret, not this node's.
+#[tokio::test]
+async fn a_webhook_with_a_good_signature_never_clones_the_desired_state() {
+    let council = council_with_gitops_secret("webhook-good-sig-clone", "secret").await;
+    let (app, _receiver, shutdown) =
+        webhook_setup_for_council("other-local-secret", 10, Some(council.clone()));
+    let body = br#"{"after":"abc"}"#;
+    let before = council.full_desired_reads();
+    let status = post_webhook(
+        &app,
+        body,
+        &[
+            ("x-hub-signature-256", github_signature("secret", body)),
+            ("x-github-delivery", "d1".to_string()),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(
+        council.full_desired_reads(),
+        before,
+        "an admitted webhook cloned the whole desired state"
+    );
+    shutdown.cancel();
+    council.shutdown().await.unwrap();
+}
+
 fn webhook_boundary_setup(
     secret: &str,
     rate_limit: u32,
@@ -12320,7 +12463,10 @@ async fn rotating_the_signing_key_publishes_both_keys_and_is_audited() {
     assert_ne!(rotated.key_id, old.key_id);
 
     let after = council.security_state().await;
-    assert_eq!(after.oidc_signing_config.unwrap().key_id, rotated.key_id);
+    assert_eq!(
+        after.oidc_signing_config.as_ref().unwrap().key_id,
+        rotated.key_id
+    );
     assert_eq!(after.retiring_oidc_keys.len(), 1);
     assert_eq!(after.retiring_oidc_keys[0].not_after, rotated.retire_after);
 

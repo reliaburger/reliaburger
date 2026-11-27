@@ -919,8 +919,9 @@ pub(super) async fn token_rotate_handler(
         .security_state()
         .await
         .api_tokens
-        .into_iter()
+        .iter()
         .find(|token| token.name == req.name)
+        .cloned()
     else {
         return (
             StatusCode::NOT_FOUND,

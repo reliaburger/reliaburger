@@ -150,6 +150,7 @@ mod linux {
                     known: vec![batch],
                     arrays: vec![ArrayAssignment {
                         template: Some(Box::new(self.template.clone())),
+                        template_known: false,
                         resources: Resources::new(
                             self.options.cpu_request_millicores,
                             self.options.memory_bytes,

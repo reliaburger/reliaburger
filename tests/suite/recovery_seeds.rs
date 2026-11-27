@@ -65,7 +65,7 @@ async fn start_with_a_seed(
         .voter_ids()
         .count();
     let leader = council.current_leader().await;
-    let security = council.security_state().await;
+    let security = (*council.security_state().await).clone();
     cancel.cancel();
     council.shutdown().await.unwrap();
     Started {
@@ -123,7 +123,8 @@ async fn a_recovered_council_keeps_its_restored_tokens_over_the_bootstrap_file()
             api_tokens: vec![token],
             next_serial: 900,
             ..Default::default()
-        },
+        }
+        .into(),
         ..Default::default()
     };
     let bootstrap = SecurityState {
