@@ -897,7 +897,8 @@ An accepted expiry removes the manifest and drops the holder records of every bl
 [1] Nominate: walk the local blob store. Skip blobs that a manifest protects:
     tagged, running here (an instance's pinned digest), or untagged for less
     than gc_retain_days. Skip untracked blobs younger than the orphan grace
-    (an hour: an upload mid-push). Skip blobs this node holds alone.
+    (an hour: an upload mid-push), and the binaries of an active rolling
+    upgrade, however old (#2419). Skip blobs this node holds alone.
     Council members nominate against the Raft catalogue; a worker, whose
     local view only knows its own pushes, nominates freely.
 
@@ -905,7 +906,10 @@ An accepted expiry removes the manifest and drops the holder records of every bl
     The state machine refuses every digest any catalogued manifest still
     references, and approves a tracked blob only while another node also
     holds it, removing this node from its holder set. Untracked blobs are
-    approved as orphans.
+    approved as orphans, except the binaries of `active_upgrade` (the
+    `reliaburger-bun` blobs nodes fetch when their turn comes), which are
+    struck from the report while the upgrade is active, paused included.
+    Completing or aborting the upgrade clears the pin.
 
 [3] Delete only the approved blobs, re-checking each against the live
     reference set first (a push may have re-referenced one since).

@@ -126,7 +126,7 @@ Disk space isn't infinite. Cleanup comes in two steps, and keeping them apart is
 
 1. **Reference protection.** A blob any catalogued manifest references is never deleted. The Raft state machine checks this when it approves a deletion, not just the node that asked.
 2. **Sole-copy protection.** A blob is deleted from a node only while some other node also holds it. You can't accidentally destroy the last copy.
-3. **Orphan grace.** A blob with no holder record that's younger than an hour is left alone: it's probably part of a push still in flight.
+3. **Orphan grace.** A blob with no holder record that's younger than an hour is left alone: it's probably part of a push still in flight. One kind of untracked blob is kept however old it is: the binary of a rolling upgrade, while the upgrade is active ([chapter 14](14-changing-the-tyres.md#a-binary-nobody-tracks) has why).
 
 The order matters. A node first *nominates* the blobs it would delete and proposes them to Raft as a `GcReport`. The state machine approves only those that pass the rails above and removes this node from their holder sets. Only then, and only for the approved blobs, does the node delete anything from disk, re-checking references once more as it goes (`PickleState::collect_garbage`). Because Raft proposals are serialised, two nodes can't simultaneously believe they're "not the sole copy" and both delete. "Expiry, then GC" is the 0.2.1 design; the story of how the first version never collected anything is in *Copies that can still answer*, below.
 
