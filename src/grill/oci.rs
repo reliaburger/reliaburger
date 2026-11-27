@@ -228,6 +228,16 @@ pub struct OciProcess {
         skip_serializing_if = "Option::is_none"
     )]
     pub oom_score_adj: Option<i32>,
+    /// Set `no_new_privs` on the process (the OCI `noNewPrivileges`
+    /// field), so no set-id binary or file capability can raise its
+    /// privileges after it starts. Rootful runc sets it on every container
+    /// (#2402).
+    #[serde(
+        rename = "noNewPrivileges",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub no_new_privileges: bool,
     /// What the workload asked for before its image config fills the gaps.
     ///
     /// Not part of the OCI runtime spec. `Some` means `args`, `env`, `cwd`
@@ -316,6 +326,69 @@ pub struct OciLinux {
     /// Device nodes runc creates or binds in the container (#1122).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub devices: Vec<OciDevice>,
+    /// The system-call filter (#2402): rootful runc sets
+    /// [`super::seccomp::default_profile`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seccomp: Option<OciSeccomp>,
+    /// Paths runc hides from the container: a file becomes `/dev/null`, a
+    /// directory an empty read-only tmpfs.
+    #[serde(rename = "maskedPaths", default, skip_serializing_if = "Vec::is_empty")]
+    pub masked_paths: Vec<String>,
+    /// Paths runc remounts read-only inside the container.
+    #[serde(
+        rename = "readonlyPaths",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub readonly_paths: Vec<String>,
+}
+
+/// A seccomp filter (the OCI `linux.seccomp` block).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OciSeccomp {
+    /// What a call no rule names gets, such as `SCMP_ACT_ERRNO`.
+    #[serde(rename = "defaultAction")]
+    pub default_action: String,
+    /// The errno a refused call returns when `default_action` is
+    /// `SCMP_ACT_ERRNO`.
+    #[serde(
+        rename = "defaultErrnoRet",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub default_errno_ret: Option<u32>,
+    /// The architectures the filter covers, such as `SCMP_ARCH_X86_64`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub architectures: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub syscalls: Vec<OciSyscall>,
+}
+
+/// One rule of a seccomp filter: `action` for the calls in `names` whose
+/// arguments match every entry of `args`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OciSyscall {
+    pub names: Vec<String>,
+    pub action: String,
+    #[serde(rename = "errnoRet", default, skip_serializing_if = "Option::is_none")]
+    pub errno_ret: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<OciSeccompArg>,
+}
+
+/// A condition on one argument of a call, such as "argument 0 equals 10".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OciSeccompArg {
+    pub index: u32,
+    pub value: u64,
+    #[serde(rename = "valueTwo", default, skip_serializing_if = "is_zero")]
+    pub value_two: u64,
+    /// The comparison, such as `SCMP_CMP_EQ` or `SCMP_CMP_MASKED_EQ`.
+    pub op: String,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// A device node in the container (the OCI `linux.devices` entry).
@@ -551,6 +624,7 @@ pub fn generate_oci_spec_with_decryptor(
             readonly: false,
         },
         process: OciProcess {
+            no_new_privileges: false,
             rlimits: Vec::new(),
             args,
             env,
@@ -573,6 +647,9 @@ pub fn generate_oci_spec_with_decryptor(
         },
         mounts,
         linux: OciLinux {
+            seccomp: None,
+            masked_paths: Vec::new(),
+            readonly_paths: Vec::new(),
             namespaces,
             resources,
             cgroups_path: Some(hierarchy_cgroup_path(cgroup_path)),
@@ -1055,6 +1132,9 @@ pub fn generate_job_oci_spec(
         process: job_process(spec),
         mounts: standard_mounts(),
         linux: OciLinux {
+            seccomp: None,
+            masked_paths: Vec::new(),
+            readonly_paths: Vec::new(),
             namespaces: standard_namespaces(netns_path),
             resources,
             cgroups_path: Some(hierarchy_cgroup_path(cgroup_path)),
@@ -1098,6 +1178,7 @@ pub fn job_process(spec: &JobSpec) -> OciProcess {
     };
 
     OciProcess {
+        no_new_privileges: false,
         rlimits: Vec::new(),
         args,
         env,
@@ -1152,6 +1233,7 @@ pub fn generate_init_oci_spec(
             readonly: false,
         },
         process: OciProcess {
+            no_new_privileges: false,
             rlimits: Vec::new(),
             args: init.command.clone(),
             env: layered_env(&app.process.env, &init.env),
@@ -1170,6 +1252,9 @@ pub fn generate_init_oci_spec(
         },
         mounts: app.mounts.clone(),
         linux: OciLinux {
+            seccomp: None,
+            masked_paths: Vec::new(),
+            readonly_paths: Vec::new(),
             namespaces: standard_namespaces(None),
             resources: None,
             cgroups_path: app.linux.cgroups_path.clone(),
@@ -1257,6 +1342,7 @@ pub fn generate_sidecar_oci_spec(
             readonly: false,
         },
         process: OciProcess {
+            no_new_privileges: false,
             rlimits: Vec::new(),
             args: sidecar
                 .command
@@ -1281,6 +1367,9 @@ pub fn generate_sidecar_oci_spec(
         },
         mounts: app.mounts.clone(),
         linux: OciLinux {
+            seccomp: None,
+            masked_paths: Vec::new(),
+            readonly_paths: Vec::new(),
             namespaces,
             resources: build_resources_from_ranges(sidecar.cpu.as_ref(), sidecar.memory.as_ref()),
             cgroups_path: app

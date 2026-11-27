@@ -29,6 +29,7 @@ fn spec() -> OciSpec {
             readonly: true,
         },
         process: OciProcess {
+            no_new_privileges: false,
             rlimits: Vec::new(),
             args: vec!["hollow".into()],
             env: Vec::new(),
@@ -41,6 +42,9 @@ fn spec() -> OciSpec {
         },
         mounts: vec![],
         linux: OciLinux {
+            seccomp: None,
+            masked_paths: Vec::new(),
+            readonly_paths: Vec::new(),
             namespaces: vec![],
             resources: None,
             cgroups_path: None,

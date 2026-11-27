@@ -527,6 +527,31 @@ fn added_capabilities_join_the_user_namespace_defaults() {
 }
 
 #[test]
+fn an_added_capability_widens_the_seccomp_filter_by_its_calls() {
+    let allows = |spec: &OciSpec, call: &str| {
+        spec.linux
+            .seccomp
+            .as_ref()
+            .unwrap()
+            .syscalls
+            .iter()
+            .any(|rule| {
+                rule.action == "SCMP_ACT_ALLOW"
+                    && rule.args.is_empty()
+                    && rule.names.iter().any(|name| name == call)
+            })
+    };
+    let mut spec = base_spec();
+    spec.process.user.uid = 0;
+    spec.process.user.gid = 0;
+    crate::grill::userns::apply(&mut spec).unwrap();
+    assert!(!allows(&spec, "mount"));
+    apply_to_spec(&mut spec, &knobs("capabilities = [\"SYS_ADMIN\"]\n"), fuse).unwrap();
+    assert!(allows(&spec, "mount"), "CAP_SYS_ADMIN without mount");
+    assert!(allows(&spec, "unshare"));
+}
+
+#[test]
 fn capabilities_on_a_spec_with_none_become_the_whole_set() {
     let mut spec = base_spec();
     apply_to_spec(&mut spec, &knobs("capabilities = [\"IPC_OWNER\"]\n"), fuse).unwrap();

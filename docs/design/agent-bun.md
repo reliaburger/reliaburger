@@ -1114,7 +1114,7 @@ before their Phase 15 cases can use this contract.
 9. **Mount volumes and config files:** Bind-mount declared volumes from the host filesystem (a host-path `source` was checked against `[storage] allowed_host_paths` at admission and again when the OCI spec was built, which mounts the resolved path that check approved). Write `ConfigFileSpec` contents to temp files and bind-mount them read-only at the declared paths.
 10. **Run init containers (Initialising):** For each init container in declaration order, create a container from its own image (the app's when it names none, trust-checked and digest-pinned like the app's) with the app's environment, decrypted secrets, cgroup and volume and config-file mounts, built from the app's finished OCI spec (`generate_init_oci_spec`, #701). It gets its own network namespace and leaves the volumes owned by the app's user. An `exec` or `script` app's init that names no image runs its command on the host instead: its spec carries `host_process` like the app's, so the mixed runtime routes it to the host backend and a switch from `--runtime process` to `mixed` mid-run adopts it there, and admission refuses it unless `[process_workloads] allowed_binaries` names the first word of its command (#935). Wait for exit code 0. If any fails, or none finishes within 300 s, transition to `Failed` and emit event.
 10a. **Start sidecars (#1120):** Register the instance's sidecar identities (`<id>__sidecar-<name>`) with the loop, then create and start each in declaration order from `generate_sidecar_oci_spec`: its own image or the app's, the app's env with its own on top (secret references resolved by `create_with_secrets` like any launch), the app's mounts, its own cgroup beside the app's (`<cgroup>-sidecar-<name>`, with its own limits, since two runc containers can't share one), and the instance's network namespace by path (`/var/run/netns/rb-<id>`) instead of one of its own. Rootful runc sees that path (`OciSpec::joined_network`), reserves no address and sets up no network for it. Apple Container, rootless runc and the process runtime can't share a namespace (`Grill::shares_network_namespaces` is false), so admission refuses an app with sidecars there and the node reports `shared_network: false`, which keeps the scheduler away. A sidecar that fails to start fails the instance, and any already started are killed.
-11. **Create and start the main container (Starting):** Write the OCI bundle (rootfs, namespaces, cgroups, mounts, env, seccomp) and start it with the runtime's own CLI: `runc run` on Linux, the `container` CLI on macOS. There's no daemon in between. Capture stdout/stderr and pipe them to Ketchup.
+11. **Create and start the main container (Starting):** Write the OCI bundle (rootfs, namespaces, cgroups, mounts, env, and on rootful runc the confinement in §8.4: seccomp filter, `noNewPrivileges`, masked and read-only paths, cgroup namespace) and start it with the runtime's own CLI: `runc run` on Linux, the `container` CLI on macOS. There's no daemon in between. Capture stdout/stderr and pipe them to Ketchup.
 12. **Health wait (HealthWait):** After `initial_delay`, begin sending HTTP GET to `health` path via the container's network namespace IP and declared port. Continue at `interval` until `threshold_healthy` consecutive successes. The state sweep reads a `HealthWait` instance's runtime state as it does a `Running` one's, so a process that exits before its first passing probe is restarted with backoff and records a `restart` event. After 60 consecutive failed probes (`STARTUP_FAILURE_LIMIT`) the instance goes to `Stopping` with cleanup owed; once the kill is confirmed it is marked `Failed`, not restarted, and a `restart.never_healthy` decision records why (#1999).
 13. **Running:** Register the instance in the Onion service map (eBPF kernel map). The workload now receives traffic via DNS resolution and connect() rewriting. Emit a `WorkloadRunning` event, which goes to the leader in the node's next report.
 14. **Ongoing health checking:** HealthChecker continues probing at `interval`. If `threshold_unhealthy` consecutive failures: transition to `Unhealthy`, remove from Onion service map, emit event. If the workload recovers (`threshold_healthy` consecutive passes), transition back to `Running` and re-add to service map.
@@ -1795,9 +1795,11 @@ The scenarios count work rather than timing turns against the host's disk (#508,
                          │
 ┌─────────────────────────────────────────────────────┐
 │  Container workloads (untrusted)                     │
-│    Isolated PID, network, mount, UTS, user namespace│
-│    Seccomp profile applied                           │
-│    Cgroup resource limits enforced                   │
+│    Isolated PID, network, mount, UTS, IPC, user and │
+│    cgroup namespaces                                 │
+│    Docker's default seccomp filter, no_new_privs     │
+│    /proc and /sys masked, own cgroup at /sys/fs/cgroup│
+│    Cgroup resource limits enforced, pids.max too     │
 │    No access to runtime state, Bun state, or        │
 │    other workloads' volumes/tmp                      │
 └─────────────────────────────────────────────────────┘
@@ -1828,20 +1830,17 @@ Available capabilities (require `admin` role, logged as security events):
 
 - `SYS_PTRACE`, `DAC_OVERRIDE`, `CHOWN`, `SETUID`, `SETGID`
 
-### 8.4 Seccomp Profile
+### 8.4 Container Confinement
 
-> **Status: planned — not yet implemented for process workloads.** No seccomp profile is applied to a host-spawned process workload today. The profile below is the intended default once the isolation stack lands.
+Every rootful runc container (apps, init containers, sidecars, fresh job containers and shared-runc executors) gets the following on top of its user namespace (#2402). `userns::apply` in `src/grill/userns.rs` writes it into the spec just before `config.json`, so it never reaches the stored desired state.
 
-The default seccomp profile blocks the following syscall families (identical for container and process workloads):
+- **Seccomp.** Docker's and containerd's default profile, an allow-list of about 370 system calls; everything else fails with `EPERM`. We ship Moby's `seccomp/v0.3.0` profile unchanged (`src/grill/seccomp_default.json`) rather than a list of our own: a deny-list, like the one this section used to sketch, misses every call added after it was written, and an allow-list of our own would break images that Docker runs. `src/grill/seccomp.rs` turns it into the OCI block for the node's architecture and the container's capabilities, as Docker does. Among what it refuses: `keyctl`, `add_key`, `userfaultfd`, `kexec_load`, `init_module`, `open_by_handle_at`, and, without `CAP_SYS_ADMIN`, `mount`, `unshare`, `setns`, `bpf` and namespace flags on `clone` (`clone3` gets `ENOSYS`, so the C library falls back to `clone`). A capability a runtime knob adds (§ runtime knobs, #1122) brings the calls it guards, as Docker's `--cap-add` does: `CAP_SYS_ADMIN` brings `mount`, `CAP_SYS_PTRACE` brings `process_vm_readv`. A shared-runc executor holds `CAP_SYS_ADMIN` on purpose, for its per-task mount namespace, so its filter has those calls too.
+- **`noNewPrivileges`.** A set-uid binary or file capability in an image can't raise a process's privileges. An image that runs as a non-root user and calls `sudo` or `su` needs to run as root instead.
+- **Masked paths.** `/proc/acpi`, `/proc/asound`, `/proc/interrupts`, `/proc/kcore`, `/proc/keys`, `/proc/latency_stats`, `/proc/sched_debug`, `/proc/scsi`, `/proc/timer_list`, `/proc/timer_stats`, `/sys/devices/virtual/powercap`, `/sys/firmware`, `/sys/fs/bpf` and `/sys/kernel/security` read as empty.
+- **Read-only paths.** `/proc/bus`, `/proc/fs`, `/proc/irq`, `/proc/sys` and `/proc/sysrq-trigger`. runc writes a container's own sysctls (runtime knobs) before it makes `/proc/sys` read-only.
+- **Cgroup namespace.** `/sys` is a read-only bind of the host's, because the kernel won't mount a fresh sysfs for a user namespace that doesn't own the network namespace. That bind would show the node's whole cgroup tree: every namespace, app and instance with its memory and CPU use. A cgroup namespace and a `cgroup` mount over `/sys/fs/cgroup` show the container its own cgroup instead.
 
-- `mount`, `umount2` -- prevents filesystem manipulation
-- `reboot` -- prevents system reboot
-- `kexec_load`, `kexec_file_load` -- prevents kernel replacement
-- `init_module`, `finit_module`, `delete_module` -- prevents kernel module manipulation
-- `pivot_root` -- prevents root filesystem changes
-- `swapon`, `swapoff` -- prevents swap manipulation
-- `sethostname`, `setdomainname` -- prevented even within UTS namespace for defense in depth
-- `keyctl` -- prevents kernel keyring access
+Process workloads get none of this: they're host processes (#360, #714), and the planned isolation for them is §5.2.
 
 ---
 

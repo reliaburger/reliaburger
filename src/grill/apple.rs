@@ -1177,6 +1177,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args: vec!["/bin/sleep".to_string(), "30".to_string()],
                 env: vec!["TEST=1".to_string()],
@@ -1189,6 +1190,9 @@ mod tests {
             },
             mounts: vec![],
             linux: crate::grill::oci::OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: vec![],
                 resources: None,
                 cgroups_path: None,
@@ -1266,6 +1270,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args: vec![
                     "/bin/sh".to_string(),
@@ -1284,6 +1289,9 @@ mod tests {
             },
             mounts: vec![],
             linux: crate::grill::oci::OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: vec![],
                 resources: None,
                 cgroups_path: None,
@@ -1367,6 +1375,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args: vec!["sleep".to_string(), "300".to_string()],
                 env: vec![],
@@ -1379,6 +1388,9 @@ mod tests {
             },
             mounts: vec![],
             linux: crate::grill::oci::OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: vec![],
                 resources: None,
                 cgroups_path: None,

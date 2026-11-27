@@ -1164,6 +1164,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args: vec!["/bin/true".to_string()],
                 env: vec![],
@@ -1176,6 +1177,9 @@ mod tests {
             },
             mounts: crate::grill::oci::standard_mounts(),
             linux: crate::grill::oci::OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: crate::grill::oci::standard_namespaces(None),
                 resources: None,
                 cgroups_path: None,
@@ -1235,6 +1239,7 @@ mod tests {
                 readonly: true,
             },
             process: crate::grill::oci::OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args: vec!["sh".into()],
                 env: vec![],
@@ -1247,6 +1252,9 @@ mod tests {
             },
             mounts: vec![],
             linux: crate::grill::oci::OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: vec![],
                 resources: None,
                 cgroups_path: None,
@@ -1310,6 +1318,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args: vec!["sh".to_string(), "-c".to_string(), "echo hello".to_string()],
                 env: vec![],
@@ -1322,6 +1331,9 @@ mod tests {
             },
             mounts: vec![],
             linux: crate::grill::oci::OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: vec![],
                 resources: None,
                 cgroups_path: None,
@@ -1412,6 +1424,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args: vec![
                     "/bin/sh".to_string(),
@@ -1437,6 +1450,9 @@ mod tests {
             },
             mounts: crate::grill::oci::standard_mounts(),
             linux: crate::grill::oci::OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: crate::grill::oci::standard_namespaces(None),
                 resources: None,
                 cgroups_path: None,
@@ -1720,6 +1736,7 @@ mod tests {
                     readonly: false,
                 },
                 process: crate::grill::oci::OciProcess {
+                    no_new_privileges: false,
                     rlimits: Vec::new(),
                     args: vec![
                         "/bin/sh".to_string(),
@@ -1739,6 +1756,9 @@ mod tests {
                 },
                 mounts: crate::grill::oci::standard_mounts(),
                 linux: crate::grill::oci::OciLinux {
+                    seccomp: None,
+                    masked_paths: Vec::new(),
+                    readonly_paths: Vec::new(),
                     namespaces: crate::grill::oci::standard_namespaces(None),
                     resources: None,
                     cgroups_path: None,
@@ -1895,6 +1915,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args: vec!["/bin/true".to_string()],
                 env: vec![],
@@ -1907,6 +1928,9 @@ mod tests {
             },
             mounts: crate::grill::oci::standard_mounts(),
             linux: crate::grill::oci::OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: crate::grill::oci::standard_namespaces(None),
                 resources: None,
                 cgroups_path: None,
@@ -1964,6 +1988,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args: vec![
                     "/bin/sh".to_string(),
@@ -1980,6 +2005,9 @@ mod tests {
             },
             mounts: crate::grill::oci::standard_mounts(),
             linux: crate::grill::oci::OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: crate::grill::oci::standard_namespaces(None),
                 resources: None,
                 cgroups_path: None,
@@ -2169,6 +2197,7 @@ mod tests {
                 readonly: true,
             },
             process: crate::grill::oci::OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args: vec!["/bin/sleep".to_string(), "30".to_string()],
                 env: vec![],
@@ -2181,6 +2210,9 @@ mod tests {
             },
             mounts: crate::grill::oci::standard_mounts(),
             linux: crate::grill::oci::OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: crate::grill::oci::standard_namespaces(None),
                 resources: None,
                 cgroups_path: None,
@@ -2331,6 +2363,60 @@ mod tests {
         );
 
         grill.kill(&id).await.unwrap();
+    }
+
+    /// #2402: a container runs under the default seccomp filter with
+    /// `no_new_privs` set, sees its own cgroup at `/sys/fs/cgroup` rather
+    /// than the node's tree, and can't read `/proc/kcore`.
+    #[tokio::test]
+    #[ignore = "requires rootful runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
+    async fn runc_container_runs_under_seccomp_without_new_privileges() {
+        assert!(runc_tests_enabled(), "set RELIABURGER_RUNC_TESTS=1");
+        assert!(nix::unistd::geteuid().is_root(), "rootful runc needs root");
+        let tmp = tempfile::tempdir().unwrap();
+        let id = InstanceId("default__confined-0".to_string());
+        remove_test_network(&id);
+        let _network_cleanup = TestNetworkCleanup(vec![id.clone()]);
+        let (grill, mut spec) = image_app(
+            tmp.path(),
+            &id,
+            &format!("image = \"{ALPINE_IMAGE}\"\ncommand = [\"sleep\", \"3608\"]\n"),
+        );
+        // A cgroup of its own, as Bun gives every instance, so the cgroup
+        // namespace has something to hide.
+        spec.linux.cgroups_path = Some(format!("/reliaburger-test/{}", id.0));
+        grill.create(&id, &spec).await.unwrap();
+        grill.start(&id).await.unwrap();
+        let probe = grill
+            .exec(
+                &id,
+                &[
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "grep -E '^(Seccomp|NoNewPrivs):' /proc/1/status; \
+                     echo cgroup:; ls /sys/fs/cgroup; echo end; \
+                     [ -s /proc/kcore ] && echo kcore-visible; \
+                     unshare -U true 2>/dev/null && echo nested-userns"
+                        .to_string(),
+                ],
+            )
+            .await
+            .unwrap()
+            .output;
+        grill.kill(&id).await.unwrap();
+        let _ = std::fs::remove_dir("/sys/fs/cgroup/reliaburger-test");
+
+        assert!(probe.contains("Seccomp:\t2"), "{probe}");
+        assert!(probe.contains("NoNewPrivs:\t1"), "{probe}");
+        let listing = probe
+            .split("cgroup:")
+            .nth(1)
+            .and_then(|rest| rest.split("end").next())
+            .unwrap_or_default();
+        assert!(!listing.contains("reliaburger"), "{probe}");
+        assert!(listing.contains("cgroup.procs"), "{probe}");
+        assert!(!probe.contains("kcore-visible"), "{probe}");
+        assert!(!probe.contains("nested-userns"), "{probe}");
     }
 
     /// Z1.1/D1: image root binds port 80 and nginx's workers drop to their

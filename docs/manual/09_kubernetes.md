@@ -116,8 +116,9 @@ sentence on what to do instead:
   the same start-up time (`failureThreshold` times `periodSeconds`);
 - `readOnlyRootFilesystem`, `allowPrivilegeEscalation`, `runAsNonRoot` and
   `seccompProfile`: every container runs in its own user namespace with
-  Docker's default capabilities, and Reliaburger sets no seccomp profile,
-  read-only root filesystem or no-new-privileges flag;
+  Docker's default capabilities, Docker's default seccomp filter and
+  no-new-privileges set, whatever the manifest asks, and Reliaburger has no
+  read-only root filesystem;
 - a Service's `type` other than `ClusterIP`, its `nodePort`s,
   `sessionAffinity` and a headless `clusterIP: None`;
 - a Deployment's `strategy.type: Recreate`, and a `maxSurge` or

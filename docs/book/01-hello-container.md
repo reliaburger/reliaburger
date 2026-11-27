@@ -702,7 +702,7 @@ Now we need something that actually runs containers. That something is Grill.
 
 The name follows the burger theme (Reliaburger, Bun, Relish, Meat, Mustard...), but the architecture is practical. When you run a container on Linux, two layers are involved:
 
-1. **runc** does the actual work. It creates Linux namespaces (isolating the container's view of the filesystem, network, and processes from the host), sets up cgroups (limiting CPU, memory, and other resources), applies security profiles (seccomp, capabilities), and exec's the container's entrypoint. It's a single binary that creates a container and exits.
+1. **runc** does the actual work. It creates Linux namespaces (isolating the container's view of the filesystem, network, and processes from the host), sets up cgroups (limiting CPU, memory, and other resources), applies the security settings the spec asks for (a seccomp filter, capabilities), and exec's the container's entrypoint. It's a single binary that creates a container and exits.
 
 2. **Grill** manages runc. It translates our `AppSpec` configuration into the OCI runtime specification that runc expects, allocates host ports, computes cgroup parameters, and tracks the lifecycle state of each container. Grill is the only part we write.
 
@@ -3189,6 +3189,52 @@ if let Some(run_as_user) = overrides.user {
 ```
 
 `by_id` is a closure that returns a `Result` of a three-element tuple. Assigning a tuple to existing `mut` variables in one go works the way it does in Python or Go (`uid, gid, home = ...`). Rust only allowed it on plain assignment, not just in `let`, from version 1.59.
+
+### Confining what root can ask for
+
+A user namespace stops container root being host root, but that's all it does. Until 0.3.4 it was the only barrier: the November 2026 audit found that a container could call any system call the kernel offers a user namespace (`keyctl`, `bpf`, `io_uring_setup`, `userfaultfd`, `unshare`), that a set-uid binary could still raise privileges inside it, and that the read-only bind of the host's `/sys` showed every container the node's whole cgroup tree: every namespace, app and instance, with its memory and CPU use (#2402). The design doc said a seccomp profile was applied. Nothing in the spec types could even hold one.
+
+Now `userns::apply` adds four things. The OCI spec has a field for each, so first the types grew:
+
+```rust
+pub struct OciLinux {
+    // ...namespaces, resources, mappings, sysctls, devices
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seccomp: Option<OciSeccomp>,
+    #[serde(rename = "maskedPaths", default, skip_serializing_if = "Vec::is_empty")]
+    pub masked_paths: Vec<String>,
+    #[serde(rename = "readonlyPaths", default, skip_serializing_if = "Vec::is_empty")]
+    pub readonly_paths: Vec<String>,
+}
+```
+
+`noNewPrivileges` on the process is a `bool` skipped when false, with `skip_serializing_if = "std::ops::Not::not"`: `Not::not` is the function behind the `!` operator, so serde calls `!value` and leaves the field out when that's true. Every new field has `#[serde(default)]`, so a runtime intent written before them still loads.
+
+The seccomp filter is the interesting one. We could have written our own list, and an earlier design-doc draft did: a dozen calls to block. A deny-list is the wrong shape. It misses every call the kernel adds after you wrote it, and `io_uring` alone has been the source of a steady run of privilege escalations since 2020. Docker and containerd use an allow-list of about 370 calls, maintained against real images for a decade, and that's what we ship, copied unchanged from Moby's `seccomp/v0.3.0` profile into `src/grill/seccomp_default.json`. Writing our own allow-list would only find, one bug report at a time, the images Docker runs and we don't.
+
+The file goes into the binary with `include_str!`, and it's parsed once:
+
+```rust
+const MOBY_DEFAULT_PROFILE: &str = include_str!("seccomp_default.json");
+
+fn moby_profile() -> Result<&'static MobyProfile, SeccompError> {
+    static PROFILE: OnceLock<Result<MobyProfile, String>> = OnceLock::new();
+    PROFILE
+        .get_or_init(|| {
+            serde_json::from_str(MOBY_DEFAULT_PROFILE).map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|error| SeccompError::Profile(error.clone()))
+}
+```
+
+`OnceLock` stores whatever the first caller's closure returns, here a `Result`, and hands every later caller a reference to it. `.as_ref()` turns `&Result<MobyProfile, String>` into `Result<&MobyProfile, &String>`, so we can borrow the profile out without moving it from the static. The `'static` in the return type is the lifetime of anything a `static` holds: the whole run of the program, so the caller can keep the reference as long as it likes.
+
+Moby's file isn't in the OCI format. Each rule may say it applies only on some architectures or only to a container holding some capabilities: `mount` and `unshare` are allowed only with `CAP_SYS_ADMIN`, `reboot` only with `CAP_SYS_BOOT`. `default_profile` does what Docker does at container start: keep the rules for this machine's architecture and the container's capability set, and drop the conditions. That's also how a runtime knob (#1122) that adds a capability works: `knobs::apply_to_spec` rebuilds the filter from the new capability set, so asking for `CAP_SYS_ADMIN` brings `mount` with it, as `docker run --cap-add` does. Without that the knob would grant a capability whose calls still failed.
+
+The other three are short. `noNewPrivileges` sets the kernel's `no_new_privs` bit, after which no set-uid binary or file capability raises the process's privileges. An image that starts as a non-root user and runs `sudo` breaks; an image that starts as root and drops with `gosu`, like Redis's and Postgres's, doesn't notice. Masked paths hide `/proc/kcore`, `/proc/keys`, `/sys/firmware`, `/sys/kernel/security` and the rest of Docker's list (plus `/sys/fs/bpf`, where the node pins its eBPF maps), and read-only paths cover `/proc/sys` and `/proc/sysrq-trigger`. Finally a cgroup namespace: runc creates one, and a `cgroup` mount after the `/sys` bind covers `/sys/fs/cgroup` with the container's own cgroup as its root. Mount order matters here, since runc mounts in order and a mount under `/sys` that came first would vanish beneath the bind.
+
+`runc_container_runs_under_seccomp_without_new_privileges` (`make test-linux`) checks the result from inside: PID 1's `/proc/self/status` shows `Seccomp: 2` (filtering) and `NoNewPrivs: 1`, `/sys/fs/cgroup` lists the container's own `cgroup.procs` and no `reliaburger` tree, `/proc/kcore` reads as empty, and `unshare -U` fails. The Redis, nginx and Postgres tests and the shared-runc executor suite run under the same filter.
 
 ### Testing image pulling
 

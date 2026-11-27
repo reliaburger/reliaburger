@@ -1650,6 +1650,7 @@ mod tests {
                 readonly: false,
             },
             process: OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args,
                 env: vec!["TEST_VAR=hello".to_string()],
@@ -1662,6 +1663,9 @@ mod tests {
             },
             mounts: vec![],
             linux: OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: vec![],
                 resources: None,
                 cgroups_path: None,
