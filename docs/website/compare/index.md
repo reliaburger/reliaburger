@@ -8,7 +8,7 @@ Reliaburger brings scheduling, ingress, image distribution, metrics, logs and fa
 
 Explore the [integrated components](https://github.com/reliaburger/reliaburger/blob/v0.2.2/README.md#whats-in-the-binary) and [diagnostic workflow](https://github.com/reliaburger/reliaburger/blob/v0.2.2/docs/manual/07_diagnostics.md).
 
-**Which Reliaburger?** These pages describe the [0.2.2 release](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.2), the one the public installer installs, and link its source at that tag. 0.2.1 (cluster safety) and 0.2.2 (UX polish) changed some answers after the first review, so we re-checked every Reliaburger claim on 21 October 2026. Read the [method and version boundaries](https://reliaburger.com/compare/methodology#method) before treating this as a purchasing decision.
+**Which Reliaburger?** These pages describe the [0.2.2 release](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.2) and link its source at that tag. 0.2.1 (cluster safety) and 0.2.2 (UX polish) changed some answers after the first review, so we re-checked every Reliaburger claim on 21 October 2026. The public installer now installs a newer release; the [changelog](https://github.com/reliaburger/reliaburger/blob/main/CHANGELOG.md) says what changed since. Read the [method and version boundaries](https://reliaburger.com/compare/methodology#method) before treating this as a purchasing decision.
 
 ## Compare the daily work
 

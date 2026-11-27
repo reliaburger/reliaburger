@@ -51,14 +51,18 @@ pub struct RollupEntry {
 /// Pre-aggregated rollup pushed from a worker node to its council
 /// aggregator every 60 seconds. Every rollup — including the reassignment
 /// backfill, which is emitted as several of these — covers exactly one
-/// minute-aligned window, so the aggregator's `(node, timestamp)` dedup key
-/// is unambiguous (M9).
+/// minute-aligned window (M9). A minute whose entries don't fit one report
+/// frame goes out as several parts (#2426), so the aggregator's dedup key
+/// is `(node, timestamp, part)`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeRollup {
     /// Identity of the reporting node.
     pub node_id: NodeId,
     /// Start of the 1-minute aggregation window (unix seconds).
     pub timestamp: u64,
+    /// Which part of the minute this is, from 0. A minute whose entries
+    /// fit one frame has only part 0.
+    pub part: u16,
     /// Rollup entries for each distinct (metric_name, labels) pair.
     pub entries: Vec<RollupEntry>,
 }
@@ -91,6 +95,9 @@ pub enum QueryWarning {
     /// Rollup data is unavailable for a time window (e.g. after
     /// aggregator reassignment).
     DataUnavailable { node_id: String, from: u64, to: u64 },
+    /// A node answered but refused the query, and why: usually a range
+    /// too large to answer, which narrowing fixes (#2451).
+    QueryRefused { node_id: String, reason: String },
 }
 
 /// Result of a metrics query, including data and any warnings.
@@ -136,6 +143,7 @@ mod tests {
         NodeRollup {
             node_id: NodeId::new("node-1"),
             timestamp: 1000,
+            part: 0,
             entries: vec![RollupEntry {
                 metric_name: "cpu_usage".to_string(),
                 labels,

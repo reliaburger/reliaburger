@@ -1551,7 +1551,7 @@ pub async fn join(
     let dir = identity_dir
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("identity"));
-    let identity = crate::sesame::join::enrol(&base, token, node_id, ca_fingerprint)
+    let enrolment = crate::sesame::join::enrol(&base, token, node_id, ca_fingerprint)
         .await
         .map_err(|e| match e {
             crate::sesame::join::JoinClientError::FingerprintMismatch { offered, expected } => {
@@ -1563,9 +1563,15 @@ pub async fn join(
             other => RelishError::JoinFailed(other.to_string()),
         })?;
 
+    let identity = &enrolment.identity;
     let fingerprint = crate::sesame::identity_store::root_ca_fingerprint(&identity.root_ca_der);
-    crate::sesame::identity_store::save(&dir, &identity)
+    crate::sesame::identity_store::save(&dir, identity)
         .map_err(|e| RelishError::JoinFailed(format!("failed to persist identity: {e}")))?;
+    // The node takes Raft replication only from this council, or from
+    // voters it vouches for, until it has one of its own (#2397).
+    // BLOCKING-OK: relish CLI, one small file written once, nothing else on its runtime
+    crate::council::admission::ExpectedCouncil::save(&dir, &enrolment.council)
+        .map_err(|e| RelishError::JoinFailed(format!("failed to save the council: {e}")))?;
 
     print_output(
         &JoinReport {
@@ -4873,7 +4879,9 @@ pub async fn join_token_create(
         "Join token created for {node_id} (expires in {}).",
         format_ttl(ttl_seconds)
     );
-    eprintln!("The joining node must enrol with `relish join --node-id {node_id}`.");
+    eprintln!(
+        "The joining node must enrol with `relish join --node-id {node_id} --ca-fingerprint <root CA fingerprint>`."
+    );
     eprintln!("The plaintext is shown once:");
     print_output(
         &JoinTokenReport {

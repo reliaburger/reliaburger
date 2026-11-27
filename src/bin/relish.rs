@@ -386,10 +386,17 @@ struct JoinOptions {
     /// `identity` in the current directory (matching `relish init`).
     #[arg(long)]
     identity_dir: Option<std::path::PathBuf>,
-    /// Pin the cluster's root CA fingerprint (`sha256:...`). When set,
-    /// a member offering a different root CA is refused.
-    #[arg(long)]
+    /// Pin the cluster's root CA fingerprint (`sha256:...`, printed by
+    /// `relish init`). A member offering a different root CA is refused
+    /// before the token is sent. Required unless
+    /// `--insecure-trust-first-ca` is given.
+    #[arg(long, required_unless_present = "insecure_trust_first_ca")]
     ca_fingerprint: Option<String>,
+    /// Trust whatever root CA the member offers, unverified, and send it the
+    /// join token. Someone on the path can then capture the token. Prefer
+    /// `--ca-fingerprint`.
+    #[arg(long, conflicts_with = "ca_fingerprint")]
+    insecure_trust_first_ca: bool,
 }
 
 // `relish metrics`, boxed to keep the generated `Command` parser
@@ -2874,6 +2881,7 @@ async fn main() -> ExitCode {
                 ref node_id,
                 ref identity_dir,
                 ref ca_fingerprint,
+                insecure_trust_first_ca: _,
             } = *options;
             async {
                 let token = match (token, token_file) {
@@ -6261,6 +6269,8 @@ mod tests {
                 "/private/join.token",
                 "--node-id",
                 "node-02",
+                "--ca-fingerprint",
+                "sha256:ab",
                 "https://10.0.1.5:9117"
             ])
             .is_ok()
@@ -6291,6 +6301,41 @@ mod tests {
         );
     }
 
+    /// Without a pinned root CA fingerprint, `relish join` would trust
+    /// whatever CA the first member offered and send it the join token
+    /// (#2410). The pin is required, unless the operator opts out by name.
+    #[test]
+    fn join_requires_a_ca_fingerprint_or_an_explicit_opt_out() {
+        let base = [
+            "relish",
+            "join",
+            "--token",
+            "t",
+            "--node-id",
+            "node-02",
+            "https://10.0.1.5:9117",
+        ];
+        assert!(parse(&base).is_err(), "an unpinned join must not parse");
+        let pinned: Vec<&str> = base
+            .iter()
+            .copied()
+            .chain(["--ca-fingerprint", "sha256:ab"])
+            .collect();
+        assert!(parse(&pinned).is_ok());
+        let opted_out: Vec<&str> = base
+            .iter()
+            .copied()
+            .chain(["--insecure-trust-first-ca"])
+            .collect();
+        assert!(parse(&opted_out).is_ok());
+        let both: Vec<&str> = pinned
+            .iter()
+            .copied()
+            .chain(["--insecure-trust-first-ca"])
+            .collect();
+        assert!(parse(&both).is_err(), "a pin and the opt-out conflict");
+    }
+
     #[test]
     fn secret_encrypt_accepts_a_value_file_or_stdin_instead_of_an_argument() {
         // An argument shows in `ps` and shell history (#2407).
@@ -6315,6 +6360,8 @@ mod tests {
             "abc123",
             "--node-id",
             "node-02",
+            "--ca-fingerprint",
+            "sha256:ab",
             "https://10.0.1.5:9117",
         ])
         .unwrap();
@@ -6327,13 +6374,15 @@ mod tests {
                     node_id,
                     identity_dir,
                     ca_fingerprint,
+                    insecure_trust_first_ca,
                 } = *options;
                 assert_eq!(token.as_deref(), Some("abc123"));
                 assert!(token_file.is_none());
                 assert_eq!(addr, "https://10.0.1.5:9117");
                 assert_eq!(node_id, "node-02");
                 assert!(identity_dir.is_none());
-                assert!(ca_fingerprint.is_none());
+                assert_eq!(ca_fingerprint.as_deref(), Some("sha256:ab"));
+                assert!(!insecure_trust_first_ca);
             }
             _ => panic!("expected Join command"),
         }

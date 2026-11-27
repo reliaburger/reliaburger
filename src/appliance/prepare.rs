@@ -575,10 +575,18 @@ async fn enrol(paths: &Paths, config: &SeedConfig) -> Result<(), PrepareError> {
             )
             .await
             {
-                Ok(identity) => {
+                Ok(enrolment) => {
                     // BLOCKING-OK: appliance prepare: its own process, one step at a time before bun starts, with nothing else on its runtime
-                    crate::sesame::identity_store::save(&paths.identity_dir(), &identity)
+                    crate::sesame::identity_store::save(&paths.identity_dir(), &enrolment.identity)
                         .map_err(|e| PrepareError::Config(format!("saving the identity: {e}")))?;
+                    // BLOCKING-OK: appliance prepare, as above
+                    crate::council::admission::ExpectedCouncil::save(
+                        &paths.identity_dir(),
+                        &enrolment.council,
+                    )
+                    .map_err(|e| {
+                        PrepareError::Config(format!("saving the expected council: {e}"))
+                    })?;
                     say(&format!("enrolled as {} through {member}", config.node));
                     return Ok(());
                 }
@@ -604,7 +612,9 @@ async fn enrol(paths: &Paths, config: &SeedConfig) -> Result<(), PrepareError> {
 fn is_final(error: &crate::sesame::join::JoinClientError) -> bool {
     use crate::sesame::join::JoinClientError;
     match error {
-        JoinClientError::FingerprintMismatch { .. } | JoinClientError::Incompatible(_) => true,
+        JoinClientError::FingerprintMismatch { .. }
+        | JoinClientError::Incompatible(_)
+        | JoinClientError::InvalidNodeId { .. } => true,
         JoinClientError::Rejected(reason) => {
             let reason = reason.to_ascii_lowercase();
             [
@@ -612,6 +622,7 @@ fn is_final(error: &crate::sesame::join::JoinClientError) -> bool {
                 "expired",
                 "invalid join token",
                 "different node id",
+                "invalid node id",
                 "retired",
             ]
             .iter()

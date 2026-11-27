@@ -689,7 +689,7 @@ relish council [status]             # Every node's council view: role, epoch, te
 relish council recover --data-dir <dir> [--from <url> [--backup <name>]] [--master-key <path>] [--api-port <port>] [--force]
 relish council backups --from <url>                # List sealed backups, newest first by epoch, term and index
 relish council re-enrol --data-dir <dir> [--force]  # Drop a fenced voter's Raft state to rejoin
-relish join --token <token> --node-id <id> <api-addr>  # Enrol a node identity
+relish join --token <token> --node-id <id> --ca-fingerprint sha256:... <api-addr>  # Enrol a node identity
 relish join --token <t> --node-id <id> <addr> --ca-fingerprint sha256:... [--identity-dir <dir>]
 
 # Secrets
@@ -1418,12 +1418,16 @@ config without an identity makes `bun --cluster` refuse and name `relish init`.
 `--development-plaintext` is the only generator of a plaintext config; such a
 cluster has no cluster registry and can't pull Docker Hub short names.
 
-**`relish join --token <token> --node-id <id> <api-address>`**
+**`relish join --token <token> --node-id <id> --ca-fingerprint sha256:... <api-address>`**
 
 Contacts the current leader's agent API (normally HTTPS on port 9117), sends a
 CSR, validates and consumes the join token, and writes the returned certificate
-bundle to `--identity-dir` (default `identity`). `--ca-fingerprint sha256:...`
-pins the first exchange. The command doesn't add `[cluster].join`, copy the
+bundle, and the council's voters as `council.json`, to `--identity-dir`
+(default `identity`). `--ca-fingerprint sha256:...` pins the first exchange,
+and is required (#2410): without it the command would trust whatever root CA
+the member offered and send the token over a connection that CA vouches for.
+`--insecure-trust-first-ca` opts out by name, and prints the offered
+fingerprint as a warning before the token is sent. The command doesn't add `[cluster].join`, copy the
 cluster master key, start Bun or claim that gossip membership has converged;
 those are explicit provisioning and startup steps. Port 9443 is a gossip seed,
 not a valid API address for this command.

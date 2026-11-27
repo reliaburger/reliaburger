@@ -3,8 +3,9 @@
 //! [`crate::council::fence`] holds the state machine. This module feeds it
 //! from gossip and keeps it on disk: a restarted voter waits for its peers'
 //! advertised epochs before it serves Raft, any node that sees a newer epoch
-//! (or its own epoch from a different recovery) in gossip fences itself, and
-//! every change is persisted, with retries, so a fence survives restarts. It
+//! (or its own epoch from a different recovery) in gossip asks its council's
+//! voters, and fences itself if one of them serves it, and every change is
+//! persisted, with retries, so a fence survives restarts. It
 //! also keeps fenced nodes out of the reconciler's candidates, since a node
 //! that refuses every Raft RPC can never catch up.
 
@@ -35,6 +36,10 @@ pub fn default_probe_window(gossip: &crate::mustard::GossipConfig) -> Duration {
 /// How often a probing node looks again for its persisted membership while
 /// openraft is still loading it.
 const MEMBERSHIP_RECHECK: Duration = Duration::from_millis(200);
+
+/// The shortest gap between two rounds of asking the council's voters about
+/// a newer epoch gossip claims.
+pub const FENCE_CONFIRM_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How long the supervisor waits before retrying a fence write that failed.
 pub const FENCE_PERSIST_RETRY: Duration = Duration::from_secs(5);
@@ -187,13 +192,19 @@ pub struct FenceSupervisorInputs {
     pub probe_window: Duration,
 }
 
-/// Feed `fence` from gossip, end the startup probe, and persist every
-/// change, retrying failed writes every [`FENCE_PERSIST_RETRY`]. Runs until
-/// `shutdown`; the caller spawns it. `peers` names the members of this
-/// node's persisted membership other than itself (`None` until it loads).
+/// Watch gossip for newer recovery epochs, end the startup probe, and
+/// persist every change, retrying failed writes every
+/// [`FENCE_PERSIST_RETRY`]. Runs until `shutdown`; the caller spawns it.
+/// `peers` names the members of this node's persisted membership other than
+/// itself (`None` until it loads). `ask_voters` starts, without waiting for
+/// it, a round of asking the council's voters which epoch they serve; the
+/// supervisor calls it at most once per [`FENCE_CONFIRM_INTERVAL`] while
+/// gossip claims an epoch that would move the fence. Only a voter's answer
+/// moves it (#2406).
 pub async fn supervise_recovery_fence(
     fence: RecoveryFence,
     peers: impl Fn() -> Option<BTreeSet<NodeId>>,
+    ask_voters: impl Fn(),
     inputs: FenceSupervisorInputs,
     shutdown: CancellationToken,
 ) {
@@ -209,6 +220,7 @@ pub async fn supervise_recovery_fence(
     let mut recorded: Option<FenceSnapshot> = None;
     let mut last_seen = fence.snapshot();
     let mut retry_at: Option<Instant> = None;
+    let mut asked_at: Option<Instant> = None;
     let mut gossip_live = true;
     loop {
         let now = Instant::now();
@@ -223,8 +235,24 @@ pub async fn supervise_recovery_fence(
         // opposite orders deadlocked four worker threads behind the two
         // channels' queued writers (#1273).
         let claims = directory_rx.borrow_and_update().recovery_claims.clone();
-        for claim in claims.values().flatten() {
-            fence.observe_peer(*claim);
+        // Gossip is authenticated only by a key every node holds, so a
+        // claim on it is a reason to ask the council's voters, never
+        // evidence (#2406). A voter serving a newer epoch refuses the
+        // question and names it, and the transport moves the fence.
+        let unconfirmed = claims
+            .values()
+            .flatten()
+            .any(|claim| fence.would_move(*claim));
+        let mut confirm_at = None;
+        if unconfirmed {
+            match asked_at.map(|at| at + FENCE_CONFIRM_INTERVAL) {
+                Some(next) if now < next => confirm_at = Some(next),
+                _ => {
+                    ask_voters();
+                    asked_at = Some(now);
+                    confirm_at = Some(now + FENCE_CONFIRM_INTERVAL);
+                }
+            }
         }
         if fence.snapshot().state == FenceState::Probing {
             let peers = peers();
@@ -296,6 +324,7 @@ pub async fn supervise_recovery_fence(
             }
             _ = sleep_until_some(wake), if wake.is_some() => {}
             _ = sleep_until_some(retry_at), if retry_at.is_some() => {}
+            _ = sleep_until_some(confirm_at), if confirm_at.is_some() => {}
         }
     }
 }
@@ -311,13 +340,19 @@ async fn sleep_until_some(deadline: Option<Instant>) {
 pub fn spawn_recovery_fence_supervisor(
     fence: RecoveryFence,
     council: Arc<CouncilNode>,
+    admission: crate::council::admission::RaftAdmission,
     inputs: FenceSupervisorInputs,
     self_name: String,
     shutdown: CancellationToken,
 ) {
     tokio::spawn(async move {
         let peers = || persisted_peers(&council, &self_name);
-        supervise_recovery_fence(fence, peers, inputs, shutdown).await;
+        let ask_voters = || {
+            let admission = admission.clone();
+            let raft = council.raft().clone();
+            tokio::spawn(async move { admission.ask_voters_for_their_epoch(&raft).await });
+        };
+        supervise_recovery_fence(fence, peers, ask_voters, inputs, shutdown).await;
     });
 }
 
@@ -450,6 +485,11 @@ mod tests {
         directory_tx: watch::Sender<NodeDirectory>,
         synced_tx: watch::Sender<bool>,
         shutdown: CancellationToken,
+        /// The epoch the council's voters serve. Asking them shows this
+        /// node that epoch, as a refusal over the Raft transport would.
+        voters_epoch: Arc<std::sync::atomic::AtomicU64>,
+        /// How many times the supervisor asked the voters.
+        asked: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     fn probing_fence(file: Option<std::path::PathBuf>) -> RecoveryFence {
@@ -466,12 +506,24 @@ mod tests {
     /// The supervisor future for `fence`, whose persisted peers are `n2` and
     /// `n3`, plus the senders that drive it.
     fn rig(fence: RecoveryFence) -> (Rig, impl Future<Output = ()>) {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
         let (directory_tx, directory_rx) = watch::channel(NodeDirectory::default());
         let (synced_tx, gossip_synced_rx) = watch::channel(false);
         let shutdown = CancellationToken::new();
+        let voters_epoch = Arc::new(AtomicU64::new(0));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let (answering, counting, asked_fence) =
+            (Arc::clone(&voters_epoch), Arc::clone(&asked), fence.clone());
         let supervisor = supervise_recovery_fence(
             fence.clone(),
             || Some(peers(&["n2", "n3"])),
+            move || {
+                counting.fetch_add(1, Ordering::SeqCst);
+                asked_fence.observe_peer(RecoveryClaim {
+                    epoch: answering.load(Ordering::SeqCst),
+                    id: None,
+                });
+            },
             FenceSupervisorInputs {
                 directory_rx,
                 gossip_synced_rx,
@@ -484,6 +536,8 @@ mod tests {
             directory_tx,
             synced_tx,
             shutdown,
+            voters_epoch,
+            asked,
         };
         (rig, supervisor)
     }
@@ -556,15 +610,65 @@ mod tests {
         supervisor.await;
     }
 
+    /// A newer epoch in gossip is a reason to ask the council's voters,
+    /// and a voter that serves it fences the node (#2406).
     #[tokio::test(start_paused = true)]
     async fn a_newer_epoch_heard_during_the_probe_fences_the_node() {
         let (rig, supervisor) = rig(probing_fence(None));
         tokio::pin!(supervisor);
+        rig.voters_epoch
+            .store(1, std::sync::atomic::Ordering::SeqCst);
         rig.directory_tx.send_replace(directory(&[("n2", Some(1))]));
         run_for(&mut supervisor, Duration::from_millis(10)).await;
         assert_eq!(rig.fence.snapshot().fenced_by(), Some(1));
         rig.shutdown.cancel();
         supervisor.await;
+    }
+
+    /// Gossip is authenticated only by a key every node holds, so a claim
+    /// on it is never evidence by itself (#2406). `n9` claims a newer epoch;
+    /// the voters still serve epoch 0, so the node stays serving, and asks
+    /// them again only after [`FENCE_CONFIRM_INTERVAL`].
+    #[tokio::test(start_paused = true)]
+    async fn a_newer_epoch_claimed_by_a_node_outside_the_council_does_not_fence() {
+        use std::sync::atomic::Ordering;
+        let (serving, supervisor) = rig(RecoveryFence::serving(0));
+        tokio::pin!(supervisor);
+        serving
+            .directory_tx
+            .send_replace(directory(&[("n9", Some(1))]));
+        run_for(&mut supervisor, Duration::from_millis(10)).await;
+        assert!(!serving.fence.is_fenced(), "{:?}", serving.fence.snapshot());
+        assert_eq!(serving.asked.load(Ordering::SeqCst), 1);
+
+        // Gossip repeating the claim doesn't make the node ask again at once.
+        serving
+            .directory_tx
+            .send_replace(directory(&[("n9", Some(1)), ("n3", Some(0))]));
+        run_for(&mut supervisor, Duration::from_millis(10)).await;
+        assert_eq!(serving.asked.load(Ordering::SeqCst), 1);
+        run_for(&mut supervisor, FENCE_CONFIRM_INTERVAL).await;
+        assert_eq!(serving.asked.load(Ordering::SeqCst), 2);
+        assert!(!serving.fence.is_fenced());
+
+        // A node with no epoch can't be pushed above the real council's by
+        // gossip either: the claim never raises its floor.
+        let (fresh, supervisor) = rig(RecoveryFence::new(
+            FenceSnapshot {
+                epoch: 0,
+                recovery_id: None,
+                state: FenceState::Unclaimed,
+            },
+            None,
+        ));
+        tokio::pin!(supervisor);
+        fresh
+            .directory_tx
+            .send_replace(directory(&[("n9", Some(u64::MAX))]));
+        run_for(&mut supervisor, Duration::from_millis(10)).await;
+        assert_eq!(fresh.fence.snapshot().epoch, 0);
+        serving.shutdown.cancel();
+        fresh.shutdown.cancel();
     }
 
     // #1273: the supervisor read the persisted membership (openraft's
@@ -608,6 +712,7 @@ mod tests {
         let supervisor = supervise_recovery_fence(
             probing_fence(None),
             peers,
+            || {},
             FenceSupervisorInputs {
                 directory_rx,
                 gossip_synced_rx,

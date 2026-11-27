@@ -13,7 +13,7 @@ ask any node and
 it gathers from every node that runs the app:
 
 ```sh
-relish logs web                  # everything captured
+relish logs web                  # the newest 10,000 lines
 relish logs web --tail 20 -f     # last 20 per replica, then follow
 relish logs web --grep error --since 1h
 relish logs web --grep 'GET /(healthz|ready)' --since 2h --until 1h
@@ -21,6 +21,12 @@ relish logs web --instance default__web-2      # one replica
 relish logs web --stream stderr                # only what it wrote to stderr
 relish logs web --json-field level=warn
 ```
+
+Without `--tail`, you get the newest 10,000 lines across the cluster, and a
+`warning: showing the newest 10000 lines` on stderr when there were more. Ask
+for an older stretch with `--since` and `--until`, or for more with `--tail`,
+up to 100,000. A query that runs longer than 8 seconds on a node is refused
+with a 400 asking you to narrow it, so give a busy app a time window.
 
 `--grep` is a regular expression, matched anywhere in the line, so quote it
 for your shell. A pattern that won't compile is refused before anything is
@@ -171,6 +177,22 @@ doesn't answer becomes a `warning:` line rather than an error:
 ```sh
 relish top                       # every node's workloads, with CPU and memory
 ```
+
+Each node also sends the council a one-minute summary of every series it
+has, which is what `/v1/metrics/cluster` sums. A node with many series sends
+its minute in several parts; if a single series is too large to send at all
+(a label holding a megabyte, say), the node counts it in its own
+`mayo_rollups_refused_total` metric and logs it.
+
+The metrics API answers within bounds. `GET /v1/metrics?name=X` and
+`/v1/metrics/rollup?name=X` return at most the newest 10,000 rows of the
+range you ask for, `/v1/metrics/summary` and `/v1/metrics/keys` list the
+metrics reported in the last hour, and a query that runs longer than 8
+seconds is refused with a 400 asking for a narrower range.
+`/v1/metrics/cluster` reads the last hour when you give no `start`. A council
+member that refuses a range (more than 200,000 node-minute contributions, or
+one minute holding more than 10,000) shows up in the answer's `warnings` as
+`QueryRefused` with its reason, not as an unresponsive node.
 
 ### Remote metrics archives
 

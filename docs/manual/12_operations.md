@@ -8,7 +8,10 @@ cluster, and getting the council back when everything else has gone wrong.
 `relish upgrade` rolls a new `bun` across the cluster: workers first
 (`--parallel` at a time), then council members one by one, the leader last.
 The new binary adopts running workloads without restarting them, and one that
-crash-loops on boot reverts to the previous version by itself. Adopted
+crash-loops on boot reverts to the previous version by itself, even one that
+exits before it has read its config. It counts each start, and after
+`[upgrades] max_boot_attempts` + 1 failed starts it puts the previous version
+back. Adopted
 replicas stay on their node: while a restarted bun's subsystems are still in
 their first start, the leader keeps that node's placements and places nothing
 new there. (Up to 0.2.3, a bun restart in a multi-node cluster could move its
@@ -141,6 +144,14 @@ recorded:
 ```text
 refusing to upgrade to v0.2.0: incompatible binary: found protocol 51, state 68; this cluster (reliaburger v0.1.6 (…)) needs protocol 46, state 63. …
 ```
+
+From 0.3.4 `bun --compatibility` also prints the binary's own version, and
+the check refuses a binary that says it's a different version from the one
+you asked for, such as `bun-v0.3.1` copied in as `bun-v0.3.5`. The signatures
+prove the bytes are a release, not which release. A binary from before 0.3.4
+doesn't say its version, so it can only be a downgrade and needs
+`--allow-downgrade`. If a swapped-in binary still turns out to be neither the
+old nor the new version, the node reverts to the old one by itself.
 
 The candidate gets 60 seconds to answer. It normally takes milliseconds, but
 on macOS the first run of a new executable waits while the system assesses
@@ -291,6 +302,14 @@ cluster and the release share a pair.
    relish upgrade plan v0.2.1 --cluster-size 8
    ```
 
+   A node gossip has `dead` or `left` can't take a binary, so the run leaves
+   it out. `plan` lists such nodes under their own heading, `start` prints
+   `not upgrading 1 node that is down: node-5 (dead); it will still run its
+   current version when it returns`, and `status` names every member the run
+   didn't cover, with "on 7 of 8 nodes" once it's finished. A node that comes
+   back runs its old version, and `relish wtf` shows `version-skew` until you
+   upgrade it. A node that joins while the run is going is left out too.
+
 4. Start it. relish downloads each node's build, countersigns it with your
    key and pushes it to the cluster's registry; each node fetches it, checks
    both signatures and swaps itself.
@@ -363,7 +382,7 @@ holds the `bun-<platform>` binaries for the signature check and
 `--release-url` points at a mirror of the release downloads instead.
 
 ```sh
-gh release download v0.3.2 --repo reliaburger/reliaburger --pattern metadata.json --pattern cli-metadata.json --pattern 'bun-*' --dir release
+gh release download v0.3.3 --repo reliaburger/reliaburger --pattern metadata.json --pattern cli-metadata.json --pattern 'bun-*' --dir release
 relish verify --metadata release/metadata.json --cli-metadata release/cli-metadata.json --artefacts release
 ```
 
@@ -792,7 +811,9 @@ isn't fenced; `--force` overrides that for an old voter that never heard of the
 recovery.
 
 The fence has one gap. An old voter learns of the new epoch only from a node
-that holds it. **After `council recover`, don't start the old voters where
+that holds it: a recovered node it dials, or a voter of its own council that
+serves the new epoch when it asks. A claim it merely hears over gossip makes
+it ask, but doesn't fence it, because any node could forge one. **After `council recover`, don't start the old voters where
 they can reach each other but never the recovered side.** Wipe them with
 `relish council re-enrol` first, or keep them stopped until they can see the
 recovered council. If two of them do come back cut off from it, they form a

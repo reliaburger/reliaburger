@@ -1255,10 +1255,10 @@ pub(super) async fn join_token_create_handler(
     };
     let (plaintext, join_token) = match created {
         Ok(created) => created,
-        Err(crate::sesame::join::JoinError::EmptyNodeId) => {
+        Err(error @ crate::sesame::join::JoinError::InvalidNodeId(_)) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "node_id is required" })),
+                Json(serde_json::json!({ "error": error.to_string() })),
             )
                 .into_response();
         }

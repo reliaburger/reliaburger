@@ -217,6 +217,15 @@ the wrapped age keys and the wrapped Ingress CA key. It drops the root, Node
 and Workload CA keys, the OIDC signing key, join tokens, secret seals,
 pending intermediates and the serial counter.
 
+Where the leader is comes from gossip, and gossip is authenticated only by
+a key every node holds, so a forged leader hint could have pointed seatless
+nodes at a compromised worker (#2406). The node therefore asks only a node
+that is a voter of the council it knows: its own Raft membership, or, while
+it has none, the council `relish join` saved beside its identity
+(`council.json`, see `docs/design/gossip-mustard.md`, "Council membership
+check"). The TLS connection is bound to that voter's node id, and a node that
+isn't a voter is refused before the service token leaves the node.
+
 ---
 
 ## 4. Data Structures
@@ -1901,7 +1910,7 @@ council_size = 3
 
 ### 7.3 Join Token Leak
 
-**Scenario:** A join token is accidentally exposed (e.g., CI logs, terminal recording).
+**Scenario:** A join token is accidentally exposed (e.g., CI logs, terminal recording), or captured on the wire by a host that answers `relish join`'s first, unverified request with its own CA.
 
 **Impact:** An attacker with the token can join a rogue node to the cluster within the token's TTL (default 15 minutes).
 
@@ -1911,6 +1920,7 @@ council_size = 3
 - Tokens are short-lived: default 15 minutes.
 - Tokens are output to stderr only, never written to disk or structured logs.
 - Each token enrols exactly one node id, the one it was created for.
+- `relish join` requires `--ca-fingerprint` (#2410). It fetches the cluster CA over a connection that can't verify anything yet, so without the pin a host on the path could offer its own CA, receive the token over a connection that CA vouches for, and spend it against the real cluster within its TTL. With the pin, a different root is refused before the token is sent. `--insecure-trust-first-ca` opts out by name and prints the offered fingerprint as a warning, still before the token is sent. The appliance seed and the quickstart scripts always pin.
 - TPM attestation, where the token alone wouldn't be enough, is planned.
 - If a leak is suspected before the token is consumed: `relish join-token revoke <node-id>` revokes every unused token for that node id. Once the TTL has passed, the token is useless anyway.
 - If a rogue node has already joined: `relish decommission-node <rogue-node> --workloads-stopped --reason "..."` retires its id, and every node refuses its certificate within five seconds (§5.7). Revoking its certificate by serial with `relish ca revoke` is planned (#362).

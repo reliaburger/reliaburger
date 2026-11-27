@@ -6664,6 +6664,17 @@
           ]
         },
         {
+          "id": "legacy-ci-reliaburger-self_upgrade-an_upgrade_that_fails_before_config_load_reverts_by_itself",
+          "binary": "reliaburger::self_upgrade",
+          "test": "an_upgrade_that_fails_before_config_load_reverts_by_itself",
+          "requires": [
+            "upgrade-node"
+          ],
+          "sources": [
+            "tests/self_upgrade.rs"
+          ]
+        },
+        {
           "id": "legacy-ci-reliaburger-self_upgrade-version_retention_gc_keeps_last_three",
           "binary": "reliaburger::self_upgrade",
           "test": "version_retention_gc_keeps_last_three",

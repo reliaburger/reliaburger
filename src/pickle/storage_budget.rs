@@ -238,6 +238,14 @@ impl StorageBudget {
         state.limit = Some(limit);
         Ok(())
     }
+    /// Bytes still free under the ceiling, or `None` when there is none.
+    pub(super) fn remaining(&self) -> Result<Option<u64>, PickleError> {
+        let state = self.lock()?;
+        Ok(state
+            .limit
+            .filter(|limit| *limit != 0)
+            .map(|limit| limit.saturating_sub(state.used)))
+    }
     #[cfg(test)]
     pub(super) fn set_file_limit(&self, limit: usize) -> Result<(), PickleError> {
         self.lock()?.file_limit = limit;
