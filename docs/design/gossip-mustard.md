@@ -295,6 +295,13 @@ In the planned tree, each non-council node is assigned to a specific council mem
 
 Under that planned design, with a council of 7 and 10,000 total nodes each council member would aggregate reports from ~1,400 worker nodes. **Today, with the flat star, the leader receives all ~10,000 StateReports itself** — which is exactly why the two-level tree is the documented next step for large clusters. Workers send full StateReports at the reporting interval (default 5 seconds).
 
+**Admission at the leader's report listener** (`TcpReportingTransport::accept_loop` in `src/reporting/transport.rs`). Every node, the leader included, reports over TCP (mTLS when the node has an identity) to the leader's reporting port, one connection per message. The listener keeps two budgets so that a socket which proves nothing can't take a slot a report needs (#2380):
+
+- **Pending** (`MAX_PENDING_CONNECTIONS`, 64): from accept until the whole length-prefixed frame has arrived, including the TLS handshake that checks the client certificate. One source address may hold at most `MAX_PENDING_PER_SOURCE` (4) of them; loopback is exempt, since the hollow-node harness runs every node on 127.0.0.1. When the budget is full and a new connection is waiting, the oldest pending connection is closed once it has been pending for `PENDING_EVICTION_AGE` (1 s); until then the newcomer waits and later connections queue in the kernel's listen backlog.
+- **Admission** (`MAX_REPORT_CONNECTIONS`, 64): a connection with a whole frame waits here for room in the aggregator's 256-deep queue, and is acknowledged only once queued. A sender whose report finds no room inside its ten-second deadline gets no acknowledgement and counts the report as refused (#1411).
+
+A connection task gives back its pending slot only after it holds an admission slot, so there are never more than 128 connection tasks. The aggregator stores everything queued and publishes its view once per burst (#1411); it reconciles its freshness table with gossip membership only when membership or the leadership epoch changes, never per report (#2440).
+
 When (in the planned tree) a council member departs, its assigned workers re-hash to the remaining council members and the new parent receives a full StateReport on the next cycle. In the flat star there is only ever one parent — the leader — so a leader change simply re-points every worker at the new leader.
 
 ---
