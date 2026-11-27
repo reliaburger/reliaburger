@@ -611,6 +611,12 @@ class TrainAndQueueTests(unittest.TestCase):
         self.assertIn("RELEASE_GATE: ${{ contains(github.event.pull_request.labels.*.name, 'release-gate') }}",
                       blocks[aggregate])
         self.assertIn('--release-gate "$RELEASE_GATE"', blocks[aggregate])
+        # A ready gate PR without the label is refused there (#2483).
+        for line in ("HEAD_REF: ${{ github.event.pull_request.head.ref }}",
+                     "BASE_REF: ${{ github.event.pull_request.base.ref }}",
+                     "DRAFT: ${{ github.event.pull_request.draft == true }}",
+                     '--head-ref "$HEAD_REF" --base-ref "$BASE_REF" --draft "$DRAFT"'):
+            self.assertIn(line, blocks[aggregate])
         # The owner check still reports when another job failed, so one red
         # job doesn't hide whether the evidence was complete.
         self.assertIn("if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}", blocks[aggregate])

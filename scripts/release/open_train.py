@@ -221,7 +221,9 @@ class Opener:
         if existing:
             self.say(f"4. gate PR #{existing[0]} is open")
             return
-        create = ["pr", "create", "-R", REPOSITORY, "--base", "main", "--head", self.train,
+        # A draft: a ready gate PR without the release-gate label fails the
+        # required check (#2483), and the label goes on at code freeze.
+        create = ["pr", "create", "-R", REPOSITORY, "--draft", "--base", "main", "--head", self.train,
                   "--title", f"Release {self.milestone}", "--milestone", self.milestone,
                   "--body", gate_pr_body(self.train, self.milestone)]
         ahead = 0

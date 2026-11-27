@@ -1105,15 +1105,20 @@ jobs:
       - name: Every selected owner and exact required case completed this run
         if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
         env:
-          # The release gate PR qualifies only with every owner (#1443).
+          # The release gate PR qualifies only with every owner (#1443), and
+          # a train's gate PR into main that is out of draft must carry the
+          # label (#2483), so this required check stays red until it does.
           RELEASE_GATE: ${{ contains(github.event.pull_request.labels.*.name, 'release-gate') }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          DRAFT: ${{ github.event.pull_request.draft == true }}
         run: |
           python3 scripts/ci/workflow_adapter.py aggregate --root . \
             --manifest tests/contracts/manifest.json --directory incoming \
             --ignored-bindings tests/contracts/ignored-bindings.json \
             --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" \
             --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --event "$GITHUB_EVENT_NAME" \
-            --release-gate "$RELEASE_GATE"
+            --release-gate "$RELEASE_GATE" --head-ref "$HEAD_REF" --base-ref "$BASE_REF" --draft "$DRAFT"
 
   macos:
     outputs:

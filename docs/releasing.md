@@ -107,10 +107,29 @@ treats the three kinds of run differently ([which jobs run](testing.md#which-job
   freeze, label it `release-gate`: from then on it runs everything, and the
   evidence gate refuses it without every owner, macOS included. Merging it
   pushes to `main`, which runs everything again, and that run is the one the
-  candidate build reuses.
+  candidate build reuses. The gate PR is opened as a draft, and once it's
+  ready for review the evidence gate refuses it until it carries the
+  label, so it can't merge on the light set
+  ([#2483](https://github.com/reliaburger/reliaburger/issues/2483)).
 
 So nothing reaches a train without every Linux job having passed on that
-exact commit, and nothing reaches `main` without the full set. macOS runs on
+exact commit, and nothing reaches `main` without the full set. What enforces
+each half:
+
+- **The train**: ruleset 25015244 ("release trains merge queue") requires the
+  merge queue and the `ignored-test evidence` check on every named train.
+- **`main`**: `ignored-test evidence` is red on a ready gate PR without the
+  `release-gate` label, and on any run missing an owner its selection needs.
+  It blocks the merge only where a ruleset requires it: ruleset 13556416
+  ("protect main") must list `pull_request` and `required_status_checks`
+  for that check. Changing a ruleset is the maintainer's; until it lists
+  both, merging a red gate PR is possible and the rule above is a
+  convention, with `ci_reuse.py` as the backstop (a candidate never rests on
+  a run that skipped a job). Check what `main` enforces with:
+
+  ```
+  gh api repos/reliaburger/reliaburger/rules/branches/main --jq '[.[].type]'
+  ``` macOS runs on
 the push to `main` and on `main`'s nightly, on the newest train every night,
 on the release gate PR and on the candidate build, but not on ordinary pull
 requests or in the merge queue: the organisation's plan runs at most five

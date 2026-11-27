@@ -1192,6 +1192,19 @@ with `git show` into a variable and matches it with `case`, not `git show | grep
 `set -o pipefail`, `grep -q` exits at its first match, `git show` can die of `SIGPIPE`
 writing the rest, and the pipeline then reports failure for a file that matched.
 
+"The maintainer labels it at code freeze" is a habit, though, and a habit is what the audit
+of November 2026 found doing the work of a lock
+([#2483](https://github.com/reliaburger/reliaburger/issues/2483)). `main`'s ruleset forbade
+deleting the branch and rewriting its history, and nothing else: no required check, no required
+pull request. An unlabelled gate PR ran the light set, went green, and its merge button worked.
+There are two halves to fixing that. The code half is ours: the evidence gate now refuses a
+`release-*` pull request into `main` that's out of draft and has no `release-gate` label, with
+a message saying to add it, and `open_train.py` opens the gate PR as a draft. The other half is
+a repository setting, a ruleset that makes `ignored-test evidence` a required check on `main`,
+and changing who may merge what is the maintainer's call, not an agent's. So the runbook now
+says which ruleset enforces each sentence, and gives the one `gh api` command that shows whether
+it does.
+
 Three weeks later we undid the split. By November the macOS queue was worse, not better:
 over three days, 147 macOS jobs queued a median of 6.9 minutes, but 90 at p90. The job logs
 said why. Shard 3 of one run spent 30 minutes compiling and 3.1 testing; on `main`, with a

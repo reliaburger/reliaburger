@@ -178,6 +178,8 @@ class OpenTrainTests(unittest.TestCase):
         self.assertEqual(len(writes), 1)
         self.assertEqual(writes[0][:2], ["pr", "create"])
         self.assertIn("--milestone", writes[0])
+        # Ready without the release-gate label, it would fail its required check.
+        self.assertIn("--draft", writes[0])
 
     def test_fails_when_the_branch_still_has_no_queue(self):
         github = FakeGitHub(branch_rules=[{"type": "deletion"}])
