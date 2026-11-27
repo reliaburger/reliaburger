@@ -12,7 +12,7 @@ use openraft::storage::{LogFlushed, LogState, RaftLogStorage};
 use openraft::{Entry, LogId, RaftLogReader, StorageError, Vote};
 use tokio::sync::Mutex;
 
-use super::types::TypeConfig;
+use super::types::{LOG_READ_BUDGET_BYTES, TypeConfig, json_len};
 
 // ---------------------------------------------------------------------------
 // Inner state
@@ -50,6 +50,22 @@ impl LogStoreInner {
             .range(range)
             .map(|(_, entry)| entry.clone())
             .collect()
+    }
+
+    /// [`Self::read_range`] bounded by bytes as the durable log bounds it:
+    /// stop before the entry that takes the batch's JSON past
+    /// [`LOG_READ_BUDGET_BYTES`], but always return the first (#2370).
+    fn read_range_limited(&self, start: u64, end: u64) -> Vec<Entry<TypeConfig>> {
+        let mut out = Vec::new();
+        let mut bytes = 0usize;
+        for entry in self.log.range(start..end).map(|(_, entry)| entry) {
+            bytes = bytes.saturating_add(json_len(entry));
+            if bytes > LOG_READ_BUDGET_BYTES && !out.is_empty() {
+                break;
+            }
+            out.push(entry.clone());
+        }
+        out
     }
 
     fn truncate_since(&mut self, index: u64) {
@@ -132,6 +148,15 @@ impl RaftLogReader<TypeConfig> for MemLogReader {
         let guard = self.inner.lock().await;
         Ok(guard.read_range(range))
     }
+
+    async fn limited_get_log_entries(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<Entry<TypeConfig>>, StorageError<u64>> {
+        let guard = self.inner.lock().await;
+        Ok(guard.read_range_limited(start, end))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +170,15 @@ impl RaftLogReader<TypeConfig> for MemLogStore {
     ) -> Result<Vec<Entry<TypeConfig>>, StorageError<u64>> {
         let guard = self.inner.lock().await;
         Ok(guard.read_range(range))
+    }
+
+    async fn limited_get_log_entries(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<Entry<TypeConfig>>, StorageError<u64>> {
+        let guard = self.inner.lock().await;
+        Ok(guard.read_range_limited(start, end))
     }
 }
 
@@ -391,6 +425,37 @@ mod tests {
         };
         let entries = reader.try_get_log_entries(5..10).await.unwrap();
         assert!(entries.is_empty());
+    }
+
+    /// #2370: the in-memory reader bounds an AppendEntries batch by bytes,
+    /// as the durable one does, and never answers a non-empty range with
+    /// nothing.
+    #[tokio::test]
+    async fn a_bounded_read_stops_at_the_byte_budget_but_returns_at_least_one_entry() {
+        use crate::council::types::{LOG_READ_BUDGET_BYTES, RaftRequest};
+        let store = MemLogStore::new();
+        let mib = 1024 * 1024;
+        let big = |index: u64, bytes: usize| Entry {
+            log_id: log_id(1, index),
+            payload: openraft::EntryPayload::Normal(RaftRequest::ConfigSet {
+                key: format!("key-{index}"),
+                value: "x".repeat(bytes),
+            }),
+        };
+        {
+            let mut guard = store.inner.lock().await;
+            guard.append_entries((1..=10).map(|index| big(index, mib)));
+            guard.append_entries(vec![big(11, LOG_READ_BUDGET_BYTES + mib)]);
+        }
+        let mut reader = MemLogReader {
+            inner: Arc::clone(&store.inner),
+        };
+        let entries = reader.limited_get_log_entries(1, 11).await.unwrap();
+        assert!(!entries.is_empty());
+        assert!(entries.len() <= LOG_READ_BUDGET_BYTES / mib);
+        assert_eq!(entries[0].log_id.index, 1);
+        let entries = reader.limited_get_log_entries(11, 12).await.unwrap();
+        assert_eq!(entries.len(), 1);
     }
 
     #[tokio::test]

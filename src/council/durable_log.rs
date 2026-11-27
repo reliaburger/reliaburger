@@ -21,7 +21,7 @@ use openraft::storage::{LogFlushed, LogState, RaftLogStorage};
 use openraft::{Entry, LogId, RaftLogReader, StorageError, StorageIOError, Vote};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
-use super::types::TypeConfig;
+use super::types::{LOG_READ_BUDGET_BYTES, TypeConfig};
 use crate::sesame::raft_encryption::{self, EncryptedEntry};
 
 /// Log entries: index → JSON `Entry`, or the marker byte and a postcard
@@ -45,6 +45,114 @@ const PURGED_KEY: &str = "last_purged";
 /// (an unreadable log must not be mistaken for a fresh one, CP3).
 const ENCRYPTED_MARKER: u8 = 0x01;
 
+/// How long a committed pointer may wait in memory for an append to carry
+/// it to disk before it gets a durable commit of its own (#2437).
+const COMMITTED_FLUSH_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The committed pointer openraft saved most recently, and whether it has
+/// reached disk yet (#2437).
+#[derive(Default)]
+struct CommittedState {
+    latest: Option<LogId<u64>>,
+    /// `latest` isn't on disk yet.
+    dirty: bool,
+    /// Bumped on every save, so a write that carried an older pointer
+    /// doesn't mark a newer one clean.
+    generation: u64,
+}
+
+/// The committed pointer in memory, shared by every clone of a store.
+///
+/// openraft saves the pointer before every apply. Writing it in a durable
+/// commit of its own cost a second fsync per committed batch, so instead it
+/// waits here and rides on the next append's commit. When no append follows
+/// within [`COMMITTED_FLUSH_DELAY`] it is flushed on its own, and when the
+/// last handle to the store is dropped (a clean stop) it is flushed then.
+struct CommittedPointer {
+    db: Arc<Database>,
+    // A std mutex: held only to copy or set a few fields, never across an
+    // await, and also taken in `Drop` and on the blocking pool, where an
+    // async lock can't be.
+    state: std::sync::Mutex<CommittedState>,
+    /// A delayed flush is already waiting.
+    flush_scheduled: std::sync::atomic::AtomicBool,
+}
+
+impl CommittedPointer {
+    fn lock(&self) -> std::sync::MutexGuard<'_, CommittedState> {
+        // A panic while holding this lock leaves plain data behind, still
+        // valid, so a poisoned lock is used as it is.
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The pointer an append should carry: `Some` when one is waiting.
+    fn pending(&self) -> Option<(LogId<u64>, u64)> {
+        let state = self.lock();
+        match (state.dirty, state.latest) {
+            (true, Some(latest)) => Some((latest, state.generation)),
+            _ => None,
+        }
+    }
+
+    /// Note that the pointer of `generation` reached disk.
+    fn written(&self, generation: u64) {
+        let mut state = self.lock();
+        if state.generation == generation {
+            state.dirty = false;
+        }
+    }
+
+    /// Write a waiting pointer in a durable commit of its own. Blocking.
+    fn flush(&self) -> Result<bool, StorageError<u64>> {
+        let Some((latest, generation)) = self.pending() else {
+            return Ok(false);
+        };
+        let bytes = postcard::to_stdvec(&latest).map_err(write_err)?;
+        let wtx = self.db.begin_write().map_err(write_err)?;
+        {
+            let mut t = wtx.open_table(META).map_err(write_err)?;
+            t.insert(COMMITTED_KEY, bytes.as_slice())
+                .map_err(write_err)?;
+        }
+        wtx.commit().map_err(write_err)?;
+        self.written(generation);
+        Ok(true)
+    }
+}
+
+impl Drop for CommittedPointer {
+    /// The last handle to the store is gone: a clean stop. Write the newest
+    /// pointer, or `relish council recover` would replay one batch short.
+    fn drop(&mut self) {
+        // BLOCKING-OK: one small commit, once, as the store closes.
+        if let Err(error) = self.flush() {
+            eprintln!("raft: could not write the committed pointer on close: {error}");
+        }
+    }
+}
+
+/// Writes a store's waiting committed pointer on a clean stop (#2437).
+///
+/// It holds a weak reference (`std::sync::Weak`), which doesn't keep the
+/// store's database open: once every [`DurableLogStore`] handle is gone the
+/// pointer was already written by their `Drop`, and [`Self::flush`] does
+/// nothing.
+#[derive(Clone)]
+pub struct CommittedFlusher(std::sync::Weak<CommittedPointer>);
+
+impl CommittedFlusher {
+    /// Write the committed pointer if one is still waiting in memory, so
+    /// `relish council recover` replays every committed write.
+    pub async fn flush(&self) -> Result<(), StorageError<u64>> {
+        let Some(pointer) = self.0.upgrade() else {
+            return Ok(());
+        };
+        run_blocking(move || pointer.flush().map(|_| ())).await
+    }
+}
+
 /// Durable Raft log + vote storage backed by redb.
 ///
 /// `Clone` shares the underlying `Arc<Database>`, so the log reader (used by
@@ -52,6 +160,8 @@ const ENCRYPTED_MARKER: u8 = 0x01;
 #[derive(Clone)]
 pub struct DurableLogStore {
     db: Arc<Database>,
+    /// The committed pointer waiting for the next append (#2437).
+    committed: Arc<CommittedPointer>,
     /// Input key material for at-rest log encryption, or `None` for a keyless
     /// (dev / pre-security) cluster that stores entries as plaintext JSON.
     ///
@@ -60,6 +170,10 @@ pub struct DurableLogStore {
     /// [`raft_encryption::decrypt_entry`], each of which calls
     /// `derive_log_encryption_key` internally with a fresh per-entry salt.
     key: Option<Vec<u8>>,
+    /// Test hook: how many write transactions this store committed durably,
+    /// that is, with an fsync (#2437).
+    #[cfg(test)]
+    durable_commits: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Map any error into an openraft read-logs storage error.
@@ -128,9 +242,17 @@ impl DurableLogStore {
             wtx.open_table(META)?;
         }
         wtx.commit()?;
+        let db = Arc::new(db);
         Ok(Self {
-            db: Arc::new(db),
+            committed: Arc::new(CommittedPointer {
+                db: Arc::clone(&db),
+                state: std::sync::Mutex::default(),
+                flush_scheduled: std::sync::atomic::AtomicBool::new(false),
+            }),
+            db,
             key,
+            #[cfg(test)]
+            durable_commits: Arc::default(),
         })
     }
 
@@ -213,6 +335,7 @@ impl DurableLogStore {
             t.insert(key, value).map_err(write_err)?;
         }
         wtx.commit().map_err(write_err)?;
+        self.count_durable_commit();
         Ok(())
     }
 
@@ -223,6 +346,7 @@ impl DurableLogStore {
             t.remove(key).map_err(write_err)?;
         }
         wtx.commit().map_err(write_err)?;
+        self.count_durable_commit();
         Ok(())
     }
 
@@ -254,9 +378,13 @@ impl DurableLogStore {
         }
     }
 
+    /// Read the entries in `range`, in order, stopping before the entry that
+    /// would take their stored bytes past `budget`. The first entry is always
+    /// read, however large, so a non-empty range never reads as empty.
     fn read_range<RB: RangeBounds<u64>>(
         &self,
         range: RB,
+        budget: usize,
     ) -> Result<Vec<Entry<TypeConfig>>, StorageError<u64>> {
         let bounds = (
             copy_bound(range.start_bound()),
@@ -265,9 +393,15 @@ impl DurableLogStore {
         let rtx = self.db.begin_read().map_err(read_err)?;
         let t = rtx.open_table(ENTRIES).map_err(read_err)?;
         let mut out = Vec::new();
+        let mut bytes = 0usize;
         for row in t.range::<u64>(bounds).map_err(read_err)? {
             let (_, v) = row.map_err(read_err)?;
-            out.push(self.decode_value(v.value())?);
+            let stored = v.value();
+            bytes = bytes.saturating_add(stored.len());
+            if bytes > budget && !out.is_empty() {
+                break;
+            }
+            out.push(self.decode_value(stored)?);
         }
         Ok(out)
     }
@@ -278,6 +412,10 @@ impl DurableLogStore {
         &self,
         entries: impl IntoIterator<Item = Entry<TypeConfig>>,
     ) -> Result<(), StorageError<u64>> {
+        // A committed pointer waiting in memory rides on this commit, so a
+        // committed batch costs one fsync, not two (#2437). It names an
+        // entry already on disk, so the pointer is never ahead of the log.
+        let pending = self.committed.pending();
         let wtx = self.db.begin_write().map_err(write_err)?;
         {
             let mut t = wtx.open_table(ENTRIES).map_err(write_err)?;
@@ -286,10 +424,70 @@ impl DurableLogStore {
                 t.insert(entry.log_id.index, bytes.as_slice())
                     .map_err(write_err)?;
             }
+            if let Some((committed, _)) = pending {
+                let bytes = postcard::to_stdvec(&committed).map_err(write_err)?;
+                let mut meta = wtx.open_table(META).map_err(write_err)?;
+                meta.insert(COMMITTED_KEY, bytes.as_slice())
+                    .map_err(write_err)?;
+            }
         }
         // commit() fsyncs — the entries are durable once this returns.
         wtx.commit().map_err(write_err)?;
+        self.count_durable_commit();
+        if let Some((_, generation)) = pending {
+            self.committed.written(generation);
+        }
         Ok(())
+    }
+
+    /// Flush the committed pointer [`COMMITTED_FLUSH_DELAY`] from now, unless
+    /// an append has carried it to disk by then, so an idle council's last
+    /// committed write still reaches disk.
+    ///
+    /// The waiting task holds only a weak reference: it never keeps the
+    /// database open after the store's last handle is gone (which flushes
+    /// on its own, in `Drop`).
+    fn schedule_committed_flush(&self) {
+        use std::sync::atomic::Ordering;
+        if self.committed.flush_scheduled.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let pointer = Arc::downgrade(&self.committed);
+        tokio::spawn(async move {
+            tokio::time::sleep(COMMITTED_FLUSH_DELAY).await;
+            let Some(pointer) = pointer.upgrade() else {
+                return;
+            };
+            pointer.flush_scheduled.store(false, Ordering::SeqCst);
+            let result = tokio::task::spawn_blocking(move || pointer.flush()).await;
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    eprintln!("raft: could not write the committed pointer: {error}")
+                }
+                Err(error) => eprintln!("raft: the committed pointer flush failed: {error}"),
+            }
+        });
+    }
+
+    /// A handle that writes this store's waiting committed pointer on a
+    /// clean stop, without keeping the store open meanwhile (#2437).
+    pub fn committed_flusher(&self) -> CommittedFlusher {
+        CommittedFlusher(Arc::downgrade(&self.committed))
+    }
+
+    /// Test hook: count a durable commit.
+    fn count_durable_commit(&self) {
+        #[cfg(test)]
+        self.durable_commits
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test hook: how many durable (fsynced) commits this store has made.
+    #[cfg(test)]
+    fn durable_commits(&self) -> usize {
+        self.durable_commits
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn last_purged(&self) -> Result<Option<LogId<u64>>, StorageError<u64>> {
@@ -336,7 +534,19 @@ impl RaftLogReader<TypeConfig> for DurableLogReader {
         &mut self,
         range: RB,
     ) -> Result<Vec<Entry<TypeConfig>>, StorageError<u64>> {
-        self.store.read_range_blocking(range).await
+        self.store.read_range_blocking(range, usize::MAX).await
+    }
+
+    /// The entries openraft puts in one AppendEntries: at most
+    /// [`LOG_READ_BUDGET_BYTES`] of them, and never none (#2370).
+    async fn limited_get_log_entries(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<Entry<TypeConfig>>, StorageError<u64>> {
+        self.store
+            .read_range_blocking(start..end, LOG_READ_BUDGET_BYTES)
+            .await
     }
 }
 
@@ -345,7 +555,16 @@ impl RaftLogReader<TypeConfig> for DurableLogStore {
         &mut self,
         range: RB,
     ) -> Result<Vec<Entry<TypeConfig>>, StorageError<u64>> {
-        self.read_range_blocking(range).await
+        self.read_range_blocking(range, usize::MAX).await
+    }
+
+    async fn limited_get_log_entries(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<Entry<TypeConfig>>, StorageError<u64>> {
+        self.read_range_blocking(start..end, LOG_READ_BUDGET_BYTES)
+            .await
     }
 }
 
@@ -357,13 +576,14 @@ impl DurableLogStore {
     async fn read_range_blocking<RB: RangeBounds<u64>>(
         &self,
         range: RB,
+        budget: usize,
     ) -> Result<Vec<Entry<TypeConfig>>, StorageError<u64>> {
         let bounds = (
             copy_bound(range.start_bound()),
             copy_bound(range.end_bound()),
         );
         let store = self.clone();
-        run_blocking(move || store.read_range(bounds)).await
+        run_blocking(move || store.read_range(bounds, budget)).await
     }
 }
 
@@ -371,15 +591,19 @@ impl RaftLogStorage<TypeConfig> for DurableLogStore {
     type LogReader = DurableLogReader;
 
     async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<u64>> {
-        let last_purged = self.last_purged()?;
-        let last_log_id = match self.last_log_index()? {
-            Some(index) => self.read_entry(index)?.map(|e| e.log_id).or(last_purged),
-            None => last_purged,
-        };
-        Ok(LogState {
-            last_purged_log_id: last_purged,
-            last_log_id,
+        let store = self.clone();
+        run_blocking(move || {
+            let last_purged = store.last_purged()?;
+            let last_log_id = match store.last_log_index()? {
+                Some(index) => store.read_entry(index)?.map(|e| e.log_id).or(last_purged),
+                None => last_purged,
+            };
+            Ok(LogState {
+                last_purged_log_id: last_purged,
+                last_log_id,
+            })
         })
+        .await
     }
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
@@ -395,28 +619,42 @@ impl RaftLogStorage<TypeConfig> for DurableLogStore {
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<u64>>, StorageError<u64>> {
-        self.get_vote()
+        let store = self.clone();
+        run_blocking(move || store.get_vote()).await
     }
 
     async fn save_committed(
         &mut self,
         committed: Option<LogId<u64>>,
     ) -> Result<(), StorageError<u64>> {
-        let store = self.clone();
-        match committed {
-            Some(log_id) => {
-                let bytes = postcard::to_stdvec(&log_id).map_err(write_err)?;
-                run_blocking(move || store.put_meta(COMMITTED_KEY, &bytes)).await
-            }
-            None => run_blocking(move || store.del_meta(COMMITTED_KEY)).await,
+        // The vote must be durable before it's acted on; the committed
+        // pointer needn't be. openraft re-commits entries it finds in the
+        // log once a leader is known, so a pointer a crash left one batch
+        // behind costs nothing but a re-apply (#2437).
+        {
+            let mut state = self.committed.lock();
+            state.latest = committed;
+            state.dirty = committed.is_some();
+            state.generation = state.generation.wrapping_add(1);
         }
+        let Some(_) = committed else {
+            let store = self.clone();
+            return run_blocking(move || store.del_meta(COMMITTED_KEY)).await;
+        };
+        self.schedule_committed_flush();
+        Ok(())
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogId<u64>>, StorageError<u64>> {
-        match self.get_meta(COMMITTED_KEY)? {
+        if let Some((latest, _)) = self.committed.pending() {
+            return Ok(Some(latest));
+        }
+        let store = self.clone();
+        run_blocking(move || match store.get_meta(COMMITTED_KEY)? {
             Some(bytes) => Ok(Some(decode_exact(&bytes)?)),
             None => Ok(None),
-        }
+        })
+        .await
     }
 
     async fn append<I>(
@@ -458,6 +696,7 @@ impl RaftLogStorage<TypeConfig> for DurableLogStore {
                 }
             }
             wtx.commit().map_err(write_err)?;
+            store.count_durable_commit();
             Ok(())
         })
         .await
@@ -484,6 +723,7 @@ impl RaftLogStorage<TypeConfig> for DurableLogStore {
                 }
             }
             wtx.commit().map_err(write_err)?;
+            store.count_durable_commit();
             Ok(())
         })
         .await
@@ -540,6 +780,96 @@ mod tests {
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].log_id.index, 1);
         assert_eq!(entries[2].log_id.index, 3);
+    }
+
+    fn config_entry(index: u64, value_bytes: usize) -> Entry<TypeConfig> {
+        Entry {
+            log_id: log_id(1, index),
+            payload: EntryPayload::Normal(crate::council::types::RaftRequest::ConfigSet {
+                key: format!("key-{index}"),
+                value: "x".repeat(value_bytes),
+            }),
+        }
+    }
+
+    /// #2370: openraft asks for up to 300 entries per AppendEntries and
+    /// nothing bounded their bytes, so a batch of large entries made a frame
+    /// the receiver drops, for ever.
+    #[tokio::test]
+    async fn a_bounded_read_stops_at_the_byte_budget_but_returns_at_least_one_entry() {
+        use crate::council::types::LOG_READ_BUDGET_BYTES;
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DurableLogStore::open(dir.path().join("store.redb")).unwrap();
+        let mib = 1024 * 1024;
+        store
+            .write_entries((1..=10).map(|index| config_entry(index, mib)))
+            .unwrap();
+
+        let mut reader = store.get_log_reader().await;
+        let entries = reader.limited_get_log_entries(1, 11).await.unwrap();
+        assert!(!entries.is_empty());
+        assert!(
+            entries.len() <= LOG_READ_BUDGET_BYTES / mib,
+            "{} entries of 1 MiB came back for a {LOG_READ_BUDGET_BYTES}-byte budget",
+            entries.len()
+        );
+        for (offset, entry) in entries.iter().enumerate() {
+            assert_eq!(entry.log_id.index, 1 + offset as u64);
+        }
+
+        // One entry bigger than the whole budget still comes back, alone:
+        // openraft needs a non-empty answer for a non-empty range.
+        store
+            .write_entries(vec![config_entry(11, LOG_READ_BUDGET_BYTES + mib)])
+            .unwrap();
+        let entries = reader.limited_get_log_entries(11, 12).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].log_id.index, 11);
+        // The same holds from the store itself.
+        let entries = store.limited_get_log_entries(10, 12).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].log_id.index, 10);
+    }
+
+    /// #2437: openraft saves the committed pointer before every apply, and
+    /// that was a durable commit of its own: two fsyncs per committed batch.
+    #[tokio::test]
+    async fn committing_a_batch_costs_one_fsync_not_two() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DurableLogStore::open(dir.path().join("store.redb")).unwrap();
+        let before = store.durable_commits();
+        for index in 1..=10 {
+            store.write_entries(vec![entry(1, index)]).unwrap();
+            store.save_committed(Some(log_id(1, index))).await.unwrap();
+        }
+        let commits = store.durable_commits() - before;
+        assert!(
+            commits <= 11,
+            "ten appended and committed batches cost {commits} durable commits"
+        );
+    }
+
+    /// The pointer rides on the next append, so after a crash it may be one
+    /// batch behind, never ahead of the log, and a clean stop loses nothing.
+    #[tokio::test]
+    async fn a_committed_pointer_survives_a_reopen_once_the_next_append_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.redb");
+        {
+            let mut store = DurableLogStore::open(&path).unwrap();
+            for index in 1..=10 {
+                store.write_entries(vec![entry(1, index)]).unwrap();
+                store.save_committed(Some(log_id(1, index))).await.unwrap();
+            }
+            // What a crash would leave: the pointer the last append carried.
+            let on_disk: LogId<u64> =
+                decode_exact(&store.get_meta(COMMITTED_KEY).unwrap().unwrap()).unwrap();
+            assert!(on_disk >= log_id(1, 9));
+            assert!(on_disk.index <= store.last_log_index().unwrap().unwrap());
+        }
+        // A clean stop (the last handle dropped) writes the newest pointer.
+        let mut store = DurableLogStore::open(&path).unwrap();
+        assert_eq!(store.read_committed().await.unwrap(), Some(log_id(1, 10)));
     }
 
     #[test]

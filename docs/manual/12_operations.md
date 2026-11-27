@@ -662,7 +662,11 @@ Without `--from`, it rebuilds the state from the node's own Raft directory:
 its snapshot, if it has taken one, plus every committed log entry after it.
 That only works on a node that was a voter, and the log is encrypted, so pass
 `--master-key` (it defaults to `/etc/reliaburger/master.key` when that file
-exists). Entries the node hadn't seen committed are left out. It moves the dead
+exists). Entries the node hadn't seen committed are left out. A node that was
+stopped cleanly recovers every write it saw committed. A node that crashed may
+have its record of the commit point one batch behind, since that record is
+written with the next batch rather than on its own, so recovering a crashed
+survivor can leave out its newest writes. It moves the dead
 council's Raft directory aside (to `.raft-recovery-*/previous` in the data
 directory, where you can delete it once the cluster is healthy) and stamps a
 new recovery epoch, with a random recovery id that tells this recovery apart
