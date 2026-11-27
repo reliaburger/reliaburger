@@ -4,6 +4,7 @@
 //! and queryable via DataFusion SQL. Periodically flushed to Parquet
 //! files for persistence. The same architecture as InfluxDB IOx.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -903,8 +904,9 @@ struct BufferedSample {
 /// memory is its working set regardless of how much history is on disk.
 pub struct MayoStore {
     pending: Option<PendingFlush>,
-    /// In-memory buffer of unflushed samples.
-    buffer: Vec<BufferedSample>,
+    /// In-memory buffer of unflushed samples, oldest first. A ring buffer,
+    /// so shedding the oldest when full moves nothing (#2450).
+    buffer: VecDeque<BufferedSample>,
     /// Local directory for Parquet files (also the checkpoint dir under a
     /// remote backend, which otherwise ignores it).
     data_dir: PathBuf,
@@ -922,6 +924,9 @@ pub struct MayoStore {
     index: SourceIndex,
     #[cfg(test)]
     test_gate: Option<Arc<MayoWriteGate>>,
+    /// The most unflushed rows (buffer plus a pending flush) kept before
+    /// the oldest are shed: [`MAX_PENDING_METRIC_ROWS`], smaller in tests.
+    max_pending_rows: usize,
     #[cfg(test)]
     query_gate: Option<Arc<QueryGate>>,
 }
@@ -938,7 +943,7 @@ impl MayoStore {
         let flush_counter = next_flush_counter(&data_dir, "metrics");
         Self {
             pending: None,
-            buffer: Vec::new(),
+            buffer: VecDeque::new(),
             data_dir,
             backend: Backend::Local,
             flush_counter,
@@ -946,6 +951,7 @@ impl MayoStore {
             index: SourceIndex::default(),
             #[cfg(test)]
             test_gate: None,
+            max_pending_rows: MAX_PENDING_METRIC_ROWS,
             #[cfg(test)]
             query_gate: None,
         }
@@ -967,7 +973,7 @@ impl MayoStore {
         let flush_counter = 0;
         Ok(Self {
             pending: None,
-            buffer: Vec::new(),
+            buffer: VecDeque::new(),
             data_dir,
             backend: Backend::Remote { store, prefix },
             flush_counter,
@@ -975,6 +981,7 @@ impl MayoStore {
             index: SourceIndex::default(),
             #[cfg(test)]
             test_gate: None,
+            max_pending_rows: MAX_PENDING_METRIC_ROWS,
             #[cfg(test)]
             query_gate: None,
         })
@@ -1023,7 +1030,7 @@ impl MayoStore {
                 *latest = sample;
             }
         }
-        self.buffer.push(BufferedSample {
+        self.buffer.push_back(BufferedSample {
             timestamp: sample.timestamp,
             metric_name: key.name.0.clone(),
             labels_json: key.labels_json(),
@@ -1033,11 +1040,10 @@ impl MayoStore {
             .pending
             .as_ref()
             .map_or(0, |pending| pending.batch.num_rows());
-        let available = MAX_PENDING_METRIC_ROWS.saturating_sub(reserved);
-        if self.buffer.len() > available {
-            let overflow = self.buffer.len() - available;
-            self.buffer.drain(0..overflow);
-        }
+        let available = self.max_pending_rows.saturating_sub(reserved);
+        // Drop the oldest. `pop_front` on a `VecDeque` is O(1); the `Vec`
+        // this used to be moved every remaining row on each shed (#2450).
+        while self.buffer.len() > available && self.buffer.pop_front().is_some() {}
     }
 
     /// The newest sample of the node-level metric `name` (such as
@@ -2065,6 +2071,36 @@ mod tests {
             rows.windows(2).all(|pair| pair[0].0 <= pair[1].0),
             "rows must come back oldest first"
         );
+    }
+
+    /// #2450: a full buffer shed its oldest row with `Vec::drain(0..1)`,
+    /// which moved every other row down by one: about 64 MB copied per
+    /// sample, under the write lock, exactly when the node was already in
+    /// trouble. Shedding now moves nothing.
+    #[tokio::test]
+    async fn shedding_from_a_full_buffer_does_not_move_the_buffer_per_insert() {
+        // The guard is the buffer's type: a `VecDeque` sheds with
+        // `pop_front`, which moves nothing. This pins the cap still holds.
+        let (mut store, _dir) = test_store();
+        store.max_pending_rows = 1_000;
+        for timestamp in 0..2_000 {
+            store.insert(&MetricKey::simple("m"), Sample::at(timestamp, 1.0));
+        }
+        assert_eq!(store.buffer_len(), 1_000);
+    }
+
+    /// #2450: what shedding drops is the oldest, never the newest.
+    #[tokio::test]
+    async fn the_newest_samples_survive_shedding() {
+        let (mut store, _dir) = test_store();
+        store.max_pending_rows = 100;
+        for timestamp in 1..=250 {
+            store.insert(&MetricKey::simple("m"), Sample::at(timestamp, 1.0));
+        }
+        store.flush().await.unwrap();
+        let rows = store.query("m", 0, 1_000).await.unwrap();
+        let stamps: Vec<u64> = rows.iter().map(|row| row.0).collect();
+        assert_eq!(stamps, (151..=250).collect::<Vec<_>>());
     }
 
     /// #2382: a named query over all time used to return every sample of

@@ -763,7 +763,9 @@ impl DropMarker {
 /// unflushed buffer. Persisted logs survive restarts and in-memory use stays
 /// bounded to the buffer.
 pub struct LogStore {
-    buffer: Vec<BufferedLogEntry>,
+    /// Unflushed lines, oldest first. A ring buffer, so shedding the oldest
+    /// when full moves nothing (#2450).
+    buffer: std::collections::VecDeque<BufferedLogEntry>,
     pending: Option<LogPendingFlush>,
     data_dir: PathBuf,
     /// Seeded past any existing `logs_NNNNNN.parquet` so restarts don't clobber.
@@ -792,7 +794,7 @@ impl LogStore {
         let flush_counter = next_flush_counter(&data_dir, "logs");
         let ingested = IngestCheckpoint::load(&data_dir);
         Self {
-            buffer: Vec::new(),
+            buffer: std::collections::VecDeque::new(),
             pending: None,
             data_dir,
             flush_counter,
@@ -943,7 +945,7 @@ impl LogStore {
             line: line.to_string(),
         };
         self.buffer_bytes += entry.size();
-        self.buffer.push(entry);
+        self.buffer.push_back(entry);
         self.shed_overflow();
     }
 
@@ -962,18 +964,15 @@ impl LogStore {
             .map_or((0, 0), |pending| (pending.batch.num_rows(), pending.bytes));
         let row_limit = self.limits.max_rows.saturating_sub(pending_rows);
         let byte_limit = self.limits.max_bytes.saturating_sub(pending_bytes);
-        let mut rows = self.buffer.len();
-        let mut bytes = self.buffer_bytes;
         let mut overflow = 0;
-        while overflow < self.buffer.len() && (rows > row_limit || bytes > byte_limit) {
-            rows -= 1;
-            bytes -= self.buffer[overflow].size();
+        // `pop_front` on a `VecDeque` is O(1); the `Vec` this used to be
+        // moved every remaining line on each shed (#2450).
+        while self.buffer.len() > row_limit || self.buffer_bytes > byte_limit {
+            let Some(entry) = self.buffer.pop_front() else {
+                break;
+            };
             overflow += 1;
-        }
-        if overflow == 0 {
-            return;
-        }
-        for entry in self.buffer.drain(0..overflow) {
+            self.buffer_bytes -= entry.size();
             let owner = (entry.app, entry.namespace, entry.instance);
             // Lines arrive in sequence order, so the last one shed is where
             // the gap ends.
@@ -986,7 +985,6 @@ impl LogStore {
             marker.timestamp = entry.timestamp;
             marker.sequence = entry.sequence;
         }
-        self.buffer_bytes = bytes;
         self.dropped_lines += overflow as u64;
         self.dropped_unreported += overflow as u64;
     }
@@ -1935,7 +1933,7 @@ mod tests {
         }
         assert!(store.buffer_bytes <= 64 * 1024, "{}", store.buffer_bytes);
         assert!(store.buffer_len() < 100);
-        assert!(store.buffer.last().unwrap().line.starts_with("99 "));
+        assert!(store.buffer.back().unwrap().line.starts_with("99 "));
     }
 
     /// A burst that outruns flushing sheds the oldest buffered lines. They
@@ -1968,6 +1966,36 @@ mod tests {
             ]
         );
         assert_eq!(store.dropped_lines(), 3);
+    }
+
+    /// #2450: a full buffer shed its oldest line with `Vec::drain`, which
+    /// moved every other line down, under the write lock and once per
+    /// ingested line. Shedding now moves nothing, and keeps the newest.
+    #[tokio::test]
+    async fn shedding_from_a_full_log_buffer_moves_nothing_and_keeps_the_newest() {
+        let (mut store, _dir) = test_store();
+        store.limits = BufferLimits {
+            max_rows: 100,
+            max_bytes: usize::MAX,
+            flush_rows: usize::MAX,
+            flush_bytes: usize::MAX,
+        };
+        for n in 1..=250 {
+            store.append_at(n, "web", "default", LogStream::Stdout, &format!("{n}"));
+        }
+        assert_eq!(store.buffer_len(), 100);
+        store.flush().await.unwrap();
+        let entries = store
+            .query("web", "default", None, None, None, None)
+            .await
+            .unwrap();
+        let kept: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry.line.as_str())
+            .filter(|line| !line.contains("dropped"))
+            .collect();
+        let expected: Vec<String> = (151..=250).map(|n| n.to_string()).collect();
+        assert_eq!(kept, expected);
     }
 
     /// The first fix held a capture's checkpoint at the first shed line for

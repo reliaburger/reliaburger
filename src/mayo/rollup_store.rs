@@ -5,7 +5,7 @@
 //! a different schema that includes node identity and aggregate columns
 //! (min, max, sum, count) instead of a single value.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -92,8 +92,9 @@ struct BufferedRollup {
 /// Cluster-wide queries are evaluated against this store rather than
 /// fanning out to every worker node.
 pub struct RollupStore {
-    /// In-memory buffer of un-flushed rollup entries.
-    buffer: Vec<BufferedRollup>,
+    /// In-memory buffer of un-flushed rollup entries, oldest first. A ring
+    /// buffer, so shedding the oldest moves nothing (#2450).
+    buffer: VecDeque<BufferedRollup>,
     /// Directory for Parquet files.
     data_dir: PathBuf,
     /// Counter for unique Parquet file names. Seeded past any existing files so
@@ -110,6 +111,8 @@ pub struct RollupStore {
     /// Each Parquet file's time range, so a query skips the files outside
     /// its window without reading their footers (#2425).
     index: SourceIndex,
+    /// The most unflushed rows kept: [`MAX_BUFFER_ROWS`], smaller in tests.
+    max_buffer_rows: usize,
 }
 
 impl RollupStore {
@@ -121,12 +124,13 @@ impl RollupStore {
     pub fn new(data_dir: PathBuf) -> Self {
         let flush_counter = next_flush_counter(&data_dir, "rollup");
         Self {
-            buffer: Vec::new(),
+            buffer: VecDeque::new(),
             data_dir,
             flush_counter,
             seen_windows: HashSet::new(),
             newest_window: 0,
             index: SourceIndex::default(),
+            max_buffer_rows: MAX_BUFFER_ROWS,
         }
     }
 
@@ -216,7 +220,7 @@ impl RollupStore {
         for entry in &rollup.entries {
             let labels_json =
                 serde_json::to_string(&entry.labels).unwrap_or_else(|_| "{}".to_string());
-            self.buffer.push(BufferedRollup {
+            self.buffer.push_back(BufferedRollup {
                 timestamp: rollup.timestamp,
                 node_id: node_id.clone(),
                 metric_name: entry.metric_name.clone(),
@@ -230,10 +234,7 @@ impl RollupStore {
 
         // Bound the buffer: drop the oldest rows if a stuck flush let it grow
         // past the cap.
-        if self.buffer.len() > MAX_BUFFER_ROWS {
-            let overflow = self.buffer.len() - MAX_BUFFER_ROWS;
-            self.buffer.drain(0..overflow);
-        }
+        while self.buffer.len() > self.max_buffer_rows && self.buffer.pop_front().is_some() {}
         true
     }
 
@@ -1365,6 +1366,21 @@ mod tests {
         assert_eq!(rows.len(), crate::mayo::store::ALL_QUERY_ROW_LIMIT);
         assert_eq!(rows.last().unwrap().0, total * 60, "newest kept");
         assert!(rows.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    }
+
+    /// #2450: shedding from a full buffer moves no buffered row, and keeps
+    /// the newest windows.
+    #[tokio::test]
+    async fn shedding_rollups_moves_nothing_and_keeps_the_newest() {
+        let (mut store, _dir) = test_store();
+        store.max_buffer_rows = 100;
+        for minute in 1..=250 {
+            store.ingest(&make_rollup("n1", minute * 60, "cpu", 1.0));
+        }
+        assert_eq!(store.buffer_len(), 100);
+        let rows = store.query_cluster_metric("cpu", 0, 100_000).await.unwrap();
+        assert_eq!(rows.first().unwrap().0, 151 * 60);
+        assert_eq!(rows.last().unwrap().0, 250 * 60);
     }
 
     #[tokio::test]

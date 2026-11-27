@@ -1463,7 +1463,12 @@ So a drop is now an honest, counted loss. The checkpoint moves on as usual.
 Each log that lost lines gets one marker line, on stderr, where the gap is:
 
 ```rust
-for entry in self.buffer.drain(0..overflow) {
+while self.buffer.len() > row_limit || self.buffer_bytes > byte_limit {
+    let Some(entry) = self.buffer.pop_front() else {
+        break;
+    };
+    overflow += 1;
+    self.buffer_bytes -= entry.size();
     let owner = (entry.app, entry.namespace, entry.instance);
     let marker = self.drop_markers.entry(owner).or_insert(DropMarker {
         count: 0,
@@ -1476,9 +1481,24 @@ for entry in self.buffer.drain(0..overflow) {
 }
 ```
 
-`drain(0..overflow)` removes that range from the vector and hands each
-element over by value, so the loop can move the strings into the map key
-instead of copying them. The marker takes the last dropped line's sequence,
+`pop_front` hands the oldest element over by value, so the loop can move the
+strings into the map key instead of copying them. The first version of this
+loop used `self.buffer.drain(0..overflow)` on a `Vec`, which reads the same
+and hides a cost the audit caught ([#2450](https://github.com/reliaburger/reliaburger/issues/2450)):
+removing from the front of a `Vec` shifts every remaining element down to
+close the gap. At the cap that's one shed line per ingested line, and each
+shed moved a million `BufferedLogEntry`s, about 100 MB of memmove, under the
+write lock, exactly when the node was already struggling to keep up. The
+metrics buffer did the same per sample (64 MB each), and the rollup buffer
+per ingested rollup. All three buffers are now a
+`std::collections::VecDeque`, a ring buffer: it keeps its elements in a
+circular array with a head and a tail index, so pushing at the back and
+popping at the front are both O(1), where a `Vec` is O(n) at the front. The
+caps and what they drop didn't change, only what dropping costs.
+`the_newest_samples_survive_shedding` and its log and rollup twins fill past
+a small cap and check the newest rows are the ones left.
+
+The marker takes the last dropped line's sequence,
 so a query sorts it into the gap. Markers live beside the buffer, not in it,
 so they're never dropped themselves; the next flush writes them as ordinary
 rows reading "3 log lines dropped: the log store fell behind". The store also
