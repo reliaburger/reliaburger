@@ -571,9 +571,21 @@
   },
   {
     "source": "tests/ebpf.rs",
+    "function": "a_v4_mapped_connect_to_a_vip_reaches_a_backend",
+    "binary": "reliaburger::ebpf",
+    "test": "a_v4_mapped_connect_to_a_vip_reaches_a_backend"
+  },
+  {
+    "source": "tests/ebpf.rs",
     "function": "a_lapsed_view_lease_routes_only_to_local_backends",
     "binary": "reliaburger::ebpf",
     "test": "a_lapsed_view_lease_routes_only_to_local_backends"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "a_lapsed_view_lease_refuses_a_v4_mapped_remote_vip",
+    "binary": "reliaburger::ebpf",
+    "test": "a_lapsed_view_lease_refuses_a_v4_mapped_remote_vip"
   },
   {
     "source": "tests/ebpf.rs",

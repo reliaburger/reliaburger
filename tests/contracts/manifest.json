@@ -4453,9 +4453,31 @@
           ]
         },
         {
+          "id": "legacy-ci-reliaburger-ebpf-a_v4_mapped_connect_to_a_vip_reaches_a_backend",
+          "binary": "reliaburger::ebpf",
+          "test": "a_v4_mapped_connect_to_a_vip_reaches_a_backend",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        },
+        {
           "id": "legacy-ci-reliaburger-ebpf-a_lapsed_view_lease_routes_only_to_local_backends",
           "binary": "reliaburger::ebpf",
           "test": "a_lapsed_view_lease_routes_only_to_local_backends",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-ebpf-a_lapsed_view_lease_refuses_a_v4_mapped_remote_vip",
+          "binary": "reliaburger::ebpf",
+          "test": "a_lapsed_view_lease_refuses_a_v4_mapped_remote_vip",
           "requires": [
             "linux-root-storage"
           ],
