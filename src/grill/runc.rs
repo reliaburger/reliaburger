@@ -2394,7 +2394,7 @@ mod tests {
                     "/bin/sh".to_string(),
                     "-c".to_string(),
                     "grep -E '^(Seccomp|NoNewPrivs):' /proc/1/status; \
-                     echo cgroup:; ls /sys/fs/cgroup; echo end; \
+                     echo listing-start; ls /sys/fs/cgroup; echo listing-end; \
                      [ -s /proc/kcore ] && echo kcore-visible; \
                      unshare -U true 2>/dev/null && echo nested-userns"
                         .to_string(),
@@ -2409,9 +2409,9 @@ mod tests {
         assert!(probe.contains("Seccomp:\t2"), "{probe}");
         assert!(probe.contains("NoNewPrivs:\t1"), "{probe}");
         let listing = probe
-            .split("cgroup:")
+            .split("listing-start")
             .nth(1)
-            .and_then(|rest| rest.split("end").next())
+            .and_then(|rest| rest.split("listing-end").next())
             .unwrap_or_default();
         assert!(!listing.contains("reliaburger"), "{probe}");
         assert!(listing.contains("cgroup.procs"), "{probe}");
