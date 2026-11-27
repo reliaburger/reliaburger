@@ -312,6 +312,18 @@ task owns a UDP socket. A report worker owns the receiving end of a channel. Sta
 second copy may fail to bind, steal messages or leave two authorities alive. Those owners
 never auto-restart. Bun records their death and fences scheduling.
 
+One of them is too important to merely record. The agent loop is what probes, restarts,
+retires and deploys every workload on the node. When it panicked, `spawn_owned` caught it
+and marked `agent` degraded, and Bun carried on: the API answered from its last snapshot,
+nothing supervised the apps any more, and `systemctl status bun` said active, so nothing
+restarted it either (#2379). A fresh Bun, though, adopts the running workloads in seconds.
+So the loop is spawned with `spawn_fatal_owned`, which records the degradation the same way,
+then writes the reason into an `OwnerFailure` and cancels the shutdown token. `main` winds
+down as for a signal and returns that reason as an error, so Bun exits non-zero and the
+service manager starts it again, the way the council's Raft core watchdog already did.
+`OwnerFailure` is an `Arc<std::sync::OnceLock<String>>`: a cell that can be written once and
+read by anyone, so the first owner to fail names the cause and a second can't overwrite it.
+
 The security-state refresher is different. Its factory owns only cloneable handles and can
 recreate its timer from scratch, so Bun may reconstruct it. Even then the policy names a
 maximum retry count, a delay, a recovery window and a shutdown deadline. The factory takes

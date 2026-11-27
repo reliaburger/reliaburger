@@ -2514,11 +2514,15 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         ));
     }
 
-    let agent_handle = reliaburger::bun::readiness::spawn_owned(
+    // The loop is what supervises every workload: if it ends, Bun exits and
+    // the service manager starts one that adopts them (#2379).
+    let owner_failure = reliaburger::bun::readiness::OwnerFailure::default();
+    let agent_handle = reliaburger::bun::readiness::spawn_fatal_owned(
         "agent",
         true,
         readiness.clone(),
         shutdown.clone(),
+        Arc::clone(&owner_failure),
         move |ready| async move {
             agent.run_with_readiness(ready).await;
         },
@@ -4244,6 +4248,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     println!("bun: shutdown complete");
     if let Some(reason) = raft_failure.get() {
         anyhow::bail!("council Raft core stopped: {reason}");
+    }
+    if let Some(reason) = owner_failure.get() {
+        anyhow::bail!("{reason}");
     }
 
     Ok(())
