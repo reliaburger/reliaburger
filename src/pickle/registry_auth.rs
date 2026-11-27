@@ -254,6 +254,74 @@ pub fn check_repository_scope(
     }
 }
 
+/// Why a token's `[permission]` block refused a registry write.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PermissionDenied {
+    /// The block grants no `deploy` on the repository's app and namespace.
+    #[error("permission for {token:?} does not grant deploy on {app} in namespace {namespace}")]
+    App {
+        token: String,
+        namespace: String,
+        app: String,
+    },
+    /// The repository names no namespace, so only a grant for every app in
+    /// every namespace covers it, and the block isn't one.
+    #[error(
+        "permission for {token:?} does not grant deploy across the cluster, \
+         which repository {repository:?} needs because it names no namespace"
+    )]
+    ClusterWide { token: String, repository: String },
+}
+
+/// Hold a registry write to the writer's `[permission]` block (#2398).
+///
+/// Pushing an image is a deploy of its app, the rule `/v1/build` applies to
+/// the image it pushes, so a token with a block may write only to
+/// repositories whose app the block grants `deploy` on. A repository that
+/// [`repository_namespace`] can't place could be anyone's, so only a
+/// cluster-wide grant covers it. A token with no block, the system principal
+/// and the standalone bootstrap pass, as on the API.
+///
+/// Reads are outside permission blocks: there is no "pull" action, and the
+/// role and token scope already decide them. Blob uploads to the
+/// [`BLOB_ONLY_REPOSITORIES`] pass too, as they do for scope: the API route
+/// that consumes each blob checks the block itself.
+pub fn check_repository_permission(
+    principal: Option<&AuthContext>,
+    repository: &str,
+    access: RepositoryAccess,
+    permissions: &std::collections::BTreeMap<String, crate::config::PermissionSpec>,
+) -> Result<(), PermissionDenied> {
+    if access == RepositoryAccess::Read
+        || (access == RepositoryAccess::WriteBlob && BLOB_ONLY_REPOSITORIES.contains(&repository))
+    {
+        return Ok(());
+    }
+    let Some(principal) = principal else {
+        return Ok(());
+    };
+    if principal.token_name == crate::sesame::auth::SYSTEM_PRINCIPAL {
+        return Ok(());
+    }
+    let Some(spec) = permissions.get(&principal.token_name) else {
+        return Ok(());
+    };
+    let deploy = crate::config::PermissionAction::Deploy;
+    match repository_namespace(repository) {
+        Some((namespace, app)) if spec.allows(deploy, app, namespace) => Ok(()),
+        Some((namespace, app)) => Err(PermissionDenied::App {
+            token: principal.token_name.clone(),
+            namespace: namespace.to_string(),
+            app: app.to_string(),
+        }),
+        None if spec.allows_cluster_wide(deploy) => Ok(()),
+        None => Err(PermissionDenied::ClusterWide {
+            token: principal.token_name.clone(),
+            repository: repository.to_string(),
+        }),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UploadState {
     Active,
@@ -717,6 +785,112 @@ mod tests {
         }
         // The anonymous standalone bootstrap has no scope either.
         assert!(check_repository_scope(None, "web", RepositoryAccess::WriteManifest).is_ok());
+    }
+
+    // --- `[permission]` blocks on registry writes (#2398) ---
+
+    fn web_only_block() -> std::collections::BTreeMap<String, crate::config::PermissionSpec> {
+        std::collections::BTreeMap::from([(
+            "ci".to_string(),
+            crate::config::PermissionSpec {
+                actions: vec!["deploy".into()],
+                apps: vec!["web".into()],
+                namespaces: Some(vec!["shop".into()]),
+            },
+        )])
+    }
+
+    #[test]
+    fn a_permission_block_without_deploy_on_the_repository_refuses_a_push() {
+        let ctx = principal(ApiRole::Deployer, None, None);
+        let permissions = web_only_block();
+        for access in [RepositoryAccess::WriteBlob, RepositoryAccess::WriteManifest] {
+            assert!(
+                check_repository_permission(Some(&ctx), "shop/api", access, &permissions).is_err()
+            );
+            assert!(
+                check_repository_permission(Some(&ctx), "shop/web", access, &permissions).is_ok()
+            );
+            // A bare name places no namespace, so only a cluster-wide grant
+            // covers it.
+            assert!(check_repository_permission(Some(&ctx), "web", access, &permissions).is_err());
+            // With no block at all, the token pushes as before.
+            assert!(
+                check_repository_permission(
+                    Some(&ctx),
+                    "shop/api",
+                    access,
+                    &std::collections::BTreeMap::new()
+                )
+                .is_ok()
+            );
+            // Replication and the build runner aren't held to anyone's block.
+            assert!(
+                check_repository_permission(
+                    Some(&crate::sesame::auth::system_context()),
+                    "shop/api",
+                    access,
+                    &permissions
+                )
+                .is_ok()
+            );
+            assert!(check_repository_permission(None, "shop/api", access, &permissions).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_permission_block_leaves_reads_and_scratch_blob_uploads_alone() {
+        let ctx = principal(ApiRole::Deployer, None, None);
+        let logs_only = std::collections::BTreeMap::from([(
+            "ci".to_string(),
+            crate::config::PermissionSpec {
+                actions: vec!["logs".into()],
+                apps: vec!["*".into()],
+                namespaces: None,
+            },
+        )]);
+        assert!(
+            check_repository_permission(Some(&ctx), "shop/api", RepositoryAccess::Read, &logs_only)
+                .is_ok()
+        );
+        for scratch in BLOB_ONLY_REPOSITORIES {
+            assert!(
+                check_repository_permission(
+                    Some(&ctx),
+                    scratch,
+                    RepositoryAccess::WriteBlob,
+                    &logs_only
+                )
+                .is_ok()
+            );
+            assert!(
+                check_repository_permission(
+                    Some(&ctx),
+                    scratch,
+                    RepositoryAccess::WriteManifest,
+                    &logs_only
+                )
+                .is_err()
+            );
+        }
+        // A cluster-wide deploy grant covers a bare name.
+        let everywhere = std::collections::BTreeMap::from([(
+            "ci".to_string(),
+            crate::config::PermissionSpec {
+                actions: vec!["deploy".into()],
+                apps: vec!["*".into()],
+                namespaces: None,
+            },
+        )]);
+        assert!(
+            check_repository_permission(
+                Some(&ctx),
+                "web",
+                RepositoryAccess::WriteManifest,
+                &everywhere
+            )
+            .is_ok()
+        );
     }
 
     #[test]

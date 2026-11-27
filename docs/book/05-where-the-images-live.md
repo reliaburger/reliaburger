@@ -1487,6 +1487,20 @@ The honest limits for 0.1.0 are in the manual and design doc. Basic-auth clients
 
 Opening the door to docker also showed us who else could walk through it. The Basic middleware makes every client take the bearer path, and the bearer path checked the token's role but never its scope, so a Deployer scoped to one namespace could push to any repository. Repositories now map to namespaces (`team-a/web` belongs to `team-a`), and a scoped token can only push and pull inside its own. Chapter 10 has the rule and the awkward cases, like what a bare `web` belongs to.
 
+A token's scope wasn't the last thing the registry forgot. A `[permission]` block can narrow a Deployer token to, say, `deploy` on `shop/web` and nothing else. The API honoured that, and so did `/v1/build` for the image it pushes, but the registry port only asked about role and scope. With that token as the password, `docker push NODE:5050/shop/api:v1` went through, and the next apply of `shop/api:v1` ran whatever it pushed (#2398). The write gate now asks one more question after the scope check:
+
+```rust
+let deploy = crate::config::PermissionAction::Deploy;
+match repository_namespace(repository) {
+    Some((namespace, app)) if spec.allows(deploy, app, namespace) => Ok(()),
+    Some((namespace, app)) => Err(PermissionDenied::App { /* ... */ }),
+    None if spec.allows_cluster_wide(deploy) => Ok(()),
+    None => Err(PermissionDenied::ClusterWide { /* ... */ }),
+}
+```
+
+The `if` after a pattern is a *match guard*: the arm matches only when the pattern fits and the condition holds, so the two `Some` arms split on whether the block allows the push without a nested `if`. A bare name like `web` places no namespace, so only a block that grants `deploy` on every app everywhere covers it, the same rule `/v1/build` applies. Reads stay outside blocks, because there's no pull action to grant. The block comes from the node's replica of the desired state, and `permission_refusal` copies out only the writer's own entry inside `read_desired`, rather than cloning the whole desired state for every blob a push uploads.
+
 ## A burger in the five-minute tour
 
 For a long time the tour ran podinfo and nothing of yours. Pulling somebody else's image proves the runtime works. It doesn't prove the thing this chapter is about: that you can go from source to a running, signed image without Docker on your laptop or an account anywhere. So the tour now builds `examples/demo/burger`, a Go service of about 130 lines that takes a burger order and asks podinfo's backend, by its service name, which kitchen cooked it:

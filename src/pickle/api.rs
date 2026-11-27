@@ -108,6 +108,8 @@ impl PickleState {
         {
             Ok(principal) => {
                 scope_refusal(principal.as_ref(), repository, access)?;
+                self.permission_refusal(principal.as_ref(), repository, access)
+                    .await?;
                 Ok(principal)
             }
             Err(WriteDenied::Unauthenticated) => Err(oci_error(
@@ -121,6 +123,41 @@ impl PickleState {
                 "insufficient permissions to push to the registry".to_string(),
             )),
         }
+    }
+
+    /// The 403 for a writer whose `[permission]` block doesn't grant
+    /// `deploy` on `repository` (#2398). The block comes from this node's
+    /// replica of the desired state; only the writer's own entry is copied
+    /// out. Without a council handle (a standalone registry) there are no
+    /// blocks to apply.
+    // `Response` is large but it IS the HTTP reply to send on failure.
+    #[allow(clippy::result_large_err)]
+    async fn permission_refusal(
+        &self,
+        principal: Option<&crate::sesame::auth::AuthContext>,
+        repository: &str,
+        access: RepositoryAccess,
+    ) -> Result<(), Response> {
+        let (Some(principal), Some(council)) = (principal, &self.council) else {
+            return Ok(());
+        };
+        if access == RepositoryAccess::Read
+            || principal.token_name == crate::sesame::auth::SYSTEM_PRINCIPAL
+        {
+            return Ok(());
+        }
+        let name = principal.token_name.clone();
+        let block = council
+            .read_desired(|state| state.permissions.get(&name).cloned())
+            .await;
+        let permissions = block.map(|spec| (name, spec)).into_iter().collect();
+        super::registry_auth::check_repository_permission(
+            Some(principal),
+            repository,
+            access,
+            &permissions,
+        )
+        .map_err(|denied| oci_error(StatusCode::FORBIDDEN, "DENIED", denied.to_string()))
     }
 
     #[allow(clippy::result_large_err)]
@@ -4251,6 +4288,93 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A single-member in-memory council, initialised and leading, so a
+    /// test can write replicated state (a `[permission]` block) through Raft.
+    async fn leading_council(node_raft_id: u64) -> Arc<crate::council::CouncilNode> {
+        use crate::council::CouncilNode;
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+        use crate::council::types::{CouncilConfig, CouncilNodeInfo};
+        let network = InMemoryRaftRouter::new();
+        let council = Arc::new(
+            CouncilNode::new(
+                node_raft_id,
+                CouncilConfig::default(),
+                InMemoryRaftNetworkFactory::new(node_raft_id, network.clone()),
+                crate::council::log_store::MemLogStore::new(),
+                crate::council::state_machine::CouncilStateMachine::new(),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        network.register(node_raft_id, &council).await;
+        council
+            .initialize(std::collections::BTreeMap::from([(
+                node_raft_id,
+                CouncilNodeInfo {
+                    addr: "127.0.0.1:19001".parse().unwrap(),
+                    name: "registry".into(),
+                },
+            )]))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !council.is_leader().await {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        council
+    }
+
+    /// #2398: a `[permission]` block narrows what a token may push, on the
+    /// registry port exactly as on `/v1/build`.
+    #[tokio::test]
+    async fn a_push_outside_the_tokens_permission_block_is_refused() {
+        let (mut state, _dir, deployer, _reader) = standard_client_state().await;
+        let council = leading_council(state.node_raft_id).await;
+        council
+            .write(crate::council::RaftRequest::PermissionSpec {
+                name: "ci".into(),
+                spec: Box::new(crate::config::PermissionSpec {
+                    actions: vec!["deploy".into()],
+                    apps: vec!["web".into()],
+                    namespaces: Some(vec!["shop".into()]),
+                }),
+            })
+            .await
+            .unwrap();
+        state.council = Some(council.clone());
+        let app = test_router(state);
+        let bearer = format!("Bearer {deployer}");
+        let refused = app
+            .clone()
+            .oneshot(client_request(
+                "POST",
+                "/v2/shop/api/blobs/uploads/",
+                Some(&bearer),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes(refused).await).unwrap();
+        assert_eq!(body["errors"][0]["code"], "DENIED", "body: {body}");
+        let allowed = app
+            .clone()
+            .oneshot(client_request(
+                "POST",
+                "/v2/shop/web/blobs/uploads/",
+                Some(&bearer),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert!(allowed.status().is_success(), "{}", allowed.status());
+        council.shutdown().await.unwrap();
     }
 
     #[tokio::test]

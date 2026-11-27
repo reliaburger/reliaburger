@@ -401,6 +401,15 @@ token pulls only its own namespaces' images (a loopback registry serves reads
 to anyone on the node, token or not), and `relish images` lists only those.
 Unscoped tokens push and pull anything, as before.
 
+A `[permission]` block (see `security`) narrows pushes further. Pushing an
+image is a deploy of its app, so a token with a block may push only to
+`<namespace>/<app>` repositories whose app the block grants `deploy` on. A
+bare name like `api:v1` names no namespace, so only a block granting `deploy`
+on `apps = ["*"]` with no `namespaces` may push it. The registry refuses
+anything else with 403 `DENIED`, the answer `relish build` gives for the same
+push. Pulls aren't part of a block: there's no pull action, so a token with a
+block pulls whatever its role and scope allow.
+
 ### Trusting the cluster CA
 
 The registry serves the node's certificate, which names the node rather than
