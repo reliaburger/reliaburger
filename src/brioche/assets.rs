@@ -130,6 +130,24 @@ mod tests {
         assert!(js.contains("idx == null ? latest("));
     }
 
+    /// The live log viewer appended a line per event and never removed
+    /// one, so a page left open on a busy app grew until the browser killed
+    /// the tab (#2433). This guards the trimming against being deleted.
+    #[test]
+    fn the_log_viewer_script_trims_old_lines() {
+        let js = asset_text("brioche.js");
+        let start = js.find("function initLogStream(el)").expect("initLogStream");
+        let viewer = &js[start..];
+        let viewer = &viewer[..viewer.find("\n    }\n").expect("its end")];
+        assert!(js.contains("var MAX_LOG_LINES = "));
+        assert!(viewer.contains("el.childElementCount > MAX_LOG_LINES"));
+        assert!(viewer.contains("el.removeChild(el.firstChild)"));
+        // It follows the tail only for a reader already there.
+        assert!(viewer.contains("if (atBottom)"));
+        // Text, never markup: a log line can't inject HTML.
+        assert!(viewer.contains("line.textContent = event.data"));
+    }
+
     #[test]
     fn missing_asset_returns_none() {
         assert!(BriocheAssets::get("nonexistent.js").is_none());
