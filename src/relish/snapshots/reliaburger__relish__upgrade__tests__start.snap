@@ -7,5 +7,6 @@ expression: "json(&UpgradeStarted::from_answer(UpgradeScope::Cluster, &target,\n
   "target_version": "v0.2.7",
   "upgrade_id": "u-1",
   "already_running": false,
-  "detail": null
+  "detail": null,
+  "left_out": []
 }

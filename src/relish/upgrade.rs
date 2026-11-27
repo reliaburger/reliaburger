@@ -371,6 +371,62 @@ pub struct UpgradeStarted {
     pub already_running: bool,
     /// What the node said about the one already running.
     pub detail: Option<String>,
+    /// Members the run leaves out because gossip has them down (#2417).
+    pub left_out: Vec<LeftOutNode>,
+}
+
+/// A cluster member an upgrade leaves out, and the gossip state why.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LeftOutNode {
+    pub node_id: String,
+    /// Gossip's word for it: `dead` or `left` at start, or whatever it is
+    /// now for a member a finished run didn't cover.
+    pub state: String,
+}
+
+impl std::fmt::Display for LeftOutNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "node {} ({})", self.node_id, self.state)
+    }
+}
+
+/// The members gossip has down, which a cluster upgrade can't reach and so
+/// leaves out. They come back on their old version (#2417).
+fn left_out_nodes(nodes: &[crate::bun::agent::NodeStatus]) -> Vec<LeftOutNode> {
+    nodes
+        .iter()
+        .filter(|node| node.is_down())
+        .map(|node| LeftOutNode {
+            node_id: node.node_id.clone(),
+            state: node.state.clone(),
+        })
+        .collect()
+}
+
+/// `n2 (dead), n5 (left)`.
+fn list_left_out(left_out: &[LeftOutNode]) -> String {
+    left_out
+        .iter()
+        .map(|node| format!("{} ({})", node.node_id, node.state))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The line `upgrade start` prints about the down nodes it leaves out, or
+/// `None` when every member is in the run.
+fn left_out_line(left_out: &[LeftOutNode]) -> Option<String> {
+    let names = list_left_out(left_out);
+    match left_out.len() {
+        0 => None,
+        1 => Some(format!(
+            "not upgrading 1 node that is down: {names}; it will still run its current \
+             version when it returns"
+        )),
+        count => Some(format!(
+            "not upgrading {count} nodes that are down: {names}; they will still run \
+             their current version when they return"
+        )),
+    }
 }
 
 /// Whom an upgrade, or a rollback, covers.
@@ -400,6 +456,7 @@ impl UpgradeStarted {
                     .unwrap_or("already running")
                     .to_string()
             }),
+            left_out: Vec::new(),
         }
     }
 }
@@ -417,6 +474,9 @@ impl std::fmt::Display for UpgradeStarted {
                 self.upgrade_id.as_deref().unwrap_or("?")
             )?,
             UpgradeScope::Node => writeln!(f, "node upgrade to {} started", self.target_version)?,
+        }
+        if let Some(line) = left_out_line(&self.left_out) {
+            writeln!(f, "{line}")?;
         }
         writeln!(f, "watch it with: relish upgrade status")
     }
@@ -644,6 +704,12 @@ async fn start_cluster(
     let nodes = client.nodes().await?;
     let overrides = parse_overrides(&args.node_addresses)?;
     let node_list = build_node_list(&nodes, &overrides)?;
+    // Say up front which members the run can't reach, before the pushes
+    // (#2417); the result repeats it.
+    let left_out = left_out_nodes(&nodes);
+    if let Some(line) = left_out_line(&left_out) {
+        eprintln!("{line}");
+    }
     let route = match &args.registry {
         Some(explicit) => RegistryRoute::explicit(client.scheme(), explicit),
         None => {
@@ -682,11 +748,9 @@ async fn start_cluster(
         "allow_downgrade": args.allow_downgrade,
     });
     let response = client.upgrade_start(&request).await?;
-    Ok(UpgradeStarted::from_answer(
-        UpgradeScope::Cluster,
-        target_version,
-        &response,
-    ))
+    let mut started = UpgradeStarted::from_answer(UpgradeScope::Cluster, target_version, &response);
+    started.left_out = left_out;
+    Ok(started)
 }
 
 /// Hand a node-level directive straight to the connected (single) node.
@@ -754,13 +818,16 @@ impl StagedBinary {
 /// `-o json` prints `{scope, state}`, `state` as the node answered it.
 pub async fn status(client: &BunClient, output: super::OutputFormat) -> Result<(), RelishError> {
     let report = match topology(client.upgrade_cluster().await)? {
-        Topology::Cluster(cluster) => UpgradeStatus {
-            scope: UpgradeScope::Cluster,
-            state: cluster,
-        },
+        Topology::Cluster(cluster) => {
+            // The membership only adds the left-out line; a status that
+            // can't list the nodes still shows the run.
+            let members = client.nodes().await.ok();
+            UpgradeStatus::cluster(cluster, members.as_deref())
+        }
         Topology::SingleNode => UpgradeStatus {
             scope: UpgradeScope::Node,
             state: client.upgrade_status().await?,
+            left_out: Vec::new(),
         },
     };
     super::output::print_output(&report, output)
@@ -772,12 +839,67 @@ pub async fn status(client: &BunClient, output: super::OutputFormat) -> Result<(
 pub struct UpgradeStatus {
     pub scope: UpgradeScope,
     pub state: serde_json::Value,
+    /// Members the run shown (the active one, else the last) doesn't
+    /// cover, with their gossip state now (#2417).
+    pub left_out: Vec<LeftOutNode>,
+}
+
+impl UpgradeStatus {
+    /// A cluster's status, naming the `members` its run leaves out.
+    fn cluster(
+        state: serde_json::Value,
+        members: Option<&[crate::bun::agent::NodeStatus]>,
+    ) -> Self {
+        let run = state
+            .get("active")
+            .filter(|active| !active.is_null())
+            .or_else(|| {
+                state["history"]
+                    .as_array()
+                    .and_then(|history| history.last())
+            });
+        let left_out = match (run, members) {
+            (Some(run), Some(members)) => {
+                let covered: std::collections::BTreeSet<&str> = run["nodes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|node| node["node_id"].as_str())
+                    .collect();
+                members
+                    .iter()
+                    .filter(|member| !covered.contains(member.node_id.as_str()))
+                    .map(|member| LeftOutNode {
+                        node_id: member.node_id.clone(),
+                        state: member.state.clone(),
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        Self {
+            scope: UpgradeScope::Cluster,
+            state,
+            left_out,
+        }
+    }
 }
 
 impl std::fmt::Display for UpgradeStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.scope {
-            UpgradeScope::Cluster => f.write_str(&render_cluster_status(&self.state)),
+            UpgradeScope::Cluster => {
+                f.write_str(&render_cluster_status(&self.state, self.left_out.len()))?;
+                if !self.left_out.is_empty() {
+                    writeln!(
+                        f,
+                        "not in this upgrade: {}; it still runs the version it had \
+                         (`relish wtf` shows version-skew until it is upgraded)",
+                        list_left_out(&self.left_out)
+                    )?;
+                }
+                Ok(())
+            }
             UpgradeScope::Node => f.write_str(&render_node_status(&self.state)),
         }
     }
@@ -838,9 +960,9 @@ pub async fn plan(
     parallel: u32,
     output: super::OutputFormat,
 ) -> Result<(), RelishError> {
-    let (workers, council, leader) = plan_roles(client, cluster_size).await?;
+    let ((workers, council, leader), left_out) = plan_roles(client, cluster_size).await?;
     super::output::print_output(
-        &UpgradePlan::new(version, workers, council, leader, parallel),
+        &UpgradePlan::new(version, workers, council, leader, parallel).with_left_out(left_out),
         output,
     )
 }
@@ -851,25 +973,28 @@ pub async fn plan(
 /// Only a node that says it has no council is planned as a single node. A
 /// cluster relish couldn't see is refused: planning one node for it printed
 /// a confident rolling order for a cluster nobody looked at (#1568).
+///
+/// Also returns the live cluster's down members, which the plan leaves out.
 async fn plan_roles(
     client: &BunClient,
     cluster_size: Option<usize>,
-) -> Result<(usize, usize, usize), RelishError> {
+) -> Result<((usize, usize, usize), Vec<LeftOutNode>), RelishError> {
     if let Some(size) = cluster_size {
-        return Ok(hypothetical_roles(size));
+        return Ok((hypothetical_roles(size), Vec::new()));
     }
     let unseen = |error| RelishError::UnseenCluster(Box::new(error));
     match topology(client.upgrade_cluster().await).map_err(unseen)? {
-        Topology::SingleNode => Ok((0, 0, 1)),
+        Topology::SingleNode => Ok(((0, 0, 1), Vec::new())),
         Topology::Cluster(_) => {
             let mut nodes = client.nodes().await.map_err(unseen)?;
+            let left_out = left_out_nodes(&nodes);
             nodes.retain(|node| !node.is_down());
             let leader = nodes.iter().filter(|n| n.is_leader).count();
             let council = nodes
                 .iter()
                 .filter(|n| n.is_council && !n.is_leader)
                 .count();
-            Ok((nodes.len() - council - leader, council, leader))
+            Ok(((nodes.len() - council - leader, council, leader), left_out))
         }
     }
 }
@@ -963,6 +1088,8 @@ pub struct UpgradePlan {
     pub estimated_secs: u64,
     /// The assumed time for one node to swap and verify.
     pub seconds_per_node: u64,
+    /// Members the plan leaves out because gossip has them down (#2417).
+    pub left_out: Vec<LeftOutNode>,
 }
 
 /// One stage of an [`UpgradePlan`].
@@ -1022,7 +1149,14 @@ impl UpgradePlan {
             stages,
             estimated_secs: batches as u64 * SECONDS_PER_NODE,
             seconds_per_node: SECONDS_PER_NODE,
+            left_out: Vec::new(),
         }
+    }
+
+    /// Name the members this plan leaves out.
+    fn with_left_out(mut self, left_out: Vec<LeftOutNode>) -> Self {
+        self.left_out = left_out;
+        self
     }
 }
 
@@ -1055,6 +1189,12 @@ impl std::fmt::Display for UpgradePlan {
             self.estimated_secs.div_ceil(60),
             self.seconds_per_node
         )?;
+        if !self.left_out.is_empty() {
+            writeln!(f, "left out (down, will keep their current version):")?;
+            for node in &self.left_out {
+                writeln!(f, "  {node}")?;
+            }
+        }
         writeln!(
             f,
             "workloads keep running throughout (adoption across exec)"
@@ -1073,7 +1213,9 @@ fn render_plan(
     UpgradePlan::new(version, workers, council, leader, parallel).to_string()
 }
 
-fn render_cluster_status(cluster: &serde_json::Value) -> String {
+/// The cluster run's status. `left_out` members aren't in it: a finished
+/// run then says how many of the cluster's nodes it covered.
+fn render_cluster_status(cluster: &serde_json::Value, left_out: usize) -> String {
     // Writing to a String never fails.
     use std::fmt::Write as _;
 
@@ -1102,9 +1244,15 @@ fn render_cluster_status(cluster: &serde_json::Value) -> String {
         None => {
             out.push_str("no upgrade in progress\n");
             if let Some(last) = cluster["history"].as_array().and_then(|h| h.last()) {
+                let covered = last["nodes"].as_array().map_or(0, Vec::len);
+                let coverage = if left_out > 0 {
+                    format!(" on {covered} of {} nodes", covered + left_out)
+                } else {
+                    String::new()
+                };
                 let _ = writeln!(
                     out,
-                    "last upgrade: {} to {} ({})",
+                    "last upgrade: {} to {} ({}){coverage}",
                     last["upgrade_id"].as_str().unwrap_or("?"),
                     last["target_version"].as_str().unwrap_or("?"),
                     render_phase(&last["phase"]),
@@ -1497,7 +1645,7 @@ mod tests {
             },
             "history": [],
         });
-        insta::assert_snapshot!(render_cluster_status(&cluster));
+        insta::assert_snapshot!(render_cluster_status(&cluster, 0));
     }
 
     #[test]
@@ -1511,7 +1659,7 @@ mod tests {
             },
             "history": [],
         });
-        insta::assert_snapshot!(render_cluster_status(&cluster));
+        insta::assert_snapshot!(render_cluster_status(&cluster, 0));
     }
 
     #[test]
@@ -1582,6 +1730,100 @@ mod tests {
         let list = build_node_list(&[live, dead], &[]).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0]["node_id"], "n1");
+    }
+
+    /// #2417: leaving a down node out is right (it has no address and can't
+    /// take a binary); saying nothing about it was the bug.
+    #[test]
+    fn the_nodes_left_out_of_an_upgrade_are_named() {
+        let mut dead = member("n2", "10.0.0.2:9443");
+        dead.state = "dead".to_string();
+        let live = member("n1", "10.0.0.1:9443");
+
+        let left_out = left_out_nodes(&[live, dead]);
+
+        let named: Vec<String> = left_out.iter().map(ToString::to_string).collect();
+        assert_eq!(named, ["node n2 (dead)"]);
+    }
+
+    #[test]
+    fn start_says_which_down_nodes_it_leaves_out() {
+        let one = vec![LeftOutNode {
+            node_id: "n2".to_string(),
+            state: "dead".to_string(),
+        }];
+        assert_eq!(
+            left_out_line(&one).unwrap(),
+            "not upgrading 1 node that is down: n2 (dead); it will still run its current \
+             version when it returns"
+        );
+        let two = vec![
+            one[0].clone(),
+            LeftOutNode {
+                node_id: "n5".to_string(),
+                state: "left".to_string(),
+            },
+        ];
+        assert_eq!(
+            left_out_line(&two).unwrap(),
+            "not upgrading 2 nodes that are down: n2 (dead), n5 (left); they will still run \
+             their current version when they return"
+        );
+        assert_eq!(left_out_line(&[]), None);
+    }
+
+    /// #2417: a finished run says how many members it covered, and which
+    /// ones it didn't, so "complete" can't hide a node on the old version.
+    #[test]
+    fn cluster_status_names_the_members_a_finished_run_left_out() {
+        let cluster = serde_json::json!({
+            "active": null,
+            "history": [{
+                "upgrade_id": "up-1",
+                "target_version": "v0.2.0",
+                "phase": "Completed",
+                "nodes": [{"node_id": "n1"}, {"node_id": "n3"}],
+            }],
+        });
+        let mut n2 = member("n2", "10.0.0.2:9443");
+        n2.state = "dead".to_string();
+        let members = [
+            member("n1", "10.0.0.1:9443"),
+            n2,
+            member("n3", "10.0.0.3:9443"),
+        ];
+
+        let status = UpgradeStatus::cluster(cluster, Some(&members));
+
+        assert_eq!(
+            status.left_out,
+            vec![LeftOutNode {
+                node_id: "n2".to_string(),
+                state: "dead".to_string(),
+            }]
+        );
+        let text = status.to_string();
+        assert!(
+            text.contains("last upgrade: up-1 to v0.2.0 (Completed) on 2 of 3 nodes"),
+            "{text}"
+        );
+        assert!(
+            text.contains("not in this upgrade: n2 (dead); it still runs the version it had"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn plan_lists_the_nodes_it_leaves_out() {
+        let plan = UpgradePlan::new("v0.2.0", 2, 0, 1, 1).with_left_out(vec![LeftOutNode {
+            node_id: "n4".to_string(),
+            state: "dead".to_string(),
+        }]);
+        let text = plan.to_string();
+        assert!(
+            text.contains("left out (down, will keep their current version):\n  node n4 (dead)"),
+            "{text}"
+        );
     }
 
     fn member(node_id: &str, gossip: &str) -> crate::bun::agent::NodeStatus {
@@ -2010,14 +2252,14 @@ mod tests {
         )
         .await;
 
-        assert_eq!(plan_roles(&client, None).await.unwrap(), (0, 0, 1));
+        assert_eq!(plan_roles(&client, None).await.unwrap().0, (0, 0, 1));
     }
 
     /// `--cluster-size` is the offline form: it needs no cluster at all.
     #[tokio::test]
     async fn plan_with_a_cluster_size_needs_no_cluster() {
         let client = BunClient::new_with_token("http://127.0.0.1:1", None);
-        assert_eq!(plan_roles(&client, Some(5)).await.unwrap(), (2, 2, 1));
+        assert_eq!(plan_roles(&client, Some(5)).await.unwrap().0, (2, 2, 1));
     }
 
     /// `relish upgrade check -o json` gives a script the verdict as a
@@ -2091,6 +2333,7 @@ mod tests {
             json(&UpgradeStatus {
                 scope: UpgradeScope::Node,
                 state: serde_json::json!({"running_version": "v0.2.6", "in_flight": null}),
+                left_out: Vec::new(),
             })
         );
         insta::assert_snapshot!(

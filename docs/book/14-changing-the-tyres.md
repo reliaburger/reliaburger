@@ -2145,3 +2145,17 @@ The debug builds the upgrade tests use need one more step. A test gives one comp
 ### What we decided not to do
 
 We didn't sign a statement `{version, platform, sha256}` instead of bare bytes, or sign `metadata.json`. Either would bind the label to the bytes cryptographically, and it may still come. The version compiled into the binary already does that job: it's covered by the signature, so it can't be relabelled.
+
+## Complete, except for the node that was off
+
+`relish upgrade start` builds the run's node list from the membership listing, and that listing shows dead members too, so it drops every node gossip calls `dead` or `left`. That part is right: a dead node has no address and can't fetch a binary. What was wrong is that it did it silently (#2417). The leader checks each node it's given and calls the run `Completed` when every listed node is `Healthy`. So a node that was powered off when you typed `start` came back on the old version, rejoined (the formats match, so nothing refused it), and you'd been told the cluster upgrade was complete. For a security release, that's an unpatched node nobody mentioned.
+
+Now relish says so, at every step that could mislead. `left_out_nodes` picks the down members out of the listing. `start` prints them before it pushes anything (`not upgrading 1 node that is down: node-5 (dead); it will still run its current version when it returns`) and returns them as `left_out` in its JSON. `plan` lists them under their own heading. `status` compares the run's node list with the membership, so it also catches a node that joined while the run was going, and a finished run reads "on 7 of 8 nodes".
+
+### What we decided not to do
+
+We didn't record the skipped nodes in the run itself, as a `NodeUpgradePhase::Skipped` the history would keep. The run lives in Raft, so that's a durable-state change, and it's only worth making for the history: status can work the same answer out from the membership. Nor does the orchestrator chase a node that reappears. That would keep a run open for as long as a node might stay off, which could be for ever.
+
+### Tests
+
+`the_nodes_left_out_of_an_upgrade_are_named`, `start_says_which_down_nodes_it_leaves_out`, `plan_lists_the_nodes_it_leaves_out` and `cluster_status_names_the_members_a_finished_run_left_out` in `src/relish/upgrade.rs`. `build_node_list_leaves_out_dead_members` stays as it was: leaving the node out is still right.

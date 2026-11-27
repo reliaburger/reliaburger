@@ -299,6 +299,14 @@ cluster and the release share a pair.
    relish upgrade plan v0.2.1 --cluster-size 8
    ```
 
+   A node gossip has `dead` or `left` can't take a binary, so the run leaves
+   it out. `plan` lists such nodes under their own heading, `start` prints
+   `not upgrading 1 node that is down: node-5 (dead); it will still run its
+   current version when it returns`, and `status` names every member the run
+   didn't cover, with "on 7 of 8 nodes" once it's finished. A node that comes
+   back runs its old version, and `relish wtf` shows `version-skew` until you
+   upgrade it. A node that joins while the run is going is left out too.
+
 4. Start it. relish downloads each node's build, countersigns it with your
    key and pushes it to the cluster's registry; each node fetches it, checks
    both signatures and swaps itself.
