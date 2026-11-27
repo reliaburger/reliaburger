@@ -612,6 +612,25 @@ The SWIM paper doesn't say much about this: it's an implementation detail. Our a
 
 Why 60 seconds? At 500ms gossip intervals, a 10,000-node cluster needs about `3 × ceil(log2(10000))` = 42 rounds (21 seconds) for an update to reach every node. 60 seconds gives nearly three times that margin. We don't want to reap a Dead node before all other nodes have learned about its death, because a late-arriving node might add it back as Alive from stale gossip.
 
+For a long time the delay was the *only* protection, and an audit in 0.3.4 showed how thin it was (#2474). Picture a 300-node cluster where node C is cut off for 90 seconds. While it's away, X dies, and everyone but C declares it dead and, a minute later, reaps it. C comes back still believing "X Alive at incarnation 4", and its first push-pull says so. Every receiver has no entry for X, so `apply_update` adds it as `Alive` and re-broadcasts it. Within seconds X is alive everywhere, and every node has to probe it, suspect it and declare it dead all over again. With tables over 64 entries you don't even need the partition: a node that missed the `Dead` rumour can easily miss X's entry in the rotating sync window too.
+
+So a reap now leaves a tombstone: the incarnation X was reaped at, kept in the same `RetainedFloor` as its sequence floor, so it inherits the floor's 24-hour expiry and its 1,024-entry bound for free. Before an update is applied, one check:
+
+```rust
+fn tombstoned(&self, update: &MembershipUpdate, now: Instant) -> bool {
+    update.state == NodeState::Alive
+        && self.membership.get(&update.node_id).is_none()
+        && self
+            .sequence_floors
+            .get(&update.node_id)
+            .filter(|floor| floor.expires > now)
+            .and_then(|floor| floor.reaped_incarnation)
+            .is_some_and(|tombstone| update.incarnation <= tombstone)
+}
+```
+
+The chain reads left to right: `get` gives an `Option<&RetainedFloor>`, `filter` turns an expired floor into `None`, `and_then` swaps the floor for its own `Option<u64>` tombstone, and `is_some_and` answers `false` for any `None` along the way. A higher incarnation is a real return and passes, and so does X's own datagram, which clears the floor. `a_stale_alive_about_a_reaped_member_does_not_bring_it_back` failed before the fix; `a_tombstone_expires_with_its_floor` and `a_restarted_member_refutes_past_its_tombstone` cover the edges. We could also have shared tombstones in the floor exchange, which would cover a node that joined after the reap, but that's a wire change for a corner of a corner, and a node that takes one stale `Alive` just probes X and finds it dead.
+
 The reap runs every probe cycle (500ms). Iterating the membership table and comparing timestamps is trivial: even at 10,000 nodes it takes microseconds.
 
 ### Graceful leave

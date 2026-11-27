@@ -241,11 +241,18 @@ impl MembershipTable {
     /// bound. Only removes nodes that have been in a terminal state long
     /// enough for all cluster members to have learned about the departure
     /// via gossip dissemination.
-    pub fn reap_expired_dead(&mut self, timeout: std::time::Duration, now: Instant) -> Vec<NodeId> {
+    ///
+    /// Returns each reaped node with the incarnation it was reaped at, which
+    /// the caller keeps as a tombstone (#2474).
+    pub fn reap_expired_dead(
+        &mut self,
+        timeout: std::time::Duration,
+        now: Instant,
+    ) -> Vec<(NodeId, u64)> {
         let mut reaped = Vec::new();
         self.members.retain(|id, m| {
             if m.state.is_down() && now.duration_since(m.state_changed) > timeout {
-                reaped.push(id.clone());
+                reaped.push((id.clone(), m.incarnation));
                 false
             } else {
                 true
@@ -811,7 +818,7 @@ mod tests {
             Instant::now() - Duration::from_secs(61);
 
         let reaped = table.reap_expired_dead(Duration::from_secs(60), Instant::now());
-        assert_eq!(reaped, vec![NodeId::new("n1")]);
+        assert_eq!(reaped, vec![(NodeId::new("n1"), 1)]);
         assert!(table.get(&NodeId::new("n1")).is_none());
     }
 
@@ -835,7 +842,7 @@ mod tests {
             Instant::now() - Duration::from_secs(61);
 
         let reaped = table.reap_expired_dead(Duration::from_secs(60), Instant::now());
-        assert_eq!(reaped, vec![NodeId::new("n1")]);
+        assert_eq!(reaped, vec![(NodeId::new("n1"), 1)]);
     }
 
     #[test]

@@ -94,6 +94,13 @@ struct Freshness {
 }
 
 impl Freshness {
+    /// Below every real datagram: the floor of a member we never heard
+    /// from directly, which holds only a tombstone.
+    const UNHEARD: Freshness = Freshness {
+        incarnation: 0,
+        sequence: 0,
+    };
+
     fn of(message: &GossipMessage) -> Self {
         Self {
             incarnation: message.incarnation,
@@ -105,8 +112,15 @@ impl Freshness {
 /// A reaped member's sequence floor, as this node keeps it.
 #[derive(Debug, Clone)]
 struct RetainedFloor {
-    /// The freshest datagram accepted from the member.
+    /// The freshest datagram accepted from the member. Zero for a member
+    /// this node reaped without ever hearing from it directly: then the
+    /// floor holds only its tombstone.
     freshness: Freshness,
+    /// The incarnation the member had when this node reaped it: a
+    /// tombstone (#2474). A rumour that the member is `Alive` at or below
+    /// it is from before its death, and doesn't bring it back. `None` for
+    /// a floor learned from a peer.
+    reaped_incarnation: Option<u64>,
     /// When the floor stops applying.
     expires: Instant,
     /// Whether we've already logged a datagram dropped below this floor,
@@ -701,15 +715,24 @@ impl<T: MustardTransport> MustardNode<T> {
             && floor.expires > now
         {
             if fresh <= floor.freshness {
+                // Tell a restarted member to refute past its tombstone too,
+                // so its next rumoured Alive isn't dropped as a stale one.
+                let held = Freshness {
+                    incarnation: floor
+                        .freshness
+                        .incarnation
+                        .max(floor.reaped_incarnation.unwrap_or(0)),
+                    sequence: floor.freshness.sequence,
+                };
                 if !floor.logged {
                     floor.logged = true;
                     eprintln!(
                         "mustard: dropping an old datagram from departed node {} (at or below \
                          what we heard before reaping it); answering with incarnation {}",
-                        message.sender, floor.freshness.incarnation
+                        message.sender, held.incarnation
                     );
                 }
-                return Err(floor.freshness);
+                return Err(held);
             }
             // Fresher: the member really is back. Track it as a live sender
             // from here on.
@@ -1063,24 +1086,40 @@ impl<T: MustardTransport> MustardNode<T> {
         if reaped.is_empty() {
             return;
         }
-        for node in &reaped {
-            if let Some(freshness) = self.sequences.remove(node) {
-                self.retain_floor(node.clone(), freshness, now + SEQUENCE_FLOOR_RETENTION);
-            }
-        }
-        for node in &reaped {
-            self.stale_answers.remove(node);
-        }
+        let reaped: Vec<NodeId> = reaped
+            .into_iter()
+            .map(|(node, incarnation)| {
+                // A member we never heard from directly has no sequence to
+                // keep, only its tombstone.
+                let freshness = self.sequences.remove(&node).unwrap_or(Freshness::UNHEARD);
+                self.retain_floor(
+                    node.clone(),
+                    freshness,
+                    Some(incarnation),
+                    now + SEQUENCE_FLOOR_RETENTION,
+                );
+                self.stale_answers.remove(&node);
+                node
+            })
+            .collect();
         if self.directory.prune(&reaped) {
             self.publish_directory();
         }
     }
 
-    /// Keep a sequence floor for `node`, raising an existing one. When the
-    /// table is full, the floor closest to expiring makes room.
-    fn retain_floor(&mut self, node: NodeId, freshness: Freshness, expires: Instant) {
+    /// Keep a sequence floor for `node`, raising an existing one (and its
+    /// tombstone, if `reaped_incarnation` gives one). When the table is
+    /// full, the floor closest to expiring makes room.
+    fn retain_floor(
+        &mut self,
+        node: NodeId,
+        freshness: Freshness,
+        reaped_incarnation: Option<u64>,
+        expires: Instant,
+    ) {
         if let Some(floor) = self.sequence_floors.get_mut(&node) {
             floor.freshness = floor.freshness.max(freshness);
+            floor.reaped_incarnation = floor.reaped_incarnation.max(reaped_incarnation);
             floor.expires = floor.expires.max(expires);
             return;
         }
@@ -1098,6 +1137,7 @@ impl<T: MustardTransport> MustardNode<T> {
             node,
             RetainedFloor {
                 freshness,
+                reaped_incarnation,
                 expires,
                 logged: false,
             },
@@ -1140,7 +1180,7 @@ impl<T: MustardTransport> MustardNode<T> {
             if remaining.is_zero() {
                 continue;
             }
-            self.retain_floor(floor.node_id.clone(), freshness, now + remaining);
+            self.retain_floor(floor.node_id.clone(), freshness, None, now + remaining);
         }
     }
 
@@ -1171,7 +1211,7 @@ impl<T: MustardTransport> MustardNode<T> {
         let mut floors: Vec<SequenceFloor> = self
             .sequence_floors
             .iter()
-            .filter(|(_, floor)| floor.expires > now)
+            .filter(|(_, floor)| floor.expires > now && floor.freshness != Freshness::UNHEARD)
             .map(|(node, floor)| SequenceFloor {
                 node_id: node.clone(),
                 incarnation: floor.freshness.incarnation,
@@ -1291,6 +1331,9 @@ impl<T: MustardTransport> MustardNode<T> {
             if update.incarnation > MAX_INCARNATION {
                 self.implausible
                     .record(now, &message.sender, "a membership update");
+                continue;
+            }
+            if self.tombstoned(update, now) {
                 continue;
             }
             let changed = self.membership.apply_update(update, now);
@@ -1414,6 +1457,23 @@ impl<T: MustardTransport> MustardNode<T> {
             }
         }
         true
+    }
+
+    /// Whether `update` is a stale `Alive` about a member this node reaped:
+    /// one at or below the incarnation it was reaped at, about a member not
+    /// in the table (#2474). A peer that missed the death (it was cut off,
+    /// or the rotating sync window never showed it) still says `Alive`, and
+    /// without the tombstone one such rumour re-added the member on every
+    /// node. A higher incarnation is a real return, and passes.
+    fn tombstoned(&self, update: &MembershipUpdate, now: Instant) -> bool {
+        update.state == NodeState::Alive
+            && self.membership.get(&update.node_id).is_none()
+            && self
+                .sequence_floors
+                .get(&update.node_id)
+                .filter(|floor| floor.expires > now)
+                .and_then(|floor| floor.reaped_incarnation)
+                .is_some_and(|tombstone| update.incarnation <= tombstone)
     }
 
     /// Remember that we pinged `target` for `requester`, so its ACK can be
@@ -4000,6 +4060,116 @@ mod tests {
         assert!(!node.handle_message(addr(7), ping_from("peer")).await);
     }
 
+    /// #2474: a peer that missed a member's death still says it's `Alive`.
+    /// Without a tombstone, one such rumour re-added the reaped member on
+    /// every node.
+    #[tokio::test]
+    async fn a_stale_alive_about_a_reaped_member_does_not_bring_it_back() {
+        let net = InMemoryNetwork::new();
+        let t = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("observer"), addr(1), fast_config(), t);
+        node.membership.add_node(
+            NodeId::new("x"),
+            addr(3),
+            4,
+            BTreeMap::new(),
+            Instant::now(),
+        );
+        node.membership.declare_dead(&NodeId::new("x"));
+        node.reap_departed(after_the_reap());
+        assert!(node.membership.get(&NodeId::new("x")).is_none());
+
+        node.handle_message(
+            addr(2),
+            sync_from("peer", vec![entry("x", 3, NodeState::Alive, 4)], false),
+        )
+        .await;
+        assert_eq!(state_of(&node, "x"), None);
+        assert!(
+            node.dissemination.is_empty() || {
+                let queued = node.dissemination.select_updates();
+                queued
+                    .iter()
+                    .all(|update| update.node_id != NodeId::new("x"))
+            },
+            "the stale Alive was passed on"
+        );
+
+        // A real return, at a higher incarnation, is still heard.
+        node.handle_message(
+            addr(2),
+            sync_from("peer", vec![entry("x", 3, NodeState::Alive, 5)], false),
+        )
+        .await;
+        assert_eq!(state_of(&node, "x"), Some((NodeState::Alive, 5)));
+    }
+
+    /// The tombstone lives in the floor table, so it shares its bound
+    /// (`MAX_SEQUENCE_FLOORS`) and its expiry, and isn't sent in anti-entropy
+    /// as a floor with nothing in it.
+    #[tokio::test]
+    async fn a_tombstone_expires_with_its_floor() {
+        let net = InMemoryNetwork::new();
+        let t = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("observer"), addr(1), fast_config(), t);
+        node.membership.add_node(
+            NodeId::new("x"),
+            addr(3),
+            4,
+            BTreeMap::new(),
+            Instant::now(),
+        );
+        node.membership.declare_dead(&NodeId::new("x"));
+        node.reap_departed(after_the_reap());
+        assert!(node.floor_window(Instant::now()).is_empty());
+
+        node.reap_departed(after_the_reap() + SEQUENCE_FLOOR_RETENTION);
+        node.handle_message(
+            addr(2),
+            sync_from("peer", vec![entry("x", 3, NodeState::Alive, 4)], false),
+        )
+        .await;
+        assert_eq!(state_of(&node, "x"), Some((NodeState::Alive, 4)));
+    }
+
+    /// A member reaped at a higher incarnation than its last datagram to us
+    /// (it refuted by rumour, then died) restarts at 1. The `Stale` answer
+    /// names the tombstone, so it refutes past it and its rumoured `Alive`
+    /// isn't then dropped as a stale one.
+    #[tokio::test]
+    async fn a_restarted_member_refutes_past_its_tombstone() {
+        let net = InMemoryNetwork::new();
+        let t = net.register(addr(1)).await;
+        let peer_transport = net.register(addr(2)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t);
+        let old = GossipMessage::new(
+            NodeId::new("peer"),
+            3,
+            GossipPayload::Ping { updates: vec![] },
+        );
+        assert!(node.handle_message(addr(2), old).await);
+        node.membership
+            .apply_update(&entry("peer", 2, NodeState::Alive, 6), Instant::now());
+        node.membership.declare_dead(&NodeId::new("peer"));
+        node.reap_departed(after_the_reap());
+
+        let mut restarted =
+            MustardNode::new(NodeId::new("peer"), addr(2), fast_config(), peer_transport);
+        let first = GossipMessage::new(
+            NodeId::new("peer"),
+            1,
+            GossipPayload::Ping { updates: vec![] },
+        );
+        // Its datagram is from incarnation 1, below the floor: answered Stale.
+        assert!(!node.handle_message(addr(2), first).await);
+        deliver(&mut restarted).await;
+        assert!(
+            restarted.incarnation > 6,
+            "refuted only to {}, not past the tombstone",
+            restarted.incarnation
+        );
+    }
+
     #[tokio::test]
     async fn a_node_that_never_heard_the_departed_member_learns_its_floor_in_push_pull() {
         let net = InMemoryNetwork::new();
@@ -4301,6 +4471,7 @@ mod tests {
         node.retain_floor(
             NodeId::new("gone"),
             freshness,
+            None,
             now + Duration::from_secs(100),
         );
 
@@ -4360,6 +4531,7 @@ mod tests {
                     incarnation: 1,
                     sequence: i,
                 },
+                None,
                 now + Duration::from_secs(i + 1),
             );
         }
