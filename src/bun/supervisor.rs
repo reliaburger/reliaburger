@@ -32,8 +32,14 @@ pub struct WorkloadInstance {
     pub state: ContainerState,
     /// Health check counters for this instance.
     pub health_counters: HealthCounters,
-    /// Number of times this instance has been restarted.
+    /// Number of times this instance has been restarted, over its life:
+    /// what `relish apps` shows as RESTARTS.
     pub restart_count: u32,
+    /// How far up its backoff the instance is: like `restart_count`, but
+    /// back to 0 once a run lasts [`RESTART_FORGIVEN_AFTER`] (#2373).
+    ///
+    /// [`RESTART_FORGIVEN_AFTER`]: crate::bun::restart::RESTART_FORGIVEN_AFTER
+    pub backoff_step: u32,
     /// When the last restart occurred.
     pub last_restart: Option<Instant>,
     /// Host port allocated for this instance, if any.
@@ -871,6 +877,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
                 state: ContainerState::Pending,
                 health_counters: HealthCounters::new(),
                 restart_count: 0,
+                backoff_step: 0,
                 last_restart: None,
                 host_port,
                 container_ip: None,
@@ -1096,10 +1103,16 @@ impl<G: Grill> WorkloadSupervisor<G> {
             });
         }
 
-        // Check backoff timing
+        // A long run since the last restart forgives the earlier ones, so a
+        // crash after months of uptime waits seconds, not five minutes.
+        if instance.last_restart.is_some_and(|last| {
+            now.saturating_duration_since(last) >= crate::bun::restart::RESTART_FORGIVEN_AFTER
+        }) {
+            instance.backoff_step = 0;
+        }
         let required_backoff = instance
             .restart_policy
-            .compute_backoff(instance.restart_count);
+            .compute_backoff(instance.backoff_step);
         if let Some(last) = instance.last_restart
             && now.duration_since(last) < required_backoff
         {
@@ -1116,6 +1129,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
         instance.state = instance.state.transition_to(ContainerState::Pending)?;
         instance.retry_pending = false;
         instance.restart_count += 1;
+        instance.backoff_step = instance.backoff_step.saturating_add(1);
         instance.last_restart = Some(now);
         instance.health_counters.reset();
 
@@ -2012,6 +2026,7 @@ mod tests {
         let instance = sup.get_instance_mut(&ids[0]).unwrap();
         instance.state = ContainerState::Stopped;
         instance.restart_count = 1;
+        instance.backoff_step = 1;
         instance.last_restart = Some(now);
 
         // Too soon: backoff for restart_count=1 is 2s
@@ -2026,6 +2041,34 @@ mod tests {
             .await
             .unwrap();
         assert!(restarted);
+    }
+
+    #[tokio::test]
+    async fn a_long_healthy_run_forgives_earlier_restarts() {
+        let mut sup = test_supervisor();
+        let now = Instant::now();
+        let spec = basic_app_spec(Some(8080));
+        let ids = sup.deploy_app("web", "default", &spec, now).await.unwrap();
+
+        let instance = sup.get_instance_mut(&ids[0]).unwrap();
+        instance.restart_count = 9;
+        instance.backoff_step = 9;
+        instance.last_restart = Some(now);
+        instance.state = ContainerState::Stopped;
+
+        // An hour of running since the last restart forgives the earlier
+        // ones, so the next crash backs off as a fresh instance's would.
+        let later = now + Duration::from_secs(3600);
+        assert!(sup.maybe_restart(&ids[0], later).await.unwrap());
+        sup.get_instance_mut(&ids[0]).unwrap().state = ContainerState::Stopped;
+        assert!(
+            sup.maybe_restart(&ids[0], later + Duration::from_secs(3))
+                .await
+                .unwrap()
+        );
+
+        // RESTARTS stays a lifetime count.
+        assert_eq!(sup.get_instance(&ids[0]).unwrap().restart_count, 11);
     }
 
     #[tokio::test]

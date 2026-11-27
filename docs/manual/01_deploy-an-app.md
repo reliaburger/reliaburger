@@ -124,6 +124,12 @@ minutes at the default interval). The node stops its process and marks it
 `restart.never_healthy`. Restarting wouldn't help: the same probe fails the
 same way. Fix the check and apply again.
 
+An app instance that crashes is restarted after a backoff that doubles with
+each restart: 1 s, 2 s, 4 s, up to five minutes. A run of ten minutes
+forgives the earlier restarts, so the next crash waits a second again, as a
+sidecar's does. The RESTARTS column in `relish apps` still counts every
+restart over the instance's life.
+
 ## Init containers
 
 ```toml

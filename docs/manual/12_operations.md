@@ -54,6 +54,9 @@ It needs three things on every node:
   recovering from a bad one depends on being started again. `on-failure`
   covers every exit bun makes on purpose; `always` also covers a release that
   exits cleanly while it's being verified. The quickstart uses `always`.
+  Bun also exits non-zero on purpose when its council Raft core stops or
+  its agent loop, which supervises every workload, ends or panics; the
+  restarted bun adopts the workloads still running.
 - **A writable binary directory.** Bun keeps `bun-vX.Y.Z` files beside its
   own binary and makes `bun` a symlink to the active one, with the previous
   versions kept for rollback (`[upgrades] retain_versions`, default 3). A

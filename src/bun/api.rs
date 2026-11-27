@@ -416,7 +416,7 @@ pub struct ApiState {
     /// Alert evaluator.
     pub alerts: Option<Arc<RwLock<AlertEvaluator>>>,
     /// Deploy history (shared with agent).
-    pub deploy_history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
+    pub deploy_history: Option<Arc<RwLock<crate::bun::agent::DeployHistory>>>,
     /// Bounded cluster event history and live feed.
     pub events: Option<Arc<RwLock<crate::bun::events::EventStore>>>,
     /// Pickle image catalog (shared with registry).
@@ -519,7 +519,7 @@ pub fn router(
     cmd_tx: mpsc::Sender<AgentCommand>,
     mayo: Option<Arc<RwLock<MayoStore>>>,
     log_store: Option<Arc<RwLock<LogStore>>>,
-    deploy_history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
+    deploy_history: Option<Arc<RwLock<crate::bun::agent::DeployHistory>>>,
     pickle_catalog: Option<Arc<RwLock<ManifestCatalog>>>,
     alerts: Option<Arc<RwLock<AlertEvaluator>>>,
     council: Option<Arc<crate::council::CouncilNode>>,
@@ -572,7 +572,7 @@ pub fn router_with_upgrade(
     cmd_tx: mpsc::Sender<AgentCommand>,
     mayo: Option<Arc<RwLock<MayoStore>>>,
     log_store: Option<Arc<RwLock<LogStore>>>,
-    deploy_history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
+    deploy_history: Option<Arc<RwLock<crate::bun::agent::DeployHistory>>>,
     pickle_catalog: Option<Arc<RwLock<ManifestCatalog>>>,
     alerts: Option<Arc<RwLock<AlertEvaluator>>>,
     council: Option<Arc<crate::council::CouncilNode>>,

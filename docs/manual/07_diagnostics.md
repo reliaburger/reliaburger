@@ -25,7 +25,10 @@ authentication and authorisation check, so an exec through the relay needs
 the same Deployer role and `exec` permission as one sent straight to the
 node. The relay builds the target's path one segment at a time and refuses a
 path that would need any percent-encoding, and a node-only route on the
-target refuses a relayed request.
+target refuses a relayed request. A relayed request ends within 30 seconds,
+body included, or answers 504, and the relay refuses a followed event stream
+(`v1/events?follow=true`) with 400: `/v1/events?follow=true` on the node
+you're connected to already follows every node.
 
 ```sh
 relish wtf                       # diagnose the whole cluster: one row per check

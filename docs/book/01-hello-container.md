@@ -1716,6 +1716,23 @@ pub fn compute_backoff(&self, restart_count: u32) -> Duration {
 
 `powi` is "power, integer exponent." It's faster than `powf` (which takes a float exponent) because integer exponentiation can use repeated squaring. The `i` suffix is Rust's naming convention for integer-argument variants.
 
+### Forgiving old restarts
+
+The first version passed the instance's `restart_count` straight in, and the count only ever went up. An instance that had restarted nine times over three months needed a five-minute gap before any later restart, however long it had run in between: the day its database failed over, it sat down for five minutes when a fresh instance would have waited two seconds (#2373). The count can't just be reset, because `relish apps` shows it as RESTARTS and the state sweep compares it to tell one run from the next, so it must never go backwards. The instance carries a second counter instead, `backoff_step`, which climbs with `restart_count` but drops to 0 when a run has lasted `RESTART_FORGIVEN_AFTER`, ten minutes, the window sidecars already used:
+
+```rust
+if instance.last_restart.is_some_and(|last| {
+    now.saturating_duration_since(last) >= crate::bun::restart::RESTART_FORGIVEN_AFTER
+}) {
+    instance.backoff_step = 0;
+}
+let required_backoff = instance
+    .restart_policy
+    .compute_backoff(instance.backoff_step);
+```
+
+`saturating_duration_since` returns zero rather than panicking if `last` is somehow later than `now`. A job's restart budget still counts `restart_count`: forgiving a job's failures would let it retry for ever.
+
 ### The struct update syntax
 
 The `for_job` constructor uses `..Self::default()` to fill in fields it doesn't explicitly set:

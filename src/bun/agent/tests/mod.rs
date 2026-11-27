@@ -4098,6 +4098,7 @@ async fn a_restore_is_refused_while_an_instance_awaits_its_restart() {
             state: ContainerState::Stopped,
             health_counters: Default::default(),
             restart_count: 1,
+            backoff_step: 1,
             last_restart: Some(Instant::now()),
             host_port: None,
             container_ip: None,
@@ -8002,7 +8003,7 @@ async fn deploy_history_times_a_fresh_deploy_and_a_rolling_redeploy() {
 
     let first = Config::parse("[app.web]\nimage = 'web:v1'\nport = 8080\n").unwrap();
     expect_complete(&drain_deploy(&mut agent, first).await);
-    let fresh = took(&history.read().await);
+    let fresh = took(&history.read().await.entries());
     assert!(
         fresh >= slow,
         "a fresh deploy that took over {slow:?} recorded {fresh:?}"
@@ -8010,7 +8011,7 @@ async fn deploy_history_times_a_fresh_deploy_and_a_rolling_redeploy() {
 
     let second = Config::parse("[app.web]\nimage = 'web:v2'\nport = 8080\n").unwrap();
     expect_complete(&drain_deploy(&mut agent, second).await);
-    let entries = history.read().await;
+    let entries = history.read().await.entries();
     assert_eq!(entries.len(), 2, "{entries:?}");
     let rolled = took(&entries);
     assert!(
@@ -8081,7 +8082,7 @@ async fn rolling_redeploy_halts_without_reverting_when_auto_rollback_is_false() 
     );
 
     // The deploy is recorded as Halted, not RolledBack.
-    let hist = history.read().await;
+    let hist = history.read().await.entries();
     assert!(
         hist.iter()
             .any(|e| e.result == crate::meat::deploy_types::DeployResult::Halted),
@@ -8183,7 +8184,7 @@ async fn failed_rollout_retains_every_owner_until_cleanup_is_confirmed() {
                 let retained =
                     tokio::time::timeout(std::time::Duration::from_secs(1), status).await;
                 let record_retained = record.exists();
-                let claimed_rollback = history.read().await.iter().any(|entry| {
+                let claimed_rollback = history.read().await.entries().iter().any(|entry| {
                     entry.result == crate::meat::deploy_types::DeployResult::RolledBack
                 });
                 grill.set_fail_kill(false);
@@ -8787,7 +8788,7 @@ async fn deploy_over_failing_replacements(
     )
     .await
     .expect("the aborted rollout must finish");
-    let history = history.read().await.clone();
+    let history = history.read().await.entries();
     shutdown.cancel();
     (task.await.unwrap(), events, history)
 }
@@ -14720,7 +14721,7 @@ async fn deploy_history_spans_the_time_the_deploy_took() {
         if let Some(id) = &failing {
             grill.set_state(id, ContainerState::Failed);
         }
-        let before = history.read().await.len();
+        let before = history.read().await.entries().len();
         let began = std::time::Instant::now();
         let events = send_deploy(&tx, Config::parse(config).unwrap()).await;
         let took = began.elapsed();
@@ -14736,7 +14737,7 @@ async fn deploy_history_spans_the_time_the_deploy_took() {
                 "the replica must start in place, not roll: {events:?}"
             );
         }
-        let entries = history.read().await.clone();
+        let entries = history.read().await.entries();
         assert_eq!(
             entries.len(),
             before + 1,

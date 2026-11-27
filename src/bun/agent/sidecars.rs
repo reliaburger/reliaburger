@@ -38,8 +38,8 @@ use crate::grill::oci::OciSpec;
 pub(super) const SIDECAR_MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 /// How long a restarted sidecar must run before its next crash counts as
-/// the first again: ten minutes, as a kubelet resets a container's back-off.
-pub(super) const SIDECAR_STABLE_RUN: Duration = Duration::from_secs(600);
+/// the first again: the same ten minutes that forgive an app's restarts.
+pub(super) const SIDECAR_STABLE_RUN: Duration = crate::bun::restart::RESTART_FORGIVEN_AFTER;
 
 /// How long a sidecar waits before restart number `restarts + 1`: nothing
 /// for the first, then 1 s, doubling to [`SIDECAR_MAX_BACKOFF`].
