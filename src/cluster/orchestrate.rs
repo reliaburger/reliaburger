@@ -6462,6 +6462,7 @@ image = "busybox:latest"
             let rollup = NodeRollup {
                 node_id: NodeId::new("n1"),
                 timestamp: now.saturating_sub(60),
+                part: 0,
                 // Instance means: 30% and 50% of a core → 40% on average.
                 entries: vec![
                     entry("prod__web-0", 60.0, 2),

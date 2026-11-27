@@ -128,6 +128,11 @@ pub enum MayoError {
     Io(#[from] std::io::Error),
     #[error("object store error: {0}")]
     ObjectStore(String),
+    /// The caller's query asked for more than a node answers: it ran past
+    /// its deadline or its range holds too many rows. Narrowing it helps;
+    /// retrying it doesn't (#2382, #2451).
+    #[error("query rejected: {0}")]
+    QueryRejected(String),
 }
 
 #[cfg(test)]

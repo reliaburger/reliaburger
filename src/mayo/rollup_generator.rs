@@ -1,6 +1,6 @@
 //! Rollup generator for hierarchical metrics aggregation.
 //!
-//! Runs on each node. Queries the local `MayoStore` for the previous
+//! Runs on each node. Queries a snapshot of the local `MayoStore` for the previous
 //! time window and produces a `NodeRollup` containing per-metric
 //! aggregate statistics (min, max, sum, count).
 
@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use crate::meat::NodeId;
 
 use super::rollup::{NodeRollup, RollupAggregate, RollupEntry};
-use super::store::MayoStore;
+use super::store::MetricsSnapshot;
 use super::types::MayoError;
 
 /// Default rollup window in seconds.
@@ -18,7 +18,7 @@ pub const DEFAULT_ROLLUP_WINDOW_SECS: u64 = 60;
 /// Total span (5 minutes) re-sent as per-minute rollups after reassignment.
 pub const BACKFILL_SPAN_SECS: u64 = 300;
 
-/// Generates `NodeRollup` entries from a local `MayoStore`.
+/// Generates `NodeRollup` entries from a snapshot of the local `MayoStore`.
 pub struct RollupGenerator {
     node_id: NodeId,
 }
@@ -37,7 +37,11 @@ impl RollupGenerator {
     /// the council can't tell one node's re-sent window from a genuinely new
     /// one and can't deduplicate. Aligned windows give every node the same
     /// `(node, window)` key for the same minute.
-    pub async fn generate(&self, store: &MayoStore, now: u64) -> Result<NodeRollup, MayoError> {
+    pub async fn generate(
+        &self,
+        store: &MetricsSnapshot,
+        now: u64,
+    ) -> Result<NodeRollup, MayoError> {
         // Align the window end down to a minute boundary, then step back one
         // window. `now - (now % W)` is the start of the current minute; the
         // completed window we roll up is the one before it.
@@ -61,7 +65,7 @@ impl RollupGenerator {
     /// held by both parents before calculating the cluster sum.
     pub async fn generate_backfill(
         &self,
-        store: &MayoStore,
+        store: &MetricsSnapshot,
         now: u64,
     ) -> Result<Vec<NodeRollup>, MayoError> {
         let aligned_end = now - (now % DEFAULT_ROLLUP_WINDOW_SECS);
@@ -84,7 +88,7 @@ impl RollupGenerator {
     /// Roll up one `[start, end)` window into a `NodeRollup` stamped at `start`.
     async fn window_rollup(
         &self,
-        store: &MayoStore,
+        store: &MetricsSnapshot,
         start: u64,
         end: u64,
     ) -> Result<NodeRollup, MayoError> {
@@ -111,6 +115,7 @@ impl RollupGenerator {
         Ok(NodeRollup {
             node_id: self.node_id.clone(),
             timestamp: start,
+            part: 0,
             entries,
         })
     }
@@ -143,7 +148,10 @@ mod tests {
         store.flush().await.unwrap();
 
         let generator = RollupGenerator::new(NodeId::new("node-1"));
-        let rollup = generator.generate(&store, 1080).await.unwrap();
+        let rollup = generator
+            .generate(&store.snapshot().await.unwrap(), 1080)
+            .await
+            .unwrap();
 
         assert_eq!(rollup.node_id, NodeId::new("node-1"));
         // The window start is aligned to a minute boundary.
@@ -175,7 +183,10 @@ mod tests {
         store.flush().await.unwrap();
 
         let generator = RollupGenerator::new(NodeId::new("node-1"));
-        let rollups = generator.generate_backfill(&store, 1000).await.unwrap();
+        let rollups = generator
+            .generate_backfill(&store.snapshot().await.unwrap(), 1000)
+            .await
+            .unwrap();
 
         // Empty minutes ([720, 780) and [840, 900)) are skipped.
         assert_eq!(rollups.len(), 3);
@@ -201,8 +212,14 @@ mod tests {
         store.flush().await.unwrap();
 
         let generator = RollupGenerator::new(NodeId::new("node-1"));
-        let rollups = generator.generate_backfill(&store, 1000).await.unwrap();
-        let normal = generator.generate(&store, 1000).await.unwrap();
+        let rollups = generator
+            .generate_backfill(&store.snapshot().await.unwrap(), 1000)
+            .await
+            .unwrap();
+        let normal = generator
+            .generate(&store.snapshot().await.unwrap(), 1000)
+            .await
+            .unwrap();
 
         assert_eq!(rollups.len(), 5);
         assert_eq!(
@@ -223,7 +240,10 @@ mod tests {
         store.flush().await.unwrap();
 
         let generator = RollupGenerator::new(NodeId::new("node-1"));
-        let rollup = generator.generate(&store, 1000).await.unwrap();
+        let rollup = generator
+            .generate(&store.snapshot().await.unwrap(), 1000)
+            .await
+            .unwrap();
 
         assert_eq!(rollup.entries.len(), 1);
         assert_eq!(rollup.entries[0].aggregate.count, 1);
@@ -252,7 +272,10 @@ mod tests {
             // `now` lands anywhere inside minute [1080, 1140); the generator
             // must always roll up the completed previous minute [1020, 1080).
             let now = 1080 + phase;
-            let rollup = generator.generate(&store, now).await.unwrap();
+            let rollup = generator
+                .generate(&store.snapshot().await.unwrap(), now)
+                .await
+                .unwrap();
 
             assert_eq!(
                 rollup.entries.len(),
@@ -269,7 +292,10 @@ mod tests {
         let (store, _dir) = test_store();
 
         let generator = RollupGenerator::new(NodeId::new("node-1"));
-        let rollup = generator.generate(&store, 1000).await.unwrap();
+        let rollup = generator
+            .generate(&store.snapshot().await.unwrap(), 1000)
+            .await
+            .unwrap();
 
         assert!(rollup.entries.is_empty());
     }
@@ -283,7 +309,10 @@ mod tests {
         store.flush().await.unwrap();
 
         let generator = RollupGenerator::new(NodeId::new("node-1"));
-        let rollup = generator.generate(&store, 1000).await.unwrap();
+        let rollup = generator
+            .generate(&store.snapshot().await.unwrap(), 1000)
+            .await
+            .unwrap();
 
         assert_eq!(rollup.entries.len(), 3);
         let names: Vec<&str> = rollup
@@ -307,7 +336,10 @@ mod tests {
         store.flush().await.unwrap();
 
         let generator = RollupGenerator::new(NodeId::new("node-1"));
-        let rollup = generator.generate(&store, 1000).await.unwrap();
+        let rollup = generator
+            .generate(&store.snapshot().await.unwrap(), 1000)
+            .await
+            .unwrap();
 
         assert_eq!(rollup.entries.len(), 1);
         assert_eq!(rollup.entries[0].labels, labels);
@@ -336,7 +368,10 @@ mod tests {
         let mut rollups = Vec::new();
         for (store, _dir, node_name) in &stores {
             let generator = RollupGenerator::new(NodeId::new(node_name));
-            let rollup = generator.generate(store, 1000).await.unwrap();
+            let rollup = generator
+                .generate(&store.snapshot().await.unwrap(), 1000)
+                .await
+                .unwrap();
             rollups.push(rollup);
         }
 

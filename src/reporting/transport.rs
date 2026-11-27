@@ -142,6 +142,9 @@ impl ReportingTransport for InMemoryReportingTransport {
         target: SocketAddr,
         message: &ReportingMessage,
     ) -> Result<(), ReportingError> {
+        // The same frame limit as the TCP transport, so tests see what a
+        // real send would refuse (#2426).
+        checked_frame_size(message)?;
         let inner = self.network.lock().await;
 
         if inner
@@ -176,8 +179,8 @@ impl ReportingTransport for InMemoryReportingTransport {
 // TCP transport for production
 // ---------------------------------------------------------------------------
 
-/// Maximum reporting message size (1 MiB).
-const MAX_REPORT_SIZE: usize = 1_048_576;
+/// Maximum reporting message size (1 MiB), header included.
+pub(crate) const MAX_REPORT_SIZE: usize = 1_048_576;
 /// Connections that have delivered a whole report and are being admitted:
 /// waiting for room in the queue, then writing the acknowledgement. Past
 /// this, connections wait rather than being refused (#1411): refusing them
@@ -791,9 +794,10 @@ fn check_event_admission(message: &ReportingMessage) -> Result<(), String> {
     Ok(())
 }
 
-fn encode_report(message: &ReportingMessage) -> Result<Vec<u8>, ReportingError> {
-    check_event_admission(message).map_err(|reason| ReportingError::SendFailed { reason })?;
-    // The size pass traverses borrowed data without allocating an encoded copy.
+/// The size of `message`'s frame, header included, or `ReportTooLarge`
+/// when it is over [`MAX_REPORT_SIZE`]. The size pass traverses borrowed
+/// data without allocating an encoded copy.
+pub(crate) fn checked_frame_size(message: &ReportingMessage) -> Result<usize, ReportingError> {
     let body_size = postcard::experimental::serialized_size(message)
         .map_err(|error| ReportingError::Serialisation(error.to_string()))?;
     let size = body_size.saturating_add(report_header().len());
@@ -803,6 +807,12 @@ fn encode_report(message: &ReportingMessage) -> Result<Vec<u8>, ReportingError> 
             max: MAX_REPORT_SIZE,
         });
     }
+    Ok(size)
+}
+
+fn encode_report(message: &ReportingMessage) -> Result<Vec<u8>, ReportingError> {
+    check_event_admission(message).map_err(|reason| ReportingError::SendFailed { reason })?;
+    let size = checked_frame_size(message)?;
     let mut bytes = Vec::with_capacity(size);
     bytes.extend(report_header());
     postcard::to_extend(message, bytes)
@@ -906,6 +916,7 @@ mod tests {
         let metrics = ReportingMessage::MetricsRollup(NodeRollup {
             node_id: NodeId::new("worker"),
             timestamp: 60,
+            part: 0,
             entries: vec![RollupEntry {
                 metric_name: "m".repeat(MAX_REPORT_SIZE),
                 labels: Default::default(),
@@ -1265,6 +1276,7 @@ mod tests {
         let rollup = ReportingMessage::MetricsRollup(NodeRollup {
             node_id: NodeId::new("worker"),
             timestamp: 60,
+            part: 0,
             entries: vec![RollupEntry {
                 metric_name: "cpu".into(),
                 labels: [("app".to_string(), "web".to_string())].into(),

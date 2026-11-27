@@ -1355,6 +1355,7 @@ async fn autoscaler_scales_up_on_high_metric() {
         let rollup = NodeRollup {
             node_id: reliaburger::meat::NodeId::new(&node.name),
             timestamp: now.saturating_sub(30),
+            part: 0,
             entries: vec![RollupEntry {
                 metric_name: "process_cpu_percent".to_string(),
                 labels,
