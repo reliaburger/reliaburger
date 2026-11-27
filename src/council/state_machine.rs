@@ -2098,7 +2098,7 @@ impl StateMachineInner {
             }
             RaftRequest::PublishEndpoints {
                 expected_generation,
-                catalog,
+                changes,
             } => {
                 if *expected_generation != self.state.endpoint_withdrawals.generation {
                     return Some(CouncilResponse::Refused {
@@ -2108,6 +2108,17 @@ impl StateMachineInner {
                         ),
                     });
                 }
+                // The checks below look at the whole next catalogue, as they
+                // did when the entry carried it whole: a backend committed
+                // earlier on a node retired since still refuses it.
+                let catalog = match self.state.endpoint_catalog.with_changes(changes) {
+                    Ok(catalog) => catalog,
+                    Err(reason) => {
+                        return Some(CouncilResponse::Refused {
+                            reason: reason.into(),
+                        });
+                    }
+                };
                 if catalog.services.values().any(|service| {
                     service.backends.iter().any(|backend| {
                         self.state
@@ -2132,7 +2143,7 @@ impl StateMachineInner {
                 }
                 let withdrawals = match self.state.endpoint_withdrawals.plan_publication(
                     &self.state.endpoint_catalog,
-                    catalog,
+                    &catalog,
                     &self.state.endpoint_consumers,
                 ) {
                     Ok(withdrawals) => withdrawals,
@@ -2143,7 +2154,7 @@ impl StateMachineInner {
                     }
                 };
                 self.state.endpoint_withdrawals = withdrawals;
-                self.state.endpoint_catalog = Shared::new(*catalog.clone());
+                self.state.endpoint_catalog = Shared::new(catalog);
             }
             RaftRequest::TestLeaseCreate(lease) => {
                 if !lease.repositories.is_empty() || lease.workloads_retired {
@@ -5676,6 +5687,77 @@ mod tests {
         assert_eq!(placements.len(), 2);
     }
 
+    /// The entry that publishes `next` over the catalogue `state` holds.
+    fn publication(
+        state: &DesiredState,
+        expected_generation: u64,
+        next: crate::onion::catalog::EndpointCatalog,
+    ) -> RaftRequest {
+        publication_from(&state.endpoint_catalog, expected_generation, next)
+    }
+
+    /// The entry that publishes `next` over `previous`.
+    fn publication_from(
+        previous: &crate::onion::catalog::EndpointCatalog,
+        expected_generation: u64,
+        next: crate::onion::catalog::EndpointCatalog,
+    ) -> RaftRequest {
+        RaftRequest::PublishEndpoints {
+            expected_generation,
+            changes: Box::new(previous.changes_to(&next)),
+        }
+    }
+
+    /// #2438: a publication carries only the services that changed, and
+    /// applying it to the committed catalogue gives exactly the next one,
+    /// with the withdrawal ledger planned as for the whole catalogue.
+    #[test]
+    fn a_small_publication_yields_the_next_catalogue_and_its_withdrawals() {
+        let mut inner = StateMachineInner::default();
+        inner.state.endpoint_consumers.insert("reader".into());
+        let first = withdrawal_fixture_catalogue();
+        let mut first_with_web = first.clone();
+        let web = crate::onion::catalog::EndpointCatalog::rebuild([(
+            crate::onion::service_id::ServiceId::new("default", "web"),
+            80,
+            vec![],
+        )])
+        .unwrap();
+        first_with_web.services.extend(web.services);
+        assert!(
+            inner
+                .apply_request(&publication(&inner.state, 0, first_with_web.clone()))
+                .is_none()
+        );
+        let mut next = first_with_web.clone();
+        next.services.get_mut("default__api").unwrap().backends[0].healthy = false;
+        let expected = inner
+            .state
+            .endpoint_withdrawals
+            .plan_publication(
+                &inner.state.endpoint_catalog,
+                &next,
+                &inner.state.endpoint_consumers,
+            )
+            .unwrap();
+        let request = publication(
+            &inner.state,
+            inner.state.endpoint_withdrawals.generation,
+            next.clone(),
+        );
+        let RaftRequest::PublishEndpoints { changes, .. } = &request else {
+            unreachable!()
+        };
+        assert_eq!(
+            changes.changed.keys().collect::<Vec<_>>(),
+            vec!["default__api"]
+        );
+        assert!(changes.removed.is_empty());
+        assert!(inner.apply_request(&request).is_none());
+        assert_eq!(*inner.state.endpoint_catalog, next);
+        assert_eq!(inner.state.endpoint_withdrawals, expected);
+    }
+
     fn withdrawal_fixture_catalogue() -> crate::onion::catalog::EndpointCatalog {
         use crate::onion::catalog::{CatalogBackend, EndpointCatalog};
         use crate::onion::service_id::ServiceId;
@@ -5724,10 +5806,7 @@ mod tests {
             .unwrap();
         assert!(
             inner
-                .apply_request(&RaftRequest::PublishEndpoints {
-                    expected_generation: 0,
-                    catalog: Box::new(first.clone())
-                })
+                .apply_request(&publication(&inner.state, 0, first.clone()))
                 .is_none()
         );
         let request = retire_endpoint("producer", &execution);
@@ -5747,10 +5826,7 @@ mod tests {
                 stale.services.get_mut("default__api").unwrap().backends[0].execution = None;
             }
             assert!(matches!(
-                inner.apply_request(&RaftRequest::PublishEndpoints {
-                    expected_generation: 2,
-                    catalog: Box::new(stale)
-                }),
+                inner.apply_request(&publication(&inner.state, 2, stale)),
                 Some(CouncilResponse::Refused { .. })
             ));
             assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
@@ -5780,19 +5856,13 @@ mod tests {
             .generation = "b".repeat(64).try_into().unwrap();
         assert!(
             inner
-                .apply_request(&RaftRequest::PublishEndpoints {
-                    expected_generation: 2,
-                    catalog: Box::new(successor.clone())
-                })
+                .apply_request(&publication(&inner.state, 2, successor.clone()))
                 .is_none()
         );
         released(inner.apply_request(&request), true);
         assert_eq!(*inner.state.endpoint_catalog, successor);
         assert!(matches!(
-            inner.apply_request(&RaftRequest::PublishEndpoints {
-                expected_generation: 3,
-                catalog: Box::new(first)
-            }),
+            inner.apply_request(&publication(&inner.state, 3, first)),
             Some(CouncilResponse::Refused { .. })
         ));
     }
@@ -5812,10 +5882,7 @@ mod tests {
             .unwrap();
         assert!(
             inner
-                .apply_request(&RaftRequest::PublishEndpoints {
-                    expected_generation: 0,
-                    catalog: Box::new(catalog),
-                })
+                .apply_request(&publication(&inner.state, 0, catalog))
                 .is_none()
         );
         let read = |inner: &StateMachineInner| {
@@ -5875,10 +5942,7 @@ mod tests {
             catalog.services.get_mut("default__api").unwrap().backends[0].host_port += 1;
             assert!(
                 inner
-                    .apply_request(&RaftRequest::PublishEndpoints {
-                        expected_generation: generation,
-                        catalog: Box::new(catalog.clone())
-                    })
+                    .apply_request(&publication(&inner.state, generation, catalog.clone()))
                     .is_none()
             );
         }
@@ -5950,10 +6014,11 @@ mod tests {
                 normal_entry(
                     1,
                     2,
-                    RaftRequest::PublishEndpoints {
-                        expected_generation: 0,
-                        catalog: Box::new(catalog),
-                    },
+                    publication_from(
+                        &crate::onion::catalog::EndpointCatalog::default(),
+                        0,
+                        catalog,
+                    ),
                 ),
                 normal_entry(1, 3, retirement),
             ])
@@ -5978,10 +6043,11 @@ mod tests {
         for (expected_generation, catalog) in [first, Default::default()].into_iter().enumerate() {
             assert!(
                 inner
-                    .apply_request(&RaftRequest::PublishEndpoints {
-                        expected_generation: expected_generation as u64,
-                        catalog: Box::new(catalog),
-                    })
+                    .apply_request(&publication(
+                        &inner.state,
+                        expected_generation as u64,
+                        catalog
+                    ))
                     .is_none()
             );
         }
@@ -6025,14 +6091,16 @@ mod tests {
             RaftRequest::RegisterEndpointConsumer {
                 node_id: "offline".into(),
             },
-            RaftRequest::PublishEndpoints {
-                expected_generation: 0,
-                catalog: Box::new(withdrawal_fixture_catalogue()),
-            },
-            RaftRequest::PublishEndpoints {
-                expected_generation: 1,
-                catalog: Box::default(),
-            },
+            publication_from(
+                &crate::onion::catalog::EndpointCatalog::default(),
+                0,
+                withdrawal_fixture_catalogue(),
+            ),
+            publication_from(
+                &withdrawal_fixture_catalogue(),
+                1,
+                crate::onion::catalog::EndpointCatalog::default(),
+            ),
             endpoint_receipt("reader", 1),
         ];
         for (index, request) in requests.into_iter().enumerate() {
@@ -6081,20 +6149,14 @@ mod tests {
         let first = withdrawal_fixture_catalogue();
         assert!(
             inner
-                .apply_request(&RaftRequest::PublishEndpoints {
-                    expected_generation: 0,
-                    catalog: Box::new(first.clone())
-                })
+                .apply_request(&publication(&inner.state, 0, first.clone()))
                 .is_none()
         );
         let mut second = first.clone();
         second.services.get_mut("default__api").unwrap().backends[0].host_port = 30002;
         assert!(
             inner
-                .apply_request(&RaftRequest::PublishEndpoints {
-                    expected_generation: 1,
-                    catalog: Box::new(second.clone())
-                })
+                .apply_request(&publication(&inner.state, 1, second.clone()))
                 .is_none()
         );
         assert_eq!(inner.state.endpoint_withdrawals.pending.len(), 1);
@@ -6103,10 +6165,11 @@ mod tests {
         candidate.services.get_mut("default__api").unwrap().backends[0].host_port = 30003;
         for expected_generation in [1, 3] {
             assert!(matches!(
-                inner.apply_request(&RaftRequest::PublishEndpoints {
+                inner.apply_request(&publication(
+                    &inner.state,
                     expected_generation,
-                    catalog: Box::new(candidate.clone())
-                }),
+                    candidate.clone()
+                )),
                 Some(CouncilResponse::Refused { .. })
             ));
             assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
@@ -6117,17 +6180,19 @@ mod tests {
     fn endpoint_publication_generation_requires_current_evidence_even_for_noops() {
         let mut inner = StateMachineInner::default();
         assert!(matches!(
-            inner.apply_request(&RaftRequest::PublishEndpoints {
-                expected_generation: 1,
-                catalog: Box::default()
-            }),
+            inner.apply_request(&publication(
+                &inner.state,
+                1,
+                crate::onion::catalog::EndpointCatalog::default()
+            )),
             Some(CouncilResponse::Refused { .. })
         ));
         let first = withdrawal_fixture_catalogue();
-        let request = RaftRequest::PublishEndpoints {
-            expected_generation: 0,
-            catalog: Box::new(first.clone()),
-        };
+        let request = publication_from(
+            &crate::onion::catalog::EndpointCatalog::default(),
+            0,
+            first.clone(),
+        );
         assert!(inner.apply_request(&request).is_none());
         let before = serde_json::to_value(&inner.state).unwrap();
         assert!(matches!(
@@ -6137,10 +6202,7 @@ mod tests {
         assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
         assert!(
             inner
-                .apply_request(&RaftRequest::PublishEndpoints {
-                    expected_generation: 1,
-                    catalog: Box::new(first)
-                })
+                .apply_request(&publication(&inner.state, 1, first))
                 .is_none()
         );
         assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
@@ -6149,10 +6211,11 @@ mod tests {
     #[tokio::test]
     async fn endpoint_publication_generation_survives_snapshot_for_stale_noop_refusal() {
         let mut sm = CouncilStateMachine::new();
-        let request = RaftRequest::PublishEndpoints {
-            expected_generation: 0,
-            catalog: Box::new(withdrawal_fixture_catalogue()),
-        };
+        let request = publication_from(
+            &crate::onion::catalog::EndpointCatalog::default(),
+            0,
+            withdrawal_fixture_catalogue(),
+        );
         let applied = sm
             .apply_fixture(vec![normal_entry(1, 1, request.clone())])
             .await
@@ -6183,10 +6246,7 @@ mod tests {
         let first = withdrawal_fixture_catalogue();
         assert!(
             inner
-                .apply_request(&RaftRequest::PublishEndpoints {
-                    expected_generation: 0,
-                    catalog: Box::new(first.clone())
-                })
+                .apply_request(&publication(&inner.state, 0, first.clone()))
                 .is_none()
         );
         let request = RaftRequest::DecommissionNode {
@@ -6207,19 +6267,13 @@ mod tests {
         backend.node_ip = "10.0.0.2".parse().unwrap();
         let before = serde_json::to_value(&inner.state).unwrap();
         assert!(matches!(
-            inner.apply_request(&RaftRequest::PublishEndpoints {
-                expected_generation: 1,
-                catalog: Box::new(candidate.clone())
-            }),
+            inner.apply_request(&publication(&inner.state, 1, candidate.clone())),
             Some(CouncilResponse::Refused { .. })
         ));
         assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
         assert!(
             inner
-                .apply_request(&RaftRequest::PublishEndpoints {
-                    expected_generation: 2,
-                    catalog: Box::new(candidate)
-                })
+                .apply_request(&publication(&inner.state, 2, candidate))
                 .is_none()
         );
         assert_eq!(inner.state.endpoint_withdrawals.generation, 3);
@@ -6243,14 +6297,16 @@ mod tests {
             RaftRequest::RegisterEndpointConsumer {
                 node_id: "survivor".into(),
             },
-            RaftRequest::PublishEndpoints {
-                expected_generation: 0,
-                catalog: Box::new(catalogue.clone()),
-            },
-            RaftRequest::PublishEndpoints {
-                expected_generation: 1,
-                catalog: Box::default(),
-            },
+            publication_from(
+                &crate::onion::catalog::EndpointCatalog::default(),
+                0,
+                catalogue.clone(),
+            ),
+            publication_from(
+                &catalogue,
+                1,
+                crate::onion::catalog::EndpointCatalog::default(),
+            ),
             RaftRequest::RegisterEndpointConsumer {
                 node_id: "late-reader".into(),
             },
@@ -6323,10 +6379,7 @@ mod tests {
             });
         }
         let catalogue = withdrawal_fixture_catalogue();
-        inner.apply_request(&RaftRequest::PublishEndpoints {
-            expected_generation: 0,
-            catalog: Box::new(catalogue.clone()),
-        });
+        inner.apply_request(&publication(&inner.state, 0, catalogue.clone()));
         let request = RaftRequest::DecommissionNode {
             node_id: "producer".into(),
             retired_by: "operator".into(),
@@ -6360,20 +6413,15 @@ mod tests {
         let mut inner = StateMachineInner::default();
         inner.state.endpoint_consumers.insert("reader".into());
         let original = withdrawal_fixture_catalogue();
-        inner.apply_request(&RaftRequest::PublishEndpoints {
-            expected_generation: 0,
-            catalog: Box::new(original.clone()),
-        });
-        inner.apply_request(&RaftRequest::PublishEndpoints {
-            expected_generation: 1,
-            catalog: Box::default(),
-        });
+        inner.apply_request(&publication(&inner.state, 0, original.clone()));
+        inner.apply_request(&publication(
+            &inner.state,
+            1,
+            crate::onion::catalog::EndpointCatalog::default(),
+        ));
         let before = serde_json::to_value(&inner.state).unwrap();
         assert!(matches!(
-            inner.apply_request(&RaftRequest::PublishEndpoints {
-                expected_generation: 2,
-                catalog: Box::new(original)
-            }),
+            inner.apply_request(&publication(&inner.state, 2, original)),
             Some(CouncilResponse::Refused { .. })
         ));
         assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
@@ -6387,10 +6435,11 @@ mod tests {
         inner.state.endpoint_withdrawals.generation = u64::MAX;
         let before = serde_json::to_value(&inner.state).unwrap();
         for request in [
-            RaftRequest::PublishEndpoints {
-                expected_generation: u64::MAX,
-                catalog: Box::default(),
-            },
+            publication(
+                &inner.state,
+                u64::MAX,
+                crate::onion::catalog::EndpointCatalog::default(),
+            ),
             RaftRequest::DecommissionNode {
                 node_id: "producer".into(),
                 retired_by: "operator".into(),
@@ -6419,14 +6468,12 @@ mod tests {
             });
         }
         let original = withdrawal_fixture_catalogue();
-        inner.apply_request(&RaftRequest::PublishEndpoints {
-            expected_generation: 0,
-            catalog: Box::new(original),
-        });
-        inner.apply_request(&RaftRequest::PublishEndpoints {
-            expected_generation: 1,
-            catalog: Box::default(),
-        });
+        inner.apply_request(&publication(&inner.state, 0, original));
+        inner.apply_request(&publication(
+            &inner.state,
+            1,
+            crate::onion::catalog::EndpointCatalog::default(),
+        ));
         assert_eq!(
             inner.state.endpoint_withdrawals.pending[&1].consumers,
             std::collections::BTreeSet::from(["stopped".into(), "survivor".into()])
@@ -6627,10 +6674,7 @@ mod tests {
         let entry = normal_entry(
             1,
             1,
-            RaftRequest::PublishEndpoints {
-                expected_generation: 0,
-                catalog: Box::new(catalog),
-            },
+            publication_from(&EndpointCatalog::default(), 0, catalog),
         );
         sm.apply_fixture(vec![entry]).await.unwrap();
 
@@ -6650,17 +6694,11 @@ mod tests {
         assert_eq!(d.backends[0].node_id, "node-a");
         assert_eq!(p.backends[0].node_id, "node-b");
 
-        // A later publish wholly replaces the catalogue (leader is authoritative).
+        // A later publish replaces the catalogue (leader is authoritative):
+        // the services it doesn't name any more are removed.
         let replacement =
             EndpointCatalog::rebuild([(ServiceId::new("default", "web"), 80, vec![])]).unwrap();
-        let entry2 = normal_entry(
-            2,
-            1,
-            RaftRequest::PublishEndpoints {
-                expected_generation: 1,
-                catalog: Box::new(replacement),
-            },
-        );
+        let entry2 = normal_entry(2, 1, publication(&state, 1, replacement));
         sm.apply_fixture(vec![entry2]).await.unwrap();
         let state = sm.desired_state().await;
         assert!(
@@ -13560,10 +13598,11 @@ mod tests {
         inner.apply_request(&RaftRequest::ManifestCommit(test_manifest_commit()));
         assert!(
             inner
-                .apply_request(&RaftRequest::PublishEndpoints {
-                    expected_generation: 0,
-                    catalog: Box::new(withdrawal_fixture_catalogue()),
-                })
+                .apply_request(&publication(
+                    &inner.state,
+                    0,
+                    withdrawal_fixture_catalogue()
+                ))
                 .is_none()
         );
         insta::assert_snapshot!(

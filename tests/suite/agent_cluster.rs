@@ -128,7 +128,7 @@ async fn scheduler_repairs_a_catalogue_replaced_after_its_last_publication() {
         let response = council
             .write(RaftRequest::PublishEndpoints {
                 expected_generation,
-                catalog: Box::default(),
+                changes: Box::new(original.changes_to(&Default::default())),
             })
             .await
             .unwrap();
@@ -136,7 +136,9 @@ async fn scheduler_repairs_a_catalogue_replaced_after_its_last_publication() {
         let stale = council
             .write(RaftRequest::PublishEndpoints {
                 expected_generation,
-                catalog: Box::new((*original).clone()),
+                changes: Box::new(
+                    reliaburger::onion::catalog::EndpointCatalog::default().changes_to(&original),
+                ),
             })
             .await
             .unwrap();

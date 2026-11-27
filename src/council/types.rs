@@ -278,15 +278,17 @@ pub enum RaftRequest {
     /// commit returns a serial.
     ConsumeJoinTokenForIssue { token_hash: [u8; 32] },
     /// Publish the cluster-wide service endpoint catalogue (12b.4). The
-    /// leader rebuilds it from every node's health reports and replicates
-    /// the whole catalogue as one entry, so every node's DNS and ingress can
-    /// resolve services whose backends live on other nodes. Replacement requires
-    /// the exact publication generation used to prepare the candidate.
+    /// leader rebuilds it from every node's health reports, so every node's
+    /// DNS and ingress can resolve services whose backends live on other
+    /// nodes, and replicates only the services that changed since the
+    /// committed catalogue (#2438). Applying them requires the exact
+    /// publication generation used to prepare the candidate.
     PublishEndpoints {
         /// Committed generation observed while preparing this publication.
         expected_generation: u64,
-        /// Complete replacement catalogue, including original execution identities.
-        catalog: Box<crate::onion::catalog::EndpointCatalog>,
+        /// The changed services, in full with their original execution
+        /// identities, and the removed ones.
+        changes: Box<crate::onion::catalog::EndpointChanges>,
     },
     /// Create a durable Phase 15 resource lease.
     TestLeaseCreate(crate::testkit::lease::TestLease),
@@ -1530,7 +1532,7 @@ mod tests {
         .unwrap();
         let req = RaftRequest::PublishEndpoints {
             expected_generation: 42,
-            catalog: Box::new(catalog),
+            changes: Box::new(EndpointCatalog::new().changes_to(&catalog)),
         };
         let json = serde_json::to_string(&req).unwrap();
         let decoded: RaftRequest = serde_json::from_str(&json).unwrap();

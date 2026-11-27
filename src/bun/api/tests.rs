@@ -3872,6 +3872,7 @@ async fn placements_expose_only_the_consumers_original_withdrawal_generations() 
     let mut catalog = EndpointCatalog::default();
     let mut originals = Vec::new();
     for generation in 1..=3_u64 {
+        let previous = catalog.clone();
         catalog = catalog
             .reconcile([(
                 ServiceId::new("default", "web"),
@@ -3892,7 +3893,7 @@ async fn placements_expose_only_the_consumers_original_withdrawal_generations() 
             council
                 .write(RaftRequest::PublishEndpoints {
                     expected_generation: generation - 1,
-                    catalog: Box::new(catalog.clone()),
+                    changes: Box::new(previous.changes_to(&catalog)),
                 })
                 .await
                 .unwrap(),
@@ -3970,7 +3971,7 @@ async fn placements_expose_only_the_consumers_original_withdrawal_generations() 
         council
             .write(RaftRequest::PublishEndpoints {
                 expected_generation: 3,
-                catalog: Box::new(EndpointCatalog::default()),
+                changes: Box::new(catalog.changes_to(&EndpointCatalog::default())),
             })
             .await
             .unwrap(),
