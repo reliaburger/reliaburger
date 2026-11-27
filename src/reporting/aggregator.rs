@@ -126,6 +126,20 @@ pub struct ReportAggregator<T: ReportingTransport> {
     /// Gossip membership, for evicting reports of departed nodes.
     /// `None` disables eviction-by-membership.
     membership_rx: Option<watch::Receiver<Vec<MembershipSnapshot>>>,
+    /// How often the aggregator did work that grows with the fleet, so a
+    /// test can pin it per message without timing anything (#2440).
+    #[cfg(test)]
+    work: WorkCounts,
+}
+
+/// Counts of the aggregator's fleet-sized steps, for tests.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct WorkCounts {
+    /// Views built and published.
+    publishes: usize,
+    /// Freshness table reconciled against the whole membership list.
+    reconciliations: usize,
 }
 
 impl<T: ReportingTransport> ReportAggregator<T> {
@@ -141,7 +155,7 @@ impl<T: ReportingTransport> ReportAggregator<T> {
         membership_rx: Option<watch::Receiver<Vec<MembershipSnapshot>>>,
     ) -> (Self, watch::Receiver<AggregatedState>) {
         let (watch_tx, watch_rx) = watch::channel(AggregatedState::default());
-        let aggregator = Self {
+        let mut aggregator = Self {
             transport,
             entries: HashMap::new(),
             report_freshness: HashMap::new(),
@@ -154,7 +168,10 @@ impl<T: ReportingTransport> ReportAggregator<T> {
             shutdown,
             epoch_rx,
             membership_rx,
+            #[cfg(test)]
+            work: WorkCounts::default(),
         };
+        aggregator.refresh_report_deadlines(true);
         (aggregator, watch_rx)
     }
 
@@ -200,7 +217,8 @@ impl<T: ReportingTransport> ReportAggregator<T> {
                         self.membership_rx = None;
                         continue;
                     }
-                    if self.evict_departed() {
+                    let forgot = self.refresh_report_deadlines(true);
+                    if self.evict_departed() || forgot {
                         self.publish();
                         unpublished = 0;
                     }
@@ -320,7 +338,7 @@ impl<T: ReportingTransport> ReportAggregator<T> {
     }
 
     fn store_report(&mut self, report: StateReport) {
-        self.refresh_report_deadlines();
+        self.refresh_report_deadlines(false);
         self.report_freshness
             .insert(report.node_id.clone(), Instant::now());
         self.entries.insert(
@@ -394,32 +412,54 @@ impl<T: ReportingTransport> ReportAggregator<T> {
             || self.readiness_entries.len() != readiness_before
     }
 
-    fn refresh_report_deadlines(&mut self) {
+    /// Bring the freshness table in line with the leadership epoch and,
+    /// when `membership_changed` or the epoch moved, with gossip's member
+    /// list. Returns whether it forgot any node.
+    ///
+    /// Reconciling walks the whole member list, so it runs only when
+    /// something it depends on changed: at construction, when the
+    /// membership watch fires and on a new epoch. Every report used to pay
+    /// for it, which made the leader's work per reporting interval grow
+    /// with the square of the fleet (#2440).
+    fn refresh_report_deadlines(&mut self, membership_changed: bool) -> bool {
         let epoch = self.current_epoch();
-        if epoch != self.freshness_epoch {
+        let epoch_changed = epoch != self.freshness_epoch;
+        let before = self.report_freshness.len();
+        if epoch_changed {
             self.report_freshness.clear();
             self.freshness_epoch = epoch;
+        }
+        if !(membership_changed || epoch_changed) {
+            return false;
         }
         if let Some(rx) = &self.membership_rx {
             let members = rx.borrow();
             if !members.is_empty() {
-                // A set, not a scan per entry: this runs for every report,
-                // and a scan made it quadratic in the fleet (#1411).
+                #[cfg(test)]
+                {
+                    self.work.reconciliations += 1;
+                }
                 let active: std::collections::HashSet<&NodeId> =
                     members.iter().map(|m| &m.node_id).collect();
                 self.report_freshness
                     .retain(|node, _| active.contains(node));
                 for member in members.iter() {
-                    self.report_freshness
-                        .entry(member.node_id.clone())
-                        .or_insert_with(Instant::now);
+                    if !self.report_freshness.contains_key(&member.node_id) {
+                        self.report_freshness
+                            .insert(member.node_id.clone(), Instant::now());
+                    }
                 }
             }
         }
+        self.report_freshness.len() < before
     }
 
     fn publish(&mut self) {
-        self.refresh_report_deadlines();
+        self.refresh_report_deadlines(false);
+        #[cfg(test)]
+        {
+            self.work.publishes += 1;
+        }
         let _ = self.watch_tx.send(self.build_aggregated_state());
     }
 
@@ -861,6 +901,63 @@ mod tests {
 
         shutdown.cancel();
         let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn a_report_does_not_rebuild_the_state_once_per_message() {
+        // #2440: storing a report must cost the same whatever the fleet's
+        // size. 200 members, each reported once, then a queued burst of
+        // 200 more reports: one published view, and no pass over the
+        // membership list, because membership didn't change.
+        let net = InMemoryReportingNetwork::new();
+        let worker_transport = net.register(addr(1)).await;
+        let council_transport = net.register(addr(2)).await;
+        let shutdown = CancellationToken::new();
+        let names: Vec<String> = (0..200).map(|index| format!("w{index}")).collect();
+        let (_members, membership) =
+            watch::channel(names.iter().map(|name| member(name)).collect::<Vec<_>>());
+        let (mut aggregator, mut watch_rx) = ReportAggregator::new(
+            council_transport,
+            test_config(),
+            shutdown.clone(),
+            None,
+            None,
+            Some(membership),
+        );
+        for name in &names {
+            aggregator.insert_local_report(report(name));
+        }
+        aggregator.work = WorkCounts::default();
+        for index in 0..200 {
+            worker_transport
+                .send(
+                    addr(2),
+                    &ReportingMessage::Report(report(&format!("n{index}"))),
+                )
+                .await
+                .unwrap();
+        }
+        let handle = tokio::spawn(async move {
+            aggregator.run().await;
+            aggregator
+        });
+        let complete = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if watch_rx.borrow_and_update().reports.len() == 400 {
+                    return;
+                }
+                watch_rx.changed().await.unwrap();
+            }
+        })
+        .await;
+        assert!(complete.is_ok(), "the burst never reached the view");
+        shutdown.cancel();
+        let aggregator = handle.await.unwrap();
+        // Tokio makes a task yield after about 128 channel operations (its
+        // cooperative budget), so a long burst publishes once per stretch,
+        // not once: two for these 200. Per message it was 200.
+        assert!(aggregator.work.publishes <= 2, "{:?}", aggregator.work);
+        assert_eq!(aggregator.work.reconciliations, 0, "{:?}", aggregator.work);
     }
 
     #[tokio::test]

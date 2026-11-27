@@ -10857,6 +10857,23 @@ it. Consumers lose nothing, because a `watch` channel only ever holds the
 latest value anyway. The membership check builds a `HashSet` once per call
 instead of scanning the list once per entry.
 
+That still left the membership check running once per report, a walk over
+the whole member list each time: O(N) per message, O(N²) per interval again,
+just with a smaller constant. The audit caught it too
+([#2440](https://github.com/reliaburger/reliaburger/issues/2440)). The
+freshness table only depends on the member list and the leadership epoch, so
+now it's reconciled when one of them changes: at construction, in the
+membership watch's arm of the `select!`, and when the epoch moves (a cheap
+integer comparison on every report notices that). The test that pins it,
+`a_report_does_not_rebuild_the_state_once_per_message`, counts work instead
+of timing it. A `#[cfg(test)]` field on the aggregator counts publishes and
+reconciliations (the attribute compiles the field, and every line touching
+it, only into test builds, so production carries none of it). With 200
+members and a queued burst of 200 reports it sees no reconciliation at all
+and at most two publishes. Two, not one, because tokio makes a task yield
+after about 128 channel operations, its *cooperative budget*, so one burst
+reaches the last `select!` arm twice.
+
 After the fix the same test admits all 6,000 sends with every node in the
 view, and 1,000 workers admit all 12,000. The full harness agrees: on the Mac
 Studio, 500 hollow nodes went from 17,223 refused admissions to none
