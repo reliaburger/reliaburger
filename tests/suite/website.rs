@@ -1575,6 +1575,33 @@ fn the_release_testing_section_shows_the_installed_release() {
     }
 }
 
+/// Release step 9 profiles one release of every minor series against the
+/// last profiled one (#2488): the newest `X.Y.0` in the release log needs a
+/// `docs/qualification/*-vX.Y.*-profile` record, from any release of that
+/// series, so a skipped profile shows up before the next minor release.
+#[test]
+#[ignore = "fails until the 0.3 series has a profile record (qualify-profile.sh on the quiet host), #2488"]
+fn the_newest_minor_release_has_a_profile_record() {
+    let log = read("docs/release-log.md");
+    let (major, minor, _) = log
+        .lines()
+        .filter(|line| line.starts_with("## "))
+        .filter_map(|line| versions_named(line).into_iter().next())
+        .find(|&(_, _, patch)| patch == 0)
+        .expect("the release log names no minor release");
+    let series = format!("-v{major}.{minor}.");
+    let records: Vec<String> = std::fs::read_dir(repository().join("docs/qualification"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(&series) && name.contains("-profile"))
+        .collect();
+    assert!(
+        !records.is_empty(),
+        "no docs/qualification/*{series}*-profile record for the {major}.{minor} series; \
+         run scripts/release/qualify-profile.sh (docs/releasing.md, step 9)"
+    );
+}
+
 /// Every `<img>` tag in `html`, from `<img` to its closing `>`.
 fn img_tags(html: &str) -> Vec<&str> {
     html.match_indices("<img")

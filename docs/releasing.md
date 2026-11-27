@@ -2172,9 +2172,22 @@ the real `curl … | sh` install against it on every host we advertise.
    whether a release got slower, or why. The [0.2.3 host-job
    profile](qualification/2026-10-20-host-job-profile/README.md) found a
    GitOps loop burning a core and grants running in lockstep that no test or
-   soak had noticed. This step runs that profile on every release and
-   compares it with the previous one. The staging pre-release is gone by now,
-   so point it at the published release:
+   soak had noticed. This step runs that profile and compares it with the
+   last profiled release.
+
+   It runs on every minor release (`X.Y.0`), and on a patch release that
+   changes the job path or follows a throughput regression. The step said
+   "every release" until November 2026, and with releases two to four days
+   apart six of the eight releases after 0.2.4 went without one, so #2209
+   (0.3.1's jobs 22 to 28% slower than 0.2.8's) had no profile to answer it
+   ([#2488](https://github.com/reliaburger/reliaburger/issues/2488)). The
+   closure record says which: the profile's record, or why there is none.
+   `the_newest_minor_release_has_a_profile_record` in
+   `tests/suite/website.rs` fails while the newest minor series in the
+   [release log](release-log.md) has no `-vX.Y.*-profile` record; it's
+   ignored until the 0.3 series has one, and that record removes the
+   `#[ignore]`. The
+   staging pre-release is gone by now, so point it at the published release:
 
    ```sh
    scripts/release/qualify-profile.sh \
@@ -2185,7 +2198,8 @@ the real `curl … | sh` install against it on every host we advertise.
    It creates a disposable Lima VM `rb-profile-<random>` with the profile
    record's shape (VZ, 4 vCPUs, 8 GiB, 60 GiB, `template:ubuntu-24.04`),
    and installs two versions in it: the candidate, and the previous release
-   (the patch number one lower; `--previous vX.Y.Z` names another). Every
+   (by default the patch number one lower; name the last profiled release
+   with `--previous vX.Y.Z`, which a `.0` release must). Every
    binary is checked against its `candidate.json`. Rates come from those
    release binaries, unchanged. Attribution comes from each version's
    profiling build: `build.yml` builds `bun` and `relish` for Linux arm64
