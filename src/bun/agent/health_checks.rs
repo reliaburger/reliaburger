@@ -48,6 +48,10 @@ pub(super) struct HealthWrite {
 /// capped to 500 ms — a deploy gate wants responsiveness, not the
 /// steady-state cadence — all bounded by the deploy's `health_timeout`
 /// deadline. Returns the failure message for the deploy's error event.
+/// The health wait a deploy gets when its `health_timeout` is too large to
+/// add to the clock: the most config accepts.
+const HEALTH_WAIT_FALLBACK: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
 pub(super) async fn wait_instance_healthy<G: Grill>(
     grill: &G,
     id: &InstanceId,
@@ -55,7 +59,14 @@ pub(super) async fn wait_instance_healthy<G: Grill>(
     container_ip: Option<std::net::Ipv4Addr>,
     wait: std::time::Duration,
 ) -> Result<(), String> {
-    let deadline = std::time::Instant::now() + wait;
+    // `Instant + Duration` panics when the sum doesn't fit the clock
+    // (#2378). Config caps `health_timeout` at a day, so a wait too large
+    // to add gets that day.
+    let now = std::time::Instant::now();
+    let deadline = now
+        .checked_add(wait)
+        .or_else(|| now.checked_add(HEALTH_WAIT_FALLBACK))
+        .unwrap_or(now);
     let mut state = grill.state(id).await;
     while std::time::Instant::now() < deadline
         && !matches!(state, Ok(crate::grill::state::ContainerState::Running))
@@ -506,4 +517,22 @@ pub(super) fn health_evidence(
         evidence.push(("interval_seconds", config.interval.as_secs().to_string()));
     }
     evidence
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::grill::mock::MockGrill;
+
+    /// A deploy's health wait too large to add to the clock still waits,
+    /// rather than panicking the deploy worker (#2378, #2527). Passed in
+    /// directly: config refuses such a `health_timeout` before it gets here.
+    #[tokio::test]
+    async fn a_health_wait_too_large_to_add_to_the_clock_does_not_panic() {
+        let grill = MockGrill::new();
+        let id = InstanceId("default__web-0".into());
+        let spec: AppSpec = toml::from_str("image = \"web:1\"").unwrap();
+        let answer = wait_instance_healthy(&grill, &id, &spec, None, std::time::Duration::MAX);
+        assert_eq!(answer.await, Ok(()));
+    }
 }

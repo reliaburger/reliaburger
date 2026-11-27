@@ -2325,6 +2325,62 @@ async fn a_follower_forwards_a_scale_to_the_leader_with_its_body() {
     }
 }
 
+/// A scale's progress stream ends once the token that started it expires,
+/// as apply's and rollback's do (#2399), with the farewell that says the
+/// scale carries on (#2526). The leader here streams for ever, so only the
+/// credential check can end the follower's answer.
+#[tokio::test]
+async fn a_scale_progress_stream_ends_once_its_token_expires() {
+    let created = crate::sesame::token::create_token(
+        "brief",
+        crate::sesame::types::ApiRole::Deployer,
+        crate::sesame::types::TokenScope::default(),
+        Some(std::time::SystemTime::now() + std::time::Duration::from_secs(2)),
+    )
+    .unwrap();
+    let leader_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let leader_port = leader_listener.local_addr().unwrap().port();
+    let leader = axum::Router::new().fallback(|| async {
+        let first = futures_util::stream::once(async {
+            Ok::<_, std::convert::Infallible>(
+                axum::response::sse::Event::default()
+                    .data(r#"{"type":"progress","message":"web: committed"}"#),
+            )
+        });
+        Sse::new(first.chain(futures_util::stream::pending())).into_response()
+    });
+    tokio::spawn(async move { axum::serve(leader_listener, leader).await.unwrap() });
+    let (follower, nodes) =
+        follower_of_the_leader_api_on(created.token.clone(), None, leader_port).await;
+
+    let request = axum::http::Request::post("/v1/scale/web/default")
+        .header("authorization", format!("Bearer {}", created.plaintext))
+        .extension(axum::extract::ConnectInfo(
+            "203.0.113.9:40000".parse::<std::net::SocketAddr>().unwrap(),
+        ))
+        .body(Body::from(r#"{"replicas":3}"#))
+        .unwrap();
+    let response = follower.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        response.into_body().collect(),
+    )
+    .await
+    .expect("the scale stream outlived its expired token")
+    .unwrap()
+    .to_bytes();
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("web: committed"), "{text}");
+    assert!(
+        text.contains(crate::sesame::auth::CREDENTIAL_ENDED_MESSAGE),
+        "{text}"
+    );
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn a_follower_forwards_upgrade_control_calls_to_the_leader_with_the_callers_token() {
     let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
