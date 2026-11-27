@@ -97,7 +97,10 @@ pub struct ApplyEntryPosition {
 struct StateMachineInner {
     state: DesiredState,
     snapshot_index: u64,
-    snapshot_data: Option<Vec<u8>>,
+    /// The latest snapshot's bytes, kept once: the copy here, the one
+    /// persisted to redb and the one the snapshot builder returns share it
+    /// (#2452).
+    snapshot_data: Option<Arc<Vec<u8>>>,
     /// The log id and membership `snapshot_data` covers. The live `state`
     /// moves on as entries apply; a snapshot handed to a learner must
     /// describe its own contents, or the learner records a log position its
@@ -172,7 +175,7 @@ fn persist_snapshot(db: &Database, data: &[u8], index: u64) -> Result<(), redb::
 #[allow(clippy::result_large_err)]
 async fn persist_snapshot_blocking(
     db: Arc<Database>,
-    data: Vec<u8>,
+    data: Arc<Vec<u8>>,
     index: u64,
 ) -> Result<(), StorageError<u64>> {
     match tokio::task::spawn_blocking(move || persist_snapshot(&db, &data, index)).await {
@@ -3836,7 +3839,7 @@ impl CouncilStateMachine {
                 // security state (app specs, CA material, tokens). Refuse to
                 // start so an operator can restore from backup instead.
                 inner.state = serde_json::from_slice::<DesiredState>(&bytes)?;
-                inner.snapshot_data = Some(bytes);
+                inner.snapshot_data = Some(Arc::new(bytes));
                 inner.snapshot_last_log_id = inner.state.last_applied_log;
                 inner.snapshot_membership = inner.state.last_membership.clone();
             }
@@ -4053,6 +4056,7 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
         .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?
         .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
 
+        let data = Arc::new(data);
         let (db, index) = {
             let mut guard = self.inner.write().await;
             guard.state = new_state;
@@ -4061,7 +4065,7 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
             self.publish_gitops_triggers(&guard.state);
             self.publish_api_tokens(&guard.state);
             guard.snapshot_index += 1;
-            guard.snapshot_data = Some(data.clone());
+            guard.snapshot_data = Some(Arc::clone(&data));
             guard.snapshot_last_log_id = meta.last_log_id;
             guard.snapshot_membership = meta.last_membership.clone();
             guard.snapshot_id = snapshot_id_for(meta.last_log_id, guard.snapshot_index);
@@ -4089,7 +4093,9 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
                 };
                 Ok(Some(Snapshot {
                     meta,
-                    snapshot: Box::new(Cursor::new(data.clone())),
+                    // openraft's snapshot type owns its bytes, so each
+                    // send to a follower takes one copy of the kept ones.
+                    snapshot: Box::new(Cursor::new(Vec::clone(data))),
                 }))
             }
             None => Ok(None),
@@ -4114,7 +4120,7 @@ pub struct MemSnapshotBuilder {
 /// What [`MemSnapshotBuilder::build_snapshot`] stored, and the store to
 /// persist it to (`None` when there is nothing new to persist).
 struct BuiltSnapshot {
-    data: Vec<u8>,
+    data: Arc<Vec<u8>>,
     snapshot_id: String,
     index: u64,
     db: Option<Arc<Database>>,
@@ -4141,7 +4147,7 @@ impl RaftSnapshotBuilder<TypeConfig> for MemSnapshotBuilder {
                     std::sync::atomic::Ordering::SeqCst,
                 );
             }
-            let data = serde_json::to_vec(&state)?;
+            let data = Arc::new(serde_json::to_vec(&state)?);
             let mut guard = inner.blocking_write();
             // A snapshot installed from the leader while this one encoded
             // is newer: keep it, and hand it back instead of this one.
@@ -4149,7 +4155,7 @@ impl RaftSnapshotBuilder<TypeConfig> for MemSnapshotBuilder {
                 && let Some(newer) = &guard.snapshot_data
             {
                 return Ok::<_, serde_json::Error>(BuiltSnapshot {
-                    data: newer.clone(),
+                    data: Arc::clone(newer),
                     snapshot_id: guard.snapshot_id.clone(),
                     index: guard.snapshot_index,
                     db: None,
@@ -4158,7 +4164,7 @@ impl RaftSnapshotBuilder<TypeConfig> for MemSnapshotBuilder {
                 });
             }
             guard.snapshot_index += 1;
-            guard.snapshot_data = Some(data.clone());
+            guard.snapshot_data = Some(Arc::clone(&data));
             guard.snapshot_last_log_id = state.last_applied_log;
             guard.snapshot_membership = state.last_membership.clone();
             guard.snapshot_id = snapshot_id_for(state.last_applied_log, guard.snapshot_index);
@@ -4187,7 +4193,7 @@ impl RaftSnapshotBuilder<TypeConfig> for MemSnapshotBuilder {
         // (M7): the lock is released before the fsync. A newer installed
         // snapshot was persisted by its install.
         if let Some(db) = db {
-            persist_snapshot_blocking(db, data.clone(), index).await?;
+            persist_snapshot_blocking(db, Arc::clone(&data), index).await?;
         }
 
         let meta = SnapshotMeta {
@@ -4196,9 +4202,11 @@ impl RaftSnapshotBuilder<TypeConfig> for MemSnapshotBuilder {
             snapshot_id,
         };
 
+        // The state machine keeps `data`, so openraft's owned snapshot is
+        // the one copy a build makes.
         Ok(Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(data)),
+            snapshot: Box::new(Cursor::new(Arc::unwrap_or_clone(data))),
         })
     }
 }

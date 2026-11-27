@@ -104,8 +104,27 @@ pub struct SealedBackup {
     pub hkdf_info: String,
     /// AES-256-GCM nonce.
     pub nonce: [u8; 12],
-    /// Ciphertext with the 16-byte GCM tag appended.
+    /// Ciphertext with the 16-byte GCM tag appended, stored as base64: as
+    /// a JSON array of numbers it took 3.6 bytes per byte (#2452).
+    #[serde(with = "base64_bytes")]
     pub ciphertext: Vec<u8>,
+}
+
+/// Serde helper that writes bytes as one standard base64 string.
+mod base64_bytes {
+    use base64::Engine;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        base64::engine::general_purpose::STANDARD
+            .decode(text)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 /// Errors from sealing, unsealing, or shipping a council backup.
@@ -647,6 +666,26 @@ mod tests {
         sealed.ciphertext[0] ^= 0x01;
         let err = unseal_snapshot(&master, &sealed).unwrap_err();
         assert!(matches!(err, BackupError::Crypto(_)), "got {err:?}");
+    }
+
+    /// #2452: the stored backup carries its ciphertext compactly, not as a
+    /// JSON array of decimal numbers 3.6 times its size, and still
+    /// round-trips.
+    #[test]
+    fn an_encoded_backup_is_not_much_larger_than_its_payload() {
+        let master = key(7);
+        let payload = vec![0xA5u8; 64 * 1024];
+        let sealed = seal_snapshot(&master, &payload, &BackupConfig::default()).unwrap();
+        let encoded = encode_backup(&sealed).unwrap();
+        assert!(
+            encoded.len() < payload.len() * 3 / 2,
+            "a {} byte payload encoded to {} bytes",
+            payload.len(),
+            encoded.len()
+        );
+        let decoded = decode_backup(&encoded).unwrap();
+        assert_eq!(decoded, sealed);
+        assert_eq!(unseal_snapshot(&master, &decoded).unwrap(), payload);
     }
 
     #[test]
