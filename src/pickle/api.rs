@@ -2462,6 +2462,28 @@ mod tests {
         drop(writers);
     }
 
+    /// #2520: a stock client sends a layer in one request, so the manual
+    /// has to say how big and how slow that request may be, and how many
+    /// run at once. The numbers come from the constants, so they can't drift.
+    #[test]
+    fn the_manual_states_the_registry_push_limits() {
+        let manual = include_str!("../../docs/manual/11_images-and-volumes.md");
+        let size = format!("{} MiB", MAX_REQUEST_BYTES / (1024 * 1024));
+        let timeout = format!("{} minutes", UPLOAD_TIMEOUT.as_secs() / 60);
+        let writers = format!("{} write requests", number_word(MAX_CONCURRENT_WRITES));
+        let wait = format!("{} minutes", WRITE_ADMISSION_WAIT.as_secs() / 60);
+        for fact in [size, timeout, writers, wait] {
+            assert!(manual.contains(&fact), "the manual doesn't say {fact:?}");
+        }
+    }
+
+    fn number_word(number: usize) -> &'static str {
+        ["zero", "one", "two", "three", "four", "five", "six"]
+            .get(number)
+            .copied()
+            .unwrap_or("many")
+    }
+
     /// #2466: a slot can be held for a whole upload (`UPLOAD_TIMEOUT`), so a
     /// queued writer waits at least that long. A layer pushed beside four
     /// slow ones mustn't fail with a 429 that docker never retries.

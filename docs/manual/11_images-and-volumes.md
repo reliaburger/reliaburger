@@ -392,6 +392,21 @@ podman takes the same `login`, `push` and `pull`. skopeo takes the token as
 and crane as `crane auth login NODE:5050 -u push -p "$TOKEN"`. Apps refer to
 the image by its bare name, `api:v1`.
 
+### Push limits
+
+Each upload request may carry at most 512 MiB and must arrive within
+5 minutes. A bigger request is refused with 413 and a slower one with 408, and
+the client reports the push as failed. A layer over 512 MiB has to be sent in
+several `PATCH` chunks, but docker, podman, skopeo and crane each send a layer
+in one request, and we haven't found a setting in any of them that splits it.
+`relish build` uploads each blob in one request too. So keep every layer under
+512 MiB: split a large `COPY` or `RUN` into several steps.
+
+At most four write requests run at once on a node. Clients push layers in
+parallel, so a fifth waits for a free slot, for up to 6 minutes, longer than
+an upload may take, and only then gets 429. Copies between nodes have slots of
+their own and never take one of these.
+
 CI runs all four against a Pickle TLS listener:
 docker, podman and skopeo as the Ubuntu runner image ships them, and a pinned
 crane. Each one logs in with a token, verifies the cluster CA, pushes a
