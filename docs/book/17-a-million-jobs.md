@@ -1705,7 +1705,14 @@ That's what the `protocol` number in `src/compatibility.rs` is for, and before
 size rather than the mechanism: `a_node_that_already_has_a_template_is_not_sent_it_again`
 checks that the second request for eight runs is under a quarter of the first,
 and `control_state_stays_within_budget_at_the_global_cap` now checks that a
-node's steady-state call at the 128-run cap stays under 64 KiB.
+node's steady-state call at the 128-run cap stays under 64 KiB. A new
+`sync_requests` Criterion group puts numbers on it, with 96 runs (the most bulk
+runs admission allows) carrying 1 KiB templates and 200 nodes. On the Mac
+Studio, building every node's request the old way took about 12.7 ms, all of it
+under the lock, and twice a tick; the requests came to 48 MB. In the steady
+state the plan takes about 0.56 ms under the lock, the requests another 0.71 ms
+after it, and they come to 5.9 MB, most of it the per-run spec and labels a
+node still needs to report its slots.
 
 The Criterion suite now has a `leader_tick` group, so the cost is a number,
 not a hunch (`make bench-task-arrays`): one tick for sixty-four arrays on three
