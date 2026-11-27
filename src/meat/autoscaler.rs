@@ -353,30 +353,9 @@ impl AutoscaleTracker {
         }
     }
 
-    /// Update baseline when config changes (e.g. from GitOps).
-    pub fn update_baseline(&mut self, app_id: &AppId, new_baseline: u32) {
-        if let Some(state) = self.states.get_mut(app_id) {
-            state.baseline_replicas = new_baseline;
-            // Reset current to baseline if baseline changed
-            state.current_replicas = new_baseline;
-            state.last_scale_event = None;
-        }
-    }
-
-    /// Get the current override for an app (None if at baseline).
-    pub fn get_override(&self, app_id: &AppId) -> Option<u32> {
-        self.states.get(app_id).and_then(|s| {
-            if s.current_replicas != s.baseline_replicas {
-                Some(s.current_replicas)
-            } else {
-                None
-            }
-        })
-    }
-
-    /// Remove tracking for an app.
-    pub fn remove(&mut self, app_id: &AppId) {
-        self.states.remove(app_id);
+    /// Forget every app not in `live`, the apps that autoscale now.
+    pub fn retain_apps(&mut self, live: &std::collections::HashSet<AppId>) {
+        self.states.retain(|app_id, _| live.contains(app_id));
     }
 }
 
@@ -607,6 +586,32 @@ mod tests {
         }
     }
 
+    /// A deleted app's cooldown must not carry over to an app created
+    /// later under the same name. An app deleted and applied again inside
+    /// one autoscale interval still keeps its entry: the loop never sees it
+    /// leave.
+    #[test]
+    fn an_app_that_stopped_autoscaling_is_forgotten() {
+        let mut tracker = AutoscaleTracker::default();
+        let app = test_app();
+        tracker.get_or_insert(&app, 2);
+        tracker.apply_decision(
+            &AutoscaleDecision {
+                app_id: app.clone(),
+                from: 2,
+                to: 6,
+                reason: "cpu".into(),
+            },
+            Instant::now(),
+        );
+
+        tracker.retain_apps(&std::collections::HashSet::new());
+
+        let state = tracker.get_or_insert(&app, 2);
+        assert!(state.last_scale_event.is_none());
+        assert_eq!(state.current_replicas, 2);
+    }
+
     #[test]
     fn tracker_get_or_insert() {
         let mut tracker = AutoscaleTracker::default();
@@ -627,39 +632,12 @@ mod tests {
             to: 5,
             reason: "test".to_string(),
         };
-        tracker.apply_decision(&decision, Instant::now());
-        assert_eq!(tracker.get_override(&app), Some(5));
-    }
-
-    #[test]
-    fn tracker_update_baseline_resets() {
-        let mut tracker = AutoscaleTracker::default();
-        let app = test_app();
-        tracker.get_or_insert(&app, 3);
-        let decision = AutoscaleDecision {
-            app_id: app.clone(),
-            from: 3,
-            to: 5,
-            reason: "test".to_string(),
-        };
-        tracker.apply_decision(&decision, Instant::now());
-        assert_eq!(tracker.get_override(&app), Some(5));
-
-        // Git changes replicas to 4 → baseline update resets override
-        tracker.update_baseline(&app, 4);
-        assert_eq!(tracker.get_override(&app), None);
-    }
-
-    #[test]
-    fn tracker_no_override_at_baseline() {
-        let mut tracker = AutoscaleTracker::default();
-        let app = test_app();
-        tracker.get_or_insert(&app, 3);
-        assert_eq!(
-            tracker.get_override(&app),
-            None,
-            "no override when at baseline"
-        );
+        let now = Instant::now();
+        tracker.apply_decision(&decision, now);
+        let state = tracker.get_or_insert(&app, 3);
+        assert_eq!(state.current_replicas, 5);
+        assert_eq!(state.baseline_replicas, 3);
+        assert_eq!(state.last_scale_event, Some(now));
     }
 
     #[test]

@@ -2,8 +2,8 @@
 //!
 //! `SchedulingDecisions` carries the Raft log id its plan was made against, and the state machine refuses the entry with "admission
 //! revision changed" if any other entry was applied in between. That is the
-//! designed contract: the ordinary scheduler replans from committed state on
-//! its next tick. Tests that seed these entries beside a running API share the
+//! designed contract: the ordinary scheduler replans from fresh committed
+//! state, up to three times a tick (#2369). Tests that seed these entries beside a running API share the
 //! leader with its task-array loop, whose first tick commits a cron
 //! observation (#735), so the fixture replans the same way instead of
 //! assuming nobody else writes.
