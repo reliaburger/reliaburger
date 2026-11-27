@@ -90,6 +90,14 @@ pub async fn unmount_bundle(bundle: PathBuf) -> Result<(), RootfsError> {
         .map_err(|error| RootfsError::Worker(error.to_string()))?
 }
 
+/// The image generation a bundle's private overlay sits on, as the bundle's
+/// marker records it (canonical). `None` when the bundle has no overlay.
+pub fn lower_generation(bundle: &Path) -> Option<PathBuf> {
+    std::fs::read(bundle.join(LOWER_MARKER))
+        .ok()
+        .map(|bytes| PathBuf::from(OsStr::from_bytes(&bytes)))
+}
+
 /// Whether `path` is an exact mountpoint in the current mount namespace.
 pub fn is_mountpoint(path: &Path) -> bool {
     let Ok(target) = std::fs::canonicalize(path) else {

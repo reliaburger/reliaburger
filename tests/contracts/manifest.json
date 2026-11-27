@@ -4123,6 +4123,19 @@
           ]
         },
         {
+          "id": "issue-2423-runc_image_collection_removes_a_replaced_generation_and_keeps_running_ones",
+          "binary": "reliaburger",
+          "test": "grill::runc::tests::runc_image_collection_removes_a_replaced_generation_and_keeps_running_ones",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/grill/runc.rs",
+            "src/grill/image.rs",
+            "src/grill/image/gc.rs"
+          ]
+        },
+        {
           "id": "legacy-ci-reliaburger-grill-runc-tests-runc_create_failure_rolls_back_private_rootfs_mount",
           "binary": "reliaburger",
           "test": "grill::runc::tests::runc_create_failure_rolls_back_private_rootfs_mount",

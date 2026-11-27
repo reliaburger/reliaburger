@@ -8,9 +8,10 @@
 /// Supports rootless mode via user namespaces and `--rootless` flag,
 /// and pulls real OCI images from Docker Hub when the spec's root
 /// path looks like an image reference.
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::Mutex;
 
@@ -22,6 +23,50 @@ use super::state::ContainerState;
 use super::{GrillError, InstanceId};
 
 mod owned;
+
+/// How often a node that keeps creating containers looks for image
+/// generations nothing uses (#2423). A full image filesystem looks at the
+/// next create whatever the interval.
+const IMAGE_COLLECTION_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// How long a generation a pull handed out, or a tree an unpack left
+/// without its marker, is spared by the collector.
+const IMAGE_COLLECTION_GRACE: Duration = Duration::from_secs(3600);
+
+/// Every image generation a bundle under `bundle_base` uses: the lower of a
+/// writable overlay (its `rootfs-lower` marker) or the root a read-only
+/// container runs straight from (its config.json). An error means the set
+/// may be incomplete, and the caller must not collect with it.
+pub(crate) fn live_image_generations(bundle_base: &Path) -> std::io::Result<HashSet<PathBuf>> {
+    let mut live = HashSet::new();
+    let entries = match std::fs::read_dir(bundle_base) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(live),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let bundle = entry.path();
+        if let Some(lower) = super::rootfs::lower_generation(&bundle) {
+            live.insert(lower);
+        }
+        let bytes = match std::fs::read(bundle.join("config.json")) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let spec: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+        if let Some(root) = spec.pointer("/root/path").and_then(|path| path.as_str()) {
+            let root = PathBuf::from(root);
+            live.insert(std::fs::canonicalize(&root).unwrap_or(root));
+        }
+    }
+    Ok(live)
+}
 
 /// Runc-based Grill implementation.
 ///
@@ -326,7 +371,8 @@ impl RuncGrill {
         }
 
         // If root.path looks like an image reference, pull and unpack it
-        if looks_like_image_ref(&spec.root.path) {
+        let from_image = looks_like_image_ref(&spec.root.path);
+        if from_image {
             let pulled = self
                 .image_store
                 .pull_and_unpack(&spec.root.path)
@@ -485,8 +531,51 @@ impl RuncGrill {
         if let Some(mounted) = rootfs_mount {
             mounted.commit();
         }
+        if from_image {
+            self.collect_images_in_background();
+        }
 
         Ok(())
+    }
+
+    /// Start an image collection pass on its own task when one is due
+    /// (#2423). Unpacking is what grows the image store, so a create from
+    /// an image is the time to look.
+    fn collect_images_in_background(&self) {
+        let store = self.image_store.clone();
+        let bundle_base = self.bundle_base.clone();
+        tokio::spawn(async move {
+            let Some(_pass) = store.start_collection(IMAGE_COLLECTION_INTERVAL).await else {
+                return;
+            };
+            let live =
+                match tokio::task::spawn_blocking(move || live_image_generations(&bundle_base))
+                    .await
+                    .map_err(std::io::Error::other)
+                    .and_then(|live| live)
+                {
+                    Ok(live) => live,
+                    Err(error) => {
+                        eprintln!("warning: image collection skipped: {error}");
+                        return;
+                    }
+                };
+            match store
+                .collect_rootfs_garbage(&live, IMAGE_COLLECTION_GRACE)
+                .await
+            {
+                Ok(report) if report != super::image::RootfsGcReport::default() => eprintln!(
+                    "grill: image collection removed {} generation(s), {} partial tree(s), \
+                     {} manifest(s) and {} metadata file(s)",
+                    report.generations_removed,
+                    report.partials_removed,
+                    report.manifests_removed,
+                    report.metadata_removed
+                ),
+                Ok(_) => {}
+                Err(error) => eprintln!("warning: image collection failed: {error}"),
+            }
+        });
     }
 }
 
@@ -1445,6 +1534,145 @@ mod tests {
         }
         shutdown.cancel();
         responder_task.await.ok();
+    }
+
+    #[test]
+    fn live_generations_are_overlay_lowers_and_read_only_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundles = tmp.path().join("bundles");
+        let writable_lower = tmp.path().join("images/rootfs/a/gen-0123456789abcdef");
+        let read_only_root = tmp.path().join("images/rootfs/b/gen-fedcba9876543210");
+        std::fs::create_dir_all(&writable_lower).unwrap();
+        std::fs::create_dir_all(&read_only_root).unwrap();
+        let writable = bundles.join("default__web-0");
+        std::fs::create_dir_all(&writable).unwrap();
+        std::fs::write(
+            writable.join("rootfs-lower"),
+            writable_lower.as_os_str().as_encoded_bytes(),
+        )
+        .unwrap();
+        let read_only = bundles.join("default__cache-0");
+        std::fs::create_dir_all(&read_only).unwrap();
+        std::fs::write(
+            read_only.join("config.json"),
+            serde_json::json!({"root": {"path": read_only_root, "readonly": true}}).to_string(),
+        )
+        .unwrap();
+        // A bundle that exited cleanly keeps its upper but not its spec.
+        std::fs::create_dir_all(bundles.join("default__done-0")).unwrap();
+
+        let live = live_image_generations(&bundles).unwrap();
+        assert!(live.contains(&writable_lower));
+        assert!(live.contains(&std::fs::canonicalize(&read_only_root).unwrap()));
+        assert_eq!(live.len(), 2);
+    }
+
+    #[test]
+    fn an_unreadable_spec_refuses_the_whole_live_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("bundles/default__web-0");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("config.json"), b"not json").unwrap();
+        assert!(
+            live_image_generations(&tmp.path().join("bundles")).is_err(),
+            "a set missing a running container's root must never drive a collection"
+        );
+    }
+
+    /// A long-running container of `image` that checks a file of its image
+    /// is still there before it exits.
+    fn sleeping_image_spec(image: &str, readonly: bool) -> OciSpec {
+        let mut spec = preparation_spec("/bin/sh");
+        spec.root = crate::grill::oci::OciRoot {
+            path: image.to_string(),
+            readonly,
+        };
+        spec.process.args = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "sleep 20; test -s /bin/sh".to_string(),
+        ];
+        spec.process.env = vec!["PATH=/usr/sbin:/usr/bin:/sbin:/bin".to_string()];
+        spec.mounts = crate::grill::oci::standard_mounts();
+        spec.linux.namespaces = crate::grill::oci::standard_namespaces(None);
+        spec
+    }
+
+    #[tokio::test]
+    #[ignore = "requires rootful runc, overlayfs, pinned OCI images (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
+    async fn runc_image_collection_removes_a_replaced_generation_and_keeps_running_ones() {
+        assert!(
+            runc_tests_enabled(),
+            "set RELIABURGER_RUNC_TESTS=1 after provisioning rootful runc"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let store = pinned_image_store(tmp.path());
+        let grill = RuncGrill::new(
+            tmp.path().join("bundles"),
+            store.clone(),
+            false,
+            tmp.path().join("state"),
+            test_owner(),
+        )
+        .unwrap();
+        let web = InstanceId("runc-image-gc-web-0".to_string());
+        let cache = InstanceId("runc-image-gc-cache-0".to_string());
+        for id in [&web, &cache] {
+            remove_test_network(id);
+        }
+        let _network_cleanup = TestNetworkCleanup(vec![web.clone(), cache.clone()]);
+        let bundles = tmp.path().join("bundles");
+
+        // The first version of `web`, then its replacement on another image.
+        grill
+            .create(&web, &sleeping_image_spec(ALPINE_IMAGE, false))
+            .await
+            .unwrap();
+        let replaced = crate::grill::rootfs::lower_generation(&bundles.join(&web.0)).unwrap();
+        grill.kill(&web).await.ok();
+        grill.forget_retired(&web).await.unwrap();
+        grill
+            .create(&web, &sleeping_image_spec(REDIS_IMAGE, false))
+            .await
+            .unwrap();
+        grill.start(&web).await.unwrap();
+        let running = crate::grill::rootfs::lower_generation(&bundles.join(&web.0)).unwrap();
+        assert_ne!(replaced, running);
+        // A read-only container runs straight from its generation.
+        grill
+            .create(&cache, &sleeping_image_spec(NGINX_IMAGE, true))
+            .await
+            .unwrap();
+        grill.start(&cache).await.unwrap();
+        let config: OciSpec = serde_json::from_slice(
+            &std::fs::read(bundles.join(&cache.0).join("config.json")).unwrap(),
+        )
+        .unwrap();
+        let read_only = PathBuf::from(config.root.path);
+
+        let live = live_image_generations(&bundles).unwrap();
+        let report = store
+            .collect_rootfs_garbage(&live, Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert!(!replaced.exists(), "the replaced image's generation stays");
+        assert!(report.generations_removed >= 1);
+        assert!(running.join("bin/sh").exists());
+        assert!(read_only.join("bin/sh").exists());
+        for id in [&web, &cache] {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !matches!(grill.state(id).await, Ok(ContainerState::Stopped)) {
+                assert!(std::time::Instant::now() < deadline, "{id} did not exit");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            assert_eq!(
+                grill.exit_code(id).await.unwrap(),
+                Some(0),
+                "{id} lost its image files: {}",
+                grill.logs(id).await.unwrap_or_default()
+            );
+        }
     }
 
     #[tokio::test]

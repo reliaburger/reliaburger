@@ -249,6 +249,9 @@ format 76, and a 0.3.1 cluster's leader refuses it
 0.3.3 keeps 0.3.2's pair, protocol 61 and state format 76, so a 0.3.2
 cluster can roll onto it in place
 ([upgrading from 0.3.2](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-032)).
+0.3.4 moves the pair to protocol 62 and state format 77, and a 0.3.3
+cluster's leader refuses it
+([upgrading from 0.3.3](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-033)).
 
 A laptop cluster says the same thing when you rerun the quickstart installer
 from a newer release over it. Its saved record names the release that set it
@@ -681,7 +684,11 @@ Without `--from`, it rebuilds the state from the node's own Raft directory:
 its snapshot, if it has taken one, plus every committed log entry after it.
 That only works on a node that was a voter, and the log is encrypted, so pass
 `--master-key` (it defaults to `/etc/reliaburger/master.key` when that file
-exists). Entries the node hadn't seen committed are left out. It moves the dead
+exists). Entries the node hadn't seen committed are left out. A node that was
+stopped cleanly recovers every write it saw committed. A node that crashed may
+have its record of the commit point one batch behind, since that record is
+written with the next batch rather than on its own, so recovering a crashed
+survivor can leave out its newest writes. It moves the dead
 council's Raft directory aside (to `.raft-recovery-*/previous` in the data
 directory, where you can delete it once the cluster is healthy) and stamps a
 new recovery epoch, with a random recovery id that tells this recovery apart
