@@ -50,6 +50,10 @@ impl From<NodeFailure> for LogQueryWarning {
     }
 }
 
+/// How many nodes one log query asks at the same time (#2453). The rest
+/// wait for a slot; each node's deadline starts when its request does.
+pub const MAX_CONCURRENT_NODE_QUERIES: usize = 16;
+
 /// Most of an error body a warning repeats. A node's error bodies are short
 /// messages; anything longer is noise on a terminal.
 const MAX_ERROR_BODY_CHARS: usize = 200;
@@ -182,6 +186,8 @@ pub async fn fan_out_query(
     let mut handles = tokio::task::JoinSet::new();
     // A task that panics returns no node id, so remember whose task it was.
     let mut owners = std::collections::HashMap::new();
+    // Every node gets a task, but only this many send at once (#2453).
+    let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_NODE_QUERIES));
 
     for (node_id, url) in nodes {
         let node_id = node_id.clone();
@@ -198,7 +204,13 @@ pub async fn fan_out_query(
         let client = client.clone();
 
         let owner = node_id.clone();
+        let slots = std::sync::Arc::clone(&slots);
         let handle = handles.spawn(async move {
+            // Wait for a slot before the deadline starts, so a node queued
+            // behind slow ones isn't reported as timed out. The semaphore is
+            // never closed, so `acquire_owned` can't fail; the permit is held
+            // until this task ends.
+            let _permit = slots.acquire_owned().await.ok();
             // Build the target URL through `url::Url` so `app`/`namespace`
             // path segments are percent-encoded, and hand the query pairs to
             // reqwest's `.query()`, which encodes each value. A `grep` value
@@ -352,6 +364,59 @@ mod tests {
             }
         });
         (url, ready, task)
+    }
+
+    /// A 500-node cluster used to open 500 requests at once for one
+    /// `relish logs` (#2453).
+    #[tokio::test]
+    async fn a_fan_out_runs_at_most_the_concurrency_limit_at_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let most = Arc::new(AtomicUsize::new(0));
+        let handler = {
+            let in_flight = Arc::clone(&in_flight);
+            let most = Arc::clone(&most);
+            axum::routing::get(move || {
+                let in_flight = Arc::clone(&in_flight);
+                let most = Arc::clone(&most);
+                async move {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    most.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    axum::Json(Vec::<LogEntry>::new())
+                }
+            })
+        };
+        let router = axum::Router::new().route("/v1/logs/entries/{app}/{namespace}", handler);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let nodes: Vec<(String, String)> =
+            (0..64).map(|n| (format!("n{n}"), url.clone())).collect();
+        let result = fan_out_query(
+            &log_query(None),
+            &nodes,
+            &reqwest::Client::new(),
+            std::time::Duration::from_secs(10),
+            None,
+        )
+        .await
+        .unwrap();
+        server.abort();
+
+        assert!(result.failures.is_empty(), "{:?}", result.failures);
+        let most = most.load(Ordering::SeqCst);
+        assert!(
+            most <= MAX_CONCURRENT_NODE_QUERIES,
+            "{most} requests in flight at once"
+        );
+        assert!(most > 1, "the fan-out should still run nodes in parallel");
     }
 
     #[tokio::test]

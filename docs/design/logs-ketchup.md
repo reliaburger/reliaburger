@@ -121,7 +121,9 @@ relish logs web --since 1h --grep "ERROR"          (one-shot, no -f)
     └─ Merge-sort the returned LogEntry lists by timestamp
 ```
 
-Non-follow queries fan out over HTTP (`fan_out_query` in `src/ketchup/query.rs`) to the nodes running the app and merge-sort the results by timestamp.
+Non-follow queries fan out over HTTP (`fan_out_query` in `src/ketchup/query.rs`) to every live member, since an app's lines stay on every node it ever ran on (`query_targets`), and merge-sort the results. At most `MAX_CONCURRENT_NODE_QUERIES` (16) node requests are in flight at once; each node's 10 s deadline starts when its request does (#2453).
+
+**Planned -- not yet implemented: asking only the nodes that hold lines for the app.** Each query still costs one request and one Parquet scan per live node, most of which find nothing. The proposed design: each node keeps the set of `(namespace, app)` pairs it has stored lines for, adds a pair when an instance first logs there, drops it when retention removes the pair's last file, and reports the set in its node report or gossip; the entry node then asks only the members whose set names the app, plus any placed node. That costs no Raft writes and survives leader changes, but it is a wire change (a `protocol` bump), so it waits for a release that takes one. The alternative, a per-app "nodes that ever ran it" set in Raft trimmed by retention, adds a Raft write per placement change.
 
 **Follow (`-f`) covers every node that runs the app.** `relish logs web -f` and the dashboard open `GET /v1/logs/{app}/{namespace}?follow=true` (SSE); the TUI opens `GET /v1/ws/logs/{app}/{namespace}` (WebSocket). On a cluster member both read the same merge task, `follow_cluster_logs` in `src/bun/api/logs.rs`: every 2 s it re-reads the app's placements and the live membership, opens a stream to each placed node it isn't following yet (`?follow=true&local=true&label=true`, so the peer answers for itself and prefixes each line `[node instance]`), and drops nodes that left. Its own replicas come through the `FollowLogs` agent command. Lines arrive in the order they reach the merging node; there is no clock-skew reordering window.
 

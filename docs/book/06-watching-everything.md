@@ -1063,6 +1063,33 @@ every node an app ever ran on, is state the cluster would have to keep
 forever for the sake of a log query. `tail_after_an_app_moves_back_includes_the_nodes_it_ran_on_meanwhile`
 reproduces the soak with two stores and fails against the old node choice.
 
+What we could bound straight away was how many nodes one query asks at once
+(#2453). `fan_out_query` spawned a task per node into a `JoinSet` and let them
+all send, so a 500-node cluster opened 500 requests for one `relish logs`.
+Each task now takes a permit from a `tokio::sync::Semaphore` holding
+`MAX_CONCURRENT_NODE_QUERIES` (16) before it sends:
+
+```rust
+let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_NODE_QUERIES));
+// ...in each task:
+let _permit = slots.acquire_owned().await.ok();
+```
+
+A semaphore is a counter of permits: `acquire` waits until one is free and
+hands back a guard, and dropping the guard returns the permit. Like a
+`MutexGuard`, the permit's lifetime is the critical section, so there's no
+"release" call to forget; the task ends, the permit drops. `acquire_owned`
+needs the semaphore in an `Arc` because the permit it returns owns a
+reference to it, and a spawned task can't borrow from the function that
+spawned it. The leading underscore in `_permit` keeps the guard alive to the
+end of the task without a "never used" warning; a bare `_` would drop it at
+once. The per-node deadline starts after the permit, so a node queued behind
+slow ones isn't reported as timed out. The handler also stopped cloning the
+whole desired state to find the app's placements: `read_desired` takes a
+closure, runs it under the read lock, and returns only the node ids.
+`a_fan_out_runs_at_most_the_concurrency_limit_at_once` counts the requests a
+test server has in flight and fails at 64 without the bound.
+
 ### Two runs, one name
 
 The final soak tier found the next one, and it was the same shape again. The
