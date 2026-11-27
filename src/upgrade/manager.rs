@@ -511,6 +511,8 @@ impl UpgradeManager {
             "upgrade-fixture phase=signature-verified-probe-begin elapsed={:?}",
             fixture_phase_started.elapsed()
         );
+        // BLOCKING-OK: reads only a debug build's small `.version` sidecar; a
+        // release build's override is a constant `None`
         let checked = match super::compatibility::query_probe(&probe).await {
             Ok(reported) => self.check_reported_version(directive, reported),
             Err(error) => Err(error),
