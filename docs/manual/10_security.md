@@ -59,6 +59,22 @@ only cluster members and the node itself. That holds for ports published to
 containers too, which the node's own containers can also reach. Clients
 outside the cluster reach apps through Wrapper's ingress ports instead.
 
+The perimeter closes the whole range, including ports Bun never allocated.
+If another service on the node listens inside it (a monitoring agent on
+10050, memcached on 11211), clients outside the cluster can't reach it while
+Bun runs. Bun names each such listener in a warning when it starts. Move
+`[network] port_range` away from it, or move the service.
+
+A graceful stop (`systemctl stop`) that stops every workload also removes the
+perimeter's nftables tables. After a crash, or a stop that left something
+running, they stay, guarding the workloads' ports. To remove them by hand
+once nothing of Reliaburger's runs:
+
+```sh
+sudo nft delete table ip reliaburger_fw
+sudo nft delete table ip6 reliaburger_fw
+```
+
 Bun never publishes a workload on one of its own ports, and its own ports keep
 their usual policy inside the range. Put the API port there
 (`--listen 0.0.0.0:29117`, say) and `operator_cidrs` still reach it; put

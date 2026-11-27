@@ -556,6 +556,39 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .collect();
         // LOOP-INLINE: shutdown's last turn; nothing is queued behind it
         self.stop_round(&sidecar_stops, deadline).await;
+        // LOOP-INLINE: shutdown's last turn; bounded by the nft timeout
+        self.remove_perimeter_if_nothing_runs(&app_stops, &sidecar_stops)
+            .await;
+    }
+
+    /// Take the perimeter's nftables tables down once every workload has
+    /// stopped, so a Bun that's stopped for good doesn't leave its drops
+    /// loaded until a reboot (#2479). While anything still runs they stay:
+    /// they guard its host ports, and the next Bun takes them over.
+    async fn remove_perimeter_if_nothing_runs(
+        &self,
+        app_stops: &[(InstanceId, InstanceStop)],
+        sidecar_stops: &[(InstanceId, InstanceStop)],
+    ) {
+        if !self.perimeter_config.enabled {
+            return;
+        }
+        let grill = self.supervisor.grill();
+        for (id, _) in app_stops.iter().chain(sidecar_stops) {
+            // LOOP-INLINE: shutdown's last turn; bounded by the confirmation timeout
+            let state = tokio::time::timeout(self.stop_confirmation_timeout, grill.state(id)).await;
+            match state {
+                Ok(Ok(ContainerState::Stopped))
+                | Ok(Err(crate::grill::GrillError::NotFound { .. })) => {}
+                _ => return,
+            }
+        }
+        let removal = crate::firewall::rules::removal_ruleset();
+        // LOOP-INLINE: shutdown's last turn; `apply_ruleset` bounds nft itself
+        match crate::firewall::rules::apply_ruleset(&removal).await {
+            Ok(()) => eprintln!("bun: every workload stopped; perimeter firewall removed"),
+            Err(error) => eprintln!("warning: removing the perimeter firewall failed: {error}"),
+        }
     }
 
     /// Stop every instance in `stops` at once, each its own way, until

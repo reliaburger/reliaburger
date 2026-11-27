@@ -72,7 +72,13 @@ Ensure the following ports are open:
 
 Bun manages its own nftables perimeter on top of that: once it's running, only
 cluster members can reach the container host ports, and only they and the
-`bootstrap_peers` you list in `node.toml` can reach the API and cluster ports. Your laptop gets in to the API port,
+`bootstrap_peers` you list in `node.toml` can reach the API and cluster ports.
+It closes the whole `10000`-`32767` range, not just the ports Bun hands out, so
+move `[network] port_range` if another service on the node listens inside it;
+Bun warns about each one it finds at start-up. A graceful stop that stops
+every workload removes the perimeter again; otherwise
+`sudo nft delete table ip reliaburger_fw` and
+`sudo nft delete table ip6 reliaburger_fw` remove it by hand. Your laptop gets in to the API port,
 and only that port, through `operator_cidrs` (see §5.3). Your host firewall
 still has to let that traffic in. With UFW, run this on every node:
 
