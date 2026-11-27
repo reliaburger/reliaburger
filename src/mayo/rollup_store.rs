@@ -5,7 +5,7 @@
 //! a different schema that includes node identity and aggregate columns
 //! (min, max, sum, count) instead of a single value.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -15,7 +15,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::prelude::*;
 
-use super::rollup::{MetricsQueryRow, NodeRollup, OwnedRollupRow};
+use super::rollup::{MetricsQueryRow, NodeRollup, OwnedRollupRow, RollupReporter};
 use super::scan::{
     ParquetSource, ParquetTable, SourceIndex, batch_time_range, list_local, list_local_off_runtime,
     streaming_session,
@@ -113,6 +113,10 @@ pub struct RollupStore {
     /// Newest window timestamp seen, used as the anchor for pruning
     /// `seen_windows` (kept off the wall clock for determinism).
     newest_window: u64,
+    /// The newest window each node has sent, duplicates included: a cluster
+    /// query names a node that stopped reporting (#2536). One entry per
+    /// node that ever reported.
+    last_windows: HashMap<String, u64>,
     /// Each Parquet file's time range, so a query skips the files outside
     /// its window without reading their footers (#2425).
     index: SourceIndex,
@@ -180,6 +184,7 @@ impl RollupStore {
             seen_windows: HashSet::new(),
             hydrated_windows: HashSet::new(),
             newest_window: 0,
+            last_windows: HashMap::new(),
             index: SourceIndex::default(),
             max_buffer_rows: MAX_BUFFER_ROWS,
             pending: None,
@@ -235,6 +240,7 @@ impl RollupStore {
             for i in 0..batch.num_rows() {
                 let window = windows.value(i);
                 self.newest_window = self.newest_window.max(window);
+                self.note_window(nodes.value(i), window);
                 self.hydrated_windows
                     .insert((nodes.value(i).to_string(), window));
             }
@@ -254,6 +260,8 @@ impl RollupStore {
     /// if it was a duplicate.
     pub fn ingest(&mut self, rollup: &NodeRollup) -> bool {
         let node_id = rollup.node_id.0.clone();
+        // A re-sent window still shows the node is reporting.
+        self.note_window(&node_id, rollup.timestamp);
         if self
             .hydrated_windows
             .contains(&(node_id.clone(), rollup.timestamp))
@@ -302,6 +310,28 @@ impl RollupStore {
         let available = self.max_buffer_rows.saturating_sub(reserved);
         while self.buffer.len() > available && self.buffer.pop_front().is_some() {}
         true
+    }
+
+    /// The newest window this aggregator holds from each node that has
+    /// reported to it, flushed or not (#2536).
+    pub fn reporters(&self) -> Vec<RollupReporter> {
+        self.last_windows
+            .iter()
+            .map(|(node_id, last_window)| RollupReporter {
+                node_id: node_id.clone(),
+                last_window: *last_window,
+            })
+            .collect()
+    }
+
+    /// Record that `node_id` sent the window starting at `window`.
+    fn note_window(&mut self, node_id: &str, window: u64) {
+        match self.last_windows.get_mut(node_id) {
+            Some(last) => *last = (*last).max(window),
+            None => {
+                self.last_windows.insert(node_id.to_string(), window);
+            }
+        }
     }
 
     /// Number of un-flushed entries in the buffer.
@@ -1105,6 +1135,33 @@ mod tests {
             restarted.newest_window
         ));
         insta::assert_snapshot!("rollup_golden_reads", report.join("\n\n"));
+    }
+
+    /// #2536: the store names the newest window each node sent, whatever the
+    /// metric, a re-sent window included, and a restart reads it back from
+    /// the flushed files.
+    #[tokio::test]
+    async fn reporters_name_each_nodes_newest_window_across_a_restart() {
+        let (mut store, directory) = test_store();
+        store.ingest(&make_rollup("w1", 120, "cpu", 1.0));
+        store.ingest(&make_rollup("w1", 180, "mem", 1.0));
+        store.ingest(&make_rollup("w2", 60, "cpu", 1.0));
+        // A duplicate is dropped, but still tells us w2 is talking.
+        assert!(!store.ingest(&make_rollup("w2", 60, "cpu", 1.0)));
+        let sorted = |mut reporters: Vec<RollupReporter>| {
+            reporters.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+            reporters
+                .into_iter()
+                .map(|reporter| (reporter.node_id, reporter.last_window))
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![("w1".to_string(), 180), ("w2".to_string(), 60)];
+        assert_eq!(sorted(store.reporters()), expected);
+
+        store.flush().await.unwrap();
+        let mut restarted = RollupStore::new(directory.path().to_path_buf());
+        restarted.hydrate_seen_windows().await.unwrap();
+        assert_eq!(sorted(restarted.reporters()), expected);
     }
 
     fn make_rollup(node: &str, timestamp: u64, metric: &str, value: f64) -> NodeRollup {

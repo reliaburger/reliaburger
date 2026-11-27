@@ -193,6 +193,10 @@ seconds is refused with a 400 asking for a narrower range.
 member that refuses a range (more than 200,000 node-minute contributions, or
 one minute holding more than 10,000) shows up in the answer's `warnings` as
 `QueryRefused` with its reason, not as an unresponsive node.
+A live node whose rollups haven't reached the council for five minutes is
+named as `NodeSilent`, with when its last rollup arrived (`last_seen`, or
+none): its share of the sums is missing. A node that joined in the last five
+minutes isn't expected to have reported yet.
 `/v1/metrics/app/{app}/{namespace}` (what `relish metrics` reads) asks each
 node running the app for its newest 10,000 rows in the range. A node whose
 answer reached that limit is named in `warnings` as `Truncated`, and `relish`

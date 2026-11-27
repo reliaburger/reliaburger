@@ -319,6 +319,7 @@ These endpoints expose the aggregation:
 
 - `GET /v1/metrics/rollup` -- this aggregator's own summed view of its rollups.
 - `GET /v1/metrics/rollup/owned` -- internal fan-out endpoint returning per-worker contributions.
+- `GET /v1/metrics/rollup/reporters` -- internal fan-out endpoint naming the newest window this aggregator holds from each node.
 - `GET /v1/metrics/cluster` -- cluster-wide query. Fans out to council aggregators, deduplicates ownership, then sums.
 - `GET /v1/metrics/app/{app}/{namespace}` -- single-app query. Queries local metrics filtered by app labels.
 
@@ -334,6 +335,8 @@ pub enum QueryWarning {
     NodeUnresponsive { node_id: String },
     DataUnavailable { node_id: String, from: u64, to: u64 },
     QueryRefused { node_id: String, reason: String },
+    Truncated { node_id: String, limit: usize },
+    NodeSilent { node_id: String, last_seen: Option<u64> },
 }
 ```
 
@@ -342,6 +345,10 @@ Graceful degradation is the goal. If one council member is down, you get partial
 `QueryRefused` arrived with the audit ([#2451](https://github.com/reliaburger/reliaburger/issues/2451)), and it's the log fan-out's lesson below, learned a second time. Each member refused any answer of more than 10,000 contributions, one row per node, minute and series. With no `start`, the window was the whole 24-hour rollup retention, and one unlabelled series on one node is 1,440 rows a day, so a member aggregating seven nodes failed a dashboard's very first request. It answered 500 with "narrow the time range", the fan-out's `error_for_status()` threw that body away, and the operator saw every council member "unresponsive" on a healthy cluster.
 
 Three changes. With no `start`, `/v1/metrics/cluster` reads the last hour. A member answers in pages: `/v1/metrics/rollup/owned` returns at most 10,000 rows ending on a whole minute, plus an `x-reliaburger-next-start` header naming where the next page begins, and the entry node follows it until there's no header. A header rather than a new response type keeps the body the same `Vec<OwnedRollupRow>`. And a member's refusal (past `MAX_OWNED_ROWS`, 200,000 rows, or one minute too big for a page) comes back as `QueryRefused` with the member's own words, read from the error body, instead of `NodeUnresponsive`. A single node with no council refuses the same way, as a 400. `a_cluster_query_over_a_day_of_one_series_on_ten_nodes_succeeds` is 14,400 contributions that used to be refused; `a_member_answer_in_pages_is_read_to_the_end` and `a_member_that_refuses_the_query_is_not_reported_as_unresponsive` drive the fan-out against a small axum server.
+
+`NodeSilent` closes the gap #2426 left ([#2536](https://github.com/reliaburger/reliaburger/issues/2536)). A node whose rollups stopped reaching the council, because its sender died or every frame was refused, simply vanished from the sums, and nothing in the answer said so. The trouble is that a council member only knows who *has* reported, not who *should*. Gossip knows that: every live member runs a rollup worker. So the entry node takes its live members from the table of remembered members, which now also records when each one joined (or came back after being down), and asks every council member a second, cheap question beside the owned rows: `/v1/metrics/rollup/reporters`, the newest window each node has sent it. A member whose newest rollup is more than five minutes older than the end of the window (or now, for a window that hasn't ended) is named, with when it was last heard; five minutes is the span a reassigned worker re-sends, so a shorter gap is ordinary. A member that joined within those five minutes owes nothing yet. The newest window comes from an in-memory map the store updates on every ingest, duplicates included, so the answer doesn't depend on which metric you asked about: a node that runs none of the app whose metric you queried is still reporting. And if any council member can't answer the second question, nobody is called silent, because its workers would all look silent; its failure is already in the warnings.
+
+The two questions go out at once with `tokio::join!`, which polls both futures on the current task and returns both results as a tuple when both have finished. Unlike `tokio::spawn` it needs no `'static` future, so the two can borrow the query and the URL list. `Option::is_none_or` reads as it says: `last_seen.is_none_or(|last| last < due_by)` is true for no rollup at all or one that's too old.
 
 ## Testing hierarchical aggregation
 
