@@ -128,7 +128,7 @@ term moved.
 
 Lettuce parses TOML files in a defined order to handle cross-references:
 
-1. **Discovery.** Walk all `.toml` files under `path`, subdirectories included (`git ls-tree -r -z`, so paths with tabs or non-ASCII bytes arrive unquoted). There is no shallow mode and no `recursive` key. A listed file that can't be read, or whose path isn't UTF-8, fails the whole sync: a partial file set would delete what the missing file declares.
+1. **Discovery.** Walk all `.toml` files under `path`, subdirectories included (`git ls-tree -r -z`, so paths with tabs or non-ASCII bytes arrive unquoted). There is no shallow mode and no `recursive` key. A listed file that can't be read, or whose path isn't UTF-8, fails the whole sync: a partial file set would delete what the missing file declares. A tree with no `.toml` file under `path` fails the sync too while GitOps owns any resource, because its empty config would remove everything GitOps owns (#2467); an explicit empty `.toml` file is how a commit removes everything on purpose. A general cap on removals per sync and a commit-trailer override were considered and not built.
 2. **Namespace resolution.** Files can declare `[namespace]` blocks. If a file doesn't declare a namespace, it inherits the namespace from its parent directory name, or falls back to `default`.
 3. **Parse and validate.** Each file is parsed with the `toml` crate. Validation checks:
    - Required fields present (`image` or `exec`/`script` for apps/jobs)

@@ -542,6 +542,14 @@ the signature against the node's own GnuPG keyring or
 job's `script` needs a signature from one of `trusted_signing_keys`, and so
 does any script on the first sync.
 
+A commit that leaves no `.toml` file under `path` at all (the files renamed,
+moved elsewhere, or lost in a bad merge) is refused while GitOps owns
+anything, since applying it would remove everything GitOps wrote. The sync
+shows the error and waits for a commit that brings the files back. To remove
+every GitOps-managed resource on purpose, commit an empty `.toml` file under
+`path` instead; a comment line is enough. To stop GitOps without removing
+anything, use `relish gitops disable`.
+
 Every poll reconciles, not just polls that find a new commit: change or delete
 a GitOps-managed app by hand and the next poll puts it back. Autoscaler
 replica overrides and `relish stop` are left alone. A `git` command that runs
