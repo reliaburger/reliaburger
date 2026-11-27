@@ -581,7 +581,7 @@ An expression sees three things and nothing else:
 |------|---------------|
 | `app` | The app's spec as you wrote it, every `[app.*]` field, plus `app.name` and `app.namespace` (`default` when the app names none). A field you didn't set is absent: test it with `has(app.memory)` |
 | `job` | The same for a job, every `[job.*]` field plus `job.name` and `job.namespace`, in a policy that applies to jobs |
-| `workload` | The app or job, with only the fields both have: `name`, `namespace`, `image`, `command`, `exec`, `script`, `memory`, `cpu`, `env`, `firewall` and `egress` |
+| `workload` | The app or job, with only the fields both have: `name`, `namespace`, `image`, `command`, `exec`, `script`, `memory`, `cpu`, `pids`, `env`, `firewall` and `egress` |
 | `caller` | `caller.name`, the token's name, and `caller.role`: `admin`, `deployer`, `read-only`, or `system` for a GitOps sync |
 | `source` | `apply` or `gitops` |
 
@@ -775,6 +775,49 @@ repository with the declared spec, so a filled-in field never looks like a
 change and a sync doesn't re-apply the app. A new or changed default
 reaches an app the next time the app itself is applied.
 
+## What a container can reach
+
+On a rootful runc node every container (an app, its init containers and
+sidecars, a fresh job container and a shared-runc executor) gets these,
+with no configuration:
+
+- **Its own user namespace.** Container ids 0 to 65,535 map onto host ids
+  from 2,000,000,000, so root in the container is an unprivileged user on
+  the node (see `images-and-volumes`). Every container on a node shares
+  that range, so its files, set-uid binaries included, are what a local
+  user must not reach: the unpacked image store, the bundle directory and
+  the volumes directory are `0710`, root's with group 2,000,000,000, so
+  only root and container root pass through, and sized volumes are mounted
+  `nosuid,nodev`. That only matters on a node with unprivileged local
+  accounts; the appliance has none.
+- **Docker's default capability set**, which acts only on what the
+  container's own namespaces own. The next section has the details.
+- **Docker's default seccomp filter.** About 370 system calls are allowed
+  and the rest fail with "operation not permitted": `keyctl`, `bpf`,
+  `userfaultfd`, `kexec_load`, module loading and, without
+  `CAP_SYS_ADMIN`, `mount`, `unshare` and `setns`. It's Moby's
+  `seccomp/v0.3.0` profile, unchanged, so an image that runs under Docker
+  runs here. A capability added with a runtime knob brings the calls it
+  guards, as `docker run --cap-add` does.
+- **No new privileges.** A set-uid binary or file capability can't raise
+  a process's privileges. An image that starts as root and drops to a
+  service user (Redis, nginx) doesn't notice; one that starts as
+  a non-root user and runs `sudo` or `su` fails, and needs to start as
+  root instead.
+- **Masked and read-only `/proc` and `/sys`.** `/proc/kcore`,
+  `/proc/keys`, `/proc/timer_list`, `/sys/firmware`,
+  `/sys/kernel/security`, `/sys/fs/bpf` and the rest of Docker's list read
+  as empty, and `/proc/sys`, `/proc/sysrq-trigger`, `/proc/bus`,
+  `/proc/fs` and `/proc/irq` are read-only.
+- **Its own cgroup.** `/sys/fs/cgroup` shows the container's own cgroup
+  as its root, never the node's tree or another app's statistics. A
+  shared-runc executor's `/sys/fs/cgroup` is empty.
+- **A process limit** (`pids.max`) of 4,096 processes and threads unless
+  the app sets `pids` (see `reference`).
+
+A host workload (`exec` or `script`) gets none of this. It runs on the
+node as an ordinary process, which is why it needs the node's allowlist.
+
 ## Runtime knobs
 
 Some apps need a little more from the kernel than a container gets by
@@ -869,7 +912,9 @@ What each kind accepts:
   `CAP_SYS_PTRACE` and `CAP_SYS_BOOT`) are allowed only when listed by name.
   Bun warns at startup for each one it finds. A container's root is still
   an unprivileged user on the host (see `images-and-volumes`), so these act
-  on the container's own namespaces. As in Docker and Kubernetes, a
+  on the container's own namespaces. An added capability also lets through
+  the system calls the seccomp filter keeps for it: `CAP_SYS_ADMIN` brings
+  `mount` and `unshare`, `CAP_SYS_PTRACE` brings `process_vm_readv`. As in Docker and Kubernetes, a
   capability reaches a process that runs as root in the container; a
   non-root user needs file capabilities on its binary.
 

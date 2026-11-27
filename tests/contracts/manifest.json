@@ -4180,6 +4180,45 @@
           ]
         },
         {
+          "id": "issue-2402-runc_container_runs_under_seccomp_without_new_privileges",
+          "binary": "reliaburger",
+          "test": "grill::runc::tests::runc_container_runs_under_seccomp_without_new_privileges",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/grill/runc.rs",
+            "src/grill/userns.rs",
+            "src/grill/seccomp.rs"
+          ]
+        },
+        {
+          "id": "issue-2386-runc_a_fork_bomb_fills_its_own_pids_limit_not_the_nodes",
+          "binary": "reliaburger",
+          "test": "grill::runc::tests::runc_a_fork_bomb_fills_its_own_pids_limit_not_the_nodes",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/grill/runc.rs",
+            "src/grill/oci.rs",
+            "src/config/app.rs"
+          ]
+        },
+        {
+          "id": "issue-2412-runc_a_local_user_cannot_reach_a_containers_set_id_files",
+          "binary": "reliaburger",
+          "test": "grill::runc::tests::runc_a_local_user_cannot_reach_a_containers_set_id_files",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/grill/runc.rs",
+            "src/grill/bundle.rs",
+            "src/grill/image.rs"
+          ]
+        },
+        {
           "id": "legacy-ci-reliaburger-grill-runc-tests-runc_image_root_binds_port_80_without_being_host_root",
           "binary": "reliaburger",
           "test": "grill::runc::tests::runc_image_root_binds_port_80_without_being_host_root",

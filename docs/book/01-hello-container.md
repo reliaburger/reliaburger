@@ -702,7 +702,7 @@ Now we need something that actually runs containers. That something is Grill.
 
 The name follows the burger theme (Reliaburger, Bun, Relish, Meat, Mustard...), but the architecture is practical. When you run a container on Linux, two layers are involved:
 
-1. **runc** does the actual work. It creates Linux namespaces (isolating the container's view of the filesystem, network, and processes from the host), sets up cgroups (limiting CPU, memory, and other resources), applies security profiles (seccomp, capabilities), and exec's the container's entrypoint. It's a single binary that creates a container and exits.
+1. **runc** does the actual work. It creates Linux namespaces (isolating the container's view of the filesystem, network, and processes from the host), sets up cgroups (limiting CPU, memory, and other resources), applies the security settings the spec asks for (a seccomp filter, capabilities), and exec's the container's entrypoint. It's a single binary that creates a container and exits.
 
 2. **Grill** manages runc. It translates our `AppSpec` configuration into the OCI runtime specification that runc expects, allocates host ports, computes cgroup parameters, and tracks the lifecycle state of each container. Grill is the only part we write.
 
@@ -955,6 +955,30 @@ runc init was OOM-killed before the workload started: it runs inside the contain
 We match runc's text, which is fragile in principle: a future runc could reword it. The cost of that is small, though. If the match misses, we're back to the old generic failure, not a wrong answer. The pure function is tested on its own with runc's real message, and it works on any platform, like the cgroup helpers above.
 
 Notice that none of these functions touch the filesystem. They compute values and return them. The actual writing to `/sys/fs/cgroup` happens elsewhere, when we're running on Linux with the right permissions. This separation is deliberate. These functions are pure: same input, same output, no side effects. That makes them testable on any platform: your CI server, your macOS laptop, anywhere. We test the computation now and test the filesystem operations in integration tests on Linux later.
+
+### A ceiling on processes
+
+CPU and memory aren't the only things a container can exhaust. Run `:(){ :|:& };:` in a container with no process limit and within seconds the node hits `kernel.threads-max`. From then on every `fork` on the node fails with `EAGAIN`, Bun's included, and stopping the offender needs a `runc kill` child that Bun can no longer start. Until 0.3.4 that was every app: jobs had a `pids` field since #741, but an app, its init containers and its sidecars never got a `pids.max` (#2386).
+
+Now the resource builder takes a third argument, and an image app always passes one:
+
+```rust
+fn build_resources(spec: &AppSpec) -> Option<OciResources> {
+    let host = spec.exec.is_some() || spec.script.is_some();
+    let pids = (!host).then(|| container_pids(spec.pids));
+    build_resources_from_ranges(spec.cpu.as_ref(), spec.memory.as_ref(), pids)
+}
+
+fn container_pids(asked: Option<PidsLimit>) -> u32 {
+    asked.map_or(DEFAULT_CONTAINER_PIDS, |limit| limit.get())
+}
+```
+
+`map_or(default, f)` is `match asked { Some(limit) => f(limit), None => default }` in one call. The default, `DEFAULT_CONTAINER_PIDS`, is 4,096: enough for a JVM or a Postgres with hundreds of connections, and a tiny slice of a node's process table. An app that needs more sets `pids`, up to the same 32,768 a job may ask for, and `PidsLimit` (the type jobs already used) refuses 0 and anything above that when the TOML is parsed, so no later code has to check. A sidecar has its own cgroup and its own `pids`. An init container runs in the app's cgroup before the app does, so it takes the app's limit. A host app gets none: it's a process on the node, with no container cgroup to put the limit in, and `relish apply` refuses `pids` on one rather than accept a number it would ignore.
+
+Jobs keep their old rule, no limit unless they ask. Their commands already run under a 256 default when an executor reuses its container, and a fresh job container is the one place where "unset means unlimited" was a deliberate choice.
+
+The default changes behaviour for an app that already runs more than 4,096 threads, and that's a real cost: it fails with `EAGAIN` where it used to work. We took it because the alternative fails worse. An app over the limit breaks itself; an app with no limit can break the node and every other app on it.
 
 ### The last one out turns off the lights
 
@@ -3174,7 +3198,7 @@ The underscores are just digit separators, like `2_000_000_000` in Python. We pi
 
 With the namespace comes Docker's default capability set: `CAP_CHOWN`, `CAP_SETUID`, `CAP_NET_BIND_SERVICE` and a handful more. Inside a user namespace a capability only acts on what the namespace owns, so these let an entrypoint manage its own files and processes without any say over the host's.
 
-Three details make it actually work. First, the files. Container root is host uid 2,000,000,000, and the unpacked image was owned by host root, which the namespace doesn't map at all. So the image store shifts ownership once, at unpack time: a file owned by uid 999 in the layer is owned by 2,000,000,999 on disk, and any directory the unpacker invents goes to container root. `chown` quietly clears set-uid bits, so we put the mode back afterwards. Every container on a node shares this one range (like Docker's `userns-remap`), which is what keeps the unpacked image cache shareable. Per-container ranges would need idmapped mounts for every rootfs, and we don't need that yet.
+Three details make it actually work. First, the files. Container root is host uid 2,000,000,000, and the unpacked image was owned by host root, which the namespace doesn't map at all. So the image store shifts ownership once, at unpack time: a file owned by uid 999 in the layer is owned by 2,000,000,999 on disk, and any directory the unpacker invents goes to container root. `chown` quietly clears set-uid bits, so we put the mode back afterwards (which is why Chapter 10 closes the unpacked tree to other local users). Every container on a node shares this one range (like Docker's `userns-remap`), which is what keeps the unpacked image cache shareable. Per-container ranges would need idmapped mounts for every rootfs, and we don't need that yet.
 
 Second, `/sys`. The kernel only lets a user namespace mount a fresh `sysfs` if it also owns the network namespace, and ours was created by the node beforehand. Rootless mode already had the answer, a read-only bind of the host's `/sys`, so both paths share it now.
 
@@ -3189,6 +3213,54 @@ if let Some(run_as_user) = overrides.user {
 ```
 
 `by_id` is a closure that returns a `Result` of a three-element tuple. Assigning a tuple to existing `mut` variables in one go works the way it does in Python or Go (`uid, gid, home = ...`). Rust only allowed it on plain assignment, not just in `let`, from version 1.59.
+
+### Confining what root can ask for
+
+A user namespace stops container root being host root, but that's all it does. Until 0.3.4 it was the only barrier: the November 2026 audit found that a container could call any system call the kernel offers a user namespace (`keyctl`, `bpf`, `io_uring_setup`, `userfaultfd`, `unshare`), that a set-uid binary could still raise privileges inside it, and that the read-only bind of the host's `/sys` showed every container the node's whole cgroup tree: every namespace, app and instance, with its memory and CPU use (#2402). The design doc said a seccomp profile was applied. Nothing in the spec types could even hold one.
+
+Now `userns::apply` adds four things. The OCI spec has a field for each, so first the types grew:
+
+```rust
+pub struct OciLinux {
+    // ...namespaces, resources, mappings, sysctls, devices
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seccomp: Option<OciSeccomp>,
+    #[serde(rename = "maskedPaths", default, skip_serializing_if = "Vec::is_empty")]
+    pub masked_paths: Vec<String>,
+    #[serde(rename = "readonlyPaths", default, skip_serializing_if = "Vec::is_empty")]
+    pub readonly_paths: Vec<String>,
+}
+```
+
+`noNewPrivileges` on the process is a `bool` skipped when false, with `skip_serializing_if = "std::ops::Not::not"`: `Not::not` is the function behind the `!` operator, so serde calls `!value` and leaves the field out when that's true. Every new field has `#[serde(default)]`, so a runtime intent written before them still loads.
+
+The seccomp filter is the interesting one. We could have written our own list, and an earlier design-doc draft did: a dozen calls to block. A deny-list is the wrong shape. It misses every call the kernel adds after you wrote it, and `io_uring` alone has been the source of a steady run of privilege escalations since 2020. Docker and containerd use an allow-list of about 370 calls, maintained against real images for a decade, and that's what we ship, copied unchanged from Moby's `seccomp/v0.3.0` profile into `src/grill/seccomp_default.json`. Writing our own allow-list would only find, one bug report at a time, the images Docker runs and we don't.
+
+The file goes into the binary with `include_str!`, and it's parsed once:
+
+```rust
+const MOBY_DEFAULT_PROFILE: &str = include_str!("seccomp_default.json");
+
+fn moby_profile() -> Result<&'static MobyProfile, SeccompError> {
+    static PROFILE: OnceLock<Result<MobyProfile, String>> = OnceLock::new();
+    PROFILE
+        .get_or_init(|| {
+            serde_json::from_str(MOBY_DEFAULT_PROFILE).map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|error| SeccompError::Profile(error.clone()))
+}
+```
+
+`OnceLock` stores whatever the first caller's closure returns, here a `Result`, and hands every later caller a reference to it. `.as_ref()` turns `&Result<MobyProfile, String>` into `Result<&MobyProfile, &String>`, so we can borrow the profile out without moving it from the static. The `'static` in the return type is the lifetime of anything a `static` holds: the whole run of the program, so the caller can keep the reference as long as it likes.
+
+Moby's file isn't in the OCI format. Each rule may say it applies only on some architectures or only to a container holding some capabilities: `mount` and `unshare` are allowed only with `CAP_SYS_ADMIN`, `reboot` only with `CAP_SYS_BOOT`. `default_profile` does what Docker does at container start: keep the rules for this machine's architecture and the container's capability set, and drop the conditions. That's also how a runtime knob (#1122) that adds a capability works: `knobs::apply_to_spec` rebuilds the filter from the new capability set, so asking for `CAP_SYS_ADMIN` brings `mount` with it, as `docker run --cap-add` does. Without that the knob would grant a capability whose calls still failed.
+
+The other three are short. `noNewPrivileges` sets the kernel's `no_new_privs` bit, after which no set-uid binary or file capability raises the process's privileges. An image that starts as a non-root user and runs `sudo` breaks; an image that starts as root and drops with `gosu`, as Redis's does, doesn't notice. Masked paths hide `/proc/kcore`, `/proc/keys`, `/sys/firmware`, `/sys/kernel/security` and the rest of Docker's list (plus `/sys/fs/bpf`, where the node pins its eBPF maps), and read-only paths cover `/proc/sys` and `/proc/sysrq-trigger`. Finally a cgroup namespace: runc creates one, and a `cgroup` mount after the `/sys` bind covers `/sys/fs/cgroup` with the container's own cgroup as its root. Mount order matters here, since runc mounts in order and a mount under `/sys` that came first would vanish beneath the bind.
+
+The first `make test-linux` run broke every shared-runc job, with the helper reporting `ENOENT` for each task. Chapter 17's executor starts a task with `clone3(CLONE_INTO_CGROUP)` straight into a *sibling* of its own cgroup, and the kernel refuses a target outside the caller's cgroup namespace, with "no such file" rather than "permission denied". So the executor gets no cgroup namespace, and its `/sys/fs/cgroup` is masked instead: Bun already hands it the task cgroup as a file descriptor, so it never needed the path.
+
+`runc_container_runs_under_seccomp_without_new_privileges` (`make test-linux`) checks the result from inside: PID 1's `/proc/1/status` shows `Seccomp: 2` (filtering) and `NoNewPrivs: 1`, `/sys/fs/cgroup` lists the container's own `cgroup.procs` and no `reliaburger` tree, `/proc/kcore` reads as empty, and `unshare -U` fails. The Redis and nginx tests and the shared-runc executor suite run under the same filter.
 
 ### Testing image pulling
 

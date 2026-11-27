@@ -116,8 +116,9 @@ sentence on what to do instead:
   the same start-up time (`failureThreshold` times `periodSeconds`);
 - `readOnlyRootFilesystem`, `allowPrivilegeEscalation`, `runAsNonRoot` and
   `seccompProfile`: every container runs in its own user namespace with
-  Docker's default capabilities, and Reliaburger sets no seccomp profile,
-  read-only root filesystem or no-new-privileges flag;
+  Docker's default capabilities, Docker's default seccomp filter and
+  no-new-privileges set, whatever the manifest asks, and Reliaburger has no
+  read-only root filesystem;
 - a Service's `type` other than `ClusterIP`, its `nodePort`s,
   `sessionAffinity` and a headless `clusterIP: None`;
 - a Deployment's `strategy.type: Recreate`, and a `maxSurge` or
@@ -187,7 +188,7 @@ and `runAsUser`/`runAsGroup`; a job's `max_attempts` becomes `backoffLimit` and
 `forbid` → `Forbid`); an omitted `overlap` still exports as `Forbid`, because
 that's Reliaburger's default and Kubernetes' is `Allow`. It reports what it
 can't express: firewall and egress rules on apps and jobs, process workloads,
-`run_before`, a job's `pids` and `replay_unknown`, and for now health checks,
+`run_before`, an app's, a sidecar's or a job's `pids`, a job's `replay_unknown`, and for now health checks,
 metrics, volumes, config files and placement. Init containers export as
 ordinary ones named `init-0`, `init-1` and so on, before any native sidecars,
 with the app's image when they name none and the app's `env` under their own,

@@ -811,6 +811,7 @@ fn import_sidecars(
             image: container.image.clone(),
             command: container.command.clone().unwrap_or_default(),
             args: container.args.clone().unwrap_or_default(),
+            pids: None,
             env,
             memory: resources.and_then(|resources| {
                 resource_range_from(
@@ -1693,6 +1694,7 @@ fn empty_app_spec() -> AppSpec {
         health: None,
         memory: None,
         cpu: None,
+        pids: None,
         gpu: None,
         env: BTreeMap::new(),
         config_file: Vec::new(),
@@ -2369,8 +2371,8 @@ const fn unless_default(defaults: &'static [&'static str]) -> FieldUse {
 }
 
 const HARDENING: &str = "Reliaburger runs every container in its own user namespace \
-     with Docker's default capabilities, and sets no seccomp profile, read-only root \
-     filesystem or no-new-privileges flag";
+     with Docker's default capabilities, Docker's default seccomp filter and \
+     no-new-privileges, whatever the manifest asks, and has no read-only root filesystem";
 const HOST_NAMESPACE: &str = "Reliaburger has no host namespaces: the app runs in its own";
 const NO_API_ACCESS: &str = "a workload gets no Kubernetes API credentials";
 const STORAGE: &str = "declare a [[app.<name>.volumes]] entry for each mount path; \

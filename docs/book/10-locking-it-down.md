@@ -153,7 +153,7 @@ pub enum RotationState {
 }
 ```
 
-If the council is unreachable when rotation is due, the worker extends the certificate's local validity by up to 4 hours. That gives 5 hours total (1-hour cert + 4-hour grace) before things break. Long enough to survive most outages. The grace period is tracked locally and logged as a security event.
+If the council is unreachable when rotation is due, the worker keeps the certificate it has and tries again on each check. Nothing extends it, though. The design sketched a 4-hour local grace period, five hours in all, and `GracePeriod` above is the state it would use, but nothing in Bun's renewal loop ever enters it. It couldn't help much anyway: a certificate's `notAfter` is signed, and the peer checks it, not the worker. So a council outage breaks workload mTLS between 30 and 60 minutes in, one hour after each instance's last good rotation. The design doc said otherwise in the present tense until the November 2026 audit caught it (#2498); an operator who planned a three-hour council window around "five hours" would have found out the hard way.
 
 ### OIDC JWTs
 
@@ -1587,7 +1587,7 @@ Decryption is only half the story. Where does the plaintext go next? The agent d
 
 Two things made that a real leak rather than a theoretical one. `tokio::fs::write` creates files with the process umask, which on most hosts means 0644, so any local user could `cat` the file. And nothing ever deleted it. Stop the instance, `relish delete` the app, and the spec stayed in `bundles/<instance>/` indefinitely. Only the rootless path happened to rewrite it 0600, and only because it adds a hook to the spec after the first write.
 
-The fix lives in a small `grill::bundle` module with three functions. `create_private_directory` makes the bundle directory 0711 (and tightens one an older release left at 0755): searchable but not listable, because a container with a user namespace remounts its rootfs from inside that namespace and needs to pass through, which 0700 refused with `remount-private …: permission denied` the first time CI ran it. `write_spec` goes through the same `atomic_write_mode` helper the identity code uses: the temporary file gets mode 0600 *before* a single byte lands in it, then a rename swaps it into place, so there is never a moment when a readable copy exists. `remove_spec` deletes `config.json` once runc has deleted the container, along with any temporary a killed writer left behind (it holds the same plaintext).
+The fix lives in a small `grill::bundle` module with three functions. `create_private_directory` made the bundle directory 0711 (and tightened one an older release left at 0755): searchable but not listable, because a container with a user namespace remounts its rootfs from inside that namespace and needs to pass through, which 0700 refused with `remount-private …: permission denied` the first time CI ran it. It's 0710 now; we'll see why in a moment. `write_spec` goes through the same `atomic_write_mode` helper the identity code uses: the temporary file gets mode 0600 *before* a single byte lands in it, then a rename swaps it into place, so there is never a moment when a readable copy exists. `remove_spec` deletes `config.json` once runc has deleted the container, along with any temporary a killed writer left behind (it holds the same plaintext).
 
 ```rust
 tokio::task::spawn_blocking(move || super::super::bundle::remove_spec(&bundle))
@@ -1596,6 +1596,25 @@ tokio::task::spawn_blocking(move || super::super::bundle::remove_spec(&bundle))
 ```
 
 The helpers are ordinary blocking `std::fs` code, so the async cleanup hands them to `spawn_blocking`. That returns a `Result` wrapped in another `Result`: the outer one says whether the blocking task itself survived (it could panic), the inner one is our I/O result. Hence the double `??`, which unwraps one layer each.
+
+That 0711 had a hole of its own, which the November 2026 audit found (#2412). "Searchable but not listable" protects a secret file whose name nobody can guess. It doesn't protect a path everybody knows: the private overlay's upper directory is `bundles/<instance>/rootfs-upper`, and instance ids aren't secret. A container running as root writes `cp /bin/busybox /pwn && chmod 4755 /pwn`, and on the host that's a set-uid binary owned by uid 2,000,000,000 at a path any local user can reach. Run it, and you're container root's host uid: the owner of every container's writable layer and managed volume on the node. The unpacked image store had the same problem without needing an accomplice, since image layers keep their set-uid bits.
+
+The fix is the one Docker uses for its `userns-remap` range: `/var/lib/docker` is 0710, owned by root with the remapped root's group. Container root on our nodes is host uid *and gid* 2,000,000,000, so a directory that's `0710 root:2000000000` lets runc's init (container root) pass through and stops everyone else. `close_to_other_users` in `grill::bundle` does it, and `create_private_directory` now applies it to the bundle and the bundle base above it; the image store's `rootfs` and the volumes directory get the same treatment. A rootless node has no shifted ids, its container root is the directory's owner, so there the mode is just 0700.
+
+```rust
+let mode = match container_group {
+    Some(group) => {
+        std::os::unix::fs::lchown(directory, None, Some(group))?;
+        0o710
+    }
+    None => 0o700,
+};
+std::fs::set_permissions(directory, std::fs::Permissions::from_mode(mode))
+```
+
+The group changes first and the mode second, so there's no moment when the directory is open to a group it doesn't belong to yet. `lchown` takes `Option`s for both ids, and `None` leaves that one alone: the C call's `-1`, with the type saying what the magic number meant. Each function runs on every create, so a node upgraded from a release that left 0711 behind is tightened the first time it starts a container.
+
+Loop-mounted volumes also gained `nosuid,nodev`. Together with `noNewPrivileges` (Chapter 1), a set-uid file in a volume does nothing inside the container either.
 
 Why delete only the spec and not the whole bundle directory? Because the bundle also holds the instance's private overlay upper, and we promised in chapter 5 that a restart of `default__web-0` on the same image keeps its files. Removing the spec keeps that promise and still takes the secret off the disk. It also sidesteps a nasty failure mode: a `remove_dir_all` through a rootfs that is still mounted would happily delete files inside the container's view.
 

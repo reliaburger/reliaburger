@@ -716,6 +716,7 @@ mod inventory_tests {
                 readonly: false,
             },
             process: OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args: vec!["sleep".into(), "60".into()],
                 env: vec![],
@@ -728,6 +729,9 @@ mod inventory_tests {
             },
             mounts: vec![],
             linux: OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: vec![],
                 resources: None,
                 cgroups_path: None,

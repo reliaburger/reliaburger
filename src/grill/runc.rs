@@ -249,14 +249,19 @@ impl RuncGrill {
         let bundle_dir = self.bundle_base.join(&instance.0);
         // The bundle will hold the decrypted environment: root-only.
         let private = bundle_dir.clone();
-        tokio::task::spawn_blocking(move || super::bundle::create_private_directory(&private))
-            .await
-            .map_err(std::io::Error::other)
-            .and_then(|result| result)
-            .map_err(|e| GrillError::StartFailed {
-                instance: instance.clone(),
-                reason: format!("failed to create bundle dir: {e}"),
-            })?;
+        // Container root's host group passes through a rootful bundle; a
+        // rootless container's root is the bundle's owner (#2412).
+        let group = (!self.rootless).then_some(super::userns::HOST_ID_BASE);
+        tokio::task::spawn_blocking(move || {
+            super::bundle::create_private_directory(&private, group)
+        })
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(|result| result)
+        .map_err(|e| GrillError::StartFailed {
+            instance: instance.clone(),
+            reason: format!("failed to create bundle dir: {e}"),
+        })?;
 
         let mut spec = spec.clone();
         let mut rootfs_mount = None;
@@ -1007,7 +1012,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let mode =
             |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(bundle), 0o711, "bundle directory mode");
+        // Root's, and at most container root's group may pass through
+        // (#2412): 0710 on a rootful grill, 0700 on a rootless one.
+        assert_eq!(mode(bundle) & 0o767, 0o700, "bundle directory mode");
         assert_eq!(mode(&bundle.join("config.json")), 0o600, "config.json mode");
     }
 
@@ -1164,6 +1171,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args: vec!["/bin/true".to_string()],
                 env: vec![],
@@ -1176,6 +1184,9 @@ mod tests {
             },
             mounts: crate::grill::oci::standard_mounts(),
             linux: crate::grill::oci::OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: crate::grill::oci::standard_namespaces(None),
                 resources: None,
                 cgroups_path: None,
@@ -1235,6 +1246,7 @@ mod tests {
                 readonly: true,
             },
             process: crate::grill::oci::OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args: vec!["sh".into()],
                 env: vec![],
@@ -1247,6 +1259,9 @@ mod tests {
             },
             mounts: vec![],
             linux: crate::grill::oci::OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: vec![],
                 resources: None,
                 cgroups_path: None,
@@ -1310,6 +1325,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args: vec!["sh".to_string(), "-c".to_string(), "echo hello".to_string()],
                 env: vec![],
@@ -1322,6 +1338,9 @@ mod tests {
             },
             mounts: vec![],
             linux: crate::grill::oci::OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: vec![],
                 resources: None,
                 cgroups_path: None,
@@ -1412,6 +1431,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args: vec![
                     "/bin/sh".to_string(),
@@ -1437,6 +1457,9 @@ mod tests {
             },
             mounts: crate::grill::oci::standard_mounts(),
             linux: crate::grill::oci::OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: crate::grill::oci::standard_namespaces(None),
                 resources: None,
                 cgroups_path: None,
@@ -1720,6 +1743,7 @@ mod tests {
                     readonly: false,
                 },
                 process: crate::grill::oci::OciProcess {
+                    no_new_privileges: false,
                     rlimits: Vec::new(),
                     args: vec![
                         "/bin/sh".to_string(),
@@ -1739,6 +1763,9 @@ mod tests {
                 },
                 mounts: crate::grill::oci::standard_mounts(),
                 linux: crate::grill::oci::OciLinux {
+                    seccomp: None,
+                    masked_paths: Vec::new(),
+                    readonly_paths: Vec::new(),
                     namespaces: crate::grill::oci::standard_namespaces(None),
                     resources: None,
                     cgroups_path: None,
@@ -1895,6 +1922,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args: vec!["/bin/true".to_string()],
                 env: vec![],
@@ -1907,6 +1935,9 @@ mod tests {
             },
             mounts: crate::grill::oci::standard_mounts(),
             linux: crate::grill::oci::OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: crate::grill::oci::standard_namespaces(None),
                 resources: None,
                 cgroups_path: None,
@@ -1964,6 +1995,7 @@ mod tests {
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args: vec![
                     "/bin/sh".to_string(),
@@ -1980,6 +2012,9 @@ mod tests {
             },
             mounts: crate::grill::oci::standard_mounts(),
             linux: crate::grill::oci::OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: crate::grill::oci::standard_namespaces(None),
                 resources: None,
                 cgroups_path: None,
@@ -2169,6 +2204,7 @@ mod tests {
                 readonly: true,
             },
             process: crate::grill::oci::OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args: vec!["/bin/sleep".to_string(), "30".to_string()],
                 env: vec![],
@@ -2181,6 +2217,9 @@ mod tests {
             },
             mounts: crate::grill::oci::standard_mounts(),
             linux: crate::grill::oci::OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: crate::grill::oci::standard_namespaces(None),
                 resources: None,
                 cgroups_path: None,
@@ -2331,6 +2370,246 @@ mod tests {
         );
 
         grill.kill(&id).await.unwrap();
+    }
+
+    /// #2402: a container runs under the default seccomp filter with
+    /// `no_new_privs` set, sees its own cgroup at `/sys/fs/cgroup` rather
+    /// than the node's tree, and can't read `/proc/kcore`.
+    #[tokio::test]
+    #[ignore = "requires rootful runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
+    async fn runc_container_runs_under_seccomp_without_new_privileges() {
+        assert!(runc_tests_enabled(), "set RELIABURGER_RUNC_TESTS=1");
+        assert!(nix::unistd::geteuid().is_root(), "rootful runc needs root");
+        let tmp = tempfile::tempdir().unwrap();
+        let id = InstanceId("default__confined-0".to_string());
+        remove_test_network(&id);
+        let _network_cleanup = TestNetworkCleanup(vec![id.clone()]);
+        let (grill, mut spec) = image_app(
+            tmp.path(),
+            &id,
+            &format!("image = \"{ALPINE_IMAGE}\"\ncommand = [\"sleep\", \"3608\"]\n"),
+        );
+        // A cgroup of its own, as Bun gives every instance, so the cgroup
+        // namespace has something to hide.
+        spec.linux.cgroups_path = Some(format!("/reliaburger-test/{}", id.0));
+        grill.create(&id, &spec).await.unwrap();
+        grill.start(&id).await.unwrap();
+        let probe = grill
+            .exec(
+                &id,
+                &[
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "grep -E '^(Seccomp|NoNewPrivs):' /proc/1/status; \
+                     echo listing-start; ls /sys/fs/cgroup; echo listing-end; \
+                     [ -s /proc/kcore ] && echo kcore-visible; \
+                     unshare -U true 2>/dev/null && echo nested-userns"
+                        .to_string(),
+                ],
+            )
+            .await
+            .unwrap()
+            .output;
+        grill.kill(&id).await.unwrap();
+        let _ = std::fs::remove_dir("/sys/fs/cgroup/reliaburger-test");
+
+        assert!(probe.contains("Seccomp:\t2"), "{probe}");
+        assert!(probe.contains("NoNewPrivs:\t1"), "{probe}");
+        let listing = probe
+            .split("listing-start")
+            .nth(1)
+            .and_then(|rest| rest.split("listing-end").next())
+            .unwrap_or_default();
+        assert!(!listing.contains("reliaburger"), "{probe}");
+        assert!(listing.contains("cgroup.procs"), "{probe}");
+        assert!(!probe.contains("kcore-visible"), "{probe}");
+        assert!(!probe.contains("nested-userns"), "{probe}");
+    }
+
+    /// #2386: an app's container gets a `pids.max` by default, a fork bomb
+    /// fills its own limit, and the node still starts the next container.
+    #[tokio::test]
+    #[ignore = "requires rootful runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
+    async fn runc_a_fork_bomb_fills_its_own_pids_limit_not_the_nodes() {
+        assert!(runc_tests_enabled(), "set RELIABURGER_RUNC_TESTS=1");
+        assert!(nix::unistd::geteuid().is_root(), "rootful runc needs root");
+        let tmp = tempfile::tempdir().unwrap();
+        let ids: Vec<InstanceId> = ["default__quiet-0", "default__bomb-0", "default__after-0"]
+            .iter()
+            .map(|id| InstanceId(id.to_string()))
+            .collect();
+        for id in &ids {
+            remove_test_network(id);
+        }
+        let _network_cleanup = TestNetworkCleanup(ids.clone());
+        let cgroup = |id: &InstanceId| format!("/reliaburger-test/{}", id.0);
+        let host_cgroup =
+            |id: &InstanceId| std::path::PathBuf::from(format!("/sys/fs/cgroup{}", cgroup(id)));
+        let (grill, _) = image_app(tmp.path(), &ids[0], &format!("image = \"{ALPINE_IMAGE}\""));
+        let start = |id: &InstanceId, toml: String| {
+            // One grill for all three, as on a node; only the spec is new.
+            let (_, mut spec) = image_app(tmp.path(), id, &toml);
+            spec.linux.cgroups_path = Some(cgroup(id));
+            let (grill, id) = (&grill, id.clone());
+            async move {
+                grill.create(&id, &spec).await.unwrap();
+                grill.start(&id).await.unwrap();
+            }
+        };
+
+        start(
+            &ids[0],
+            format!("image = \"{ALPINE_IMAGE}\"\ncommand = [\"sleep\", \"3609\"]\n"),
+        )
+        .await;
+        let default_limit = std::fs::read_to_string(host_cgroup(&ids[0]).join("pids.max")).unwrap();
+
+        // A small limit of its own keeps the bomb cheap for the test host.
+        // The bomb runs through exec, so the shell that dies on a failed
+        // fork isn't the container's init. Its children let go of exec's
+        // output, or exec would wait for them.
+        start(
+            &ids[1],
+            format!("image = \"{ALPINE_IMAGE}\"\npids = 32\ncommand = [\"sleep\", \"3614\"]\n"),
+        )
+        .await;
+        let _ = grill
+            .exec(
+                &ids[1],
+                &[
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "for i in $(seq 1 64); do sleep 600 >/dev/null 2>&1 & done; true".to_string(),
+                ],
+            )
+            .await;
+        let events = std::fs::read_to_string(host_cgroup(&ids[1]).join("pids.events")).unwrap();
+        let refused: u64 = events
+            .lines()
+            .find_map(|line| line.strip_prefix("max "))
+            .and_then(|count| count.trim().parse().ok())
+            .unwrap_or(0);
+        let bomb_limit = std::fs::read_to_string(host_cgroup(&ids[1]).join("pids.max")).unwrap();
+
+        // The node can still fork runc for another container.
+        start(
+            &ids[2],
+            format!("image = \"{ALPINE_IMAGE}\"\ncommand = [\"sleep\", \"3610\"]\n"),
+        )
+        .await;
+        let after_state = grill.state(&ids[2]).await.ok();
+
+        for id in &ids {
+            grill.kill(id).await.unwrap();
+        }
+        let _ = std::fs::remove_dir("/sys/fs/cgroup/reliaburger-test");
+
+        assert_eq!(
+            default_limit.trim(),
+            crate::grill::oci::DEFAULT_CONTAINER_PIDS.to_string()
+        );
+        assert_eq!(bomb_limit.trim(), "32");
+        assert!(refused > 0, "the bomb never reached its limit");
+        assert_eq!(after_state, Some(ContainerState::Running));
+    }
+
+    /// #2412: a set-uid file a container writes, and the unpacked image it
+    /// runs from, are out of reach of an unprivileged local user, while the
+    /// container itself still starts from both a writable and a read-only
+    /// root.
+    #[tokio::test]
+    #[ignore = "requires rootful runc, overlayfs, setpriv, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
+    async fn runc_a_local_user_cannot_reach_a_containers_set_id_files() {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(runc_tests_enabled(), "set RELIABURGER_RUNC_TESTS=1");
+        assert!(nix::unistd::geteuid().is_root(), "rootful runc needs root");
+        let tmp = tempfile::tempdir().unwrap();
+        // Like /var/lib/reliaburger: any user may pass through the top.
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let writable = InstanceId("default__setid-0".to_string());
+        let read_only = InstanceId("default__setid-ro-0".to_string());
+        for id in [&writable, &read_only] {
+            remove_test_network(id);
+        }
+        let _network_cleanup = TestNetworkCleanup(vec![writable.clone(), read_only.clone()]);
+        let (grill, spec) = image_app(
+            tmp.path(),
+            &writable,
+            &format!(
+                "image = \"{ALPINE_IMAGE}\"\n\
+                 command = [\"/bin/sh\", \"-c\", \"cp /bin/busybox /pwn && chmod 4755 /pwn && sleep 3611\"]\n"
+            ),
+        );
+        grill.create(&writable, &spec).await.unwrap();
+        grill.start(&writable).await.unwrap();
+        let (_, mut read_only_spec) = image_app(
+            tmp.path(),
+            &read_only,
+            &format!("image = \"{ALPINE_IMAGE}\"\ncommand = [\"sleep\", \"3612\"]\n"),
+        );
+        read_only_spec.root.readonly = true;
+        grill.create(&read_only, &read_only_spec).await.unwrap();
+        grill.start(&read_only).await.unwrap();
+
+        let planted = tmp
+            .path()
+            .join("bundles")
+            .join(&writable.0)
+            .join("rootfs-upper/pwn");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !planted.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the container never wrote /pwn"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let mode = std::fs::metadata(&planted).unwrap().permissions().mode();
+        let as_nobody = |path: &std::path::Path| {
+            std::process::Command::new("setpriv")
+                .args([
+                    "--reuid",
+                    "65534",
+                    "--regid",
+                    "65534",
+                    "--clear-groups",
+                    "stat",
+                ])
+                .arg(path)
+                .output()
+                .unwrap()
+        };
+        let upper = as_nobody(&planted);
+        // Something inside the store: reaching it needs search permission
+        // on `rootfs`, which stat of `rootfs` itself doesn't.
+        let unpacked = std::fs::read_dir(tmp.path().join("images/rootfs"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let images = as_nobody(&unpacked);
+        let writable_state = grill.state(&writable).await.ok();
+        let read_only_state = grill.state(&read_only).await.ok();
+        for id in [&writable, &read_only] {
+            grill.kill(id).await.unwrap();
+        }
+
+        assert_eq!(
+            mode & 0o4000,
+            0o4000,
+            "the container's file is set-uid: {mode:o}"
+        );
+        for (what, output) in [("the writable layer", &upper), ("the image store", &images)] {
+            let said = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !output.status.success(),
+                "a local user reached {what}: {said}"
+            );
+            assert!(said.contains("Permission denied"), "{said}");
+        }
+        assert_eq!(writable_state, Some(ContainerState::Running));
+        assert_eq!(read_only_state, Some(ContainerState::Running));
     }
 
     /// Z1.1/D1: image root binds port 80 and nginx's workers drop to their
