@@ -47,6 +47,14 @@ what runs:
 mirrors = { "ghcr.io" = "mirror.internal:5000" }
 ```
 
+A layer may be a plain tar or a tar compressed with gzip or zstd, in OCI's
+media types (`application/vnd.oci.image.layer.v1.tar`, `…tar+gzip`,
+`…tar+zstd`) or Docker's (`application/vnd.docker.image.rootfs.diff.tar.gzip`),
+so images BuildKit builds with `compression=zstd` run as they are. A pull
+refuses any other layer type before downloading it, naming the type, for
+example `layer sha256:… has media type application/vnd.oci.image.layer.v1.tar+bzip2,
+which no node can unpack`. Foreign (non-distributable) layers aren't supported.
+
 Layers stream to disk as they arrive, so a large image doesn't need its
 size in memory, and a slow link isn't a problem while bytes keep coming: an
 attempt is abandoned only after 60 seconds with nothing received, and the

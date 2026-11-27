@@ -868,6 +868,15 @@ impl ImageStore {
             reason: e.to_string(),
         })?;
 
+        // Refuse a layer format nothing here can unpack before fetching it.
+        // Only a runtime pull checks: the cache also holds signature images,
+        // whose layers aren't tars at all.
+        super::oci_pull::check_layer_media_types(&verified.manifest).map_err(|e| {
+            ImageError::ManifestPull {
+                image: source.full_reference(),
+                reason: e.to_string(),
+            }
+        })?;
         let config = parse_config(&verified.config_bytes, &verified.manifest.config.digest)?;
         if image_ref.tag.starts_with("sha256:") {
             self.remember_pin(&image_ref.tag, &verified).await?;
@@ -1150,7 +1159,49 @@ fn sha256_hex(data: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Unpack OCI image layers (gzipped tarballs) into a rootfs directory.
+/// A layer blob as a tar stream, whichever way it was compressed (#2465).
+///
+/// The layer's first bytes decide: `1f 8b` is gzip, `28 b5 2f fd` is zstd,
+/// and `ustar` at offset 257 (or an all-zero first block, an empty tar) is a
+/// plain tar. Cluster and pull-through blobs arrive as paths with no media
+/// type, so the bytes are the only evidence every path shares.
+fn layer_reader(file: std::fs::File, digest: &str) -> Result<Box<dyn std::io::Read>, ImageError> {
+    use std::io::BufRead;
+    let failed = |reason: String| ImageError::UnpackFailed {
+        digest: digest.to_string(),
+        reason,
+    };
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+    let head = reader
+        .fill_buf()
+        .map_err(|e| failed(format!("failed to read layer blob: {e}")))?;
+    if head.starts_with(&[0x1f, 0x8b]) {
+        return Ok(Box::new(flate2::read::GzDecoder::new(reader)));
+    }
+    if head.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        let decoder = zstd::stream::read::Decoder::with_buffer(reader)
+            .map_err(|e| failed(format!("failed to start zstd decoder: {e}")))?;
+        return Ok(Box::new(decoder));
+    }
+    let ustar = head.get(257..262) == Some(b"ustar".as_slice());
+    let empty_tar = head.len() >= 512 && head[..512].iter().all(|byte| *byte == 0);
+    if ustar || empty_tar {
+        return Ok(Box::new(reader));
+    }
+    let start: Vec<String> = head
+        .iter()
+        .take(4)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Err(failed(format!(
+        "unsupported layer compression: the layer starts with {}; \
+         a layer must be a tar, compressed with gzip or zstd or not at all",
+        start.join(" ")
+    )))
+}
+
+/// Unpack OCI image layers (tarballs, gzip- or zstd-compressed or plain)
+/// into a rootfs directory.
 ///
 /// Layers are applied base-first (index 0 is the bottom layer).
 /// Handles OCI whiteout files (see the `whiteout` module):
@@ -1199,8 +1250,7 @@ pub fn unpack_layers_with_owner(
             reason: format!("failed to open layer blob: {e}"),
         })?;
 
-        let decoder = flate2::read::GzDecoder::new(file);
-        let mut archive = tar::Archive::new(decoder);
+        let mut archive = tar::Archive::new(layer_reader(file, &digest)?);
         archive.set_preserve_permissions(true);
         archive.set_unpack_xattrs(true);
         archive.set_overwrite(true);
@@ -2020,6 +2070,76 @@ mod tests {
         assert_eq!(content, "hello world");
     }
 
+    /// An uncompressed tar holding `bin/tool`.
+    fn plain_tar_with_a_tool() -> Vec<u8> {
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(9);
+        header.set_mode(0o755);
+        header.set_cksum();
+        tar.append_data(&mut header, "bin/tool", &b"#!/bin/sh"[..])
+            .unwrap();
+        tar.into_inner().unwrap()
+    }
+
+    /// #2465: BuildKit's `compression=zstd` layers unpack like gzip ones.
+    #[test]
+    fn unpack_accepts_a_zstd_compressed_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = tmp.path().join("layer.tar.zst");
+        std::fs::write(
+            &layer,
+            zstd::stream::encode_all(&plain_tar_with_a_tool()[..], 3).unwrap(),
+        )
+        .unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        unpack_layers(&[layer], &rootfs).unwrap();
+        assert_eq!(
+            std::fs::read(rootfs.join("bin/tool")).unwrap(),
+            b"#!/bin/sh"
+        );
+    }
+
+    /// #2465: an uncompressed `application/vnd.oci.image.layer.v1.tar` layer.
+    #[test]
+    fn unpack_accepts_an_uncompressed_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = tmp.path().join("layer.tar");
+        std::fs::write(&layer, plain_tar_with_a_tool()).unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        unpack_layers(&[layer], &rootfs).unwrap();
+        assert_eq!(
+            std::fs::read(rootfs.join("bin/tool")).unwrap(),
+            b"#!/bin/sh"
+        );
+    }
+
+    /// An empty tar is all zeros, with no `ustar` magic anywhere.
+    #[test]
+    fn unpack_accepts_an_empty_uncompressed_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = tmp.path().join("layer.tar");
+        std::fs::write(&layer, tar::Builder::new(Vec::new()).into_inner().unwrap()).unwrap();
+        let rootfs = tmp.path().join("rootfs");
+        unpack_layers(&[layer], &rootfs).unwrap();
+        assert!(rootfs.is_dir());
+    }
+
+    /// A format we can't read says so, rather than `invalid gzip header`.
+    #[test]
+    fn unpack_names_an_unknown_compression() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = tmp.path().join("layer.tar.bz2");
+        let mut bytes = b"BZh91AY&SY".to_vec();
+        bytes.resize(1024, 7);
+        std::fs::write(&layer, bytes).unwrap();
+        let error = unpack_layers(&[layer], &tmp.path().join("rootfs")).unwrap_err();
+        assert!(
+            error.to_string().contains("unsupported layer compression"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn unpack_multi_layer_applies_in_order() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2578,6 +2698,10 @@ mod tests {
         NegativeLayerSize,
         OverflowingLayerSizes,
         WrongLayerSize,
+        UnknownLayerMediaType,
+        /// Not a fault: the layer is zstd-compressed, as BuildKit's
+        /// `compression=zstd` writes it.
+        ZstdLayer,
     }
 
     #[derive(Clone)]
@@ -2803,7 +2927,15 @@ mod tests {
             &["bin/", "etc/"],
             &[("bin/sh", b"fixture shell"), ("etc/os-release", b"fixture")],
         );
-        let layer = std::fs::read(layer_path).unwrap();
+        let mut layer = std::fs::read(layer_path).unwrap();
+        let mut layer_media_type = "application/vnd.oci.image.layer.v1.tar+gzip";
+        if matches!(integrity, Some(RegistryIntegrityCase::ZstdLayer)) {
+            let mut tar = Vec::new();
+            std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&layer[..]), &mut tar)
+                .unwrap();
+            layer = zstd::stream::encode_all(&tar[..], 3).unwrap();
+            layer_media_type = "application/vnd.oci.image.layer.v1.tar+zstd";
+        }
         let layer_digest = format!("sha256:{}", sha256_hex(&layer));
 
         let config = br#"{"architecture":"amd64","os":"linux","config":{"Entrypoint":["/bin/sh"],"Cmd":["-c","true"],"Env":["FIXTURE=1"],"WorkingDir":"/etc"},"rootfs":{"type":"layers","diff_ids":[]}}"#
@@ -2818,7 +2950,7 @@ mod tests {
                 "size": config.len(),
             },
             "layers": [{
-                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "mediaType": layer_media_type,
                 "digest": layer_digest,
                 "size": layer.len(),
             }],
@@ -2830,6 +2962,15 @@ mod tests {
         ) {
             let mut value: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
             value["config"]["size"] = serde_json::json!(config.len() + 1);
+            manifest = serde_json::to_vec(&value).unwrap();
+        }
+        if matches!(
+            integrity,
+            Some(RegistryIntegrityCase::UnknownLayerMediaType)
+        ) {
+            let mut value: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+            value["layers"][0]["mediaType"] =
+                serde_json::json!("application/vnd.oci.image.layer.v1.tar+bzip2");
             manifest = serde_json::to_vec(&value).unwrap();
         }
         if matches!(
@@ -2973,6 +3114,41 @@ mod tests {
             assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 0);
             assert!(!store.manifest_path(&reference).exists());
         }
+    }
+
+    /// #2465: a layer format no node can unpack fails the pull before
+    /// any layer is downloaded, and the error names the media type.
+    #[tokio::test]
+    async fn a_layer_of_an_unknown_media_type_is_refused_before_it_is_downloaded() {
+        let fixture = start_registry_fixture_with_options(
+            None,
+            Some(RegistryIntegrityCase::UnknownLayerMediaType),
+        )
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(directory.path().to_path_buf());
+        let error = store.pull_and_unpack(&fixture.reference).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("application/vnd.oci.image.layer.v1.tar+bzip2"),
+            "{error}"
+        );
+        assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 0);
+    }
+
+    /// #2465: a whole zstd image, pulled from a registry and unpacked.
+    #[tokio::test]
+    async fn a_zstd_image_pulls_and_unpacks() {
+        let fixture =
+            start_registry_fixture_with_options(None, Some(RegistryIntegrityCase::ZstdLayer)).await;
+        let directory = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(directory.path().to_path_buf());
+        let pulled = store.pull_and_unpack(&fixture.reference).await.unwrap();
+        assert_eq!(
+            std::fs::read(pulled.rootfs.join("bin/sh")).unwrap(),
+            b"fixture shell"
+        );
     }
 
     #[tokio::test]

@@ -203,6 +203,34 @@ pub(crate) fn platform_descriptor<'a>(
         })
 }
 
+/// The layer media types a node can unpack: a tar, compressed with gzip or
+/// zstd or not at all, in OCI's spelling and Docker's.
+pub(crate) const LAYER_MEDIA_TYPES: &[&str] = &[
+    "application/vnd.oci.image.layer.v1.tar",
+    "application/vnd.oci.image.layer.v1.tar+gzip",
+    "application/vnd.oci.image.layer.v1.tar+zstd",
+    "application/vnd.docker.image.rootfs.diff.tar.gzip",
+];
+
+/// Refuse an image whose layers no node can unpack, naming the first media
+/// type that isn't one of [`LAYER_MEDIA_TYPES`] (#2465).
+pub(crate) fn check_layer_media_types(
+    manifest: &OciImageManifest,
+) -> Result<(), OciDistributionError> {
+    match manifest
+        .layers
+        .iter()
+        .find(|layer| !LAYER_MEDIA_TYPES.contains(&layer.media_type.as_str()))
+    {
+        Some(layer) => Err(invalid(format!(
+            "layer {} has media type {}, which no node can unpack: \
+             rebuild the image with gzip, zstd or uncompressed layers",
+            layer.digest, layer.media_type
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Refuse negative layer sizes and totals that overflow cache accounting.
 pub(crate) fn check_layer_sizes(manifest: &OciImageManifest) -> Result<(), OciDistributionError> {
     manifest.layers.iter().try_fold(0_u64, |total, layer| {

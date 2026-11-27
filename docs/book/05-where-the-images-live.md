@@ -1159,6 +1159,49 @@ anything over 64 MiB before asking. Layers go through the new
 reads into memory, and which `OciUpstream` overrides with the streaming
 function.
 
+### Not every layer is gzip
+
+The same audit (#2465) noticed the unpacker wrapped every layer in a
+`GzDecoder` without looking. OCI allows three layer formats: a plain tar, a
+gzipped tar and, since image-spec 1.1, a zstd-compressed tar, which BuildKit
+writes with `compression=zstd`. An image like that applied fine, downloaded
+and verified, and then failed on every node with `invalid gzip header`.
+
+The obvious fix is to read the layer's media type from the manifest. Only
+one of our three paths has it, though: a cluster or pull-through image
+arrives at the runtime as `LocalImageBlobs`, a list of file paths. So the
+unpacker looks at the bytes instead, which every path has. `1f 8b` starts
+every gzip stream, `28 b5 2f fd` every zstd frame, and a tar has `ustar` at
+offset 257 (or, if it's empty, a first block of zeros). Anything else fails
+with `unsupported layer compression` and the first four bytes, which beats a
+gzip error for a file that was never gzip.
+
+```rust
+fn layer_reader(file: File, digest: &str) -> Result<Box<dyn std::io::Read>, ImageError> {
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+    let head = reader.fill_buf()?;
+    if head.starts_with(&[0x1f, 0x8b]) {
+        return Ok(Box::new(flate2::read::GzDecoder::new(reader)));
+    }
+    // … zstd, then plain tar, then the error
+}
+```
+
+The three readers are three different types, and a function can return only
+one. `Box<dyn Read>` is that one type: a pointer to *something* that
+implements `Read`, with calls dispatched through a table at run time, much
+like a Go interface value. `tar::Archive` doesn't care which it gets.
+`fill_buf` lets us peek without consuming: the bytes stay in the
+`BufReader`'s buffer, and the decoder reads them again from the start.
+
+The direct pull, which does have the manifest, also refuses an unknown layer
+media type before downloading it, naming the type. The pull-through cache
+doesn't: it caches cosign signature images too, whose "layers" are JSON, so
+there the bytes decide at unpack time. An apply still accepts such an image,
+because binding only asks the registry for a digest and never sees the
+manifest; checking there would mean fetching it, which is a change to the
+binder for another day.
+
 ## Who owns these bytes?
 
 Content addressing answers "are these the right bytes?". It says nothing about
