@@ -74,8 +74,9 @@ pub fn app_spec_view(desired: &DesiredState, id: &AppId) -> Option<AppSpecView> 
 }
 
 /// `spec` with its secrets left out, each redacted field's path, under
-/// `prefix`, pushed onto `redacted`.
-fn redact_spec(spec: &AppSpec, prefix: &str, redacted: &mut Vec<String>) -> AppSpec {
+/// `prefix`, pushed onto `redacted`. The deploy history route (#2400) uses
+/// it too, so both reads of a spec leave out the same fields.
+pub(crate) fn redact_spec(spec: &AppSpec, prefix: &str, redacted: &mut Vec<String>) -> AppSpec {
     let mut spec = spec.clone();
     redact_env(&mut spec.env, &format!("{prefix}.env"), redacted);
     redact_words(&mut spec.command, &format!("{prefix}.command"), redacted);

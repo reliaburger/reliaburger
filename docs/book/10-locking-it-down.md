@@ -705,6 +705,62 @@ Writing the join-token test turned up one more. `join_token_create_handler` matc
 
 `join-token list` and `join-token revoke` came later (#1893), and at first they repeated the old pattern: read the node's own replica, then write. On a follower, revoke then called `council.write`, which answers `503` there. On a follower that hadn't yet applied a token the leader had just committed, the replica held nothing for that node id, so there was nothing to write, and the answer was `200` with `"revoked": 0`. Both now start the way create does, with `council_to_forward_to`, and the leader does the reading and the writing. The list is a `GET`, so it goes through `forward_get_to_leader`, and both are wrapped in the same timeout, 20 seconds today. The proxy passes on the leader's body but not its headers, so a small helper, `with_json_content_type`, labels a successful answer as JSON again, which is what create already did inline. Every join-token route now asks who leads before it touches the replica.
 
+### Streams that outlive their token
+
+All of that stops the *next* request. A followed log, the event stream and their WebSocket twins aren't a next request: the middleware authenticates them once, when they open, and then they run for as long as the client stays connected. Revoking a token, or its expiry passing, left them delivering until the TLS connection's one-hour lifetime cut them off, and on a plaintext loopback listener, never ([#2399](https://github.com/reliaburger/reliaburger/issues/2399)). Revoke is what you run when a token has leaked, so this was the one place where "stops at once" mattered most and held least.
+
+The fix is a small handle the middleware leaves beside the `AuthContext`, a `CredentialWatch`. It holds the token store and the principal id (or, for a browser session, the session store and its id; for a workload JWT, its `exp`), and it has one method, `is_live`, which applies exactly the rules the middleware applies to a new request, grace periods included. The service principal and the bootstrap window get no watch, so the node-to-node fan-out streams carry on as before. A stream then waits on this:
+
+```rust
+pub async fn credential_ended(watch: Option<CredentialWatch>) {
+    let Some(watch) = watch else {
+        return std::future::pending().await;
+    };
+    loop {
+        tokio::time::sleep(CREDENTIAL_RECHECK_INTERVAL).await;
+        if !watch.is_live().await {
+            return;
+        }
+    }
+}
+```
+
+`std::future::pending()` is a future that never completes: with nothing to watch, the stream never ends for this reason. We poll every 15 seconds, the SSE keep-alive period, instead of pushing revocations to each stream. The store is a plain `RwLock<Vec<ApiToken>>` refreshed from Raft every five seconds, so a channel per principal would be more machinery for a few seconds' gain.
+
+For the SSE responses, one helper wraps the body after the handler has built it. `end_with_credential` leaves anything that isn't `text/event-stream` alone, so a refusal or an ordinary answer passes through, and otherwise ends the body once `credential_ended` resolves, sending one farewell event first. For a log or event stream that's a `warning` event, which `relish logs -f` already prints to stderr; for `relish apply --wait` and `relish rollback` it's an `ApplyEvent::Error` saying the deploy itself carries on. The stream combinator inside is `futures_util::stream::unfold`, which builds a stream from a state and an async closure that returns the next item and the next state, or `None` to stop:
+
+```rust
+futures_util::stream::unfold(state, |(mut stream, mut ended, farewell)| async move {
+    let farewell = farewell?;
+    tokio::select! {
+        item = stream.next() => item.map(|item| (item, (stream, ended, Some(farewell)))),
+        () = &mut ended => Some((farewell, (stream, ended, None))),
+    }
+})
+```
+
+The farewell rides in the state as an `Option`. Once it has been sent the state holds `None`, and `farewell?` ends the stream on the next poll. (`?` works on `Option` as well as `Result`: on `None` it returns `None` from the closure's future.) Wrapping the whole response, rather than each handler's stream, is what let the deploy and job progress streams pick the check up without threading a watch through every function between the handler and the job runner.
+
+The WebSocket sessions are loops around `tokio::select!`, so they take the future as one more branch:
+
+```rust
+let credential_ended = crate::sesame::auth::credential_ended(watch);
+tokio::pin!(credential_ended);
+loop {
+    tokio::select! {
+        () = &mut credential_ended => {
+            let _ = socket.send(credential_ended_close()).await;
+            return;
+        }
+        // ... frames and the client's messages
+    }
+}
+```
+
+`select!` would build a fresh future from `credential_ended(watch)` on every turn of the loop if we wrote the call in the branch, restarting its timer each time a log line arrived. So we make it once and poll it by `&mut` reference. Polling through a reference needs the future pinned (it may hold references into itself across `.await`s, so it mustn't move), and `tokio::pin!` pins it on the stack. The Close frame carries code 1008, policy violation, and the same reason the SSE warning gives.
+
+The tests drive real sockets, because an in-process `oneshot` request can't hold a stream open. `an_open_event_stream_ends_once_its_token_is_revoked` opens `/v1/events?follow=true` with a read-only token, revokes it, records an event, and checks the body ends with the warning and without the event. `an_open_log_websocket_closes_once_its_token_expires` gives a token two seconds to live and waits for the 1008 Close. `an_open_event_stream_outlives_its_recheck_while_the_token_is_valid` is the twin that keeps us honest the other way. Under `cfg!(test)` the re-check runs every 200 ms, so none of them waits 15 seconds.
+
 ### Every node at once
 
 The moment a token is created and the moment it's first used used to be minutes apart, with a human in between. Then agents arrived. The agent gym creates a read-only token for each run and hands it to the solver, which calls `relish agent context` straight away. `context` asks every node for its own diagnostics, events and faults, with the solver's token. On a local model's runs of the partitioned-node scenario, the answer listed sixteen `401: invalid token` errors from the two followers, and the model stopped there and blamed the wrong node.

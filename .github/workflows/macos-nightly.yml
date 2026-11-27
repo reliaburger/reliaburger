@@ -69,16 +69,17 @@ jobs:
           fi
           git checkout --quiet --detach "$ref"
           echo "testing $ref at $(git rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
+          toolchain: 1.98.0
           components: clippy
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
         with:
           tool: cargo-nextest@0.9.151
       # Restores main's macOS cache (ci.yml's push to main saves it) and never
       # saves one: the key would carry the train's Cargo.lock under main's
       # scope, beside the cache ci.yml keeps for main.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: macos
           save-if: false

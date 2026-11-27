@@ -21,11 +21,19 @@ second run finishes what a failed first run started:
    no commits, so on a branch that's still at its base this step prints the
    command to run once the version bump has merged, and the script exits 0.
 
+Before any of them it checks that every schedule-only workflow in the local
+tree (one that only `schedule` or `workflow_dispatch` starts) is on `main`
+too. GitHub runs and dispatches those from the default branch's copy only,
+so one that exists only on a train never runs (#2481); it goes to `main` in
+its own PR. A missing one stops the run before any write.
+
 `--dry-run` reads what it needs, prints every write it would make (the
-ruleset's new body included) and makes none.
+ruleset's new body included) and makes none; it reports a missing
+schedule-only workflow and goes on.
 """
 import argparse
 import json
+from pathlib import Path
 import re
 import shlex
 import subprocess
@@ -40,6 +48,9 @@ MILESTONE = re.compile(r"^\d+\.\d+\.\d+$")
 RULESET_FIELDS = ("name", "target", "enforcement", "conditions", "rules", "bypass_actors")
 # What `rules/branches/<train>` must list once the ruleset names the train.
 QUEUE_RULES = ("merge_queue", "required_status_checks")
+WORKFLOWS = Path(__file__).resolve().parents[2] / ".github" / "workflows"
+# Triggers GitHub runs from the default branch's copy of a workflow only.
+MAIN_ONLY_TRIGGERS = {"schedule", "workflow_dispatch"}
 
 
 class GhError(Exception):
@@ -83,6 +94,38 @@ def missing_queue_rules(branch_rules):
     return [rule for rule in QUEUE_RULES if rule not in present]
 
 
+def triggers(text):
+    """The event names in a workflow's top-level `on:`."""
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        match = re.match(r"^on:\s*(.*?)\s*(#.*)?$", line)
+        if not match:
+            continue
+        inline = match.group(1)
+        if inline:
+            return {name.strip() for name in inline.strip("[]").split(",") if name.strip()}
+        found = set()
+        for following in lines[index + 1:]:
+            if following and not following.startswith((" ", "#")):
+                break
+            key = re.match(r"^  ([a-z_]+):", following)
+            if key:
+                found.add(key.group(1))
+        return found
+    return set()
+
+
+def schedule_only(text):
+    """True when only a schedule or a dispatch starts the workflow."""
+    events = triggers(text)
+    return bool(events) and events <= MAIN_ONLY_TRIGGERS
+
+
+def local_workflows(directory=WORKFLOWS):
+    """{file name: text} for the workflows in this checkout."""
+    return {path.name: path.read_text() for path in sorted(directory.glob("*.yml"))}
+
+
 def gate_pr_body(train, milestone):
     """The gate PR's first body: what it is, and an empty closing list."""
     return (
@@ -96,8 +139,9 @@ def gate_pr_body(train, milestone):
 class Opener:
     """Opens one train, through `run` (a `gh` caller), writing only when `apply`."""
 
-    def __init__(self, run, train, milestone, base, apply, out=sys.stdout):
+    def __init__(self, run, train, milestone, base, apply, out=sys.stdout, workflows=None):
         self.run = run
+        self.workflows = {} if workflows is None else workflows
         self.train = train
         self.milestone = milestone
         self.base = base
@@ -121,6 +165,20 @@ class Opener:
             return True
         except GhError:
             return False
+
+    def check_schedule_only_workflows(self):
+        wanted = sorted(name for name, text in self.workflows.items() if schedule_only(text))
+        on_main = set(self.run(["api", f"repos/{REPOSITORY}/contents/.github/workflows?ref=main",
+                                "--jq", ".[].name"]).split())
+        missing = [name for name in wanted if name not in on_main]
+        if not missing:
+            self.say("0. every schedule-only workflow is on main")
+            return
+        message = (f"schedule-only workflows missing from main: {', '.join(missing)}. GitHub runs "
+                   "them only from main's copy: land them on main in their own PR first")
+        if self.apply:
+            raise GhError(message)
+        self.say(f"0. {message}")
 
     def create_branch(self):
         if self.branch_exists(self.train):
@@ -163,7 +221,9 @@ class Opener:
         if existing:
             self.say(f"4. gate PR #{existing[0]} is open")
             return
-        create = ["pr", "create", "-R", REPOSITORY, "--base", "main", "--head", self.train,
+        # A draft: a ready gate PR without the release-gate label fails the
+        # required check (#2483), and the label goes on at code freeze.
+        create = ["pr", "create", "-R", REPOSITORY, "--draft", "--base", "main", "--head", self.train,
                   "--title", f"Release {self.milestone}", "--milestone", self.milestone,
                   "--body", gate_pr_body(self.train, self.milestone)]
         ahead = 0
@@ -178,13 +238,14 @@ class Opener:
         self.write(create)
 
     def open(self):
+        self.check_schedule_only_workflows()
         self.create_branch()
         self.add_to_ruleset()
         self.create_milestone()
         self.open_gate_pr()
 
 
-def main(argv=None, run=gh, out=sys.stdout):
+def main(argv=None, run=gh, out=sys.stdout, workflows=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("train", help="the branch, release-X-Y-Z")
     parser.add_argument("--milestone", required=True, help="the release's milestone, e.g. 0.3.4")
@@ -199,7 +260,8 @@ def main(argv=None, run=gh, out=sys.stdout):
     if not MILESTONE.match(args.milestone):
         parser.error(f"a milestone is X.Y.Z, not {args.milestone!r}")
     try:
-        Opener(run, args.train, args.milestone, args.base, not args.dry_run, out).open()
+        workflows = local_workflows() if workflows is None else workflows
+        Opener(run, args.train, args.milestone, args.base, not args.dry_run, out, workflows).open()
     except GhError as error:
         print(f"open_train: {error}", file=sys.stderr)
         return 1

@@ -4,7 +4,7 @@ import io
 import json
 import unittest
 
-from open_train import GhError, RULESET, main, missing_queue_rules, ruleset_with_train
+from open_train import GhError, RULESET, main, missing_queue_rules, ruleset_with_train, schedule_only
 
 # The ruleset as `gh api repos/reliaburger/reliaburger/rulesets/25015244`
 # returned it on 24 November 2026, trimmed to the fields that matter.
@@ -71,7 +71,8 @@ class FakeGitHub:
     """Answers `gh` calls for a repo where `branches` exist, and records every call."""
 
     def __init__(self, branches=("main",), milestones=("0.3.3",), ruleset=RULESET_GET,
-                 ahead=0, branch_rules=None):
+                 ahead=0, branch_rules=None, main_workflows=("ci.yml", "fuzz.yml")):
+        self.main_workflows = list(main_workflows)
         self.branches = set(branches)
         self.milestones = list(milestones)
         self.ruleset = json.loads(json.dumps(ruleset))
@@ -117,14 +118,26 @@ class FakeGitHub:
                 self.milestones.append(next(a for a in args if a.startswith("title=")).removeprefix("title="))
                 return "{}"
             return "\n".join(self.milestones) + "\n"
+        if "/contents/.github/workflows" in path:
+            self.assertion_ref = path
+            return "\n".join(self.main_workflows) + "\n"
         if "/compare/" in path:
             return f"{self.ahead}\n"
         raise AssertionError(f"unexpected gh call {args}")
 
 
-def run(argv, github):
+# The local tree's workflows, as {file name: text}: one that runs on pushes and
+# pull requests, and one that GitHub only ever runs from main.
+LOCAL_WORKFLOWS = {
+    "ci.yml": "name: CI\non:\n  push:\n  pull_request:\n  schedule:\n    - cron: '0 1 * * *'\njobs: {}\n",
+    "fuzz.yml": "name: Fuzz\non:\n  schedule:\n    - cron: '29 2 * * *'\n  workflow_dispatch:\njobs: {}\n",
+}
+
+
+def run(argv, github, workflows=None):
     out = io.StringIO()
-    return main(argv, run=github, out=out), out.getvalue()
+    workflows = LOCAL_WORKFLOWS if workflows is None else workflows
+    return main(argv, run=github, out=out, workflows=workflows), out.getvalue()
 
 
 class OpenTrainTests(unittest.TestCase):
@@ -165,6 +178,8 @@ class OpenTrainTests(unittest.TestCase):
         self.assertEqual(len(writes), 1)
         self.assertEqual(writes[0][:2], ["pr", "create"])
         self.assertIn("--milestone", writes[0])
+        # Ready without the release-gate label, it would fail its required check.
+        self.assertIn("--draft", writes[0])
 
     def test_fails_when_the_branch_still_has_no_queue(self):
         github = FakeGitHub(branch_rules=[{"type": "deletion"}])
@@ -179,6 +194,55 @@ class OpenTrainTests(unittest.TestCase):
             with self.subTest(argv=argv), self.assertRaises(SystemExit), \
                     contextlib.redirect_stderr(io.StringIO()):
                 run(argv, FakeGitHub())
+
+
+
+class ScheduleOnlyWorkflowTests(unittest.TestCase):
+    """GitHub runs a scheduled or dispatched workflow from main's copy only (#2481)."""
+
+    NIGHTLY = ("name: macOS nightly\non:\n  schedule:\n    - cron: \"41 1 * * *\"\n"
+               "  workflow_dispatch:\n    inputs:\n      ref:\n        type: string\njobs: {}\n")
+
+    def test_a_workflow_with_only_schedule_or_dispatch_triggers_is_schedule_only(self):
+        self.assertTrue(schedule_only(self.NIGHTLY))
+        self.assertTrue(schedule_only("on:\n  workflow_dispatch:\njobs: {}\n"))
+        self.assertTrue(schedule_only("on: [schedule, workflow_dispatch]\njobs: {}\n"))
+
+    def test_a_workflow_a_push_pull_request_or_queue_starts_is_not(self):
+        for text in (LOCAL_WORKFLOWS["ci.yml"], "on:\n  merge_group:\n  schedule:\n",
+                     "on: push\n", "on:\n  pull_request:\n    branches: [main]\n"):
+            with self.subTest(text=text):
+                self.assertFalse(schedule_only(text))
+
+    def test_opening_a_train_refuses_a_schedule_only_workflow_missing_from_main(self):
+        github = FakeGitHub()
+        workflows = {**LOCAL_WORKFLOWS, "macos-nightly.yml": self.NIGHTLY}
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            code, out = run(["release-1-3-4", "--milestone", "0.3.4"], github, workflows)
+        self.assertEqual(code, 1)
+        self.assertIn("macos-nightly.yml", err.getvalue())
+        self.assertEqual(github.writes(), [])
+        self.assertIn("ref=main", github.assertion_ref)
+
+    def test_a_dry_run_reports_the_missing_workflow_and_goes_on(self):
+        github = FakeGitHub()
+        workflows = {**LOCAL_WORKFLOWS, "macos-nightly.yml": self.NIGHTLY}
+        code, out = run(["release-1-3-4", "--milestone", "0.3.4", "--dry-run"], github, workflows)
+        self.assertEqual(code, 0)
+        self.assertIn("macos-nightly.yml", out)
+        self.assertIn("would run: gh api -X POST repos/reliaburger/reliaburger/milestones", out)
+        self.assertEqual(github.writes(), [])
+
+    def test_a_schedule_only_workflow_on_main_passes(self):
+        github = FakeGitHub(main_workflows=("ci.yml", "fuzz.yml", "macos-nightly.yml"))
+        workflows = {**LOCAL_WORKFLOWS, "macos-nightly.yml": self.NIGHTLY}
+        code, out = run(["release-1-3-4", "--milestone", "0.3.4"], github, workflows)
+        self.assertEqual(code, 0)
+        self.assertIn("every schedule-only workflow is on main", out)
+
+    def test_the_repository_s_own_workflows_are_read_by_default(self):
+        from open_train import local_workflows
+        self.assertIn("ci.yml", local_workflows())
 
 
 if __name__ == "__main__":
