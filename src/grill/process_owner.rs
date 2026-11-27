@@ -378,6 +378,18 @@ fn run_locked_owner(directory: &Path, record: &mut OwnerRecord, _lock: FileLock)
             .custom_flags(nix::libc::O_NOFOLLOW)
             .open(directory.join(format!("output.{suffix}")))
     };
+    // A workload writes straight into its capture files, which Ketchup
+    // follows and reclaims. An exec helper's command writes into pipes this
+    // owner drains, so its files stay under the exec output limit (#2392).
+    let mut drains = Vec::new();
+    let (stdout, stderr) = if exec::is_helper_directory(directory) {
+        let (stdout, stdout_sink) = exec::OutputDrain::new(log("stdout")?)?;
+        let (stderr, stderr_sink) = exec::OutputDrain::new(log("stderr")?)?;
+        drains = vec![stdout, stderr];
+        (Stdio::from(stdout_sink), Stdio::from(stderr_sink))
+    } else {
+        (Stdio::from(log("stdout")?), Stdio::from(log("stderr")?))
+    };
     // The gate's stdin is one end of a socket pair, not a pipe, so the gate
     // can answer on it: activation goes one way, its report the other.
     let (mut channel, gate_end) = UnixStream::pair()?;
@@ -386,8 +398,8 @@ fn run_locked_owner(directory: &Path, record: &mut OwnerRecord, _lock: FileLock)
         .arg(directory)
         .process_group(0)
         .stdin(Stdio::from(std::os::fd::OwnedFd::from(gate_end)))
-        .stdout(log("stdout")?)
-        .stderr(log("stderr")?)
+        .stdout(stdout)
+        .stderr(stderr)
         .spawn()?;
     let mut owned = OwnedChild {
         child,
@@ -417,11 +429,18 @@ fn run_locked_owner(directory: &Path, record: &mut OwnerRecord, _lock: FileLock)
         if exit_code.is_none() {
             exit_code = observe_exit(owned.child.id())?;
         }
+        for drain in &mut drains {
+            drain.drain();
+        }
         let executions_retired = exec::poll(&mut executions, exit_code.is_some())?;
         if let Some(code) = exit_code
             && executions_retired
             && retire_children(&mut owned)?
         {
+            // Every writer the group held has gone: keep its last words.
+            for drain in &mut drains {
+                drain.drain();
+            }
             record.phase = OwnerPhase::Retiring { exit_code: code };
             persist(directory, record)?;
             drop(listener);

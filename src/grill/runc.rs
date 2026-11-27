@@ -2513,6 +2513,45 @@ mod tests {
         assert_eq!(after_state, Some(ContainerState::Running));
     }
 
+    /// #2392: `runc exec` goes through the same exec helper as a host
+    /// command, so a container's chatty command is cut at 1 MiB too.
+    #[tokio::test]
+    #[ignore = "requires rootful runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
+    async fn runc_exec_output_past_the_limit_is_cut_and_the_first_mebibyte_returned() {
+        assert!(runc_tests_enabled(), "set RELIABURGER_RUNC_TESTS=1");
+        assert!(nix::unistd::geteuid().is_root(), "rootful runc needs root");
+        let tmp = tempfile::tempdir().unwrap();
+        let id = InstanceId("default__chatty-0".to_string());
+        remove_test_network(&id);
+        let _network_cleanup = TestNetworkCleanup(vec![id.clone()]);
+        let (grill, spec) = image_app(
+            tmp.path(),
+            &id,
+            &format!("image = \"{ALPINE_IMAGE}\"\ncommand = [\"sleep\", \"3620\"]\n"),
+        );
+        grill.create(&id, &spec).await.unwrap();
+        grill.start(&id).await.unwrap();
+        let result = grill
+            .exec(
+                &id,
+                &[
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "yes a | head -c 4194304".to_string(),
+                ],
+            )
+            .await;
+        grill.kill(&id).await.unwrap();
+
+        let result = result.unwrap();
+        assert_eq!(result.exit_code, 0);
+        let marker = crate::grill::process_owner::exec::CUT_MARKER;
+        let limit = crate::grill::process_owner::exec::OUTPUT_LIMIT as usize;
+        assert!(result.output.ends_with(marker), "not cut");
+        assert!(result.output.len() <= limit + 1 + marker.len());
+        assert!(result.output.starts_with("a\na\n"));
+    }
+
     /// #2412: a set-uid file a container writes, and the unpacked image it
     /// runs from, are out of reach of an unprivileged local user, while the
     /// container itself still starts from both a writable and a read-only

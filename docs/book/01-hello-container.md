@@ -3339,6 +3339,17 @@ The methods that write to the journal take the claim by value and hand it back: 
 
 That socket conversation once panicked a Bun that had already shut down cleanly. Bun's owner bookkeeping takes file locks, so it runs in `tokio::task::spawn_blocking`, which hands a closure to a separate pool of threads where blocking is allowed. Inside it, `request` borrowed the runtime back with `Handle::current().block_on(...)` so it could put a Tokio `timeout` around the connect, write and read. Tokio's shutdown order is what broke it: when the runtime is dropped, async tasks are dropped first, then the timer stops, and only then does Tokio wait for blocking threads to finish. A status request still running at that moment registered a timer on a stopped driver, and Tokio panics with "A Tokio 1.x context was found, but it is being shutdown". It happened once in a jobs soak, during a graceful stop. The request now uses a plain `std` Unix socket instead. A nonblocking `connect` still fails at once on a full backlog, and socket read and write timeouts, plus one overall deadline, replace the Tokio timer. The code that runs on a blocking thread no longer needs the runtime at all, and a test calls it from a thread that has no runtime.
 
+`relish exec` and exec health checks use the same machinery. Each exec gets a helper owner of its own, in an `exec-*` directory inside its workload owner's, and the command's output used to go straight into two files there. The 1 MiB limit was checked only when the files were read back, after the command had finished. A command that printed a lot wrote gigabytes to the node's disk first, for up to five minutes, and then the caller got an error and none of the output ([#2392](https://github.com/reliaburger/reliaburger/issues/2392)). `exec_output_file_never_grows_past_its_limit` in `tests/process_recovery.rs` runs `yes` for two seconds and watches the file: on the old code it reached 4 GB.
+
+A workload's own output can't move off files: [Chapter 14](14-changing-the-tyres.md) explains how a pipe whose reader dies kills its writer with SIGPIPE. An exec is different. Its command is short-lived and its helper retires it anyway, so the helper hands the command pipes and drains them itself:
+
+```rust
+let (source, sink) = std::io::pipe()?;
+fcntl(&source, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
+```
+
+`std::io::pipe` returns the two ends as owned values, `PipeReader` and `PipeWriter`, each closed when it's dropped and marked close-on-exec, so no other child inherits them. The writer becomes the command's stdout through `Stdio::from(sink)`. The reader is non-blocking, because the helper is a single-threaded loop that mustn't stall on a quiet command. Each turn, `OutputDrain::drain` copies what the pipe holds into the file, up to 1 MiB plus one byte, and throws away the rest. It keeps reading past the cap, or the command would block on a full pipe and never finish. The extra byte is the evidence that there was more. When Bun reads the files back, it returns the first mebibyte with `[output cut at 1 MiB]` as the last line, rather than an error. The in-process path that tests use reads its pipes with the same cap, and `runc exec`, which runs under the same helper, behaves the same way.
+
 With those three pieces, restart becomes a matter of reading and checking. For each instance, Bun finds its *adoption record* (its own note of what it was running: spec, PID, process start time, log location). `owned_adopt` claims the generation and cross-checks everything:
 
 ```rust
