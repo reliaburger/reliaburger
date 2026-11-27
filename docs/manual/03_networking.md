@@ -198,18 +198,51 @@ If a route that slipped past those checks reaches the cluster anyway (say, one
 written before them), every node skips that one route, logs it with its app and
 namespace, and keeps serving discovery and ingress for every other app.
 
+A request body is read whole before the ingress contacts your app, so it can
+retry another instance if the first one can't be reached. Three limits guard
+that buffer. A body over `[ingress] max_request_body_bytes` (10 MiB) gets 413.
+A body that sends nothing for 30 seconds gets 408. And all the bodies a node is
+buffering share `[ingress] request_body_budget_bytes` (256 MiB): a request
+whose declared body won't fit in what's left gets 503 before any of it is
+read, so a crowd of slow uploads can't pin the node's memory. The node picks a
+backend only once the body has arrived, so a slow upload doesn't hold up a
+rollout.
+
+```toml
+[ingress]
+enabled = true
+max_request_body_bytes = 1048576     # 1 MiB
+request_body_budget_bytes = 67108864 # 64 MiB shared by every upload
+```
+
+A node holds at most `[ingress] max_open_connections` (32,768) connections
+across its two ingress listeners and closes any past that at once.
+`max_connections` (10,000) counts requests in flight, not connections. One
+client address may have 16 TLS handshakes in progress
+(`max_tls_handshakes_per_source`); behind a load balancer that doesn't pass the
+client's address through, every client shares the balancer's address, so raise
+it there.
+
 Streaming responses pass through, and so do WebSockets on routes that allow
-them. A stopping instance drains its connections before it goes. A WebSocket
+them. A response is cut when your app sends nothing for 30 seconds, before
+its headers (the client gets 502) or in the middle of its body, so give a
+long-lived stream such as server-sent events a heartbeat. A quiet WebSocket
+is never cut for being idle. If your app refuses a WebSocket upgrade (a 401 for a missing token, say),
+the client gets your status, headers and up to 64 KiB of the body, not a 502. A stopping instance drains its connections before it goes. A WebSocket
 still open when the drain timeout ends gets a Close frame with code 1001
 (Going Away), so a well-behaved client reconnects to another instance rather
 than reporting an error.
 
-Your app sees the client's address in `X-Forwarded-For` and `X-Real-IP`, and
-`X-Forwarded-Proto` says whether the client came over HTTPS. The ingress sets
-all three itself and drops any a client sent, so your app can trust them. Each
-request also carries an `X-Request-ID`: the client's own, or a new random one,
-for matching your app's logs to the client's. WebSocket upgrades get the same
-headers.
+Your app sees the `Host` the client asked for (`web.example.com`, not the
+instance's own address), so absolute links, cookie domains and virtual hosts
+work without any proxy setting. The client's address is in `X-Forwarded-For`
+and `X-Real-IP`, `X-Forwarded-Proto` says whether the client came over HTTPS,
+`X-Forwarded-Host` repeats the client's `Host`, and `X-Forwarded-Port` is the
+ingress port it connected to (80 or 443 unless you moved them). The ingress
+sets all five itself and drops any a client sent, so your app can trust them.
+Each request also carries an `X-Request-ID`: the client's own, or a new random
+one, for matching your app's logs to the client's. WebSocket upgrades get the
+same headers.
 
 ## Fault injection lives nearby
 
