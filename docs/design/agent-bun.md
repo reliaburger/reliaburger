@@ -1373,6 +1373,13 @@ Three decisions shape everything that follows, and each earns its keep against t
       new. A timeout names how far the candidate got (pid, first output,
       exit). The probe that passed is the file staged in 4, renamed into
       place, so the bytes that run are the bytes that were checked.
+   e. the version in that answer is target_version (#2403). Signatures
+      cover bytes, not the label (a file name, a metadata key), so a
+      genuine older release under a newer label would otherwise pass the
+      downgrade gate. A candidate that prints no version predates 0.3.4
+      and is accepted only with allow_downgrade. After the swap, a binary
+      that is neither the marker's target nor its previous version reverts
+      (RevertAndExecPrevious) instead of archiving the marker as stale.
    Any failure aborts before staging: the node reports failure and does NOT
    swap.
 

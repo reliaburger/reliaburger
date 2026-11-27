@@ -2123,3 +2123,25 @@ Both cluster clients, plaintext and mTLS, also got a 5 s `connect_timeout`, so n
 ### Tests
 
 `a_node_that_never_answers_its_probe_does_not_stall_the_step` gives `MockControl` a silent node whose probe is `std::future::pending()`, a future that never finishes, beside a node that's been `Directed` for longer than `NODE_TIMEOUT`. Before the fix `step` never returned and the test's outer 30 s timeout fired. Now the silent node stays `Healthy` and the stuck one fails and pauses the run. `a_groups_probes_run_concurrently` checks that three silent nodes cost one probe bound, and `a_directive_that_never_answers_is_a_transient_failure` that a silent directive leaves the node `Pending` with a retry booked. All three run with `#[tokio::test(start_paused = true)]`. With the clock paused, Tokio jumps straight to the next timer whenever every task is waiting, so a 150 s bound takes no real time. That's safe here because nothing in the test calls `tokio::spawn`.
+
+## A version label is not a version
+
+Both signatures cover a binary's bytes, and nothing else. The version the gates compare (same version? a downgrade?) was a label: the file name for `--binary`, or a key in the unsigned release metadata for the network form. So a genuine, signed v0.3.1 copied onto a USB stick as `bun-v0.3.3` passed everything. Its signature verified, 0.3.3 is newer than the running 0.3.2 so no `--allow-downgrade` was asked for, and the formats matched. Worse, whoever controls a metadata mirror could list an old, vulnerable release under a new number, and `--external-key` would countersign it (#2403).
+
+After the swap it got stranger. The process that came up was 0.3.1, and the marker said `0.3.2 -> 0.3.3`. `decide_startup` had no arm for "a version the marker never mentions", so the catch-all archived the marker as stale and booted normally: no verification, no boot counting, no revert.
+
+The fix asks the bytes. `bun --compatibility` now prints `{protocol, state, version}`, a `CompatibilityAnswer` in `src/upgrade/compatibility.rs`, and the version comes from the code compiled into the binary, which no one can change without breaking its signature. Before staging, `check_reported_version` compares it with the directive's `target_version` and refuses a mismatch with `UpgradeError::VersionMismatch`, naming both. A release from before 0.3.4 prints no version, so it can only be an older release: it's accepted only with `allow_downgrade`.
+
+The answer is a new struct, not a new field on `Compatibility`. `Compatibility` has `#[serde(deny_unknown_fields)]` and release metadata stores it too, so growing it would change what every metadata reader accepts. The new field is `Option<BinaryVersion>` with `#[serde(default)]`, which is how serde reads an answer that leaves it out: as `None`, not an error.
+
+The debug builds the upgrade tests use need one more step. A test gives one compiled binary several versions with `.version` sidecars beside the store's files (§14.1), but the candidate is queried as a private copy, which has no sidecar, so it answers with the compiled version. `development_version_override` reads the sidecar beside the store's file for the target version instead, the same file the swapped-in binary will read. Release builds compile that branch out.
+
+`decide_startup` also splits its catch-all. `Executed` or `Verifying` with a version that's neither side of the upgrade now returns `RevertAndExecPrevious`: the swap happened and something unexpected runs. Only a `Staged` marker, or a revert that landed on an unexpected version, is still archived, the second so that a mislabelled *previous* binary can't loop the node.
+
+### Tests
+
+`a_candidate_whose_own_version_differs_from_the_directive_is_refused_before_staging` signs a candidate that says it's v0.1.5 and labels it v0.2.0: `prepare` refuses it, and no marker or candidate file is left. `a_candidate_that_does_not_say_its_version_needs_allow_downgrade` plays a pre-0.3.4 release. In `src/upgrade/marker.rs`, `a_swapped_in_binary_of_an_unexpected_version_reverts` replaces the old test that pinned the archive.
+
+### What we decided not to do
+
+We didn't sign a statement `{version, platform, sha256}` instead of bare bytes, or sign `metadata.json`. Either would bind the label to the bytes cryptographically, and it may still come. The version compiled into the binary already does that job: it's covered by the signature, so it can't be relabelled.

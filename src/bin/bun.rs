@@ -851,9 +851,16 @@ fn main() -> anyhow::Result<()> {
         }
     };
     if cli.compatibility {
+        // The version too, so an upgrade can check a binary is the release
+        // it's labelled as (#2403).
+        let version = std::env::current_exe()
+            .map(|exe| reliaburger::upgrade::resolve_running_version(&exe))
+            .unwrap_or_else(|_| reliaburger::upgrade::version::compiled_version());
         println!(
             "{}",
-            serde_json::to_string(&reliaburger::compatibility::CURRENT)?
+            serde_json::to_string(&reliaburger::upgrade::CompatibilityAnswer::this_binary(
+                version
+            ))?
         );
         return Ok(());
     }

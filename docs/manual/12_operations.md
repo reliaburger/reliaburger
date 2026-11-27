@@ -145,6 +145,14 @@ recorded:
 refusing to upgrade to v0.2.0: incompatible binary: found protocol 51, state 68; this cluster (reliaburger v0.1.6 (…)) needs protocol 46, state 63. …
 ```
 
+From 0.3.4 `bun --compatibility` also prints the binary's own version, and
+the check refuses a binary that says it's a different version from the one
+you asked for, such as `bun-v0.3.1` copied in as `bun-v0.3.5`. The signatures
+prove the bytes are a release, not which release. A binary from before 0.3.4
+doesn't say its version, so it can only be a downgrade and needs
+`--allow-downgrade`. If a swapped-in binary still turns out to be neither the
+old nor the new version, the node reverts to the old one by itself.
+
 The candidate gets 60 seconds to answer. It normally takes milliseconds, but
 on macOS the first run of a new executable waits while the system assesses
 it: about a second for a release `bun`, and longer while the host is starting

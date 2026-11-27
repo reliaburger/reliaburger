@@ -511,7 +511,11 @@ impl UpgradeManager {
             "upgrade-fixture phase=signature-verified-probe-begin elapsed={:?}",
             fixture_phase_started.elapsed()
         );
-        if let Err(error) = super::compatibility::query_probe(&probe).await {
+        let checked = match super::compatibility::query_probe(&probe).await {
+            Ok(reported) => self.check_reported_version(directive, reported),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = checked {
             super::compatibility::discard_probe(probe).await;
             return Err(error);
         }
@@ -802,6 +806,8 @@ impl UpgradeManager {
         })
         .await
         .map_err(|error| UpgradeError::IncompatibleBinary(error.to_string()))??;
+        // A stored binary is checked by its version-keyed name in the
+        // store, and an older release can't report its version anyway.
         let answer = super::compatibility::query_probe(&probe).await;
         super::compatibility::discard_probe(probe).await;
         answer?;
@@ -1046,6 +1052,33 @@ impl UpgradeManager {
             super::plan::TargetCheck::Proceed => Ok(()),
             super::plan::TargetCheck::AlreadyRunning => Err(UpgradeError::AlreadyRunning {
                 version: directive.target_version.clone(),
+            }),
+        }
+    }
+
+    /// Refuse a candidate whose own version isn't the directive's (#2403).
+    ///
+    /// The signatures cover the bytes, so a genuine build of one version
+    /// can be labelled as another. A candidate that names no version is
+    /// older than 0.3.4, so it can only be a downgrade.
+    fn check_reported_version(
+        &self,
+        directive: &UpgradeDirective,
+        reported: Option<BinaryVersion>,
+    ) -> Result<(), UpgradeError> {
+        let labelled = &directive.target_version;
+        let reported =
+            super::version::development_version_override(&self.store.binary_path(labelled))
+                .or(reported);
+        match reported {
+            Some(actual) if actual == *labelled => Ok(()),
+            Some(actual) => Err(UpgradeError::VersionMismatch {
+                labelled: labelled.clone(),
+                actual,
+            }),
+            None if directive.allow_downgrade => Ok(()),
+            None => Err(UpgradeError::VersionUnreported {
+                labelled: labelled.clone(),
             }),
         }
     }
@@ -1406,9 +1439,22 @@ mod tests {
         }
     }
 
+    /// A candidate that answers `--compatibility` like this build, as
+    /// version 0.2.0, the version `directive_for` asks for.
     fn compatible_binary(label: &[u8]) -> Vec<u8> {
-        let formats = serde_json::to_string(&crate::compatibility::CURRENT).unwrap();
-        let mut binary = format!("#!/bin/sh\nprintf '%s' '{formats}'\n# ").into_bytes();
+        binary_reporting(Some("v0.2.0"), label)
+    }
+
+    /// A candidate that answers with this build's formats and `version`
+    /// (none at all, like a release from before #2403).
+    fn binary_reporting(version: Option<&str>, label: &[u8]) -> Vec<u8> {
+        let answer = serde_json::to_string(&crate::upgrade::CompatibilityAnswer {
+            protocol: crate::compatibility::CURRENT.protocol,
+            state: crate::compatibility::CURRENT.state,
+            version: version.map(v),
+        })
+        .unwrap();
+        let mut binary = format!("#!/bin/sh\nprintf '%s' '{answer}'\n# ").into_bytes();
         binary.extend_from_slice(label);
         binary.push(b'\n');
         binary
@@ -1456,8 +1502,7 @@ mod tests {
         use std::time::Duration;
         use tokio_util::sync::CancellationToken;
         let fixture = fixture();
-        let formats = serde_json::to_string(&crate::compatibility::CURRENT).unwrap();
-        let mut binary = format!("#!/bin/sh\nprintf '%s' '{formats}'\nexit 0\n").into_bytes();
+        let mut binary = binary_reporting(Some("v0.2.0"), b"large");
         // Build and sign the candidate on a thread of its own. That's
         // seconds of CPU, and done on the runtime's thread it made the
         // scheduler rank that thread below fresher ones for a while
@@ -1578,6 +1623,58 @@ mod tests {
             "{err}"
         );
         assert!(!trace.exists(), "an unverified candidate must never run");
+    }
+
+    /// #2403: the signatures cover bytes, not the version label, so the
+    /// candidate is asked which version it is. A genuine older build under
+    /// a newer label is refused before anything is staged.
+    #[tokio::test]
+    async fn a_candidate_whose_own_version_differs_from_the_directive_is_refused_before_staging() {
+        let fixture = fixture();
+        let directive = directive_for(
+            &fixture,
+            &binary_reporting(Some("v0.1.5"), b"an older release, relabelled"),
+            "up-1",
+        );
+
+        let error = fixture
+            .manager
+            .prepare(&directive, vec![])
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, UpgradeError::VersionMismatch { labelled, actual }
+                if *labelled == v("0.2.0") && *actual == v("0.1.5")),
+            "{error}"
+        );
+        assert!(error.to_string().contains("v0.1.5"), "{error}");
+        assert!(!fixture.manager.upgrade_in_flight());
+        assert!(!fixture.binary_dir.join("bun-v0.2.0").exists());
+        assert_eq!(stray_files(&fixture), Vec::<String>::new());
+    }
+
+    /// #2403: a candidate too old to say its version can only be a
+    /// downgrade, so it needs `allow_downgrade`.
+    #[tokio::test]
+    async fn a_candidate_that_does_not_say_its_version_needs_allow_downgrade() {
+        let fixture = fixture();
+        let mut directive =
+            directive_for(&fixture, &binary_reporting(None, b"before #2403"), "up-1");
+
+        let error = fixture
+            .manager
+            .prepare(&directive, vec![])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, UpgradeError::VersionUnreported { .. }),
+            "{error}"
+        );
+        assert!(!fixture.manager.upgrade_in_flight());
+
+        directive.allow_downgrade = true;
+        fixture.manager.prepare(&directive, vec![]).await.unwrap();
     }
 
     #[tokio::test]
@@ -1746,7 +1843,11 @@ mod tests {
     #[tokio::test]
     async fn downgrade_directive_needs_allow_downgrade() {
         let fixture = fixture();
-        let mut directive = directive_for(&fixture, b"soak build", "downgrade");
+        let mut directive = directive_for(
+            &fixture,
+            &binary_reporting(Some("v0.1.0-soak.1"), b"soak build"),
+            "downgrade",
+        );
         directive.target_version = v("0.1.0-soak.1");
 
         let err = fixture
