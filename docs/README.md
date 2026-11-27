@@ -195,7 +195,8 @@ place ([record](qualification/2026-10-29-rolling-walk-0.2.2-to-0.2.3.md));
 and 0.3.0 each change them again, so a 0.2.8 cluster starts afresh on 0.3.0;
 0.3.1 keeps 0.3.0's, so a 0.3.0 cluster rolls onto it in place, and 0.3.2
 moves the protocol to 61, so a 0.3.1 cluster starts afresh on 0.3.2;
-0.3.3 keeps 0.3.2's (61/76), so a 0.3.2 cluster rolls onto it in place
+0.3.3 keeps 0.3.2's (61/76), so a 0.3.2 cluster rolls onto it in place,
+and 0.3.4 moves both to 62/77, so a 0.3.3 cluster starts afresh on 0.3.4
 ([compatibility before 1.0.0](releasing.md#compatibility-before-100)). A release with other cluster formats, or a
 rollback to a version some node doesn't hold, is refused before anything is
 recorded.

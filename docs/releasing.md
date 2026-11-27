@@ -906,6 +906,22 @@ running the applied image, and says so on stderr
 If a walk fails, a fresh cluster, as [from 0.2.0](#upgrading-from-020),
 still works.
 
+### Upgrading from 0.3.3
+
+0.3.4 can't roll onto a 0.3.2 or 0.3.3 cluster, which both speak protocol 61
+and state format 76. The council's snapshot chunks travel as base64 instead
+of a JSON array of numbers
+([#2367](https://github.com/reliaburger/reliaburger/issues/2367)), so nodes
+on either side of the change can't hand each other a snapshot; the full list
+is in `src/compatibility.rs`. The release makes one bump for all its audit
+fixes, at its first wire or state change: the protocol moved from 61 to 62
+and the state format from 76 to 77. Nodes refuse 61/76 peers and data
+directories, and a 0.3.3 leader refuses `relish upgrade start v0.3.4` before
+it records a run.
+
+The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
+same steps and the same losses.
+
 ## Signing identity
 
 Configure `RELIABURGER_RELEASE_KEY` as a secret of the `release` GitHub
