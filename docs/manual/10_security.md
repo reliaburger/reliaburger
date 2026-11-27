@@ -130,6 +130,16 @@ you asked and on the leader, and on the others within about five seconds. If
 the node you asked is more than two seconds behind the leader, the message says
 so, and that node may accept the token until it catches up.
 
+A stream that is already open ends too. A followed log (`relish logs -f`), the
+event stream (`/v1/events?follow=true`), their WebSocket versions, the
+dashboard's live panes and the progress of `relish apply` or `relish rollback`
+re-check the token that opened them every 15 seconds. Once it's revoked or
+expired, the stream ends with a warning, `the token that opened this stream was
+revoked or has expired`, and a WebSocket closes with code 1008 (policy). A
+deploy whose progress stream ended this way carries on; follow it with
+`relish status`. A token rotated with a grace period keeps its streams open
+until the grace ends.
+
 If the leader doesn't answer within 20 seconds you get a `504`, and the write
 may have happened anyway. Repeating a `revoke` is safe, and a lost join token
 expires by itself. Check `relish token list` before repeating a `create` or a

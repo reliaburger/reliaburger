@@ -76,6 +76,39 @@ pub(super) const CAPACITY_PROBE_HEADER: &str = "x-reliaburger-capacity-probe";
 pub(super) const APPLY_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub(super) async fn apply_handler(
+    watch: Option<axum::Extension<crate::sesame::auth::CredentialWatch>>,
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    capacity_admission: Option<axum::Extension<crate::cluster::capacity::CapacityAdmission>>,
+    binder: Option<axum::Extension<ImageBinder>>,
+    state: State<ApiState>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    // `apply --wait` follows the deploy's progress for as long as it runs;
+    // a token revoked meanwhile ends the stream, not the deploy (#2399).
+    let response = apply_stream(auth, capacity_admission, binder, state, headers, body).await;
+    crate::sesame::auth::end_with_credential(
+        response,
+        watch.map(|extension| extension.0),
+        credential_ended_apply_event(),
+    )
+}
+
+/// The last event of a deploy's progress stream whose token ended while
+/// it ran: an [`ApplyEvent::Error`] that says the deploy itself carries on.
+pub(super) fn credential_ended_apply_event() -> axum::body::Bytes {
+    let event = ApplyEvent::Error {
+        status: None,
+        message: format!(
+            "{}; the deploy carries on: follow it with `relish status`",
+            crate::sesame::auth::CREDENTIAL_ENDED_MESSAGE
+        ),
+    };
+    let json = serde_json::to_string(&event).unwrap_or_default();
+    axum::body::Bytes::from(format!("data: {json}\n\n"))
+}
+
+async fn apply_stream(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     capacity_admission: Option<axum::Extension<crate::cluster::capacity::CapacityAdmission>>,
     binder: Option<axum::Extension<ImageBinder>>,

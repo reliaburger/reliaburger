@@ -423,6 +423,25 @@ const ROLLBACK_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// An app GitOps manages is refused without `?force=true`: the next sync
 /// would put back what git declares (#693).
 pub(super) async fn rollback_handler(
+    watch: Option<axum::Extension<crate::sesame::auth::CredentialWatch>>,
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    binder: Option<axum::Extension<crate::pickle::binding::ImageBinder>>,
+    state: State<ApiState>,
+    path: Path<(String, String)>,
+    query: Query<super::apps::ForceQuery>,
+    headers: HeaderMap,
+) -> Response {
+    // Like `apply --wait`: a token revoked mid-rollback ends the progress
+    // stream, not the rollback (#2399).
+    let response = rollback_stream(auth, binder, state, path, query, headers).await;
+    crate::sesame::auth::end_with_credential(
+        response,
+        watch.map(|extension| extension.0),
+        super::apply::credential_ended_apply_event(),
+    )
+}
+
+async fn rollback_stream(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     binder: Option<axum::Extension<crate::pickle::binding::ImageBinder>>,
     State(state): State<ApiState>,

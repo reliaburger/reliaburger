@@ -494,6 +494,50 @@ async fn node_page_says_when_that_node_did_not_answer() {
 // WebSocket log stream
 // ---------------------------------------------------------------------------
 
+/// A log WebSocket is authenticated before the upgrade. A token that
+/// expires while the socket is open must close it, with a policy-violation
+/// Close frame that says why (#2399).
+#[tokio::test]
+async fn an_open_log_websocket_closes_once_its_token_expires() {
+    use futures_util::StreamExt as _;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    let created = crate::sesame::token::create_token(
+        "brief",
+        crate::sesame::types::ApiRole::ReadOnly,
+        crate::sesame::types::TokenScope::default(),
+        Some(SystemTime::now() + Duration::from_secs(2)),
+    )
+    .unwrap();
+    let mut setup = Setup::new(spawn_agent(Vec::new(), vec!["hello".into()]));
+    setup.tokens = vec![created.token.clone()];
+    let address = serve_peer(setup.router().await).await;
+
+    let mut request = format!("ws://{address}/v1/ws/logs/web/default")
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {}", created.plaintext).parse().unwrap(),
+    );
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let close = tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(message) = socket.next().await {
+            if let Ok(WsMessage::Close(frame)) = message {
+                return frame;
+            }
+        }
+        None
+    })
+    .await
+    .expect("the socket outlived its expired token")
+    .expect("the socket ended without a Close frame");
+    assert_eq!(close.code, CloseCode::Policy);
+    assert!(close.reason.contains("expired"), "{close:?}");
+}
+
 /// Each WebSocket frame is a [`crate::ketchup::follow::LogFrame`], so the
 /// TUI can tell a log line from a "node left" notice.
 #[tokio::test]
