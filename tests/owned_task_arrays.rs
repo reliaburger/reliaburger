@@ -2517,7 +2517,7 @@ async fn runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_sec
         .await
         .unwrap();
     let identities =
-        secret::namespace_identities(&council.security_state().await, "rbtest-reuse", &ikm);
+        secret::namespace_identities(&*council.security_state().await, "rbtest-reuse", &ikm);
     assert!(
         identities
             .iter()
