@@ -114,7 +114,16 @@ pub struct MockGrill {
     fail_state: Arc<AtomicBool>,
     /// State queries still to answer `StateUnavailable`, per instance.
     state_unavailable: Arc<Mutex<HashMap<InstanceId, u32>>>,
+    /// Stop and kill requests still to answer `StopUnanswered`, per call
+    /// and instance.
+    unanswered: Arc<Mutex<HashMap<(MockCall, InstanceId), u32>>>,
     inspection_failures: Arc<Mutex<std::collections::HashSet<InstanceId>>>,
+    /// Instances whose `adopt` fails, as an uncertain runtime's does.
+    adopt_failures: Arc<Mutex<std::collections::HashSet<InstanceId>>>,
+    /// Whether `forget_retired` really forgets, as runc's deletes the
+    /// intent journal: a later kill or state read is `NotFound`.
+    forget_for_real: Arc<AtomicBool>,
+    forgotten: Arc<Mutex<std::collections::HashSet<InstanceId>>>,
     exit_code_failures: Arc<Mutex<std::collections::HashSet<InstanceId>>>,
     /// How many times `network_reference` was asked. Kept apart from
     /// `calls`, which records what a runtime handle was made to do.
@@ -194,7 +203,11 @@ impl Default for MockGrill {
             fail_start: Arc::default(),
             fail_state: Arc::default(),
             state_unavailable: Arc::default(),
+            unanswered: Arc::default(),
             inspection_failures: Arc::default(),
+            adopt_failures: Arc::default(),
+            forget_for_real: Arc::default(),
+            forgotten: Arc::default(),
             exit_code_failures: Arc::default(),
             network_reference_reads: Arc::default(),
             log_stems: Arc::default(),
@@ -308,6 +321,51 @@ impl MockGrill {
             .lock()
             .unwrap()
             .insert(instance.clone(), times);
+    }
+
+    /// Make `adopt` of `instance` fail, as a runtime that can't tell does.
+    pub fn set_adopt_failure(&self, instance: &InstanceId) {
+        self.adopt_failures.lock().unwrap().insert(instance.clone());
+    }
+
+    /// Make `forget_retired` forget, as runc's does: until it's created
+    /// again, a kill or state read of that instance is `NotFound`.
+    pub fn forget_retired_for_real(&self) {
+        self.forget_for_real.store(true, Ordering::SeqCst);
+    }
+
+    /// The `NotFound` a forgotten instance answers with, if it was forgotten.
+    fn forgotten_error(&self, instance: &InstanceId) -> Result<(), GrillError> {
+        if self.forgotten.lock().unwrap().contains(instance) {
+            return Err(GrillError::NotFound {
+                instance: instance.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Answer the next `times` `call`s (a stop or a kill) for `instance`
+    /// with `StopUnanswered`, as a process owner stalled past its request
+    /// timeout does (#1902).
+    pub fn set_unanswered_times(&self, call: MockCall, instance: &InstanceId, times: u32) {
+        self.unanswered
+            .lock()
+            .unwrap()
+            .insert((call, instance.clone()), times);
+    }
+
+    /// Whether this `call` for `instance` goes unanswered, counting it.
+    fn unanswered(&self, call: MockCall, instance: &InstanceId) -> Option<GrillError> {
+        let mut unanswered = self.unanswered.lock().unwrap();
+        let left = unanswered.get_mut(&(call, instance.clone()))?;
+        if *left == 0 {
+            return None;
+        }
+        *left -= 1;
+        Some(GrillError::StopUnanswered {
+            instance: instance.clone(),
+            reason: "process owner request timed out".into(),
+        })
     }
 
     /// Fail state inspection only for the named instance.
@@ -689,6 +747,9 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .push(("forget_retired".to_string(), instance.clone()));
+        if self.forget_for_real.load(Ordering::SeqCst) {
+            self.forgotten.lock().unwrap().insert(instance.clone());
+        }
         Ok(())
     }
 
@@ -795,6 +856,7 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .push(("create".to_string(), instance.clone()));
+        self.forgotten.lock().unwrap().remove(instance);
         self.delay(MockCall::Create).await;
         if self.block_create.load(Ordering::SeqCst) {
             self.create_started.add_permits(1);
@@ -878,6 +940,9 @@ impl super::Grill for MockGrill {
             .unwrap()
             .push(("stop".to_string(), instance.clone()));
         self.delay(MockCall::Stop).await;
+        if let Some(error) = self.unanswered(MockCall::Stop, instance) {
+            return Err(error);
+        }
         if self.fail_stop.load(Ordering::SeqCst) {
             return Err(GrillError::StopFailed {
                 instance: instance.clone(),
@@ -903,7 +968,11 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .push(("kill".to_string(), instance.clone()));
+        self.forgotten_error(instance)?;
         self.delay(MockCall::Kill).await;
+        if let Some(error) = self.unanswered(MockCall::Kill, instance) {
+            return Err(error);
+        }
         if self.block_kill.load(Ordering::SeqCst) {
             self.kill_started.add_permits(1);
             let permit = self.kill_release.acquire().await.unwrap();
@@ -933,6 +1002,7 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .push(("state".to_string(), instance.clone()));
+        self.forgotten_error(instance)?;
         self.delay(MockCall::State).await;
         if let Some(left) = self.state_unavailable.lock().unwrap().get_mut(instance)
             && *left > 0
@@ -1110,6 +1180,12 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .push(("adopt".to_string(), instance.clone()));
+        if self.adopt_failures.lock().unwrap().contains(instance) {
+            return Err(GrillError::StateUnavailable {
+                instance: instance.clone(),
+                reason: "simulated adoption failure".into(),
+            });
+        }
         if self.fail_state.load(Ordering::SeqCst)
             || self.inspection_failures.lock().unwrap().contains(instance)
         {

@@ -93,7 +93,8 @@ def selected_workflow(expected, *, code, heavy, macos):
     boundaries, and `light` only portable Linux and the optimized boundaries.
     `train-full` runs every owner except portable macOS: a code pull
     request into main, or one into a train labelled full-ci, that doesn't
-    touch macOS code (#1443). Pushes and the nightly still run them.
+    touch macOS code (#1443), and every merge-queue group with code
+    (24 November 2026). Pushes and the nightly still run them.
     """
     c.fields(expected, ('commit', 'run_id', 'attempt'))
     c.require(re.fullmatch('[0-9a-f]{40}', expected['commit']) is not None,

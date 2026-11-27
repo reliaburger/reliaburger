@@ -534,6 +534,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         let cgroup_path =
             crate::grill::cgroup::instance_cgroup_path(namespace, app_name, instance_id)?;
+        // Before anything makes the cgroup, so the namespace's last app
+        // retiring can't remove its directory mid-launch (#2324).
+        self.supervisor.hold_workload_cgroup(app_name, namespace);
         let cgroup_str = cgroup_path.to_string_lossy().into_owned();
         let netns_path = self
             .netns_paths
@@ -697,10 +700,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         } else {
             None
         };
-        if let Err(error) = self
-            .supervisor
-            .reserve_execution(id.clone(), crate::meat::admission::app_requests(spec))
-        {
+        if let Err(error) = self.supervisor.reserve_execution(
+            id.clone(),
+            &crate::meat::AppId::new(app_name, namespace),
+            crate::meat::admission::app_requests(spec),
+        ) {
             if let Some(port) = host_port {
                 // LOOP-INLINE: in-memory lock, no I/O
                 self.supervisor.port_allocator.release(port).await?;
@@ -769,6 +773,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         let cgroup_path =
             crate::grill::cgroup::instance_cgroup_path(namespace, app_name, instance_id)?;
+        self.supervisor.hold_workload_cgroup(app_name, namespace);
         // A replacement never went through `admit_app`, so this is its host
         // path check as well as the resolution of what to mount (#797).
         // LOOP-INLINE: the container is built from the approved paths; symlinks resolve on a blocking thread, and an app with none does no I/O

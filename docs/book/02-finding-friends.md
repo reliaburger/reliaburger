@@ -3085,6 +3085,8 @@ The fourth was a one-liner. The supervisor set `recorded = current` even when `p
 
 The gated tests replay the audit's scenarios on real transports and real data directories. `recovering_two_survivors_independently_fences_one` recovers two survivors of one council separately, watches them meet and both fence as a split, refuses the plain re-recovery of a fenced directory, and shows that `--force` leaves exactly one council serving. `slow_gossip_restart_never_acknowledges_on_the_old_epoch` brings two old voters back first, keeps the recovered node down for eight seconds (past the old window), and checks that neither old voter acknowledges a single write before it hears about epoch 1.
 
+Both tests stop a council and then open its stores offline, the way `relish council recover` does. Stopping a node cancels its tasks, but a cancelled task finishes in its own time, and until the last one holding the Raft log drops it, redb refuses a second open with "Database already open". The harness used to sleep 500 ms and hope. On a quiet laptop that's plenty. On the Studio at a load average of 30, it wasn't, and the slow-gossip test failed on a store its own stopped node still held (#2312). Now `FenceNode::stop` waits for the thing it actually needs: it opens each Raft store, inside `spawn_blocking` because opening a file is blocking work, and goes round again while redb answers `DatabaseAlreadyOpen`, for up to a minute. A fixed sleep guesses how slow the host is. A wait on the condition doesn't have to.
+
 ### Three more from the field
 
 The same tester came back with three more reports, all from following the recovery runbook to the letter. Each one is a different way of forgetting that the restored state isn't the only state in the world.

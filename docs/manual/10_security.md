@@ -334,6 +334,17 @@ which is less than an anonymous caller can already do in that window. The
 moment the cluster has a master key or a first token, both need the service
 token again.
 
+That same cluster refuses its first token. Once a token exists the API
+answers every call without a credential with 401, so the nodes, which have
+no service token, would be shut out. `relish token create` answers 409:
+
+```text
+error: API error (status 409): refusing to create the first API token: this plaintext cluster has no master key, so its nodes have no service token, and once a token exists the API answers their calls (placement polls, rollout reports) with 401. Set [security] master_key_path to the same key on every node, restart them, then create the token
+```
+
+Give every node the same master key first, as the message says, then make
+the token.
+
 ## Agent tokens and proposals
 
 An AI agent should have its own token, never yours. Make one with `--agent`:
@@ -577,6 +588,7 @@ The cluster checks a policy when you apply it, and refuses one that:
 - has an empty `deny` or `match`, or one over 1024 bytes, or a `message` over
   512 bytes;
 - isn't valid CEL;
+- nests brackets and `? :` conditionals more than 32 deep;
 - nests `all`, `exists`, `exists_one`, `map` or `filter` more than two deep
   (`app.args.all(a, app.args.exists_one(b, a == b))` is as deep as it goes),
   because each level multiplies what the policy costs to run;
@@ -668,8 +680,13 @@ token's role, from `apply`, since only that token writes it (see
 `writing-a-controller`). An app GitOps owns is judged as a GitOps sync, and
 everything else as the cluster's own caller `audit`, role `system`, from
 `apply`; so is a controller-owned app whose token is gone. Jobs are judged from
-the definitions the cluster keeps, which are scheduled jobs and deployment
-hooks; a one-off job's definition goes once its runs are pruned. `relish wtf` shows the same
+the definitions the cluster keeps, with their schedules put back: scheduled
+jobs, deployment hooks, and one-off jobs while a run refers to them. Once a
+one-off job's last run is pruned its definition goes, and so does the job
+from the audit: it won't run again, and the next submission is judged when
+it arrives. The cluster keeps no declared spec for a job, so a job pinned by
+tag and digest (`report:v1@sha256:…`) is judged by its tag, `report:v1`, as
+a tag the cluster bound would be. `relish wtf` shows the same
 denials and audit findings as warnings.
 
 Any token can run it, but a token limited to some apps or namespaces sees
@@ -777,6 +794,36 @@ shortened its list) refuses the deploy and names the key it's missing:
 ```text
 runtime.devices /dev/fuse refused by the node gate: this node's [runtime] allowed_devices in node.toml doesn't list it
 ```
+
+The refusal names every knob the node doesn't allow, each with its key, so
+you can fix them all in one go.
+
+The node asks again each time an instance restarts, because a restart builds
+the container from what was approved at deploy. So if you take a knob out of
+`node.toml` and restart Bun, a container that's still running keeps the knob
+until it next exits. Then its restart is refused, the instance is `Failed`,
+and `relish apps` and `relish wtf` show the refusal. The node doesn't retry
+it, so redeploy once the app and the node agree. A volume or config-file
+`source` that `[storage] allowed_host_paths` no longer covers is refused the
+same way, and the reason says the restart was refused because the path
+isn't allowed on this node any more. Each restart asks about the paths that instance mounts, so during a
+rollout an old instance is judged by the old version's paths. A sidecar that
+crashes on its own mounts its app's paths and is asked too. If it's refused,
+the sidecar isn't started again, and `relish apps` lists it as `refused`
+with the reason, which the events and `relish wtf` show too. The app keeps
+running, with its mount, until it next restarts, and that restart is
+refused the same way.
+
+The check resolves symlinks, which can hang on an NFS or autofs source that
+isn't answering. It waits at most `[runtime] stop_confirmation_timeout_secs`
+(10 seconds by default). Running out of time isn't a refusal: the restart
+counts as a failed attempt and is tried again after its backoff. While an
+earlier check of a path is still stuck, a retry doesn't start another; it
+fails the same way until the path answers.
+
+An instance adopted after an in-place upgrade from 0.3.2 has no record of
+the host paths it mounts, so its restarts aren't checked until it's next
+deployed.
 
 Only rootful runc applies knobs. A node on the process runtime, Apple
 Container or rootless runc advertises none, whatever its `[runtime]` says,
@@ -899,7 +946,7 @@ What's recorded:
 |------|---------|
 | Workloads | `app.applied`, `app.stopped`, `app.deleted`, `app.exec`, `deploy.rolled_back`, `deploy.cancelled`, `snapshot.created`, `snapshot.restored`, `snapshot.deleted` |
 | Jobs and builds | `job.submitted`, `job.replayed`, `job.schedule_disabled`, `batch.submitted`, `array.submitted`, `batch.cancelled`, `build.submitted` |
-| The cluster | `upgrade.started`, `upgrade.aborted` (and `applied`, `resumed`, `rolled_back`, `cluster_rolled_back`), `node.decommissioned`, `council.elect`, `os.staged`, `os.rollout_started` (and `rollout_resumed`, `rollout_aborted`), `perimeter.admitted`, `logs.exported`, `test_lease.created`, `test_lease.released`, `test_lease.retired` |
+| The cluster | `upgrade.started`, `upgrade.aborted` (and `applied`, `resumed`, `rolled_back`, `cluster_rolled_back`), `node.decommissioned`, `council.elect`, `os.staged`, `os.rollout_started` (and `rollout_resumed`, `rollout_aborted`), `os.boot_logs_set`, `perimeter.admitted`, `logs.exported`, `test_lease.created`, `test_lease.released`, `test_lease.retired` |
 | Policies | `policy.denied`, `policy.deleted`; an apply that writes a policy is `app.applied` with the policy names under `policies` |
 | Trust | `token.created`, `token.revoked`, `token.rotated`, `token.expired_swept`, `join_token.created`, `join_token.revoked`, `secret.rotated`, `secret.rotation_finalised`, `secret.namespace_key_created`, `ca.rotation_prepared`, `ca.rotation_begun`, `ca.rotation_finalised`, `identity.signed` |
 | Chaos | `fault.injected`, `fault.cleared`, `fault.cleared-by-service`, `fault.cleared-all-workload`, `fault.expired` |
@@ -1202,6 +1249,11 @@ The node keeps only the reference. The secret goes into the container's
 environment, the same way a decrypted `ENC[AGE:...]` value does, and every
 restart asks the provider again, so a secret you rotate at the source reaches
 the next restart without a redeploy.
+
+A Bun restart or self-upgrade isn't an instance restart. Bun adopts an app
+that uses a provider, and its sidecars, like any other running workload: they
+keep running with the values they started with, and the provider isn't asked.
+(Up to 0.3.2, Bun killed and restarted them instead, #2334.)
 
 ## The root CA backup
 

@@ -24,12 +24,16 @@ BOOT_CHECK = ROOT / "image" / "mkosi.extra" / "usr" / "lib" / "reliaburger" / "b
 # healthy 38 s after its boot's first journal line. The lab's x86 nodes
 # answer in 8 to 23 s.
 SLOWEST_HEALTHY_BUN = 38
+# A counted boot's budget runs from the kernel's start (#2245), and a Wyse
+# 3040 reached network-online.target about 66 s in (the 0.3.2 lab).
+WYSE_KERNEL_TO_NETWORK = 66
 # What a counted boot must have left over even then.
-MARGIN = 20
+MARGIN = 15
 
 
 def counted_boot_budget():
-    """The seconds boot-check gives a counted boot, read from the script."""
+    """The seconds after the kernel starts by which boot-check needs a
+    counted boot healthy, read from the script."""
     match = re.search(r"^if counted; then limit=(\d+); else limit=\d+; fi$",
                       BOOT_CHECK.read_text(), re.MULTILINE)
     if match is None:
@@ -81,7 +85,8 @@ class TimeWaitTests(unittest.TestCase):
         # A clock that never syncs must still leave a counted boot time to
         # see the slowest bun healthy, or every update on an offline LAN
         # would fall back.
-        self.assertLessEqual(seconds + SLOWEST_HEALTHY_BUN + MARGIN, counted_boot_budget())
+        self.assertLessEqual(WYSE_KERNEL_TO_NETWORK + seconds + SLOWEST_HEALTHY_BUN + MARGIN,
+                             counted_boot_budget())
         self.assertEqual(service["Type"], ["oneshot"])
         # Once per boot: bun's own restarts don't wait again.
         self.assertEqual(service["RemainAfterExit"], ["yes"])

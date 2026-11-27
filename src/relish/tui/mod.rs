@@ -185,6 +185,20 @@ async fn event_loop<P: DataProvider, B: Backend>(
                         let _ = tx.send(Msg::Data(DataUpdate::AppMetrics(result))).await;
                     });
                 }
+                Effect::FetchAppSpec { app, namespace } => {
+                    let provider = Arc::clone(&provider);
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let result = provider.app_spec(&app, &namespace).await.map(Box::new);
+                        let _ = tx
+                            .send(Msg::Data(DataUpdate::AppSpec {
+                                app,
+                                namespace,
+                                result,
+                            }))
+                            .await;
+                    });
+                }
             }
         }
         if app.should_quit {

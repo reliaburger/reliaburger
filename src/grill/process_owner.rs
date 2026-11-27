@@ -12,7 +12,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
@@ -237,8 +237,41 @@ pub(crate) fn from_previous_boot(record: &OwnerRecord) -> io::Result<bool> {
     Ok(current_boot_id()?.is_some_and(|current| record.boot_id != current))
 }
 
+impl OwnerRecord {
+    /// Whether the launch has stopped for good: no gate can exec from this
+    /// record and no exec can copy its environment any more.
+    fn finished(&self) -> bool {
+        match self.phase {
+            OwnerPhase::Prepared | OwnerPhase::Running { .. } => false,
+            OwnerPhase::Retiring { .. } | OwnerPhase::Retired { .. } | OwnerPhase::Cancelled => {
+                true
+            }
+        }
+    }
+
+    /// The same record with no environment value left, as a retired runc
+    /// intent keeps it: the spec's entries cut to their names, and no copy
+    /// of the environment the gate would have exported. Recovery still
+    /// compares the spec through [`OciSpec::matches_journal`].
+    ///
+    /// [`OciSpec::matches_journal`]: super::oci::OciSpec::matches_journal
+    fn without_environment_values(&self) -> OwnerRecord {
+        let mut reduced = self.clone();
+        reduced.environment.clear();
+        reduced.launch.spec = reduced.launch.spec.without_environment_values();
+        reduced
+    }
+}
+
+/// Write `record` atomically with mode 0600. A finished launch is written
+/// without its environment values, which have no reader once it can no
+/// longer run, decrypted and provider secrets included.
 pub(crate) fn persist(directory: &Path, record: &OwnerRecord) -> io::Result<()> {
-    let bytes = serde_json::to_vec(record)?;
+    let bytes = if record.finished() {
+        serde_json::to_vec(&record.without_environment_values())?
+    } else {
+        serde_json::to_vec(record)?
+    };
     if bytes.len() as u64 > RECORD_LIMIT {
         return Err(io::Error::other("process owner record exceeds size limit"));
     }
@@ -376,14 +409,10 @@ fn run_locked_owner(directory: &Path, record: &mut OwnerRecord, _lock: FileLock)
         if exec::cancelled() {
             owned.signal(Signal::SIGKILL)?;
         }
-        match listener.accept() {
-            Ok((connection, _)) => {
-                // An abandoned or malformed client must not end the owner.
-                let _ = respond(connection, directory, record, &owned, &mut executions);
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(error),
-        }
+        serve_waiting_clients(&listener, |connection| {
+            // An abandoned or malformed client must not end the owner.
+            let _ = respond(connection, directory, record, &owned, &mut executions);
+        })?;
         reap_orphans(owned.child.id(), &executions)?;
         if exit_code.is_none() {
             exit_code = observe_exit(owned.child.id())?;
@@ -725,6 +754,39 @@ enum Action {
     Kill,
 }
 
+/// Most clients one turn of the owner's loop answers before it goes back
+/// to watching its workload and exec helpers.
+const CLIENTS_PER_TURN: usize = 32;
+
+/// Longest one turn of the owner's loop spends answering clients before it
+/// goes back to its workload (#2304). Each client may take 100 ms to read
+/// and 100 ms to write, so 32 slow ones would hold a turn for over 6 s, and
+/// a SIGKILL, an orphan or the workload's exit would wait behind them. A
+/// client already being answered finishes, so a turn ends within this plus
+/// one client's 200 ms.
+const TURN_BUDGET: Duration = Duration::from_millis(250);
+
+/// Answer the clients waiting on `listener`, up to [`CLIENTS_PER_TURN`] and
+/// for no longer than [`TURN_BUDGET`], and return how many there were.
+fn serve_waiting_clients(
+    listener: &UnixListener,
+    mut serve: impl FnMut(UnixStream),
+) -> io::Result<usize> {
+    let started = Instant::now();
+    let mut served = 0;
+    while served < CLIENTS_PER_TURN && started.elapsed() < TURN_BUDGET {
+        match listener.accept() {
+            Ok((connection, _)) => {
+                serve(connection);
+                served += 1;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(served)
+}
+
 fn respond(
     mut socket: UnixStream,
     directory: &Path,
@@ -942,6 +1004,88 @@ fn retire_children(owner: &mut OwnedChild) -> io::Result<bool> {
 mod tests {
     use super::*;
 
+    /// #2236: the owner answered one client per 10 ms turn. Status asks it
+    /// three questions at once, so on a loaded host every status waited
+    /// past its 500 ms deadline behind the others, and the abandoned
+    /// requests kept the queue full: the workload's pid stayed unknown.
+    #[test]
+    fn one_turn_answers_every_waiting_client() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("owner.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let clients: Vec<_> = (0..3)
+            .map(|_| UnixStream::connect(&path).unwrap())
+            .collect();
+        let mut answered = 0;
+        let served = serve_waiting_clients(&listener, |_| answered += 1).unwrap();
+        assert_eq!((served, answered), (3, 3));
+        assert_eq!(serve_waiting_clients(&listener, |_| {}).unwrap(), 0);
+        drop(clients);
+    }
+
+    #[test]
+    fn one_turn_answers_at_most_its_share_of_clients() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("owner.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let clients: Vec<_> = (0..CLIENTS_PER_TURN + 2)
+            .map(|_| UnixStream::connect(&path).unwrap())
+            .collect();
+        assert_eq!(
+            serve_waiting_clients(&listener, |_| {}).unwrap(),
+            CLIENTS_PER_TURN
+        );
+        assert_eq!(serve_waiting_clients(&listener, |_| {}).unwrap(), 2);
+        drop(clients);
+    }
+
+    /// #2304: a backlog of slow clients gives the turn back within its
+    /// budget, so a SIGKILL or the workload's exit isn't left waiting
+    /// seconds behind them.
+    #[test]
+    fn a_backlog_of_slow_clients_ends_the_turn_within_its_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("owner.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let clients: Vec<_> = (0..CLIENTS_PER_TURN)
+            .map(|_| UnixStream::connect(&path).unwrap())
+            .collect();
+        // As slow as a client that sends nothing: one read timeout.
+        let slow = Duration::from_millis(100);
+        let started = Instant::now();
+        let served = serve_waiting_clients(&listener, |_| std::thread::sleep(slow)).unwrap();
+        let took = started.elapsed();
+        assert!(served < CLIENTS_PER_TURN, "served {served}");
+        // The budget, the client that started inside it, and slack for a
+        // loaded host: far short of 32 clients' 3.2 s.
+        assert!(took < TURN_BUDGET + slow * 3, "the turn took {took:?}");
+        // The rest wait for the next turn rather than being dropped.
+        let rest = serve_waiting_clients(&listener, |_| {}).unwrap();
+        assert_eq!(served + rest, CLIENTS_PER_TURN);
+        drop(clients);
+    }
+
+    /// The budget doesn't undo #2236: a backlog of quick clients still
+    /// drains in one turn.
+    #[test]
+    fn a_backlog_of_fast_clients_is_answered_in_one_turn() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("owner.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let clients: Vec<_> = (0..CLIENTS_PER_TURN)
+            .map(|_| UnixStream::connect(&path).unwrap())
+            .collect();
+        let served =
+            serve_waiting_clients(&listener, |_| std::thread::sleep(Duration::from_millis(1)))
+                .unwrap();
+        assert_eq!(served, CLIENTS_PER_TURN);
+        drop(clients);
+    }
+
     pub(super) fn record(boot_id: String) -> OwnerRecord {
         use super::super::oci::{OciLinux, OciProcess, OciRoot, OciSpec, OciUser};
         OwnerRecord {
@@ -956,6 +1100,7 @@ mod tests {
                 instance_id: super::super::InstanceId("default__web-0".into()),
                 spec: OciSpec {
                     managed_volumes: Vec::new(),
+                    host_path_sources: Vec::new(),
                     reusable_executor: false,
                     host_process: false,
                     initialiser: false,
@@ -1154,6 +1299,77 @@ mod tests {
         let status = owned.child.wait().unwrap();
         owned.reaped = true;
         assert_eq!(status.code(), Some(3), "the handler didn't run: {status:?}");
+    }
+
+    /// A record carrying resolved values: a provider's and a decrypted
+    /// `ENC[...]` one, plus a variable inherited from Bun.
+    fn record_with_secrets() -> OwnerRecord {
+        let mut record = record(current_boot_id().unwrap().unwrap());
+        record.launch.spec.process.env = vec![
+            "DB_PASSWORD=provider-value-1".into(),
+            "API_KEY=decrypted-value-2".into(),
+        ];
+        record.environment = BTreeMap::from([
+            ("DB_PASSWORD".into(), "provider-value-1".into()),
+            ("API_KEY".into(), "decrypted-value-2".into()),
+            ("PATH".into(), "/usr/bin:/bin".into()),
+        ]);
+        record
+    }
+
+    /// Persist `record`, then return what landed on disk, what loads back
+    /// and the file's mode.
+    fn persisted(record: &OwnerRecord) -> (String, OwnerRecord, u32) {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        persist(directory.path(), record).unwrap();
+        let path = directory.path().join("owner.json");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        (raw, load(directory.path()).unwrap(), mode)
+    }
+
+    /// The gate execs from a Prepared record and an exec copies a Running
+    /// one, so both keep every value.
+    #[test]
+    fn a_launch_that_can_still_run_keeps_its_environment_values() {
+        for phase in [OwnerPhase::Prepared, OwnerPhase::Running { pid: 1 }] {
+            let mut record = record_with_secrets();
+            record.phase = phase;
+            let (raw, loaded, mode) = persisted(&record);
+            assert!(raw.contains("provider-value-1"), "{raw}");
+            assert!(raw.contains("decrypted-value-2"), "{raw}");
+            assert_eq!(loaded.environment, record.environment);
+            assert_eq!(loaded.launch.spec, record.launch.spec);
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    /// Once a launch has stopped for good, nothing reads its values, so the
+    /// record keeps only the variable names, as runc's retired intent does.
+    #[test]
+    fn a_retired_or_cancelled_launch_keeps_only_variable_names() {
+        for phase in [
+            OwnerPhase::Retiring { exit_code: Some(0) },
+            OwnerPhase::Retired { exit_code: Some(0) },
+            OwnerPhase::Cancelled,
+        ] {
+            let mut record = record_with_secrets();
+            record.phase = phase;
+            let (raw, loaded, mode) = persisted(&record);
+            for value in ["provider-value-1", "decrypted-value-2", "/usr/bin:/bin"] {
+                assert!(!raw.contains(value), "{value} kept: {raw}");
+            }
+            assert!(loaded.environment.is_empty());
+            assert_eq!(
+                loaded.launch.spec,
+                record.launch.spec.without_environment_values()
+            );
+            assert_eq!(loaded.launch.spec.process.env, ["DB_PASSWORD", "API_KEY"]);
+            assert_eq!(mode, 0o600);
+            // Writing the reduced record again changes nothing.
+            assert_eq!(persisted(&loaded).0, raw);
+        }
     }
 
     #[test]

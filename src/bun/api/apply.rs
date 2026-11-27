@@ -48,6 +48,19 @@ async fn binding_catalog(state: &ApiState) -> ManifestCatalog {
     }
 }
 
+/// Refuse a caller who may not write operator policy (namespace quotas,
+/// permission grants and policies): it takes an unscoped admin user whose
+/// permission spec grants `admin` across the cluster.
+#[allow(clippy::result_large_err)]
+async fn authorize_operator_policy(
+    state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+) -> Result<(), Response> {
+    crate::sesame::auth::authorize_user(auth, crate::sesame::types::ApiRole::Admin)?;
+    crate::sesame::auth::require_unscoped(auth)?;
+    enforce_cluster_permission(state, auth, crate::config::PermissionAction::Admin).await
+}
+
 /// Deploy workloads, streaming progress via SSE.
 ///
 /// Returns a Server-Sent Events stream. Each event's `data` field
@@ -96,11 +109,22 @@ pub(super) async fn apply_handler(
             .into_response();
     }
 
+    // Validation compiles every policy's CEL, so a caller who may not
+    // write policies is refused first and their expressions never reach
+    // the parser. The same check runs again below for permissions and
+    // namespaces.
+    if !config.policy.is_empty()
+        && let Err(response) = authorize_operator_policy(&state, auth.as_deref()).await
+    {
+        return response;
+    }
+
     let validation = if state.council.is_some() {
         config.validate_intrinsic()
     } else {
         config.validate()
-    };
+    }
+    .and_then(|()| config.refuse_redaction_placeholders());
     if let Err(e) = validation {
         return (
             StatusCode::BAD_REQUEST,
@@ -289,28 +313,13 @@ pub(super) async fn apply_handler(
     // operator policy. A test lease has already confined its namespace
     // declaration to the caller-owned reservation above; its quota cannot
     // affect other tenants.
-    if !config.permission.is_empty()
+    let operator_policy = !config.permission.is_empty()
         || !config.policy.is_empty()
-        || (lease_id.is_none() && !config.namespace.is_empty())
+        || (lease_id.is_none() && !config.namespace.is_empty());
+    if operator_policy
+        && let Err(response) = authorize_operator_policy(&state, auth.as_deref()).await
     {
-        if let Err(response) = crate::sesame::auth::authorize_user(
-            auth.as_deref(),
-            crate::sesame::types::ApiRole::Admin,
-        ) {
-            return response;
-        }
-        if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
-            return response;
-        }
-        if let Err(response) = enforce_cluster_permission(
-            &state,
-            auth.as_deref(),
-            crate::config::PermissionAction::Admin,
-        )
-        .await
-        {
-            return response;
-        }
+        return response;
     }
 
     let images = config

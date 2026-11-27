@@ -13,6 +13,9 @@ status-level = "leak"
 final-status-level = "slow"
 slow-timeout = { period = "30s", terminate-after = 2 }
 
+# Portable Linux's coverage run passes --test-threads=8 on the command line
+# (the Makefile's coverage recipe, pinned by scripts/ci/coverage_owner.py);
+# every other job using this profile keeps one thread per CPU (#1723).
 [profile.ci]
 retries = 0
 leak-timeout = { period = "100ms", result = "fail" }
@@ -64,6 +67,25 @@ slow-timeout = { period = "120s", terminate-after = 5 }
 filter = 'binary(autoscale_memory)'
 test-group = "host-network"
 slow-timeout = { period = "120s", terminate-after = 4 }
+
+# The owned-runc capacity contract cold-starts five runc executors in turn
+# and retires each one. Alone it takes about 6 s; in an 8-vCPU VM at load
+# 8 to 17 it took up to 107 s, and beside a full `make test-linux` one
+# start alone ran past 20 s (#2267). Each step now waits up to 90 s, so the
+# test gets more than the host-network limit below, which it would
+# otherwise match first. The limit only has to catch a hang.
+[[profile.default.overrides]]
+filter = 'binary(owned_runc) & test(=capacity_contract::runc_ordinary_terminal_receipt_releases_nonzero_capacity_for_actual_batch_http)'
+test-group = "host-network"
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# The delegated namespace test starts two task containers, one per
+# isolation mode, and gives each start up to 90 s on a loaded host (#2315).
+# The first matching override wins, so this precedes the host-network one.
+[[profile.default.overrides]]
+filter = 'binary(owned_task_arrays) & test(=runc_delegated_namespace_isolation_and_policy_loss_retire_the_original_owner)'
+test-group = "host-network"
+slow-timeout = { period = "60s", terminate-after = 5 }
 
 [[profile.default.overrides]]
 filter = 'binary(ebpf) | binary(owned_network) | binary(owned_runc) | binary(owned_rootless) | test(/(runc_|_runc|runc::|netns|btrfs|buildah|image_pull)/)'
@@ -154,6 +176,14 @@ filter = 'test(/a_shell_waiting_on_killed_children_as_killed$/)'
 test-group = "process-heavy"
 slow-timeout = { period = "60s", terminate-after = 3 }
 
+# The role owner stall tests stop process owners with SIGSTOP and time
+# their next step from a 2 s owner request deadline, with about 1 s of
+# margin (#2328). A crowded host eats that margin, so they run at most two
+# at a time.
+[[profile.default.overrides]]
+filter = 'binary(runc_roles) & test(/stall|request_deadline|too_late|patient_role_read|dies_before_the_drain/)'
+test-group = "process-heavy"
+
 [[profile.default.overrides]]
 filter = 'binary(integration) | binary(placement) | binary(job_recovery)'
 test-group = "process-heavy"
@@ -191,6 +221,12 @@ slow-timeout = { period = "120s", terminate-after = 5 }
 filter = 'binary(autoscale_memory)'
 test-group = "host-network"
 slow-timeout = { period = "120s", terminate-after = 4 }
+
+# The delegated namespace override above (#2315).
+[[profile.ci.overrides]]
+filter = 'binary(owned_task_arrays) & test(=runc_delegated_namespace_isolation_and_policy_loss_retire_the_original_owner)'
+test-group = "host-network"
+slow-timeout = { period = "60s", terminate-after = 5 }
 
 [[profile.ci.overrides]]
 filter = 'binary(ebpf) | binary(owned_network) | binary(owned_runc) | binary(owned_rootless) | test(/(runc_|_runc|runc::|netns|btrfs|buildah|image_pull)/)'
@@ -253,6 +289,14 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 filter = 'test(/a_shell_waiting_on_killed_children_as_killed$/)'
 test-group = "process-heavy"
 slow-timeout = { period = "60s", terminate-after = 3 }
+
+# The role owner stall tests stop process owners with SIGSTOP and time
+# their next step from a 2 s owner request deadline, with about 1 s of
+# margin (#2328). A crowded host eats that margin, so they run at most two
+# at a time.
+[[profile.ci.overrides]]
+filter = 'binary(runc_roles) & test(/stall|request_deadline|too_late|patient_role_read|dies_before_the_drain/)'
+test-group = "process-heavy"
 
 [[profile.ci.overrides]]
 filter = 'binary(integration) | binary(placement) | binary(job_recovery)'

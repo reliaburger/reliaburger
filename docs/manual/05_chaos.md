@@ -139,7 +139,7 @@ You don't need to know where a replica runs. The node you talk to looks up
 which nodes run the target, checks the replica rail against every replica in
 the cluster (so `kill web --count 3` on a three-replica app is refused even
 though each node holds one, and a pause without `--instance` counts as
-freezing every replica, so it's always refused), and forwards each owner its
+freezing every replica, so it's always refused; and a replica killed in the last ten seconds still counts as gone, since it can read `running` until its node notices, so two quick kills can't take the last replica between them), and forwards each owner its
 share under your own credential, so the owner repeats every check. Add `--node NAME` to pick the
 node. A fault spread over several nodes becomes one fault per node, and the
 command prints each one. `relish fault list` shows every node's faults with a
@@ -227,7 +227,11 @@ container workload, fresh node-kill and node-pressure evidence, and server
 grants for `provision_isolated_workloads`, `alter_node_state` and
 `saturate_capacity`. Missing destructive prerequisites refuse the suite. They
 don't turn into green skips. Node pressure needs rootful Linux runc with
-cgroup v2.
+cgroup v2 and the cpu and memory controllers. A pressure fault prepares the
+pressure cgroup, enabling the controllers in its parent when it can, so they
+can come on after Bun starts. The node's `/v1/capabilities` report only
+checks: it changes nothing on the host, and when a controller isn't there it
+says which one is missing.
 
 An interactive run asks you to type exactly `yes`; CI uses `--yes`. Pass
 `--filter` with a scenario name to run just that one:

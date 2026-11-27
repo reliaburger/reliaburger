@@ -60,6 +60,17 @@ async fn record_token_use(last_used: &TokenLastUsed, principal_id: &str) {
 /// token). Not a real user token; never stored in `SecurityState`.
 pub const SYSTEM_PRINCIPAL: &str = "__system";
 
+/// Reserved name for the appliance console's read-only principal (#2150),
+/// the one [`super::token::derive_console_token`]'s token authenticates as.
+/// Never a stored token.
+pub const CONSOLE_PRINCIPAL: &str = "__console";
+
+/// Whether `name` belongs to one of the built-in principals, which no user
+/// token may take.
+pub fn is_reserved_name(name: &str) -> bool {
+    name == SYSTEM_PRINCIPAL || name == CONSOLE_PRINCIPAL
+}
+
 /// Verifies workload-identity JWTs presented as bearer tokens (PKI10).
 ///
 /// The cluster mints these for its workloads (SPIFFE-style, signed with the
@@ -126,6 +137,9 @@ pub struct AuthState {
     /// The cluster's internal service token, accepted as the system principal.
     /// `None` in single-node mode (no master key).
     pub service_token: Option<String>,
+    /// The appliance console's token, derived from the service token and
+    /// accepted as the read-only [`CONSOLE_PRINCIPAL`].
+    pub console_token: Option<String>,
     /// Browser sessions, exchanged for a token at `POST /ui/session`. A valid
     /// session cookie authenticates a request as a read-only principal.
     pub sessions: super::session::SessionStore,
@@ -139,9 +153,15 @@ pub struct AuthState {
 impl AuthState {
     /// Build auth state from a token store and optional service token.
     pub fn new(tokens: TokenStore, service_token: Option<String>) -> Self {
+        // A derivation can't fail for a token we hold; if it ever did, the
+        // console would only lose its reads, so it's dropped, not fatal.
+        let console_token = service_token
+            .as_deref()
+            .and_then(|service| super::token::derive_console_token(service).ok());
         Self {
             tokens,
             service_token,
+            console_token,
             sessions: super::session::SessionStore::new(),
             jwt_verifier: None,
             last_used: new_token_last_used(),
@@ -251,7 +271,7 @@ pub fn authenticate(
     // through a future write path that skips `create_token`'s guard — it must
     // still not authenticate *as* the system principal, or it would clear
     // `require_system` and skip `authorize_scoped`/`require_unscoped`.
-    if stored.name == SYSTEM_PRINCIPAL {
+    if is_reserved_name(&stored.name) {
         return Err((StatusCode::UNAUTHORIZED, "invalid token".to_string()));
     }
 
@@ -448,6 +468,42 @@ pub(crate) fn system_context() -> AuthContext {
     }
 }
 
+/// The `AuthContext` for the appliance console (#2150): read-only and
+/// unscoped, so the screen can show the whole cluster and change nothing.
+pub(crate) fn console_context() -> AuthContext {
+    AuthContext {
+        token_name: CONSOLE_PRINCIPAL.to_string(),
+        principal_id: CONSOLE_PRINCIPAL.to_string(),
+        role: ApiRole::ReadOnly,
+        kind: crate::sesame::types::TokenKind::Human,
+        granted_role: ApiRole::ReadOnly,
+        scoped_apps: None,
+        scoped_namespaces: None,
+    }
+}
+
+/// Whether `context` is the appliance console's, as the middleware makes
+/// it from the console token. No stored token can take the reserved name
+/// ([`is_reserved_name`]), and a workload's name always has a `workload:`
+/// prefix, so the name alone tells.
+pub(crate) fn is_console(context: &AuthContext) -> bool {
+    context.principal_id == CONSOLE_PRINCIPAL && context.token_name == CONSOLE_PRINCIPAL
+}
+
+/// The console principal once the fault route has admitted one of its
+/// kills (#2151): a `Deployer` for that one request, so the rest of the
+/// route (the server's test policy, Smoker's rails, the audit record)
+/// treats it as it treats `relish fault kill`. Only
+/// `bun::api::faults` makes one, after checking the cluster's
+/// `[appliance] console_chaos` and the request's shape.
+pub(crate) fn console_kill_context() -> AuthContext {
+    AuthContext {
+        role: ApiRole::Deployer,
+        granted_role: ApiRole::Deployer,
+        ..console_context()
+    }
+}
+
 /// Constant-time comparison of two token strings, to avoid leaking the service
 /// token byte-by-byte through response timing. The length is not secret (all
 /// tokens share the fixed `rbrg_` + 64-hex shape), so an early length check is
@@ -490,6 +546,14 @@ pub async fn auth_middleware(
         && tokens_equal(bearer, service)
     {
         request.extensions_mut().insert(system_context());
+        return next.run(request).await;
+    }
+
+    // The appliance console's token: read-only, whoever holds it.
+    if let (Some(bearer), Some(console)) = (bearer, state.console_token.as_deref())
+        && tokens_equal(bearer, console)
+    {
+        request.extensions_mut().insert(console_context());
         return next.run(request).await;
     }
 
@@ -1198,6 +1262,63 @@ mod tests {
         let state = AuthState::new(store, Some("rbrg_service".to_string()));
         let status = status_of(guarded_router(state), Some("Bearer rbrg_service")).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    /// The appliance console's token (#2150) reads as a read-only,
+    /// unscoped principal of its own, on every node that holds the service
+    /// token it's derived from.
+    #[tokio::test]
+    async fn middleware_accepts_the_console_token_as_a_read_only_principal() {
+        let user = create_token("u", ApiRole::ReadOnly, TokenScope::default(), None).unwrap();
+        let store = new_token_store();
+        store.write().await.push(user.token);
+        let service = crate::sesame::token::derive_service_token(&[3u8; 32]).unwrap();
+        let console = crate::sesame::token::derive_console_token(&service).unwrap();
+        let state = AuthState::new(store, Some(service));
+        let router = Router::new()
+            .route(
+                "/x",
+                get(
+                    |axum::Extension(ctx): axum::Extension<AuthContext>| async move {
+                        format!("{} {:?} {:?}", ctx.token_name, ctx.role, ctx.scoped_apps)
+                    },
+                ),
+            )
+            .layer(from_fn_with_state(state, auth_middleware));
+        let response = respond(router, &[("authorization", &format!("Bearer {console}"))]).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            format!("{CONSOLE_PRINCIPAL} ReadOnly None")
+        );
+    }
+
+    #[tokio::test]
+    async fn another_clusters_console_token_is_refused() {
+        let user = create_token("u", ApiRole::ReadOnly, TokenScope::default(), None).unwrap();
+        let store = new_token_store();
+        store.write().await.push(user.token);
+        let ours = crate::sesame::token::derive_service_token(&[3u8; 32]).unwrap();
+        let theirs = crate::sesame::token::derive_service_token(&[4u8; 32]).unwrap();
+        let console = crate::sesame::token::derive_console_token(&theirs).unwrap();
+        let state = AuthState::new(store, Some(ours));
+        let status = status_of(guarded_router(state), Some(&format!("Bearer {console}"))).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn the_console_principal_is_read_only_and_human() {
+        let ctx = console_context();
+        assert_eq!(ctx.role, ApiRole::ReadOnly);
+        assert_eq!(ctx.granted_role, ApiRole::ReadOnly);
+        assert!(require_role(&ctx, ApiRole::Deployer).is_err());
+        assert_eq!(
+            ctx.principal_kind(),
+            crate::sesame::types::PrincipalKind::Human
+        );
     }
 
     #[tokio::test]

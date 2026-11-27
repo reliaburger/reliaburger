@@ -1,0 +1,29 @@
+---
+source: src/appliance/console/view.rs
+expression: output
+---
+ Reliaburger OS 2026.47.228                                   bun not answering
+ [1 Status]  2 Metrics   3 Workloads   4 Cluster   5 Versions   6 Logs
+┌ 1 Status ────────────────────────────────────────────────────────────────────┐
+│Node       not seeded yet                                                     │
+│Cluster    -                                                                  │
+│Address    192.168.1.60                                                       │
+│MAC        d8:9e:f3:12:34:57                                                  │
+│bun        not answering (0.3.3)                                              │
+│Claim key  3f9a-12bc-77de-0a41                                                │
+│                                                                              │
+│Claim this machine with `relish machines claim`, comparing the claim key.     │
+│                                                                              │
+│███ ███ ███  █       █  ███ ██  ███     ███ ███ ██  ███     ███  █  █ █  █    │
+│  █ █   █ █ █ █     ██    █ █ █ █         █   █ █ █ █       █ █ █ █ █ █ ██    │
+│ ██ ██  ███ ███ ███  █  ███ ██  █   ███   █   █ █ █ ██  ███ █ █ ███ ███  █    │
+│  █ █     █ █ █      █  █   █ █ █         █   █ █ █ █       █ █ █ █   █  █    │
+│███ █   ███ █ █     ███ ███ ██  ███       █   █ ██  ███     ███ █ █   █ ███   │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+ 1-6 or <- -> tabs   up/down scroll   read-only: no login here     15:06:40 UTC

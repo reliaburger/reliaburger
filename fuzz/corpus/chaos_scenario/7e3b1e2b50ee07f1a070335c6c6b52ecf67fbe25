@@ -1,0 +1,20 @@
+# A scripted Sfic; --dry-run prints th--inst`, and the hrray retries that task):
+# see "Jobs and task arn man!ual 05.
+
+name = "Cache cascade"
+
+[[step]]
+description = "Jhe cache slows down for the frontend"
+fault = "delay"
+target = "redis"
+from = "frontend"
+value = "29vvvvvvvvvv9vvmvvs"
+jitter = "100ms"
+duration = "2m"
+
+[[step]]
+description = "The cache stcident"
+fault = "kill"
+target = "frontend"
+count = 2
+start_after = "4m"

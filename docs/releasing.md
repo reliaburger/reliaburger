@@ -86,10 +86,13 @@ treats the three kinds of run differently ([which jobs run](testing.md#which-job
   Linux (on Ubuntu 24.04 and 26.04), cluster, acceptance,
   upgrades and benchmarks. Portable macOS runs on the PR only when it
   touches macOS-specific code or carries a `macos` label.
-- **The merge queue** runs every job, portable macOS and the heavy suites
+- **The merge queue** runs every job but portable macOS, the heavy suites
   included, on the batch merged onto the train, before any of it lands. The
   queue requires the single check `ignored-test evidence`, which waits for
-  every other job and demands every evidence owner. A group that changes
+  every other job and demands every evidence owner but macOS's. Portable
+  macOS runs on the newest train every night instead
+  ([`macos-nightly.yml`](../.github/workflows/macos-nightly.yml), maintainer
+  decision of 24 November 2026). A group that changes
   only documentation runs no code job: its code is its base's. When the
   queue drops a group, `queue-sweep.yml` cancels its run
   ([what a merge costs](testing.md#what-a-merge-costs-in-runners)).
@@ -106,16 +109,36 @@ treats the three kinds of run differently ([which jobs run](testing.md#which-job
   pushes to `main`, which runs everything again, and that run is the one the
   candidate build reuses.
 
-So nothing reaches a train, or `main`, without the full set having passed on
-that exact commit. The one exception is privileged Linux on Ubuntu 26.04,
-which is advisory until
-[#1943](https://github.com/reliaburger/reliaburger/issues/1943) closes: it
-runs and reports, but its failure only warns, in `ignored-test evidence` and
-in a candidate's `find passing CI`, and making it required again is part of
-closing #1943 ([advisory jobs](testing.md#which-jobs-a-pull-request-runs)). macOS runs on every push and on the nightly, on the
-release gate PR and on the candidate build, but not on ordinary pull
-requests: the organisation's plan runs at most five macOS jobs at once, and
-each full run takes one ([portable macOS in one job](testing.md#portable-macos-in-one-job)).
+So nothing reaches a train without every Linux job having passed on that
+exact commit, and nothing reaches `main` without the full set. macOS runs on
+the push to `main` and on `main`'s nightly, on the newest train every night,
+on the release gate PR and on the candidate build, but not on ordinary pull
+requests or in the merge queue: the organisation's plan runs at most five
+macOS jobs at once, each full run takes one
+([portable macOS in one job](testing.md#portable-macos-in-one-job)), and in
+the queue it set every group's length.
+
+How the release still gets macOS:
+
+- **The gate PR labelled `release-gate`** runs portable macOS, and its
+  evidence gate refuses it without the `portable-darwin` owner.
+- **The push to `main`** when the gate PR merges runs everything, macOS
+  included.
+- **The candidate build** reuses a `ci.yml` run only from a push or the
+  nightly schedule, and only when `portable macOS` passed in it
+  ([`ci_reuse.py`](../scripts/release/ci_reuse.py)); a merge-queue run never
+  counts. Otherwise `validate-release` runs all of `ci.yml`, macOS included.
+  A train's nightly build therefore runs it too.
+- **The nightly on the newest train** shows a macOS break within a day, long
+  before code freeze. A red one gets an issue the same day, like a flake.
+
+The qualification scripts install staged builds on the hosts in the matrix
+and never read a merge-queue run, so nothing there relied on the queue's
+macOS job.
+
+Drafts, and pull requests from a `0-4-0/` branch, run only select jobs, CI
+policy and lint until they're marked ready for review
+([which jobs run](testing.md#which-jobs-a-pull-request-runs)).
 That job builds and tests `relish` and the macOS-only code; Bun's tests run
 on Linux only ([what runs on macOS](testing.md#what-runs-on-macos-and-what-runs-on-linux)).
 Dependabot's PRs never get macOS unless labelled; the nightly on `main`
@@ -123,29 +146,54 @@ covers them.
 
 ### Opening a train
 
-A train opens in one sitting, in this order:
+A train opens with one command, run by a repository admin, because step 2
+edits a ruleset and only an admin can
+([#1053](https://github.com/reliaburger/reliaburger/issues/1053)):
 
-1. **Create the branch** `release-X-Y-Z` from the previous train's frozen
-   tip, or from `main` once the previous release is out.
-2. **Bump the version first.** The first PR into the train sets the
-   version in `Cargo.toml` (and its lockfile entries), so everything built
-   from the train says which release it's heading for.
-3. **Add the branch to the merge-queue ruleset** by its exact name. Only a
-   repository admin can:
+```
+python3 scripts/release/open_train.py release-X-Y-Z --milestone X.Y.Z --dry-run
+python3 scripts/release/open_train.py release-X-Y-Z --milestone X.Y.Z [--from release-X-Y-W]
+```
 
-   ```
-   gh api repos/reliaburger/reliaburger/rulesets/25015244 > ruleset.json
-   # add "refs/heads/release-X-Y-Z" to .conditions.ref_name.include, then
-   gh api -X PUT repos/reliaburger/reliaburger/rulesets/25015244 --input ruleset.json
-   ```
+The dry run reads what it needs and prints every write it would make,
+including the ruleset's new body, and makes none. Without `--dry-run`, the
+script does the four steps in order and skips any that's already done, so
+running it again finishes what a failed run started:
 
-   Then check it took:
-   `gh api repos/reliaburger/reliaburger/rules/branches/release-X-Y-Z`
-   must list `merge_queue` and `required_status_checks`. An empty list
-   means the train has no queue ([merging through the queue](#merging-through-the-queue)).
+1. **Create the branch** `release-X-Y-Z` from `--from`: the previous
+   train's frozen tip, or `main` (the default) once the previous release is
+   out.
+2. **Add the branch to the merge-queue ruleset** (25015244) by its exact
+   name, then check that `rules/branches/release-X-Y-Z` lists
+   `merge_queue` and `required_status_checks`. The script stops if it
+   doesn't, because a train without them has no queue
+   ([merging through the queue](#merging-through-the-queue)). A pattern such
+   as `refs/heads/release-*` would make this step unnecessary, but GitHub
+   refuses it in a ruleset with a merge queue: "Wildcard ref names are not
+   supported when merge queue is enabled" (HTTP 422). So every train is
+   named, and the list keeps the old trains, which is harmless.
+3. **Create the milestone** `X.Y.Z`.
 4. **Open the gate PR** from the train into `main`, with an empty list of
    `Fixes` lines that grows as PRs merge
-   ([every issue closes itself](#every-issue-closes-itself)).
+   ([every issue closes itself](#every-issue-closes-itself)). GitHub won't
+   open a PR with no commits, so on a fresh branch the script prints the
+   `gh pr create` command instead. Run it, or the script again, once the
+   first PR has merged.
+
+The first PR into the train **bumps the version**: it sets the version in
+`Cargo.toml` (and its lockfile entries), so everything built from the train
+says which release it's heading for.
+
+Without the script, step 2 by hand is:
+
+```
+gh api repos/reliaburger/reliaburger/rulesets/25015244 > ruleset.json
+# add "refs/heads/release-X-Y-Z" to .conditions.ref_name.include, then
+gh api -X PUT repos/reliaburger/reliaburger/rulesets/25015244 --input ruleset.json
+gh api repos/reliaburger/reliaburger/rules/branches/release-X-Y-Z
+```
+
+and the last command must list `merge_queue` and `required_status_checks`.
 
 ### Every issue closes itself
 
@@ -204,20 +252,50 @@ the queue. Don't use `--auto` (maintainer decision of 17 November 2026): a
 PR queues only once a person has seen it green. GitHub can drop a PR from
 the queue without saying so, so afterwards check that `isInMergeQueue` is
 true, and again after any queue event. The queue
-builds a temporary branch with the train plus the PR (and up to seven more
-waiting behind it: the ruleset's group size went from 4 to 8 on 7 November
-2026, #1724), and `ci.yml`'s `merge_group` trigger runs every job on it.
-The PR lands only if `ignored-test evidence` passes on that exact commit. A
-batch that fails drops the PR that broke it, and the rest go round again.
+builds each PR alone on a temporary branch, `gh-readonly-queue/<train>/pr-<N>-<base>`,
+whose base is the entry ahead of it (or the train), and `ci.yml`'s
+`merge_group` trigger runs every job but portable macOS on it. The PR lands only if `ignored-test
+evidence` passes on that exact commit and on every entry ahead. Up to
+`max_entries_to_build` entries build at once, and up to
+`max_entries_to_merge` that have passed land in one push; neither puts two
+PRs in one build. An entry that fails drops out, and every entry behind it is
+rebuilt without it.
+
+**Check for a conflict with the queue first.** Run `python3
+scripts/ci/queue_conflicts.py <PR>` before queueing. A PR that conflicts with
+an entry ahead of it is never built: the queue marks it `UNMERGEABLE`, builds
+the entries behind it past it, and drops it for `merge_conflict` only when it
+reaches the head, an hour or two later, while the PR page still says it's
+queued. On 24 November 2026 four 0.3.3 PRs waited 1.6 to 2.6 hours like that,
+and all four merged cleanly onto the train: each conflicted with a PR still in
+the queue that edited the same rows of `docs/flakes.md` or `CHANGELOG.md`. The
+script merges the PR onto the last built entry, names the entry that brings in
+the conflict, and exits 1. Wait for that entry to land, merge the train in,
+and queue again. `merge=union` isn't the answer for those two files: it
+keeps a stale flake row beside its fixed copy and files changelog bullets
+under the wrong heading
+([the measurements](qualification/2026-11-24-merge-queue-experiments.md)).
+
+**Settings.** The same record measured the queue's runners: with eight
+groups building at once, a group's jobs waited more than twice as long for a
+runner as they ran, and the slowest group took the whole 240-minute timeout.
+Build concurrency doesn't change the runner-minutes the queue uses, since each
+entry is built once, but 1 would land under one PR an hour against the 2.25
+an hour that week. The recommendation for the maintainer is
+`max_entries_to_build` 3 and `check_response_timeout_minutes` 360, keeping
+"only merge non-failing pull requests" (`ALLGREEN`).
 
 Why bother, when the push to the train runs everything anyway? Because the
 push runs after the merge. Without the queue, a PR that passed the light set
-could break the macOS or heavy suites, and the train would carry the break
+could break the heavy suites, and the train would carry the break
 until someone noticed the push run. Merges also landed faster than the push
 runs finished: each merge cancelled the previous push run, so in early
 November four of six pushes to `release-0-2-7` were cancelled 31 to 52
 minutes in, and those commits never had a finished full run. With the queue,
-every commit on a train has passed every job before it got there.
+every commit on a train has passed every Linux job before it got there.
+macOS is the one exception: the nightly on the newest train finds a macOS
+break within a day, and the release gate PR and the push to `main` run it
+before anything ships.
 
 ## Refreshing dependencies
 
@@ -760,6 +838,19 @@ before it records a run.
 The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
 same steps and the same losses.
 
+### Upgrading from 0.3.2
+
+0.3.3 keeps 0.3.2's formats, protocol 61 and state format 76: `CURRENT` in
+`src/compatibility.rs` doesn't change on the 0.3.3 train. So a 0.3.2
+cluster's nodes accept 0.3.3's binary, and `relish upgrade start v0.3.3`
+rolls it in place, workers first and the leader last. Until every node runs
+0.3.3, `relish apply --wait` through a 0.3.2 leader counts only instances
+running the applied image, and says so on stderr
+([#2302](https://github.com/reliaburger/reliaburger/issues/2302)).
+
+If a walk fails, a fresh cluster, as [from 0.2.0](#upgrading-from-020),
+still works.
+
 ## Signing identity
 
 Configure `RELIABURGER_RELEASE_KEY` as a secret of the `release` GitHub
@@ -1083,12 +1174,10 @@ to `main`, so the build reuses that run instead of running the suite again
 ([#1363](https://github.com/reliaburger/reliaburger/issues/1363)): its
 `find passing CI` job runs
 [`ci_reuse.py`](../scripts/release/ci_reuse.py), which asks the GitHub API
-for a `ci.yml` run on exactly this commit, from a push, the merge queue or the
-nightly schedule (a pull request's run tests a merge commit and may skip
-jobs). The run counts only if it succeeded on its first attempt and every
-job in it succeeded, `ignored-test evidence` included, apart from the
-advisory Ubuntu 26.04 job, whose failure only puts a warning in the build log
-until #1943 closes. A run that went green
+for a `ci.yml` run on exactly this commit, from a push or the nightly
+schedule (a pull request's run tests a merge commit and may skip jobs, and the
+merge queue's skips portable macOS). The run counts only if it succeeded on its first attempt and every
+job in it succeeded, `ignored-test evidence` included. A run that went green
 only when someone re-ran it doesn't count: a failure that passes on a re-run
 is a flake, retries are 0, and the candidate runs its own suite instead
 ([#1436](https://github.com/reliaburger/reliaburger/issues/1436)); the script's list of required jobs is kept
@@ -1100,7 +1189,7 @@ to about 50 minutes, the macOS `relish` build's time; most of the hour saved
 was spent waiting for hosted macOS runners.
 
 You don't have to wait for `main`'s CI before dispatching the build. If a
-push, merge-queue or nightly run on the commit is still queued or running,
+push or nightly run on the commit is still queued or running,
 `find passing CI` waits for it, asking again every minute for up to two hours,
 and then applies the same rules
 ([#1722](https://github.com/reliaburger/reliaburger/issues/1722)). Until 0.2.8
@@ -2316,7 +2405,12 @@ free. It grows the root partition and filesystem into that space
 (`growpart`, `resize2fs`), loop-mounts the root and boot partitions, and runs `apt-get install` in a chroot, with
 package indexes and downloads on a tmpfs so they never reach the image and with
 service starts blocked. It disables chrony, Ubuntu 26.04's time daemon, because
-Lima's guest agent owns the guest clock (#608). It adds a systemd `.link` file
+Lima's guest agent owns the guest clock (#608). It masks `apt-daily.timer`,
+`apt-daily-upgrade.timer` and `unattended-upgrades.service`, fails unless the
+masks are in the image, and sets needrestart, if present, to list only, failing
+unless an installed needrestart got that setting (26.04's image has it), so
+nothing upgrades the guest or restarts Bun behind a tester's back (#2274);
+updates arrive with releases. It adds a systemd `.link` file
 naming the virtio NIC `eth0`: 26.04's initrd brings the NIC up as `enp0s1`,
 cloud-init can't rename an interface that's up, and without the file each new
 VM waited two minutes for an `eth0` that never appeared. Then it seals the image: an empty `/etc/machine-id`,
@@ -2359,7 +2453,11 @@ fallback. Development runs (`--development-binaries`) have no release to take a
 built image from, so they boot the pinned upstream image and install the
 packages at first boot. The stock image has no `.link` file, so its first boot
 loses the NIC rename and setup restarts the VM once; later boots are fine. The VM's provisioning script skips `apt` whenever every
-package is already present, so both paths use the same script.
+package is already present, so both paths use the same script. To try a
+changed `build_guest_image.sh` end to end before a release, a development run
+boots the built image from `RELIABURGER_DEV_GUEST_IMAGE`, checked against
+`RELIABURGER_DEV_GUEST_IMAGE_SHA256` ([quickstart.md](quickstart.md#development-qualification)).
+That's integration evidence for the image, not qualification of a signed one.
 
 Packaging generates `install.sh` with the exact native CLI checksums. The
 static `docs/website/install.sh` fetches that versioned installer over HTTPS.

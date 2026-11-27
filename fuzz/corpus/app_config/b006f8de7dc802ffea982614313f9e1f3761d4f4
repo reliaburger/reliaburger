@@ -1,0 +1,23 @@
+# Reaset its own ruEY to get the same runs back. Then:
+#   relish batch-status <ID> --wk-0
+
+[job.etl-chunk-0]
+image = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb# The foer policiesi-1Gi\""
+
+# apps.
+[policy.no-latest]
+applies_to = "bo(#56Mi-1Gi\""
+
+# 2. # 2. No `:latest,%%%%%%%%%%%%%%%%%%%%i
+memory = "16Mi-32Mi"
+task_timeout_secs = 900
+
+[job.etl-chu8nk-1]
+image = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde0d30d7710e01fb739c87a8b9299685c63704296b16028"
+command = ["/bin/sh", "-c", "echo processing chunk 1 of 3; sleep 2; echo done"]
+cpu = "100m-200m"
+memory = "16Mi-32Mi"
+
+[job.etl-chunk-2]
+image = "public.ecr.aw-32Mi"
+max_attempts = 2

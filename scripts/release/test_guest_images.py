@@ -5,14 +5,13 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
 import unittest
 
 HERE = Path(__file__).resolve().parent
 PINS = json.loads((HERE / "guest-images.json").read_text())
 BUILD = HERE / "build_guest_image.sh"
 APPLIANCE = HERE.parent.parent / "image" / "mkosi.conf"
-# Guest-only packages. The appliance builds no images, so it has no Buildah.
-GUEST_ONLY = {"buildah"}
 
 
 def appliance_packages():
@@ -57,13 +56,13 @@ class GuestImagePinTests(unittest.TestCase):
 
     def test_guest_and_appliance_share_the_node_packages(self):
         # Both run Ubuntu 26.04 and the same bun, so a node package added to
-        # one and not the other is a node that works in one place only.
+        # one and not the other is a node that works in one place only. That
+        # includes Buildah: an appliance cluster builds the tour's burger
+        # too (#2144).
         appliance = appliance_packages()
         self.assertIn("linux-image-generic", appliance)
-        node = [package for package in PINS["packages"] if package not in GUEST_ONLY]
+        node = PINS["packages"]
         self.assertEqual(node, appliance[-len(node):])
-        for package in GUEST_ONLY:
-            self.assertNotIn(package, appliance)
 
 
 class BuildScriptTests(unittest.TestCase):
@@ -94,6 +93,72 @@ class BuildScriptTests(unittest.TestCase):
         disable = text.index("in_guest systemctl disable chrony.service")
         self.assertLess(text.index("in_guest apt-get"), disable)
         self.assertLess(disable, text.index("qemu-img convert -c"))
+
+    def test_image_ships_with_automatic_updates_masked(self):
+        # unattended-upgrades upgraded libc in a quickstart guest and
+        # needrestart restarted Bun with it (#2274). Updates arrive with the
+        # next release's image instead.
+        text = BUILD.read_text()
+        units = ('automatic_updates="apt-daily.timer apt-daily-upgrade.timer '
+                 'unattended-upgrades.service"')
+        self.assertIn(units, text)
+        mask = text.index("in_guest systemctl mask $automatic_updates")
+        # The build fails unless the masks landed in the image's root.
+        check = text.index('readlink "$root/etc/systemd/system/$unit")" = /dev/null')
+        self.assertLess(text.index("in_guest apt-get"), mask)
+        self.assertLess(mask, check)
+        self.assertLess(check, text.index("qemu-img convert -c"))
+
+    def test_image_sets_needrestart_to_list_only(self):
+        text = BUILD.read_text()
+        self.assertIn('if [ -d "$root/etc/needrestart" ]; then', text)
+        drop_in = ('echo "\\$nrconf{restart} = ' + "'l';" + '" '
+                   '>"$root/etc/needrestart/conf.d/50-reliaburger.conf"')
+        self.assertIn(drop_in, text)
+        self.assertLess(text.index("50-reliaburger.conf"), text.index("qemu-img convert -c"))
+
+    def test_build_fails_unless_an_installed_needrestart_lists_only(self):
+        # Ubuntu 26.04's cloud image ships needrestart (3.11), so the drop-in
+        # is all that stands between an upgrade and a restarted Bun. Like the
+        # masks, the build checks it landed in the image rather than trusting
+        # that /etc/needrestart was there to write it into.
+        text = BUILD.read_text()
+        installed = text.index(
+            "needrestart=$(in_guest dpkg-query -W -f='${db:Status-Abbrev}' needrestart")
+        self.assertIn('case "$needrestart" in\n  ii*) grep', text)
+        check = text.index(
+            'grep -qxF "\\$nrconf{restart} = \'l\';" '
+            '"$root/etc/needrestart/conf.d/50-reliaburger.conf"')
+        self.assertIn("needrestart is not set to list only in the image", text)
+        self.assertLess(text.index('>"$root/etc/needrestart/conf.d/50-reliaburger.conf"'), installed)
+        self.assertLess(installed, check)
+        self.assertLess(check, text.index("qemu-img convert -c"))
+
+    def test_needrestart_check_refuses_an_image_without_the_drop_in(self):
+        # Run the script's own check against a fake image root, with a stub
+        # in place of the chroot.
+        text = BUILD.read_text()
+        start = text.index("needrestart=$(in_guest")
+        snippet = text[start:text.index("esac\n", start) + len("esac\n")]
+
+        def check(status, drop_in):
+            with tempfile.TemporaryDirectory() as root:
+                if drop_in is not None:
+                    conf = Path(root, "etc/needrestart/conf.d")
+                    conf.mkdir(parents=True)
+                    (conf / "50-reliaburger.conf").write_text(drop_in)
+                stub = f"in_guest() {{ printf '%s' '{status}'; }}\nroot={root}\n"
+                return subprocess.run(["bash", "-euo", "pipefail", "-c", stub + snippet],
+                                      capture_output=True, text=True)
+
+        missing = check("ii ", None)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("needrestart is not set to list only", missing.stderr)
+        self.assertNotEqual(check("ii ", "$nrconf{restart} = 'a';\n").returncode, 0)
+        self.assertEqual(check("ii ", "$nrconf{restart} = 'l';\n").returncode, 0)
+        # Removed but not purged, or never installed: nothing to check.
+        self.assertEqual(check("rc ", None).returncode, 0)
+        self.assertEqual(check("", None).returncode, 0)
 
     def test_script_grows_the_root_filesystem_before_installing(self):
         # Ubuntu 26.04's cloud image leaves its 2.5 GiB root about 160 MiB

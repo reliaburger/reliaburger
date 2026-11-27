@@ -14,7 +14,7 @@ use crate::sesame::secret_provider::{
 };
 
 /// A value no status, event or error may ever carry.
-const SECRET: &str = "s3cret-from-the-provider";
+pub(super) const SECRET: &str = "s3cret-from-the-provider";
 
 /// Write an executable `/bin/sh` provider script.
 fn provider_script(dir: &Path, body: &str) -> PathBuf {
@@ -25,7 +25,7 @@ fn provider_script(dir: &Path, body: &str) -> PathBuf {
 }
 
 /// A provider that answers with [`SECRET`].
-fn answering(dir: &Path) -> PathBuf {
+pub(super) fn answering(dir: &Path) -> PathBuf {
     provider_script(
         dir,
         &format!("head -n 1 > /dev/null\nprintf '{{\"version\":1,\"value\":\"{SECRET}\"}}'"),
@@ -35,10 +35,10 @@ fn answering(dir: &Path) -> PathBuf {
 /// The timeout for a provider whose test isn't about time. A loaded host can
 /// take seconds just to start `/bin/sh`, so these get the longest a node
 /// accepts, and only the slow-provider test judges the timeout itself.
-const PATIENT: u64 = MAX_TIMEOUT_SECS;
+pub(super) const PATIENT: u64 = MAX_TIMEOUT_SECS;
 
 /// The node's `vault` provider, running `binary` with a `timeout_secs` timeout.
-fn vault(binary: &Path, timeout_secs: u64) -> SecretProviders {
+pub(super) fn vault(binary: &Path, timeout_secs: u64) -> SecretProviders {
     let config = SecretProviderConfig {
         timeout_secs,
         ..SecretProviderConfig::new(binary)

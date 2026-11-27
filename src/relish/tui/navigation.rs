@@ -118,6 +118,14 @@ impl TuiApp {
                 app: app.clone(),
                 namespace: namespace.clone(),
             }),
+            DetailTab::Config => {
+                // A refusal from the last visit says nothing about this one.
+                self.data.app_spec_error = None;
+                self.pending.push(Effect::FetchAppSpec {
+                    app: app.clone(),
+                    namespace: namespace.clone(),
+                });
+            }
             _ => {}
         }
     }

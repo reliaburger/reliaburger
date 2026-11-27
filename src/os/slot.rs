@@ -7,7 +7,7 @@
 //! `/usr` images into a root-only staging directory, checking each against
 //! `SHA256SUMS`, and lets `systemd-sysupdate` copy them into the spare slot
 //! and onto the ESP. Then it reboots. systemd-boot gives the new version
-//! three tries; if none reaches `boot-complete.target`, it falls back.
+//! two tries; if neither reaches `boot-complete.target`, it falls back.
 //!
 //! What it's doing is kept in `os-update.json`, so after the reboot bun can
 //! tell whether it came up on the version it staged or fell back, and say

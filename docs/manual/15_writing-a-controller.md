@@ -71,6 +71,11 @@ $ relish apply -f pg/
 app 'db-a' in namespace 'pg' is owned by 'db-failover'; skipped, so this apply doesn't fight it
 ```
 
+`relish apply --dry-run` says the same before you apply: an owned app the
+file doesn't claim shows as `! app.pg/db-a (owned by 'db-failover', skipped)`,
+with `"action": "owned_skipped"` in `-o json`, not as an update. `GET /v1/apps`
+carries each app's `owner` for this.
+
 To take an app back, release it. The owner's token or an admin can:
 
 ```sh
@@ -108,6 +113,7 @@ controller's token too, since that's who writes it next.
 | `POST /v1/delete/{app}/{namespace}` | Remove an app |
 | `POST /v1/release/{app}/{namespace}` | Clear an app's owner |
 | `GET /v1/diagnostics/apps` | Every app the token can see: owner, replicas, placements |
+| `GET /v1/apps/{app}/{namespace}/spec` | One app's spec, its secrets left out |
 | `GET /v1/status?cluster=true` | Every instance the token can see, and its state |
 | `GET /v1/events` | Recent events; with `?follow=true`, a live stream |
 
@@ -121,6 +127,7 @@ expect:
 | 400 | The body didn't parse or validate |
 | 401 | No token, or one the cluster doesn't know |
 | 403 | The token's role, scope or permission doesn't allow it, or it declared an owner it can't speak for |
+| 404 | The app named in the path doesn't exist, or (with an empty body, or an `error` saying so) the node or leader runs a release without that call |
 | 409 | Someone else owns the app, or (for a release) nobody does |
 | 422 | A policy denied the apply: `{"error", "policy_denials", "policy_warnings"}` |
 | 503 | No council leader right now; try again |
@@ -186,6 +193,70 @@ token can see, sorted by namespace and name:
 | `volume_homes` | The nodes holding its managed volumes; absent when it has none |
 | `rollout_failed` | Present when the current spec failed to roll out |
 
+### An app's spec
+
+`GET /v1/apps/{app}/{namespace}/spec` answers one app's spec as the cluster
+holds it: the image, replicas, resources, health check and the rest of what a
+manifest declares. Desired apps carry counts and placements; this is the read
+for "what is this app, exactly". A token reads only apps its scope allows;
+any other answers 403, and an app the cluster doesn't have answers 404.
+
+```json
+{"app": "db-a", "namespace": "pg", "owner": "db-failover", "gitops_owned": false,
+ "spec": {"image": "postgres:17@sha256:…", "replicas": 1, "port": 5432,
+          "memory": "536870912", "env": {"PGPASSWORD": "[redacted]",
+          "VAULT": "PROVIDER[vault:kv/pg]"}, "namespace": "pg", "owner": "db-failover"},
+ "declared": {"image": "postgres:17", "…": "…"},
+ "redacted": ["spec.env.PGPASSWORD", "declared.env.PGPASSWORD"]}
+```
+
+| Field | Means |
+|-------|-------|
+| `app`, `namespace` | The app |
+| `owner` | The token that owns it; absent when nobody does |
+| `gitops_owned` | Whether a GitOps repository manages it |
+| `spec` | The spec the cluster runs: policy defaults filled in, each image tag bound to its digest. Its fields are the manifest's `[app.*]` keys |
+| `declared` | The spec as it was applied, when it differs from `spec`; absent otherwise |
+| `redacted` | Each field whose value the answer leaves out, as a dotted path |
+
+The spec is where an app's secrets live, so the answer leaves them out, for
+every token, admins included:
+
+- every env value, plain or encrypted, in the app, its init containers and
+  its sidecars, reads `"[redacted]"`. A `PROVIDER[...]` reference stays, as it
+  names where a secret lives, not the secret;
+- every config file's inline `content` reads `"[redacted]"`;
+- commands, arguments, scripts and `pre_stop` keep their words, with any
+  token, key or URL password the redaction rules recognise taken out. A
+  word after a flag or key that names a secret goes whole: the value in
+  `--password hunter2`, `--db-token abc` or `DB_PASSWORD hunter2` reads
+  `"[redacted]"`. A short flag with its value joined on, such as MySQL's
+  `-phunter2`, isn't recognised, so pass such secrets through env instead;
+- a health check's or ingress route's `path` loses any secret in its query
+  string, such as `?token=…`.
+
+So the answer is for reading, not for applying back as it stands, and the
+cluster refuses it if you try. `relish apply`, `POST /v1/apply` and a GitOps
+sync each refuse a spec in which an env value, an inline config file's
+content, or a word of a command, argument list, script or `pre_stop` is
+exactly `[redacted]`, and name the field:
+
+```
+app web: env DB_PASSWORD is the redaction placeholder "[redacted]"; supply the real value
+```
+
+The check is for a whole value or word only: `x[redacted]y`, or a
+`--password=[redacted]` that the redaction rules left inside a word, goes
+through as written, so a controller still mustn't apply what it read. One
+that rewrites an app supplies the env values itself, from its own manifest. Memory reads as a byte count, as the cluster stores it.
+
+A node that isn't the leader asks the leader, which redacts before it
+answers. During a rolling upgrade from 0.3.2 a leader still on 0.3.2 doesn't
+serve this read, and the call answers 404 with the error "the leader doesn't
+serve spec reads; it may run an older release" until it's upgraded; a 0.3.2
+node asked directly answers 404 with an empty body. `relish tui`'s
+Config tab shows the same answer.
+
 ### Instances
 
 `GET /v1/status?cluster=true` answers a JSON array, one object per instance
@@ -237,7 +308,11 @@ dead instances.
 `?follow=true` streams new events as they happen, from every node, each as a
 `data:` line holding one event object. A scoped token sees only events about
 apps and namespaces in its scope, in both forms; events that name no
-namespace, such as a token being created, are for unscoped tokens.
+namespace, such as a token being created, are for unscoped tokens. Its
+`limit` counts its own events: each node's events are trimmed to the
+token's scope before the newest `limit` are taken, so a busy namespace
+elsewhere can't push them out. Each node keeps its newest 1,024 events, and
+older ones are gone for every caller.
 
 Treat events as a hint to look again, not as the truth. A stream can drop
 while a node restarts, and an event can arrive twice. Re-read desired apps and

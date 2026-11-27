@@ -4,7 +4,7 @@
 /var/lib/reliaburger/bin and installs the image's own bun there only when
 it's newer than the active one, so an OS update can't undo a bun upgrade.
 But an OS update that brings a bun which starts and never gets healthy
-fails its boot check three times, systemd-boot falls back to the previous
+fails its boot check on both tries, systemd-boot falls back to the previous
 OS, and that OS's older bun was never put back: the node kept the bad bun,
 on a boot that isn't counted, so nothing rebooted it again.
 

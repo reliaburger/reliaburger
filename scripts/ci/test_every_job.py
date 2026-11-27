@@ -37,6 +37,15 @@ class EveryJob(unittest.TestCase):
         problems = every_job.problems(needs(task_array_benchmarks='failure'), 'merge_group')
         self.assertEqual(problems, ["task-array-benchmarks finished as 'failure'"])
 
+    def test_a_merge_group_passes_with_portable_macos_skipped(self):
+        # select-jobs.sh leaves portable macOS out of every merge group (24
+        # November 2026); a skipped job counts only because selection skipped it.
+        found = needs(macos='skipped')
+        found['changes']['outputs'].update(heavy='true', macos='false')
+        self.assertEqual(every_job.problems(found, 'merge_group'), [])
+        self.assertEqual(every_job.problems(needs(macos='failure'), 'merge_group'),
+                         ["macos finished as 'failure'"])
+
     def test_selection_must_succeed_before_any_skip_counts(self):
         found = needs()
         found['changes']['result'] = 'failure'
@@ -82,34 +91,6 @@ class EveryJob(unittest.TestCase):
         self.assertIn('::notice::', done.stdout)
         self.assertIn('44820647332', done.stdout)
 
-    def test_a_linux_next_failure_leaves_the_gate_green_with_a_warning(self):
-        # The Ubuntu 26.04 job keeps losing its runner (#1943): it runs and
-        # reports, but its failure only warns until that issue closes.
-        for result in ['failure', 'cancelled', '']:
-            with self.subTest(result=result):
-                found = needs(linux_next=result)
-                self.assertEqual(every_job.problems(found, 'merge_group'), [])
-                warnings = every_job.warnings(found)
-                self.assertEqual(len(warnings), 1)
-                self.assertIn('linux-next', warnings[0])
-                self.assertIn('#1943', warnings[0])
-
-    def test_a_linux_next_success_masked_by_continue_on_error_still_warns(self):
-        # The job has continue-on-error, so its result may say success when
-        # it failed; only its last step sets `passed`.
-        found = needs(linux_next='success')
-        self.assertIn('#1943', every_job.warnings(found)[0])
-        found['linux-next']['outputs'] = dict(passed='true')
-        self.assertEqual(every_job.warnings(found), [])
-        self.assertEqual(every_job.warnings(needs(linux_next='skipped')), [])
-
-    def test_a_linux_failure_still_fails_the_gate(self):
-        found = needs(linux='failure', linux_next='failure')
-        self.assertEqual(every_job.problems(found, 'merge_group'), ["linux finished as 'failure'"])
-
-    def test_only_linux_next_is_advisory_and_it_cites_its_issue(self):
-        self.assertEqual(every_job.ADVISORY, {'linux-next': 1943})
-
     def test_the_command_reads_the_workflow_needs_and_exits_nonzero_on_a_problem(self):
         with tempfile.TemporaryDirectory() as scratch:
             path = Path(scratch) / 'needs.json'
@@ -122,13 +103,6 @@ class EveryJob(unittest.TestCase):
                                  capture_output=True, text=True)
             self.assertEqual(bad.returncode, 1)
             self.assertIn("portable finished as 'cancelled'", bad.stderr)
-            path.write_text(json.dumps(needs(linux_next='failure')))
-            advisory = subprocess.run([sys.executable, str(SCRIPT), '--needs', str(path), '--event', 'merge_group'],
-                                      capture_output=True, text=True)
-            self.assertEqual(advisory.returncode, 0, advisory.stderr)
-            self.assertIn('::warning::', advisory.stdout)
-            self.assertIn('#1943', advisory.stdout)
-            self.assertNotIn('::error::', advisory.stdout + advisory.stderr)
 
 
 if __name__ == '__main__':

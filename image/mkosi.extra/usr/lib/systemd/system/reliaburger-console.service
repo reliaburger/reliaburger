@@ -1,19 +1,31 @@
-# The node's status on tty1: its name, cluster, address, MAC, whether bun
-# is up and, until the machine is claimed, its claim key (`bun appliance
-# console`). The appliance has no login, so this replaces the getty there.
+# The node's dashboard on tty1 (`bun appliance console`): its name, cluster,
+# address, MAC, whether bun is up and, until the machine is claimed, its
+# claim key; then, once bun answers, tabs for metrics, workloads, the
+# cluster, versions and logs. The appliance has no login, so this replaces
+# the getty there, and the dashboard is read-only.
 #
 # Not ordered after reliaburger-seed.service, the network or bun. An
 # unclaimed machine's seed unit stays activating until the claim, and the
 # claim key is what its screen has to show meanwhile (#2161). The console
-# redraws every 5 s and says "waiting for DHCP" or "not answering" itself,
-# so it starts at once and shows each thing as it appears.
+# polls and says "waiting for DHCP" or "not answering" itself, so it starts
+# at once and shows each thing as it appears.
+#
+# tty1 is the console's standard input, so it's its controlling terminal:
+# it reads the keyboard there and draws on /dev/tty. Standard output stays
+# the journal's, for the launcher's install messages.
 [Unit]
-Description=Reliaburger console status
+Description=Reliaburger console dashboard
 Conflicts=getty@tty1.service
 After=getty@tty1.service
 
 [Service]
 ExecStart=/usr/lib/reliaburger/start console
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
 Restart=always
 RestartSec=5
 

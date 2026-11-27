@@ -50,13 +50,17 @@ pub(crate) fn load_config_file(path: &Path) -> Result<Config, RelishError> {
 }
 
 /// Read a manifest for `apply`, printing any migration report to stderr.
-async fn load_manifest(source: &super::manifest::ManifestSource) -> Result<Config, RelishError> {
+pub(crate) async fn load_manifest(
+    source: &super::manifest::ManifestSource,
+) -> Result<Config, RelishError> {
     let loaded = super::manifest::load(source).await?;
     if let Some(report) = &loaded.migration_report {
         eprint!("{report}");
         eprintln!();
     }
     loaded.config.validate_intrinsic()?;
+    // The server refuses this too; checking here keeps `--dry-run` honest.
+    loaded.config.refuse_redaction_placeholders()?;
     for warning in loaded.config.warnings() {
         eprintln!("warning: {warning}");
     }
@@ -2119,6 +2123,7 @@ pub async fn deploy(
 ) -> Result<(), RelishError> {
     let config = load_config_file(path)?;
     config.validate_intrinsic()?;
+    config.refuse_redaction_placeholders()?;
 
     let client = BunClient::default_local().breaking_leases(break_lease);
 
@@ -2367,6 +2372,7 @@ impl std::fmt::Display for LintReport {
 fn lint_report(path: &Path) -> Result<LintReport, RelishError> {
     let config = load_config_file(path)?;
     config.validate()?;
+    config.refuse_redaction_placeholders()?;
     let mut warnings: Vec<String> = config
         .warnings()
         .into_iter()
@@ -5396,6 +5402,7 @@ mod tests {
                 age_seconds: None,
                 image: None,
                 data_on_node: false,
+                sidecars: Vec::new(),
                 reason: None,
             },
             cpu_percent: cpu,

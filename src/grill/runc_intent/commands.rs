@@ -5,7 +5,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::grill::command::{CommandId, CommandOutput, CommandState, OwnedCommands};
+use crate::grill::command::{
+    CommandId, CommandOutput, CommandState, OwnedCommands, ask_while_late,
+};
 
 use super::{IntentClaim, IntentPhase, RuntimeIntent};
 
@@ -168,9 +170,13 @@ impl IntentCommands {
         }
     }
 
-    // Check every role before signalling any command. An unbound prepared
-    // attempt is a crash before activation permission; executed ones are corruption.
-    async fn validate_roles(&self) -> io::Result<()> {
+    /// Check every role's binding against its owner before signalling any
+    /// command. An unbound prepared attempt is a crash before activation
+    /// permission; executed ones are corruption. Asks each bound role's
+    /// owner for its state, so a busy owner can answer late. Idempotent,
+    /// not read-only: observing an owner that died after its workload ended
+    /// completes that retirement record, and asking again finds it done.
+    pub(crate) async fn validate_roles(&self) -> io::Result<()> {
         let record = self
             .record()
             .ok_or_else(|| io::Error::other("no runtime role intent"))?;
@@ -503,11 +509,19 @@ impl IntentCommands {
     /// Persist refusal of new work, then positively retire every admitted mutator.
     /// Caller cancellation retains the claim through this bounded drain.
     /// A failed or timed-out drain leaves the generation sealed for recovery.
+    ///
+    /// The drain's role checks ask each running role's owner for its state,
+    /// one short request each. A late answer is asked again within
+    /// `timeout`, so a busy owner delays the drain rather than failing it
+    /// (#2328); any other refusal, like an owner that died while its
+    /// workload runs, fails it at once. Retiring a command already asks
+    /// again on its own.
     pub async fn seal(mut self, timeout: Duration) -> io::Result<Self> {
         tokio::spawn(async move {
             self.claim = self.claim.begin_retirement().await?;
-            tokio::time::timeout(timeout, async {
-                self.validate_roles().await?;
+            let mut late = None;
+            let drained = tokio::time::timeout(timeout, async {
+                ask_while_late(&mut late, || self.validate_roles()).await?;
                 for role in RuntimeRole::ALL {
                     let collection = self.collection(role);
                     for id in collection.inventory().await.map_err(io::Error::other)? {
@@ -523,16 +537,14 @@ impl IntentCommands {
                         .await
                         .map_err(io::Error::other)?;
                 }
-                self.require_terminal_roles().await?;
-                self.require_terminal_commands().await
+                ask_while_late(&mut late, || async {
+                    self.require_terminal_roles().await?;
+                    self.require_terminal_commands().await
+                })
+                .await
             })
-            .await
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "runtime command retirement timed out",
-                )
-            })??;
+            .await;
+            drained.map_err(|_| retirement_timed_out(late))??;
             self.drained = true;
             Ok(self)
         })
@@ -639,6 +651,18 @@ impl IntentCommands {
         }
         Ok(None)
     }
+}
+
+/// A drain that ran out of time, with the owner's last late answer when
+/// that is what it was waiting on.
+fn retirement_timed_out(late: Option<io::Error>) -> io::Error {
+    let message = match late {
+        Some(error) => format!(
+            "runtime command retirement timed out; the process owner was still answering late: {error}"
+        ),
+        None => "runtime command retirement timed out".into(),
+    };
+    io::Error::new(io::ErrorKind::TimedOut, message)
 }
 
 /// Name the command that blocks admission and its state, so a refusal in a

@@ -136,6 +136,23 @@ pub(super) async fn local_capability_report(
             placement: Some(placement),
             cluster_id,
             council_quorum,
+            // Probe now rather than trust startup: the host may have enabled
+            // the cpu and memory controllers since (#2242).
+            node_pressure: Some(
+                crate::smoker::node_pressure::probe(
+                    crate::smoker::node_pressure::NodePressureLimits {
+                        max_cpu_percentage: state
+                            .static_capabilities
+                            .test_policy
+                            .max_node_pressure_cpu_percent,
+                        max_memory_percentage: state
+                            .static_capabilities
+                            .test_policy
+                            .max_node_pressure_memory_percent,
+                    },
+                )
+                .await,
+            ),
         },
     )
 }
@@ -504,6 +521,62 @@ async fn desired_apps_from_leader(
     council: &crate::council::CouncilNode,
     directory: Option<&LeaderDirectory>,
 ) -> Result<Vec<crate::bun::diagnostics::DesiredAppEvidence>, String> {
+    read_from_leader(
+        state,
+        council,
+        directory,
+        "/v1/diagnostics/apps",
+        LeaderRead {
+            read: "desired-apps",
+            what: "desired apps",
+        },
+    )
+    .await
+}
+
+/// How a leader read names itself in its errors.
+struct LeaderRead {
+    /// `the leader did not answer the {read} read in time`.
+    read: &'static str,
+    /// `could not read {what} from the leader`.
+    what: &'static str,
+}
+
+/// GET `path` from the leader's API, marked as forwarded so the leader
+/// never forwards it again, and decode the answer.
+async fn read_from_leader<T: serde::de::DeserializeOwned>(
+    state: &ApiState,
+    council: &crate::council::CouncilNode,
+    directory: Option<&LeaderDirectory>,
+    path: &str,
+    names: LeaderRead,
+) -> Result<T, String> {
+    let what = names.what;
+    match read_from_leader_or_missing(state, council, directory, path, names).await? {
+        LeaderAnswer::Found(answer) => Ok(answer),
+        LeaderAnswer::Missing(body) => Err(format!(
+            "could not read {what} from the leader: the leader answered 404 Not Found: {body}"
+        )),
+    }
+}
+
+/// What the leader answered a read that may name something it doesn't have.
+enum LeaderAnswer<T> {
+    /// The decoded answer.
+    Found(T),
+    /// A 404, with the leader's body: empty when the leader doesn't serve
+    /// the route at all.
+    Missing(String),
+}
+
+/// [`read_from_leader`], telling a 404 apart from a failed read.
+async fn read_from_leader_or_missing<T: serde::de::DeserializeOwned>(
+    state: &ApiState,
+    council: &crate::council::CouncilNode,
+    directory: Option<&LeaderDirectory>,
+    path: &str,
+    names: LeaderRead,
+) -> Result<LeaderAnswer<T>, String> {
     // A read another node forwarded never gets here (it is refused
     // first), so there's no inbound marker to check.
     let leader_url = super::upgrade::leader_base_url(state, council, directory, &HeaderMap::new())
@@ -518,7 +591,7 @@ async fn desired_apps_from_leader(
         state
             .cluster_http
             .client()
-            .get(format!("{leader_url}/v1/diagnostics/apps"))
+            .get(format!("{leader_url}{path}"))
             .header(DESIRED_APPS_FORWARDED_HEADER, "1"),
     );
     if let Some(token) = &state.service_token {
@@ -527,19 +600,206 @@ async fn desired_apps_from_leader(
     let exchange = async {
         let response = request.send().await.map_err(|error| error.to_string())?;
         let status = response.status();
+        if status == StatusCode::NOT_FOUND {
+            return Ok(LeaderAnswer::Missing(
+                response.text().await.unwrap_or_default(),
+            ));
+        }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             return Err(format!("the leader answered {status}: {body}"));
         }
         response
-            .json::<Vec<crate::bun::diagnostics::DesiredAppEvidence>>()
+            .json::<T>()
             .await
+            .map(LeaderAnswer::Found)
             .map_err(|error| format!("the leader's answer was unreadable: {error}"))
     };
     tokio::time::timeout(DESIRED_APPS_FORWARD_TIMEOUT, exchange)
         .await
-        .map_err(|_| "the leader did not answer the desired-apps read in time".to_string())?
-        .map_err(|error| format!("could not read desired apps from the leader: {error}"))
+        .map_err(|_| format!("the leader did not answer the {} read in time", names.read))?
+        .map_err(|error| format!("could not read {} from the leader: {error}", names.what))
+}
+
+/// `GET /v1/diagnostics/rollouts` — whether each app's current spec has
+/// finished rolling out, for `relish apply --wait` (#2240). The leader
+/// answers from the rollouts it records; any other node forwards the read
+/// to it, as `/v1/diagnostics/apps` does. A node with no council has no
+/// rollouts and answers an empty list. A token sees only the apps in its
+/// scope.
+///
+/// A leader that doesn't serve the read (an older release during a rolling
+/// upgrade) answers 404, and the follower passes the 404 on (#2302): relish
+/// then sees what it would see asking the old node itself, and waits on the
+/// instances alone.
+pub(super) async fn rollouts_handler(
+    State(state): State<ApiState>,
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    directory: Option<axum::Extension<LeaderDirectory>>,
+    headers: HeaderMap,
+) -> Response {
+    let forwarded = headers.contains_key(DESIRED_APPS_FORWARDED_HEADER)
+        || headers.contains_key(LEADER_FORWARDED_HEADER);
+    let Some(council) = &state.council else {
+        return Json(Vec::<crate::bun::diagnostics::RolloutEvidence>::new()).into_response();
+    };
+    let rollouts = if confirmed_lease_leader(council).await {
+        Ok(LeaderAnswer::Found(council_rollout_evidence(
+            &council.desired_state().await,
+        )))
+    } else if forwarded {
+        Err("this node was named the leader but isn't; retry once the election settles".into())
+    } else {
+        read_from_leader_or_missing(
+            &state,
+            council,
+            directory.as_deref(),
+            "/v1/diagnostics/rollouts",
+            LeaderRead {
+                read: "rollouts",
+                what: "rollouts",
+            },
+        )
+        .await
+    };
+    match rollouts {
+        Ok(LeaderAnswer::Missing(_)) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "the leader doesn't serve rollouts; it may run an older release"
+            })),
+        )
+            .into_response(),
+        Ok(LeaderAnswer::Found(mut rollouts)) => {
+            rollouts.retain(|rollout: &crate::bun::diagnostics::RolloutEvidence| {
+                crate::sesame::auth::authorize_scoped(
+                    auth.as_deref(),
+                    &rollout.app,
+                    &rollout.namespace,
+                )
+                .is_ok()
+            });
+            Json(rollouts).into_response()
+        }
+        Err(error) => unavailable_response(error),
+    }
+}
+
+/// `GET /v1/apps/{app}/{namespace}/spec` — the spec the cluster runs for
+/// one app and, where it kept one apart, the spec as declared, with every
+/// secret left out (#1322). A token reads only an app its scope allows.
+///
+/// The leader answers from desired state. Any other node forwards the read
+/// to it, as `/v1/diagnostics/apps` does, and the leader redacts before it
+/// answers, so no secret crosses the wire. A node with no council answers
+/// from its own agent's copy of the spec.
+pub(super) async fn app_spec_handler(
+    State(state): State<ApiState>,
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    directory: Option<axum::Extension<LeaderDirectory>>,
+    headers: HeaderMap,
+    Path((app, namespace)): Path<(String, String)>,
+) -> Response {
+    if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
+    let id = crate::meat::AppId::new(&app, &namespace);
+    let not_found = || {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("no app {app:?} in namespace {namespace:?}")
+            })),
+        )
+            .into_response()
+    };
+    let Some(council) = &state.council else {
+        return match ask_agent(&state.cmd_tx, |response| AgentCommand::AppConfig {
+            app_name: app.clone(),
+            namespace: namespace.clone(),
+            response,
+        })
+        .await
+        {
+            Ok(Some(spec)) => {
+                let mut desired = crate::council::types::DesiredState::default();
+                desired.apps.insert(id.clone(), spec);
+                match crate::bun::spec_read::app_spec_view(&desired, &id) {
+                    Some(view) => Json(view).into_response(),
+                    None => not_found(),
+                }
+            }
+            Ok(None) => not_found(),
+            Err(_) => unavailable_response("agent unavailable".to_string()),
+        };
+    };
+    if confirmed_lease_leader(council).await {
+        return match council
+            .read_desired(|desired| crate::bun::spec_read::app_spec_view(desired, &id))
+            .await
+        {
+            Some(view) => Json(view).into_response(),
+            None => not_found(),
+        };
+    }
+    if headers.contains_key(DESIRED_APPS_FORWARDED_HEADER)
+        || headers.contains_key(LEADER_FORWARDED_HEADER)
+    {
+        return unavailable_response(
+            "this node was named the leader but isn't; retry once the election settles".into(),
+        );
+    }
+    let path = match crate::cluster::http::peer_path(&["v1", "apps", &app, &namespace, "spec"]) {
+        Ok(path) => path,
+        Err(error) => return peer_path_refusal(&error),
+    };
+    let names = LeaderRead {
+        read: "app-spec",
+        what: "the app's spec",
+    };
+    match read_from_leader_or_missing::<crate::bun::spec_read::AppSpecView>(
+        &state,
+        council,
+        directory.as_deref(),
+        &path,
+        names,
+    )
+    .await
+    {
+        Ok(LeaderAnswer::Found(view)) => Json(view).into_response(),
+        // A leader that doesn't know the route at all (an older release
+        // during a rolling upgrade) answers an empty 404. Pass the 404 on,
+        // saying why, rather than claim the app doesn't exist (#2302).
+        Ok(LeaderAnswer::Missing(body)) if body.is_empty() => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "the leader doesn't serve spec reads; it may run an older release"
+            })),
+        )
+            .into_response(),
+        Ok(LeaderAnswer::Missing(_)) => not_found(),
+        Err(error) => unavailable_response(error),
+    }
+}
+
+/// Every app the council knows, with whether its current spec rolled out,
+/// sorted by namespace and name.
+pub(super) fn council_rollout_evidence(
+    desired: &crate::council::types::DesiredState,
+) -> Vec<crate::bun::diagnostics::RolloutEvidence> {
+    let mut rollouts: Vec<_> = desired
+        .apps
+        .iter()
+        .map(|(app_id, spec)| crate::bun::diagnostics::RolloutEvidence {
+            app: app_id.name.clone(),
+            namespace: app_id.namespace.clone(),
+            fingerprint: crate::meat::deploy_types::rollout_fingerprint(spec),
+            rolled_out: crate::cluster::rollout::is_rolled_out(spec, desired.rollouts.get(app_id)),
+        })
+        .collect();
+    rollouts
+        .sort_by(|left, right| (&left.namespace, &left.app).cmp(&(&right.namespace, &right.app)));
+    rollouts
 }
 
 /// `POST /v1/path` — fixed DNS and TCP probes from a local source workload.

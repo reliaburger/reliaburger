@@ -265,6 +265,17 @@ with lines cut at 16 KiB (512 bytes for an event). `relish events` and
 `details` into `author_text`, the same as the timeline. Their plain output
 for people is unchanged.
 
+Two commands outside `relish agent` answer in the envelope itself, and
+`relish agent schema` describes their `data` too: `relish status -o json`,
+and `relish apply --wait -o json`. The second applies a file and returns
+once its apps run and pass their health checks. `ok` is `true` whenever the
+apply went through; `data.ready` says whether every app got there before
+`--timeout` (5 minutes by default), and `data.apps` gives each one's
+replicas, what it's doing and, when the cluster knows, why it isn't ready.
+The process exits 1 when an app wasn't ready, and 3, 4 or 5, with `ok:
+false` and an `error.code`, when the apply itself failed. An apply changes
+the cluster, so ask your human first.
+
 ## Commands
 
 <!-- agent-commands:start -->
@@ -877,10 +888,11 @@ field names and no URL carries, gets through. Read `MANIFEST.json` and
 ## Every other command
 
 The rest of `relish` was written for people first, but every command takes
-`-o json` (or `-o yaml`) and prints the facts its table shows, except eight
+`-o json` (or `-o yaml`) and prints the facts its table shows, except nine
 interactive ones that exit `2`: `tui`, `dashboard`, `manual`, `source`, `dev
 shell`, `setup` without `--quickstart` or `--ssh`, `machines claim`, which
-asks you to compare claim keys, and `netboot`, which serves until stopped.
+asks you to compare claim keys, and `machines logs` and `netboot`, which
+serve until stopped.
 Without a terminal, `relish`, `relish manual` and `relish source` exit at
 once and name the command to use instead. The `reference` chapter lists each
 command's JSON.

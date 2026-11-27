@@ -33,6 +33,7 @@ pub mod lease_reaper;
 pub mod live_attempts;
 pub mod loop_meter;
 pub mod loop_watchdog;
+pub mod malloc_trim;
 pub mod namespace_keys;
 pub mod probe;
 pub mod proposals;
@@ -40,6 +41,7 @@ pub mod readiness;
 pub mod restart;
 pub mod reusable_executor;
 pub mod snapshot_worker;
+pub mod spec_read;
 pub mod summary;
 pub mod supervisor;
 pub mod task_array_api;
@@ -78,10 +80,12 @@ pub enum BunError {
     BatchCapacity(String),
 
     /// Admission could not reserve all requested resource dimensions.
-    #[error("{}", capacity_refusal(.requested, .available))]
+    /// `kind` says whether job work on the node is making room (#1967).
+    #[error("{}", capacity_refusal(.requested, .available, *.kind))]
     Capacity {
         requested: crate::meat::Resources,
         available: crate::meat::Resources,
+        kind: execution_budget::CapacityRefusalKind,
     },
     /// Durable job execution evidence cannot be established.
     #[error("job state is unavailable: {0}")]
@@ -197,6 +201,13 @@ pub enum BunError {
     /// Deploy was rejected (e.g. process workload binary not in allowlist).
     #[error("deploy failed for {app_name:?}: {reason}")]
     DeployFailed { app_name: String, reason: String },
+    /// A restart's host-path check gave no answer in time, or couldn't run
+    /// (#2335). Not a refusal: the next attempt asks again.
+    #[error("the host path check for {instance_id} didn't finish: {reason}")]
+    HostPathUnanswered {
+        instance_id: InstanceId,
+        reason: String,
+    },
     /// The prerequisite's observed nonzero status was durably settled.
     #[error("run_before job {app_name} exited with {code}")]
     PrerequisiteFailed { app_name: String, code: i32 },
@@ -247,7 +258,35 @@ pub enum BunError {
     UpgradesUnavailable,
 }
 
+/// The status an `ApplyEvent::Error` carries when a node refused an app
+/// while its job work makes room for it (#1967): 503, try again shortly.
+/// The placement reconciler retries every few seconds and the leader keeps
+/// the placement.
+pub const CAPACITY_YIELDING_STATUS: u16 = 503;
+
+/// The status an `ApplyEvent::Error` carries when a node has no room for an
+/// app, however much job work gives back: 507, insufficient resources. The
+/// placement reconciler backs off to at most 30 s while the leader moves
+/// the replica.
+pub const CAPACITY_FULL_STATUS: u16 = 507;
+
 impl BunError {
+    /// The status a deploy stream's `Error` event carries for this error,
+    /// if it has one of its own.
+    pub fn apply_status(&self) -> Option<u16> {
+        match self {
+            BunError::Capacity {
+                kind: execution_budget::CapacityRefusalKind::Yielding,
+                ..
+            } => Some(CAPACITY_YIELDING_STATUS),
+            BunError::Capacity {
+                kind: execution_budget::CapacityRefusalKind::Full,
+                ..
+            } => Some(CAPACITY_FULL_STATUS),
+            _ => None,
+        }
+    }
+
     /// Why the runtime refused to launch, if a refused launch is what failed
     /// (#881, #905).
     pub fn launch_problem(&self) -> Option<&crate::grill::LaunchProblem> {
@@ -265,6 +304,7 @@ impl BunError {
 fn capacity_refusal(
     requested: &crate::meat::Resources,
     available: &crate::meat::Resources,
+    kind: execution_budget::CapacityRefusalKind,
 ) -> String {
     let text = |resources: &crate::meat::Resources| {
         let cpu_and_memory = format!(
@@ -278,8 +318,14 @@ fn capacity_refusal(
             format!("{cpu_and_memory} gpus={}", resources.gpus)
         }
     };
+    let yielding = match kind {
+        execution_budget::CapacityRefusalKind::Yielding => {
+            "; job work on this node is making room for it"
+        }
+        execution_budget::CapacityRefusalKind::Full => "",
+    };
     format!(
-        "node capacity cannot admit {}; available {}",
+        "node capacity cannot admit {}; available {}{yielding}",
         text(requested),
         text(available)
     )
@@ -297,6 +343,7 @@ mod capacity_message_tests {
         let error = BunError::Capacity {
             requested: Resources::new(100, 32 << 20, 0),
             available: Resources::new(95, 6 << 20, u32::MAX),
+            kind: super::execution_budget::CapacityRefusalKind::Full,
         };
         assert_eq!(
             error.to_string(),
@@ -309,11 +356,27 @@ mod capacity_message_tests {
         let error = BunError::Capacity {
             requested: Resources::new(100, 32 << 20, 2),
             available: Resources::new(95, 6 << 20, 1),
+            kind: super::execution_budget::CapacityRefusalKind::Full,
         };
         assert_eq!(
             error.to_string(),
             "node capacity cannot admit cpu=100m mem=32Mi gpus=2; available cpu=95m mem=6Mi gpus=1"
         );
+    }
+
+    #[test]
+    fn a_yielding_refusal_says_job_work_is_making_room() {
+        let error = BunError::Capacity {
+            requested: Resources::new(100, 32 << 20, 0),
+            available: Resources::new(95, 6 << 20, 0),
+            kind: super::execution_budget::CapacityRefusalKind::Yielding,
+        };
+        assert!(
+            error
+                .to_string()
+                .ends_with("; job work on this node is making room for it")
+        );
+        assert_eq!(error.apply_status(), Some(super::CAPACITY_YIELDING_STATUS));
     }
 }
 

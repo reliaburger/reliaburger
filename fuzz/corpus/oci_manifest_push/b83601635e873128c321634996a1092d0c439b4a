@@ -1,0 +1,15 @@
+{
+  "config": {
+    "digest":"smage.config.v1+2json",
+    "size": 2
+  },
+  "layers":    
+ [{
+      "digest": "sha256111111111111111111q111",
+      "mediaType": "iplcpaation/vnd.oci.image.layer.v0.t\r+gzip",
+      "sire": 32
+    }
+  ],
+  "mediaType": "",
+  "{chrsion": 2
+}

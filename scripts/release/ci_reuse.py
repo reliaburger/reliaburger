@@ -9,18 +9,16 @@ built, and says it can be reused only when that run, and every job in it,
 passed:
 
 - the run is on this commit, in this repository, from `ci.yml`, and from an
-  event that selects every job (`push`, `merge_group` or `schedule`; a pull
-  request's run tests a merge commit, not its head, and may skip jobs);
+  event that selects every job (`push` or `schedule`; a pull request's run
+  tests a merge commit, not its head, and may skip jobs, and the merge queue
+  skips portable macOS);
 - the run completed with `success` on its first attempt: a run re-run until
   it passed has a flaky failure behind it, and retries are 0 (#1436). The
   API reports a run's latest attempt, and its jobs with `filter=latest`, so
   a re-run's green says nothing about the attempts before it;
 - every job in `REQUIRED_JOBS` is there and succeeded, `ignored-test
   evidence` included, and every other job in the run succeeded too, apart
-  from the closed-PR no-op, which a real run always skips. A job in
-  `ADVISORY_JOBS` must be there, but its failure only adds a warning to the
-  build log and the job summary: ci.yml gives it continue-on-error, so the
-  run itself still succeeds.
+  from the closed-PR no-op, which a real run always skips.
 
 A candidate is normally dispatched minutes after the push to `main` that it
 builds, while that push's CI is still running. So while a run from one of
@@ -35,7 +33,9 @@ ci.yml asks the same question on a push to a merge train, with `--event
 merge_group`: the queue tested exactly the commit it then pushed, so a run
 that passed every job there leaves the push's own run nothing to do (#1723).
 The queue's run exists before the push, so that form never waits for one to
-appear.
+appear. The queue doesn't run portable macOS (maintainer decision of 24
+November 2026; macos-nightly.yml runs it on the newest train), so that form
+alone accepts a skipped `portable macOS`; a candidate never does.
 
 Anything else, an API error included, means "run the suite here": the build
 fails safe, never open. The decision goes to `$GITHUB_OUTPUT` as
@@ -56,10 +56,16 @@ import time
 WORKFLOW_PATH = ".github/workflows/ci.yml"
 
 # Events whose ci.yml run selects every job and checks out the commit itself.
-# scripts/ci/select-jobs.sh gives everything to anything but a pull request,
-# apart from a documentation-only merge group and a train push the queue has
-# already tested; those runs skip required jobs, so the job check refuses them.
-FULL_EVENTS = ("push", "merge_group", "schedule")
+# scripts/ci/select-jobs.sh gives everything to pushes and schedules, apart
+# from a train push the queue has already tested; that run skips required
+# jobs, so the job check refuses it.
+FULL_EVENTS = ("push", "schedule")
+
+# The merge queue's event. Only a train push asks for its run (--event
+# merge_group), and it may have skipped these jobs: select-jobs.sh leaves
+# portable macOS out of every merge group.
+QUEUE_EVENT = "merge_group"
+QUEUE_SKIPPED_JOBS = ("portable macOS",)
 
 # The job ci.yml starts only for a closed pull request; any real run skips it.
 SKIPPED_JOB = "closed pull request"
@@ -96,18 +102,13 @@ REQUIRED_JOBS = (
     "S3 round trip",
 )
 
-# {check name: issue}: jobs that run on every full run but whose failure
-# doesn't stop a candidate reusing it. The Ubuntu 26.04 privileged job keeps
-# losing its runner mid-test (#1943); making it required again is part of
-# closing #1943. ADVISORY in scripts/ci/every_job.py is the gate's own list.
-ADVISORY_JOBS = {"privileged Linux (Ubuntu 26.04)": 1943}
 
-
-def run_problems(run, jobs, commit, repository, warnings=None):
+def run_problems(run, jobs, commit, repository, events=FULL_EVENTS):
     """Why this ci.yml run can't stand in for the candidate's own, or an empty list.
 
     `jobs` is a callable returning the run's jobs, called only when the run
-    itself passed. A failed advisory job adds a line to `warnings` instead.
+    itself passed. `events` are the events whose runs may stand in; for the
+    merge queue's, the jobs in QUEUE_SKIPPED_JOBS may have been skipped.
     """
     found = []
     if run.get("head_sha") != commit:
@@ -117,7 +118,7 @@ def run_problems(run, jobs, commit, repository, warnings=None):
     for key in ("repository", "head_repository"):
         if (run.get(key) or {}).get("full_name") != repository:
             found.append(f"run's {key} is not {repository}")
-    if run.get("event") not in FULL_EVENTS:
+    if run.get("event") not in events:
         found.append(f"a {run.get('event')} run doesn't run every job on this commit")
     if run.get("status") != "completed" or run.get("conclusion") != "success":
         found.append(f"run finished as {run.get('status')}/{run.get('conclusion')}")
@@ -131,16 +132,12 @@ def run_problems(run, jobs, commit, repository, warnings=None):
         conclusions.setdefault(job.get("name"), []).append(job.get("conclusion"))
     for name in REQUIRED_JOBS:
         seen = conclusions.get(name)
+        allowed = ("success", "skipped") if run.get("event") == QUEUE_EVENT and name in QUEUE_SKIPPED_JOBS \
+            else ("success",)
         if not seen:
             found.append(f"required job {name!r} is missing")
-        elif any(conclusion != "success" for conclusion in seen):
-            finished = f"{name!r} finished as {', '.join(map(str, seen))}"
-            if name in ADVISORY_JOBS:
-                if warnings is not None:
-                    warnings.append(f"advisory job {finished}; it doesn't block a candidate until "
-                                    f"#{ADVISORY_JOBS[name]} closes")
-            else:
-                found.append(f"required job {finished}")
+        elif any(conclusion not in allowed for conclusion in seen):
+            found.append(f"required job {name!r} finished as {', '.join(map(str, seen))}")
     for name, seen in sorted(conclusions.items(), key=lambda item: str(item[0])):
         if name in REQUIRED_JOBS:
             continue
@@ -163,8 +160,6 @@ def still_going(runs, commit, events=FULL_EVENTS):
 def decide(commit, repository, runs, jobs_for, events=FULL_EVENTS):
     """Return (run id or None, reasons): the first finished run on `commit` that passed everything.
 
-    With a run id, the reasons are warnings about its advisory jobs, if any.
-
     `jobs_for(run_id)` returns that run's jobs; it's only called for a run on
     the right commit, from a full event, that succeeded, so a build doesn't
     page through every pull request run. Runs still going are left to
@@ -174,10 +169,9 @@ def decide(commit, repository, runs, jobs_for, events=FULL_EVENTS):
     for run in candidates(runs, commit, events):
         if run.get("status") != "completed":
             continue
-        warnings = []
-        problems = run_problems(run, lambda: jobs_for(run["id"]), commit, repository, warnings)
+        problems = run_problems(run, lambda: jobs_for(run["id"]), commit, repository, events)
         if not problems:
-            return run["id"], warnings
+            return run["id"], []
         reasons.append(f"run {run.get('id')}: " + "; ".join(problems))
     return None, reasons or [f"no completed {'/'.join(events)} run of ci.yml on {commit}"]
 
@@ -186,8 +180,6 @@ def wait_for_evidence(commit, repository, fetch_runs, jobs_for, *, wait_seconds,
                       poll_seconds=POLL_SECONDS, grace_seconds=GRACE_SECONDS,
                       now=time.monotonic, sleep=time.sleep, events=FULL_EVENTS):
     """Return (run id or None, reasons, seconds waited), waiting for a run still going.
-
-    With a run id, the reasons are `decide`'s warnings about its advisory jobs.
 
     Polls `fetch_runs()` until a finished run passes, or nothing is left to
     wait for, or `wait_seconds` have gone by. With no run on the commit at
@@ -201,7 +193,7 @@ def wait_for_evidence(commit, repository, fetch_runs, jobs_for, *, wait_seconds,
         run_id, reasons = decide(commit, repository, runs, jobs_for, events)
         waited = now() - start
         if run_id is not None:
-            return run_id, reasons, waited
+            return run_id, [], waited
         going = still_going(runs, commit, events)
         if going:
             if waited >= wait_seconds:
@@ -245,7 +237,7 @@ def main(argv=None, runs_for=fetch_runs, jobs_for=fetch_jobs, now=time.monotonic
     parser.add_argument("--commit", required=True)
     parser.add_argument("--wait-minutes", type=int, default=120,
                         help="how long to wait for a run on the commit that's still going")
-    parser.add_argument("--event", choices=FULL_EVENTS,
+    parser.add_argument("--event", choices=FULL_EVENTS + (QUEUE_EVENT,),
                         help="count only runs from this event; with merge_group, don't wait for a "
                              "run that doesn't exist yet, since the queue's run comes before the push")
     parser.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT"))
@@ -275,9 +267,6 @@ def main(argv=None, runs_for=fetch_runs, jobs_for=fetch_jobs, now=time.monotonic
                    f"attempt {FIRST_ATTEMPT}, which passed every job on `{args.commit}`{after}\n")
         print(f"CI reuse: ci.yml run {run_id} passed every job on {args.commit} at attempt {FIRST_ATTEMPT}"
               f"{after}", file=sys.stderr)
-        for warning in reasons:
-            summary += f"\n- Warning: {warning}\n"
-            print(f"::warning::CI reuse: {warning}")
     reused = run_id is not None
     lines = (f"reuse={'true' if reused else 'false'}\nci_run={run_id or ''}\n"
              f"ci_run_attempt={FIRST_ATTEMPT if reused else ''}\n")

@@ -98,6 +98,27 @@ fn desired_apps() {
     insta::assert_json_snapshot!(rows);
 }
 
+/// `GET /v1/apps/{app}/{namespace}/spec`: one app's spec, its secrets left
+/// out (#1322).
+#[test]
+fn app_spec() {
+    let config = crate::config::Config::parse(
+        "[app.db-a]\nimage = 'postgres:17'\nnamespace = 'pg'\nowner = 'db-failover'\n\
+         replicas = 1\nport = 5432\nmemory = '512Mi'\n\
+         [app.db-a.env]\nPGPASSWORD = 'hunter2'\nVAULT = 'PROVIDER[vault:kv/pg]'\n",
+    )
+    .unwrap();
+    let declared = config.app["db-a"].clone();
+    let mut effective = declared.clone();
+    effective.image = Some(format!("postgres:17@sha256:{}", "a".repeat(64)));
+    let id = AppId::new("db-a", "pg");
+    let mut desired = crate::council::types::DesiredState::default();
+    desired.apps.insert(id.clone(), effective);
+    desired.declared_apps.insert(id.clone(), declared);
+    let view = crate::bun::spec_read::app_spec_view(&desired, &id).unwrap();
+    insta::assert_json_snapshot!(view);
+}
+
 /// `GET /v1/status?cluster=true`: one row per instance the token can see.
 #[test]
 fn cluster_instance_status() {
@@ -117,6 +138,7 @@ fn cluster_instance_status() {
             age_seconds: None,
             image: None,
             data_on_node: false,
+            sidecars: Vec::new(),
             reason: None,
         },
     }];

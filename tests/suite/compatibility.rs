@@ -55,6 +55,8 @@ registry_port = {registry_port}
         ),
     )
     .unwrap();
+    // Workload host ports outside the lease range (#2261).
+    crate::bun_process::use_test_workload_ports(&config);
     // Pay `bun`'s first launch before the 30 s wait below starts (#1149).
     crate::bun_process::first_launch_binaries();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_bun"))

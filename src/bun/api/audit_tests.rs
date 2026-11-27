@@ -903,3 +903,34 @@ fn a_suppressed_refusal_summary_says_how_many_and_from_whom() {
         overflow.message
     );
 }
+
+/// A boot log change is audited with where the node now sends its kernel
+/// log, or `off` (#2149).
+#[tokio::test]
+async fn a_boot_log_change_is_audited_with_its_target() {
+    let (admin, admin_key) = named_user_token("operator", ApiRole::Admin);
+    let audit = audited();
+    let (app, shutdown) = refusing_router(vec![admin], &audit).await;
+    let esp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(esp.path().join("boot/EFI")).unwrap();
+    let app = app.layer(axum::Extension(crate::os::netlog::NetlogPaths {
+        esp_candidates: vec![esp.path().join("boot")],
+        netconsole: esp.path().join("netconsole"),
+        restart: vec!["true".into()],
+        journal: vec!["true".into()],
+    }));
+
+    for body in [r#"{"target":"10.42.0.1"}"#, r#"{"target":null}"#] {
+        let (status, reply) = call(&app, "POST", "/v1/os/boot-logs", &admin_key, body).await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+    }
+    let records = audit.records("os.boot_logs_set").await;
+    let targets: Vec<Option<&str>> = records.iter().map(|r| detail(r, "target")).collect();
+    assert_eq!(targets, vec![Some("10.42.0.1:6666"), Some("off")]);
+
+    // A body that doesn't say what it wants changes nothing.
+    let (status, _) = call(&app, "POST", "/v1/os/boot-logs", &admin_key, "{}").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(audit.records("os.boot_logs_set").await.len(), 2);
+    shutdown.cancel();
+}

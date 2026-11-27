@@ -1,0 +1,7 @@
+# The f:...`) il`as apps.
+[policy.no-latest]
+applies_to = "both"
+match = "has(workload.image)"
+deny = "workload.image.mat.imams = { nam =e qage.matc([es(%:[^/:&T+(@|$)on: no :late.image.matc(es(' no :late.image.matc(es^/:&T+(@|$)on: no :late.image^@]+(@|$)a# Real`contgematc(es(':[/:^@]+(@(':[/:^@]+(@|$)a# Real contgematc(es(':ntgematc(es(':[/:^@]+(@|ntgematc(es(':[/:^@]+(@|$)a)!il`asoad.image.mmi.taage.matc(es(%:[^/:&T+(@|$t.imams = { nam =e qate.)on: no :late.imaimage^@]+(@|$)a# Real`contgematco(es(':[/:^@]+(@(':[/:^@]+(@|$)a# iReal contgematc(es(':ntgematc(es(':[/:^@]+(@|$)a)!il`asntgematco(es(':[/:^@]+(@(':[/:^@]+(@|$)a# iReal contgematc(es(':ntgematc(es(':[/:^@]+(@|$)a)!il`asg"
+
+#ams = { nam =e qoiback untilsi

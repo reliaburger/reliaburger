@@ -53,6 +53,10 @@ on:
       - "src/appliance/**"
       - "src/relish/netboot/**"
       - "scripts/demo/netboot.sh"
+    # A draft, or a 0-4-0/ branch, builds no image (24 November 2026):
+    # ready_for_review starts the build, and converted_to_draft cancels one
+    # still going.
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
 
 concurrency:
   group: appliance-${{ github.event.pull_request.number || github.run_id }}
@@ -64,6 +68,7 @@ permissions:
 jobs:
   # Whether this run publishes, and the version it builds.
   plan:
+    if: github.event_name != 'pull_request' || (!github.event.pull_request.draft && !startsWith(github.event.pull_request.head.ref, '0-4-0/'))
     runs-on: ubuntu-24.04
     outputs:
       publish: ${{ steps.plan.outputs.publish }}
@@ -146,6 +151,7 @@ jobs:
   # The image's shell scripts that have unit tests (image/tests): quick, and
   # Linux-only, since the scripts use GNU coreutils as the appliance does.
   scripts:
+    if: github.event_name != 'pull_request' || (!github.event.pull_request.draft && !startsWith(github.event.pull_request.head.ref, '0-4-0/'))
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -189,7 +195,7 @@ jobs:
           df -h /
 
       - name: Set up mkosi v27
-        uses: systemd/mkosi@f2b04fcd671110e3a7372027162752f71de0c9b0 # v27
+        uses: systemd/mkosi@4736cd836108a97772142c461c49f1ddb4172348 # v27
 
       - uses: actions/download-artifact@v4
         if: needs.bun.result == 'success'
@@ -317,6 +323,16 @@ jobs:
           lab=()
           [ "$PUBLISH" = true ] || lab=(--lab)
           python3 image/tests/no_ssh_server.py manifest "${lab[@]}" \
+            "image/mkosi.output/reliaburger-os_$IMAGE_VERSION.manifest"
+
+      - name: Buildah, and only what it needs
+        # An appliance cluster builds its own images (#2144). The manifest
+        # lists what was really installed: Buildah, its configuration, the
+        # network stack and runtime its RUN steps use, and none of the
+        # recommends the node never uses (GnuPG's agents, fuse-overlayfs,
+        # crun, cpp). The seeded pair below builds the tour's burger on it.
+        run: |
+          python3 image/tests/builder_packages.py manifest \
             "image/mkosi.output/reliaburger-os_$IMAGE_VERSION.manifest"
 
       - name: Installer drivers
@@ -518,8 +534,12 @@ jobs:
         # Two appliances form a cluster from their seeds alone, with the
         # bun and relish of the commit under test (lab builds only). Node 1
         # reads its seed from an RBSEED stick: qemu-img and mtools make it.
+        # Node 1's console dashboard must show the cluster's verdict on
+        # tty1 (#2150). Then the pair builds the tour's burger with the
+        # image's Buildah, pulling its base images through the runner's NAT
+        # (#2144).
         if: matrix.arch == 'x86_64' && env.BROKEN_BUN != '1' && hashFiles('source-bin/relish-linux-x86_64') != ''
-        timeout-minutes: 25
+        timeout-minutes: 40
         run: |
           set -euo pipefail
           sudo apt-get install -y -qq dnsmasq-base qemu-utils mtools
@@ -576,12 +596,12 @@ jobs:
             "$RUNNER_TEMP/lab-release" "$NEXT_VERSION" source-bin/relish-linux-x86_64
 
       - name: OS fallback (x86-64, KVM)
-        # bun rolls the broken version onto a one-node cluster: three counted
+        # bun rolls the broken version onto a one-node cluster: two counted
         # boots fail their boot checks, systemd-boot falls back on its own,
         # and bun reports it, which pauses the rollout. The summary records
         # how long the fallback took (#406; the Wyse exit test needs 10 min).
         # The node streams its boot logs to `relish machines logs`, and the
-        # stream must show the three tries (#2149); mtools writes
+        # stream must show the two tries (#2149); mtools writes
         # netlog.conf onto its ESP.
         if: env.BROKEN_VERSION != '' && hashFiles('source-bin/relish-linux-x86_64') != ''
         timeout-minutes: 30
@@ -590,6 +610,19 @@ jobs:
           sudo apt-get install -y -qq mtools
           image/tests/os-update.sh image/mkosi.output "$IMAGE_VERSION" \
             "$RUNNER_TEMP/lab-release" "$BROKEN_VERSION" source-bin/relish-linux-x86_64 --fallback
+
+      - name: OS update with no network link (x86-64, KVM)
+        # The next version, but the VM's link goes down as the node reboots
+        # into it, as a Wyse's did in the 0.3.2 lab (#2245). The boot check
+        # doesn't wait for the network and wants an address on a counted
+        # boot, so both tries fail and the node falls back; with the link
+        # back, the rollout pauses on it.
+        if: env.NEXT_VERSION != '' && hashFiles('source-bin/relish-linux-x86_64') != ''
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          image/tests/os-update.sh image/mkosi.output "$IMAGE_VERSION" \
+            "$RUNNER_TEMP/lab-release" "$NEXT_VERSION" source-bin/relish-linux-x86_64 --no-link
 
       - name: Upload the image
         uses: actions/upload-artifact@v4

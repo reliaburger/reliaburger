@@ -15,10 +15,16 @@
 #                  dependency cache (below)
 #   tested_by    - the merge-queue run that already tested a train push's
 #                  commit, or empty
+#   lint         - run lint and format: with `code`, and on its own for a
+#                  draft or a 0.4.0 branch (below)
 #
-# Pushes (to main and to every train), merge-queue groups, schedules and
-# manual runs get everything; so does build.yml's call. Two exceptions save
-# runners (#1723):
+# Pushes (to main and to every train), schedules and manual runs get
+# everything; so does build.yml's call. A merge-queue group gets everything
+# but portable macOS (maintainer decision of 24 November 2026): it took 50
+# minutes to over 2 hours there and was cancelled or failed three times that
+# day, each time rebuilding the whole queue. macos-nightly.yml runs it on the
+# newest train every night instead, and the release gate PR and the push to
+# main still run it. Two more exceptions save runners (#1723):
 #
 #   - a merge group that changes only documentation runs no code job. Its
 #     code is its base's, which the train's last run or the group ahead of
@@ -29,7 +35,12 @@
 #     still runs when the train's dependency graph differs from main's
 #     (MAIN_REF), because only a train push saves the cache its PRs restore.
 #
-# Pull requests are judged by the files they change against their base:
+# A draft pull request, and one from a `0-4-0/` branch (work for a release
+# whose train isn't open yet), runs only the cheap set: CI policy, select jobs
+# and lint, whatever its labels say (maintainer decision of 24 November
+# 2026). Marking a draft ready for review starts a run with the full set.
+#
+# Other pull requests are judged by the files they change against their base:
 #
 #   - into a release's merge train (`release-*`): the light set. Lint, MSRV,
 #     portable Linux, the source bundle build and the optimized contract
@@ -51,7 +62,7 @@
 # the whole train, so only its labels give it macOS. Dependabot never gets
 # it unless labelled; the nightly covers it. The evidence gate names a
 # heavy selection without macOS `train-full` (scripts/ci/workflow_assembly.py)
-# and accepts it, like the light set, on pull requests only.
+# and accepts it on pull requests and merge groups only.
 #
 # Retargeting a PR (GitHub does it when the branch under it merges) reruns
 # this through ci-retarget.yml, so the new base's rules apply at once.
@@ -61,19 +72,20 @@
 # Inputs (environment): EVENT, BASE_REF, HEAD_REF, BASE_SHA (a merge
 # group's base for merge_group), FULL_CI, RELEASE_GATE and MACOS_LABEL (each
 # "true"/"false": whether the PR carries the full-ci, release-gate or macos
-# label), and optionally HEAD_SHA (defaults to HEAD). For a push: GITHUB_REF,
+# label), DRAFT ("true" for a draft pull request), and optionally HEAD_SHA
+# (defaults to HEAD). For a push: GITHUB_REF,
 # QUEUE_RUN and MAIN_REF (defaults to origin/main).
 set -euo pipefail
 
 output="${GITHUB_OUTPUT:-/dev/stdout}"
 
-# emit code gossip heavy task_arrays macos s3 [portable [tested_by]]
+# emit code gossip heavy task_arrays macos s3 [portable [tested_by [lint]]]
 emit() {
-    local portable="${7:-$1}" tested_by="${8:-}"
-    printf 'code=%s\ngossip=%s\nheavy=%s\ntask_arrays=%s\nmacos=%s\ns3=%s\nportable=%s\ntested_by=%s\n' \
-        "$1" "$2" "$3" "$4" "$5" "$6" "$portable" "$tested_by" >>"$output"
-    printf 'code=%s gossip=%s heavy=%s task_arrays=%s macos=%s s3=%s portable=%s tested_by=%s\n' \
-        "$1" "$2" "$3" "$4" "$5" "$6" "$portable" "$tested_by" >&2
+    local portable="${7:-$1}" tested_by="${8:-}" lint="${9:-$1}"
+    printf 'code=%s\ngossip=%s\nheavy=%s\ntask_arrays=%s\nmacos=%s\ns3=%s\nportable=%s\ntested_by=%s\nlint=%s\n' \
+        "$1" "$2" "$3" "$4" "$5" "$6" "$portable" "$tested_by" "$lint" >>"$output"
+    printf 'code=%s gossip=%s heavy=%s task_arrays=%s macos=%s s3=%s portable=%s tested_by=%s lint=%s\n' \
+        "$1" "$2" "$3" "$4" "$5" "$6" "$portable" "$tested_by" "$lint" >&2
 }
 
 case "${GITHUB_REF:-}" in
@@ -93,7 +105,7 @@ if [ "${EVENT}" = push ] && [ "$train_push" = true ] && [[ "${QUEUE_RUN:-}" =~ ^
 fi
 
 if [ "${EVENT}" = merge_group ] && [ -z "${BASE_SHA:-}" ]; then
-    emit true true true true true true
+    emit true true true true false true
     exit 0
 fi
 if [ "${EVENT}" != pull_request ] && [ "${EVENT}" != merge_group ]; then
@@ -212,8 +224,19 @@ if [ "${EVENT}" = merge_group ]; then
     if [ "$code" = false ]; then
         emit false false false false false false
     else
-        emit true true true true true true
+        emit true true true true false true
     fi
+    exit 0
+fi
+
+# A draft, or a 0.4.0 branch: lint alone, when there's code to lint.
+case "${HEAD_REF:-}" in
+    0-4-0/*) parked=true ;;
+    *) parked=false ;;
+esac
+if [ "${DRAFT:-false}" = true ] || [ "$parked" = true ]; then
+    echo "a draft or 0-4-0/ pull request runs only the cheap set" >&2
+    emit false false false false false false false "" "$code"
     exit 0
 fi
 

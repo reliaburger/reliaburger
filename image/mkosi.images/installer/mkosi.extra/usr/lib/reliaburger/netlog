@@ -50,6 +50,8 @@ valid_ipv4() {
     case $1 in '' | *[!0-9.]* | .* | *. | *..*) return 1 ;; esac
     for part in $1; do
         count=$((count + 1))
+        # No leading zero: ip(8) and bash's /dev/udp may read 010 as octal.
+        case $part in 0?*) return 1 ;; esac
         [ ${#part} -le 3 ] && [ "$((10#$part))" -le 255 ] || return 1
     done
     [ "$count" -eq 4 ]
@@ -63,7 +65,8 @@ parse_target() {
         *) address=$value port=$DEFAULT_PORT ;;
     esac
     valid_ipv4 "$address" || return 1
-    case $port in '' | *[!0-9]*) return 1 ;; esac
+    # Digits only, and no leading zero, as relish and bun read it.
+    case $port in '' | *[!0-9]* | 0?*) return 1 ;; esac
     [ ${#port} -le 5 ] && [ "$((10#$port))" -ge 1 ] && [ "$((10#$port))" -le 65535 ] || return 1
     echo "$address $((10#$port))"
 }
@@ -179,8 +182,10 @@ echo "$src" >"$nc/local_ip"
 echo "$address" >"$nc/remote_ip"
 echo "$port" >"$nc/remote_port"
 # Without the next hop's MAC, netconsole broadcasts, which reaches a target
-# on the same LAN.
-[ -n "$remote_mac" ] && echo "$remote_mac" >"$nc/remote_mac"
+# on the same LAN. Say so, rather than leave it unset: the target outlives a
+# restart of this unit, and `relish os boot-logs --to` restarts it with a new
+# target (#2255), so an unset MAC would keep the old next hop's.
+echo "${remote_mac:-ff:ff:ff:ff:ff:ff}" >"$nc/remote_mac"
 if ! echo 1 >"$nc/enabled"; then
     say "netconsole refused the target $address:$port on $dev; not streaming"
     exit 0

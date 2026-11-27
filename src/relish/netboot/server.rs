@@ -14,7 +14,7 @@ use super::dhcp::{self, DhcpContext, ListenPort};
 use super::http::{self, HttpState};
 use super::installed::{InstallTickets, InstalledRecord, RECORD_FILE, chain_script};
 use super::interface::{self, Interface, udp_socket};
-use super::netlog::{self, NETLOG_PORT, SharedPeers};
+use super::netlog::{self, NETLOG_PORT, SharedPeers, StreamLogs};
 use super::tftp::{self, Outcome, TftpFiles, TftpSettings};
 use super::wipe::{self, DiskSession, Question};
 use super::{DhcpSetup, IpxeBuild, Log, MacAddress, NetbootError, NetbootOptions};
@@ -59,14 +59,16 @@ pub async fn run(options: NetbootOptions) -> Result<(), NetbootError> {
     let listener = TcpListener::bind(SocketAddrV4::new(server, options.http_port))
         .await
         .map_err(|e| interface::bind_error("HTTP", options.http_port, e))?;
-    let netlog_socket = if options.stream_logs {
-        Some(udp_socket(
-            "the boot log listener",
-            SocketAddrV4::new(server, NETLOG_PORT),
-            None,
-        )?)
-    } else {
-        None
+    let netlog_socket = match options.stream_logs {
+        Some(shown) => Some((
+            udp_socket(
+                "the boot log listener",
+                SocketAddrV4::new(server, NETLOG_PORT),
+                None,
+            )?,
+            shown,
+        )),
+        None => None,
     };
     // BLOCKING-OK: relish netboot: read once at start, before it serves anything
     let record = InstalledRecord::load(&options.directory.join(RECORD_FILE))?;
@@ -94,7 +96,7 @@ pub async fn run(options: NetbootOptions) -> Result<(), NetbootError> {
         installs: Mutex::new(InstallTickets::default()),
         netlog: options
             .stream_logs
-            .then_some(SocketAddrV4::new(server, NETLOG_PORT)),
+            .map(|_| SocketAddrV4::new(server, NETLOG_PORT)),
         log: log.clone(),
     });
     let http_state = state.clone();
@@ -123,7 +125,9 @@ pub async fn run(options: NetbootOptions) -> Result<(), NetbootError> {
     let netlog_log = log.clone();
     let netlog_task = async move {
         match netlog_socket {
-            Some(socket) => netlog::listen(socket, peers, Some(directory), netlog_log).await,
+            Some((socket, shown)) => {
+                netlog::listen(socket, peers, Some(directory), shown, netlog_log).await
+            }
             None => std::future::pending().await,
         }
     };
@@ -537,6 +541,20 @@ fn stamped(time: jiff::civil::Time, line: &str) -> String {
     )
 }
 
+/// The summary's line for `--stream-logs`: where installs send their
+/// boot logs, what prints here, and the file that keeps every line.
+fn stream_logs_summary(shown: StreamLogs, server: Ipv4Addr, file: &Path) -> String {
+    let file = file.display();
+    match shown {
+        StreamLogs::All => format!(
+            "  --stream-logs: installs send their boot logs to {server}:{NETLOG_PORT}; they print here as log <mac>: and go to {file}"
+        ),
+        StreamLogs::Units => format!(
+            "  --stream-logs=units: installs send their boot logs to {server}:{NETLOG_PORT}; the boot units' lines and kernel panics print here as log <mac>:, and every line goes to {file}"
+        ),
+    }
+}
+
 fn print_summary(
     options: &NetbootOptions,
     interface: &Interface,
@@ -581,15 +599,12 @@ fn print_summary(
             macs.join(", ")
         );
     }
-    if options.stream_logs {
-        println!(
-            "  --stream-logs: installs send their boot logs to {server}:{NETLOG_PORT}; they print here as log <mac>: and go to {}",
-            options
-                .directory
-                .join(netlog::LOGS_DIRECTORY)
-                .join("<mac>.log")
-                .display()
-        );
+    if let Some(shown) = options.stream_logs {
+        let file = options
+            .directory
+            .join(netlog::LOGS_DIRECTORY)
+            .join("<mac>.log");
+        println!("{}", stream_logs_summary(shown, server, &file));
     }
     if std::io::stdin().is_terminal() {
         println!("  a machine whose disk isn't blank asks here first: answer y to wipe it");
@@ -633,6 +648,20 @@ mod tests {
         );
         let morning = jiff::civil::time(9, 5, 3, 999_999_999);
         assert_eq!(stamped(morning, "http: done"), "09:05:03 http: done");
+    }
+
+    #[test]
+    fn the_summary_says_what_prints_and_where_every_line_goes() {
+        let server = Ipv4Addr::new(10, 42, 0, 1);
+        let file = Path::new("os/logs/<mac>.log");
+        assert_eq!(
+            stream_logs_summary(StreamLogs::All, server, file),
+            "  --stream-logs: installs send their boot logs to 10.42.0.1:6666; they print here as log <mac>: and go to os/logs/<mac>.log"
+        );
+        assert_eq!(
+            stream_logs_summary(StreamLogs::Units, server, file),
+            "  --stream-logs=units: installs send their boot logs to 10.42.0.1:6666; the boot units' lines and kernel panics print here as log <mac>:, and every line goes to os/logs/<mac>.log"
+        );
     }
 
     /// A server that dies is a failure of the whole run, so `relish

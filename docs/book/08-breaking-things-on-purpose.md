@@ -1495,6 +1495,97 @@ runs the signalling step that `stop` and `kill` share. Before the fix it failed
 on every run on macOS with `Operation not permitted`; afterwards the original
 test passed 400 loaded iterations in a row.
 
+### Answer everyone who's waiting
+
+The owner is single-threaded on purpose: one loop does everything, so nothing
+in it needs a lock. Each turn it accepts a client, checks whether the workload
+has exited, polls its exec helpers and sleeps 10 ms. For a long time "accepts
+a client" meant exactly one, and that was the bug behind
+[#2236](https://github.com/reliaburger/reliaburger/issues/2236).
+
+`job_recovery::killed_bun_retires_api_exec_and_adopts_the_original_workload`
+failed now and then on a loaded Mac. It polls `/v1/status` until the job's
+pid is known, once before it kills Bun and once after Bun recovers, and for a
+full minute every answer said `runtime_unknown: true`. Either wait could fail,
+so the crash had nothing to do with it. We looped the test under six busy
+loops with a temporary log line in the status reader. Every read of the pid,
+the exit code and the liveness check ran into its 500 ms deadline, poll after
+poll.
+
+A status answer asks the owner three questions at once, one connection each.
+On a quiet machine a turn takes about 10 ms, so the third answer comes back in
+30. On a busy one, a background-priority helper's 10 ms sleep can last far
+longer, and the third question waited out the deadline. The status reader
+moved on, but the blocking thread it had started didn't: it kept its
+connection in the owner's queue for up to two seconds. The next poll's three
+questions queued behind those. Once the owner fell behind, every later request
+waited behind abandoned ones, and the pid stayed unknown while anyone kept
+asking. It's a small congestion collapse: the load that caused it went on
+long after the slow moment had passed.
+
+`relish status` would have shown the same `?` for the pid on a real node, so
+we fixed the owner rather than the test. Each turn now answers every client
+already waiting, up to 32:
+
+```rust
+fn serve_waiting_clients(
+    listener: &UnixListener,
+    mut serve: impl FnMut(UnixStream),
+) -> io::Result<usize> {
+    let mut served = 0;
+    while served < CLIENTS_PER_TURN {
+        match listener.accept() {
+            Ok((connection, _)) => {
+                serve(connection);
+                served += 1;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(served)
+}
+```
+
+The listener is non-blocking, so `accept` returns `WouldBlock` as soon as the
+queue is empty, and the turn goes back to watching the workload. The cap keeps
+a flood of clients from starving that watch. `impl FnMut(UnixStream)` takes
+any closure that can be called repeatedly and may change what it captures.
+The owner passes one that borrows its exec list mutably and calls `respond`.
+That indirection is what makes the change testable. The unit tests connect
+three clients, or 34, to a real socket and call the function once with a
+counting closure. Before the fix they got one answer per turn, every time.
+Under six busy loops, with the Studio's load average between 17 and 55, the
+integration test had failed 21 times in 200 runs. With the fix it passed 300
+of 300, at loads up to 58, and the median run got quicker too, from 9.5 s to
+3.2 s in the first pair of loops.
+
+A review of the 0.3.3 train found the cap was the wrong unit
+([#2304](https://github.com/reliaburger/reliaburger/issues/2304)). `respond`
+gives each client 100 ms to send its request and 100 ms to take the answer, so
+32 slow clients could hold one turn for 6.4 s. All that time the owner isn't
+checking for cancellation, so a SIGKILL Bun asked for waits, and neither does
+it reap orphans or notice the workload exit. It's mostly theoretical, because
+a client that gives up closes its socket and `respond` returns at once, but
+a turn should be bounded by what it costs, not by how many clients it saw. So
+the loop now stops at whichever comes first, 32 clients or 250 ms:
+
+```rust
+let started = Instant::now();
+let mut served = 0;
+while served < CLIENTS_PER_TURN && started.elapsed() < TURN_BUDGET {
+```
+
+The check comes before each `accept`, so a client already being answered
+finishes; a turn ends within 250 ms plus one client's 200 ms. Clients left in
+the queue aren't dropped: the kernel holds them until the next turn, 10 ms
+later. And #2236's benefit stays, because a quick answer takes well under a
+millisecond: two new tests pin both sides. One queues 32 clients and serves
+each with a 100 ms sleep, and the turn must stop early, well short of 3.2 s,
+with the rest served next turn. The other serves 32 quick ones and they must
+all go in one turn. `Instant` is `std::time::Instant`, a monotonic clock, so
+a wall-clock jump can't stretch or cut a turn.
+
 ### Kill the shell before its children
 
 Both fallbacks above answered "why did the signal fail?". The next macOS
@@ -1690,6 +1781,133 @@ nothing else can stop the workload either. The regression tests are
 `tests/suite/paused_workloads.rs`, which pauses and resumes a real owned
 workload and checks the reads `relish status` makes, then stops it, once after
 the pause is cleared and once while it's still in force.
+
+That heartbeat test later failed in a way that taught us more about our
+tests than about pauses
+([#2315](https://github.com/reliaburger/reliaburger/issues/2315)). The
+workload's loop runs `sleep 0.05` over and over, so `workload_pids` often
+names a `sleep` that has exited by the time the signal goes out. `kill`
+answers `ESRCH` (no such process), and the test's `.unwrap()` panicked. That
+was one flake. The damage came next: the panic skipped the test's own
+cleanup, so its container kept running, and with it the network namespace,
+the veth and the route to its address. Every test runtime hands out the same
+first address, so fourteen of the next sixteen container tests failed to add
+that route with `RTNETLINK answers: File exists`.
+
+The pause fix copies Smoker, which already skips a pid it can't signal: the
+test pauses what's still there, treats `ESRCH` as "already gone", and fails
+on any other error. It now also requires the container's init, the shell that
+lives for the whole test, to be among the paused, so skipping a pid can't
+hide a pause that froze nothing.
+
+The leak fix is a guard. In Rust, a value's `Drop` runs when it goes out of
+scope, and that includes a panic unwinding past it, so a cleanup in `Drop`
+runs on a failure as surely as on a pass. Go's `defer` and Python's `finally`
+do the same job, but you have to remember to write them at each call site;
+here the type carries it. `RuncRoot` wraps the temporary directory a test's
+runtime lives in, and its `Drop` kills that root's runc containers and
+deletes the namespaces and veths its address pool reserved, before the
+directory itself goes:
+
+```rust
+pub struct RuncRoot {
+    // Fields drop in declaration order, so the residue goes before the
+    // directory that names it.
+    residue: RuncResidue,
+    directory: tempfile::TempDir,
+}
+```
+
+The order matters. A struct's fields drop in the order they're declared,
+while a function's local variables drop in reverse. Had the directory gone
+first, runc would have lost the state it needs to find the containers.
+
+A panic is the easy case, though. A test that nextest kills for running too
+long gets no unwinding and no `Drop`. So every new guard first sweeps up after
+such tests: each guard holds a file lock in its root, the kernel releases it
+when the process dies however it dies, and a root whose lock is free has lost
+its owner. The sweep releases those roots, then any `rb-rbtest-*` namespace
+that no live guard's pool names. `runc_a_panicking_test_leaves_no_container_or_network_behind`
+panics with a container running and checks that nothing is left, and two
+more tests leave a container behind the way an unguarded panic and a SIGKILL
+would, then start a container that takes the same address.
+
+That last rule, "no live guard names it", turned out to be one step too
+eager ([#2332](https://github.com/reliaburger/reliaburger/issues/2332)).
+`owned_network_setup_and_forwarding_retire_through_the_generation` makes its
+namespace itself, with no runtime root and so no guard, and it started
+failing about three runs in four with `Cannot open network namespace`: the
+namespace vanished between two steps of its own setup. Nextest runs every
+runc and network test one at a time, so no other runc test could have swept
+it. But the leader-loss test on host processes runs outside that group (its
+name says `cgroup_`, not `runc_`), and it sweeps before it starts. Name
+alone said "stale"; the namespace was seconds old.
+
+A name nobody claims isn't evidence that its owner is dead. So the fix gives
+those tests a claim, `TestNamespaces`, with the same proof of life as
+`TestCgroups`: a registry file named after the owning process ID and its
+start time. The sweep releases a claimed namespace only once that process
+has gone, and an unclaimed one only once it is older than two minutes,
+which it reads from the namespace file's modification time. That time comes
+from the kernel's namespace inode, which is stamped when `ip netns add`
+mounts it and never changes after. A test that registers before it makes
+its namespace can never lose it to a sweep, and an unguarded test that runs
+for less than two minutes can't either.
+
+The same full runs turned up an older flake in a reusable runc executor
+test, which parsed `printf '%s' "$!"`, the PID of a job it had just put in
+the background, and sometimes got `ParseIntError`. The shell forks the job
+first and applies its `>/dev/null` afterwards, in the child. For that moment
+the child holds the command's output pipe, and on a busy host the moment can
+outlast the command. The executor waits only 10 ms for a silent pipe after
+the command exits, then stops and appends
+`[reliaburger: output written after exit truncated]` to stderr, because
+silence is no proof the writer has finished
+([#715](https://github.com/reliaburger/reliaburger/issues/715)). The test,
+not the executor, was wrong: it now reads the PID from the first line and
+accepts that marker after it, and nothing else.
+
+Even passing tests left something behind, though
+([#2322](https://github.com/reliaburger/reliaburger/issues/2322)). A cgroup v2
+group is a directory, and it stays when its last process exits: the kernel
+only removes it when someone calls `rmdir`. Bun removes the leaves it knows
+about, but the namespace and app groups above them stayed. A passing
+`make test-linux` left about 29 empty groups, and our shared test VM had
+gathered more than 700. Harmless one at a time, unbounded over months.
+
+The fix is another guard, `TestCgroups`, which claims the cgroups one test
+makes and removes them in its `Drop`, deepest first. It never has to decide
+whether a group is still in use: `rmdir` on a cgroup that still has
+processes fails with `EBUSY`, so the kernel makes that call for us, and the
+guard just retries for a few seconds while the last processes exit. The
+sweep is more careful, because it cleans up after other tests. It only looks
+at names tests own (`rbtest-*` and `cap-tmp*`), only removes a group with no
+processes anywhere in it (`populated 0` in its `cgroup.events`), and skips
+any group a live guard claims. "Live" here is a registry file naming the
+guard's process ID and that process's start time from `/proc/<pid>/stat`, so
+a recycled process ID doesn't keep a dead test's claim alive.
+
+One more rule keeps the sweep from removing a group a test made a moment
+ago and hasn't put a process in yet: the whole tree must have gone two
+minutes without changing, by its directories' modification times. The
+sweep's own test fakes that age by setting the times an hour back, and it
+failed now and then in CI
+([#2356](https://github.com/reliaburger/reliaburger/issues/2356)) with one
+stale group kept and the rest swept. The kernel had moved the time forward
+again. Enabling a controller in a parent, as runc does in every parent of a
+container's cgroup, adds that controller's files to each child group, and
+adding a file to a directory updates its modification time. A runc test
+starting beside the sweep test made the stale group look brand new. The
+sweep was right to keep it by its own rule, so the fix is in the test: it
+enables every offered controller in those parents before it ages anything,
+and enabling a controller that's already on adds nothing.
+
+The file lives in `tests/support/` and uses only the standard library,
+because two kinds of tests include it. An integration test pulls it in with
+`#[path = "support/test_cgroups.rs"] mod test_cgroups;`, and the library's
+own unit tests do the same from `src/lib.rs` under `#[cfg(test)]`. The
+`#[path]` attribute tells the compiler where a module's file is when it isn't
+where the module's name says, which lets one file serve both.
 
 ### A signal is not proof of exit
 
@@ -2302,6 +2520,79 @@ let reason = match crate::pickle::registry_auth::repository_namespace(&destinati
 `match` with a guard (`if dest_namespace == namespace`) picks the first arm whose pattern fits *and* whose guard holds, so the happy path returns early and every other arm builds the reason for one way of being wrong. `repository_namespace` is the registry's own rule for placing a repository, the one a scoped `docker push` meets, so `cache/myapp` and `production//myapp` are refused here for the same reasons they're refused there.
 
 The check lives in `config::build::check_destination_namespace`, and two places call it. `relish build` runs it as part of config validation, so you hear about it before your context uploads. `POST /v1/build` runs it again before anything else, with or without a council, because the API is where the trust decision is made: a raw `curl` never meets `relish`'s validation. A build with no `namespace` is still held only by its caller's token, so an unscoped admin can build a shared, bare-named image. Layer caching is deferred to Phase 12.
+
+## Space invaders with live ammunition
+
+Every appliance has a monitor, and every monitor shows the console dashboard from chapter 15a. Hidden behind its `7` key is a game: one invader for each app instance on the node, labelled with the instance's id. Shoot one and it pops. That's all it does, unless the cluster has turned on *kill mode*, and then shooting `web-0` kills `web-0`. It's a toy, and it's also the most honest demo of chaos engineering we have: put a cluster on a table at a meetup, hand someone the keyboard, and watch the services they shoot come back.
+
+It's also a keyboard with no login attached to a cluster. Anyone who can reach the machine can press space. So the design starts from the question "who decides?", and the answer can't be "whoever is standing there".
+
+### The switch lives in the council
+
+Kill mode is one setting, `[appliance] console_chaos`, and it lives in the council, not in a node's `node.toml`. A switch in a node's own files is a switch for whoever has that node's disk. A switch in Raft is one only a cluster admin can flip, and every node agrees on it.
+
+We didn't need a new Raft request for it. `DesiredState` already has a small key-value map, `config`, written with `RaftRequest::ConfigSet`. The setting is the key `appliance.console_chaos`, and `src/appliance/settings.rs` is the only code that names it:
+
+```rust
+pub fn from_council(config: &HashMap<String, String>) -> Self {
+    Self {
+        console_chaos: config.get(CONSOLE_CHAOS_KEY).map(String::as_str) == Some("true"),
+    }
+}
+```
+
+`config.get` returns an `Option<&String>`, and `.map(String::as_str)` turns it into an `Option<&str>` so it can be compared with `Some("true")`. A missing key, `"yes"`, `"TRUE"` or anything else reads as off. Off is the answer for every case we didn't think of. Since no new request or state format went in, there's no compatibility bump either.
+
+`relish os settings --set FILE` reads an `[appliance]` section and posts it to `POST /v1/os/settings`. That route takes an unscoped cluster admin, as an OS rollout does; a follower passes it to the leader with the caller's own credential, and the leader audits it as `os.settings_set`. The struct has `#[serde(deny_unknown_fields)]`, so `console_choas = true` is an error, not a silent no.
+
+### One request, one shape
+
+The console reads the API as `__console`, a read-only principal (chapter 15a). Kill mode doesn't give it a new token or a new role. Instead, the fault route makes one exception, for one request at a time:
+
+```rust
+let mut auth = auth;
+if let Some(axum::Extension(context)) = auth.as_mut()
+    && crate::sesame::auth::is_console(context)
+{
+    if let Err(response) = admit_console_kill(&state, directory.as_deref(), &request).await {
+        return response;
+    }
+    *context = crate::sesame::auth::console_kill_context();
+}
+```
+
+`if let ... && ...` is a *let chain* (Rust 2024): the pattern has to match and the condition has to hold, and `context` is in scope for both. `auth.as_mut()` turns the `Option<Extension<AuthContext>>` the handler was given into an `Option<&mut Extension<AuthContext>>`, so `*context = ...` replaces the context in the handler's own copy. Axum hands every handler its extensions by value, so the change can't outlive this request: the next one from the console arrives read-only, as before.
+
+`admit_console_kill` refuses with 403 unless three things hold. The request must be exactly the one `relish fault kill --instance ID --node NODE` sends: a `Kill { count: 1 }` of a named instance, with no duration, no task index, `target_node` naming this node, and neither `include_leader` nor `override_safety`. That's `console_kill_refusal`, a plain function a unit test drives through every field. The instance must run on this node (more on that below). And the council must say `console_chaos = true`. A node with a Raft seat reads its own replica; a node without one asks the leader, with the service token and a five-second timeout; a standalone node has no council, so its answer is off. If the answer can't be had at all, the kill is refused: a setting we can't read is a setting that's off.
+
+Once admitted, the console is a `Deployer` for the rest of the handler, which is the whole point. Nothing after the gate knows it's a game. The node's own `[testing]` policy must allow `inject_workload_faults`, Smoker's replica rail applies, and the fault, the event and the audit record all say `injected_by = __console`. `relish fault list` shows it next to the faults people made.
+
+### The hole the review found
+
+The rule says "an instance on this node", and the first version only checked the request's fields. But Smoker's routing decides for itself whether a target is an app or a job, from what runs (an app relabelled as a job would step around the replica rail, #704), and a job's `--instance` is a task index. So a console request naming a job and `--instance 0` passed the shape check and would have killed task 0's attempt on this node. It was still one kill on this node, under every rail, but it wasn't the request the setting promised.
+
+The fix asks the node instead of trusting the request. Before admitting a kill, `admit_console_kill` asks the agent what runs here and refuses unless one instance has exactly that id, app and namespace. Instance ids look like `default__web-0`, with the namespace and a `__` in them, so one never parses as a task index, and the job path is closed as a side effect. The test for it is in the table of widening attempts: beside a counted kill, another node, a node fault, a lasting fault and both overrides, a job's task by index, an instance that doesn't run here, another app's instance and another namespace must each come back 403 with kill mode on.
+
+### A kill that hasn't landed yet
+
+The second review found a race that was never the console's alone. Smoker answers a kill once the signal is sent. The instance is dead a moment later, but the agent only notices when its sweep next looks, and until then the instance reads `running`. The replica rail counted running instances and active pauses; a kill was instantaneous, so it never stayed on the fault list. Kill `web-0` of a two-replica app, kill `web-1` within the second, and the rail saw two running replicas and nothing faulted, and let the second kill through. No replicas left. The CLI could do it too; a space bar only made it easy.
+
+So a kill now stays on its node's fault list for `KILL_SETTLE`, ten seconds, and the rail counts what's on the list:
+
+```rust
+pub fn replicas_out_of_service(fault_type: &FaultType) -> u32 {
+    match fault_type {
+        FaultType::Pause => 1,
+        FaultType::Kill { count: 0 } => KILL_ALL_REPLICAS,
+        FaultType::Kill { count } => *count,
+        _ => 0,
+    }
+}
+```
+
+Match arms are tried in order, so `Kill { count: 0 }` (every replica) is caught before the general `Kill { count }` binds the count. `KILL_ALL_REPLICAS` is `u16::MAX`: more replicas than any service has, but small enough that adding a few never overflows the `u32` the rail sums in (`fold(0, u32::saturating_add)` makes sure of that anyway). The same function serves the node's own registry and the cluster-wide evidence a routed kill is judged by, which reads each node's fault list over HTTP and recovers the type from its displayed form. A replica that restarts within the ten seconds counts as gone a little longer than it is, which only makes the rail stricter. The `relish fault list` line a kill leaves for those ten seconds is the visible side of it.
+
+The game keeps a rule of its own as well: in kill mode it holds fire while a kill is out. That isn't the protection any more; the server is. It's about what the screen says. The console gives bun ten seconds, and the server's path can take longer (a leader read, the cluster-wide evidence, the signal), so a timeout doesn't mean the kill failed. Only a 4xx is a clear no, which brings the invader back. A timeout, a dropped connection or a 5xx is `KillAnswer::Unknown`: the game says so, and holds fire until the workload list shows the instance has left `running` or restarted (its restart count moved), or 30 seconds have passed, by which time the server's own window has closed too.
 
 ## Lessons learned
 

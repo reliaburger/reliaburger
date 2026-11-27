@@ -90,6 +90,27 @@ pub const RULES: &[DecisionRule] = &[
         ],
     },
     DecisionRule {
+        id: "placement.jobs_yield_to_apps",
+        kind: DecisionKind::Placement,
+        meaning: "no node had free room for a replica, so the scheduler counted the room job \
+                  work holds as free and placed it there, on the node with the most room after \
+                  apps; that node's attempts and executors give the room back at their next \
+                  boundary, and nothing running is stopped",
+        evidence: &[
+            (
+                "<instance>",
+                "the node chosen, scored as for placement.scored but with job work's room \
+                 counted as free",
+            ),
+            ("wanted", "the replicas the app wants"),
+            (
+                "kept",
+                "replicas that stayed where they were, so weren't decided again",
+            ),
+            ("yielded", "replicas placed on room job work holds"),
+        ],
+    },
+    DecisionRule {
         id: "placement.daemon",
         kind: DecisionKind::Placement,
         meaning: "a daemon set runs one replica on every node that passes the filter; there's \

@@ -930,7 +930,8 @@ evaluates one.
   (`apply` or `gitops`). Nothing else.
 - **Commit checks.** `policy::check_policy`, run by `Config::validate`: a DNS
   label name, expressions of at most 1024 bytes, a message of at most 512,
-  valid CEL, only the three variables, and only known `app` and `caller`
+  valid CEL nested at most 32 deep (`MAX_EXPRESSION_NESTING`, checked before
+  the parser runs, because it recurses per level), only the three variables, and only known `app` and `caller`
   fields, and no more than two nested macros (`all`, `exists`, `exists_one`,
   `map`, `filter`; `MAX_COMPREHENSION_NESTING`). The `cel` crate has no cost
   limit, so evaluation is bounded by expression size times input size squared,
@@ -1085,7 +1086,11 @@ functions, one per kind of change:
   rollout. Claiming or releasing restarts nothing. A rollback keeps today's
   owner, whatever the old spec said.
 - **Reads.** `GET /v1/diagnostics/apps` carries `owner`, and a policy sees it
-  as `app.owner`. The JSON a controller reads and writes is documented in the
+  as `app.owner`. `GET /v1/apps/{app}/{namespace}/spec` reads one app's spec
+  back, as run and as declared, with every env value, config file content and
+  recognisable secret redacted on the leader before it answers
+  (`bun::spec_read`, #1322). `GET /v1/events` trims each node's events to a
+  scoped token's namespaces before the merge takes the newest `limit`. The JSON a controller reads and writes is documented in the
   manual's "Writing a controller" chapter and pinned by
   `src/bun/api/contract_tests.rs`.
 - **Scope.** A controller's token is a `deployer` scoped to its namespace; the

@@ -66,7 +66,11 @@ Ctrl-C stops the browser connection, leaving the cluster running. Use
 
 There is no Rust build and no repository checkout in the published path.
 Native macOS uses Apple's Virtualization.framework through Lima. Linux needs
-QEMU, KVM access and Lima's host prerequisites already installed. Allow at
+QEMU, KVM access and Lima's host prerequisites already installed. QEMU 10.2
+and later abort under Lima's `user-v2` network while io_uring is open to
+ordinary users ([#1495](https://github.com/reliaburger/reliaburger/issues/1495)),
+so setup refuses that combination; `sudo sysctl -w kernel.io_uring_disabled=1`,
+or QEMU 10.1 or older, gets you past it. Allow at
 least 8 GiB of available memory and 15 GiB of free disk for the default cluster;
 image download time also depends on your connection. The VMs don't install
 anything at first boot, so setup doesn't depend on Ubuntu's package mirrors. No host directories are mounted into the VMs. Managed Lima state lives under
@@ -89,6 +93,18 @@ source: the guest image ships with Ubuntu's time daemon (chrony on 26.04)
 disabled, and provisioning disables chrony or systemd-timesyncd on a stock
 Ubuntu image. With both running, they fought, and the guest clock jumped back
 about 0.1 s every 10 s.
+
+The VMs don't update themselves. The guest image ships with Ubuntu's
+`apt-daily.timer`, `apt-daily-upgrade.timer` and `unattended-upgrades` masked,
+and provisioning masks them on a stock image or an older guest image too.
+Where needrestart is installed, it's set to list the services it would restart
+and restart none. Left on, they upgraded libc in a guest and restarted Bun
+without warning: a short API outage, with every workload restarted
+([#2274](https://github.com/reliaburger/reliaburger/issues/2274)). A laptop
+cluster is disposable, and each release builds its guest image again from a
+pinned Ubuntu image, so the guest's packages change with releases, never under
+a running cluster. Security updates arrive with Reliaburger releases: upgrade
+`relish` and build a fresh cluster to pick them up.
 
 For a smaller single-node cluster:
 
@@ -244,14 +260,37 @@ RELIABURGER_HOME=/absolute/path/to/isolated-state \
 
 This bypasses release downloads for those two operator-supplied binaries. With
 no release to take the built guest image from, it boots the stock Ubuntu cloud
-image that image is built from, checked against its pinned SHA-256, and each VM
-installs the node packages from Ubuntu's mirrors at first boot: expect each
-boot to take 15–40 s longer, or much longer when the mirror is slow. The
-stock Ubuntu 26.04 image also can't name its network interface on its first
-boot, so setup restarts each VM once. If setup stops at its deadline, rerun
-the same command to resume. It still verifies the Lima archive. It prints a
-notice and does not count as qualification of a signed, downloadable release.
-Use the same `RELIABURGER_HOME` for subsequent CLI and lifecycle commands.
+image that image is built from, checked against its pinned SHA-256. That's
+much slower than a release. The stock Ubuntu 26.04 image can't name its
+network interface on its first boot (it renames `eth0` to `enp0s1` and
+stalls), so on a Mac the boot watchdog restarts each VM about 30 s in, with
+the note "restarted a VM whose console went silent". The second boot then
+installs the node packages from Ubuntu's mirrors, which took about 130 s on
+the Mac Studio: roughly 200 s per VM in all, or longer when the mirror is
+slow. A release image boots in about 65 s. If setup stops at its deadline,
+rerun the same command to resume. It still verifies the Lima archive. It
+prints a notice and does not count as qualification of a signed, downloadable
+release. Use the same `RELIABURGER_HOME` for subsequent CLI and lifecycle
+commands.
+
+To test a change to the guest image itself, boot one you built with
+`scripts/release/build_guest_image.sh` instead of the stock image. Name it,
+and the SHA-256 you expect it to have, in two environment variables:
+
+```sh
+RELIABURGER_HOME=/absolute/path/to/isolated-state \
+  RELIABURGER_DEV_GUEST_IMAGE=/absolute/path/to/guest-aarch64.qcow2 \
+  RELIABURGER_DEV_GUEST_IMAGE_SHA256="$(shasum -a 256 /absolute/path/to/guest-aarch64.qcow2 | cut -d' ' -f1)" \
+  target/debug/relish setup --quickstart \
+  --development-binaries /absolute/path/to/linux-binaries
+```
+
+The image must be for the host's architecture, since a laptop's VMs run its
+own. Setup hashes the file and refuses it unless the digest matches, then
+boots it with no package installs and no restart, like a release image. These
+variables are for development only: setup refuses them without
+`--development-binaries`, so a release quickstart always boots the signed
+release image.
 
 The [release runbook](releasing.md) lists the gates a candidate passes before
 it's published, including clean-host timing, interrupted setup, real container

@@ -446,5 +446,24 @@ class StrangerChecksTests(unittest.TestCase):
         self.assertIn("needs.build-binaries.result == 'success'", condition)
 
 
+class DraftTests(unittest.TestCase):
+    """A draft, or a 0-4-0/ branch, builds nothing until it's ready (24 November 2026)."""
+
+    def setUp(self):
+        self.text = WORKFLOW.read_text()
+
+    def test_ready_for_review_starts_the_builds(self):
+        triggers = self.text.split("\njobs:", 1)[0]
+        self.assertRegex(triggers, r"\n    types: \[[^\]]*ready_for_review[^\]]*\]\n")
+
+    def test_a_draft_or_a_0_4_0_branch_selects_no_build(self):
+        select = self.text[self.text.index("    name: select builds"):self.text.index("\n  ci-evidence:")]
+        self.assertIn("DRAFT: ${{ github.event.pull_request.draft == true }}", select)
+        self.assertIn("HEAD_REF: ${{ github.event.pull_request.head.ref }}", select)
+        guard = select[select.index('if [ "$DRAFT" = true ]'):]
+        self.assertIn('[[ "$HEAD_REF" == 0-4-0/* ]]', guard.splitlines()[0])
+        self.assertIn("pdf=false binaries=false guest_images=false profiling=false", guard)
+
+
 if __name__ == "__main__":
     unittest.main()

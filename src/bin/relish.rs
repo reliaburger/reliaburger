@@ -31,8 +31,10 @@ struct Cli {
     #[arg(long, global = true)]
     ca_cert: Option<PathBuf>,
 
-    /// Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default
-    /// local address (`http[s]://127.0.0.1:9117`).
+    /// Bun API base URL. Overrides `RELIABURGER_ENDPOINT`, the saved
+    /// context's endpoints (whose other nodes it falls over to when the
+    /// first doesn't answer) and the default local address
+    /// (`http[s]://127.0.0.1:9117`).
     #[arg(long, global = true, value_parser = parse_endpoint)]
     endpoint: Option<String>,
 
@@ -188,6 +190,12 @@ struct SetupOptions {
     #[arg(long, requires = "quickstart")]
     registry_port: Option<u16>,
     /// Use explicitly supplied Linux binaries for development before a release exists.
+    ///
+    /// Development only: such a run never qualifies a release. With
+    /// --quickstart, also set RELIABURGER_DEV_GUEST_IMAGE=<absolute path> and
+    /// RELIABURGER_DEV_GUEST_IMAGE_SHA256=<hex> to boot a locally built guest
+    /// image, checked against that digest, instead of the stock Ubuntu image.
+    /// A quickstart refuses those variables without this flag.
     #[arg(long, requires = "managed")]
     development_binaries: Option<PathBuf>,
     /// HTTPS directory containing unchanged signed release candidate assets.
@@ -684,6 +692,15 @@ enum Command {
         /// it, someone else's lease refuses the change, naming them.
         #[arg(long)]
         break_lease: bool,
+        /// Return once every app in the file runs its replicas, passes its
+        /// health checks and has finished rolling out, printing progress.
+        /// Exits 1 when one isn't ready in time, naming it and why; 3, 4 or
+        /// 5 when the apply itself failed.
+        #[arg(long, conflicts_with_all = ["dry_run", "rerun_jobs"])]
+        wait: bool,
+        /// How long --wait waits, as `90s`, `5m` or `1h` (default 5m).
+        #[arg(long, requires = "wait", value_name = "DURATION", value_parser = parse_wait_timeout)]
+        timeout: Option<std::time::Duration>,
     },
     /// Is the cluster all right? One screen: a verdict, then one line per part
     /// of the cluster with the command that lists the detail.
@@ -1166,10 +1183,20 @@ enum Command {
         mode_dhcp_proxy: bool,
         /// Have each install send the machine's kernel and boot logs here
         /// over UDP 6666, from the installer on and on every boot after,
-        /// and print them as `log <mac>:` lines. The lines cross the LAN in
+        /// and print them as `log <mac>:` lines: all of them, or with
+        /// --stream-logs=units only the boot units' lines (installer, boot
+        /// check, bun, seed, clock wait) and kernel panics. Every line goes
+        /// to DIR/logs/<mac>.log either way. The lines cross the LAN in
         /// cleartext.
-        #[arg(long)]
-        stream_logs: bool,
+        #[arg(
+            long,
+            value_name = "WHICH",
+            value_enum,
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "all"
+        )]
+        stream_logs: Option<reliaburger::relish::netboot::netlog::StreamLogs>,
         /// Trust only this key (ed25519:BASE64) instead of the release keys.
         /// Debug builds only, for tests.
         #[arg(long, hide = true)]
@@ -1643,10 +1670,37 @@ enum OsAction {
     },
     /// The rollout in progress, or the last one.
     Status,
+    /// The cluster's `[appliance]` settings, such as whether the console
+    /// invaders' kill mode is on, or change them: with --set, replace them
+    /// with a file's `[appliance]` section (admin only; audited; a key left
+    /// out is off).
+    Settings {
+        /// TOML file with an `[appliance]` section, such as
+        /// `console_chaos = true`.
+        #[arg(long, value_name = "FILE")]
+        set: Option<PathBuf>,
+    },
     /// Carry on with a paused rollout, retrying the node that stopped it.
     Resume,
     /// Stop the rollout; nodes keep the version they're on.
     Abort,
+    /// Where each appliance sends its kernel and boot logs over UDP, or
+    /// change it: with --to, to that machine from now on, where `relish
+    /// machines logs` or `relish netboot --stream-logs` shows them; with
+    /// --off, nowhere. The lines cross the LAN in cleartext. Each node keeps
+    /// the setting on its ESP, so it holds across reboots and OS updates.
+    BootLogs {
+        /// Send them to this machine: an IPv4 address, and a UDP port if
+        /// not 6666.
+        #[arg(long, value_name = "ADDRESS[:PORT]", conflicts_with = "off")]
+        to: Option<reliaburger::os::netlog::NetlogTarget>,
+        /// Stop sending them.
+        #[arg(long)]
+        off: bool,
+        /// Only this node (repeatable). Default: every node.
+        #[arg(long = "node", value_name = "NODE")]
+        nodes: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1725,6 +1779,18 @@ fn parse_ipxe(value: &str) -> Result<reliaburger::relish::netboot::IpxeBuild, St
         .map_err(|e: reliaburger::relish::netboot::NetbootError| e.to_string())
 }
 
+/// `relish apply --timeout`: `90s`, `5m`, `1h` or bare seconds, more than
+/// zero.
+fn parse_wait_timeout(value: &str) -> Result<std::time::Duration, String> {
+    match reliaburger::meat::deploy_types::parse_duration(value) {
+        Some(duration) if !duration.is_zero() => Ok(duration),
+        Some(_) => Err("must be longer than zero".to_string()),
+        None => Err(format!(
+            "{value:?} isn't a duration: write it as 90s, 5m or 1h"
+        )),
+    }
+}
+
 fn parse_netboot_duration(value: &str) -> Result<std::time::Duration, String> {
     reliaburger::relish::netboot::parse_duration(value).map_err(|e| e.to_string())
 }
@@ -1743,7 +1809,7 @@ async fn netboot(
     wipe: Vec<reliaburger::relish::netboot::MacAddress>,
     ipxe: reliaburger::relish::netboot::IpxeBuild,
     dhcp: reliaburger::relish::netboot::DhcpSetup,
-    stream_logs: bool,
+    stream_logs: Option<reliaburger::relish::netboot::netlog::StreamLogs>,
     trust_key: Option<String>,
 ) -> Result<(), reliaburger::relish::RelishError> {
     use reliaburger::relish::netboot::{self, InterfaceChoice, NetbootOptions};
@@ -2555,11 +2621,26 @@ async fn main() -> ExitCode {
             dry_run,
             rerun_jobs,
             break_lease,
+            wait,
+            timeout,
         } => match reliaburger::relish::manifest::ManifestSource::parse(
             // The ArgGroup makes exactly one of the two present.
             path.as_deref().or(file.as_deref()).unwrap_or_default(),
         ) {
             Err(error) => Err(error),
+            Ok(source) if wait => {
+                use reliaburger::relish::apply_wait;
+                let timeout = timeout.unwrap_or(apply_wait::DEFAULT_TIMEOUT);
+                // Like `status`: a failure exits 3, 4 or 5, never 1, which
+                // means "applied, not ready in time".
+                return match apply_wait::run(&source, cli.output, break_lease, timeout).await {
+                    Err(error) => {
+                        report(&error);
+                        ExitCode::from(apply_wait::failure_exit_code(&error))
+                    }
+                    outcome => finish_outcome(outcome),
+                };
+            }
             Ok(source) if rerun_jobs => commands::rerun_jobs(&source, cli.output).await,
             Ok(source) => commands::apply(&source, cli.output, dry_run, break_lease).await,
         },
@@ -3670,8 +3751,20 @@ async fn main() -> ExitCode {
                 }
             },
             OsAction::Status => reliaburger::relish::os::status(cli.output).await,
+            OsAction::Settings { set: None } => reliaburger::relish::os::settings(cli.output).await,
+            OsAction::Settings { set: Some(path) } => {
+                reliaburger::relish::os::set_settings(&path, cli.output).await
+            }
             OsAction::Resume => reliaburger::relish::os::resume(cli.output).await,
             OsAction::Abort => reliaburger::relish::os::abort(cli.output).await,
+            OsAction::BootLogs { to, off, nodes } => {
+                reliaburger::relish::os::boot_logs(
+                    reliaburger::relish::os::BootLogsRequest::from_flags(to, off),
+                    &nodes,
+                    cli.output,
+                )
+                .await
+            }
         },
         Command::JoinToken { action } => match &action {
             JoinTokenAction::List => commands::join_token_list(cli.output).await,
@@ -4341,7 +4434,7 @@ fn report(error: &reliaburger::relish::RelishError) {
         RelishError::AgentUnreachable {
             cause: UnreachableCause::Refused | UnreachableCause::TimedOut,
             ..
-        }
+        } | RelishError::NoEndpointAnswered { .. }
     ) && !reliaburger::relish::client::endpoint_overridden()
         && let Some(hint) = reliaburger::relish::quickstart::server_runner::unreachable_hint()
     {
@@ -5005,6 +5098,40 @@ mod tests {
     }
 
     #[test]
+    fn os_boot_logs_takes_a_target_or_off_but_not_both() {
+        let boot_logs = |args: &[&str]| match parse(args).unwrap().command {
+            Command::Os {
+                action: OsAction::BootLogs { to, off, nodes },
+            } => (to.map(|t| t.to_string()), off, nodes),
+            _ => panic!("not os boot-logs"),
+        };
+        assert_eq!(
+            boot_logs(&["relish", "os", "boot-logs"]),
+            (None, false, vec![])
+        );
+        assert_eq!(
+            boot_logs(&["relish", "os", "boot-logs", "--to", "10.42.0.1"]),
+            (Some("10.42.0.1:6666".to_string()), false, vec![])
+        );
+        assert_eq!(
+            boot_logs(&[
+                "relish",
+                "os",
+                "boot-logs",
+                "--off",
+                "--node",
+                "home-1",
+                "--node",
+                "home-2"
+            ]),
+            (None, true, vec!["home-1".to_string(), "home-2".to_string()])
+        );
+        assert!(parse(&["relish", "os", "boot-logs", "--to", "10.42.0.1", "--off"]).is_err());
+        assert!(parse(&["relish", "os", "boot-logs", "--to", "laptop.local"]).is_err());
+        assert!(parse(&["relish", "os", "boot-logs", "--to", "10.42.0.1:0"]).is_err());
+    }
+
+    #[test]
     fn os_upgrade_takes_a_lab_key_only_when_it_reads_the_channel() {
         let upgrade = |args: &[&str]| match parse(args).unwrap().command {
             Command::Os {
@@ -5584,7 +5711,7 @@ mod tests {
     fn parse_apply_command() {
         let cli = parse(&["relish", "apply", "config.toml"]).unwrap();
         assert!(
-            matches!(cli.command, Command::Apply { ref path, file: None, dry_run: false, rerun_jobs: false, break_lease: false } if path.as_deref() == Some("config.toml"))
+            matches!(cli.command, Command::Apply { ref path, file: None, dry_run: false, rerun_jobs: false, break_lease: false, wait: false, timeout: None } if path.as_deref() == Some("config.toml"))
         );
     }
 
@@ -5611,6 +5738,35 @@ mod tests {
             parse(&["relish", "apply", "a.toml", "-f", "b.yaml"]).is_err(),
             "one manifest at a time"
         );
+    }
+
+    /// #2240: `--wait` takes no value, so `apply --wait app.toml` reads
+    /// the file as the manifest; `--timeout` bounds it and needs it.
+    #[test]
+    fn parse_apply_wait_and_its_timeout() {
+        let cli = parse(&["relish", "apply", "--wait", "app.toml"]).unwrap();
+        assert!(
+            matches!(cli.command, Command::Apply { ref path, wait: true, timeout: None, .. } if path.as_deref() == Some("app.toml"))
+        );
+        let cli = parse(&["relish", "apply", "app.toml", "--wait", "--timeout", "90s"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Apply { wait: true, timeout: Some(timeout), .. } if timeout == std::time::Duration::from_secs(90)
+        ));
+        let cli = parse(&["relish", "apply", "app.toml", "--wait", "--timeout", "10m"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Apply { timeout: Some(timeout), .. } if timeout == std::time::Duration::from_secs(600)
+        ));
+        for refused in [
+            &["relish", "apply", "app.toml", "--timeout", "5m"][..],
+            &["relish", "apply", "app.toml", "--wait", "--timeout", "soon"],
+            &["relish", "apply", "app.toml", "--wait", "--timeout", "0s"],
+            &["relish", "apply", "app.toml", "--wait", "--dry-run"],
+            &["relish", "apply", "app.toml", "--wait", "--rerun-jobs"],
+        ] {
+            assert!(parse(refused).is_err(), "{refused:?}");
+        }
     }
 
     #[test]
@@ -6579,7 +6735,10 @@ mod tests {
         else {
             panic!("expected netboot");
         };
-        assert!(!stream_logs, "boot logs cross the LAN in cleartext: opt-in");
+        assert_eq!(
+            stream_logs, None,
+            "boot logs cross the LAN in cleartext: opt-in"
+        );
         assert_eq!(dir, PathBuf::from("os"));
         assert_eq!((interface, address), (None, None));
         assert_eq!(http_port, 8080);
@@ -6596,11 +6755,38 @@ mod tests {
 
     #[test]
     fn netboot_streams_boot_logs_when_asked() {
-        let cli = parse(&["relish", "netboot", "os", "--stream-logs"]).unwrap();
-        let Command::Netboot { stream_logs, .. } = cli.command else {
-            panic!("expected netboot");
+        use reliaburger::relish::netboot::netlog::StreamLogs;
+        let stream_logs = |args: &[&str]| {
+            let cli = parse(args).unwrap();
+            let Command::Netboot {
+                dir, stream_logs, ..
+            } = cli.command
+            else {
+                panic!("expected netboot");
+            };
+            (dir, stream_logs)
         };
-        assert!(stream_logs);
+        let os = PathBuf::from("os");
+        // No value: every line, as before.
+        assert_eq!(
+            stream_logs(&["relish", "netboot", "os", "--stream-logs"]),
+            (os.clone(), Some(StreamLogs::All))
+        );
+        assert_eq!(
+            stream_logs(&["relish", "netboot", "os", "--stream-logs=all"]),
+            (os.clone(), Some(StreamLogs::All))
+        );
+        assert_eq!(
+            stream_logs(&["relish", "netboot", "os", "--stream-logs=units"]),
+            (os.clone(), Some(StreamLogs::Units))
+        );
+        // The value needs `=`, so a directory after the flag stays the
+        // directory.
+        assert_eq!(
+            stream_logs(&["relish", "netboot", "--stream-logs", "lab"]),
+            (PathBuf::from("lab"), Some(StreamLogs::All))
+        );
+        assert!(parse(&["relish", "netboot", "os", "--stream-logs=kernel"]).is_err());
     }
 
     #[test]

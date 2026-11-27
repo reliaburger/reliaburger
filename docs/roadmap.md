@@ -528,13 +528,15 @@ migration and no feature gate
   claiming machines over the LAN, signed OS builds with A/B updates (built
   weekly once v0.3.0 is out),
   and the quickstart guest on Ubuntu 26.04. The claim flow is designed so the
-  fleet control plane can extend it later. Alongside it: the acceptance gates
-  0.1.0 didn't close (V01–V04, below) and WebSocket drain parity (F08,
-  [#369](https://github.com/reliaburger/reliaburger/issues/369)). Exit test:
-  three Dell Wyse 3040s from power-on to a cluster
-  ([#407](https://github.com/reliaburger/reliaburger/issues/407)), which runs
-  on the release's artefacts in parallel with it: the maintainer chose not to
-  hold the tag for it. Candidate 4 passed the full gate but for one
+  fleet control plane can extend it later. Alongside it: WebSocket drain
+  parity (F08, [#369](https://github.com/reliaburger/reliaburger/issues/369),
+  by [#1661](https://github.com/reliaburger/reliaburger/pull/1661)). Two of
+  the acceptance gates 0.1.0 didn't close (below) missed it: V01 passed later
+  on the 0.3.2 Wyse lab, and the V02 leftovers moved to 0.3.3.
+  Exit test: three Dell Wyse 3040s from power-on to a cluster
+  ([#407](https://github.com/reliaburger/reliaburger/issues/407), now in
+  0.3.3), which runs on the release's artefacts in parallel with it: the
+  maintainer chose not to hold the tag for it. Candidate 4 passed the full gate but for one
   catalogue deploy that stalled for its 5-minute deadline after a disk fault
   in the 8-hour final, accepted as a known issue
   ([#2128](https://github.com/reliaburger/reliaburger/issues/2128), in 0.3.1;
@@ -575,6 +577,29 @@ migration and no feature gate
   [release log](release-log.md#032-wyse-lab-fixes)). 0.3.2 moves the wire
   protocol from 60 to 61, so a 0.3.1 cluster starts afresh
   ([upgrading from 0.3.1](releasing.md#upgrading-from-031)).
+- [x] **0.3.3: loose ends before outside testers.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.3)
+  on 27 November 2026
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/36)).
+  A patch release before outside testers arrive: the bugs they would see,
+  Buildah on the appliance
+  ([#2144](https://github.com/reliaburger/reliaburger/issues/2144)), a
+  first appliance console
+  ([#2150](https://github.com/reliaburger/reliaburger/issues/2150)), boot
+  logs you can turn on and off from `relish`
+  ([#2149](https://github.com/reliaburger/reliaburger/issues/2149)) and a
+  context that falls over to another node
+  ([#2241](https://github.com/reliaburger/reliaburger/issues/2241)).
+  Candidate 1 passed the full gate (the agent loop changed) clean, with no
+  known issue accepted; the quiet macOS upgrade-node loop passed 115 of 115
+  for the V02 leftovers
+  ([#287](https://github.com/reliaburger/reliaburger/issues/287), in
+  0.3.4). The Wyse lab didn't run on the candidate: the maintainer chose to
+  release without it, and its exit test
+  ([#407](https://github.com/reliaburger/reliaburger/issues/407)) runs on
+  the release's artefacts, in 0.3.4
+  ([closure](qualification/2026-11-27-v0.3.3-release-closure.md)). 0.3.3
+  keeps 0.3.2's cluster formats, so a 0.3.2 cluster rolls onto it in place
+  ([upgrading from 0.3.2](releasing.md#upgrading-from-032)).
 - [ ] **0.4.0: "Planned maintenance"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/7),
   [review](plans/2026-11-19-review-0.4.x.md),
@@ -589,7 +614,7 @@ migration and no feature gate
   rolling OS update of three appliance nodes, where a volume app keeps every
   acknowledged write and no instance dies without its stop hook. The
   [0.4.x review](plans/2026-11-19-review-0.4.x.md) of 19 November 2026 set
-  this order for 0.4.0 to 0.4.5. Next.
+  this order for 0.4.0 to 0.4.5. Next after 0.3.3.
 - [ ] **0.4.1: "The front door"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/13)). ACME certificates for the ingress ([#1667](https://github.com/reliaburger/reliaburger/issues/1667),
   [plan](plans/2026-11-06-plan-f08-acme.md)), an ingress address that fails
@@ -723,11 +748,19 @@ What's still missing, with its issue where one exists. The
 what's shipped and what's scheduled.
 
 - **Acceptance gates 0.1.0 didn't close.** V01, the live catalogue on three
-  independent runc nodes ([#286](https://github.com/reliaburger/reliaburger/issues/286));
-  the V02 leftover, the snapshot uploader under power cuts
-  ([#287](https://github.com/reliaburger/reliaburger/issues/287); the
-  `v02-loops` bounds are [recorded](qualification/2026-11-12-v02-loops-bounds.md)),
-  in 0.3.0. V04, the cold installs on Linux x86_64 and arm64
+  independent runc nodes
+  ([#286](https://github.com/reliaburger/reliaburger/issues/286)), missed
+  0.3.0 and passed on three Wyse 3040s running 0.3.2 on 23 November 2026
+  ([lab record](qualification/2026-11-20-wyse-3040.md)). The V02 leftovers
+  ([#287](https://github.com/reliaburger/reliaburger/issues/287)) are in
+  [0.3.3](https://github.com/reliaburger/reliaburger/milestone/36): the
+  snapshot uploader passed 20 of 20 power cuts on Btrfs
+  ([record](qualification/2026-11-23-power-cut-volumes.md),
+  [#2227](https://github.com/reliaburger/reliaburger/pull/2227)), and the
+  `v02-loops` bounds, first
+  [recorded](qualification/2026-11-12-v02-loops-bounds.md) on 12 November,
+  are being recorded again this week. V04, the cold installs on Linux x86_64
+  and arm64
   ([#288](https://github.com/reliaburger/reliaburger/issues/288)), passed on
   the published 0.2.8 on 12 November 2026: a ready cluster in a median 84.8 s
   and 83.2 s ([record](qualification/2026-11-12-v04-cold-installs-linux.md)).
@@ -741,9 +774,12 @@ what's shipped and what's scheduled.
   [0.1.5](https://github.com/reliaburger/reliaburger/milestone/11) (F05 I2, landed),
   [0.1.6](https://github.com/reliaburger/reliaburger/milestone/12) (F03a,
   F04 R1–R4, F05 I3–I4, landed),
-  [0.3.0](https://github.com/reliaburger/reliaburger/milestone/6) (F08),
+  [0.3.0](https://github.com/reliaburger/reliaburger/milestone/6) (F08's
+  WebSocket drain and proxy headers, landed),
   [0.4.0](https://github.com/reliaburger/reliaburger/milestone/7) (F10's
-  volume retirement, [#2121](https://github.com/reliaburger/reliaburger/issues/2121)) and
+  volume retirement, [#2121](https://github.com/reliaburger/reliaburger/issues/2121)),
+  [0.4.1](https://github.com/reliaburger/reliaburger/milestone/13) (F08's
+  ACME certificates, [#1667](https://github.com/reliaburger/reliaburger/issues/1667)) and
   [Later](https://github.com/reliaburger/reliaburger/milestone/9) (F02,
   F06, F09, F11, the rest of F03–F05, and F10's Apple runtime). F01
   ([#359](https://github.com/reliaburger/reliaburger/issues/359)) moves to

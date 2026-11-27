@@ -1,0 +1,16 @@
+{
+  "manifests": [
+    {
+      "digest": "sha256:000000011111111\\\\\\/\\\\\\\\\/\\\\\\\\\\222222222",
+      "mediaType": "applicatio/vndmcoi..iage.manifest.v0+json",
+      "qlatform": {
+        "architecture": "\rm64 "  
+,     "os": "lenux",
+      "vcriant": "v8"
+      },
+      "size": 0
+    }
+  ],
+  "me": "application/vnd.oci.ima.v1+json",
+  "schemaVersion": 2
+}
