@@ -1953,6 +1953,25 @@ Four changes close it. The scraper now treats a name the node writes itself the 
 
 The pattern `Firing { since, missed }` binds both fields by reference, because we're matching on `&AlertState`; `*since` copies the `SystemTime` out, and `missed + 1` works on a `&u32` because the arithmetic operators are implemented for references to numbers too. Arms that don't care about the count write `Firing { since, .. }`, where `..` means "and any other fields", so adding the field touched only the arms that build a `Firing`. One reading resets the count, so a gap of a scrape or two still can't resolve an alert. Fourth, Bun hands each evaluation's transitions to `WebhookDispatcher::dispatch_all`, which runs them through `for_each_concurrent`, and every delivery takes a permit from a semaphore the dispatcher's clones share, so at most `MAX_CONCURRENT_DISPATCHES` (8) posts run at once however many evaluations overlap.
 
+### What an alert remembers across a restart
+
+The evaluator's states lived in memory, so every Bun restart started every alert at Inactive (#2478). A disk at 85% fired `disk_high` and paged someone; they freed space and upgraded the cluster, which restarts Bun; afterwards the disk read 60%, Inactive plus an in-range reading is no transition, and the incident stayed open on the pager while `GET /v1/alerts` showed nothing firing. Every self-upgrade restarts Bun, so this wasn't rare.
+
+Now Bun keeps the firing alerts in `<data dir>/alerts-firing.json`: rule name, labels and the Unix second it started firing. It saves the file after any evaluation that produced a transition and restores it at start-up, before the first evaluation, skipping rules that no longer exist. Only firing state is worth keeping. A pending alert that restarts its timer fires a little later, which costs nothing; a firing one that's forgotten never resolves. A restored alert that never gets another reading still resolves after `MAX_MISSED_EVALUATIONS`. We considered sending a blanket "resolved" for every rule at start-up instead, and rejected it: it closes incidents whose condition still holds, and they don't come back until the rule's `for` window passes again.
+
+The record is its own small type, separate from `AlertState`:
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FiringRecord {
+    rule_name: String,
+    labels: BTreeMap<String, String>,
+    since_unix_secs: u64,
+}
+```
+
+`AlertState` holds a `SystemTime`, which serde can serialise but in a shape that's awkward to read; storing whole seconds since the Unix epoch keeps the file obvious to a human with `cat`. The file is written atomically, through a temporary file and a rename, and the write runs under `spawn_blocking` because file I/O blocks. Bun awaits it before the next evaluation, so two saves can't land out of order. A file that's missing or doesn't parse restores nothing, with a line on stderr: before 1.0 there's no migration, and a bad file mustn't stop Bun starting. It's node-local state, not Raft state or a wire format, so the compatibility version doesn't change. `a_resolve_reaches_the_webhook_after_a_restart` fires an alert against a local webhook receiver, saves, builds a fresh evaluator from the file, feeds it an in-range reading and checks the receiver got `firing` then `resolved`.
+
 ### A test that passed for the wrong reason
 
 A dependency advisory flagged the Thrift crate that Parquet used to decode file metadata: a crafted length could make it reserve absurd amounts of memory. Parquet 59 replaced Thrift with its own decoder, and DataFusion 55 uses Parquet 59, so we upgraded DataFusion by ten major versions. It changed two lines of ours, because we never name `parquet` in `Cargo.toml`; we use DataFusion's re-export (`datafusion::parquet::...`) and always get the version DataFusion was built against. We kept regression tests that corrupt a real Parquet file's metadata and check that the reader refuses it.

@@ -5,6 +5,7 @@
 //! cover the most common failure modes.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::Path;
 
 use super::types::MetricKey;
 use std::time::{Duration, SystemTime};
@@ -143,6 +144,53 @@ struct AlertInstance {
     labels: BTreeMap<String, String>,
 }
 
+/// The alerts that were firing, as Bun keeps them across a restart in
+/// `<data dir>/alerts-firing.json` (#2478). Node-local state, not Raft
+/// state or a wire format.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FiringAlerts {
+    alerts: Vec<FiringRecord>,
+}
+
+/// One firing alert instance in [`FiringAlerts`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FiringRecord {
+    rule_name: String,
+    labels: BTreeMap<String, String>,
+    since_unix_secs: u64,
+}
+
+impl FiringAlerts {
+    /// Write to `path` atomically (temporary file, then rename).
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        let json = serde_json::to_vec(self).map_err(std::io::Error::other)?;
+        crate::sesame::identity::atomic_write(path, &json)
+    }
+
+    /// Read `path`; a missing file is empty, and so is an unreadable one,
+    /// with a line on stderr, so a bad file can't stop Bun starting.
+    pub fn load(path: &Path) -> Self {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(error) => {
+                eprintln!(
+                    "mayo: reading {}: {error}; no alert restored",
+                    path.display()
+                );
+                return Self::default();
+            }
+        };
+        serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            eprintln!(
+                "mayo: {} is not valid: {error}; no alert restored",
+                path.display()
+            );
+            Self::default()
+        })
+    }
+}
+
 /// Evaluates alert rules independently for each labelled metric series.
 pub struct AlertEvaluator {
     rules: Vec<AlertRule>,
@@ -232,6 +280,55 @@ impl AlertEvaluator {
             }
         }
         transitions
+    }
+
+    /// The firing alerts, for [`FiringAlerts::save`]. Pending ones aren't
+    /// kept: after a restart their timer starts again, which can only delay
+    /// a firing, never lose a resolve.
+    pub fn firing_records(&self) -> FiringAlerts {
+        FiringAlerts {
+            alerts: self
+                .states
+                .iter()
+                .filter_map(|(instance, state)| match state {
+                    AlertState::Firing { since, .. } => Some(FiringRecord {
+                        rule_name: instance.rule_name.clone(),
+                        labels: instance.labels.clone(),
+                        since_unix_secs: since
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    }),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Save the firing alerts to `path` (#2478). Blocking file I/O.
+    pub fn save_firing(&self, path: &Path) -> std::io::Result<()> {
+        self.firing_records().save(path)
+    }
+
+    /// Mark the alerts saved at `path` as firing again, skipping any whose
+    /// rule no longer exists. Returns how many were restored. A missing or
+    /// unreadable file restores nothing. Blocking file I/O.
+    pub fn restore_firing(&mut self, path: &Path) -> usize {
+        let mut restored = 0;
+        for record in FiringAlerts::load(path).alerts {
+            if !self.rules.iter().any(|rule| rule.name == record.rule_name) {
+                continue;
+            }
+            let instance = AlertInstance {
+                rule_name: record.rule_name,
+                labels: record.labels,
+            };
+            let since = SystemTime::UNIX_EPOCH + Duration::from_secs(record.since_unix_secs);
+            self.states
+                .insert(instance, AlertState::Firing { since, missed: 0 });
+            restored += 1;
+        }
+        restored
     }
 
     /// Get all firing labelled alert instances.
@@ -480,6 +577,66 @@ mod tests {
             assert!(evaluator.evaluate(&make_values(&[("m", 99.0)])).is_empty());
         }
         assert_eq!(evaluator.firing_alerts().len(), 1);
+    }
+
+    /// Bun restarted while an alert fired; afterwards the reading was back
+    /// in range, and with nothing remembered no resolve was ever sent
+    /// (#2478).
+    #[test]
+    fn a_restored_firing_alert_sends_a_resolve_when_its_reading_is_back_in_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alerts-firing.json");
+        let rule = || simple_rule("m-high", "m", 50.0, AlertOperator::GreaterThan);
+        let mut before = AlertEvaluator::new(vec![rule()]);
+        before.evaluate(&make_values(&[("m", 99.0)]));
+        assert_eq!(before.evaluate(&make_values(&[("m", 99.0)])).len(), 1);
+        let since = before.firing_alerts()[0].since;
+        before.save_firing(&path).unwrap();
+
+        let mut after = AlertEvaluator::new(vec![rule()]);
+        assert_eq!(after.restore_firing(&path), 1);
+        assert_eq!(after.firing_alerts().len(), 1);
+        assert_eq!(after.firing_alerts()[0].since, since);
+        let transitions = after.evaluate(&make_values(&[("m", 1.0)]));
+        assert_eq!(transitions.len(), 1, "{transitions:?}");
+        assert_eq!(transitions[0].rule_name, "m-high");
+        assert_eq!(transitions[0].kind, TransitionKind::Resolved);
+    }
+
+    /// Only firing alerts are kept, and only for rules that still exist.
+    #[test]
+    fn only_firing_alerts_of_known_rules_are_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alerts-firing.json");
+        let mut before = AlertEvaluator::new(vec![
+            simple_rule("gone", "g", 50.0, AlertOperator::GreaterThan),
+            AlertRule {
+                for_duration: Duration::from_secs(3600),
+                ..simple_rule("slow", "s", 50.0, AlertOperator::GreaterThan)
+            },
+        ]);
+        before.evaluate(&make_values(&[("g", 99.0), ("s", 99.0)]));
+        before.evaluate(&make_values(&[("g", 99.0), ("s", 99.0)]));
+        before.save_firing(&path).unwrap();
+
+        let mut after = AlertEvaluator::new(vec![AlertRule {
+            for_duration: Duration::from_secs(3600),
+            ..simple_rule("slow", "s", 50.0, AlertOperator::GreaterThan)
+        }]);
+        assert_eq!(after.restore_firing(&path), 0);
+        assert!(after.firing_alerts().is_empty());
+    }
+
+    /// A bad file mustn't stop Bun starting.
+    #[test]
+    fn a_missing_or_corrupt_alert_state_file_starts_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut evaluator = AlertEvaluator::with_defaults();
+        assert_eq!(evaluator.restore_firing(&dir.path().join("absent.json")), 0);
+        let corrupt = dir.path().join("corrupt.json");
+        std::fs::write(&corrupt, b"{not json").unwrap();
+        assert_eq!(evaluator.restore_firing(&corrupt), 0);
+        assert!(evaluator.firing_alerts().is_empty());
     }
 
     #[test]

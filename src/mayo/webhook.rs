@@ -1034,6 +1034,82 @@ mod tests {
         assert!(most <= MAX_CONCURRENT_DISPATCHES, "{most} posts at once");
     }
 
+    /// An alert that fired before a restart is resolved at the receiver
+    /// after it (#2478).
+    #[tokio::test]
+    async fn a_resolve_reaches_the_webhook_after_a_restart() {
+        use crate::mayo::alert::{AlertEvaluator, AlertOperator, AlertRule};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let received = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let sink = Arc::clone(&received);
+        let app = axum::Router::new().route(
+            "/hook",
+            axum::routing::post(move |body: axum::body::Bytes| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    sink.lock()
+                        .await
+                        .push(serde_json::from_slice(&body).unwrap());
+                    "ok"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let dest = AlertDestination {
+            dest_type: "webhook".to_string(),
+            url: format!("http://{addr}/hook"),
+            severity: vec![],
+            secret: None,
+        };
+        let dispatcher = WebhookDispatcher::new(reqwest::Client::new(), vec![dest], "prod".into());
+        let rule = || AlertRule {
+            name: "disk_high".to_string(),
+            metric_name: "node_disk_usage_percent".to_string(),
+            threshold: 80.0,
+            operator: AlertOperator::GreaterThan,
+            for_duration: Duration::ZERO,
+            severity: AlertSeverity::Warning,
+            description: "disk".to_string(),
+        };
+        let reading = |value: f64| {
+            HashMap::from([(
+                crate::mayo::types::MetricKey::simple("node_disk_usage_percent"),
+                value,
+            )])
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("alerts-firing.json");
+
+        let mut before = AlertEvaluator::new(vec![rule()]);
+        before.evaluate(&reading(85.0));
+        dispatcher
+            .dispatch_all(before.evaluate(&reading(85.0)))
+            .await;
+        before.save_firing(&state).unwrap();
+        drop(before);
+
+        let mut after = AlertEvaluator::new(vec![rule()]);
+        after.restore_firing(&state);
+        dispatcher
+            .dispatch_all(after.evaluate(&reading(60.0)))
+            .await;
+        server.abort();
+
+        let statuses: Vec<String> = received
+            .lock()
+            .await
+            .iter()
+            .map(|body| body["alert"]["status"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(statuses, vec!["firing", "resolved"]);
+    }
+
     #[test]
     fn firing_transition_produces_firing_status() {
         let dispatcher = WebhookDispatcher::new(reqwest::Client::new(), vec![], "test".to_string());

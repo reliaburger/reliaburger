@@ -294,7 +294,9 @@ seconds: CPU above 90% for 5 minutes and memory above 85% for 2 minutes
 The rules read only the node's own series, never one with an `app` label. A
 firing alert whose metric stops reporting resolves after 10 evaluations
 without a reading (5 minutes at the default interval), and at most 8
-deliveries run at once. You can't define your own rules yet ([#1773](https://github.com/reliaburger/reliaburger/issues/1773)).
+deliveries run at once. A firing alert survives a Bun restart (an upgrade,
+say): it's kept in `alerts-firing.json` in the data directory, so a
+condition that cleared while Bun was down still sends its resolve. You can't define your own rules yet ([#1773](https://github.com/reliaburger/reliaburger/issues/1773)).
 Webhooks deliver them, optionally signed with HMAC-SHA256:
 
 ```toml
