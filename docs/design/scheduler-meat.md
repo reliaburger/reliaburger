@@ -178,6 +178,9 @@ All types are Rust structs using `serde` for serialisation (Raft log entries and
 
 ### Core Scheduling Types
 
+Original sketch, in part: `JobId` is not in the tree. `NodeId`, `AppId` and `Resources` are in `src/meat/types.rs`.
+
+<!-- sketch -->
 ```rust
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -224,6 +227,9 @@ pub struct ResourceRange {
 
 ### Placement and Constraints
 
+Original sketch; these types are not in the tree. Placement is `PlacementSpec` in `src/config/app.rs`, with `required` and `preferred` as lists of `key=value` labels, and the replica mode is the `Replicas` enum in `src/config/types.rs`.
+
+<!-- sketch -->
 ```rust
 /// Placement constraints for an App or Job.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -250,6 +256,9 @@ pub enum ReplicaMode {
 
 ### App and Job Specs
 
+Original sketch, in part: `WorkloadSource` and `InitContainer` are not in the tree. The shipped `AppSpec`, `JobSpec` and `InitContainerSpec` are in `src/config/app.rs` and `src/config/job.rs`; a workload names its source with the `image`, `exec` or `script` field.
+
+<!-- sketch -->
 ```rust
 /// Workload source: either a container image or a host process.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -573,6 +582,9 @@ pub struct AppRollouts {
 
 ### Autoscaler State
 
+Original sketch; `MetricSample` is not in the tree, and the shipped `AutoscaleState` in `src/meat/autoscaler.rs` keeps only the baseline and current replica counts and the last scale event.
+
+<!-- sketch -->
 ```rust
 /// Runtime state for the autoscaler for a single App.
 #[derive(Clone, Debug)]

@@ -1009,12 +1009,55 @@ fn manual_bun_runtime_row_names_every_value_bun_offers() {
     assert!(missing.is_empty(), "the --runtime row omits {missing:?}: {row}");
 }
 
-// --- The CLI design doc ------------------------------------------------------
+// --- Commands in design docs ------------------------------------------------
+
+/// Design docs besides `cli-relish.md` whose inline `relish …` spans must
+/// name real commands, or carry `*(planned)*`.
+const DESIGN_DOCS_WITH_REAL_COMMANDS: &[&str] =
+    &["docs/design/deployments.md", "docs/design/metrics-mayo.md"];
+
+/// Check each inline `relish …` span in `file` outside `skipped_lines`: a
+/// real one has no `*(planned)*`, and a planned one must still fail, so the
+/// label lapses when it lands. Returns how many spans it checked.
+fn check_design_doc_commands(
+    file: &str,
+    skipped_lines: &std::ops::RangeInclusive<usize>,
+    cache: &mut BTreeMap<Vec<String>, Result<String, String>>,
+    failures: &mut Vec<String>,
+) -> usize {
+    let mut checked = 0;
+    for span in inline_spans(file, &read(file)) {
+        let line: usize = span
+            .location
+            .rsplit(':')
+            .next()
+            .and_then(|number| number.parse().ok())
+            .unwrap_or_default();
+        if skipped_lines.contains(&line) {
+            continue;
+        }
+        checked += 1;
+        let result = check_inline_span(&span.text, cache);
+        match (result, span.labelled_planned) {
+            (Ok(()), false) | (Err(_), true) => {}
+            (Err(error), false) => {
+                failures.push(format!("{}: `{}`: {error}", span.location, span.text))
+            }
+            (Ok(()), true) => failures.push(format!(
+                "{}: `{}` works now; remove its *(planned)*",
+                span.location, span.text
+            )),
+        }
+    }
+    checked
+}
 
 /// `docs/design/cli-relish.md` describes what `relish` does. Every inline
 /// `relish …` span outside its "Planned commands" section must name a real
 /// subcommand with real flags; a planned one there or elsewhere is labelled
 /// `*(planned)*`, and must still fail, so the label lapses when it lands.
+/// The design docs in [`DESIGN_DOCS_WITH_REAL_COMMANDS`] follow the same
+/// rule, with no exempt section.
 #[test]
 fn cli_design_doc_names_no_missing_commands() {
     let file = "docs/design/cli-relish.md";
@@ -1030,31 +1073,14 @@ fn cli_design_doc_names_no_missing_commands() {
 
     let mut cache = BTreeMap::new();
     let mut failures = Vec::new();
-    let mut checked = 0;
-    for span in inline_spans(file, &text) {
-        let line: usize = span
-            .location
-            .rsplit(':')
-            .next()
-            .and_then(|number| number.parse().ok())
-            .unwrap_or_default();
-        if planned_lines.contains(&line) {
-            continue;
-        }
-        checked += 1;
-        let result = check_inline_span(&span.text, &mut cache);
-        match (result, span.labelled_planned) {
-            (Ok(()), false) | (Err(_), true) => {}
-            (Err(error), false) => {
-                failures.push(format!("{}: `{}`: {error}", span.location, span.text))
-            }
-            (Ok(()), true) => failures.push(format!(
-                "{}: `{}` works now; remove its *(planned)*",
-                span.location, span.text
-            )),
-        }
-    }
+    let checked = check_design_doc_commands(file, &planned_lines, &mut cache, &mut failures);
     assert!(checked > 50, "found only {checked} inline commands");
+    let mut others = 0;
+    for file in DESIGN_DOCS_WITH_REAL_COMMANDS {
+        // Line numbers start at 1, so nothing in these docs is exempt.
+        others += check_design_doc_commands(file, &(0..=0), &mut cache, &mut failures);
+    }
+    assert!(others > 10, "found only {others} inline commands in other design docs");
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
@@ -1062,7 +1088,11 @@ fn cli_design_doc_names_no_missing_commands() {
 
 /// Design docs whose Rust listings must declare real types, unless the
 /// listing is labelled a sketch.
-const DESIGN_DOCS_WITH_REAL_TYPES: &[&str] = &["docs/design/cli-relish.md"];
+const DESIGN_DOCS_WITH_REAL_TYPES: &[&str] = &[
+    "docs/design/cli-relish.md",
+    "docs/design/gitops-lettuce.md",
+    "docs/design/scheduler-meat.md",
+];
 
 /// Put on the line before a ```` ```rust ```` fence whose types aren't in the
 /// tree, under a prose line that says so.

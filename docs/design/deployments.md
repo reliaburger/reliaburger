@@ -691,7 +691,7 @@ When a new instance fails its health check, the deploy halts immediately. The sy
 - Instances that haven't yet been rolled remain on the old version.
 - The failed instance is stopped (it never entered the routing pool).
 
-The operator can inspect the situation via `relish status`, which clearly shows the partial rollout state (e.g., "web: 1/3 instances on v2, 2/3 on v1, deploy halted"). The operator then decides whether to fix the issue and continue or manually roll back. (The `relish deploy --continue` resume flow and a dedicated `relish rollback` command are **planned — not yet implemented**; rollback today is a fresh deploy of the previous spec version.)
+The operator can inspect the situation via `relish status`, which clearly shows the partial rollout state (e.g., "web: 1/3 instances on v2, 2/3 on v1, deploy halted"). The operator then decides whether to fix the issue and continue or manually roll back. (The `relish deploy --continue` *(planned)* resume flow is **planned, not yet implemented**. `relish rollback <app>` rolls back to the previous version, as a fresh deploy of the previous spec version.)
 
 **Mode 2: Active Revert (default, `auto_rollback = true`)**
 
@@ -753,7 +753,7 @@ web deploys:
   #1  2026-02-01 10:00  (initial deploy)   completed in 45s    (alice@myorg via relish deploy)
 ```
 
-Rollback re-deploys a previous spec version through the same rolling mechanism, creating a new deploy history entry with `initiated_by: Rollback`. A single `relish rollback web --to v1.4.1` command that targets a named version, and one-click rollback in Brioche, are **planned — not yet implemented**.
+Rollback re-deploys a previous spec version through the same rolling mechanism, creating a new deploy history entry with `initiated_by: Rollback`. A single `relish rollback web --to v1.4.1` *(planned)* command that targets a named version, and one-click rollback in Brioche, are **planned — not yet implemented**.
 
 ### 5.4 Dependency Ordering (`run_before`)
 
@@ -1351,11 +1351,12 @@ In a cluster either outcome marks the app `RolloutFailed` (Section 5.2), so the 
 
 **Behaviour:** `relish scale` refuses an autoscaled app (5.13): the autoscaler owns its count between `min` and `max`, so a manual count would only be undone. A git push or an apply that changes the `replicas` field resets the autoscaler's runtime override. The autoscaler respects the new base count and re-evaluates from there. However, if the autoscaler's evaluation window still shows low utilisation, it may scale back down to 3 on the next evaluation cycle.
 
-**Mitigation:** To temporarily override the autoscaler, operators can:
+**Mitigation:** To override the autoscaler, operators change the app's file and apply it (or push it, under GitOps):
 
-- Set `min` to the desired floor: `relish config set app.web.autoscale.min 5`
-- Disable autoscaling temporarily: `relish config set app.web.autoscale.enabled false`
-- Both are runtime overrides stored in Raft and don't modify the git config.
+- Raise `min` in `[app.web.autoscale]` to the floor you want.
+- Remove the `[app.web.autoscale]` table to stop autoscaling: the app returns to its `replicas` count.
+
+Nothing overrides the autoscaler at runtime without a change to the file.
 
 ### 7.6 Image Pull Failure
 
@@ -1392,8 +1393,8 @@ A user with this permission can deploy and scale the `web` and `api` apps but ca
 | `relish deploy` | `deploy` | Must include the target app |
 | `relish rollback` | `deploy` | Must include the target app (rollback is a deploy) |
 | `relish scale` | `scale` | Must include the target app |
-| `relish deploy --continue` (resume halted deploy) | `deploy` | Must include the target app |
-| `relish deploy --cancel` | `deploy` | Must include the target app |
+| `relish deploy --continue` *(planned)* (resume halted deploy) | `deploy` | Must include the target app |
+| `relish deploy --cancel` *(planned)* | `deploy` | Must include the target app |
 | Autoscaler scale events | (system-initiated) | No user permission required; logged as actor `Autoscaler` |
 | GitOps-triggered deploys | (system-initiated) | Lettuce acts with system privileges; logged with commit SHA |
 
@@ -1636,7 +1637,7 @@ Should the deploy system support manual approval gates (e.g., "deploy to staging
 **Implementation considerations:**
 
 - This is a pipeline concern rather than a single-cluster concern. Reliaburger manages one cluster; multi-stage pipelines (staging -> production) span multiple clusters.
-- For single-cluster gates (e.g., "pause after canary phase for approval"), a `Paused` state could be added to the deploy state machine with a `relish deploy --approve` command to resume.
+- For single-cluster gates (e.g., "pause after canary phase for approval"), a `Paused` state could be added to the deploy state machine with a `relish deploy --approve` *(planned)* command to resume.
 - Lettuce (GitOps) already provides a natural approval gate: the git merge/PR process. The deploy only happens when the change is merged.
 
 **Current stance:** Not in v1. Git-based approval via Lettuce covers the majority of use cases. Explicit in-deploy approval gates may be added in v2 alongside canary support, where pausing after the canary phase for human review would be the primary use case.

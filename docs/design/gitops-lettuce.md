@@ -328,6 +328,9 @@ pub enum SignatureStatus {
 
 ### 4.4 DiffResult
 
+Original sketch; `DiffResult`, `FieldChange`, `FileParseError` and `ResourceKind` are not in the tree. The shipped diff is `ResourceChange` and `ChangePayload` in `src/lettuce/diff.rs`, with `DiffSummary` in `src/lettuce/types.rs`.
+
+<!-- sketch -->
 ```rust
 /// The complete diff between git desired state and Raft desired state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -415,6 +418,9 @@ pub enum ResourceKind {
 
 ### 4.5 WebhookPayload
 
+Original sketch; these types are not in the tree. The shipped webhook check is `WebhookValidator` and `WebhookAdmission` in `src/lettuce/webhook.rs`, and an accepted push is a `WebhookEvent` in `src/lettuce/types.rs`.
+
+<!-- sketch -->
 ```rust
 /// Parsed and validated webhook payload. Lettuce supports GitHub and
 /// GitLab webhook formats. The payload is validated for HMAC-SHA256
@@ -451,6 +457,9 @@ pub enum WebhookValidation {
 
 ### 4.6 SigningKeySet
 
+Original sketch; this type is not in the tree. The shipped types are in `src/lettuce/types.rs`: `[gitops] trusted_signing_keys` stays a list of strings, and `verify_commit` in `src/lettuce/verify.rs` checks a commit against it.
+
+<!-- sketch -->
 ```rust
 /// The set of trusted signing keys, parsed from `trusted_signing_keys` in
 /// the GitOps config. Supports both GPG and SSH key fingerprints.
