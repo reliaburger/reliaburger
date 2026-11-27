@@ -6631,6 +6631,40 @@ asked once. The flaky test also polls at 250 ms instead of 50, and it treats
 says it can't answer yet) as "look again" rather than a failure, which was
 the other way it failed.
 
+That left the limit of eight leaking at the deadline (#2457). `buffered(8)`
+caps how many of the mapped futures are pending, not how many tasks they
+spawned. Once the deadline had passed, each new future spawned its read,
+timed out on its first poll and finished, and `buffered` started the next
+one at once: on a slow node with 200 instances, about 176 `runc state`
+processes began together, just when the node could least afford them. A
+future now checks the clock before it spawns anything:
+
+```rust
+let mut task = match earlier {
+    Some(task) => task,
+    None if tokio::time::Instant::now() >= deadline => {
+        return (read, Observed::Unknown, Pending::NotStarted);
+    }
+    None => {
+        let id = read.id.clone();
+        tokio::spawn(async move { observe(&grill, &id).await })
+    }
+};
+```
+
+A `match` arm can carry a guard (`if ...`) like the ones we saw in Chapter 5;
+the arm with the guard is tried first, and an unguarded `None` catches the
+rest. The third value of the tuple, which used to be an `Option` of the
+leftover task, is now a small enum, `Pending`, with a variant for each way a
+read can end: `Done`, `Running(task)` for the next sweep to wait on, and
+`NotStarted`. Those not started would always be the plan's tail, so the next
+sweep sorts them to the front, after the reads still running.
+`UnfinishedReads` carries both sets, and `sort_by_key` is stable, so within
+each group the plan's order stays. `a_state_sweep_starts_no_more_than_its_limit_after_the_deadline`
+gives the mock runtime forty instances and 30-second reads: it saw 40 reads
+start before the change and 8 after. `every_instance_is_read_within_a_few_slow_sweeps`
+checks that no instance is left out for good.
+
 #### A restart, one step at a time
 
 The restart was the longest turn of them all. It killed whatever was left of
