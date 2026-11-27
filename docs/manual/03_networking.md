@@ -50,6 +50,38 @@ straight away. A resolver that didn't answer is tried after the others for
 10 seconds. Positive answers are cached for their TTL, at most 30 seconds, so
 a changed external record can take that long to reach containers.
 
+### When the council has no leader
+
+Each node routes to instances on other nodes only while the council leader
+keeps answering it. If no leader answers for 60 seconds (the council lost its
+quorum, or this node is cut off from it), the node stops routing to other
+nodes until one answers again. The reason is safety: once the leader can't
+hear from a node, it may let another node reuse an address that node still
+routes to, and a call landing on whatever got that address is worse than a
+call that fails.
+
+What keeps working:
+
+- calls that an instance on the same node can serve, through the VIP, DNS
+  and the ingress;
+- connections that were already open.
+
+What stops after 60 seconds:
+
+- a call whose only instances run on other nodes: `connect()` fails with
+  `EPERM` (permission denied);
+- an ingress route with no instance on the node the request reached: it
+  answers 503.
+
+Two things stay stuck for the whole outage. A Bun restarted during it routes
+nothing, local instances included, until a leader answers. And an instance
+that crashes can't restart, because releasing its old address needs the
+leader. Everything comes back on the leader's first answer.
+
+An app with an instance on every node (enough replicas, spread out) rides out
+a council outage untouched. `relish wtf` reports the outage as `no-leader` or
+`quorum-loss` ([Diagnostics](07_diagnostics.md)).
+
 ## Who may connect
 
 Apps in the same namespace can reach each other; other namespaces can't. That
@@ -219,6 +251,9 @@ requests and logs
 `wrapper: web-1 at 10.0.0.5:30001 is unreachable from this node: ...`. Two
 answered checks bring it back, with another log line. The other nodes decide
 for themselves. When no instance of a route is left, the route answers 502.
+If the council has had no leader for 60 seconds, a node routes only to
+instances it runs itself and answers 503 for a route with none ([When the
+council has no leader](#when-the-council-has-no-leader)).
 
 A request body is read whole before the ingress contacts your app, so it can
 retry another instance if the first one can't be reached. Three limits guard
