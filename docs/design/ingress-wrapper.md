@@ -32,7 +32,7 @@ Wrapper is disabled by default. Operators enable it on selected nodes with `[ing
 |---|---|---|
 | **Bun agent** | Lifecycle host. Wrapper runs as async tasks within the Bun process. Bun starts Wrapper after the node has joined the cluster and the service map is initialised. | If Bun crashes, Wrapper stops. Bun's watchdog restarts the entire agent within seconds. |
 | **Sesame (PKI)** | Provides Ingress CA signing material to the resolver on a council-enabled ingress node for `tls = "cluster"` routes. | Without a usable resolver, Wrapper falls back to its development self-signed listener certificate. That isn't a production substitute for a cluster certificate. |
-| **Reporting tree** | Delivers runtime state (which app instances are running, on which nodes, at which host ports, and their health status) from Bun agents through council members to the leader, and back down to each node. Wrapper reads this state to build its routing table. | If the reporting tree stalls, Wrapper continues routing with the last known good routing table. Stale backends are detected by Wrapper's own active health probes. |
+| **Reporting tree** | Delivers runtime state (which app instances are running, on which nodes, at which host ports, and their health status) from Bun agents through council members to the leader, and back down to each node. Wrapper reads this state to build its routing table. | If the reporting tree stalls, Wrapper keeps routing with the last known good routing table for up to 60 s, the view lease, which only an answer from the council leader renews. Once the lease lapses, Wrapper routes only to backends on its own node and answers 503 for a route with none, until a leader answers again ([discovery-onion.md §7.6](discovery-onion.md#76-a-node-that-is-gone-view-leases)). Unreachable backends within the lease are found by Wrapper's own active probes. |
 | **Onion (service map)** | The in-kernel BPF hash map that maps app names to lists of healthy backend `(host_ip, host_port)` entries. Wrapper reads this map to resolve which backends are available for each ingress route. | The service map is maintained by Bun locally on each node. It is always available as long as Bun is running. |
 
 **Startup order within Bun:**
@@ -101,7 +101,7 @@ The routing table is an in-memory data structure mapping `(host, path_prefix)` p
 2. Look up the host in a `HashMap<String, Vec<PathRoute>>`. This is an exact match (no wildcard host matching in v1).
 3. Within the matched host, iterate `PathRoute` entries sorted by path length descending (longest prefix match). The first matching prefix wins.
 4. The matched `PathRoute` contains a `BackendPool` with a list of healthy backend addresses.
-5. Select a backend using **unweighted round-robin** — the only strategy implemented today (`PathRoute::select_backend`). Weighted round-robin, least-connections, and consistent-hash are planned (see §4).
+5. Select a backend using **unweighted round-robin** — the only strategy implemented today (`PathRoute::select_backend`). Weighted round-robin, least-connections, and consistent-hash are planned (see §4). A route keeps its round-robin position through table rebuilds and replacements, matched by host and path prefix, so a quiet route doesn't restart at its first backend each time the table changes (#2454).
 
 **Routing table updates:**
 
@@ -114,6 +114,10 @@ Wrapper's health information comes from two sources:
 1. **Passive health (from reporting tree):** The service map already excludes instances that have failed their application-level health checks. Wrapper inherits this by reading the service map.
 
 2. **Active health (Wrapper-local) — implemented.** A background probe loop (`run_health_probes`) runs its own lightweight L7 probes against each backend to catch instances that are "healthy" cluster-wide but unreachable from this specific node. A `ProbeTracker` applies hysteresis (three consecutive failures mark a backend locally unhealthy; two successes recover it), flipping `Backend.locally_healthy`, which `select_backend` then honours on top of the passive service-map signal.
+
+   A probe is a `GET /` that asks only whether this node can reach the backend. Any HTTP response, a 5xx included, passes; a refused or reset connection, a connection closed without an answer, or no answer within the 2 s timeout fails. Whether the app is well is the passive signal's job: its own health check, on its own path. Until #2464 a 5xx at `/` failed the probe, so an app with no handler there (a 501 from its framework, say) deployed green and then answered 502 on every path through every ingress node. The probe loop logs a backend's first flip to locally unhealthy, with the reason, and its recovery (`wrapper: web-1 at 10.0.0.5:30001 is unreachable from this node: ...`). Probing the app's declared health path instead would need that path, and its port and protocol, in the endpoint catalogue, a wire and durable-state change, to tell apart what the passive signal already reports.
+
+   A sweep probes up to 32 backends at once (`PROBE_CONCURRENCY`, with `buffer_unordered`), so backends that never answer cost one timeout per 32 of them, not one each (#2448). With thousands of backends a sweep can still take (B / 32) × timeout in the worst case. The loop applies a sweep's verdicts together: it checks under the read lock whether any verdict changes a backend (`RoutingTable::health_differs`), and takes the write lock once per sweep only when one does. A verdict applies only to the same `(instance_id, address)` pair it probed, so a late result can't judge a replaced endpoint.
 
 When all backends in a pool are unhealthy (per either signal), Wrapper returns `502 Bad Gateway`. Upstream **retry/failover of a single request** is now implemented for connect failures: `do_proxy` selects a primary plus up to two distinct candidates and retries on `reqwest::Error::is_connect()` (a connection that never established, so replay is side-effect-free). A 5xx is a completed send and is returned as-is, never replayed. A request sent on a pooled keep-alive connection that the backend had already closed (the send fails with an incomplete message or a reset, before any response head) is retried once on the same backend over a fresh, unpooled connection (`ProxyState::fresh_client`), but only when replay is safe: the method is idempotent (`GET`, `HEAD`, `OPTIONS`, `PUT`, `DELETE`, `TRACE`), or the request has a body that the HTTP client never began reading. The body is passed as a one-chunk stream that sets a flag on first poll, so a `POST` whose body was streamed is never replayed and answers 502. To make the race rare, the upstream pool drops idle connections after 50 s (`UPSTREAM_POOL_IDLE_TIMEOUT`), under nginx's 60 s and Go's 90 s keep-alive defaults (#322).
 
@@ -173,7 +177,12 @@ grow the in-memory cache without limit. An SNI for any other host — and a
 handshake with no SNI at all — is served the self-signed development
 certificate instead; a client that validates the hostname rejects it, so an
 unconfigured host can never obtain a trusted cluster certificate. The cache is
-additionally capped as defence in depth.
+additionally capped at 1,024 hosts (`MAX_SNI_CACHE`) as defence in depth. When
+it's full, a new host first evicts every entry whose host no longer has a
+`tls = "cluster"` route and every expired leaf, then, if all entries are still
+live, the least recently used one. Before #2430 a full cache refused new hosts,
+so a cluster that had served 1,024 preview hosts signed a fresh leaf on every
+handshake for the 1,025th, on a runtime worker thread.
 
 This currently requires the ingress node to have council state and the
 wrapping key material. If it doesn't, `cluster` hosts get the listener's
@@ -244,6 +253,8 @@ Drain coordination is event-driven: Bun publishes a `DrainBackend { app, instanc
 ---
 
 ## 4. Data Structures
+
+This section is a design sketch, not the code. The types that exist in `src/wrapper/` are `RoutingTable`, `PathRoute`, `Backend`, `TlsMode`, `RateLimitConfig`, `RateLimiter`, `TokenBucket`, `HealthProbeConfig` and `WrapperConfig`, and their fields differ from the sketch. `BackendPool`, `LoadBalanceStrategy`, `DrainingBackend`, `ConnectionDrainState`, `DrainInfo`, `TrackedConnection`, `IngressRoute`, `HeaderRule` and `TlsVersion` don't exist: routes hold their backends directly, the drain tracker lives in `src/wrapper/draining.rs`, and headers and the TLS minimum aren't configurable.
 
 ```rust
 use std::collections::HashMap;
@@ -436,9 +447,10 @@ pub enum HeaderRule {
     Remove { name: String },
 }
 
-/// Active health probe configuration. The probe loop ships (§3.3) with fixed
-/// defaults: every 5s, 2s timeout, GET "/", 3 failures down, 2 successes up.
-/// Making it configurable, and `expected_status`, are planned.
+/// Active reachability probe configuration. The probe loop ships (§3.3)
+/// with fixed defaults: every 5s, 2s timeout, GET "/", 3 failures down,
+/// 2 successes up. Any HTTP response passes (#2464), so the shipped struct
+/// has no `expected_status`. Making it configurable is planned.
 pub struct HealthProbeConfig {
     /// Interval between probes.
     pub interval: Duration,
@@ -448,10 +460,8 @@ pub struct HealthProbeConfig {
     pub threshold_unhealthy: u32,
     /// Number of consecutive successes before marking healthy again.
     pub threshold_healthy: u32,
-    /// HTTP path to probe (default: "/").
+    /// HTTP path to probe (default: "/"). Its status doesn't matter.
     pub path: String,
-    /// Expected HTTP status codes (default: 200-399).
-    pub expected_status: std::ops::RangeInclusive<u16>,
 }
 
 /// Global Wrapper configuration (from node.toml [ingress] section).
@@ -753,24 +763,23 @@ max_tls_handshakes_per_source = 16
 max_request_body_bytes = 10485760
 request_body_budget_bytes = 268435456
 
-# Default drain timeout for rolling deploys.
-# Per-app drain_timeout in the app spec overrides this.
-# Default: "30s".
-drain_timeout = "30s"
-
-# Global default rate limit (requests per second per client IP).
-# Applied to routes that do not specify their own rate limit.
-# Default: none (no rate limiting).
-# rate_limit_rps = 1000
-# rate_limit_burst = 2000
-
-# NOTE: the keys below are PLANNED, not parsed today.
+# NOTE: the keys below are PLANNED, not parsed today. The section refuses
+# unknown keys, so uncommenting one stops Bun at startup.
+#   - `drain_timeout` would set a node-wide default drain timeout. Today
+#     each app's `[app.<name>.deploy] drain_timeout` (default 30s) is the
+#     only one.
+#   - `rate_limit_rps` / `rate_limit_burst` would set a node-wide default
+#     rate limit per client IP. Today only routes that set their own are
+#     limited.
 #   - `min_tls_version` does not exist as a config key. The TLS minimum is
 #     not configurable; rustls 0.23's default (TLS 1.2+) applies, so 1.0/1.1
 #     are rejected, but there is no key to force 1.3-only.
 #   - the `health_probe_*` keys would tune the Wrapper-local active health
 #     probe (§3.3). The probe runs today, but only with its built-in
 #     defaults (5s interval, 2s timeout, GET "/").
+# drain_timeout = "30s"
+# rate_limit_rps = 1000
+# rate_limit_burst = 2000
 # min_tls_version = "1.2"
 # health_probe_interval = "5s"
 # health_probe_timeout = "2s"
@@ -799,7 +808,7 @@ websocket = false
 # rate_limit_burst = 200
 
 [app.web.deploy]
-# Drain timeout for this app during rolling deploys. Default: node-level setting.
+# Drain timeout for this app during rolling deploys. Default: 30s.
 drain_timeout = "30s"
 ```
 

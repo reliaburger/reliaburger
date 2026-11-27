@@ -16,9 +16,11 @@
 //! entry = index: u32, length: u32, bytes * length
 //! ```
 //!
-//! A crash can tear the last entry. The ledger record is appended only
-//! after its output, so a torn entry belongs to a task that will run
-//! again; the next append cuts the torn tail off first.
+//! A crash can tear the last entry, or, on a filesystem that records a
+//! file's size before its data, leave the unsynced tail as zeros. Both are
+//! a torn tail. The ledger record is appended only after its output, so a
+//! torn entry belongs to a task that will run again; the next append cuts
+//! the torn tail off first.
 
 use std::collections::BTreeSet;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -62,6 +64,9 @@ fn parse_name(name: &str) -> Option<(RangeInclusive<u32>, u64)> {
 fn scan(bytes: &[u8], mut entry: impl FnMut(u32, &[u8])) -> usize {
     let mut at = 0;
     while let Some(header) = bytes.get(at..at + ENTRY_HEADER_BYTES) {
+        if is_zero_filled_tail(&bytes[at..]) {
+            break;
+        }
         let index = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
         let length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
         let start = at + ENTRY_HEADER_BYTES;
@@ -72,6 +77,17 @@ fn scan(bytes: &[u8], mut entry: impl FnMut(u32, &[u8])) -> usize {
         at = start + length;
     }
     at
+}
+
+/// Whether `rest`, the bytes from an entry's start to the end of the
+/// segment, is a zero-filled tail. A filesystem that records a file's new
+/// size before its data can bring the unsynced tail back as zeros after a
+/// power cut (#2525), which would read as entries for task 0 with no
+/// output. One all-zero header on its own is exactly such an entry, task 0
+/// failing with no output, so it stays; and zeros followed by data are
+/// entries too, for the same reason.
+fn is_zero_filled_tail(rest: &[u8]) -> bool {
+    rest.len() > ENTRY_HEADER_BYTES && rest.iter().all(|byte| *byte == 0)
 }
 
 /// Append failed tasks' output to their chunk grant's segment, keeping at
@@ -176,6 +192,37 @@ mod tests {
         assert_eq!(read(dir.path(), 1, 1).unwrap(), Some(b"one".to_vec()));
         assert_eq!(read(dir.path(), 3, 1).unwrap(), Some(b"three".to_vec()));
         assert_eq!(read(dir.path(), 2, 1).unwrap(), None);
+    }
+
+    #[test]
+    fn a_zero_filled_tail_is_a_torn_tail_not_task_zero_output() {
+        let dir = tempfile::tempdir().unwrap();
+        append(dir.path(), &(0..=9), 1, &[(3, b"three".to_vec())]).unwrap();
+        let path = segment_path(dir.path(), &(0..=9), 1);
+        let durable = std::fs::metadata(&path).unwrap().len();
+        // A filesystem that records the size before the data (#2525).
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend(std::iter::repeat_n(0u8, 4096));
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert_eq!(read(dir.path(), 0, 1).unwrap(), None);
+        assert_eq!(read(dir.path(), 3, 1).unwrap(), Some(b"three".to_vec()));
+
+        let appended = append(dir.path(), &(0..=9), 1, &[(5, b"five".to_vec())]).unwrap();
+        assert_eq!(appended.kept, 1);
+        let entry = (ENTRY_HEADER_BYTES + b"five".len()) as u64;
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), durable + entry);
+        assert_eq!(read(dir.path(), 5, 1).unwrap(), Some(b"five".to_vec()));
+        assert_eq!(read(dir.path(), 0, 1).unwrap(), None);
+    }
+
+    #[test]
+    fn an_empty_output_for_task_zero_followed_by_more_entries_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        append(dir.path(), &(0..=9), 1, &[(0, Vec::new())]).unwrap();
+        append(dir.path(), &(0..=9), 1, &[(4, b"four".to_vec())]).unwrap();
+        assert_eq!(read(dir.path(), 0, 1).unwrap(), Some(Vec::new()));
+        assert_eq!(read(dir.path(), 4, 1).unwrap(), Some(b"four".to_vec()));
     }
 
     #[test]

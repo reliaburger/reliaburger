@@ -24,6 +24,15 @@ use crate::config::node::NodeConfig;
 /// anything near this is not a seed.
 const MAX_SEED_BYTES: u64 = 1024 * 1024;
 
+/// The most a seed's files add up to, unpacked. Gzip packs zeros about a
+/// thousand to one, so the packed limit alone would let 1 MiB unpack to
+/// about a gigabyte, held in memory before the seed is refused.
+const MAX_SEED_UNPACKED_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The most entries (files and directories) a seed holds. A create seed
+/// has under ten.
+const MAX_SEED_ENTRIES: usize = 64;
+
 /// Where an appliance keeps its node configuration and secrets. `etc-sync`
 /// never touches `/etc/reliaburger` (it's the node's own).
 pub const CONFIG_DIR: &str = "/etc/reliaburger";
@@ -33,8 +42,12 @@ pub const CONFIG_DIR: &str = "/etc/reliaburger";
 pub enum SeedError {
     #[error("the seed isn't a gzipped tarball: {0}")]
     Archive(String),
-    #[error("the seed is larger than {MAX_SEED_BYTES} bytes")]
+    #[error(
+        "the seed is larger than a seed can be ({MAX_SEED_BYTES} bytes packed or per file, {MAX_SEED_UNPACKED_BYTES} unpacked)"
+    )]
     TooLarge,
+    #[error("the seed holds more than {MAX_SEED_ENTRIES} entries")]
+    TooManyFiles,
     #[error("the seed has an unsafe path: {0}")]
     UnsafePath(String),
     #[error("the seed has neither seed.toml nor node.toml")]
@@ -128,17 +141,27 @@ pub enum Seed {
 
 impl Seed {
     /// Parse a seed tarball. Every entry must be a plain file or directory
-    /// under a relative path without `..`.
+    /// under a relative path without `..`. A seed with more than
+    /// [`MAX_SEED_ENTRIES`] entries, or whose files add up to more than
+    /// [`MAX_SEED_UNPACKED_BYTES`], is refused before those bytes are read.
     pub fn from_tar_gz(bytes: &[u8]) -> Result<Self, SeedError> {
         if bytes.len() as u64 > MAX_SEED_BYTES {
             return Err(SeedError::TooLarge);
         }
-        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(bytes));
+        // The headers and padding come on top of the files' own bytes; the
+        // checks below catch a real seed's limits first, this one a stream
+        // of nothing but headers.
+        let unpacked = flate2::read::GzDecoder::new(bytes).take(2 * MAX_SEED_UNPACKED_BYTES);
+        let mut archive = tar::Archive::new(unpacked);
         let mut files = BTreeMap::new();
+        let mut total: u64 = 0;
         let entries = archive
             .entries()
             .map_err(|e| SeedError::Archive(e.to_string()))?;
-        for entry in entries {
+        for (count, entry) in entries.enumerate() {
+            if count >= MAX_SEED_ENTRIES {
+                return Err(SeedError::TooManyFiles);
+            }
             let mut entry = entry.map_err(|e| SeedError::Archive(e.to_string()))?;
             let kind = entry.header().entry_type();
             let path = entry
@@ -152,7 +175,8 @@ impl Seed {
             if !kind.is_file() {
                 return Err(SeedError::UnsafePath(format!("{name} isn't a plain file")));
             }
-            if entry.size() > MAX_SEED_BYTES {
+            total = total.saturating_add(entry.size());
+            if entry.size() > MAX_SEED_BYTES || total > MAX_SEED_UNPACKED_BYTES {
                 return Err(SeedError::TooLarge);
             }
             let mut data = Vec::new();
@@ -436,6 +460,33 @@ advertise = "192.168.1.51"
             Seed::from_tar_gz(&tarball(&entries)),
             Err(SeedError::Config(_))
         ));
+    }
+
+    /// Gzip packs zeros about a thousand to one, so a body under the
+    /// compressed cap can unpack to far more than any seed. The parser
+    /// stops counting before it holds that much.
+    #[test]
+    fn a_seed_with_too_many_or_too_large_contents_is_refused_early() {
+        let zeros = vec![0u8; 512 * 1024];
+        let names: Vec<String> = (0..40).map(|n| format!("f{n:02}")).collect();
+        let entries: Vec<(&str, &[u8])> = names
+            .iter()
+            .map(|name| (name.as_str(), zeros.as_slice()))
+            .collect();
+        let bytes = tarball(&entries);
+        assert!(bytes.len() < 1024 * 1024, "it fits the compressed cap");
+        assert_eq!(Seed::from_tar_gz(&bytes), Err(SeedError::TooLarge));
+    }
+
+    #[test]
+    fn a_seed_with_more_than_the_allowed_number_of_files_is_refused() {
+        let names: Vec<String> = (0..100).map(|n| format!("f{n:03}")).collect();
+        let mut entries: Vec<(&str, &[u8])> = vec![("seed.toml", JOIN_TOML.as_bytes())];
+        entries.extend(names.iter().map(|name| (name.as_str(), &b"x"[..])));
+        assert_eq!(
+            Seed::from_tar_gz(&tarball(&entries)),
+            Err(SeedError::TooManyFiles)
+        );
     }
 
     #[test]

@@ -428,6 +428,17 @@ fn export_app(
             "[app.{name}] exec/script process workloads — no K8s equivalent"
         ));
     }
+    if app.pids.is_some() {
+        report.unsupported.push(format!(
+            "[app.{name}] pids — a Pod spec has no process limit; the kubelet sets one per node (podPidsLimit)"
+        ));
+    }
+    for sidecar in app.sidecar.iter().filter(|sidecar| sidecar.pids.is_some()) {
+        report.unsupported.push(format!(
+            "[app.{name}.sidecar.{}] pids — a Pod spec has no process limit; the kubelet sets one per node (podPidsLimit)",
+            sidecar.name
+        ));
+    }
 
     // M28: everything below has a perfectly good Kubernetes equivalent and is
     // simply not translated yet. The distinction matters, so these are reported
@@ -1120,6 +1131,24 @@ mod tests {
                 .unsupported
                 .iter()
                 .any(|u| u.contains("shared-runc") && u.contains("fresh Pod"))
+        );
+    }
+
+    #[test]
+    fn an_apps_and_a_sidecars_pids_limit_are_reported() {
+        let config = parse_config(
+            "[app.web]\nimage='fixture:v1'\npids=512\n[[app.web.sidecar]]\nname='proxy'\npids=64",
+        );
+        let unsupported = export_kubernetes(&config).unwrap().report.unsupported;
+        assert!(
+            unsupported.iter().any(|u| u.starts_with("[app.web] pids")),
+            "{unsupported:?}"
+        );
+        assert!(
+            unsupported
+                .iter()
+                .any(|u| u.starts_with("[app.web.sidecar.proxy] pids")),
+            "{unsupported:?}"
         );
     }
 

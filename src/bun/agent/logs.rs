@@ -12,12 +12,28 @@ use tokio::sync::{mpsc, oneshot};
 
 use super::{BunAgent, BunError, Grill, InstanceId, LogExecutionSelection, tail_lines};
 
-/// Every instance's capture, one after another. More than one instance gets
+/// Every instance's capture, one after another, in instance-id order, each
+/// cut to its own last `tail` lines when asked. More than one instance gets
 /// a `==> id <==` header each, like `tail` over several files.
-async fn read_captures<G: Grill>(grill: &G, instance_ids: &[InstanceId]) -> String {
+///
+/// The tail is taken per capture, before the header: tailing the joined text
+/// kept only the last instance's lines, without its header (#2472).
+async fn read_captures<G: Grill>(
+    grill: &G,
+    instance_ids: &[InstanceId],
+    tail: Option<usize>,
+) -> String {
+    // The ids come from a `HashMap`; sorting keeps the sections in the same
+    // order on every call.
+    let mut sorted: Vec<&InstanceId> = instance_ids.iter().collect();
+    sorted.sort_by(|left, right| left.0.cmp(&right.0));
     let mut all_logs = String::new();
-    for id in instance_ids {
+    for id in sorted {
         let logs = grill.logs(id).await.unwrap_or_default();
+        let logs = match tail {
+            Some(n) => tail_lines(&logs, n),
+            None => logs,
+        };
         if logs.is_empty() {
             continue;
         }
@@ -151,17 +167,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     ) {
         let grill = self.supervisor.grill().clone();
         tokio::spawn(async move {
-            let logs = read_captures(&grill, &instances).await;
-            let logs = match tail {
-                Some(n) => tail_lines(&logs, n),
-                None => logs,
-            };
+            let logs = read_captures(&grill, &instances, tail).await;
             let _ = response.send(Ok(logs));
         });
     }
 
-    /// Answer a `Logs` command from a task: every instance's capture, cut to
-    /// the last `tail` lines when asked.
+    /// Answer a `Logs` command from a task: every instance's capture, each
+    /// cut to its last `tail` lines when asked.
     pub(super) fn spawn_logs_read(
         &self,
         app_name: &str,
@@ -178,11 +190,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
         let grill = self.supervisor.grill().clone();
         tokio::spawn(async move {
-            let logs = read_captures(&grill, &instance_ids).await;
-            let logs = match tail {
-                Some(n) => tail_lines(&logs, n),
-                None => logs,
-            };
+            let logs = read_captures(&grill, &instance_ids, tail).await;
             let _ = response.send(Ok(logs));
         });
     }

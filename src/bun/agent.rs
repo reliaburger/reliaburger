@@ -384,7 +384,13 @@ async fn stop_instance_alone<G: Grill>(
     if let Some(pre_stop) = &stop.pre_stop {
         run_pre_stop(grill, id, pre_stop).await;
     }
-    let grace_ends = tokio::time::Instant::now() + stop.grace;
+    // `Instant + Duration` panics when the sum doesn't fit the clock
+    // (#2378), so a grace too large to add gets the longest stop step.
+    let now = tokio::time::Instant::now();
+    let grace_ends = now
+        .checked_add(stop.grace)
+        .or_else(|| now.checked_add(crate::grill::stop::MAX_STOP_DURATION))
+        .unwrap_or(now);
     let signalled = ask_until_answered(grace_ends, |_left| async {
         tokio::time::timeout(confirmation_timeout, grill.stop(id))
             .await

@@ -395,7 +395,7 @@ def owner_completion(receipt, expected, child_path):
     )
     prebuild_order(expected['stages'])
     c.require(
-        any(('--fail-under-lines=78.65' in command or ('--fail-under-lines' in command and command[command.index('--fail-under-lines') + 1:command.index('--fail-under-lines') + 2] == ['78.65']) for command in expected['stages'])),
+        any(('--fail-under-lines=87.60' in command or ('--fail-under-lines' in command and command[command.index('--fail-under-lines') + 1:command.index('--fail-under-lines') + 2] == ['87.60']) for command in expected['stages'])),
         'existing line floor missing or changed',
     )
     if 'runtime' in expected:

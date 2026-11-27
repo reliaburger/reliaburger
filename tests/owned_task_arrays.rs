@@ -2332,6 +2332,7 @@ async fn runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_sec
         known: vec![1],
         arrays: vec![ArrayAssignment {
             template: Some(Box::new(template.clone())),
+            template_known: false,
             resources: Resources::new(100, 32 << 20, 0),
             batch_id: 1,
             spec,
@@ -2516,7 +2517,7 @@ async fn runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_sec
         .await
         .unwrap();
     let identities =
-        secret::namespace_identities(&council.security_state().await, "rbtest-reuse", &ikm);
+        secret::namespace_identities(&*council.security_state().await, "rbtest-reuse", &ikm);
     assert!(
         identities
             .iter()
@@ -3453,6 +3454,7 @@ async fn cgroup_host_arrays_advertise_running_commands_not_queued_callers() {
         known: vec![1],
         arrays: vec![ArrayAssignment {
             template: Some(Box::new(template.clone())),
+            template_known: false,
             resources: Resources::new(100, 32 << 20, 0),
             batch_id: 1,
             spec: spec.clone(),
@@ -3811,6 +3813,7 @@ async fn runc_shared_profile_reports_cgroup_cpu_and_memory() {
         known: vec![1],
         arrays: vec![ArrayAssignment {
             template: Some(Box::new(template.clone())),
+            template_known: false,
             resources: Resources::new(200, 32 << 20, 0),
             batch_id: 1,
             spec: spec.clone(),

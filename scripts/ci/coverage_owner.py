@@ -27,7 +27,7 @@ import contracts as c
 import gates
 import coverage_contract as k
 import owner_tools
-MAKE_RECIPE = """COVERAGE_MIN_LINES ?= 78.65
+MAKE_RECIPE = """COVERAGE_MIN_LINES ?= 87.60
 COVERAGE_REPORT = $(CARGO) llvm-cov report --failure-mode all
 coverage: ## Run the portable suite once under line coverage, write the lcov report and enforce the floor
 	$(CARGO) llvm-cov clean --workspace
@@ -57,7 +57,7 @@ def recipe_stages(profile, floor):
     floor (plan 2026-11-06, F3); the HTML is make coverage-html's, outside
     this owner.
     """
-    c.require(profile == 'ci' and floor == '78.65', 'unaudited coverage selection/floor')
+    c.require(profile == 'ci' and floor == '87.60', 'unaudited coverage selection/floor')
     return [
         ['clean', '--workspace'],
         ['--no-report', 'test', '--lib', '--', '--list'],
@@ -391,7 +391,7 @@ def execute(root, directory, context, source_files, run=subprocess.run, commands
     target = str(Path(data['target_directory']) / 'llvm-cov-target')
     nonce = secrets.token_hex(32)
     profile = 'ci'
-    stages = [[tools['coverage']['path'], 'llvm-cov'] + args for args in recipe_stages(profile, '78.65')]
+    stages = [[tools['coverage']['path'], 'llvm-cov'] + args for args in recipe_stages(profile, '87.60')]
     actual = [
         tools['nextest']['path'],
         'nextest',
@@ -452,7 +452,7 @@ def execute(root, directory, context, source_files, run=subprocess.run, commands
         'make',
         'coverage',
         'NEXTEST_PROFILE=ci',
-        'COVERAGE_MIN_LINES=78.65',
+        'COVERAGE_MIN_LINES=87.60',
         'CARGO=' + shlex.join([sys.executable, str(Path(__file__).resolve()), 'stage', configured['config_path']]),
     ]
     base['RELIABURGER_COVERAGE_OWNER_CONFIG'] = configured['config_path']

@@ -1025,6 +1025,68 @@ fn cli_design_doc_names_no_missing_commands() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// The design docs describe target behaviour in many places, so they aren't
+/// parse-checked like the manual. But a command an open issue is still
+/// adding mustn't read as one an operator can run (#2517): each
+/// [`INLINE_PENDING`] span in `docs/design/*.md` sits in a list item, table
+/// row or paragraph that says "planned" and names its issue.
+#[test]
+fn design_docs_mark_pending_commands_as_planned() {
+    let directory = super::website::repository().join("docs/design");
+    let mut files: Vec<String> = std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.ends_with(".md"))
+        .map(|name| format!("docs/design/{name}"))
+        .collect();
+    files.sort();
+    let mut failures = Vec::new();
+    for file in &files {
+        let text = read(file);
+        for (number, unit) in design_doc_units(&text) {
+            for (span, issue) in INLINE_PENDING {
+                let marked = unit.to_lowercase().contains("planned")
+                    && (unit.contains(&format!("#{issue}"))
+                        || unit.contains(&format!("issues/{issue}")));
+                if unit.contains(span) && !marked {
+                    failures.push(format!(
+                        "{file}:{number}: `{span}` without \"planned\" and #{issue}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A design doc cut into what one statement lives in, each with its first
+/// line's number: a list item or table row on its own, or else a paragraph.
+fn design_doc_units(text: &str) -> Vec<(usize, String)> {
+    let mut units: Vec<(usize, String)> = Vec::new();
+    let mut paragraph: Option<(usize, String)> = None;
+    for (index, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+        let item = trimmed.starts_with("- ")
+            || trimmed.starts_with("* ")
+            || trimmed.starts_with('|')
+            || trimmed.split_once(". ").is_some_and(|(digits, _)| {
+                !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+            });
+        if trimmed.is_empty() || item {
+            units.extend(paragraph.take());
+        }
+        if item {
+            units.push((index + 1, line.to_string()));
+        } else if !trimmed.is_empty() {
+            let (_, body) = paragraph.get_or_insert_with(|| (index + 1, String::new()));
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    units.extend(paragraph);
+    units
+}
+
 // --- The extractor itself ----------------------------------------------------
 
 fn shell(body: &str) -> Snippet {

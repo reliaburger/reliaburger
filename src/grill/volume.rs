@@ -483,7 +483,7 @@ impl VolumeManager {
 
         // Loop mount
         let status = Command::new("mount")
-            .args(["-o", "loop"])
+            .args(["-o", "loop,nosuid,nodev"])
             .arg(img_path)
             .arg(path)
             .status()
@@ -590,7 +590,7 @@ impl VolumeManager {
             ));
         }
         let status = std::process::Command::new("mount")
-            .args(["-o", "loop"])
+            .args(["-o", "loop,nosuid,nodev"])
             .arg(&img_path)
             .arg(path)
             .status()
@@ -784,7 +784,11 @@ fn resolve_volume_path(
         reason: format!("volume path {why}"),
     };
     if walk == PathWalk::Create {
-        std::fs::create_dir_all(volumes_dir)?;
+        // Volumes hold files container root owns, set-id ones included, so
+        // no other local user may reach them (#2412). Rootful runc mounts
+        // them as container root, whose host group passes through.
+        let group = is_root().then_some(super::userns::HOST_ID_BASE);
+        super::bundle::close_to_other_users(volumes_dir, group)?;
     }
     let components: Vec<_> = relative.components().collect();
     let Some(last) = components.len().checked_sub(1) else {
@@ -1273,6 +1277,22 @@ mod tests {
         assert!(path.exists());
         assert!(path.is_dir());
         assert!(path.ends_with("default/redis/data"));
+    }
+
+    /// #2412: a volume holds files a container's root owns, set-id ones
+    /// included, so other local users can't reach the volumes directory.
+    #[test]
+    fn the_volumes_directory_is_closed_to_other_local_users() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let volumes = dir.path().join("volumes");
+        std::fs::create_dir(&volumes).unwrap();
+        std::fs::set_permissions(&volumes, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let vm = VolumeManager::new(&volumes);
+        vm.create_managed_volume("default", "redis", Path::new("/data"), None)
+            .unwrap();
+        let mode = std::fs::metadata(&volumes).unwrap().permissions().mode();
+        assert_eq!(mode & 0o007, 0, "{mode:o}");
     }
 
     #[test]

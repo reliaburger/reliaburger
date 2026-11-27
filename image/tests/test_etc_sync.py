@@ -6,6 +6,7 @@ need Linux (GNU coreutils and bash 4): the appliance workflow runs them.
 """
 
 import os
+import platform
 import subprocess
 import tempfile
 import unittest
@@ -14,6 +15,10 @@ from pathlib import Path
 SCRIPT = Path(__file__).resolve().parents[1] / "mkosi.extra/usr/lib/reliaburger/etc-sync"
 
 
+@unittest.skipUnless(
+    platform.system() == "Linux",
+    "etc-sync needs bash 4 (declare -A) and GNU coreutils; macOS has bash 3.2 and BSD tools",
+)
 class EtcSync(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

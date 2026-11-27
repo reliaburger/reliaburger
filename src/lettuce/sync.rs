@@ -117,6 +117,29 @@ pub fn execute_sync(
         Err(e) => return failed(Some(commit), e.to_string()),
     };
 
+    // No `.toml` at all under `path` parses as an empty config, whose diff
+    // removes everything GitOps owns (#2467). That is almost always a
+    // mistake (files renamed to `.yaml`, moved to a sibling directory, a
+    // bad merge), so it is refused while GitOps owns anything. Removing
+    // everything on purpose takes an explicit, empty `.toml` file.
+    if toml_files.is_empty() {
+        let owned = current.owned.apps.len()
+            + current.owned.namespaces.len()
+            + current.owned.permissions.len()
+            + current.owned.policies.len();
+        if owned > 0 {
+            return failed(
+                Some(commit),
+                format!(
+                    "refusing to apply a tree with no .toml files under {}: it would \
+                     remove all {owned} GitOps-owned resource(s); to remove them on \
+                     purpose, commit an empty .toml file there",
+                    config.path
+                ),
+            );
+        }
+    }
+
     let (git_config, file_errors) = parse_toml_files(&toml_files);
 
     // A parse or duplicate-resource error means the merged config is
@@ -909,6 +932,97 @@ mod tests {
             output.status.success(),
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// The outcome of syncing a `configs/` tree in which only `remaining`
+    /// is left after `configs/web.toml` (declaring `web`) is removed, with
+    /// `web` running and, when `owned`, owned by GitOps.
+    fn sync_after_removing_the_last_toml(remaining: &[(&str, &str)], owned: bool) -> SyncOutcome {
+        let repository = SigningRepo::new();
+        let root = repository.work.join("configs");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("web.toml"), "[app.web]\nimage = 'web:v1'\n").unwrap();
+        std::fs::write(root.join("README.md"), "the apps\n").unwrap();
+        commit_in(&repository.work, "add web", false);
+        std::fs::remove_file(root.join("web.toml")).unwrap();
+        for (name, content) in remaining {
+            std::fs::write(root.join(name), content).unwrap();
+        }
+        commit_in(&repository.work, "remove web", false);
+
+        let web = AppId::new("web", "default");
+        let spec: AppSpec = toml::from_str("image = 'web:v1'\n").unwrap();
+        let apps = HashMap::from([(web.clone(), spec)]);
+        let declared = HashMap::new();
+        let namespaces = Default::default();
+        let permissions = Default::default();
+        let policies = Default::default();
+        let mut ownership = GitOpsOwnership::default();
+        if owned {
+            ownership.apps.insert(web);
+        }
+        let current = CurrentState {
+            apps: &apps,
+            declared_apps: &declared,
+            namespaces: &namespaces,
+            permissions: &permissions,
+            policies: &policies,
+            owned: &ownership,
+        };
+        let mut config = repository.config();
+        config.path = "/configs".into();
+        execute_sync(&repository.repo, &config, &current, &[], None)
+    }
+
+    /// #2467: a commit that leaves the watched path without a single
+    /// `.toml` (renamed to `.yaml`, moved away, a bad merge) parses as an
+    /// empty config, whose diff would remove everything GitOps owns.
+    #[test]
+    fn a_tree_with_no_toml_files_is_refused_while_gitops_owns_apps() {
+        let outcome = sync_after_removing_the_last_toml(&[], true);
+        match &outcome.result {
+            SyncResult::Failure { error } => assert!(
+                error.contains("no .toml files"),
+                "refused for the wrong reason: {error}"
+            ),
+            other => panic!("an empty tree was applied: {other:?}"),
+        }
+        assert!(outcome.changes.is_empty(), "{:?}", outcome.changes);
+    }
+
+    /// #2467: a fresh repository with nothing in it yet still syncs.
+    #[test]
+    fn a_tree_with_no_toml_files_is_accepted_when_gitops_owns_nothing() {
+        let outcome = sync_after_removing_the_last_toml(&[], false);
+        assert!(
+            matches!(outcome.result, SyncResult::Success),
+            "{:?}",
+            outcome.result
+        );
+        assert!(outcome.changes.is_empty(), "{:?}", outcome.changes);
+    }
+
+    /// #2467: removing everything on purpose takes an explicit, empty
+    /// `.toml` file under the path, and then the owned apps go.
+    #[test]
+    fn an_empty_toml_file_removes_every_owned_app_on_purpose() {
+        let outcome = sync_after_removing_the_last_toml(
+            &[("empty.toml", "# GitOps manages nothing here on purpose\n")],
+            true,
+        );
+        assert!(
+            matches!(outcome.result, SyncResult::Success),
+            "{:?}",
+            outcome.result
+        );
+        assert!(
+            outcome.changes.iter().any(|change| matches!(
+                change,
+                ResourceChange::Remove { resource_id, .. } if resource_id == "app.default/web"
+            )),
+            "{:?}",
+            outcome.changes
         );
     }
 

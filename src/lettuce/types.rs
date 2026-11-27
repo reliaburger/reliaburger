@@ -206,9 +206,9 @@ impl StoredGitOpsConfig {
 /// userinfo. An scp-style address (`git@host:org/repo`) has no scheme and
 /// carries a user name, not a credential, so it comes back unchanged.
 ///
-/// Unlike `git::split_credentials`, which moves only a password out of
-/// git's argv, this takes the whole userinfo: a bare `token@host` is a
-/// credential too. It splits on the last `@`, so a password holding `@` or
+/// Unlike `git::split_credentials`, which keeps a non-secret username in
+/// the URL git is given, this takes the whole userinfo: a `user:` name is
+/// stored with the credential it came with. It splits on the last `@`, so a password holding `@` or
 /// `/` is never left in clear, and [`join_url_userinfo`] always rebuilds
 /// the exact URL.
 fn split_url_userinfo(url: &str) -> (String, Option<String>) {
