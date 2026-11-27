@@ -84,7 +84,10 @@ impl BpfServiceMap {
                 port: entry.port.to_be(),
                 _pad: 0,
             };
-            let backend_value = service_entry_to_backend_value_for_consumer(entry, &self.consumer);
+            let backend_value = carry_round_robin(
+                backend_map.get(&backend_key, 0).ok().as_ref(),
+                service_entry_to_backend_value_for_consumer(entry, &self.consumer),
+            );
 
             if let Err(source) = backend_map.insert(backend_key, backend_value, 0)
                 && first_error.is_none()
@@ -134,7 +137,12 @@ impl BpfServiceMap {
             port: port.to_be(),
             _pad: 0,
         };
-        let value = service_entry_to_backend_value_for_consumer(entry, &self.consumer);
+        // Reading first and inserting after isn't atomic against the connect
+        // hook advancing the index; losing a few increments is harmless.
+        let value = carry_round_robin(
+            backend_map.get(&key, 0).ok().as_ref(),
+            service_entry_to_backend_value_for_consumer(entry, &self.consumer),
+        );
         backend_map
             .insert(key, value, 0)
             .map_err(|source| BpfMapError::Operation {
@@ -294,6 +302,19 @@ pub fn service_entry_to_backend_value_for_consumer(
     }
 }
 
+/// Keep a service's round-robin position across a rewrite of its entry.
+///
+/// Every update and full sync writes a whole new `BackendValue`. Starting
+/// each one at `rr_index` 0 sent nearly every connection of a quiet service
+/// to its first backend (#2454). The connect hook takes the index modulo
+/// `count`, so an index past a shrunken pool is safe.
+pub fn carry_round_robin(previous: Option<&BackendValue>, new: BackendValue) -> BackendValue {
+    BackendValue {
+        rr_index: previous.map_or(new.rr_index, |previous| previous.rr_index),
+        ..new
+    }
+}
+
 /// Convert an `Ipv4Addr` to network byte order u32.
 fn ip_to_network_byte_order(ip: Ipv4Addr) -> u32 {
     u32::from(ip).to_be()
@@ -348,6 +369,21 @@ mod tests {
 
     /// The connect hook reads this flag to keep routing to this node's own
     /// backends after the view lease lapses.
+    #[test]
+    fn an_updated_backend_value_keeps_the_previous_round_robin_index() {
+        let mut previous = service_entry_to_backend_value(&test_entry());
+        previous.rr_index = 7;
+        let mut entry = test_entry();
+        entry.backends.pop();
+        let merged = carry_round_robin(Some(&previous), service_entry_to_backend_value(&entry));
+        assert_eq!(merged.rr_index, 7);
+        assert_eq!(merged.count, 1);
+
+        // A service with no entry yet starts at zero.
+        let fresh = carry_round_robin(None, service_entry_to_backend_value(&entry));
+        assert_eq!(fresh.rr_index, 0);
+    }
+
     #[test]
     fn backend_value_marks_only_local_backends() {
         let value = service_entry_to_backend_value(&test_entry());

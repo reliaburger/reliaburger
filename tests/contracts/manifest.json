@@ -4549,6 +4549,17 @@
           ]
         },
         {
+          "id": "legacy-ci-reliaburger-ebpf-a_rewritten_backend_entry_keeps_its_round_robin_position",
+          "binary": "reliaburger::ebpf",
+          "test": "a_rewritten_backend_entry_keeps_its_round_robin_position",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        },
+        {
           "id": "legacy-ci-reliaburger-ebpf-ebpf_connect_to_vip_no_backends_refused",
           "binary": "reliaburger::ebpf",
           "test": "ebpf_connect_to_vip_no_backends_refused",

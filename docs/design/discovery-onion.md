@@ -748,6 +748,8 @@ The `onion_connect` eBPF program selects backends using round-robin with health 
 4. Otherwise, try the next index. Repeat up to `val->count` times.
 5. If no healthy backend is found after a full scan, the hook returns 0, which the kernel surfaces to `connect()` as `-EPERM`.
 
+Bun rewrites a service's whole `backend_map` entry on every update and full sync, and keeps the entry's `rr_index` when it does (`carry_round_robin` in `src/onion/ebpf/maps.rs`). Before #2454 each write reset it to 0, so a service whose entry was rewritten between connections sent nearly all of them to its first backend.
+
 The health status of each backend is maintained by Bun based on the health check results reported through the reporting tree. Bun writes the `healthy` field directly into the BPF map entry. The eBPF program never performs health checks itself -- it only reads the pre-computed health status.
 
 ### 5.6 External Service Passthrough

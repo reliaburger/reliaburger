@@ -634,6 +634,64 @@ async fn a_lapsed_view_lease_routes_only_to_local_backends() {
     ebpf.detach().unwrap();
 }
 
+/// #2454: every write of a service's `backend_map` entry used to reset
+/// `rr_index` to 0, so a service whose entry was rewritten between its
+/// connections sent every one of them to its first backend.
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
+async fn a_rewritten_backend_entry_keeps_its_round_robin_position() {
+    let mut ebpf = load_ebpf();
+    let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let second = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    first.set_nonblocking(true).unwrap();
+    second.set_nonblocking(true).unwrap();
+    let backend = |instance_id: &str, listener: &std::net::TcpListener| BackendInstance {
+        instance_id: instance_id.to_string(),
+        node_ip: Ipv4Addr::LOCALHOST,
+        host_port: listener.local_addr().unwrap().port(),
+        healthy: true,
+        local: true,
+    };
+    let id = ServiceId::new("default", "rr-keep");
+    let mut services = ServiceMap::new();
+    services
+        .register_app("rr-keep", "default", 9996, None)
+        .unwrap();
+    services.add_backend(&id, backend("rr-0", &first)).unwrap();
+    services.add_backend(&id, backend("rr-1", &second)).unwrap();
+    let mut maps = BpfServiceMap::new();
+    maps.sync_from_service_map(&services, &mut ebpf).unwrap();
+    let vip = VirtualIP::from_service_id(&id);
+    let address = SocketAddr::new(vip.0.into(), 9996);
+    let entry = services.resolve(&id).unwrap().clone();
+
+    let mut held = Vec::new();
+    for round in 0..4 {
+        held.push(
+            TcpStream::connect_timeout(&address, Duration::from_secs(2))
+                .expect("connect to the VIP"),
+        );
+        // Rewrite the entry both ways Bun does: a full sync and a
+        // single-service update.
+        if round % 2 == 0 {
+            maps.sync_from_service_map(&services, &mut ebpf).unwrap();
+        } else {
+            maps.update_backends_bpf(&mut ebpf, vip, 9996, &entry)
+                .unwrap();
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let accepted =
+        |listener: &std::net::TcpListener| std::iter::from_fn(|| listener.accept().ok()).count();
+    let (on_first, on_second) = (accepted(&first), accepted(&second));
+    assert_eq!(on_first + on_second, held.len());
+    assert!(
+        on_first > 0 && on_second > 0,
+        "every rewrite restarted at one backend: {on_first} and {on_second}"
+    );
+    ebpf.detach().unwrap();
+}
+
 #[tokio::test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
 async fn ebpf_connect_to_vip_no_backends_refused() {

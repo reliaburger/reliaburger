@@ -212,6 +212,7 @@ impl FileCertResolver {
             Ok(CachedCertificate {
                 key: certified_key(chain, key)?,
                 validity,
+                last_used: std::time::Instant::now(),
             })
         })
         .await
@@ -362,11 +363,16 @@ impl CertificateValidity {
 struct CachedCertificate {
     key: Arc<rustls::sign::CertifiedKey>,
     validity: CertificateValidity,
+    /// When a handshake last used this entry. The per-SNI cache evicts the
+    /// least recent one when it's full of live hosts.
+    last_used: std::time::Instant,
 }
 
 /// Largest number of per-SNI certificates the resolver caches. The host
 /// allowlist already bounds this to the number of configured ingress routes;
 /// the cap is defence in depth against a pathologically large route set.
+/// A full cache first drops hosts that lost their `tls = "cluster"` route
+/// and expired leaves, then the least recently used host (#2430).
 const MAX_SNI_CACHE: usize = 1024;
 
 /// A certificate resolver whose inner resolver can be swapped under a running
@@ -437,6 +443,8 @@ pub struct IngressCertResolver {
     default_key: Arc<rustls::sign::CertifiedKey>,
     modes: Arc<super::routing::CertificateModes>,
     cache: std::sync::Mutex<std::collections::HashMap<String, CachedCertificate>>,
+    /// Most hosts the cache holds; [`MAX_SNI_CACHE`] outside tests.
+    capacity: usize,
 }
 
 impl std::fmt::Debug for IngressCertResolver {
@@ -468,7 +476,16 @@ impl IngressCertResolver {
             default_key: certified_key(default_cert, default_key)?,
             modes,
             cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            capacity: MAX_SNI_CACHE,
         })
+    }
+
+    /// The same resolver with a smaller cache, so a test can fill it without
+    /// signing a thousand certificates.
+    #[cfg(test)]
+    fn with_cache_capacity(mut self, capacity: usize) -> Self {
+        self.capacity = capacity;
+        self
     }
 
     /// Issue (or fetch from cache) a certified key for `hostname`.
@@ -479,7 +496,11 @@ impl IngressCertResolver {
             .cache
             .lock()
             .ok()
-            .and_then(|cache| cache.get(&hostname).cloned())
+            .and_then(|mut cache| {
+                let entry = cache.get_mut(&hostname)?;
+                entry.last_used = std::time::Instant::now();
+                Some(entry.clone())
+            })
             .filter(|entry| entry.validity.contains(now));
         if let Some(entry) = &existing
             && !entry.validity.renewal_due(now)
@@ -520,18 +541,44 @@ impl IngressCertResolver {
         // its renewal midpoint, from the moment we issued it.
         validity.not_before = validity.not_before.max(issued_at);
         let certified = certified_key(chain, key).ok()?;
-        if let Ok(mut cache) = self.cache.lock()
-            && (cache.len() < MAX_SNI_CACHE || cache.contains_key(hostname))
-        {
+        if let Ok(mut cache) = self.cache.lock() {
+            if !cache.contains_key(hostname) && cache.len() >= self.capacity {
+                self.make_room(&mut cache, issued_at);
+            }
             cache.insert(
                 hostname.to_string(),
                 CachedCertificate {
                     key: Arc::clone(&certified),
                     validity,
+                    last_used: std::time::Instant::now(),
                 },
             );
         }
         Some(certified)
+    }
+
+    /// Free one slot in a full cache.
+    ///
+    /// Hosts that lost their `tls = "cluster"` route and expired leaves go
+    /// first; if every entry is still live, the least recently used one does.
+    /// A full cache used to refuse new hosts, so each later handshake for one
+    /// signed a fresh leaf on the runtime's worker thread (#2430).
+    fn make_room(
+        &self,
+        cache: &mut std::collections::HashMap<String, CachedCertificate>,
+        now: i64,
+    ) {
+        cache.retain(|host, entry| self.is_configured_host(host) && entry.validity.contains(now));
+        if cache.len() < self.capacity {
+            return;
+        }
+        let least_recent = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(host, _)| host.clone());
+        if let Some(host) = least_recent {
+            cache.remove(&host);
+        }
     }
 
     /// Whether `hostname` has a `tls = "cluster"` route in the last
@@ -1067,6 +1114,91 @@ mod tests {
     /// self-signed default — it never triggers CA signing and never touches the
     /// cache, so an attacker's arbitrary SNI can neither mint certs nor grow
     /// memory.
+    /// A routing table whose `tls = "cluster"` hosts are `hosts`.
+    fn cluster_routes(hosts: &[&str]) -> super::super::routing::RoutingTable {
+        use crate::config::app::IngressSpec;
+        use crate::onion::service_map::ServiceMap;
+
+        let mut map = ServiceMap::new();
+        let mut configs = std::collections::HashMap::new();
+        for host in hosts {
+            let app = host.replace('.', "-");
+            map.register_app(&app, "default", 8080, None).unwrap();
+            configs.insert(
+                ("default".to_string(), app),
+                IngressSpec {
+                    host: host.to_string(),
+                    path: None,
+                    tls: Some("cluster".to_string()),
+                    websocket: None,
+                    rate_limit_rps: None,
+                    rate_limit_burst: None,
+                },
+            );
+        }
+        let mut table = super::super::routing::RoutingTable::new();
+        table.rebuild(&map, &configs).unwrap();
+        table
+    }
+
+    fn cached_hosts(resolver: &IngressCertResolver) -> std::collections::BTreeSet<String> {
+        resolver.cache.lock().unwrap().keys().cloned().collect()
+    }
+
+    #[test]
+    fn a_full_cache_still_caches_a_new_host() {
+        let resolver = resolver_with(empty_routes()).with_cache_capacity(4);
+        for i in 0..4 {
+            resolver.key_for(&format!("h{i}.example.com")).unwrap();
+        }
+
+        let first = resolver.key_for("late.example.com").unwrap();
+        let second = resolver.key_for("late.example.com").unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a host past the cap signed a new leaf on every handshake"
+        );
+        assert!(resolver.cache.lock().unwrap().len() <= 4);
+    }
+
+    #[test]
+    fn hosts_without_a_cluster_route_are_evicted_when_the_cache_is_full() {
+        let hosts = ["a.example", "b.example", "c.example"];
+        let routes = Arc::new(tokio::sync::RwLock::new(cluster_routes(&hosts)));
+        let resolver = resolver_with(Arc::clone(&routes)).with_cache_capacity(3);
+        for host in hosts {
+            resolver.key_for(host).unwrap();
+        }
+
+        // b's route goes away, and d's arrives.
+        let replacement = cluster_routes(&["a.example", "c.example", "d.example"]);
+        routes.try_write().unwrap().replace(replacement);
+        resolver.key_for("d.example").unwrap();
+
+        let expected: std::collections::BTreeSet<String> = ["a.example", "c.example", "d.example"]
+            .map(String::from)
+            .into();
+        assert_eq!(cached_hosts(&resolver), expected);
+    }
+
+    #[test]
+    fn the_least_recently_used_host_is_evicted_when_every_host_is_routed() {
+        let hosts = ["a.example", "b.example", "c.example", "d.example"];
+        let routes = Arc::new(tokio::sync::RwLock::new(cluster_routes(&hosts)));
+        let resolver = resolver_with(routes).with_cache_capacity(3);
+        let a = resolver.key_for("a.example").unwrap();
+        resolver.key_for("b.example").unwrap();
+        resolver.key_for("c.example").unwrap();
+        // A handshake for a makes b the least recently used.
+        assert!(Arc::ptr_eq(&a, &resolver.key_for("a.example").unwrap()));
+
+        resolver.key_for("d.example").unwrap();
+        let expected: std::collections::BTreeSet<String> = ["a.example", "c.example", "d.example"]
+            .map(String::from)
+            .into();
+        assert_eq!(cached_hosts(&resolver), expected);
+    }
+
     #[test]
     fn unconfigured_sni_gets_the_default_and_never_caches() {
         let resolver = resolver_with(empty_routes());

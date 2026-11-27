@@ -629,7 +629,10 @@ and snapshots are refused rather than migrated.
 
 The council holds the cluster's desired state: apps, jobs, tokens and the
 rest. Turn on sealed backups to object storage, and you can rebuild a cluster
-that has lost every council member:
+that has lost every council member. Don't wait long to decide: a minute
+after the council loses its leader, nodes stop routing to each other ([When
+the council has no leader](03_networking.md#when-the-council-has-no-leader)).
+
 
 ```toml
 [cluster.backup]

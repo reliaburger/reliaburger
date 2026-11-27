@@ -984,6 +984,33 @@ Three error codes tell the client exactly what happened:
 - **503 Service Unavailable**: The connection limit was reached. We're overloaded.
 - **413 Payload Too Large**: The request body exceeded the configured cap (more on that below).
 
+A 502 often comes from Wrapper's own probe loop rather than from the service map. Every 5 s each ingress node probes every backend it routes to, and three failed probes in a row take a backend out of rotation on that node. The first version sent the probes one at a time, each with a 2 s timeout, and took the routing table's write lock after every one. When a node lost power, its backends didn't refuse connections, they just never answered, so a sweep over 40 of them took 80 s, and the three sweeps needed to drop them took over four minutes (#2448). The loop now probes concurrently:
+
+```rust
+futures_util::stream::iter(targets)
+    .map(|(instance_id, addr)| async move {
+        let ok = probe_backend_once(client, addr, &config.path, config.timeout).await;
+        (instance_id, addr, ok)
+    })
+    .buffer_unordered(PROBE_CONCURRENCY)
+    .collect()
+    .await
+```
+
+A *stream* is the async cousin of an iterator, and `buffer_unordered(32)` keeps up to 32 of the probe futures running at once, yielding each result as it lands; in Go you'd write a worker pool with a semaphore. Chapter 6 uses the same shape for metric scrapes and explains it in more detail. A sweep over silent backends now costs one timeout per 32 of them. The verdicts are applied together: the loop asks under the read lock whether any of them changes a backend (`health_differs`), and only then takes the write lock, once, for the whole batch. A quiet sweep never makes a request wait. The test gives the loop eight listeners that accept and never answer, a 200 ms timeout, and 800 ms to mark all eight down; one at a time it needed 1.6 s.
+
+The probe also had the wrong idea of failure. It counted a 5xx as "unreachable", so an API whose framework answers `GET /` with 501, because it has no handler there, deployed green, passed its own health check on `/healthz`, and then got 502 on every path through every ingress node, with nothing in the logs naming the probe (#2464). But the probe exists to answer one question the service map can't: can *this node* reach that instance? A 501 answers it. The app's own health check covers "is the app well", and its verdict already arrives as `Backend::healthy`. So any HTTP response now passes, and only a refused connection, a connection closed without an answer, or a timeout fails:
+
+```rust
+match tokio::time::timeout(timeout, client.get(&url).send()).await {
+    Ok(Ok(_)) => Ok(()),
+    Ok(Err(error)) => Err(ProbeFailure::Request(error.to_string())),
+    Err(_) => Err(ProbeFailure::Timeout),
+}
+```
+
+The nested `Ok(Ok(_))` reads from the outside in: the timeout didn't fire, and the request got a response. `ProbeFailure` carries the reason so the loop can log a backend's flip out of rotation, and its recovery, with the cause. We considered probing the app's declared health path instead. Every ingress node would need that path, plus the health port and protocol, which can differ from the app's port, so the endpoint catalogue would grow a field on the wire and on disk, all to ask a question the app's own health check already answers. The tests that used a backend answering 500 as their "dead" backend now use a listener that closes each connection unanswered, which is what a dead backend looks like from the network.
+
 ### Connection draining
 
 When an app is being redeployed (rolling update), the old instances need to finish serving in-flight requests before they're stopped. This is the drain protocol:
@@ -1247,6 +1274,8 @@ pub fn get(&self, host: &str) -> Option<TlsMode> {
 
 This is the one place a std lock beats tokio's. It's held only long enough to clone an `Arc` (a reference-count bump), never across an `.await`, and the code reading it is synchronous anyway. Writers build the whole map first and swap the pointer, so a reader sees either the old map or the new one, never half of each. `unwrap_or_else(|p| p.into_inner())` recovers a poisoned lock: Rust marks a lock poisoned when a thread panics holding it, but a panic mid-swap can't leave a torn `Arc`.
 
+The cluster resolver caches the leaf it signs for each host, up to 1,024 of them. The first version never evicted anything: once the cache was full, a new host was never cached, so every handshake for it generated a key and signed a leaf. TLS session resumption is off, so that was every connection. A team that deploys a preview app per pull request, each on its own host, gets there over the life of one Bun process (#2430). A full cache now makes room before it inserts: hosts that lost their `tls = "cluster"` route and expired leaves go first, and if every entry is still live, the one whose last handshake is oldest goes. Each entry records that time, updated on every cache hit. The cache stays a `HashMap` behind a `std::sync::Mutex`; at 1,024 entries a linear scan for the oldest is cheap, and it happens only when the cache is full. The tests shrink the cap to three or four with a test-only `with_cache_capacity`, so they don't sign a thousand certificates.
+
 The resolver takes the `Arc<CertificateModes>` once, when the listener binds. That only works if the table keeps the same one for life, and the agent sometimes swaps in a whole new table (`*table = candidate`), which would leave the resolver watching an orphan. `RoutingTable::replace` takes the new routes but keeps its own handle and publishes to it, and the agent's three swap sites use it.
 
 SNI names a host, not a path, so two routes on one host share a certificate. When they disagree, `explicit` wins over `cluster`, since the operator chose that certificate for that name on purpose. `RoutingTable::certificate_mode` makes that call, and its test pins it.
@@ -1298,6 +1327,19 @@ So the source hadn't changed and the kernel would take the program. What changed
 The routing table's round-robin counter uses `AtomicU64` with `Ordering::Relaxed`. If you're coming from Go, think `atomic.AddUint64` with no memory barrier. If you're coming from C, think `__atomic_fetch_add` with `__ATOMIC_RELAXED`.
 
 Why relaxed? Because we don't care about precise ordering between threads. If two requests arrive simultaneously and both increment the counter, they'll pick different backends — that's the desired outcome. We're not coordinating anything; we're distributing load. The weaker memory ordering means no cache-line bouncing on most architectures.
+
+The counter had a weakness that ordering has nothing to do with: it lived in the route, and the route didn't survive a rebuild. Any deploy, health flip or catalogue change anywhere in the cluster rebuilds the whole table, and every rebuilt route started its counter at 0 again. A route with fewer requests than rebuilds then sent almost all of them to its first backend, while the other replicas sat idle (#2454). The kernel had the same bug in its own counter: every write of a service's `backend_map` entry set `rr_index` back to 0. Now `rebuild` and `replace` copy each route's position into the new route with the same host and path prefix, and the BPF map writers read the old entry first and keep its index through `carry_round_robin`:
+
+```rust
+pub fn carry_round_robin(previous: Option<&BackendValue>, new: BackendValue) -> BackendValue {
+    BackendValue {
+        rr_index: previous.map_or(new.rr_index, |previous| previous.rr_index),
+        ..new
+    }
+}
+```
+
+`..new` is the struct update syntax from Chapter 1: every field we didn't name comes from `new`. `map_or` is the `Option` version of "if present, transform it, else use this default". The read and the write aren't atomic against the connect hook, which may advance the index in between, so a few increments can be lost; for spreading load that doesn't matter. Keeping the helper pure lets a unit test check it without a kernel, and `a_rewritten_backend_entry_keeps_its_round_robin_position` in `tests/ebpf.rs` checks the real map: four connections to a VIP, each followed by a rewrite of its entry, must reach both backends.
 
 ### `#[repr(C)]` is your FFI contract
 
@@ -1845,7 +1887,7 @@ Is this safe? Follow one poll. The node reads its clock at `t_s`, just before se
 
 When the node comes back, its first poll registers it again. A restarted Bun withdraws everything it recovered before it publishes anything, as described above. A Bun that lived through a partition holds only its local view, and the answer replaces that in place. That's true even when the answer is the very catalogue generation it published before the lapse, which is the usual case after a short outage: the agent remembers it's running on the local part and installs the whole thing again. The answer is the current catalogue, so every remote address in it is live.
 
-The price is still real, just smaller. A node that can't hear from any leader for a minute stops routing to *other* nodes until one answers. A service with a replica on every node (a daemon set, or simply enough replicas) rides out a council outage untouched; a call whose only backends live elsewhere fails with `EPERM` from `connect()` or 503 from Wrapper. Two corners stay fully closed. A Bun that restarts during the outage routes nothing until a leader answers, because it can't prove what it published before it died. And a local instance that crashes can't be restarted, because releasing its old address needs the leader. That's a council outage long enough to stop scheduling too, and failing closed on the cross-node traffic is the whole point of the protocol. Running out of connections is an outage you can see.
+The price is still real, just smaller. A node that can't hear from any leader for a minute stops routing to *other* nodes until one answers. A service with a replica on every node (a daemon set, or simply enough replicas) rides out a council outage untouched; a call whose only backends live elsewhere fails with `EPERM` from `connect()` or 503 from Wrapper. Two corners stay fully closed. A Bun that restarts during the outage routes nothing until a leader answers, because it can't prove what it published before it died. And a local instance that crashes can't be restarted, because releasing its old address needs the leader. That's a council outage long enough to stop scheduling too, and failing closed on the cross-node traffic is the whole point of the protocol. Running out of connections is an outage you can see. It's only visible if someone has told the operator to look for it, though: for a while the ingress design doc still said Wrapper "continues routing with the last known good routing table", and the user manual didn't mention the lease at all (#2500). The manual's networking chapter now has a section on what keeps working and what stops a minute after the council loses its leader, and the `no-leader` and `quorum-loss` findings point to it.
 
 ### What went wrong on the way
 
