@@ -430,6 +430,7 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
             name: name.to_string(),
         });
     }
+    validate_app_replicas(name, app)?;
     validate_network_policy(
         &format!("app {name:?}"),
         app.firewall.as_ref(),
@@ -533,11 +534,8 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
             Some(0) => return Err(metrics_error("port must not be 0".to_string())),
             Some(_) => {}
         }
-        if !metrics.path.starts_with('/') || metrics.path.contains(char::is_whitespace) {
-            return Err(metrics_error(format!(
-                "path {:?} must start with '/' and contain no whitespace",
-                metrics.path
-            )));
+        if let Err(reason) = check_http_path(&metrics.path) {
+            return Err(metrics_error(reason));
         }
     }
 
@@ -642,6 +640,30 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
         });
     }
 
+    Ok(())
+}
+
+/// Refuse a replica count, fixed or autoscaled, above
+/// [`MAX_REPLICAS`](super::MAX_REPLICAS) (#2368). The leader plans every
+/// replica of a pass in memory, so one absurd count committed to desired
+/// state would take down each leader in turn.
+fn validate_app_replicas(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError> {
+    let max = super::MAX_REPLICAS;
+    let refuse = |field: &str, what: &str, count: u32| ConfigError::Validation {
+        field: field.to_string(),
+        context: format!("app {name:?}"),
+        reason: format!("{what} ({count}) must be at most {max}"),
+    };
+    if let super::Replicas::Fixed(count) = app.replicas
+        && count > max
+    {
+        return Err(refuse("replicas", "replicas", count));
+    }
+    if let Some(autoscale) = &app.autoscale
+        && autoscale.max > max
+    {
+        return Err(refuse("autoscale", "max", autoscale.max));
+    }
     Ok(())
 }
 
@@ -818,6 +840,12 @@ fn validate_app_honoured_fields(name: &str, app: &super::app::AppSpec) -> Result
             "no port to probe: set health.port or the app's port".to_string(),
         ));
     }
+    // The probe URL is the instance's address followed by this path, so a
+    // path starting with `@` or `//` would move the probe to another host
+    // (#2401).
+    if let Err(reason) = check_http_path(&health.path) {
+        return Err(refuse("health.path", reason));
+    }
     let zero = [
         ("health.interval", health.interval == Some(0)),
         ("health.timeout", health.timeout == Some(0)),
@@ -857,6 +885,23 @@ fn validate_app_honoured_fields(name: &str, app: &super::app::AppSpec) -> Result
         return Err(refuse(
             "health.timeout",
             format!("timeout ({timeout}s) must not be longer than interval ({interval}s)"),
+        ));
+    }
+    Ok(())
+}
+
+/// Check a path Bun appends to an instance's `host:port` to build a probe
+/// or scrape URL: it starts with one `/` and holds no whitespace or control
+/// character, so it can't end the URL's authority early or name another
+/// host. A query string after it is fine.
+pub(crate) fn check_http_path(path: &str) -> Result<(), String> {
+    if !path.starts_with('/')
+        || path.starts_with("//")
+        || path.contains(|c: char| c.is_whitespace() || c.is_control())
+    {
+        return Err(format!(
+            "path {path:?} must start with '/' (not '//') and contain no whitespace or \
+             control characters"
         ));
     }
     Ok(())
@@ -1070,6 +1115,7 @@ impl NodeConfig {
                 reason: "0.1.0 supports a fixed 100-event admission limit; custom limits are not supported".into(),
             });
         }
+        self.node.validate()?;
         self.images.trust_policy.validate()?;
         // Storage paths must be absolute
         let paths = [
@@ -1945,6 +1991,34 @@ mod tests {
             .unwrap();
             config_with_app("web", app).validate().unwrap();
         }
+    }
+
+    #[test]
+    fn an_over_long_deploy_timeout_is_refused() {
+        // The deploy worker adds these to `Instant::now()`, which panics
+        // on overflow (#2378). A day and an hour are the caps.
+        for (field, value) in [
+            ("health_timeout", "9223372036854775807s"),
+            ("health_timeout", "86401s"),
+            ("drain_timeout", "86401s"),
+            ("drain_timeout", "3601s"),
+        ] {
+            let app: AppSpec = toml::from_str(&format!(
+                "image = \"web:v1\"\n[deploy]\n{field} = \"{value}\"\n"
+            ))
+            .unwrap();
+            let err = config_with_app("web", app).validate().unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::Validation { field: f, reason, .. }
+                    if f == "deploy" && reason.contains(field) && reason.contains("at most")),
+                "{field} = {value}: {err:?}"
+            );
+        }
+        let app: AppSpec = toml::from_str(
+            "image = \"web:v1\"\n[deploy]\nhealth_timeout = \"24h\"\ndrain_timeout = \"1h\"\n",
+        )
+        .unwrap();
+        config_with_app("web", app).validate().unwrap();
     }
 
     #[test]
@@ -3188,6 +3262,34 @@ exec = "/usr/bin/python3""#,
     }
 
     #[test]
+    fn replicas_above_the_limit_are_refused() {
+        // A count in the billions would make the leader plan billions of
+        // replicas in memory (#2368).
+        assert_app_refused("image = \"web:v1\"\nreplicas = 4294967295", "replicas");
+        assert_app_refused(
+            &format!(
+                "image = \"web:v1\"\nreplicas = {}",
+                crate::config::types::MAX_REPLICAS + 1
+            ),
+            "replicas",
+        );
+        validate_app_toml(&format!(
+            "image = \"web:v1\"\nreplicas = {}",
+            crate::config::types::MAX_REPLICAS
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn an_autoscale_max_above_the_replica_limit_is_refused() {
+        assert_app_refused(
+            "image = \"web:v1\"\ncpu = \"100m\"\n[app.web.autoscale]\nmetric = \"cpu\"\n\
+             target = \"70%\"\nmin = 1\nmax = 4294967295",
+            "autoscale",
+        );
+    }
+
+    #[test]
     fn zero_health_timeout_is_refused() {
         let health = "image = \"web:v1\"\nport = 8080\n[app.web.health]\npath = \"/healthz\"";
         for field in [
@@ -3197,6 +3299,32 @@ exec = "/usr/bin/python3""#,
             "threshold_healthy",
         ] {
             assert_app_refused(&format!("{health}\n{field} = 0"), field);
+        }
+    }
+
+    #[test]
+    fn health_path_must_be_absolute_without_whitespace() {
+        // A path that starts with `@` turns the probe URL's host into one
+        // the app's author chose (#2401).
+        for path in [
+            "@169.254.169.254/latest/",
+            "healthz",
+            "/health z",
+            "/a\nb",
+            "//169.254.169.254/latest/",
+            "/a\u{7f}b",
+        ] {
+            let quoted = toml::Value::String(path.to_string()).to_string();
+            assert_app_refused(
+                &format!("image = \"web:v1\"\nport = 8080\n[app.web.health]\npath = {quoted}"),
+                "health.path",
+            );
+        }
+        for path in ["/", "/healthz", "/healthz?full=1", "/a@b"] {
+            validate_app_toml(&format!(
+                "image = \"web:v1\"\nport = 8080\n[app.web.health]\npath = {path:?}"
+            ))
+            .unwrap();
         }
     }
 

@@ -191,6 +191,8 @@ fn the_refusals_name_their_rule() {
     let mut scale = request(RequestKind::Scale, Some("web"));
     scale.replicas = Some(0);
     assert_eq!(rule_of(refused(&state, &scale)), "scale_to_zero");
+    scale.replicas = Some(u32::MAX);
+    assert_eq!(rule_of(refused(&state, &scale)), "too_many_replicas");
 
     scale.replicas = Some(4);
     state.gitops_owned.apps.insert(web.clone());

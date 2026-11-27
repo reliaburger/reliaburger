@@ -434,6 +434,10 @@ fn one_app_change(
                     ScaleRefusal::DaemonSet => {
                         format!("{app} runs one replica on every node and has no count to scale")
                     }
+                    ScaleRefusal::TooMany => format!(
+                        "{replicas} replicas is more than the {} an app may run",
+                        crate::config::MAX_REPLICAS
+                    ),
                 };
                 return refused(refusal.rule(), message);
             }

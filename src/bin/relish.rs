@@ -2126,12 +2126,21 @@ enum SecretAction {
         namespace: Option<String>,
     },
     /// Encrypt a plaintext value for use in app config ENC[AGE:...] fields.
+    ///
+    /// The value comes from `--value-file`, or from standard input when
+    /// neither it nor VALUE is given (asked for without echo at a terminal).
+    /// One trailing newline is dropped, so `echo` and `printf` both work.
     Encrypt {
         /// The age public key (from `relish secret pubkey`).
         #[arg(long)]
         pubkey: String,
-        /// The plaintext value to encrypt.
-        value: String,
+        /// The plaintext value to encrypt. An argument shows in the process
+        /// list and shell history: prefer --value-file or standard input
+        /// for a real secret.
+        value: Option<String>,
+        /// Read the value from this file instead.
+        #[arg(long, conflicts_with = "value")]
+        value_file: Option<PathBuf>,
     },
     /// Rotate the secret encryption key (start or finalise).
     ///
@@ -3334,9 +3343,16 @@ async fn main() -> ExitCode {
             SecretAction::Pubkey { dir, namespace } => {
                 commands::secret_pubkey(dir.as_deref(), namespace.as_deref(), cli.output).await
             }
-            SecretAction::Encrypt { pubkey, value } => {
-                commands::secret_encrypt(pubkey, value, cli.output)
+            SecretAction::Encrypt {
+                pubkey,
+                value,
+                value_file,
+            } => match (value, value_file) {
+                (Some(value), _) => Ok(value.clone()),
+                (None, Some(path)) => commands::read_secret_value_file(path),
+                (None, None) => commands::read_secret_value_stdin(),
             }
+            .and_then(|value| commands::secret_encrypt(pubkey, &value, cli.output)),
             SecretAction::Rotate {
                 finalize,
                 namespace,
@@ -6182,6 +6198,59 @@ mod tests {
         assert!(parse(&["relish", "setup", "--ssh", "u@a", "--nodes", "3"]).is_err());
     }
 
+    /// Every `relish ...` command quoted in backticks in `source`'s
+    /// non-test half, cut before its first argument placeholder or flag.
+    fn quoted_relish_commands(source: &str) -> Vec<Vec<String>> {
+        let code = source.split("#[cfg(test)]").next().unwrap_or_default();
+        code.match_indices("`relish ")
+            .map(|(start, opening)| {
+                let rest = &code[start + opening.len()..];
+                let end = rest.find(['`', '\n']).unwrap_or(rest.len());
+                rest[..end]
+                    .split_whitespace()
+                    .take_while(|word| {
+                        !word.starts_with('-') && !word.contains(['<', '[', '{', '"', '\\'])
+                    })
+                    .map(str::to_string)
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_command_a_wtf_suggestion_names_exists() {
+        // `relish wtf` advised `relish pickle gc`, which has never existed,
+        // and agents run what `relish agent diagnose` suggests (#2468).
+        let sources = [
+            ("wtf/diagnose.rs", include_str!("../relish/wtf/diagnose.rs")),
+            ("wtf_cmd.rs", include_str!("../relish/wtf_cmd.rs")),
+            (
+                "agent/diagnose.rs",
+                include_str!("../relish/agent/diagnose.rs"),
+            ),
+        ];
+        let root = <Cli as clap::CommandFactory>::command();
+        let mut checked = 0;
+        for (file, source) in sources {
+            for words in quoted_relish_commands(source) {
+                let mut command = &root;
+                for word in &words {
+                    if command.get_subcommands().next().is_none() {
+                        break; // the rest are arguments
+                    }
+                    command = command.find_subcommand(word).unwrap_or_else(|| {
+                        panic!(
+                            "{file} suggests `relish {}`: no subcommand {word:?}",
+                            words.join(" ")
+                        )
+                    });
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 20, "found only {checked} quoted commands");
+    }
+
     #[test]
     fn parse_join_token_file_and_reject_conflicting_credentials() {
         assert!(
@@ -6220,6 +6289,21 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn secret_encrypt_accepts_a_value_file_or_stdin_instead_of_an_argument() {
+        // An argument shows in `ps` and shell history (#2407).
+        let base = ["relish", "secret", "encrypt", "--pubkey", "age1x"];
+        let with = |extra: &[&'static str]| {
+            let mut args = base.to_vec();
+            args.extend_from_slice(extra);
+            parse(&args)
+        };
+        assert!(with(&["--value-file", "/private/secret"]).is_ok());
+        assert!(with(&[]).is_ok(), "no value means standard input");
+        assert!(with(&["plain"]).is_ok(), "the argument still works");
+        assert!(with(&["plain", "--value-file", "/private/secret"]).is_err());
     }
 
     #[test]

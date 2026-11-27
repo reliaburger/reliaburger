@@ -308,6 +308,14 @@ impl From<PidsLimit> for u32 {
 // Replicas
 // ---------------------------------------------------------------------------
 
+/// The most replicas an app may ask for (#2368), in its file, through
+/// `relish scale` or through a scale proposal. The leader plans every
+/// replica of a pass in memory, so a count in the billions would exhaust it;
+/// ten thousand is far above anything a cluster runs today. The
+/// deserialiser doesn't enforce it, so desired state that already holds a
+/// larger count still loads and can be scaled back down.
+pub const MAX_REPLICAS: u32 = 10_000;
+
 /// Replica count for an App.
 ///
 /// Either a fixed integer (`replicas = 3`) or daemon mode
