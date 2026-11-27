@@ -2199,6 +2199,7 @@ pub fn spawn_autoscaler(
             let desired = council.desired_state().await;
             forget_unscaled_apps(&mut tracker, &desired);
             let overrides = autoscale_overrides(&desired);
+            let mut scaled = Vec::new();
             for (app_id, spec) in &desired.apps {
                 let Some(autoscale) = &spec.autoscale else {
                     continue;
@@ -2222,11 +2223,20 @@ pub fn spawn_autoscaler(
                         Replicas::Fixed(n) => n,
                         Replicas::DaemonSet => continue, // daemon sets don't autoscale
                     });
+                scaled.push((app_id, config, baseline));
+            }
 
-                // Utilisation of the app's request over the CONFIGURED window
-                // (was hardcoded to five minutes regardless of the spec).
-                let Some(metric) = app_metric_utilisation(&rollup_store, &config, app_id).await
-                else {
+            // Utilisation of each app's request over its CONFIGURED window
+            // (was hardcoded to five minutes regardless of the spec), all
+            // read from one snapshot of the store (#2530).
+            let wanted: Vec<_> = scaled
+                .iter()
+                .map(|(app_id, config, _)| (*app_id, config))
+                .collect();
+            let metrics = apps_metric_utilisation(&rollup_store, &wanted).await;
+            for (app_id, config, baseline) in &scaled {
+                let (app_id, config, baseline) = (*app_id, config, *baseline);
+                let Some(&metric) = metrics.get(app_id) else {
                     continue; // no data yet
                 };
 
@@ -2235,7 +2245,7 @@ pub fn spawn_autoscaler(
                 // Keep the tracker's current in sync with cluster truth
                 // (another leader may have scaled while we were a follower).
                 state.current_replicas = baseline;
-                if let Some(decision) = evaluate(app_id, &config, state, metric, now) {
+                if let Some(decision) = evaluate(app_id, config, state, metric, now) {
                     // Commit FIRST, start the cooldown only after the write
                     // succeeds (DEP8). The old code applied the decision —
                     // and thus started the cooldown — before the Raft write,
@@ -2302,9 +2312,9 @@ fn record_autoscale_write(
     }
 }
 
-/// Average utilisation of the app's resource request over the app's
-/// `[autoscale] evaluation_window`, as a fraction, from the leader's
-/// rollup store.
+/// Average utilisation of each app's resource request over the app's
+/// `[autoscale] evaluation_window`, as a fraction, from the leader's rollup
+/// store. Apps with no data are left out.
 ///
 /// Reads the per-instance series the node collector really records
 /// (`process_cpu_percent`, percent of one core, or `process_memory_bytes`),
@@ -2313,36 +2323,80 @@ fn record_autoscale_write(
 /// for. The autoscaler used to query a series literally named `cpu`, which
 /// nothing records, so it never scaled a real cluster.
 ///
-/// Returns `None` when there's no data.
-async fn app_metric_utilisation(
+/// The store's lock is held only to copy a snapshot, in one statement, and
+/// the queries run on that (#2530): one per series the apps use, over the
+/// longest window any of them asks for. The answer is per minute, so each
+/// app then reads only the minutes inside its own window. The loop used to
+/// hold the read lock through one query per app, and the aggregator's
+/// ingest and flush waited behind it.
+async fn apps_metric_utilisation(
     rollup_store: &tokio::sync::RwLock<crate::mayo::rollup_store::RollupStore>,
-    config: &crate::meat::autoscaler::AutoscaleConfig,
-    app_id: &crate::meat::types::AppId,
-) -> Option<f64> {
-    let now = std::time::SystemTime::now()
+    apps: &[(
+        &crate::meat::types::AppId,
+        &crate::meat::autoscaler::AutoscaleConfig,
+    )],
+) -> HashMap<crate::meat::types::AppId, f64> {
+    let mut found = HashMap::new();
+    if apps.is_empty() {
+        return found;
+    }
+    let Some(now) = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
-    let window_start = now.saturating_sub(config.evaluation_window.as_secs());
+        .ok()
+        .map(|elapsed| elapsed.as_secs())
+    else {
+        return found;
+    };
+    let window_start = |config: &crate::meat::autoscaler::AutoscaleConfig| {
+        now.saturating_sub(config.evaluation_window.as_secs())
+    };
+    let mut series: BTreeMap<&str, u64> = BTreeMap::new();
+    for (_, config) in apps {
+        let start = window_start(config);
+        series
+            .entry(config.metric.series_name())
+            .and_modify(|earliest| *earliest = (*earliest).min(start))
+            .or_insert(start);
+    }
+    // The guard is a temporary of this statement: it's dropped at the end
+    // of the `let`, before any query runs.
+    let Ok(snapshot) = rollup_store.read().await.snapshot().await else {
+        return found;
+    };
+    for (name, earliest) in series {
+        let Ok(aggregates) = snapshot.query_cluster_aggregates(name, earliest, now).await else {
+            continue;
+        };
+        for (app_id, config) in apps
+            .iter()
+            .filter(|(_, config)| config.metric.series_name() == name)
+        {
+            if let Some(value) = app_utilisation(&aggregates, app_id, config, window_start(config))
+            {
+                found.insert((*app_id).clone(), value);
+            }
+        }
+    }
+    found
+}
 
-    let store = rollup_store.read().await;
-    let aggregates = store
-        .query_cluster_aggregates(config.metric.series_name(), window_start, now)
-        .await
-        .ok()?;
+/// `app_id`'s utilisation from one series' per-minute `aggregates`, counting
+/// only the minutes at or after `start`. `None` when it has none.
+fn app_utilisation(
+    aggregates: &[crate::mayo::rollup_store::ClusterAggregate],
+    app_id: &crate::meat::types::AppId,
+    config: &crate::meat::autoscaler::AutoscaleConfig,
+    start: u64,
+) -> Option<f64> {
     let mut total = 0.0;
     let mut n = 0u64;
-    for agg in &aggregates {
-        if agg.count > 0 && aggregate_is_for_app(&agg.labels, app_id) {
+    for agg in aggregates {
+        if agg.count > 0 && agg.timestamp >= start && aggregate_is_for_app(&agg.labels, app_id) {
             total += agg.sum / f64::from(agg.count);
             n += 1;
         }
     }
-    if n == 0 {
-        None
-    } else {
-        Some(config.utilisation(total / n as f64))
-    }
+    (n > 0).then(|| config.utilisation(total / n as f64))
 }
 
 /// Whether a rollup aggregate's labels belong to exactly `app_id` (M26).
@@ -6428,6 +6482,100 @@ image = "busybox:latest"
         assert_eq!(effective_replicas(&spec, None, 3), 3);
     }
 
+    /// #2530: the autoscaler held the rollup store's read lock through one
+    /// query per autoscaled app, and the aggregator's ingest and flush
+    /// waited behind it. It now queries one snapshot, taken in one
+    /// statement, once per metric series, whatever each app's window.
+    #[tokio::test]
+    async fn the_autoscaler_queries_one_snapshot_per_series_holding_no_lock() {
+        use crate::mayo::rollup::{NodeRollup, RollupAggregate, RollupEntry};
+        use crate::mayo::rollup_store::RollupStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = RollupStore::new(dir.path().to_path_buf());
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let entry = |app: &str| RollupEntry {
+            metric_name: "process_cpu_percent".to_string(),
+            labels: BTreeMap::from([("app".to_string(), app.to_string())]),
+            aggregate: RollupAggregate {
+                min: 0.0,
+                max: 40.0,
+                sum: 40.0,
+                count: 1,
+            },
+        };
+        store.ingest(&NodeRollup {
+            node_id: NodeId::new("n1"),
+            timestamp: now.saturating_sub(60),
+            entries: vec![entry("prod/web"), entry("prod/api")],
+            part: 0,
+        });
+        let gate = Arc::new(crate::mayo::store::QueryGate::default());
+        store.set_query_gate(Arc::clone(&gate));
+        let store = Arc::new(tokio::sync::RwLock::new(store));
+
+        let config = |window: &str| {
+            let spec = crate::config::app::AutoscaleSpec {
+                metric: "cpu".to_string(),
+                target: "50%".to_string(),
+                min: 1,
+                max: 5,
+                evaluation_window: Some(window.to_string()),
+                cooldown: None,
+                scale_down_threshold: None,
+            };
+            let cpu = Some(crate::config::types::ResourceRange {
+                request: 200,
+                limit: 1000,
+            });
+            crate::meat::autoscaler::AutoscaleConfig::from_spec(&spec, cpu, None).unwrap()
+        };
+        // Two apps on one series, with different windows.
+        let apps = [
+            (AppId::new("web", "prod"), config("5m")),
+            (AppId::new("api", "prod"), config("10m")),
+        ];
+        let reader = Arc::clone(&store);
+        let task = tokio::spawn(async move {
+            let apps: Vec<_> = apps.iter().map(|(app, config)| (app, config)).collect();
+            apps_metric_utilisation(&reader, &apps).await
+        });
+        gate.entered.notified().await;
+        let write =
+            tokio::time::timeout(std::time::Duration::from_millis(200), store.write()).await;
+        assert!(
+            write.is_ok(),
+            "the rollup store's writer waited for the query"
+        );
+        drop(write);
+        // One release: a second query (one per app) would park for good.
+        gate.release.notify_one();
+        let found = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the autoscaler queried more than once for one series")
+            .unwrap();
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(
+            found.values().all(|value| (value - 2.0).abs() < 1e-9),
+            "{found:?}"
+        );
+    }
+
+    /// One app's utilisation, read the way the autoscaler reads them all.
+    async fn one_app_utilisation(
+        store: &tokio::sync::RwLock<crate::mayo::rollup_store::RollupStore>,
+        config: &crate::meat::autoscaler::AutoscaleConfig,
+        app_id: &AppId,
+    ) -> Option<f64> {
+        apps_metric_utilisation(store, &[(app_id, config)])
+            .await
+            .get(app_id)
+            .copied()
+    }
+
     #[tokio::test]
     async fn app_metric_utilisation_averages_the_app_rows() {
         use crate::mayo::rollup::{NodeRollup, RollupAggregate, RollupEntry};
@@ -6489,7 +6637,7 @@ image = "busybox:latest"
             limit: 1000,
         });
         let config = crate::meat::autoscaler::AutoscaleConfig::from_spec(&spec, cpu, None).unwrap();
-        let value = app_metric_utilisation(&store, &config, &AppId::new("web", "prod")).await;
+        let value = one_app_utilisation(&store, &config, &AppId::new("web", "prod")).await;
         assert!(
             value.is_some_and(|v| (v - 2.0).abs() < 1e-9),
             "expected utilisation 2.0 of the request, got {value:?}"
@@ -6497,13 +6645,13 @@ image = "busybox:latest"
 
         // Same app name, different namespace → no data (M26).
         assert!(
-            app_metric_utilisation(&store, &config, &AppId::new("web", "staging"))
+            one_app_utilisation(&store, &config, &AppId::new("web", "staging"))
                 .await
                 .is_none()
         );
         // Unknown app → no data.
         assert!(
-            app_metric_utilisation(&store, &config, &AppId::new("other", "prod"))
+            one_app_utilisation(&store, &config, &AppId::new("other", "prod"))
                 .await
                 .is_none()
         );
@@ -6520,7 +6668,7 @@ image = "busybox:latest"
             crate::meat::autoscaler::AutoscaleConfig::from_spec(&memory_spec, None, memory)
                 .unwrap();
         assert!(
-            app_metric_utilisation(&store, &memory_config, &AppId::new("web", "prod"))
+            one_app_utilisation(&store, &memory_config, &AppId::new("web", "prod"))
                 .await
                 .is_none()
         );

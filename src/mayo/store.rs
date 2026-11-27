@@ -879,7 +879,7 @@ pub(crate) struct QueryGate {
 
 #[cfg(test)]
 impl QueryGate {
-    async fn pass(gate: &Option<Arc<QueryGate>>) {
+    pub(crate) async fn pass(gate: &Option<Arc<QueryGate>>) {
         if let Some(gate) = gate {
             gate.entered.notify_one();
             gate.release.notified().await;
