@@ -984,6 +984,21 @@ Three error codes tell the client exactly what happened:
 - **503 Service Unavailable**: The connection limit was reached. We're overloaded.
 - **413 Payload Too Large**: The request body exceeded the configured cap (more on that below).
 
+A 502 often comes from Wrapper's own probe loop rather than from the service map. Every 5 s each ingress node probes every backend it routes to, and three failed probes in a row take a backend out of rotation on that node. The first version sent the probes one at a time, each with a 2 s timeout, and took the routing table's write lock after every one. When a node lost power, its backends didn't refuse connections, they just never answered, so a sweep over 40 of them took 80 s, and the three sweeps needed to drop them took over four minutes (#2448). The loop now probes concurrently:
+
+```rust
+futures_util::stream::iter(targets)
+    .map(|(instance_id, addr)| async move {
+        let ok = probe_backend_once(client, addr, &config.path, config.timeout).await;
+        (instance_id, addr, ok)
+    })
+    .buffer_unordered(PROBE_CONCURRENCY)
+    .collect()
+    .await
+```
+
+A *stream* is the async cousin of an iterator, and `buffer_unordered(32)` keeps up to 32 of the probe futures running at once, yielding each result as it lands; in Go you'd write a worker pool with a semaphore. Chapter 6 uses the same shape for metric scrapes and explains it in more detail. A sweep over silent backends now costs one timeout per 32 of them. The verdicts are applied together: the loop asks under the read lock whether any of them changes a backend (`health_differs`), and only then takes the write lock, once, for the whole batch. A quiet sweep never makes a request wait. The test gives the loop eight listeners that accept and never answer, a 200 ms timeout, and 800 ms to mark all eight down; one at a time it needed 1.6 s.
+
 ### Connection draining
 
 When an app is being redeployed (rolling update), the old instances need to finish serving in-flight requests before they're stopped. This is the drain protocol:

@@ -446,17 +446,38 @@ impl RoutingTable {
         }
     }
 
-    fn set_endpoint_health(&mut self, instance_id: &str, address: SocketAddr, healthy: bool) {
+    /// Whether applying `verdicts` would change any backend's
+    /// `locally_healthy`. The probe loop asks this under the read lock, so a
+    /// sweep that changes nothing never takes the write lock every request
+    /// waits behind.
+    pub fn health_differs(&self, verdicts: &[(String, SocketAddr, bool)]) -> bool {
+        let wanted = verdict_index(verdicts);
+        self.routes
+            .values()
+            .flatten()
+            .flat_map(|route| &route.backends)
+            .any(|backend| {
+                wanted
+                    .get(&(backend.instance_id.as_str(), backend.addr))
+                    .is_some_and(|healthy| *healthy != backend.locally_healthy)
+            })
+    }
+
+    /// Apply a sweep's probe verdicts in one walk over the table.
+    ///
+    /// A verdict applies only to a backend with the same instance ID *and*
+    /// address: the table may have replaced an endpoint while its old probe
+    /// awaited I/O, and an old result can't judge the new address.
+    pub fn set_endpoint_health_batch(&mut self, verdicts: &[(String, SocketAddr, bool)]) {
+        let wanted = verdict_index(verdicts);
         for backend in self
             .routes
             .values_mut()
             .flatten()
             .flat_map(|route| &mut route.backends)
         {
-            // The table may have replaced this endpoint while its old probe
-            // awaited I/O. An old result cannot judge the new address.
-            if backend.instance_id == instance_id && backend.addr == address {
-                backend.locally_healthy = healthy;
+            if let Some(healthy) = wanted.get(&(backend.instance_id.as_str(), backend.addr)) {
+                backend.locally_healthy = *healthy;
             }
         }
     }
@@ -483,6 +504,14 @@ impl Default for RoutingTable {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Index a sweep's verdicts by `(instance_id, address)`, borrowing the IDs.
+fn verdict_index(verdicts: &[(String, SocketAddr, bool)]) -> HashMap<(&str, SocketAddr), bool> {
+    verdicts
+        .iter()
+        .map(|(instance_id, address, healthy)| ((instance_id.as_str(), *address), *healthy))
+        .collect()
 }
 
 /// A route whose config the routing rebuild refused to install.
@@ -831,17 +860,54 @@ pub async fn run_health_probes(
         let live: std::collections::HashSet<String> =
             targets.iter().map(|(id, _)| id.clone()).collect();
 
-        for (instance_id, addr) in &targets {
-            let ok = probe_backend_once(&client, *addr, &config.path, config.timeout).await;
-            let now_healthy = tracker.record_endpoint(instance_id, *addr, ok);
+        let results = tokio::select! {
+            _ = shutdown.cancelled() => return,
+            results = probe_all(&client, targets, &config) => results,
+        };
+        let verdicts: Vec<(String, SocketAddr, bool)> = results
+            .into_iter()
+            .map(|(instance_id, addr, ok)| {
+                let now_healthy = tracker.record_endpoint(&instance_id, addr, ok);
+                (instance_id, addr, now_healthy)
+            })
+            .collect();
+
+        // Decide under the read lock; take the write lock, once, only when a
+        // verdict changes a backend. Every request reads this lock.
+        if routing_table.read().await.health_differs(&verdicts) {
             routing_table
                 .write()
                 .await
-                .set_endpoint_health(instance_id, *addr, now_healthy);
+                .set_endpoint_health_batch(&verdicts);
         }
 
         tracker.retain_only(&live);
     }
+}
+
+/// Most probes one sweep has in flight at once.
+///
+/// A sweep over unreachable backends costs about `targets / PROBE_CONCURRENCY`
+/// timeouts, rather than one timeout per backend.
+const PROBE_CONCURRENCY: usize = 32;
+
+/// Probe every target concurrently, at most [`PROBE_CONCURRENCY`] at a time,
+/// and return each `(instance_id, address, reachable)` in completion order.
+async fn probe_all(
+    client: &reqwest::Client,
+    targets: Vec<(String, SocketAddr)>,
+    config: &HealthProbeConfig,
+) -> Vec<(String, SocketAddr, bool)> {
+    use futures_util::StreamExt;
+
+    futures_util::stream::iter(targets)
+        .map(|(instance_id, addr)| async move {
+            let ok = probe_backend_once(client, addr, &config.path, config.timeout).await;
+            (instance_id, addr, ok)
+        })
+        .buffer_unordered(PROBE_CONCURRENCY)
+        .collect()
+        .await
 }
 
 #[cfg(test)]
@@ -1755,6 +1821,108 @@ mod tests {
         shutdown.cancel();
         probes.await.unwrap();
         backend.abort();
+    }
+
+    /// A listener that accepts connections and never answers them, so every
+    /// probe sent to it waits for its whole timeout.
+    async fn silent_backend() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        (port, task)
+    }
+
+    #[tokio::test]
+    async fn a_sweep_over_unresponsive_backends_takes_one_timeout_not_one_per_backend() {
+        let mut map = ServiceMap::new();
+        map.register_app("web", "default", 80, None).unwrap();
+        let mut servers = Vec::new();
+        for i in 0..8 {
+            let (port, server) = silent_backend().await;
+            servers.push(server);
+            map.add_backend(
+                &ServiceId::new("default", "web"),
+                BackendInstance {
+                    instance_id: format!("web-{i}"),
+                    node_ip: Ipv4Addr::LOCALHOST,
+                    host_port: port,
+                    healthy: true,
+                    local: true,
+                },
+            )
+            .unwrap();
+        }
+        let configs = HashMap::from([(ns_key("default", "web"), spec_with_path("web.test", "/"))]);
+        let mut initial = RoutingTable::new();
+        initial.rebuild(&map, &configs).unwrap();
+        let table = Arc::new(RwLock::new(initial));
+        let shutdown = CancellationToken::new();
+        let probes = tokio::spawn(run_health_probes(
+            table.clone(),
+            HealthProbeConfig {
+                interval: Duration::from_millis(10),
+                timeout: Duration::from_millis(200),
+                threshold_unhealthy: 1,
+                ..Default::default()
+            },
+            shutdown.clone(),
+        ));
+        let started = tokio::time::Instant::now();
+        // One probe at a time took 8 x 200 ms = 1.6 s for this sweep.
+        let all_out = tokio::time::timeout(Duration::from_millis(800), async {
+            while table
+                .read()
+                .await
+                .lookup("web.test", "/")
+                .unwrap()
+                .healthy_count()
+                != 0
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        shutdown.cancel();
+        probes.await.unwrap();
+        for server in servers {
+            server.abort();
+        }
+        assert!(
+            all_out.is_ok(),
+            "eight silent backends still routable after {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_batch_of_verdicts_updates_only_matching_endpoints() {
+        let (map, configs) = setup_map_and_configs();
+        let mut table = RoutingTable::new();
+        table.rebuild(&map, &configs).unwrap();
+        let web_0: SocketAddr = "10.0.2.2:30001".parse().unwrap();
+        let web_1: SocketAddr = "10.0.4.2:30002".parse().unwrap();
+        let moved: SocketAddr = "10.0.9.9:30001".parse().unwrap();
+
+        // web-0's verdict names an address it no longer has, so it's stale.
+        let verdicts = vec![
+            ("web-0".to_string(), moved, false),
+            ("web-1".to_string(), web_1, false),
+        ];
+        assert!(table.health_differs(&verdicts));
+        table.set_endpoint_health_batch(&verdicts);
+        let route = table.lookup("myapp.com", "/").unwrap();
+        assert!(route.backends[0].locally_healthy);
+        assert!(!route.backends[1].locally_healthy);
+
+        // Applying the same verdicts again changes nothing, so the probe loop
+        // needs no write lock for them.
+        assert!(!table.health_differs(&verdicts));
+        assert!(table.health_differs(&[("web-0".to_string(), web_0, false)]));
     }
 
     #[tokio::test]
