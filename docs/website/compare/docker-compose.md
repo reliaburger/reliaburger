@@ -8,7 +8,7 @@ Take application operations beyond one Docker host. Reliaburger combines placeme
 
 Basis: [Compose's development workflow](https://docs.docker.com/compose/gettingstarted/), [production scope](https://docs.docker.com/compose/how-tos/production/) and [Reliaburger architecture](https://github.com/reliaburger/reliaburger/blob/v0.2.2/docs/manual/06_under-the-hood.md). Suitability is our qualitative assessment.
 
-**Version boundary.** Reliaburger's public installer installs [0.2.2](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.2), and the feature analysis describes that release, re-checked on 21 October 2026. Compose commands follow current official documentation, reviewed 15 October 2026. This page compares ordinary `docker compose` operation; [Swarm](https://docs.docker.com/engine/swarm/) is a separate clustering mode.
+**Version boundary.** The feature analysis describes Reliaburger [0.2.2](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.2), re-checked on 21 October 2026. The public installer now installs a newer release; the [changelog](https://github.com/reliaburger/reliaburger/blob/main/CHANGELOG.md) says what changed since. Compose commands follow current official documentation, reviewed 15 October 2026. This page compares ordinary `docker compose` operation; [Swarm](https://docs.docker.com/engine/swarm/) is a separate clustering mode.
 
 ## Where each wins
 
