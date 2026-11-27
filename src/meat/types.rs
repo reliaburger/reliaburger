@@ -123,6 +123,15 @@ impl Resources {
         }
     }
 
+    /// `self` times `count`, each field saturating at its maximum value.
+    pub fn saturating_mul(&self, count: u32) -> Resources {
+        Resources {
+            cpu_millicores: self.cpu_millicores.saturating_mul(u64::from(count)),
+            memory_bytes: self.memory_bytes.saturating_mul(u64::from(count)),
+            gpus: self.gpus.saturating_mul(count),
+        }
+    }
+
     /// Returns `true` if all fields are zero.
     pub fn is_zero(&self) -> bool {
         self.cpu_millicores == 0 && self.memory_bytes == 0 && self.gpus == 0

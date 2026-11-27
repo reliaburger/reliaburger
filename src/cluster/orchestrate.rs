@@ -1272,18 +1272,19 @@ pub fn plan_pass(
         });
     }
 
-    // Seed the quota ledger with every already-converged app's footprint
-    // BEFORE admitting any new app. Converged apps `continue` below and never
-    // reach `try_admit`; without this seeding they contribute nothing to their
-    // namespace's usage, so a later new app is admitted against a clean slate
-    // and the budget is silently busted once the earlier apps converge.
+    // Seed the quota ledger with every app's committed placements BEFORE
+    // admitting anything, at the footprint each was committed with: that is
+    // what runs. Converged or not makes no difference. An app the quota
+    // refuses a scale-up, or one that lost a node, still runs what it has, and
+    // leaving it out let the next app in its namespace take that room (#2462).
     if !quotas.is_empty() {
-        for app in planned.iter().filter(|app| app.converged) {
-            quotas.charge_committed(
-                &app.app_id.namespace,
-                &scheduler_resources(app.spec),
-                app.want as u32,
-            );
+        for app in &planned {
+            if let Some(placements) = desired.scheduling.get(app.app_id) {
+                quotas.charge_committed_placements(
+                    &app.app_id.namespace,
+                    placements.iter().map(|placement| &placement.resources),
+                );
+            }
         }
     }
 
@@ -1324,14 +1325,14 @@ pub fn plan_pass(
         }
 
         // Quota admission (cumulative within the pass, on top of the seeded
-        // committed usage). A rejection is returned with the plan, and the
-        // leader records it in council state, so the app isn't left pending
-        // without an explanation anyone can read.
+        // committed usage): only what the app adds to what it already runs.
+        // A rejection is returned with the plan, and the leader records it in
+        // council state, so the app isn't left pending without an
+        // explanation anyone can read.
         let per_replica = scheduler_resources(spec);
-        let is_new_app = !desired.scheduling.contains_key(app_id);
+        let committed = desired.scheduling.get(app_id);
         if !quotas.is_empty()
-            && let Err(e) =
-                quotas.try_admit(&app_id.namespace, &per_replica, want as u32, is_new_app)
+            && let Err(e) = admit_growth(quotas, app_id, &per_replica, want, committed)
         {
             // Log only news, not the same rejection every tick.
             if desired.quota_blocked.get(app_id) != Some(&e) {
@@ -1513,6 +1514,34 @@ pub fn plan_pass(
         provenance,
         deferred,
     }
+}
+
+/// Admit to `quotas` what an app adds to its `committed` placements when it
+/// runs `want` replicas of `per_replica`: the resources over what it was
+/// committed with, and the replicas over how many it has. An app with no
+/// committed entry is new and takes an app slot too. A scale-down, or a
+/// replacement for a lost replica, adds nothing and is never refused.
+fn admit_growth(
+    quotas: &mut crate::meat::quota::QuotaLedger,
+    app_id: &crate::meat::types::AppId,
+    per_replica: &Resources,
+    want: usize,
+    committed: Option<&Vec<crate::meat::types::Placement>>,
+) -> Result<(), crate::meat::quota::QuotaError> {
+    let placements = committed.map(Vec::as_slice).unwrap_or_default();
+    let running = placements
+        .iter()
+        .fold(Resources::default(), |sum, placement| {
+            sum.saturating_add(&placement.resources)
+        });
+    let wanted = per_replica.saturating_mul(u32::try_from(want).unwrap_or(u32::MAX));
+    let new_replicas = u32::try_from(want.saturating_sub(placements.len())).unwrap_or(u32::MAX);
+    quotas.try_admit_growth(
+        &app_id.namespace,
+        &wanted.saturating_sub(&running),
+        new_replicas,
+        committed.is_none(),
+    )
 }
 
 /// What one app's pass decided, for [`placement_provenance`].
@@ -9007,6 +9036,151 @@ image = "busybox:latest"
             1,
             "an app within its namespace budget must be admitted"
         );
+    }
+
+    // -- #2462: quota counts every committed replica -------------------------
+
+    /// App `a` runs three replicas and asks for five, which the quota
+    /// refuses. Its three still run, so a new app `b` can't take their room.
+    #[test]
+    fn a_quota_blocked_scale_up_still_counts_its_running_replicas() {
+        let mut desired = DesiredState::default();
+        desired
+            .namespaces
+            .insert("prod".to_string(), cpu_namespace("4000m"));
+        let a = AppId::new("a", "prod");
+        let b = AppId::new("b", "prod");
+        desired.apps.insert(a.clone(), app_spec(1000, 5));
+        desired.scheduling.insert(
+            a.clone(),
+            (0..3)
+                .map(|ordinal| crate::meat::types::Placement {
+                    node_id: NodeId::new("big"),
+                    resources: Resources::new(1000, 0, 0),
+                    ordinal,
+                })
+                .collect(),
+        );
+        desired.apps.insert(b.clone(), app_spec(1000, 2));
+
+        let plan = quota_pass(&desired);
+
+        assert!(
+            plan.quota_blocked.contains_key(&a),
+            "{:?}",
+            plan.quota_blocked
+        );
+        assert!(
+            plan.quota_blocked.contains_key(&b),
+            "b must not take the room a's running replicas use: {:?}",
+            plan.quota_blocked
+        );
+        assert!(
+            !plan.decisions.iter().any(|d| d.app_id == b),
+            "{:?}",
+            plan.decisions
+        );
+    }
+
+    /// The scale-up is refused for the replicas it adds, not for the ones
+    /// that already run: three of five fit, so the refusal asks for two.
+    #[test]
+    fn a_quota_blocked_scale_up_is_refused_for_its_growth_only() {
+        let mut desired = DesiredState::default();
+        desired
+            .namespaces
+            .insert("prod".to_string(), cpu_namespace("4000m"));
+        let a = AppId::new("a", "prod");
+        desired.apps.insert(a.clone(), app_spec(1000, 5));
+        desired.scheduling.insert(
+            a.clone(),
+            (0..3)
+                .map(|ordinal| crate::meat::types::Placement {
+                    node_id: NodeId::new("big"),
+                    resources: Resources::new(1000, 0, 0),
+                    ordinal,
+                })
+                .collect(),
+        );
+
+        let plan = quota_pass(&desired);
+
+        assert_eq!(
+            plan.quota_blocked.get(&a),
+            Some(&crate::meat::quota::QuotaError::CpuExceeded {
+                namespace: "prod".to_string(),
+                current: 3000,
+                requested: 2000,
+                limit: 4000,
+            })
+        );
+    }
+
+    /// Two apps whose only node died are re-placed, not re-admitted as if
+    /// they were new: a third app still finds the namespace's two app
+    /// slots taken.
+    #[test]
+    fn max_apps_counts_existing_apps_that_are_being_rescheduled() {
+        let mut desired = DesiredState::default();
+        desired.namespaces.insert(
+            "prod".to_string(),
+            crate::config::NamespaceSpec {
+                cpu: None,
+                memory: None,
+                gpu: None,
+                max_apps: Some(2),
+                max_replicas: None,
+                secret_key: false,
+            },
+        );
+        let (a, b, c) = (
+            AppId::new("a", "prod"),
+            AppId::new("b", "prod"),
+            AppId::new("c", "prod"),
+        );
+        for app in [&a, &b] {
+            let spec = app_spec(100, 1);
+            desired
+                .scheduling
+                .insert(app.clone(), placed_as(&spec, &[("gone", 0)]));
+            desired.apps.insert(app.clone(), spec);
+        }
+        desired.apps.insert(c.clone(), app_spec(100, 1));
+
+        let plan = quota_pass(&desired);
+
+        assert!(
+            matches!(
+                plan.quota_blocked.get(&c),
+                Some(crate::meat::quota::QuotaError::MaxAppsExceeded { current: 2, .. })
+            ),
+            "{:?}",
+            plan.quota_blocked
+        );
+        assert!(!plan.quota_blocked.contains_key(&a));
+        assert!(!plan.quota_blocked.contains_key(&b));
+    }
+
+    /// A namespace pushed over its quota (the quota shrank) still re-places
+    /// a replica lost with its node: nothing new runs, so nothing is refused.
+    #[test]
+    fn an_over_quota_namespace_still_replaces_a_lost_replica() {
+        let mut desired = DesiredState::default();
+        desired
+            .namespaces
+            .insert("prod".to_string(), cpu_namespace("1000m"));
+        let a = AppId::new("a", "prod");
+        let spec = app_spec(1000, 2);
+        desired
+            .scheduling
+            .insert(a.clone(), placed_as(&spec, &[("big", 0), ("gone", 1)]));
+        desired.apps.insert(a.clone(), spec);
+
+        let plan = quota_pass(&desired);
+
+        assert!(plan.quota_blocked.is_empty(), "{:?}", plan.quota_blocked);
+        assert_eq!(plan.decisions.len(), 1, "{:?}", plan.decisions);
+        assert!(nodes_of(&plan.decisions[0]).iter().all(|n| *n == "big"));
     }
 
     // -- #2366: a pass never plans more than the council admits ------------

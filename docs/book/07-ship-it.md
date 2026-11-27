@@ -1199,6 +1199,26 @@ let mut quotas = crate::meat::quota::ledger_from_namespaces(&desired.namespaces)
 
 Declare a namespace with `cpu = "2000m"`, apply an app that wants three replicas at 800 millicores each, and the scheduler does the arithmetic — 2,400 > 2,000 — and refuses the placement with a clear reason in the log, instead of over-committing the budget you set. A namespace with headroom admits the same app without complaint. The enforcement was built and proven long ago; all this theme did was hand it the numbers.
 
+The arithmetic needs the right "already used", though, and for a long time it
+had the wrong one. The pass charged the ledger with every *converged* app's
+footprint and then admitted each unconverged app for all of its replicas. Say
+`prod` has 4,000 millicores, app `a` runs three 1,000m replicas, and you scale
+it to five. `a` isn't converged any more, so it wasn't charged; the quota
+refused its five (0 + 5,000 > 4,000), and its three running replicas vanished
+from the books. A new app `b` with two replicas then fitted into a ledger that
+said 0, and `prod` ran 5,000m against its 4,000m
+([#2462](https://github.com/reliaburger/reliaburger/issues/2462)). Losing a
+node did the same to `max_apps`: re-placed apps weren't counted as apps.
+
+Now the ledger is charged with every app's committed placements first, at the
+footprint each was committed with, converged or not, because that's what runs.
+Then an app is admitted only for what it adds: the resources it wants over
+what it was committed with, and the replicas over the ones it has. A scale-up
+of `a` from three to five asks for 2,000m on top of 3,000m, and a replacement
+for a replica lost with its node adds nothing, so it's never refused, even in
+a namespace whose quota was cut below what it already runs. The quota still
+never stops something that's running; it only stops growth.
+
 ## A deploy owns what it starts
 
 A later audit went looking for every place where a deploy said "done" before it was. There were a lot of them, and they all had the same shape: a step reported success, and something (a process, a port, a file, a route) was left with nobody responsible for it. So the rule we settled on is simple to say. A deploy *owns* everything it starts: the replacement containers, their ports, their on-disk adoption records, their routes. It keeps each of those in the supervisor until it has seen, with its own eyes, that the thing is gone. A failure never releases ownership; it just stops the deploy and leaves the leftovers where Stop or Retire can find them.
