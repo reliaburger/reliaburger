@@ -810,7 +810,9 @@ impl CouncilNode {
     /// A node with no Raft seat has nothing applied; it gets the leader's view
     /// instead, once it has fetched one (#1477).
     pub async fn security_state(&self) -> crate::sesame::types::SecurityState {
-        let local = self.state_machine.desired_state().await.security_state;
+        let local = crate::sesame::types::SecurityState::clone(
+            &self.state_machine.desired_state().await.security_state,
+        );
         if local.is_initialised() {
             return local;
         }
@@ -964,7 +966,9 @@ impl CouncilNode {
             .ensure_linearizable()
             .await
             .map_err(|e| CouncilError::ReadFailed(e.to_string()))?;
-        Ok(self.state_machine.desired_state().await.security_state)
+        Ok(crate::sesame::types::SecurityState::clone(
+            &self.state_machine.desired_state().await.security_state,
+        ))
     }
 
     /// [`Self::security_state_linearizable`], but a leader gets `within` to
@@ -988,7 +992,9 @@ impl CouncilNode {
                 "this node can't prove it leads the council".into(),
             ));
         }
-        Ok(self.state_machine.desired_state().await.security_state)
+        Ok(crate::sesame::types::SecurityState::clone(
+            &self.state_machine.desired_state().await.security_state,
+        ))
     }
 
     /// The desired state, confirmed fresh with a quorum first, as
@@ -1008,7 +1014,9 @@ impl CouncilNode {
 
     /// Read the current Pickle manifest catalogue from the state machine.
     pub async fn manifest_catalog(&self) -> crate::pickle::types::ManifestCatalog {
-        self.state_machine.desired_state().await.manifest_catalog
+        crate::pickle::types::ManifestCatalog::clone(
+            &self.state_machine.desired_state().await.manifest_catalog,
+        )
     }
 
     /// Sign a workload CSR with the Workload CA.

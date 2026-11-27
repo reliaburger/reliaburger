@@ -1090,6 +1090,49 @@ explains the admission boundary.
 
 Exhaustive `match`: add a new variant and the compiler forces you to handle it everywhere. Compare that to a `switch` in Go, where a forgotten `case` silently falls through to nothing.
 
+### All or nothing, without copying everything
+
+A placement pass is all or nothing: if its tenth decision is invalid, the first nine mustn't land either. Three other entries have the same rule: a job deployment's begin and its commit, and an approved agent proposal, each of which writes several apps. The first way we got there was the obvious one. Copy the whole `DesiredState`, apply the entry to the copy, and swap the copy in only if every part succeeded.
+
+It was correct, and it cost the size of the cluster on every entry ([#2435](https://github.com/reliaburger/reliaburger/issues/2435)). `DesiredState` held plain `HashMap`s and `Vec`s, so the copy took every app spec, the image catalogue, the endpoint catalogue, the task arrays and the security state. It ran inside `apply`, under the state's write lock, on every voter and learner, on most two-second scheduler ticks. A pass that moved one app copied five thousand.
+
+The fix has two halves. For a placement pass we didn't need a copy at all. A decision's checks never read what an earlier decision in the same pass wrote, apart from test-lease bookkeeping, so the state machine now checks every decision first and writes them all afterwards. The test leases get checked on a copy of the leases alone, which is committed with the pass.
+
+The other three entries call back into the ordinary apply code on their staged copy, so splitting them would mean duplicating it. Instead we made the copy cheap. The large collections of `DesiredState` now sit behind a small wrapper:
+
+```rust
+pub struct Shared<T>(std::sync::Arc<T>);
+
+impl<T> Clone for Shared<T> {
+    fn clone(&self) -> Self {
+        Self(std::sync::Arc::clone(&self.0))
+    }
+}
+
+impl<T> std::ops::Deref for Shared<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T: Clone> std::ops::DerefMut for Shared<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        std::sync::Arc::make_mut(&mut self.0)
+    }
+}
+```
+
+`Deref` and `DerefMut` are the traits behind Rust's `*` operator, and the compiler calls them for you whenever you use a field or a method through the wrapper. That's called auto-deref: `state.apps.get(&id)` finds no `get` on `Shared`, so the compiler tries `Deref` and calls `HashMap::get` on what's inside. A Go programmer can think of embedding a struct, except that here the wrapper decides what happens on the way through. The same coercion turns a `&Shared<HashMap<..>>` into a `&HashMap<..>` when you pass it to a function that wants the latter.
+
+The interesting half is `DerefMut`, which runs for every write. `Arc::make_mut` looks at the reference count. If this is the only handle on the value, it hands back a mutable reference to it, no copy. If another handle exists, it clones the value first, points this handle at the clone and hands that back. It's copy on write, enforced by the type system: you can't get a `&mut` to a value another copy can see.
+
+So `state.clone()` now copies about twenty pointers. An entry staged on that copy pays for the collections it writes, once each, and nothing else. An app deployment copies the app maps, which it's about to change anyway; the image catalogue, the task arrays and the security state stay where they were. We hand-wrote `Clone` rather than deriving it, for two reasons. `#[derive(Clone)]` would ask for `T: Clone` even though cloning an `Arc` doesn't need it, and it would read as if it copied the collection.
+
+There's one trap here. `DerefMut` doesn't know whether you'll write. `state.apps.get_mut(&id)` goes through `DerefMut` even when the key is missing, so if the map is shared at that moment, it gets copied for nothing. Inside `apply` that's rare, because nothing else holds the live state's collections for long. The snapshot builder does, and a reader that took a copy with `desired_state()` does, and then the next write to that collection pays for one copy. We took that trade.
+
+The wrapper serialises as the value inside, so the snapshot format didn't change. `a_fixed_state_serialises_to_the_same_snapshot_bytes` pins the exact bytes of a small fixed state, taken before the change. The tests for the change itself look at pointers, not timings: `a_placement_pass_does_not_copy_state_it_does_not_touch` commits an image manifest, applies a placement pass and checks that the catalogue's `Vec` is the same allocation afterwards, and `deployments_and_proposals_do_not_copy_state_they_do_not_touch` does the same for the other three entries. The `council_apply` group in `benches/task_arrays.rs` times one one-app pass against states of 100, 1,000 and 10,000 apps; the line should be flat.
+
 ### Snapshots and the JSON key problem
 
 When a follower falls far behind the leader's log, re-sending thousands of entries one by one is wasteful. Raft handles this with snapshots: the leader serialises the current state machine into a blob and sends it in one shot. The follower installs the snapshot and picks up replication from there.

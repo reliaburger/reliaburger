@@ -397,7 +397,7 @@ pub fn spawn_leader_scheduler(
             // The state machine plans with these exact inputs, so a full
             // ledger would only commit another refusal every tick.
             if let Some(catalog) = catalog
-                && desired.endpoint_catalog != catalog
+                && *desired.endpoint_catalog != catalog
                 && !matches!(
                     desired.endpoint_withdrawals.plan_publication(
                         &desired.endpoint_catalog,
@@ -6034,7 +6034,7 @@ image = "busybox:latest"
                     )
                     .unwrap();
             } else {
-                desired.endpoint_catalog = original.clone();
+                desired.endpoint_catalog = original.clone().into();
             }
             desired.apps.insert(
                 crate::meat::types::AppId::new("new", "default"),
@@ -6070,7 +6070,8 @@ image = "busybox:latest"
         desired.producer_retirements = desired
             .producer_retirements
             .plan_retirement("a", &execution)
-            .unwrap();
+            .unwrap()
+            .into();
         let mut successor = execution.clone();
         successor.generation = "b".repeat(64).try_into().unwrap();
         for original in [None, Some(execution), Some(successor.clone())] {
@@ -6187,7 +6188,7 @@ image = "busybox:latest"
 
         // Widening the list changes the committed catalogue, so every node
         // is sent the new one.
-        desired.endpoint_catalog = catalog.clone();
+        desired.endpoint_catalog = catalog.clone().into();
         desired.apps.insert(
             crate::meat::types::AppId::new("db", "backend"),
             spec_from_toml(
@@ -6232,7 +6233,9 @@ image = "busybox:latest"
             healthy: true,
         };
         desired.endpoint_catalog =
-            build_endpoint_catalog(&[], &AggregatedState::default(), &desired).unwrap();
+            build_endpoint_catalog(&[], &AggregatedState::default(), &desired)
+                .unwrap()
+                .into();
         desired
             .endpoint_catalog
             .services
@@ -6292,7 +6295,8 @@ image = "busybox:latest"
         retiring.producer_retirements = retiring
             .producer_retirements
             .plan_retirement("node-b", &execution)
-            .unwrap();
+            .unwrap()
+            .into();
         let catalog = build_endpoint_catalog(&members, &reports, &retiring).unwrap();
         assert!(catalog.services["default__redis"].backends.is_empty());
 
@@ -6332,7 +6336,9 @@ image = "busybox:latest"
         };
         let (predecessor, running) = (execution("a"), execution("b"));
         desired.endpoint_catalog =
-            build_endpoint_catalog(&[], &AggregatedState::default(), &desired).unwrap();
+            build_endpoint_catalog(&[], &AggregatedState::default(), &desired)
+                .unwrap()
+                .into();
         desired
             .endpoint_catalog
             .services
@@ -9512,7 +9518,9 @@ mod audit_stale_endpoints {
         // report was fresh.
         let mut fresh = reports.clone();
         fresh.stale_nodes.clear();
-        desired.endpoint_catalog = build_endpoint_catalog(&members, &fresh, &desired).unwrap();
+        desired.endpoint_catalog = build_endpoint_catalog(&members, &fresh, &desired)
+            .unwrap()
+            .into();
         assert_eq!(backends(&desired.endpoint_catalog).len(), 1);
 
         // Its payload is evicted but the node stays stale: withdrawn, not carried.

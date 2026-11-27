@@ -761,6 +761,104 @@ pub enum CouncilResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Shared: copy-on-write desired-state collections
+// ---------------------------------------------------------------------------
+
+/// One collection of the desired state, shared between copies of the state
+/// until one of them writes to it (#2435).
+///
+/// Cloning a `Shared` copies a pointer, not the collection. Reading goes
+/// through [`Deref`](std::ops::Deref) and costs nothing extra. Writing goes
+/// through [`DerefMut`](std::ops::DerefMut), which calls [`Arc::make_mut`]:
+/// the collection is copied only if another copy of the state still points
+/// at it. So a staged copy of the whole [`DesiredState`] is cheap, and an
+/// entry that writes one collection copies that one alone.
+///
+/// It serialises exactly as the value inside, so the snapshot format is
+/// the same as for a plain field.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Shared<T>(std::sync::Arc<T>);
+
+impl<T> Shared<T> {
+    /// Wrap a value.
+    pub fn new(value: T) -> Self {
+        Self(std::sync::Arc::new(value))
+    }
+
+    /// Whether two copies still point at one allocation.
+    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&this.0, &other.0)
+    }
+
+    /// Another handle on the same allocation, for a caller that keeps it
+    /// after the state lock is released.
+    pub fn to_arc(&self) -> std::sync::Arc<T> {
+        std::sync::Arc::clone(&self.0)
+    }
+}
+
+// Hand-written so that cloning needs no `T: Clone`: it only copies the
+// pointer. `#[derive(Clone)]` would ask for `T: Clone` and, worse, read as
+// if it copied the collection.
+impl<T> Clone for Shared<T> {
+    fn clone(&self) -> Self {
+        Self(std::sync::Arc::clone(&self.0))
+    }
+}
+
+impl<T> std::ops::Deref for Shared<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T: Clone> std::ops::DerefMut for Shared<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        std::sync::Arc::make_mut(&mut self.0)
+    }
+}
+
+impl<T> From<T> for Shared<T> {
+    fn from(value: T) -> Self {
+        Self::new(value)
+    }
+}
+
+// `for (id, spec) in &state.apps` iterates the collection inside.
+impl<'a, T> IntoIterator for &'a Shared<T>
+where
+    &'a T: IntoIterator,
+{
+    type Item = <&'a T as IntoIterator>::Item;
+    type IntoIter = <&'a T as IntoIterator>::IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.as_ref().into_iter()
+    }
+}
+
+// `.collect()` builds the collection inside, then shares it.
+impl<A, T: FromIterator<A>> FromIterator<A> for Shared<T> {
+    fn from_iter<I: IntoIterator<Item = A>>(iter: I) -> Self {
+        Self::new(iter.into_iter().collect())
+    }
+}
+
+impl<T: Serialize> Serialize for Shared<T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Shared<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        T::deserialize(deserializer).map(Self::new)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DesiredState
 // ---------------------------------------------------------------------------
 
@@ -775,17 +873,17 @@ pub struct DesiredState {
         serialize_with = "map_as_vec::serialize",
         deserialize_with = "map_as_vec::deserialize"
     )]
-    pub apps: HashMap<AppId, AppSpec>,
+    pub apps: Shared<HashMap<AppId, AppSpec>>,
     /// Scheduling placements per app.
     #[serde(
         serialize_with = "map_as_vec::serialize",
         deserialize_with = "map_as_vec::deserialize"
     )]
-    pub scheduling: HashMap<AppId, Vec<Placement>>,
+    pub scheduling: Shared<HashMap<AppId, Vec<Placement>>>,
     /// Cluster-wide configuration key-value pairs.
     pub config: HashMap<String, String>,
     /// Pickle image registry manifest catalog.
-    pub manifest_catalog: ManifestCatalog,
+    pub manifest_catalog: Shared<ManifestCatalog>,
     /// Monotonic per-node fencing generations for registry blob collection.
     pub registry_gc_generations: std::collections::BTreeMap<u64, u64>,
     /// Autoscale replica overrides (runtime adjustments above/below baseline).
@@ -802,7 +900,7 @@ pub struct DesiredState {
         serialize_with = "map_as_vec::serialize",
         deserialize_with = "map_as_vec::deserialize"
     )]
-    pub last_placed_nodes: HashMap<AppId, Vec<NodeId>>,
+    pub last_placed_nodes: Shared<HashMap<AppId, Vec<NodeId>>>,
     /// Apps the leader's last scheduling pass left unplaced because their
     /// namespace quota has no room, with the reason. Any node can answer
     /// "why isn't this running?" from it; it clears as soon as an app fits.
@@ -811,7 +909,7 @@ pub struct DesiredState {
         serialize_with = "map_as_vec::serialize",
         deserialize_with = "map_as_vec::deserialize"
     )]
-    pub quota_blocked: HashMap<AppId, crate::meat::quota::QuotaError>,
+    pub quota_blocked: Shared<HashMap<AppId, crate::meat::quota::QuotaError>>,
     /// Fixed-size apps the leader's last scheduling pass placed only part
     /// of: how many replicas found a node, out of how many, and why the rest
     /// didn't (#702). It clears once every replica is placed.
@@ -820,7 +918,7 @@ pub struct DesiredState {
         serialize_with = "map_as_vec::serialize",
         deserialize_with = "map_as_vec::deserialize"
     )]
-    pub unschedulable: HashMap<AppId, crate::meat::types::Unschedulable>,
+    pub unschedulable: Shared<HashMap<AppId, crate::meat::types::Unschedulable>>,
     /// Each app's rollout record (#692): the fully rolled-out specs that
     /// `relish rollback` and the leader's node-by-node release fall back on,
     /// and the spec whose rollout failed. Survives every node restarting.
@@ -829,7 +927,7 @@ pub struct DesiredState {
         serialize_with = "map_as_vec::serialize",
         deserialize_with = "map_as_vec::deserialize"
     )]
-    pub rollouts: HashMap<AppId, crate::meat::deploy_types::AppRollouts>,
+    pub rollouts: Shared<HashMap<AppId, crate::meat::deploy_types::AppRollouts>>,
     /// GitOps sync state.
     pub gitops_sync_state: Option<crate::lettuce::types::SyncState>,
     /// GitOps coordinator election.
@@ -844,7 +942,7 @@ pub struct DesiredState {
     pub gitops_owned: crate::lettuce::types::GitOpsOwnership,
     /// Cluster security state: CAs, tokens, age keypairs, OIDC config.
     /// Contains wrapped (encrypted) private keys — safe to replicate.
-    pub security_state: SecurityState,
+    pub security_state: Shared<SecurityState>,
     /// The rolling binary upgrade in progress, if any (at most one).
     pub active_upgrade: Option<crate::upgrade::types::ClusterUpgradeState>,
     /// Completed/abandoned cluster upgrades, newest last (bounded to 20).
@@ -861,9 +959,9 @@ pub struct DesiredState {
     pub batch_ids: crate::meat::batch_ids::BatchIds,
     /// Task arrays (0.2.0): chunk tables and counts, never a record per
     /// task. Ids come from `batch_ids`.
-    pub task_arrays: crate::meat::task_array_store::TaskArrays,
+    pub task_arrays: Shared<crate::meat::task_array_store::TaskArrays>,
     /// Durable build tracker: a monotonic id counter plus recent builds.
-    pub build_state: crate::bun::build_runner::BuildDurableState,
+    pub build_state: Shared<crate::bun::build_runner::BuildDurableState>,
     /// Monotonic disaster-recovery epoch (12b.2 D21/CP12). Zero on a cluster
     /// that has never been recovered; the recovery path stamps a strictly
     /// higher value into the restored state so anything issued before the
@@ -900,18 +998,18 @@ pub struct DesiredState {
         serialize_with = "map_as_vec::serialize",
         deserialize_with = "map_as_vec::deserialize"
     )]
-    pub declared_apps: HashMap<AppId, AppSpec>,
+    pub declared_apps: Shared<HashMap<AppId, AppSpec>>,
     /// Cluster-wide service endpoint catalogue (12b.4): every namespace's
     /// services, their VIPs and healthy backends across all nodes. Built by
     /// the leader from health reports and replicated so any node resolves
     /// any service. Distinct from `manifest_catalog` (Pickle images).
-    pub endpoint_catalog: crate::onion::catalog::EndpointCatalog,
+    pub endpoint_catalog: Shared<crate::onion::catalog::EndpointCatalog>,
     /// Original discovery exposures awaiting remote withdrawal confirmation.
     pub endpoint_withdrawals: crate::onion::withdrawal::EndpointWithdrawals,
     /// Nodes that may retain discovery publications, including offline nodes.
     pub endpoint_consumers: std::collections::BTreeSet<String>,
     /// Permanent fences preventing stale reports from reviving retired executions.
-    pub producer_retirements: crate::onion::producer::ProducerRetirements,
+    pub producer_retirements: Shared<crate::onion::producer::ProducerRetirements>,
     /// Active or interrupted-cleanup Phase 15 leases. Replication lets a new
     /// leader resume cleanup after the issuing process dies.
     pub test_leases: std::collections::BTreeMap<String, crate::testkit::lease::TestLease>,
@@ -920,7 +1018,7 @@ pub struct DesiredState {
     pub agent_leases: crate::proposal::lease::AgentLeases,
     /// Agent proposals (#1682): pending ones, applied ones inside the undo
     /// window, compacted records, and the id counter.
-    pub proposals: crate::proposal::Proposals,
+    pub proposals: Shared<crate::proposal::Proposals>,
     /// Durable ownership of the single cluster-wide node-chaos slot.
     pub node_fault_reservations: crate::smoker::reservation::NodeFaultReservations,
     /// How many voters the council grows to, when the cluster was created
@@ -1030,7 +1128,10 @@ impl DesiredState {
 mod map_as_vec {
     use super::*;
 
-    pub fn serialize<K, V, S>(map: &HashMap<K, V>, serializer: S) -> Result<S::Ok, S::Error>
+    pub fn serialize<K, V, S>(
+        map: &super::Shared<HashMap<K, V>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
     where
         K: Serialize + Eq + Hash,
         V: Serialize,
@@ -1040,14 +1141,16 @@ mod map_as_vec {
         vec.serialize(serializer)
     }
 
-    pub fn deserialize<'de, K, V, D>(deserializer: D) -> Result<HashMap<K, V>, D::Error>
+    pub fn deserialize<'de, K, V, D>(
+        deserializer: D,
+    ) -> Result<super::Shared<HashMap<K, V>>, D::Error>
     where
         K: Deserialize<'de> + Eq + Hash,
         V: Deserialize<'de>,
         D: Deserializer<'de>,
     {
         let vec: Vec<(K, V)> = Vec::deserialize(deserializer)?;
-        Ok(vec.into_iter().collect())
+        Ok(super::Shared::new(vec.into_iter().collect()))
     }
 }
 

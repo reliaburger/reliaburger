@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
 use super::types::{
-    CouncilNodeInfo, CouncilResponse, DesiredState, RaftRequest, ReplacesPaused, TypeConfig,
+    CouncilNodeInfo, CouncilResponse, DesiredState, RaftRequest, ReplacesPaused, Shared, TypeConfig,
 };
 use crate::sesame::types::AgeKeyScope;
 
@@ -338,9 +338,15 @@ impl StateMachineInner {
             })
     }
 
-    fn apply_scheduling_decision(
-        &mut self,
+    /// Check one decision of a placement pass without writing anything.
+    /// A decision for a test-lease namespace records its placements in
+    /// `leases`, a copy of the test leases taken on first use, so the
+    /// pass's later decisions see them and the caller commits the copy only
+    /// once the whole pass passes.
+    fn check_scheduling_decision(
+        &self,
         decision: &crate::meat::SchedulingDecision,
+        leases: &mut Option<std::collections::BTreeMap<String, crate::testkit::lease::TestLease>>,
     ) -> Option<CouncilResponse> {
         if decision.placements.iter().any(|placement| {
             self.state
@@ -370,9 +376,8 @@ impl StateMachineInner {
             let resource = crate::testkit::lease::LeasedResource::App {
                 app_id: decision.app_id.clone(),
             };
-            let Some(lease) = self
-                .state
-                .test_leases
+            let Some(lease) = leases
+                .get_or_insert_with(|| self.state.test_leases.clone())
                 .values_mut()
                 .find(|lease| lease.resources.contains(&resource))
             else {
@@ -406,6 +411,11 @@ impl StateMachineInner {
             }
             lease.placements = owners;
         }
+        None
+    }
+
+    /// Write one checked decision of a placement pass.
+    fn write_scheduling_decision(&mut self, decision: &crate::meat::SchedulingDecision) {
         // A stop commits an empty decision; where the app ran must
         // outlive it, because that's where its managed volumes are.
         // Recorded in ordinal order, so a returning app gets each
@@ -424,7 +434,6 @@ impl StateMachineInner {
         self.state
             .scheduling
             .insert(decision.app_id.clone(), decision.placements.clone());
-        None
     }
 
     /// Apply a request. Returns a request-specific response for entries
@@ -725,22 +734,29 @@ impl StateMachineInner {
                         reason: "placement pass exceeds admission limits".into(),
                     });
                 }
+                // All or nothing without a staged copy (#2435): every
+                // decision is checked before any is written. A decision's
+                // checks don't read what an earlier one writes, apart from
+                // test-lease placements, which are checked on a copy of the
+                // leases committed with the pass.
                 let mut identities = std::collections::HashSet::new();
-                let mut staged = StateMachineInner {
-                    state: self.state.clone(),
-                    ..Default::default()
-                };
+                let mut leases = None;
                 for decision in decisions {
                     if !identities.insert(&decision.app_id) {
                         return Some(CouncilResponse::Refused {
                             reason: "placement pass repeats an application".into(),
                         });
                     }
-                    if let Some(response) = staged.apply_scheduling_decision(decision) {
+                    if let Some(response) = self.check_scheduling_decision(decision, &mut leases) {
                         return Some(response);
                     }
                 }
-                self.state = staged.state;
+                if let Some(leases) = leases {
+                    self.state.test_leases = leases;
+                }
+                for decision in decisions {
+                    self.write_scheduling_decision(decision);
+                }
             }
             RaftRequest::ConfigSet { key, value } => {
                 self.state.config.insert(key.clone(), value.clone());
@@ -853,25 +869,34 @@ impl StateMachineInner {
                 // racing to delete the last two copies of a layer get
                 // their reports arbitrated in order — the second one is
                 // refused the digest that would lose its final holder.
-                let mut next = self.state.manifest_catalog.clone();
-                let approved = next.apply_gc_report(report);
+                // The report changes the catalogue only where it approves a
+                // deletion, and an approval needs a next generation. So it
+                // applies in place unless the generation is exhausted, and
+                // only then on a copy, to find out whether it would approve
+                // anything (#2435).
+                let generation = self
+                    .state
+                    .registry_gc_generations
+                    .get(&report.node_id)
+                    .copied()
+                    .unwrap_or(0)
+                    .checked_add(1);
+                let Some(generation) = generation else {
+                    let mut next =
+                        crate::pickle::types::ManifestCatalog::clone(&self.state.manifest_catalog);
+                    let approved = next.apply_gc_report(report);
+                    if approved.is_empty() {
+                        return Some(CouncilResponse::GcApproved { approved });
+                    }
+                    return Some(CouncilResponse::Refused {
+                        reason: "registry GC generation exhausted".into(),
+                    });
+                };
+                let approved = self.state.manifest_catalog.apply_gc_report(report);
                 if !approved.is_empty() {
-                    let Some(generation) = self
-                        .state
-                        .registry_gc_generations
-                        .get(&report.node_id)
-                        .copied()
-                        .unwrap_or(0)
-                        .checked_add(1)
-                    else {
-                        return Some(CouncilResponse::Refused {
-                            reason: "registry GC generation exhausted".into(),
-                        });
-                    };
                     self.state
                         .registry_gc_generations
                         .insert(report.node_id, generation);
-                    self.state.manifest_catalog = next;
                 }
                 return Some(CouncilResponse::GcApproved { approved });
             }
@@ -985,7 +1010,7 @@ impl StateMachineInner {
                         reason: "the cluster's security state is already initialised".to_string(),
                     });
                 }
-                self.state.security_state = *ss.clone();
+                self.state.security_state = Shared::new(*ss.clone());
             }
             RaftRequest::CreateJoinToken(jt) => {
                 if self
@@ -1048,7 +1073,7 @@ impl StateMachineInner {
                     .state
                     .security_state
                     .join_tokens
-                    .iter_mut()
+                    .iter()
                     .find(|jt| jt.token_hash == *token_hash);
                 let Some(token) = token else {
                     return Some(CouncilResponse::Refused {
@@ -2066,8 +2091,8 @@ impl StateMachineInner {
                     }
                 };
                 let released = retirements.release_confirmed(node_id, execution, &withdrawals);
-                self.state.producer_retirements = retirements;
-                self.state.endpoint_catalog = catalog;
+                self.state.producer_retirements = retirements.into();
+                self.state.endpoint_catalog = catalog.into();
                 self.state.endpoint_withdrawals = withdrawals;
                 return Some(CouncilResponse::EndpointExecutionRetired { released });
             }
@@ -2118,7 +2143,7 @@ impl StateMachineInner {
                     }
                 };
                 self.state.endpoint_withdrawals = withdrawals;
-                self.state.endpoint_catalog = *catalog.clone();
+                self.state.endpoint_catalog = Shared::new(*catalog.clone());
             }
             RaftRequest::TestLeaseCreate(lease) => {
                 if !lease.repositories.is_empty() || lease.workloads_retired {
@@ -5746,7 +5771,7 @@ mod tests {
                 .is_none()
         );
         released(inner.apply_request(&request), true);
-        assert_eq!(inner.state.endpoint_catalog, successor);
+        assert_eq!(*inner.state.endpoint_catalog, successor);
         assert!(matches!(
             inner.apply_request(&RaftRequest::PublishEndpoints {
                 expected_generation: 3,
@@ -5868,7 +5893,7 @@ mod tests {
     #[test]
     fn producer_retirement_withdrawal_failure_preserves_catalogue_fence_and_history() {
         let mut inner = StateMachineInner::default();
-        inner.state.endpoint_catalog = withdrawal_fixture_catalogue();
+        inner.state.endpoint_catalog = withdrawal_fixture_catalogue().into();
         inner.state.endpoint_withdrawals.generation = u64::MAX;
         let execution = inner.state.endpoint_catalog.services["default__api"].backends[0]
             .execution
@@ -6342,7 +6367,7 @@ mod tests {
     fn endpoint_withdrawal_refusal_leaves_publication_and_decommission_atomic() {
         let mut inner = StateMachineInner::default();
         inner.state.endpoint_consumers.insert("reader".into());
-        inner.state.endpoint_catalog = withdrawal_fixture_catalogue();
+        inner.state.endpoint_catalog = withdrawal_fixture_catalogue().into();
         inner.state.endpoint_withdrawals.generation = u64::MAX;
         let before = serde_json::to_value(&inner.state).unwrap();
         for request in [
@@ -7406,7 +7431,7 @@ mod tests {
     fn security_state_init_never_replaces_an_initialised_security_state() {
         let mut inner = StateMachineInner::default();
         let hierarchy = crate::sesame::ca::generate_ca_hierarchy("restored", &[3; 32]).unwrap();
-        inner.state.security_state = crate::sesame::types::SecurityState {
+        inner.state.security_state = Shared::new(crate::sesame::types::SecurityState {
             certificate_authorities: vec![hierarchy.root.ca.clone()],
             api_tokens: vec![crate::sesame::types::ApiToken {
                 name: "admin".to_string(),
@@ -7420,7 +7445,7 @@ mod tests {
             }],
             next_serial: 900,
             ..Default::default()
-        };
+        });
         let bootstrap = crate::sesame::types::SecurityState {
             certificate_authorities: vec![hierarchy.root.ca],
             next_serial: 2,
@@ -7495,7 +7520,7 @@ mod tests {
         use crate::sesame::types::{CaRole, CertificateAuthority, SerialNumber};
         let mut inner = StateMachineInner::default();
         let hierarchy = crate::sesame::ca::generate_ca_hierarchy("rotate", &[4; 32]).unwrap();
-        inner.state.security_state = crate::sesame::types::SecurityState {
+        inner.state.security_state = Shared::new(crate::sesame::types::SecurityState {
             certificate_authorities: vec![
                 CertificateAuthority {
                     private_key_wrapped: None,
@@ -7505,7 +7530,7 @@ mod tests {
             ],
             next_serial: 10,
             ..Default::default()
-        };
+        });
         // node-a joins under generation 0.
         inner
             .state
@@ -7654,7 +7679,7 @@ mod tests {
         use crate::sesame::types::{CaRole, CertificateAuthority};
         let mut inner = StateMachineInner::default();
         let hierarchy = crate::sesame::ca::generate_ca_hierarchy("rotate", &[4; 32]).unwrap();
-        inner.state.security_state = crate::sesame::types::SecurityState {
+        inner.state.security_state = Shared::new(crate::sesame::types::SecurityState {
             certificate_authorities: vec![
                 CertificateAuthority {
                     private_key_wrapped: None,
@@ -7664,7 +7689,7 @@ mod tests {
             ],
             next_serial: 10,
             ..Default::default()
-        };
+        });
         let (csr_der, private_key_wrapped) =
             crate::sesame::ca::create_intermediate_csr(CaRole::Node, &[4; 32]).unwrap();
         let prepare = RaftRequest::CaRotationPrepare {
@@ -13480,5 +13505,141 @@ mod tests {
             }),
             Some(CouncilResponse::Refused { .. })
         ));
+    }
+
+    /// A fixed state serialises to the same snapshot bytes, whatever the
+    /// in-memory layout of `DesiredState` (#2435): sharing its collections
+    /// behind `Arc` must not change the snapshot format.
+    #[test]
+    fn a_fixed_state_serialises_to_the_same_snapshot_bytes() {
+        let mut inner = StateMachineInner::default();
+        let app_id = AppId::new("web", "default");
+        assert!(
+            inner
+                .apply_request(&RaftRequest::AppSpec {
+                    app_id: app_id.clone(),
+                    spec: web_spec("web:v1"),
+                })
+                .is_none()
+        );
+        assert!(
+            inner
+                .apply_request(&RaftRequest::SchedulingDecisions {
+                    expected_log_id: None,
+                    decisions: vec![SchedulingDecision {
+                        app_id,
+                        placements: vec![Placement {
+                            node_id: NodeId::new("home"),
+                            resources: Resources::new(1000, 0, 0),
+                            ordinal: 0,
+                        }],
+                    }],
+                })
+                .is_none()
+        );
+        inner.apply_request(&RaftRequest::ConfigSet {
+            key: "colour".into(),
+            value: "blue".into(),
+        });
+        inner.apply_request(&RaftRequest::ManifestCommit(test_manifest_commit()));
+        assert!(
+            inner
+                .apply_request(&RaftRequest::PublishEndpoints {
+                    expected_generation: 0,
+                    catalog: Box::new(withdrawal_fixture_catalogue()),
+                })
+                .is_none()
+        );
+        insta::assert_snapshot!(
+            String::from_utf8(serde_json::to_vec(&inner.state).unwrap()).unwrap()
+        );
+    }
+
+    /// A state holding one committed image manifest, so a test can tell
+    /// whether an entry that never writes the catalogue copied it.
+    fn state_with_a_manifest() -> StateMachineInner {
+        let mut inner = StateMachineInner::default();
+        assert!(
+            inner
+                .apply_request(&RaftRequest::ManifestCommit(test_manifest_commit()))
+                .is_none()
+        );
+        assert!(!inner.state.manifest_catalog.manifests.is_empty());
+        inner
+    }
+
+    /// #2435: a placement pass is all or nothing, but it must not get
+    /// there by copying the whole desired state. The image catalogue, which
+    /// a pass never writes, is the same allocation afterwards.
+    #[test]
+    fn a_placement_pass_does_not_copy_state_it_does_not_touch() {
+        let mut inner = state_with_a_manifest();
+        let before = inner.state.manifest_catalog.manifests.as_ptr();
+        assert!(
+            inner
+                .apply_request(&RaftRequest::SchedulingDecisions {
+                    expected_log_id: None,
+                    decisions: vec![SchedulingDecision {
+                        app_id: AppId::new("web", "default"),
+                        placements: vec![Placement {
+                            node_id: NodeId::new("home"),
+                            resources: Resources::new(1000, 0, 0),
+                            ordinal: 0,
+                        }],
+                    }],
+                })
+                .is_none()
+        );
+        assert_eq!(inner.state.scheduling.len(), 1);
+        assert_eq!(inner.state.manifest_catalog.manifests.as_ptr(), before);
+    }
+
+    /// #2435: the other three staged entries, a deployment's begin and
+    /// commit and an approved proposal, also leave what they don't write
+    /// where it was.
+    #[test]
+    fn deployments_and_proposals_do_not_copy_state_they_do_not_touch() {
+        use crate::meat::task_array_store::TaskArrayWrite;
+        let mut inner = state_with_a_manifest();
+        let before = inner.state.manifest_catalog.manifests.as_ptr();
+        let op = "0123456789abcdef0123456789abcdef".to_string();
+        let config = crate::config::Config::parse(
+            "[app.web]\nimage='web:v1'\n[job.once]\nruntime='process'\nexec='/bin/true'",
+        )
+        .unwrap();
+        let begin = inner.apply_request(&RaftRequest::TaskArray(Box::new(
+            TaskArrayWrite::DeployBegin {
+                operation_id: op.clone(),
+                config: Box::new(config),
+                now_epoch_secs: 10,
+            },
+        )));
+        assert!(
+            !matches!(begin, Some(CouncilResponse::Refused { .. })),
+            "{begin:?}"
+        );
+        assert_eq!(inner.state.manifest_catalog.manifests.as_ptr(), before);
+        let commit = inner.apply_request(&RaftRequest::JobApplyCommit {
+            operation_id: op,
+            now_epoch_secs: 11,
+        });
+        assert!(
+            !matches!(commit, Some(CouncilResponse::Refused { .. })),
+            "{commit:?}"
+        );
+        assert!(inner.state.apps.contains_key(&AppId::new("web", "default")));
+        assert_eq!(inner.state.manifest_catalog.manifests.as_ptr(), before);
+
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: web_app(),
+            spec: shop_web(3),
+        });
+        let create = scale_proposal(&inner.state, 5, 1_000);
+        proposal_outcome(inner.apply_request(&create));
+        match proposal_outcome(inner.apply_request(&approve_entry(1, 0, 2_000))) {
+            crate::proposal::ProposalOutcome::Applied { .. } => {}
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(inner.state.manifest_catalog.manifests.as_ptr(), before);
     }
 }

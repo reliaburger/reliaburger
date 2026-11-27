@@ -123,7 +123,8 @@ async fn a_recovered_council_keeps_its_restored_tokens_over_the_bootstrap_file()
             api_tokens: vec![token],
             next_serial: 900,
             ..Default::default()
-        },
+        }
+        .into(),
         ..Default::default()
     };
     let bootstrap = SecurityState {

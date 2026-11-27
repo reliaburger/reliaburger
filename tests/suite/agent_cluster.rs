@@ -136,7 +136,7 @@ async fn scheduler_repairs_a_catalogue_replaced_after_its_last_publication() {
         let stale = council
             .write(RaftRequest::PublishEndpoints {
                 expected_generation,
-                catalog: Box::new(original.clone()),
+                catalog: Box::new((*original).clone()),
             })
             .await
             .unwrap();

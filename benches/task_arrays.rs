@@ -19,7 +19,10 @@
 ///   compacted results of the finished run, failing above
 ///   `STORAGE_BYTES_PER_TASK`;
 /// - the same 64k-task writes on tmpfs (Linux), where fsync costs nothing,
-///   so the ledger and index code is measured without the runner's disk.
+///   so the ledger and index code is measured without the runner's disk;
+/// - one council apply of a one-app placement pass over a state holding
+///   100, 1,000 and 10,000 apps: an entry's apply cost must follow the
+///   entry, not the state (#2435).
 ///
 /// Every benchmark reports tasks (or elements) per second.
 use std::collections::HashMap;
@@ -443,12 +446,84 @@ fn bench_storage(c: &mut Criterion) {
     group.finish();
 }
 
+/// A council state machine holding `apps` placed apps, and the index of
+/// the last entry it applied.
+fn council_with_apps(apps: usize) -> reliaburger::council::state_machine::CouncilStateMachine {
+    use reliaburger::council::types::DesiredState;
+    use reliaburger::meat::types::{AppId, Placement, Resources};
+    let spec: reliaburger::config::app::AppSpec =
+        toml::from_str("image = \"web:v1\"\nreplicas = 1\n").unwrap();
+    let mut state = DesiredState::default();
+    for app in 0..apps {
+        let app_id = AppId::new(format!("app-{app}"), "default");
+        state.apps.insert(app_id.clone(), spec.clone());
+        state.scheduling.insert(
+            app_id,
+            vec![Placement {
+                node_id: NodeId::new("node-1"),
+                resources: Resources::new(100, 0, 0),
+                ordinal: 0,
+            }],
+        );
+    }
+    reliaburger::council::state_machine::CouncilStateMachine::from_recovered_state(state)
+}
+
+fn bench_council_apply(c: &mut Criterion) {
+    use openraft::storage::RaftStateMachine;
+    use reliaburger::council::types::RaftRequest;
+    use reliaburger::meat::types::{AppId, Placement, Resources, SchedulingDecision};
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let log_id = |index: u64| openraft::LogId::new(openraft::CommittedLeaderId::new(1, 0), index);
+    let mut group = c.benchmark_group("council_apply");
+    group.throughput(Throughput::Elements(1));
+    for apps in [100usize, 1_000, 10_000] {
+        let mut machine = council_with_apps(apps);
+        let mut index = 0u64;
+        group.bench_with_input(
+            BenchmarkId::new("one_app_placement_pass", apps),
+            &apps,
+            |b, _| {
+                b.iter(|| {
+                    index += 1;
+                    let decision = SchedulingDecision {
+                        app_id: AppId::new("app-0", "default"),
+                        placements: vec![Placement {
+                            node_id: NodeId::new(format!("node-{}", index % 2)),
+                            resources: Resources::new(100, 0, 0),
+                            ordinal: 0,
+                        }],
+                    };
+                    let entry = openraft::Entry {
+                        log_id: log_id(index),
+                        payload: openraft::EntryPayload::Normal(RaftRequest::SchedulingDecisions {
+                            expected_log_id: (index > 1).then(|| log_id(index - 1)),
+                            decisions: vec![decision],
+                        }),
+                    };
+                    let responses = runtime.block_on(machine.apply([entry])).unwrap();
+                    assert!(
+                        matches!(
+                            responses[0],
+                            reliaburger::council::types::CouncilResponse::Applied { .. }
+                        ),
+                        "{:?}",
+                        responses[0]
+                    );
+                })
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_index_set,
     bench_leader,
     bench_tick,
     bench_executor,
-    bench_storage
+    bench_storage,
+    bench_council_apply
 );
 criterion_main!(benches);

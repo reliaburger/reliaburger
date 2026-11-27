@@ -434,7 +434,13 @@ function that takes `&self` change the store, so "the preview can't leak into
 the real state" isn't a convention any more; it's checked. A test-only counter
 in `copy_for_preview` pins the cost: `admitting_one_job_copies_the_store_at_most_once`
 failed at 3 and now sees none. Deployment writes still try the whole
-transaction on one candidate copy, which is what makes them atomic. The `relish
+transaction on one candidate copy, which is what makes them atomic. One level
+up, the state machine previews a deployment's apps on a staged copy of the
+whole desired state, and commits a deployment's apps the same way. That copy
+used to take everything; since #2435 the big collections of `DesiredState` are
+shared copy-on-write, so the staged copy costs a few pointers plus the app maps
+it writes ([chapter 2](02-finding-friends.md#all-or-nothing-without-copying-everything)
+explains `Arc::make_mut`). The `relish
 apply` stream that polls ten times a second now reads its one deployment
 through `read_control` instead of copying the store, and so does the leader's
 `settle`.
