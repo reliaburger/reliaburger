@@ -193,49 +193,34 @@ All fault injection requests flow through the cluster API on the leader node:
 
 ### 3.1 eBPF Fault Maps
 
-Smoker adds four BPF maps to the kernel, managed alongside Onion's existing service maps. All maps are BPF_MAP_TYPE_HASH with per-CPU variants where needed for performance.
+The loaded object defines one fault map, `fault_connect_map`, and the Onion connect hooks read it. `ebpf/onion_connect.bpf.c` is the authority for which maps exist (`grep 'SEC(".maps")'` lists them), and `ebpf/smoker_common.h` for their layouts; `src/smoker/bpf_types.rs` mirrors the header and asserts its sizes and offsets.
 
 ```
 +---------------------------------------------------------------+
 |  Kernel (eBPF)                                                |
 |                                                               |
-|  DNS interception hook (sock_ops, UDP + TCP port 53):         |
-|    1. Is this a .internal query?                              |
-|    2. Look up fault_dns_map[service_name]                     |
-|       -> empty: normal resolution from dns_map                |
-|       -> nxdomain: return NXDOMAIN response                   |
-|       -> delay: hold response for N nanoseconds               |
-|                                                               |
-|  Connect interception hook (sock_ops / connect4):             |
+|  Connect hooks (cgroup/connect4, and cgroup/connect6 for a    |
+|  v4-mapped VIP), inside route_vip, before backend selection:  |
 |    1. Is this a virtual IP?                                   |
-|    2. Look up fault_connect_map[virtual_ip:port]              |
-|       -> empty: normal backend selection from backend_map     |
-|       -> drop(10%): generate random, if < 10% deny (return 0, |
-|          surfaced to connect() as -EPERM)                     |
-|       -> delay(200ms): store timestamp, defer via timer       |
-|       -> partition(from=X): check source cgroup, if match     |
-|          deny (return 0, surfaced as -EPERM)                  |
-|    3. Look up fault_bw_map[virtual_ip:port]                   |
-|       -> empty: no throttle                                   |
-|       -> 1mbps: attach token bucket rate limiter to socket    |
+|    2. Look up fault_connect_map[vip, port, source cgroup],    |
+|       then [vip, port, 0] for faults on every caller          |
+|       -> none or expired: normal backend selection            |
+|       -> partition: deny (return 0, surfaced as EPERM)        |
+|       -> drop(10%): bpf_get_prandom_u32() % 100 < 10 denies   |
+|       -> delay: falls through (netem does delay, §5.1.1)      |
 |                                                               |
-|  BPF maps (written by Bun userspace agent):                   |
-|    dns_map/backend_map -- normal Onion service discovery      |
-|    fault_dns_map      -- per-service DNS fault rules          |
+|  BPF maps (written by Bun):                                   |
+|    backend_map        -- normal Onion service discovery       |
 |    fault_connect_map  -- per-service connect fault rules      |
-|    fault_bw_map       -- per-service bandwidth limits         |
-|    fault_state_map    -- PRNG state, counters, timestamps     |
 |                                                               |
 +---------------------------------------------------------------+
 ```
 
-**fault_dns_map** -- Keyed by service name hash (u32). Values contain the fault type (NXDOMAIN or DELAY), delay duration in nanoseconds, probability (0-100), and expiry timestamp.
+DNS faults act in the userspace `.internal` responder (§5.1.3), so there is no `fault_dns_map`.
 
-**fault_connect_map** -- Keyed by `{virtual_ip: u32, port: u16, source_cgroup: u64}`. The source_cgroup field is zero for faults that apply to all callers, or set to a specific cgroup ID for partition faults. Values contain fault type (DROP, DELAY, PARTITION), parameters, probability, and expiry timestamp.
+**fault_connect_map** -- `BPF_MAP_TYPE_HASH`, 4,096 entries. Keyed by `{virtual_ip: u32, port: u16, _pad: u16, source_cgroup_id: u64}` (16 bytes, both address fields in network byte order). `source_cgroup_id` is zero for faults that apply to all callers, or a specific cgroup ID for partition faults. The 32-byte value holds the action (DROP, DELAY, PARTITION), the drop probability, delay and jitter, and an expiry on `CLOCK_MONOTONIC`.
 
-**fault_bw_map** -- Keyed by `{virtual_ip: u32, port: u16}`. Values contain the rate limit in bytes per second, token bucket state (tokens remaining, last refill timestamp).
-
-**fault_state_map** -- Keyed by CPU ID (u32). Values contain per-CPU PRNG state (u64 xorshift seed), counters for faults injected, and scratch space for delay timers.
+**Reserved, not defined in the loaded object:** `fault_bw_map` (a bandwidth token bucket) and `fault_state_map` (per-CPU PRNG state and counters). `smoker_common.h` and `bpf_types.rs` keep their structs for a later bandwidth fault, but no program declares the maps, so `bpftool map dump name fault_state_map` finds nothing.
 
 ### 3.2 Resource Fault Manager (Bun Userspace)
 
@@ -324,6 +309,8 @@ pub enum FaultType {
     Delay {
         delay_ns: u64,
         jitter_ns: u64,
+        /// Source app whose traffic is delayed; `None` delays every caller.
+        source_app: Option<String>,
     },
 
     /// Fail a percentage of connections with EPERM (the connect hook denies).
@@ -340,6 +327,12 @@ pub enum FaultType {
     /// every caller.
     Partition {
         source_app: Option<String>,
+    },
+
+    /// Cut the target node off from named peers on the gossip and Raft
+    /// transports. Only this variant can remove a council voter from quorum.
+    CouncilPartition {
+        peers: Vec<String>,
     },
 
     /// Throttle bandwidth to target service.
@@ -389,6 +382,12 @@ pub enum FaultType {
     NodeKill {
         kill_containers: bool,
     },
+
+    /// Consume bounded CPU and memory capacity on one node.
+    NodePressure {
+        cpu_percentage: u8,
+        memory_percentage: u8,
+    },
 }
 
 /// A single fault rule, as stored in Bun's in-process fault registry.
@@ -403,8 +402,18 @@ pub struct FaultRule {
     /// Target service name (e.g. "redis", "api", "payment-service").
     pub target_service: String,
 
+    /// Namespace of the target service. Every workload fault carries one;
+    /// node faults, which have no service, carry `None`.
+    pub namespace: Option<String>,
+
     /// Optional: target a specific instance by name (e.g. "redis-1").
     pub target_instance: Option<String>,
+
+    /// What kind of workload the target is (app, job or task array).
+    pub workload: WorkloadKind,
+
+    /// Optional: the one task of a job or task array to target.
+    pub task_index: Option<u32>,
 
     /// Optional: restrict fault to a specific node.
     pub target_node: Option<String>,
@@ -422,11 +431,12 @@ pub struct FaultRule {
     /// Who injected this fault.
     pub injected_by: String,
 
-    /// Source IP of the fault injection request.
-    pub source_ip: String,
-
     /// Human-readable reason (from --reason flag).
     pub reason: Option<String>,
+
+    /// Runtime-only state captured when the fault is applied, so clear and
+    /// expiry can undo it (saved limits, paused pids). Never serialised.
+    pub reversal: FaultReversal,
 }
 
 /// A scripted multi-step chaos scenario, parsed from TOML.
@@ -463,6 +473,18 @@ pub struct ScenarioStep {
     /// Delay before activating this step, relative to scenario start.
     /// If None, step activates immediately (or immediately after previous step).
     pub start_after: Option<String>,
+
+    /// Namespace of the target service; the server's `default` when absent.
+    pub namespace: Option<String>,
+
+    /// Source app for a `delay` or `partition`: only its calls are faulted.
+    pub from: Option<String>,
+
+    /// How many replicas a `kill` takes; one when absent.
+    pub count: Option<u32>,
+
+    /// One instance id to scope the fault to.
+    pub instance: Option<String>,
 }
 
 /// Safety check result, evaluated by the leader before approving a fault.
@@ -522,117 +544,43 @@ pub struct SafetyContext {
 
 ### 4.2 BPF Map Key/Value Layouts
 
-These structures are shared between the eBPF C programs and the Rust userspace via `#[repr(C)]` Rust structs and corresponding C struct definitions.
+`ebpf/smoker_common.h` defines these layouts and `src/smoker/bpf_types.rs` mirrors them as `#[repr(C)]` structs, with tests that pin every size and field offset. Only `fault_connect_map` exists in the loaded object.
 
 ```rust
-/// Key for fault_dns_map.
-/// BPF map type: BPF_MAP_TYPE_HASH, max_entries: 1024.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BpfDnsFaultKey {
-    /// FNV-1a hash of the service name (e.g. hash("redis")).
-    pub service_name_hash: u32,
-}
-
-/// Value for fault_dns_map.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct BpfDnsFaultValue {
-    /// Fault action: 0 = none, 1 = NXDOMAIN, 2 = DELAY.
-    pub action: u8,
-    pub _pad: [u8; 3],
-    /// Delay in nanoseconds (only used when action = DELAY).
-    pub delay_ns: u64,
-    /// Probability 0-100 (100 = always apply).
-    pub probability: u8,
-    pub _pad2: [u8; 3],
-    /// Expiry timestamp (CLOCK_MONOTONIC, nanoseconds). 0 = no expiry.
-    pub expires_ns: u64,
-}
-
-/// Key for fault_connect_map.
+/// Key for fault_connect_map: 16 bytes.
 /// BPF map type: BPF_MAP_TYPE_HASH, max_entries: 4096.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BpfConnectFaultKey {
-    /// Virtual IP of the target service (Onion-assigned, e.g. 127.128.0.3).
-    pub virtual_ip: u32,
+    /// Virtual IP of the target service (network byte order).
+    pub virtual_ip: u32,                 // offset 0
     /// Target port (network byte order).
-    pub port: u16,
-    pub _pad: u16,
+    pub port: u16,                       // offset 4
+    pub _pad: u16,                       // offset 6
     /// Source cgroup ID. 0 = match all callers.
     /// Non-zero = only match connections from this cgroup (partition faults).
-    pub source_cgroup_id: u64,
+    pub source_cgroup_id: u64,           // offset 8
 }
 
-/// Value for fault_connect_map.
+/// Value for fault_connect_map: 32 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct BpfConnectFaultValue {
     /// Fault action: 0 = none, 1 = DROP, 2 = DELAY, 3 = PARTITION.
-    pub action: u8,
-    pub _pad: [u8; 3],
-    /// Delay in nanoseconds (action = DELAY).
-    pub delay_ns: u64,
-    /// Jitter in nanoseconds (action = DELAY). Actual delay = delay_ns +/- rand(jitter_ns).
-    pub jitter_ns: u64,
+    pub action: u8,                      // offset 0
     /// Drop probability 0-100 (action = DROP).
-    pub probability: u8,
-    pub _pad2: [u8; 3],
+    pub probability: u8,                 // offset 1
+    pub _pad: [u8; 6],                   // offsets 2-7
+    /// Delay in nanoseconds (action = DELAY).
+    pub delay_ns: u64,                   // offset 8
+    /// Jitter in nanoseconds (action = DELAY).
+    pub jitter_ns: u64,                  // offset 16
     /// Expiry timestamp (CLOCK_MONOTONIC, nanoseconds). 0 = no expiry.
-    pub expires_ns: u64,
-}
-
-/// Key for fault_bw_map.
-/// BPF map type: BPF_MAP_TYPE_HASH, max_entries: 1024.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BpfBandwidthFaultKey {
-    /// Virtual IP of the target service.
-    pub virtual_ip: u32,
-    /// Target port (network byte order).
-    pub port: u16,
-    pub _pad: u16,
-}
-
-/// Value for fault_bw_map.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct BpfBandwidthFaultValue {
-    /// Rate limit in bytes per second.
-    pub rate_bytes_per_sec: u64,
-    /// Token bucket: current token count (bytes).
-    pub tokens: u64,
-    /// Token bucket: last refill timestamp (CLOCK_MONOTONIC, nanoseconds).
-    pub last_refill_ns: u64,
-    /// Expiry timestamp (CLOCK_MONOTONIC, nanoseconds). 0 = no expiry.
-    pub expires_ns: u64,
-}
-
-/// Key for fault_state_map.
-/// BPF map type: BPF_MAP_TYPE_PERCPU_ARRAY, max_entries: 1 (indexed by 0).
-/// Each CPU gets its own copy automatically.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct BpfFaultStateKey {
-    /// Always 0 (single entry per CPU, PERCPU_ARRAY handles per-CPU storage).
-    pub index: u32,
-}
-
-/// Value for fault_state_map (one per CPU).
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct BpfFaultStateValue {
-    /// PRNG seed for this CPU (xorshift64).
-    pub prng_state: u64,
-    /// Counter: total faults injected on this CPU.
-    pub faults_injected: u64,
-    /// Counter: total fault map lookups on this CPU.
-    pub lookups: u64,
-    /// Scratch: timestamp for delay timer bookkeeping.
-    pub scratch_ts: u64,
+    pub expires_ns: u64,                 // offset 24
 }
 ```
+
+**Reserved, not defined in the loaded object.** The header and `bpf_types.rs` also keep `BpfBandwidthFaultKey` (8 bytes: `virtual_ip`, `port`, `_pad`) and `BpfBandwidthFaultValue` (32 bytes: `rate_bytes_per_sec`, `tokens`, `last_refill_ns`, `expires_ns`) for a future `fault_bw_map`, and `BpfFaultStateKey` (4 bytes: `index`) and `BpfFaultStateValue` (32 bytes: `prng_state`, `faults_injected`, `lookups`, `scratch_ts`) for a `fault_state_map`. No program declares either map. There is no DNS fault layout: DNS faults live in the userspace responder.
 
 ---
 
@@ -699,59 +647,22 @@ backends, when a `--from` source has no local instance, or when `tc` fails
 Bandwidth could use the same tree (netem has a `rate` option), but it stays
 unimplemented until it has its own tests.
 
-#### 5.1.2 Drop (via PRNG in connect hook)
+#### 5.1.2 Drop (via the kernel PRNG in the connect hook)
 
-On each `connect()` interception, the eBPF program reads a per-CPU PRNG state from `fault_state_map`, generates a random value, and compares it to the configured drop percentage. If the random value falls within the drop range, the program denies the connection by returning 0 from the hook, which the kernel surfaces to `connect()` as `-EPERM`. No packet is ever sent.
+The check is inline in the connect hooks: `route_vip` in `ebpf/onion_connect.bpf.c`, which `cgroup/connect4` calls for a VIP and `cgroup/connect6` calls for a v4-mapped VIP. There is no separate drop program and no PRNG map. The hook looks up `fault_connect_map` for this source cgroup, then for every caller (`source_cgroup_id = 0`), and for an unexpired DROP rolls the kernel's `bpf_get_prandom_u32()`. Below the configured percentage, it denies the connection by returning 0, which the kernel surfaces to `connect()` as `EPERM`. No packet is ever sent.
 
 ```c
-// eBPF pseudocode: drop fault in connect4 program
-SEC("cgroup/connect4")
-int smoker_drop_connect4(struct bpf_sock_addr *ctx) {
-    struct bpf_connect_fault_key key = {
-        .virtual_ip       = ctx->user_ip4,
-        .port             = bpf_ntohs(ctx->user_port),
-        .source_cgroup_id = 0,
-    };
-
-    struct bpf_connect_fault_value *val =
-        bpf_map_lookup_elem(&fault_connect_map, &key);
-    if (!val)
-        return CGROUP_SOCK_ADDR_ALLOW;  // no fault, normal path
-
-    // Check expiry
-    __u64 now = bpf_ktime_get_ns();
-    if (val->expires_ns != 0 && now > val->expires_ns)
-        return CGROUP_SOCK_ADDR_ALLOW;
-
-    if (val->action != FAULT_ACTION_DROP)
-        return CGROUP_SOCK_ADDR_ALLOW;
-
-    // Generate random number using per-CPU PRNG
-    __u32 state_key = 0;
-    struct bpf_fault_state_value *state =
-        bpf_map_lookup_elem(&fault_state_map, &state_key);
-    if (!state)
-        return CGROUP_SOCK_ADDR_ALLOW;
-
-    __u64 x = state->prng_state;
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    state->prng_state = x;
-    state->lookups++;
-
-    // Check if this connection should be dropped
-    __u8 roll = x % 100;  // 0-99
-    if (roll < val->probability) {
-        state->faults_injected++;
-        // Deny by returning zero -- the cgroup connect hook's denial is
-        // surfaced to connect(2) as EPERM (not ECONNREFUSED).
-        return CGROUP_SOCK_ADDR_REJECT;  // maps to -EPERM
-    }
-
-    return CGROUP_SOCK_ADDR_ALLOW;  // this connection passes through
+/* from route_vip() in ebpf/onion_connect.bpf.c */
+if (fval->action == FAULT_ACTION_DROP) {
+    /* Probabilistic drop using kernel PRNG */
+    __u32 rand = bpf_get_prandom_u32();
+    __u8 roll = rand % 100;
+    if (roll < fval->probability)
+        return NULL;  /* deny -> EPERM */
 }
 ```
+
+Nothing counts injected faults in the kernel; Bun's fault registry and the audit log record what was injected.
 
 #### 5.1.3 DNS NXDOMAIN
 
@@ -1788,7 +1699,7 @@ kill(Pid::from_raw(container_pid), Signal::SIGSTOP)?;
 kill(Pid::from_raw(container_pid), Signal::SIGCONT)?;
 ```
 
-**rand** -- PRNG for userspace operations (selecting random instances for `kill --count N`, jitter calculation in scenario timing). The eBPF programs use their own xorshift64 PRNG (BPF programs cannot call userspace random functions).
+**rand** -- PRNG for userspace operations (selecting random instances for `kill --count N`, jitter calculation in scenario timing). The eBPF programs use the kernel's `bpf_get_prandom_u32()` helper (BPF programs cannot call userspace random functions).
 
 ```rust
 use rand::RngExt;
