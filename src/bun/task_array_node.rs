@@ -764,6 +764,7 @@ impl TaskArrayNode {
     async fn task_data_bytes(&self, claim: &SyncClaim) -> Option<u64> {
         let mut size = self.task_data.lock().await;
         let Some(measured) = size.measured else {
+            // BLOCKING-OK: this only builds the walk; it runs on the blocking pool
             let bytes = claim.spawn_blocking(self.task_data_walk()).await.ok()?;
             size.bytes = bytes;
             size.measured = Some(Instant::now());
@@ -771,6 +772,7 @@ impl TaskArrayNode {
         };
         if measured.elapsed() >= self.task_data_refresh && !size.refreshing {
             size.refreshing = true;
+            // BLOCKING-OK: this only builds the walk; it runs on the blocking pool
             let walk = self.task_data_walk();
             let cache = Arc::clone(&self.task_data);
             tokio::spawn(async move {
