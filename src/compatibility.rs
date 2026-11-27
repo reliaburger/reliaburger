@@ -321,6 +321,10 @@ pub struct Compatibility {
 /// `AppSpec` and `SidecarSpec` carry `pids`, a process and thread limit, and
 /// refuse unknown fields, so the app spec on the wire and in the replicated
 /// desired state changes (#2386).
+/// An `ArrayAssignment` that carries a `template` no longer carries
+/// `program`, `args` or `env`; the node derives them from the template, so
+/// an older node would read the run as a host job with an empty binary
+/// (#2532).
 ///
 /// Bumping either number makes the checked-in gossip and Raft fuzz seeds
 /// stale: run `make fuzz-corpus-seed` in the same change (#1941). Keep the
