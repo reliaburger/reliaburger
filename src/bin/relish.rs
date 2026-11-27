@@ -6182,6 +6182,59 @@ mod tests {
         assert!(parse(&["relish", "setup", "--ssh", "u@a", "--nodes", "3"]).is_err());
     }
 
+    /// Every `relish ...` command quoted in backticks in `source`'s
+    /// non-test half, cut before its first argument placeholder or flag.
+    fn quoted_relish_commands(source: &str) -> Vec<Vec<String>> {
+        let code = source.split("#[cfg(test)]").next().unwrap_or_default();
+        code.match_indices("`relish ")
+            .map(|(start, opening)| {
+                let rest = &code[start + opening.len()..];
+                let end = rest.find(['`', '\n']).unwrap_or(rest.len());
+                rest[..end]
+                    .split_whitespace()
+                    .take_while(|word| {
+                        !word.starts_with('-') && !word.contains(['<', '[', '{', '"', '\\'])
+                    })
+                    .map(str::to_string)
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_command_a_wtf_suggestion_names_exists() {
+        // `relish wtf` advised `relish pickle gc`, which has never existed,
+        // and agents run what `relish agent diagnose` suggests (#2468).
+        let sources = [
+            ("wtf/diagnose.rs", include_str!("../relish/wtf/diagnose.rs")),
+            ("wtf_cmd.rs", include_str!("../relish/wtf_cmd.rs")),
+            (
+                "agent/diagnose.rs",
+                include_str!("../relish/agent/diagnose.rs"),
+            ),
+        ];
+        let root = <Cli as clap::CommandFactory>::command();
+        let mut checked = 0;
+        for (file, source) in sources {
+            for words in quoted_relish_commands(source) {
+                let mut command = &root;
+                for word in &words {
+                    if command.get_subcommands().next().is_none() {
+                        break; // the rest are arguments
+                    }
+                    command = command.find_subcommand(word).unwrap_or_else(|| {
+                        panic!(
+                            "{file} suggests `relish {}`: no subcommand {word:?}",
+                            words.join(" ")
+                        )
+                    });
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 20, "found only {checked} quoted commands");
+    }
+
     #[test]
     fn parse_join_token_file_and_reject_conflicting_credentials() {
         assert!(

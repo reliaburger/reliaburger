@@ -70,9 +70,9 @@ Summary: 1 critical, 2 warning, 1 unknown, 2 OK
 CRITICAL [crashloop] app api/default restarted repeatedly (app.api/default)
   next: app api is crashlooping; inspect its recent logs and run `relish rollback api` if this started after a deploy
 WARNING [disk-high] node node-1 filesystem for images is 88.0% full (node.node-1)
-  next: node node-1 disk is at 88.0%; prune images (`relish pickle gc`) or logs
+  next: node node-1 disk is at 88.0%; list images with `relish images`, delete tags you no longer need with `relish images delete <repository:tag>` (untagged images expire after [images] gc_retain_days), or lower log and metric retention in node.toml
 WARNING [disk-high] node node-2 filesystem for images is 90.5% full (node.node-2)
-  next: node node-2 disk is at 90.5%; prune images (`relish pickle gc`) or logs
+  next: node node-2 disk is at 90.5%; list images with `relish images`, delete tags you no longer need with `relish images delete <repository:tag>` (untagged images expire after [images] gc_retain_days), or lower log and metric retention in node.toml
 UNKNOWN [alerts] cluster: node node-2: alerts: timed out after 5s
 ```
 
