@@ -6,9 +6,10 @@
 /// identity, the accept loop requires a client certificate and sends dial
 /// peers over TLS, using the same verifiers and CRL handle as the Raft RPC
 /// transport.
-use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::sync::{Mutex, mpsc};
 
@@ -177,11 +178,26 @@ impl ReportingTransport for InMemoryReportingTransport {
 
 /// Maximum reporting message size (1 MiB).
 const MAX_REPORT_SIZE: usize = 1_048_576;
-/// Connections the leader reads at once. The listener doesn't accept past
-/// this: further connections wait in the kernel's listen backlog, and their
-/// senders wait with them, inside their own deadline (#1411). Refusing them
-/// instead cost 15,310 lost reports at 500 nodes.
+/// Connections that have delivered a whole report and are being admitted:
+/// waiting for room in the queue, then writing the acknowledgement. Past
+/// this, connections wait rather than being refused (#1411): refusing them
+/// cost 15,310 lost reports at 500 nodes.
 const MAX_REPORT_CONNECTIONS: usize = 64;
+/// Connections that haven't yet delivered a whole report: the TLS handshake
+/// (under mTLS) and the framed message. They have proved nothing, so they
+/// get a budget of their own, and can't spend the one above (#2380). The
+/// listener doesn't accept past this; later connections wait in the
+/// kernel's listen backlog.
+const MAX_PENDING_CONNECTIONS: usize = 64;
+/// Pending connections one source address may hold. A node sends its
+/// reports one after another, so it needs one. Loopback is exempt: the
+/// hollow-node harness runs a thousand nodes on 127.0.0.1.
+const MAX_PENDING_PER_SOURCE: usize = 4;
+/// How long a pending connection keeps its slot while a newer one waits
+/// for it. An honest sender finishes its handshake and frame in
+/// milliseconds, so the oldest pending connection is the likeliest to be
+/// stalled, and it is closed to make room.
+const PENDING_EVICTION_AGE: std::time::Duration = std::time::Duration::from_secs(1);
 /// Reports admitted but not yet taken by the aggregator. A connection whose
 /// report finds the queue full waits for room, inside the accept deadline,
 /// rather than being refused.
@@ -244,6 +260,8 @@ impl ReportingTransport for TcpReportingSender {
 pub struct TcpReportingTransport {
     address: SocketAddr,
     inbound_rx: Mutex<mpsc::Receiver<InboundReport>>,
+    /// Connection tasks alive right now, pending and admitting together.
+    connection_tasks: Arc<AtomicUsize>,
     blocklist: std::sync::Arc<tokio::sync::RwLock<std::collections::HashSet<SocketAddr>>>,
     node_gate: crate::smoker::node_fault::NodeTransportGate,
     /// When set, peers are dialled over mTLS. `None` keeps plaintext TCP.
@@ -301,6 +319,7 @@ impl TcpReportingTransport {
             })?;
 
         let (inbound_tx, inbound_rx) = mpsc::channel(MAX_QUEUED_REPORTS);
+        let connection_tasks = Arc::new(AtomicUsize::new(0));
 
         // Spawn accept loop
         tokio::spawn(Self::accept_loop(
@@ -309,11 +328,13 @@ impl TcpReportingTransport {
             shutdown,
             acceptor,
             node_gate.clone(),
+            Arc::clone(&connection_tasks),
         ));
 
         Ok(Self {
             address: bound_addr,
             inbound_rx: Mutex::new(inbound_rx),
+            connection_tasks,
             blocklist: std::sync::Arc::new(tokio::sync::RwLock::new(
                 std::collections::HashSet::new(),
             )),
@@ -327,6 +348,12 @@ impl TcpReportingTransport {
         self.address
     }
 
+    /// How many connection tasks the listener has running: never more than
+    /// its pending and admission budgets together.
+    pub fn connection_tasks(&self) -> usize {
+        self.connection_tasks.load(Ordering::SeqCst)
+    }
+
     /// Get a handle to the blocklist for chaos injection.
     pub fn blocklist(
         &self,
@@ -335,87 +362,132 @@ impl TcpReportingTransport {
     }
 
     /// Background task: accept connections and read framed messages.
+    ///
+    /// Two budgets, so a socket that proves nothing can't hold a slot a
+    /// node's report needs (#2380). A connection is *pending* from accept
+    /// until its whole frame has arrived (with mTLS, that includes the
+    /// handshake that checks its certificate), and takes one of
+    /// `MAX_PENDING_CONNECTIONS` slots. With a whole frame in, it waits for
+    /// one of `MAX_REPORT_CONNECTIONS` admission slots, then gives its
+    /// pending slot back. Each task holds at least one slot for its whole
+    /// life, so there are never more than the two budgets together.
     async fn accept_loop(
         listener: tokio::net::TcpListener,
         tx: mpsc::Sender<InboundReport>,
         shutdown: tokio_util::sync::CancellationToken,
         acceptor: Option<tokio_rustls::TlsAcceptor>,
         node_gate: crate::smoker::node_fault::NodeTransportGate,
+        connection_tasks: Arc<AtomicUsize>,
     ) {
         let mut connections = tokio::task::JoinSet::new();
-        let capacity = Arc::new(tokio::sync::Semaphore::new(MAX_REPORT_CONNECTIONS));
-        loop {
+        let pending_slots = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_CONNECTIONS));
+        let report_slots = Arc::new(tokio::sync::Semaphore::new(MAX_REPORT_CONNECTIONS));
+        // Pending connections, oldest first.
+        let mut pending: VecDeque<PendingConnection> = VecDeque::new();
+        'accept: loop {
             // Completed tasks also occupy JoinSet storage until reaped.
             while connections.try_join_next().is_some() {}
-            // Take a connection slot before accepting, so at most
-            // MAX_REPORT_CONNECTIONS tasks exist. Past that, connections
-            // queue in the listen backlog: backpressure, not refusal.
-            let permit = tokio::select! {
+            let (stream, peer) = tokio::select! {
                 _ = shutdown.cancelled() => break,
-                permit = Arc::clone(&capacity).acquire_owned() => match permit {
-                    Ok(permit) => permit,
-                    Err(_) => break,
+                result = listener.accept() => match result {
+                    Ok(accepted) => accepted,
+                    Err(_) => continue,
                 },
             };
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                result = listener.accept() => {
-                    let Ok((stream, peer)) = result else { continue };
-                    if node_gate.is_quiesced() { continue; }
-                    let tx = tx.clone();
-                    let acceptor = acceptor.clone();
-                    let connection_gate = node_gate.clone();
-                    connections.spawn(async move {
-                        let _permit = permit;
-                        let _ = tokio::time::timeout(REPORT_ACCEPT_DEADLINE, async {
-                            match acceptor {
-                                Some(acceptor) => {
-                                    if let Ok(tls) = acceptor.accept(stream).await
-                                        && !connection_gate.is_quiesced()
-                                    {
-                                        let peer_id = peer_node_id_from_tls(&tls);
-                                        Self::handle_connection(tls, peer, peer_id, tx).await;
-                                    }
-                                }
-                                None => {
-                                    if !connection_gate.is_quiesced() {
-                                        Self::handle_connection(stream, peer, None, tx).await;
-                                    }
-                                }
-                            }
-                        }).await;
-                    });
-                }
+            if node_gate.is_quiesced() {
+                continue;
             }
+            pending.retain_mut(PendingConnection::is_pending);
+            if source_is_full(peer.ip(), &pending) {
+                continue;
+            }
+            // A slot for the newcomer: a free one, or the oldest pending
+            // connection's once it has stalled for PENDING_EVICTION_AGE.
+            // Until then the newcomer waits here, and the connections behind
+            // it wait in the listen backlog: backpressure, not refusal.
+            let pending_slot = loop {
+                let eviction_due = pending
+                    .front()
+                    .map(|oldest| oldest.since + PENDING_EVICTION_AGE);
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => break 'accept,
+                    permit = Arc::clone(&pending_slots).acquire_owned() => match permit {
+                        Ok(permit) => break permit,
+                        Err(_) => break 'accept,
+                    },
+                    _ = sleep_until_due(eviction_due) => {
+                        if let Some(oldest) = pending.pop_front() {
+                            oldest.evict.cancel();
+                            // Wait for it to go, which gives its slot back,
+                            // so one newcomer closes one connection, not
+                            // every old one at once.
+                            let _ = oldest.still_pending.await;
+                        }
+                        pending.retain_mut(PendingConnection::is_pending);
+                    }
+                }
+            };
+            let (entry, slot) =
+                PendingConnection::start(peer.ip(), pending_slot, Arc::clone(&report_slots));
+            pending.push_back(entry);
+            let tx = tx.clone();
+            let acceptor = acceptor.clone();
+            let connection_gate = node_gate.clone();
+            let task_count = TaskCount::start(&connection_tasks);
+            connections.spawn(async move {
+                let _task_count = task_count;
+                let _ = tokio::time::timeout(REPORT_ACCEPT_DEADLINE, async {
+                    match acceptor {
+                        Some(acceptor) => {
+                            let handshake = tokio::select! {
+                                biased;
+                                _ = slot.evict.cancelled() => return,
+                                handshake = acceptor.accept(stream) => handshake,
+                            };
+                            if let Ok(tls) = handshake
+                                && !connection_gate.is_quiesced()
+                            {
+                                let peer_id = peer_node_id_from_tls(&tls);
+                                Self::handle_connection(tls, peer, peer_id, tx, slot).await;
+                            }
+                        }
+                        None => {
+                            if !connection_gate.is_quiesced() {
+                                Self::handle_connection(stream, peer, None, tx, slot).await;
+                            }
+                        }
+                    }
+                })
+                .await;
+            });
         }
         connections.abort_all();
         while connections.join_next().await.is_some() {}
     }
 
     /// Read one framed message from any byte stream (plain TCP or TLS).
+    ///
+    /// The connection is pending, and can be evicted, until the whole frame
+    /// is in; then it waits for an admission slot.
     async fn handle_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         mut stream: S,
         peer: SocketAddr,
         peer_node_id: Option<NodeId>,
         tx: mpsc::Sender<InboundReport>,
+        slot: PendingSlot,
     ) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
-        // Read 4-byte length prefix
-        let mut len_buf = [0u8; 4];
-        if stream.read_exact(&mut len_buf).await.is_err() {
+        let payload = tokio::select! {
+            biased;
+            _ = slot.evict.cancelled() => return,
+            payload = read_frame(&mut stream) => payload,
+        };
+        let Some(payload) = payload else { return };
+        let Some(_admission) = slot.into_admission().await else {
             return;
-        }
-        let len = u32::from_be_bytes(len_buf) as usize;
-        if len > MAX_REPORT_SIZE {
-            return;
-        }
-
-        // Read payload
-        let mut payload = vec![0u8; len];
-        if stream.read_exact(&mut payload).await.is_err() {
-            return;
-        }
+        };
 
         // Waiting for room is bounded by the caller's accept deadline; a
         // report that never fits is never acknowledged, so its sender knows.
@@ -573,6 +645,131 @@ fn peer_node_id_from_tls(
 
 // The fixed header is inspected before decoding any peer-controlled collections.
 // Development frames have no header and are refused without interpreting them.
+/// Read a 4-byte big-endian length, then that many bytes. `None` when the
+/// peer closes early or claims more than `MAX_REPORT_SIZE`, which is checked
+/// before anything is allocated.
+async fn read_frame<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> Option<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await.ok()?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_REPORT_SIZE {
+        return None;
+    }
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload).await.ok()?;
+    Some(payload)
+}
+
+/// The accept loop's record of one pending connection.
+struct PendingConnection {
+    source: IpAddr,
+    since: tokio::time::Instant,
+    /// Cancelled to close the connection while it is still pending.
+    evict: tokio_util::sync::CancellationToken,
+    /// Its sender lives in the connection's `PendingSlot` and is dropped,
+    /// never sent on, once the connection stops being pending. A oneshot
+    /// used only for its drop is a cheap one-way "done" flag.
+    still_pending: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// What a connection task holds while it is pending.
+struct PendingSlot {
+    evict: tokio_util::sync::CancellationToken,
+    still_pending: tokio::sync::oneshot::Sender<()>,
+    pending_slot: tokio::sync::OwnedSemaphorePermit,
+    report_slots: Arc<tokio::sync::Semaphore>,
+}
+
+impl PendingConnection {
+    /// Record a newly accepted connection, and hand its task the other half.
+    fn start(
+        source: IpAddr,
+        pending_slot: tokio::sync::OwnedSemaphorePermit,
+        report_slots: Arc<tokio::sync::Semaphore>,
+    ) -> (Self, PendingSlot) {
+        let evict = tokio_util::sync::CancellationToken::new();
+        let (still_pending_tx, still_pending_rx) = tokio::sync::oneshot::channel();
+        (
+            Self {
+                source,
+                since: tokio::time::Instant::now(),
+                evict: evict.clone(),
+                still_pending: still_pending_rx,
+            },
+            PendingSlot {
+                evict,
+                still_pending: still_pending_tx,
+                pending_slot,
+                report_slots,
+            },
+        )
+    }
+
+    /// Whether the connection is still handshaking or reading its frame.
+    fn is_pending(&mut self) -> bool {
+        matches!(
+            self.still_pending.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        )
+    }
+}
+
+impl PendingSlot {
+    /// Leave the pending budget for the admission one. The pending slot is
+    /// given back only once the admission slot is held, so the number of
+    /// tasks stays bounded while they wait. `self` is taken by value: the
+    /// slot can't be used again afterwards, and the compiler checks that.
+    async fn into_admission(self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let PendingSlot {
+            still_pending,
+            pending_slot,
+            report_slots,
+            ..
+        } = self;
+        drop(still_pending);
+        let admission = report_slots.acquire_owned().await.ok()?;
+        drop(pending_slot);
+        Some(admission)
+    }
+}
+
+/// Whether `source` already holds its share of the pending budget.
+fn source_is_full(source: IpAddr, pending: &VecDeque<PendingConnection>) -> bool {
+    let source = source.to_canonical();
+    !source.is_loopback()
+        && pending
+            .iter()
+            .filter(|connection| connection.source.to_canonical() == source)
+            .count()
+            >= MAX_PENDING_PER_SOURCE
+}
+
+/// Sleep until `due`; with nothing due, never wake.
+async fn sleep_until_due(due: Option<tokio::time::Instant>) {
+    match due {
+        Some(due) => tokio::time::sleep_until(due).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Counts a connection task for as long as it lives, dropped or aborted.
+struct TaskCount(Arc<AtomicUsize>);
+
+impl TaskCount {
+    fn start(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(count))
+    }
+}
+
+impl Drop for TaskCount {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 fn report_header() -> [u8; 12] {
     let mut header = [0; 12];
     header[..4].copy_from_slice(b"RBRP");
@@ -650,6 +847,26 @@ mod tests {
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// A pending slot for driving `handle_connection` without a listener.
+    fn slot() -> PendingSlot {
+        let pending = Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .unwrap();
+        let reports = Arc::new(tokio::sync::Semaphore::new(1));
+        PendingConnection::start(addr(0).ip(), pending, reports).1
+    }
+
+    fn pending_from(source: IpAddr) -> PendingConnection {
+        let permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .unwrap();
+        let (connection, slot) =
+            PendingConnection::start(source, permit, Arc::new(tokio::sync::Semaphore::new(1)));
+        // Keep the task's half alive, so the connection stays pending.
+        std::mem::forget(slot);
+        connection
     }
 
     /// A fixed timestamp, so a message's encoded size depends only on its
@@ -763,9 +980,11 @@ mod tests {
         let receiver = TcpReportingTransport::bind(addr(0), shutdown.clone())
             .await
             .unwrap();
-        // Stalled peers hold every slot: half a length prefix, then nothing.
+        // Slow peers hold every pending slot: half a length prefix, then
+        // nothing yet. They are younger than PENDING_EVICTION_AGE, so none
+        // is closed to make room.
         let mut stalled = Vec::new();
-        for _ in 0..MAX_REPORT_CONNECTIONS {
+        for _ in 0..MAX_PENDING_CONNECTIONS {
             let mut client = tokio::net::TcpStream::connect(receiver.local_addr())
                 .await
                 .unwrap();
@@ -797,6 +1016,131 @@ mod tests {
         assert_eq!(report.node_id, NodeId::new("waiting"));
         waiting.await.unwrap().unwrap();
         shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn stalled_connections_do_not_stop_a_complete_report_being_admitted() {
+        // #2380: sockets that connect and send nothing must not hold the
+        // listener's report budget. More of them than there are slots, so a
+        // budget spent at accept time can't hide behind a short queue.
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let receiver = TcpReportingTransport::bind(addr(0), shutdown.clone())
+            .await
+            .unwrap();
+        let mut idle = Vec::new();
+        for _ in 0..MAX_PENDING_CONNECTIONS + 32 {
+            idle.push(
+                tokio::net::TcpStream::connect(receiver.local_addr())
+                    .await
+                    .unwrap(),
+            );
+        }
+        let sender = TcpReportingSender::new(None, Default::default());
+        let sent = tokio::time::timeout(
+            Duration::from_secs(5),
+            sender.send(receiver.local_addr(), &sample_msg("worker")),
+        )
+        .await;
+        assert!(
+            matches!(sent, Ok(Ok(()))),
+            "idle sockets kept a whole report out: {sent:?}"
+        );
+        let (_, _, message) = receiver.recv().await.unwrap();
+        let ReportingMessage::Report(report) = message else {
+            panic!("expected a report")
+        };
+        assert_eq!(report.node_id, NodeId::new("worker"));
+        drop(idle);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn stalled_connections_cannot_create_unbounded_receiver_tasks() {
+        // Idle sockets well past the pending budget, held while the listener
+        // closes the oldest to make room for the newest: the tasks never
+        // outnumber the pending budget, because none of them delivers a
+        // frame. Reports being admitted add at most MAX_REPORT_CONNECTIONS.
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let receiver = TcpReportingTransport::bind(addr(0), shutdown.clone())
+            .await
+            .unwrap();
+        let mut idle = Vec::new();
+        for _ in 0..MAX_PENDING_CONNECTIONS + 40 {
+            idle.push(
+                tokio::net::TcpStream::connect(receiver.local_addr())
+                    .await
+                    .unwrap(),
+            );
+        }
+        let mut most = 0;
+        for _ in 0..25 {
+            most = most.max(receiver.connection_tasks());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(most > 0, "the listener never accepted a connection");
+        assert!(
+            most <= MAX_PENDING_CONNECTIONS,
+            "{most} connection tasks for idle sockets"
+        );
+        drop(idle);
+        shutdown.cancel();
+    }
+
+    #[test]
+    fn one_source_address_holds_at_most_its_share_of_pending_slots() {
+        let remote: IpAddr = "10.0.1.7".parse().unwrap();
+        let other: IpAddr = "10.0.1.8".parse().unwrap();
+        let mut pending: VecDeque<PendingConnection> = VecDeque::new();
+        for _ in 0..MAX_PENDING_PER_SOURCE - 1 {
+            pending.push_back(pending_from(remote));
+        }
+        assert!(!source_is_full(remote, &pending));
+        pending.push_back(pending_from(remote));
+        assert!(source_is_full(remote, &pending));
+        // The same address written as IPv4-mapped IPv6 is the same source.
+        let mapped: IpAddr = "::ffff:10.0.1.7".parse().unwrap();
+        assert!(source_is_full(mapped, &pending));
+        assert!(!source_is_full(other, &pending));
+        // Loopback is exempt: the hollow-node harness puts every node there.
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        for _ in 0..MAX_PENDING_PER_SOURCE * 2 {
+            pending.push_back(pending_from(loopback));
+        }
+        assert!(!source_is_full(loopback, &pending));
+    }
+
+    #[tokio::test]
+    async fn a_connection_stops_being_pending_once_its_frame_is_in() {
+        use tokio::io::AsyncWriteExt;
+        let frame = encode_report(&sample_msg("worker")).unwrap();
+        let (mut client, server) = tokio::io::duplex(frame.len() + 8);
+        let permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .unwrap();
+        let (mut connection, slot) = PendingConnection::start(
+            addr(1).ip(),
+            permit,
+            Arc::new(tokio::sync::Semaphore::new(1)),
+        );
+        let (tx, mut rx) = mpsc::channel(1);
+        let handle = tokio::spawn(TcpReportingTransport::handle_connection(
+            server,
+            addr(1),
+            None,
+            tx,
+            slot,
+        ));
+        assert!(connection.is_pending());
+        client
+            .write_all(&(frame.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        client.write_all(&frame).await.unwrap();
+        assert!(rx.recv().await.is_some());
+        assert!(!connection.is_pending());
+        // Evicting it now does nothing: it has proved itself.
+        connection.evict.cancel();
+        let _ = handle.await;
     }
 
     #[tokio::test]
@@ -850,7 +1194,7 @@ mod tests {
         client.write_all(&frame).await.unwrap();
         let _ = tokio::time::timeout(
             REPORT_ACCEPT_DEADLINE,
-            TcpReportingTransport::handle_connection(server, addr(2), None, tx),
+            TcpReportingTransport::handle_connection(server, addr(2), None, tx, slot()),
         )
         .await;
         let mut ack = [0];
@@ -982,7 +1326,7 @@ mod tests {
         use tokio::io::AsyncWriteExt;
         let (mut client, server) = tokio::io::duplex(frame.len());
         client.write_all(&frame).await.unwrap();
-        TcpReportingTransport::handle_connection(server, addr(1234), None, tx).await;
+        TcpReportingTransport::handle_connection(server, addr(1234), None, tx, slot()).await;
         assert!(rx.recv().await.is_none());
     }
 
@@ -999,7 +1343,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(4);
         let result = tokio::time::timeout(
             Duration::from_millis(200),
-            TcpReportingTransport::handle_connection(server, addr(1), None, tx),
+            TcpReportingTransport::handle_connection(server, addr(1), None, tx, slot()),
         )
         .await;
         assert!(

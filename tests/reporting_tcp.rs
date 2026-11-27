@@ -221,6 +221,17 @@ async fn report_arrives(
     worker_tls: Option<(tokio_rustls::TlsAcceptor, tokio_rustls::TlsConnector)>,
     deadline: Duration,
 ) -> bool {
+    report_arrives_past_idle_sockets(agg_tls, worker_tls, 0, deadline).await
+}
+
+/// As `report_arrives`, with `idle_sockets` plain TCP connections opened to
+/// the aggregator first that never start a handshake or send a byte.
+async fn report_arrives_past_idle_sockets(
+    agg_tls: Option<(tokio_rustls::TlsAcceptor, tokio_rustls::TlsConnector)>,
+    worker_tls: Option<(tokio_rustls::TlsAcceptor, tokio_rustls::TlsConnector)>,
+    idle_sockets: usize,
+    deadline: Duration,
+) -> bool {
     let shutdown = CancellationToken::new();
 
     let (agg_acc, agg_con) = match agg_tls {
@@ -232,6 +243,10 @@ async fn report_arrives(
             .await
             .unwrap();
     let agg_addr = agg_transport.local_addr();
+    let mut idle = Vec::with_capacity(idle_sockets);
+    for _ in 0..idle_sockets {
+        idle.push(tokio::net::TcpStream::connect(agg_addr).await.unwrap());
+    }
     let (mut aggregator, mut watch_rx) = ReportAggregator::new(
         agg_transport,
         fast_config(),
@@ -279,6 +294,7 @@ async fn report_arrives(
     })
     .await
     .unwrap_or(false);
+    drop(idle);
     shutdown.cancel();
     for task in [aggregator_task, agent_task, worker_task] {
         tokio::time::timeout(Duration::from_secs(2), task)
@@ -309,6 +325,21 @@ async fn reporting_listener_refuses_a_plaintext_worker_when_mtls_is_required() {
     assert!(
         !report_arrives(Some(agg), None, Duration::from_secs(3)).await,
         "a plaintext worker must not report to an mTLS aggregator"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idle_sockets_do_not_take_report_slots_from_mtls_peers() {
+    // #2380: plain TCP sockets that never start a TLS handshake, more of them
+    // than the listener reads at once, must not keep an mTLS node's report out.
+    let hierarchy = ca::generate_ca_hierarchy("reporting-test", b"ikm").unwrap();
+    let agg = tls_pair(&identity(&hierarchy, "agg", 10));
+    let worker = tls_pair(&identity(&hierarchy, "w1", 11));
+
+    assert!(
+        report_arrives_past_idle_sockets(Some(agg), Some(worker), 100, Duration::from_secs(4))
+            .await,
+        "idle sockets kept an mTLS worker's report out"
     );
 }
 

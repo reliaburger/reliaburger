@@ -10817,6 +10817,17 @@ for: the unit test that used to check a refusal now holds every slot with
 half-written frames, checks that one more report isn't read, frees a slot,
 and checks the waiting report goes through.
 
+There was a hole in that. The November 2026 audit
+([#2364](https://github.com/reliaburger/reliaburger/issues/2364)) found it in
+the 16-slot listener, and the change above kept it: the slot is taken at
+accept, before the TLS handshake, so 64 sockets that never send a byte still
+hold every slot, and an honest node's report waits behind them
+until it times out. Waiting instead of refusing doesn't help when the thing
+you wait for never comes. Chapter 11 splits the budget in two: connections
+that haven't delivered a whole frame get slots of their own, and the oldest of
+them makes room for a newcomer once it has stalled for a second
+([#2380](https://github.com/reliaburger/reliaburger/issues/2380)).
+
 The queue works the same way: `tx.send(...).await` instead of `try_send`, so
 a report that finds the queue full waits for room. That wait sits inside the
 connection's ten-second accept deadline, and only a report that made it onto
