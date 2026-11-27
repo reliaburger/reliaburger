@@ -1059,8 +1059,17 @@ cluster running:
 ```sh
 relish secret pubkey                  # ask the cluster
 relish secret pubkey cluster          # offline, from `relish init` output
-relish secret encrypt --pubkey "$(relish secret pubkey)" 'the plaintext'
+relish secret encrypt --pubkey "$(relish secret pubkey)" --value-file db-password.txt
+printf %s "$DB_PASSWORD" | relish secret encrypt --pubkey "$(relish secret pubkey)"
 ```
+
+`secret encrypt` reads the value from `--value-file`, or from standard input
+when you give it neither a file nor a value. At a terminal it asks for the
+value without echoing it. One trailing newline is dropped, so a file written
+by an editor or `echo` works. A value can also go on the command line
+(`relish secret encrypt --pubkey KEY 'the value'`), but other users on the
+machine can see it in the process list while the command runs, and your shell
+history keeps it, so keep that form for values that aren't secret.
 
 `examples/phase-1/container-secrets.toml` is a job that reads an encrypted
 value and prints its length, never the value; its header has the commands.
@@ -1119,7 +1128,7 @@ starting:
 
 ```sh
 relish secret pubkey --namespace team-a
-relish secret encrypt --pubkey "$(relish secret pubkey --namespace team-a)" 'the plaintext'
+relish secret encrypt --pubkey "$(relish secret pubkey --namespace team-a)" --value-file db-password.txt
 ```
 
 The re-seal covers apps only. Encrypt a job's values in an opted-in

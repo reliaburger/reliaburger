@@ -703,7 +703,7 @@ See [security and access](10_security.md).
   - `relish token rotate <NAME>`: Give a token a new secret under the same name. The old secret keeps working for the grace period, then stops
 - `relish secret`: Manage secrets (encrypt values for use in app configs)
   - `relish secret pubkey [DIR]`: Print the cluster's age public key (for `relish secret encrypt`)
-  - `relish secret encrypt --pubkey <PUBKEY> <VALUE>`: Encrypt a plaintext value for use in app config ENC[AGE:...] fields
+  - `relish secret encrypt --pubkey <PUBKEY> [VALUE]`: Encrypt a plaintext value for use in app config ENC[AGE:...] fields
   - `relish secret rotate`: Rotate the secret encryption key (start or finalise)
 - `relish ca`: Back up the cluster's root CA, check the backup, and rotate intermediates
   - `relish ca backup --from <FROM> --out <OUT>`: Re-seal a root CA backup to a new passphrase or age recipient
