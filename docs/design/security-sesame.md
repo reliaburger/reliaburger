@@ -1919,8 +1919,8 @@ council_size = 3
 - Tokens are single-use: once consumed, a second use is rejected.
 - Tokens are short-lived: default 15 minutes.
 - Tokens are output to stderr only, never written to disk or structured logs.
-- `relish join` requires `--ca-fingerprint` (#2410). It fetches the cluster CA over a connection that can't verify anything yet, so without the pin a host on the path could offer its own CA, receive the token over a connection that CA vouches for, and spend it against the real cluster within its TTL. With the pin, a different root is refused before the token is sent. `--insecure-trust-first-ca` opts out by name and prints the offered fingerprint as a warning, still before the token is sent. The appliance seed and the quickstart scripts always pin.
 - Each token enrols exactly one node id, the one it was created for.
+- `relish join` requires `--ca-fingerprint` (#2410). It fetches the cluster CA over a connection that can't verify anything yet, so without the pin a host on the path could offer its own CA, receive the token over a connection that CA vouches for, and spend it against the real cluster within its TTL. With the pin, a different root is refused before the token is sent. `--insecure-trust-first-ca` opts out by name and prints the offered fingerprint as a warning, still before the token is sent. The appliance seed and the quickstart scripts always pin.
 - TPM attestation, where the token alone wouldn't be enough, is planned.
 - If a leak is suspected before the token is consumed: `relish join-token revoke <node-id>` revokes every unused token for that node id. Once the TTL has passed, the token is useless anyway.
 - If a rogue node has already joined: `relish decommission-node <rogue-node> --workloads-stopped --reason "..."` retires its id, and every node refuses its certificate within five seconds (§5.7). Revoking its certificate by serial with `relish ca revoke` is planned (#362).

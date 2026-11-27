@@ -487,6 +487,8 @@ way, so check the exit code before you trust it.
 `relish exec` exits with the remote command's own exit code, so
 `relish exec web ls /ready` works in a shell `if`. It exits `1` when it
 can't run the command at all, with an `error:` line on stderr.
+It prints at most 1 MiB of the command's output; longer output is cut and
+ends with the line `[output cut at 1 MiB]`.
 
 ## Terminal UI keys
 

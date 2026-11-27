@@ -123,15 +123,38 @@ impl RuncGrill {
         state_dir: PathBuf,
         owner_executable: PathBuf,
     ) -> std::io::Result<Self> {
-        // Default node index from hostname. Will be overridden when
-        // the node joins a cluster and gets a proper node ID.
         let hostname = std::fs::read_to_string("/etc/hostname")
             .unwrap_or_else(|_| "localhost".to_string())
             .trim()
             .to_string();
-        let node_index = netns::node_index_from_id(&hostname);
+        Self::for_hostname(
+            bundle_base,
+            image_store,
+            rootless,
+            state_dir,
+            owner_executable,
+            &hostname,
+        )
+    }
 
+    /// [`RuncGrill::new`] on a host named `hostname`. The name only seeds
+    /// the container subnet the first time this runtime's directories are
+    /// used; after that the subnet stays, whatever the host is called
+    /// (#2420).
+    pub(crate) fn for_hostname(
+        bundle_base: PathBuf,
+        image_store: ImageStore,
+        rootless: bool,
+        state_dir: PathBuf,
+        owner_executable: PathBuf,
+        hostname: &str,
+    ) -> std::io::Result<Self> {
         let bundle_base = std::path::absolute(&bundle_base)?;
+        let node_index = super::network_leases::persisted_node_index(
+            &bundle_base,
+            hostname,
+            &super::network_leases::host_networks_on_this_node(),
+        )?;
         let state_dir = std::path::absolute(&state_dir)?;
         // Rootful containers run in the node's user namespace, so their
         // image files must be owned by ids that namespace maps (D1).
@@ -2511,6 +2534,97 @@ mod tests {
         assert_eq!(bomb_limit.trim(), "32");
         assert!(refused > 0, "the bomb never reached its limit");
         assert_eq!(after_state, Some(ContainerState::Running));
+    }
+
+    /// #2420: renaming the host doesn't strand its containers. A runtime
+    /// built after the rename, over the same directories, still stops the
+    /// container the first one started.
+    #[tokio::test]
+    #[ignore = "requires rootful runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
+    async fn runc_a_hostname_change_leaves_live_containers_under_control() {
+        assert!(runc_tests_enabled(), "set RELIABURGER_RUNC_TESTS=1");
+        assert!(nix::unistd::geteuid().is_root(), "rootful runc needs root");
+        let tmp = tempfile::tempdir().unwrap();
+        let id = InstanceId("default__renamed-0".to_string());
+        remove_test_network(&id);
+        let _network_cleanup = TestNetworkCleanup(vec![id.clone()]);
+        let runtime = |hostname: &str| {
+            RuncGrill::for_hostname(
+                tmp.path().join("bundles"),
+                pinned_image_store(tmp.path()),
+                false,
+                tmp.path().join("state"),
+                test_owner(),
+                hostname,
+            )
+            .unwrap()
+        };
+        // The first runtime over these directories picks the subnet.
+        let before = runtime("ip-10-0-3-17");
+        assert_eq!(before.node_index, netns::node_index_from_id("ip-10-0-3-17"));
+        let (_, spec) = image_app(
+            tmp.path(),
+            &id,
+            &format!("image = \"{ALPINE_IMAGE}\"\ncommand = [\"sleep\", \"3621\"]\n"),
+        );
+        before.create(&id, &spec).await.unwrap();
+        before.start(&id).await.unwrap();
+        assert_ne!(
+            netns::node_index_from_id("ip-10-0-3-17"),
+            netns::node_index_from_id("web-node-3")
+        );
+
+        // Bun restarts after the rename: the old runtime goes first, as the
+        // old process would.
+        let pinned = before.node_index;
+        drop(before);
+        let after = runtime("web-node-3");
+        let killed = after.kill(&id).await;
+        if killed.is_err() {
+            let _ = runtime("ip-10-0-3-17").kill(&id).await;
+        }
+        killed.unwrap();
+        assert_eq!(after.state(&id).await.unwrap(), ContainerState::Stopped);
+        assert_eq!(after.node_index, pinned);
+    }
+
+    /// #2392: `runc exec` goes through the same exec helper as a host
+    /// command, so a container's chatty command is cut at 1 MiB too.
+    #[tokio::test]
+    #[ignore = "requires rootful runc, a pinned OCI image (local test mirror or registry access), and RELIABURGER_RUNC_TESTS=1; run with make test-linux"]
+    async fn runc_exec_output_past_the_limit_is_cut_and_the_first_mebibyte_returned() {
+        assert!(runc_tests_enabled(), "set RELIABURGER_RUNC_TESTS=1");
+        assert!(nix::unistd::geteuid().is_root(), "rootful runc needs root");
+        let tmp = tempfile::tempdir().unwrap();
+        let id = InstanceId("default__chatty-0".to_string());
+        remove_test_network(&id);
+        let _network_cleanup = TestNetworkCleanup(vec![id.clone()]);
+        let (grill, spec) = image_app(
+            tmp.path(),
+            &id,
+            &format!("image = \"{ALPINE_IMAGE}\"\ncommand = [\"sleep\", \"3620\"]\n"),
+        );
+        grill.create(&id, &spec).await.unwrap();
+        grill.start(&id).await.unwrap();
+        let result = grill
+            .exec(
+                &id,
+                &[
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "yes a | head -c 4194304".to_string(),
+                ],
+            )
+            .await;
+        grill.kill(&id).await.unwrap();
+
+        let result = result.unwrap();
+        assert_eq!(result.exit_code, 0);
+        let marker = crate::grill::process_owner::exec::CUT_MARKER;
+        let limit = crate::grill::process_owner::exec::OUTPUT_LIMIT as usize;
+        assert!(result.output.ends_with(marker), "not cut");
+        assert!(result.output.len() <= limit + 1 + marker.len());
+        assert!(result.output.starts_with("a\na\n"));
     }
 
     /// #2412: a set-uid file a container writes, and the unpacked image it

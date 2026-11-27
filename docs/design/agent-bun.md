@@ -54,7 +54,7 @@ The broader process-isolation design below remains future work.
 
 3. **Process workloads are first-class.** Process workloads (host binaries and inline scripts) receive the same isolation primitives as containers (cgroups, PID namespace, network namespace, mount namespace) minus the filesystem image. From the cluster's perspective, they are indistinguishable from container workloads in terms of scheduling, health checking, service discovery, and metrics.
 
-4. **Sub-millisecond per-app overhead.** At the design goal of 500 apps per node, Bun must have sub-millisecond per-app overhead. This drives the choice of Rust (no GC pauses), eBPF (kernel-space interception, not userspace proxying), and direct cgroup/namespace manipulation (no shim processes per container).
+4. **Sub-millisecond per-app overhead.** At the design goal of 500 apps per node, Bun must have sub-millisecond per-app overhead. This drives the choice of Rust (no GC pauses), eBPF (kernel-space interception, not userspace proxying), and direct cgroup/namespace manipulation. There is one small process per workload, though: its *owner*, a re-run of the Bun binary that starts the workload, reaps it and outlives Bun. It sleeps until something happens (a client, a child exiting, output to drain, a cancellation) rather than polling, so an idle one costs memory but no CPU (#2447).
 
 5. **Deny-by-default security.** Process workloads require an explicit binary allowlist in `node.toml`: an `Exec` binary runs only if its absolute path is listed, a `Script` runs only if its interpreter (`/bin/sh`) is listed, and an empty or absent allowlist refuses every host workload. This admission gate — allowlist plus honest refusal — is the enforcement that ships today. The deeper isolation stack (Linux namespaces, seccomp, capability restriction, a dedicated `burger` unprivileged user) is **planned — not yet implemented**; see the status note in §5.2. Where isolation a node cannot provide is requested (e.g. mount isolation on a non-Linux host), the deploy is refused rather than run unprotected.
 
@@ -1883,6 +1883,7 @@ Process workloads get none of this: they're host processes (#360, #714), and the
 | Apps per node | 500 | Design goal from Section 2 |
 | Per-app overhead (Bun tracking) | < 1ms | Sub-millisecond at 500 apps |
 | Memory per app (Bun tracking) | ~1.2 MB | Measured: 312 MB at 500 apps vs 48 MB idle = ~528 KB tracking + workload overhead |
+| Memory per app (its owner process) | ~40 MB PSS, debug build | Measured in the Lima VM (#2447): `Pss` in `/proc/<owner>/smaps_rollup` of an idle owner, 39.7 MB in a debug build; a release build maps a smaller binary. Not counted in Bun's own memory |
 | Bun agent memory (idle) | ~48 MB | Baseline: Tokio runtime, eBPF management, gossip and Raft, config |
 | Bun agent memory (500 apps) | ~312 MB | Scales linearly with app count |
 | eBPF service map entries | 500/node, 5M cluster-wide (10K nodes) | One entry per workload instance |
