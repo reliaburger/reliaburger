@@ -236,6 +236,9 @@ Each profile is one active run, so a manifest counts against the active-run
 limits under [Execution and capacity limits](#execution-and-capacity-limits). Reduce chunk
 size for expensive tasks and straggler tails; larger chunks amortise dispatch
 and consensus overhead. Chunk size defaults to 1,024 and is capped at 65,536.
+An array also has at most 65,536 chunks, so `count` divided by `chunk_size`
+(rounded up) can't exceed it: a million tasks need a chunk size of at least
+16, and a smaller one is refused.
 
 ## Observe summaries and inspect selected tasks
 
@@ -274,7 +277,7 @@ contact at most eight workers. A page can end earlier when tiny chunks span
 more workers. An
 empty failure page can still contain `next_after`: continue with that cursor.
 Only the worker and grant whose completion was accepted can supply an outcome
-or retained task output. Unreachable workers are explicit. Singletons keep bounded successful output as
+or retained task output. Unreachable workers are explicit: `unreachable` lists every worker whose call failed and every recorded owner that no longer holds its results. Once a run has passed 4,096 accepted ranges the cluster stops recording which worker ran each chunk and asks every worker; one that never ran the array isn't listed, so a lost worker's tasks can then be missing without a name beside them. Singletons keep bounded successful output as
 well as failure output; larger arrays discard successful output. Control reports keep exact failure counts and at most 256 index
 ranges per chunk; indexed detail remains available beyond that preview.
 Retained output keeps a bounded head and tail. Each chunk keeps the output
@@ -289,7 +292,9 @@ Detail remains on the worker disk for one hour **after completion**. Each
 namespace keeps its newest 20 finished submissions, and the cluster keeps 24
 in all: when more finish, the namespace keeping the most loses its oldest
 first, so a per-minute cron in one namespace can't push out another
-namespace's runs. The leader checks every second and prunes expired runs with
+namespace's runs. A finite batch (`relish batch FILE`) counts against the
+namespace its jobs share; one whose jobs span several namespaces counts
+against `default`. The leader checks every second and prunes expired runs with
 one replicated write, whether or not anyone submits new work; workers then
 delete the run's ledger, index and kept output on their next sync. For a mixed manifest,
 the clock starts when its last profile finishes; profiles are pruned together.
@@ -390,10 +395,14 @@ Every namespace shares the cluster, so no namespace may take all of it:
 | Job definitions per namespace | 64 | Refused; one-off definitions expire with their last run |
 | Job definitions, whole cluster | 1,024 | Refused |
 | Retained run receipts, whole cluster | 2,048 | Retention keeps it below this backstop |
+| Runs and batch profiles held, running or finished, whole cluster | 2,048 | Refused until retention prunes finished ones; a batch keeps its finished jobs while any of them runs |
+| Batches (`relish batch` and `relish batch submit`) held, whole cluster | 120 | Refused |
+| Completed `relish apply` receipts kept | 20 | The oldest receipt is dropped |
 | Finished submissions kept per namespace | 20 | The namespace's oldest detail is pruned |
 | Finished submissions kept, whole cluster | 24 | The namespace keeping the most loses its oldest |
 | Outcomes remembered per definition | 10 | The oldest outcome is dropped |
 | Named jobs in one finite batch | 64 | Refused |
+| Chunks in one array (`count` / `chunk_size`, rounded up) | 65,536 | Refused; raise the chunk size |
 
 Cron fires and deployment hooks never compete with bulk work for their
 headroom, so a tenant filling its arrays can't stop another tenant's nightly

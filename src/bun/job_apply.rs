@@ -2,13 +2,16 @@
 use super::{
     agent::{AgentCommand, ApplyEvent},
     api::ApiState,
-    task_array_leader::{WRITE_TIMEOUT, read_task_arrays, write_task_array},
+    task_array_leader::{WRITE_TIMEOUT, read_control, write_task_array},
 };
 use crate::{
     config::Config,
     council::types::{CouncilResponse, RaftRequest},
     meat::{
-        job::JobDefinition, task_array_state::TaskArrayStatus, task_array_store::TaskArrayWrite,
+        job::JobDefinition,
+        job_deploy::DeploymentRecord,
+        task_array_state::TaskArrayStatus,
+        task_array_store::{TaskArrayWrite, TaskArrays},
     },
 };
 use axum::{
@@ -227,43 +230,38 @@ pub(crate) async fn apply(
         }
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(900);
         loop {
-            let arrays = read_task_arrays(&state).await;
-            let Some((_, record)) = arrays.deployments().find(|(id, _)| *id == operation_id) else {
-                let _ = tx
-                    .send(ApplyEvent::Error {
-                        status: None,
-                        message: "deployment receipt is no longer retained; query run summaries"
-                            .into(),
-                    })
-                    .await;
-                return;
-            };
-            if record.apps_committed && !record.cancelled() {
-                let instances: Vec<_> = record
-                    .job_runs
-                    .values()
-                    .map(|id| format!("run-{id}"))
-                    .collect();
-                let _ = tx
-                    .send(ApplyEvent::Complete {
-                        created: record.config.app.len() + instances.len(),
-                        instances,
-                    })
-                    .await;
-                return;
-            }
-            if record.cancelled() {
-                let _ = tx.send(ApplyEvent::Error { status: None, message: format!("deployment {operation_id} cancelled or a hook failed; apps remain gated") }).await;
-                return;
-            }
-            if record.runs().any(|id| {
-                arrays
-                    .jobs()
-                    .run(id)
-                    .is_some_and(|run| !run.unknown_owners.is_empty())
-            }) {
-                let _ = tx.send(ApplyEvent::Error { status: None, message: format!("deployment {operation_id} retains unknown hook ownership; inspect run summaries and acknowledge replay only if repeating side effects is acceptable") }).await;
-                return;
+            // Borrow the control state for this one deployment: the stream
+            // polls ten times a second, and copying the whole store each time
+            // cost every other reader and writer (#2445).
+            let id = operation_id.clone();
+            let progress = read_control(&state, move |view| deployment_progress(view.arrays, &id))
+                .await
+                .unwrap_or(DeploymentProgress::Gone);
+            match progress {
+                DeploymentProgress::Gone => {
+                    let _ = tx
+                        .send(ApplyEvent::Error {
+                            status: None,
+                            message:
+                                "deployment receipt is no longer retained; query run summaries"
+                                    .into(),
+                        })
+                        .await;
+                    return;
+                }
+                DeploymentProgress::Complete { created, instances } => {
+                    let _ = tx.send(ApplyEvent::Complete { created, instances }).await;
+                    return;
+                }
+                DeploymentProgress::Cancelled => {
+                    let _ = tx.send(ApplyEvent::Error { status: None, message: format!("deployment {operation_id} cancelled or a hook failed; apps remain gated") }).await;
+                    return;
+                }
+                DeploymentProgress::UnknownOwners => {
+                    let _ = tx.send(ApplyEvent::Error { status: None, message: format!("deployment {operation_id} retains unknown hook ownership; inspect run summaries and acknowledge replay only if repeating side effects is acceptable") }).await;
+                    return;
+                }
+                DeploymentProgress::Pending => {}
             }
             if tokio::time::Instant::now() >= deadline {
                 let _ = tx.send(ApplyEvent::Error { status: None, message: format!("deployment {operation_id} is still durable and pending; query /v1/deploys/operations") }).await;
@@ -336,23 +334,19 @@ async fn join_lease(
 /// A replacement leader completes durable intent using accepted results, never launch receipts.
 pub(crate) async fn settle(state: &ApiState) {
     // The leader calls this every tick, and most ticks have nothing to
-    // settle: look before copying every array.
-    let pending = super::task_array_leader::read_control(state, |view| {
-        view.arrays
-            .deployments()
-            .any(|(_, record)| !record.completed)
-    })
-    .await
-    .unwrap_or(false);
-    if !pending {
-        return;
-    }
-    let arrays = read_task_arrays(state).await;
-    for (id, record) in arrays
-        .deployments()
-        .filter(|(_, record)| !record.completed)
-        .take(16)
+    // settle. Copy only the unsettled records, never the whole store (#2445).
+    let pending = read_control(state, pending_deployments)
+        .await
+        .unwrap_or_default();
+    for PendingDeployment {
+        id,
+        record,
+        hook_failed,
+        runs_terminal,
+        hooks_succeeded,
+    } in pending
     {
+        let id = id.as_str();
         if let Some(council) = &state.council
             // One round: the deployment hooks run again next tick (#1393).
             && !council.is_leader().await
@@ -360,12 +354,7 @@ pub(crate) async fn settle(state: &ApiState) {
             return;
         }
         let now = crate::meat::batch_ids::epoch_now_secs();
-        let failed = record.hook_runs.values().any(|run| {
-            arrays.get(*run).is_some_and(|run| {
-                run.state.status().is_terminal() && run.state.status() != TaskArrayStatus::Succeeded
-            })
-        });
-        if failed && !record.cancelled() {
+        if hook_failed && !record.cancelled() {
             let _ = write_task_array(
                 state,
                 TaskArrayWrite::DeployCancel {
@@ -377,11 +366,7 @@ pub(crate) async fn settle(state: &ApiState) {
             continue;
         }
         if record.apps_committed || record.cancelled() {
-            if record.runs().all(|run| {
-                arrays
-                    .get(run)
-                    .is_some_and(|run| run.state.status().is_terminal())
-            }) {
+            if runs_terminal {
                 let _ = write_task_array(
                     state,
                     TaskArrayWrite::DeployRelease {
@@ -392,11 +377,7 @@ pub(crate) async fn settle(state: &ApiState) {
             }
             continue;
         }
-        if !record.hook_runs.values().all(|run| {
-            arrays
-                .get(*run)
-                .is_some_and(|run| run.state.status() == TaskArrayStatus::Succeeded)
-        }) {
+        if !hooks_succeeded {
             continue;
         }
         if let Some(council) = &state.council {
@@ -417,11 +398,15 @@ pub(crate) async fn settle(state: &ApiState) {
             let Ok(gate) = state.task_arrays.apply_gate.clone().try_lock_owned() else {
                 continue;
             };
-            let latest = read_task_arrays(state).await;
-            if latest
-                .deployment(id)
-                .is_none_or(|current| current.cancelled() || current.apps_committed)
-            {
+            let owned = id.to_string();
+            let settled = read_control(state, move |view| {
+                view.arrays
+                    .deployment(&owned)
+                    .is_none_or(|current| current.cancelled() || current.apps_committed)
+            })
+            .await
+            .unwrap_or(true);
+            if settled {
                 continue;
             }
             if record.config.app.is_empty()
@@ -488,5 +473,156 @@ pub(crate) async fn settle(state: &ApiState) {
                 state.task_arrays.publishing.lock().await.remove(&id);
             });
         }
+    }
+}
+
+/// What the apply stream reports for one deployment.
+#[derive(Debug, PartialEq)]
+enum DeploymentProgress {
+    /// The receipt has been trimmed (or was never there).
+    Gone,
+    /// Apps are published; these runs were admitted with them.
+    Complete {
+        created: usize,
+        instances: Vec<String>,
+    },
+    /// Cancelled, or a hook failed.
+    Cancelled,
+    /// A hook's outcome is unknown and needs an acknowledged replay.
+    UnknownOwners,
+    /// Still waiting on hooks.
+    Pending,
+}
+
+/// Read one deployment's progress from borrowed control state, copying only
+/// what the stream sends.
+fn deployment_progress(arrays: &TaskArrays, operation_id: &str) -> DeploymentProgress {
+    let Some((_, record)) = arrays.deployments().find(|(id, _)| *id == operation_id) else {
+        return DeploymentProgress::Gone;
+    };
+    if record.apps_committed && !record.cancelled() {
+        let instances: Vec<_> = record
+            .job_runs
+            .values()
+            .map(|id| format!("run-{id}"))
+            .collect();
+        return DeploymentProgress::Complete {
+            created: record.config.app.len() + instances.len(),
+            instances,
+        };
+    }
+    if record.cancelled() {
+        return DeploymentProgress::Cancelled;
+    }
+    if record.runs().any(|id| {
+        arrays
+            .jobs()
+            .run(id)
+            .is_some_and(|run| !run.unknown_owners.is_empty())
+    }) {
+        return DeploymentProgress::UnknownOwners;
+    }
+    DeploymentProgress::Pending
+}
+
+/// An unsettled deployment and what `settle` needs to know about its runs.
+struct PendingDeployment {
+    id: String,
+    record: DeploymentRecord,
+    hook_failed: bool,
+    runs_terminal: bool,
+    hooks_succeeded: bool,
+}
+
+/// Up to 16 unsettled deployments, each with its run statuses folded in,
+/// so `settle` copies these records and not the whole store.
+fn pending_deployments(view: super::task_array_leader::ControlView<'_>) -> Vec<PendingDeployment> {
+    let arrays = view.arrays;
+    let status = |run: u64| arrays.get(run).map(|run| run.state.status());
+    arrays
+        .deployments()
+        .filter(|(_, record)| !record.completed)
+        .take(16)
+        .map(|(id, record)| PendingDeployment {
+            id: id.to_string(),
+            record: record.clone(),
+            hook_failed: record.hook_runs.values().any(|run| {
+                status(*run)
+                    .is_some_and(|run| run.is_terminal() && run != TaskArrayStatus::Succeeded)
+            }),
+            runs_terminal: record
+                .runs()
+                .all(|run| status(run).is_some_and(|run| run.is_terminal())),
+            hooks_succeeded: record
+                .hook_runs
+                .values()
+                .all(|run| status(*run) == Some(TaskArrayStatus::Succeeded)),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn begin(arrays: &mut TaskArrays, i: u64) -> String {
+        let operation_id = format!("{i:032x}");
+        arrays
+            .apply(
+                &TaskArrayWrite::DeployBegin {
+                    operation_id: operation_id.clone(),
+                    config: Box::new(
+                        Config::parse(&format!("[app.web-{i}]\nimage='web:v1'")).unwrap(),
+                    ),
+                    now_epoch_secs: 100,
+                },
+                || 0,
+            )
+            .unwrap();
+        operation_id
+    }
+
+    #[test]
+    fn apply_watcher_reads_only_its_own_deployment() {
+        let mut arrays = TaskArrays::default();
+        let committed = begin(&mut arrays, 1);
+        let waiting = begin(&mut arrays, 2);
+        arrays
+            .apply(
+                &TaskArrayWrite::DeployCommitted {
+                    operation_id: committed.clone(),
+                    now_epoch_secs: 101,
+                },
+                || 0,
+            )
+            .unwrap();
+        assert_eq!(
+            deployment_progress(&arrays, &committed),
+            DeploymentProgress::Complete {
+                created: 1,
+                instances: Vec::new()
+            }
+        );
+        assert_eq!(
+            deployment_progress(&arrays, &waiting),
+            DeploymentProgress::Pending
+        );
+        assert_eq!(
+            deployment_progress(&arrays, &format!("{:032x}", 3)),
+            DeploymentProgress::Gone
+        );
+        arrays
+            .apply(
+                &TaskArrayWrite::DeployCancel {
+                    operation_id: waiting.clone(),
+                    now_epoch_secs: 102,
+                },
+                || 0,
+            )
+            .unwrap();
+        assert_eq!(
+            deployment_progress(&arrays, &waiting),
+            DeploymentProgress::Cancelled
+        );
     }
 }

@@ -397,6 +397,15 @@ impl CouncilNode {
         if let Some(error) = self.fenced_error() {
             return Err(error);
         }
+        // An entry no AppendEntries frame can carry would never replicate,
+        // and every later commit would wait behind it (#2370).
+        let bytes = super::types::json_len(&request);
+        if bytes > super::types::MAX_ENTRY_BYTES {
+            return Err(CouncilError::EntryTooLarge {
+                bytes,
+                limit: super::types::MAX_ENTRY_BYTES,
+            });
+        }
         let _membership = if matches!(
             &request,
             RaftRequest::ReserveNodeFault { .. } | RaftRequest::DecommissionNode { .. }
@@ -1380,6 +1389,30 @@ mod tests {
         // Can write immediately.
         let resp = nodes[0].write(RaftRequest::Noop).await.unwrap();
         assert!(matches!(resp, CouncilResponse::Applied { .. }));
+    }
+
+    /// #2370: an entry too large for any AppendEntries frame could never
+    /// replicate, and every commit after it would wait behind it.
+    #[tokio::test]
+    async fn a_write_too_large_to_replicate_is_refused_before_it_reaches_the_log() {
+        let (nodes, _router) = create_cluster(1).await;
+        init_cluster(&nodes).await;
+        wait_for_leader(&nodes, Duration::from_secs(5)).await;
+        nodes[0].write(RaftRequest::Noop).await.unwrap();
+        let before = nodes[0].metrics().borrow().last_log_index;
+
+        let result = nodes[0]
+            .write(RaftRequest::ConfigSet {
+                key: "huge".into(),
+                value: "x".repeat(crate::council::types::MAX_ENTRY_BYTES),
+            })
+            .await;
+        assert!(
+            matches!(result, Err(CouncilError::EntryTooLarge { .. })),
+            "an oversized write was not refused: {result:?}"
+        );
+        assert_eq!(nodes[0].metrics().borrow().last_log_index, before);
+        assert!(!nodes[0].desired_state().await.config.contains_key("huge"));
     }
 
     #[tokio::test]

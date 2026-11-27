@@ -172,6 +172,36 @@ fn assert_leaf_not_ca(der: &[u8]) -> Result<(), CertError> {
     Ok(())
 }
 
+/// Check that `der` may issue a certificate with `cas_below` CA
+/// certificates between it and the leaf: `CA:TRUE`, `keyCertSign` when it
+/// states a key usage, and a path length that allows `cas_below` (#2409).
+fn check_is_issuing_ca(der: &[u8], cas_below: usize) -> Result<(), CertError> {
+    let (_, cert) =
+        X509Certificate::from_der(der).map_err(|e| CertError::ParseFailed(format!("{e}")))?;
+    let not_a_ca = |why: &str| {
+        CertError::ChainInvalid(format!("issuer {} is not a CA: {why}", cert.subject()))
+    };
+    let constraints = cert
+        .basic_constraints()
+        .map_err(|e| CertError::ParseFailed(format!("failed to read basic constraints: {e}")))?
+        .map(|ext| ext.value.clone());
+    let Some(constraints) = constraints.filter(|constraints| constraints.ca) else {
+        return Err(not_a_ca("no CA basic constraint"));
+    };
+    let key_usage = cert
+        .key_usage()
+        .map_err(|e| CertError::ParseFailed(format!("failed to read key usage: {e}")))?;
+    if key_usage.is_some_and(|ext| !ext.value.key_cert_sign()) {
+        return Err(not_a_ca("its key usage doesn't allow signing certificates"));
+    }
+    if let Some(limit) = constraints.path_len_constraint
+        && cas_below > limit as usize
+    {
+        return Err(not_a_ca("its path length doesn't allow this chain"));
+    }
+    Ok(())
+}
+
 /// Check that a certificate carries the code-signing extended key usage.
 ///
 /// A signing certificate that omits code-signing EKU is one the CA never
@@ -258,10 +288,15 @@ pub fn validate_chain_at(
         ));
     };
 
-    // Verify every adjacent link inside the presented chain.
-    for pair in chain.windows(2) {
+    // Verify every adjacent link inside the presented chain, and that each
+    // issuer is a CA allowed this many CAs below it (#2409). A signature
+    // and a matching name aren't enough: a workload holds its own leaf's
+    // key, so it can sign a certificate that names that leaf as issuer.
+    for (index, pair) in chain.windows(2).enumerate() {
         verify_signature(&pair[0], &pair[1])?;
         check_issuer_binding(&pair[0], &pair[1])?;
+        // `index` CA certificates sit between this issuer and the leaf.
+        check_is_issuing_ca(&pair[1], index)?;
     }
 
     // The last presented cert must chain to the trust anchor. When the caller
@@ -270,7 +305,9 @@ pub fn validate_chain_at(
     if last.as_slice() != root_der {
         verify_signature(last, root_der)?;
         check_issuer_binding(last, root_der)?;
+        check_is_issuing_ca(root_der, chain.len() - 1)?;
     }
+    assert_leaf_not_ca(&chain[0])?;
 
     // Every certificate, including the anchor, must be within its validity
     // window at `at`.
@@ -334,10 +371,85 @@ pub fn der_to_pem(der: &[u8], label: &str) -> String {
     ::pem::encode(&p)
 }
 
+/// A chain in which an ordinary workload leaf "issues" a code-signing
+/// leaf, as a workload holding its own identity key could (#2409). Returns
+/// `([forged leaf, workload leaf, Workload CA], forged leaf's PKCS#8 key)`.
+#[cfg(test)]
+pub(crate) fn leaf_issued_by_a_leaf(
+    hierarchy: &crate::sesame::ca::CaHierarchy,
+    signer_uri: &str,
+) -> (Vec<Vec<u8>>, Vec<u8>) {
+    use crate::sesame::identity::{CertUsage, create_workload_csr, validate_and_sign_csr};
+    use crate::sesame::types::{SpiffeUri, WorkloadType};
+
+    let uri = SpiffeUri {
+        trust_domain: "test".to_string(),
+        namespace: "shop".to_string(),
+        workload_type: WorkloadType::App,
+        name: "web".to_string(),
+    };
+    let (csr, workload_key) = create_workload_csr(&uri).unwrap();
+    let workload_leaf = validate_and_sign_csr(
+        &csr,
+        &uri,
+        SerialNumber(9),
+        CertUsage::Mtls,
+        &hierarchy.workload.signing_keypair,
+        &hierarchy.workload.certificate_params,
+        SystemTime::now(),
+    )
+    .unwrap();
+
+    // The workload's own key and subject, used as an issuer.
+    let workload_keypair = rcgen::KeyPair::try_from(workload_key.as_slice()).unwrap();
+    let workload_as_issuer = crate::sesame::ca::issuer_params_from_der(&workload_leaf).unwrap();
+    let forged_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut forged = rcgen::CertificateParams::default();
+    forged.is_ca = rcgen::IsCa::NoCa;
+    forged.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::CodeSigning];
+    forged.subject_alt_names = vec![rcgen::SanType::URI(signer_uri.try_into().unwrap())];
+    let forged = crate::sesame::ca::sign_as_issuer(
+        forged,
+        &forged_key,
+        &workload_as_issuer,
+        &workload_keypair,
+    )
+    .unwrap();
+    (
+        vec![
+            forged.der().to_vec(),
+            workload_leaf,
+            hierarchy.workload.ca.certificate_der.clone(),
+        ],
+        forged_key.serialize_der(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sesame::ca;
+
+    /// Every link signs and names its issuer, but the middle "issuer" is a
+    /// workload's leaf, not a CA, so the chain is no chain (#2409).
+    #[test]
+    fn validate_chain_at_rejects_a_non_ca_issuer() {
+        let hierarchy = ca::generate_ca_hierarchy("test", b"ikm").unwrap();
+        let (chain, _) = leaf_issued_by_a_leaf(&hierarchy, "spiffe://test/ns/ci/job/build-signer");
+        let result = validate_chain_at(
+            &chain,
+            &hierarchy.root.ca.certificate_der,
+            SystemTime::now(),
+        );
+        assert!(result.is_err(), "a leaf acted as an issuer: {result:?}");
+        // The honest chain under the same root still validates.
+        validate_chain_at(
+            &chain[1..],
+            &hierarchy.root.ca.certificate_der,
+            SystemTime::now(),
+        )
+        .unwrap();
+    }
 
     #[test]
     fn parse_root_ca_certificate() {

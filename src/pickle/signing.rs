@@ -691,6 +691,34 @@ gW44LD4On4yfIPRJkluhNQ5G35R5vZyQY5DspOlhl16ImqPQIVADgGQv
         assert!(result.is_err(), "broken chain must be rejected: {result:?}");
     }
 
+    /// A workload holds its identity key, so it can sign a certificate
+    /// naming itself as issuer. A chain through that leaf must not verify
+    /// as a keyless signature (#2409).
+    #[test]
+    fn verify_keyless_rejects_a_leaf_issued_by_another_leaf() {
+        let hierarchy =
+            ca::generate_ca_hierarchy("test", b"test-wrapping-material-32bytes!").unwrap();
+        let uri = build_signer_uri();
+        let (chain, forged_key) =
+            crate::sesame::cert::leaf_issued_by_a_leaf(&hierarchy, &uri.to_uri());
+        let sig = create_keyless_signature(
+            &test_digest(),
+            &chain[0],
+            &forged_key,
+            &chain[1..],
+            "reliaburger-council",
+            &uri.to_uri(),
+        )
+        .unwrap();
+        let result = verify_keyless(
+            &sig,
+            &test_digest(),
+            &hierarchy.root.ca.certificate_der,
+            None,
+        );
+        assert!(result.is_err(), "a leaf-issued signer was accepted");
+    }
+
     #[test]
     fn cluster_artifact_signature_remains_valid_after_two_hours() {
         let (sig, root) = codesigning_keyless_sig();

@@ -577,17 +577,29 @@ migration and no feature gate
   [release log](release-log.md#032-wyse-lab-fixes)). 0.3.2 moves the wire
   protocol from 60 to 61, so a 0.3.1 cluster starts afresh
   ([upgrading from 0.3.1](releasing.md#upgrading-from-031)).
-- [ ] **0.3.3: loose ends before outside testers**
+- [x] **0.3.3: loose ends before outside testers.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.3)
+  on 27 November 2026
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/36)).
   A patch release before outside testers arrive: the bugs they would see,
   Buildah on the appliance
-  ([#2144](https://github.com/reliaburger/reliaburger/issues/2144)), the
-  appliance console
-  ([#2150](https://github.com/reliaburger/reliaburger/issues/2150)), the
-  Wyse lab's findings with its exit test
-  ([#407](https://github.com/reliaburger/reliaburger/issues/407)), and the
-  V02 leftovers ([#287](https://github.com/reliaburger/reliaburger/issues/287)).
-  In progress.
+  ([#2144](https://github.com/reliaburger/reliaburger/issues/2144)), a
+  first appliance console
+  ([#2150](https://github.com/reliaburger/reliaburger/issues/2150)), boot
+  logs you can turn on and off from `relish`
+  ([#2149](https://github.com/reliaburger/reliaburger/issues/2149)) and a
+  context that falls over to another node
+  ([#2241](https://github.com/reliaburger/reliaburger/issues/2241)).
+  Candidate 1 passed the full gate (the agent loop changed) clean, with no
+  known issue accepted; the quiet macOS upgrade-node loop passed 115 of 115
+  for the V02 leftovers
+  ([#287](https://github.com/reliaburger/reliaburger/issues/287), in
+  0.3.4). The Wyse lab didn't run on the candidate: the maintainer chose to
+  release without it, and its exit test
+  ([#407](https://github.com/reliaburger/reliaburger/issues/407)) runs on
+  the release's artefacts, in 0.3.4
+  ([closure](qualification/2026-11-27-v0.3.3-release-closure.md)). 0.3.3
+  keeps 0.3.2's cluster formats, so a 0.3.2 cluster rolls onto it in place
+  ([upgrading from 0.3.2](releasing.md#upgrading-from-032)).
 - [ ] **0.4.0: "Planned maintenance"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/7),
   [review](plans/2026-11-19-review-0.4.x.md),

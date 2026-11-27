@@ -578,6 +578,7 @@ pub(super) fn peer_events_path(query: &EventsQuery, limit: usize) -> String {
 /// them (#1125): that's the stream a controller reads. An event that names
 /// no namespace, a token being created say, is for unscoped tokens only.
 pub(super) async fn events_handler(
+    watch: Option<axum::Extension<crate::sesame::auth::CredentialWatch>>,
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Query(query): Query<EventsQuery>,
@@ -612,9 +613,15 @@ pub(super) async fn events_handler(
         // The relays end when the client goes: their sender's receiver is
         // dropped with the response stream.
         drop(relay);
-        return Sse::new(stream)
-            .keep_alive(axum::response::sse::KeepAlive::default())
-            .into_response();
+        // Authenticated once, at the start; the watch ends the stream when
+        // its token is revoked or expires (#2399).
+        return crate::sesame::auth::end_with_credential(
+            Sse::new(stream)
+                .keep_alive(axum::response::sse::KeepAlive::default())
+                .into_response(),
+            watch.map(|extension| extension.0),
+            crate::sesame::auth::credential_ended_warning(),
+        );
     }
     let limit = query.limit.unwrap_or(100);
     Json(cluster_recent_events(&state, &query, limit, auth.as_ref()).await).into_response()
@@ -826,6 +833,7 @@ async fn relay_one_peer_feed(
 
 /// Upgrade an authenticated request to the live event stream.
 pub(super) async fn ws_events_handler(
+    watch: Option<axum::Extension<crate::sesame::auth::CredentialWatch>>,
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     upgrade: WebSocketUpgrade,
@@ -836,7 +844,9 @@ pub(super) async fn ws_events_handler(
         return resp;
     }
     upgrade
-        .on_upgrade(move |socket| ws_events_session(socket, state))
+        .on_upgrade(move |socket| {
+            ws_events_session(socket, state, watch.map(|extension| extension.0))
+        })
         .into_response()
 }
 
@@ -850,7 +860,11 @@ const LIVE_EVENTS_BACKLOG: usize = 50;
 /// lands in between arrives in both; it's dropped from the live half by its
 /// node, sequence and time. A member's events are relayed from its own
 /// `follow=true&local=true` feed, so a peer never fans out again.
-pub(super) async fn ws_events_session(mut socket: WebSocket, state: ApiState) {
+pub(super) async fn ws_events_session(
+    mut socket: WebSocket,
+    state: ApiState,
+    watch: Option<crate::sesame::auth::CredentialWatch>,
+) {
     let (events_tx, mut events_rx) = mpsc::channel::<crate::bun::events::ClusterEvent>(256);
     let Some(local_feed) = spawn_local_event_relay(&state, events_tx.clone()).await else {
         return;
@@ -879,6 +893,8 @@ pub(super) async fn ws_events_session(mut socket: WebSocket, state: ApiState) {
             .ok()
             .map(|json| Message::Text(json.into()))
     };
+    let credential_ended = crate::sesame::auth::credential_ended(watch);
+    tokio::pin!(credential_ended);
     'session: {
         for event in &backlog {
             if let Some(message) = send(event)
@@ -901,6 +917,10 @@ pub(super) async fn ws_events_session(mut socket: WebSocket, state: ApiState) {
                     }
                 }
                 message = socket.recv() => if message.is_none() { break 'session; },
+                () = &mut credential_ended => {
+                    let _ = socket.send(super::logs::credential_ended_close()).await;
+                    break 'session;
+                }
             }
         }
     }

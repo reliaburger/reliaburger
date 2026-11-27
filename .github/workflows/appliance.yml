@@ -45,7 +45,9 @@ on:
     branches: [main, "release-*"]
     # src/os (the node's half of an OS update), src/appliance (prepare,
     # claim, the console) and relish netboot run only in the image's QEMU
-    # tests, against bun and relish built from the PR.
+    # tests, against bun and relish built from the PR. So do bun's start-up
+    # and its OS update API (the boot and fallback tests), relish's `os` and
+    # `image` commands, and the plan job's os_release.py (#2484).
     paths:
       - "image/**"
       - ".github/workflows/appliance.yml"
@@ -53,6 +55,10 @@ on:
       - "src/appliance/**"
       - "src/relish/netboot/**"
       - "scripts/demo/netboot.sh"
+      - "src/bun/**"
+      - "src/relish/os.rs"
+      - "src/relish/image.rs"
+      - "scripts/release/os_release.py"
     # A draft, or a 0-4-0/ branch, builds no image (24 November 2026):
     # ready_for_review starts the build, and converted_to_draft cancels one
     # still going.
@@ -124,10 +130,11 @@ jobs:
       RELIABURGER_GIT_SHA: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
+          toolchain: 1.98.0
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: appliance-${{ matrix.target }}
           # PR runs restore main's cache but don't save their own, so they

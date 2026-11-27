@@ -453,6 +453,88 @@ async fn ingress_proxies_websocket_handshake_and_bytes() {
     assert_eq!(&echo, b"ping", "WebSocket bytes were not proxied back");
 }
 
+/// #2470: a backend that refuses a WebSocket upgrade on purpose (here 401
+/// for a missing token) has its answer relayed: status, headers and body.
+/// Before, every answer but 101 became 502, so a client retried a gateway
+/// fault instead of sending its user to log in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ingress_relays_a_refused_websocket_upgrade() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let (head, _) = read_head(&mut sock).await;
+            if !head.to_lowercase().contains("upgrade: websocket") {
+                continue;
+            }
+            let resp = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 6\r\n\r\ndenied";
+            let _ = sock.write_all(resp.as_bytes()).await;
+        }
+    });
+
+    let harness = IngressHarness::start_reaching(port).await;
+    let config = Config::parse(&format!(
+        r#"
+        [app.ws]
+        script = "exec sleep 86400"
+        port = {port}
+
+        [app.ws.ingress]
+        host = "ws.test"
+        websocket = true
+    "#
+    ))
+    .unwrap();
+    harness.client.apply(&config).await.unwrap();
+
+    // Wait until the route is live (a non-WS GET stops returning 404).
+    let http_client = reqwest::Client::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let status = http_client
+            .get(harness.http_url("/"))
+            .header("host", "ws.test")
+            .send()
+            .await
+            .map(|r| r.status().as_u16())
+            .unwrap_or(0);
+        if status != 404 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the ws.test route never went live"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let mut client = TcpStream::connect(harness.http_addr).await.unwrap();
+    let req = "GET / HTTP/1.1\r\nHost: ws.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    client.write_all(req.as_bytes()).await.unwrap();
+
+    let (head, mut body) = read_head(&mut client).await;
+    assert!(head.starts_with("HTTP/1.1 401"), "{head}");
+    assert!(
+        head.to_lowercase().contains("www-authenticate: bearer"),
+        "{head}"
+    );
+    while body.len() < 6 {
+        let mut more = [0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut more))
+            .await
+            .expect("the refusal's body never arrived")
+            .unwrap();
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&more[..n]);
+    }
+    assert_eq!(&body[..], b"denied");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ingress_serves_https_with_self_signed_cert() {
     let test_app = TestApp::start(TestAppMode::Healthy).await.unwrap();

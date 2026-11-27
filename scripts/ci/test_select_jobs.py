@@ -5,6 +5,7 @@ would carry, and reads the decision the script writes to $GITHUB_OUTPUT.
 """
 from pathlib import Path
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -30,7 +31,7 @@ class Repository:
         for path in ["src/lib.rs", "src/mustard/gossip.rs", "src/bun/task_array_leader.rs",
                      "src/bun/task_executor.rs", "benches/task_arrays.rs", "docs/design/gossip.md",
                      "docs/manual/intro.md", "README.md", "docs/book/07-ship-it.md",
-                     "src/grill/apple.rs"]:
+                     "docs/plans/README.md", "docs/talks/talk.md", "src/grill/apple.rs"]:
             self.write(path, f"{path}\n")
         # A file with macOS-only code behind a cfg, as rustfmt writes it.
         self.write("src/grill/process.rs", '#[cfg(target_os = "macos")]\nfn mac() {}\n')
@@ -79,6 +80,19 @@ class Repository:
         return {key: found[key] == "true" for key in ("code", "gossip", "heavy", "task_arrays", "macos", "s3")}
 
 
+REPO = SCRIPT.parents[2]
+
+
+def docs_only(repo, path):
+    """Whether select-jobs.sh's `is_docs_only` calls `path` documentation."""
+    script = SCRIPT.read_text()
+    start = script.index("is_docs_only() {")
+    function = script[start:script.index("\n}\n", start) + 3]
+    done = subprocess.run(["bash", "-c", function + 'is_docs_only "$1"', "is_docs_only", path],
+                          cwd=repo.root, capture_output=True, text=True)
+    return done.returncode == 0
+
+
 ALL = {"code": True, "gossip": True, "heavy": True, "task_arrays": True, "macos": True, "s3": True}
 NOTHING = {key: False for key in ALL}
 # What a merge-queue group with code runs: everything but portable macOS.
@@ -124,7 +138,7 @@ class SelectJobsTests(unittest.TestCase):
                          {"code": True, "gossip": False, "heavy": True, "task_arrays": False, "macos": False, "s3": False})
 
     def test_documentation_alone_skips_every_rust_job(self):
-        self.pull_request("docs/design/gossip.md", "docs/book/07-ship-it.md")
+        self.pull_request("docs/plans/README.md", "docs/talks/talk.md")
         self.assertEqual(self.repo.select(base_sha=self.main),
                          {"code": False, "gossip": False, "heavy": False, "task_arrays": False, "macos": False, "s3": False})
 
@@ -139,6 +153,47 @@ class SelectJobsTests(unittest.TestCase):
                 self.assertTrue(self.repo.select(base_sha=self.main)["code"])
                 self.repo.git("checkout", "-q", "main")
                 self.repo.git("branch", "-q", "-D", "feature")
+
+    def test_docs_the_suite_or_the_binary_reads_count_as_code(self):
+        # The suite reads these, or relish's source bundle packs them; a
+        # change to one ran no Rust test until the push after it (#2485).
+        for path in ["docs/testing/concept-budget.json", "docs/release-log.md", "docs/testing.md",
+                     "docs/book/17-a-million-jobs.md", "docs/book/07-ship-it.md",
+                     "docs/qualification/2026-11-06-v0.2.7-exit-test.md", "docs/flakes.md",
+                     "docs/design/gossip.md", "CLAUDE.md"]:
+            with self.subTest(path=path):
+                self.pull_request(path)
+                code = self.repo.select(base_sha=self.main)["code"]
+                self.repo.git("checkout", "-q", "main")
+                self.repo.git("branch", "-q", "-D", "feature")
+                self.assertTrue(code)
+
+    def test_no_docs_path_named_by_a_test_is_docs_only(self):
+        # Every "docs/..." literal in tests/ and src/ that names a file or
+        # directory in the repository, so a new reader can't miss the list.
+        literals = set()
+        for root in ("tests", "src"):
+            for source in (REPO / root).rglob("*.rs"):
+                literals.update(re.findall(r'"(docs/[A-Za-z0-9_./-]*)', source.read_text(errors="replace")))
+        named = set()
+        for literal in literals:
+            target = REPO / literal
+            if target.is_file():
+                named.add(literal)
+            elif target.is_dir():
+                found = next((path for path in sorted(target.rglob("*")) if path.is_file()), None)
+                if found is not None:
+                    named.add(found.relative_to(REPO).as_posix())
+        self.assertGreater(len(named), 20, "the scan found the docs the suite reads")
+        for path in sorted(named):
+            with self.subTest(path=path):
+                self.assertFalse(docs_only(self.repo, path), f"{path} is read by a test or the binary")
+
+    def test_plans_talks_and_research_stay_documentation(self):
+        for path in ["docs/plans/README.md", "docs/talks/kubecon.md", "docs/research/batch.md",
+                     "docs/_quarto/book.yml", "CHANGELOG.md"]:
+            with self.subTest(path=path):
+                self.assertTrue(docs_only(self.repo, path), path)
 
     def test_the_policy_files_count_as_code_because_the_issue_form_tests_read_them(self):
         for path in ["CONTRIBUTING.md", "SECURITY.md", "AGENTS.md"]:
@@ -167,6 +222,22 @@ class SelectJobsTests(unittest.TestCase):
     def test_a_gossip_change_runs_the_benchmarks(self):
         self.pull_request("src/mustard/gossip.rs")
         self.assertTrue(self.repo.select(base_sha=self.main)["gossip"])
+
+    def test_a_scheduler_or_policy_bench_change_runs_the_benchmarks(self):
+        # make bench runs the scheduler and policy benchmarks beside gossip's,
+        # so a change to them or to what they measure runs it (#2493).
+        for path in ["benches/scheduler.rs", "benches/policy.rs", "src/cluster/orchestrate.rs",
+                     "src/meat/scheduler.rs", "src/meat/filter.rs", "src/meat/score.rs",
+                     "src/meat/quota.rs", "src/meat/cluster_state.rs", "src/policy/check.rs",
+                     # make bench runs the ingress drain tracker's benchmark
+                     # too (#2455).
+                     "benches/wrapper_drains.rs", "src/wrapper/draining.rs"]:
+            with self.subTest(path=path):
+                self.pull_request(path)
+                gossip = self.repo.select(base_sha=self.main)["gossip"]
+                self.repo.git("checkout", "-q", "main")
+                self.repo.git("branch", "-q", "-D", "feature")
+                self.assertTrue(gossip)
 
     def test_a_task_array_change_runs_the_task_array_benchmarks(self):
         for path in ["src/bun/task_array_leader.rs", "src/bun/task_executor.rs",
@@ -367,7 +438,7 @@ class SelectJobsTests(unittest.TestCase):
                                                  macos=True)["macos"])
 
     def test_the_macos_label_does_not_make_documentation_run_rust_jobs(self):
-        self.pull_request("docs/design/gossip.md")
+        self.pull_request("docs/plans/README.md")
         self.assertFalse(self.repo.select(base_sha=self.main, macos=True)["macos"])
 
     def test_dependabot_never_gets_macos(self):
@@ -408,7 +479,7 @@ class SelectJobsTests(unittest.TestCase):
 
     def test_a_documentation_only_merge_group_runs_no_code_job(self):
         # Its code is its base's, which the run before it tests (#1723).
-        self.pull_request("docs/design/gossip.md", "docs/book/07-ship-it.md")
+        self.pull_request("docs/plans/README.md", "docs/talks/talk.md")
         self.assertEqual(self.repo.select(event="merge_group", base_ref="", head_ref="", base_sha=self.main),
                          NOTHING)
 
@@ -417,7 +488,7 @@ class SelectJobsTests(unittest.TestCase):
         self.assertEqual(self.repo.select(event="merge_group", base_sha=self.main), QUEUE)
 
     def test_a_merge_group_without_a_base_runs_everything_but_macos(self):
-        self.pull_request("docs/design/gossip.md")
+        self.pull_request("docs/plans/README.md")
         self.assertEqual(self.repo.select(event="merge_group", base_sha=""), QUEUE)
 
     def test_a_draft_runs_only_the_cheap_set(self):
@@ -442,8 +513,18 @@ class SelectJobsTests(unittest.TestCase):
         # Only the prefix counts.
         self.assertTrue(self.repo.select(base_sha=self.main, head_ref="fix/0-4-0/x")["heavy"])
 
+    def test_a_0_3_4_batch_branch_runs_only_the_cheap_set(self):
+        # 0.3.4's batch branches are folded into integration PRs and never
+        # get one of their own; one opened by mistake runs the cheap set.
+        self.pull_request("src/lib.rs")
+        found = self.repo.outputs(base_sha=self.main, head_ref="0-3-4/ci-workflows",
+                                  base_ref="release-1-3-4", full_ci=True)
+        self.assertEqual(found, dict({key: "false" for key in ALL}, portable="false", tested_by="",
+                                     lint="true"))
+        self.assertTrue(self.repo.select(base_sha=self.main, head_ref="0-3-4-x")["heavy"])
+
     def test_a_documentation_only_draft_skips_lint_too(self):
-        self.pull_request("docs/design/gossip.md")
+        self.pull_request("docs/plans/README.md")
         found = self.repo.outputs(base_sha=self.main, draft=True)
         self.assertEqual(found["lint"], "false")
         self.assertEqual(found["code"], "false")
@@ -457,7 +538,7 @@ class SelectJobsTests(unittest.TestCase):
 
     def test_documentation_into_a_release_train_skips_every_rust_job(self):
         base = self.stacked_base()
-        self.pull_request("docs/design/gossip.md")
+        self.pull_request("docs/plans/README.md")
         self.assertEqual(self.repo.select(base_ref="release-1-1-4", base_sha=base),
                          {"code": False, "gossip": False, "heavy": False, "task_arrays": False, "macos": False, "s3": False})
 
@@ -468,14 +549,14 @@ class SelectJobsTests(unittest.TestCase):
                                          full_ci=True)["heavy"])
 
     def test_the_full_ci_label_does_not_make_documentation_heavy(self):
-        self.pull_request("docs/design/gossip.md")
+        self.pull_request("docs/plans/README.md")
         self.assertFalse(self.repo.select(base_sha=self.main, full_ci=True)["heavy"])
 
     def test_retargeting_a_stacked_pull_request_to_main_selects_the_heavy_suites(self):
         # The stacked PR changes only docs; the branch under it changed code.
         # Once GitHub retargets it to main, the diff against main carries both.
         base = self.stacked_base("src/lib.rs")
-        self.pull_request("docs/design/gossip.md")
+        self.pull_request("docs/plans/README.md")
         before = self.repo.select(base_ref="fix/base", base_sha=base)
         after = self.repo.select(base_ref="main", base_sha=self.main)
         self.assertEqual(before, {"code": False, "gossip": False, "heavy": False, "task_arrays": False, "macos": False, "s3": False})

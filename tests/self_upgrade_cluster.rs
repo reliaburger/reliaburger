@@ -1552,10 +1552,13 @@ async fn start_refuses_a_candidate_with_other_formats_before_recording_a_run() {
     let leader = harness.wait_for_idle_leader().await;
     let client = harness.relish_client(harness.node(&leader));
     let staging = tempfile::tempdir().unwrap();
+    // The candidate answers with 0.3.3's formats (protocol 61, state 76),
+    // the pair the last format bump left behind, so this test also shows
+    // a cluster refusing the previous release's binary.
     let candidate = harness.signed_candidate(
         staging.path(),
         "v0.2.0",
-        b"#!/bin/sh\nprintf '%s' '{\"protocol\":1,\"state\":1}'\n",
+        b"#!/bin/sh\nprintf '%s' '{\"protocol\":61,\"state\":76}'\n",
     );
 
     let err = reliaburger::relish::upgrade::start(
@@ -1567,7 +1570,12 @@ async fn start_refuses_a_candidate_with_other_formats_before_recording_a_run() {
     .expect_err("a candidate with other formats must stop the start");
     let message = err.to_string();
     assert!(
-        message.contains("found protocol 1, state 1") && message.contains("needs protocol"),
+        message.contains("found protocol 61, state 76")
+            && message.contains(&format!(
+                "needs protocol {}, state {}",
+                reliaburger::compatibility::CURRENT.protocol,
+                reliaburger::compatibility::CURRENT.state
+            )),
         "unexpected refusal: {message}"
     );
     assert!(
