@@ -1247,7 +1247,7 @@ If split-brain somehow occurs (bug, Byzantine failure), the leader with the high
 
 UDP is unreliable. Mustard handles this through redundancy:
 
-- Each membership update is piggybacked on multiple messages (a dissemination count of `ceil(log(N))` ensures each update is sent enough times for probabilistic reliability).
+- Each membership update is piggybacked on multiple messages (a dissemination count of `3 * ceil(log2(N))`, minimum 6, as in §3.2, ensures each update is sent enough times for probabilistic reliability).
 - Indirect probing (PING-REQ) provides a second path when direct probes fail.
 - The suspicion subprotocol prevents premature failure declarations from transient loss.
 - A periodic push-pull exchange of membership tables between random node pairs (§3.2, "Anti-entropy push-pull") is the consistency backstop. It runs over the same UDP transport, not TCP.

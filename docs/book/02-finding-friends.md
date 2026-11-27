@@ -2171,7 +2171,7 @@ An app with neither `exec` nor `script` runs an image (or, with only a `command`
 | Image locality | 15 | Prefer nodes with cached images (Phase 5) |
 | Stability | 5 | Prefer longer-running nodes |
 
-These are points, not percentages. Image locality is wired into scoring, but nodes don't report their cached images to the leader yet, so in a live cluster it currently scores zero everywhere.
+These are points, not percentages. Image locality is wired into scoring, but nodes don't report their cached images to the leader yet, so in a live cluster it currently scores zero everywhere (#1214). Stability isn't a reported uptime either: the leader counts from when its own gossip table first saw the node, so a leader restart or failover makes every node look new again.
 
 Spread used to be a weight too, and it took two bugs to get it out of the table. At 10 points against bin-packing's 50, the bin-packer put every replica of an app on one node, which defeats the point of having replicas. At 60 points, scored as "runs this app or doesn't", it beat bin-packing for a node with no replica at all, but once every candidate ran one, bin-packing chose again. Lose one node of three running four replicas and both survivors run the app, so the busier one took both replacements: three replicas on one node, one on the other. No weight fixes that for good, because the next dimension someone adds can outvote it. So the replica count is the first sort key and the weighted score only breaks ties:
 
