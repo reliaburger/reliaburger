@@ -432,7 +432,9 @@ The machine's first line on
 each boot names its MAC, so it keeps its name when your router gives the
 installed system a different address from the one it network-booted with. A
 line from a machine `relish netboot` didn't answer shows as
-`log <address> (not served):`.
+`log <address> (not served):`, and goes to `os/logs/unserved.log` with the
+address in front, one file for all such senders. Each file stops growing at
+64 MiB, and relish says so once; later lines only print.
 
 - The installer writes your machine's address into `reliaburger/netlog.conf`
   on the installed disk's EFI partition. On each boot, once the network is up,
@@ -454,7 +456,7 @@ relish machines logs --interface en7 --dir os
 
 It listens on UDP 6666 until Ctrl-C. Without `--dir` it only prints. It
 answered no machine, so it names each line by its address, marked
-`(not served)`.
+`(not served)`, and with `--dir` every line goes to `os/logs/unserved.log`.
 
 #### Turn boot logs on or off later
 

@@ -153,6 +153,12 @@ passes the kernel command line, and with Secure Boot on a UKI ignores it.
   gets the installer once per run.
 - A machine whose wipe was declined this run gets a script that boots its
   disk.
+- With `--stream-logs` (and in `relish machines logs`), boot log lines from
+  a machine relish answered go to `logs/<mac>.log`; lines from any other
+  address, which anyone can forge, share `logs/unserved.log`, each prefixed
+  with its address. At most 64 files are open at once (the one written
+  longest ago is closed, and reopened in append mode if needed), and each
+  stops at 64 MiB, after which its lines only print.
 
 ### 2.5 Refusing to start beside another boot server
 
