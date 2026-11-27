@@ -801,7 +801,7 @@ with no configuration:
   guards, as `docker run --cap-add` does.
 - **No new privileges.** A set-uid binary or file capability can't raise
   a process's privileges. An image that starts as root and drops to a
-  service user (Redis, Postgres, nginx) doesn't notice; one that starts as
+  service user (Redis, nginx) doesn't notice; one that starts as
   a non-root user and runs `sudo` or `su` fails, and needs to start as
   root instead.
 - **Masked and read-only `/proc` and `/sys`.** `/proc/kcore`,
