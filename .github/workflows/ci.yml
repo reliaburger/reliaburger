@@ -1195,7 +1195,9 @@ jobs:
         run: 'cargo test --locked --doc -- relish::'
   benchmarks:
     # Criterion output is uploaded, not gated, so pull requests only pay for
-    # the release build when they touch the gossip protocol or its benches.
+    # the release build when they touch what `make bench` measures: the
+    # gossip protocol, the scheduler's planning pass, policy evaluation, or
+    # their benches (the `gossip` output, scripts/ci/select-jobs.sh, #2493).
     name: benchmarks
     needs: changes
     if: needs.changes.outputs.gossip == 'true'

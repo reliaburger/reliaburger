@@ -69,7 +69,7 @@ be visible until we remove its race.
 | `make test-ci-scripts`, `make check-ignored` | The CI scripts' fixtures; every `#[ignore]` names its owner | Every pull request ("CI policy") and `make ci` |
 | `make ci` | `fmt-check`, `lint`, `test`, `test-doc`, `test-ci-scripts`, `check-ignored` | Local; CI runs the same pieces as separate jobs |
 | `make ci-bench` | `make ci`, then `make bench` | Local |
-| `make bench` | Criterion transport and 5–250-node measurements | `main`, nightly, and PRs touching gossip |
+| `make bench` | Criterion transport and 5–250-node gossip measurements, the 1k and 10k node scheduling pass, and policy evaluation | `main`, nightly, and PRs touching gossip, the scheduler, the policy engine or their benches |
 | `make bench-large` | Criterion 500- and 1,000-node measurements | `main`, nightly, and PRs touching gossip |
 | `make fuzz-corpus-check` | Every fuzz target body over its seeds and checked-in corpus, on stable (also part of `make test`) | Local; `make test` everywhere |
 | `make fuzz-smoke` | Every cargo-fuzz target for `FUZZ_SECONDS` each (nightly Rust and cargo-fuzz) | `fuzz.yml`: 300 s a target nightly on the newest train (else `main`), any budget by hand; never on pull requests |
@@ -325,7 +325,10 @@ The 10k acceptance exercises a single real node's 10,000-member production state
 bounded protocol messages and dissemination batches. Simulating every membership table on
 one runner needs 100 million records and confuses distributed scale with single-process
 capacity. Criterion data is uploaded from CI, but we will not set a regression threshold
-until runs are stable on consistent hardware.
+until runs are stable on consistent hardware. That decision was made for gossip;
+the scheduler and policy benchmarks that `make bench` gained later inherited it,
+and run on pull requests that change them or the code they measure (#2493).
+Only `task_arrays` is compared with a baseline.
 
 `cargo-llvm-cov` runs the portable suite once, instrumented, and writes LCOV and HTML
 artefacts. On Linux that run is also the test gate and the portable JUnit source, so the suite isn't

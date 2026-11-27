@@ -223,6 +223,19 @@ class SelectJobsTests(unittest.TestCase):
         self.pull_request("src/mustard/gossip.rs")
         self.assertTrue(self.repo.select(base_sha=self.main)["gossip"])
 
+    def test_a_scheduler_or_policy_bench_change_runs_the_benchmarks(self):
+        # make bench runs the scheduler and policy benchmarks beside gossip's,
+        # so a change to them or to what they measure runs it (#2493).
+        for path in ["benches/scheduler.rs", "benches/policy.rs", "src/cluster/orchestrate.rs",
+                     "src/meat/scheduler.rs", "src/meat/filter.rs", "src/meat/score.rs",
+                     "src/meat/quota.rs", "src/meat/cluster_state.rs", "src/policy/check.rs"]:
+            with self.subTest(path=path):
+                self.pull_request(path)
+                gossip = self.repo.select(base_sha=self.main)["gossip"]
+                self.repo.git("checkout", "-q", "main")
+                self.repo.git("branch", "-q", "-D", "feature")
+                self.assertTrue(gossip)
+
     def test_a_task_array_change_runs_the_task_array_benchmarks(self):
         for path in ["src/bun/task_array_leader.rs", "src/bun/task_executor.rs",
                      "src/meat/task_array_state.rs", "src/meat/index_set.rs",

@@ -171,8 +171,15 @@ while IFS= read -r file; do
     [ -z "$file" ] && continue
     is_docs_only "$file" || code=true
     if [ "$macos_code" = false ] && macos_code_file "$file"; then macos_code=true; fi
+    # `gossip` selects the `benchmarks` job, which runs `make bench`: the
+    # gossip benchmarks and the scheduler's planning pass and policy
+    # evaluation beside them, so their benches and what they measure count
+    # (#2493).
     case "$file" in
         src/mustard/* | benches/gossip* | benches/support/* | tests/gossip_*) gossip=true ;;
+        benches/scheduler.rs | benches/policy.rs | src/cluster/orchestrate* | \
+            src/meat/scheduler* | src/meat/filter* | src/meat/score* | src/meat/quota* | \
+            src/meat/cluster_state* | src/policy/*) gossip=true ;;
     esac
     # What benches/task_arrays.rs measures: range sets, the leader's state
     # machine, the node pool and the process runner; and the script that

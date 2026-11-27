@@ -354,15 +354,21 @@ a leader pass placing 150 replicas, and a converged pass, on 1,000 and 10,000
 nodes, then [`benches/policy.rs`](../benches/policy.rs): compiling 10, 100 and
 1,000 policies, and judging one app under them) and `make bench-large`, and the `task-array benchmarks` job runs `make
 bench-task-arrays`. Both run nightly on `main` and on pushes to it. A pull
-request runs the first when it touches the gossip protocol or its benchmarks,
-and the second when it touches what `benches/task_arrays.rs` measures: the
+request runs the first when it touches what `make bench` measures: the gossip
+protocol, the scheduler's planning pass (`src/cluster/orchestrate.rs` and the
+scheduler, filter, score, quota and cluster-state modules under `src/meat/`),
+the policy engine (`src/policy/`), or any of their benchmarks
+([#2493](https://github.com/reliaburger/reliaburger/issues/2493)); and the second when it touches what `benches/task_arrays.rs` measures: the
 task-array leader and node pool, the executor, range sets, the benchmark
 itself or `bench_baseline.py` ([`select-jobs.sh`](../scripts/ci/select-jobs.sh)). A change to
 `criterion`'s version, in `Cargo.toml` or only in `Cargo.lock`, runs both,
 because both parse its output and use its filter syntax
 ([#1151](https://github.com/reliaburger/reliaburger/issues/1151)). A pull request into a
-merge train without the `full-ci` label runs neither: there both wait for the merge queue and the push. The gossip numbers
-gate nothing. The task-array job compares each benchmark's mean with the
+merge train without the `full-ci` label runs neither: there both wait for the merge queue and the push. The gossip, scheduler and policy numbers
+gate nothing: they're uploaded and no job compares them. Gossip's are a
+simulated network and vary with the runner; the scheduler and policy
+benchmarks are pure CPU work on in-memory data, the kind `bench_baseline.py`
+could compare, but whether to is a maintainer decision. The task-array job compares each benchmark's mean with the
 baseline the last `main` run saved
 ([`bench_baseline.py`](../scripts/ci/bench_baseline.py)). Hosted runners
 differ by tens of per cent from run to run, and on 12 October 2026 one was

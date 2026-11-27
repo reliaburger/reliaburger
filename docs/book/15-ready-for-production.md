@@ -1403,6 +1403,14 @@ rots the day a new test reads a new file; a list of things nothing reads rots mu
 slowly. A test also greps `src/` and `tests/` for `"docs/...` literals and asserts that none
 of them names a file the selector would skip.
 
+The benchmark output had a smaller version of the same mistake. Its name is `gossip`, because
+`make bench` once ran only the gossip benchmarks, and it was set by gossip paths alone. Then
+the scheduler's planning pass and policy evaluation joined the same target, and a pull request
+that changed either, or broke their benchmark's build, didn't run them until the merge queue
+([#2493](https://github.com/reliaburger/reliaburger/issues/2493)). The output keeps its name,
+since renaming it touches the workflow and two test files for no change in behaviour, and now also
+fires for `benches/scheduler.rs`, `benches/policy.rs` and the modules they import.
+
 Together that's about a quarter of the window's runner-minutes, 5,700 of 22,120, that no
 longer compete with the PRs an author is waiting for. What we didn't do matters as much.
 Portable macOS, 52 to 57 minutes with a warm cache, still sets the length of every queue
