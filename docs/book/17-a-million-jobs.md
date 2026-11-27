@@ -1714,6 +1714,41 @@ state the plan takes about 0.56 ms under the lock, the requests another 0.71 ms
 after it, and they come to 5.9 MB, most of it the per-run spec and labels a
 node still needs to report its slots.
 
+Two smaller copies were left after that (#2532). The first delivery of a
+template still carried the program, arguments and environment the leader had
+derived from it, the same bytes twice. Now the template goes alone, and
+`ArrayAssignment::derive_definition` on the node works them out the way the
+leader used to: `exec`, or `/bin/sh -c` for a script; `command` as the
+arguments; the plain environment plus `RELIABURGER_JOB_NAME`, taken from the
+run's `definition` label. The node does it once, when the template arrives,
+and keeps the result with its copy. Only a run with no template at all still
+sends a program, and the wire format says so: an empty `program` is left out.
+`with_definition` already returned a `Cow`; the first delivery is now its
+owned arm too, because the node changes the assignment before it keeps it.
+The test `a_first_delivery_carries_the_template_without_what_derives_from_it`
+checks the leader leaves the three fields empty and that deriving them gives
+back what it used to send, and
+`a_node_derives_the_program_from_a_template_sent_alone` runs tasks from a
+template with no program beside it. In the `sync_requests` group, the round
+that sends every node every template (a new leader's first tick) went from
+48.2 MB to 27.0 MB, and from 9.5 ms to 6.6 ms to build, on the Mac Studio.
+The steady state didn't move, as it shouldn't: it carried no templates before
+either.
+
+The second was the cron schedules. Once a second, `due_schedules` parsed the
+cron expression of every scheduled definition, up to 1,024 of them, under the
+same lock. The leader now keeps a `CronCache` in its memory: each definition's
+expression and what parsing it gave. A tick parses only an expression it
+hasn't seen, which is a string comparison, not a parse, for the rest, and drops
+the entries of definitions that are gone. The cache keys on the expression
+text rather than the definition's revision, so it can never serve a stale
+parse: any change to the expression is a different string. The read that uses
+it runs inside `read_control`, whose closure must own what it touches, so the
+cache goes in with `std::mem::take` and comes back out in the result, the way
+the run-event tracker does. The test
+`a_cron_expression_is_parsed_once_until_it_changes` counts the parses across
+three ticks and one changed definition.
+
 The Criterion suite now has a `leader_tick` group, so the cost is a number,
 not a hunch (`make bench-task-arrays`): one tick for sixty-four arrays on three
 nodes, and one for a single array of one-task chunks on ten nodes, planned,
