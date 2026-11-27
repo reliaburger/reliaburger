@@ -99,6 +99,17 @@ impl MembershipTable {
                 update.incarnation,
             );
 
+            // Only the node raises its own incarnation, so an Alive at a
+            // strictly higher one is its own newer word about itself, address
+            // included (#2475). A Suspect or Dead carries the accuser's view
+            // of the address, and an equal incarnation could be a replay
+            // (#696), so neither moves it.
+            let moved = update.state == NodeState::Alive
+                && update.incarnation > old_incarnation
+                && update.address != existing.address;
+            if moved {
+                existing.address = update.address;
+            }
             if new_state != old_state || new_incarnation != old_incarnation {
                 if new_state != old_state {
                     existing.state_changed = now;
@@ -110,7 +121,7 @@ impl MembershipTable {
                 }
                 true
             } else {
-                false
+                moved
             }
         } else {
             // New node — only add if it's alive (don't add dead nodes we've never seen)
@@ -448,6 +459,51 @@ mod tests {
         table.add_node(NodeId::new("n1"), addr(9002), 1, BTreeMap::new(), now());
         assert_eq!(table.len(), 1);
         assert_eq!(table.get(&NodeId::new("n1")).unwrap().address, addr(9002));
+    }
+
+    /// #2475: a node back on a new IP under the same name used to keep its
+    /// old address on every peer it hadn't contacted directly.
+    #[test]
+    fn a_higher_incarnation_update_replaces_the_address() {
+        let mut table = MembershipTable::new();
+        table.add_node(NodeId::new("w7"), addr(7), 1, BTreeMap::new(), now());
+        let mut update = alive_update("w7", 2);
+        update.address = addr(99);
+        assert!(table.apply_update(&update, now()));
+        assert_eq!(table.get(&NodeId::new("w7")).unwrap().address, addr(99));
+    }
+
+    /// A replayed or stale rumour at the same incarnation can't move a member.
+    #[test]
+    fn an_update_at_the_same_incarnation_keeps_the_address() {
+        let mut table = MembershipTable::new();
+        table.add_node(NodeId::new("w7"), addr(7), 1, BTreeMap::new(), now());
+        for state in [NodeState::Alive, NodeState::Suspect] {
+            let mut update = alive_update("w7", 1);
+            update.state = state;
+            update.address = addr(99);
+            table.apply_update(&update, now());
+            assert_eq!(
+                table.get(&NodeId::new("w7")).unwrap().address,
+                addr(7),
+                "a {state:?} at the same incarnation moved the member"
+            );
+        }
+    }
+
+    /// A Suspect or Dead carries the address its accuser holds, which may be
+    /// the old one: even at a higher incarnation it doesn't move the member.
+    #[test]
+    fn a_higher_incarnation_failure_keeps_the_address() {
+        let mut table = MembershipTable::new();
+        table.add_node(NodeId::new("w7"), addr(7), 1, BTreeMap::new(), now());
+        for (state, incarnation) in [(NodeState::Suspect, 2), (NodeState::Dead, 3)] {
+            let mut update = alive_update("w7", incarnation);
+            update.state = state;
+            update.address = addr(99);
+            assert!(table.apply_update(&update, now()));
+            assert_eq!(table.get(&NodeId::new("w7")).unwrap().address, addr(7));
+        }
     }
 
     #[test]
