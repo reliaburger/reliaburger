@@ -792,7 +792,9 @@ isn't fenced; `--force` overrides that for an old voter that never heard of the
 recovery.
 
 The fence has one gap. An old voter learns of the new epoch only from a node
-that holds it. **After `council recover`, don't start the old voters where
+that holds it: a recovered node it dials, or a voter of its own council that
+serves the new epoch when it asks. A claim it merely hears over gossip makes
+it ask, but doesn't fence it, because any node could forge one. **After `council recover`, don't start the old voters where
 they can reach each other but never the recovered side.** Wipe them with
 `relish council re-enrol` first, or keep them stopped until they can see the
 recovered council. If two of them do come back cut off from it, they form a
