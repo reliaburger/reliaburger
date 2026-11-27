@@ -3329,6 +3329,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             storage_paths: diagnostic_storage_paths,
             node_certificate: None,
             export_holds: export_holds.clone(),
+            image_store: cluster_image_store
+                .as_ref()
+                .map(reliaburger::grill::ImageStore::status)
+                .unwrap_or_default(),
         },
         test_policy: config.testing.clone(),
         token_lifetime: config.security.token_lifetime(),

@@ -346,6 +346,16 @@ pub(super) async fn diagnostics_handler(
         },
     };
 
+    let image_store = &state.static_capabilities.diagnostics.image_store;
+    let image_collection = match image_store.problem() {
+        Some((problem, since)) => Some(crate::bun::diagnostics::ImageCollectionEvidence {
+            problem,
+            since,
+            unpacked_bytes: image_store.unpacked_total().await.unwrap_or_default(),
+        }),
+        None => None,
+    };
+
     Json(LocalDiagnosticSnapshot {
         schema_version: crate::bun::diagnostics::LOCAL_DIAGNOSTIC_SCHEMA_VERSION,
         node_id: state.static_capabilities.node_id.clone(),
@@ -355,6 +365,7 @@ pub(super) async fn diagnostics_handler(
         certificates,
         backup,
         export_holds: state.static_capabilities.diagnostics.export_holds.current(),
+        image_collection,
     })
 }
 

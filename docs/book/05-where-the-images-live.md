@@ -726,6 +726,55 @@ borrowing it, so it can move into a spawned task) and holds it for the whole
 pass, so two creates never run two passes. A node that stops deploying stops
 collecting, which is fine: it also stops growing.
 
+### Seeing it from relish
+
+A collector nobody can see is half a fix. The pass logs what it removed, but
+#2423 also asked for the space to show where an operator looks, and that part
+came separately (#2524). Two questions: how much disk do the unpacked images
+take, and is the collector actually running?
+
+The first is cheap to answer if you measure at the right moment. Walking a
+generation's tree to add up its files costs as much as the tree is big, and
+`relish images` shouldn't walk a million files to print a table. But the
+unpack has just written the tree and flushed it, so `publish_generation`
+walks it once then, on the same blocking thread, and writes the total into
+the `.complete` marker as a second line (`complete\n48200000\n`). The marker
+is still the only thing a pull checks, and it checks only that the file
+exists, so nothing else had to change. Listing sizes is now one small read
+per generation. `/v1/images` adds an `unpacked` map, digest to bytes, from
+the node that answered, and `relish images` joins it on the digest into an
+UNPACKED column. The join works because apply binds every tag to a digest
+(see the start of this chapter), so the tag directory under `rootfs/` is
+named after the same digest the catalogue lists. A generation published
+before this change has a one-line marker and simply isn't counted.
+
+The second needed a record. A pass can fail to do its job two ways: it
+can't read one of the bundles' specs, so it refuses to remove anything (the
+error policy above), or it hits a filesystem error partway. Both used to be a
+line in Bun's log and nothing else, and a node in that state grows by one
+image version per deploy, forever. `ImageStore::run_collection` now wraps the
+pass and records the outcome in an `ImageStoreStatus`, a handle every clone
+of the store shares: a problem and when it started, cleared by the next pass
+that works. The diagnostics endpoint copies it into its snapshot, and
+`relish wtf` has an `images` check that warns `image-collection-failing`,
+naming the node, how long it's been failing and how much its unpacked images
+take. It reports no reason text, on purpose: an error can name a host path,
+and the diagnostics payload never carries one. The reason is in Bun's log,
+and the suggestion says to look there.
+
+"Close to full" needed nothing new. The `disks` check already reads every
+storage domain, `images` included, and warns at 85%. The test
+`a_full_image_filesystem_is_reported_by_the_disk_check` pins that, so it
+stays true if the disk check changes.
+
+`ImageStoreStatus` uses a `std::sync::Mutex`, not tokio's, for the same
+reason `ExportHolds` does: it's held only to copy or replace one small value,
+never across an `.await`. And it implements `PartialEq` by hand, comparing
+the two handles' `Arc`s with `Arc::ptr_eq` (are these the same allocation?)
+rather than their contents, because the static evidence it sits in derives
+`PartialEq` and "the same record" is the only equality that means anything
+for a shared handle.
+
 ### How big may an image get?
 
 Collection removes what nobody uses. It can't help with one image that is

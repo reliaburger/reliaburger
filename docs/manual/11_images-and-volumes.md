@@ -226,6 +226,14 @@ grill: image collection removed 3 generation(s), 0 partial tree(s), 3 manifest(s
 An image that's collected and needed again later is pulled and unpacked
 again, from the blob store if its layers are still there.
 
+`relish images` shows how much disk each image's unpacked copies take on the
+node you asked, in its UNPACKED column (`-` for an image that node hasn't
+unpacked). `relish wtf` warns with `image-collection-failing` when a node's
+last collection failed, or was refused because the node couldn't read one of
+its container bundles' specs and so couldn't tell which images are in use:
+such a node removes nothing until a pass works. A nearly full image
+filesystem is the `disk-high` finding on the `images` domain.
+
 ### What bounds disk use on a node
 
 | What | Bounded by |

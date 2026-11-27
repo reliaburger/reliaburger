@@ -3181,19 +3181,38 @@ pub async fn images(output: OutputFormat) -> Result<(), RelishError> {
             status: 0,
             body: format!("failed to parse images response: {e}"),
         })?;
-    print!("{}", format_images_table(&images));
+    let unpacked: std::collections::HashMap<String, u64> =
+        serde_json::from_value(result["unpacked"].clone()).unwrap_or_default();
+    print!("{}", format_images_table(&images, &unpacked));
     Ok(())
 }
 
 /// Render `relish images` as a table: one row per image, with a
 /// multi-platform image's platforms in its PLATFORMS column and `-` for
 /// LAYERS (each platform has its own; `--output json` lists them).
-pub fn format_images_table(images: &[crate::pickle::types::ImageSummary]) -> String {
+/// UNPACKED is what the image's unpacked copies take on the node that
+/// answered, from `unpacked` (keyed by digest), or `-` where it has none
+/// (#2524).
+pub fn format_images_table(
+    images: &[crate::pickle::types::ImageSummary],
+    unpacked: &std::collections::HashMap<String, u64>,
+) -> String {
     if images.is_empty() {
         return "no images in local registry\n".to_string();
     }
-    let header = ["REPOSITORY", "TAG", "PLATFORMS", "LAYERS", "SIZE"].map(str::to_string);
-    let rows: Vec<[String; 5]> = images.iter().map(image_row).collect();
+    let header = [
+        "REPOSITORY",
+        "TAG",
+        "PLATFORMS",
+        "LAYERS",
+        "SIZE",
+        "UNPACKED",
+    ]
+    .map(str::to_string);
+    let rows: Vec<[String; 6]> = images
+        .iter()
+        .map(|image| image_row(image, unpacked))
+        .collect();
     // Each column is as wide as its widest cell, so a long pull-through
     // name like `cache/public.ecr.aws/...` can't push its row out of line.
     let mut widths = header.clone().map(|cell| cell.len());
@@ -3202,19 +3221,24 @@ pub fn format_images_table(images: &[crate::pickle::types::ImageSummary]) -> Str
             *width = (*width).max(cell.chars().count());
         }
     }
-    let [repository, tag, platforms, layers, size] = widths;
+    let [repository, tag, platforms, layers, size, unpacked_width] = widths;
     let mut out = String::new();
-    for [r, t, p, l, s] in std::iter::once(&header).chain(&rows) {
-        let line =
-            format!("{r:<repository$}  {t:<tag$}  {p:<platforms$}  {l:>layers$}  {s:>size$}");
+    for [r, t, p, l, s, u] in std::iter::once(&header).chain(&rows) {
+        let line = format!(
+            "{r:<repository$}  {t:<tag$}  {p:<platforms$}  {l:>layers$}  {s:>size$}  {u:>unpacked_width$}"
+        );
         out.push_str(line.trim_end());
         out.push('\n');
     }
     out
 }
 
-/// One `relish images` row: repository, tags, platforms, layers and size.
-fn image_row(image: &crate::pickle::types::ImageSummary) -> [String; 5] {
+/// One `relish images` row: repository, tags, platforms, layers, size and
+/// unpacked size on the answering node.
+fn image_row(
+    image: &crate::pickle::types::ImageSummary,
+    unpacked: &std::collections::HashMap<String, u64>,
+) -> [String; 6] {
     let tags = image.tags.iter().cloned().collect::<Vec<_>>().join(", ");
     let tags = if tags.is_empty() {
         "<none>".to_string()
@@ -3237,6 +3261,9 @@ fn image_row(image: &crate::pickle::types::ImageSummary) -> [String; 5] {
         platforms,
         layers,
         format_image_size(image.total_size),
+        unpacked
+            .get(&image.digest)
+            .map_or_else(|| "-".to_string(), |bytes| format_image_size(*bytes)),
     ]
 }
 
@@ -6908,7 +6935,10 @@ spec:
     fn images_table_shows_a_multi_platform_image_on_one_row_with_its_platforms() {
         let mut images = registry_listing();
         images.push(multi_platform_summary());
-        insta::assert_snapshot!(format_images_table(&images));
+        insta::assert_snapshot!(format_images_table(
+            &images,
+            &std::collections::HashMap::new()
+        ));
     }
 
     #[test]
@@ -6920,12 +6950,31 @@ spec:
             &["7.2-alpine"],
         ));
         images.push(multi_platform_summary());
-        insta::assert_snapshot!(format_images_table(&images));
+        insta::assert_snapshot!(format_images_table(
+            &images,
+            &std::collections::HashMap::new()
+        ));
     }
 
     #[test]
     fn images_table_says_so_when_the_registry_is_empty() {
-        assert_eq!(format_images_table(&[]), "no images in local registry\n");
+        assert_eq!(
+            format_images_table(&[], &std::collections::HashMap::new()),
+            "no images in local registry\n"
+        );
+    }
+
+    /// #2524: `relish images` shows what each image's unpacked copies take
+    /// on the node that answered, joined by digest.
+    #[test]
+    fn images_table_shows_the_unpacked_size_on_this_node() {
+        let images = registry_listing();
+        let unpacked = std::collections::HashMap::from([(images[0].digest.clone(), 48_200_000)]);
+        let table = format_images_table(&images, &unpacked);
+        let mut lines = table.lines();
+        assert!(lines.next().unwrap().ends_with("UNPACKED"), "{table}");
+        assert!(lines.next().unwrap().ends_with("48.2 MB"), "{table}");
+        assert!(lines.all(|line| line.ends_with('-')), "{table}");
     }
 
     #[test]

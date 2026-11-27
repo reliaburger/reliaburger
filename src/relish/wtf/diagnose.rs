@@ -42,6 +42,7 @@ pub fn diagnose(inputs: &WtfInputs) -> WtfReport {
         check_faults(inputs, &mut report);
         check_disks(inputs, &mut report);
         check_export_holds(inputs, &mut report);
+        check_image_collection(inputs, &mut report);
         check_certificates(inputs, &mut report);
         check_registry(inputs, &mut report);
         check_tokens(inputs, &mut report);
@@ -90,6 +91,12 @@ fn record_cluster_unknowns(evidence: &ClusterEvidence, report: &mut WtfReport) {
     record_unknown("faults", &evidence.faults, "cluster", report);
     record_unknown("disks", &evidence.disks, "cluster", report);
     record_unknown("export_holds", &evidence.export_holds, "cluster", report);
+    record_unknown(
+        "image_collection",
+        &evidence.image_collection,
+        "cluster",
+        report,
+    );
     record_unknown("certificates", &evidence.certificates, "cluster", report);
     record_unknown("registry", &evidence.registry, "cluster", report);
     record_unknown("tokens", &evidence.tokens, "cluster", report);
@@ -1230,6 +1237,50 @@ fn check_export_holds(inputs: &WtfInputs, report: &mut WtfReport) {
     }
 }
 
+/// A node whose image collection keeps failing or being refused removes no
+/// unpacked image, and every deploy of a new version adds one (#2423,
+/// #2524). How full the disk already is, `disk-high` says.
+fn check_image_collection(inputs: &WtfInputs, report: &mut WtfReport) {
+    let Some(nodes) = inputs.cluster.image_collection.value() else {
+        return;
+    };
+    for node in nodes {
+        let failing_for = inputs.collected_at.saturating_sub(node.since);
+        let (what, why) = match node.problem {
+            crate::grill::image::CollectionProblem::Refused => (
+                "is refused",
+                "it can't read the OCI spec of one of its container bundles, so it can't \
+                 tell which unpacked images are in use and removes none",
+            ),
+            crate::grill::image::CollectionProblem::Failed => {
+                ("fails", "a pass hit a filesystem error partway through")
+            }
+        };
+        report.warnings.push(WtfFinding {
+            id: "image-collection-failing".to_string(),
+            title: format!(
+                "node {}'s image collection {what}, so its unpacked images are never removed",
+                node.node_id
+            ),
+            details: vec![
+                format!("{why}; it has for {failing_for} s"),
+                format!(
+                    "unpacked images take {} bytes on the node, and each new image version adds its own",
+                    node.unpacked_bytes
+                ),
+            ],
+            suggestion: format!(
+                "node {}'s Bun log says why (`image collection skipped` or `image collection \
+                 failed`); fix that bundle or the filesystem, and the next pass, at the next \
+                 container start from an image, removes what no container uses",
+                node.node_id
+            ),
+            correlated_events: Vec::new(),
+            affected_resource: format!("node.{}", node.node_id),
+        });
+    }
+}
+
 fn check_cpu_throttling(inputs: &WtfInputs, report: &mut WtfReport) {
     let Some(observations) = inputs.applications.cpu_throttling.value() else {
         return;
@@ -1898,9 +1949,10 @@ pub(super) mod tests {
     use crate::relish::wtf::{
         AlertObservation, BackupObservation, CertificateObservation, CouncilObservation,
         CpuThrottleObservation, DeployObservation, DiskObservation, ExportHoldObservation,
-        FaultObservation, GitOpsObservation, IsolationObservation, LaunchFailureObservation,
-        LogObservation, NodeGitOpsDifference, NodeIsolation, NodeObservation, RegistryObservation,
-        ReplicaObservation, RestartObservation, ServiceObservation, TokenObservation,
+        FaultObservation, GitOpsObservation, ImageCollectionObservation, IsolationObservation,
+        LaunchFailureObservation, LogObservation, NodeGitOpsDifference, NodeIsolation,
+        NodeObservation, RegistryObservation, ReplicaObservation, RestartObservation,
+        ServiceObservation, TokenObservation,
     };
 
     pub(in crate::relish::wtf) const NOW: u64 = 2_000_000;
@@ -1941,6 +1993,7 @@ pub(super) mod tests {
                     used_percent: 20.0,
                 }]),
                 export_holds: available(Vec::new()),
+                image_collection: available(Vec::new()),
                 certificates: available(vec![CertificateObservation {
                     certificate_kind: "node".to_string(),
                     identity: "node-1".to_string(),
@@ -2035,6 +2088,7 @@ pub(super) mod tests {
                 faults: gone(),
                 disks: gone(),
                 export_holds: gone(),
+                image_collection: gone(),
                 certificates: gone(),
                 registry: gone(),
                 tokens: gone(),
@@ -2416,6 +2470,65 @@ pub(super) mod tests {
         assert_eq!(report.node_count, 1);
         assert_eq!(report.summary.ok_count, report.ok.len());
         assert!(report.ok.iter().any(|ok| ok.id == "nodes"));
+    }
+
+    /// #2524: a node whose image collection is refused never removes an
+    /// unpacked image; only Bun's log said so.
+    #[test]
+    fn a_refused_image_collection_is_a_warning_naming_the_node() {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.image_collection = available(vec![ImageCollectionObservation {
+            node_id: "node-1".to_string(),
+            problem: crate::grill::image::CollectionProblem::Refused,
+            since: NOW - 120,
+            unpacked_bytes: 3 << 30,
+        }]);
+
+        let report = diagnose(&inputs);
+
+        let finding = report
+            .warnings
+            .iter()
+            .find(|finding| finding.id == "image-collection-failing")
+            .expect("an image-collection-failing warning");
+        assert_eq!(finding.affected_resource, "node.node-1");
+        assert!(finding.title.contains("is refused"), "{}", finding.title);
+        assert!(
+            finding.details[0].contains("120 s"),
+            "{:?}",
+            finding.details
+        );
+        assert!(
+            finding.details[1].contains(&(3u64 << 30).to_string()),
+            "{:?}",
+            finding.details
+        );
+    }
+
+    /// #2524: an image store close to full is `disk-high` on the images
+    /// domain, like any other.
+    #[test]
+    fn a_full_image_filesystem_is_reported_by_the_disk_check() {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.disks = available(vec![DiskObservation {
+            filesystem_id: None,
+            node_id: "node-1".to_string(),
+            storage_domains: vec!["images".to_string()],
+            used_bytes: 90,
+            total_bytes: 100,
+            used_percent: 90.0,
+        }]);
+
+        let report = diagnose(&inputs);
+
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|finding| finding.id == "disk-high" && finding.title.contains("images")),
+            "{:?}",
+            report.warnings
+        );
     }
 
     /// A failing export holds the store's retention, which only Bun's log

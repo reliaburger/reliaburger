@@ -202,5 +202,18 @@ pub(super) async fn images_handler(
         )
         .is_ok()
     });
-    Json(serde_json::json!({ "images": images })).into_response()
+    // What each image's unpacked copies take on this node, by digest
+    // (#2524). A node that can't read its own store still lists images.
+    let unpacked = state
+        .static_capabilities
+        .diagnostics
+        .image_store
+        .unpacked_sizes()
+        .await
+        .unwrap_or_default();
+    let unpacked: std::collections::BTreeMap<&String, &u64> = unpacked
+        .iter()
+        .filter(|(digest, _)| images.iter().any(|image| image.digest == **digest))
+        .collect();
+    Json(serde_json::json!({ "images": images, "unpacked": unpacked })).into_response()
 }
