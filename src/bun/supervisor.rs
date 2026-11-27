@@ -1343,9 +1343,16 @@ mod tests {
                 .unwrap_or_default()
                 .is_empty()
         );
+        // The runtime pins its subnet in `.network-leases.json` (and its
+        // lock) when it's built (#2420); no refused app may leave a bundle.
         assert!(
             std::fs::read_dir(root.path().join("bundles"))
-                .map(|mut entries| entries.next().is_none())
+                .map(|entries| entries.filter_map(Result::ok).all(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".network-leases")
+                }))
                 .unwrap_or(true)
         );
     }
