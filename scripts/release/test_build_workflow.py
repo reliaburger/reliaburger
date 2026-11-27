@@ -121,7 +121,7 @@ class ProfilingBuildTests(unittest.TestCase):
         self.assertIn("RUSTFLAGS: -C force-frame-pointers=yes", self.job)
         self.assertIn("CARGO_PROFILE_RELEASE_DEBUG: line-tables-only", self.job)
         self.assertIn('CARGO_PROFILE_RELEASE_STRIP: "false"', self.job)
-        self.assertIn("dtolnay/rust-toolchain@1.98.0", self.job)
+        self.assertIn("toolchain: 1.98.0", self.job)
 
     def test_it_builds_what_the_shipped_linux_aarch64_build_builds(self):
         shipped = next(entry for entry in build_matrix(self.text) if entry["suffix"] == "linux-aarch64")

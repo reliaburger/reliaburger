@@ -11,9 +11,9 @@ This file is the short version. The longer records are:
 - [docs/releasing.md](docs/releasing.md#compatibility-before-100), for the full upgrade steps between each pair of releases;
 - the [GitHub release pages](https://github.com/reliaburger/reliaburger/releases), for the binaries and every merged pull request.
 
-## [Unreleased] - 0.3.3
+## [0.3.3] - 2026-11-27
 
-Not released yet: this is what the train carries, and it can change before the tag.
+Loose ends before outside testers: the bugs they would see first, Buildah on the appliance, the appliance console, and fixes from the Wyse lab. [Release page](https://github.com/reliaburger/reliaburger/releases/tag/v0.3.3), [release log](docs/release-log.md#033-loose-ends-before-outside-testers).
 
 ### Upgrading
 
@@ -75,6 +75,11 @@ Not released yet: this is what the train carries, and it can change before the t
 - Two quick Smoker kills of a two-replica app can no longer take the last replica. A killed instance reads `running` until its node's sweep notices it has gone, so a kill now stays on `relish fault list` for 10 s and counts against the replica rail meanwhile ([#2151](https://github.com/reliaburger/reliaburger/issues/2151)).
 - `relish netboot --stream-logs` and `relish machines logs` flush each line to the machine's log file as they print it, so a printed line is always on disk.
 - `relish apply --wait` exits 4, with `lease_held` and the holder in `-o json`, when another holder's lease refuses the apply, as its exit table says; it had exited 5 as a plain conflict.
+
+### Known issues
+
+- [#2128](https://github.com/reliaburger/reliaburger/issues/2128): one registry deploy case stalled for five minutes after an injected disk fault in 0.3.0's gate. It didn't recur in 0.3.1's, 0.3.2's or 0.3.3's gates, and the cause isn't proven.
+- The Wyse lab hasn't run on 0.3.3: the release went out before it, and the lab runs on the released artefacts ([#407](https://github.com/reliaburger/reliaburger/issues/407)).
 
 ## [0.3.2] - 2026-11-23
 

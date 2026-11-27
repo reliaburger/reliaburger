@@ -1192,6 +1192,19 @@ with `git show` into a variable and matches it with `case`, not `git show | grep
 `set -o pipefail`, `grep -q` exits at its first match, `git show` can die of `SIGPIPE`
 writing the rest, and the pipeline then reports failure for a file that matched.
 
+"The maintainer labels it at code freeze" is a habit, though, and a habit is what the audit
+of November 2026 found doing the work of a lock
+([#2483](https://github.com/reliaburger/reliaburger/issues/2483)). `main`'s ruleset forbade
+deleting the branch and rewriting its history, and nothing else: no required check, no required
+pull request. An unlabelled gate PR ran the light set, went green, and its merge button worked.
+There are two halves to fixing that. The code half is ours: the evidence gate now refuses a
+`release-*` pull request into `main` that's out of draft and has no `release-gate` label, with
+a message saying to add it, and `open_train.py` opens the gate PR as a draft. The other half is
+a repository setting, a ruleset that makes `ignored-test evidence` a required check on `main`,
+and changing who may merge what is the maintainer's call, not an agent's. So the runbook now
+says which ruleset enforces each sentence, and gives the one `gh api` command that shows whether
+it does.
+
 Three weeks later we undid the split. By November the macOS queue was worse, not better:
 over three days, 147 macOS jobs queued a median of 6.9 minutes, but 90 at p90. The job logs
 said why. Shard 3 of one run spent 30 minutes compiling and 3.1 testing; on `main`, with a
@@ -1375,6 +1388,28 @@ now, which runs on every change anyway, so a train PR asks for 9 runners instead
 queue group for 18 instead of 20. A queue group that changes only documentation now skips the
 code jobs as a pull request does, since its code is the code of the group in front of it.
 Two of the window's 32 groups would have.
+
+"Only documentation" turned out to be the risky phrase. `is_docs_only` named a few files
+under `docs/` that tests read, then called the rest documentation. But the suite reads the
+release log, the book chapters and the qualification records, relish's concept-budget test
+reads `docs/testing/concept-budget.json`, and relish packs the book, the design docs and
+`testing.md` into its source bundle. A pull request that edited one of those ran no Rust test,
+nor did its queue group, and the first run to notice was the push after it landed, with the
+train already red for every group behind it
+([#2485](https://github.com/reliaburger/reliaburger/issues/2485)). So the rule is inverted:
+under `docs/`, only the plans, talks, research notes and the PDF configuration are
+documentation, and everything else is code until shown otherwise. A list of exceptions
+rots the day a new test reads a new file; a list of things nothing reads rots much more
+slowly. A test also greps `src/` and `tests/` for `"docs/...` literals and asserts that none
+of them names a file the selector would skip.
+
+The benchmark output had a smaller version of the same mistake. Its name is `gossip`, because
+`make bench` once ran only the gossip benchmarks, and it was set by gossip paths alone. Then
+the scheduler's planning pass and policy evaluation joined the same target, and a pull request
+that changed either, or broke their benchmark's build, didn't run them until the merge queue
+([#2493](https://github.com/reliaburger/reliaburger/issues/2493)). The output keeps its name,
+since renaming it touches the workflow and two test files for no change in behaviour, and now also
+fires for `benches/scheduler.rs`, `benches/policy.rs` and the modules they import.
 
 Together that's about a quarter of the window's runner-minutes, 5,700 of 22,120, that no
 longer compete with the PRs an author is waiting for. What we didn't do matters as much.
@@ -1689,6 +1724,18 @@ The candidate build rests only on a push or nightly run in which `portable macOS
 runs `ci.yml` itself. What we gave up is a day: a macOS break can now sit on a train until the
 nightly finds it, instead of being refused at the door.
 
+Except the nightly didn't run. Not once. We'd reasoned our way to a separate workflow precisely
+because GitHub schedules from the default branch, and then merged that workflow into the train,
+not `main`. A scheduled workflow GitHub can't see on `main` doesn't exist as far as GitHub is
+concerned: `gh run list --workflow macos-nightly.yml` answered "workflow not found on the
+default branch", and it couldn't be started by hand either. The train got macOS runs only by
+accident, on the two pushes that followed a docs-only merge group
+([#2481](https://github.com/reliaburger/reliaburger/issues/2481)). The fix is a rule and a check.
+The rule: a schedule-only workflow (one that only `schedule` or `workflow_dispatch` starts) goes
+to `main` in its own small PR. The check: `open_train.py` lists `main`'s workflows before it
+writes anything, and refuses to open a train while the local tree has a schedule-only one that
+`main` lacks.
+
 What didn't we do? We didn't make the macOS job `continue-on-error` in the queue: it would
 still take a runner for an hour and still set each group's length, only without counting. We
 didn't shard it again: three shards each compiled the whole crate, which is why it became one
@@ -1704,6 +1751,16 @@ whatever its labels say. A new `lint` output carries "there's code to lint" on i
 the expensive run still going. `appliance.yml` and `build.yml` follow the same rule. And the
 cargo-fuzz job no longer runs on pull requests. Its 14 to 33 minutes now run only nightly and
 by hand, while the portable suite still feeds every target its checked-in corpus on each PR.
+
+That nightly had the macOS nightly's blind spot twice over
+([#2482](https://github.com/reliaburger/reliaburger/issues/2482)). A scheduled run checks out
+`main`, and `fuzz.yml` had no step to move it anywhere else, so a decoder changed on a train got
+no fuzzing until the gate PR merged, which is the day the release is built. It now has the same
+"newest train, else `main`" step as the other two nightlies, with `fetch-depth: 0` so the train's
+branch is there to pick. `mutants.yml` already had the step, but only the train's copy did: the
+copy on `main`, the one GitHub schedules, was still the old weekly run of `main`. All three files
+go to `main` in their own pull request, and a test holds each of them to the same rule: nightly,
+never on pull requests, and on the newest train.
 
 ### A release gate that fits in a week
 
@@ -1852,6 +1909,19 @@ find is a bug for the next patch release.
 What we didn't do is move release builds onto the new quiet host. It's tempting, since it's
 fast and it's ours, but a release build is the one place where "who could have touched this
 machine?" must have a boring answer. Hosted runners give that.
+
+The runner isn't the only thing in that answer, though. The build job runs two
+third-party actions, the Rust toolchain installer and the build cache, before
+it runs `cargo build`, and both were referenced by tags like `@v2`. A tag is a
+pointer its owner can move. Someone who moved `rust-cache`'s `v2` to a commit
+that tampers with the restored `target/` directory would get a release that is
+signed with our key and attested as "built by `build.yml` on `main`", and
+both statements would be true. So every third-party action is now pinned to a
+commit, with its tag in a comment for Dependabot to update
+([#2405](https://github.com/reliaburger/reliaburger/issues/2405)), and a test
+refuses a `uses:` line that isn't. The toolchain action used to carry the
+compiler version in its tag (`@1.98.0`); pinned to a commit, it takes the
+version as a `toolchain:` input instead.
 
 ### A key nobody else trusts
 
@@ -10720,7 +10790,16 @@ with someone else's build measures that build.
 
 ### What we found
 
-Twenty nodes is a check (`make test-hollow`). The measured runs went through
+Twenty nodes is a check (`make test-hollow`), and so, later, was a hundred nodes holding a
+thousand apps, against the cluster summary's 1 s budget. For a while nobody ran either. The
+ignored-test owner check was satisfied, because the reason names a `make` target that exists,
+and the design doc said "Manual", but no document said whose hand and when
+([#2489](https://github.com/reliaburger/reliaburger/issues/2489)). "Manual" without a name is
+"never". The target now has a row in `testing.md`'s table of manual gates, with the maintainer
+as owner and the changes that call for a run, and a test fails when a `make` target that runs
+ignored tests is in neither a workflow nor that table. Putting it in CI is the better answer,
+but the hundred-node budget has never been timed on a hosted runner, and a 1 s budget measured
+on a Mac Studio is a guess about a two-core VM. The measured runs went through
 `scripts/release/qualify-hollow-nodes.sh` on an M1 Max with 64 GB, one size at
 a time ([record](../qualification/2026-10-28-hollow-nodes.md)):
 
@@ -10744,6 +10823,7 @@ grew was everything that meets the fleet one node at a time:
   about 600 a second, against the 200 a second a thousand nodes send on a
   five-second interval (a refused worker tries again). The planned reporting tree ([#364](https://github.com/reliaburger/reliaburger/issues/364))
   is meant for exactly this; now we know it's needed well before 10,000.
+  The refusals themselves are fixed; the next section shows how.
 - **The API.** Twenty small applies took 32 ms each at the median at 100
   nodes and 2.6 s at 1,000, while the Raft commits underneath stayed at 25 ms.
   A thousand placement reconcilers polling the leader every two seconds is
@@ -10759,6 +10839,151 @@ record treats the gossip and failure times as upper bounds for real hardware,
 not predictions. But a fixed limit of 16 report connections doesn't come from
 a slow laptop, and it would have stayed hidden
 behind "10,000 (target)" until somebody built that fleet.
+
+### Sixteen connections
+
+The report refusals turned out to be three limits stacked on top of each
+other, and only the first was the one the record named
+([#1411](https://github.com/reliaburger/reliaburger/issues/1411)).
+
+A worker opens a fresh TCP connection for every message, and every tick sends
+two or three: the state report, the capability report and, when the agent has
+evidence, readiness. Five hundred nodes on a five-second interval is about 250
+connections a second, and nodes that started together tick together, so they
+arrive in bursts. The listener read 16 of them at a time and closed the rest
+on the spot. That was the first limit.
+
+A connection it did read put its report on a queue for the aggregator, also 16
+deep, with `try_send`: a full queue meant no acknowledgement, which the worker
+counts as refused. That was the second.
+
+The third was why the queue was full. After every message the aggregator
+published its whole view on a `watch` channel, and building the view clones
+every node's latest report. That's O(N) work per message and O(N) messages per
+interval, so the leader's reporting work grew with the square of the fleet.
+Worse, each report also refreshed the freshness table against gossip's member
+list with `members.iter().any(...)` inside a `retain`: another N × N, twice per
+message. At 500 nodes that's a quarter of a million string comparisons per
+report.
+
+A test reproduces it without the rest of the harness.
+`five_hundred_workers_report_to_one_leader_without_a_refusal`, in
+`tests/reporting_tcp.rs`, starts one aggregator on a real socket, fed a
+500-member gossip list, and 500 real `ReportWorker`s with fake agents, all at
+once, so their ticks line up the way they do after a leader change, when
+every worker re-points and reports at the same moment. Each worker's
+transport is wrapped in a `CountingSender` that counts the sends the leader
+didn't admit. Wrapping works because `ReportWorker` is generic over the
+`ReportingTransport` trait: the test supplies its own implementation and the
+worker can't tell. Before the fix, 4,684 of 6,000 sends in 32 seconds were
+refused, and 49 nodes never made it into the leader's view at all.
+
+We had four candidate fixes: a cap sized from the membership, backpressure
+instead of refusal, long-lived multiplexed connections, or jittered report
+ticks. Multiplexing would also save a TLS handshake per message, but it's a
+new protocol, and the reporting tree
+([#364](https://github.com/reliaburger/reliaburger/issues/364)) will change
+who connects to whom anyway. Jitter spreads the steady state but does nothing
+for the burst after a leader change. A bigger cap only moves the cliff. So:
+backpressure, and stop doing quadratic work.
+
+**Wait, don't refuse.** The accept loop now takes a slot from a
+`tokio::sync::Semaphore` *before* it calls `accept()`:
+
+```rust
+let permit = tokio::select! {
+    _ = shutdown.cancelled() => break,
+    permit = Arc::clone(&capacity).acquire_owned() => match permit {
+        Ok(permit) => permit,
+        Err(_) => break,
+    },
+};
+```
+
+The permit moves into the connection's task and goes back to the semaphore
+when the task ends, because dropping an `OwnedSemaphorePermit` releases it
+(chapter 5 has the details). With every slot taken, the loop simply stops
+accepting. New connections wait in the kernel's listen backlog, and their
+senders wait with them, inside the deadlines they already had: five seconds
+to connect, ten for the whole send. The limit went from 16 to 64 because
+there's no longer anything to gain from keeping it tiny; it bounds memory
+(each slot may hold a frame of up to 1 MiB), not admissions. A stalled peer
+still can't make the listener spawn a task, which is what the old cap was
+for: the unit test that used to check a refusal now holds every slot with
+half-written frames, checks that one more report isn't read, frees a slot,
+and checks the waiting report goes through.
+
+There was a hole in that. The November 2026 audit
+([#2364](https://github.com/reliaburger/reliaburger/issues/2364)) found it in
+the 16-slot listener, and the change above kept it: the slot is taken at
+accept, before the TLS handshake, so 64 sockets that never send a byte still
+hold every slot, and an honest node's report waits behind them
+until it times out. Waiting instead of refusing doesn't help when the thing
+you wait for never comes. Chapter 11 splits the budget in two: connections
+that haven't delivered a whole frame get slots of their own, and the oldest of
+them makes room for a newcomer once it has stalled for a second
+([#2380](https://github.com/reliaburger/reliaburger/issues/2380)).
+
+The queue works the same way: `tx.send(...).await` instead of `try_send`, so
+a report that finds the queue full waits for room. That wait sits inside the
+connection's ten-second accept deadline, and only a report that made it onto
+the queue is acknowledged. A queue that never drains still can't produce a
+false acknowledgement, and
+`a_report_that_never_finds_room_is_not_acknowledged` checks exactly that, on
+a paused clock so the ten seconds cost nothing.
+
+**Publish once per burst.** The aggregator's `select!` now starts with
+`biased;` (chapter 17 explains it: arms are polled in order rather than at
+random). The timers and watches come first so a busy queue can't starve
+them, then the report queue, then one last arm:
+
+```rust
+_ = std::future::ready(()), if unpublished > 0 => {
+    self.publish();
+    unpublished = 0;
+}
+```
+
+`std::future::ready(())` is a future that's finished the moment it's polled,
+and the `if` guard switches the arm off when there's nothing to publish.
+Because it's polled last, it only wins when the report queue had nothing
+ready: the aggregator stores everything that's queued, then publishes once. A
+long burst still publishes every 256 reports, so nobody waits for the end of
+it. Consumers lose nothing, because a `watch` channel only ever holds the
+latest value anyway. The membership check builds a `HashSet` once per call
+instead of scanning the list once per entry.
+
+That still left the membership check running once per report, a walk over
+the whole member list each time: O(N) per message, O(N²) per interval again,
+just with a smaller constant. The audit caught it too
+([#2440](https://github.com/reliaburger/reliaburger/issues/2440)). The
+freshness table only depends on the member list and the leadership epoch, so
+now it's reconciled when one of them changes: at construction, in the
+membership watch's arm of the `select!`, and when the epoch moves (a cheap
+integer comparison on every report notices that). The test that pins it,
+`a_report_does_not_rebuild_the_state_once_per_message`, counts work instead
+of timing it. A `#[cfg(test)]` field on the aggregator counts publishes and
+reconciliations (the attribute compiles the field, and every line touching
+it, only into test builds, so production carries none of it). With 200
+members and a queued burst of 200 reports it sees no reconciliation at all
+and at most two publishes. Two, not one, because tokio makes a task yield
+after about 128 channel operations, its *cooperative budget*, so one burst
+reaches the last `select!` arm twice.
+
+After the fix the same test admits all 6,000 sends with every node in the
+view, and 1,000 workers admit all 12,000. The full harness agrees: on the Mac
+Studio, 500 hollow nodes went from 17,223 refused admissions to none
+([record](../qualification/2026-11-24-hollow-nodes-report-admission.md)).
+
+A thousand hollow nodes still logged resets, and they taught us where the
+next limit is. The leader's process sat at 8% CPU with its listen backlog
+full. The slots weren't waiting on the leader; they were waiting on the
+clients. A fleet process too starved to keep its own agent loops on time
+connects, then writes its frame late, and the slot waits for it. Real nodes
+aren't a thousand tasks sharing ten threads, so that's mostly the harness
+measuring itself, and splitting the fleet across machines
+([#1413](https://github.com/reliaburger/reliaburger/issues/1413)) is how
+we'll find out how much.
 
 ## Files nobody could read
 

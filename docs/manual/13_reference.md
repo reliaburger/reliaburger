@@ -384,6 +384,14 @@ under systemd or another supervisor yourself. Bun's own data goes where
 | `[storage] allowed_host_paths` | `[]`: absolute prefixes a volume or `config_file` `source` may mount from; empty refuses every host path, and the directories above are always refused (see `images-and-volumes`) |
 | `[storage] audit_max_bytes` | `67108864` (64 MiB): the bound on the audit log in `{data}/audit`, which `relish audit` reads; at least 64 KiB (see `security`) |
 
+Fixed limits on the image directory, not settings (see `images-and-volumes`):
+
+| Limit | Value |
+|-------|-------|
+| One image's unpacked file content | 16 GiB, and at most the image filesystem's free space less 1 GiB |
+| One image's files (tar entries, across all layers) | 1,000,000 |
+| Unpacked images no container uses | collected at most hourly after a create from an image, or at once when the image filesystem is 95% full; anything a pull handed out, or an interrupted unpack left, within the last hour stays |
+
 ## Node config sections
 
 Every section is optional, and an unknown key is an error, so a typo fails at
@@ -397,7 +405,8 @@ startup instead of being ignored.
 | `[resources]` | CPU and memory held back for the node itself (`500m` or `0.5` cores, `512Mi`) |
 | `[network]` | `advertise_address`, host `port_range` (default `{ start = 10000, end = 32767 }`, end exclusive: below Linux's ephemeral range; ports something on the host already listens on are skipped) |
 | `[security]` | master key, bootstrap and identity paths, `require_mtls` (default `true`: `bun --cluster` refuses to start without an identity from `relish init` or `relish join`; `false` is the explicit plaintext opt-in, and single-node `bun` ignores it; a plaintext cluster with no master key takes a node's placement poll and rollout-failure report without a service token, and refuses the first API token with 409 "refusing to create the first API token: this plaintext cluster has no master key, …" until every node has the same `master_key_path`, see `security`), `bootstrap_peers` (joining nodes through the perimeter), `operator_cidrs` (your networks to the API port only, see `security`), `leaf_lifetime_override_secs` (development only, see below), `[security.tokens] default_ttl` (the lifetime of a new deployer or read-only token, `"90d"` unless set; see `security`) |
-| `[ebpf]`, `[dns]`, `[ingress]` | the data plane (see `networking`); `[dns] upstream` defaults to the host's `/etc/resolv.conf` nameservers |
+| `[ebpf]`, `[dns]` | the data plane (see `networking`); `[dns] upstream` defaults to the host's `/etc/resolv.conf` nameservers |
+| `[ingress]` | `enabled` (false), `http_port` (80), `https_port` (443), `tls_cert` and `tls_key` (both or neither), `max_connections` (10,000 requests in flight, WebSockets included; past it, 503), `max_request_body_bytes` (10 MiB; past it, 413), `request_body_budget_bytes` (256 MiB shared by every body being buffered; past it, 503), `max_open_connections` (32,768 connections across both listeners; past it, the connection is closed), `max_tls_handshakes_per_source` (16 TLS handshakes in progress from one client address; past it, the connection is dropped). A request body that sends nothing for 30 s gets 408, and a response is cut after 30 s with no byte from the app (see `networking`) |
 | `[images]` | registry, pull-through cache, mirrors, trust policy and upstream rules (see `security`), builds (`build_timeout_secs`, `max_context_bytes`, `build_cache_max_bytes`: 100 GiB, 2 GiB on a quickstart, 1 GiB on an appliance; see `images-and-volumes`) |
 | `[metrics]`, `[logs]`, `[alerts]` | observability (see `observability`) |
 | `[gitops]`, `[upgrades]` | see `operations` |

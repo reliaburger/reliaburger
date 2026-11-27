@@ -440,8 +440,16 @@ def sealed_context(sealed, current):
     return dict(sealed)
 
 
+TRAIN_BRANCH = re.compile(r'^release-\d+-\d+-\d+$')
+
+
+def ready_gate_pull_request(head_ref, base_ref, draft):
+    """True for a train's gate PR into main once it's out of draft."""
+    return bool(head_ref) and TRAIN_BRANCH.match(head_ref) is not None and base_ref == 'main' and not draft
+
+
 def aggregate(root, manifest_path, incoming, context, needs, bindings_path=None, event=None,
-              release_gate=False):
+              release_gate=False, head_ref=None, base_ref=None, draft=False):
     """Waited job results and trusted output hashes authorize artifact consumption.
 
     `event` is the workflow's own event name. Only a pull request may qualify
@@ -449,8 +457,13 @@ def aggregate(root, manifest_path, incoming, context, needs, bindings_path=None,
     merge group with every owner but portable macOS (`train-full`, maintainer
     decision of 24 November 2026); the command line always passes it.
     `release_gate` is true for a pull request labelled `release-gate`, which
-    needs every owner, macOS included (#1443).
+    needs every owner, macOS included (#1443). A gate PR (`head_ref` a
+    `release-*` train, `base_ref` main) that is out of draft must carry that
+    label, or the light set would let it merge (#2483).
     """
+    c.require(event != 'pull_request' or release_gate or not ready_gate_pull_request(head_ref, base_ref, draft),
+              f'{head_ref} into main is ready for review without the release-gate label: add the label, '
+              'which runs every owner, or mark it a draft')
     root, incoming = Path(root), Path(incoming)
     manifest = c.inventory(c.read_json(manifest_path), root)
     changes = needs.get('changes', {}).get('outputs', {})
@@ -551,6 +564,10 @@ def main(argv=None):
         parser.add_argument('--' + name)
     parser.add_argument('--release-gate', choices=['true', 'false'], default='false',
                         help="whether the pull request carries the release-gate label")
+    parser.add_argument('--head-ref', default='', help="the pull request's head branch")
+    parser.add_argument('--base-ref', default='', help="the branch the pull request targets")
+    parser.add_argument('--draft', choices=['true', 'false'], default='false',
+                        help="whether the pull request is a draft")
     args = parser.parse_args(argv)
     context = dict(commit=args.commit, run_id=args.run_id, attempt=args.attempt)
     if args.operation == 'archive':
@@ -607,6 +624,9 @@ def main(argv=None):
             args.ignored_bindings,
             event=args.event,
             release_gate=args.release_gate == 'true',
+            head_ref=args.head_ref,
+            base_ref=args.base_ref,
+            draft=args.draft == 'true',
         )
         return 0
     c.require(args.gate and args.host and args.github_output, 'current owner gate/host/output required')

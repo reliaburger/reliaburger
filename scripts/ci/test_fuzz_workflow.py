@@ -121,6 +121,19 @@ class FuzzWorkflowTests(unittest.TestCase):
         self.assertNotIn("pull_request", triggers)
         self.assertNotIn("pull_request", self.text)
 
+    def test_the_nightly_fuzzes_the_newest_train(self):
+        # A scheduled run checks out main. Train work lands on release-*
+        # first, so without this step a decoder changed on a train got no
+        # fuzzing until the gate PR merged (#2482).
+        text = WORKFLOW.read_text()
+        self.assertIn("git branch -r --list 'origin/release-*'", text)
+        self.assertIn("sort -V | tail -n 1", text)
+        self.assertIn("fetch-depth: 0", text)
+        choose = text.index("name: Choose what to fuzz")
+        self.assertLess(choose, text.index("uses: dtolnay/rust-toolchain@"))
+        self.assertIn('echo "fuzzing $ref at', text)
+        self.assertRegex(text, r"(?m)^      ref:\n        description: ")
+
     def test_every_decoder_has_a_source_file(self):
         found = decoders()
         self.assertGreaterEqual(len(found), 9)

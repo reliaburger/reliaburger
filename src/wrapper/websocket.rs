@@ -18,6 +18,9 @@ use tokio::net::TcpStream;
 /// Cap on the backend's handshake response head we buffer before giving up.
 const MAX_HANDSHAKE_HEAD: usize = 16 * 1024;
 
+/// Most of a refused upgrade's body we relay to the client (#2470).
+const MAX_REFUSAL_BODY: usize = 64 * 1024;
+
 /// Deadline for the backend WebSocket handshake (connect + request + response
 /// head). Bounds a backend that accepts TCP but never completes the handshake,
 /// so it can't pin the handler, its permit, and the drain guard forever (M16).
@@ -53,8 +56,10 @@ pub fn is_websocket_upgrade(req: &Request<Body>) -> bool {
 /// Forwards the backend's own `101` response (including its
 /// `Sec-WebSocket-Accept` header) to the client, then splices the client's
 /// upgraded connection to the backend socket with
-/// [`tokio::io::copy_bidirectional`]. Returns `502 Bad Gateway` if the
-/// backend refuses the upgrade or the connection fails.
+/// [`tokio::io::copy_bidirectional`]. A backend that answers with a final
+/// status other than 101 has its answer relayed, body bounded (#2470).
+/// Returns `502 Bad Gateway` if the connection fails, the handshake times
+/// out, or the answer isn't a well-formed HTTP head.
 ///
 /// `permit` is the proxy's connection permit and `drain_guard` the optional
 /// drain accounting guard. Both are `Box<dyn Any>` so the WebSocket module
@@ -65,8 +70,7 @@ pub fn is_websocket_upgrade(req: &Request<Body>) -> bool {
 pub async fn handle_websocket_upgrade(
     mut req: Request<Body>,
     backend: SocketAddr,
-    remote: SocketAddr,
-    over_tls: bool,
+    view: &super::proxy::ClientView,
     permit: tokio::sync::OwnedSemaphorePermit,
     drain_guard: Option<Box<dyn std::any::Any + Send>>,
     terminate: Vec<tokio_util::sync::CancellationToken>,
@@ -80,7 +84,8 @@ pub async fn handle_websocket_upgrade(
     // but never completes the WebSocket handshake would otherwise pin this
     // handler, its connection permit, and the drain guard indefinitely — the
     // 30s reqwest timeout only covers the non-WS path.
-    let upgrade_request = build_upgrade_request(&req, backend, remote, over_tls);
+    let upgrade_request = build_upgrade_request(&req, view);
+    let started = tokio::time::Instant::now();
     let handshake = tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, async {
         let mut backend_stream = TcpStream::connect(backend).await.ok()?;
         backend_stream
@@ -106,8 +111,16 @@ pub async fn handle_websocket_upgrade(
     let Some(handshake) = parse_handshake(&head) else {
         return StatusCode::BAD_GATEWAY.into_response();
     };
-    if !handshake.is_switching_protocols {
-        return StatusCode::BAD_GATEWAY.into_response();
+    if handshake.status != StatusCode::SWITCHING_PROTOCOLS {
+        // A backend that refuses the upgrade (401, 403, 429, a redirect to
+        // a login page) made an application decision: relay it, so the
+        // client doesn't retry what looks like a gateway fault (#2470). An
+        // informational status other than 101 is a broken handshake.
+        if handshake.status.is_informational() {
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+        let deadline = started + WS_HANDSHAKE_TIMEOUT;
+        return relay_refusal(handshake, leftover, backend_stream, deadline).await;
     }
 
     // Rebuild the backend's 101 for the client, carrying its handshake
@@ -167,18 +180,82 @@ pub async fn handle_websocket_upgrade(
 
 /// The parsed backend handshake response.
 struct Handshake {
-    is_switching_protocols: bool,
+    status: StatusCode,
     headers: Vec<(String, String)>,
 }
 
-/// Parse a raw HTTP/1.1 response head into its status and end-to-end headers.
+/// Turn a backend's refusal of an upgrade into the client's response: its
+/// status and end-to-end headers, and its body, bounded by
+/// [`MAX_REFUSAL_BODY`] and by what is left of the handshake deadline. This
+/// path holds a request permit and a drain count, so it must not wait long.
 ///
-/// Drops hop-by-hop framing headers we regenerate (`Connection`/`Upgrade` are
-/// kept — they're part of the WebSocket handshake the client must see).
+/// The body is the `Content-Length` bytes the backend declared, or what it
+/// sends before closing. A chunked body isn't decoded: the client gets the
+/// status and headers with an empty body.
+async fn relay_refusal(
+    handshake: Handshake,
+    leftover: Vec<u8>,
+    mut backend_stream: TcpStream,
+    deadline: tokio::time::Instant,
+) -> Response {
+    let header = |name: &str| {
+        handshake
+            .headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    };
+    let chunked = header("transfer-encoding").is_some();
+    let declared = header("content-length").and_then(|value| value.parse::<usize>().ok());
+    let want = declared.unwrap_or(MAX_REFUSAL_BODY).min(MAX_REFUSAL_BODY);
+    let mut body = leftover;
+    if chunked {
+        body.clear();
+    } else {
+        let mut chunk = [0u8; 4096];
+        while body.len() < want {
+            match tokio::time::timeout_at(deadline, backend_stream.read(&mut chunk)).await {
+                Ok(Ok(n)) if n > 0 => body.extend_from_slice(&chunk[..n]),
+                _ => break,
+            }
+        }
+        body.truncate(want);
+    }
+
+    let mut connection_tokens = std::collections::HashSet::new();
+    if let Some(value) = header("connection") {
+        for token in value.split(',') {
+            connection_tokens.insert(token.trim().to_ascii_lowercase());
+        }
+    }
+    let mut builder = Response::builder().status(handshake.status);
+    for (name, value) in &handshake.headers {
+        let lower = name.to_ascii_lowercase();
+        if super::proxy::is_hop_by_hop(&lower)
+            || connection_tokens.contains(&lower)
+            || lower == "content-length"
+        {
+            continue;
+        }
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(Body::from(body))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
+/// Parse a raw HTTP/1.1 response head into its status and headers.
+///
+/// `None` when the status line has no three-digit status code.
 fn parse_handshake(head: &str) -> Option<Handshake> {
     let mut lines = head.split("\r\n");
     let status_line = lines.next()?;
-    let is_switching_protocols = status_line.starts_with("HTTP/1.1 101");
+    let code = status_line
+        .strip_prefix("HTTP/1.")?
+        .split(' ')
+        .nth(1)
+        .filter(|code| code.len() == 3)?;
+    let status = StatusCode::from_u16(code.parse().ok()?).ok()?;
 
     let mut headers = Vec::new();
     for line in lines {
@@ -188,10 +265,7 @@ fn parse_handshake(head: &str) -> Option<Handshake> {
         let (name, value) = line.split_once(':')?;
         headers.push((name.trim().to_string(), value.trim().to_string()));
     }
-    Some(Handshake {
-        is_switching_protocols,
-        headers,
-    })
+    Some(Handshake { status, headers })
 }
 
 /// Read from `stream` until the end of the HTTP head (`\r\n\r\n`).
@@ -229,12 +303,9 @@ fn find_head_end(buf: &[u8]) -> Option<usize> {
 /// headers are dropped and replaced with the proxy's own view (ING5/M9): a
 /// client opening a WebSocket must not be able to spoof `X-Forwarded-For` and
 /// lie to a backend that trusts it for rate-limiting or IP allow-listing.
-fn build_upgrade_request(
-    req: &Request<Body>,
-    backend: SocketAddr,
-    remote: SocketAddr,
-    over_tls: bool,
-) -> String {
+/// `Host` is the one the client sent, not the backend's address (#2404).
+fn build_upgrade_request(req: &Request<Body>, view: &super::proxy::ClientView) -> String {
+    let remote = view.address;
     let method = req.method().as_str();
     let path = req
         .uri()
@@ -242,7 +313,7 @@ fn build_upgrade_request(
         .map(|pq| pq.as_str())
         .unwrap_or("/");
 
-    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {backend}\r\n");
+    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {}\r\n", view.host);
 
     // Hop-by-hop headers and the ones the client's `Connection` names belong
     // to the client's leg, as on the plain HTTP path: `Proxy-Authorization`
@@ -281,7 +352,7 @@ fn build_upgrade_request(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("websocket");
     request.push_str(&format!("connection: upgrade\r\nupgrade: {upgrade}\r\n"));
-    for (name, value) in super::proxy::forwarded_headers(remote, over_tls) {
+    for (name, value) in super::proxy::forwarded_headers(view) {
         request.push_str(&format!("{name}: {value}\r\n"));
     }
     // The same proxy-owned headers as a plain request (F08): the client's
@@ -318,6 +389,16 @@ pub fn build_close_frame(status: u16) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The proxy's view of a client at `remote` that asked for `app.example`.
+    fn view(remote: SocketAddr, over_tls: bool) -> super::super::proxy::ClientView {
+        super::super::proxy::ClientView {
+            address: remote,
+            over_tls,
+            host: "app.example".to_string(),
+            port: if over_tls { 443 } else { 80 },
+        }
+    }
 
     fn make_ws_request() -> Request<Body> {
         Request::builder()
@@ -379,6 +460,22 @@ mod tests {
         assert!(is_websocket_upgrade(&req));
     }
 
+    /// #2470: the parsed handshake keeps the backend's status, so a refusal
+    /// can be relayed rather than turned into 502.
+    #[test]
+    fn parse_handshake_reports_the_backends_status() {
+        let refused = parse_handshake("HTTP/1.1 403 Forbidden\r\nX-Reason: no\r\n\r\n").unwrap();
+        assert_eq!(refused.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            refused.headers,
+            vec![("X-Reason".to_string(), "no".to_string())]
+        );
+        let switching = parse_handshake("HTTP/1.1 101 Switching Protocols\r\n\r\n").unwrap();
+        assert_eq!(switching.status, StatusCode::SWITCHING_PROTOCOLS);
+        assert!(parse_handshake("HTTP/1.1 abc Nope\r\n\r\n").is_none());
+        assert!(parse_handshake("garbage\r\n\r\n").is_none());
+    }
+
     #[test]
     fn close_frame_construction() {
         let frame = build_close_frame(1001);
@@ -400,12 +497,12 @@ mod tests {
     #[test]
     fn build_upgrade_request_format() {
         let req = make_ws_request();
-        let backend: SocketAddr = "10.0.2.2:8080".parse().unwrap();
         let remote: SocketAddr = "203.0.113.7:5000".parse().unwrap();
-        let raw = build_upgrade_request(&req, backend, remote, false);
+        let raw = build_upgrade_request(&req, &view(remote, false));
 
         assert!(raw.starts_with("GET /ws HTTP/1.1\r\n"));
-        assert!(raw.contains("Host: 10.0.2.2:8080\r\n"));
+        assert!(raw.contains("Host: app.example\r\n"));
+        assert!(!raw.contains("10.0.2.2"));
         assert!(raw.contains("upgrade: websocket\r\n"));
         assert!(raw.contains("sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n"));
         assert!(raw.ends_with("\r\n\r\n"));
@@ -431,9 +528,8 @@ mod tests {
             .header("X-End-To-End", "kept")
             .body(Body::empty())
             .unwrap();
-        let backend: SocketAddr = "10.0.2.2:8080".parse().unwrap();
         let remote: SocketAddr = "203.0.113.7:5000".parse().unwrap();
-        let raw = build_upgrade_request(&req, backend, remote, false).to_lowercase();
+        let raw = build_upgrade_request(&req, &view(remote, false)).to_lowercase();
 
         for dropped in [
             "\r\nproxy-authorization:",
@@ -471,9 +567,8 @@ mod tests {
             .header("Forwarded", "for=1.2.3.4")
             .body(Body::empty())
             .unwrap();
-        let backend: SocketAddr = "10.0.2.2:8080".parse().unwrap();
         let remote: SocketAddr = "203.0.113.7:5000".parse().unwrap();
-        let raw = build_upgrade_request(&req, backend, remote, true).to_lowercase();
+        let raw = build_upgrade_request(&req, &view(remote, true)).to_lowercase();
 
         // The spoofed client value is gone; the proxy's real view is present.
         assert!(
@@ -484,6 +579,30 @@ mod tests {
         assert!(raw.contains("x-forwarded-proto: https\r\n"));
         // Exactly one x-forwarded-for line (no duplicate from the client).
         assert_eq!(raw.matches("x-forwarded-for:").count(), 1);
+    }
+
+    /// #2404: the upgrade carries the host the client asked for, as `Host`
+    /// and `X-Forwarded-Host`, and never the client's own forwarded host.
+    #[test]
+    fn build_upgrade_request_keeps_the_clients_host() {
+        let req = Request::builder()
+            .uri("/ws")
+            .header(header::HOST, "app.example")
+            .header(header::CONNECTION, "Upgrade")
+            .header(header::UPGRADE, "websocket")
+            .header("X-Forwarded-Host", "evil.example")
+            .header("X-Forwarded-Port", "1")
+            .body(Body::empty())
+            .unwrap();
+        let remote: SocketAddr = "203.0.113.7:5000".parse().unwrap();
+        let raw = build_upgrade_request(&req, &view(remote, false));
+
+        assert!(raw.contains("Host: app.example\r\n"), "{raw}");
+        assert_eq!(raw.to_lowercase().matches("\r\nhost:").count(), 1, "{raw}");
+        assert!(!raw.contains("evil.example"), "{raw}");
+        assert!(raw.contains("x-forwarded-host: app.example\r\n"), "{raw}");
+        assert!(raw.contains("x-forwarded-port: 80\r\n"), "{raw}");
+        assert_eq!(raw.matches("x-forwarded-port:").count(), 1, "{raw}");
     }
 
     /// F08: the upgrade carries the same proxy-owned headers as a plain
@@ -499,9 +618,8 @@ mod tests {
             .header("X-Real-IP", "1.2.3.4")
             .body(Body::empty())
             .unwrap();
-        let backend: SocketAddr = "10.0.2.2:8080".parse().unwrap();
         let remote: SocketAddr = "203.0.113.7:5000".parse().unwrap();
-        let raw = build_upgrade_request(&req, backend, remote, false).to_lowercase();
+        let raw = build_upgrade_request(&req, &view(remote, false)).to_lowercase();
 
         assert!(!raw.contains("1.2.3.4"), "client x-real-ip leaked: {raw}");
         assert!(raw.contains("x-real-ip: 203.0.113.7\r\n"), "{raw}");
@@ -524,9 +642,8 @@ mod tests {
             .header("X-Request-ID", "client-supplied-id-123")
             .body(Body::empty())
             .unwrap();
-        let backend: SocketAddr = "10.0.2.2:8080".parse().unwrap();
         let remote: SocketAddr = "203.0.113.7:5000".parse().unwrap();
-        let raw = build_upgrade_request(&req, backend, remote, false).to_lowercase();
+        let raw = build_upgrade_request(&req, &view(remote, false)).to_lowercase();
         assert!(
             raw.contains("x-request-id: client-supplied-id-123\r\n"),
             "{raw}"
@@ -542,9 +659,8 @@ mod tests {
             .header(header::COOKIE, "rb_session=abc123; theme=dark")
             .body(Body::empty())
             .unwrap();
-        let backend: SocketAddr = "10.0.2.2:8080".parse().unwrap();
         let remote: SocketAddr = "203.0.113.7:5000".parse().unwrap();
-        let raw = build_upgrade_request(&req, backend, remote, false);
+        let raw = build_upgrade_request(&req, &view(remote, false));
         assert!(!raw.contains("rb_session"), "{raw}");
         assert!(raw.contains("cookie: theme=dark\r\n"), "{raw}");
     }

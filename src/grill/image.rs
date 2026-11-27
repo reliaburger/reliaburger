@@ -4,7 +4,9 @@
 /// GHCR, etc.) using the OCI Distribution API. Layers are cached as
 /// content-addressed blobs and unpacked into a rootfs directory that
 /// runc can use directly.
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
@@ -14,6 +16,9 @@ use oci_client::manifest::OciDescriptor;
 
 use super::oci_pull::retry_registry_read;
 use super::whiteout::{self, LayerEntries, LayerEntry};
+
+mod gc;
+pub use gc::RootfsGcReport;
 
 /// A parsed OCI image reference.
 ///
@@ -302,6 +307,62 @@ pub type ClusterFetchFuture<'a> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<Option<LocalImageBlobs>, String>> + Send + 'a>,
 >;
 
+/// Most bytes of file content one unpack may write, across all of an
+/// image's layers (#2385). A gzip of zeros expands about a thousandfold,
+/// so a layer's compressed size says nothing about this.
+pub const MAX_UNPACKED_BYTES: u64 = 16 << 30;
+
+/// Most tar entries one unpack may read, across all of an image's layers,
+/// whiteouts and skipped device nodes included.
+pub const MAX_UNPACKED_ENTRIES: u64 = 1_000_000;
+
+/// Free space an unpack always leaves on the image filesystem, so a large
+/// image can't take the room logs, metrics and the Raft log need.
+pub const UNPACK_FREE_RESERVE_BYTES: u64 = 1 << 30;
+
+/// Ceilings on what one unpack may write (#2385).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnpackLimits {
+    /// Bytes of file content, counted from each entry's header before it is
+    /// written (a sparse file counts its full size).
+    pub max_bytes: u64,
+    /// Tar entries read.
+    pub max_entries: u64,
+}
+
+impl Default for UnpackLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: MAX_UNPACKED_BYTES,
+            max_entries: MAX_UNPACKED_ENTRIES,
+        }
+    }
+}
+
+/// The per-generation publication locks of an [`ImageStore`].
+type GenerationLocks = tokio::sync::Mutex<HashMap<PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>>;
+
+/// What an [`ImageStore`]'s clones share about unpacking.
+#[derive(Default)]
+struct UnpackState {
+    /// Ceilings on each unpack, before the free-space reserve lowers them.
+    limits: UnpackLimits,
+    /// One lock per generation directory being published or collected
+    /// (#2456). Re-unpacking a generation clears its directory, which can
+    /// destroy a running container's rootfs; the lock and a marker check
+    /// under it make a second pull reuse the published tree instead.
+    /// Different images never wait for each other. An entry lives while
+    /// someone holds its lock and is dropped afterwards.
+    generation_locks: GenerationLocks,
+    /// When each generation was last handed to a caller. A caller names
+    /// the generation in its bundle only after `pull_and_unpack` returns, so
+    /// until then this record is what keeps the collector off it (#2423).
+    handed_out: tokio::sync::Mutex<HashMap<PathBuf, std::time::Instant>>,
+    /// When the last collection pass started. Held for the whole pass, so
+    /// at most one runs at a time.
+    last_collection: std::sync::Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
+}
+
 /// Content-addressed image store on disk.
 ///
 /// Disk layout:
@@ -322,11 +383,10 @@ pub struct ImageStore {
     /// clones (the runc grill holds one). A lock-free `OnceLock` read
     /// sits on every pull, a set happens at most once.
     cluster_source: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<dyn ClusterImageSource>>>,
-    /// Serialises generation publication across clones. Re-unpacking the same
-    /// generation clears its directory, which can destroy a running
-    /// container's rootfs; the completion marker makes subsequent pulls reuse
-    /// the published tree instead.
-    unpack_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Unpack limits and the locks and records shared by every clone's
+    /// unpacks and collections. One `Arc` for all of them keeps the store
+    /// small: the runtime enums that hold it are moved around by value.
+    unpacking: std::sync::Arc<UnpackState>,
     /// Added to every file's uid and gid at unpack time, so a user
     /// namespace mapping container id 0 to this host id sees the image's
     /// own ownership (see `grill::userns`). `None` keeps the unpacking
@@ -348,7 +408,7 @@ impl ImageStore {
             store_root,
             blob_store: std::sync::Arc::new(std::sync::OnceLock::new()),
             cluster_source: std::sync::Arc::new(std::sync::OnceLock::new()),
-            unpack_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            unpacking: std::sync::Arc::default(),
             owner_shift: None,
             mirrors: ImageMirrors::default(),
         }
@@ -365,6 +425,32 @@ impl ImageStore {
         self.blob_store
             .set(store)
             .map_err(|_| "runtime blob store already configured".into())
+    }
+
+    /// Unpack with `limits` instead of the defaults.
+    pub fn with_unpack_limits(mut self, limits: UnpackLimits) -> Self {
+        self.unpacking = std::sync::Arc::new(UnpackState {
+            limits,
+            ..UnpackState::default()
+        });
+        self
+    }
+
+    /// The limits for the next unpack: the store's own, with the byte ceiling
+    /// lowered to the image filesystem's free space less
+    /// [`UNPACK_FREE_RESERVE_BYTES`]. A filesystem that can't be measured
+    /// leaves the store's limits as they are.
+    async fn unpack_limits_now(&self) -> UnpackLimits {
+        let mut limits = self.unpacking.limits;
+        if let Ok(usage) =
+            crate::bun::disk_pressure::FilesystemUsage::measure(&self.store_root).await
+        {
+            let room = usage
+                .available_bytes
+                .saturating_sub(UNPACK_FREE_RESERVE_BYTES);
+            limits.max_bytes = limits.max_bytes.min(room);
+        }
+        limits
     }
 
     /// Try `mirrors` before an image's own registry for digest-pinned pulls.
@@ -411,20 +497,80 @@ impl ImageStore {
         layer_paths: Vec<PathBuf>,
         rootfs: PathBuf,
     ) -> Result<PathBuf, ImageError> {
-        let _guard = self.unpack_lock.lock().await;
         let generation = self.rootfs_generation_path(&rootfs, &layer_paths);
-        let complete = generation.with_extension("complete");
-        if complete.is_file() {
+        // A published generation needs no lock: its marker is written only
+        // after the tree is flushed, and atomically, so reading it is safe
+        // while any other image unpacks (#2456).
+        if self.claim_published(&generation).await {
             return Ok(generation);
         }
-        let target = generation.clone();
+        let lock = self.generation_lock(&generation).await;
+        let published = {
+            let _guard = lock.lock().await;
+            self.publish_generation(layer_paths, &generation).await
+        };
+        drop(lock);
+        self.release_generation_locks().await;
+        published.map(|()| generation)
+    }
+
+    /// The publication lock of `generation`, made on first use.
+    async fn generation_lock(&self, generation: &Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        self.unpacking
+            .generation_locks
+            .lock()
+            .await
+            .entry(generation.to_path_buf())
+            .or_default()
+            .clone()
+    }
+
+    /// Forget the locks nobody holds or waits for: the map's own reference
+    /// is then the only one.
+    async fn release_generation_locks(&self) {
+        self.unpacking
+            .generation_locks
+            .lock()
+            .await
+            .retain(|_, lock| std::sync::Arc::strong_count(lock) > 1);
+    }
+
+    /// Unpack `layer_paths` into `generation` and publish it, unless another
+    /// pull published it while this one waited. The caller holds the
+    /// generation's lock.
+    async fn publish_generation(
+        &self,
+        layer_paths: Vec<PathBuf>,
+        generation: &Path,
+    ) -> Result<(), ImageError> {
+        if self.claim_published(generation).await {
+            return Ok(());
+        }
+        let target = generation.to_path_buf();
+        let complete = generation.with_extension("complete");
         let owner_shift = self.owner_shift;
+        let limits = self.unpack_limits_now().await;
         tokio::task::spawn_blocking(move || {
-            unpack_layers_with_owner(&layer_paths, &target, owner_shift)?;
+            if let Err(error) = unpack_layers_with_owner(&layer_paths, &target, owner_shift, limits)
+            {
+                // Nothing runs from a generation without its marker: the
+                // partial tree is only disk taken (#2385).
+                if let Err(cleanup) = std::fs::remove_dir_all(&target)
+                    && cleanup.kind() != std::io::ErrorKind::NotFound
+                {
+                    eprintln!(
+                        "warning: could not remove partial image tree {}: {cleanup}",
+                        target.display()
+                    );
+                }
+                return Err(error);
+            }
             // The marker is the only thing a later pull checks. Flush the
             // unpacked tree before writing it: after a power cut the V02 soak
             // found `.complete` present and `redis-server` empty, and every
-            // redeploy failed with "exec format error".
+            // redeploy failed with "exec format error". `syncfs` waits for
+            // every writer on the filesystem, but only this generation's
+            // lock is held meanwhile, so it delays this image alone.
             sync_filesystem(&target)?;
             crate::sesame::identity::atomic_write(&complete, b"complete\n")?;
             Ok::<(), ImageError>(())
@@ -434,7 +580,113 @@ impl ImageStore {
             digest: "join".to_string(),
             reason: e.to_string(),
         })??;
-        Ok(generation)
+        // The marker was written under the generation's lock, which the
+        // collector also takes: nothing can have retired it since.
+        self.claim_published(generation).await;
+        Ok(())
+    }
+
+    /// Hand `generation` to a caller if it is published, recording when.
+    /// The marker check and the record share one lock with the collector's
+    /// own check-and-retire, so a generation this returns `true` for is never
+    /// retired under the caller.
+    async fn claim_published(&self, generation: &Path) -> bool {
+        let mut handed_out = self.unpacking.handed_out.lock().await;
+        if !generation.with_extension("complete").is_file() {
+            return false;
+        }
+        handed_out.insert(generation.to_path_buf(), std::time::Instant::now());
+        true
+    }
+
+    /// Start a collection pass unless one is running or the last one started
+    /// less than `interval` ago. A full image filesystem collects at once.
+    /// The pass lasts as long as the returned guard.
+    pub async fn start_collection(
+        &self,
+        interval: Duration,
+    ) -> Option<tokio::sync::OwnedMutexGuard<Option<std::time::Instant>>> {
+        let mut pass = self
+            .unpacking
+            .last_collection
+            .clone()
+            .try_lock_owned()
+            .ok()?;
+        let due = pass.is_none_or(|started| started.elapsed() >= interval)
+            || crate::bun::disk_pressure::FilesystemUsage::measure(&self.store_root)
+                .await
+                .is_ok_and(|usage| usage.is_pressured());
+        if !due {
+            return None;
+        }
+        *pass = Some(std::time::Instant::now());
+        Some(pass)
+    }
+
+    /// Remove every rootfs generation whose canonical path is not in `live`,
+    /// then the cached manifests and pin metadata only those generations
+    /// needed (#2423).
+    ///
+    /// A generation handed out by a pull less than `grace` ago is kept, as
+    /// is a marker-less tree (an unpack that never finished) younger than
+    /// `grace`. Each generation is removed under its own publication lock,
+    /// and one an unpack holds is skipped, so the pass never waits for an
+    /// unpack and an unpack waits for at most one removal.
+    pub async fn collect_rootfs_garbage(
+        &self,
+        live: &HashSet<PathBuf>,
+        grace: Duration,
+    ) -> std::io::Result<RootfsGcReport> {
+        let live = live.clone();
+        let store_root = self.store_root.clone();
+        let state = self.unpacking.clone();
+        let report = tokio::task::spawn_blocking(move || {
+            // Compare canonical paths: the live set comes from bundle
+            // markers, which hold the canonical lower directory.
+            let live: HashSet<PathBuf> = live
+                .into_iter()
+                .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
+                .collect();
+            let mut report = RootfsGcReport::default();
+            for generation in gc::generations(&store_root.join("rootfs"))? {
+                let canonical = std::fs::canonicalize(&generation).unwrap_or(generation.clone());
+                if live.contains(&canonical) {
+                    continue;
+                }
+                let lock = state
+                    .generation_locks
+                    .blocking_lock()
+                    .entry(generation.clone())
+                    .or_default()
+                    .clone();
+                let Ok(_publishing) = lock.try_lock_owned() else {
+                    continue; // an unpack is filling or reusing it
+                };
+                // Checked and retired under one lock: a pull either claims
+                // the generation first, and it stays, or finds no marker.
+                let published = {
+                    let mut handed_out = state.handed_out.blocking_lock();
+                    handed_out.retain(|_, at| at.elapsed() < grace);
+                    if handed_out.contains_key(&generation) {
+                        continue;
+                    }
+                    gc::retire_marker(&generation)?
+                };
+                if gc::remove_tree_after(&generation, published, grace)? {
+                    if published {
+                        report.generations_removed += 1;
+                    } else {
+                        report.partials_removed += 1;
+                    }
+                }
+            }
+            gc::tidy_store(&store_root, grace, &mut report)?;
+            Ok::<_, std::io::Error>(report)
+        })
+        .await
+        .map_err(std::io::Error::other)?;
+        self.release_generation_locks().await;
+        report
     }
 
     /// The content-addressed rootfs generation directory for a set of
@@ -844,13 +1096,13 @@ impl ImageStore {
         // marker is written only after the unpacked tree is flushed: the
         // same proof a registry pull relies on before reusing it.
         let generation = self.rootfs_generation_path(rootfs, &layer_paths);
-        generation
-            .with_extension("complete")
-            .is_file()
-            .then_some(PulledImage {
-                rootfs: generation,
-                config,
-            })
+        if !self.claim_published(&generation).await {
+            return None;
+        }
+        Some(PulledImage {
+            rootfs: generation,
+            config,
+        })
     }
 
     /// Unpack blobs the cluster already holds, re-checking the config
@@ -939,15 +1191,18 @@ fn sha256_hex(data: &[u8]) -> String {
 /// A whiteout never follows a symlink, and never removes an entry of its
 /// own layer, wherever it sits in the layer's tar.
 pub fn unpack_layers(layer_paths: &[PathBuf], rootfs: &Path) -> Result<(), ImageError> {
-    unpack_layers_with_owner(layer_paths, rootfs, None)
+    unpack_layers_with_owner(layer_paths, rootfs, None, UnpackLimits::default())
 }
 
 /// [`unpack_layers`], optionally shifting every entry's owner by
-/// `owner_shift` (the layer's uid 0 becomes host uid `owner_shift`).
+/// `owner_shift` (the layer's uid 0 becomes host uid `owner_shift`), and
+/// failing once the layers together pass either of `limits`. A failed
+/// unpack leaves what it had written; the caller removes it.
 pub fn unpack_layers_with_owner(
     layer_paths: &[PathBuf],
     rootfs: &Path,
     owner_shift: Option<u32>,
+    limits: UnpackLimits,
 ) -> Result<(), ImageError> {
     // Clear and recreate rootfs
     if rootfs.exists() {
@@ -961,6 +1216,7 @@ pub fn unpack_layers_with_owner(
         reason: format!("failed to create rootfs: {e}"),
     })?;
 
+    let (mut bytes, mut entries) = (0u64, 0u64);
     for layer_path in layer_paths {
         let digest = layer_path
             .file_name()
@@ -989,6 +1245,28 @@ pub fn unpack_layers_with_owner(
                 digest: digest.clone(),
                 reason: format!("failed to read tar entry: {e}"),
             })?;
+            // Count before writing: the entry that crosses a ceiling is
+            // never written. `size` is the expanded size of a sparse file.
+            entries += 1;
+            bytes = bytes.saturating_add(entry.size());
+            if entries > limits.max_entries {
+                return Err(ImageError::UnpackFailed {
+                    digest,
+                    reason: format!(
+                        "the image has more than {} entries, the unpack ceiling",
+                        limits.max_entries
+                    ),
+                });
+            }
+            if bytes > limits.max_bytes {
+                return Err(ImageError::UnpackFailed {
+                    digest,
+                    reason: format!(
+                        "the image expands past the unpack ceiling of {} bytes",
+                        limits.max_bytes
+                    ),
+                });
+            }
 
             let path = entry.path().map_err(|e| ImageError::UnpackFailed {
                 digest: digest.clone(),
@@ -1406,6 +1684,329 @@ mod tests {
             generation.join("live-sentinel").exists(),
             "a repeated pull must not clear a generation used by a running container"
         );
+    }
+
+    /// A layer blob at `{root}/{digest}/data`, the shape the store gives
+    /// every blob: the generation id hashes the parent directory's name.
+    fn blob_layer(root: &Path, digest: &str, files: &[(&str, &[u8])]) -> PathBuf {
+        let layer = root.join("blobs").join(digest).join("data");
+        std::fs::create_dir_all(layer.parent().unwrap()).unwrap();
+        create_test_layer(&layer, files);
+        layer
+    }
+
+    #[tokio::test]
+    async fn a_published_generation_is_returned_while_another_unpack_holds_the_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = blob_layer(tmp.path(), "aaaa", &[("bin/tool", b"tool")]);
+        let store = ImageStore::new(tmp.path().join("store"));
+        let tag_root = tmp.path().join("store/rootfs/docker.io/acme/web/v1");
+        let generation = store
+            .unpack_to(vec![layer.clone()], tag_root.clone())
+            .await
+            .unwrap();
+
+        // Something holds the generation's own lock, as a collection pass
+        // or a second pull of it would.
+        let lock = store.generation_lock(&generation).await;
+        let _busy = lock.lock().await;
+        let again = tokio::time::timeout(
+            Duration::from_secs(1),
+            store.unpack_to(vec![layer], tag_root),
+        )
+        .await;
+
+        assert!(
+            matches!(&again, Ok(Ok(path)) if *path == generation),
+            "{again:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unpack_of_one_image_does_not_wait_for_another() {
+        let tmp = tempfile::tempdir().unwrap();
+        let slow = blob_layer(tmp.path(), "aaaa", &[("bin/a", b"a")]);
+        let other = blob_layer(tmp.path(), "bbbb", &[("bin/b", b"b")]);
+        let store = ImageStore::new(tmp.path().join("store"));
+        let tag_root = tmp.path().join("store/rootfs/docker.io/acme/web/v1");
+        // The slow image's unpack holds its generation's lock throughout.
+        let slow_generation = store.rootfs_generation_path(&tag_root, &[slow]);
+        let lock = store.generation_lock(&slow_generation).await;
+        let _unpacking = lock.lock().await;
+
+        let unpacked = tokio::time::timeout(
+            Duration::from_secs(5),
+            store.unpack_to(vec![other], tag_root),
+        )
+        .await;
+
+        assert!(matches!(unpacked, Ok(Ok(_))), "{unpacked:?}");
+    }
+
+    #[tokio::test]
+    async fn the_collector_skips_a_generation_being_unpacked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().join("store"));
+        let partial = tmp
+            .path()
+            .join("store/rootfs/docker.io/acme/web/v1/gen-0123456789abcdef");
+        std::fs::create_dir_all(partial.join("bin")).unwrap();
+        let lock = store.generation_lock(&partial).await;
+        let unpacking = lock.lock().await;
+
+        let report = store
+            .collect_rootfs_garbage(&HashSet::new(), Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(partial.exists(), "a tree an unpack is filling stays");
+        assert_eq!(report.partials_removed, 0);
+
+        drop(unpacking);
+        drop(lock);
+        let report = store
+            .collect_rootfs_garbage(&HashSet::new(), Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(!partial.exists());
+        assert_eq!(report.partials_removed, 1);
+        assert!(
+            store.unpacking.generation_locks.lock().await.is_empty(),
+            "locks nobody holds are forgotten"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_generation_no_instance_uses_is_removed_and_a_live_one_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer_a = blob_layer(tmp.path(), "aaaa", &[("bin/a", b"a")]);
+        let layer_b = blob_layer(tmp.path(), "bbbb", &[("bin/b", b"b")]);
+        let store = ImageStore::new(tmp.path().join("store"));
+        let tag_root = tmp.path().join("store/rootfs/docker.io/acme/web/v1");
+
+        let a = store
+            .unpack_to(vec![layer_a], tag_root.clone())
+            .await
+            .unwrap();
+        let b = store.unpack_to(vec![layer_b], tag_root).await.unwrap();
+        assert_ne!(a, b);
+
+        let live = HashSet::from([std::fs::canonicalize(&a).unwrap()]);
+        let report = store
+            .collect_rootfs_garbage(&live, Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert!(a.exists());
+        assert!(a.with_extension("complete").is_file());
+        assert!(!b.exists());
+        assert!(!b.with_extension("complete").exists());
+        assert_eq!(report.generations_removed, 1);
+    }
+
+    #[tokio::test]
+    async fn a_partial_generation_older_than_the_grace_period_is_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().join("store"));
+        let tag = tmp.path().join("store/rootfs/docker.io/acme/web/v1");
+        // An unpack that died before its marker: a tree, no `.complete`.
+        let partial = tag.join("gen-0123456789abcdef");
+        std::fs::create_dir_all(partial.join("bin")).unwrap();
+        std::fs::write(partial.join("bin/half"), b"half").unwrap();
+
+        let kept = store
+            .collect_rootfs_garbage(&HashSet::new(), Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert!(
+            partial.exists(),
+            "a young partial tree may still be filling"
+        );
+        assert_eq!(kept.partials_removed, 0);
+
+        let removed = store
+            .collect_rootfs_garbage(&HashSet::new(), Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(!partial.exists());
+        assert_eq!(removed.partials_removed, 1);
+        assert!(
+            !tag.exists(),
+            "directories the collection empties are removed too"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_generation_handed_out_within_the_grace_period_is_kept() {
+        // Between `unpack_to` returning and the bundle's `rootfs-lower`
+        // marker (or config.json) naming it, no live set holds the
+        // generation: the store's own record of what it handed out does.
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = blob_layer(tmp.path(), "aaaa", &[("bin/a", b"a")]);
+        let store = ImageStore::new(tmp.path().join("store"));
+        let tag_root = tmp.path().join("store/rootfs/docker.io/acme/web/v1");
+        let generation = store.unpack_to(vec![layer], tag_root).await.unwrap();
+
+        let report = store
+            .collect_rootfs_garbage(&HashSet::new(), Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert!(generation.with_extension("complete").is_file());
+        assert_eq!(report.generations_removed, 0);
+    }
+
+    #[tokio::test]
+    async fn collection_removes_manifests_and_pin_metadata_of_removed_images() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().join("store"));
+        let root = tmp.path().join("store");
+        let hex = |c: char| std::iter::repeat_n(c, 64).collect::<String>();
+        let (kept_pin, gone_pin, config) = (hex('a'), hex('b'), hex('c'));
+        // A pinned image whose generation is live, and one whose is gone.
+        let kept_tag = root.join(format!(
+            "rootfs/docker.io/acme/web/sha256%3A{kept_pin}/gen-0123456789abcdef"
+        ));
+        std::fs::create_dir_all(&kept_tag).unwrap();
+        std::fs::write(kept_tag.with_extension("complete"), b"complete\n").unwrap();
+        let manifests = root.join("manifests/docker.io/acme/web");
+        std::fs::create_dir_all(&manifests).unwrap();
+        let kept_manifest = manifests.join(format!("sha256:{kept_pin}.json"));
+        let gone_manifest = manifests.join(format!("sha256:{gone_pin}.json"));
+        std::fs::write(&kept_manifest, b"{}").unwrap();
+        std::fs::write(&gone_manifest, b"{}").unwrap();
+        let metadata = root.join("metadata/sha256");
+        std::fs::create_dir_all(&metadata).unwrap();
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": format!("sha256:{config}"),
+                "size": 2
+            },
+            "layers": []
+        });
+        std::fs::write(metadata.join(&kept_pin), manifest.to_string()).unwrap();
+        std::fs::write(metadata.join(&config), b"{}").unwrap();
+        std::fs::write(metadata.join(&gone_pin), manifest.to_string()).unwrap();
+
+        let live = HashSet::from([std::fs::canonicalize(&kept_tag).unwrap()]);
+        let report = store
+            .collect_rootfs_garbage(&live, Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert!(kept_manifest.is_file());
+        assert!(!gone_manifest.exists());
+        assert!(metadata.join(&kept_pin).is_file());
+        assert!(metadata.join(&config).is_file(), "the kept pin's config");
+        assert!(!metadata.join(&gone_pin).exists());
+        assert_eq!(report.manifests_removed, 1);
+        assert_eq!(report.metadata_removed, 1);
+    }
+
+    #[tokio::test]
+    async fn a_second_collection_inside_the_interval_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().join("store"));
+        let interval = Duration::from_secs(3600);
+        let first = store.start_collection(interval).await;
+        assert!(first.is_some());
+        assert!(
+            store.start_collection(interval).await.is_none(),
+            "one pass at a time"
+        );
+        drop(first);
+        assert!(
+            store.start_collection(interval).await.is_none(),
+            "the next pass waits for the interval"
+        );
+        assert!(store.start_collection(Duration::ZERO).await.is_some());
+    }
+
+    /// Apparent bytes of every regular file under `root`.
+    fn tree_bytes(root: &Path) -> u64 {
+        let mut total = 0;
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let metadata = entry.metadata().unwrap();
+                if metadata.is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    total += metadata.len();
+                }
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn unpack_refuses_a_layer_that_expands_past_its_ceiling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = tmp.path().join("zeros.tar.gz");
+        // 8 MiB of zeros compresses to a few kilobytes.
+        create_test_layer(&layer, &[("fill", &vec![0u8; 8 << 20])]);
+        assert!(std::fs::metadata(&layer).unwrap().len() < 1 << 20);
+        let rootfs = tmp.path().join("rootfs");
+
+        let limits = UnpackLimits {
+            max_bytes: 1 << 20,
+            max_entries: 1_000,
+        };
+        let result = unpack_layers_with_owner(&[layer], &rootfs, None, limits);
+
+        match result {
+            Err(ImageError::UnpackFailed { reason, .. }) => {
+                assert!(reason.contains("1048576"), "{reason}")
+            }
+            other => panic!("expected the ceiling to refuse the layer, got {other:?}"),
+        }
+        assert!(tree_bytes(&rootfs) < 2 << 20);
+    }
+
+    #[test]
+    fn unpack_refuses_more_entries_than_its_ceiling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = tmp.path().join("many.tar.gz");
+        let names: Vec<String> = (0..10_000).map(|index| format!("f/{index}")).collect();
+        let files: Vec<(&str, &[u8])> =
+            names.iter().map(|name| (name.as_str(), &b""[..])).collect();
+        create_test_layer(&layer, &files);
+        let rootfs = tmp.path().join("rootfs");
+
+        let limits = UnpackLimits {
+            max_bytes: 1 << 30,
+            max_entries: 1_000,
+        };
+        let result = unpack_layers_with_owner(&[layer], &rootfs, None, limits);
+
+        match result {
+            Err(ImageError::UnpackFailed { reason, .. }) => {
+                assert!(reason.contains("1000 entries"), "{reason}")
+            }
+            other => panic!("expected the ceiling to refuse the layer, got {other:?}"),
+        }
+        let written = std::fs::read_dir(rootfs.join("f")).unwrap().count();
+        assert!(written <= 1_000, "{written} files written");
+    }
+
+    #[tokio::test]
+    async fn a_refused_unpack_leaves_no_partial_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = blob_layer(tmp.path(), "zeros", &[("fill", &vec![0u8; 4 << 20])]);
+        let store = ImageStore::new(tmp.path().join("store")).with_unpack_limits(UnpackLimits {
+            max_bytes: 1 << 20,
+            max_entries: 1_000,
+        });
+        let tag_root = tmp.path().join("store/rootfs/docker.io/acme/web/v1");
+        let generation = store.rootfs_generation_path(&tag_root, std::slice::from_ref(&layer));
+
+        assert!(store.unpack_to(vec![layer], tag_root).await.is_err());
+        assert!(!generation.exists(), "the partial tree stays on disk");
+        assert!(!generation.with_extension("complete").exists());
     }
 
     #[test]
@@ -1881,7 +2482,7 @@ mod tests {
             tar.into_inner().unwrap().finish().unwrap();
         }
         let rootfs = tmp.path().join("rootfs");
-        unpack_layers_with_owner(&[layer], &rootfs, Some(base)).unwrap();
+        unpack_layers_with_owner(&[layer], &rootfs, Some(base), UnpackLimits::default()).unwrap();
 
         let data = std::fs::metadata(rootfs.join("data")).unwrap();
         assert_eq!((data.uid(), data.gid()), (base + 999, base + 1000));

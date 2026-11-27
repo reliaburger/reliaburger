@@ -20,6 +20,15 @@ and CA, but an explicit endpoint doesn't borrow them. Plain `http://` is
 allowed only to a loopback address, so a bearer token never crosses the network
 in the clear.
 
+Over `https://`, `relish` accepts the server only if its certificate chains to
+that CA *and* is a cluster node's: it carries a node identity
+(`spiffe://reliaburger/node/<id>`), which only the Node CA issues. Workload and
+ingress certificates chain to the same root, so a workload that answers on
+the API port is refused before your token is sent. `relish` doesn't check the
+node's name against the address you gave it, and it has no revocation list: a
+removed node's certificate passes until it expires
+([#362](https://github.com/reliaburger/reliaburger/issues/362)).
+
 ### Reaching a node from another machine
 
 A clustered Linux node runs its own nftables perimeter firewall. Out of the box
@@ -91,6 +100,14 @@ relish token revoke ci-deploy
 | `deployer` | apply, deploy, stop and roll back workloads, inject workload faults |
 | `read-only` | status, logs, metrics and diagnostics (the default role) |
 
+No token reads an app's secrets back. The app's spec
+(`/v1/apps/{app}/{namespace}/spec`), the specs in its deploy history
+(`relish history`, `/v1/deploys/history/{app}`) and the dashboard's env page
+all show `[redacted]` for every env value, plain or encrypted, and for each
+inline config file's content, whatever the role. A `PROVIDER[...]` reference
+stays, because it names where the secret lives, not the secret. Only the
+nodes themselves read history whole, for a rollback.
+
 `--apps` and `--namespaces` narrow a token to those apps and namespaces. In the
 image registry that means repositories named `<namespace>/<app>` inside the
 scope; a scoped token can't push or pull a bare name like `api` at all (see
@@ -120,6 +137,16 @@ five seconds, so point a script at one node until then.
 you asked and on the leader, and on the others within about five seconds. If
 the node you asked is more than two seconds behind the leader, the message says
 so, and that node may accept the token until it catches up.
+
+A stream that is already open ends too. A followed log (`relish logs -f`), the
+event stream (`/v1/events?follow=true`), their WebSocket versions, the
+dashboard's live panes and the progress of `relish apply` or `relish rollback`
+re-check the token that opened them every 15 seconds. Once it's revoked or
+expired, the stream ends with a warning, `the token that opened this stream was
+revoked or has expired`, and a WebSocket closes with code 1008 (policy). A
+deploy whose progress stream ended this way carries on; follow it with
+`relish status`. A token rotated with a grace period keeps its streams open
+until the grace ends.
 
 If the leader doesn't answer within 20 seconds you get a `504`, and the write
 may have happened anyway. Repeating a `revoke` is safe, and a lost join token

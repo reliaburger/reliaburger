@@ -238,6 +238,9 @@ format 76, and a 0.3.1 cluster's leader refuses it
 0.3.3 keeps 0.3.2's pair, protocol 61 and state format 76, so a 0.3.2
 cluster can roll onto it in place
 ([upgrading from 0.3.2](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-032)).
+0.3.4 moves the pair to protocol 62 and state format 77, and a 0.3.3
+cluster's leader refuses it
+([upgrading from 0.3.3](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-033)).
 
 A laptop cluster says the same thing when you rerun the quickstart installer
 from a newer release over it. Its saved record names the release that set it

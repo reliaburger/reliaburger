@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use reliaburger::sesame::connection::{
-    ConnectionTimeouts, serve_router_over_tls, serve_router_plain,
+    ConnectionTimeouts, serve_router_over_tls, serve_router_plain, serve_router_plain_capped,
 };
 use reliaburger::wrapper::{proxy::bind_proxy_with_tls, routing::RoutingTable, tls, types};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -29,6 +29,7 @@ fn quick_timeouts() -> ConnectionTimeouts {
         write_stall: Duration::from_millis(400),
         tcp_keepalive_idle: Duration::from_secs(60),
         tcp_keepalive_interval: Duration::from_secs(15),
+        request_body_idle: Duration::from_millis(300),
     }
 }
 
@@ -538,5 +539,73 @@ async fn ingress_websocket_stays_open_past_the_idle_deadline() {
         .expect("websocket closed by the idle deadline")
         .unwrap();
     assert_eq!(&echo, b"ping");
+    shutdown.cancel();
+}
+
+/// #2383: a plain listener with a connection cap drops a socket past it at
+/// once, keeps the ones it holds, and serves a new one when a slot frees.
+/// Before the cap, every accepted socket got a task, however many there were.
+#[tokio::test]
+async fn plain_listener_refuses_connections_past_its_cap() {
+    let timeouts = ConnectionTimeouts {
+        request_head: Duration::from_secs(30),
+        ..quick_timeouts()
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let shutdown = CancellationToken::new();
+    let cap = Arc::new(tokio::sync::Semaphore::new(4));
+    tokio::spawn(serve_router_plain_capped(
+        listener,
+        router(Arc::new(tokio::sync::Mutex::new(None))),
+        timeouts,
+        Arc::clone(&cap),
+        shutdown.clone(),
+    ));
+
+    let mut held = Vec::new();
+    for _ in 0..4 {
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream.write_all(b"G").await.unwrap();
+        held.push(stream);
+    }
+    // The listener accepts in order; give it a moment to hold all four.
+    let started = Instant::now();
+    while cap.available_permits() > 0 && started.elapsed() < CLOSE_WITHIN {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let mut fifth = tokio::net::TcpStream::connect(address).await.unwrap();
+    let _ = fifth
+        .write_all(b"GET /ok HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await;
+    let mut answer = Vec::new();
+    let read = tokio::time::timeout(CLOSE_WITHIN, fifth.read_to_end(&mut answer)).await;
+    assert!(
+        !String::from_utf8_lossy(&answer).starts_with("HTTP/1.1 200"),
+        "a connection past the cap was served"
+    );
+    assert!(read.is_ok(), "a connection past the cap was left open");
+
+    // The four held connections are still open.
+    for stream in &held {
+        let mut probe = [0u8; 1];
+        assert!(
+            matches!(stream.try_read(&mut probe), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "a connection under the cap was closed"
+        );
+    }
+
+    drop(held.pop());
+    let started = Instant::now();
+    while cap.available_permits() == 0 {
+        assert!(
+            started.elapsed() < CLOSE_WITHIN,
+            "a closed connection never freed its slot"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    one_keep_alive_request(&mut stream).await;
     shutdown.cancel();
 }
