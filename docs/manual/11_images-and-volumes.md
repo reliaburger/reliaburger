@@ -133,8 +133,13 @@ one that names none runs where its app does.
 ## Storage ceiling
 
 `[images] max_storage` bounds each node's compressed CAS blob, temporary upload
-and repository authority receipt payload bytes. The store also allows at most
-65,536 payload files, including empty uploads and receipts. Registry pushes, peer replication,
+and repository authority receipt payload bytes. `[images] max_files` (default
+65,536) caps the payload files the store holds, with or without `max_storage`:
+each pushed blob is two files (the blob and its receipt), and an upload in
+progress is one more. A write over that cap is refused with HTTP 413 and
+`image store holds 65536 files, the limit set by [images] max_files`, so you
+can tell it from the byte limit. Raise it, or delete tags you don't need and
+let expiry and GC free the files. Registry pushes, peer replication,
 upstream cache fills and runtime image pulls share this ceiling. An upload chunk
 that would exceed it is refused before writing, with HTTP 413 from the registry.
 A pull checks the sizes the image's manifest gives before it downloads

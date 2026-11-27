@@ -1435,7 +1435,10 @@ async fn blob_upload_complete(
         Err(super::types::PickleError::InvalidUploadId(_)) => {
             StatusCode::BAD_REQUEST.into_response()
         }
-        Err(error @ super::types::PickleError::StorageQuotaExceeded) => registry_write_error(error),
+        Err(
+            error @ (super::types::PickleError::StorageQuotaExceeded
+            | super::types::PickleError::StorageFileLimitExceeded { .. }),
+        ) => registry_write_error(error),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -1549,7 +1552,10 @@ const INDEX_MEDIA_TYPES: [&str; 2] = [
 
 fn registry_write_error(error: super::types::PickleError) -> Response {
     let status = match error {
-        super::types::PickleError::StorageQuotaExceeded => StatusCode::PAYLOAD_TOO_LARGE,
+        super::types::PickleError::StorageQuotaExceeded
+        | super::types::PickleError::StorageFileLimitExceeded { .. } => {
+            StatusCode::PAYLOAD_TOO_LARGE
+        }
         super::types::PickleError::LeaseDenied(_) => StatusCode::FORBIDDEN,
         super::types::PickleError::ReplicationFailed(_)
         | super::types::PickleError::RegistryNeedsMtls => StatusCode::SERVICE_UNAVAILABLE,
@@ -5639,6 +5645,30 @@ mod tests {
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::ACCEPTED, "{name}");
         }
+    }
+
+    /// #2431: a push refused for the file count tells the client which
+    /// limit it hit and the setting that raises it.
+    #[tokio::test]
+    async fn a_push_refused_for_the_file_count_names_the_limit() {
+        let (state, _dir) = test_state();
+        state.store.configure_file_limit(0).unwrap();
+        let app = test_router(state);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v2/web/blobs/uploads/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        let message = body["errors"][0]["message"].as_str().unwrap();
+        assert!(message.contains("0 files"), "{message}");
+        assert!(message.contains("[images] max_files"), "{message}");
     }
 
     #[tokio::test]

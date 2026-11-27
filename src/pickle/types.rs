@@ -1197,6 +1197,13 @@ pub struct AttachSignature {
 pub enum PickleError {
     #[error("physical image storage quota exceeded")]
     StorageQuotaExceeded,
+    /// The store holds as many payload files as `[images] max_files` allows
+    /// (#2431). Each uploaded blob is two files: the blob and its receipt.
+    #[error(
+        "image store holds {limit} files, the limit set by [images] max_files; \
+         raise it, or let GC reclaim unused images"
+    )]
+    StorageFileLimitExceeded { limit: usize },
     /// Lease authority or exact repository ownership could not be established.
     #[error("repository lease denied: {0}")]
     LeaseDenied(String),

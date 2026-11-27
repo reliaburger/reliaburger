@@ -1235,6 +1235,8 @@ Everything here counts **effective holders**: the nodes recorded as holding a bl
 
 **Recovery:** Expiry bounds growth: superseded and deleted tags leave after `gc_retain_days`, and the next GC tick frees their blobs. Lower `gc_retain_days`, delete tags you don't need, or raise `max_storage`.
 
+The store also caps its payload files at `[images] max_files` (default 65,536), with or without a byte limit, because a byte ceiling can't bound empty uploads or tiny receipts. Each pushed blob is two files, the blob and its receipt. Hitting the cap is a separate error, `PickleError::StorageFileLimitExceeded`, also `413`, whose message names the count and the setting (#2431). The same recovery applies, or raise `max_files`.
+
 ### 7.5 GC Race Conditions
 
 **Scenario:** Two nodes each hold one of the two copies of an unreferenced blob and both nominate it.

@@ -1262,6 +1262,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         )
         .await
         .context("cannot account physical image storage")?;
+    blob_store
+        .configure_file_limit(config.images.max_files)
+        .context("cannot set images.max_files")?;
 
     // Instance records + process log files ({data}/instances). Started
     // workloads are recorded here so a future bun process (crash restart or
