@@ -2,9 +2,9 @@
 
 Design document for the Mustard gossip protocol and the Raft consensus layer in Reliaburger. Covers cluster membership, failure detection, leader election, state reconstruction, and catastrophic recovery.
 
-**Status:** Draft
+**Status:** Reconciled with the code for 0.3.4 (§4.3 to §4.5 on 27 November 2026, #2510). Sections that describe something not built say so: the two-level reporting tree (§3.5), the recovery-candidate list (§3.2, §4.5, §5.5) and gossip key rotation (§8.1).
 **Whitepaper reference:** Section 8 (Leader Election & State Management)
-**Last updated:** 2026-02-16
+**Last updated:** 2026-11-27
 
 ---
 
@@ -468,72 +468,34 @@ struct ResourceSummary {
 
 ### 4.3 Raft Entries
 
+The Raft log is openraft's, and each entry's payload is a `RaftRequest` (`src/council/types.rs`): one variant per kind of change to the council's state machine. A few of them, to give the shape:
+
 ```rust
-/// A single entry in the Raft log.
-#[derive(Serialize, Deserialize)]
-struct RaftEntry {
-    term: u64,
-    index: u64,
-    payload: RaftPayload,
-}
-
-#[derive(Serialize, Deserialize)]
-enum RaftPayload {
-    /// An app spec was created or updated.
-    AppSpec {
-        app_name: String,
-        spec: AppSpec,
-        /// SHA-256 of the serialised spec for cheap equality checks.
-        spec_hash: [u8; 32],
-    },
-    /// An app was deleted.
-    AppDelete {
-        app_name: String,
-    },
-    /// A scheduling decision was made by Meat.
-    SchedulingDecision {
-        app_name: String,
-        placements: Vec<Placement>,
-    },
-    /// A secret was created or updated.
-    SecretSet {
-        name: String,
-        /// Encrypted with the council's shared key (age encryption).
-        encrypted_value: Vec<u8>,
-    },
-    /// A secret was deleted.
-    SecretDelete {
-        name: String,
-    },
-    /// Cluster configuration change.
-    ConfigChange {
-        key: String,
-        value: toml::Value,
-    },
-    /// Raft membership change.
-    CouncilChange(CouncilChange),
-    /// No-op entry used for leader commit confirmation.
-    Noop,
-}
-
-#[derive(Serialize, Deserialize)]
-enum CouncilChange {
-    AddMember { node_id: NodeId, address: SocketAddr },
-    RemoveMember { node_id: NodeId },
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-struct Placement {
-    node_id: NodeId,
-    instance_id: u32,
+pub enum RaftRequest {
+    /// Create or update an app.
+    AppSpec { app_id: AppId, spec: Box<AppSpec> },
+    /// Delete an app.
+    AppDelete { app_id: AppId },
+    /// Record a scheduling decision.
+    SchedulingDecision(SchedulingDecision),
+    /// Set a cluster configuration key.
+    ConfigSet { key: String, value: String },
+    // ... several dozen more: registry manifests and GC reports, GitOps
+    // state, join and API tokens, the security state, council size,
+    // jobs, and a no-op.
 }
 ```
 
+To add a command, add a variant there and handle it in the state machine (`src/council/state_machine.rs`); the enum is the list, and this document doesn't repeat it. An earlier draft of this section sketched a `RaftEntry`/`RaftPayload` pair with `SecretSet`, `SecretDelete`, `ConfigChange` and `CouncilChange` variants; none of those types was built. Council membership changes go through openraft's own membership API, not a log payload of ours.
+
 ### 4.4 State Reports (Reporting Tree)
 
+The types below follow `src/reporting/types.rs`, which is the reference; the listing is abridged.
+
 ```rust
-/// Sent by each worker node to its assigned council member at the reporting interval.
-/// Also sent as a full report during the leader learning period.
+/// Sent by each node to the leader at the reporting interval (the shipped
+/// flat star, §3.5). Also sent as a full report during the leader
+/// learning period.
 #[derive(Serialize, Deserialize)]
 struct StateReport {
     node_id: NodeId,
@@ -543,10 +505,19 @@ struct StateReport {
     running_apps: Vec<RunningApp>,
     /// Cached desired-state specs this node was last assigned.
     cached_specs: Vec<CachedSpec>,
+    /// The app versions this node's placement reconciler last finished
+    /// deploying, which the leader reads rollout progress from.
+    rollouts: Vec<RolloutReport>,
     /// Current resource usage.
     resource_usage: ResourceUsage,
+    /// Capacity that task attempts and reusable executors hold.
+    job_reservations: JobReservations,
+    /// Apps this node was asked to run but couldn't fit.
+    capacity_refusals: Vec<CapacityRefusal>,
     /// Recent event log (bounded to last N events).
     event_log: Vec<NodeEvent>,
+    /// Whether this node can run image builds.
+    has_buildah: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -611,6 +582,8 @@ enum EventKind {
 ```
 
 ### 4.5 Council Member and Recovery Candidate
+
+> **Status: planned, not implemented.** None of these four types exists in the tree. The council's members are openraft's membership config, read through Raft metrics, and the pre-seeded recovery-candidate list is the proposal in §5.5, as §3.2 says. What ships for council loss is `relish council recover` (§5.5).
 
 ```rust
 /// Council member record, maintained by the leader and replicated via Raft.
@@ -761,6 +734,8 @@ Leave is **immediate**. There is no `LEAVING` state, no drain-wait, and no `reli
        │         if node re-appears:
        └──────────────────┘
 ```
+
+REMOVED is gossip's view, and the next paragraph says what it still remembers. The API still lists a reaped member for 24 hours (`KNOWN_MEMBER_RETENTION`, `src/bun/api.rs`), which is what `relish nodes` shows for a node that went away.
 
 **Tombstones (#2474).** REMOVED isn't quite forgetting. A node keeps the incarnation it reaped a member at, as a tombstone beside the member's sequence floor (§8.1), so it shares the floor's 24-hour retention and its bound of 1,024 entries. A rumour that the member is `Alive` at or below that incarnation is dropped, so a peer that missed the death (one that was cut off, or one the rotating sync window never showed the `Dead`) can't re-add it on every node. A rumour at a higher incarnation is a real return and passes, and so does the member's own fresh datagram, which clears the floor and the tombstone with it. A restarted member that the floor answers with `Stale` is told the tombstone's incarnation, so it refutes past both. Tombstones aren't shared in anti-entropy: a node that never reaped the member itself has none, and can still take one stale `Alive` about it, which it probes and declares dead again on its own.
 

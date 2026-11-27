@@ -938,8 +938,8 @@ pub const MAX_STALE_REPORT_TIMEOUT_SECS: u64 = 86_400;
 
 /// Reporting tree configuration.
 ///
-/// Controls how often worker nodes send state reports to their assigned
-/// council member, and when reports are considered stale.
+/// Controls how often nodes send state reports to the leader, and when
+/// reports are considered stale.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReportingTreeSection {
