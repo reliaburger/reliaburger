@@ -483,6 +483,52 @@ leads. Production deposition had the same flaw, and 0.2.1 gave it the same fix
 schedule lands in counts as already seen, so a request sent at 59 seconds could
 miss the occurrence it was waiting for.
 
+### Every bound the decoder checks, `apply` must keep
+
+`TaskArrays` doesn't trust what it reads back. It deserialises through
+`#[serde(try_from = "ArraysWire")]`, the same trick `IndexRangeSet` uses at the
+start of this chapter, and the `TryFrom` refuses a store that's too big: too
+many arrays, too many manifests, too many deployment receipts. That's the right
+instinct for a Raft snapshot, which can come from another node or from a
+backup. It has a sharp edge, though. The decoder's bounds only protect you if
+`apply`, the one function that changes the state, never goes past them. If it
+does, a node writes a snapshot that it and every other node refuses to read,
+and a council node that restarts doesn't start at all.
+
+That could happen three ways in 0.3.3 (#2365). Completed deployment receipts
+were trimmed to 19 when a deployment began, never when one settled, so two
+overlapping `relish apply` runs that settled in turn left 21 where the decoder
+allowed 20. The decoder allowed 84 manifests, one namespace's worth of active
+runs plus its finished ones, while admission let 96 run across namespaces. And
+nothing counted arrays against the decoder's 2,048: a finite batch with one
+long job keeps all its finished siblings, so 32 of them fill the store.
+
+The fix names every number as a constant (`MAX_ARRAYS`, `MAX_MANIFESTS`,
+`MAX_COMPLETED_DEPLOYMENTS`, `MAX_UNSETTLED_DEPLOYMENTS`) and uses the same
+constant in the decoder and in `apply`. Settling now trims receipts too. A new
+`check_room` refuses a registration that would leave more than `MAX_ARRAYS`
+arrays or `MAX_MANIFESTS` manifests once pruning has run. It asks `expired`,
+the function pruning itself uses, what a prune would drop, so it can refuse
+before it changes anything. `MAX_MANIFESTS` is now what admission can really
+reach: the 96 bulk slots plus the 24 finished units retention keeps.
+
+One bound goes the other way. A cluster running 0.3.3 may already hold more
+than 20 completed receipts. If the decoder stayed at 20, the fixed binary
+couldn't open that cluster's snapshot either, and the operator would be
+hand-editing `snapshot.redb`. So the decoder accepts up to
+`MAX_DECODED_COMPLETED_DEPLOYMENTS`, 84, the most the old code could write, and
+the next deployment trims the store back to 20. Loosening a decoder bound
+doesn't change the format: everything that decoded before still decodes.
+
+Three tests drive `apply` the way the state machine does and round-trip the
+store through JSON after each step: `completed_receipts_stay_within_decoder_bound`,
+`active_manifests_across_namespaces_stay_within_decoder_bound` and
+`arrays_retained_by_running_batches_stay_within_decoder_bound`. Each failed
+before the fix with "job state exceeds its capacity or clock bounds". The
+generated lifecycle test now also begins and settles deployments and registers
+manifests and finite batches, so its `Reopen` step checks the same invariant
+over random sequences.
+
 ### A contract you can retry, and can't misspell
 
 The run identities above were only half the story. The server read an

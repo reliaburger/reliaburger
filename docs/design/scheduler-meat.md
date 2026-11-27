@@ -1274,7 +1274,7 @@ configured was retired (§5.2).
 
 - **Namespace quotas** cap the total CPU, memory, GPU, app count, and replica count per namespace. A single tenant cannot exceed their quota.
 - **Admission validation:** Meat validates all resource requests at submission time. Requests exceeding remaining quota are rejected immediately.
-- **Job admission caps:** the council bounds active runs (128 in the cluster, 32 of them kept for cron fires and deployment hooks, 64 per namespace), job definitions and retained receipts, and a run's `per_node_concurrency` caps how many of its tasks one node runs at once. Each attempt also reserves its CPU and memory in the node's execution budget.
+- **Job admission caps:** the council bounds active runs (128 in the cluster, 32 of them kept for cron fires and deployment hooks, 64 per namespace), job definitions, retained receipts, held arrays (2,048) and held batches (120), and a run's `per_node_concurrency` caps how many of its tasks one node runs at once. Each attempt also reserves its CPU and memory in the node's execution budget. Every bound the job-state decoder checks is one `apply` enforces, so a snapshot the leader writes always reopens (#2365).
 - **Rate limiting (planned):** per-identity rate limits on deploy and job submission don't exist yet; the admission caps above are what bound a flood today.
 
 ### 8.3 Process Workload Escalation

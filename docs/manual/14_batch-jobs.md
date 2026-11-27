@@ -390,6 +390,9 @@ Every namespace shares the cluster, so no namespace may take all of it:
 | Job definitions per namespace | 64 | Refused; one-off definitions expire with their last run |
 | Job definitions, whole cluster | 1,024 | Refused |
 | Retained run receipts, whole cluster | 2,048 | Retention keeps it below this backstop |
+| Runs and batch profiles held, running or finished, whole cluster | 2,048 | Refused until retention prunes finished ones; a batch keeps its finished jobs while any of them runs |
+| Batches (`relish batch` and `relish batch submit`) held, whole cluster | 120 | Refused |
+| Completed `relish apply` receipts kept | 20 | The oldest receipt is dropped |
 | Finished submissions kept per namespace | 20 | The namespace's oldest detail is pruned |
 | Finished submissions kept, whole cluster | 24 | The namespace keeping the most loses its oldest |
 | Outcomes remembered per definition | 10 | The oldest outcome is dropped |

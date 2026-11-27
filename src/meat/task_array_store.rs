@@ -63,6 +63,36 @@ pub const MAX_UNRUNNABLE_REASON_BYTES: usize = 1024;
 /// Most named jobs in one finite batch (`relish batch` with several jobs).
 pub const MAX_FINITE_BATCH_JOBS: usize = 64;
 
+/// Most resource profiles in one manifest (`relish batch submit`).
+pub const MAX_MANIFEST_PROFILES: usize = 16;
+
+/// Most arrays the store holds, active and finished, counting every profile
+/// of every manifest. Admission refuses a run that would pass it.
+pub const MAX_ARRAYS: usize = 2048;
+
+/// Most manifests the store holds. Every active manifest holds at least one
+/// active bulk run, and pruning keeps at most [`MAX_TERMINAL_ARRAYS`]
+/// finished units, so this is what admission can really produce.
+pub const MAX_MANIFESTS: usize =
+    (MAX_ACTIVE_ARRAYS - RESERVED_TRIGGERED_RUNS) + MAX_TERMINAL_ARRAYS;
+
+/// Most deployments (`relish apply` with jobs) unsettled at once.
+pub const MAX_UNSETTLED_DEPLOYMENTS: usize = 64;
+
+/// Most completed deployment receipts kept. Older ones are dropped, oldest
+/// first, when a deployment begins or settles.
+pub const MAX_COMPLETED_DEPLOYMENTS: usize = 20;
+
+/// Most completed receipts the decoder accepts. Larger than what `apply`
+/// keeps: before 0.3.4, `apply` trimmed receipts only when a deployment
+/// began, so a store could hold up to this many. Such a store still opens,
+/// and its next deployment trims it (#2365).
+const MAX_DECODED_COMPLETED_DEPLOYMENTS: usize =
+    MAX_COMPLETED_DEPLOYMENTS + MAX_UNSETTLED_DEPLOYMENTS;
+
+/// Largest serialised config a deployment receipt may keep.
+const MAX_DEPLOYMENT_CONFIG_BYTES: usize = 128 * 1024;
+
 /// One submitted array: what to run, and how far it has got.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskArrayRecord {
@@ -402,6 +432,11 @@ pub enum TaskArrayStoreError {
          {MAX_ACTIVE_RUNS_PER_NAMESPACE} per namespace"
     )]
     NamespaceFull { namespace: String, active: usize },
+    #[error(
+        "{held} runs and batch profiles are already held, running or finished; the limit \
+         is {MAX_ARRAYS}. Wait for running batches to finish, or cancel them"
+    )]
+    TooManyArrays { held: usize },
 }
 
 /// Which share of the active-run slots a new run may use.
@@ -468,20 +503,20 @@ impl TryFrom<ArraysWire> for TaskArrays {
         };
         if store.cron_observed_minute.is_some_and(|minute| minute < 0)
             || store.active().count() > MAX_ACTIVE_ARRAYS
-            || store.arrays.len() > 2048
-            || store.manifests.len() > 84
+            || store.arrays.len() > MAX_ARRAYS
+            || store.manifests.len() > MAX_MANIFESTS
             || store
                 .deployments
                 .values()
                 .filter(|record| !record.completed)
                 .count()
-                > 64
+                > MAX_UNSETTLED_DEPLOYMENTS
             || store
                 .deployments
                 .values()
                 .filter(|record| record.completed)
                 .count()
-                > 20
+                > MAX_DECODED_COMPLETED_DEPLOYMENTS
         {
             return Err("job state exceeds its capacity or clock bounds".into());
         }
@@ -511,7 +546,12 @@ impl TryFrom<ArraysWire> for TaskArrays {
             if *id == 0
                 || store.arrays.contains_key(id)
                 || manifest.cohorts.is_empty()
-                || manifest.cohorts.len() > if manifest.common_jobs { 64 } else { 16 }
+                || manifest.cohorts.len()
+                    > if manifest.common_jobs {
+                        MAX_FINITE_BATCH_JOBS
+                    } else {
+                        MAX_MANIFEST_PROFILES
+                    }
             {
                 return Err("invalid manifest identity or profile count".into());
             }
@@ -530,7 +570,8 @@ impl TryFrom<ArraysWire> for TaskArrays {
         for (id, record) in &store.deployments {
             if id.len() != 32
                 || !id.bytes().all(|byte| byte.is_ascii_hexdigit())
-                || serde_json::to_vec(&record.config).map_or(true, |bytes| bytes.len() > 128 * 1024)
+                || serde_json::to_vec(&record.config)
+                    .map_or(true, |bytes| bytes.len() > MAX_DEPLOYMENT_CONFIG_BYTES)
             {
                 return Err("invalid deployment identity or size".into());
             }
@@ -804,11 +845,11 @@ impl TaskArrays {
                 if !crate::config::valid_workload_label(name)
                     || !crate::config::valid_workload_label(namespace)
                     || cohorts.is_empty()
-                    || cohorts.len() > 16
+                    || cohorts.len() > MAX_MANIFEST_PROFILES
                 {
-                    return Err(TaskArrayStoreError::Manifest(
-                        "give DNS-label name/namespace and 1–16 resource profiles".into(),
-                    ));
+                    return Err(TaskArrayStoreError::Manifest(format!(
+                        "give DNS-label name/namespace and 1–{MAX_MANIFEST_PROFILES} resource profiles"
+                    )));
                 }
                 let mut names = std::collections::BTreeSet::new();
                 let mut total = 0u64;
@@ -830,6 +871,7 @@ impl TaskArrays {
                     ));
                 }
                 self.check_capacity(namespace, Admission::Bulk, cohorts.len())?;
+                self.check_room(*submitted_at_epoch_secs, cohorts.len(), 1)?;
                 self.prune(*submitted_at_epoch_secs);
                 let batch_id = allocate_id();
                 let mut identities = Vec::new();
@@ -894,8 +936,9 @@ impl TaskArrays {
                 }
                 validate_template(template)?;
                 let state = TaskArrayState::new(spec.clone(), *submitted_at_epoch_secs)?;
-                self.prune(*submitted_at_epoch_secs);
                 self.check_capacity(namespace, Admission::Bulk, 1)?;
+                self.check_room(*submitted_at_epoch_secs, 1, 0)?;
+                self.prune(*submitted_at_epoch_secs);
                 let batch_id = allocate_id();
                 self.arrays.insert(
                     batch_id,
@@ -1267,7 +1310,10 @@ impl TaskArrays {
             } => {
                 let state = TaskArrayState::new(definition.tasks, now_epoch_secs)?;
                 let admission = Admission::of(Some(&run.trigger));
-                if let Err(full) = retained.check_capacity(&run.namespace, admission, 1) {
+                if let Err(full) = retained
+                    .check_capacity(&run.namespace, admission, 1)
+                    .and_then(|()| retained.check_room(now, 1, 0))
+                {
                     let super::job::RunTrigger::Cron { minute } = run.trigger else {
                         return Err(full);
                     };
@@ -1471,6 +1517,49 @@ impl TaskArrays {
         Ok(())
     }
 
+    /// Refuse a registration that would leave more than [`MAX_ARRAYS`]
+    /// arrays or [`MAX_MANIFESTS`] manifests once a prune at `now` has run.
+    /// Every bound the decoder checks must be one `apply` keeps (#2365).
+    fn check_room(
+        &self,
+        now_epoch_secs: u64,
+        arrays: usize,
+        manifests: usize,
+    ) -> Result<(), TaskArrayStoreError> {
+        let (mut kept_arrays, mut kept_manifests) = (self.arrays.len(), self.manifests.len());
+        for (id, parent) in self.expired(now_epoch_secs, TERMINAL_RETENTION_SECS) {
+            if parent {
+                kept_manifests -= 1;
+                kept_arrays -= self.manifests.get(&id).map_or(0, |m| m.cohorts.len());
+            } else {
+                kept_arrays -= 1;
+            }
+        }
+        if kept_arrays + arrays > MAX_ARRAYS {
+            return Err(TaskArrayStoreError::TooManyArrays { held: kept_arrays });
+        }
+        if kept_manifests + manifests > MAX_MANIFESTS {
+            return Err(TaskArrayStoreError::Manifest(format!(
+                "{kept_manifests} batches are already held; the limit is {MAX_MANIFESTS}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Keep only the newest `keep` completed deployment receipts.
+    fn trim_completed_deployments(&mut self, keep: usize) {
+        let mut completed: Vec<_> = self
+            .deployments
+            .iter()
+            .filter(|(_, record)| record.completed)
+            .map(|(id, record)| (record.submitted_at_epoch_secs, id.clone()))
+            .collect();
+        completed.sort();
+        for (_, id) in completed.iter().take(completed.len().saturating_sub(keep)) {
+            self.deployments.remove(id);
+        }
+    }
+
     /// Active deployment intent, excluding bounded terminal receipts.
     pub fn deployment(&self, operation_id: &str) -> Option<&super::job_deploy::DeploymentRecord> {
         self.deployments
@@ -1559,6 +1648,7 @@ impl TaskArrays {
                         Err(refuse("batch request already names different work"))
                     };
                 }
+                self.check_room(*submitted_at_epoch_secs, 0, 1)?;
                 let mut cohorts = Vec::new();
                 for (name, spec) in jobs {
                     let namespace = spec.namespace.clone().unwrap_or_else(|| "default".into());
@@ -1611,7 +1701,9 @@ impl TaskArrays {
                 config
                     .validate_intrinsic()
                     .map_err(|error| TaskArrayStoreError::Job(error.to_string()))?;
-                if serde_json::to_vec(config).map_or(true, |bytes| bytes.len() > 128 * 1024) {
+                if serde_json::to_vec(config)
+                    .map_or(true, |bytes| bytes.len() > MAX_DEPLOYMENT_CONFIG_BYTES)
+                {
                     return Err(refuse("deployment exceeds 128 KiB"));
                 }
                 if let Some(prior) = self.deployments.get(operation_id) {
@@ -1626,9 +1718,11 @@ impl TaskArrays {
                     .values()
                     .filter(|record| !record.completed)
                     .count()
-                    >= 64
+                    >= MAX_UNSETTLED_DEPLOYMENTS
                 {
-                    return Err(refuse("64 deployments are already unsettled"));
+                    return Err(TaskArrayStoreError::Job(format!(
+                        "{MAX_UNSETTLED_DEPLOYMENTS} deployments are already unsettled"
+                    )));
                 }
                 for (name, namespace) in
                     config
@@ -1678,17 +1772,8 @@ impl TaskArrays {
                         },
                     )?;
                 }
-                let terminal: Vec<_> = self
-                    .deployments
-                    .iter()
-                    .filter(|(_, record)| record.completed)
-                    .map(|(id, record)| (record.submitted_at_epoch_secs, id.clone()))
-                    .collect();
-                let mut terminal = terminal;
-                terminal.sort();
-                for (_, id) in terminal.iter().take(terminal.len().saturating_sub(19)) {
-                    self.deployments.remove(id);
-                }
+                // Leave room for this one's receipt once it settles.
+                self.trim_completed_deployments(MAX_COMPLETED_DEPLOYMENTS - 1);
                 let mut record = DeploymentRecord {
                     config: config.clone(),
                     hook_runs: BTreeMap::new(),
@@ -1854,6 +1939,9 @@ impl TaskArrays {
                     record.outcome = Some(outcome);
                     record.finished_at = Some(finished_at);
                 }
+                // Overlapping deployments settle after the next one began, so
+                // settling trims too, or receipts pass what the decoder reads.
+                self.trim_completed_deployments(MAX_COMPLETED_DEPLOYMENTS);
                 Ok(TaskArrayApplied::JobRecorded)
             }
             _ => Err(refuse("not a deployment transaction")),
@@ -3254,6 +3342,140 @@ mod tests {
         assert_ne!(other, first);
     }
 
+    /// Serialise and decode the store, as a snapshot or `jobs.json` does.
+    /// Whatever `apply` produces must come back (#2365).
+    fn assert_reopens(arrays: &TaskArrays) {
+        let bytes = serde_json::to_vec(arrays).unwrap();
+        let reopened: TaskArrays = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|error| panic!("the store wrote state it can't read back: {error}"));
+        assert_eq!(&reopened, arrays);
+    }
+
+    fn deploy_begin(i: u64) -> TaskArrayWrite {
+        TaskArrayWrite::DeployBegin {
+            operation_id: format!("{i:032x}"),
+            config: Box::new(
+                crate::config::Config::parse(&format!("[app.web-{i}]\nimage='web:v1'")).unwrap(),
+            ),
+            now_epoch_secs: 100 + i,
+        }
+    }
+
+    /// Commit and release a deployment with no jobs: nothing to wait for.
+    fn deploy_settle(arrays: &mut TaskArrays, i: u64) {
+        arrays
+            .apply(
+                &TaskArrayWrite::DeployCommitted {
+                    operation_id: format!("{i:032x}"),
+                    now_epoch_secs: 100 + i,
+                },
+                || 0,
+            )
+            .unwrap();
+        arrays
+            .apply(
+                &TaskArrayWrite::DeployRelease {
+                    operation_id: format!("{i:032x}"),
+                },
+                || 0,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn completed_receipts_stay_within_decoder_bound() {
+        let mut arrays = TaskArrays::default();
+        for i in 0..20 {
+            arrays.apply(&deploy_begin(i), || 0).unwrap();
+            deploy_settle(&mut arrays, i);
+            assert_reopens(&arrays);
+        }
+        // Two applies overlap: the second begins before the first settles.
+        arrays.apply(&deploy_begin(20), || 0).unwrap();
+        arrays.apply(&deploy_begin(21), || 0).unwrap();
+        deploy_settle(&mut arrays, 20);
+        assert_reopens(&arrays);
+        deploy_settle(&mut arrays, 21);
+        assert_reopens(&arrays);
+        let completed = arrays
+            .deployments()
+            .filter(|(_, record)| record.completed)
+            .count();
+        assert_eq!(completed, MAX_COMPLETED_DEPLOYMENTS);
+        // The newest receipts are the ones kept.
+        assert!(arrays.deployments.contains_key(&format!("{:032x}", 21)));
+    }
+
+    #[test]
+    fn active_manifests_across_namespaces_stay_within_decoder_bound() {
+        let mut arrays = TaskArrays::default();
+        let mut ids = counter();
+        for i in 0..85 {
+            let mut write = manifest_write(&format!("m-{i}"), 4);
+            if let TaskArrayWrite::RegisterManifest { namespace, .. } = &mut write {
+                *namespace = if i < 64 { "team-a" } else { "team-b" }.into();
+            }
+            arrays.apply(&write, &mut ids).unwrap();
+        }
+        assert_reopens(&arrays);
+    }
+
+    #[test]
+    fn arrays_retained_by_running_batches_stay_within_decoder_bound() {
+        let mut arrays = TaskArrays::default();
+        let mut ids = counter();
+        let mut refused = 0;
+        for k in 0..32 {
+            let jobs = (0..64)
+                .map(|n| {
+                    let mut spec = *template();
+                    spec.namespace = Some(if n < 63 { "default" } else { "keep" }.into());
+                    (format!("j{n}"), spec)
+                })
+                .collect();
+            let write = TaskArrayWrite::RegisterJobs {
+                request_id: format!("r-{k}"),
+                jobs,
+                submitted_at_epoch_secs: 10,
+            };
+            let Ok(TaskArrayApplied::Registered { batch_id }) = arrays.apply(&write, &mut ids)
+            else {
+                refused += 1;
+                continue;
+            };
+            let children: Vec<_> = arrays.manifest(batch_id).unwrap().cohorts.clone();
+            for (name, child) in children {
+                if name == "j63" {
+                    continue;
+                }
+                arrays
+                    .apply(
+                        &TaskArrayWrite::Cancel {
+                            batch_id: child,
+                            now_epoch_secs: 11,
+                        },
+                        || 0,
+                    )
+                    .unwrap();
+            }
+            assert_reopens(&arrays);
+        }
+        let mut extra = manifest_write("extra", 4);
+        if let TaskArrayWrite::RegisterManifest {
+            submitted_at_epoch_secs,
+            ..
+        } = &mut extra
+        {
+            *submitted_at_epoch_secs = 12;
+        }
+        if arrays.apply(&extra, &mut ids).is_err() {
+            refused += 1;
+        }
+        assert_reopens(&arrays);
+        assert!(arrays.arrays.len() <= MAX_ARRAYS);
+        assert!(refused > 0, "something must have been refused at the cap");
+    }
+
     /// Generated lifecycles through the store's own transitions (#1060): the
     /// writes a leader and the API commit, in any order, with the invariants
     /// every replica relies on checked after each one.
@@ -3332,6 +3554,22 @@ mod tests {
             Prune,
             /// Serialise and reopen, as a snapshot or the standalone store does.
             Reopen,
+            /// `relish apply` with one app and no jobs; `settle` commits and
+            /// releases it at once, otherwise it stays unsettled.
+            Deploy {
+                key: u8,
+                settle: bool,
+            },
+            /// `relish batch submit` with this many profiles.
+            Manifest {
+                key: u8,
+                profiles: u8,
+            },
+            /// `relish batch FILE` with this many named jobs.
+            Jobs {
+                key: u8,
+                count: u8,
+            },
         }
 
         fn step() -> impl Strategy<Value = Step> {
@@ -3356,6 +3594,9 @@ mod tests {
                 2 => (0u16..200).prop_map(|secs| Step::Advance { secs }),
                 1 => Just(Step::Prune),
                 1 => Just(Step::Reopen),
+                2 => (0u8..48, any::<bool>()).prop_map(|(key, settle)| Step::Deploy { key, settle }),
+                1 => (0u8..8, 1u8..4).prop_map(|(key, profiles)| Step::Manifest { key, profiles }),
+                1 => (0u8..8, 1u8..4).prop_map(|(key, count)| Step::Jobs { key, count }),
             ]
         }
 
@@ -3785,6 +4026,63 @@ mod tests {
                     let reopened: TaskArrays = serde_json::from_slice(&bytes).unwrap();
                     assert_eq!(reopened, *store, "reopening changed the store");
                     *store = reopened;
+                }
+                Step::Deploy { key, settle } => {
+                    let operation_id = format!("{key:032x}");
+                    let config =
+                        crate::config::Config::parse(&format!("[app.web-{key}]\nimage='web:v1'"))
+                            .unwrap();
+                    let begin = TaskArrayWrite::DeployBegin {
+                        operation_id: operation_id.clone(),
+                        config: Box::new(config),
+                        now_epoch_secs: *now,
+                    };
+                    // Keys never exceed the unsettled cap, and each names its
+                    // own app, so a new one or a retry is always admitted.
+                    apply(store, model, &begin).unwrap();
+                    if settle {
+                        let committed = TaskArrayWrite::DeployCommitted {
+                            operation_id: operation_id.clone(),
+                            now_epoch_secs: *now,
+                        };
+                        apply(store, model, &committed).unwrap();
+                        let release = TaskArrayWrite::DeployRelease { operation_id };
+                        apply(store, model, &release).unwrap();
+                    }
+                }
+                Step::Manifest { key, profiles } => {
+                    let write = TaskArrayWrite::RegisterManifest {
+                        name: "mixed".into(),
+                        namespace: "batch".into(),
+                        request_id: format!("manifest-{key}"),
+                        cohorts: (0..profiles)
+                            .map(|profile| ManifestCohort {
+                                name: format!("p{profile}"),
+                                spec: TaskArraySpec {
+                                    chunk_size: 2,
+                                    ..TaskArraySpec::with_count(3)
+                                },
+                                template: *template(),
+                            })
+                            .collect(),
+                        submitted_at_epoch_secs: *now,
+                    };
+                    // A retry with other content is refused; capacity may refuse too.
+                    let _ = apply(store, model, &write);
+                }
+                Step::Jobs { key, count } => {
+                    let write = TaskArrayWrite::RegisterJobs {
+                        request_id: format!("jobs-{key}"),
+                        jobs: (0..count)
+                            .map(|n| {
+                                let mut spec = *template();
+                                spec.namespace = Some("batch".into());
+                                (format!("finite-{n}"), spec)
+                            })
+                            .collect(),
+                        submitted_at_epoch_secs: *now,
+                    };
+                    let _ = apply(store, model, &write);
                 }
             }
         }
