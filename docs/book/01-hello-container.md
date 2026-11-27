@@ -1544,6 +1544,18 @@ This is a general pattern worth adopting for any code that depends on the clock:
 
 Why `deadline_after` and not plain `now + config.initial_delay`? Because `Instant + Duration` panics when the sum doesn't fit in the clock. In C that would be silent wraparound; Rust's standard library chooses a loud failure instead. Rust gives you the quiet version too, `checked_add`, which returns an `Option<Instant>`: `None` means overflow, and you decide what happens. A review found that `initial_delay = 9223372036854775807` sailed through validation and then took the whole agent loop down on the first `register`. Now validation refuses any `interval` or `initial_delay` over a day, and `deadline_after` cuts the delay to that day and uses `checked_add`, so even a config that skipped validation can't panic the loop.
 
+The same audit found three more `now + timeout` sums a few hops away: the deploy's health wait (`health_timeout`), the proxy's drain deadline (`drain_timeout`) and the stop grace that falls back to the drain timeout ([#2378](https://github.com/reliaburger/reliaburger/issues/2378)). Validation now caps the first at a day and the second at an hour, and the sums themselves became checked too ([#2527](https://github.com/reliaburger/reliaburger/issues/2527)):
+
+```rust
+let now = std::time::Instant::now();
+let deadline = now
+    .checked_add(wait)
+    .or_else(|| now.checked_add(HEALTH_WAIT_FALLBACK))
+    .unwrap_or(now);
+```
+
+`Option::or_else` runs its closure only when the option is `None`, so the fallback, the longest wait config accepts, is computed only on overflow. Each site has a test that passes `Duration::MAX` straight in, past validation, and expects no panic.
+
 ### evaluate_result: a pure function
 
 The function that decides state transitions is deliberately stateless:

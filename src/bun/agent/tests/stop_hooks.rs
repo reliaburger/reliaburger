@@ -459,6 +459,19 @@ async fn a_runtime_busy_for_good_still_ends_the_stop_within_its_bounds() {
     assert!(took < Duration::from_secs(3), "{took:?}");
 }
 
+/// A grace too large to add to the clock still stops the instance, rather
+/// than panicking (#2378, #2527): a drain timeout stands in for the grace
+/// when the app sets none.
+#[tokio::test]
+async fn a_grace_too_large_to_add_to_the_clock_does_not_panic() {
+    let id = InstanceId("default__forever-0".into());
+    let grill = running_mock(&id).await;
+    let stop = InstanceStop::for_policy(None, Duration::MAX);
+    stop_runtime_instance(&grill, &id, &stop, CONFIRMATION)
+        .await
+        .expect("a mock that stops at once is a confirmed stop");
+}
+
 #[tokio::test]
 async fn a_runtime_that_cannot_inspect_the_instance_fails_the_stop_at_once() {
     let id = InstanceId("default__broken-0".into());
