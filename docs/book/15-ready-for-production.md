@@ -675,7 +675,7 @@ real world it touched.
 `cargo-llvm-cov` instruments the compiled programme and records which source regions execute.
 Our `make coverage` runs the portable suite once under instrumentation and writes an LCOV
 report; `make coverage-html` turns the same counters into HTML when someone wants to read them. On Linux CI that same run is the test gate, so we don't pay for the suite twice. The first combined Linux CI measurement covered
-79.65% of lines, so CI starts at 78.65%, one percentage point lower, and can ratchet upwards.
+79.65% of lines, so CI started at 78.65%, one percentage point lower, and can ratchet upwards. It took until November for anyone to turn the ratchet. By then the suite covered 88.60% of lines, so the floor sat ten points under it, and a new subsystem with a fifth of its lines tested would have passed. The floor is now 87.60%, and every minor release reads its last `portable Linux` run and raises the floor again if coverage has risen (#2487). A floor that only goes up is only useful if somebody pushes it.
 
 Instrumented programmes write their counters to a `.profraw` file as they exit. Our
 crash-recovery tests SIGKILL instrumented Bun processes on purpose, and one day a kill landed
@@ -1083,6 +1083,14 @@ its flakes: either the row says Fixed (with a loop that used to fail and now pas
 links a successor. Re-running those loops for the register paid for itself straight away:
 one test whose old cause was fixed failed twice in a hundred runs for a new one, a stop that
 races the child's own exit on macOS.
+
+The check had a blind spot of its own: it only read rows marked "Open". By November the
+register had 281 rows and not one of them said "Open", so the nightly job checked nothing
+and passed in seconds. A row saying "Not reproduced; recheck if it recurs" needed no issue,
+and so had no owner. Now four words close a row out: Fixed, Not a defect, Infrastructure
+and Superseded. Any other status leaves the flake unresolved, and the row needs an issue
+(#2491). The first run found nine rows that didn't fit, and every one of them was done; they
+had just said so in their own words.
 
 Some flakes are tests that quietly share the machine. The port allocator skips any port
 something on the host already listens on, so a published port never shadows a host daemon.
@@ -1905,6 +1913,21 @@ itself with the same `candidate.py` and the operator's own login, and says so in
 **Publish performance after the tag.** Benchmarks, the profile and the day run don't decide
 whether a release works, so they no longer stand between it and its users. A regression they
 find is a bug for the next patch release.
+
+**Run the binary you ship, not just its version.** The gate's staged installs and soaks
+all run on Apple silicon. They exercise the macOS `relish` and, inside the quickstart's VMs,
+the aarch64 `bun`. Nothing ran the x86-64 pair before it was published except `bun
+--version`, which never starts a cluster. CI's tests don't count either: they build debug
+binaries on a newer Ubuntu, and the release is a `--release` build with eBPF on 22.04. A
+glibc symbol 22.04 lacks, or a panic on the start-up path, would have reached the first
+person to run `bun` on an x86-64 server. So the build job now starts each Linux release `bun`
+it has just built, with its own `relish`, on the process runtime, applies one app that
+sleeps, waits for it to run, and deletes it, all before it uploads the artefacts
+([#2486](https://github.com/reliaburger/reliaburger/issues/2486)). It reuses the feature
+demos' one-node cluster, so it's a real `relish init`, mTLS and an admin token, in a few
+seconds. It doesn't load the eBPF object or start runc; those need root,
+and the privileged Linux job tests them from source. The Linux cold installs still run after
+promotion, once per minor release, and the closure record says so.
 
 What we didn't do is move release builds onto the new quiet host. It's tempting, since it's
 fast and it's ours, but a release build is the one place where "who could have touched this
@@ -6760,6 +6783,19 @@ what a Go programmer finds out from a data race.
 reading held every caller on the node the moment the channel filled. Now the
 task sends the tail and then starts the per-instance follows, in that order,
 so the tail still comes first.
+
+The plain read had a quieter bug that moving it into a task kept (#2472). It
+joined every instance's capture into one string, each under a `==> id <==`
+header, and only then took the last `N` lines. With three replicas on a node,
+`GET /v1/logs/web/default?tail=20` answered with the last twenty lines of
+whichever replica came last, without its header, and nothing from the other
+two, while the follow path and the manual both meant "the last 20 of each".
+`read_captures` now takes the tail and cuts each capture before it writes the
+header, and it sorts the ids first, because they come out of a `HashMap` and
+the sections used to change order between calls. A single instance still
+gets no header, so its answer is unchanged. `a_logs_tail_takes_the_last_lines_of_each_instance`
+sends both commands the route uses with `tail: Some(1)` and expects `a3` and
+`b3`, each under its own header.
 
 A join and an image signature are the same shape with a council write in the
 middle. Without quorum, openraft's `client_write` waits until the leader steps

@@ -332,6 +332,18 @@ pub fn recover_data_dir(
         });
     }
     let floor = fence.map_or(0, |fence| fence.newest_known_epoch());
+    // Remember the voters of the council this recovery replaces, and of any
+    // an earlier recovery replaced: a recovered council has one voter, and
+    // these are the only nodes it can ask about an epoch claim on gossip
+    // (#2406), such as a second survivor recovered on the same epoch (#694).
+    let mut previous_council = crate::council::admission::load_previous_council(&raft_dir)
+        .map_err(|e| RecoveryError::OpenSource(e.to_string()))?;
+    let membership = state.last_membership.membership();
+    for id in membership.voter_ids() {
+        if let Some(info) = membership.get_node(&id) {
+            previous_council.insert(id, info.clone());
+        }
+    }
     state.enter_recovery_epoch(floor);
     let claim = RecoveryClaim {
         epoch: state.recovery_epoch,
@@ -339,7 +351,7 @@ pub fn recover_data_dir(
     };
     // The whole old directory moves aside, the fence record included: the
     // recovered snapshot is then the only source of this node's epoch.
-    super::recovery_storage::replace(&raft_dir, state)
+    super::recovery_storage::replace(&raft_dir, state, &previous_council)
         .map_err(|e| RecoveryError::Persist(e.to_string()))?;
     Ok(claim)
 }
@@ -533,6 +545,42 @@ mod tests {
             .map(|info| info.name)
             .collect();
         assert_eq!(names, ["a", "b"]);
+    }
+
+    /// A recovered council starts with one voter, so it has nobody of its
+    /// own to ask about an epoch claim on gossip. It remembers the voters of
+    /// the council it replaced, beside its fence record, and a second
+    /// recovery keeps the ones the first remembered (#2406, #694).
+    #[test]
+    fn recovery_remembers_the_voters_it_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = DesiredState::default();
+        let nodes = BTreeMap::from([
+            (
+                1,
+                CouncilNodeInfo::new(SocketAddr::from(([10, 0, 0, 1], 9444)), "a"),
+            ),
+            (
+                2,
+                CouncilNodeInfo::new(SocketAddr::from(([10, 0, 0, 2], 9444)), "b"),
+            ),
+            (
+                3,
+                CouncilNodeInfo::new(SocketAddr::from(([10, 0, 0, 3], 9444)), "learner"),
+            ),
+        ]);
+        let membership = openraft::Membership::new(vec![BTreeSet::from([1, 2])], nodes);
+        state.last_membership = openraft::StoredMembership::new(None, membership);
+        recover_data_dir(dir.path(), state, false).unwrap();
+        let raft = dir.path().join("raft");
+        let remembered = crate::council::admission::load_previous_council(&raft).unwrap();
+        let names: Vec<&str> = remembered.values().map(|info| info.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+
+        // Recovering again from a state with no membership keeps them.
+        recover_data_dir(dir.path(), DesiredState::default(), true).unwrap();
+        let remembered = crate::council::admission::load_previous_council(&raft).unwrap();
+        assert_eq!(remembered.len(), 2);
     }
 
     #[test]

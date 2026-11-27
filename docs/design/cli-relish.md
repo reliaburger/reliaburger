@@ -850,7 +850,7 @@ shipped CLI. **Status: planned — not yet implemented.**
 - `relish route <hostname>` — only `relish routes` (no argument) exists.
 - `relish firewall <app>` / `relish firewall test` — no firewall-inspection command; use `relish path`.
 - `relish identity <app>` — no workload-identity command.
-- `relish ca status | revoke`: `relish ca` has `backup`, `verify` and `rotate` only (#362).
+- `relish ca status | revoke` *(planned, #362)*: `relish ca` has `backup`, `verify` and `rotate` only.
 - `relish pickle gc` — no registry garbage-collection command.
 - `relish volume snapshot | snapshots | restore` — the real surface is `relish snapshot create | list | restore | delete`.
 - `relish completions <shell>` — no shell-completion generator (no `clap_complete`).

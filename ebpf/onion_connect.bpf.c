@@ -1,9 +1,11 @@
 /* Onion connect rewrite — intercepts connect() to VIPs.
  *
- * Attached to: BPF_CGROUP_INET4_CONNECT (root cgroup v2)
+ * Attached to: BPF_CGROUP_INET4_CONNECT, plus connect6, sendmsg4 and
+ * sendmsg6 below (root cgroup v2)
  *
  * When a process calls connect() with a destination in the VIP range
- * (127.128.0.0/16), this program:
+ * (127.128.0.0/16), or with that address v4-mapped (::ffff:127.128.x.y)
+ * from an AF_INET6 socket, this program:
  * 1. Notes whether this node's cluster view lease has lapsed
  * 2. Looks up the backend list in backend_map
  * 3. Checks firewall rules (namespace isolation + per-app allow_from)
@@ -262,8 +264,10 @@ static __always_inline int egress4_allowed(__u64 cg, __u32 ip_be, __u16 port_be)
     return 0;
 }
 
-/* IPv6 equivalent, including v4-mapped destinations. VIPs remain outside
- * egress policy because internal service discovery owns that range. */
+/* IPv6 equivalent, including v4-mapped destinations. connect6 routes a
+ * v4-mapped VIP before it gets here, as connect4 does, so VIPs stay outside
+ * egress policy. sendmsg6 still passes a v4-mapped VIP through: there's no
+ * UDP rewrite in either family. */
 static __always_inline int egress6_allowed(__u64 cg, struct bpf_sock_addr *ctx)
 {
     if (ctx->user_ip6[0] == 0 && ctx->user_ip6[1] == 0 &&
@@ -311,32 +315,16 @@ struct {
  * for probabilistic drops instead. The fault_state_key/value types in
  * smoker_common.h exist for userspace counters if needed later. */
 
-/* ---------- Connect hook ------------------------------------------------ */
+/* ---------- VIP routing ------------------------------------------------- */
 
-SEC("cgroup/connect4")
-int onion_connect(struct bpf_sock_addr *ctx)
+/* Route a connect to a VIP (both arguments in network byte order): apply
+ * the view lease, any Smoker fault, namespace isolation and backend
+ * selection. Returns the chosen backend, or NULL to deny (EPERM). Shared by
+ * connect4 and by connect6 for a v4-mapped VIP, so a dual-stack socket
+ * (the JVM's and .NET's default) gets the same rewrite and the same
+ * policy (#2460). */
+static __always_inline struct backend_endpoint *route_vip(__u32 vip_be, __u16 port_be)
 {
-    __u32 dst_ip = bpf_ntohl(ctx->user_ip4);
-
-    /* Only intercept VIPs in the 127.128.0.0/16 range */
-    if ((dst_ip & VIP_MASK) != VIP_PREFIX) {
-        /* Not a VIP. A workload's real address (container address, or a
-         * node address and published host port) belongs to its namespace
-         * exactly as its VIP does. */
-        __u64 eg_cgroup = bpf_get_current_cgroup_id();
-        if (real_destination_denied(eg_cgroup, ctx->user_ip4, ctx->user_port))
-            return 0;  /* EPERM: another namespace's workload */
-
-        /* Then the egress allowlist: if the calling cgroup has egress
-         * enforcement enabled and the destination is neither an exact
-         * allow entry nor inside an allowed CIDR, deny the connection. */
-        __u32 *enforced = bpf_map_lookup_elem(&egress_enabled_map, &eg_cgroup);
-        if (enforced && *enforced == 1 &&
-            !egress4_allowed(eg_cgroup, ctx->user_ip4, ctx->user_port))
-            return 0;  /* EPERM: egress not allowed */
-        return 1;  /* pass through (no enforcement or allowed) */
-    }
-
     /* --- View lease: a lapsed cluster view routes only to this node --- */
     int local_only = 0;
     {
@@ -359,8 +347,8 @@ int onion_connect(struct bpf_sock_addr *ctx)
 
         /* Check partition fault: specific source -> destination */
         struct fault_connect_key fkey = {
-            .virtual_ip       = ctx->user_ip4,
-            .port             = ctx->user_port,
+            .virtual_ip       = vip_be,
+            .port             = port_be,
             .source_cgroup_id = src_cgroup,
         };
         struct fault_connect_value *fval =
@@ -383,7 +371,7 @@ int onion_connect(struct bpf_sock_addr *ctx)
 
                 if (fval->action == FAULT_ACTION_PARTITION) {
                     /* Block this connection entirely */
-                    return 0;  /* deny -> EPERM */
+                    return NULL;  /* deny -> EPERM */
                 }
 
                 if (fval->action == FAULT_ACTION_DROP) {
@@ -391,7 +379,7 @@ int onion_connect(struct bpf_sock_addr *ctx)
                     __u32 rand = bpf_get_prandom_u32();
                     __u8 roll = rand % 100;
                     if (roll < fval->probability)
-                        return 0;  /* deny -> EPERM */
+                        return NULL;  /* deny -> EPERM */
                 }
 
                 /* FAULT_ACTION_DELAY is handled in sock_ops or tc netem,
@@ -404,20 +392,20 @@ no_fault:
 
     /* Look up the backend list for this (VIP, port) */
     struct backend_key key = {
-        .vip  = ctx->user_ip4,   /* keep network byte order */
-        .port = ctx->user_port,
+        .vip  = vip_be,   /* keep network byte order */
+        .port = port_be,
         ._pad = 0,
     };
 
     struct backend_value *val = bpf_map_lookup_elem(&backend_map, &key);
     if (!val || val->count == 0)
-        return 0;  /* deny -> EPERM: no backends registered */
+        return NULL;  /* deny -> EPERM: no backends registered */
 
     /* --- Firewall: namespace isolation. App-specific source bindings take
      * precedence over the inherited /reliaburger/<namespace> binding, which
      * is installed before any delegated descendant can start. --- */
     if (isolation_denies(bpf_get_current_cgroup_id(), val->namespace_id, val->app_id))
-        return 0;  /* deny -> EPERM: cross-namespace denied */
+        return NULL;  /* deny -> EPERM: cross-namespace denied */
 
     /* --- Backend selection: round-robin among healthy (and, once the
      * lease has lapsed, local) backends --- */
@@ -460,11 +448,43 @@ no_fault:
     }
 
     if (!found)
-        return 0;  /* deny -> EPERM: no healthy (or, lapsed, local) backends */
+        return NULL;  /* deny -> EPERM: no healthy (or, lapsed, local) backends */
+
+    asm volatile("" : "+r"(selected_idx));
+    return &val->backends[selected_idx & (MAX_BACKENDS - 1)];
+}
+
+/* ---------- Connect hook ------------------------------------------------ */
+
+SEC("cgroup/connect4")
+int onion_connect(struct bpf_sock_addr *ctx)
+{
+    __u32 dst_ip = bpf_ntohl(ctx->user_ip4);
+
+    /* Only intercept VIPs in the 127.128.0.0/16 range */
+    if ((dst_ip & VIP_MASK) != VIP_PREFIX) {
+        /* Not a VIP. A workload's real address (container address, or a
+         * node address and published host port) belongs to its namespace
+         * exactly as its VIP does. */
+        __u64 eg_cgroup = bpf_get_current_cgroup_id();
+        if (real_destination_denied(eg_cgroup, ctx->user_ip4, ctx->user_port))
+            return 0;  /* EPERM: another namespace's workload */
+
+        /* Then the egress allowlist: if the calling cgroup has egress
+         * enforcement enabled and the destination is neither an exact
+         * allow entry nor inside an allowed CIDR, deny the connection. */
+        __u32 *enforced = bpf_map_lookup_elem(&egress_enabled_map, &eg_cgroup);
+        if (enforced && *enforced == 1 &&
+            !egress4_allowed(eg_cgroup, ctx->user_ip4, ctx->user_port))
+            return 0;  /* EPERM: egress not allowed */
+        return 1;  /* pass through (no enforcement or allowed) */
+    }
+
+    struct backend_endpoint *be = route_vip(ctx->user_ip4, ctx->user_port);
+    if (!be)
+        return 0;  /* deny -> EPERM */
 
     /* Rewrite destination to the selected backend */
-    asm volatile("" : "+r"(selected_idx));
-    struct backend_endpoint *be = &val->backends[selected_idx & (MAX_BACKENDS - 1)];
     ctx->user_ip4  = be->host_ip;
     ctx->user_port = be->host_port;
 
@@ -473,17 +493,30 @@ no_fault:
 
 /* ---------- Connect6 hook ------------------------------------------------ */
 
-/* IPv6 policy. Without this hook a dual-stack workload bypasses the whole
+/* IPv6. Without this hook a dual-stack workload bypasses the whole
  * allowlist by connecting over IPv6 (NET7), and could reach another
- * namespace's workload through its v4-mapped address. VIP rewrite stays
- * v4-only: VIPs live in 127.128.0.0/16 and the service map never hands out
- * IPv6 backends, so this program is pure policy — no rewriting.
+ * namespace's workload through its v4-mapped address. A socket opened as
+ * AF_INET6 reaches an IPv4 address as ::ffff:a.b.c.d and runs this program,
+ * not connect4, so a v4-mapped VIP is routed here exactly as connect4 routes
+ * it: only the last word of the address changes, and the ::ffff: prefix
+ * stays (#2460). Native IPv6 destinations are policy only; the service map
+ * never hands out IPv6 backends.
  */
 SEC("cgroup/connect6")
 int onion_connect6(struct bpf_sock_addr *ctx)
 {
     __u64 cg = bpf_get_current_cgroup_id();
     __u32 v4 = mapped_ipv4(ctx);
+    if (v4 && (bpf_ntohl(v4) & VIP_MASK) == VIP_PREFIX) {
+        struct backend_endpoint *be = route_vip(v4, ctx->user_port);
+        if (!be)
+            return 0;  /* deny -> EPERM */
+        /* user_ip6 is read and written in 32-bit words; the verifier
+         * refuses narrower access. */
+        ctx->user_ip6[3] = be->host_ip;
+        ctx->user_port   = be->host_port;
+        return 1;
+    }
     if (v4 && real_destination_denied(cg, v4, ctx->user_port))
         return 0;
     __u32 *enforced = bpf_map_lookup_elem(&egress_enabled_map, &cg);

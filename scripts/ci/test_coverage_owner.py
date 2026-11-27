@@ -14,7 +14,7 @@ import coverage_adapter as a
 import coverage_contract as k
 
 # Independent expected front door copied from the existing Makefile.
-EXPECTED_RECIPE = """COVERAGE_MIN_LINES ?= 78.65
+EXPECTED_RECIPE = """COVERAGE_MIN_LINES ?= 87.60
 COVERAGE_REPORT = $(CARGO) llvm-cov report --failure-mode all
 coverage: ## Run the portable suite once under line coverage, write the lcov report and enforce the floor
 	$(CARGO) llvm-cov clean --workspace
@@ -89,7 +89,7 @@ class Owner(unittest.TestCase):
             return SimpleNamespace(returncode=0, stdout=json.dumps(data))
         if cmd[0] == 'make':
             configuration = c.read_json(kw['env']['RELIABURGER_COVERAGE_OWNER_CONFIG'])
-            args = [['llvm-cov'] + x for x in self.o.recipe_stages('ci', '78.65')]
+            args = [['llvm-cov'] + x for x in self.o.recipe_stages('ci', '87.60')]
             for stage in args:
                 try:
                     with patch.dict(os.environ, kw['env'], clear=True):
@@ -220,17 +220,17 @@ class Owner(unittest.TestCase):
             {('reliaburger', 'cron::boundary')},
         )
         coverage = [x for x in self.calls if Path(x[0]).name == 'coverage' and '--version' not in x]
-        self.assertEqual([x[2:] for x in coverage], self.o.recipe_stages('ci', '78.65'))
+        self.assertEqual([x[2:] for x in coverage], self.o.recipe_stages('ci', '87.60'))
         self.assertEqual(len([x for x in self.calls if x[0] == 'make']), 1)
         self.assertTrue((self.directory / 'handshake.json').is_file())
 
     def test_one_report_stage_writes_the_lcov_and_enforces_the_floor(self):
         # Plan 2026-11-06, F3: each report stage merged every profile again;
         # the HTML is make coverage-html's, outside the evidence owner (D5).
-        stages = self.o.recipe_stages('ci', '78.65')
+        stages = self.o.recipe_stages('ci', '87.60')
         self.assertEqual(stages[-1:], [[
             'report', '--failure-mode', 'all', '--lcov', '--output-path',
-            'target/coverage/lcov.info', '--fail-under-lines', '78.65',
+            'target/coverage/lcov.info', '--fail-under-lines', '87.60',
         ]])
         self.assertFalse(any('--html' in stage for stage in stages))
 
@@ -242,7 +242,7 @@ class Owner(unittest.TestCase):
         # never compile together on a 16 GB runner (#1943). The build lists
         # the lib tests and runs none; the profile that listing writes is
         # deleted before the run, so the report reads only the run's.
-        self.assertEqual(self.o.recipe_stages('ci', '78.65')[:4], [
+        self.assertEqual(self.o.recipe_stages('ci', '87.60')[:4], [
             ['clean', '--workspace'],
             ['--no-report', 'test', '--lib', '--', '--list'],
             ['clean', '--profraw-only'],
@@ -297,7 +297,7 @@ class Owner(unittest.TestCase):
         self.assertEqual(self.child_count, 1)
 
     def test_source_recipe_drift_refused_before_tool_or_make_execution(self):
-        self.root.joinpath('Makefile').write_text(self.o.MAKE_RECIPE.replace('78.65', '70'))
+        self.root.joinpath('Makefile').write_text(self.o.MAKE_RECIPE.replace('87.60', '70'))
         with self.assertRaisesRegex(c.Invalid, 'recipe'):
             self.execute()
         self.assertFalse(self.calls)

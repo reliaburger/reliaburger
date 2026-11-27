@@ -113,6 +113,35 @@ pub type CouncilRoster = BTreeMap<u64, CouncilNodeInfo>;
 /// The file, in a node's identity directory, holding its expected council.
 pub const EXPECTED_COUNCIL_FILE: &str = "council.json";
 
+/// The file, in a node's Raft directory, naming the voters of the council a
+/// recovery replaced (#2406). Node-local: it sits beside the fence record and
+/// never replicates.
+pub const PREVIOUS_COUNCIL_FILE: &str = "previous-council.json";
+
+/// The voters of the councils this node's recoveries replaced, as
+/// `relish council recover` saved them in `raft_dir`. Empty when it was
+/// never recovered.
+pub fn load_previous_council(raft_dir: &std::path::Path) -> std::io::Result<CouncilRoster> {
+    match std::fs::read(raft_dir.join(PREVIOUS_COUNCIL_FILE)) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(CouncilRoster::new()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Save `roster` as the previous council in `raft_dir`, atomically.
+pub fn save_previous_council(
+    raft_dir: &std::path::Path,
+    roster: &CouncilRoster,
+) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(roster).map_err(std::io::Error::other)?;
+    crate::sesame::identity::atomic_write_mode(
+        &raft_dir.join(PREVIOUS_COUNCIL_FILE),
+        &bytes,
+        Some(0o644),
+    )
+}
+
 /// How often a node refreshes its expected council: from its own membership
 /// when it has one, otherwise by asking the voters it expects.
 pub const EXPECTED_COUNCIL_REFRESH: Duration = Duration::from_secs(30);
@@ -364,6 +393,8 @@ pub struct RaftAdmission {
     dialer: Option<TcpRaftNetworkFactory>,
     /// The council this node expects while it has none of its own.
     expected: ExpectedCouncil,
+    /// The voters of the councils this node's recoveries replaced.
+    previous: Arc<CouncilRoster>,
     state: Arc<AdmissionState>,
 }
 
@@ -384,6 +415,7 @@ impl RaftAdmission {
         Self {
             dialer: Some(dialer),
             expected: ExpectedCouncil::default(),
+            previous: Arc::default(),
             state: Arc::default(),
         }
     }
@@ -394,6 +426,7 @@ impl RaftAdmission {
         Self {
             dialer: None,
             expected: ExpectedCouncil::default(),
+            previous: Arc::default(),
             state: Arc::default(),
         }
     }
@@ -401,6 +434,16 @@ impl RaftAdmission {
     /// The same check, expecting `expected` while this node has no council.
     pub fn expecting(mut self, expected: ExpectedCouncil) -> Self {
         self.expected = expected;
+        self
+    }
+
+    /// The same check, also asking `previous`, the voters of the councils
+    /// this node's recoveries replaced, about an epoch claim on gossip
+    /// (#2406). A recovered council starts with one voter, so without them
+    /// two survivors recovered on one epoch would have nobody to ask, and
+    /// would never see the split (#694).
+    pub fn remembering(mut self, previous: CouncilRoster) -> Self {
+        self.previous = Arc::new(previous);
         self
     }
 
@@ -551,8 +594,9 @@ impl RaftAdmission {
         self.expected.replace(roster).await
     }
 
-    /// Ask the voters of this node's council (or of the council it expects)
-    /// which councils they serve, so that one that serves a newer recovery
+    /// Ask the voters of this node's council (or of the council it expects),
+    /// and those of the councils its recoveries replaced, which councils they
+    /// serve, so that one that serves a newer recovery
     /// epoch tells this node so, and its fence moves (#2406). The answers
     /// themselves aren't needed: a refusal carries the epoch, and the
     /// transport hands that to the fence.
@@ -560,8 +604,17 @@ impl RaftAdmission {
         let Some(dialer) = &self.dialer else {
             return;
         };
-        let voters = askable_voters(raft, &self.expected, None).await;
-        ask_voters(dialer, voters).await;
+        let me = raft.metrics().borrow().id;
+        let mut voters: BTreeMap<u64, CouncilNodeInfo> = askable_voters(raft, &self.expected, None)
+            .await
+            .into_iter()
+            .collect();
+        for (id, info) in self.previous.iter() {
+            if *id != me {
+                voters.entry(*id).or_insert_with(|| info.clone());
+            }
+        }
+        ask_voters(dialer, voters.into_iter().collect()).await;
     }
 }
 

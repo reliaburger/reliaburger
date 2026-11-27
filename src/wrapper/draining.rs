@@ -13,6 +13,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
+/// The drain a backend gets when its timeout is too large to add to the
+/// clock: the most `drain_timeout` config accepts.
+const DRAIN_TIMEOUT_FALLBACK: Duration = Duration::from_secs(60 * 60);
+
 /// A drain tracker shared between the live Wrapper proxy and Bun's deploy
 /// path.
 ///
@@ -221,7 +225,15 @@ impl DrainTracker {
             return false;
         }
         entry.app_name = cmd.app_name.clone();
-        entry.deadline = Some(Instant::now() + cmd.timeout);
+        // `Instant + Duration` panics when the sum doesn't fit the clock
+        // (#2378), so a timeout too large to add gets the most config
+        // accepts.
+        let now = Instant::now();
+        entry.deadline = Some(
+            now.checked_add(cmd.timeout)
+                .or_else(|| now.checked_add(DRAIN_TIMEOUT_FALLBACK))
+                .unwrap_or(now),
+        );
         true
     }
 
@@ -381,6 +393,22 @@ mod tests {
             instance_id: instance.to_string(),
             timeout: Duration::from_secs(timeout_secs),
         }
+    }
+
+    /// A drain timeout too large to add to the clock still drains, rather
+    /// than panicking the caller (#2378, #2527). Passed in directly: config
+    /// refuses such a `drain_timeout` before it gets here.
+    #[tokio::test]
+    async fn a_drain_timeout_too_large_to_add_to_the_clock_does_not_panic() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut tracker = DrainTracker::new(tx);
+        let command = DrainCommand {
+            app_name: "web".into(),
+            instance_id: "web-0".into(),
+            timeout: Duration::MAX,
+        };
+        assert!(tracker.start_drain(&command));
+        assert!(!tracker.is_terminating("web-0"));
     }
 
     #[tokio::test]

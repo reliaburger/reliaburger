@@ -9835,6 +9835,7 @@ fn adoption_record(
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                no_new_privileges: false,
                 rlimits: Vec::new(),
                 args: vec!["sleep".to_string(), "60".to_string()],
                 env: vec![],
@@ -9847,6 +9848,9 @@ fn adoption_record(
             },
             mounts: vec![],
             linux: crate::grill::oci::OciLinux {
+                seccomp: None,
+                masked_paths: Vec::new(),
+                readonly_paths: Vec::new(),
                 namespaces: vec![],
                 resources: None,
                 cgroups_path: None,

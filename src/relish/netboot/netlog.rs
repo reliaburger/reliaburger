@@ -13,7 +13,11 @@
 //! paired with that address, or that the machine's first line on each boot
 //! (its hello) names, when this process answered that MAC ([`Peers`]). A
 //! sender it never answered is named by its address. It also appends the
-//! line to `<netboot dir>/logs/<mac>.log`, so a lab record can quote it.
+//! line to `<netboot dir>/logs/<mac>.log`, so a lab record can quote it, or,
+//! for a sender it never answered, to `logs/unserved.log` with the address
+//! in front. Files are capped at 64 MiB each and 64 open at once, so lines
+//! from many forged addresses can't use up relish's file descriptors or the
+//! disk.
 //!
 //! The screen can show less than the file ([`StreamLogs`]). Three machines
 //! booting send hundreds of kernel lines each, so `--stream-logs=units`
@@ -43,6 +47,19 @@ pub const NETLOG_PORT: u16 = crate::os::netlog::DEFAULT_PORT;
 /// The directory under the netboot directory the raw lines go to.
 pub const LOGS_DIRECTORY: &str = "logs";
 
+/// The one file under `logs/` for every sender this process never served,
+/// each line marked with its address: anyone can send from any number of
+/// (forged) addresses, so they don't get a file each.
+pub const UNSERVED_LOG: &str = "unserved.log";
+
+/// The files under `logs/` kept open at once. Past this, the one written
+/// longest ago is closed, and reopened if its machine sends again.
+const MAX_OPEN_LOG_FILES: usize = 64;
+
+/// The most a file under `logs/` grows to; later lines only print. A whole
+/// boot's kernel log is a few hundred KiB.
+const MAX_LOG_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// The largest datagram the listener reads. netconsole sends at most a
 /// few hundred bytes a packet; anything longer is cut there.
 const MAX_DATAGRAM: usize = 2048;
@@ -61,7 +78,7 @@ impl Sender {
     pub fn file_name(self) -> String {
         match self {
             Sender::Served(mac) => format!("{mac}.log"),
-            Sender::NotServed(address) => format!("{address}.log"),
+            Sender::NotServed(_) => UNSERVED_LOG.to_string(),
         }
     }
 }
@@ -81,6 +98,9 @@ impl fmt::Display for Sender {
 pub struct Peers {
     answered: HashSet<MacAddress>,
     by_address: HashMap<Ipv4Addr, MacAddress>,
+    /// The address each MAC's latest DHCP request came from. Only DHCP
+    /// sets it, never a hello, which anyone can send.
+    asked_from: HashMap<MacAddress, Ipv4Addr>,
 }
 
 impl Peers {
@@ -93,6 +113,13 @@ impl Peers {
             return;
         }
         self.by_address.insert(address, mac);
+        self.asked_from.insert(mac, address);
+    }
+
+    /// The address `mac`'s latest DHCP request came from, if it sent one
+    /// from an address of its own.
+    pub fn asked_from(&self, mac: MacAddress) -> Option<Ipv4Addr> {
+        self.asked_from.get(&mac).copied()
     }
 
     /// A machine at `address` said hello naming `mac` ([`hello_mac`]).
@@ -307,42 +334,112 @@ pub fn describe(sender: Sender, line: &str) -> String {
     format!("log {sender}: {line}")
 }
 
-/// The files under `logs/` that lines are appended to, kept open.
+/// One file under `logs/`, open for appending.
+struct OpenLog {
+    file: tokio::fs::File,
+    /// Its length so far.
+    length: u64,
+    /// When it was last written, by [`LogFiles`]'s count of writes.
+    last_write: u64,
+}
+
+/// The files under `logs/` that lines are appended to: at most
+/// [`MAX_OPEN_LOG_FILES`] open at once, each growing to `max_bytes`.
 struct LogFiles {
     directory: Option<PathBuf>,
-    open: HashMap<String, tokio::fs::File>,
+    open: HashMap<String, OpenLog>,
+    /// Files that reached `max_bytes`: their lines only print.
+    full: HashSet<String>,
+    /// Writes so far, to tell which open file was written longest ago.
+    writes: u64,
     /// A write failed once, and the operator heard why; later failures
     /// stay quiet so the terminal isn't flooded.
     warned: bool,
+    /// The most a file grows to.
+    max_bytes: u64,
 }
 
 impl LogFiles {
-    async fn append(&mut self, sender: Sender, line: &str) -> std::io::Result<()> {
-        let Some(directory) = &self.directory else {
-            return Ok(());
+    fn new(directory: Option<PathBuf>) -> Self {
+        Self {
+            directory,
+            open: HashMap::new(),
+            full: HashSet::new(),
+            writes: 0,
+            warned: false,
+            max_bytes: MAX_LOG_FILE_BYTES,
+        }
+    }
+
+    /// Append `line` to `sender`'s file. True when this line is the first
+    /// one dropped because the file is full, so the caller can say so once.
+    async fn append(&mut self, sender: Sender, line: &str) -> std::io::Result<bool> {
+        let Some(directory) = self.directory.clone() else {
+            return Ok(false);
         };
         let name = sender.file_name();
+        if self.full.contains(&name) {
+            return Ok(false);
+        }
+        let text = match sender {
+            Sender::Served(_) => format!("{line}\n"),
+            Sender::NotServed(address) => format!("{address} {line}\n"),
+        };
         if !self.open.contains_key(&name) {
-            tokio::fs::create_dir_all(directory).await?;
+            self.close_oldest_if_full();
+            tokio::fs::create_dir_all(&directory).await?;
             let file = tokio::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(directory.join(&name))
                 .await?;
-            self.open.insert(name.clone(), file);
+            let length = file.metadata().await?.len();
+            self.open.insert(
+                name.clone(),
+                OpenLog {
+                    file,
+                    length,
+                    last_write: 0,
+                },
+            );
         }
-        if let Some(file) = self.open.get_mut(&name) {
-            file.write_all(format!("{line}\n").as_bytes()).await?;
-            // tokio's File hands the write to a blocking thread and returns
-            // before it lands; flush waits for it, so a line that has
-            // printed is in the file too.
-            file.flush().await?;
+        self.writes += 1;
+        let Some(open) = self.open.get_mut(&name) else {
+            return Ok(false);
+        };
+        if open.length + text.len() as u64 > self.max_bytes {
+            self.open.remove(&name);
+            self.full.insert(name);
+            return Ok(true);
         }
-        Ok(())
+        open.file.write_all(text.as_bytes()).await?;
+        // tokio's File hands the write to a blocking thread and returns
+        // before it lands; flush waits for it, so a line that has printed
+        // is in the file too.
+        open.file.flush().await?;
+        open.length += text.len() as u64;
+        open.last_write = self.writes;
+        Ok(false)
+    }
+
+    /// Make room for one more open file by closing the one written longest
+    /// ago. It opens again, appending, if its machine sends another line.
+    fn close_oldest_if_full(&mut self) {
+        if self.open.len() < MAX_OPEN_LOG_FILES {
+            return;
+        }
+        let oldest = self
+            .open
+            .iter()
+            .min_by_key(|(_, open)| open.last_write)
+            .map(|(name, _)| name.clone());
+        if let Some(name) = oldest {
+            self.open.remove(&name);
+        }
     }
 }
 
-/// Append each line that arrives on `socket` to `logs/<sender>.log` under
+/// Append each line that arrives on `socket` to its sender's file under
 /// `directory` when there is one, and print the ones `shown` shows through
 /// `log`, naming the sender from `peers`. Runs until the socket fails.
 pub async fn listen(
@@ -352,11 +449,7 @@ pub async fn listen(
     shown: StreamLogs,
     log: Log,
 ) -> std::io::Result<()> {
-    let mut files = LogFiles {
-        directory: directory.map(|d| d.join(LOGS_DIRECTORY)),
-        open: HashMap::new(),
-        warned: false,
-    };
+    let mut files = LogFiles::new(directory.map(|d| d.join(LOGS_DIRECTORY)));
     let mut buffer = vec![0u8; MAX_DATAGRAM];
     loop {
         let (len, source) = socket.recv_from(&mut buffer).await?;
@@ -366,14 +459,21 @@ pub async fn listen(
         for line in lines(&buffer[..len]) {
             let sender = sender(&peers, *source.ip(), &line);
             // The file first: once a line has printed, it's on disk too.
-            if let Err(error) = files.append(sender, &line).await
-                && !files.warned
-            {
-                files.warned = true;
-                log(format!(
-                    "log: can't write {}: {error}; boot logs only print from now on",
-                    sender.file_name()
-                ));
+            match files.append(sender, &line).await {
+                Ok(true) => log(format!(
+                    "log: {} reached {} MiB; its lines only print from now on",
+                    sender.file_name(),
+                    files.max_bytes / (1024 * 1024)
+                )),
+                Ok(false) => {}
+                Err(error) if !files.warned => {
+                    files.warned = true;
+                    log(format!(
+                        "log: can't write {}: {error}; boot logs only print from now on",
+                        sender.file_name()
+                    ));
+                }
+                Err(_) => {}
             }
             if shown.shows(&line) {
                 log(describe(sender, &line));
@@ -476,7 +576,7 @@ mod tests {
             "log 192.168.1.99 (not served): hello"
         );
         assert_eq!(peers.sender(address).file_name(), "52:54:00:12:34:56.log");
-        assert_eq!(peers.sender(stranger).file_name(), "192.168.1.99.log");
+        assert_eq!(peers.sender(stranger).file_name(), "unserved.log");
     }
 
     #[test]
@@ -652,6 +752,57 @@ mod tests {
             "reliaburger: bun not healthy after 120 s\nreliaburger: counted boot failed, rebooting\n"
         );
         task.abort();
+    }
+
+    /// Anyone on the LAN can send a line, from as many (forged) source
+    /// addresses as it likes. A file and an open handle each would run
+    /// relish, and the netboot servers in the same process, out of file
+    /// descriptors. Lines from senders this process never served share one
+    /// file, each marked with its address.
+    #[tokio::test]
+    async fn lines_from_addresses_this_server_never_answered_share_one_bounded_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut files = LogFiles::new(Some(directory.path().to_path_buf()));
+        for n in 0..300u16 {
+            let address = Ipv4Addr::new(10, 0, (n / 256) as u8, (n % 256) as u8);
+            files.append(Sender::NotServed(address), "x").await.unwrap();
+        }
+        assert!(files.open.len() <= MAX_OPEN_LOG_FILES);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        let shared = std::fs::read_to_string(directory.path().join("unserved.log")).unwrap();
+        assert!(shared.starts_with("10.0.0.0 x\n10.0.0.1 x\n"), "{shared}");
+
+        // Served machines each have a file, but not each an open handle.
+        for n in 0..100u8 {
+            let mac = MacAddress([0x52, 0x54, 0x00, 0x00, 0x01, n]);
+            files.append(Sender::Served(mac), "y").await.unwrap();
+        }
+        assert!(files.open.len() <= MAX_OPEN_LOG_FILES);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 101);
+        // A machine whose file was closed is appended to again.
+        let first = MacAddress([0x52, 0x54, 0x00, 0x00, 0x01, 0]);
+        files.append(Sender::Served(first), "z").await.unwrap();
+        let written =
+            std::fs::read_to_string(directory.path().join(Sender::Served(first).file_name()))
+                .unwrap();
+        assert_eq!(written, "y\nz\n");
+    }
+
+    #[tokio::test]
+    async fn a_log_file_stops_growing_at_its_cap() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut files = LogFiles::new(Some(directory.path().to_path_buf()));
+        files.max_bytes = 1000;
+        for _ in 0..100 {
+            files
+                .append(Sender::Served(MAC), &"a".repeat(49))
+                .await
+                .unwrap();
+        }
+        let file = directory.path().join(Sender::Served(MAC).file_name());
+        let length = std::fs::metadata(&file).unwrap().len();
+        assert!(length <= 1000, "{length}");
+        assert!(length >= 950, "it filled up to the cap: {length}");
     }
 
     // `--stream-logs=units` (#2149 follow-up): what the screen keeps.

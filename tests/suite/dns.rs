@@ -3,6 +3,7 @@
 //! and speaks wire-format DNS to it.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use reliaburger::onion::dns::{
@@ -333,6 +334,186 @@ async fn external_lookup_falls_through_to_the_next_resolver() {
         .expect("the second resolver should have answered");
     assert_eq!(rcode(&response), 0);
     drop(silent);
+}
+
+/// #2384: a resolver that timed out is tried last for a while, so a dead
+/// first nameserver doesn't add its whole timeout to every external lookup.
+#[tokio::test]
+async fn a_dead_upstream_is_skipped_on_the_next_lookup() {
+    let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let live = echoing_upstream().await;
+    let harness = DnsHarness::start_with_upstreams(
+        vec![silent.local_addr().unwrap(), live],
+        ServiceMap::new(),
+    )
+    .await;
+    let first = harness
+        .query(&build_query("example.com", QTYPE_A))
+        .await
+        .expect("the second resolver should have answered");
+    assert_eq!(rcode(&first), 0);
+
+    let started = std::time::Instant::now();
+    let second = harness
+        .query(&build_query("example.org", QTYPE_A))
+        .await
+        .expect("the live resolver should have answered");
+    let took = started.elapsed();
+    assert_eq!(rcode(&second), 0);
+    assert!(
+        took < Duration::from_millis(200),
+        "the dead resolver was asked again first: {took:?}"
+    );
+    drop(silent);
+}
+
+/// Send `count` distinct external queries from `client` without waiting
+/// for answers.
+async fn send_distinct_queries(client: &UdpSocket, to: std::net::SocketAddr, count: u16) {
+    for index in 0..count {
+        let query = build_query_with_id(
+            &format!("name{index}.example.com"),
+            QTYPE_A,
+            index.to_be_bytes(),
+        );
+        client.send_to(&query, to).await.unwrap();
+    }
+}
+
+/// The first answer `client` receives within `wait`, if any.
+async fn first_answer(client: &UdpSocket, wait: Duration) -> Option<Vec<u8>> {
+    let mut buf = [0u8; 1500];
+    match tokio::time::timeout(wait, client.recv_from(&mut buf)).await {
+        Ok(Ok((n, _))) => Some(buf[..n].to_vec()),
+        _ => None,
+    }
+}
+
+/// #2384: one container can hold at most a quarter of the node's forward
+/// slots. Past its share it gets SERVFAIL at once, and the rest stay free
+/// for everyone else.
+#[tokio::test]
+async fn one_source_gets_servfail_past_its_share_of_forward_slots() {
+    let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let harness =
+        DnsHarness::start_with_upstreams(vec![silent.local_addr().unwrap()], ServiceMap::new())
+            .await;
+    let noisy = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    send_distinct_queries(&noisy, harness.addr, 17).await;
+
+    let answer = first_answer(&noisy, Duration::from_millis(200))
+        .await
+        .expect("the query past this source's share should fail at once");
+    assert_eq!(rcode(&answer), 2, "SERVFAIL");
+    assert_eq!(&answer[..2], &16u16.to_be_bytes(), "the seventeenth query");
+    drop(silent);
+}
+
+/// #2384: a second source still gets its query forwarded while another
+/// source is at its share. It needs a second loopback address, which Linux
+/// has and macOS doesn't by default.
+#[tokio::test]
+async fn one_source_cannot_hold_every_forward_slot() {
+    let Ok(quiet) = UdpSocket::bind("127.0.0.2:0").await else {
+        eprintln!("skipping: this host has no 127.0.0.2");
+        return;
+    };
+    let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let harness =
+        DnsHarness::start_with_upstreams(vec![silent.local_addr().unwrap()], ServiceMap::new())
+            .await;
+    let noisy = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    send_distinct_queries(&noisy, harness.addr, 64).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    quiet
+        .send_to(&build_query("other.example.com", QTYPE_A), harness.addr)
+        .await
+        .unwrap();
+    let answer = first_answer(&quiet, Duration::from_millis(100)).await;
+    assert!(
+        answer.is_none(),
+        "another source's query should be forwarded and wait, got {answer:?}"
+    );
+    drop(silent);
+}
+
+/// A fake resolver that answers every A query with one record (TTL
+/// `ttl`) and counts the queries it receives.
+async fn answering_upstream(ttl: u32) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+    let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = upstream.local_addr().unwrap();
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&asked);
+    tokio::spawn(async move {
+        let mut buf = [0u8; 512];
+        while let Ok((n, src)) = upstream.recv_from(&mut buf).await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let mut reply = buf[..n].to_vec();
+            reply[2] = 0x81; // QR=1, RD=1
+            reply[3] = 0x80; // RA=1, NOERROR
+            reply[7] = 1; // ANCOUNT=1
+            reply.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01]);
+            reply.extend_from_slice(&ttl.to_be_bytes());
+            reply.extend_from_slice(&[0x00, 0x04, 192, 0, 2, 10]);
+            let _ = upstream.send_to(&reply, src).await;
+        }
+    });
+    (addr, asked)
+}
+
+/// #2384: a positive answer is kept for its TTL (at most 30 s), so the
+/// same lookup again doesn't leave the node. The cached copy carries the
+/// new query's transaction ID.
+#[tokio::test]
+async fn a_positive_answer_is_served_from_the_cache() {
+    let (upstream, asked) = answering_upstream(300).await;
+    let harness = DnsHarness::start(upstream, ServiceMap::new()).await;
+    let first = harness
+        .query(&build_query_with_id("cached.example.com", QTYPE_A, [0, 1]))
+        .await
+        .expect("an answer");
+    let second = harness
+        .query(&build_query_with_id("CACHED.example.com", QTYPE_A, [0, 2]))
+        .await
+        .expect("a cached answer");
+
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        1,
+        "the second came from cache"
+    );
+    assert_eq!(&first[..2], &[0, 1]);
+    assert_eq!(&second[..2], &[0, 2], "the cached answer takes the new id");
+    assert_eq!(rcode(&second), 0);
+    assert_eq!(second[7], 1, "the answer record is kept");
+    let ttl = u32::from_be_bytes(
+        second[second.len() - 10..second.len() - 6]
+            .try_into()
+            .unwrap(),
+    );
+    assert!(ttl <= 30, "the TTL is capped at the cache's ceiling: {ttl}");
+    let question = b"\x06CACHED\x07example\x03com\x00";
+    assert!(
+        second
+            .windows(question.len())
+            .any(|window| window == question),
+        "the question echoes the client's own spelling"
+    );
+}
+
+/// #2384: an answer with a zero TTL isn't cached.
+#[tokio::test]
+async fn a_zero_ttl_answer_is_not_cached() {
+    let (upstream, asked) = answering_upstream(0).await;
+    let harness = DnsHarness::start(upstream, ServiceMap::new()).await;
+    for _ in 0..2 {
+        harness
+            .query(&build_query("fresh.example.com", QTYPE_A))
+            .await
+            .expect("an answer");
+    }
+    assert_eq!(asked.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

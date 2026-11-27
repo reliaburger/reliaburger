@@ -2,13 +2,16 @@
 """Check the known-flakes register (docs/flakes.md) against GitHub.
 
 The register's rule: a flake that isn't fixed the day it's seen gets an issue,
-and its row links that issue. A row whose status starts with "Open" is still
-flaky, so it must link at least one issue, and every issue it links must
-still be open. An open row that points at a closed issue has lost its owner.
+and its row links that issue. A row is closed out when its status starts with
+one of RESOLVED: "Fixed", "Not a defect", "Infrastructure" or "Superseded".
+Every other row is unresolved and must link at least one issue, so a status
+like "Not reproduced" can't leave a flake with no owner (#2491). A row whose
+status starts with "Open" is still flaky, so every issue it links must also
+still be open: an open row that points at a closed issue has lost its owner.
 
     flakes_register.py check [--register docs/flakes.md] [--offline]
 
-`--offline` checks only that open rows link an issue. Without it, each linked
+`--offline` checks only that unresolved rows link an issue. Without it, each linked
 issue's state comes from `gh issue view` (GH_TOKEN must be set in CI).
 
 Fixtures: scripts/ci/test_flakes_register.py.
@@ -25,6 +28,9 @@ HEADER = ["Test", "First seen", "Cause", "Status"]
 ISSUE_LINK = re.compile(r"https://github\.com/reliaburger/reliaburger/issues/(\d+)")
 # A cell boundary is a pipe that Markdown hasn't escaped.
 CELL_BOUNDARY = re.compile(r"(?<!\\)\|")
+# Statuses that close a row out, so it needs no issue. Each is a whole word
+# or phrase at the start of the status.
+RESOLVED = ("Fixed", "Not a defect", "Infrastructure", "Superseded")
 
 
 @dataclass
@@ -40,6 +46,10 @@ class Row:
     def is_open(self):
         """The flake isn't fixed yet."""
         return self.status.startswith("Open")
+
+    def is_resolved(self):
+        """The row needs no issue: the flake is fixed, or was never a defect."""
+        return any(re.match(re.escape(prefix) + r"\b", self.status) for prefix in RESOLVED)
 
     def issues(self):
         """The issue numbers the status links, in order, without repeats."""
@@ -71,9 +81,17 @@ def parse(text):
 
 
 def missing_issues(rows):
-    """A message for each open row that links no issue."""
-    return [f"docs/flakes.md:{row.line}: {row.test} is open but links no issue"
-            for row in rows if row.is_open() and not row.issues()]
+    """A message for each unresolved row that links no issue."""
+    problems = []
+    for row in rows:
+        if row.is_resolved() or row.issues():
+            continue
+        if row.is_open():
+            kind = "open"
+        else:
+            kind = f"unresolved (its status starts with none of {', '.join(RESOLVED)})"
+        problems.append(f"docs/flakes.md:{row.line}: {row.test} is {kind} but links no issue")
+    return problems
 
 
 def closed_issues(rows, state_of):
@@ -117,12 +135,12 @@ def main(argv=None):
         problems += closed_issues(rows, github_state)
     for problem in problems:
         print(problem, file=sys.stderr)
-    open_rows = sum(1 for row in rows if row.is_open())
+    open_rows = sum(1 for row in rows if not row.is_resolved())
     if problems:
         print(f"{len(problems)} problem(s) in the flakes register", file=sys.stderr)
         return 1
-    checked = "an issue" if arguments.offline else "an open issue"
-    print(f"{open_rows} open row(s) of {len(rows)}, each linking {checked}")
+    checked = "" if arguments.offline else "; every Open row's issues are open"
+    print(f"{open_rows} unresolved row(s) of {len(rows)}, each linking an issue{checked}")
     return 0
 
 

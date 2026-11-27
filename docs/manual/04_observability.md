@@ -193,6 +193,11 @@ seconds is refused with a 400 asking for a narrower range.
 member that refuses a range (more than 200,000 node-minute contributions, or
 one minute holding more than 10,000) shows up in the answer's `warnings` as
 `QueryRefused` with its reason, not as an unresponsive node.
+`/v1/metrics/app/{app}/{namespace}` (what `relish metrics` reads) asks each
+node running the app for its newest 10,000 rows in the range. A node whose
+answer reached that limit is named in `warnings` as `Truncated`, and `relish`
+prints the warning: that node's older rows are missing, so ask for a shorter
+range or one metric with `--name`.
 
 ### Remote metrics archives
 
@@ -264,6 +269,21 @@ app's page in the web dashboard charts the same data, one line per instance.
 Axes and legends pick a readable unit (`12 MiB`, `300 µs`, `1.5k req/s`),
 and the legend shows each line's newest value until you hover over a point.
 
+A scrape takes at most an 8 MiB response and 20,000 samples; one over either
+limit fails whole, so nothing from it is stored, `up` is 0 for that instance
+and Bun logs the reason. The limits are fixed, not settings.
+
+An app can't use the names the node writes for itself: anything starting
+`node_`, `ingress_`, `ketchup_`, `bun_`, `mayo_` or
+`discovery_withdrawal_`, plus `up`, `process_cpu_percent`,
+`process_memory_bytes` and the `job_*` names the
+[batch jobs chapter](14_batch-jobs.md#job-history-metrics-and-events) lists.
+A scraped sample with one of those names is stored as `exported_<name>`
+(`exported_node_cpu_usage_percent`), the way a clashing `app`, `namespace`,
+`instance` or `node` label becomes `exported_<label>`, so an app can't raise
+the node's alerts or draw on its charts. Other `process_*` names, such as a
+client library's `process_cpu_seconds_total`, keep their names.
+
 There's no PromQL. You read metrics through `relish metrics`, the dashboards
 and the API. For something that isn't an app on the cluster, such as a node
 exporter, list fixed URLs as `[[metrics.scrape_targets]]` with a `job` and a
@@ -274,7 +294,13 @@ exporter, list fixed URLs as `[[metrics.scrape_targets]]` with a `job` and a
 Each node evaluates four built-in rules against its own metrics every 30
 seconds: CPU above 90% for 5 minutes and memory above 85% for 2 minutes
 (critical); memory above 70% for 10 minutes and disk above 80% for 5 minutes
-(warning). An idle node raises nothing: low CPU is spare capacity, not a fault. You can't define your own rules yet ([#1773](https://github.com/reliaburger/reliaburger/issues/1773)).
+(warning). An idle node raises nothing: low CPU is spare capacity, not a fault.
+The rules read only the node's own series, never one with an `app` label. A
+firing alert whose metric stops reporting resolves after 10 evaluations
+without a reading (5 minutes at the default interval), and at most 8
+deliveries run at once. A firing alert survives a Bun restart (an upgrade,
+say): it's kept in `alerts-firing.json` in the data directory, so a
+condition that cleared while Bun was down still sends its resolve. You can't define your own rules yet ([#1773](https://github.com/reliaburger/reliaburger/issues/1773)).
 Webhooks deliver them, optionally signed with HMAC-SHA256:
 
 ```toml

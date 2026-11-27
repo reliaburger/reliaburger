@@ -3104,8 +3104,17 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
     // Create the alert evaluator (shared between the API and the
     // evaluation loop so /v1/alerts always reflects current state).
+    // Firing alerts survive a restart, so a condition that clears while
+    // Bun is down still gets its resolve sent (#2478).
+    let alerts_state_path = data_base.join("alerts-firing.json");
     let alerts: Option<Arc<RwLock<AlertEvaluator>>> = if config.metrics.alerts_enabled {
-        Some(Arc::new(RwLock::new(AlertEvaluator::with_defaults())))
+        let mut evaluator = AlertEvaluator::with_defaults();
+        // BLOCKING-OK: startup, before the evaluation loop runs; one small file
+        let restored = evaluator.restore_firing(&alerts_state_path);
+        if restored > 0 {
+            println!("bun: {restored} firing alert(s) restored");
+        }
+        Some(Arc::new(RwLock::new(evaluator)))
     } else {
         None
     };
@@ -3651,6 +3660,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         let eval_alerts = Arc::clone(alert_evaluator);
         let eval_shutdown = shutdown.clone();
         let eval_interval = config.alerts.evaluation_interval_secs;
+        let eval_state_path = alerts_state_path.clone();
         let cluster_name = config.cluster.name.clone();
 
         let webhook_client = reliaburger::http_client::builder()
@@ -3683,15 +3693,28 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             .as_secs();
                         let latest = gather_latest_values(&eval_mayo, now_secs).await;
 
-                        let transitions = {
+                        let (transitions, firing) = {
                             let mut eval = eval_alerts.write().await;
-                            eval.evaluate(&latest)
+                            let transitions = eval.evaluate(&latest);
+                            let firing = (!transitions.is_empty()).then(|| eval.firing_records());
+                            (transitions, firing)
                         };
+                        // Saved whenever the firing set changed, before the
+                        // next evaluation, so saves can't land out of order.
+                        if let Some(firing) = firing {
+                            let path = eval_state_path.clone();
+                            let saved = tokio::task::spawn_blocking(move || firing.save(&path)).await;
+                            if let Ok(Err(error)) = saved {
+                                eprintln!("bun: saving firing alerts to {}: {error}", eval_state_path.display());
+                            }
+                        }
 
-                        for t in transitions {
+                        // One task per evaluation, not per transition; the
+                        // dispatcher bounds how many posts run at once (#2387).
+                        if !transitions.is_empty() {
                             let d = dispatcher.clone();
                             tokio::spawn(async move {
-                                d.dispatch(&t).await;
+                                d.dispatch_all(transitions).await;
                             });
                         }
                     }

@@ -861,9 +861,12 @@ pub struct HostDevice {
     pub gid: u32,
 }
 
-/// Why a device couldn't be passed in.
+/// Why a device couldn't be passed in, or the knobs couldn't be applied.
 #[derive(Debug, thiserror::Error)]
 pub enum DeviceLookupError {
+    /// The seccomp filter couldn't be rebuilt for the added capabilities.
+    #[error(transparent)]
+    Seccomp(#[from] super::seccomp::SeccompError),
     #[error("device {path} can't be read on this node: {source}")]
     Unreadable {
         path: String,
@@ -964,6 +967,12 @@ where
             let mut joined: BTreeSet<String> = set.drain(..).collect();
             joined.extend(knobs.capabilities.iter().map(|c| c.name().to_string()));
             *set = joined.into_iter().collect();
+        }
+        // An added capability brings the calls it guards into the seccomp
+        // filter, as Docker's `--cap-add` does (#2402): `CAP_SYS_ADMIN`
+        // would mean little if `mount` stayed refused.
+        if spec.linux.seccomp.is_some() {
+            spec.linux.seccomp = Some(super::seccomp::default_profile(&capabilities.bounding)?);
         }
     }
     for (name, value) in &knobs.sysctls {

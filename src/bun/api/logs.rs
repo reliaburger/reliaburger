@@ -176,7 +176,7 @@ async fn owned_follow_node(
 
 /// Get logs for an app.
 ///
-/// Supports `?tail=N` to return only the last N lines, and
+/// Supports `?tail=N` to return only the last N lines of each instance, and
 /// `?follow=true` to stream new lines as an SSE stream.
 pub(super) async fn logs_handler(
     watch: Option<axum::Extension<crate::sesame::auth::CredentialWatch>>,
@@ -1108,6 +1108,8 @@ pub(super) async fn logs_cross_node_handler(
         let app_id = AppId::new(&app, &namespace);
 
         // Where the app runs now; its history may be on any live member.
+        // Read under the lock, copying out only the node ids, not the whole
+        // desired state (#2453).
         let placed: Vec<String> = council
             .read_desired(|desired| {
                 desired

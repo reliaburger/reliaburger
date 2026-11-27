@@ -98,6 +98,10 @@ pub enum QueryWarning {
     /// A node answered but refused the query, and why: usually a range
     /// too large to answer, which narrowing fixes (#2451).
     QueryRefused { node_id: String, reason: String },
+    /// A node's answer reached the per-node row limit, so it holds only that
+    /// node's newest `limit` rows and older ones in the range are missing
+    /// (#2477).
+    Truncated { node_id: String, limit: usize },
 }
 
 /// Result of a metrics query, including data and any warnings.
