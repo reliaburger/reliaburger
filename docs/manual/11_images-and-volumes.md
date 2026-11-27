@@ -53,7 +53,12 @@ media types (`application/vnd.oci.image.layer.v1.tar`, `…tar+gzip`,
 so images BuildKit builds with `compression=zstd` run as they are. A pull
 refuses any other layer type before downloading it, naming the type, for
 example `layer sha256:… has media type application/vnd.oci.image.layer.v1.tar+bzip2,
-which no node can unpack`. Foreign (non-distributable) layers aren't supported.
+which no node can unpack`. `relish apply` refuses such an image too, before
+anything is scheduled, with the same message: it reads the layers from
+Pickle's catalogue when the image is there, and otherwise asks the registry
+for the manifest. If the registry doesn't answer in time, the apply goes
+ahead and the pull refuses the image on the node instead. Foreign
+(non-distributable) layers aren't supported.
 
 Layers stream to disk as they arrive, so a large image doesn't need its
 size in memory, and a slow link isn't a problem while bytes keep coming: an

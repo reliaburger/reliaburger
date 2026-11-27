@@ -1197,10 +1197,26 @@ like a Go interface value. `tar::Archive` doesn't care which it gets.
 The direct pull, which does have the manifest, also refuses an unknown layer
 media type before downloading it, naming the type. The pull-through cache
 doesn't: it caches cosign signature images too, whose "layers" are JSON, so
-there the bytes decide at unpack time. An apply still accepts such an image,
-because binding only asks the registry for a digest and never sees the
-manifest; checking there would mean fetching it, which is a change to the
-binder for another day.
+there the bytes decide at unpack time.
+
+An apply used to accept such an image anyway, because binding only asked the
+registry for a digest and never saw the manifest. So `relish apply` said yes,
+and then every node's pull failed. The binder now checks too (#2528). Once it
+has bound an image, `check_layers` looks for the layers in the catalogue
+first: a Pickle image, or the pull-through cache's copy, is already there,
+and checking it costs nothing. For anything else it asks the registry for the
+platform manifest, one more request per distinct image an apply binds (an
+image named twice in one apply is checked once, like the digest). That's the
+price, and we judged it worth paying: an apply already waits on one round trip
+per image, and a refusal at apply names the image and the type while the
+person who wrote it is still looking. A registry that doesn't answer within
+the binding timeout doesn't fail the apply; the pull still refuses the image
+on the node, as before. For a multi-platform image in the catalogue, every
+catalogued platform is checked except the `unknown` entries BuildKit adds for
+its build attestations, whose layers are JSON and which nobody runs. The test
+`a_cluster_apply_refuses_an_image_whose_layers_no_node_can_unpack` applies an
+image with an `lz4` layer and finds an error naming the type and nothing in
+Raft.
 
 ### A restart shouldn't need a leader
 

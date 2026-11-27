@@ -150,6 +150,25 @@ async fn a_cluster_apply_fails_and_writes_nothing_when_the_registry_is_down() {
     council.raft().shutdown().await.unwrap();
 }
 
+/// #2528: an image with a layer no node can unpack is refused at apply,
+/// naming the layer's media type, and nothing reaches Raft. Before, the
+/// apply said yes and every node's pull failed.
+#[tokio::test]
+async fn a_cluster_apply_refuses_an_image_whose_layers_no_node_can_unpack() {
+    let council = seeded_council("bind-unpackable-layer").await;
+    let lz4 = "application/vnd.oci.image.layer.v1.tar+lz4";
+    let binder = ImageBinder::with_upstream(Arc::new(crate::pickle::binding::LayeredUpstream(lz4)));
+    let (app, shutdown) = router_with(Some(council.clone()), None, Some(binder));
+
+    let (_, body) = post(app, "/v1/apply", "[app.web]\nimage = \"nginx:1.27\"\n").await;
+
+    assert!(body.contains("\"Error\""), "{body}");
+    assert!(body.contains(lz4), "{body}");
+    assert_eq!(desired_image(&council, "web").await, None);
+    shutdown.cancel();
+    council.raft().shutdown().await.unwrap();
+}
+
 /// Decision 5: a node whose runtime pulls nothing (ProcessGrill) has no
 /// binder, and stores the image as written.
 #[tokio::test]
