@@ -4668,6 +4668,23 @@ check sits right beside that catalogue's thresholds. `--explain` doesn't
 repeat the numbers in prose. It prints them from the constants the checks
 compare against, so the words can't say 15 minutes while the code says 10.
 
+The `next:` steps needed the same treatment, and the November 2026 audit
+showed why (#2468). Three of them named commands that couldn't run. The
+disk-pressure finding said `relish pickle gc`, which has never existed. The
+unreachable-node finding said `relish dev shell <node>`, which only works on a
+developer Lima cluster, and `journalctl -u bun`, though the systemd unit is
+`reliaburger`. The dead-node finding said "drain it", and there's no drain
+command yet. `relish agent diagnose` hands the same strings to AI agents,
+which will try to run them. The text is fixed, and a test now keeps it fixed:
+`every_command_a_wtf_suggestion_names_exists`, in `src/bin/relish.rs` because
+that's where the real clap tree is, reads the source of the wtf and diagnose
+modules with `include_str!`, takes every backtick-quoted span that starts
+with `relish `, and walks the words through `Command::find_subcommand` until
+the first placeholder or flag. A suggestion naming a subcommand clap doesn't
+know fails the build's tests. `include_str!` embeds a file's text into the
+binary at compile time, so the test reads exactly the source it was built
+from, with no path to get wrong at run time.
+
 The renderer groups the report's four lists into rows, and the row type
 borrows from the report rather than copying it:
 

@@ -689,7 +689,7 @@ relish council [status]             # Every node's council view: role, epoch, te
 relish council recover --data-dir <dir> [--from <url> [--backup <name>]] [--master-key <path>] [--api-port <port>] [--force]
 relish council backups --from <url>                # List sealed backups, newest first by epoch, term and index
 relish council re-enrol --data-dir <dir> [--force]  # Drop a fenced voter's Raft state to rejoin
-relish join --token <token> --node-id <id> <api-addr>  # Enrol a node identity
+relish join --token <token> --node-id <id> --ca-fingerprint sha256:... <api-addr>  # Enrol a node identity
 relish join --token <t> --node-id <id> <addr> --ca-fingerprint sha256:... [--identity-dir <dir>]
 
 # Secrets
@@ -1418,12 +1418,16 @@ config without an identity makes `bun --cluster` refuse and name `relish init`.
 `--development-plaintext` is the only generator of a plaintext config; such a
 cluster has no cluster registry and can't pull Docker Hub short names.
 
-**`relish join --token <token> --node-id <id> <api-address>`**
+**`relish join --token <token> --node-id <id> --ca-fingerprint sha256:... <api-address>`**
 
 Contacts the current leader's agent API (normally HTTPS on port 9117), sends a
 CSR, validates and consumes the join token, and writes the returned certificate
-bundle to `--identity-dir` (default `identity`). `--ca-fingerprint sha256:...`
-pins the first exchange. The command doesn't add `[cluster].join`, copy the
+bundle, and the council's voters as `council.json`, to `--identity-dir`
+(default `identity`). `--ca-fingerprint sha256:...` pins the first exchange,
+and is required (#2410): without it the command would trust whatever root CA
+the member offered and send the token over a connection that CA vouches for.
+`--insecure-trust-first-ca` opts out by name, and prints the offered
+fingerprint as a warning before the token is sent. The command doesn't add `[cluster].join`, copy the
 cluster master key, start Bun or claim that gossip membership has converged;
 those are explicit provisioning and startup steps. Port 9443 is a gossip seed,
 not a valid API address for this command.
@@ -1628,10 +1632,10 @@ Each correlated group becomes one `[app.*]` block. Two apps or jobs with the sam
 |---|---|---|
 | Deployment | `[app.*]` | `replicas`, pod template (below), rolling-update strategy |
 | DaemonSet | `[app.*]` with `replicas = "*"` | Direct equivalent |
-| StatefulSet | `[app.*]` | **Warning**: ordering guarantees and stable network IDs lost |
+| StatefulSet | `[app.*]` | **Warning**: ordering guarantees and stable network IDs lost; `volumeClaimTemplates` and each `volumeMounts[].mountPath` **warned** with the `[[app.*.volumes]]` to declare |
 | Service | Merged into the selected `[app.*]` `port` | Onion handles discovery; see the correlation rules above |
 | Ingress | `[app.*.ingress]` | First rule's host + first path only (Reliaburger is one host/path per app); extra rules/paths, non-Prefix `pathType`, `defaultBackend`, `ingressClassName` and TLS Secrets are **warned** |
-| HorizontalPodAutoscaler | `[app.*.autoscale]` | `min`, `max`, `metric`, `target`; correlated by `scaleTargetRef` |
+| HorizontalPodAutoscaler | `[app.*.autoscale]` | `min`, `max`, `metric`, `target`; correlated by `scaleTargetRef`. A first metric that isn't a resource metric (or none) becomes `cpu` at `70%` and is **warned**; later metrics and `behavior` are **warned** |
 | ConfigMap (envFrom) | `[app.*.env]` / `[job.*.env]` | Flattened, `prefix` applied, explicit `env` wins; **warned** as approximate (later ConfigMap changes don't reach it). A ConfigMap no workload reads is **warned** |
 | Secret | **Warning** | `envFrom.secretRef` and every Secret are named; re-encrypt values with `relish secret encrypt` |
 | Job | `[job.*]` | `command`+`args`, `image`, `env`, resources, namespace; `backoffLimit` → `max_attempts` (+1, capped at 10 with a warning); the pod's `activeDeadlineSeconds` → `task_timeout_secs`; the Job's own `activeDeadlineSeconds` → `task_timeout_secs` with a warning (it becomes per attempt); `completions`, `parallelism`, `completionMode`, `podFailurePolicy` **warned** |
@@ -1659,11 +1663,15 @@ Each correlated group becomes one `[app.*]` block. Two apps or jobs with the sam
 | `nodeSelector` | `[app.*.placement] required` (**warned** on a job) |
 | `tolerations`, `affinity`, `topologySpreadConstraints` | **Warning** (no equivalent) |
 | `volumes`, `fsGroup` | **Warning**; a `hostPath` volume gets its own |
-| `strategy.rollingUpdate.maxSurge` | `[app.*.deploy] max_surge` |
-| `strategy.rollingUpdate.maxUnavailable` | `[app.*.deploy] max_unavailable` |
+| `strategy.rollingUpdate.maxSurge` | `[app.*.deploy] max_surge` (a percentage is **warned**) |
+| `strategy.rollingUpdate.maxUnavailable` | `[app.*.deploy] max_unavailable` (a percentage is **warned**) |
+| `strategy.type: Recreate` | **Warning**: Reliaburger always rolls |
+| `startupProbe` | **Warning**, giving the `[health] initial_delay` that allows the same start-up time |
 | `terminationGracePeriodSeconds` | `[app.*] stop_grace`, clamped to 1 s to 1 h (**warned** when clamped) |
 | `lifecycle.stopSignal` | `[app.*] stop_signal` (**warned** when it isn't one Reliaburger accepts) |
 | `lifecycle.preStop.exec.command` | `[app.*] pre_stop` (**warned**: it gets its own bound, `pre_stop_timeout`, instead of sharing the grace); any other preStop handler and `postStart` are **warned** |
+
+**Every other field is reported (#2461).** The rows above are what the conversion reads. After converting a Deployment, DaemonSet, StatefulSet, Job or CronJob, and each Service, Ingress and HPA that attached to one, the importer serialises the object back to JSON and walks every field against a per-kind table of rules (`deployment_rules`, `service_rules` and so on in `src/relish/k8s_import.rs`). A rule names a field path, with `[*]`, `[0]` or `[+]` for array elements, and says the field is *read* (mapped, or reported in its own words), *ignored* (metadata, `status`, selectors, history limits: nothing to lose), or *dropped*: reported, unless its value is the Kubernetes default, with a sentence on what to do instead. The longest matching rule wins, and a field no rule covers is reported as `PATH = VALUE is not imported`, so a field Kubernetes adds later warns by default instead of vanishing. Dropped with advice: `imagePullSecrets`, `hostNetwork`/`hostPID`/`hostIPC`, a port's `hostPort`, the hardening fields of `securityContext` (`readOnlyRootFilesystem`, `allowPrivilegeEscalation`, `runAsNonRoot`, `seccompProfile`), `imagePullPolicy` other than `IfNotPresent`, `serviceAccountName`, a Service's `type`, `nodePort`, `sessionAffinity` and headless `clusterIP: None`, and `progressDeadlineSeconds`. A container is named in a path by its name (`containers[proxy].readinessProbe`), so a sidecar's dropped probe or `securityContext` is easy to find. `every_field_of_a_full_pod_spec_is_consumed_or_reported` sets every `PodSpec` and `Container` field and checks each is read or reported.
 
 **Migration report** (printed to stderr):
 

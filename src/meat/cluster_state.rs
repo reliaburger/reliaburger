@@ -276,7 +276,19 @@ impl ClusterStateCache {
         };
         let key = (node_id.clone(), app_id.clone(), ordinal);
         let previous = self.accounted_instances.get(&key).copied();
-        let accounted = previous.unwrap_or_default();
+        // A reported instance's GPUs are already in the node's reported
+        // total (`gpu_used` sums every active instance's request), but the
+        // per-instance report carries no GPU count, so it was recorded with
+        // none. Count its request as accounted, or the node holds its GPUs
+        // twice (#2476). An instance not reported yet isn't in the total and
+        // is reserved in full.
+        let accounted = match previous {
+            Some(reported) => Resources {
+                gpus: reported.gpus.max(request.gpus),
+                ..reported
+            },
+            None => Resources::default(),
+        };
         let missing = request.saturating_sub(&accounted);
         node.allocated = node.allocated.saturating_add(&missing);
         if previous.is_none() {

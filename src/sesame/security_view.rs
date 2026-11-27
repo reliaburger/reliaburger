@@ -6,6 +6,14 @@
 //! node asks the leader for [`SecurityState::node_view`] over mTLS, every
 //! time Bun's security refresh ticks, and the council handle serves that view
 //! to every reader until the node's own replica holds the state.
+//!
+//! The leader's address comes from gossip, and gossip is authenticated only
+//! by a key every node holds, so a hint proves nothing (#2406). A node takes
+//! a view only from a node that is a voter of the council it knows (its own
+//! membership, or the council it expects while it has none, see
+//! [`crate::council::admission::ExpectedCouncil`]), over TLS bound to that
+//! voter's node id. Anything else is refused before the service token
+//! leaves the node.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -15,6 +23,7 @@ use super::mtls::{self, CrlHandle, MtlsError};
 use super::renewal::{RenewalError, TlsPeerCertificate, validate_peer};
 use super::types::SecurityState;
 use crate::council::CouncilNode;
+use crate::council::admission::ExpectedCouncil;
 
 /// The leader's answer: the view, with the generations it was read under.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -47,17 +56,22 @@ pub async fn issue_view(
 /// The node's side: fetches the view from the leader with this node's live
 /// mTLS identity and the cluster's service token.
 pub struct SecurityViewClient {
-    http: reqwest::Client,
+    identity: LiveNodeIdentity,
+    crl: CrlHandle,
+    headers: reqwest::header::HeaderMap,
+    expected: ExpectedCouncil,
 }
 
 impl SecurityViewClient {
-    /// A client presenting `identity`'s current leaf, refusing redirects.
+    /// A client presenting `identity`'s current leaf, refusing redirects,
+    /// that takes a view only from a voter of this node's council or of
+    /// `expected`, the council it expects while it has none.
     pub fn new(
         identity: &LiveNodeIdentity,
         crl: CrlHandle,
         service_token: &str,
+        expected: ExpectedCouncil,
     ) -> Result<Self, MtlsError> {
-        let tls = (*mtls::build_live_mtls_client_config(identity, crl, None)?).clone();
         let mut headers = reqwest::header::HeaderMap::new();
         let mut bearer = reqwest::header::HeaderValue::from_str(&format!("Bearer {service_token}"))
             .map_err(|error| {
@@ -65,24 +79,50 @@ impl SecurityViewClient {
             })?;
         bearer.set_sensitive(true);
         headers.insert(reqwest::header::AUTHORIZATION, bearer);
+        Ok(Self {
+            identity: identity.clone(),
+            crl,
+            headers,
+            expected,
+        })
+    }
+
+    /// Fetch the view from `leader`, the node gossip or Raft names as
+    /// leader, at its API `address`. Refused before any connection when
+    /// `leader` isn't a voter of `council` (or, while `council` has no
+    /// membership, of the expected council); the TLS connection must then
+    /// present `leader`'s own certificate.
+    pub async fn fetch(
+        &self,
+        council: &CouncilNode,
+        leader: &str,
+        address: SocketAddr,
+    ) -> Result<SecurityState, String> {
+        let voters = match crate::council::admission::council_voters(council.raft()).await {
+            Some(voters) => voters,
+            None => crate::council::admission::roster_names(&self.expected.roster().await),
+        };
+        if !voters.values().any(|name| name == leader) {
+            return Err(format!(
+                "{leader} is named as leader, but is not a council voter this node knows \
+                 ({:?}); not asking it for the security view",
+                voters.values().collect::<Vec<_>>()
+            ));
+        }
+        let tls =
+            (*mtls::build_live_mtls_client_config(&self.identity, self.crl.clone(), Some(leader))
+                .map_err(|error| error.to_string())?)
+            .clone();
         let http = crate::http_client::builder()
             .use_preconfigured_tls(tls)
-            .default_headers(headers)
+            .default_headers(self.headers.clone())
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(10))
             .build()
-            .map_err(|error| {
-                MtlsError::ConfigFailed(format!("security view HTTP client: {error}"))
-            })?;
-        Ok(Self { http })
-    }
-
-    /// Fetch the view from the leader's API at `leader`.
-    pub async fn fetch(&self, leader: SocketAddr) -> Result<SecurityState, String> {
-        let response = self
-            .http
-            .get(format!("https://{leader}/v1/cluster/security-view"))
+            .map_err(|error| format!("security view HTTP client: {error}"))?;
+        let response = http
+            .get(format!("https://{address}/v1/cluster/security-view"))
             .send()
             .await
             .map_err(|error| error.to_string())?;

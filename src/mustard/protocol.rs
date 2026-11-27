@@ -44,7 +44,7 @@ use super::dissemination::DisseminationQueue;
 use super::membership::{MembershipSnapshot, MembershipTable};
 use super::message::{
     DirectoryExtension, GossipMessage, GossipPayload, LeaderHint, MAX_PIGGYBACK_UPDATES,
-    MAX_SYNC_ENTRIES, MembershipUpdate, SequenceFloor,
+    MAX_SYNC_DATAGRAMS, MAX_SYNC_ENTRIES, MembershipUpdate, SequenceFloor,
 };
 use super::state::NodeState;
 use super::transport::MustardTransport;
@@ -1459,31 +1459,70 @@ impl<T: MustardTransport> MustardNode<T> {
     /// so the whole UDP budget goes to membership entries instead.
     async fn send_membership(&mut self, target: SocketAddr, wants_reply: bool) {
         let window = self.membership_window();
-        for (index, entries) in window.chunks(MAX_PIGGYBACK_UPDATES).enumerate() {
-            let sync = GossipMessage::new(
-                self.node_id.clone(),
-                self.incarnation,
-                GossipPayload::Sync {
-                    entries: entries.to_vec(),
-                    floors: vec![],
-                    wants_reply: wants_reply && index == 0,
-                },
-            );
-            self.send(target, &sync).await;
-        }
+        let mut syncs = self.sync_datagrams(window, |entries, first| GossipPayload::Sync {
+            entries,
+            floors: vec![],
+            wants_reply: wants_reply && first,
+        });
+        syncs.truncate(MAX_SYNC_DATAGRAMS);
         let floors = self.floor_window(Instant::now());
-        for floors in floors.chunks(MAX_PIGGYBACK_UPDATES) {
-            let sync = GossipMessage::new(
+        syncs.extend(
+            self.sync_datagrams(floors, |floors, _| GossipPayload::Sync {
+                entries: vec![],
+                floors,
+                wants_reply: false,
+            }),
+        );
+        for sync in &syncs {
+            self.send(target, sync).await;
+        }
+    }
+
+    /// Pack `items` in order into `Sync` datagrams of at most
+    /// [`MAX_PIGGYBACK_UPDATES`] items that each fit
+    /// [`MAX_DATAGRAM_BYTES`](super::message::MAX_DATAGRAM_BYTES) (#2394).
+    /// Cutting by count alone assumed short node names; a long one made
+    /// every datagram too large to send. An item too large for a datagram
+    /// of its own is left out, since no datagram could carry it.
+    /// `payload` builds a datagram's payload, told whether it's the first.
+    fn sync_datagrams<Item: Clone>(
+        &self,
+        items: Vec<Item>,
+        payload: impl Fn(Vec<Item>, bool) -> GossipPayload,
+    ) -> Vec<GossipMessage> {
+        let message = |batch: &[Item], first: bool| {
+            GossipMessage::new(
                 self.node_id.clone(),
                 self.incarnation,
-                GossipPayload::Sync {
-                    entries: vec![],
-                    floors: floors.to_vec(),
-                    wants_reply: false,
-                },
-            );
-            self.send(target, &sync).await;
+                payload(batch.to_vec(), first),
+            )
+        };
+        let fits = |batch: &[Item], first: bool| {
+            batch.len() <= MAX_PIGGYBACK_UPDATES
+                && message(batch, first).encoded_len() <= super::message::MAX_DATAGRAM_BYTES
+        };
+        let mut datagrams = Vec::new();
+        let mut batch: Vec<Item> = Vec::new();
+        for item in items {
+            batch.push(item);
+            if fits(&batch, datagrams.is_empty()) {
+                continue;
+            }
+            // The newest item overflowed: send the rest, start again with it.
+            let Some(item) = batch.pop() else { continue };
+            if !batch.is_empty() {
+                datagrams.push(message(&batch, datagrams.is_empty()));
+                batch.clear();
+            }
+            batch.push(item);
+            if !fits(&batch, datagrams.is_empty()) {
+                batch.clear();
+            }
         }
+        if !batch.is_empty() {
+            datagrams.push(message(&batch, datagrams.is_empty()));
+        }
+        datagrams
     }
 
     /// The membership entries for one exchange: the whole table when it fits
@@ -2760,6 +2799,41 @@ mod tests {
         node.handle_message(addr(2), sync_from("requester", vec![], false))
             .await;
         assert!(requester.try_recv().is_none());
+    }
+
+    #[tokio::test]
+    async fn sync_datagrams_fit_the_udp_budget_with_long_names() {
+        // Sync datagrams were cut by count alone, so long node names made
+        // every one too large to send and anti-entropy stopped (#2394).
+        let net = InMemoryNetwork::new();
+        let t = net.register(addr(1)).await;
+        let peer = net.register(addr(2)).await;
+        let mut node = MustardNode::new(NodeId::new("observer"), addr(1), fast_config(), t);
+        for i in 0..16u16 {
+            node.membership.add_node(
+                NodeId::new(format!("{}{}", "m".repeat(197), 100 + i)),
+                addr(10 + i),
+                1,
+                BTreeMap::new(),
+                Instant::now(),
+            );
+        }
+
+        node.send_membership(addr(2), false).await;
+
+        let mut seen = std::collections::HashSet::new();
+        while let Some((_, message)) = peer.try_recv() {
+            assert!(
+                message.encoded_len() <= super::super::message::MAX_DATAGRAM_BYTES,
+                "a {}-byte sync datagram",
+                message.encoded_len()
+            );
+            if let GossipPayload::Sync { entries, .. } = message.payload {
+                seen.extend(entries.into_iter().map(|entry| entry.node_id));
+            }
+        }
+        // Sixteen long names plus the observer itself.
+        assert_eq!(seen.len(), 17);
     }
 
     #[tokio::test]

@@ -10,6 +10,64 @@ in the [changelog](../CHANGELOG.md). A new
 paragraph goes at the top when a release is promoted
 ([release gate, step 9](releasing.md#staging-a-candidate)).
 
+## 0.3.3: loose ends before outside testers
+
+Promoted on 27 November 2026 as tag `v0.3.3` at `dd0337ad`
+([promote run](https://github.com/reliaburger/reliaburger/actions/runs/46034807388)),
+four days after 0.3.2.
+A patch release: the bugs outside testers would hit first, Buildah on the
+appliance ([#2144](https://github.com/reliaburger/reliaburger/issues/2144)),
+the appliance's console dashboard
+([#2150](https://github.com/reliaburger/reliaburger/issues/2150)),
+`relish os boot-logs` and `relish netboot --stream-logs=units`
+([#2149](https://github.com/reliaburger/reliaburger/issues/2149)), contexts
+that fail over between nodes
+([#2241](https://github.com/reliaburger/reliaburger/issues/2241)), sidecars
+in `relish apps` and adopted across a Bun restart
+([#2336](https://github.com/reliaburger/reliaburger/issues/2336)) and
+`relish apply --wait`
+([#2240](https://github.com/reliaburger/reliaburger/issues/2240)). It keeps
+0.3.2's cluster formats but changes the agent loop, so `release_tier.py`
+asked for the full gate. Before it, the quiet Studio ran the macOS
+upgrade-node loop on the candidate, 115 of 115
+([record](qualification/2026-11-26-v02-upgrade-node-macos.md)). Candidate 1,
+`5f21eef6`, then ran the gate on the Mac Studio in about a day, from 23:24
+GMT on 26 November to 12:57 GMT on 27 November
+([closure record](qualification/2026-11-27-v0.3.3-release-closure.md)). It
+passed both staged installs, in 87 s and 70 s
+([first](qualification/2026-11-27-v0.3.3-staged-install-apple-silicon.md),
+[second](qualification/2026-11-27-v0.3.3-staged-install-apple-silicon-2.md)),
+the power-cut and reboot lanes, 25 of 25 in every lane
+([record](qualification/2026-11-27-power-cut-reboot.md)), the V02 fast tier
+([record](qualification/2026-11-27-v0.3.3-sustained-v02-fast.md)) and the
+jobs fast tier at 8,781.2 accepted jobs a second
+([record](qualification/2026-11-27-v0.3.3-jobs-fast.md)). The 8-hour jobs
+final ran its whole schedule with no failures
+([record](qualification/2026-11-27-v0.3.3-jobs-final.md)): 9,172.2 accepted
+jobs a second against the 1,390 target, job-start p99 64 ms over 219
+million starts, a median 1,048,576-task array in 122 s (the slowest of 64
+took 862 s), a council history linearizable over 209,970 operations, Bun's
+worst steady-state RSS 214.00 MiB against 384 MiB, and no data lost. Every
+fault class settled every time, every tier was clean at the first attempt,
+and no agent-loop turn went over its 1 s budget on any node in any tier. No
+known issue was accepted at the gate. #2128, 0.3.0's registry deploy stall,
+didn't recur (the catalogue pulse passed all eight runs), but its cause is
+still unproven and it stays open, in 0.3.4
+([#2128](https://github.com/reliaburger/reliaburger/issues/2128)). The Wyse
+lab didn't run before the release: it runs on the released artefacts, and
+its findings go into 0.3.4
+([#407](https://github.com/reliaburger/reliaburger/issues/407)).
+The tag is the merge of the train into `main`, candidate 1's code with only
+the gate's records added, so only the staged installs ran again on the
+release build, in 95 s and 79 s
+([first](qualification/2026-11-27-v0.3.3-release-staged-install-apple-silicon.md),
+[second](qualification/2026-11-27-v0.3.3-release-staged-install-apple-silicon-2.md)).
+0.3.3 keeps 0.3.2's wire protocol (61) and state format (76), so a 0.3.2
+cluster rolls onto it in place with `relish upgrade start v0.3.3`. The appliance OS
+with 0.3.3's Bun, Buildah and the console went out the same afternoon as
+`os-2026.48.0`
+([run](https://github.com/reliaburger/reliaburger/actions/runs/46035511965)).
+
 ## 0.3.2: Wyse lab fixes
 
 Promoted on 23 November 2026 as tag `v0.3.2` at `3edd5461`

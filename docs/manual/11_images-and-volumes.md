@@ -47,8 +47,26 @@ what runs:
 mirrors = { "ghcr.io" = "mirror.internal:5000" }
 ```
 
+A layer may be a plain tar or a tar compressed with gzip or zstd, in OCI's
+media types (`application/vnd.oci.image.layer.v1.tar`, `…tar+gzip`,
+`…tar+zstd`) or Docker's (`application/vnd.docker.image.rootfs.diff.tar.gzip`),
+so images BuildKit builds with `compression=zstd` run as they are. A pull
+refuses any other layer type before downloading it, naming the type, for
+example `layer sha256:… has media type application/vnd.oci.image.layer.v1.tar+bzip2,
+which no node can unpack`. Foreign (non-distributable) layers aren't supported.
+
+Layers stream to disk as they arrive, so a large image doesn't need its
+size in memory, and a slow link isn't a problem while bytes keep coming: an
+attempt is abandoned only after 60 seconds with nothing received, and the
+retry carries on from the bytes already on disk when the registry supports
+it. One layer gets six minutes in all, or as long as it takes at 64 KiB/s
+if that's longer; past that the pull fails with `layer … did not arrive
+within N s`.
+
 Once a node has pulled and unpacked a digest-pinned image, it doesn't ask any
-registry about it again. Bun keeps the index, manifest and config it verified
+registry about it again, nor the cluster's catalogue: a replica of a pushed
+or pull-through image restarts even while the cluster has no council
+leader. Bun keeps the index, manifest and config it verified
 and checks each against its digest before reusing it, so a burst of
 containers or job executors from that image can't trip a registry's rate
 limit. A tag reference, or a pin whose local copy is missing or no longer
@@ -118,7 +136,14 @@ one that names none runs where its app does.
 and repository authority receipt payload bytes. The store also allows at most
 65,536 payload files, including empty uploads and receipts. Registry pushes, peer replication,
 upstream cache fills and runtime image pulls share this ceiling. An upload chunk
-that would exceed it is refused before writing, with HTTP 413 from the registry. Completed uploads remain charged
+that would exceed it is refused before writing, with HTTP 413 from the registry.
+A pull checks the sizes the image's manifest gives before it downloads
+anything, so an image that can't fit fails at once, naming both numbers:
+
+```text
+physical image storage quota exceeded: ghcr.io/acme/web@sha256:… needs
+1610612736 bytes, 524288000 bytes remain under [images] max_storage
+``` Completed uploads remain charged
 without a manifest; deleting confirmed payloads returns their space to the budget.
 The accounting is rebuilt from disk at startup.
 

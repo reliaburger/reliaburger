@@ -460,7 +460,7 @@ fn enforce_mtls_mode(
     }
     anyhow::bail!(
         "[security] require_mtls is set but this node has no identity yet at {dir}: \
-         run `relish join --token <token> --node-id {} <member-api-url>` to enrol, then restart bun",
+         run `relish join --token <token> --node-id {} --ca-fingerprint <root-ca-fingerprint> <member-api-url>` to enrol, then restart bun",
         params.node_name
     );
 }
@@ -567,9 +567,9 @@ async fn refresh_leader_security_view(
         return;
     }
     let metrics = council.metrics();
-    let leader = reliaburger::cluster::directory::leader_api_address(Some(&metrics), directory);
+    let leader = reliaburger::cluster::directory::leader_api_target(Some(&metrics), directory);
     let result = match leader {
-        Some(leader) => client.fetch(leader).await,
+        Some((leader, address)) => client.fetch(council, &leader.0, address).await,
         None => Err("no council leader is known yet".to_string()),
     };
     match result {
@@ -838,11 +838,29 @@ async fn run_testapp(
 }
 
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            // A flag the new release renamed or removed stops it right here,
+            // so a fresh self-upgrade counts this boot first (#2415). Help
+            // and version output are not boots.
+            if error.use_stderr() {
+                count_upgrade_boot(&std::env::args().collect::<Vec<_>>());
+            }
+            error.exit()
+        }
+    };
     if cli.compatibility {
+        // The version too, so an upgrade can check a binary is the release
+        // it's labelled as (#2403).
+        let version = std::env::current_exe()
+            .map(|exe| reliaburger::upgrade::resolve_running_version(&exe))
+            .unwrap_or_else(|_| reliaburger::upgrade::version::compiled_version());
         println!(
             "{}",
-            serde_json::to_string(&reliaburger::compatibility::CURRENT)?
+            serde_json::to_string(&reliaburger::upgrade::CompatibilityAnswer::this_binary(
+                version
+            ))?
         );
         return Ok(());
     }
@@ -1022,6 +1040,49 @@ async fn storage_directory(configured: &std::path::Path, label: &str) -> anyhow:
     prepare_storage_directory(configured, &fallback, label).await
 }
 
+/// Count this boot against an in-flight self-upgrade, and exec the previous
+/// version if the new one has used up its attempts (#2415).
+///
+/// Runs before the config is read, so it needs nothing but the executable
+/// and the command line. A failure here is reported and left to startup
+/// recovery: never stop a boot over upgrade bookkeeping.
+fn count_upgrade_boot(original_argv: &[String]) -> reliaburger::upgrade::manager::EarlyBoot {
+    use reliaburger::upgrade::manager::{self, EarlyBoot};
+    let Ok(exe_path) = std::env::current_exe() else {
+        return EarlyBoot::Uncounted;
+    };
+    let running_version = reliaburger::upgrade::resolve_running_version(&exe_path);
+    // BLOCKING-OK: startup, before the agent loop or any workload runs
+    match manager::count_upgrade_boot(&exe_path, &running_version) {
+        Ok(EarlyBoot::ExecPrevious { symlink }) => {
+            // Only returns on error; on success the process is replaced.
+            let error = manager::exec_symlink(&symlink, original_argv);
+            eprintln!("bun: warning: cannot exec the previous version: {error}");
+            EarlyBoot::Uncounted
+        }
+        Ok(early) => early,
+        Err(error) => {
+            eprintln!("bun: warning: cannot count this boot of an upgrade: {error}");
+            EarlyBoot::Uncounted
+        }
+    }
+}
+
+/// Is there a `{exe}{suffix}` file next to the resolved executable? The
+/// self-upgrade tests poison a version this way.
+fn debug_sidecar_exists(exe_path: &std::path::Path, suffix: &str) -> bool {
+    // BLOCKING-OK: startup, before the agent loop or any workload runs
+    let Ok(resolved) = std::fs::canonicalize(exe_path) else {
+        return false;
+    };
+    let mut name = resolved
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(suffix);
+    resolved.with_file_name(name).exists()
+}
+
 async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // `bun testapp` never becomes an agent — it's the workload, not the
     // orchestrator. Handle it before any node config is touched.
@@ -1062,6 +1123,19 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             reliaburger::upgrade::version::build_commit()
         )
     );
+    // Count a fresh self-upgrade's boot before anything here can fail: a
+    // release that can't read this node's config must still revert by
+    // itself (#2415).
+    let original_argv: Vec<String> = std::env::args().collect();
+    let early_boot = count_upgrade_boot(&original_argv);
+
+    // Debug-only test hook: a `{exe}.fail-early` sidecar makes this process
+    // exit before it reads its config, as a release that rejects it would.
+    // Release builds never contain this branch.
+    if cfg!(debug_assertions) && debug_sidecar_exists(&exe_path, ".fail-early") {
+        eprintln!("bun: fail-early sidecar present; exiting (test hook)");
+        std::process::exit(101);
+    }
 
     // A rootless runc cluster is a contradiction between the command line
     // and the host, so refuse it before loading config or touching storage.
@@ -1200,7 +1274,6 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // Self-upgrade: build the manager and run startup recovery BEFORE any
     // subsystem starts. A crash-looping new version reverts here; a freshly
     // swapped-in version gets a verification marker to prove itself against.
-    let original_argv: Vec<String> = std::env::args().collect();
     let upgrade_manager = match reliaburger::upgrade::manager::UpgradeManager::new(
         &config.upgrades,
         &data_base,
@@ -1217,7 +1290,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let mut upgrade_verify = None;
     if let Some(manager) = &upgrade_manager {
         use reliaburger::upgrade::manager::StartupAction;
-        match manager.startup_action() {
+        match manager.startup_action(&early_boot) {
             Ok(StartupAction::Continue { verify }) => upgrade_verify = verify,
             Ok(StartupAction::ExecPrevious) => {
                 // Only returns on error; on success the process is replaced.
@@ -1238,18 +1311,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // runs AFTER startup recovery so each failed boot burns an attempt and
     // the crash-loop revert machinery gets exercised for real. Release
     // builds never contain this branch.
-    // BLOCKING-OK: startup, before the agent loop or any workload runs
-    if cfg!(debug_assertions)
-        && let Ok(resolved) = std::fs::canonicalize(&exe_path)
-        && {
-            let mut name = resolved
-                .file_name()
-                .map(|n| n.to_os_string())
-                .unwrap_or_default();
-            name.push(".fail-boot");
-            resolved.with_file_name(name).exists()
-        }
-    {
+    if cfg!(debug_assertions) && debug_sidecar_exists(&exe_path, ".fail-boot") {
         eprintln!("bun: fail-boot sidecar present; exiting (test hook)");
         std::process::exit(101);
     }
@@ -1420,6 +1482,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // Gossip membership for the pickle replication loop (cluster only).
     let mut replication_membership = None;
     let mut registry_directory = None;
+    let mut expected_council = None;
     // Address peers use for this node, captured before ClusterParams moves.
     let mut registry_cluster_advertise = None;
     // Peer API addresses for cross-node fan-out and apply forwarding.
@@ -1507,6 +1570,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         // replication loop derives its peer list from gossip.
         replication_membership = Some(handle.membership_rx.clone());
         registry_directory = Some(cluster_runtime.directory_rx.clone());
+        expected_council = Some(cluster_runtime.expected_council.clone());
         api_gossip_stats = Some(cluster_runtime.gossip_stats.clone());
         api_backup_monitor = Some(reliaburger::council::backup::BackupMonitor(
             cluster_runtime.backup_rx.clone(),
@@ -2052,12 +2116,18 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     if let Some(council) = &api_council {
         // A node with no Raft seat reads the leader's view of the security
         // state instead of its own empty replica (#1477).
-        let view_client = match (&api_identity, &crl_refresh, service_token.as_deref()) {
-            (Some(identity), Some(crl), Some(token)) => {
+        let view_client = match (
+            &api_identity,
+            &crl_refresh,
+            service_token.as_deref(),
+            &expected_council,
+        ) {
+            (Some(identity), Some(crl), Some(token), Some(expected)) => {
                 match reliaburger::sesame::security_view::SecurityViewClient::new(
                     identity,
                     crl.clone(),
                     token,
+                    expected.clone(),
                 ) {
                     Ok(client) => Some(Arc::new(client)),
                     Err(error) => {
@@ -3731,7 +3801,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             )),
             pull_through: config.images.pull_through,
             cache_recheck_secs: config.images.cache_recheck_secs,
-            fill_lock: tokio::sync::Mutex::new(()),
+            fill_locks: Default::default(),
         });
         if let Some(source) = &signature_source {
             source.use_cache(cluster_source.clone());

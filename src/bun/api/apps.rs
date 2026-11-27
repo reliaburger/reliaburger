@@ -381,6 +381,13 @@ fn scaled_config(
                 StatusCode::CONFLICT,
                 format!("{app_id} runs one replica on every node, so it has no count to set"),
             ),
+            ScaleRefusal::TooMany => (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "{replicas} replicas is more than the {} an app may run",
+                    crate::config::MAX_REPLICAS
+                ),
+            ),
         });
     }
     // The count in the spec, which a scale changes. A stopped app keeps

@@ -61,23 +61,39 @@ impl Default for DeployConfig {
 }
 
 impl DeployConfig {
-    /// Parse a `DeploySpec`, refusing a duration that doesn't parse and a
-    /// surge/unavailable pair that can't make progress.
+    /// Parse a `DeploySpec`, refusing a duration that doesn't parse or is
+    /// over its cap, and a surge/unavailable pair that can't make progress.
     ///
     /// `"1m30s"` or `"500ms"` used to fall back to the default without a
     /// word, so an operator who asked for a 90-second drain got 30 seconds.
     /// Like `[autoscale]`, a `[deploy]` table is refused rather than clamped.
     pub fn parse(spec: &crate::config::app::DeploySpec) -> Result<Self, String> {
-        for (field, value) in [
-            ("drain_timeout", &spec.drain_timeout),
-            ("health_timeout", &spec.health_timeout),
+        // The deploy worker adds each to `Instant::now()`, which panics on
+        // overflow, so each has a cap (#2378): a day for health, as for
+        // `[health] initial_delay`, and an hour for a drain, as for a stop.
+        for (field, value, cap) in [
+            (
+                "drain_timeout",
+                &spec.drain_timeout,
+                crate::grill::stop::MAX_STOP_DURATION,
+            ),
+            (
+                "health_timeout",
+                &spec.health_timeout,
+                Duration::from_secs(crate::bun::health::MAX_HEALTH_DELAY_SECS),
+            ),
         ] {
-            if let Some(value) = value
-                && parse_duration(value).is_none()
-            {
+            let Some(value) = value else { continue };
+            let Some(duration) = parse_duration(value) else {
                 return Err(format!(
                     "{field} {value:?} is not a duration: use a whole number of seconds, \
                      minutes or hours, such as \"90s\", \"5m\" or \"1h\""
+                ));
+            };
+            if duration > cap {
+                return Err(format!(
+                    "{field} {value:?} is too long: it must be at most {}s",
+                    cap.as_secs()
                 ));
             }
         }
@@ -704,20 +720,25 @@ impl DeployHistoryEntry {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Parse a duration string like "30s", "5m", "1h".
+/// Parse a duration string like "30s", "5m", "1h". `None` when it doesn't
+/// parse, or when it is more seconds than a `u64` holds.
 pub fn parse_duration(s: &str) -> Option<Duration> {
     let s = s.trim();
     if let Some(secs) = s.strip_suffix('s') {
         secs.parse::<u64>().ok().map(Duration::from_secs)
     } else if let Some(mins) = s.strip_suffix('m') {
+        // `checked_mul` is `None` on overflow, where `*` panics in a debug
+        // build and wraps in a release one (#2480).
         mins.parse::<u64>()
             .ok()
-            .map(|m| Duration::from_secs(m * 60))
+            .and_then(|m| m.checked_mul(60))
+            .map(Duration::from_secs)
     } else if let Some(hours) = s.strip_suffix('h') {
         hours
             .parse::<u64>()
             .ok()
-            .map(|h| Duration::from_secs(h * 3600))
+            .and_then(|h| h.checked_mul(3600))
+            .map(Duration::from_secs)
     } else {
         s.parse::<u64>().ok().map(Duration::from_secs)
     }
@@ -1019,6 +1040,20 @@ mod tests {
     #[test]
     fn parse_duration_invalid() {
         assert_eq!(parse_duration("abc"), None);
+    }
+
+    #[test]
+    fn parse_duration_refuses_a_value_that_overflows() {
+        // `m * 60` used to panic in a test build and wrap in a release
+        // build: "307445734561825861m" became 44 seconds (#2480, #2378).
+        assert_eq!(parse_duration("400000000000000000m"), None);
+        assert_eq!(parse_duration("307445734561825861m"), None);
+        assert_eq!(parse_duration("5124095576030432h"), None);
+        assert_eq!(parse_duration("18446744073709551615h"), None);
+        assert_eq!(
+            parse_duration("18446744073709551615s"),
+            Some(Duration::from_secs(u64::MAX))
+        );
     }
 
     // -- History entry ---

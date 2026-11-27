@@ -19,7 +19,7 @@ use openraft::raft::{
 use openraft::{Raft, RaftNetwork, RaftNetworkFactory};
 use tokio::sync::Mutex;
 
-use super::admission::{CouncilVoters, PeerIdentity, RaftAdmission, Standing};
+use super::admission::{CouncilRoster, PeerIdentity, RaftAdmission, Standing};
 use super::connection_pool::{
     PeerKey, RaftConnection, RaftConnectionPool, ReuseCheck, SERVER_CONNECTION_MAX_AGE,
     SERVER_IDLE_TIMEOUT,
@@ -427,8 +427,9 @@ pub enum RaftRpcResponse {
         recovery_id: Option<RecoveryId>,
     },
     /// The voters of the answering node's council (committed and effective
-    /// membership together), by Raft id, with their node names.
-    CouncilVoters(CouncilVoters),
+    /// membership together), by Raft id, with their node names and Raft
+    /// addresses, so a node with no council can follow them (#2397).
+    CouncilVoters(CouncilRoster),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -870,11 +871,11 @@ async fn handle_raft_frame<S: AsyncWrite + Unpin>(
     let admission_verdict = match admission.standing(raft, sender, identity).await {
         // Only a council member's epoch may move the fence.
         Standing::Member => fence.admit(claim),
-        // A node with no council serves whoever replicates to it, and adopts
-        // that council's epoch while it holds none. One that already holds
-        // an epoch (a recovered survivor before it re-forms its council, a
-        // joiner between its first contact and its first membership) serves
-        // its own epoch but can't be fenced by a stranger.
+        // A node with no council serves a voter of the council it expects
+        // (#2397), and adopts that council's epoch while it holds none. One
+        // that already holds an epoch (a recovered survivor before it
+        // re-forms its council, a joiner between its first contact and its
+        // first membership) serves its own epoch but can't be fenced by it.
         Standing::NoCouncil => match fence.admit_if_unclaimed(claim) {
             Some(verdict) => verdict,
             None if fence.peek(claim) == Admission::Serve => Admission::Serve,
@@ -885,8 +886,8 @@ async fn handle_raft_frame<S: AsyncWrite + Unpin>(
         },
         Standing::Stranger => {
             // A leader or candidate this node has never heard of may be a
-            // voter that joined while this node was away: ask the voters it
-            // knows. Copy the index out of the metrics in one statement.
+            // voter that joined while this node was away, or, on a node with
+            // no council, since it enrolled: ask the voters it knows. Copy the index out of the metrics in one statement.
             let our_last_index = raft.metrics().borrow().last_log_index;
             if let Some(sender) = sender
                 && rpc.worth_vouching_for(our_last_index)
@@ -954,17 +955,21 @@ async fn handle_raft_frame<S: AsyncWrite + Unpin>(
 /// Answer a [`RaftRpc::CouncilVoters`] question with this node's council.
 ///
 /// Only a node serving Raft at the asker's own epoch answers: a probing or
-/// fenced node's membership may be a replaced council's. An asker on an
-/// older epoch is told the newer one, as any outsider is. The answer reaches
-/// no Raft state and never moves the fence.
+/// fenced node's membership may be a replaced council's. Any other asker is
+/// told what the fence would tell a member, `Fenced` with the newest epoch
+/// this node knows and its own recovery id when that epoch is its own, so an
+/// asker on an older epoch fences itself, and one on the same epoch from
+/// another recovery sees the split (#694, #2406). The answer reaches no Raft
+/// state and never moves this node's fence.
 async fn answer_council_voters<S: AsyncWrite + Unpin>(
     stream: &mut S,
     raft: &Raft<TypeConfig>,
     fence: &RecoveryFence,
     claim: RecoveryClaim,
 ) -> bool {
-    if fence.peek(claim) != Admission::Serve {
-        if let Some(newest) = fence.refusal_for_outsider(claim) {
+    match fence.peek(claim) {
+        Admission::Serve => {}
+        Admission::Refuse { newest } => {
             write_response(
                 stream,
                 RaftRpcResponse::Fenced {
@@ -973,13 +978,14 @@ async fn answer_council_voters<S: AsyncWrite + Unpin>(
                 },
             )
             .await;
+            return false;
         }
-        return false;
+        Admission::Adopted => return false,
     }
-    let Some(voters) = super::admission::council_voters(raft).await else {
+    let Some(roster) = super::admission::council_roster(raft).await else {
         return false;
     };
-    write_response(stream, RaftRpcResponse::CouncilVoters(voters)).await
+    write_response(stream, RaftRpcResponse::CouncilVoters(roster)).await
 }
 
 /// Write one enveloped response frame. Returns whether it was written; a
@@ -1245,7 +1251,14 @@ impl TcpRaftNetwork {
             return Err(Unreachable::new(&RouterError("blocked by chaos partition".into())).into());
         }
 
-        let Some(claim) = self.fence.outbound_claim() else {
+        // A question reaches no Raft state, so a node that doesn't serve
+        // Raft yet (no epoch, or probing) may still ask one (#2397, #2406).
+        let claim = if matches!(rpc, RaftRpc::CouncilVoters) {
+            self.fence.question_claim()
+        } else {
+            self.fence.outbound_claim()
+        };
+        let Some(claim) = claim else {
             return Err(Unreachable::new(&RouterError(
                 "recovery fence: this node is not serving raft".into(),
             ))
@@ -1284,9 +1297,10 @@ impl TcpRaftNetwork {
         Ok(response)
     }
 
-    /// Ask this peer which nodes are voters in its council (see
-    /// [`super::admission`]).
-    pub(crate) async fn council_voters(&self) -> Result<CouncilVoters, Unreachable> {
+    /// Ask this peer which nodes are voters in its council, with their
+    /// addresses (see [`super::admission`]). A peer on a newer recovery
+    /// epoch refuses, and the refusal moves this node's fence.
+    pub(crate) async fn council_voters(&self) -> Result<CouncilRoster, Unreachable> {
         match self.rpc(RaftRpc::CouncilVoters).await? {
             RaftRpcResponse::CouncilVoters(voters) => Ok(voters),
             _ => Err(Unreachable::new(&RouterError(

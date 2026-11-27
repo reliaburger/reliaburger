@@ -8,7 +8,7 @@ Take application operations beyond one Docker host. Reliaburger combines placeme
 
 Basis: [Compose's development workflow](https://docs.docker.com/compose/gettingstarted/), [production scope](https://docs.docker.com/compose/how-tos/production/) and [Reliaburger architecture](https://github.com/reliaburger/reliaburger/blob/v0.2.2/docs/manual/06_under-the-hood.md). Suitability is our qualitative assessment.
 
-**Version boundary.** Reliaburger's public installer installs [0.2.2](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.2), and the feature analysis describes that release, re-checked on 21 October 2026. Compose commands follow current official documentation, reviewed 15 October 2026. This page compares ordinary `docker compose` operation; [Swarm](https://docs.docker.com/engine/swarm/) is a separate clustering mode.
+**Version boundary.** The feature analysis describes Reliaburger [0.2.2](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.2), re-checked on 21 October 2026. The public installer now installs a newer release; the [changelog](https://github.com/reliaburger/reliaburger/blob/main/CHANGELOG.md) says what changed since. Compose commands follow current official documentation, reviewed 15 October 2026. This page compares ordinary `docker compose` operation; [Swarm](https://docs.docker.com/engine/swarm/) is a separate clustering mode.
 
 ## Where each wins
 
@@ -78,7 +78,7 @@ relish logs web --tail 50
 relish wtf --app web
 ```
 
-Compose's shell example needs an image containing `sh`; logs and exec are service-oriented commands. Reliaburger's diagnostic command investigates placement and network paths instead of being a shell equivalent. Its authenticated dashboard is read-only. [Compose logs](https://docs.docker.com/reference/cli/docker/compose/logs/) · [exec](https://docs.docker.com/reference/cli/docker/compose/exec/) · [diagnostics](https://github.com/reliaburger/reliaburger/blob/v0.2.2/docs/manual/07_diagnostics.md) · [dashboard](https://github.com/reliaburger/reliaburger/blob/v0.2.2/docs/manual/04_observability.md).
+Compose's shell example needs an image containing `sh`; logs and exec are service-oriented commands. Reliaburger's diagnostic command investigates placement and network paths instead of being a shell equivalent. Its authenticated dashboard is read-only through `relish dashboard`. [Compose logs](https://docs.docker.com/reference/cli/docker/compose/logs/) · [exec](https://docs.docker.com/reference/cli/docker/compose/exec/) · [diagnostics](https://github.com/reliaburger/reliaburger/blob/v0.2.2/docs/manual/07_diagnostics.md) · [dashboard](https://github.com/reliaburger/reliaburger/blob/v0.2.2/docs/manual/04_observability.md).
 
 Reliaburger also makes the resolved deployment configuration inspectable: `relish compile config/ > all.toml` combines manifests, inherited defaults and derived namespaces into one file before admission. Compose provides `docker compose config` for its resolved service model. Both give the reader a concrete configuration to review. [Reliaburger compilation](https://github.com/reliaburger/reliaburger/blob/v0.2.2/docs/manual/01_deploy-an-app.md#many-files) · [Compose configuration](https://docs.docker.com/reference/cli/docker/compose/config/).
 

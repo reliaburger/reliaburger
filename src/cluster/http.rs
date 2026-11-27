@@ -12,6 +12,12 @@
 
 use reqwest::Client;
 
+/// How long a peer call may take to connect. Without it a black-holed
+/// address waits out the kernel's SYN retries, about two minutes (#2416).
+/// There is no overall request timeout on the shared client: it also carries
+/// streaming calls (log fan-out, build transfers) that run for minutes.
+pub const PEER_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The scheme and client this node uses for peer agent-API calls.
 #[derive(Clone)]
 pub struct ClusterHttp {
@@ -35,6 +41,7 @@ impl ClusterHttp {
             // bundled roots that parsed, so it can't fail here.
             client: crate::http_client::builder()
                 .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(PEER_CONNECT_TIMEOUT)
                 .build()
                 .expect("valid plaintext cluster HTTP configuration"),
             bearer: None,

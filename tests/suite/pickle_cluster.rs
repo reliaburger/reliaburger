@@ -733,7 +733,7 @@ fn cluster_source_for(registry: &Registry) -> reliaburger::pickle::p2p::ClusterS
         upstream: None,
         pull_through: true,
         cache_recheck_secs: 3600,
-        fill_lock: tokio::sync::Mutex::new(()),
+        fill_locks: Default::default(),
     }
 }
 
@@ -1105,6 +1105,92 @@ async fn a_bound_pull_through_remembers_the_tag_for_binding_offline() {
         ),
         "{binding:?}"
     );
+}
+
+/// An upstream that never answers for one repository and passes everything
+/// else to a real client: a registry whose CDN edge has hung on one image.
+struct StallingUpstream {
+    inner: reliaburger::pickle::upstream::OciUpstream,
+    stalled_repository: String,
+}
+
+impl reliaburger::pickle::upstream::UpstreamRegistry for StallingUpstream {
+    fn head_manifest_digest<'a>(
+        &'a self,
+        image: &'a reliaburger::grill::image::ImageReference,
+    ) -> reliaburger::pickle::upstream::UpstreamFuture<'a, Digest> {
+        self.inner.head_manifest_digest(image)
+    }
+
+    fn fetch_manifest<'a>(
+        &'a self,
+        image: &'a reliaburger::grill::image::ImageReference,
+    ) -> reliaburger::pickle::upstream::UpstreamFuture<
+        'a,
+        reliaburger::pickle::upstream::UpstreamManifest,
+    > {
+        self.inner.fetch_manifest(image)
+    }
+
+    fn fetch_root<'a>(
+        &'a self,
+        image: &'a reliaburger::grill::image::ImageReference,
+    ) -> reliaburger::pickle::upstream::UpstreamFuture<
+        'a,
+        reliaburger::pickle::upstream::UpstreamRoot,
+    > {
+        if image.repository == self.stalled_repository {
+            return Box::pin(std::future::pending());
+        }
+        self.inner.fetch_root(image)
+    }
+
+    fn fetch_blob<'a>(
+        &'a self,
+        image: &'a reliaburger::grill::image::ImageReference,
+        layer: &'a reliaburger::pickle::types::LayerDescriptor,
+    ) -> reliaburger::pickle::upstream::UpstreamFuture<'a, Vec<u8>> {
+        self.inner.fetch_blob(image, layer)
+    }
+}
+
+/// #2424: a fill stuck on one image doesn't hold the cache fill of another.
+/// One node-wide lock used to make every new image wait for the slow one.
+#[tokio::test]
+async fn a_stalled_pull_through_fill_does_not_hold_up_another_image() {
+    use reliaburger::grill::image::ImageReference;
+
+    let (upstream, _) = Registry::start_counted(9).await;
+    push_test_image(&upstream.base_url(), "nginx", "v1").await;
+    push_test_image(&upstream.base_url(), "redis", "v1").await;
+    let stalled = ImageReference::parse(&format!("{}/nginx:v1", upstream.addr)).unwrap();
+    let other = ImageReference::parse(&format!("{}/redis:v1", upstream.addr)).unwrap();
+
+    let node = Registry::start(1, false).await;
+    let mut source = cluster_source_for(&node);
+    source.upstream = Some(Arc::new(StallingUpstream {
+        inner: reliaburger::pickle::upstream::OciUpstream::insecure_http(Default::default()),
+        stalled_repository: stalled.repository.clone(),
+    }));
+    let source = Arc::new(source);
+
+    let stuck = {
+        let source = Arc::clone(&source);
+        tokio::spawn(async move { source.ensure_external_image_with_peers(&stalled, &[]).await })
+    };
+    // Let the stuck fill take its lock before the other one starts.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!stuck.is_finished());
+
+    let served = tokio::time::timeout(
+        Duration::from_secs(10),
+        source.ensure_external_image_with_peers(&other, &[]),
+    )
+    .await
+    .expect("the second image waited for the stalled fill")
+    .unwrap();
+    assert!(served.is_some());
+    stuck.abort();
 }
 
 /// D2: `pull_through = false` is a clean fall-through, not an error.

@@ -17,9 +17,15 @@ async fn compatibility_query_requires_no_configuration_or_runtime_state() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let value: reliaburger::compatibility::Compatibility =
+    let value: reliaburger::upgrade::CompatibilityAnswer =
         serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(value, reliaburger::compatibility::CURRENT);
+    assert_eq!(value.formats(), reliaburger::compatibility::CURRENT);
+    // The binary names its version too, so an upgrade can check it is the
+    // release it is labelled as (#2403).
+    assert_eq!(
+        value.version,
+        Some(reliaburger::upgrade::version::compiled_version())
+    );
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
 }
 

@@ -304,6 +304,29 @@ impl RecoveryFence {
         }
     }
 
+    /// The claim to stamp on a question that reaches no Raft state
+    /// ([`super::network::RaftRpc::CouncilVoters`]): this node's own claim
+    /// once it holds an epoch, fenced or not, and the newest epoch it knows
+    /// (with no recovery id) while it holds none. A fenced node still asks:
+    /// a split node learns of a newer recovery that way (#2406).
+    pub fn question_claim(&self) -> Option<RecoveryClaim> {
+        let snapshot = self.snapshot();
+        match snapshot.state {
+            FenceState::Unclaimed => Some(RecoveryClaim {
+                epoch: snapshot.epoch,
+                id: None,
+            }),
+            _ => snapshot.claim(),
+        }
+    }
+
+    /// Whether hearing `peer` would move this fence: a newer epoch than any
+    /// this node knows, or its own epoch from a different recovery.
+    pub fn would_move(&self, peer: RecoveryClaim) -> bool {
+        let mut copy = self.snapshot();
+        fence_if_newer(&mut copy, peer.epoch) || split_if_conflicting(&mut copy, peer)
+    }
+
     /// Decide what to do with an inbound RPC from a sender claiming
     /// `sender`, moving the fence if the sender reveals something new.
     ///

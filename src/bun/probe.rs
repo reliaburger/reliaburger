@@ -32,20 +32,36 @@ fn probe_client() -> &'static Result<reqwest::Client, ProbeError> {
     })
 }
 
+/// The URL to probe: the instance's address with the configured path and
+/// query. The path is never pasted next to the authority as text, where
+/// `@` or `//` would make it name another host (#2401); admission refuses
+/// such a path, and this refuses one that skipped admission (a spec already
+/// in desired state).
+fn probe_url(config: &HealthCheckConfig, host: &str) -> Result<reqwest::Url, ProbeError> {
+    crate::config::validate::check_http_path(&config.path)
+        .map_err(|reason| ProbeError::Request(format!("health {reason}")))?;
+    let mut url = reqwest::Url::parse(&format!("{}://{}:{}/", config.protocol, host, config.port))
+        .map_err(|error| ProbeError::Request(error.to_string()))?;
+    let (path, query) = match config.path.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (config.path.as_str(), None),
+    };
+    url.set_path(path);
+    url.set_query(query);
+    Ok(url)
+}
+
 /// Probe the local workload with a shared HTTP pool and a per-request deadline.
 /// Local configuration errors are distinct from workload health failures.
 pub async fn probe_health(
     config: &HealthCheckConfig,
     host: &str,
 ) -> Result<HealthStatus, ProbeError> {
-    let url = format!(
-        "{}://{}:{}{}",
-        config.protocol, host, config.port, config.path
-    );
+    let url = probe_url(config, host)?;
     let client = probe_client().as_ref().map_err(Clone::clone)?;
     match tokio::time::timeout(
         config.timeout,
-        client.get(&url).timeout(config.timeout).send(),
+        client.get(url).timeout(config.timeout).send(),
     )
     .await
     {
@@ -92,6 +108,54 @@ mod tests {
             probe_health(&test_config(8080), "invalid host")
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_path_cannot_move_the_probe_to_another_host() {
+        // `@host` after the port turns the instance address into URL
+        // userinfo and makes Bun probe a host the app's author chose (#2401).
+        let a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let b_port = b.local_addr().unwrap().port();
+        let mut config = test_config(a.local_addr().unwrap().port());
+        config.path = format!("@127.0.0.1:{b_port}/");
+        config.timeout = Duration::from_millis(500);
+        let result = probe_health(&config, "127.0.0.1").await;
+        assert!(matches!(result, Err(ProbeError::Request(_))), "{result:?}");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), b.accept())
+                .await
+                .is_err(),
+            "the probe reached the other listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_path_with_a_query_string_is_probed_as_written() {
+        use tokio::io::AsyncReadExt;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let n = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&request[..n]).to_string()
+        });
+        let mut config = test_config(port);
+        config.path = "/healthz?full=1".to_string();
+        assert_eq!(
+            probe_health(&config, "127.0.0.1").await.unwrap(),
+            HealthStatus::Healthy
+        );
+        let request = server.await.unwrap();
+        assert!(
+            request.starts_with("GET /healthz?full=1 HTTP/1.1"),
+            "{request}"
         );
     }
 

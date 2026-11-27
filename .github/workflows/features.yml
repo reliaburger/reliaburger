@@ -6,6 +6,11 @@ name: Feature status
 # so its row needs updating. Issues close without anyone editing the file,
 # so this runs nightly, and on pull requests that edit it.
 #
+# Issues close when a pull request into main merges, and main's nightly
+# then fails on the rows that link them (#2492). So a pull request into
+# main also fails while a row links an issue it will close
+# (check-closing): the row is updated on the branch, before the merge.
+#
 # It is its own workflow because it reads issues, like flakes.yml: ci.yml is
 # also called from workflows that grant only `contents: read`.
 
@@ -14,15 +19,14 @@ on:
     - cron: "47 3 * * *"
   pull_request:
     branches: [main, "codex/**", "fix/**", "release-*"]
-    paths:
-      - docs/features.toml
-      - scripts/ci/features_page.py
-      - .github/workflows/features.yml
+    # `edited`: a new "Fixes #N" in the body changes what the merge closes.
+    types: [opened, synchronize, reopened, edited]
   workflow_dispatch:
 
 permissions:
   contents: read
   issues: read
+  pull-requests: read
 
 jobs:
   issues:
@@ -31,7 +35,36 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # On a pull request, only when it changes the catalogue or its check:
+      # an issue someone else closed isn't this pull request's problem.
+      - name: Decide whether the catalogue changed
+        id: changed
+        if: github.event_name == 'pull_request'
+        run: |
+          if ! git diff --quiet "origin/$GITHUB_BASE_REF...HEAD" -- \
+              docs/features.toml scripts/ci/features_page.py .github/workflows/features.yml; then
+            echo catalogue=true >> "$GITHUB_OUTPUT"
+          fi
       - name: Check each linked issue's state
+        if: github.event_name != 'pull_request' || steps.changed.outputs.catalogue == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/ci/features_page.py check-issues
+
+  closing:
+    name: no feature row links an issue this pull request closes
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the rows against the issues the merge will close
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          fixes=$(gh pr view "$NUMBER" --repo "$GITHUB_REPOSITORY" --json closingIssuesReferences --jq '.closingIssuesReferences[].number')
+          # One issue number per word, so the list is left unquoted.
+          python3 scripts/ci/features_page.py check-closing $fixes

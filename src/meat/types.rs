@@ -123,6 +123,15 @@ impl Resources {
         }
     }
 
+    /// `self` times `count`, each field saturating at its maximum value.
+    pub fn saturating_mul(&self, count: u32) -> Resources {
+        Resources {
+            cpu_millicores: self.cpu_millicores.saturating_mul(u64::from(count)),
+            memory_bytes: self.memory_bytes.saturating_mul(u64::from(count)),
+            gpus: self.gpus.saturating_mul(count),
+        }
+    }
+
     /// Returns `true` if all fields are zero.
     pub fn is_zero(&self) -> bool {
         self.cpu_millicores == 0 && self.memory_bytes == 0 && self.gpus == 0
@@ -196,6 +205,22 @@ pub struct SchedulingDecision {
     /// Ordered list of node assignments (one per replica).
     pub placements: Vec<Placement>,
 }
+
+/// The most decisions one placement pass may carry. The council refuses a
+/// larger `SchedulingDecisions` entry, and the leader's planner stops adding
+/// decisions here, so a pass that touches more apps commits the first ones
+/// and leaves the rest for the next tick (#2366).
+pub const MAX_PASS_DECISIONS: usize = 4096;
+
+/// The most placements, summed over its decisions, one placement pass may
+/// carry. A pass of a single decision may hold more: an app is never too big
+/// to place on its own, only too big to share a pass (#2366).
+pub const MAX_PASS_PLACEMENTS: usize = 131_072;
+
+/// The council's answer to a placement pass planned against a log position
+/// that another entry has since moved. The pass is stale, not wrong: the
+/// leader plans it again from fresh state (#2369).
+pub const PASS_REVISION_CHANGED: &str = "admission revision changed";
 
 /// A single replica placement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

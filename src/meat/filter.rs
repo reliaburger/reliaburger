@@ -170,13 +170,28 @@ pub fn filter_nodes(
 ) -> Vec<NodeId> {
     cluster
         .nodes()
-        .filter(|node| {
-            node_can_run(node, requirements)
-                && node.matches_labels(&requirements.labels)
-                && node.can_fit(&requirements.resources)
-        })
+        .filter(|node| passes_filter(requirements, node, None))
         .map(|node| node.node_id.clone())
         .collect()
+}
+
+/// Whether `node` passes [`filter_nodes`], with `credit` taken off its
+/// allocation first: the room a copy it runs would hand back by being
+/// replaced. Only the two `Resources` values are adjusted, on the stack;
+/// the node itself is untouched (#2458).
+pub fn passes_filter(
+    requirements: &WorkloadRequirements,
+    node: &SchedulerNodeState,
+    credit: Option<&Resources>,
+) -> bool {
+    let fits = match credit {
+        Some(credit) => node
+            .allocatable
+            .saturating_sub(&node.allocated.saturating_sub(credit))
+            .fits(&requirements.resources),
+        None => node.can_fit(&requirements.resources),
+    };
+    node_can_run(node, requirements) && node.matches_labels(&requirements.labels) && fits
 }
 
 /// Why [`filter_nodes`] found no node: the first constraint, in filter

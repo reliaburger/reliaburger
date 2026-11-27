@@ -707,15 +707,19 @@ impl StateMachineInner {
             } => {
                 if *expected_log_id != position.previous_log_id {
                     return Some(CouncilResponse::Refused {
-                        reason: "admission revision changed".into(),
+                        reason: crate::meat::types::PASS_REVISION_CHANGED.into(),
                     });
                 }
-                if decisions.len() > 4096
-                    || decisions
-                        .iter()
-                        .map(|d| d.placements.len())
-                        .try_fold(0usize, |n, size| n.checked_add(size))
-                        .is_none_or(|n| n > 131072)
+                // The leader's planner reads the same limits, so it never
+                // proposes a pass this refuses (#2366). One decision may be
+                // any size: an app is never too big to place on its own.
+                if decisions.len() > crate::meat::types::MAX_PASS_DECISIONS
+                    || (decisions.len() > 1
+                        && decisions
+                            .iter()
+                            .map(|d| d.placements.len())
+                            .try_fold(0usize, |n, size| n.checked_add(size))
+                            .is_none_or(|n| n > crate::meat::types::MAX_PASS_PLACEMENTS))
                 {
                     return Some(CouncilResponse::Refused {
                         reason: "placement pass exceeds admission limits".into(),
@@ -9662,6 +9666,56 @@ mod tests {
             .unwrap();
         assert!(matches!(response[0], CouncilResponse::Refused { .. }));
         assert_eq!(sm.desired_state().await.scheduling, before);
+    }
+
+    /// A pass is held to the limits the leader's planner reads (#2366),
+    /// except a pass of one decision: one app is never too big to place.
+    #[tokio::test]
+    async fn a_pass_over_the_placement_limit_is_admitted_only_alone() {
+        use crate::meat::types::{MAX_PASS_DECISIONS, MAX_PASS_PLACEMENTS};
+        let decision = |name: &str, replicas: usize| SchedulingDecision {
+            app_id: AppId::new(name, "default"),
+            placements: (0..replicas)
+                .map(|ordinal| Placement {
+                    node_id: NodeId::new("home"),
+                    resources: Resources::new(1, 0, 0),
+                    ordinal: ordinal as u32,
+                })
+                .collect(),
+        };
+        let pass = |index: u64, decisions: Vec<SchedulingDecision>| {
+            normal_entry(
+                1,
+                index,
+                RaftRequest::SchedulingDecisions {
+                    expected_log_id: (index > 1).then(|| log_id(1, index - 1)),
+                    decisions,
+                },
+            )
+        };
+        let mut sm = CouncilStateMachine::new();
+
+        let half = MAX_PASS_PLACEMENTS / 2 + 1;
+        let response = sm
+            .apply([pass(1, vec![decision("a", half), decision("b", half)])])
+            .await
+            .unwrap();
+        assert!(matches!(response[0], CouncilResponse::Refused { .. }));
+
+        let response = sm
+            .apply([pass(2, vec![decision("big", MAX_PASS_PLACEMENTS + 1)])])
+            .await
+            .unwrap();
+        assert!(
+            matches!(response[0], CouncilResponse::Applied { .. }),
+            "{response:?}"
+        );
+
+        let many = (0..=MAX_PASS_DECISIONS)
+            .map(|index| decision(&format!("app-{index}"), 1))
+            .collect();
+        let response = sm.apply([pass(3, many)]).await.unwrap();
+        assert!(matches!(response[0], CouncilResponse::Refused { .. }));
     }
 
     #[tokio::test]
