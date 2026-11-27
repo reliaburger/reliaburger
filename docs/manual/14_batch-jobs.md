@@ -421,13 +421,17 @@ costs up to one node's slots at once, so set `--concurrency` (per-node
 concurrency) low enough for one node's share to fit the quota.
 
 The leader syncs every node once a second and writes one Raft entry per tick
-for all running arrays together, however many there are. It waits for the
+for all running arrays together, however many there are. A run's template goes
+to each node once; later syncs carry only the node's chunks of it. It waits for the
 nodes' answers for half a second at most. A node that's slow or hung (still in
 gossip, but its API doesn't answer) delays only its own grants: the others are
 planned from the answers that arrived, and the slow node's call carries over
 into later ticks rather than being repeated. Its chunks stay with it until it
 has been silent for 30 seconds, then go to other nodes at the next attempt, as
-for a node that left.
+for a node that left. The same happens, after three ticks, to a node that keeps
+reporting a finished chunk the leader can't accept (its counts don't add up);
+the leader's log names the run, chunk, attempt, node and reason once, in a
+line starting `bun: task array N: refused chunk`.
 
 Small chunks spread across many nodes are safe for the replicated state. The
 leader records which node and grant finished each chunk, and once that record
@@ -478,7 +482,10 @@ bench-task-arrays` fails above either bound). `relish batch results` and
 at most 16 tasks' head and tail per chunk. All of it goes when the run retires. Task data,
 together with the node's audit log, counts toward disk pressure: past a quarter of the filesystem, or with less
 than 1 GiB free, a worker finishes the chunks it holds but advertises no
-free slots, so it takes no new grants until retention frees space.
+free slots, so it takes no new grants until retention frees space. The free
+space is checked on every sync; the size of the task data and audit log is
+measured every 30 seconds, so a worker can take up to that long to notice its
+data passing a quarter of the disk.
 
 After council disaster recovery advances the recovery epoch, workers with old
 array directories stop their attempts and persist a refusal. Old results and
@@ -550,7 +557,9 @@ node's `allowed_binaries` from that node's capability report; until a node
 has reported, it only knows whether the allowlist names anything. If a node
 hasn't advertised yet, or might allow the binary, the run is admitted, and
 the leader fails it
-within a sync or two once every node it can reach has refused it. The same
+within a sync or two once every node it can reach has refused it. A node that
+stops answering (restarting, say) still holds the run open for the silence
+timeout, 30 seconds by default, in case it's the one node that could run it. The same
 happens when a node leaves or changes its configuration after admission.
 `relish batch-status` and `relish jobs` then show `Failed`, every task not
 run, and a `refused:` line quoting the nodes' reason; the JSON summary
