@@ -21,7 +21,7 @@ Sesame is not a separate binary or sidecar. It is compiled into the single `reli
 
 1. **Zero-configuration security (target).** A fresh cluster should have mTLS between all nodes, workload identity for all apps, namespace isolation, deny-by-default egress, and encrypted Raft logs. The current egress implementation is narrower: a declared `[app.NAME.egress]` allowlist is deny-by-default and fail-closed, but an app with no block still has unrestricted egress. A cluster-wide default policy remains planned.
 2. **Separation of privilege (target — see the note below).** The intended model is that worker nodes never hold CA private keys and can only obtain certificates for workloads they are scheduled to run. **The current implementation does not yet enforce this key split:** every clustered node loads the same cluster master key and its bootstrap security state, from which it can locally unwrap the age private key, the intermediate CA private keys, and the OIDC signing key (see §3.2). A genuine council/worker key separation is planned, not shipped.
-3. **Data plane survives control plane failures.** Existing certificates, firewall rules, and secrets continue working during council outages. Grace period extensions prevent hard cliffs.
+3. **Data plane survives control plane failures.** Existing node certificates, firewall rules, and secrets continue working during council outages. Workload certificates are the exception: they last an hour and nothing extends them yet, so a council outage longer than that breaks workload mTLS (§7.1). A local grace period is planned.
 4. **Short-lived credentials by default.** Workload certificates live 1 hour, rotated every 30 minutes. Deployer and ReadOnly API tokens live 90 days unless created with `--ttl-days` or `--no-expiry`, and `relish token rotate` replaces a secret with a 24-hour overlap (§5.4). Admin tokens are the exception: they get no default expiry, so the cluster can't lock itself out, and `relish wtf` warns about old ones. Short lifetimes reduce the blast radius of credential theft.
 
 ---
@@ -543,7 +543,9 @@ pub struct CrlEntry {
 
 ### 4.7 Firewall Rules
 
-> **As built (#677).** The listing below is the original design. The binary
+> **As built (#677).** The listing below is the original design: none of its
+> types (`FirewallRule`, `AppRef`, `EgressRule`, `ResolvedEgressEntry`,
+> `NftablesState`, `BpfFirewallEntry`) exists in `src/`. The binary
 > keys `firewall_map` by `(source cgroup, destination app id)` and grants only
 > cross-namespace paths (D4): apps in one namespace always reach each other,
 > and `allow_from` names `app` or `namespace/app` sources from other
@@ -763,6 +765,9 @@ nodes, so two nodes never share a seat in the council directory (#2050).
 
 ### 4.10 Raft Log Encryption
 
+> **Planned shape.** `RaftLogEncryption`, `tpm_sealed` and `PcrValue` don't
+> exist in `src/`; §5.6 describes what ships.
+
 ```rust
 /// Encryption state for the Raft log on a council node.
 #[derive(Debug)]
@@ -952,7 +957,9 @@ Bun on each worker node maintains a rotation schedule for every running workload
 4. **Writing.** Bun writes `cert.pem`, `key.pem`, `ca.pem`, `bundle.pem`, `token` (OIDC JWT) and `api-token` (the same JWT with the API's audience, §5.3) to the workload's tmpfs mount at `/var/run/reliaburger/identity/`.
 5. **Rotation timer.** Bun schedules the next rotation for 30 minutes later (half the certificate lifetime).
 6. **Pre-fetch.** At the 30-minute mark, Bun generates a new keypair, sends a new CSR, receives the new certificate, and atomically writes the new files to the tmpfs mount.
-7. **Grace period.** If the CSR fails because the council is unreachable, Bun keeps the current certificate and extends its local validity window by up to 4 additional hours (configurable). The extension is logged as a security event, `relish wtf` warns about it, and an alert fires.
+7. **Council unreachable.** If the CSR fails, Bun keeps the current certificate and tries again on each check while it's still valid. Nothing extends it: when its hour runs out it has expired, peers that verify it refuse it, and Bun logs `identity expired` for the instance (`check_identity_rotation` in `src/bun/agent/identity.rs`). A certificate's signed `notAfter` can't be extended locally anyway, because the peer checks it.
+
+> **Grace period: planned, not implemented.** The design keeps the current certificate past expiry for up to 4 more hours (configurable) when the council is unreachable, logs a security event, warns in `relish wtf` and fires an alert. `extend_grace_period` and `RotationState::GracePeriod` in `src/sesame/identity.rs` model it, but nothing in Bun's renewal loop calls them, and a peer would still refuse the certificate. The `cert_grace_period` key in §6.1 is part of the same sketch.
 
 **Host-side layout.** The mount source is a per-*instance* directory, `{volumes}/.identity/{instance_id}` — never shared between replicas of the same app, so no replica can overwrite another's private key. Bun prepares the directory before the container is created (it is the bind-mount source); on Linux, running as root, it is backed by a dedicated size-bounded tmpfs (`mode=0700`) so key material never touches persistent storage, and the key/token files are chowned to the container's runtime UID. On other platforms it is a plain `0700` directory (documented gap). The directory is removed — and the tmpfs unmounted — when the instance stops, is replaced by a rolling deploy, or is rolled back.
 
@@ -1607,7 +1614,7 @@ key on three nodes while writes and gossip keep flowing.
 
 ## 6. Configuration
 
-All security configuration lives in the cluster config (applied via `relish apply` or set during `relish init`).
+Security settings are node config: the `[security]` section of each node's `node.toml`, which `relish init` and `relish join` write. Several blocks below are design sketches that Bun doesn't parse; each says so, and `node.toml` refuses unknown keys, so copying one in stops Bun at start-up.
 
 ### 6.1 Certificate Lifetimes and Rotation
 
@@ -1699,6 +1706,12 @@ A node without the override behind a leader with it simply receives short
 leaves and renews at their midpoint as usual.
 
 ### 6.2 Node Authentication
+
+> **Planned, not parsed: Bun refuses these keys.** `[cluster]` has no
+> `node_attestation`, `join_token_ttl` or `external_ca_path`, and TPM and
+> external-CA attestation don't exist. A join token's lifetime is the `--ttl`
+> flag of `relish join-token create` (default 15 minutes, 1 second to 1 hour;
+> a token minted into a seed may last up to a week).
 
 ```toml
 [cluster]
@@ -1793,7 +1806,12 @@ allow_from = ["api", "admin", "team-web/frontend"]
 
 ### 6.6 OIDC Configuration
 
+> **Planned, not parsed.** `[security]` has no `oidc` table, so Bun refuses
+> `issuer` as it refuses the per-app audiences below; the issuer is derived
+> from the cluster's API endpoint.
+
 ```toml
+# PLANNED, not parsed: Bun refuses the whole block.
 [security.oidc]
 # The OIDC issuer URL published in the discovery document.
 # Default: derived from the cluster's API endpoint.
@@ -1822,19 +1840,20 @@ council_size = 3
 
 ## 7. Failure Modes
 
-### 7.1 Council Outage (Certificate Grace Period)
+### 7.1 Council Outage (Workload Certificate Expiry)
 
 **Scenario:** All council nodes are unavailable. No CSRs can be signed.
 
 **Impact:**
 
 - Running workloads continue operating with their current certificates.
-- When a workload's certificate approaches expiry (after the normal 1-hour lifetime), Bun activates the grace period extension, extending local validity by up to 4 hours (configurable).
-- Total window before mTLS breaks: 5 hours (1-hour cert lifetime + 4-hour grace).
+- Bun rotates each workload certificate at half its one-hour lifetime. While the council is down, each attempt fails and Bun keeps the certificate it has, trying again until it expires.
+- Total window before mTLS breaks: one hour from each instance's last successful rotation, so between 30 and 60 minutes after the outage starts. After that the certificate has expired and peers that verify it refuse it.
 - New workloads that start during the outage cannot receive identity certificates. They wait for council availability.
-- Grace-extended certificates are flagged in the local event log. `relish wtf` warns about them. An alert fires.
 
-**Mitigation:** Council size of 3 or 5 ensures quorum survives single-node or dual-node failures. The 5-hour window gives operators ample time to restore at least one council node.
+> **Grace period: planned, not implemented.** The design extends an expired certificate locally by up to 4 hours, for a 5-hour window, flags it in the event log, warns in `relish wtf` and fires an alert (§5.3 step 7). None of that runs.
+
+**Mitigation:** Council size of 3 or 5 ensures quorum survives single-node or dual-node failures. Plan council maintenance in windows shorter than 30 minutes, or accept that workload mTLS stops until the council is back.
 
 ### 7.2 CA Key Compromise
 
@@ -2006,8 +2025,9 @@ See Section 7.3. The short TTL (15 minutes), single-use property, and optional T
 
 **Mitigations:**
 
-- Bun resolves via multiple upstream DNS servers and requires consistent answers. Divergent responses are logged as security events.
-- When a hostname's resolved IP changes, the event is logged for audit.
+- What ships: Bun resolves each hostname entry with one lookup through the node's own resolver, re-resolves it periodically, and rewrites the kernel maps when the answer changes. It compares no answers and logs no audit event for the change.
+- *(Planned)* Resolve through several upstream servers, require consistent answers, and log divergent ones as security events.
+- *(Planned)* Log a changed answer for audit.
 - IP-based allowlists (CIDR notation) are immune to DNS poisoning.
 - DNSSEC validation can be enabled in the system resolver to cryptographically verify DNS responses.
 - For highly sensitive services, use IP-based allowlists instead of hostname-based ones.
@@ -2018,10 +2038,11 @@ See Section 7.3. The short TTL (15 minutes), single-use property, and optional T
 
 **Mitigations:**
 
-- Workloads run in unprivileged containers without `CAP_NET_RAW`, `CAP_NET_ADMIN`, or `CAP_SYS_ADMIN`.
+- Each container runs in its own user namespace with Docker's default capability set, which includes `CAP_NET_RAW` and excludes `CAP_NET_ADMIN` and `CAP_SYS_ADMIN`. Bun creates the container's network namespace before runc starts it, so the node's user namespace owns it, and the kernel checks the network capabilities there, where the container has none: raw sockets, `ip link` and TUN devices fail with `EPERM` (#1427). A runtime knob that asks for a network capability is refused for the same reason.
+- Docker's default seccomp filter refuses `bpf` and the other calls that could reach the programs or maps, and `no_new_privs` is set (agent-bun §8.4).
 - Cgroup IDs are assigned by the kernel at container creation and cannot be changed by unprivileged processes.
 - The eBPF programs are attached at the cgroup level for IPv4 and IPv6 connect and UDP sendmsg operations (`BPF_CGROUP_INET4_CONNECT`, `BPF_CGROUP_INET6_CONNECT`, `BPF_CGROUP_UDP4_SENDMSG`, `BPF_CGROUP_UDP6_SENDMSG`).
-- Raw socket creation requires `CAP_NET_RAW`, which is dropped from the container's capability set.
+- The `reliaburger_isolation` nftables table enforces namespace isolation on the forward path for any packet that doesn't pass a socket hook, raw sockets included.
 - The nftables perimeter layer provides defense-in-depth: even if a workload bypasses eBPF, the nftables rules on the destination node enforce cluster perimeter policy.
 
 ### 8.7 Confused Deputy (OIDC Token Replay)
@@ -2110,16 +2131,16 @@ Decrypted values are held in memory and injected as env vars. There is no per-re
 
 ### 10.2 Certificate Expiry Simulation
 
-- **Grace period test:** Start a workload, then make the council unreachable. Verify that the workload certificate enters grace period extension after the normal lifetime. Verify that `relish wtf` reports the grace-extended certificate. Verify that after the grace period (default 5 hours total), the certificate is no longer accepted.
-- **Hard expiry test:** Set `cert_grace_period = "0s"` and verify that workloads lose mTLS exactly at the certificate lifetime boundary.
+- **Grace period test** *(planned with the grace period, §5.3)*: Start a workload, then make the council unreachable. Verify that the workload certificate enters grace period extension after the normal lifetime. Verify that `relish wtf` reports the grace-extended certificate. Verify that after the grace period (default 5 hours total), the certificate is no longer accepted.
+- **Hard expiry test** *(planned)*: Verify that workloads lose mTLS exactly at the certificate lifetime boundary. Today that's the only behaviour; `cert_grace_period` isn't a key Bun parses.
 - **Clock skew test:** Simulate clock skew between worker and council nodes. Verify that certificates with `not_before` in the future are rejected, and that near-expiry certificates trigger early rotation.
 
 ### 10.3 Firewall Verification
 
 - **nftables perimeter test:** From outside the cluster, attempt to connect to management ports and app ports. Verify that connections are rejected unless originating from cluster nodes, `bootstrap_peers`, or (API port only) `operator_cidrs`. Implemented for `operator_cidrs` as `operator_cidr_reaches_the_api_port_but_not_cluster_ports` in `tests/owned_network.rs`, which applies the real ruleset in a throwaway network namespace.
-- **eBPF firewall test:** Deploy two apps in the same namespace with `allow_from` restrictions. Verify that unauthorized apps receive `EPERM`. Verify that authorised apps connect successfully. Verify that apps in different namespaces cannot communicate without explicit cross-namespace rules.
+- **eBPF firewall test:** Deploy two apps in different namespaces with `allow_from` restrictions (`allow_from` only opens cross-namespace paths; apps in one namespace always reach each other). Verify that unauthorized apps receive `EPERM`. Verify that authorised apps connect successfully. Verify that apps in different namespaces cannot communicate without explicit cross-namespace rules.
 - **Egress allowlist test:** Deploy an app with an `egress` block. Verify that TCP and UDP connections to allowed IPv4/IPv6 destinations succeed and connections to disallowed destinations are dropped. Verify DNS resolution refresh by changing the DNS record and confirming the eBPF maps update.
-- **`relish firewall test` integration:** Verify that the `--from` / `--to` diagnostic command accurately reports whether a connection would be permitted.
+- **`relish firewall test` integration** *(planned: the command doesn't exist; `relish path` answers the question today)*: Verify that the `--from` / `--to` diagnostic command accurately reports whether a connection would be permitted.
 
 ### 10.4 Join Token Security
 

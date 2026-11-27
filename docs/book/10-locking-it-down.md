@@ -151,7 +151,7 @@ pub enum RotationState {
 }
 ```
 
-If the council is unreachable when rotation is due, the worker extends the certificate's local validity by up to 4 hours. That gives 5 hours total (1-hour cert + 4-hour grace) before things break. Long enough to survive most outages. The grace period is tracked locally and logged as a security event.
+If the council is unreachable when rotation is due, the worker keeps the certificate it has and tries again on each check. Nothing extends it, though. The design sketched a 4-hour local grace period, five hours in all, and `GracePeriod` above is the state it would use, but nothing in Bun's renewal loop ever enters it. It couldn't help much anyway: a certificate's `notAfter` is signed, and the peer checks it, not the worker. So a council outage breaks workload mTLS between 30 and 60 minutes in, one hour after each instance's last good rotation. The design doc said otherwise in the present tense until the November 2026 audit caught it (#2498); an operator who planned a three-hour council window around "five hours" would have found out the hard way.
 
 ### OIDC JWTs
 
