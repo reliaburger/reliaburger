@@ -10020,29 +10020,33 @@ async fn webhook_rejects_a_bad_signature_without_triggering_a_sync() {
 #[tokio::test]
 async fn webhook_full_queue_is_bounded_and_delivery_can_be_retried() {
     let (app, mut receiver, shutdown) = webhook_setup("hooksecret", 100);
-    let body = br#"{"after":"abc123"}"#;
+    // Each delivery is a distinct push: a repeated body is a replay (#2408).
+    let body = |id: usize| format!(r#"{{"after":"abc{id}"}}"#).into_bytes();
     let headers = |id: usize| {
         vec![
-            ("x-hub-signature-256", github_signature("hooksecret", body)),
+            (
+                "x-hub-signature-256",
+                github_signature("hooksecret", &body(id)),
+            ),
             ("x-github-delivery", format!("queue-{id}")),
         ]
     };
     for id in 0..4 {
         assert_eq!(
-            post_webhook(&app, body, &headers(id)).await,
+            post_webhook(&app, &body(id), &headers(id)).await,
             StatusCode::ACCEPTED
         );
     }
     let status = tokio::time::timeout(
         std::time::Duration::from_millis(500),
-        post_webhook(&app, body, &headers(4)),
+        post_webhook(&app, &body(4), &headers(4)),
     )
     .await
     .expect("full queue must not stall the request");
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     receiver.recv().await.unwrap();
     assert_eq!(
-        post_webhook(&app, body, &headers(4)).await,
+        post_webhook(&app, &body(4), &headers(4)).await,
         StatusCode::ACCEPTED
     );
     shutdown.cancel();
@@ -10147,13 +10151,15 @@ async fn webhook_rate_limit_trips_on_a_flood() {
         .await,
         StatusCode::ACCEPTED
     );
-    // Second, fresh delivery id but the per-minute slot is used → 429.
+    // Second, a new push with a fresh delivery id, but the per-minute
+    // slot is used → 429.
+    let second = br#"{"after":"def"}"#;
     assert_eq!(
         post_webhook(
             &app,
-            body,
+            second,
             &[
-                ("x-hub-signature-256", sig),
+                ("x-hub-signature-256", github_signature(secret, second)),
                 ("x-github-delivery", "d-2".to_string())
             ]
         )

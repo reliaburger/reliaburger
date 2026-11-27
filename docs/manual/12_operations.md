@@ -565,7 +565,12 @@ To sync on push rather than on the next poll, point a GitHub, Gitea or GitLab
 webhook at `https://NODE:9117/v1/gitops/webhook` with the same secret. The
 endpoint needs no token, only the HMAC signature (`X-Hub-Signature-256`) or
 GitLab's `X-Gitlab-Token`. It refuses replays and is rate-limited
-(`webhook_rate_limit`, 10 a minute by default). A delivery refused for the
+(`webhook_rate_limit`, 10 a minute by default). For a signed delivery a replay
+is the same body again, whatever its delivery ID, since the signature covers
+only the body; the provider's "Redeliver" button on an old delivery is
+refused as a replay too. A GitLab token isn't a signature but the secret
+itself, so anyone who captures one GitLab delivery holds your secret: there
+only the delivery ID is checked, and the endpoint should sit behind TLS. A delivery refused for the
 rate limit isn't counted as seen, so the provider's retry gets through.
 
 A follower forwards an authenticated webhook to the leader. A clustered
@@ -577,9 +582,9 @@ original delivery ID is safe. Admission has one five-second budget, including
 waiting for the validator, resolving the leader and forwarding or replicating
 the trigger. Timing out releases the local rate and replay reservation.
 The cluster retains the most recent 1,000
-committed delivery IDs across restarts and leader changes. A delivery still
+committed deliveries across restarts and leader changes. A delivery still
 in that inventory is refused as a replay; one that was not admitted can be
-tried again. Older delivery IDs can be admitted again after eviction.
+tried again. Older deliveries can be admitted again after eviction.
 
 Durable webhook admission changes both protocol and state formats. Check
 `bun --compatibility` before upgrading. Before 1.0, recreate the cluster

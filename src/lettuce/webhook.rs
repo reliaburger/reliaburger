@@ -26,6 +26,10 @@ pub struct WebhookValidator {
     rate_limit: u32,
     /// Recent delivery IDs for replay detection.
     recent_ids: VecDeque<String>,
+    /// SHA-256 digests of recently admitted HMAC-signed bodies (#2408).
+    /// The signature covers the body and not the delivery header, so a
+    /// captured delivery resent under a new id is caught here.
+    recent_bodies: VecDeque<[u8; 32]>,
     /// Max entries in the replay detection set.
     max_replay_entries: usize,
     /// Timestamps of recent triggers for rate limiting.
@@ -42,6 +46,7 @@ pub struct WebhookValidator {
 pub struct WebhookAdmission<'a> {
     validator: &'a mut WebhookValidator,
     ids: VecDeque<String>,
+    bodies: VecDeque<[u8; 32]>,
     triggers: VecDeque<Instant>,
     committed: bool,
 }
@@ -57,6 +62,7 @@ impl Drop for WebhookAdmission<'_> {
     fn drop(&mut self) {
         if !self.committed {
             self.validator.recent_ids = std::mem::take(&mut self.ids);
+            self.validator.recent_bodies = std::mem::take(&mut self.bodies);
             self.validator.recent_triggers = std::mem::take(&mut self.triggers);
         }
     }
@@ -74,6 +80,7 @@ impl WebhookValidator {
             secret: Some(secret.as_bytes().to_vec()),
             rate_limit,
             recent_ids: VecDeque::with_capacity(1000),
+            recent_bodies: VecDeque::with_capacity(1000),
             max_replay_entries: 1000,
             recent_triggers: VecDeque::with_capacity(rate_limit as usize),
             clock,
@@ -141,6 +148,7 @@ impl WebhookValidator {
         branch: &str,
     ) -> Result<WebhookAdmission<'a>, LettuceError> {
         let ids = self.recent_ids.clone();
+        let bodies = self.recent_bodies.clone();
         let triggers = self.recent_triggers.clone();
         if let Some(token) = gitlab_token {
             self.validate_gitlab(body, token, delivery, branch)?;
@@ -150,6 +158,7 @@ impl WebhookValidator {
         Ok(WebhookAdmission {
             validator: self,
             ids,
+            bodies,
             triggers,
             committed: false,
         })
@@ -169,8 +178,9 @@ impl WebhookValidator {
         // HMAC validation
         self.verify_signature(body, signature_header)?;
 
-        // Replay + rate limit.
-        self.check_replay_and_rate(delivery_id)?;
+        // Replay + rate limit. The body is what the signature covers, so it
+        // is deduplicated as well as the delivery id (#2408).
+        self.check_replay_and_rate(delivery_id, Some(signed_body_digest(body)))?;
 
         // Extract commit SHA from webhook body (simplified — real impl
         // would parse the JSON from GitHub/GitLab/Gitea format)
@@ -187,7 +197,10 @@ impl WebhookValidator {
     /// shared secret verbatim rather than an HMAC signature.
     ///
     /// The token is compared to the configured secret in constant time,
-    /// then replay and rate-limit checks run exactly as for GitHub.
+    /// then replay and rate-limit checks run as for GitHub, on the delivery
+    /// id only. The token is the secret itself, so whoever captures one
+    /// request holds the secret, and no deduplication would help; a body
+    /// check would only refuse GitLab's own identical test deliveries.
     pub fn validate_gitlab(
         &mut self,
         body: &[u8],
@@ -198,7 +211,7 @@ impl WebhookValidator {
         if !constant_time_eq(token.as_bytes(), self.key()?) {
             return Err(LettuceError::WebhookInvalid("token mismatch".to_string()));
         }
-        self.check_replay_and_rate(delivery_id)?;
+        self.check_replay_and_rate(delivery_id, None)?;
 
         let commit_sha = extract_head_commit(body).unwrap_or_default();
         Ok(WebhookEvent {
@@ -209,10 +222,18 @@ impl WebhookValidator {
     }
 
     /// Run the replay and rate-limit checks shared by every provider.
-    fn check_replay_and_rate(&mut self, delivery_id: Option<&str>) -> Result<(), LettuceError> {
-        // A delivery ID is mandatory (M27): the endpoint is secret-authenticated,
-        // and without an id there is nothing to deduplicate against, so a
-        // captured request could be replayed indefinitely. Refuse rather than
+    ///
+    /// What this guarantees: a provider's own duplicate (same delivery id)
+    /// and, for a signed body, a verbatim resend under any id are refused
+    /// while they are among the last 1000 admitted deliveries. Nothing
+    /// older is remembered.
+    fn check_replay_and_rate(
+        &mut self,
+        delivery_id: Option<&str>,
+        body_digest: Option<[u8; 32]>,
+    ) -> Result<(), LettuceError> {
+        // A delivery ID is mandatory (M27): without one a provider's own
+        // retry can't be told from a new delivery. Refuse rather than
         // silently skip replay protection.
         let id = delivery_id.ok_or_else(|| {
             LettuceError::WebhookInvalid(
@@ -222,6 +243,13 @@ impl WebhookValidator {
         if self.recent_ids.iter().any(|existing| existing == id) {
             return Err(LettuceError::WebhookInvalid(
                 "duplicate delivery ID (replay)".to_string(),
+            ));
+        }
+        if let Some(digest) = &body_digest
+            && self.recent_bodies.contains(digest)
+        {
+            return Err(LettuceError::WebhookInvalid(
+                "duplicate signed body (replay)".to_string(),
             ));
         }
 
@@ -249,6 +277,12 @@ impl WebhookValidator {
         if self.recent_ids.len() > self.max_replay_entries {
             self.recent_ids.pop_front();
         }
+        if let Some(digest) = body_digest {
+            self.recent_bodies.push_back(digest);
+            if self.recent_bodies.len() > self.max_replay_entries {
+                self.recent_bodies.pop_front();
+            }
+        }
         self.recent_triggers.push_back(now);
         Ok(())
     }
@@ -272,6 +306,13 @@ impl WebhookValidator {
         hmac::verify(&key, body, &expected_sig)
             .map_err(|_| LettuceError::WebhookInvalid("signature mismatch".to_string()))
     }
+}
+
+/// The SHA-256 of a webhook body: the replay key for an HMAC-signed
+/// delivery, locally and in the cluster's replicated receipts (#2408).
+pub fn signed_body_digest(body: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(body).into()
 }
 
 /// Constant-time byte-slice equality for the GitLab shared-secret token.
@@ -387,6 +428,44 @@ mod tests {
         );
     }
 
+    /// #2408: the signature covers the body, not the delivery header, so
+    /// a captured delivery resent under a fresh id is still a replay.
+    #[test]
+    fn a_signed_body_replayed_under_a_new_delivery_id_is_refused() {
+        let mut validator = WebhookValidator::new("mysecret", 10);
+        let body = br#"{"after": "abc"}"#;
+        let sig = sign_payload("mysecret", body);
+        validator
+            .validate(body, Some(&sig), Some("id-1"), "main")
+            .unwrap();
+        let replay = validator.validate(body, Some(&sig), Some("id-2"), "main");
+        assert!(replay.unwrap_err().to_string().contains("replay"));
+    }
+
+    /// #2408: a genuine new push has a new body, and is admitted.
+    #[test]
+    fn a_different_body_under_a_new_delivery_id_is_admitted() {
+        let mut validator = WebhookValidator::new("mysecret", 10);
+        let first = br#"{"after": "abc"}"#;
+        let second = br#"{"after": "def"}"#;
+        validator
+            .validate(
+                first,
+                Some(&sign_payload("mysecret", first)),
+                Some("id-1"),
+                "main",
+            )
+            .unwrap();
+        validator
+            .validate(
+                second,
+                Some(&sign_payload("mysecret", second)),
+                Some("id-2"),
+                "main",
+            )
+            .expect("a different signed body is a new delivery");
+    }
+
     /// M27: a valid signature with no delivery ID is refused — replay
     /// protection is impossible without one, so we must not silently skip it.
     #[test]
@@ -403,19 +482,24 @@ mod tests {
     #[test]
     fn webhook_rate_limiting() {
         let mut validator = WebhookValidator::new("mysecret", 2); // 2 per minute
-        let body = br#"{"after": "abc"}"#;
-        let sig = sign_payload("mysecret", body);
+        // Three distinct pushes: a repeated body would be a replay (#2408).
+        let bodies = [
+            br#"{"after": "abc"}"#,
+            br#"{"after": "def"}"#,
+            br#"{"after": "ghi"}"#,
+        ];
+        let mut deliver = |index: usize| {
+            let body = bodies[index];
+            let sig = sign_payload("mysecret", body);
+            validator.validate(body, Some(&sig), Some(&format!("id-{index}")), "main")
+        };
 
         // First two succeed
-        validator
-            .validate(body, Some(&sig), Some("id-1"), "main")
-            .unwrap();
-        validator
-            .validate(body, Some(&sig), Some("id-2"), "main")
-            .unwrap();
+        deliver(0).unwrap();
+        deliver(1).unwrap();
 
         // Third is rate-limited
-        let result = validator.validate(body, Some(&sig), Some("id-3"), "main");
+        let result = deliver(2);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("rate limit"));
     }
@@ -436,12 +520,18 @@ mod tests {
             1,
             Box::new(move || base + Duration::from_secs(clock_secs.load(Ordering::SeqCst))),
         );
-        let body = br#"{"after": "abc"}"#;
+        let first = br#"{"after": "abc"}"#;
+        let body = br#"{"after": "def"}"#;
         let sig = sign_payload("mysecret", body);
 
         // Exhaust the budget, then get a fresh delivery refused.
         validator
-            .validate(body, Some(&sig), Some("id-1"), "main")
+            .validate(
+                first,
+                Some(&sign_payload("mysecret", first)),
+                Some("id-1"),
+                "main",
+            )
             .unwrap();
         let limited = validator.validate(body, Some(&sig), Some("id-2"), "main");
         assert!(
@@ -529,9 +619,24 @@ mod tests {
                 .to_string()
                 .contains("replay")
         );
+        // The cancelled reservation released the body digest too, so the
+        // committed one is the only record of it (#2408).
         assert!(
             validator
                 .validate(body, Some(&signature), Some("different"), "main")
+                .unwrap_err()
+                .to_string()
+                .contains("replay")
+        );
+        let other = b"{\"after\": \"def\"}";
+        assert!(
+            validator
+                .validate(
+                    other,
+                    Some(&sign_payload("secret", other)),
+                    Some("different"),
+                    "main"
+                )
                 .unwrap_err()
                 .to_string()
                 .contains("rate limit")

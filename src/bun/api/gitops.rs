@@ -189,10 +189,17 @@ async fn admit_gitops_webhook(
         let Some(delivery) = delivery.as_deref() else {
             return webhook_unavailable("validated webhook has no delivery ID");
         };
-        let receipt = Sha256::digest(delivery.as_bytes());
-        let write = council.write(crate::council::types::RaftRequest::GitOpsSyncRequested {
-            delivery: receipt.into(),
-        });
+        // An HMAC signature covers the body, not the delivery header, so the
+        // body is what the leader deduplicates; a captured delivery resent
+        // under a new id is refused on every node (#2408). A GitLab token
+        // signs nothing, so its receipt stays the delivery id.
+        let receipt: [u8; 32] = if gitlab_token.is_some() {
+            Sha256::digest(delivery.as_bytes()).into()
+        } else {
+            crate::lettuce::webhook::signed_body_digest(&body)
+        };
+        let write = council
+            .write(crate::council::types::RaftRequest::GitOpsSyncRequested { delivery: receipt });
         match tokio::time::timeout(WEBHOOK_ADMISSION_TIMEOUT, write).await {
             Ok(Ok(crate::council::types::CouncilResponse::GitOpsSyncRequested { generation })) => {
                 admission.commit();

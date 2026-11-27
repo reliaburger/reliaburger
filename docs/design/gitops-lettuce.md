@@ -546,7 +546,7 @@ For instant deploys on push. The webhook endpoint is served on the cluster API p
 1. **Method check.** Only POST is accepted. Other methods return 405.
 2. **HMAC-SHA256 signature validation.** The `X-Hub-Signature-256` header (GitHub format) is checked against the payload body using the configured `webhook_secret`. GitLab uses `X-Gitlab-Token` (compared directly). Lettuce auto-detects the provider from the headers. Invalid signatures return 401.
 3. **Rate limiting.** A token bucket rate limiter allows `webhook_rate_limit` (default 10) triggers per minute. Excess triggers return 429 with a `Retry-After` header.
-4. **Replay detection.** The `X-GitHub-Delivery` (or equivalent) header is stored in a bounded deduplication set (1000 entries, LRU eviction). Duplicate delivery IDs are rejected with 409.
+4. **Replay detection.** The `X-GitHub-Delivery` (or equivalent) header is stored in a bounded deduplication set (1000 entries, LRU eviction). Duplicate delivery IDs are rejected with 409. For an HMAC-signed delivery the SHA-256 of the body is deduplicated too, because the signature covers the body and not the header (#2408); a GitLab token signs nothing, so GitLab deliveries are deduplicated by id alone.
 5. **Branch filter.** The payload is parsed to extract the pushed branch. If it doesn't match the configured branch, the webhook is acknowledged (200) but no sync is triggered.
 6. **Trigger sync.** A signal is sent to the sync loop to run immediately, bypassing the poll timer. The webhook returns 202 (accepted) before the sync completes.
 
@@ -840,7 +840,7 @@ An earlier draft kept git credentials out of the `[gitops]` block, in a per-node
 
 **Cause:** An attacker captures a valid webhook payload and re-sends it.
 
-**Behaviour:** The deduplication set rejects duplicate `delivery_id` values with 409. Even if the deduplication set has evicted the entry (after 1000 newer deliveries), a replayed webhook for an already-applied commit is a no-op (the commit SHA matches `last_applied_commit`, so the sync short-circuits).
+**Behaviour:** The deduplication set rejects duplicate `delivery_id` values (401 today). For a signed delivery it also rejects a body it has admitted before, under any delivery id, because the HMAC covers the body but not the header: an attacker can't replay a captured delivery by changing its id (#2408). The leader's replicated receipt is the body digest, so every node refuses it. The guarantee covers the last 1000 admitted deliveries and nothing older. GitLab's `X-Gitlab-Token` is the shared secret itself, so a captured GitLab request leaks the secret; there the check is the delivery id alone. Even if the deduplication set has evicted the entry (after 1000 newer deliveries), a replayed webhook for an already-applied commit is a no-op (the commit SHA matches `last_applied_commit`, so the sync short-circuits).
 
 **Residual risk:** An attacker could replay a webhook for a commit that has been reverted in git. However, since Lettuce always fetches the latest commit from the remote (not the commit referenced in the webhook), a replayed webhook simply triggers a normal sync cycle that applies whatever is currently at HEAD. The webhook commit SHA isn't used for checkout.
 
