@@ -2574,14 +2574,18 @@ mod tests {
             netns::node_index_from_id("web-node-3")
         );
 
+        // Bun restarts after the rename: the old runtime goes first, as the
+        // old process would.
+        let pinned = before.node_index;
+        drop(before);
         let after = runtime("web-node-3");
         let killed = after.kill(&id).await;
         if killed.is_err() {
-            let _ = before.kill(&id).await;
+            let _ = runtime("ip-10-0-3-17").kill(&id).await;
         }
         killed.unwrap();
         assert_eq!(after.state(&id).await.unwrap(), ContainerState::Stopped);
-        assert_eq!(after.node_index, before.node_index);
+        assert_eq!(after.node_index, pinned);
     }
 
     /// #2392: `runc exec` goes through the same exec helper as a host
