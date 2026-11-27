@@ -596,6 +596,45 @@ spec:
 
 #[cfg(feature = "kubernetes")]
 #[test]
+fn import_strict_fails_on_image_pull_secrets() {
+    // A Deployment from a private registry imported with an empty report,
+    // so a CI gate on `--strict` passed it (#2461).
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = dir.path().join("private.yaml");
+    std::fs::write(
+        &manifest,
+        r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  selector:
+    matchLabels: {app: api}
+  template:
+    metadata:
+      labels: {app: api}
+    spec:
+      imagePullSecrets:
+      - name: regcred
+      containers:
+      - name: api
+        image: registry.example.com/team/api:1.4
+"#,
+    )
+    .unwrap();
+    let strict = run(&["import", "--strict", "-f", manifest.to_str().unwrap()]);
+    assert_eq!(strict.status.code(), Some(1));
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&strict.stdout),
+        String::from_utf8_lossy(&strict.stderr)
+    );
+    assert!(output.contains("imagePullSecrets"), "{output}");
+}
+
+#[cfg(feature = "kubernetes")]
+#[test]
 fn import_strict_passes_a_manifest_that_converts_cleanly() {
     let dir = tempfile::tempdir().unwrap();
     let manifest = dir.path().join("clean.yaml");

@@ -141,7 +141,7 @@ fn check_nodes(inputs: &WtfInputs, report: &mut WtfReport) {
                 id: "unreachable-nodes".to_string(),
                 title: format!("node {} did not answer its Bun API", node.node_id),
                 details: vec!["authenticated per-node evidence collection failed".to_string()],
-                suggestion: "check the node's bun agent and network: `relish dev shell <node>` / `journalctl -u bun`".to_string(),
+                suggestion: "check the node's bun agent and network: on the node, `systemctl status reliaburger` and `journalctl -u reliaburger`".to_string(),
                 correlated_events: Vec::new(),
                 affected_resource: format!("node.{}", node.node_id),
             });
@@ -156,8 +156,8 @@ fn check_nodes(inputs: &WtfInputs, report: &mut WtfReport) {
                 title: format!("node {} is {}", node.node_id, node.membership_state),
                 details: vec!["Mustard membership does not consider this node alive".to_string()],
                 suggestion: format!(
-                    "node {} is {}; if expected, drain it; if not, check the host",
-                    node.node_id, node.membership_state
+                    "node {} is {}; if it is gone for good, retire it with `relish decommission-node {} --workloads-stopped --reason <why>`; if not, check the host",
+                    node.node_id, node.membership_state, node.node_id
                 ),
                 correlated_events: Vec::new(),
                 affected_resource: format!("node.{}", node.node_id),
@@ -1176,7 +1176,7 @@ fn check_disks(inputs: &WtfInputs, report: &mut WtfReport) {
                 disk.storage_domains.join(", ")
             )],
             suggestion: format!(
-                "node {} disk is at {:.1}%; prune images (`relish pickle gc`) or logs",
+                "node {} disk is at {:.1}%; list images with `relish images`, delete tags you no longer need with `relish images delete <repository:tag>` (untagged images expire after [images] gc_retain_days), or lower log and metric retention in node.toml",
                 disk.node_id, disk.used_percent
             ),
             correlated_events: Vec::new(),
@@ -4158,5 +4158,75 @@ pub(super) mod tests {
         assert_eq!(at(DISK_WARNING_PERCENT as f64), (true, false));
         assert_eq!(at(DISK_CRITICAL_PERCENT as f64 - 0.1), (true, false));
         assert_eq!(at(DISK_CRITICAL_PERCENT as f64), (false, true));
+
+        // There is no `relish pickle gc` (#2468).
+        let mut inputs = healthy_inputs();
+        inputs.cluster.disks = available(vec![DiskObservation {
+            filesystem_id: None,
+            node_id: "node-1".to_string(),
+            storage_domains: vec!["images".to_string()],
+            used_bytes: 1,
+            total_bytes: 100,
+            used_percent: DISK_WARNING_PERCENT as f64,
+        }]);
+        let report = diagnose(&inputs);
+        let finding = report
+            .warnings
+            .iter()
+            .find(|f| f.id == "disk-high")
+            .unwrap();
+        assert!(
+            !finding.suggestion.contains("pickle"),
+            "{}",
+            finding.suggestion
+        );
+        assert!(
+            finding.suggestion.contains("relish images delete"),
+            "{}",
+            finding.suggestion
+        );
+    }
+
+    #[test]
+    fn a_down_node_is_advised_only_commands_that_apply_to_it() {
+        // `relish dev shell` works only on a developer Lima cluster, the
+        // unit is `reliaburger`, not `bun`, and there's no drain (#2468).
+        let mut inputs = healthy_inputs();
+        let mut nodes = inputs.cluster.nodes.value().unwrap().clone();
+        nodes[0].agent_reachable = false;
+        nodes[0].membership_state = "dead".to_string();
+        inputs.cluster.nodes = available(nodes);
+        let report = diagnose(&inputs);
+        let unreachable = report
+            .critical
+            .iter()
+            .find(|f| f.id == "unreachable-nodes")
+            .unwrap();
+        assert!(
+            !unreachable.suggestion.contains("relish dev"),
+            "{}",
+            unreachable.suggestion
+        );
+        assert!(
+            !unreachable.suggestion.contains("-u bun"),
+            "{}",
+            unreachable.suggestion
+        );
+        assert!(
+            unreachable.suggestion.contains("journalctl -u reliaburger"),
+            "{}",
+            unreachable.suggestion
+        );
+        let dead = report
+            .critical
+            .iter()
+            .find(|f| f.id == "node-dead")
+            .unwrap();
+        assert!(!dead.suggestion.contains("drain"), "{}", dead.suggestion);
+        assert!(
+            dead.suggestion.contains("relish decommission-node"),
+            "{}",
+            dead.suggestion
+        );
     }
 }
