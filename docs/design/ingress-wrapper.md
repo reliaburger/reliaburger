@@ -881,6 +881,8 @@ Wrapper adds the following headers to proxied requests today (`forwarded_headers
 
 - `X-Forwarded-For`: Client IP appended to any existing chain.
 - `X-Forwarded-Proto`: `https`.
+- `Host` and `X-Forwarded-Host`: the host the client asked for, as it sent it (its `Host` header, or the HTTP/2 `:authority`), never the backend's address (#2404).
+- `X-Forwarded-Port`: the port of the listener the request arrived on.
 
 Planned, not yet added:
 
@@ -890,6 +892,7 @@ Planned, not yet added:
 Wrapper strips the following headers from client requests before proxying:
 
 - `X-Forwarded-For` (replaced with accurate value to prevent spoofing, unless the peer IP is in a configured trusted proxy CIDR range).
+- `X-Forwarded-Host` and `X-Forwarded-Port` (#2404).
 
 ---
 

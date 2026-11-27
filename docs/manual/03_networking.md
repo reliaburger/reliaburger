@@ -229,12 +229,16 @@ still open when the drain timeout ends gets a Close frame with code 1001
 (Going Away), so a well-behaved client reconnects to another instance rather
 than reporting an error.
 
-Your app sees the client's address in `X-Forwarded-For` and `X-Real-IP`, and
-`X-Forwarded-Proto` says whether the client came over HTTPS. The ingress sets
-all three itself and drops any a client sent, so your app can trust them. Each
-request also carries an `X-Request-ID`: the client's own, or a new random one,
-for matching your app's logs to the client's. WebSocket upgrades get the same
-headers.
+Your app sees the `Host` the client asked for (`web.example.com`, not the
+instance's own address), so absolute links, cookie domains and virtual hosts
+work without any proxy setting. The client's address is in `X-Forwarded-For`
+and `X-Real-IP`, `X-Forwarded-Proto` says whether the client came over HTTPS,
+`X-Forwarded-Host` repeats the client's `Host`, and `X-Forwarded-Port` is the
+ingress port it connected to (80 or 443 unless you moved them). The ingress
+sets all five itself and drops any a client sent, so your app can trust them.
+Each request also carries an `X-Request-ID`: the client's own, or a new random
+one, for matching your app's logs to the client's. WebSocket upgrades get the
+same headers.
 
 ## Fault injection lives nearby
 

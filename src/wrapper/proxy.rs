@@ -130,6 +130,35 @@ struct Listener {
     over_tls: bool,
     /// How long the request body may go without a new byte (#2381).
     request_body_idle: std::time::Duration,
+    /// The port the listener is bound to, for `X-Forwarded-Port`.
+    port: u16,
+}
+
+/// What the proxy itself saw of a client's request. The forwarding headers
+/// report it to the backend, which can trust them because the proxy drops
+/// any the client sent (ING5, #2404).
+#[derive(Debug, Clone)]
+pub struct ClientView {
+    /// The client's address as the socket reports it.
+    pub address: SocketAddr,
+    /// Whether the client came over HTTPS.
+    pub over_tls: bool,
+    /// The host the client asked for, exactly as it sent it (port and all):
+    /// the backend gets it as `Host` and `X-Forwarded-Host`.
+    pub host: String,
+    /// The port of the listener the request arrived on.
+    pub port: u16,
+}
+
+/// The host a request names, as the client sent it: its `Host` header, or
+/// the URI's authority when it sent none (an HTTP/2 `:authority`).
+fn sent_host(req: &Request<Body>) -> String {
+    req.headers()
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| req.uri().authority().map(|authority| authority.to_string()))
+        .unwrap_or_default()
 }
 
 /// One KiB, the unit [`ProxyState::request_body_budget`] counts in.
@@ -383,6 +412,7 @@ impl BoundProxy {
             .layer(axum::Extension(Listener {
                 over_tls: false,
                 request_body_idle,
+                port: self.http_addr.port(),
             }))
             .with_state(Arc::clone(&self.state));
 
@@ -391,6 +421,7 @@ impl BoundProxy {
             .layer(axum::Extension(Listener {
                 over_tls: true,
                 request_body_idle,
+                port: self.https_addr.port(),
             }))
             .with_state(Arc::clone(&self.state));
 
@@ -831,6 +862,12 @@ async fn do_proxy(
     };
 
     let path = req.uri().path().to_string();
+    let view = ClientView {
+        address: remote,
+        over_tls,
+        host: sent_host(&req),
+        port: listener.port,
+    };
 
     // Once the view lease lapses, other nodes may have reused any remote
     // address in the table; only this node's own backends stay routable.
@@ -915,8 +952,7 @@ async fn do_proxy(
         return super::websocket::handle_websocket_upgrade(
             req,
             *backend,
-            remote,
-            over_tls,
+            &view,
             permit,
             boxed_guard,
             capture.terminate,
@@ -978,7 +1014,7 @@ async fn do_proxy(
         .unwrap_or_else(generate_request_id);
 
     // Collect the end-to-end request headers once so each attempt replays them.
-    // Skip `host` (the backend derives its own), the hop-by-hop set (RFC 7230
+    // Skip `host` (set from `view` with the forwarding headers), the hop-by-hop set (RFC 7230
     // §6.1) plus anything the client named in its own `Connection` header, the
     // client's own `X-Forwarded-*` and `X-Real-IP` (we set those from our own
     // view so a backend can't be lied to), and `X-Request-ID` (set explicitly
@@ -1009,8 +1045,7 @@ async fn do_proxy(
     let upstream = UpstreamRequest {
         method: &parts.method,
         forward_headers: &forward_headers,
-        remote,
-        over_tls,
+        view: &view,
         request_id: &request_id,
         body: body_bytes,
         // The buffered body is the truth about its length, whatever framing
@@ -1118,8 +1153,7 @@ async fn do_proxy(
 struct UpstreamRequest<'a> {
     method: &'a axum::http::Method,
     forward_headers: &'a [(axum::http::HeaderName, axum::http::HeaderValue)],
-    remote: SocketAddr,
-    over_tls: bool,
+    view: &'a ClientView,
     request_id: &'a str,
     body: &'a axum::body::Bytes,
     /// `Content-Length` to send, if any. Set from the buffered body.
@@ -1139,13 +1173,19 @@ impl UpstreamRequest<'_> {
         for (name, value) in self.forward_headers {
             request = request.header(name, value);
         }
+        // The host the client asked for, not the backend's address: an
+        // explicit `Host` stops the HTTP client deriving one from the URL
+        // (#2404).
+        if !self.view.host.is_empty() {
+            request = request.header(axum::http::header::HOST, &self.view.host);
+        }
         // The proxy's own view of the connection (ING5), plus X-Real-IP and
         // the request id. A client cannot influence these: we stripped any
         // it sent.
-        for (name, value) in forwarded_headers(self.remote, self.over_tls) {
+        for (name, value) in forwarded_headers(self.view) {
             request = request.header(name, value);
         }
-        request = request.header("x-real-ip", self.remote.ip().to_string());
+        request = request.header("x-real-ip", self.view.address.ip().to_string());
         request = request.header("x-request-id", self.request_id);
         if let Some(length) = self.content_length {
             request = request.header(axum::http::header::CONTENT_LENGTH, length);
@@ -1275,9 +1315,15 @@ pub(crate) fn redirect_to_https(host: &str, uri: &Uri) -> Response {
 /// Whether a header name is one of the forwarding headers the proxy owns and
 /// therefore must strip from client input (ING5).
 pub(super) fn is_forwarded_header(name: &str) -> bool {
-    name.eq_ignore_ascii_case("x-forwarded-for")
-        || name.eq_ignore_ascii_case("x-forwarded-proto")
-        || name.eq_ignore_ascii_case("forwarded")
+    [
+        "x-forwarded-for",
+        "x-forwarded-proto",
+        "x-forwarded-host",
+        "x-forwarded-port",
+        "forwarded",
+    ]
+    .iter()
+    .any(|owned| name.eq_ignore_ascii_case(owned))
 }
 
 /// A client's `Cookie` header without the dashboard's session cookie, or
@@ -1302,15 +1348,20 @@ pub(crate) fn without_session_cookie(value: &str) -> Option<String> {
 
 /// The `X-Forwarded-*` headers the proxy sets from its own view of the
 /// connection. A client cannot influence these — we already stripped any it
-/// sent — so a backend can trust them (ING5).
-pub(super) fn forwarded_headers(remote: SocketAddr, over_tls: bool) -> Vec<(&'static str, String)> {
-    vec![
-        ("x-forwarded-for", remote.ip().to_string()),
+/// sent — so a backend can trust them (ING5, #2404).
+pub(super) fn forwarded_headers(view: &ClientView) -> Vec<(&'static str, String)> {
+    let mut headers = vec![
+        ("x-forwarded-for", view.address.ip().to_string()),
         (
             "x-forwarded-proto",
-            if over_tls { "https" } else { "http" }.to_string(),
+            if view.over_tls { "https" } else { "http" }.to_string(),
         ),
-    ]
+        ("x-forwarded-port", view.port.to_string()),
+    ];
+    if !view.host.is_empty() {
+        headers.push(("x-forwarded-host", view.host.clone()));
+    }
+    headers
 }
 
 /// Hop-by-hop headers that apply to a single transport leg and must not be
@@ -1443,12 +1494,20 @@ mod tests {
 
     #[test]
     fn forwarded_headers_reflect_the_proxy_view() {
-        let remote: SocketAddr = "203.0.113.7:54321".parse().unwrap();
-        let headers = forwarded_headers(remote, true);
+        let mut view = ClientView {
+            address: "203.0.113.7:54321".parse().unwrap(),
+            over_tls: true,
+            host: "app.example:8443".to_string(),
+            port: 8443,
+        };
+        let headers = forwarded_headers(&view);
         assert!(headers.contains(&("x-forwarded-for", "203.0.113.7".to_string())));
         assert!(headers.contains(&("x-forwarded-proto", "https".to_string())));
+        assert!(headers.contains(&("x-forwarded-host", "app.example:8443".to_string())));
+        assert!(headers.contains(&("x-forwarded-port", "8443".to_string())));
 
-        let plain = forwarded_headers(remote, false);
+        view.over_tls = false;
+        let plain = forwarded_headers(&view);
         assert!(plain.contains(&("x-forwarded-proto", "http".to_string())));
     }
 
@@ -1457,6 +1516,8 @@ mod tests {
         assert!(is_forwarded_header("X-Forwarded-For"));
         assert!(is_forwarded_header("x-forwarded-proto"));
         assert!(is_forwarded_header("Forwarded"));
+        assert!(is_forwarded_header("X-Forwarded-Host"));
+        assert!(is_forwarded_header("x-forwarded-port"));
         assert!(!is_forwarded_header("x-real-ip"));
         assert!(!is_forwarded_header("content-type"));
     }
@@ -1767,6 +1828,75 @@ mod tests {
             echoed.contains("x-forwarded-proto: http"),
             "proxy did not set x-forwarded-proto to the terminated scheme: {echoed}"
         );
+
+        shutdown.cancel();
+    }
+
+    /// #2404: the backend sees the `Host` the client asked for, not its own
+    /// address, and the forwarding headers name that host and the listener's
+    /// port. A client's own `X-Forwarded-Host` and `X-Forwarded-Port` never
+    /// reach it: an app that builds links from them would otherwise send
+    /// users wherever the client said.
+    #[tokio::test]
+    async fn backend_receives_the_clients_host_and_never_its_forwarded_host() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_port = backend.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = backend.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    head.len(),
+                    head
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        let shutdown = CancellationToken::new();
+        let bound = bind_proxy(
+            WrapperConfig {
+                http_port: 0,
+                https_port: 0,
+                ..WrapperConfig::default()
+            },
+            web_test_table(&[("default__web-0", backend_port)]),
+            shutdown.clone(),
+        )
+        .await
+        .unwrap();
+        let http_port = bound.http_addr.port();
+        tokio::spawn(async move {
+            bound.serve().await.ok();
+        });
+
+        let echoed = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{http_port}/"))
+            .header("host", "web.test")
+            .header("x-forwarded-host", "evil.example")
+            .header("x-forwarded-port", "1")
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+            .to_lowercase();
+
+        assert!(echoed.contains("\r\nhost: web.test\r\n"), "{echoed}");
+        assert!(!echoed.contains("evil.example"), "{echoed}");
+        assert!(
+            echoed.contains("x-forwarded-host: web.test\r\n"),
+            "{echoed}"
+        );
+        assert!(
+            echoed.contains(&format!("x-forwarded-port: {http_port}\r\n")),
+            "{echoed}"
+        );
+        assert_eq!(echoed.matches("x-forwarded-port:").count(), 1, "{echoed}");
 
         shutdown.cancel();
     }

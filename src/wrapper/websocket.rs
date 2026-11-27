@@ -65,8 +65,7 @@ pub fn is_websocket_upgrade(req: &Request<Body>) -> bool {
 pub async fn handle_websocket_upgrade(
     mut req: Request<Body>,
     backend: SocketAddr,
-    remote: SocketAddr,
-    over_tls: bool,
+    view: &super::proxy::ClientView,
     permit: tokio::sync::OwnedSemaphorePermit,
     drain_guard: Option<Box<dyn std::any::Any + Send>>,
     terminate: Vec<tokio_util::sync::CancellationToken>,
@@ -80,7 +79,7 @@ pub async fn handle_websocket_upgrade(
     // but never completes the WebSocket handshake would otherwise pin this
     // handler, its connection permit, and the drain guard indefinitely — the
     // 30s reqwest timeout only covers the non-WS path.
-    let upgrade_request = build_upgrade_request(&req, backend, remote, over_tls);
+    let upgrade_request = build_upgrade_request(&req, view);
     let handshake = tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, async {
         let mut backend_stream = TcpStream::connect(backend).await.ok()?;
         backend_stream
@@ -229,12 +228,9 @@ fn find_head_end(buf: &[u8]) -> Option<usize> {
 /// headers are dropped and replaced with the proxy's own view (ING5/M9): a
 /// client opening a WebSocket must not be able to spoof `X-Forwarded-For` and
 /// lie to a backend that trusts it for rate-limiting or IP allow-listing.
-fn build_upgrade_request(
-    req: &Request<Body>,
-    backend: SocketAddr,
-    remote: SocketAddr,
-    over_tls: bool,
-) -> String {
+/// `Host` is the one the client sent, not the backend's address (#2404).
+fn build_upgrade_request(req: &Request<Body>, view: &super::proxy::ClientView) -> String {
+    let remote = view.address;
     let method = req.method().as_str();
     let path = req
         .uri()
@@ -242,7 +238,7 @@ fn build_upgrade_request(
         .map(|pq| pq.as_str())
         .unwrap_or("/");
 
-    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {backend}\r\n");
+    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {}\r\n", view.host);
 
     // Hop-by-hop headers and the ones the client's `Connection` names belong
     // to the client's leg, as on the plain HTTP path: `Proxy-Authorization`
@@ -281,7 +277,7 @@ fn build_upgrade_request(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("websocket");
     request.push_str(&format!("connection: upgrade\r\nupgrade: {upgrade}\r\n"));
-    for (name, value) in super::proxy::forwarded_headers(remote, over_tls) {
+    for (name, value) in super::proxy::forwarded_headers(view) {
         request.push_str(&format!("{name}: {value}\r\n"));
     }
     // The same proxy-owned headers as a plain request (F08): the client's
@@ -318,6 +314,16 @@ pub fn build_close_frame(status: u16) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The proxy's view of a client at `remote` that asked for `app.example`.
+    fn view(remote: SocketAddr, over_tls: bool) -> super::super::proxy::ClientView {
+        super::super::proxy::ClientView {
+            address: remote,
+            over_tls,
+            host: "app.example".to_string(),
+            port: if over_tls { 443 } else { 80 },
+        }
+    }
 
     fn make_ws_request() -> Request<Body> {
         Request::builder()
@@ -400,12 +406,12 @@ mod tests {
     #[test]
     fn build_upgrade_request_format() {
         let req = make_ws_request();
-        let backend: SocketAddr = "10.0.2.2:8080".parse().unwrap();
         let remote: SocketAddr = "203.0.113.7:5000".parse().unwrap();
-        let raw = build_upgrade_request(&req, backend, remote, false);
+        let raw = build_upgrade_request(&req, &view(remote, false));
 
         assert!(raw.starts_with("GET /ws HTTP/1.1\r\n"));
-        assert!(raw.contains("Host: 10.0.2.2:8080\r\n"));
+        assert!(raw.contains("Host: app.example\r\n"));
+        assert!(!raw.contains("10.0.2.2"));
         assert!(raw.contains("upgrade: websocket\r\n"));
         assert!(raw.contains("sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n"));
         assert!(raw.ends_with("\r\n\r\n"));
@@ -431,9 +437,8 @@ mod tests {
             .header("X-End-To-End", "kept")
             .body(Body::empty())
             .unwrap();
-        let backend: SocketAddr = "10.0.2.2:8080".parse().unwrap();
         let remote: SocketAddr = "203.0.113.7:5000".parse().unwrap();
-        let raw = build_upgrade_request(&req, backend, remote, false).to_lowercase();
+        let raw = build_upgrade_request(&req, &view(remote, false)).to_lowercase();
 
         for dropped in [
             "\r\nproxy-authorization:",
@@ -471,9 +476,8 @@ mod tests {
             .header("Forwarded", "for=1.2.3.4")
             .body(Body::empty())
             .unwrap();
-        let backend: SocketAddr = "10.0.2.2:8080".parse().unwrap();
         let remote: SocketAddr = "203.0.113.7:5000".parse().unwrap();
-        let raw = build_upgrade_request(&req, backend, remote, true).to_lowercase();
+        let raw = build_upgrade_request(&req, &view(remote, true)).to_lowercase();
 
         // The spoofed client value is gone; the proxy's real view is present.
         assert!(
@@ -484,6 +488,30 @@ mod tests {
         assert!(raw.contains("x-forwarded-proto: https\r\n"));
         // Exactly one x-forwarded-for line (no duplicate from the client).
         assert_eq!(raw.matches("x-forwarded-for:").count(), 1);
+    }
+
+    /// #2404: the upgrade carries the host the client asked for, as `Host`
+    /// and `X-Forwarded-Host`, and never the client's own forwarded host.
+    #[test]
+    fn build_upgrade_request_keeps_the_clients_host() {
+        let req = Request::builder()
+            .uri("/ws")
+            .header(header::HOST, "app.example")
+            .header(header::CONNECTION, "Upgrade")
+            .header(header::UPGRADE, "websocket")
+            .header("X-Forwarded-Host", "evil.example")
+            .header("X-Forwarded-Port", "1")
+            .body(Body::empty())
+            .unwrap();
+        let remote: SocketAddr = "203.0.113.7:5000".parse().unwrap();
+        let raw = build_upgrade_request(&req, &view(remote, false));
+
+        assert!(raw.contains("Host: app.example\r\n"), "{raw}");
+        assert_eq!(raw.to_lowercase().matches("\r\nhost:").count(), 1, "{raw}");
+        assert!(!raw.contains("evil.example"), "{raw}");
+        assert!(raw.contains("x-forwarded-host: app.example\r\n"), "{raw}");
+        assert!(raw.contains("x-forwarded-port: 80\r\n"), "{raw}");
+        assert_eq!(raw.matches("x-forwarded-port:").count(), 1, "{raw}");
     }
 
     /// F08: the upgrade carries the same proxy-owned headers as a plain
@@ -499,9 +527,8 @@ mod tests {
             .header("X-Real-IP", "1.2.3.4")
             .body(Body::empty())
             .unwrap();
-        let backend: SocketAddr = "10.0.2.2:8080".parse().unwrap();
         let remote: SocketAddr = "203.0.113.7:5000".parse().unwrap();
-        let raw = build_upgrade_request(&req, backend, remote, false).to_lowercase();
+        let raw = build_upgrade_request(&req, &view(remote, false)).to_lowercase();
 
         assert!(!raw.contains("1.2.3.4"), "client x-real-ip leaked: {raw}");
         assert!(raw.contains("x-real-ip: 203.0.113.7\r\n"), "{raw}");
@@ -524,9 +551,8 @@ mod tests {
             .header("X-Request-ID", "client-supplied-id-123")
             .body(Body::empty())
             .unwrap();
-        let backend: SocketAddr = "10.0.2.2:8080".parse().unwrap();
         let remote: SocketAddr = "203.0.113.7:5000".parse().unwrap();
-        let raw = build_upgrade_request(&req, backend, remote, false).to_lowercase();
+        let raw = build_upgrade_request(&req, &view(remote, false)).to_lowercase();
         assert!(
             raw.contains("x-request-id: client-supplied-id-123\r\n"),
             "{raw}"
@@ -542,9 +568,8 @@ mod tests {
             .header(header::COOKIE, "rb_session=abc123; theme=dark")
             .body(Body::empty())
             .unwrap();
-        let backend: SocketAddr = "10.0.2.2:8080".parse().unwrap();
         let remote: SocketAddr = "203.0.113.7:5000".parse().unwrap();
-        let raw = build_upgrade_request(&req, backend, remote, false);
+        let raw = build_upgrade_request(&req, &view(remote, false));
         assert!(!raw.contains("rb_session"), "{raw}");
         assert!(raw.contains("cookie: theme=dark\r\n"), "{raw}");
     }
