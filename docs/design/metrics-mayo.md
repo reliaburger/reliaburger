@@ -343,7 +343,7 @@ The council member stores received rollups in a rollup store and serves them at 
 
 **Status: implemented.** The fan-out helpers in `src/mayo/query_fanout.rs` (`fan_out_app_query`, `fan_out_cluster_query`, and the merge functions) are now wired into the handlers:
 
-- `/v1/metrics/app/{app}/{namespace}` resolves the app's nodes from the Meat placement map and fans the query out to each, merging the results (falling back to the local store when there's no placement).
+- `/v1/metrics/app/{app}/{namespace}` resolves the app's nodes from the Meat placement map and fans the query out to each, merging the results (falling back to the local store when there's no placement). Each node answers with at most its newest `APP_QUERY_ROW_LIMIT` (10,000) rows; an answer at that limit adds `QueryWarning::Truncated { node_id, limit }`, on the fan-out and the local path alike (#2477). The merge sorts on `(timestamp, metric_name, labels)` and drops equal rows.
 - `/v1/metrics/cluster` enumerates the Raft voters, maps each to its live membership address, and sums each member's `/v1/metrics/rollup/owned` after dropping duplicate worker contributions (falling back to local rollup data on a single node / no council).
 
 Both the single-app path (`/v1/metrics/app`, via the Meat placement map) and the cluster-wide path (`/v1/metrics/cluster`, across council voters) fan out and merge, with a 10 s timeout on each member's whole answer (`src/bun/api/metrics.rs`).
