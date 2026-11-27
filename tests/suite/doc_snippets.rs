@@ -926,7 +926,9 @@ fn accepted_fields<T: serde::de::DeserializeOwned>() -> Vec<String> {
         Ok(_) => panic!("the table accepted an unknown field"),
         Err(error) => error.to_string(),
     };
-    let Some((_, list)) = error.split_once("expected one of") else {
+    // serde says ``expected one of `a`, `b`, `c` `` for three or more fields,
+    // ``expected `a` or `b` `` for two and ``expected `a` `` for one.
+    let Some((_, list)) = error.split_once(", expected ") else {
         panic!("serde's unknown-field error changed shape: {error}");
     };
     list.split('`')
@@ -1006,7 +1008,107 @@ fn manual_bun_runtime_row_names_every_value_bun_offers() {
         .iter()
         .filter(|value| !row.contains(&format!("`{value}`")))
         .collect();
-    assert!(missing.is_empty(), "the --runtime row omits {missing:?}: {row}");
+    assert!(
+        missing.is_empty(),
+        "the --runtime row omits {missing:?}: {row}"
+    );
+}
+
+#[test]
+fn accepted_fields_reads_one_and_two_field_tables() {
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct One {
+        alpha: u8,
+    }
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct Two {
+        alpha: u8,
+        beta: u8,
+    }
+    assert_eq!(accepted_fields::<One>(), ["alpha"]);
+    assert_eq!(accepted_fields::<Two>(), ["alpha", "beta"]);
+}
+
+/// Every `node.toml` section is in the reference's "Node config sections"
+/// table, and every key in it is named somewhere in the manual: as
+/// `` `[section] key` ``, `` `section.key` ``, `` `key` `` or `` `key = …` ``,
+/// as a `[section.key]` table, or on a line starting `key = `. An unknown key is an error, so a key the manual
+/// doesn't name can only be found by reading `src/config/node.rs`.
+#[test]
+fn manual_names_every_node_config_key() {
+    use reliaburger::config::node::*;
+    use reliaburger::config::process_workloads::ProcessWorkloadsConfig;
+    use reliaburger::council::backup::BackupConfig;
+    use reliaburger::lettuce::types::GitOpsConfig;
+    use reliaburger::testkit::safety::ClusterTestPolicy;
+
+    let reference = read("docs/manual/13_reference.md");
+    let table = manual_section(&reference, "## Node config sections");
+    let mut missing = Vec::new();
+    for section in accepted_fields::<NodeConfig>() {
+        let named =
+            table.contains(&format!("`[{section}]`")) || table.contains(&format!("`[{section}."));
+        if !named {
+            missing.push(format!("no `[{section}]` row in Node config sections"));
+        }
+    }
+
+    let manual: String = manual_files().iter().map(|file| read(file)).collect();
+    let sections = [
+        ("node", accepted_fields::<NodeSection>()),
+        ("cluster", accepted_fields::<ClusterSection>()),
+        ("cluster.backup", accepted_fields::<BackupConfig>()),
+        ("storage", accepted_fields::<StorageSection>()),
+        ("storage.snapshots", accepted_fields::<SnapshotsSection>()),
+        ("resources", accepted_fields::<ResourcesSection>()),
+        ("network", accepted_fields::<NetworkSection>()),
+        ("reporting_tree", accepted_fields::<ReportingTreeSection>()),
+        ("reconstruction", accepted_fields::<ReconstructionSection>()),
+        ("images", accepted_fields::<ImagesSection>()),
+        ("metrics", accepted_fields::<MetricsSection>()),
+        ("logs", accepted_fields::<LogsSection>()),
+        ("alerts", accepted_fields::<AlertsSection>()),
+        ("security", accepted_fields::<SecuritySection>()),
+        ("security.tokens", accepted_fields::<TokensSection>()),
+        ("ingress", accepted_fields::<IngressSection>()),
+        ("dns", accepted_fields::<DnsSection>()),
+        ("ebpf", accepted_fields::<EbpfSection>()),
+        ("upgrades", accepted_fields::<UpgradeSection>()),
+        ("smoker", accepted_fields::<SmokerSection>()),
+        ("runtime", accepted_fields::<RuntimeSection>()),
+        (
+            "process_workloads",
+            accepted_fields::<ProcessWorkloadsConfig>(),
+        ),
+        ("gitops", accepted_fields::<GitOpsConfig>()),
+        ("testing", accepted_fields::<ClusterTestPolicy>()),
+    ];
+    for (section, keys) in sections {
+        for key in keys {
+            let named = manual.contains(&format!("`[{section}] {key}`"))
+                || manual.contains(&format!("`{section}.{key}`"))
+                || manual.contains(&format!("`{key}`"))
+                || manual.contains(&format!("`{key} = "))
+                || manual.contains(&format!("[{section}.{key}]"))
+                || manual.lines().any(|line| {
+                    let line = line.trim_start();
+                    line.starts_with(&format!("{key} = "))
+                        || line.starts_with(&format!("# {key} = "))
+                });
+            if !named {
+                missing.push(format!("[{section}] {key}"));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "the manual doesn't name these node.toml keys:\n{}",
+        missing.join("\n")
+    );
 }
 
 // --- Commands in design docs ------------------------------------------------
@@ -1080,7 +1182,10 @@ fn cli_design_doc_names_no_missing_commands() {
         // Line numbers start at 1, so nothing in these docs is exempt.
         others += check_design_doc_commands(file, &(0..=0), &mut cache, &mut failures);
     }
-    assert!(others > 10, "found only {others} inline commands in other design docs");
+    assert!(
+        others > 10,
+        "found only {others} inline commands in other design docs"
+    );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
@@ -1156,7 +1261,8 @@ fn unlabelled_listing_types(file: &str, text: &str) -> Vec<(String, String)> {
 
 #[test]
 fn a_sketch_marker_exempts_only_the_listing_it_precedes() {
-    let text = "<!-- sketch -->\n```rust\npub struct Gone;\n```\n\n```rust\npub enum Real {}\n```\n";
+    let text =
+        "<!-- sketch -->\n```rust\npub struct Gone;\n```\n\n```rust\npub enum Real {}\n```\n";
     assert_eq!(
         unlabelled_listing_types("doc.md", text),
         vec![("doc.md:7".to_string(), "Real".to_string())]
