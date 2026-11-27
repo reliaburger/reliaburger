@@ -6761,6 +6761,19 @@ reading held every caller on the node the moment the channel filled. Now the
 task sends the tail and then starts the per-instance follows, in that order,
 so the tail still comes first.
 
+The plain read had a quieter bug that moving it into a task kept (#2472). It
+joined every instance's capture into one string, each under a `==> id <==`
+header, and only then took the last `N` lines. With three replicas on a node,
+`GET /v1/logs/web/default?tail=20` answered with the last twenty lines of
+whichever replica came last, without its header, and nothing from the other
+two, while the follow path and the manual both meant "the last 20 of each".
+`read_captures` now takes the tail and cuts each capture before it writes the
+header, and it sorts the ids first, because they come out of a `HashMap` and
+the sections used to change order between calls. A single instance still
+gets no header, so its answer is unchanged. `a_logs_tail_takes_the_last_lines_of_each_instance`
+sends both commands the route uses with `tail: Some(1)` and expects `a3` and
+`b3`, each under its own header.
+
 A join and an image signature are the same shape with a council write in the
 middle. Without quorum, openraft's `client_write` waits until the leader steps
 down, or longer. The task now has a deadline the loop never had to have:

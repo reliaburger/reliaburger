@@ -22,9 +22,12 @@ pub const NEXT_START_HEADER: &str = "x-reliaburger-next-start";
 /// Use this for single-app queries where each node reports its own data.
 pub fn merge_metrics_results(mut sources: Vec<Vec<MetricsQueryRow>>) -> Vec<MetricsQueryRow> {
     let mut all: Vec<MetricsQueryRow> = sources.drain(..).flatten().collect();
-    all.sort_by_key(|r| r.timestamp);
+    // Sorting on the whole identity, not the timestamp alone, puts equal
+    // rows next to each other: `dedup_by` only removes neighbours (#2477).
+    all.sort_by(|a, b| {
+        (a.timestamp, &a.metric_name, &a.labels).cmp(&(b.timestamp, &b.metric_name, &b.labels))
+    });
 
-    // Deduplicate by (timestamp, metric_name, labels)
     all.dedup_by(|a, b| {
         a.timestamp == b.timestamp && a.metric_name == b.metric_name && a.labels == b.labels
     });
@@ -119,7 +122,7 @@ pub async fn fan_out_cluster_query(
     )
     .await;
 
-    let mut result = merge_owned_rollups(data_sources);
+    let mut result = merge_owned_rollups(data_sources.into_iter().map(|(_, rows)| rows).collect());
     result.warnings.extend(warnings);
     result
 }
@@ -145,10 +148,40 @@ pub async fn fan_out_app_query(
     )
     .await;
 
+    merge_app_answers(data_sources, warnings)
+}
+
+/// Merge the per-node answers of a single-app query, `(node URL, rows)`
+/// each, keeping `warnings`.
+///
+/// A node answers with at most its newest
+/// [`APP_QUERY_ROW_LIMIT`](super::store::APP_QUERY_ROW_LIMIT) rows, so an
+/// answer of exactly that many may have lost older ones: it adds a
+/// [`QueryWarning::Truncated`] naming the node (#2477).
+pub fn merge_app_answers(
+    sources: Vec<(String, Vec<MetricsQueryRow>)>,
+    mut warnings: Vec<QueryWarning>,
+) -> MetricsQueryResult {
+    warnings.extend(
+        sources
+            .iter()
+            .filter_map(|(node_id, rows)| truncation_warning(node_id, rows.len())),
+    );
     MetricsQueryResult {
-        data: merge_metrics_results(data_sources),
+        data: merge_metrics_results(sources.into_iter().map(|(_, rows)| rows).collect()),
         warnings,
     }
+}
+
+/// A [`QueryWarning::Truncated`] for `node_id` when its answer of `rows`
+/// rows reached the per-node limit. The leaf query ends in `LIMIT`, so a
+/// full answer means more rows may exist.
+pub fn truncation_warning(node_id: &str, rows: usize) -> Option<QueryWarning> {
+    let limit = super::store::APP_QUERY_ROW_LIMIT;
+    (rows >= limit).then(|| QueryWarning::Truncated {
+        node_id: node_id.to_string(),
+        limit,
+    })
 }
 
 /// Internal helper: fan out a query to a set of URLs, collect results.
@@ -159,7 +192,7 @@ async fn fan_out_to_urls<T: serde::de::DeserializeOwned + Send + 'static>(
     client: &reqwest::Client,
     timeout: Duration,
     service_token: Option<&str>,
-) -> (Vec<Vec<T>>, Vec<QueryWarning>) {
+) -> (Vec<(String, Vec<T>)>, Vec<QueryWarning>) {
     let mut handles = Vec::new();
 
     for url in urls {
@@ -189,7 +222,7 @@ async fn fan_out_to_urls<T: serde::de::DeserializeOwned + Send + 'static>(
             // peer can send headers then stall its body.
             let pages = read_pages::<T>(&client, &endpoint, token.as_deref(), &params, start);
             match tokio::time::timeout(timeout, pages).await {
-                Ok(Ok(rows)) => Ok(rows),
+                Ok(Ok(rows)) => Ok((node_url, rows)),
                 Ok(Err(MemberFailure::Refused(reason))) => Err(QueryWarning::QueryRefused {
                     node_id: node_url,
                     reason,
@@ -206,7 +239,7 @@ async fn fan_out_to_urls<T: serde::de::DeserializeOwned + Send + 'static>(
 
     for handle in handles {
         match handle.await {
-            Ok(Ok(rows)) => sources.push(rows),
+            Ok(Ok(answer)) => sources.push(answer),
             Ok(Err(warning)) => warnings.push(warning),
             Err(_join_err) => {
                 // Task panicked — treat as unresponsive
@@ -376,6 +409,43 @@ mod tests {
         ];
         let result = merge_metrics_results(vec![s1, s2]);
         assert_eq!(result.len(), 4);
+    }
+
+    #[test]
+    fn equal_rows_from_two_sources_are_merged_even_when_not_adjacent() {
+        let result = merge_metrics_results(vec![
+            vec![row(10, "cpu", "{}", 1.0), row(10, "mem", "{}", 2.0)],
+            vec![row(10, "cpu", "{}", 1.0), row(10, "mem", "{}", 2.0)],
+        ]);
+        assert_eq!(result.len(), 2, "{result:?}");
+    }
+
+    #[test]
+    fn a_node_answer_at_the_row_limit_is_reported_as_truncated() {
+        use crate::mayo::store::APP_QUERY_ROW_LIMIT;
+        let full: Vec<_> = (0..APP_QUERY_ROW_LIMIT as u64)
+            .map(|ts| row(ts, "cpu", r#"{"node":"a"}"#, 1.0))
+            .collect();
+        let short = vec![
+            row(1, "cpu", r#"{"node":"b"}"#, 1.0),
+            row(2, "cpu", r#"{"node":"b"}"#, 1.0),
+            row(3, "cpu", r#"{"node":"b"}"#, 1.0),
+        ];
+        let result = merge_app_answers(
+            vec![
+                ("http://node-a:9117".to_string(), full),
+                ("http://node-b:9117".to_string(), short),
+            ],
+            vec![],
+        );
+        assert_eq!(
+            result.warnings,
+            vec![QueryWarning::Truncated {
+                node_id: "http://node-a:9117".to_string(),
+                limit: APP_QUERY_ROW_LIMIT,
+            }]
+        );
+        assert_eq!(result.data.len(), APP_QUERY_ROW_LIMIT + 3);
     }
 
     #[test]

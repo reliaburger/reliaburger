@@ -165,7 +165,7 @@ A *stream* is the async cousin of an iterator: it yields values over time, and y
 
 The first version borrowed `target` and `client` inside the future instead of owning them. It compiled as a plain function and failed the moment the loop ran inside `tokio::spawn`, with the wonderfully opaque "implementation of `FnOnce` is not general enough". The borrowed version ties each future's lifetime to the function's borrows, and the compiler can't prove that combination is `Send` (safe to move between threads, which the multi-threaded runtime requires). Giving every future its own copy fixed it. A `reqwest::Client` is an `Arc` inside, so cloning it costs a reference count, not a connection pool.
 
-Each fetch is also bounded three ways: a timeout (half the interval, at most five seconds), an 8 MiB body cap, and a 20,000-sample cap. The endpoint belongs to the app, and a node shouldn't buffer whatever an app feels like sending.
+Each fetch is also bounded three ways: a timeout (half the interval, at most five seconds), an 8 MiB body cap, and a 20,000-sample cap. The endpoint belongs to the app, and a node shouldn't buffer whatever an app feels like sending. A scrape over either cap fails whole, the way Prometheus's `sample_limit` does: storing the first 20,000 samples would keep an arbitrary subset of the app's series and hide that anything was cut, so nothing is stored and `up` reads 0. `a_scrape_over_the_sample_limit_is_refused_whole` serves 20,001 samples and checks exactly that.
 
 ### Labels are the whole point
 
@@ -244,6 +244,8 @@ up                             gauge           2          2  2
 How does it know a counter from a gauge without a `TYPE` line? By name, the way Prometheus's own conventions intend: `_total` is a counter, and `_sum`/`_count` are when they come as a pair. `--name` shows one metric per instance with a rate and a sparkline, and a histogram named by its base (`--name http_request_duration_seconds`) shows mean latency per instance. It asks for only the newest two samples of each series (`per_series=2`), which is plenty for a rate and cheap across a big cluster.
 
 That parameter fixed a real bug on the way. The per-app query sorted oldest first and stopped at 10,000 rows, so on a busy app the newest samples, the ones anything called "latest" needs, were the first to be cut. The query now sorts newest first before the limit and flips the rows back, and the endpoint defaults to the last fifteen minutes instead of the beginning of time.
+
+Each node still stops at 10,000 rows, so on a cluster the entry node merges answers that can cover different stretches of time: fifteen minutes from a quiet node, under a minute from one exporting thousands of series. The merge used to return that without comment, and a chart read the busy node's missing history as "the instance just started". Now a node whose answer is exactly at the limit is named in a `Truncated` warning, since a query that ends in `LIMIT` and comes back full may have left rows out. The same merge promised to drop duplicate rows but sorted on the timestamp alone, and `Vec::dedup_by` only compares neighbours, so two equal rows with a different row between them both survived. It now sorts on the whole identity, `(timestamp, metric_name, labels)`, comparing tuples of references so nothing is cloned to build the key, and equal rows end up side by side.
 
 The dashboard's app charts had a bug of their own: `brioche.js` expected an array, the per-app endpoint answered `{data, warnings}`, and the script returned early. Every app chart was empty, always. They now read from a small chart endpoint that returns series already lined up per instance, `{timestamps, series: [{label, values}]}`, with counters as rates and histograms as means, so the browser only draws. A Rust test pins that shape, because that's the contract the JavaScript relies on. An app with scraped metrics also gets a requests-per-second chart (its `http_requests_total`, or failing that its own first counter) and a latency chart.
 
@@ -624,6 +626,8 @@ A rejected query is a `400`, not a `500` — the client asked for something the 
 **A filesystem "copy" pretending to be an object store.** The export config accepted `s3://` and `gs://` URLs, but the code turned the destination into a `PathBuf` and called `std::fs::copy`. An S3 target silently wrote to a local directory named `s3:`. Ketchup already had the right tool in the tree — `object_store`, which the snapshot uploader uses — so export now parses the destination through `object_store::parse_url` and `put`s each file. A bare path still works (we normalise it to `file://`), so nothing in the local tests changed; `s3://` and `gs://` now mean what they say.
 
 **A checkpoint that skipped reused filenames — and a second one behind its back.** Export is incremental: a checkpoint records which files have shipped so a restart doesn't re-send everything. The old checkpoint keyed on filename. But log files are named `logs_NNNNNN.parquet` from a counter that resumes past the highest file on disk, so once retention prunes every file the counter resets to zero and a later flush reuses `logs_000000.parquet` for *different* bytes — which the filename-keyed checkpoint skips forever. We key the checkpoint on a durable id instead: the filename plus a hash of its contents, so a reused name with new bytes is a new object. And `relish logs-export` used to keep its own competing checkpoint in the same directory; both now share one Bun-owned file, so a manual export and the agent's export loop can't skip or double-ship each other's work.
+
+**A checkpoint that only saved on success.** The export kept its checkpoint in memory while it uploaded file after file, and wrote it to disk once every file had gone. A failed read or `put` returned through `?` before the save, and the in-memory copy, holding every file uploaded so far, was dropped with it. Files go in name order, so the next run uploaded the same early files again, failed somewhere later, and the checkpoint never moved. Because disk-pressure pruning waits for an export to work, the log directory then grew past its cap. `?` is the right default, but it returns *now*, skipping everything after it in the function, cleanup included. Here the cleanup mattered, so `export_logs` keeps the `Result` in a variable, saves the checkpoint either way, and returns the export's error afterwards. `a_failed_export_keeps_the_files_it_already_uploaded` makes the second of two files unreadable and checks the checkpoint on disk names the first.
 
 **A doc comment describing a feature that didn't exist.** `relish logs-export`'s doc said it "triggers an immediate export from the running Bun agent's LogStore" and "falls back to direct file copy if the agent is unreachable." Neither sentence was true. The function never contacted the agent — there was no endpoint to contact — and it read two hardcoded local paths in the *opposite* preference order from the one bun itself uses, so an operator with a custom `[storage] logs` path got "no log store found" from a machine with gigabytes of logs on it. When a doc comment and its function disagree, you have two choices: fix the doc, or make the doc true. We made it true, because the described design was simply better: a `POST /v1/logs/export` endpoint on the agent runs the export server-side against the store's real directory with the Bun-owned checkpoint, the destination (`s3://`, `gs://`, or a path) resolves with the agent's credentials, and the CLI calls it when the agent answers a health probe — falling back to the direct local read, now in the agent's own path order, only when nothing is listening. The endpoint is Admin-only: it writes files wherever you point it, with the agent's credentials, which is not a thing a Deployer token should be able to do.
 
@@ -1060,6 +1064,33 @@ The alternative, recording
 every node an app ever ran on, is state the cluster would have to keep
 forever for the sake of a log query. `tail_after_an_app_moves_back_includes_the_nodes_it_ran_on_meanwhile`
 reproduces the soak with two stores and fails against the old node choice.
+
+What we could bound straight away was how many nodes one query asks at once
+(#2453). `fan_out_query` spawned a task per node into a `JoinSet` and let them
+all send, so a 500-node cluster opened 500 requests for one `relish logs`.
+Each task now takes a permit from a `tokio::sync::Semaphore` holding
+`MAX_CONCURRENT_NODE_QUERIES` (16) before it sends:
+
+```rust
+let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_NODE_QUERIES));
+// ...in each task:
+let _permit = slots.acquire_owned().await.ok();
+```
+
+A semaphore is a counter of permits: `acquire` waits until one is free and
+hands back a guard, and dropping the guard returns the permit. Like a
+`MutexGuard`, the permit's lifetime is the critical section, so there's no
+"release" call to forget; the task ends, the permit drops. `acquire_owned`
+needs the semaphore in an `Arc` because the permit it returns owns a
+reference to it, and a spawned task can't borrow from the function that
+spawned it. The leading underscore in `_permit` keeps the guard alive to the
+end of the task without a "never used" warning; a bare `_` would drop it at
+once. The per-node deadline starts after the permit, so a node queued behind
+slow ones isn't reported as timed out. The handler also stopped cloning the
+whole desired state to find the app's placements: `read_desired` takes a
+closure, runs it under the read lock, and returns only the node ids.
+`a_fan_out_runs_at_most_the_concurrency_limit_at_once` counts the requests a
+test server has in flight and fails at 64 without the bound.
 
 ### Two runs, one name
 
@@ -1903,6 +1934,43 @@ struct AlertInstance {
 ```
 
 The evaluator keeps a `BTreeMap<AlertInstance, AlertState>`. A `BTreeMap` is sorted, so its keys must be orderable, and deriving `PartialOrd` and `Ord` gives us that: Rust compares fields in declaration order, with no hand-written comparison. Each series now has its own pending timer, firing state and recovery, and only a fresh healthy reading from the *same* series resolves an alert. The labels reach the webhooks too, so resolving A can't close B's PagerDuty incident.
+
+### An app that paged the operator
+
+Per-series alerts opened a hole we found in the November 2026 audit (#2387). The rules choose series by metric name, and an app's scraped samples kept whatever names the app chose. So an app with `metrics = {}` whose `/metrics` page said `node_cpu_usage_percent{shard="0"} 99`, and so on up to the 20,000-sample scrape limit, stored 20,000 series named like the node's CPU gauge. Five minutes later `cpu_throttle` fired 20,000 times, Bun spawned a task per transition to post to every destination, and when the app was deleted the alerts stayed firing, because "firing with no reading" kept firing for ever.
+
+Four changes close it. The scraper now treats a name the node writes itself the way it already treated a clashing label: `node_cpu_usage_percent` from an app is stored as `exported_node_cpu_usage_percent`. `is_reserved_metric_name` lists the node's prefixes (`node_`, `ingress_`, `ketchup_`, `bun_`, `mayo_`, `discovery_withdrawal_`) and, for prefixes apps use too, exact names: `process_cpu_percent` is the node's, but a client library's `process_cpu_seconds_total` keeps its name. `every_metric_the_node_writes_is_reserved` runs the collector and checks each name it produces, so a new node metric can't slip past the list. Second, as defence in depth, a rule on a `node_*` metric reads only series without an `app` label. Third, `Firing` now counts the evaluations in a row with no reading, and resolves at `MAX_MISSED_EVALUATIONS` (10):
+
+```rust
+(AlertState::Firing { since, missed }, None) => {
+    if missed + 1 >= MAX_MISSED_EVALUATIONS {
+        AlertState::Inactive
+    } else {
+        AlertState::Firing { since: *since, missed: missed + 1 }
+    }
+}
+```
+
+The pattern `Firing { since, missed }` binds both fields by reference, because we're matching on `&AlertState`; `*since` copies the `SystemTime` out, and `missed + 1` works on a `&u32` because the arithmetic operators are implemented for references to numbers too. Arms that don't care about the count write `Firing { since, .. }`, where `..` means "and any other fields", so adding the field touched only the arms that build a `Firing`. One reading resets the count, so a gap of a scrape or two still can't resolve an alert. Fourth, Bun hands each evaluation's transitions to `WebhookDispatcher::dispatch_all`, which runs them through `for_each_concurrent`, and every delivery takes a permit from a semaphore the dispatcher's clones share, so at most `MAX_CONCURRENT_DISPATCHES` (8) posts run at once however many evaluations overlap.
+
+### What an alert remembers across a restart
+
+The evaluator's states lived in memory, so every Bun restart started every alert at Inactive (#2478). A disk at 85% fired `disk_high` and paged someone; they freed space and upgraded the cluster, which restarts Bun; afterwards the disk read 60%, Inactive plus an in-range reading is no transition, and the incident stayed open on the pager while `GET /v1/alerts` showed nothing firing. Every self-upgrade restarts Bun, so this wasn't rare.
+
+Now Bun keeps the firing alerts in `<data dir>/alerts-firing.json`: rule name, labels and the Unix second it started firing. It saves the file after any evaluation that produced a transition and restores it at start-up, before the first evaluation, skipping rules that no longer exist. Only firing state is worth keeping. A pending alert that restarts its timer fires a little later, which costs nothing; a firing one that's forgotten never resolves. A restored alert that never gets another reading still resolves after `MAX_MISSED_EVALUATIONS`. We considered sending a blanket "resolved" for every rule at start-up instead, and rejected it: it closes incidents whose condition still holds, and they don't come back until the rule's `for` window passes again.
+
+The record is its own small type, separate from `AlertState`:
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FiringRecord {
+    rule_name: String,
+    labels: BTreeMap<String, String>,
+    since_unix_secs: u64,
+}
+```
+
+`AlertState` holds a `SystemTime`, which serde can serialise but in a shape that's awkward to read; storing whole seconds since the Unix epoch keeps the file obvious to a human with `cat`. The file is written atomically, through a temporary file and a rename, and the write runs under `spawn_blocking` because file I/O blocks. Bun awaits it before the next evaluation, so two saves can't land out of order. A file that's missing or doesn't parse restores nothing, with a line on stderr: before 1.0 there's no migration, and a bad file mustn't stop Bun starting. It's node-local state, not Raft state or a wire format, so the compatibility version doesn't change. `a_resolve_reaches_the_webhook_after_a_restart` fires an alert against a local webhook receiver, saves, builds a fresh evaluator from the file, feeds it an in-range reading and checks the receiver got `firing` then `resolved`.
 
 ### A test that passed for the wrong reason
 
