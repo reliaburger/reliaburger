@@ -49,7 +49,13 @@ The hierarchical reporting tree is the source of truth for service map updates. 
 
 ## 3. Architecture
 
-Onion consists of one eBPF program (`onion_connect`) and the BPF hash maps that feed it, plus a userspace DNS responder, all managed by the Bun agent process.
+Onion consists of one eBPF object (`onion_connect.bpf.o`) with four programs, the BPF maps that feed them, and a userspace DNS responder, all managed by the Bun agent process. The loader attaches all four at the root cgroup v2:
+
+- `onion_connect` on `cgroup/connect4`: rewrites a TCP `connect()` to a VIP and applies namespace isolation and the egress allowlist to other IPv4 destinations (Program 2 below).
+- `onion_connect6` on `cgroup/connect6`: rewrites a v4-mapped VIP (`::ffff:127.128.x.y`) from a dual-stack socket the same way, and applies the same policy to IPv6 and v4-mapped destinations, so IPv6 isn't a way around it.
+- `onion_sendmsg4` and `onion_sendmsg6` on `cgroup/sendmsg4` and `cgroup/sendmsg6`: apply namespace isolation and the egress allowlist to unconnected UDP (`sendto()`), which never runs a connect hook. They rewrite nothing: a VIP is TCP only.
+
+`connect4` is mandatory; the other three are best-effort at load, and a node missing any of them refuses egress allowlists and `allow_from` (§2).
 
 > **Decision log — the `onion_dns` eBPF program below was never shipped.** The `onion_dns` program, its `BPF_CGROUP_UDP4_SENDMSG`/`RECVMSG` hooks, and the `dns_map` it reads are the *original* in-kernel DNS design. We built and abandoned it because those hooks can't read the DNS payload (see §1). The live implementation is a supervised userspace UDP/TCP responder (`src/onion/dns.rs`), with a per-instance resolver file mounted into rootful runc workloads. The kernel listings are preserved for teaching, not as a description of the running binary. 0.2.1 deleted the leftovers (#700): `ebpf/onion_dns.bpf.c` is no longer compiled, and the `dns_map` key and value types are gone from `ebpf/onion_common.h` and `src/onion/types.rs`. The later TC proof demonstrates that packet-hook synthesis is feasible, but it remains review evidence rather than production code.
 
@@ -62,9 +68,9 @@ Onion consists of one eBPF program (`onion_connect`) and the BPF hash maps that 
 - Trigger: Any UDP `sendmsg()` call targeting destination port 53
 - Behaviour: Inspects the DNS query payload. If the queried name ends with `.internal`, looks up the name in `dns_map` and synthesizes a DNS response containing the mapped virtual IP. If the name is not `.internal`, the call passes through untouched to the host's configured upstream DNS resolver.
 
-**Program 2: `onion_connect` (connect rewrite)**
+**Program 2: `onion_connect` (connect rewrite), with `onion_connect6` for v4-mapped VIPs**
 
-- Hook type: `BPF_CGROUP_INET4_CONNECT`
+- Hook type: `BPF_CGROUP_INET4_CONNECT` (and `BPF_CGROUP_INET6_CONNECT` for `onion_connect6`)
 - Attachment point: root cgroup v2 (`/sys/fs/cgroup`)
 - Trigger: Any `connect()` syscall
 - Behaviour: Checks whether the destination IP falls within the virtual IP range (127.128.0.0/16). If yes, looks up `(vip, port)` in `backend_map`, selects a healthy backend via round-robin, checks namespace isolation and `firewall_map`, then rewrites the destination address and port to the selected backend's real `host_ip:host_port`. If the VIP is not found or no healthy backends exist, the hook denies the connection by returning 0, which the kernel surfaces to `connect()` as `EPERM`. A destination outside the VIP range is never rewritten, but when `destination_map` says a workload owns it (a backend's container address, a published host port, any port of a container address), the same namespace check applies before the caller's egress allowlist does.
@@ -776,13 +782,19 @@ Expanding the VIP range or the kernel backend pool means changing the constant a
 
 ```toml
 [ebpf]
-# Directory containing compiled eBPF object files.
-# Default: "/var/lib/reliaburger/ebpf/"
-program_dir = "/var/lib/reliaburger/ebpf/"
+# Load and attach the eBPF programs at startup. Default: false.
+enabled = true
 
-# Cgroup v2 mount point for eBPF program attachment.
-# Default: "/sys/fs/cgroup"
+# Load the object from this directory instead of the one embedded in the
+# binary (development only). Default: unset, which uses the embedded object.
+# program_dir = "target/ebpf"
+
+# Cgroup v2 mount point the hooks attach to. Default: "/sys/fs/cgroup".
 cgroup_path = "/sys/fs/cgroup"
+
+# Seconds between sweeps that reconcile the kernel maps with live instances.
+# 0 disables the sweep. Default: 60.
+sweep_interval_secs = 60
 ```
 
 The host port range Onion references for backend map entries is not an
