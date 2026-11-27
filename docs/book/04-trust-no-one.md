@@ -451,6 +451,8 @@ The issuer takes exactly one thing from the CSR — its public key. Every other 
 
 That endpoint is one of the few public routes: a joiner has no bearer token yet, so the join token in the request body *is* the credential. Which raises an obvious question — if the joiner can't verify anyone yet, how does it know it's talking to the real cluster and not an imposter handing out a poisoned CA? It doesn't, on first contact. This is trust-on-first-use, the same model as SSH. The mitigation is the fingerprint: `relish join` prints the `sha256:` fingerprint of the root CA it received, and `--ca-fingerprint sha256:...` refuses the bundle if it doesn't match. Compare it against what `relish init` printed and an imposter is caught before a single byte is written to disk. The token's 15-minute, single-use lifetime keeps the replay window small.
 
+For a long time the pin was optional, and that was the gap the November 2026 audit found (#2410). Without `--ca-fingerprint`, `relish join` pinned whatever CA came back and sent the token over a connection that CA vouched for, silently. An imposter didn't need to fool the operator, only to answer first, and then it could spend the token against the real cluster. Every documented command already passed the flag, so the fix makes the documented habit the rule: clap's `required_unless_present = "insecure_trust_first_ca"` refuses the command without a pin, and the opt-out has a name nobody types by accident. With the opt-out, `enrol` prints the fingerprint it was offered on stderr before the token leaves the machine, so even then the operator sees what they're trusting.
+
 So how do you add a node? Mint a credential for it, explicitly, naming the id
 it will enrol as:
 

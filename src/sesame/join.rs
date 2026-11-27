@@ -621,7 +621,9 @@ fn mint_join_token(
 /// joiner has no CA yet, and the CA reveals nothing. A pinned
 /// `expected_fingerprint` that doesn't match stops here, before the token is
 /// sent, so a man-in-the-middle can't capture a token the real cluster
-/// never consumed. Phase 2 sends the token only over a connection whose
+/// never consumed. With no pin (`relish join --insecure-trust-first-ca`)
+/// that protection is gone, so the offered fingerprint is printed, as a
+/// warning, before the token is sent (#2410). Phase 2 sends the token only over a connection whose
 /// server certificate chains to that CA. `relish join` and an appliance's
 /// `bun appliance prepare` both enrol this way.
 pub async fn enrol(
@@ -646,13 +648,21 @@ pub async fn enrol(
         .map_err(|e| JoinClientError::Transport(e.to_string()))?;
     let ca = fetch_ca(&tofu_client, &format!("{base}/v1/cluster/ca")).await?;
     let offered = ca.root_ca_fingerprint()?;
-    if let Some(expected) = expected_fingerprint
-        && offered != expected
-    {
-        return Err(JoinClientError::FingerprintMismatch {
-            offered,
-            expected: expected.to_string(),
-        });
+    match expected_fingerprint {
+        Some(expected) if offered != expected => {
+            return Err(JoinClientError::FingerprintMismatch {
+                offered,
+                expected: expected.to_string(),
+            });
+        }
+        Some(_) => {}
+        // Said before the token is sent, so an operator who opted out of
+        // the pin can still see what they are trusting (#2410).
+        None => eprintln!(
+            "warning: trusting root CA {offered}, offered by {base}, without verifying it; \
+             the join token goes to whoever holds that CA. Compare it with the root CA \
+             fingerprint `relish init` printed, and pass --ca-fingerprint next time"
+        ),
     }
     let trust = ca.decode()?;
     let pinned_client = super::mtls::build_ca_pinned_client(trust)

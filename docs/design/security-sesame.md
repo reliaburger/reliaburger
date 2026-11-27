@@ -1867,7 +1867,7 @@ council_size = 3
 
 ### 7.3 Join Token Leak
 
-**Scenario:** A join token is accidentally exposed (e.g., CI logs, terminal recording).
+**Scenario:** A join token is accidentally exposed (e.g., CI logs, terminal recording), or captured on the wire by a host that answers `relish join`'s first, unverified request with its own CA.
 
 **Impact:** An attacker with the token can join a rogue node to the cluster within the token's TTL (default 15 minutes).
 
@@ -1876,6 +1876,7 @@ council_size = 3
 - Tokens are single-use: once consumed, a second use is rejected.
 - Tokens are short-lived: default 15 minutes.
 - Tokens are output to stderr only, never written to disk or structured logs.
+- `relish join` requires `--ca-fingerprint` (#2410). It fetches the cluster CA over a connection that can't verify anything yet, so without the pin a host on the path could offer its own CA, receive the token over a connection that CA vouches for, and spend it against the real cluster within its TTL. With the pin, a different root is refused before the token is sent. `--insecure-trust-first-ca` opts out by name and prints the offered fingerprint as a warning, still before the token is sent. The appliance seed and the quickstart scripts always pin.
 - If `node_attestation = "tpm"` is enabled, the token alone is insufficient -- the attacker also needs a trusted TPM.
 - If a leak is suspected before the token is consumed: no action needed if the TTL has expired. If the TTL has not expired, generate a new token and do not use the leaked one. There is no explicit "revoke token" command because the token auto-expires.
 - If a rogue node has already joined: `relish ca revoke --node <rogue-node>` immediately expels it.

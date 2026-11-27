@@ -460,7 +460,7 @@ fn enforce_mtls_mode(
     }
     anyhow::bail!(
         "[security] require_mtls is set but this node has no identity yet at {dir}: \
-         run `relish join --token <token> --node-id {} <member-api-url>` to enrol, then restart bun",
+         run `relish join --token <token> --node-id {} --ca-fingerprint <root-ca-fingerprint> <member-api-url>` to enrol, then restart bun",
         params.node_name
     );
 }

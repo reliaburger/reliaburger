@@ -98,8 +98,12 @@ whether each is used, expired or still valid, never the token itself), and
 Like `create`, both are answered by the council leader, whichever member
 you ask.
 
-`relish init` printed the root CA fingerprint; pinning it means a member
-offering a different CA is refused. `--token-file` reads the token from a
+`relish init` printed the root CA fingerprint, and `--ca-fingerprint` is
+required: `join` fetches the CA before it can verify anything, so without the
+pin someone on the path could offer their own CA and receive your token. With
+it, a member offering a different CA is refused before the token is sent.
+`--insecure-trust-first-ca` skips the pin and prints the fingerprint it was
+offered as a warning; compare it with the one `relish init` printed. `--token-file` reads the token from a
 private file instead of the command line. `join` only enrols the identity (into
 `./identity` unless you pass `--identity-dir`). The identity directory also
 gets `council.json`, the council's voters when the leader signed the

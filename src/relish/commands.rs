@@ -4878,7 +4878,9 @@ pub async fn join_token_create(
         "Join token created for {node_id} (expires in {}).",
         format_ttl(ttl_seconds)
     );
-    eprintln!("The joining node must enrol with `relish join --node-id {node_id}`.");
+    eprintln!(
+        "The joining node must enrol with `relish join --node-id {node_id} --ca-fingerprint <root CA fingerprint>`."
+    );
     eprintln!("The plaintext is shown once:");
     print_output(
         &JoinTokenReport {

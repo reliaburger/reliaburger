@@ -478,6 +478,8 @@ fn post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed() {
         "node-02",
         "--identity-dir",
         root.path().join("node-02-reuse").to_str().unwrap(),
+        "--ca-fingerprint",
+        &fingerprint,
         &endpoint,
     ]);
     assert_eq!(reused.status.code(), Some(1));
@@ -510,6 +512,8 @@ fn post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed() {
         "node-05",
         "--identity-dir",
         root.path().join("node-05").to_str().unwrap(),
+        "--ca-fingerprint",
+        &fingerprint,
         &endpoint,
     ]);
     assert_eq!(expired.status.code(), Some(1));
@@ -748,6 +752,8 @@ script = "exec true"
         "documentation-only-token",
         "--node-id",
         "node-02",
+        "--ca-fingerprint",
+        "sha256:0123",
         "https://127.0.0.1:1",
     ]);
     assert_eq!(join.status.code(), Some(1));
