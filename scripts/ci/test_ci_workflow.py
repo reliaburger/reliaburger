@@ -1841,5 +1841,44 @@ class DeadTriggerTests(unittest.TestCase):
                 self.assertNotIn("feat/appliance-", path.read_text())
 
 
+class ActionPinTests(unittest.TestCase):
+    """A third-party action runs the commit we reviewed, not whatever its tag points at now (#2405).
+
+    The release build runs actions before it compiles what the candidate job
+    signs, so a moved tag would be signed and attested truthfully.
+    """
+
+    THIRD_PARTY = re.compile(r"uses:\s*([^\s#]+)")
+
+    def uses(self):
+        for path in sorted(WORKFLOWS.glob("*.yml")):
+            for line in path.read_text().splitlines():
+                match = self.THIRD_PARTY.search(line)
+                if match and not match.group(1).startswith(("actions/", "./")):
+                    yield path, line, match.group(1)
+
+    def test_every_third_party_action_is_pinned_to_a_commit(self):
+        for path, _, action in self.uses():
+            with self.subTest(workflow=path.name, action=action):
+                self.assertRegex(action, r"@[0-9a-f]{40}$")
+
+    def test_every_pin_names_its_version_for_dependabot(self):
+        # Dependabot rewrites a SHA pin and its trailing comment together.
+        for path, line, action in self.uses():
+            with self.subTest(workflow=path.name, action=action):
+                self.assertRegex(line, r"@[0-9a-f]{40} # \S+$")
+
+    def test_the_toolchain_action_states_its_compiler(self):
+        # Pinned to a commit, the action no longer carries the compiler in
+        # its ref, so each step names the toolchain it installs.
+        for path in sorted(WORKFLOWS.glob("*.yml")):
+            for name, job in jobs(path.read_text()).items():
+                for step in steps(job):
+                    if "uses: dtolnay/rust-toolchain@" not in step:
+                        continue
+                    with self.subTest(workflow=path.name, job=name):
+                        self.assertRegex(step, r"(?m)^\s+toolchain: .+$")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1853,6 +1853,19 @@ What we didn't do is move release builds onto the new quiet host. It's tempting,
 fast and it's ours, but a release build is the one place where "who could have touched this
 machine?" must have a boring answer. Hosted runners give that.
 
+The runner isn't the only thing in that answer, though. The build job runs two
+third-party actions, the Rust toolchain installer and the build cache, before
+it runs `cargo build`, and both were referenced by tags like `@v2`. A tag is a
+pointer its owner can move. Someone who moved `rust-cache`'s `v2` to a commit
+that tampers with the restored `target/` directory would get a release that is
+signed with our key and attested as "built by `build.yml` on `main`", and
+both statements would be true. So every third-party action is now pinned to a
+commit, with its tag in a comment for Dependabot to update
+([#2405](https://github.com/reliaburger/reliaburger/issues/2405)), and a test
+refuses a `uses:` line that isn't. The toolchain action used to carry the
+compiler version in its tag (`@1.98.0`); pinned to a commit, it takes the
+version as a `toolchain:` input instead.
+
 ### A key nobody else trusts
 
 One question was left over. The nightly's soaks install a staged build through `curl | sh`,

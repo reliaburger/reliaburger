@@ -50,7 +50,7 @@ jobs:
     timeout-minutes: 185
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: ${{ env.FUZZ_TOOLCHAIN }}
       # rust-cache hashes every installed toolchain into its key, and the
@@ -65,7 +65,7 @@ jobs:
             esac
           done
           rustup toolchain list
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
         with:
           tool: cargo-fuzz@0.13.2
       # The sanitizer build of the whole crate is most of the job. One key
@@ -79,7 +79,7 @@ jobs:
       # the whole crate (33 minutes instead of 11) and then took about 20
       # minutes per 30-second target, so every one hit the job's limit
       # (#2125).
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: fuzz -> target
           shared-key: fuzz

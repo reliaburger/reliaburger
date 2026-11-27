@@ -344,6 +344,23 @@ candidate and new checksums; never replace an existing release's binaries.
 The compiler pin does not promise identical bytes across different linkers or
 host operating systems.
 
+### Third-party actions are pinned to a commit
+
+Every action outside `actions/*` is referenced by a full commit SHA with its
+tag in a trailing comment, `uses: Swatinem/rust-cache@<40 hex> # v2.9.3`
+(#2405). A tag is a pointer its owner can move, and `build-binaries` runs
+`rust-cache` and the toolchain action before it compiles what `candidate`
+signs and attests: a moved tag would give a truthfully signed release that
+isn't what the source says. `ActionPinTests` in
+`scripts/ci/test_ci_workflow.py` refuses an unpinned `uses:`.
+
+Dependabot's weekly "Actions" PR moves a pin and its comment together. The one
+exception is `dtolnay/rust-toolchain`, which Dependabot ignores: its commit is
+pinned the same way, and each step names the compiler in its `toolchain:`
+input (1.97.0 for the minimum-Rust job, 1.98.0 everywhere else). Move that
+commit by hand, with the compiler, under the policy above. First-party
+`actions/*` stay on tags.
+
 ## Release profile and binary size
 
 `[profile.release]` sets `strip = true` and `codegen-units = 1`. Release builds
