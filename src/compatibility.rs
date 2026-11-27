@@ -325,6 +325,10 @@ pub struct Compatibility {
 /// `program`, `args` or `env`; the node derives them from the template, so
 /// an older node would read the run as a host job with an empty binary
 /// (#2532).
+/// `SecurityView`, the body of `/v1/cluster/security-view`, carries a
+/// required `permissions` map, the leader's `[permission]` blocks, so a node
+/// with no Raft seat can enforce them; old and new nodes can't read each
+/// other's view (#2538).
 ///
 /// Bumping either number makes the checked-in gossip and Raft fuzz seeds
 /// stale: run `make fuzz-corpus-seed` in the same change (#1941). Keep the
