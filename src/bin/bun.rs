@@ -2727,13 +2727,15 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             loop {
                 tokio::select! {
                     _ = rollup_flush_shutdown.cancelled() => {
-                        if let Err(e) = rollup_store.write().await.flush().await {
+                        if let Err(e) = reliaburger::mayo::rollup_store::flush_off_lock(&rollup_store).await {
                             eprintln!("bun: final rollup flush error: {e}");
                         }
                         break;
                     }
                     _ = tick.tick() => {
-                        if let Err(e) = rollup_store.write().await.flush().await {
+                        // The write runs outside the store lock, so the
+                        // aggregator's ingest and queries go on (#2443).
+                        if let Err(e) = reliaburger::mayo::rollup_store::flush_off_lock(&rollup_store).await {
                             eprintln!("bun: rollup flush error: {e}");
                         }
                     }

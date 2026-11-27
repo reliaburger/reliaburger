@@ -113,6 +113,51 @@ pub struct RollupStore {
     index: SourceIndex,
     /// The most unflushed rows kept: [`MAX_BUFFER_ROWS`], smaller in tests.
     max_buffer_rows: usize,
+    /// Rows frozen for a flush being written outside the store lock, kept
+    /// until their file is written (#2443).
+    pending: Option<RollupPendingFlush>,
+}
+
+/// A batch of rollups frozen for one flush, written with
+/// [`write_rollup_pending`] while the store goes on taking rollups.
+#[derive(Clone)]
+pub struct RollupPendingFlush {
+    data_dir: PathBuf,
+    path: PathBuf,
+    batch: RecordBatch,
+}
+
+/// Write `pending`'s Parquet file. Needs no store lock: the store keeps the
+/// rows until [`RollupStore::complete_flush`], and a failed write leaves
+/// them to be retried.
+pub async fn write_rollup_pending(pending: &RollupPendingFlush) -> Result<(), MayoError> {
+    tokio::fs::create_dir_all(&pending.data_dir)
+        .await
+        .map_err(MayoError::Io)?;
+    let path = pending.path.clone();
+    let batch = pending.batch.clone();
+    // Move the write off the async runtime. `spawn_blocking` runs the
+    // closure on tokio's blocking pool and hands back its result; the outer
+    // `?` on `.await` surfaces a join error, the inner one the write error.
+    tokio::task::spawn_blocking(move || write_batch_parquet(&path, &batch))
+        .await
+        .map_err(|e| MayoError::Io(std::io::Error::other(e.to_string())))?
+}
+
+/// Flush a shared store without holding its lock during the write: the
+/// lock is taken only to freeze the batch and to drop it once written, so
+/// the aggregator's ingest and every query go on meanwhile (#2443). At
+/// most two batches: a retried one, then the current buffer.
+pub async fn flush_off_lock(store: &tokio::sync::RwLock<RollupStore>) -> Result<(), MayoError> {
+    for _ in 0..2 {
+        let pending = store.write().await.take_flush_batch()?;
+        let Some(pending) = pending else {
+            break;
+        };
+        write_rollup_pending(&pending).await?;
+        store.write().await.complete_flush(&pending);
+    }
+    Ok(())
 }
 
 impl RollupStore {
@@ -131,6 +176,7 @@ impl RollupStore {
             newest_window: 0,
             index: SourceIndex::default(),
             max_buffer_rows: MAX_BUFFER_ROWS,
+            pending: None,
         }
     }
 
@@ -234,13 +280,22 @@ impl RollupStore {
 
         // Bound the buffer: drop the oldest rows if a stuck flush let it grow
         // past the cap.
-        while self.buffer.len() > self.max_buffer_rows && self.buffer.pop_front().is_some() {}
+        let reserved = self
+            .pending
+            .as_ref()
+            .map_or(0, |pending| pending.batch.num_rows());
+        let available = self.max_buffer_rows.saturating_sub(reserved);
+        while self.buffer.len() > available && self.buffer.pop_front().is_some() {}
         true
     }
 
     /// Number of un-flushed entries in the buffer.
     pub fn buffer_len(&self) -> usize {
         self.buffer.len()
+            + self
+                .pending
+                .as_ref()
+                .map_or(0, |pending| pending.batch.num_rows())
     }
 
     /// Convert the buffer to an Arrow RecordBatch.
@@ -276,39 +331,59 @@ impl RollupStore {
         Ok(Some(batch))
     }
 
-    /// Flush the buffer: convert to a RecordBatch and persist it to Parquet.
-    ///
-    /// The batch is written on a blocking thread (`spawn_blocking`) so the
-    /// synchronous Arrow/Parquet encode never stalls the async runtime (OBS5).
-    /// Once on disk the rows are dropped from memory; queries read them back
-    /// from the Parquet directory, so a restart recovers all history and
-    /// memory stays bounded to the buffer.
+    /// Flush the buffer to Parquet, holding the store throughout: at most
+    /// a retried pending batch, then the current buffer. Callers that share
+    /// the store behind a lock use [`flush_off_lock`] instead, so queries and
+    /// ingest go on during the write (#2443).
     pub async fn flush(&mut self) -> Result<(), MayoError> {
-        let batch = self.buffer_to_batch()?;
-        let Some(batch) = batch else {
-            return Ok(());
-        };
+        for _ in 0..2 {
+            let Some(pending) = self.take_flush_batch()? else {
+                break;
+            };
+            write_rollup_pending(&pending).await?;
+            self.complete_flush(&pending);
+        }
+        Ok(())
+    }
 
+    /// Freeze the buffer into a batch for a flush written outside the store
+    /// lock, or hand back the batch an earlier flush failed to write, so it
+    /// is retried before newer rows. The rows stay queryable, from memory,
+    /// until [`complete_flush`](Self::complete_flush). `None` when there is
+    /// nothing to write.
+    pub fn take_flush_batch(&mut self) -> Result<Option<RollupPendingFlush>, MayoError> {
+        if let Some(pending) = &self.pending {
+            return Ok(Some(pending.clone()));
+        }
+        let Some(batch) = self.buffer_to_batch()? else {
+            return Ok(None);
+        };
         let filename = format!("rollup_{:06}.parquet", self.flush_counter);
         let path = self.data_dir.join(filename);
         if let Some(range) = batch_time_range(&batch) {
             self.index.record(path.display().to_string(), range);
         }
-        tokio::fs::create_dir_all(&self.data_dir)
-            .await
-            .map_err(MayoError::Io)?;
-
-        // Move the write off the async runtime. `spawn_blocking` runs the
-        // closure on tokio's blocking pool and hands back its result; the
-        // outer `?` on `.await` surfaces a join error, the inner one the
-        // write error.
-        tokio::task::spawn_blocking(move || write_batch_parquet(&path, &batch))
-            .await
-            .map_err(|e| MayoError::Io(std::io::Error::other(e.to_string())))??;
-
-        self.buffer.clear();
         self.flush_counter += 1;
-        Ok(())
+        self.buffer.clear();
+        let pending = RollupPendingFlush {
+            data_dir: self.data_dir.clone(),
+            path,
+            batch,
+        };
+        self.pending = Some(pending.clone());
+        Ok(Some(pending))
+    }
+
+    /// Forget `flushed` once its file is written: queries read it from disk
+    /// from now on.
+    pub fn complete_flush(&mut self, flushed: &RollupPendingFlush) {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.path == flushed.path)
+        {
+            self.pending = None;
+        }
     }
 
     /// What one query reads, captured now: the Parquet files and the
@@ -325,9 +400,27 @@ impl RollupStore {
     /// time and metric-name predicates (#377), so a cluster query reads the
     /// files its window touches, not every one.
     pub async fn snapshot(&self) -> Result<RollupSnapshot, MayoError> {
+        let mut sources = list_local_off_runtime(&self.data_dir).await?;
+        let mut memory: Vec<RecordBatch> = self.buffer_to_batch()?.into_iter().collect();
+        if let Some(pending) = &self.pending {
+            // A pending batch is read from memory until its flush completes,
+            // even if its file has just appeared, so no row is read twice.
+            sources.retain(
+                |source| !matches!(source, ParquetSource::Local(path) if *path == pending.path),
+            );
+            memory.push(pending.batch.clone());
+        }
+        let memory = match memory.len() {
+            0 => None,
+            1 => memory.pop(),
+            _ => Some(
+                datafusion::arrow::compute::concat_batches(&Arc::new(rollup_schema()), &memory)
+                    .map_err(|error| MayoError::Arrow(error.to_string()))?,
+            ),
+        };
         Ok(RollupSnapshot {
-            sources: Arc::new(list_local_off_runtime(&self.data_dir).await?),
-            memory: self.buffer_to_batch()?,
+            sources: Arc::new(sources),
+            memory,
             index: self.index.clone(),
         })
     }
@@ -1366,6 +1459,52 @@ mod tests {
         assert_eq!(rows.len(), crate::mayo::store::ALL_QUERY_ROW_LIMIT);
         assert_eq!(rows.last().unwrap().0, total * 60, "newest kept");
         assert!(rows.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    }
+
+    /// #2443: a flush written outside the store lock keeps its rows
+    /// queryable while it runs, and once it completes they are read from
+    /// the file, never twice.
+    #[tokio::test]
+    async fn a_rollup_flush_outside_the_lock_reads_each_row_once() {
+        let (mut store, _dir) = test_store();
+        store.ingest(&make_rollup("n1", 60, "cpu", 1.0));
+        let pending = store.take_flush_batch().unwrap().unwrap();
+        store.ingest(&make_rollup("n1", 120, "cpu", 2.0));
+        assert_eq!(store.buffer_len(), 2);
+        let sums = |rows: Vec<(u64, String, String, f64)>| -> Vec<(u64, f64)> {
+            rows.into_iter().map(|row| (row.0, row.3)).collect()
+        };
+        let before = store.query_cluster_metric("cpu", 0, 1_000).await.unwrap();
+        assert_eq!(sums(before), [(60, 1.0), (120, 2.0)]);
+
+        write_rollup_pending(&pending).await.unwrap();
+        // Written but not yet completed: still read once, from memory.
+        let during = store.query_cluster_metric("cpu", 0, 1_000).await.unwrap();
+        assert_eq!(sums(during), [(60, 1.0), (120, 2.0)]);
+        store.complete_flush(&pending);
+        let after = store.query_cluster_metric("cpu", 0, 1_000).await.unwrap();
+        assert_eq!(sums(after), [(60, 1.0), (120, 2.0)]);
+        assert_eq!(store.buffer_len(), 1);
+    }
+
+    /// #2443: the flush task no longer holds the write lock through the
+    /// Parquet write, so ingest goes on.
+    #[tokio::test]
+    async fn flushing_off_the_lock_persists_and_empties_the_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = tokio::sync::RwLock::new(RollupStore::new(dir.path().to_path_buf()));
+        store
+            .write()
+            .await
+            .ingest(&make_rollup("n1", 60, "cpu", 1.0));
+        flush_off_lock(&store).await.unwrap();
+        assert_eq!(store.read().await.buffer_len(), 0);
+        let reopened = RollupStore::new(dir.path().to_path_buf());
+        let rows = reopened
+            .query_cluster_metric("cpu", 0, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
     }
 
     /// #2450: shedding from a full buffer moves no buffered row, and keeps

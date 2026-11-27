@@ -138,16 +138,23 @@ pub enum ReportingMessage {
 The `ReportAggregator` already handles `Report`. We add a case for `MetricsRollup`:
 
 ```rust
-Some((_, peer, ReportingMessage::MetricsRollup(rollup))) => {
+ReportingMessage::MetricsRollup(rollup) => {
     if Self::report_identity_ok(&peer, &rollup.node_id)
-        && let Some(ref store) = self.rollup_store
+        && let Some(tx) = &self.rollup_tx
+        && tx.try_send(rollup).is_err()
     {
-        store.write().await.ingest(&rollup);
+        self.rollups_dropped += 1;
+        // ...and say so in Bun's log, at 1, 2, 4, 8... drops
     }
+    false
 }
 ```
 
 `peer` is the node id the connection's mTLS certificate proves, and `report_identity_ok` refuses a rollup that claims to be from anyone else. Without that check node X could send a rollup for node Y, poisoning Y's metrics and pre-claiming Y's dedup keys so Y's real rollups were dropped as duplicates.
+
+The first version of this arm ingested inline: `store.write().await.ingest(&rollup)`. That looks harmless, since `ingest` only appends to a buffer. The `await` is the problem ([#2443](https://github.com/reliaburger/reliaburger/issues/2443)). This one `select!` loop handles every state, capability and readiness report the leader receives, and three other tasks held the rollup store's lock across slow work: the autoscaler and the metrics API across DataFusion queries, and the flush task across a Parquet write. While the aggregator waited for the write lock, no report was processed, its 16-slot admission queue filled, and workers were refused. Report handling depended on query latency.
+
+So rollups leave the loop. When `run` starts it spawns an ingest task that owns the write side of the store and reads a bounded `mpsc` queue of 1,024 rollups; the arm above only `try_send`s into it. `try_send` never waits: if the queue is full the rollup is dropped and counted, and the worker's five-minute backfill after a failed push covers most such gaps. When `run` returns it drops the sender, and the task ingests whatever is still queued and ends, because `recv()` returns `None` once every sender is gone. The other two holders changed as well. Queries now read a snapshot taken in one statement (see [Watching Everything](06-watching-everything.md)), and the flush task calls `rollup_store::flush_off_lock`, which takes the write lock only to freeze the buffer into a pending batch and again to drop it once the file is written; the Parquet write itself runs with no lock held, and queries read the pending batch from memory until then. `a_report_is_published_while_the_rollup_store_is_locked` holds a read guard on the store, sends a rollup and then a report, and expects the report published within 500 ms and the rollup ingested once the guard is dropped. Measured on a debug build with six hours of rollups from three nodes (360 files), the autoscaler's five-minute aggregate took 9 ms (33 ms for the first, which reads every footer once) and a flush 9 ms: the stall was a structural bug before it was a slow one.
 
 The enum used to have one more variant, `AggregatedReport { reports: HashMap<NodeId, StateReport> }`, for a council member forwarding its workers' reports to the leader. It carried many nodes' reports, so it couldn't be bound to one certificate, and the aggregator stored every report in it unchecked. Production never sent it (every worker reports straight to the leader), but any authenticated peer could, and keep a dead node "fresh" or inject endpoints for it. We deleted it in 0.2.1. If the two-level tree is ever built, the forwarding message comes back with council-peer authentication rather than trust.
 

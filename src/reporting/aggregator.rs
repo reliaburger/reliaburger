@@ -36,6 +36,29 @@ const EVICTION_MULTIPLIER: u32 = 3;
 /// even while more are queued, so consumers never wait on a long burst.
 const MAX_UNPUBLISHED: usize = 256;
 
+/// Rollups waiting for the rollup store's write lock (#2443). One rollup
+/// arrives per node per minute, so this covers a long stall of a large
+/// fleet; past it a rollup is dropped and counted, and the worker's
+/// five-minute backfill after a failed send covers most such gaps.
+const ROLLUP_INGEST_QUEUE: usize = 1024;
+
+/// Ingest rollups into `store` from a queue, off the report loop, so a
+/// query or flush holding the store's lock never stalls state reports
+/// (#2443). The task ends when the queue's sender is dropped, once it has
+/// ingested everything already queued.
+fn spawn_rollup_ingest(
+    store: Arc<RwLock<RollupStore>>,
+) -> tokio::sync::mpsc::Sender<crate::mayo::rollup::NodeRollup> {
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<crate::mayo::rollup::NodeRollup>(ROLLUP_INGEST_QUEUE);
+    tokio::spawn(async move {
+        while let Some(rollup) = rx.recv().await {
+            store.write().await.ingest(&rollup);
+        }
+    });
+    tx
+}
+
 /// The aggregated view of all worker reports.
 ///
 /// Published via a `watch` channel so any number of consumers
@@ -117,6 +140,10 @@ pub struct ReportAggregator<T: ReportingTransport> {
     readiness_entries: HashMap<NodeId, ReadinessEntry>,
     watch_tx: watch::Sender<AggregatedState>,
     rollup_store: Option<Arc<RwLock<RollupStore>>>,
+    /// The queue into the rollup ingest task, while [`run`](Self::run) runs.
+    rollup_tx: Option<tokio::sync::mpsc::Sender<crate::mayo::rollup::NodeRollup>>,
+    /// Rollups dropped because the ingest queue was full.
+    rollups_dropped: u64,
     config: ReportingTreeSection,
     shutdown: CancellationToken,
     /// Current leadership epoch (the Raft term the leader-target
@@ -164,6 +191,8 @@ impl<T: ReportingTransport> ReportAggregator<T> {
             readiness_entries: HashMap::new(),
             watch_tx,
             rollup_store,
+            rollup_tx: None,
+            rollups_dropped: 0,
             config,
             shutdown,
             epoch_rx,
@@ -177,6 +206,13 @@ impl<T: ReportingTransport> ReportAggregator<T> {
 
     /// Run the aggregator event loop until shutdown.
     pub async fn run(&mut self) {
+        self.rollup_tx = self.rollup_store.clone().map(spawn_rollup_ingest);
+        self.run_loop().await;
+        // Dropping the sender lets the ingest task finish what's queued.
+        self.rollup_tx = None;
+    }
+
+    async fn run_loop(&mut self) {
         let stale_timeout = Duration::from_secs(self.config.stale_report_timeout_secs);
         let mut stale_check = tokio::time::interval(stale_timeout);
         // The first tick fires immediately — skip it so we don't
@@ -273,10 +309,20 @@ impl<T: ReportingTransport> ReportAggregator<T> {
                 // NodeRollup{node_id: Y}, poisoning Y's cluster metrics and
                 // pre-claiming Y's (node, window) dedup keys so Y's genuine
                 // rollups drop as duplicates. Rollups don't change the view.
+                // The store's lock may be held by a query or a flush, so the
+                // rollup is queued for the ingest task rather than ingested
+                // here (#2443).
                 if Self::report_identity_ok(&peer, &rollup.node_id)
-                    && let Some(ref store) = self.rollup_store
+                    && let Some(tx) = &self.rollup_tx
+                    && tx.try_send(rollup).is_err()
                 {
-                    store.write().await.ingest(&rollup);
+                    self.rollups_dropped += 1;
+                    if self.rollups_dropped.is_power_of_two() {
+                        eprintln!(
+                            "report aggregator: rollup ingest queue full; {} rollup(s) dropped so far",
+                            self.rollups_dropped
+                        );
+                    }
                 }
                 false
             }
@@ -779,6 +825,12 @@ mod tests {
             "capability reports must have the same mTLS identity binding"
         );
         drop(state);
+        // Rollups are ingested off the report loop (#2443): give the
+        // honest one a moment to land.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while rollups.read().await.buffer_len() == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert_eq!(
             rollups.read().await.buffer_len(),
             1,
@@ -856,6 +908,77 @@ mod tests {
         // Only one entry for "w1" — second report overwrote the first
         assert_eq!(state.reports.len(), 1);
         assert!(state.reports.contains_key(&NodeId::new("w1")));
+
+        shutdown.cancel();
+        let _ = handle.await;
+    }
+
+    /// #2443: the aggregator ingested a rollup inline, awaiting the rollup
+    /// store's write lock, on the loop that handles every report. A query
+    /// or a flush holding that lock stalled state, capability and readiness
+    /// reports with it. A report is now published while the store is
+    /// locked, and the rollup is ingested once the lock is free.
+    #[tokio::test]
+    async fn a_report_is_published_while_the_rollup_store_is_locked() {
+        let net = InMemoryReportingNetwork::new();
+        let worker_transport = net.register(addr(1)).await;
+        let council_transport = net.register(addr(2)).await;
+        let shutdown = CancellationToken::new();
+        let rollup_dir = tempfile::tempdir().unwrap();
+        let rollups = Arc::new(RwLock::new(crate::mayo::rollup_store::RollupStore::new(
+            rollup_dir.path().to_path_buf(),
+        )));
+        let (mut aggregator, mut watch_rx) = ReportAggregator::new(
+            council_transport,
+            test_config(),
+            shutdown.clone(),
+            Some(Arc::clone(&rollups)),
+            None,
+            None,
+        );
+
+        let guard = rollups.read().await;
+        let rollup = crate::mayo::rollup::NodeRollup {
+            node_id: NodeId::new("w1"),
+            timestamp: 60,
+            entries: vec![crate::mayo::rollup::RollupEntry {
+                metric_name: "node_cpu_usage_percent".to_string(),
+                labels: std::collections::BTreeMap::new(),
+                aggregate: crate::mayo::rollup::RollupAggregate {
+                    min: 1.0,
+                    max: 1.0,
+                    sum: 1.0,
+                    count: 1,
+                },
+            }],
+        };
+        worker_transport
+            .send(addr(2), &ReportingMessage::MetricsRollup(rollup))
+            .await
+            .unwrap();
+        worker_transport
+            .send(addr(2), &ReportingMessage::Report(report("w1")))
+            .await
+            .unwrap();
+        let handle = tokio::spawn(async move { aggregator.run().await });
+
+        tokio::time::timeout(Duration::from_millis(500), watch_rx.changed())
+            .await
+            .expect("the report waited for the rollup store's lock")
+            .unwrap();
+        assert!(watch_rx.borrow().reports.contains_key(&NodeId::new("w1")));
+
+        // The rollup isn't lost: it lands once the lock is free.
+        drop(guard);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while rollups.read().await.buffer_len() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the rollup was never ingested"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(rollups.read().await.buffer_len(), 1);
 
         shutdown.cancel();
         let _ = handle.await;
