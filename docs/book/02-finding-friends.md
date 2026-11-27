@@ -1979,6 +1979,21 @@ let hint_plausible = |hint: &LeaderHint| {
 
 `Option::is_none_or(f)` is `true` for `None` and `f(value)` for `Some(value)`: no term, no bound. A member keeps the bound, because its term is real, but only for hints from its own recovery epoch (more on epochs in a moment). A voter that a recovery has fenced still holds the old council's term, and comparing that with the new council's fresh term line would make it refuse the new leader for no reason. A non-member takes the newest hint gossip has shown it. Isn't that the forged-term problem again? Not really. Forging a hint takes the cluster's gossip key, since every extension carries an HMAC, and the reporting epoch a hint can move only gates anything on the leader, which is a member and judges hints by its own term.
 
+"Not really" turned out to need one more piece. Every node derives the gossip key from the same master key, so any compromised worker can sign a hint naming itself at term `u64::MAX`. No later hint outranks that, so a seatless node followed it until it restarted (#2406). The security half of that issue closed elsewhere: a seatless node now fetches its security state only from a voter of the council it knows. The rest, a reporting stall that lasted for ever, closes here: hints now expire. Each extension carries `leader_age_ms`, how long ago its stamping node last heard the hint fresh. The leader stamps its own hint at 0, and a relay passes on the age it holds, so the real leader's hint arrives a few seconds old even across a large cluster, refreshed all the time. A forged hint nobody re-advertises ages on every hop, and once it's older than `LEADER_HINT_EXPIRY` (a minute) the directory drops it and refuses any copy that old:
+
+```rust
+pub fn observe_hint_at(&mut self, hint: &LeaderHint, age: Duration, now: Instant) -> bool {
+    let expired = self.expire_leader(now);
+    if hint.recovery_epoch < self.recovery_floor || age >= LEADER_HINT_EXPIRY {
+        return expired;
+    }
+    let heard = now.checked_sub(age).unwrap_or(now);
+    // ... adopt a newer hint, or refresh `leader_heard` for the same one
+}
+```
+
+Why an age and not a timestamp? Hosts' clocks disagree, and an age needs no agreement: each node measures it on its own monotonic `Instant` and only ever adds to it. `Instant::checked_sub` returns `None` instead of panicking when the subtraction would go before the clock's start, which is the `Instant` version of the `checked_add` we met with incarnations. A compromised node can still re-sign its forged hint every few seconds; then the stall lasts as long as the attack, and the node doing it is the one to find and remove. `a_node_outside_raft_does_not_follow_an_unbounded_hint_for_ever` failed before the fix.
+
 The same review found a second way for a hint to lie about its term. `relish council recover` builds a new council at a new *recovery epoch*, and its terms start again from the bottom. For a while, surviving workers still relay the old council's last hint: epoch 0, term 9, say, against the recovered leader's epoch 1, term 3. The directory ordered hints by `(recovery_epoch, term)`, but `resolve_leader_view` compared terms alone, so 9 beat 3 and the recovered leader's reporting epoch jumped to 9. The maintainer only ever let that epoch grow, and the scheduler skips every pass while the epoch differs from the leader's own term. Nothing would ever bring it back down ([#1997](https://github.com/reliaburger/reliaburger/issues/1997)).
 
 Two changes close it. The gossip directory now holds a *recovery floor*, the newest epoch the node's own recovery fence knows. `observe_hint` refuses a hint from below the floor, and `raise_recovery_floor` drops one already held when the floor rises, so a node never resolves the old council at all. And the reporting epoch is keyed on the pair, not the term:

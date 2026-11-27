@@ -603,16 +603,21 @@ impl<T: MustardTransport> MustardNode<T> {
             .as_ref()
             .and_then(|rx| rx.borrow().clone());
         let relayed = self.directory.leader.clone();
-        let leader = match (own, relayed) {
-            (Some(a), Some(b)) => Some(
+        let relayed_age = self.directory.leader_age(Instant::now());
+        // Our own hint is fresh by definition; a relayed one goes on with
+        // the age we hold for it (#2406).
+        let (leader, leader_age) = match (own, relayed) {
+            (Some(a), Some(b)) => {
                 if (a.recovery_epoch, a.term) >= (b.recovery_epoch, b.term) {
-                    a
+                    (Some(a), Duration::ZERO)
                 } else {
-                    b
-                },
-            ),
-            (a, b) => a.or(b),
+                    (Some(b), relayed_age)
+                }
+            }
+            (Some(a), None) => (Some(a), Duration::ZERO),
+            (None, b) => (b, relayed_age),
         };
+        let leader_age_ms = u32::try_from(leader_age.as_millis()).unwrap_or(u32::MAX);
         let recovery_claim = self
             .recovery_fence_rx
             .as_ref()
@@ -627,6 +632,7 @@ impl<T: MustardTransport> MustardNode<T> {
             api_address,
             reporting_address,
             leader,
+            leader_age_ms,
             labels: super::message::bounded_labels(&self.advertised_labels),
             disk_pressured,
             recovery_epoch: recovery_claim.map(|claim| claim.epoch),
@@ -1143,6 +1149,11 @@ impl<T: MustardTransport> MustardNode<T> {
     /// counter carries on from where it was, or restarts from the wall
     /// clock, above the floor either way.
     fn reap_departed(&mut self, now: Instant) {
+        // A leader hint nobody has re-advertised for a minute goes, even
+        // with no datagram to trigger it (#2406).
+        if self.directory.expire_leader(now) {
+            self.publish_directory();
+        }
         self.sequence_floors.retain(|_, floor| floor.expires > now);
         let reaped = self
             .membership
@@ -3451,6 +3462,52 @@ mod tests {
         assert_eq!(endpoints.reporting_address, addr(9445));
     }
 
+    /// #2406: a relay passes a hint on with the age it holds, and a hint
+    /// older than the expiry isn't adopted, so a forged one nobody
+    /// re-advertises ages out everywhere.
+    #[tokio::test]
+    async fn a_relayed_hint_carries_its_age_and_an_expired_one_is_refused() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        node.set_advertised_endpoints(9117, 9445, BTreeMap::new());
+        let hint = |name: &str, term| LeaderHint {
+            node_id: NodeId::new(name),
+            term,
+            recovery_epoch: 0,
+            api_address: addr(9200),
+            reporting_address: addr(9201),
+        };
+        let from = |sender: &str, leader: LeaderHint, age_ms| {
+            let mut message = ping_from(sender);
+            message.extension = Some(DirectoryExtension {
+                node_id: NodeId::new(sender),
+                api_address: addr(9300),
+                reporting_address: addr(9301),
+                leader: Some(leader),
+                leader_age_ms: age_ms,
+                labels: BTreeMap::new(),
+                disk_pressured: false,
+                recovery_epoch: None,
+                recovery_id: None,
+                jobs: None,
+                hmac: [0u8; 32],
+            });
+            message
+        };
+        let expiry =
+            u32::try_from(super::super::directory::LEADER_HINT_EXPIRY.as_millis()).unwrap();
+        node.handle_message(addr(2), from("p1", hint("stale", 99), expiry))
+            .await;
+        assert_eq!(node.directory().leader, None);
+
+        node.handle_message(addr(3), from("p2", hint("leader", 4), 59_000))
+            .await;
+        let relayed = node.local_extension().unwrap();
+        assert_eq!(relayed.leader.unwrap().node_id, NodeId::new("leader"));
+        assert!(relayed.leader_age_ms >= 59_000, "{}", relayed.leader_age_ms);
+    }
+
     #[tokio::test]
     async fn leader_hint_relays_through_a_non_leader() {
         // n1 is the leader (local hint set); n2 learns the hint from n1's
@@ -3524,6 +3581,7 @@ mod tests {
             api_address: addr(1),
             reporting_address: addr(2),
             leader: Some(hint.clone()),
+            leader_age_ms: 0,
             labels: BTreeMap::new(),
             disk_pressured: false,
             recovery_epoch: None,
@@ -3592,6 +3650,7 @@ mod tests {
                     api_address: addr(9217),
                     reporting_address: addr(9545),
                 }),
+                leader_age_ms: 0,
                 labels: BTreeMap::new(),
                 disk_pressured: false,
                 recovery_epoch: None,
@@ -3638,6 +3697,7 @@ mod tests {
             api_address: addr(9127),
             reporting_address: addr(9455),
             leader: None,
+            leader_age_ms: 0,
             labels: BTreeMap::new(),
             disk_pressured: false,
             recovery_epoch: None,
@@ -4444,6 +4504,7 @@ mod tests {
                 api_address: addr(9117),
                 reporting_address: addr(9445),
                 leader: None,
+                leader_age_ms: 0,
                 labels: BTreeMap::new(),
                 disk_pressured: false,
                 recovery_epoch: Some(epoch),
@@ -4477,6 +4538,7 @@ mod tests {
             api_address: addr(9117),
             reporting_address: addr(9445),
             leader: None,
+            leader_age_ms: 0,
             labels: BTreeMap::new(),
             disk_pressured: true,
             recovery_epoch: Some(9),
@@ -5072,6 +5134,7 @@ mod tests {
             api_address: addr(9117),
             reporting_address: addr(9445),
             leader: None,
+            leader_age_ms: 0,
             labels: BTreeMap::from([("zone".to_string(), "recorded".to_string())]),
             disk_pressured: true,
             recovery_epoch: Some(1),

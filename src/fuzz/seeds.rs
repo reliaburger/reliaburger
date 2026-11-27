@@ -118,6 +118,7 @@ fn gossip() -> Vec<Seed> {
             api_address: address(9443),
             reporting_address: address(9444),
         }),
+        leader_age_ms: 0,
         labels: BTreeMap::from([("zone".to_string(), "a".to_string())]),
         disk_pressured: false,
         recovery_epoch: None,
