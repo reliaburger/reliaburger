@@ -1717,6 +1717,16 @@ the expensive run still going. `appliance.yml` and `build.yml` follow the same r
 cargo-fuzz job no longer runs on pull requests. Its 14 to 33 minutes now run only nightly and
 by hand, while the portable suite still feeds every target its checked-in corpus on each PR.
 
+That nightly had the macOS nightly's blind spot twice over
+([#2482](https://github.com/reliaburger/reliaburger/issues/2482)). A scheduled run checks out
+`main`, and `fuzz.yml` had no step to move it anywhere else, so a decoder changed on a train got
+no fuzzing until the gate PR merged, which is the day the release is built. It now has the same
+"newest train, else `main`" step as the other two nightlies, with `fetch-depth: 0` so the train's
+branch is there to pick. `mutants.yml` already had the step, but only the train's copy did: the
+copy on `main`, the one GitHub schedules, was still the old weekly run of `main`. All three files
+go to `main` in their own pull request, and a test holds each of them to the same rule: nightly,
+never on pull requests, and on the newest train.
+
 ### A release gate that fits in a week
 
 Pull requests were quick by 0.2.3. The release wasn't. From code freeze to ready-to-tag took

@@ -1092,6 +1092,13 @@ and hit its timeout.
 also ran for 30 seconds a target on every pull request that touched a
 decoder's file, but the job takes 14 to 33 minutes and runners were short, so
 the maintainer took it off pull requests; the release gate never used it.
+The nightly fuzzes the newest `release-*` train that has work `main` doesn't,
+else `main`, picked the way [mutation testing](#mutation-testing) picks it, and
+says which in the job summary (`fuzzing origin/release-... at <commit>`); a
+run by hand takes a `ref`
+([#2482](https://github.com/reliaburger/reliaburger/issues/2482)). GitHub runs
+the copy of `fuzz.yml` on `main`, so a change to it takes effect only once
+it's there ([a schedule-only workflow lives on `main`](releasing.md#merge-trains-and-their-ci)).
 The stable half, every target over its checked-in corpus, still runs in the
 portable suite on every pull request. The job summary has each target's last
 libFuzzer status line (executions, coverage, corpus size). A crash fails the
@@ -1168,7 +1175,10 @@ runner for up to 75 minutes per train PR while the train's own CI queued
 behind it, so it moved to a nightly run.
 
 The nightly run mutates the newest release train (`release-*`), where work
-lands before `main`, or `main` when no train has work `main` doesn't.
+lands before `main`, or `main` when no train has work `main` doesn't. That
+needs the train's copy of `mutants.yml` on `main`, since GitHub schedules
+from `main`'s; until it is, `main`'s older copy runs weekly and mutates
+`main` ([#2482](https://github.com/reliaburger/reliaburger/issues/2482)).
 
 | Run | What it mutates | At most | Test budget |
 |---|---|---|---|
