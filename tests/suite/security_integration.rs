@@ -324,7 +324,16 @@ async fn spawn_issuer(
         })();
 
         match issued {
-            Ok(result) => Json(join::JoinBundle::from_result(&result)).into_response(),
+            Ok(result) => Json(join::JoinBundle::from_result(&result).with_council(
+                std::collections::BTreeMap::from([(
+                    7,
+                    reliaburger::council::types::CouncilNodeInfo {
+                        addr: "10.0.0.7:9118".parse().unwrap(),
+                        name: "node-01".into(),
+                    },
+                )]),
+            ))
+            .into_response(),
             Err(e) => (
                 axum::http::StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "error": e.to_string() })),
@@ -368,9 +377,15 @@ async fn joiner_persists_the_identity_returned_by_a_remote_member() {
     let (url, server) = spawn_issuer(state, ikm).await;
 
     let client = reqwest::Client::new();
-    let identity = join::request_join(&client, &url, &token, "node-02", None)
+    let enrolment = join::request_join(&client, &url, &token, "node-02", None)
         .await
         .expect("join should succeed");
+    // The bundle names the council the node should expect (#2397).
+    assert_eq!(
+        enrolment.council.get(&7).map(|voter| voter.name.as_str()),
+        Some("node-01")
+    );
+    let identity = enrolment.identity;
     assert_eq!(identity.node_id, "node-02");
 
     // Persist and reload, proving the round trip lands on disk usable.
@@ -401,7 +416,8 @@ async fn joiner_checks_compatibility_while_the_members_binary_hash_is_still_runn
     )
     .await
     .expect("the join waited on the member's /v1/version")
-    .expect("join should succeed");
+    .expect("join should succeed")
+    .identity;
     assert_eq!(identity.node_id, "node-02");
 
     server.abort();

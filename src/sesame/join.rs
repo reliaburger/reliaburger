@@ -130,6 +130,20 @@ pub struct JoinBundle {
     pub trusted_node_cas_b64: Vec<String>,
     /// Base64 DER of every root the council trusts.
     pub trusted_roots_b64: Vec<String>,
+    /// The council's voters when the leader issued the certificate (#2397).
+    /// A node with no council of its own takes Raft replication only from
+    /// these, or from voters they vouch for. Empty in a renewal.
+    pub council: crate::council::admission::CouncilRoster,
+}
+
+/// What a successful enrolment hands the joiner: its identity, and the
+/// council it should expect to hear from (#2397).
+#[derive(Debug)]
+pub struct Enrolment {
+    /// The node's new identity, to save with `identity_store::save`.
+    pub identity: NodeIdentity,
+    /// The council's voters, to save with `ExpectedCouncil::save` beside it.
+    pub council: crate::council::admission::CouncilRoster,
 }
 
 /// Errors from the joiner side of the ceremony.
@@ -179,7 +193,15 @@ impl JoinBundle {
                 .iter()
                 .map(|der| BASE64.encode(der))
                 .collect(),
+            council: Default::default(),
         }
+    }
+
+    /// The same bundle, naming `council` as the voters the joiner should
+    /// expect.
+    pub fn with_council(mut self, council: crate::council::admission::CouncilRoster) -> Self {
+        self.council = council;
+        self
     }
 
     /// Decode the bundle into an on-disk [`NodeIdentity`], supplying the
@@ -335,7 +357,7 @@ pub async fn request_join(
     token: &str,
     node_id: &str,
     expected_fingerprint: Option<&str>,
-) -> Result<NodeIdentity, JoinClientError> {
+) -> Result<Enrolment, JoinClientError> {
     // Ask the pinned member for its formats before sending the one-time
     // credential. Its CA endpoint reports them and answers at once. Not
     // `/v1/version`: that reports the member's binary hash, and a member
@@ -387,7 +409,7 @@ pub async fn request_join(
         return Err(JoinClientError::Rejected(format!("{status}: {body}")));
     }
 
-    let bundle: JoinBundle = response
+    let mut bundle: JoinBundle = response
         .json()
         .await
         .map_err(|e| JoinClientError::Malformed(e.to_string()))?;
@@ -402,7 +424,9 @@ pub async fn request_join(
         }
     }
 
-    bundle.into_identity(private_key_der)
+    let council = std::mem::take(&mut bundle.council);
+    let identity = bundle.into_identity(private_key_der)?;
+    Ok(Enrolment { identity, council })
 }
 
 /// Pre-validate a join token against the replicated security state.
@@ -590,7 +614,8 @@ fn mint_join_token(
 }
 
 /// Enrol this machine as `node_id` through the member at `member_base`
-/// (`https://<host>:9117`), and return its new identity.
+/// (`https://<host>:9117`), and return its new identity with the council it
+/// should expect.
 ///
 /// Phase 1 fetches the cluster's public CA over trust-on-first-use: a
 /// joiner has no CA yet, and the CA reveals nothing. A pinned
@@ -604,7 +629,7 @@ pub async fn enrol(
     token: &str,
     node_id: &str,
     expected_fingerprint: Option<&str>,
-) -> Result<NodeIdentity, JoinClientError> {
+) -> Result<Enrolment, JoinClientError> {
     // A name the cluster would refuse (#2394) never reaches it, so the
     // token isn't spent on it.
     crate::cluster::retirement::validate_node_id(node_id).map_err(|reason| {

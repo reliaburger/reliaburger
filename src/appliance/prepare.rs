@@ -575,10 +575,18 @@ async fn enrol(paths: &Paths, config: &SeedConfig) -> Result<(), PrepareError> {
             )
             .await
             {
-                Ok(identity) => {
+                Ok(enrolment) => {
                     // BLOCKING-OK: appliance prepare: its own process, one step at a time before bun starts, with nothing else on its runtime
-                    crate::sesame::identity_store::save(&paths.identity_dir(), &identity)
+                    crate::sesame::identity_store::save(&paths.identity_dir(), &enrolment.identity)
                         .map_err(|e| PrepareError::Config(format!("saving the identity: {e}")))?;
+                    // BLOCKING-OK: appliance prepare, as above
+                    crate::council::admission::ExpectedCouncil::save(
+                        &paths.identity_dir(),
+                        &enrolment.council,
+                    )
+                    .map_err(|e| {
+                        PrepareError::Config(format!("saving the expected council: {e}"))
+                    })?;
                     say(&format!("enrolled as {} through {member}", config.node));
                     return Ok(());
                 }

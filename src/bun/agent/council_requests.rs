@@ -93,7 +93,12 @@ async fn issue_join_bundle(
     )
     .map_err(|e| security_error(format!("join signing failed: {e}")))?;
 
-    Ok(crate::sesame::join::JoinBundle::from_result(&join_result))
+    // The joiner takes Raft replication only from these voters, or from
+    // voters they vouch for, until it has a council of its own (#2397).
+    let council = crate::council::admission::council_roster(council.raft())
+        .await
+        .unwrap_or_default();
+    Ok(crate::sesame::join::JoinBundle::from_result(&join_result).with_council(council))
 }
 
 /// Verify an operator's detached signature and attach it to the manifest

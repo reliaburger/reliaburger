@@ -434,7 +434,22 @@ pub async fn start(
     let raft_blocklist = factory.blocklist();
     // The council membership check dials the voters this node knows with
     // the node's own identity, to ask about a leader it has never heard of.
-    let raft_admission = crate::council::admission::RaftAdmission::new(factory.clone());
+    // While it has no council of its own it expects the one `relish join`
+    // saved beside its identity (#2397).
+    let expected_council = match &params.identity {
+        Some(identity) => crate::council::admission::ExpectedCouncil::load(identity.directory())
+            .unwrap_or_else(|error| {
+                eprintln!(
+                    "cluster: could not read the expected council in {} ({error}); this node \
+                     takes Raft replication only once a voter it knows vouches for the leader",
+                    identity.directory().display()
+                );
+                crate::council::admission::ExpectedCouncil::default()
+            }),
+        None => crate::council::admission::ExpectedCouncil::default(),
+    };
+    let raft_admission = crate::council::admission::RaftAdmission::new(factory.clone())
+        .expecting(expected_council.clone());
     let committed_flusher = log_store.committed_flusher();
     let council = CouncilNode::new(
         raft_id,
@@ -523,6 +538,18 @@ pub async fn start(
     // sending none to them, or the leader keeps replicating to a
     // "partitioned" node over the connections it opens (#1810).
     let rpc_blocklist = raft_blocklist.clone();
+    let expected_maintainer = raft_admission.clone();
+    let expected_raft = council.raft().clone();
+    let expected_shutdown = shutdown.clone();
+    spawn_supervised(
+        "cluster:expected-council",
+        supervision.clone(),
+        async move {
+            expected_maintainer
+                .maintain_expected_council(expected_raft, expected_shutdown)
+                .await;
+        },
+    );
     spawn_supervised("cluster:raft-rpc", supervision.clone(), async move {
         serve_raft_rpc_with_admission(
             raft_listener,
