@@ -1,5 +1,9 @@
 # Relish: CLI & TUI Design Document
 
+**Status:** Partly shipped. Every `relish` command here exists unless it's marked *(planned)*, and a test checks that.
+**Reconciled against:** not reconciled (§4 and §10 checked against 0.3.4, #2513)
+**Sketches:** the §4 listings marked as sketches, the planned plan and diff types in §5, the commands marked *(planned)*, §13
+
 ## 1. Overview
 
 Relish is the CLI and interactive terminal UI for Reliaburger. It's a single Rust binary that replaces five separate tools from the Kubernetes ecosystem: `kubectl` (cluster management), `k9s` (interactive TUI), `stern` (multi-instance log streaming), `kubectl-debug` (debug containers), and `terraform plan` (change previewing). Every debugging, diagnostic, configuration, and operational capability is compiled into the binary. There's nothing to install, no plugins to manage, no separate monitoring stack to query, and no shell scripts to maintain.

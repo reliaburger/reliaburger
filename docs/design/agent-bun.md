@@ -2,7 +2,9 @@
 
 **Component:** Bun (per-node agent/daemon), Grill (container runtime interface)
 **Scope:** Container lifecycle, process workload isolation, node configuration (`node.toml`), self-upgrade mechanism
-**Status:** Draft
+**Status:** Partly shipped. The container runtime, health checks, node config and self-upgrade ship; the isolation stack for process workloads is planned.
+**Reconciled against:** not reconciled (§4 and §6.1 checked against 0.3.4, #2506)
+**Sketches:** §4.3, §5.2 steps 7–12, the OOM detection in §5.4, the process-workload boundary in §8.2, §8.3, §8.4
 **Source:** Whitepaper sections 5 (Core Concepts), 17 (Process Workloads), 7 (Cluster Architecture), 9 (Networking), 11 (Security), 13 (Deployments), 18 (Fault Injection), 6 (Node Configuration), 20 (Self-Upgrades), 19 (Testing)
 
 ---

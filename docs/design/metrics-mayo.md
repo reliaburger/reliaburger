@@ -2,7 +2,9 @@
 
 **Component:** Mayo (Metrics store + Built-In Alerts)
 **Binary:** Embedded in Bun (the single-node agent)
-**Status:** Design (this document reconciled against the shipped code)
+**Status:** Partly shipped. Collection, Parquet storage, rollups and the four built-in node alerts ship; the sections marked planned don't.
+**Reconciled against:** not reconciled at a named release; an earlier pass reconciled it with the shipped code, and §10.3 was checked against 0.3.4 (#2515)
+**Sketches:** tiered retention in §3.2, §3.4, §4.4, §5.3, §5.8, the planned tests in §10.3
 **Whitepaper Reference:** Section 15
 
 ---

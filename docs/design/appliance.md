@@ -2,6 +2,8 @@
 
 **Component:** the appliance OS, `relish netboot`, `relish machines claim`, `relish os`
 **Status:** Shipped in 0.3.0 (#401–#406); the Wyse exit test (#407) runs alongside the release
+**Reconciled against:** not reconciled
+**Sketches:** §5 (what's deferred)
 
 ---
 

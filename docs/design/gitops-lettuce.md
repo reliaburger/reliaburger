@@ -1,5 +1,9 @@
 # Lettuce: GitOps Sync Engine
 
+**Status:** Partly shipped.
+**Reconciled against:** not reconciled (§4 checked against 0.3.4, #2515)
+**Sketches:** §4.4–§4.6, the jitter in §5.1, §13
+
 ## 1. Overview
 
 Lettuce is Reliaburger's built-in GitOps sync engine, compiled directly into the Bun binary. It replaces external tools like ArgoCD and Flux with a first-class subsystem that understands the native TOML configuration format, the Raft-based desired state model, and the autoscaler's runtime overrides.

@@ -1,5 +1,9 @@
 # Deployments & Rollouts
 
+**Status:** Partly shipped (see the implementation status note below).
+**Reconciled against:** not reconciled (§7.5 checked against 0.3.4, #2515)
+**Sketches:** the library `DeployState` in §4 (see the note below), the cluster-wide defaults in §6, §13.3
+
 Cross-cutting design for Reliaburger's deployment system: rolling deploys with zero downtime, automatic rollback on health check failure, dependency ordering via `run_before`, deploy history and audit trail, blue-green deploys, and built-in autoscaling.
 
 This subsystem is cross-cutting. It doesn't live in a single component; it coordinates across Meat (scheduling), Bun (container lifecycle), Wrapper (connection draining and routing pool updates), Onion (service map backend updates), and Ketchup (deploy event logging). The deploy orchestration loop itself runs on the leader node as part of the Meat scheduler.

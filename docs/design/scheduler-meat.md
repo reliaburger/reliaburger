@@ -1,5 +1,9 @@
 # Meat: The Reliaburger Scheduler
 
+**Status:** Partly shipped.
+**Reconciled against:** not reconciled (§4 and the scoring in §3 checked against 0.3.4, #2515, #2518)
+**Sketches:** the §4 listings marked as sketches, the dedicated CPU budget in §1, the `[scheduler]` section in §6
+
 ## 1. Overview
 
 Meat is the centralized scheduling engine of the Reliaburger container orchestrator. It runs exclusively on the current Raft leader node as a dedicated async task and is responsible for all workload placement decisions in the cluster: placing App replicas across nodes, granting job tasks to workers in chunks, releasing rollouts node by node, enforcing namespace resource quotas, and driving autoscaling reactions.

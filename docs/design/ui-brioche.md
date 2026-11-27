@@ -2,7 +2,9 @@
 
 **Component:** Brioche (Web UI)
 **Binary:** Compiled into Bun (the node agent)
-**Status:** Design document
+**Status:** Partly shipped. The overview, app, node and GitOps pages ship; the pages marked planned don't.
+**Reconciled against:** not reconciled
+**Sketches:** §5.4, §5.6, §5.7, OIDC in §6.2, §8.4, §8.5
 
 ---
 

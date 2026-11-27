@@ -2,9 +2,10 @@
 
 Design document for the Mustard gossip protocol and the Raft consensus layer in Reliaburger. Covers cluster membership, failure detection, leader election, state reconstruction, and catastrophic recovery.
 
-**Status:** Draft
+**Status:** Partly shipped. Gossip, the Raft council and state reconstruction ship; nodes report straight to the leader, not through the two-level tree in §3.5.
+**Reconciled against:** not reconciled (§7.6 checked against 0.3.4, #2518)
+**Sketches:** the reporting tree in §3.5 and §9.4, pre-vote in §5.2, gossip key rotation in §8.1
 **Whitepaper reference:** Section 8 (Leader Election & State Management)
-**Last updated:** 2026-02-16
 
 ---
 

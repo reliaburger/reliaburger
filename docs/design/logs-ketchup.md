@@ -1,7 +1,9 @@
 # Ketchup: Log Collection System
 
 **Component:** Ketchup (Log Collector)
-**Status:** Design (this document reconciled against the shipped code)
+**Status:** Partly shipped. Capture, Parquet storage and SQL queries ship; the sections marked planned don't.
+**Reconciled against:** not reconciled at a named release; an earlier pass reconciled it with the shipped code
+**Sketches:** the per-app file layout, record format, index and compression in §3.2–§3.6, §4.3, §4.4, the parts of §5 marked planned
 **Whitepaper Reference:** Section 15
 
 ---

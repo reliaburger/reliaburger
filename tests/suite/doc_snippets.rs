@@ -1189,6 +1189,55 @@ fn cli_design_doc_names_no_missing_commands() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+// --- Design-doc status headers ----------------------------------------------
+
+/// The words a design doc's `**Status:**` line starts with.
+const DESIGN_DOC_STATUSES: &[&str] = &["Shipped", "Partly shipped", "Design only"];
+
+/// Every design doc opens with the same three header lines, so a reader (or an
+/// agent reading it through `relish agent source`) can tell built from
+/// planned before trusting it: `**Status:**` (one of
+/// [`DESIGN_DOC_STATUSES`]), `**Reconciled against:**` (a release someone
+/// checked the whole doc at, or "not reconciled") and `**Sketches:**` (the
+/// sections that describe unbuilt design, or "none").
+#[test]
+fn every_design_doc_has_a_status_header() {
+    let directory = super::website::repository().join("docs/design");
+    let mut files: Vec<String> = std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.ends_with(".md"))
+        .map(|name| format!("docs/design/{name}"))
+        .collect();
+    files.sort();
+    assert!(files.len() > 10, "found only {files:?}");
+    let mut failures = Vec::new();
+    for file in files {
+        let text = read(&file);
+        let head: Vec<&str> = text.lines().take(12).collect();
+        let field = |name: &str| {
+            head.iter()
+                .find_map(|line| line.strip_prefix(&format!("**{name}:** ")))
+        };
+        match field("Status") {
+            Some(status)
+                if DESIGN_DOC_STATUSES
+                    .iter()
+                    .any(|word| status.starts_with(word)) => {}
+            Some(status) => failures.push(format!(
+                "{file}: status {status:?} starts with none of {DESIGN_DOC_STATUSES:?}"
+            )),
+            None => failures.push(format!("{file}: no **Status:** line in its first 12 lines")),
+        }
+        for name in ["Reconciled against", "Sketches"] {
+            if field(name).is_none() {
+                failures.push(format!("{file}: no **{name}:** line in its first 12 lines"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 // --- Types in design-doc listings --------------------------------------------
 
 /// Design docs whose Rust listings must declare real types, unless the
