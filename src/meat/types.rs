@@ -208,6 +208,11 @@ pub const MAX_PASS_DECISIONS: usize = 4096;
 /// to place on its own, only too big to share a pass (#2366).
 pub const MAX_PASS_PLACEMENTS: usize = 131_072;
 
+/// The council's answer to a placement pass planned against a log position
+/// that another entry has since moved. The pass is stale, not wrong: the
+/// leader plans it again from fresh state (#2369).
+pub const PASS_REVISION_CHANGED: &str = "admission revision changed";
+
 /// A single replica placement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Placement {

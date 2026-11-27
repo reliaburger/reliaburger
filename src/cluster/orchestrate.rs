@@ -39,6 +39,10 @@ const RECONCILE_IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// write that later commits is picked up then, and one that never does
 /// can't hold up every other app's placement.
 const SCHEDULER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How many times one tick plans a placement pass. A pass refused because
+/// another writer moved the log is planned again from fresh state (#2369);
+/// a writer that never pauses leaves the rest to the next tick.
+const MAX_PASS_PLANS: usize = 3;
 /// How many retirements one reconcile cycle has in flight at once.
 const MAX_CONCURRENT_RETIREMENTS: usize = 4;
 
@@ -291,7 +295,7 @@ pub fn spawn_leader_scheduler(
             readiness.ready(WITHDRAWAL_BACKLOG_SUBSYSTEM).await;
         }
         let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
-        loop {
+        'tick: loop {
             let capacity_request = tokio::select! {
                 _ = shutdown.cancelled() => break,
                 _ = tick.tick() => None,
@@ -375,6 +379,9 @@ pub fn spawn_leader_scheduler(
                 backlog_warning = warning;
             }
 
+            // Whether this tick wrote to the council before it plans: the
+            // pass must then be planned from state read after those writes.
+            let mut wrote = false;
             // Publish the cluster endpoint catalogue every tick the backends
             // change (12b.4). This runs before the learning-period gate below:
             // cross-node resolution shouldn't wait for a fresh leader to finish
@@ -400,6 +407,7 @@ pub fn spawn_leader_scheduler(
                     Err(crate::onion::withdrawal::WithdrawalError::CapacityReached)
                 )
             {
+                wrote = true;
                 match council
                     .write_within(
                         SCHEDULER_WRITE_TIMEOUT,
@@ -429,6 +437,7 @@ pub fn spawn_leader_scheduler(
                     app_id: app_id.clone(),
                     spec: Box::new(spec),
                 };
+                wrote = true;
                 match council
                     .write_within(SCHEDULER_WRITE_TIMEOUT, released)
                     .await
@@ -468,157 +477,194 @@ pub fn spawn_leader_scheduler(
 
             let alive: HashSet<NodeId> = alive.into_iter().collect();
 
-            // Build the cache ONCE per tick, cordon mid-upgrade nodes, and
-            // plan every app against a single mutable reservation view so
-            // apps planned in the same pass reserve against each other. The
-            // old code rebuilt a fresh cache per app, so two apps that
-            // together exceeded one node's headroom both landed on it — a
-            // cache you rebuild per decision is a cache that lies between
-            // decisions (CP8).
-            let mut cache = build_cluster_cache(&members, &reports);
-            if cache.node_count() == 0 {
-                // No node has reported capacity yet; scheduling against
-                // unknown capacity would place blindly.
-                continue;
-            }
-            crate::meat::filter::apply_upgrade_cordon(&mut cache, desired.active_upgrade.as_ref());
-            crate::meat::filter::apply_os_rollout_cordon(&mut cache, desired.os_rollout.as_ref());
-
-            let pass_members = PassMembers {
-                unheard: unheard_nodes(&alive, &reports, stale_node_grace),
-                suspect: nodes_in_state(&members, NodeState::Suspect),
-                lapsed: lapsed_nodes(&alive, &reports, stale_node_grace),
-                alive: alive.clone(),
+            // A pass is admitted only against the log position it was
+            // planned from, and the catalogue and rollout writes above moved
+            // it. Planned from the state read before them, the pass would be
+            // refused by the scheduler's own writes (#2369), and they change
+            // what it plans from (a released rollout), so read it again.
+            let mut desired = if wrote {
+                council.desired_state().await
+            } else {
+                desired
             };
-            // A forecast (#1682) plans from the view the real pass starts
-            // from, and costs this tick one pass: the real one runs on the
-            // next tick, a second later.
-            let capacity_request = match capacity_request {
-                Some(super::capacity::SchedulerRequest::Forecast(request)) => {
-                    let forecast =
-                        forecast_pass(cache, &desired, &pass_members, dns_required, &request.apps);
-                    let _ = request.response.send(Ok(forecast));
-                    continue;
+            let mut capacity_request = capacity_request;
+            let mut plans = 0;
+            let (quota_blocked, unschedulable) = loop {
+                plans += 1;
+                // Build the cache ONCE per pass, cordon mid-upgrade nodes, and
+                // plan every app against a single mutable reservation view so
+                // apps planned in the same pass reserve against each other. The
+                // old code rebuilt a fresh cache per app, so two apps that
+                // together exceeded one node's headroom both landed on it — a
+                // cache you rebuild per decision is a cache that lies between
+                // decisions (CP8).
+                let mut cache = build_cluster_cache(&members, &reports);
+                if cache.node_count() == 0 {
+                    // No node has reported capacity yet; scheduling against
+                    // unknown capacity would place blindly.
+                    continue 'tick;
                 }
-                Some(super::capacity::SchedulerRequest::Admit(request)) => Some(*request),
-                None => None,
-            };
-
-            // Quotas come from desired-state namespaces (12b.2 T6). A
-            // cluster with no declared namespace budgets gets an empty
-            // ledger that admits everything; declaring a namespace with a
-            // CPU/memory/replica cap now rejects over-budget placements at
-            // deploy time, with the reason surfaced through the log.
-            let mut quotas = crate::meat::quota::ledger_from_namespaces(&desired.namespaces);
-
-            let PassPlan {
-                decisions,
-                quota_blocked,
-                unschedulable,
-                provenance,
-                deferred,
-            } = plan_pass(
-                &mut cache,
-                &desired,
-                &pass_members,
-                &mut quotas,
-                dns_required,
-            );
-
-            if let Some(request) = capacity_request {
-                use super::capacity::CapacityAdmissionError;
-                use crate::meat::scheduler::{ScheduleError, Scheduler};
-
-                let ready = !has_stale_member(&members, &reports)
-                    && members
-                        .iter()
-                        .all(|member| member.state == NodeState::Alive)
-                    && cache.node_count() == alive.len()
-                    && cache.nodes().all(|node| {
-                        node.ready
-                            && (!dns_required || node.capabilities.dns.can_resolve_internal())
-                    });
-                let result = if !ready {
-                    Err(CapacityAdmissionError::Unavailable(
-                        "every member needs fresh, ready placement evidence".into(),
-                    ))
-                } else if desired.apps.contains_key(&request.app_id) {
-                    Err(CapacityAdmissionError::Rejected(
-                        ScheduleError::InvalidSpec {
-                            reason: "capacity admission requires a new app".into(),
-                        },
-                    ))
-                } else if let Err(error) = quotas.try_admit(
-                    &request.app_id.namespace,
-                    &scheduler_resources(&request.spec),
-                    1,
-                    true,
-                ) {
-                    Err(CapacityAdmissionError::Rejected(
-                        ScheduleError::QuotaExceeded {
-                            namespace: request.app_id.namespace.clone(),
-                            detail: error.to_string(),
-                        },
-                    ))
-                } else {
-                    Scheduler::new(cache)
-                        .with_dns_required(dns_required)
-                        .schedule_app(&request.app_id, &request.spec)
-                        .map(|_| ())
-                        .map_err(CapacityAdmissionError::Rejected)
-                };
-                let _ = request.response.send(result);
-                continue;
-            }
-
-            if deferred > 0 {
-                eprintln!(
-                    "scheduler: placement pass is full; {deferred} apps wait for the next pass"
+                crate::meat::filter::apply_upgrade_cordon(
+                    &mut cache,
+                    desired.active_upgrade.as_ref(),
                 );
-            }
+                crate::meat::filter::apply_os_rollout_cordon(
+                    &mut cache,
+                    desired.os_rollout.as_ref(),
+                );
 
-            // A pass owns one original revision, even if unrelated entries
-            // commit while we plan. Refreshing it would admit a stale plan.
-            let live: HashSet<NodeId> = membership_rx
-                .borrow()
-                .iter()
-                .filter(|m| matches!(m.state, NodeState::Alive | NodeState::Suspect))
-                .map(|m| m.node_id.clone())
-                .collect();
-            if !decisions.is_empty()
-                && decisions.iter().all(|decision| {
-                    decision
-                        .placements
-                        .iter()
-                        .all(|p| live.contains(&p.node_id))
-                })
-            {
-                match tokio::time::timeout(
-                    SCHEDULER_WRITE_TIMEOUT,
-                    council.write(RaftRequest::SchedulingDecisions {
-                        expected_log_id: desired.last_applied_log,
-                        decisions,
-                    }),
-                )
-                .await
+                let pass_members = PassMembers {
+                    unheard: unheard_nodes(&alive, &reports, stale_node_grace),
+                    suspect: nodes_in_state(&members, NodeState::Suspect),
+                    lapsed: lapsed_nodes(&alive, &reports, stale_node_grace),
+                    alive: alive.clone(),
+                };
+                // A forecast (#1682) plans from the view the real pass starts
+                // from, and costs this tick one pass: the real one runs on the
+                // next tick, a second later.
+                let admit = match capacity_request.take() {
+                    Some(super::capacity::SchedulerRequest::Forecast(request)) => {
+                        let forecast = forecast_pass(
+                            cache,
+                            &desired,
+                            &pass_members,
+                            dns_required,
+                            &request.apps,
+                        );
+                        let _ = request.response.send(Ok(forecast));
+                        continue 'tick;
+                    }
+                    Some(super::capacity::SchedulerRequest::Admit(request)) => Some(*request),
+                    None => None,
+                };
+
+                // Quotas come from desired-state namespaces (12b.2 T6). A
+                // cluster with no declared namespace budgets gets an empty
+                // ledger that admits everything; declaring a namespace with a
+                // CPU/memory/replica cap now rejects over-budget placements at
+                // deploy time, with the reason surfaced through the log.
+                let mut quotas = crate::meat::quota::ledger_from_namespaces(&desired.namespaces);
+
+                let PassPlan {
+                    decisions,
+                    quota_blocked,
+                    unschedulable,
+                    provenance,
+                    deferred,
+                } = plan_pass(
+                    &mut cache,
+                    &desired,
+                    &pass_members,
+                    &mut quotas,
+                    dns_required,
+                );
+
+                if let Some(request) = admit {
+                    use super::capacity::CapacityAdmissionError;
+                    use crate::meat::scheduler::{ScheduleError, Scheduler};
+
+                    let ready = !has_stale_member(&members, &reports)
+                        && members
+                            .iter()
+                            .all(|member| member.state == NodeState::Alive)
+                        && cache.node_count() == alive.len()
+                        && cache.nodes().all(|node| {
+                            node.ready
+                                && (!dns_required || node.capabilities.dns.can_resolve_internal())
+                        });
+                    let result = if !ready {
+                        Err(CapacityAdmissionError::Unavailable(
+                            "every member needs fresh, ready placement evidence".into(),
+                        ))
+                    } else if desired.apps.contains_key(&request.app_id) {
+                        Err(CapacityAdmissionError::Rejected(
+                            ScheduleError::InvalidSpec {
+                                reason: "capacity admission requires a new app".into(),
+                            },
+                        ))
+                    } else if let Err(error) = quotas.try_admit(
+                        &request.app_id.namespace,
+                        &scheduler_resources(&request.spec),
+                        1,
+                        true,
+                    ) {
+                        Err(CapacityAdmissionError::Rejected(
+                            ScheduleError::QuotaExceeded {
+                                namespace: request.app_id.namespace.clone(),
+                                detail: error.to_string(),
+                            },
+                        ))
+                    } else {
+                        Scheduler::new(cache)
+                            .with_dns_required(dns_required)
+                            .schedule_app(&request.app_id, &request.spec)
+                            .map(|_| ())
+                            .map_err(CapacityAdmissionError::Rejected)
+                    };
+                    let _ = request.response.send(result);
+                    continue 'tick;
+                }
+
+                if deferred > 0 {
+                    eprintln!(
+                        "scheduler: placement pass is full; {deferred} apps wait for the next pass"
+                    );
+                }
+
+                // A pass owns one original revision, even if unrelated entries
+                // commit while we plan. Refreshing it would admit a stale plan,
+                // so a refusal for a changed revision replans from a fresh
+                // read instead, a bounded number of times in the tick: each
+                // try plans from scratch, never resends the old plan.
+                let live: HashSet<NodeId> = membership_rx
+                    .borrow()
+                    .iter()
+                    .filter(|m| matches!(m.state, NodeState::Alive | NodeState::Suspect))
+                    .map(|m| m.node_id.clone())
+                    .collect();
+                if !decisions.is_empty()
+                    && decisions.iter().all(|decision| {
+                        decision
+                            .placements
+                            .iter()
+                            .all(|p| live.contains(&p.node_id))
+                    })
                 {
-                    Ok(Ok(crate::council::types::CouncilResponse::Refused { reason })) => {
-                        eprintln!("scheduler: placement pass refused: {reason}")
-                    }
-                    Ok(Err(error)) => {
-                        eprintln!("scheduler: failed to commit placement pass: {error}")
-                    }
-                    Err(_) => eprintln!(
-                        "scheduler: placement acknowledgement timed out; outcome unknown; next tick replans from committed state"
-                    ),
-                    // Committed: say why each app's new replicas went where
-                    // they did, once, where the decision was made.
-                    Ok(Ok(_)) => {
-                        record_placement_events(provenance_events(provenance), events.as_ref())
-                            .await
+                    match tokio::time::timeout(
+                        SCHEDULER_WRITE_TIMEOUT,
+                        council.write(RaftRequest::SchedulingDecisions {
+                            expected_log_id: desired.last_applied_log,
+                            decisions,
+                        }),
+                    )
+                    .await
+                    {
+                        Ok(Ok(crate::council::types::CouncilResponse::Refused { reason }))
+                            if reason == crate::meat::types::PASS_REVISION_CHANGED
+                                && plans < MAX_PASS_PLANS =>
+                        {
+                            desired = council.desired_state().await;
+                            continue;
+                        }
+                        Ok(Ok(crate::council::types::CouncilResponse::Refused { reason })) => {
+                            eprintln!("scheduler: placement pass refused: {reason}")
+                        }
+                        Ok(Err(error)) => {
+                            eprintln!("scheduler: failed to commit placement pass: {error}")
+                        }
+                        Err(_) => eprintln!(
+                            "scheduler: placement acknowledgement timed out; outcome unknown; next tick replans from committed state"
+                        ),
+                        // Committed: say why each app's new replicas went where
+                        // they did, once, where the decision was made.
+                        Ok(Ok(_)) => {
+                            record_placement_events(provenance_events(provenance), events.as_ref())
+                                .await
+                        }
                     }
                 }
-            }
+                break (quota_blocked, unschedulable);
+            };
             // Why an app isn't placed is durable council state, so any node
             // can answer `relish status`. Written only when it changes.
             if let Some(update) = quota_blocked_update(&desired.quota_blocked, &quota_blocked) {

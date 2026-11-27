@@ -2210,8 +2210,28 @@ assumption. A leader's job loop commits entries of its own, a cron observation
 on its first tick and again every minute. A fixture that read the position
 and then wrote now and then lost that race and was refused with "admission
 revision changed" ([#735](https://github.com/reliaburger/reliaburger/issues/735)).
-The state machine was right. The fixture now replans on that refusal, as the
-scheduler does.
+The state machine was right. The fixture now replans on that refusal.
+
+The scheduler didn't, and it was its own worst rival
+([#2369](https://github.com/reliaburger/reliaburger/issues/2369)). A leader
+tick reads the desired state, publishes the endpoint catalogue if a backend
+changed, records any rollout that finished, and only then plans the pass, with
+the position it read at the top. Its own two writes had moved the log, so in
+every tick that published anything the pass was refused, and a rollout
+publishes on most ticks. The fix has two parts. A tick that wrote reads the
+state again before planning, so the pass is planned from where the log really
+is, and a released rollout is in the state it plans from. And a pass refused
+for a changed revision is planned again from a fresh read, at most three
+times a tick (`MAX_PASS_PLANS`), because other writers are entitled to land
+in between. The loop that does it is a Rust `loop` used as an expression:
+`break (quota_blocked, unschedulable)` leaves it with a value, the way a
+function returns one, and `continue 'tick` jumps to the next turn of the outer
+loop, which carries the label `'tick:`, from inside the inner one. Go has
+labelled `continue` too; C would need a `goto`. The test,
+`a_pass_is_admitted_in_the_tick_that_also_publishes_the_catalogue`, starts a
+one-node council whose first tick has a catalogue to publish and an app to
+place, and checks the app is placed before the second tick could have done
+it.
 
 Durable retirement excludes a worker even while gossip and reports still call
 it alive. The planner filters it, and Raft refuses a registration assigned to

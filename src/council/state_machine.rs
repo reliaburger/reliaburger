@@ -707,7 +707,7 @@ impl StateMachineInner {
             } => {
                 if *expected_log_id != position.previous_log_id {
                     return Some(CouncilResponse::Refused {
-                        reason: "admission revision changed".into(),
+                        reason: crate::meat::types::PASS_REVISION_CHANGED.into(),
                     });
                 }
                 // The leader's planner reads the same limits, so it never
