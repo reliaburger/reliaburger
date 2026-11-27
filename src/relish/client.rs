@@ -5088,15 +5088,12 @@ mod tests {
         shutdown: tokio_util::sync::CancellationToken,
     ) -> std::net::SocketAddr {
         use axum::{Router, routing::get};
-        use tower::Service as _;
 
-        let acceptor = tokio_rustls::TlsAcceptor::from(
-            crate::sesame::mtls::build_api_server_config(
-                identity,
-                crate::sesame::mtls::CrlHandle::default(),
-            )
-            .unwrap(),
-        );
+        let config = crate::sesame::mtls::build_api_server_config(
+            identity,
+            crate::sesame::mtls::CrlHandle::default(),
+        )
+        .unwrap();
         let router = Router::new().route(
             "/v1/health",
             get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
@@ -5117,6 +5114,19 @@ mod tests {
                 },
             ),
         );
+        spawn_tls_router(config, router, shutdown).await
+    }
+
+    /// Serve `router` over TLS with `config` on an ephemeral port. Returns
+    /// the address; the task ends when `shutdown` fires.
+    async fn spawn_tls_router(
+        config: Arc<rustls::ServerConfig>,
+        router: axum::Router,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> std::net::SocketAddr {
+        use tower::Service as _;
+
+        let acceptor = tokio_rustls::TlsAcceptor::from(config);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -5569,6 +5579,139 @@ mod tests {
         assert!(right.get(&url).send().await.unwrap().status().is_success());
 
         shutdown.cancel();
+    }
+
+    /// Serve `GET /v1/health` over TLS presenting `chain` (leaf first) with
+    /// `key`, recording any Authorization header that reaches it.
+    async fn spawn_tls_capture(
+        chain: Vec<Vec<u8>>,
+        key: Vec<u8>,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> (std::net::SocketAddr, Arc<Mutex<Option<String>>>) {
+        use axum::{Router, http::HeaderMap, routing::get};
+
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let cap = Arc::clone(&captured);
+        let router = Router::new().route(
+            "/v1/health",
+            get(move |headers: HeaderMap| {
+                let cap = Arc::clone(&cap);
+                async move {
+                    *cap.lock().unwrap() = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .map(String::from);
+                    axum::Json(serde_json::json!({"status": "ok"}))
+                }
+            }),
+        );
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            chain.into_iter().map(CertificateDer::from).collect(),
+            rustls::pki_types::PrivateKeyDer::Pkcs8(key.into()),
+        )
+        .unwrap();
+        let addr = spawn_tls_router(Arc::new(config), router, shutdown).await;
+        (addr, captured)
+    }
+
+    /// Ask the server at `addr` for its health with the root CA as the only
+    /// anchor and a bearer token.
+    async fn health_with_root_anchor(
+        hierarchy: &crate::sesame::ca::CaHierarchy,
+        addr: std::net::SocketAddr,
+    ) -> Result<(), RelishError> {
+        let root = pem_cert(&hierarchy.root.ca.certificate_der);
+        BunClient::build(&format!("https://{addr}"), Some("rbrg_test"), Some(&root))
+            .health()
+            .await
+    }
+
+    /// Workload identity certificates chain to the cluster root, carry the
+    /// server-auth usage, and their keys live inside the workload (#2396).
+    /// The CLI must not take one for the API server, and must not send the
+    /// operator's token to it. A node certificate under the same root is
+    /// still accepted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_client_refuses_a_workload_certificate_under_the_same_root() {
+        use crate::sesame::identity::{CertUsage, create_workload_csr, validate_and_sign_csr};
+        use crate::sesame::types::{SerialNumber, SpiffeUri, WorkloadType};
+
+        let hierarchy = crate::sesame::ca::generate_ca_hierarchy("c", b"ikm").unwrap();
+        let uri = SpiffeUri {
+            namespace: "default".to_string(),
+            workload_type: WorkloadType::App,
+            name: "web".to_string(),
+            trust_domain: "c".to_string(),
+        };
+        let (csr, workload_key) = create_workload_csr(&uri).unwrap();
+        let workload_leaf = validate_and_sign_csr(
+            &csr,
+            &uri,
+            SerialNumber(9),
+            CertUsage::Mtls,
+            &hierarchy.workload.signing_keypair,
+            &hierarchy.workload.certificate_params,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (addr, captured) = spawn_tls_capture(
+            vec![workload_leaf, hierarchy.workload.ca.certificate_der.clone()],
+            workload_key,
+            shutdown.clone(),
+        )
+        .await;
+        let refused = health_with_root_anchor(&hierarchy, addr).await;
+        assert!(
+            refused.is_err(),
+            "a workload leaf was accepted: {refused:?}"
+        );
+        assert!(captured.lock().unwrap().is_none(), "the token reached it");
+
+        let node = test_identity(&hierarchy, "node-01");
+        let node_addr = spawn_tls_health(&node, shutdown.clone()).await;
+        let accepted = health_with_root_anchor(&hierarchy, node_addr).await;
+        shutdown.cancel();
+        assert!(accepted.is_ok(), "a node leaf was refused: {accepted:?}");
+    }
+
+    /// Ingress certificates chain to the same root with the server-auth
+    /// usage, so the CLI must refuse them as the API server too (#2396).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_client_refuses_an_ingress_certificate_under_the_same_root() {
+        let hierarchy = crate::sesame::ca::generate_ca_hierarchy("c", b"ikm").unwrap();
+        let (chain, key) = crate::wrapper::tls::issue_ingress_cert(
+            &["app.example.com".to_string()],
+            std::time::Duration::from_secs(3600),
+            &hierarchy.ingress.signing_keypair,
+            &hierarchy.ingress.certificate_params,
+            &CertificateDer::from(hierarchy.ingress.ca.certificate_der.clone()),
+        )
+        .unwrap();
+        let key = key.secret_der().to_vec();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (addr, captured) = spawn_tls_capture(
+            chain
+                .into_iter()
+                .map(|certificate| certificate.to_vec())
+                .collect(),
+            key,
+            shutdown.clone(),
+        )
+        .await;
+        let refused = health_with_root_anchor(&hierarchy, addr).await;
+        shutdown.cancel();
+        assert!(
+            refused.is_err(),
+            "an ingress leaf was accepted: {refused:?}"
+        );
+        assert!(captured.lock().unwrap().is_none(), "the token reached it");
     }
 
     /// Start a throwaway server that records the Authorization header it sees on

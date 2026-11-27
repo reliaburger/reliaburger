@@ -20,6 +20,16 @@ use super::types::{ApiRole, ApiToken, TokenKind, TokenScope};
 /// blocking request handling.
 pub type TokenStore = Arc<RwLock<Vec<ApiToken>>>;
 
+/// How often a long-lived stream (a followed log, the event stream, their
+/// WebSocket twins, a deploy's progress) re-checks the credential that
+/// opened it, so a revoked or expired token ends it (#2399). It matches the
+/// SSE keep-alive period. Tests use a short one so they don't wait.
+pub const CREDENTIAL_RECHECK_INTERVAL: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(200)
+} else {
+    std::time::Duration::from_secs(15)
+};
+
 /// Create an empty token store.
 pub fn new_token_store() -> TokenStore {
     Arc::new(RwLock::new(Vec::new()))
@@ -412,6 +422,142 @@ fn session_credential_is_live(
     find_credential(&identity.principal_id, tokens)
         .is_some_and(|credential| credential.valid_until.is_none_or(|at| now < at))
 }
+
+/// What a long-lived response re-checks to know the credential that opened
+/// it still stands (#2399). The auth middleware puts one in the request's
+/// extensions beside the [`AuthContext`] for every credential that can end:
+/// a user token, a browser session and a workload JWT. The service and
+/// console principals and the bootstrap window get none, so their streams
+/// run as before.
+#[derive(Clone)]
+pub struct CredentialWatch {
+    credential: WatchedCredential,
+}
+
+#[derive(Clone)]
+enum WatchedCredential {
+    /// A user token's secret, current or old, found by its principal id.
+    Token {
+        tokens: TokenStore,
+        principal_id: String,
+    },
+    /// A browser session, which ends with its own lifetime or its token's.
+    Session {
+        tokens: TokenStore,
+        sessions: super::session::SessionStore,
+        session_id: String,
+        service_token_configured: bool,
+    },
+    /// A credential that carries its own end, a workload JWT's `exp`.
+    Until(std::time::SystemTime),
+}
+
+impl CredentialWatch {
+    /// Whether the credential still authenticates, by the same rules the
+    /// middleware applies to a new request.
+    pub async fn is_live(&self) -> bool {
+        match &self.credential {
+            WatchedCredential::Token {
+                tokens,
+                principal_id,
+            } => {
+                // Copy the answer out under the read lock and drop it.
+                let credential = find_credential(principal_id, &tokens.read().await);
+                let now = std::time::SystemTime::now();
+                credential.is_some_and(|found| found.valid_until.is_none_or(|at| now < at))
+            }
+            WatchedCredential::Session {
+                tokens,
+                sessions,
+                session_id,
+                service_token_configured,
+            } => {
+                let Some(identity) = sessions.validate(session_id).await else {
+                    return false;
+                };
+                let tokens = tokens.read().await.clone();
+                session_credential_is_live(&identity, &tokens, *service_token_configured)
+            }
+            WatchedCredential::Until(at) => std::time::SystemTime::now() < *at,
+        }
+    }
+}
+
+/// What a stream ended by [`credential_ended`] tells its client last.
+pub const CREDENTIAL_ENDED_MESSAGE: &str =
+    "the token that opened this stream was revoked or has expired; the stream has ended";
+
+/// An SSE `warning` event carrying [`CREDENTIAL_ENDED_MESSAGE`]: the last
+/// thing a followed log or event stream sends when its credential ends.
+/// `relish logs -f` prints it to stderr.
+pub fn credential_ended_warning() -> axum::body::Bytes {
+    axum::body::Bytes::from(format!(
+        "event: {}\ndata: {CREDENTIAL_ENDED_MESSAGE}\n\n",
+        crate::ketchup::sse::WARNING_EVENT
+    ))
+}
+
+/// End `response`'s body once `watch`'s credential no longer stands, after
+/// sending `farewell` (a whole SSE event, as bytes). Only an event stream
+/// is wrapped: an ordinary answer, a refusal or an error passes through.
+pub fn end_with_credential(
+    response: Response,
+    watch: Option<CredentialWatch>,
+    farewell: axum::body::Bytes,
+) -> Response {
+    let is_event_stream = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/event-stream"));
+    if watch.is_none() || !is_event_stream {
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    let body = until_credential_ends(body.into_data_stream(), watch, Ok(farewell));
+    Response::from_parts(parts, axum::body::Body::from_stream(body))
+}
+
+/// Resolve once `watch`'s credential no longer stands, re-checking every
+/// [`CREDENTIAL_RECHECK_INTERVAL`]. With no watch it never resolves.
+pub async fn credential_ended(watch: Option<CredentialWatch>) {
+    let Some(watch) = watch else {
+        return std::future::pending().await;
+    };
+    loop {
+        tokio::time::sleep(CREDENTIAL_RECHECK_INTERVAL).await;
+        if !watch.is_live().await {
+            return;
+        }
+    }
+}
+
+/// `stream`, ended once `watch`'s credential no longer stands. When that
+/// happens it yields `farewell` first, so the client can say why.
+pub fn until_credential_ends<S>(
+    stream: S,
+    watch: Option<CredentialWatch>,
+    farewell: S::Item,
+) -> impl futures_util::Stream<Item = S::Item> + Send
+where
+    S: futures_util::Stream + Send + 'static,
+    S::Item: Send + 'static,
+{
+    use futures_util::StreamExt as _;
+    let state = (
+        stream.boxed(),
+        Box::pin(credential_ended(watch)),
+        Some(farewell),
+    );
+    futures_util::stream::unfold(state, |(mut stream, mut ended, farewell)| async move {
+        // `None` means the farewell went out: the stream is over.
+        let farewell = farewell?;
+        tokio::select! {
+            item = stream.next() => item.map(|item| (item, (stream, ended, Some(farewell)))),
+            () = &mut ended => Some((farewell, (stream, ended, None))),
+        }
+    })
+}
 /// Check that the authenticated context has sufficient role.
 pub fn require_role(ctx: &AuthContext, required: ApiRole) -> Result<(), (StatusCode, String)> {
     token::check_role(ctx.role, required).map_err(|_| {
@@ -579,12 +725,23 @@ pub async fn auth_middleware(
             && looks_like_jwt(bearer_token)
             && let Some(claims) = verifier.verify(bearer_token)
         {
+            request.extensions_mut().insert(CredentialWatch {
+                credential: WatchedCredential::Until(
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(claims.exp),
+                ),
+            });
             request.extensions_mut().insert(workload_context(&claims));
             return next.run(request).await;
         }
         return match authenticate(bearer_token, &tokens) {
             Ok(ctx) => {
                 record_token_use(&state.last_used, &ctx.principal_id).await;
+                request.extensions_mut().insert(CredentialWatch {
+                    credential: WatchedCredential::Token {
+                        tokens: Arc::clone(&state.tokens),
+                        principal_id: ctx.principal_id.clone(),
+                    },
+                });
                 request.extensions_mut().insert(ctx);
                 next.run(request).await
             }
@@ -609,6 +766,14 @@ pub async fn auth_middleware(
         if session_credential_is_live(&identity, &tokens, state.service_token.is_some()) {
             // A dashboard session is its token at work, too.
             record_token_use(&state.last_used, &identity.principal_id).await;
+            request.extensions_mut().insert(CredentialWatch {
+                credential: WatchedCredential::Session {
+                    tokens: Arc::clone(&state.tokens),
+                    sessions: state.sessions.clone(),
+                    session_id: id.clone(),
+                    service_token_configured: state.service_token.is_some(),
+                },
+            });
             request
                 .extensions_mut()
                 .insert(readonly_session_context(&identity));
@@ -989,6 +1154,80 @@ mod tests {
     use crate::sesame::token::create_token;
     use crate::sesame::types::TokenScope;
     use std::time::{Duration, SystemTime};
+
+    fn token_watch(tokens: &TokenStore, token: &ApiToken) -> CredentialWatch {
+        CredentialWatch {
+            credential: WatchedCredential::Token {
+                tokens: Arc::clone(tokens),
+                principal_id: token_principal_id(token),
+            },
+        }
+    }
+
+    /// A rotation with a grace period keeps the old secret working until
+    /// the grace ends, so a stream opened with it must keep running too.
+    #[tokio::test]
+    async fn a_watched_old_secret_stays_live_through_its_grace_period() {
+        let created = create_token("ci", ApiRole::ReadOnly, TokenScope::default(), None).unwrap();
+        let old = created.token.clone();
+        let mut rotated = created.token.clone();
+        let rotation = crate::sesame::token::rotate_token(
+            &created.token,
+            SystemTime::now(),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        crate::sesame::token::apply_rotation(&mut rotated, &rotation.rotation);
+        let tokens = new_token_store();
+        *tokens.write().await = vec![rotated.clone()];
+        let watch = token_watch(&tokens, &old);
+        assert!(
+            watch.is_live().await,
+            "the old secret is still in its grace"
+        );
+
+        if let Some(previous) = tokens.write().await[0].previous_secret.as_mut() {
+            previous.valid_until = SystemTime::now() - Duration::from_secs(1);
+        }
+        assert!(!watch.is_live().await, "the grace period is over");
+    }
+
+    /// Only an event stream is cut: an ordinary answer passes through
+    /// whole, and a revoked token's event stream ends with the farewell.
+    #[tokio::test]
+    async fn end_with_credential_cuts_only_an_event_stream() {
+        use http_body_util::BodyExt as _;
+
+        let created = create_token("r", ApiRole::ReadOnly, TokenScope::default(), None).unwrap();
+        let tokens = new_token_store();
+        *tokens.write().await = vec![created.token.clone()];
+        let watch = token_watch(&tokens, &created.token);
+        tokens.write().await.clear();
+
+        let plain = end_with_credential(
+            "answer".into_response(),
+            Some(watch.clone()),
+            credential_ended_warning(),
+        );
+        let body = plain.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"answer");
+
+        // An event stream that never ends by itself.
+        let endless = futures_util::stream::pending::<Result<axum::body::Bytes, std::io::Error>>();
+        let response = Response::builder()
+            .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+            .body(axum::body::Body::from_stream(endless))
+            .unwrap();
+        let cut = end_with_credential(response, Some(watch), credential_ended_warning());
+        let body = tokio::time::timeout(Duration::from_secs(10), cut.into_body().collect())
+            .await
+            .expect("the stream outlived its revoked token")
+            .unwrap()
+            .to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.starts_with("event: warning\n"), "{text}");
+        assert!(text.contains(CREDENTIAL_ENDED_MESSAGE), "{text}");
+    }
 
     /// Every audit record says what kind of principal acted (#1682's
     /// design), read from what the API already knows about the caller: the
