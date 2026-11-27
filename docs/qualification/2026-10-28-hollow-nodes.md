@@ -79,7 +79,7 @@ Signals in the fleet's own log over each whole run:
    from an idle council to a thousand nodes. The council process's CPU levels
    off near 60% of one core between 500 and 1,000 nodes, and its memory grows
    by about a megabyte per node.
-2. **The leader refuses reports from 500 nodes up** ([#1411](https://github.com/reliaburger/reliaburger/issues/1411)). Every node reports
+2. **The leader refuses reports from 500 nodes up** ([#1411](https://github.com/reliaburger/reliaburger/issues/1411); fixed, and remeasured in [2026-11-24-hollow-nodes-report-admission.md](2026-11-24-hollow-nodes-report-admission.md)). Every node reports
    straight to the leader, whose reporting listener serves 16 connections at
    a time and drops the rest (`MAX_REPORT_CONNECTIONS` in
    `src/reporting/transport.rs`). At 1,000 nodes the refusals ran at about

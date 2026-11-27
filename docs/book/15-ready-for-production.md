@@ -10727,6 +10727,7 @@ grew was everything that meets the fleet one node at a time:
   about 600 a second, against the 200 a second a thousand nodes send on a
   five-second interval (a refused worker tries again). The planned reporting tree ([#364](https://github.com/reliaburger/reliaburger/issues/364))
   is meant for exactly this; now we know it's needed well before 10,000.
+  The refusals themselves are fixed; the next section shows how.
 - **The API.** Twenty small applies took 32 ms each at the median at 100
   nodes and 2.6 s at 1,000, while the Raft commits underneath stayed at 25 ms.
   A thousand placement reconcilers polling the leader every two seconds is
@@ -10742,6 +10743,123 @@ record treats the gossip and failure times as upper bounds for real hardware,
 not predictions. But a fixed limit of 16 report connections doesn't come from
 a slow laptop, and it would have stayed hidden
 behind "10,000 (target)" until somebody built that fleet.
+
+### Sixteen connections
+
+The report refusals turned out to be three limits stacked on top of each
+other, and only the first was the one the record named
+([#1411](https://github.com/reliaburger/reliaburger/issues/1411)).
+
+A worker opens a fresh TCP connection for every message, and every tick sends
+two or three: the state report, the capability report and, when the agent has
+evidence, readiness. Five hundred nodes on a five-second interval is about 250
+connections a second, and nodes that started together tick together, so they
+arrive in bursts. The listener read 16 of them at a time and closed the rest
+on the spot. That was the first limit.
+
+A connection it did read put its report on a queue for the aggregator, also 16
+deep, with `try_send`: a full queue meant no acknowledgement, which the worker
+counts as refused. That was the second.
+
+The third was why the queue was full. After every message the aggregator
+published its whole view on a `watch` channel, and building the view clones
+every node's latest report. That's O(N) work per message and O(N) messages per
+interval, so the leader's reporting work grew with the square of the fleet.
+Worse, each report also refreshed the freshness table against gossip's member
+list with `members.iter().any(...)` inside a `retain`: another N × N, twice per
+message. At 500 nodes that's a quarter of a million string comparisons per
+report.
+
+A test reproduces it without the rest of the harness.
+`five_hundred_workers_report_to_one_leader_without_a_refusal`, in
+`tests/reporting_tcp.rs`, starts one aggregator on a real socket, fed a
+500-member gossip list, and 500 real `ReportWorker`s with fake agents, all at
+once, so their ticks line up the way they do after a leader change, when
+every worker re-points and reports at the same moment. Each worker's
+transport is wrapped in a `CountingSender` that counts the sends the leader
+didn't admit. Wrapping works because `ReportWorker` is generic over the
+`ReportingTransport` trait: the test supplies its own implementation and the
+worker can't tell. Before the fix, 4,684 of 6,000 sends in 32 seconds were
+refused, and 49 nodes never made it into the leader's view at all.
+
+We had four candidate fixes: a cap sized from the membership, backpressure
+instead of refusal, long-lived multiplexed connections, or jittered report
+ticks. Multiplexing would also save a TLS handshake per message, but it's a
+new protocol, and the reporting tree
+([#364](https://github.com/reliaburger/reliaburger/issues/364)) will change
+who connects to whom anyway. Jitter spreads the steady state but does nothing
+for the burst after a leader change. A bigger cap only moves the cliff. So:
+backpressure, and stop doing quadratic work.
+
+**Wait, don't refuse.** The accept loop now takes a slot from a
+`tokio::sync::Semaphore` *before* it calls `accept()`:
+
+```rust
+let permit = tokio::select! {
+    _ = shutdown.cancelled() => break,
+    permit = Arc::clone(&capacity).acquire_owned() => match permit {
+        Ok(permit) => permit,
+        Err(_) => break,
+    },
+};
+```
+
+The permit moves into the connection's task and goes back to the semaphore
+when the task ends, because dropping an `OwnedSemaphorePermit` releases it
+(chapter 5 has the details). With every slot taken, the loop simply stops
+accepting. New connections wait in the kernel's listen backlog, and their
+senders wait with them, inside the deadlines they already had: five seconds
+to connect, ten for the whole send. The limit went from 16 to 64 because
+there's no longer anything to gain from keeping it tiny; it bounds memory
+(each slot may hold a frame of up to 1 MiB), not admissions. A stalled peer
+still can't make the listener spawn a task, which is what the old cap was
+for: the unit test that used to check a refusal now holds every slot with
+half-written frames, checks that one more report isn't read, frees a slot,
+and checks the waiting report goes through.
+
+The queue works the same way: `tx.send(...).await` instead of `try_send`, so
+a report that finds the queue full waits for room. That wait sits inside the
+connection's ten-second accept deadline, and only a report that made it onto
+the queue is acknowledged. A queue that never drains still can't produce a
+false acknowledgement, and
+`a_report_that_never_finds_room_is_not_acknowledged` checks exactly that, on
+a paused clock so the ten seconds cost nothing.
+
+**Publish once per burst.** The aggregator's `select!` now starts with
+`biased;` (chapter 17 explains it: arms are polled in order rather than at
+random). The timers and watches come first so a busy queue can't starve
+them, then the report queue, then one last arm:
+
+```rust
+_ = std::future::ready(()), if unpublished > 0 => {
+    self.publish();
+    unpublished = 0;
+}
+```
+
+`std::future::ready(())` is a future that's finished the moment it's polled,
+and the `if` guard switches the arm off when there's nothing to publish.
+Because it's polled last, it only wins when the report queue had nothing
+ready: the aggregator stores everything that's queued, then publishes once. A
+long burst still publishes every 256 reports, so nobody waits for the end of
+it. Consumers lose nothing, because a `watch` channel only ever holds the
+latest value anyway. The membership check builds a `HashSet` once per call
+instead of scanning the list once per entry.
+
+After the fix the same test admits all 6,000 sends with every node in the
+view, and 1,000 workers admit all 12,000. The full harness agrees: on the Mac
+Studio, 500 hollow nodes went from 17,223 refused admissions to none
+([record](../qualification/2026-11-24-hollow-nodes-report-admission.md)).
+
+A thousand hollow nodes still logged resets, and they taught us where the
+next limit is. The leader's process sat at 8% CPU with its listen backlog
+full. The slots weren't waiting on the leader; they were waiting on the
+clients. A fleet process too starved to keep its own agent loops on time
+connects, then writes its frame late, and the slot waits for it. Real nodes
+aren't a thousand tasks sharing ten threads, so that's mostly the harness
+measuring itself, and splitting the fleet across machines
+([#1413](https://github.com/reliaburger/reliaburger/issues/1413)) is how
+we'll find out how much.
 
 ## Files nobody could read
 

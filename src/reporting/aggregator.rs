@@ -32,6 +32,10 @@ use super::types::{NodeCapabilityReport, NodeReadinessReport, ReportingMessage, 
 /// (as opposed to merely listed in `stale_nodes`).
 const EVICTION_MULTIPLIER: u32 = 3;
 
+/// The most reports the aggregator stores before it publishes the view,
+/// even while more are queued, so consumers never wait on a long burst.
+const MAX_UNPUBLISHED: usize = 256;
+
 /// The aggregated view of all worker reports.
 ///
 /// Published via a `watch` channel so any number of consumers
@@ -162,63 +166,23 @@ impl<T: ReportingTransport> ReportAggregator<T> {
         // mark everything stale at startup.
         stale_check.tick().await;
 
+        // Reports that changed the view since it was last published. One
+        // publish copies every node's report, so publishing per message made
+        // the leader's work grow with the square of the fleet and its queue
+        // overflow from 500 nodes up (#1411). The view is published once the
+        // queue is empty, or after `MAX_UNPUBLISHED` reports in a busy spell.
+        let mut unpublished = 0usize;
         loop {
+            // `biased` polls the arms in order. The timers and watches come
+            // before the reports so a busy queue can't starve them, and the
+            // publish arm comes last so it only runs once the queue is empty.
             tokio::select! {
+                biased;
                 _ = self.shutdown.cancelled() => break,
-                msg = self.transport.recv() => {
-                    match msg {
-                        Some((_, peer, ReportingMessage::Report(report))) => {
-                            // C6: a self-report may only claim the node id the
-                            // peer's cert authenticates. Under mTLS a worker
-                            // that sends Report{node_id: victim} is dropped, so
-                            // it can't overwrite another node's entry. When mTLS
-                            // is off (`peer` is None) no binding is applied.
-                            if Self::report_identity_ok(&peer, &report.node_id) {
-                                self.store_report(report);
-                                self.publish();
-                            }
-                        }
-                        Some((_, _, ReportingMessage::Ack { .. })) => {
-                            // Workers don't send Acks to the aggregator
-                        }
-                        Some((_, peer, ReportingMessage::MetricsRollup(rollup))) => {
-                            // C6: a rollup may only claim the node id the peer's
-                            // cert authenticates. Otherwise, under mTLS, node X
-                            // could submit a NodeRollup{node_id: Y}, poisoning Y's
-                            // cluster metrics and pre-claiming Y's (node, window)
-                            // dedup keys so Y's genuine rollups drop as duplicates.
-                            if Self::report_identity_ok(&peer, &rollup.node_id)
-                                && let Some(ref store) = self.rollup_store
-                            {
-                                store.write().await.ingest(&rollup);
-                            }
-                        }
-                        Some((_, peer, ReportingMessage::CapabilityReport(report))) => {
-                            if Self::report_identity_ok(&peer, &report.node_id) {
-                                self.store_capability(report);
-                                self.publish();
-                            }
-                        }
-                        Some((_, peer, ReportingMessage::NodeReadinessReport(report))) => {
-                            if Self::report_identity_ok(&peer, &report.node_id) {
-                                self.store_readiness(report);
-                                self.publish();
-                            }
-                        }
-                        None => {
-                            // The transport only closes at shutdown; anything
-                            // else is a bug worth a loud log, not a silent
-                            // stop (CP10).
-                            if !self.shutdown.is_cancelled() {
-                                eprintln!("report aggregator: transport closed unexpectedly");
-                            }
-                            break;
-                        }
-                    }
-                }
                 _ = stale_check.tick() => {
                     self.evict_expired(stale_timeout);
                     self.publish();
+                    unpublished = 0;
                 }
                 changed = Self::watch_changed(&mut self.epoch_rx) => {
                     if changed.is_err() {
@@ -229,6 +193,7 @@ impl<T: ReportingTransport> ReportAggregator<T> {
                     // count. Republish so consumers see coverage drop now,
                     // not at the next report.
                     self.publish();
+                    unpublished = 0;
                 }
                 changed = Self::watch_changed(&mut self.membership_rx) => {
                     if changed.is_err() {
@@ -237,8 +202,79 @@ impl<T: ReportingTransport> ReportAggregator<T> {
                     }
                     if self.evict_departed() {
                         self.publish();
+                        unpublished = 0;
                     }
                 }
+                msg = self.transport.recv() => {
+                    let Some((_, peer, message)) = msg else {
+                        // The transport only closes at shutdown; anything
+                        // else is a bug worth a loud log, not a silent
+                        // stop (CP10).
+                        if !self.shutdown.is_cancelled() {
+                            eprintln!("report aggregator: transport closed unexpectedly");
+                        }
+                        break;
+                    };
+                    if self.handle_message(peer, message).await {
+                        unpublished += 1;
+                    }
+                    if unpublished >= MAX_UNPUBLISHED {
+                        self.publish();
+                        unpublished = 0;
+                    }
+                }
+                _ = std::future::ready(()), if unpublished > 0 => {
+                    self.publish();
+                    unpublished = 0;
+                }
+            }
+        }
+    }
+
+    /// Store one inbound message. Returns whether the published view needs
+    /// to change.
+    async fn handle_message(&mut self, peer: Option<NodeId>, message: ReportingMessage) -> bool {
+        match message {
+            ReportingMessage::Report(report) => {
+                // C6: a self-report may only claim the node id the peer's
+                // cert authenticates. Under mTLS a worker that sends
+                // Report{node_id: victim} is dropped, so it can't overwrite
+                // another node's entry. When mTLS is off (`peer` is None) no
+                // binding is applied.
+                if !Self::report_identity_ok(&peer, &report.node_id) {
+                    return false;
+                }
+                self.store_report(report);
+                true
+            }
+            // Workers don't send Acks to the aggregator.
+            ReportingMessage::Ack { .. } => false,
+            ReportingMessage::MetricsRollup(rollup) => {
+                // C6: a rollup may only claim the node id the peer's cert
+                // authenticates. Otherwise, under mTLS, node X could submit a
+                // NodeRollup{node_id: Y}, poisoning Y's cluster metrics and
+                // pre-claiming Y's (node, window) dedup keys so Y's genuine
+                // rollups drop as duplicates. Rollups don't change the view.
+                if Self::report_identity_ok(&peer, &rollup.node_id)
+                    && let Some(ref store) = self.rollup_store
+                {
+                    store.write().await.ingest(&rollup);
+                }
+                false
+            }
+            ReportingMessage::CapabilityReport(report) => {
+                if !Self::report_identity_ok(&peer, &report.node_id) {
+                    return false;
+                }
+                self.store_capability(report);
+                true
+            }
+            ReportingMessage::NodeReadinessReport(report) => {
+                if !Self::report_identity_ok(&peer, &report.node_id) {
+                    return false;
+                }
+                self.store_readiness(report);
+                true
             }
         }
     }
@@ -367,8 +403,12 @@ impl<T: ReportingTransport> ReportAggregator<T> {
         if let Some(rx) = &self.membership_rx {
             let members = rx.borrow();
             if !members.is_empty() {
+                // A set, not a scan per entry: this runs for every report,
+                // and a scan made it quadratic in the fleet (#1411).
+                let active: std::collections::HashSet<&NodeId> =
+                    members.iter().map(|m| &m.node_id).collect();
                 self.report_freshness
-                    .retain(|node, _| members.iter().any(|m| &m.node_id == node));
+                    .retain(|node, _| active.contains(node));
                 for member in members.iter() {
                     self.report_freshness
                         .entry(member.node_id.clone())
@@ -399,13 +439,15 @@ impl<T: ReportingTransport> ReportAggregator<T> {
             })
             .map(|(node, _)| node.clone())
             .collect();
+        let mut stale_set: std::collections::HashSet<NodeId> =
+            stale_nodes.iter().cloned().collect();
         for (node_id, entry) in &self.entries {
             if entry.epoch != epoch {
                 continue; // a previous leadership epoch — not current truth
             }
             reports.insert(node_id.clone(), entry.report.clone());
             if now.duration_since(entry.received_at) > stale_timeout
-                && !stale_nodes.contains(node_id)
+                && stale_set.insert(node_id.clone())
             {
                 stale_nodes.push(node_id.clone());
             }
@@ -774,6 +816,48 @@ mod tests {
         // Only one entry for "w1" — second report overwrote the first
         assert_eq!(state.reports.len(), 1);
         assert!(state.reports.contains_key(&NodeId::new("w1")));
+
+        shutdown.cancel();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_reports_is_published_once_the_queue_is_empty() {
+        let net = InMemoryReportingNetwork::new();
+        let worker_transport = net.register(addr(1)).await;
+        let council_transport = net.register(addr(2)).await;
+        let shutdown = CancellationToken::new();
+        // The whole burst is queued before the aggregator starts, so it
+        // stores them back to back and publishes in batches.
+        for index in 0..200 {
+            worker_transport
+                .send(
+                    addr(2),
+                    &ReportingMessage::Report(report(&format!("w{index}"))),
+                )
+                .await
+                .unwrap();
+        }
+        let (mut aggregator, mut watch_rx) = ReportAggregator::new(
+            council_transport,
+            test_config(),
+            shutdown.clone(),
+            None,
+            None,
+            None,
+        );
+        let handle = tokio::spawn(async move { aggregator.run().await });
+
+        let complete = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if watch_rx.borrow_and_update().reports.len() == 200 {
+                    return;
+                }
+                watch_rx.changed().await.unwrap();
+            }
+        })
+        .await;
+        assert!(complete.is_ok(), "the burst never reached the view");
 
         shutdown.cancel();
         let _ = handle.await;

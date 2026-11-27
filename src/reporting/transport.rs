@@ -177,8 +177,15 @@ impl ReportingTransport for InMemoryReportingTransport {
 
 /// Maximum reporting message size (1 MiB).
 const MAX_REPORT_SIZE: usize = 1_048_576;
-const MAX_REPORT_CONNECTIONS: usize = 16;
-const MAX_QUEUED_REPORTS: usize = 16;
+/// Connections the leader reads at once. The listener doesn't accept past
+/// this: further connections wait in the kernel's listen backlog, and their
+/// senders wait with them, inside their own deadline (#1411). Refusing them
+/// instead cost 15,310 lost reports at 500 nodes.
+const MAX_REPORT_CONNECTIONS: usize = 64;
+/// Reports admitted but not yet taken by the aggregator. A connection whose
+/// report finds the queue full waits for room, inside the accept deadline,
+/// rather than being refused.
+const MAX_QUEUED_REPORTS: usize = 256;
 const ADMITTED: u8 = 1;
 /// Fixed event admission limit for protocol generation three.
 pub(crate) const MAX_EVENTS_PER_REPORT: usize = 100;
@@ -336,23 +343,30 @@ impl TcpReportingTransport {
         node_gate: crate::smoker::node_fault::NodeTransportGate,
     ) {
         let mut connections = tokio::task::JoinSet::new();
+        let capacity = Arc::new(tokio::sync::Semaphore::new(MAX_REPORT_CONNECTIONS));
         loop {
             // Completed tasks also occupy JoinSet storage until reaped.
             while connections.try_join_next().is_some() {}
+            // Take a connection slot before accepting, so at most
+            // MAX_REPORT_CONNECTIONS tasks exist. Past that, connections
+            // queue in the listen backlog: backpressure, not refusal.
+            let permit = tokio::select! {
+                _ = shutdown.cancelled() => break,
+                permit = Arc::clone(&capacity).acquire_owned() => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => break,
+                },
+            };
             tokio::select! {
                 _ = shutdown.cancelled() => break,
-                _ = connections.join_next(), if !connections.is_empty() => {},
                 result = listener.accept() => {
                     let Ok((stream, peer)) = result else { continue };
                     if node_gate.is_quiesced() { continue; }
-                    if connections.len() >= MAX_REPORT_CONNECTIONS {
-                        // Refuse immediately rather than spawn a task waiting for capacity.
-                        continue;
-                    }
                     let tx = tx.clone();
                     let acceptor = acceptor.clone();
                     let connection_gate = node_gate.clone();
                     connections.spawn(async move {
+                        let _permit = permit;
                         let _ = tokio::time::timeout(REPORT_ACCEPT_DEADLINE, async {
                             match acceptor {
                                 Some(acceptor) => {
@@ -403,8 +417,10 @@ impl TcpReportingTransport {
             return;
         }
 
+        // Waiting for room is bounded by the caller's accept deadline; a
+        // report that never fits is never acknowledged, so its sender knows.
         if let Ok(msg) = decode_report(&payload)
-            && tx.try_send((peer, peer_node_id, msg)).is_ok()
+            && tx.send((peer, peer_node_id, msg)).await.is_ok()
         {
             // Admission is volatile, not a durable processing receipt. A lost
             // ACK can cause a retry; snapshots and owned rollups are idempotent.
@@ -741,58 +757,107 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stalled_connections_cannot_create_unbounded_receiver_tasks() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn connections_past_the_limit_wait_for_a_slot_instead_of_being_refused() {
+        use tokio::io::AsyncWriteExt;
         let shutdown = tokio_util::sync::CancellationToken::new();
         let receiver = TcpReportingTransport::bind(addr(0), shutdown.clone())
             .await
             .unwrap();
-        let mut clients = Vec::new();
+        // Stalled peers hold every slot: half a length prefix, then nothing.
+        let mut stalled = Vec::new();
         for _ in 0..MAX_REPORT_CONNECTIONS {
             let mut client = tokio::net::TcpStream::connect(receiver.local_addr())
                 .await
                 .unwrap();
             client.write_all(&[0, 0]).await.unwrap();
-            clients.push(client);
+            stalled.push(client);
         }
-        let mut excess = tokio::net::TcpStream::connect(receiver.local_addr())
-            .await
-            .unwrap();
-        let mut byte = [0];
-        let refused = tokio::time::timeout(Duration::from_secs(1), excess.read(&mut byte)).await;
+        // One more report waits rather than spawning a task or being refused.
+        let target = receiver.local_addr();
+        let waiting = tokio::spawn(async move {
+            TcpReportingSender::new(None, Default::default())
+                .send(target, &sample_msg("waiting"))
+                .await
+        });
         assert!(
-            matches!(refused, Ok(Ok(0)) | Ok(Err(_))),
-            "capacity was not refused: {refused:?}"
+            tokio::time::timeout(Duration::from_millis(300), receiver.recv())
+                .await
+                .is_err(),
+            "a report was read past the connection limit"
         );
+        // A slot frees up, and the waiting report is admitted.
+        drop(stalled.pop());
+        let (_, _, message) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("the waiting report was never read")
+            .unwrap();
+        let ReportingMessage::Report(report) = message else {
+            panic!("expected a report")
+        };
+        assert_eq!(report.node_id, NodeId::new("waiting"));
+        waiting.await.unwrap().unwrap();
         shutdown.cancel();
-        drop(clients);
     }
 
     #[tokio::test]
-    async fn full_receiver_refuses_admission_instead_of_acknowledging_loss() {
+    async fn full_receiver_holds_the_sender_until_there_is_room() {
         let shutdown = tokio_util::sync::CancellationToken::new();
         let receiver = TcpReportingTransport::bind(addr(0), shutdown.clone())
             .await
             .unwrap();
         let sender = TcpReportingSender::new(None, Default::default());
-        for _ in 0..16 {
+        for _ in 0..MAX_QUEUED_REPORTS {
             sender
                 .send(receiver.local_addr(), &sample_msg("worker"))
                 .await
                 .unwrap();
         }
-        assert!(
-            sender
-                .send(receiver.local_addr(), &sample_msg("overflow"))
+        // The queue is full: the next report isn't acknowledged yet...
+        let target = receiver.local_addr();
+        let mut overflow = tokio::spawn(async move {
+            TcpReportingSender::new(None, Default::default())
+                .send(target, &sample_msg("overflow"))
                 .await
-                .is_err()
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut overflow)
+                .await
+                .is_err(),
+            "a report was acknowledged while the queue was full"
         );
+        // ...and is admitted once the aggregator takes one.
         assert!(receiver.recv().await.is_some());
-        sender
-            .send(receiver.local_addr(), &sample_msg("retry"))
+        tokio::time::timeout(Duration::from_secs(5), overflow)
             .await
+            .expect("the held report was never admitted")
+            .unwrap()
             .unwrap();
         shutdown.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_report_that_never_finds_room_is_not_acknowledged() {
+        // The receiving half of the accept path: a queue nobody drains.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send((addr(1), None, sample_msg("filler"))).unwrap();
+        let frame = encode_report(&sample_msg("worker")).unwrap();
+        let (mut client, server) = tokio::io::duplex(frame.len() + 8);
+        client
+            .write_all(&(frame.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        client.write_all(&frame).await.unwrap();
+        let _ = tokio::time::timeout(
+            REPORT_ACCEPT_DEADLINE,
+            TcpReportingTransport::handle_connection(server, addr(2), None, tx),
+        )
+        .await;
+        let mut ack = [0];
+        assert!(
+            !matches!(client.read(&mut ack).await, Ok(1)),
+            "a report that was never queued was acknowledged"
+        );
     }
 
     #[tokio::test]
