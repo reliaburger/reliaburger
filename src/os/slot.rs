@@ -98,6 +98,38 @@ pub fn asset_url(
     Ok(format!("{base}/os-{version}-{arch}/{file}"))
 }
 
+/// How much of the UKI [`OsSlot`] reads to find its PE header. The DOS
+/// stub in front of it is a few hundred bytes in every UKI we build.
+const PE_HEAD_BYTES: u64 = 4096;
+
+/// The architecture a PE image (the UKI) is built for, by Rust's name for
+/// it (`std::env::consts::ARCH`), from the first bytes of the file.
+///
+/// The DOS header starts `MZ` and holds the PE header's offset at 0x3c; the
+/// PE header is `PE\0\0` followed by the machine type.
+pub fn pe_architecture(head: &[u8]) -> Result<&'static str, String> {
+    if !head.starts_with(b"MZ") {
+        return Err("it isn't a PE image (no MZ header)".to_string());
+    }
+    let truncated = || "its PE header is cut short".to_string();
+    let offset = head.get(0x3c..0x40).ok_or_else(truncated)?;
+    let offset = u32::from_le_bytes([offset[0], offset[1], offset[2], offset[3]]) as usize;
+    let header = offset
+        .checked_add(6)
+        .and_then(|end| head.get(offset..end))
+        .ok_or_else(truncated)?;
+    if &header[..4] != b"PE\0\0" {
+        return Err("it isn't a PE image (no PE signature)".to_string());
+    }
+    match u16::from_le_bytes([header[4], header[5]]) {
+        0x8664 => Ok("x86_64"),
+        0xAA64 => Ok("aarch64"),
+        other => Err(format!(
+            "its PE machine type 0x{other:04x} is neither x86_64 nor aarch64"
+        )),
+    }
+}
+
 /// What the saved state means once the node is up again on `running`: a
 /// reboot into the target that left us on another version was a fallback.
 ///
@@ -386,12 +418,42 @@ impl OsSlot {
             let digest = download(&client, &url(file)?, &incoming.join(file)).await?;
             check_asset(&entries, &sums_name, file, &digest).map_err(|e| e.to_string())?;
         }
+        // The signed sums name no architecture, and both builds name their
+        // files the same, so the UKI's own header is what says whose it is.
+        let uki = files
+            .iter()
+            .find(|file| file.ends_with(".efi"))
+            .ok_or_else(|| "the release has no UKI".to_string())?;
+        self.check_architecture(&incoming.join(uki)).await?;
         let staging = self.paths.staging.clone();
         tokio::task::spawn_blocking(move || promote_incoming(&staging, &incoming, &files))
             .await
             .map_err(|e| e.to_string())??;
         eprintln!("bun: os update: {version} checked; running systemd-sysupdate");
         run(&self.paths.sysupdate, &[version.as_str()]).await
+    }
+}
+
+impl OsSlot {
+    /// Refuse a UKI built for another architecture than this node's.
+    async fn check_architecture(&self, uki: &Path) -> Result<(), String> {
+        use tokio::io::AsyncReadExt;
+        let mut head = Vec::new();
+        tokio::fs::File::open(uki)
+            .await
+            .map_err(|e| format!("{}: {e}", uki.display()))?
+            .take(PE_HEAD_BYTES)
+            .read_to_end(&mut head)
+            .await
+            .map_err(|e| format!("{}: {e}", uki.display()))?;
+        let built_for = pe_architecture(&head).map_err(|e| format!("the release's UKI: {e}"))?;
+        if built_for != self.arch {
+            return Err(format!(
+                "the release's UKI is for {built_for}, this node is {}",
+                self.arch
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -567,6 +629,31 @@ mod tests {
     }
 
     #[test]
+    fn the_uki_s_pe_header_names_its_architecture() {
+        assert_eq!(pe_architecture(&pe_header(0x8664)), Ok("x86_64"));
+        assert_eq!(pe_architecture(&pe_header(0xAA64)), Ok("aarch64"));
+        assert!(
+            pe_architecture(&pe_header(0x014c))
+                .unwrap_err()
+                .contains("0x014c")
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_whole_pe_header_names_no_architecture() {
+        let whole = pe_header(0x8664);
+        assert!(pe_architecture(b"uki").is_err(), "no MZ");
+        assert!(pe_architecture(&whole[..0x3e]).is_err(), "no offset");
+        assert!(pe_architecture(&whole[..0x44]).is_err(), "no machine");
+        let mut far = whole.clone();
+        far[0x3c..0x40].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(pe_architecture(&far).is_err(), "offset past the end");
+        let mut unsigned = whole;
+        unsigned[0x40] = b'X';
+        assert!(pe_architecture(&unsigned).is_err(), "no PE signature");
+    }
+
+    #[test]
     fn the_release_sits_beside_the_channel() {
         assert_eq!(
             asset_url(
@@ -734,13 +821,23 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn staging_checks_the_release_then_runs_sysupdate_and_reboots() {
-        let dir = tempfile::tempdir().unwrap();
-        let (signing, public) = keypair();
-        let version = "2026.42.0";
-        let files = [
-            (format!("reliaburger-os_{version}.efi"), b"uki".to_vec()),
+    /// The first bytes of a PE image (a UKI) built for `machine`: the DOS
+    /// header's `MZ`, the offset of the PE header at 0x3c, and the PE
+    /// signature followed by the machine field.
+    fn pe_header(machine: u16) -> Vec<u8> {
+        let mut bytes = vec![0u8; 0x40];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        bytes.extend_from_slice(b"PE\0\0");
+        bytes.extend_from_slice(&machine.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 18]);
+        bytes
+    }
+
+    /// The three files of release `version`, with `uki` as its UKI.
+    fn release_files(version: &str, uki: Vec<u8>) -> Vec<(String, Vec<u8>)> {
+        vec![
+            (format!("reliaburger-os_{version}.efi"), uki),
             (
                 format!("reliaburger-os_{version}.usr.0a1b.raw.zst"),
                 b"usr".to_vec(),
@@ -749,7 +846,19 @@ mod tests {
                 format!("reliaburger-os_{version}.usr-verity.2c3d.raw.zst"),
                 b"verity".to_vec(),
             ),
-        ];
+        ]
+    }
+
+    /// Serve `files` and their signed `SHA256SUMS` as the x86_64 release
+    /// `version`, on a loopback port. A file named in `stall` sends its
+    /// first chunk and then nothing, without closing. Returns the channel
+    /// URL a directive carries.
+    async fn serve_release(
+        version: &str,
+        files: &[(String, Vec<u8>)],
+        signing: impl Fn(&[u8]) -> Vec<u8>,
+        stall: Option<&str>,
+    ) -> String {
         let sums: String = files
             .iter()
             .map(|(name, bytes)| format!("{}  {name}\n", hex::encode(Sha256::digest(bytes))))
@@ -760,26 +869,41 @@ mod tests {
         served.insert(format!("{sums_name}.sig"), signing(sums.as_bytes()));
         served.insert(sums_name, sums.into_bytes());
         let served = Arc::new(served);
+        let stall = stall.map(str::to_string);
         let app = axum::Router::new().route(
-            "/releases/download/os-2026.42.0-x86_64/{file}",
-            axum::routing::get({
-                let served = Arc::clone(&served);
+            &format!("/releases/download/os-{version}-x86_64/{{file}}"),
+            axum::routing::get(
                 move |axum::extract::Path(file): axum::extract::Path<String>| {
                     let served = Arc::clone(&served);
+                    let stall = stall.clone();
                     async move {
-                        served
+                        let bytes = served
                             .get(&file)
                             .cloned()
-                            .ok_or(axum::http::StatusCode::NOT_FOUND)
+                            .ok_or(axum::http::StatusCode::NOT_FOUND)?;
+                        if stall.as_deref() != Some(file.as_str()) {
+                            return Ok(axum::body::Body::from(bytes));
+                        }
+                        let first = futures_util::stream::once(async move {
+                            Ok::<_, std::io::Error>(axum::body::Bytes::from(bytes))
+                        });
+                        Ok::<_, axum::http::StatusCode>(axum::body::Body::from_stream(
+                            first.chain(futures_util::stream::pending()),
+                        ))
                     }
-                }
-            }),
+                },
+            ),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await });
+        format!("http://{address}/releases/download/os-channel/os-channel.json")
+    }
 
-        let log = dir.path().join("commands.log");
+    /// Paths in `dir` whose sysupdate and reboot only append their name and
+    /// arguments to `commands.log`.
+    fn recording_paths(dir: &Path) -> SlotPaths {
+        let log = dir.join("commands.log");
         let record = |name: &str| {
             vec![
                 "sh".to_string(),
@@ -788,38 +912,64 @@ mod tests {
                 "sh".to_string(),
             ]
         };
-        let paths = SlotPaths {
-            state_file: dir.path().join("os-update.json"),
-            staging: dir.path().join("staging"),
+        SlotPaths {
+            state_file: dir.join("os-update.json"),
+            staging: dir.join("staging"),
             sysupdate: record("sysupdate"),
             reboot: record("reboot"),
-            boot_count: dir.path().join("LoaderBootCountPath"),
+            boot_count: dir.join("LoaderBootCountPath"),
             boot_complete: vec!["true".into()],
-        };
-        let slot = OsSlot::new(paths, "x86_64", vec![public], Some("2026.41.0".into()));
-        let directive = OsDirective {
+        }
+    }
+
+    /// Wait up to five seconds for staging to end, in a reboot or a failure.
+    async fn settled(slot: &OsSlot, log: &Path) -> OsUpdateState {
+        for _ in 0..100 {
+            match slot.state().await {
+                OsUpdateState::Failed { .. } => break,
+                OsUpdateState::Rebooting { .. }
+                    if std::fs::read_to_string(log).is_ok_and(|l| l.contains("reboot")) =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        slot.state().await
+    }
+
+    fn directive(version: &str, channel_url: String) -> OsDirective {
+        OsDirective {
             rollout_id: "r1".into(),
             version: version.into(),
-            channel_url: format!("http://{address}/releases/download/os-channel/os-channel.json"),
-        };
+            channel_url,
+        }
+    }
+
+    #[tokio::test]
+    async fn staging_checks_the_release_then_runs_sysupdate_and_reboots() {
+        let dir = tempfile::tempdir().unwrap();
+        let (signing, public) = keypair();
+        let version = "2026.42.0";
+        let files = release_files(version, pe_header(0x8664));
+        let channel_url = serve_release(version, &files, signing, None).await;
+        let log = dir.path().join("commands.log");
+        let slot = OsSlot::new(
+            recording_paths(dir.path()),
+            "x86_64",
+            vec![public],
+            Some("2026.41.0".into()),
+        );
+        let directive = directive(version, channel_url);
         assert_eq!(slot.begin(&directive).await.unwrap(), Begun::Started);
         assert_eq!(slot.begin(&directive).await.unwrap(), Begun::InProgress);
         let mut other = directive.clone();
         other.version = "2026.43.0".into();
         assert!(slot.begin(&other).await.is_err(), "one update at a time");
 
-        for _ in 0..100 {
-            if matches!(
-                slot.state().await,
-                OsUpdateState::Rebooting { .. } | OsUpdateState::Failed { .. }
-            ) && std::fs::read_to_string(&log).is_ok_and(|l| l.contains("reboot"))
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
         assert_eq!(
-            slot.state().await,
+            settled(&slot, &log).await,
             OsUpdateState::Rebooting {
                 target: version.into()
             }
@@ -842,6 +992,34 @@ mod tests {
         };
         let again = OsSlot::new(paths, "x86_64", Vec::new(), Some("2026.41.0".into()));
         assert!(matches!(again.state().await, OsUpdateState::Failed { .. }));
+    }
+
+    /// The signed sums name no architecture, and both builds name their
+    /// files the same, so an aarch64 release served at an x86_64 node's URL
+    /// passes the signature and sum checks. The UKI's PE header doesn't.
+    #[tokio::test]
+    async fn a_release_built_for_another_architecture_is_never_staged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (signing, public) = keypair();
+        let version = "2026.42.0";
+        let files = release_files(version, pe_header(0xAA64));
+        let channel_url = serve_release(version, &files, signing, None).await;
+        let log = dir.path().join("commands.log");
+        let slot = OsSlot::new(
+            recording_paths(dir.path()),
+            "x86_64",
+            vec![public],
+            Some("2026.41.0".into()),
+        );
+        slot.begin(&directive(version, channel_url)).await.unwrap();
+
+        let state = settled(&slot, &log).await;
+        assert!(
+            matches!(&state, OsUpdateState::Failed { reason, .. }
+                if reason.contains("aarch64") && reason.contains("x86_64")),
+            "{state:?}"
+        );
+        assert!(!log.exists(), "neither sysupdate nor the reboot ran");
     }
 
     #[tokio::test]

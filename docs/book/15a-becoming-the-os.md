@@ -872,6 +872,21 @@ pub enum Cordon {
 
 Then the leader posts the directive, and the node takes over. It fetches the release's `SHA256SUMS` and signature from the GitHub release named after the version, checks the signature, streams each file to disk while hashing it, and hands the directory to sysupdate, exactly as `os-stage` did. Which key does it check against? The release keys compiled into bun, *and* the key in `/usr/lib/reliaburger/os-signing-key.pub.pem` in its own image. dm-verity guards that file like every other byte of `/usr`, so an image vouches for its successors. A published image carries the release key; a CI lab build carries its own throwaway key, which is what lets CI test a real update between two lab builds.
 
+There's one thing the signature doesn't say: which machine the release is for. The x86_64 and aarch64 builds name their files the same, and the architecture lives only in the download URL (`os-2026.42.0-x86_64/`). Put the aarch64 files under the x86_64 URL, by a publishing slip or on purpose, and every check passes: right key, right hashes. The node then reboots into a UKI its firmware can't run, burns both tries and falls back, ten minutes of downtime for a release everything said was fine. So, once the UKI's hash checks out, the node reads its first 4 KiB and asks the file itself. A UKI is a PE image, the format Windows uses for `.exe` files: it starts `MZ`, holds the offset of the real header at byte 0x3c, and that header is `PE\0\0` followed by a two-byte machine type, 0x8664 for x86_64 and 0xAA64 for aarch64. `pe_architecture` reads those few bytes:
+
+```rust
+let offset = head.get(0x3c..0x40).ok_or_else(truncated)?;
+let offset = u32::from_le_bytes([offset[0], offset[1], offset[2], offset[3]]) as usize;
+let header = offset
+    .checked_add(6)
+    .and_then(|end| head.get(offset..end))
+    .ok_or_else(truncated)?;
+```
+
+Two Rust habits keep a hostile file from crashing it. Indexing a slice with `head[0x3c..0x40]` panics when the file is shorter; `head.get(0x3c..0x40)` returns an `Option` instead, `None` when the range runs off the end, and `ok_or_else` turns that into our error. And the offset comes from the file, so `offset + 6` could overflow on a 32-bit build; `checked_add` returns `None` rather than wrapping. `u32::from_le_bytes` is C's "cast the bytes to a little-endian `uint32_t`" without the cast: it takes exactly four bytes by value, so there's no alignment or aliasing question to get wrong. A UKI built for another machine ends the update as `Failed` with `the release's UKI is for aarch64, this node is x86_64`, before sysupdate touches the spare slot.
+
+The other fix would bind the architecture into what's signed: the leader could pass the channel's per-architecture `sums_sha256` in the directive. That changes the cluster's wire format, and the PE check closes the hole without one, so it waits.
+
 Before it reboots, the node writes what it's doing to `/var/lib/reliaburger/os-update.json`: `{"state": "rebooting", "target": "2026.42.0"}`. That one file answers the hard question after the reboot. If the node comes up on 2026.42.0 and the boot gets blessed, the update worked. If it comes up on anything else, it was a fallback, and bun says so in `/v1/version`:
 
 ```rust

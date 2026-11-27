@@ -490,6 +490,12 @@ appliance or is already updating to another version. Then, off the request:
 2. Download exactly three files, the UKI, `usr.<uuid>.raw.zst` and
    `usr-verity.<uuid>.raw.zst`, into a private `.incoming` directory,
    checking each one's hash, then move them into staging.
+   The signed sums don't name the architecture (both builds name their files
+   the same), so the node also reads the UKI's PE header and refuses one whose
+   machine type (0x8664 x86_64, 0xAA64 aarch64) isn't its own. Binding the
+   architecture into what is signed, by passing the channel's per-architecture
+   `sums_sha256` in the directive, would change the wire format; it hasn't
+   been done.
 3. Run `systemd-sysupdate` with `/usr/lib/reliaburger/sysupdate.d`. It writes
    `/usr` and its verity into the inactive slot, and the UKI into
    `/EFI/Linux` with two tries left (`TriesLeft=2`). Its own verification is

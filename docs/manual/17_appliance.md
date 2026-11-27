@@ -1065,8 +1065,9 @@ leader takes the nodes in turn: workers first, then the council (only while
 the others can keep a majority), and itself last. For each node it first
 moves the workloads it can elsewhere, then tells the node to update. The node
 downloads the release from GitHub, checks its signature against the key its
-own image carries and every file against the release's `SHA256SUMS`, writes
-it into the spare slot and reboots. Once it's healthy on the new version, the
+own image carries and every file against the release's `SHA256SUMS`, checks
+that the UKI is built for its own architecture, writes it into the spare slot
+and reboots. Once it's healthy on the new version, the
 leader moves on. Apps with a managed volume or a host-path mount (a volume
 with a `source`) stay with their data and are back when the node is, a minute
 or two later. While a node drains and updates it takes no new work, and
