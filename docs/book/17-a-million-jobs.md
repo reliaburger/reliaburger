@@ -399,6 +399,30 @@ schedule text. Before checking the shared counter, the store computes whether
 this exact write needs an ID. Replaying an accepted run or skipping an occurrence
 still works when the counter has no IDs left.
 
+"A candidate clone" used to mean a clone of the whole store, and that got
+expensive (#2445). `TaskArrays` holds every retained array's chunk sets and
+every deployment's whole config, up to 128 KiB each, so it can run to
+megabytes. Admitting one manual job copied all of it three times inside one
+Raft apply, on every council member, while every other write waited: once to
+count the ids it needed, once in that preview's own capacity check, and once
+more in the real apply. Now a read-only `admit_job(&self, ...)` makes every
+check against borrowed state and a copy of the job catalogue alone, and returns
+a `JobAdmission` enum saying what would happen. `apply_job` publishes it;
+counting ids just matches on it. Capacity doesn't need a pruned copy either,
+because pruning only ever removes finished runs, so the active count is the
+same before and after. What pruning would do to the catalogue, it does to the
+catalogue's copy, by asking `expired` the same question `prune` asks.
+
+`&self` in that signature is the point. The borrow checker won't let a
+function that takes `&self` change the store, so "the preview can't leak into
+the real state" isn't a convention any more; it's checked. A test-only counter
+in `copy_for_preview` pins the cost: `admitting_one_job_copies_the_store_at_most_once`
+failed at 3 and now sees none. Deployment writes still try the whole
+transaction on one candidate copy, which is what makes them atomic. The `relish
+apply` stream that polls ten times a second now reads its one deployment
+through `read_control` instead of copying the store, and so does the leader's
+`settle`.
+
 The public paths now use those transactions. TOML apply persists a deployment
 intent, admits prerequisite hooks, and waits for accepted successful results.
 A leader commits app publication and ordinary run admission together. The
@@ -408,7 +432,8 @@ event stream. Tokio's `OwnedMutexGuard` keeps an `Arc` reference to the mutex,
 so a spawned task can hold it without borrowing a departed stack frame.
 
 Standalone writes clone the checkpoint, preflight identities and progress
-capacity, then publish private JSON with file and directory fsync. Only durable
+capacity, then publish private JSON with file and directory fsync. The JSON is
+serialised once and the same bytes are sized, reserved for and written. Only durable
 publication replaces the in-memory value. An I/O error fences later writes and
 dispatch.
 

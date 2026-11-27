@@ -93,6 +93,12 @@ const MAX_DECODED_COMPLETED_DEPLOYMENTS: usize =
 /// Largest serialised config a deployment receipt may keep.
 const MAX_DEPLOYMENT_CONFIG_BYTES: usize = 128 * 1024;
 
+// How many whole-store copies admission made on this thread (#2445).
+#[cfg(test)]
+thread_local! {
+    static PREVIEW_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// One submitted array: what to run, and how far it has got.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskArrayRecord {
@@ -439,6 +445,28 @@ pub enum TaskArrayStoreError {
     TooManyArrays { held: usize },
 }
 
+/// What a job write would do, decided before anything changes.
+enum JobAdmission {
+    /// A cron minute already observed: nothing to do.
+    Claimed,
+    /// A retry of a retained run.
+    Existing(u64),
+    /// Only the catalogue changes (a definition, or a skipped occurrence),
+    /// after a prune at `now`.
+    Recorded {
+        jobs: super::job::JobCatalog,
+        now: u64,
+    },
+    /// A new run, after a prune at `now`.
+    Register {
+        jobs: super::job::JobCatalog,
+        definition: Box<super::job::JobDefinition>,
+        run: super::job::RunRecord,
+        state: Box<TaskArrayState>,
+        now: u64,
+    },
+}
+
 /// Which share of the active-run slots a new run may use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Admission {
@@ -764,7 +792,7 @@ impl TaskArrays {
                 // Preflight the complete transaction, including every definition and ID,
                 // before touching the caller's allocation counter or publishing any state.
                 self.registration_ids(write)?;
-                let mut candidate = self.clone();
+                let mut candidate = self.copy_for_preview();
                 let result = candidate.apply_deployment(write, &mut allocate_id)?;
                 *self = candidate;
                 Ok(result)
@@ -1143,7 +1171,7 @@ impl TaskArrays {
                 | TaskArrayWrite::DeployCancel { .. }
                 | TaskArrayWrite::DeployRelease { .. }
         ) {
-            let mut candidate = self.clone();
+            let mut candidate = self.copy_for_preview();
             let mut next = 0u64;
             let mut count = 0;
             candidate.apply_deployment(write, &mut || {
@@ -1156,27 +1184,11 @@ impl TaskArrays {
             })?;
             return Ok(count);
         }
-        if let TaskArrayWrite::Job(write) = write
-            && let super::job::JobWrite::Fire { minute, .. } = write.as_ref()
-            && self
-                .cron_observed_minute
-                .is_some_and(|observed| observed > *minute)
-        {
-            return Ok(0);
-        }
         if let TaskArrayWrite::Job(write) = write {
-            let mut candidate = self.clone();
-            let mut next = 0u64;
-            let mut count = 0;
-            candidate.apply_job(write, || {
-                next += 1;
-                while self.arrays.contains_key(&next) || self.manifests.contains_key(&next) {
-                    next += 1;
-                }
-                count += 1;
-                next
-            })?;
-            return Ok(count);
+            return Ok(match self.admit_job(write)? {
+                JobAdmission::Register { .. } => 1,
+                _ => 0,
+            });
         }
         Ok(write.registration_ids())
     }
@@ -1238,31 +1250,33 @@ impl TaskArrays {
                 .any(|(_, run)| run.namespace == namespace && run.name == name)
     }
 
-    fn apply_job(
-        &mut self,
-        write: &super::job::JobWrite,
-        mut allocate_id: impl FnMut() -> u64,
-    ) -> Result<TaskArrayApplied, TaskArrayStoreError> {
+    /// Decide what a job write would do, without changing anything: every
+    /// check `apply_job` makes, run against borrowed state and a copy of the
+    /// job catalogue only (#2445).
+    fn admit_job(&self, write: &super::job::JobWrite) -> Result<JobAdmission, TaskArrayStoreError> {
+        use super::job::JobPlan;
         if let super::job::JobWrite::Fire { minute, .. } = write
             && self
                 .cron_observed_minute
                 .is_some_and(|observed| observed > *minute)
         {
-            return Ok(TaskArrayApplied::JobRecorded);
+            return Ok(JobAdmission::Claimed);
         }
-        use super::job::JobPlan;
         let active = self.active().map(|(id, _)| id).collect();
         let mut replay = self.jobs.clone();
-        if let Ok(super::job::JobPlan::Existing(batch_id)) = replay.prepare(write, &active) {
-            return Ok(TaskArrayApplied::Registered { batch_id });
+        if let Ok(JobPlan::Existing(batch_id)) = replay.prepare(write, &active) {
+            return Ok(JobAdmission::Existing(batch_id));
         }
         let now = match write {
             super::job::JobWrite::Put { now_epoch_secs, .. }
             | super::job::JobWrite::Fire { now_epoch_secs, .. } => *now_epoch_secs,
         };
-        let mut retained = self.clone();
-        retained.prune(now);
-        let mut jobs = retained.jobs.clone();
+        // The catalogue as a prune at `now` would leave it. Pruning drops
+        // only finished runs, so the store's active runs, and so its
+        // capacity, are the same before and after.
+        let expired = self.expired(now, TERMINAL_RETENTION_SECS);
+        let mut jobs = self.jobs.clone();
+        self.prune_catalogue(&mut jobs, &expired);
         let plan = jobs
             .prepare(write, &active)
             .map_err(TaskArrayStoreError::Job)?;
@@ -1297,35 +1311,63 @@ impl TaskArrays {
             }
         }
         match plan {
-            JobPlan::Existing(batch_id) => Ok(TaskArrayApplied::Registered { batch_id }),
-            JobPlan::Recorded => {
-                self.prune(now);
-                self.jobs = jobs;
-                Ok(TaskArrayApplied::JobRecorded)
-            }
+            JobPlan::Existing(batch_id) => Ok(JobAdmission::Existing(batch_id)),
+            JobPlan::Recorded => Ok(JobAdmission::Recorded { jobs, now }),
             JobPlan::Register {
                 definition,
                 run,
                 now_epoch_secs,
             } => {
-                let state = TaskArrayState::new(definition.tasks, now_epoch_secs)?;
+                let state = TaskArrayState::new(definition.tasks.clone(), now_epoch_secs)?;
                 let admission = Admission::of(Some(&run.trigger));
-                if let Err(full) = retained
+                if let Err(full) = self
                     .check_capacity(&run.namespace, admission, 1)
-                    .and_then(|()| retained.check_room(now, 1, 0))
+                    .and_then(|()| self.check_room_after(&expired, 1, 0))
                 {
                     let super::job::RunTrigger::Cron { minute } = run.trigger else {
                         return Err(full);
                     };
                     // A refused cron fire still claims its minute, so the
                     // leader doesn't retry it all minute and lose it silently.
-                    self.prune(now_epoch_secs);
                     jobs.record_skip(&run.namespace, &run.name, minute);
-                    self.jobs = jobs;
-                    return Ok(TaskArrayApplied::JobRecorded);
+                    return Ok(JobAdmission::Recorded {
+                        jobs,
+                        now: now_epoch_secs,
+                    });
                 }
-                // Every fallible check completes before pruning, allocating or publishing.
-                self.prune(now_epoch_secs);
+                Ok(JobAdmission::Register {
+                    jobs,
+                    definition,
+                    run,
+                    state: Box::new(state),
+                    now: now_epoch_secs,
+                })
+            }
+        }
+    }
+
+    fn apply_job(
+        &mut self,
+        write: &super::job::JobWrite,
+        mut allocate_id: impl FnMut() -> u64,
+    ) -> Result<TaskArrayApplied, TaskArrayStoreError> {
+        // Every fallible check completes before pruning, allocating or publishing.
+        match self.admit_job(write)? {
+            JobAdmission::Claimed => Ok(TaskArrayApplied::JobRecorded),
+            JobAdmission::Existing(batch_id) => Ok(TaskArrayApplied::Registered { batch_id }),
+            JobAdmission::Recorded { jobs, now } => {
+                self.prune(now);
+                self.jobs = jobs;
+                Ok(TaskArrayApplied::JobRecorded)
+            }
+            JobAdmission::Register {
+                mut jobs,
+                definition,
+                run,
+                state,
+                now,
+            } => {
+                self.prune(now);
                 let batch_id = allocate_id();
                 self.arrays.insert(
                     batch_id,
@@ -1333,7 +1375,7 @@ impl TaskArrays {
                         name: run.name.clone(),
                         namespace: run.namespace.clone(),
                         template: definition.template,
-                        state,
+                        state: *state,
                         terminal_at_epoch_secs: None,
                         quota_blocked: None,
                         unrunnable: None,
@@ -1426,10 +1468,36 @@ impl TaskArrays {
                 self.arrays.remove(&id);
             }
         }
-        self.jobs
-            .retain_runs(&self.arrays.keys().copied().collect());
+        let retained = self.arrays.keys().copied().collect();
         let deployments = &self.deployments;
-        self.jobs.expire_one_off(|namespace, name| {
+        Self::forget_pruned_runs(&mut self.jobs, &retained, deployments);
+    }
+
+    /// Bring `jobs` to what a prune dropping `expired` would leave, from this store's
+    /// arrays, without pruning the store itself.
+    fn prune_catalogue(&self, jobs: &mut super::job::JobCatalog, expired: &[(u64, bool)]) {
+        let mut retained: std::collections::BTreeSet<u64> = self.arrays.keys().copied().collect();
+        for &(id, parent) in expired {
+            if !parent {
+                retained.remove(&id);
+            } else if let Some(manifest) = self.manifests.get(&id) {
+                for (_, child) in &manifest.cohorts {
+                    retained.remove(child);
+                }
+            }
+        }
+        Self::forget_pruned_runs(jobs, &retained, &self.deployments);
+    }
+
+    /// Drop run provenance for arrays no longer `retained`, then one-off
+    /// definitions nothing references or deploys.
+    fn forget_pruned_runs(
+        jobs: &mut super::job::JobCatalog,
+        retained: &std::collections::BTreeSet<u64>,
+        deployments: &BTreeMap<String, super::job_deploy::DeploymentRecord>,
+    ) {
+        jobs.retain_runs(retained);
+        jobs.expire_one_off(|namespace, name| {
             deployments
                 .values()
                 .any(|record| record.blocks(name, namespace))
@@ -1526,8 +1594,19 @@ impl TaskArrays {
         arrays: usize,
         manifests: usize,
     ) -> Result<(), TaskArrayStoreError> {
+        let expired = self.expired(now_epoch_secs, TERMINAL_RETENTION_SECS);
+        self.check_room_after(&expired, arrays, manifests)
+    }
+
+    /// [`Self::check_room`], given what a prune would drop.
+    fn check_room_after(
+        &self,
+        expired: &[(u64, bool)],
+        arrays: usize,
+        manifests: usize,
+    ) -> Result<(), TaskArrayStoreError> {
         let (mut kept_arrays, mut kept_manifests) = (self.arrays.len(), self.manifests.len());
-        for (id, parent) in self.expired(now_epoch_secs, TERMINAL_RETENTION_SECS) {
+        for &(id, parent) in expired {
             if parent {
                 kept_manifests -= 1;
                 kept_arrays -= self.manifests.get(&id).map_or(0, |m| m.cohorts.len());
@@ -1544,6 +1623,15 @@ impl TaskArrays {
             )));
         }
         Ok(())
+    }
+
+    /// A whole copy of the store, for admission to try a write on before
+    /// publishing it. The store can hold megabytes, and this runs inside a
+    /// Raft apply on every replica, so tests count the copies (#2445).
+    fn copy_for_preview(&self) -> Self {
+        #[cfg(test)]
+        PREVIEW_COPIES.with(|copies| copies.set(copies.get() + 1));
+        self.clone()
     }
 
     /// Keep only the newest `keep` completed deployment receipts.
@@ -1744,7 +1832,7 @@ impl TaskArrays {
                         "app identity belongs to a job definition or retained run",
                     ));
                 }
-                let mut prospective = self.clone();
+                let mut prospective = self.copy_for_preview();
                 let mut preview_id = 0u64;
                 for (name, spec) in &config.job {
                     let namespace = spec.namespace.clone().unwrap_or_else(|| "default".into());
@@ -3342,6 +3430,36 @@ mod tests {
         assert_ne!(other, first);
     }
 
+    fn preview_copies() -> usize {
+        PREVIEW_COPIES.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn admitting_one_job_copies_the_store_at_most_once() {
+        let mut arrays = TaskArrays::default();
+        let write = job_put(
+            "default",
+            "work",
+            None,
+            Some(super::super::job::RunTrigger::Manual {
+                request_id: "r1".into(),
+            }),
+            10,
+        );
+        let before = preview_copies();
+        // As the state machine does: plan the ids, then apply.
+        assert_eq!(arrays.planned_ids(&write).unwrap(), 1);
+        assert!(matches!(
+            arrays.apply(&write, counter()).unwrap(),
+            TaskArrayApplied::Registered { batch_id: 1 }
+        ));
+        let copies = preview_copies() - before;
+        assert!(
+            copies <= 1,
+            "admitting one job copied the store {copies} times"
+        );
+    }
+
     /// Serialise and decode the store, as a snapshot or `jobs.json` does.
     /// Whatever `apply` produces must come back (#2365).
     fn assert_reopens(arrays: &TaskArrays) {
@@ -3458,7 +3576,11 @@ mod tests {
                     )
                     .unwrap();
             }
-            assert_reopens(&arrays);
+            // Reopening a store this size is slow in a debug build: check
+            // every eighth batch, and the final state below.
+            if k % 8 == 7 {
+                assert_reopens(&arrays);
+            }
         }
         let mut extra = manifest_write("extra", 4);
         if let TaskArrayWrite::RegisterManifest {
