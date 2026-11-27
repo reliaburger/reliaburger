@@ -897,6 +897,8 @@ Git credentials (SSH keys, HTTPS tokens) are stored on each council member node 
 
 **HTTPS tokens:** Can be encrypted with the cluster's `age` public key (same encryption used for secrets). Bun decrypts at runtime.
 
+**Not in argv or the clone's config (M27, #2414).** Bun hands git the repository URL with the credential removed and supplies the credential through a `credential.helper` that reads it from the child's environment (`RELIABURGER_GIT_PASSWORD`, and `RELIABURGER_GIT_USERNAME` for a token-only `https://TOKEN@host` URL, sent as the username with an empty password, as the URL form would be). The helper string in argv names the variables, never their values. A reused clone whose stored remote still carries a credential is rewritten to the clean URL when it's opened.
+
 **No credential passthrough.** Lettuce never logs, emits, or includes git credentials in error messages, webhook responses, or `SyncState`. Error messages from `git2` are sanitized to remove any credential material before being stored.
 
 ### 8.4 Inline Script RCE Prevention

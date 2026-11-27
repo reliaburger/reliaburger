@@ -527,8 +527,11 @@ credential therefore needs `[security] master_key_path` on the council
 members, and `relish gitops status` never shows one.
 
 The sync always reads every `.toml` file under `path`, subdirectories
-included. Credentials go in the URL; Bun strips them out of the process arguments and
-Git's config. With `require_signed_commits`, a commit that doesn't verify
+included. Credentials go in the URL, either as `https://user:TOKEN@host/...`
+or as a bare token, `https://TOKEN@host/...`. Bun strips them out of git's
+process arguments and the clone's config in both forms, and hands them to git
+through a credential helper; a clone an older Bun left with a token in its
+config is cleaned the next time it's opened. With `require_signed_commits`, a commit that doesn't verify
 against `trusted_signing_keys` isn't applied, and an empty key list refuses
 everything. List full fingerprints: the 40-hex-digit GPG fingerprint of the
 signing key or its primary key (case and spaces don't matter), or an SSH
