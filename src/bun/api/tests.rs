@@ -7405,6 +7405,55 @@ async fn the_metrics_query_handler_releases_the_store_before_it_queries() {
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
 }
 
+/// #2451: `/v1/metrics/cluster` with no `start` read the whole rollup
+/// retention, which is what a dashboard's first request looks like. It now
+/// reads the last hour.
+#[tokio::test]
+async fn a_cluster_query_without_a_start_reads_the_last_hour() {
+    let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+    let dir = tempfile::tempdir().unwrap();
+    let mut rollups = crate::mayo::rollup_store::RollupStore::new(dir.path().to_path_buf());
+    let now = crate::mayo::types::Sample::now(0.0).timestamp;
+    for timestamp in [60, now - now % 60 - 60] {
+        rollups.ingest(&crate::mayo::rollup::NodeRollup {
+            node_id: crate::meat::NodeId::new("w1"),
+            timestamp,
+            part: 0,
+            entries: vec![crate::mayo::rollup::RollupEntry {
+                metric_name: "cpu".into(),
+                labels: std::collections::BTreeMap::new(),
+                aggregate: crate::mayo::rollup::RollupAggregate {
+                    min: 1.0,
+                    max: 1.0,
+                    sum: 1.0,
+                    count: 1,
+                },
+            }],
+        });
+    }
+    let app = router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::new(RwLock::new(rollups))),
+        None,
+        None,
+        9117,
+        None,
+    );
+    let (status, body) = get_bytes(app, "/v1/metrics/cluster?name=cpu").await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let result: MetricsQueryResult = serde_json::from_slice(&body).unwrap();
+    assert_eq!(result.data.len(), 1, "{:?}", result.data);
+    assert_eq!(result.data[0].timestamp, now - now % 60 - 60);
+}
+
 /// #1499: `relish logs-export` copies a node's archive to the operator's
 /// machine through these two routes. The listing names each Parquet file
 /// with its size and SHA-256, the file route serves those exact bytes, and

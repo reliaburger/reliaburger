@@ -318,15 +318,26 @@ pub(super) async fn metrics_owned_rollup_handler(
         Ok(snapshot) => snapshot,
         Err(error) => return metrics_store_error(error),
     };
+    // One page at a time; a longer answer names where the next page starts
+    // (#2451), and the entry node follows it.
     match snapshot
-        .query_owned_rows(
+        .query_owned_page(
             params.name.as_deref(),
             params.start.unwrap_or(0),
             params.end.unwrap_or(i64::MAX as u64),
         )
         .await
     {
-        Ok(rows) => Json(rows).into_response(),
+        Ok(page) => {
+            let mut response = Json(page.rows).into_response();
+            if let Some(next) = page.next_start {
+                response.headers_mut().insert(
+                    crate::mayo::query_fanout::NEXT_START_HEADER,
+                    axum::http::HeaderValue::from(next),
+                );
+            }
+            response
+        }
         Err(error) => metrics_store_error(error),
     }
 }
@@ -362,7 +373,15 @@ pub(super) async fn resolve_council_urls(state: &ApiState) -> Option<Vec<String>
     if urls.is_empty() { None } else { Some(urls) }
 }
 
+/// Window `/v1/metrics/cluster` reads when the caller gives no `start`: the
+/// last hour, not the whole rollup retention (#2451).
+pub(super) const CLUSTER_METRICS_DEFAULT_WINDOW_SECS: u64 = 60 * 60;
+
 /// `GET /v1/metrics/cluster?name=X&start=S&end=E` — cluster-wide query.
+///
+/// Without `start` it reads the last [`CLUSTER_METRICS_DEFAULT_WINDOW_SECS`].
+/// A member's answer comes in pages; a member that refuses the query (too
+/// many contributions in the range) is reported with its reason.
 ///
 /// Fans out to all council aggregators' `/v1/metrics/rollup/owned` endpoints,
 /// deduplicates worker contributions before summing, and returns the combined data
@@ -385,7 +404,11 @@ pub(super) async fn metrics_cluster_handler(
     {
         return resp;
     }
-    let start = params.start.unwrap_or(0);
+    let start = params.start.unwrap_or_else(|| {
+        crate::mayo::types::Sample::now(0.0)
+            .timestamp
+            .saturating_sub(CLUSTER_METRICS_DEFAULT_WINDOW_SECS)
+    });
     // Clamped below u64::MAX: DataFusion 45's interval analysis
     // overflows (debug-build panic) computing the cardinality of a
     // full-domain unsigned range like `timestamp <= u64::MAX`.

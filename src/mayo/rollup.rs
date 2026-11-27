@@ -95,6 +95,9 @@ pub enum QueryWarning {
     /// Rollup data is unavailable for a time window (e.g. after
     /// aggregator reassignment).
     DataUnavailable { node_id: String, from: u64, to: u64 },
+    /// A node answered but refused the query, and why: usually a range
+    /// too large to answer, which narrowing fixes (#2451).
+    QueryRefused { node_id: String, reason: String },
 }
 
 /// Result of a metrics query, including data and any warnings.

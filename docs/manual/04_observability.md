@@ -189,6 +189,10 @@ The metrics API answers within bounds. `GET /v1/metrics?name=X` and
 range you ask for, `/v1/metrics/summary` and `/v1/metrics/keys` list the
 metrics reported in the last hour, and a query that runs longer than 8
 seconds is refused with a 400 asking for a narrower range.
+`/v1/metrics/cluster` reads the last hour when you give no `start`. A council
+member that refuses a range (more than 200,000 node-minute contributions, or
+one minute holding more than 10,000) shows up in the answer's `warnings` as
+`QueryRefused` with its reason, not as an unresponsive node.
 
 ### Remote metrics archives
 

@@ -462,6 +462,19 @@ impl RollupStore {
             .await
     }
 
+    /// See [`RollupSnapshot::query_owned_page`].
+    pub async fn query_owned_page(
+        &self,
+        metric_name: Option<&str>,
+        start: u64,
+        end: u64,
+    ) -> Result<OwnedRowsPage, MayoError> {
+        self.snapshot()
+            .await?
+            .query_owned_page(metric_name, start, end)
+            .await
+    }
+
     /// See [`RollupSnapshot::query_cluster_metric`].
     pub async fn query_cluster_metric(
         &self,
@@ -618,14 +631,42 @@ impl RollupSnapshot {
         Ok(results)
     }
 
-    /// Read worker contributions without losing the identity needed for reassignment deduplication.
-    /// Refuse oversized results rather than silently returning a truncated cluster sum.
+    /// Worker contributions in `[start, end]`, every page of them, without
+    /// losing the identity needed for reassignment deduplication. Refuses a
+    /// range of more than [`MAX_OWNED_ROWS`] rather than return a truncated
+    /// cluster sum.
     pub async fn query_owned_rows(
         &self,
         metric_name: Option<&str>,
         start: u64,
         end: u64,
     ) -> Result<Vec<OwnedRollupRow>, MayoError> {
+        let mut rows = Vec::new();
+        let mut cursor = start;
+        loop {
+            let page = self.query_owned_page(metric_name, cursor, end).await?;
+            rows.extend(page.rows);
+            if rows.len() > MAX_OWNED_ROWS {
+                return Err(too_many_contributions());
+            }
+            match page.next_start {
+                Some(next) if next > cursor => cursor = next,
+                _ => return Ok(rows),
+            }
+        }
+    }
+
+    /// One page of worker contributions from `start`, oldest first: at most
+    /// [`OWNED_ROWS_PAGE`] rows, ending on a whole minute, and the `start`
+    /// of the next page if there is more (#2451). A single minute holding
+    /// more than a page is refused: it can't be paged, and filtering by
+    /// metric name narrows it.
+    pub async fn query_owned_page(
+        &self,
+        metric_name: Option<&str>,
+        start: u64,
+        end: u64,
+    ) -> Result<OwnedRowsPage, MayoError> {
         let name_filter = metric_name
             .map(|name| {
                 format!(
@@ -636,7 +677,8 @@ impl RollupSnapshot {
             .unwrap_or_default();
         let end = end.min(i64::MAX as u64);
         let sql = format!(
-            "SELECT DISTINCT timestamp, node_id, metric_name, labels, sum_val FROM rollups WHERE timestamp >= {start} AND timestamp <= {end}{name_filter} ORDER BY timestamp, node_id, metric_name, labels LIMIT 10001"
+            "SELECT DISTINCT timestamp, node_id, metric_name, labels, sum_val FROM rollups WHERE timestamp >= {start} AND timestamp <= {end}{name_filter} ORDER BY timestamp, node_id, metric_name, labels LIMIT {}",
+            OWNED_ROWS_PAGE + 1
         );
         let batches = super::store::collect_sql(&self.session()?, &sql).await?;
         let mut rows = Vec::new();
@@ -678,13 +720,24 @@ impl RollupSnapshot {
                 });
             }
         }
-        if rows.len() > 10000 {
-            return Err(MayoError::QueryFailed(
-                "rollup query exceeds 10000 contributions; narrow the time range or metric filter"
-                    .into(),
-            ));
+        if rows.len() <= OWNED_ROWS_PAGE {
+            return Ok(OwnedRowsPage {
+                rows,
+                next_start: None,
+            });
         }
-        Ok(rows)
+        // The page ends before the first minute it couldn't hold whole.
+        let next = rows[OWNED_ROWS_PAGE].row.timestamp;
+        rows.retain(|owned| owned.row.timestamp < next);
+        if rows.is_empty() {
+            return Err(MayoError::QueryRejected(format!(
+                "one minute holds more than {OWNED_ROWS_PAGE} rollup contributions; filter by metric name"
+            )));
+        }
+        Ok(OwnedRowsPage {
+            rows,
+            next_start: Some(next),
+        })
     }
 
     /// Query cluster-wide aggregated metrics by name and time range.
@@ -839,6 +892,28 @@ impl RollupSnapshot {
 
         Ok(names)
     }
+}
+
+/// The most worker contributions one page of `/v1/metrics/rollup/owned`
+/// holds (#2451).
+pub const OWNED_ROWS_PAGE: usize = 10_000;
+
+/// The most worker contributions one cluster query reads from one member,
+/// over all its pages (#2451).
+pub const MAX_OWNED_ROWS: usize = 200_000;
+
+/// The refusal for a range with more than [`MAX_OWNED_ROWS`] contributions.
+pub(crate) fn too_many_contributions() -> MayoError {
+    MayoError::QueryRejected(format!(
+        "the range holds more than {MAX_OWNED_ROWS} rollup contributions; narrow the time range or filter by metric name"
+    ))
+}
+
+/// One page of worker contributions, and where the next page starts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OwnedRowsPage {
+    pub rows: Vec<OwnedRollupRow>,
+    pub next_start: Option<u64>,
 }
 
 /// A cluster-wide aggregate row with full statistics.
@@ -1080,19 +1155,22 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_owned_queries_refuse_instead_of_truncating_the_sum() {
+        // Paged since #2451: the refusal is at MAX_OWNED_ROWS, not one page.
         let (mut store, _dir) = test_store();
-        for window in 0..=10000 {
+        let most = MAX_OWNED_ROWS as u64;
+        for window in 0..=most {
             store.ingest(&make_rollup("worker-a", window, "cpu", 1.0));
         }
-        let error = store.query_owned_rows(None, 0, 10000).await.unwrap_err();
+        let error = store.query_owned_rows(None, 0, most).await.unwrap_err();
+        assert!(matches!(error, MayoError::QueryRejected(_)), "{error}");
         assert!(error.to_string().contains("narrow the time range"));
         assert_eq!(
             store
-                .query_owned_rows(Some("cpu"), 0, 9999)
+                .query_owned_rows(Some("cpu"), 0, most - 1)
                 .await
                 .unwrap()
                 .len(),
-            10000
+            MAX_OWNED_ROWS
         );
     }
 
@@ -1477,6 +1555,70 @@ mod tests {
         assert_eq!(rows.len(), crate::mayo::store::ALL_QUERY_ROW_LIMIT);
         assert_eq!(rows.last().unwrap().0, total * 60, "newest kept");
         assert!(rows.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    }
+
+    /// #2451: a member refused any cluster query over 10,000 contributions,
+    /// and one series on ten nodes is 14,400 a day. The query now reads in
+    /// pages and succeeds.
+    #[tokio::test]
+    async fn a_cluster_query_over_a_day_of_one_series_on_ten_nodes_succeeds() {
+        let (mut store, _dir) = test_store();
+        for node in 0..10 {
+            for minute in 1..=1_440 {
+                store.ingest(&make_rollup(
+                    &format!("node-{node}"),
+                    minute * 60,
+                    "node_cpu_usage_percent",
+                    1.0,
+                ));
+            }
+        }
+        let rows = store
+            .query_owned_rows(Some("node_cpu_usage_percent"), 0, i64::MAX as u64)
+            .await
+            .unwrap();
+        let merged = crate::mayo::query_fanout::merge_owned_rollups(vec![rows]);
+        assert!(merged.warnings.is_empty(), "{:?}", merged.warnings);
+        assert_eq!(merged.data.len(), 1_440);
+        assert!(merged.data.iter().all(|row| row.value == 10.0));
+    }
+
+    /// #2451: a page holds whole minutes only, so the next page starts
+    /// where it stopped and no minute is split between two.
+    #[tokio::test]
+    async fn an_owned_rows_page_ends_on_a_whole_minute() {
+        let (mut store, _dir) = test_store();
+        for node in 0..3 {
+            for minute in 1..=5_000 {
+                store.ingest(&make_rollup(&format!("n{node}"), minute * 60, "cpu", 1.0));
+            }
+        }
+        let page = store
+            .snapshot()
+            .await
+            .unwrap()
+            .query_owned_page(Some("cpu"), 0, i64::MAX as u64)
+            .await
+            .unwrap();
+        let next = page.next_start.expect("15,000 rows take two pages");
+        assert!(page.rows.len() <= OWNED_ROWS_PAGE);
+        assert_eq!(page.rows.len() % 3, 0, "a minute was split");
+        assert!(page.rows.iter().all(|row| row.row.timestamp < next));
+    }
+
+    /// #2451: one minute with more contributions than a page can't be
+    /// paged; it's refused as the caller's to narrow, not as a failure.
+    #[tokio::test]
+    async fn a_minute_larger_than_a_page_is_refused() {
+        let (mut store, _dir) = test_store();
+        for node in 0..=OWNED_ROWS_PAGE {
+            store.ingest(&make_rollup(&format!("n{node}"), 60, "cpu", 1.0));
+        }
+        let error = store
+            .query_owned_rows(Some("cpu"), 0, 1_000)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, MayoError::QueryRejected(_)), "{error}");
     }
 
     /// #2426: a minute too large for one frame arrives in parts. Each part

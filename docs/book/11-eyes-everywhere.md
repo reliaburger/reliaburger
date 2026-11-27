@@ -333,10 +333,15 @@ pub struct MetricsQueryResult {
 pub enum QueryWarning {
     NodeUnresponsive { node_id: String },
     DataUnavailable { node_id: String, from: u64, to: u64 },
+    QueryRefused { node_id: String, reason: String },
 }
 ```
 
 Graceful degradation is the goal. If one council member is down, you get partial results plus a warning telling you which data is missing. No 500 error, no empty response, no silent data loss. The caller can decide whether partial data is good enough for their use case.
+
+`QueryRefused` arrived with the audit ([#2451](https://github.com/reliaburger/reliaburger/issues/2451)), and it's the log fan-out's lesson below, learned a second time. Each member refused any answer of more than 10,000 contributions, one row per node, minute and series. With no `start`, the window was the whole 24-hour rollup retention, and one unlabelled series on one node is 1,440 rows a day, so a member aggregating seven nodes failed a dashboard's very first request. It answered 500 with "narrow the time range", the fan-out's `error_for_status()` threw that body away, and the operator saw every council member "unresponsive" on a healthy cluster.
+
+Three changes. With no `start`, `/v1/metrics/cluster` reads the last hour. A member answers in pages: `/v1/metrics/rollup/owned` returns at most 10,000 rows ending on a whole minute, plus an `x-reliaburger-next-start` header naming where the next page begins, and the entry node follows it until there's no header. A header rather than a new response type keeps the body the same `Vec<OwnedRollupRow>`. And a member's refusal (past `MAX_OWNED_ROWS`, 200,000 rows, or one minute too big for a page) comes back as `QueryRefused` with the member's own words, read from the error body, instead of `NodeUnresponsive`. A single node with no council refuses the same way, as a 400. `a_cluster_query_over_a_day_of_one_series_on_ten_nodes_succeeds` is 14,400 contributions that used to be refused; `a_member_answer_in_pages_is_read_to_the_end` and `a_member_that_refuses_the_query_is_not_reported_as_unresponsive` drive the fan-out against a small axum server.
 
 ## Testing hierarchical aggregation
 

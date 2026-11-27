@@ -344,9 +344,11 @@ The council member stores received rollups in a rollup store and serves them at 
 **Status: implemented.** The fan-out helpers in `src/mayo/query_fanout.rs` (`fan_out_app_query`, `fan_out_cluster_query`, and the merge functions) are now wired into the handlers:
 
 - `/v1/metrics/app/{app}/{namespace}` resolves the app's nodes from the Meat placement map and fans the query out to each, merging the results (falling back to the local store when there's no placement).
-- `/v1/metrics/cluster` enumerates the Raft voters, maps each to its live membership address, and sums each member's `/v1/metrics/rollup` (falling back to local rollup data on a single node / no council).
+- `/v1/metrics/cluster` enumerates the Raft voters, maps each to its live membership address, and sums each member's `/v1/metrics/rollup/owned` after dropping duplicate worker contributions (falling back to local rollup data on a single node / no council).
 
-Both the single-app path (`/v1/metrics/app`, via the Meat placement map) and the cluster-wide path (`/v1/metrics/cluster`, across council voters) fan out and merge, with a 10 s timeout on each fan-out (`src/bun/api/metrics.rs`). Top-N merge and annotations naming the nodes that didn't answer remain part of the planned design.
+Both the single-app path (`/v1/metrics/app`, via the Meat placement map) and the cluster-wide path (`/v1/metrics/cluster`, across council voters) fan out and merge, with a 10 s timeout on each member's whole answer (`src/bun/api/metrics.rs`).
+
+`/v1/metrics/cluster` bounds (#2451): without `start` it reads the last hour (`CLUSTER_METRICS_DEFAULT_WINDOW_SECS`). Each member answers `/v1/metrics/rollup/owned` in pages of at most `OWNED_ROWS_PAGE` (10,000) contributions ending on a whole minute, with an `x-reliaburger-next-start` header while more remain; the entry node follows the pages up to `MAX_OWNED_ROWS` (200,000) per member. A member that refuses (past that total, or one minute larger than a page) is reported as `QueryWarning::QueryRefused { node_id, reason }`, the reason read from its error body; only a member that doesn't answer is `NodeUnresponsive`. The single-node fallback refuses the same ranges with a 400. Top-N merge and annotations naming the nodes that didn't answer remain part of the planned design.
 
 ### 5.6 Alert Evaluation
 
