@@ -697,7 +697,7 @@ let tokens = council.api_tokens().await;
 replace_tokens_unless_changed(store, &seen, tokens).await;
 ```
 
-`replace_tokens_unless_changed` takes the write lock, and only writes if the store still equals `seen`. If a handler got in between, that tick does nothing and the next one, five seconds later, catches up. `ApiToken` derives `PartialEq`, and comparing a slice compares its elements one by one, so `current.as_slice() == seen` is all the comparison takes. `api_tokens()` is new too. It clones only the token list under the read lock, where `security_state()` clones the whole desired state to throw most of it away, and this runs on every tick on every node.
+`replace_tokens_unless_changed` takes the write lock, and only writes if the store still equals `seen`. If a handler got in between, that tick does nothing and the next one, five seconds later, catches up. `ApiToken` derives `PartialEq`, and comparing a slice compares its elements one by one, so `current.as_slice() == seen` is all the comparison takes. `api_tokens()` is new too. It clones only the token list under the read lock, where `security_state()` then cloned the whole desired state to throw most of it away (it no longer does; see [How fresh is "the current state"?](#how-fresh-is-the-current-state)), and this runs on every tick on every node.
 
 What if the replica is more than two seconds behind? We can't wait for ever, and the write has committed, so the node drops the token from its store anyway and answers. A refresh from that lagging replica can bring it back until the replica catches up, though, and a silent "revoked" would be a lie. So the answer says so: `token ci revoked, but this node's replica is behind: it may accept the token again until it catches up`. Only a revoke gets that warning. A rotated secret on a lagging node just gets a `401` until it catches up, and the caller still has the secret. The one gap we left is a zero-grace rotation through a node that far behind: the old secret works there until the replica catches up, and the answer doesn't say so.
 
@@ -2046,6 +2046,10 @@ pub fn check_crl(serial: SerialNumber, crl: &Crl) -> Result<(), CertError> {
 
 CRLs are small (one entry per revoked cert, most clusters have few revocations). They propagate through Raft replication, so all council members have the same CRL. Worker nodes read it from their assigned council parent.
 
+The CRL carries one more list: retired node identities. `relish decommission-node` adds a permanent tombstone for the node's name, so the name, its Raft id and its old certificates are never accepted again. Permanent means nothing removes one, and the list is capped at 65,536 (`MAX_RETIRED_NODES`) so it can't grow without bound. At the cap every further decommission is refused with "retired identity limit reached". That's the right answer, since forgetting a tombstone silently would let an old disk rejoin as an old node, but for a long time nothing told the operator the wall was coming ([#2375](https://github.com/reliaburger/reliaburger/issues/2375)). A cluster that autoscales workers and decommissions each one on scale-in walks towards it at fifty a day for three and a half years, then stops being able to retire nodes at all.
+
+Now `relish council status` prints `Retired: 3 of 65536 node identities`, from a `retired_identities` field each node's council status carries, and `relish wtf` raises `council-retired-identities-nearly-full` from 90%. We kept the tombstones permanent and didn't add expiry: a retired certificate stops mattering once it expires, but the name-reuse half of the rule never does. If a real cluster gets near the cap, raising it is the simpler answer. The apply paths that check a registry report or a join against the list still scan it; at a few hashes per name that's cheap until there are thousands of retirements, so we left it.
+
 ### Wiring the CRL into TLS handshakes
 
 For a long time `check_crl()` had exactly one caller: its own tests. Making revocation real meant getting it into the TLS handshake path, and that surfaced three problems worth walking through.
@@ -2074,16 +2078,38 @@ Signing a workload certificate is different. That read *is* the decision: it pul
 ```rust
 pub async fn security_state_linearizable(
     &self,
-) -> Result<SecurityState, CouncilError> {
+) -> Result<Arc<SecurityState>, CouncilError> {
     self.raft.ensure_linearizable().await
         .map_err(|e| CouncilError::ReadFailed(e.to_string()))?;
-    Ok(self.state_machine.desired_state().await.security_state)
+    Ok(self.local_security_state().await)
+}
+
+async fn local_security_state(&self) -> Arc<SecurityState> {
+    self.state_machine
+        .read_desired(|state| state.security_state.to_arc())
+        .await
 }
 ```
 
 `ensure_linearizable` checks with a quorum that this node is still the leader and has applied everything committed. On a follower it fails, and on a deposed leader it fails, which sounds like a limitation and is actually the entire point. The alternative isn't a fresh answer — followers can't produce one — it's a stale answer presented as authoritative. Returning an error says "I can't prove this is current", and the caller can forward to the leader or refuse.
 
 The general shape is worth keeping: a read whose staleness only costs you a retry can be local, a read that *is* the security decision has to prove it's current, and the two should be different function names so you can't pick the wrong one by accident.
+
+The listing above isn't the one we first wrote. That one ended with `self.state_machine.desired_state().await.security_state`: copy the *whole* desired state, every app spec, the image catalogue and the task arrays, then keep one field and drop the rest ([#2436](https://github.com/reliaburger/reliaburger/issues/2436)). `security_state()`, `security_state_confirmed()` and `manifest_catalog()` all did it, and they sit on busy paths: twice per workload certificate signed, every signed-image launch, every apply, and the council reconciler on every node every two seconds.
+
+`read_desired` was already there for this. It takes a closure and runs it against the state while holding the read lock:
+
+```rust
+pub async fn read_desired<T>(&self, read: impl FnOnce(&DesiredState) -> T) -> T {
+    read(&self.inner.read().await.state)
+}
+```
+
+The closure gets a `&DesiredState`, a borrow, and whatever it returns must not borrow from it: `T` has no lifetime tying it to the state, so the compiler won't let a reference escape past the unlock. You decide inside the closure exactly what to copy out. The reconciler, which only wants the retired names, now copies those names and nothing else.
+
+What should the security accessors copy out, then? Nothing, it turned out. Since the state's big collections became copy-on-write ([chapter 2](02-finding-friends.md#all-or-nothing-without-copying-everything)), each sits behind an `Arc`, and `to_arc()` hands out another pointer to the same allocation. So `security_state()` now returns an `Arc<SecurityState>` without copying a byte. Callers barely changed: `security.crl` and `security.trusted_cas(...)` work through the `Arc` by auto-deref. The ones that did change were moving a field *out*, like `council.security_state().await.api_tokens`, which you can't do through a shared pointer; they now say `.api_tokens.clone()`, which makes the copy visible where it happens. A reader that holds its `Arc` while a security write applies makes that write copy the security state once, which is the price of not holding the lock.
+
+A test-only counter in `CouncilStateMachine::desired_state` pins it: `reading_one_field_never_copies_the_whole_desired_state` calls every accessor and a membership change, and checks the counter didn't move. It moved by one per call before.
 
 ## Egress DNS resolution
 

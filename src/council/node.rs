@@ -614,6 +614,11 @@ impl CouncilNode {
     }
 
     /// Read the current desired state from the state machine.
+    ///
+    /// This copies the whole state (cheaply since #2435, but it still holds
+    /// every collection). It's for callers that need all of it, the
+    /// scheduler tick and the backup; a caller that wants one field uses
+    /// [`Self::read_desired`] or an accessor built on it.
     pub async fn desired_state(&self) -> DesiredState {
         #[cfg(test)]
         self.full_desired_reads
@@ -644,11 +649,8 @@ impl CouncilNode {
         let guard = self.node_fault_membership.lock().await;
         self.write(RaftRequest::Noop).await?;
         if self
-            .desired_state()
+            .read_desired(|state| state.node_fault_reservations.active.is_some())
             .await
-            .node_fault_reservations
-            .active
-            .is_some()
         {
             return Err(CouncilError::WriteFailed(
                 "membership change waits for node fault reversal".into(),
@@ -809,16 +811,26 @@ impl CouncilNode {
     ///
     /// A node with no Raft seat has nothing applied; it gets the leader's view
     /// instead, once it has fetched one (#1477).
-    pub async fn security_state(&self) -> crate::sesame::types::SecurityState {
-        let local = self.state_machine.desired_state().await.security_state;
+    ///
+    /// It hands back the replicated state behind an `Arc`, without copying
+    /// it (#2436): a reader that drops it before the next security write
+    /// costs nothing, and one that keeps it makes that write copy once.
+    pub async fn security_state(&self) -> std::sync::Arc<crate::sesame::types::SecurityState> {
+        let local = self.local_security_state().await;
         if local.is_initialised() {
             return local;
         }
-        self.leader_security_view
-            .read()
+        match self.leader_security_view.read().await.as_ref() {
+            Some(view) => std::sync::Arc::new(view.clone()),
+            None => local,
+        }
+    }
+
+    /// This node's own replica of the security state, without copying it.
+    async fn local_security_state(&self) -> std::sync::Arc<crate::sesame::types::SecurityState> {
+        self.state_machine
+            .read_desired(|state| state.security_state.to_arc())
             .await
-            .clone()
-            .unwrap_or(local)
     }
 
     /// Whether this node's own replica holds the security state. A node with
@@ -863,8 +875,7 @@ impl CouncilNode {
         }
     }
 
-    /// Every API token this node's replica has applied. Copies only the
-    /// tokens, where [`Self::security_state`] copies the whole desired state.
+    /// Every API token this node's replica has applied, copied out.
     ///
     /// A node with no Raft seat gets the tokens in the leader's view (#1477).
     pub async fn api_tokens(&self) -> Vec<crate::sesame::types::ApiToken> {
@@ -954,7 +965,7 @@ impl CouncilNode {
     /// rather than a stale answer it presents as authoritative (O7).
     pub async fn security_state_linearizable(
         &self,
-    ) -> Result<crate::sesame::types::SecurityState, CouncilError> {
+    ) -> Result<std::sync::Arc<crate::sesame::types::SecurityState>, CouncilError> {
         #[cfg(test)]
         self.hang_if_asked().await;
         if let Some(error) = self.fenced_error() {
@@ -964,7 +975,7 @@ impl CouncilNode {
             .ensure_linearizable()
             .await
             .map_err(|e| CouncilError::ReadFailed(e.to_string()))?;
-        Ok(self.state_machine.desired_state().await.security_state)
+        Ok(self.local_security_state().await)
     }
 
     /// [`Self::security_state_linearizable`], but a leader gets `within` to
@@ -977,7 +988,7 @@ impl CouncilNode {
     pub async fn security_state_confirmed(
         &self,
         within: std::time::Duration,
-    ) -> Result<crate::sesame::types::SecurityState, CouncilError> {
+    ) -> Result<std::sync::Arc<crate::sesame::types::SecurityState>, CouncilError> {
         #[cfg(test)]
         self.hang_if_asked().await;
         if let Some(error) = self.fenced_error() {
@@ -988,7 +999,7 @@ impl CouncilNode {
                 "this node can't prove it leads the council".into(),
             ));
         }
-        Ok(self.state_machine.desired_state().await.security_state)
+        Ok(self.local_security_state().await)
     }
 
     /// The desired state, confirmed fresh with a quorum first, as
@@ -1007,8 +1018,12 @@ impl CouncilNode {
     }
 
     /// Read the current Pickle manifest catalogue from the state machine.
-    pub async fn manifest_catalog(&self) -> crate::pickle::types::ManifestCatalog {
-        self.state_machine.desired_state().await.manifest_catalog
+    /// Like [`Self::security_state`], it shares the replicated catalogue
+    /// rather than copying it (#2436).
+    pub async fn manifest_catalog(&self) -> std::sync::Arc<crate::pickle::types::ManifestCatalog> {
+        self.state_machine
+            .read_desired(|state| state.manifest_catalog.to_arc())
+            .await
     }
 
     /// Sign a workload CSR with the Workload CA.
@@ -1288,6 +1303,74 @@ mod tests {
         // A fresh council has an empty catalogue; the accessor reads it from the
         // same replicated desired state as security_state().
         assert!(nodes[0].manifest_catalog().await.manifests.is_empty());
+    }
+
+    /// #2436: an accessor that returns one field of the desired state reads
+    /// it under the lock; it never copies the whole state to drop the rest.
+    #[tokio::test]
+    async fn reading_one_field_never_copies_the_whole_desired_state() {
+        let (mut nodes, router) = create_cluster(1).await;
+        init_cluster(&nodes).await;
+        wait_for_leader(&nodes, Duration::from_secs(5)).await;
+        let network = InMemoryRaftNetworkFactory::new(2, router.clone());
+        let learner = CouncilNode::new(
+            2,
+            fast_config(),
+            network,
+            MemLogStore::new(),
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        router.register(2, &learner).await;
+        nodes.push(learner);
+        let leader = &nodes[0];
+        let before = leader.state_machine.full_clones();
+        leader.security_state().await;
+        leader.security_state_linearizable().await.unwrap();
+        leader
+            .security_state_confirmed(LEADER_CONFIRMATION)
+            .await
+            .unwrap();
+        leader.manifest_catalog().await;
+        leader.add_learner(2, node_info(2)).await.unwrap();
+        assert_eq!(leader.state_machine.full_clones(), before);
+    }
+
+    /// #2375: `relish council status` says how many permanent identity
+    /// tombstones the council holds, against the limit.
+    #[tokio::test]
+    async fn council_status_reports_how_full_the_retired_identity_list_is() {
+        let (nodes, _router) = create_cluster(1).await;
+        init_cluster(&nodes).await;
+        wait_for_leader(&nodes, Duration::from_secs(5)).await;
+        for (at, name) in ["gone-1", "gone-2", "gone-3"].into_iter().enumerate() {
+            let membership_log_id = *nodes[0].metrics().borrow().membership_config.log_id();
+            let response = nodes[0]
+                .write(RaftRequest::DecommissionNode {
+                    node_id: name.into(),
+                    retired_by: "operator".into(),
+                    reason: "scale-in".into(),
+                    retired_at_unix_ms: at as u64 + 1,
+                    membership_log_id,
+                })
+                .await
+                .unwrap();
+            assert!(
+                matches!(response, CouncilResponse::NodeDecommissioned { .. }),
+                "{response:?}"
+            );
+        }
+        let metrics = nodes[0].metrics().borrow().clone();
+        let status = crate::bun::agent::council_status(&nodes[0], &metrics).await;
+        assert_eq!(
+            status.retired_identities,
+            Some(crate::cluster::retirement::RetiredIdentities {
+                count: 3,
+                limit: 65_536,
+            })
+        );
     }
 
     /// Wait for a leader to be elected (up to timeout).

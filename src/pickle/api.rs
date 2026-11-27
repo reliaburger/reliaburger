@@ -2066,14 +2066,17 @@ impl PickleState {
             if !council.is_leader().await {
                 return Ok(Vec::new());
             }
-            let desired = council.desired_state().await;
             let mut pinned = pinned.clone();
-            pinned.extend(desired.pinned_image_digests());
+            let candidates = council
+                .read_desired(|desired| {
+                    pinned.extend(desired.pinned_image_digests());
+                    desired
+                        .manifest_catalog
+                        .expirable_manifests(now_unix_ms, retain, &pinned)
+                })
+                .await;
             let mut expired = Vec::new();
-            for expire in desired
-                .manifest_catalog
-                .expirable_manifests(now_unix_ms, retain, &pinned)
-            {
+            for expire in candidates {
                 match council
                     .write(crate::council::RaftRequest::ExpireManifest(expire.clone()))
                     .await

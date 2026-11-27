@@ -224,6 +224,15 @@ replacement machine enrols fresh with `relish join`. Don't decommission a node
 that might still be running, such as one behind a network partition: it could
 still be sending traffic to addresses the cluster would then hand out again.
 
+Retirement is permanent: the council keeps every retired name for good, so
+an old disk can never come back as the old node. A cluster can hold 65,536
+retired names. At that limit `relish decommission-node` is refused with
+`retired identity limit reached`, and nothing frees a name. `relish council
+status` shows how many are used (`Retired: 3 of 65536 node identities`), and
+`relish wtf` warns with `council-retired-identities-nearly-full` from 90%. If
+you replace workers often, give a returning machine its old name back rather
+than retiring it and enrolling a new one.
+
 ## Contributors: clusters from a checkout
 
 `relish dev create` builds `bun` and `relish` from your source tree inside a

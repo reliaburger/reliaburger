@@ -349,7 +349,7 @@ pub(super) async fn signing_key_rotate_handler(
         Ok(security) => security,
         Err(error) => return error_response(StatusCode::SERVICE_UNAVAILABLE, error),
     };
-    let Some(current) = security.oidc_signing_config else {
+    let Some(current) = security.oidc_signing_config.clone() else {
         return error_response(
             StatusCode::CONFLICT,
             crate::sesame::oidc::OidcError::NoSigningKey,

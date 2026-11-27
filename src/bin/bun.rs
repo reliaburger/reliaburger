@@ -330,7 +330,7 @@ async fn current_registry_capability(
     };
     let authoritative;
     let local;
-    let catalog = if let Some(council) = council {
+    let catalog: &reliaburger::pickle::types::ManifestCatalog = if let Some(council) = council {
         authoritative = council.manifest_catalog().await;
         &authoritative
     } else {
@@ -3353,6 +3353,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             .security_state()
             .await
             .oidc_signing_config
+            .clone()
             .map(|oidc| {
                 reliaburger::sesame::auth::WorkloadJwtVerifier::new(oidc, &config.cluster.name)
             }),
@@ -4070,8 +4071,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 // arbiter refuse anything still referenced.
                 let catalog_snapshot = match (&gc_council, gc_registry.forwarder.is_some()) {
                     (Some(council), _) => council.manifest_catalog().await,
-                    (None, true) => reliaburger::pickle::types::ManifestCatalog::default(),
-                    (None, false) => gc_catalog.read().await.clone(),
+                    (None, true) => Arc::default(),
+                    (None, false) => Arc::new(gc_catalog.read().await.clone()),
                 };
                 let store = Arc::clone(&gc_store);
                 let gc_cfg = gc_config.clone();

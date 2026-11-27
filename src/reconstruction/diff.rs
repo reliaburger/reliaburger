@@ -134,7 +134,7 @@ mod tests {
             });
         }
         DesiredState {
-            scheduling,
+            scheduling: scheduling.into(),
             ..Default::default()
         }
     }

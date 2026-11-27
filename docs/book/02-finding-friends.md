@@ -1090,6 +1090,49 @@ explains the admission boundary.
 
 Exhaustive `match`: add a new variant and the compiler forces you to handle it everywhere. Compare that to a `switch` in Go, where a forgotten `case` silently falls through to nothing.
 
+### All or nothing, without copying everything
+
+A placement pass is all or nothing: if its tenth decision is invalid, the first nine mustn't land either. Three other entries have the same rule: a job deployment's begin and its commit, and an approved agent proposal, each of which writes several apps. The first way we got there was the obvious one. Copy the whole `DesiredState`, apply the entry to the copy, and swap the copy in only if every part succeeded.
+
+It was correct, and it cost the size of the cluster on every entry ([#2435](https://github.com/reliaburger/reliaburger/issues/2435)). `DesiredState` held plain `HashMap`s and `Vec`s, so the copy took every app spec, the image catalogue, the endpoint catalogue, the task arrays and the security state. It ran inside `apply`, under the state's write lock, on every voter and learner, on most two-second scheduler ticks. A pass that moved one app copied five thousand.
+
+The fix has two halves. For a placement pass we didn't need a copy at all. A decision's checks never read what an earlier decision in the same pass wrote, apart from test-lease bookkeeping, so the state machine now checks every decision first and writes them all afterwards. The test leases get checked on a copy of the leases alone, which is committed with the pass.
+
+The other three entries call back into the ordinary apply code on their staged copy, so splitting them would mean duplicating it. Instead we made the copy cheap. The large collections of `DesiredState` now sit behind a small wrapper:
+
+```rust
+pub struct Shared<T>(std::sync::Arc<T>);
+
+impl<T> Clone for Shared<T> {
+    fn clone(&self) -> Self {
+        Self(std::sync::Arc::clone(&self.0))
+    }
+}
+
+impl<T> std::ops::Deref for Shared<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T: Clone> std::ops::DerefMut for Shared<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        std::sync::Arc::make_mut(&mut self.0)
+    }
+}
+```
+
+`Deref` and `DerefMut` are the traits behind Rust's `*` operator, and the compiler calls them for you whenever you use a field or a method through the wrapper. That's called auto-deref: `state.apps.get(&id)` finds no `get` on `Shared`, so the compiler tries `Deref` and calls `HashMap::get` on what's inside. A Go programmer can think of embedding a struct, except that here the wrapper decides what happens on the way through. The same coercion turns a `&Shared<HashMap<..>>` into a `&HashMap<..>` when you pass it to a function that wants the latter.
+
+The interesting half is `DerefMut`, which runs for every write. `Arc::make_mut` looks at the reference count. If this is the only handle on the value, it hands back a mutable reference to it, no copy. If another handle exists, it clones the value first, points this handle at the clone and hands that back. It's copy on write, enforced by the type system: you can't get a `&mut` to a value another copy can see.
+
+So `state.clone()` now copies about twenty pointers. An entry staged on that copy pays for the collections it writes, once each, and nothing else. An app deployment copies the app maps, which it's about to change anyway; the image catalogue, the task arrays and the security state stay where they were. We hand-wrote `Clone` rather than deriving it, for two reasons. `#[derive(Clone)]` would ask for `T: Clone` even though cloning an `Arc` doesn't need it, and it would read as if it copied the collection.
+
+There's one trap here. `DerefMut` doesn't know whether you'll write. `state.apps.get_mut(&id)` goes through `DerefMut` even when the key is missing, so if the map is shared at that moment, it gets copied for nothing. Inside `apply` that's rare, because nothing else holds the live state's collections for long. The snapshot builder does, and a reader that took a copy with `desired_state()` does, and then the next write to that collection pays for one copy. We took that trade.
+
+The wrapper serialises as the value inside, so the snapshot format didn't change. `a_fixed_state_serialises_to_the_same_snapshot_bytes` pins the exact bytes of a small fixed state, taken before the change. The tests for the change itself look at pointers, not timings: `a_placement_pass_does_not_copy_state_it_does_not_touch` commits an image manifest, applies a placement pass and checks that the catalogue's `Vec` is the same allocation afterwards, and `deployments_and_proposals_do_not_copy_state_they_do_not_touch` does the same for the other three entries. The `council_apply` group in `benches/task_arrays.rs` times one one-app pass against states of 100, 1,000 and 10,000 apps; the line should be flat.
+
 ### Snapshots and the JSON key problem
 
 When a follower falls far behind the leader's log, re-sending thousands of entries one by one is wasteful. Raft handles this with snapshots: the leader serialises the current state machine into a blob and sends it in one shot. The follower installs the snapshot and picks up replication from there.
@@ -1136,6 +1179,8 @@ pub struct DesiredState {
 ```
 
 The `'de` lifetime on the deserialise function is serde's way of tracking the lifetime of the input data. If you're deserialising from a borrowed `&str`, the `K` and `V` types could borrow from that string (if they contain `&str` fields). The `'de` lifetime makes this safe. Our types all own their data (they use `String`, not `&str`), so the lifetime doesn't change runtime behaviour, but serde's trait bounds require it regardless.
+
+How many copies of a snapshot does a node hold? More than it needed to ([#2452](https://github.com/reliaburger/reliaburger/issues/2452)). The builder encoded the state to JSON, kept one copy of the bytes to hand to followers later, cloned them again for the redb write and returned the original to openraft. Each follower that needed the snapshot cloned the kept bytes once more. The kept bytes are an `Arc<Vec<u8>>` now, shared by the state machine and the redb write, so a build makes one extra copy, the one openraft's snapshot type insists on owning. Sending to a follower still copies, for the same reason: openraft 0.9 wants a `Cursor<Vec<u8>>` it can own, and a shared-bytes snapshot type would mean changing the transport too. The state itself is copied under a short read lock before the encode, which since the copy-on-write change above costs a few pointers.
 
 ### When the snapshot becomes the only copy
 
@@ -2498,7 +2543,7 @@ The behaviour test needed a slow link, and the in-memory router had none. `InMem
 
 ### A batch needs a byte limit too
 
-AppendEntries had the same shape of problem with a different deadline ([#2370](https://github.com/reliaburger/reliaburger/issues/2370)). openraft sends a lagging follower up to 300 entries in one RPC (`max_payload_entries`) and gives it `heartbeat_interval`, 150 ms. Nothing bounded those 300 entries by *bytes*. Our endpoint catalogue is written whole on every change, and a placement pass can carry 131,072 placements, so a follower that came back 300 entries behind could be sent hundreds of megabytes in one frame. The receiver drops any frame over 64 MiB and closes the connection. The leader saw that as an unreachable peer, backed off, and sent the very same batch again. For ever.
+AppendEntries had the same shape of problem with a different deadline ([#2370](https://github.com/reliaburger/reliaburger/issues/2370)). openraft sends a lagging follower up to 300 entries in one RPC (`max_payload_entries`) and gives it `heartbeat_interval`, 150 ms. Nothing bounded those 300 entries by *bytes*. Our endpoint catalogue was written whole on every change (it isn't any more; see [Talking to Each Other](03-talking-to-each-other.md)), and a placement pass can carry 131,072 placements, so a follower that came back 300 entries behind could be sent hundreds of megabytes in one frame. The receiver drops any frame over 64 MiB and closes the connection. The leader saw that as an unreachable peer, backed off, and sent the very same batch again. For ever.
 
 openraft has the fix built in; we just never used it. Its replication task doesn't read the log with `try_get_log_entries` but with `limited_get_log_entries(start, end)`, a trait method whose default returns the whole range. A trait in Rust can ship a *default method body*, which an implementation gets for free unless it writes its own, and our log readers never wrote one. Now `DurableLogReader` and the in-memory reader stop before the entry that would take the batch past `LOG_READ_BUDGET_BYTES` (4 MiB), and always return the first entry, however big: openraft's contract says a non-empty range must never come back empty. The durable log stores entries as JSON, the same encoding they travel in, so the stored length redb already hands us is a fair measure of frame bytes, with no decoding to count.
 
@@ -2786,6 +2831,8 @@ let target = largest_odd_at_most(pool.len().min(config.max_council_size));
 
 The awkward part is getting from one odd number to the next without stopping on an even one. Growing from one voter to three by single promotions would pass through two. So growth waits until two learners have caught up and promotes both in one change, `PromotePair`. Replacing a dead voter is the `Replace` swap above. And when the council is even on arrival, left over from an older release or a `relish decommission-node`, the planner returns it to odd: up by one with `Promote` if a caught-up learner and the live nodes allow it, otherwise down by one with `RemoveVoter`, a dead voter first.
 
+"A dead voter first" had a gap ([#2374](https://github.com/reliaburger/reliaburger/issues/2374)). A voter only counts as dead once it's been down for `dead_window`, 30 seconds, so a voter that died ten seconds ago, or one SWIM only suspects, wasn't on the list, and the fallback picked the highest-numbered voter that isn't the leader, alive or not. On a four-node cluster with voter 2 freshly dead, the planner removed voter 4, which was fine, and kept voter 2. The council was three voters with one down: one more failure from losing quorum, for no reason. Now a shrinking even council looks for a voter that's down in any way before it touches a live one. That bends the hysteresis rule (eviction normally waits out the window), but the council loses a seat either way, and a node that comes back rejoins as a learner and gets promoted the usual way. `an_even_council_sheds_a_voter_that_is_down_before_a_live_one` checks it for a voter dead inside the window, a suspect one and one gossip hasn't seen.
+
 The planner's guards look a little different with pairs about. The old code had one shrink rule; now there are three ways to change the voter count, and each has to be committable. Rather than repeat the majority arithmetic in each branch, every candidate action is turned into the voter set it would produce, and one closure checks it:
 
 ```rust
@@ -2909,6 +2956,8 @@ pub fn seal_snapshot(
 The `info` string is the important bit. HKDF binds the derived key to that exact string, so a key derived for backups can't decrypt anything else, and nothing else can decrypt a backup. The salt is random per backup and travels in the (public) envelope; the master key never does. Tamper with a single byte of the ciphertext and AES-GCM's authentication tag refuses to open it: that's not a nice-to-have, it's the difference between restoring your cluster and restoring an attacker's.
 
 Why derive from the master key rather than, say, generate a fresh backup key and store it somewhere? Because *any* surviving node must be able to restore, and every node already has the master key. There's no new secret to distribute, lose, or leak.
+
+"Self-describing envelope" hid a size problem for a while ([#2452](https://github.com/reliaburger/reliaburger/issues/2452)). The envelope is JSON, and serde writes a `Vec<u8>` as a JSON array of numbers: `[201,17,88,...]`. Ciphertext bytes are uniformly random, so each costs 3.57 characters on average, digits plus a comma. A 40 MB state became a 143 MB backup, built in memory every five minutes and uploaded at that size. The field now goes through a small `#[serde(with = "base64_bytes")]` module, a pair of `serialize` and `deserialize` functions serde calls for that one field instead of its default, which writes one base64 string at 4 characters per 3 bytes. `an_encoded_backup_is_not_much_larger_than_its_payload` seals 64 KiB and checks the encoded backup is under 1.5 times that; it was 3.6 times. The envelope version follows the cluster's `state` compatibility number, so a backup written before the change is refused by name rather than mis-parsed.
 
 Uploading rides `object_store`, the same crate the volume-snapshot worker uses, so `file://`, `s3://` and `gs://` all work with one code path and each backend's standard credentials. The loop runs only on the leader, only when you've set a destination, and prunes old backups past a retention count:
 

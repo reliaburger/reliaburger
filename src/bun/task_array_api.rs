@@ -395,7 +395,7 @@ pub(crate) async fn admit_template_image(
     };
     let catalog = match (&state.council, &state.pickle_catalog) {
         (Some(council), _) => council.manifest_catalog().await,
-        (None, Some(catalog)) => catalog.read().await.clone(),
+        (None, Some(catalog)) => std::sync::Arc::new(catalog.read().await.clone()),
         _ => Default::default(),
     };
     if crate::meat::scheduler::lookup_pickle_manifest(image, &catalog).is_none() {

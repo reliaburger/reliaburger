@@ -98,7 +98,7 @@ impl PickleState {
         let state = match &query {
             RegistryQuery::Images | RegistryQuery::Repository { .. } => {
                 crate::council::DesiredState {
-                    manifest_catalog: self.catalog.read().await.clone(),
+                    manifest_catalog: self.catalog.read().await.clone().into(),
                     ..Default::default()
                 }
             }

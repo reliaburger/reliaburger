@@ -152,6 +152,12 @@ and one a scoped token can't see says `not visible to a scoped token`.
 `--watch`, and `--output json` or `yaml` refuses them, since the machine
 report always carries everything (see [diagnostics](07_diagnostics.md#three-ways-to-read-it)).
 
+## Cluster limits
+
+| Limit | Value | At the limit |
+|---|---|---|
+| Retired node identities | 65,536 | `relish decommission-node` is refused with `retired identity limit reached`; retired names are permanent, so nothing frees one. `relish council status` shows the count and `relish wtf` warns from 90% |
+
 ## Environment variables
 
 | Variable | Read by | Meaning |

@@ -651,6 +651,14 @@ The leader confirms it's still the leader before each export, so a deposed
 one skips it. Backups written by 0.2.0 or earlier are named by time alone;
 they're left alone and never restored.
 
+A backup is a small JSON envelope with the encrypted state in it as one
+base64 string, about a third larger than the state itself. Its format follows
+the cluster's state format, so a release that changes either refuses older
+backups by name: `relish council recover` says the envelope version isn't
+supported. Backups written before 0.3.4 stored the ciphertext as a list of
+numbers, about 3.6 times the state, and 0.3.4 doesn't restore them; take a
+fresh backup after upgrading.
+
 A configured backup can still be off. With no master key on the node (there's
 nothing to seal with, and plaintext state never leaves it), or a `url` the
 object store can't open, the loop never starts. `relish wtf` reports either as
