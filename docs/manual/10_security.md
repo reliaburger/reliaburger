@@ -275,7 +275,9 @@ namespaces = ["shop"]   # omit for every namespace
 A permission can only take away: the token still needs the role and scope for
 anything it does. A token with no block is governed by its role and scope
 alone, so permissions are opt-in per token. Once a token has a block, it may
-do only what the block lists:
+do only what the block lists, on every node. A node with no Raft seat gets the
+blocks from the council leader along with the tokens, so a new or changed
+block reaches it within one security refresh (five seconds):
 
 | Action | What it covers |
 |--------|----------------|

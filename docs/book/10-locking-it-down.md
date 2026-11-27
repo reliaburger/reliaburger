@@ -977,7 +977,7 @@ Reads got the same rule, for the same reason `/v1/status` did: a token scoped to
 
 One case has no scope to apply. On the loopback listener reads are open to anyone, and a scoped token that gets refused could just be left off the request. We check it only where reads need a principal in the first place.
 
-Scopes weren't the only thing the registry forgot. A `[permission]` block narrows one token to named actions on named apps, and `/v1/build` already treated pushing an image as a `deploy` of its app. The registry port didn't read the blocks at all, so a Deployer token whose block allowed only `logs` could still `docker push` over any repository its scope reached (#2398). Chapter 5 has the fix: the write gate now holds a push to the same `deploy` rule, so `relish build` and `docker push` agree again.
+Scopes weren't the only thing the registry forgot. A `[permission]` block narrows one token to named actions on named apps, and `/v1/build` already treated pushing an image as a `deploy` of its app. The registry port didn't read the blocks at all, so a Deployer token whose block allowed only `logs` could still `docker push` over any repository its scope reached (#2398). Chapter 5 has the fix: the write gate now holds a push to the same `deploy` rule, so `relish build` and `docker push` agree again. The fix read the blocks from the node's replica, and that turned up one more hole: a node with no Raft seat has an empty replica, so neither its API nor its registry saw any block at all (#2538). Chapter 4's "Tokens for a node with no seat" has how the leader's security view now carries the blocks.
 
 ### Fail closed, not open
 

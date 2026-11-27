@@ -1164,13 +1164,15 @@ async fn enforce_cluster_permission(
     crate::sesame::auth::authorize_cluster_permission(auth, action, &permissions)
 }
 
-/// The replicated `[permission]` map, keyed by token name. Empty without a
-/// council (single-node mode, where permissions can't be configured).
+/// The replicated `[permission]` map, keyed by token name: this node's
+/// replica, or the leader's view on a node with no Raft seat (#2538). Empty
+/// without a council (single-node mode, where permissions can't be
+/// configured).
 pub(crate) async fn permission_map(
     state: &ApiState,
 ) -> std::collections::BTreeMap<String, crate::config::PermissionSpec> {
     match &state.council {
-        Some(council) => council.desired_state().await.permissions,
+        Some(council) => council.permissions().await,
         None => std::collections::BTreeMap::new(),
     }
 }

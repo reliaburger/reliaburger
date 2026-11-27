@@ -111,9 +111,10 @@ pub struct CouncilNode {
     /// send a burst of heartbeat rounds (#1441).
     leadership_proof: super::proof::SharedProof,
     /// The leader's [`node_view`](crate::sesame::types::SecurityState::node_view)
-    /// of the security state, for a node whose own replica holds none
-    /// because it has no Raft seat (#1477). `None` until it has fetched one.
-    leader_security_view: tokio::sync::RwLock<Option<crate::sesame::types::SecurityState>>,
+    /// of the security state, with the `[permission]` blocks that go with
+    /// its tokens (#2538), for a node whose own replica holds none because
+    /// it has no Raft seat (#1477). `None` until it has fetched one.
+    leader_security_view: tokio::sync::RwLock<Option<crate::sesame::security_view::SecurityView>>,
     /// Test hook: writes and linearizable reads never return, as they don't
     /// on a leader that has lost its quorum and not yet stepped down.
     #[cfg(test)]
@@ -821,7 +822,7 @@ impl CouncilNode {
             return local;
         }
         match self.leader_security_view.read().await.as_ref() {
-            Some(view) => std::sync::Arc::new(view.clone()),
+            Some(view) => std::sync::Arc::new(view.security.clone()),
             None => local,
         }
     }
@@ -841,10 +842,44 @@ impl CouncilNode {
             .await
     }
 
-    /// Keep the leader's view of the security state, for a node whose replica
-    /// holds none (#1477). Ignored once the replica holds its own.
-    pub async fn adopt_leader_security_view(&self, view: crate::sesame::types::SecurityState) {
+    /// Keep the leader's view of the security state and permission blocks,
+    /// for a node whose replica holds none (#1477, #2538). Ignored once the
+    /// replica holds its own.
+    pub async fn adopt_leader_security_view(
+        &self,
+        view: crate::sesame::security_view::SecurityView,
+    ) {
         *self.leader_security_view.write().await = Some(view);
+    }
+
+    /// The `[permission]` block for the token called `name`, copied out of
+    /// this node's replica. A node with no Raft seat reads the leader's
+    /// view instead, once it has one, so it enforces blocks as a voter
+    /// does (#2538).
+    pub async fn permission(&self, name: &str) -> Option<crate::config::PermissionSpec> {
+        if !self.holds_security_state().await
+            && let Some(view) = self.leader_security_view.read().await.as_ref()
+        {
+            return view.permissions.get(name).cloned();
+        }
+        self.state_machine
+            .read_desired(|state| state.permissions.get(name).cloned())
+            .await
+    }
+
+    /// Every `[permission]` block, copied out of this node's replica, or of
+    /// the leader's view on a node with no Raft seat (#2538).
+    pub async fn permissions(
+        &self,
+    ) -> std::collections::BTreeMap<String, crate::config::PermissionSpec> {
+        if !self.holds_security_state().await
+            && let Some(view) = self.leader_security_view.read().await.as_ref()
+        {
+            return view.permissions.clone();
+        }
+        self.state_machine
+            .read_desired(|state| state.permissions.clone())
+            .await
     }
 
     /// The API token stored under `token_hash` in this node's replica,
@@ -895,7 +930,7 @@ impl CouncilNode {
                 .read()
                 .await
                 .as_ref()
-                .map(|view| view.api_tokens.clone())
+                .map(|view| view.security.api_tokens.clone())
                 .unwrap_or_default(),
         }
     }

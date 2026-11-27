@@ -5,7 +5,9 @@
 //! never came, and a revocation or a rotated CA never reached it. So such a
 //! node asks the leader for [`SecurityState::node_view`] over mTLS, every
 //! time Bun's security refresh ticks, and the council handle serves that view
-//! to every reader until the node's own replica holds the state.
+//! to every reader until the node's own replica holds the state. The view
+//! carries the `[permission]` blocks too, so such a node narrows a token as
+//! a voter does (#2538).
 //!
 //! The leader's address comes from gossip, and gossip is authenticated only
 //! by a key every node holds, so a hint proves nothing (#2406). A node takes
@@ -33,6 +35,11 @@ pub struct SecurityView {
     pub compatibility: crate::compatibility::Compatibility,
     /// [`SecurityState::node_view`] of the leader's committed state.
     pub security: SecurityState,
+    /// Every `[permission]` block, keyed by token name. They live in the
+    /// desired state, not the security state, but a block narrows a token,
+    /// so a node that takes its tokens from this view must take their
+    /// blocks too, or it treats a narrowed token as unrestricted (#2538).
+    pub permissions: std::collections::BTreeMap<String, crate::config::PermissionSpec>,
 }
 
 /// The leader's side: read the state linearizably, so a deposed leader can't
@@ -47,9 +54,15 @@ pub async fn issue_view(
         .await
         .map_err(|error| RenewalError::Unavailable(error.to_string()))?;
     validate_peer(peer, &state)?;
+    // Read after the leadership proof, so the blocks are at least as fresh
+    // as the security state they go with.
+    let permissions = council
+        .read_desired(|desired| desired.permissions.clone())
+        .await;
     Ok(SecurityView {
         compatibility: crate::compatibility::CURRENT,
         security: state.node_view(),
+        permissions,
     })
 }
 
@@ -97,7 +110,7 @@ impl SecurityViewClient {
         council: &CouncilNode,
         leader: &str,
         address: SocketAddr,
-    ) -> Result<SecurityState, String> {
+    ) -> Result<SecurityView, String> {
         let voters = match crate::council::admission::council_voters(council.raft()).await {
             Some(voters) => voters,
             None => crate::council::admission::roster_names(&self.expected.roster().await),
@@ -139,6 +152,6 @@ impl SecurityViewClient {
         view.compatibility
             .require_current()
             .map_err(|error| error.to_string())?;
-        Ok(view.security)
+        Ok(view)
     }
 }
