@@ -306,6 +306,7 @@ fn rollups_for_minute(keys: &[MetricKey], minute: u64) -> Vec<NodeRollup> {
         .map(|node| NodeRollup {
             node_id: NodeId::new(format!("node-{node}")),
             timestamp: minute,
+            part: 0,
             entries: keys
                 .iter()
                 .enumerate()

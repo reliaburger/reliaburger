@@ -724,6 +724,7 @@ mod tests {
         let rollup = |name: &str| crate::mayo::rollup::NodeRollup {
             node_id: NodeId::new(name),
             timestamp: 60,
+            part: 0,
             entries: vec![crate::mayo::rollup::RollupEntry {
                 metric_name: "node_cpu_usage_percent".to_string(),
                 labels: std::collections::BTreeMap::new(),
@@ -941,6 +942,7 @@ mod tests {
         let rollup = crate::mayo::rollup::NodeRollup {
             node_id: NodeId::new("w1"),
             timestamp: 60,
+            part: 0,
             entries: vec![crate::mayo::rollup::RollupEntry {
                 metric_name: "node_cpu_usage_percent".to_string(),
                 labels: std::collections::BTreeMap::new(),

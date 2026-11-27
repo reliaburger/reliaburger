@@ -457,7 +457,7 @@ if !self.seen_windows.insert(key) {
 }
 ```
 
-`HashSet::insert` returns `false` if the key was already present, which is exactly the "have I seen this?" question we need in one call.
+`HashSet::insert` returns `false` if the key was already present, which is exactly the "have I seen this?" question we need in one call. (The key has since grown a third part, the rollup's part number, for minutes too big for one message; [Eyes Everywhere](11-eyes-everywhere.md#the-rollupworker) has that story.)
 
 **Temp files that outlived a crash, and a sync nobody checked.** A metrics flush writes a randomly named `.mayo-pending-*` file and renames it into place. A crash between the two left the temp file for good: nothing deleted it and the size cap didn't count it (#2059). `MayoStore::new` now deletes them, which is safe because one Bun owns the directory. The rollup writer had the opposite slip. It renamed its file and then synced the directory, but threw away a failed sync and returned `Ok`, so the caller cleared its buffer while the rename could still vanish in a power cut (#2060). The error now propagates and the rows wait for the next flush. That alone left a second bug, which review caught: the renamed file stayed in place while the rows waited, so queries counted them twice until the retry. So the writer removes the file before it reports the failure. A filesystem that can't sync a directory at all answers `EINVAL`, `ENOTSUP` or `ENOSYS`, and that isn't a failed flush: the bytes are synced and there's nothing to retry. The test takes read permission off the directory (`0o300`: write and search only), so creating and renaming the file still work and only opening the directory to sync it fails.
 

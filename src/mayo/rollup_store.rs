@@ -104,7 +104,12 @@ pub struct RollupStore {
     /// worker re-sends the same window after reassignment (extended backfill),
     /// so the aggregator must ingest each `(node, window)` exactly once or the
     /// cluster sum double-counts (OBS2). Pruned to stay bounded.
-    seen_windows: HashSet<(String, u64)>,
+    seen_windows: HashSet<(String, u64, u16)>,
+    /// `(node_id, window)` keys found flushed on disk at startup. The files
+    /// don't record which part a row came from, so any part of such a
+    /// window is taken as already ingested: a part straddling a restart is
+    /// lost rather than counted twice.
+    hydrated_windows: HashSet<(String, u64)>,
     /// Newest window timestamp seen, used as the anchor for pruning
     /// `seen_windows` (kept off the wall clock for determinism).
     newest_window: u64,
@@ -173,6 +178,7 @@ impl RollupStore {
             data_dir,
             flush_counter,
             seen_windows: HashSet::new(),
+            hydrated_windows: HashSet::new(),
             newest_window: 0,
             index: SourceIndex::default(),
             max_buffer_rows: MAX_BUFFER_ROWS,
@@ -229,25 +235,32 @@ impl RollupStore {
             for i in 0..batch.num_rows() {
                 let window = windows.value(i);
                 self.newest_window = self.newest_window.max(window);
-                self.seen_windows
+                self.hydrated_windows
                     .insert((nodes.value(i).to_string(), window));
             }
         }
         // Keep the seeded set bounded to the idempotency horizon.
         let cutoff = self.newest_window.saturating_sub(IDEMPOTENCY_HORIZON_SECS);
-        self.seen_windows.retain(|(_, window)| *window >= cutoff);
+        self.hydrated_windows
+            .retain(|(_, window)| *window >= cutoff);
         Ok(())
     }
 
     /// Ingest a `NodeRollup` into the buffer.
     ///
-    /// Idempotent per `(node_id, window)`: a window already ingested this
+    /// Idempotent per `(node_id, window, part)`: a part already ingested this
     /// lifetime is dropped, so a re-sent rollup (worker reassignment backfill)
     /// never double-counts. Returns `true` if the rollup was ingested, `false`
     /// if it was a duplicate.
     pub fn ingest(&mut self, rollup: &NodeRollup) -> bool {
         let node_id = rollup.node_id.0.clone();
-        let key = (node_id.clone(), rollup.timestamp);
+        if self
+            .hydrated_windows
+            .contains(&(node_id.clone(), rollup.timestamp))
+        {
+            return false;
+        }
+        let key = (node_id.clone(), rollup.timestamp, rollup.part);
         if !self.seen_windows.insert(key) {
             return false;
         }
@@ -260,7 +273,9 @@ impl RollupStore {
         self.newest_window = self.newest_window.max(rollup.timestamp);
         if self.seen_windows.len() > MAX_SEEN_WINDOWS {
             let cutoff = self.newest_window.saturating_sub(IDEMPOTENCY_HORIZON_SECS);
-            self.seen_windows.retain(|(_, window)| *window >= cutoff);
+            self.seen_windows.retain(|(_, window, _)| *window >= cutoff);
+            self.hydrated_windows
+                .retain(|(_, window)| *window >= cutoff);
         }
 
         for entry in &rollup.entries {
@@ -918,6 +933,7 @@ mod tests {
                     store.ingest(&NodeRollup {
                         node_id: NodeId::new(*node),
                         timestamp,
+                        part: 0,
                         entries,
                     });
                 }
@@ -1007,7 +1023,7 @@ mod tests {
         store.flush().await.unwrap();
         let mut restarted = RollupStore::new(directory.path().to_path_buf());
         restarted.hydrate_seen_windows().await.unwrap();
-        let mut seen: Vec<_> = restarted.seen_windows.iter().cloned().collect();
+        let mut seen: Vec<_> = restarted.hydrated_windows.iter().cloned().collect();
         seen.sort();
         report.push(format!(
             "## hydrated windows (newest {})\n{seen:?}",
@@ -1020,6 +1036,7 @@ mod tests {
         NodeRollup {
             node_id: NodeId::new(node),
             timestamp,
+            part: 0,
             entries: vec![RollupEntry {
                 metric_name: metric.to_string(),
                 labels: BTreeMap::new(),
@@ -1047,6 +1064,7 @@ mod tests {
         NodeRollup {
             node_id: NodeId::new(node),
             timestamp,
+            part: 0,
             entries: vec![RollupEntry {
                 metric_name: metric.to_string(),
                 labels,
@@ -1459,6 +1477,21 @@ mod tests {
         assert_eq!(rows.len(), crate::mayo::store::ALL_QUERY_ROW_LIMIT);
         assert_eq!(rows.last().unwrap().0, total * 60, "newest kept");
         assert!(rows.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    }
+
+    /// #2426: a minute too large for one frame arrives in parts. Each part
+    /// is ingested once; a re-sent part is a duplicate.
+    #[tokio::test]
+    async fn each_part_of_a_minute_is_ingested_once() {
+        let (mut store, _dir) = test_store();
+        let part = |part: u16, metric: &str| NodeRollup {
+            part,
+            ..make_rollup("n1", 60, metric, 1.0)
+        };
+        assert!(store.ingest(&part(0, "cpu")));
+        assert!(store.ingest(&part(1, "mem")));
+        assert!(!store.ingest(&part(1, "mem")), "a re-sent part");
+        assert_eq!(store.buffer_len(), 2);
     }
 
     /// #2443: a flush written outside the store lock keeps its rows

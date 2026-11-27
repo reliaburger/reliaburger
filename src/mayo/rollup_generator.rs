@@ -115,6 +115,7 @@ impl RollupGenerator {
         Ok(NodeRollup {
             node_id: self.node_id.clone(),
             timestamp: start,
+            part: 0,
             entries,
         })
     }

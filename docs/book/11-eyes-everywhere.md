@@ -239,6 +239,16 @@ Two related fixes from the same review live in chapter 2, where the aggregator i
 
 The reporting topology stays a flat star: every node reports straight to the leader. The consistent-hash tree this chapter's title promises is real in the library (`assignment.rs`) and deliberately unwired — with the council capped at seven and reports every few seconds, a star to the leader handles thousands of nodes before the maths says otherwise. When it does, the tree slots in behind the same `watch` channel interface without touching the workers. What did change in 12b.2 is who can *find* the star's centre: the gossip directory (chapter 2) now tells every node, voter or not, where the leader's reporting endpoint lives, so the star finally extends past the council.
 
+
+### A minute too big for one message
+
+A rollup carries one entry per series the node had in that minute, and the reporting transport refuses any frame over 1 MiB. We measured an entry at about 149 bytes in postcard, for a series labelled the way an app scrape labels it (`app`, `namespace`, `instance`, `node` and one label of its own), so a node with about 7,000 series, 30 instances of an ordinary instrumented service, crossed the limit ([#2426](https://github.com/reliaburger/reliaburger/issues/2426)). Every push then failed with `ReportTooLarge`. The worker treated that like any failed send and asked for a backfill, which built five rollups of the same size and failed on the first, every minute, for ever. The node vanished from `/v1/metrics/cluster` and the only trace was a line in its stderr.
+
+Now `split_to_fit` cuts a minute into parts that each fit. It measures every entry with `postcard::experimental::serialized_size` (which walks the value without allocating the encoding) and fills a part greedily up to the frame limit, less the part's fixed cost. The split depends only on the entries, which come out of the store sorted by name and labels, so a backfill re-sending the same minute cuts it the same way. That matters because of the dedup above: each part carries a `part` number, and the council's key is now `(node_id, window, part)`. That's a wire format change (`NodeRollup` grew a field), so it moves the protocol version.
+
+A part can still be refused if one entry is over the limit on its own, a label with a megabyte in it say. Retrying can't help, so the worker no longer starts a backfill for `ReportTooLarge`. It counts the part in a node metric, `mayo_rollups_refused_total`, logs it, and sends the minute's other parts. `a_rollup_larger_than_one_report_frame_still_reaches_the_parent` pushes 8,000 series through an in-memory transport that now applies the same frame check as TCP, and expects all 8,000 at the other end in more than one part; `a_rollup_too_large_to_send_does_not_start_a_backfill` and `a_split_is_deterministic_and_every_part_fits` pin the rest.
+
+One edge we chose rather than fixed: after a restart the council seeds its dedup set from the Parquet files, which don't record parts. So any part of a minute already on disk counts as seen, and a part that arrives across a restart is dropped rather than risk counting the minute twice.
 ## Two merge strategies
 
 When results come back from multiple sources, how you combine them depends on the query type.

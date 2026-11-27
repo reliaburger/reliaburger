@@ -178,6 +178,12 @@ doesn't answer becomes a `warning:` line rather than an error:
 relish top                       # every node's workloads, with CPU and memory
 ```
 
+Each node also sends the council a one-minute summary of every series it
+has, which is what `/v1/metrics/cluster` sums. A node with many series sends
+its minute in several parts; if a single series is too large to send at all
+(a label holding a megabyte, say), the node counts it in its own
+`mayo_rollups_refused_total` metric and logs it.
+
 The metrics API answers within bounds. `GET /v1/metrics?name=X` and
 `/v1/metrics/rollup?name=X` return at most the newest 10,000 rows of the
 range you ask for, `/v1/metrics/summary` and `/v1/metrics/keys` list the
